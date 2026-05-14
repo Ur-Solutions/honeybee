@@ -11,6 +11,7 @@ It creates agent sessions on demand, sends prompts into them, captures panes, an
 - Tail/capture panes
 - List/kill sessions
 - Agent presets: `claude`, `codex`, `opencode`, `pi`, `droid`
+- Claude transcript discovery via `~/.claude/projects/<cwd-key>/*.jsonl`
 - No Desk integration yet
 
 ## Usage
@@ -20,9 +21,11 @@ npm install
 npm run build
 npm link
 
-ap spawn claude --cwd ~/Projects/agentpit
+ap spawn claude --cwd ~/Projects/trmd/agentpit/repos/agentpit
 ap send <session> "Please inspect the repo and propose a plan. Do not edit."
 ap tail <session>
+ap transcript <session>
+ap last <session>
 ap list
 ap kill <session>
 ```

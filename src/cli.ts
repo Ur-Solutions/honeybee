@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { resolveAgent, shellCommand } from "./agents.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, type SessionRecord } from "./store.js";
 import { capture, hasSession, kill, listTmuxSessions, newSession, sendText } from "./tmux.js";
+import { lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
 
 const VERSION = "0.0.1";
 
@@ -30,6 +31,13 @@ async function main(argv: string[]) {
     case "list":
     case "ls":
       await cmdList();
+      break;
+    case "transcript":
+    case "tx":
+      await cmdTranscript(parsed);
+      break;
+    case "last":
+      await cmdLast(parsed);
       break;
     case "kill":
       await cmdKill(parsed);
@@ -111,6 +119,31 @@ async function cmdList() {
     const status = live.has(record.tmuxTarget) ? "running" : "dead";
     console.log(`${status}\t${record.name}\t${record.agent}\t${record.cwd}\t${record.command}`);
   }
+}
+
+async function cmdTranscript(parsed: Parsed) {
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: ap transcript <session> [-n rows] [--json]");
+  const record = await resolveSession(target);
+  const tx = await latestTranscript(record.agent, record.cwd, record.createdAt);
+  if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
+  const limitRaw = flag(parsed, "n") ?? flag(parsed, "limit");
+  const limit = limitRaw ? Number(limitRaw) : undefined;
+  const json = truthy(flag(parsed, "json"));
+  console.error(`# ${tx.provider} transcript: ${tx.path}`);
+  console.log(renderTranscript(tx.rows, { limit: Number.isFinite(limit) ? limit : undefined, json }));
+}
+
+async function cmdLast(parsed: Parsed) {
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: ap last <session>");
+  const record = await resolveSession(target);
+  const tx = await latestTranscript(record.agent, record.cwd, record.createdAt);
+  if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
+  const text = lastAssistantText(tx.rows);
+  if (!text) throw new Error(`No assistant text found in transcript: ${tx.path}`);
+  console.error(`# ${tx.provider} transcript: ${tx.path}`);
+  console.log(text);
 }
 
 async function cmdKill(parsed: Parsed) {
@@ -235,6 +268,8 @@ Usage:
   ap run <agent> -p <prompt> [--cwd dir] [--keep] [-- <agent-args...>]
   ap send <session> <prompt>
   ap tail <session> [-n lines]
+  ap transcript <session> [-n rows] [--json]
+  ap last <session>
   ap list
   ap kill <session>
   ap attach <session>
