@@ -9,7 +9,7 @@ export type AgentSpec = {
 const DEFAULT_COMMANDS: Record<string, string> = {
   claude: "claude",
   codex: "codex",
-  opencode: "opencode",
+  opencode: "opencode run --interactive --dangerously-skip-permissions",
   pi: "pi",
   droid: "droid",
 };

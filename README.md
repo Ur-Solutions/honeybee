@@ -52,3 +52,13 @@ AP_DROID_CMD="python3 ~/bin/droid-agent.py" ap spawn droid
 ## Transcript readers
 
 `ap transcript` and `ap last` now support Claude, Codex, and OpenCode when their local transcript stores are present. Claude is still the best-tested live path; Codex and OpenCode readers are file-store parsers and should be hardened against future provider format changes as we use them.
+
+## Agent defaults
+
+OpenCode defaults to full-permission interactive mode because Tormod typically runs worker agents that way:
+
+```sh
+opencode run --interactive --dangerously-skip-permissions
+```
+
+Override with `AP_OPENCODE_CMD` if a safer or different profile is needed.
