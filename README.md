@@ -12,7 +12,11 @@ It creates agent sessions on demand, sends prompts into them, captures panes, an
 - List/kill sessions
 - Agent presets: `claude`, `codex`, `opencode`, `pi`, `droid`
 - `ap wait` idle detection via pane/transcript stability
-- Claude transcript discovery via `~/.claude/projects/<cwd-key>/*.jsonl`, with prompt/session/path matching
+- Provider transcript discovery and rendering:
+  - Claude: `~/.claude/projects/<cwd-key>/*.jsonl`
+  - Codex: `~/.codex/sessions/**/*.jsonl`
+  - OpenCode: `~/.local/share/opencode/storage/**`
+- Transcript matching by cwd, prompt, session id/path, timestamp, and mtime
 - No Desk integration yet
 
 ## Usage
@@ -44,3 +48,7 @@ Override an agent command with environment variables:
 AP_CLAUDE_CMD="/Users/me/.local/bin/claude --model sonnet" ap spawn claude
 AP_DROID_CMD="python3 ~/bin/droid-agent.py" ap spawn droid
 ```
+
+## Transcript readers
+
+`ap transcript` and `ap last` now support Claude, Codex, and OpenCode when their local transcript stores are present. Claude is still the best-tested live path; Codex and OpenCode readers are file-store parsers and should be hardened against future provider format changes as we use them.

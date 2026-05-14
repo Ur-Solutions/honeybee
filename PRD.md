@@ -15,7 +15,7 @@ Desk integration is explicitly out of v0 scope.
 - Use tmux as the durable process/session substrate.
 - Send prompts safely into interactive TUIs.
 - Capture pane output for all agents.
-- Read durable transcripts for agents that expose them, starting with Claude.
+- Read durable transcripts for agents that expose them, starting with Claude, Codex, and OpenCode.
 - Keep a lightweight local ledger of sessions and prompts.
 - Be useful from both human shell and OpenClaw/Jancsi automation.
 
@@ -178,11 +178,15 @@ Claude transcript lookup now scores candidates by explicit transcript path, prov
 
 ### 7.3 Codex transcript reader
 
-Locate and parse Codex durable logs/transcripts. Add `latestTranscript(agent="codex")`.
+Status: first pass implemented.
+
+Parses `~/.codex/sessions/**/*.jsonl`, normalizes user/assistant messages from `event_msg` and `response_item` records, and scores candidates by cwd, prompt, session id/path, timestamp, and mtime.
 
 ### 7.4 OpenCode transcript reader
 
-Same for OpenCode.
+Status: first pass implemented.
+
+Parses OpenCode JSON storage under `~/.local/share/opencode/storage`, joining session, message, and part files into normalized transcript rows. Needs live-session hardening after current OpenCode CLI behavior is exercised through `ap`.
 
 ### 7.5 `ap packet`
 
@@ -259,5 +263,5 @@ Agentpit is ready for early development when:
 
 - Should default project area remain `trmd`, or should this graduate to `openclaw` if packaged as a plugin?
 - Should `ap run` keep or kill sessions by default? Current bias: keep sessions; explicit cleanup is safer.
-- Which agent transcript source should be implemented after Claude: Codex or OpenCode?
+- Which provider reader needs hardening first under live `ap run`: Codex or OpenCode?
 - Should session names be human-readable task slugs by default instead of random suffixes?

@@ -259,7 +259,7 @@ async function cmdKill(parsed: Parsed) {
 async function cmdRun(parsed: Parsed) {
   const agent = parsed.args[0];
   const prompt = String(flag(parsed, "prompt") ?? flag(parsed, "p") ?? parsed.args.slice(1).join(" "));
-  if (!agent || !prompt) throw new Error("Usage: ap run <agent> -p <prompt> [--cwd dir] [--keep]");
+  if (!agent || !prompt) throw new Error("Usage: ap run <agent> -p <prompt> [--cwd dir] [--wait] [--last] [--keep]");
 
   const spawnParsed: Parsed = {
     command: "spawn",
@@ -404,7 +404,7 @@ function printHelp() {
 
 Usage:
   ap spawn <agent> [--name name] [--cwd dir] [-- <agent-args...>]
-  ap run <agent> -p <prompt> [--cwd dir] [--keep] [-- <agent-args...>]
+  ap run <agent> -p <prompt> [--cwd dir] [--wait] [--last] [--keep] [-- <agent-args...>]
   ap send <session> <prompt>
   ap tail <session> [-n lines]
   ap transcript <session> [-n rows] [--json]
