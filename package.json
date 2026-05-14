@@ -1,0 +1,23 @@
+{
+  "name": "agentpit",
+  "version": "0.0.1",
+  "description": "On-demand tmux cockpit for interactive agent CLIs.",
+  "type": "module",
+  "bin": {
+    "ap": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/cli.ts",
+    "ap": "node dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}
