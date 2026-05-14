@@ -153,23 +153,28 @@ Convenience: spawn, send prompt, then capture initial pane.
 
 ### 7.1 `ap wait`
 
+Status: implemented first pass.
+
 Wait until an agent appears quiescent, then print result.
 
 Initial heuristic:
 
-- observe transcript mtime and pane output hash
+- observe transcript mtime, last assistant text, and pane output hash
 - require no change for N seconds
 - configurable timeout
+- optionally print `--last` assistant text or `--transcript` instead of pane
 
 Example:
 
 ```sh
-ap wait frontend-polish --idle-ms 3000 --timeout-ms 600000
+ap wait frontend-polish --idle-ms 3000 --timeout-ms 600000 --last
 ```
 
 ### 7.2 Better Claude transcript matching
 
-Current v0 picks latest transcript for cwd after session creation time. Improve by matching the submitted prompt text and/or Claude session id when visible.
+Status: first pass implemented.
+
+Claude transcript lookup now scores candidates by explicit transcript path, provider session id, submitted prompt text, since timestamp, and mtime. Further hardening should capture Claude session id directly from initialization output when possible.
 
 ### 7.3 Codex transcript reader
 
@@ -247,6 +252,7 @@ Agentpit is ready for early development when:
 - `ap spawn claude` can start a real Claude Code session.
 - `ap send <claude-session>` can submit a prompt.
 - `ap transcript` or `ap last` can retrieve Claude output from JSONL transcript after a turn.
+- `ap wait` can wait for pane/transcript stability and return pane, latest assistant text, or transcript.
 - Jancsi can use `ap` from OpenClaw to launch and inspect an agent session.
 
 ## 11. Open Questions

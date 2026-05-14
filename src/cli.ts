@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { resolveAgent, shellCommand } from "./agents.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, type SessionRecord } from "./store.js";
@@ -38,6 +38,9 @@ async function main(argv: string[]) {
       break;
     case "last":
       await cmdLast(parsed);
+      break;
+    case "wait":
+      await cmdWait(parsed);
       break;
     case "kill":
       await cmdKill(parsed);
@@ -98,7 +101,8 @@ async function cmdSend(parsed: Parsed) {
   const record = await resolveSession(target);
   await ensureLive(record.tmuxTarget);
   await sendText(record.tmuxTarget, prompt);
-  await saveSession({ ...record, updatedAt: new Date().toISOString(), status: "running" });
+  const now = new Date().toISOString();
+  await saveSession({ ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
   await appendLedger({ type: "prompt.send", session: record.name, agent: record.agent, cwd: record.cwd, chars: prompt.length });
   console.log(`sent\t${record.name}\t${prompt.length} chars`);
 }
@@ -125,7 +129,7 @@ async function cmdTranscript(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: ap transcript <session> [-n rows] [--json]");
   const record = await resolveSession(target);
-  const tx = await latestTranscript(record.agent, record.cwd, record.createdAt);
+  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookup(record));
   if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
   const limitRaw = flag(parsed, "n") ?? flag(parsed, "limit");
   const limit = limitRaw ? Number(limitRaw) : undefined;
@@ -138,12 +142,67 @@ async function cmdLast(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: ap last <session>");
   const record = await resolveSession(target);
-  const tx = await latestTranscript(record.agent, record.cwd, record.createdAt);
+  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookup(record));
   if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
   const text = lastAssistantText(tx.rows);
   if (!text) throw new Error(`No assistant text found in transcript: ${tx.path}`);
   console.error(`# ${tx.provider} transcript: ${tx.path}`);
   console.log(text);
+}
+
+async function cmdWait(parsed: Parsed) {
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: ap wait <session> [--idle-ms 3000] [--timeout-ms 600000] [--last|--transcript]");
+  const record = await resolveSession(target);
+  await ensureLive(record.tmuxTarget);
+
+  const idleMs = numberFlag(parsed, ["idle-ms", "idle"], 3_000);
+  const timeoutMs = numberFlag(parsed, ["timeout-ms", "timeout"], 600_000);
+  const pollMs = numberFlag(parsed, ["poll-ms", "poll"], 750);
+  const started = Date.now();
+  let lastFingerprint = "";
+  let stableSince = Date.now();
+  let lastPane = "";
+  let lastTxPath: string | undefined;
+
+  while (Date.now() - started < timeoutMs) {
+    const pane = await capture(record.tmuxTarget, 200).catch(() => "");
+    const tx = await latestTranscript(record.agent, record.cwd, transcriptLookup(record)).catch(() => null);
+    const assistant = tx ? lastAssistantText(tx.rows) : "";
+    const fingerprint = hashParts([pane, tx?.path ?? "", String(tx?.mtimeMs ?? 0), assistant]);
+
+    if (fingerprint !== lastFingerprint) {
+      lastFingerprint = fingerprint;
+      stableSince = Date.now();
+      lastPane = pane;
+      lastTxPath = tx?.path;
+      if (tx && tx.path !== record.transcriptPath) {
+        await saveSession({
+          ...record,
+          transcriptPath: tx.path,
+          providerSessionId: tx.sessionId,
+          updatedAt: new Date().toISOString(),
+          status: "running",
+        });
+      }
+    } else if (Date.now() - stableSince >= idleMs) {
+      if (truthy(flag(parsed, "last")) && tx) {
+        const text = lastAssistantText(tx.rows);
+        if (text) console.log(text);
+      } else if (truthy(flag(parsed, "transcript")) && tx) {
+        console.error(`# ${tx.provider} transcript: ${tx.path}`);
+        console.log(renderTranscript(tx.rows, { limit: numberFlag(parsed, ["n", "limit"], 0) || undefined, json: truthy(flag(parsed, "json")) }));
+      } else {
+        console.log(lastPane);
+      }
+      await appendLedger({ type: "session.wait", session: record.name, agent: record.agent, cwd: record.cwd, idleMs, timeoutMs, transcriptPath: lastTxPath });
+      return;
+    }
+
+    await sleep(Math.max(100, pollMs));
+  }
+
+  throw new Error(`Timed out waiting for idle session after ${timeoutMs}ms: ${record.name}`);
 }
 
 async function cmdKill(parsed: Parsed) {
@@ -173,6 +232,8 @@ async function cmdRun(parsed: Parsed) {
   // semantic waiting; v0 is a cockpit, not a transcript parser.
   await sleep(Number(flag(parsed, "boot-ms") ?? 1200));
   await sendText(record.tmuxTarget, prompt);
+  const now = new Date().toISOString();
+  await saveSession({ ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
   await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, cwd: record.cwd, chars: prompt.length });
 
   const waitMs = Number(flag(parsed, "wait-ms") ?? 1000);
@@ -248,6 +309,32 @@ function flag(parsed: Parsed, key: string): string | true | string[] | undefined
   return parsed.flags.get(key);
 }
 
+function transcriptLookup(record: SessionRecord) {
+  return {
+    sinceIso: record.lastPromptAt ?? record.createdAt,
+    prompt: record.lastPrompt,
+    transcriptPath: record.transcriptPath,
+    sessionId: record.providerSessionId,
+  };
+}
+
+function numberFlag(parsed: Parsed, keys: string[], fallback: number): number {
+  for (const key of keys) {
+    const value = flag(parsed, key);
+    if (typeof value === "string") {
+      const parsedValue = Number(value);
+      if (Number.isFinite(parsedValue)) return parsedValue;
+    }
+  }
+  return fallback;
+}
+
+function hashParts(parts: string[]): string {
+  const hash = createHash("sha256");
+  for (const part of parts) hash.update(part).update("\0");
+  return hash.digest("hex");
+}
+
 function truthy(value: unknown) {
   return value === true || value === "true" || value === "1" || value === "yes";
 }
@@ -270,6 +357,7 @@ Usage:
   ap tail <session> [-n lines]
   ap transcript <session> [-n rows] [--json]
   ap last <session>
+  ap wait <session> [--idle-ms 3000] [--last|--transcript]
   ap list
   ap kill <session>
   ap attach <session>

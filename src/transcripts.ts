@@ -6,6 +6,7 @@ export type TranscriptProvider = "claude";
 export type TranscriptRow = Record<string, unknown> & {
   type?: string;
   timestamp?: string;
+  content?: unknown;
   message?: {
     role?: string;
     content?: unknown;
@@ -22,14 +23,28 @@ export type TranscriptFile = {
   sessionId: string;
   mtimeMs: number;
   rows: TranscriptRow[];
+  score: number;
+  matchedBy: string[];
 };
 
-export async function latestTranscript(agent: string, cwd: string, sinceIso?: string): Promise<TranscriptFile | null> {
+export type TranscriptLookupOptions = {
+  sinceIso?: string;
+  prompt?: string;
+  transcriptPath?: string;
+  sessionId?: string;
+};
+
+export async function latestTranscript(agent: string, cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
   if (agent !== "claude") return null;
-  return latestClaudeTranscript(cwd, sinceIso);
+  return latestClaudeTranscript(cwd, options);
 }
 
-export async function latestClaudeTranscript(cwd: string, sinceIso?: string): Promise<TranscriptFile | null> {
+export async function latestClaudeTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
+  if (options.transcriptPath) {
+    const direct = await loadClaudeTranscript(options.transcriptPath, options);
+    if (direct) return direct;
+  }
+
   const dir = claudeProjectFolder(cwd);
   let names: string[];
   try {
@@ -38,7 +53,7 @@ export async function latestClaudeTranscript(cwd: string, sinceIso?: string): Pr
     return null;
   }
 
-  const sinceMs = sinceIso ? Date.parse(sinceIso) - 5_000 : 0;
+  const sinceMs = options.sinceIso ? Date.parse(options.sinceIso) - 5_000 : 0;
   const candidates = await Promise.all(
     names
       .filter((name) => name.endsWith(".jsonl"))
@@ -49,23 +64,18 @@ export async function latestClaudeTranscript(cwd: string, sinceIso?: string): Pr
       }),
   );
 
-  const sorted = candidates
-    .filter((candidate) => candidate.mtimeMs >= sinceMs)
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  for (const candidate of sorted) {
-    const rows = await readJsonl(candidate.path);
-    if (rows.length === 0) continue;
-    return {
-      provider: "claude",
-      path: candidate.path,
-      sessionId: basename(candidate.name, ".jsonl"),
-      mtimeMs: candidate.mtimeMs,
-      rows,
-    };
+  const loaded: TranscriptFile[] = [];
+  for (const candidate of candidates.filter((candidate) => candidate.mtimeMs >= sinceMs)) {
+    const tx = await loadClaudeTranscript(candidate.path, options, candidate.mtimeMs);
+    if (tx) loaded.push(tx);
   }
 
-  return null;
+  loaded.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return b.mtimeMs - a.mtimeMs;
+  });
+
+  return loaded[0] ?? null;
 }
 
 export function claudeProjectFolder(cwd: string, home = process.env.HOME ?? "") {
@@ -85,7 +95,7 @@ export async function readJsonl(path: string): Promise<TranscriptRow[]> {
     try {
       rows.push(JSON.parse(trimmed) as TranscriptRow);
     } catch {
-      // Ignore partial/corrupt final line while Claude is still writing.
+      // Ignore partial/corrupt final line while the provider is still writing.
     }
   }
   return rows;
@@ -114,6 +124,51 @@ export function lastAssistantText(rows: TranscriptRow[]): string {
     if (text) return text;
   }
   return "";
+}
+
+export function rowsContainPrompt(rows: TranscriptRow[], prompt: string): boolean {
+  const needle = normalizeForMatch(prompt);
+  if (!needle) return false;
+  return rows.some((row) => normalizeForMatch(textFromContent(row.message?.content ?? row.content)).includes(needle));
+}
+
+async function loadClaudeTranscript(path: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
+  let mtimeMs = knownMtimeMs;
+  if (mtimeMs === undefined) {
+    try {
+      mtimeMs = (await stat(path)).mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
+  const rows = await readJsonl(path);
+  if (rows.length === 0) return null;
+
+  const sessionId = basename(path).replace(/\.jsonl$/, "");
+  let score = mtimeMs / 1_000_000_000_000;
+  const matchedBy: string[] = ["mtime"];
+
+  if (options.sessionId && options.sessionId === sessionId) {
+    score += 1_000;
+    matchedBy.push("session-id");
+  }
+
+  if (options.prompt && rowsContainPrompt(rows, options.prompt)) {
+    score += 500;
+    matchedBy.push("prompt");
+  }
+
+  if (options.sinceIso && mtimeMs >= Date.parse(options.sinceIso) - 5_000) {
+    score += 10;
+    matchedBy.push("since");
+  }
+
+  return { provider: "claude", path, sessionId, mtimeMs, rows, score, matchedBy };
+}
+
+function normalizeForMatch(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function textFromContent(content: unknown): string {

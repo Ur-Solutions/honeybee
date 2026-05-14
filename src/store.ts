@@ -12,6 +12,10 @@ export type SessionRecord = {
   updatedAt: string;
   status?: "running" | "dead";
   notes?: string;
+  lastPrompt?: string;
+  lastPromptAt?: string;
+  transcriptPath?: string;
+  providerSessionId?: string;
 };
 
 const root = join(homedir(), ".agentpit");
