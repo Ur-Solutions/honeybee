@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { resolveAgent, shellCommand } from "./agents.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, type SessionRecord } from "./store.js";
@@ -73,7 +74,8 @@ async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
   const name = safeName(String(flag(parsed, "name") ?? `${agent}-${shortId()}`));
   if (await hasSession(name)) throw new Error(`tmux session already exists: ${name}`);
 
-  const cwd = resolve(String(flag(parsed, "cwd") ?? process.cwd()).replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
+  const requestedCwd = resolve(String(flag(parsed, "cwd") ?? process.cwd()).replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
+  const cwd = await realpath(requestedCwd);
   const spec = resolveAgent(agent, parsed.rest);
   const command = shellCommand(spec);
   await newSession(name, cwd, command);
@@ -155,10 +157,50 @@ async function cmdWait(parsed: Parsed) {
   if (!target) throw new Error("Usage: ap wait <session> [--idle-ms 3000] [--timeout-ms 600000] [--last|--transcript]");
   const record = await resolveSession(target);
   await ensureLive(record.tmuxTarget);
+  await waitForIdle({
+    record,
+    idleMs: numberFlag(parsed, ["idle-ms", "idle"], 3_000),
+    timeoutMs: numberFlag(parsed, ["timeout-ms", "timeout"], 600_000),
+    pollMs: numberFlag(parsed, ["poll-ms", "poll"], 750),
+    output: truthy(flag(parsed, "last")) ? "last" : truthy(flag(parsed, "transcript")) ? "transcript" : "pane",
+    rows: numberFlag(parsed, ["n", "limit"], 0),
+    json: truthy(flag(parsed, "json")),
+  });
+}
 
-  const idleMs = numberFlag(parsed, ["idle-ms", "idle"], 3_000);
-  const timeoutMs = numberFlag(parsed, ["timeout-ms", "timeout"], 600_000);
-  const pollMs = numberFlag(parsed, ["poll-ms", "poll"], 750);
+async function waitForAgentReady(record: SessionRecord, timeoutMs: number) {
+  if (record.agent !== "claude") {
+    await sleep(timeoutMs);
+    return;
+  }
+
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const pane = await capture(record.tmuxTarget, 80).catch(() => "");
+    if (isClaudeReadyPane(pane)) return;
+    await sleep(500);
+  }
+  // Fall through rather than fail: sending late is usually safer than not
+  // sending, and ap tail will show any blocking onboarding prompt.
+}
+
+function isClaudeReadyPane(pane: string): boolean {
+  if (/Enter to confirm|Esc to cancel|MCP server found/i.test(pane)) return false;
+  return /(?:^|\n)❯\s/.test(pane) || /Try "fix lint errors"/.test(pane);
+}
+
+type WaitForIdleOptions = {
+  record: SessionRecord;
+  idleMs: number;
+  timeoutMs: number;
+  pollMs: number;
+  output: "pane" | "last" | "transcript";
+  rows: number;
+  json: boolean;
+};
+
+async function waitForIdle(options: WaitForIdleOptions) {
+  const { record, idleMs, timeoutMs, pollMs } = options;
   const started = Date.now();
   let lastFingerprint = "";
   let stableSince = Date.now();
@@ -186,12 +228,12 @@ async function cmdWait(parsed: Parsed) {
         });
       }
     } else if (Date.now() - stableSince >= idleMs) {
-      if (truthy(flag(parsed, "last")) && tx) {
+      if (options.output === "last" && tx) {
         const text = lastAssistantText(tx.rows);
         if (text) console.log(text);
-      } else if (truthy(flag(parsed, "transcript")) && tx) {
+      } else if (options.output === "transcript" && tx) {
         console.error(`# ${tx.provider} transcript: ${tx.path}`);
-        console.log(renderTranscript(tx.rows, { limit: numberFlag(parsed, ["n", "limit"], 0) || undefined, json: truthy(flag(parsed, "json")) }));
+        console.log(renderTranscript(tx.rows, { limit: options.rows || undefined, json: options.json }));
       } else {
         console.log(lastPane);
       }
@@ -228,18 +270,28 @@ async function cmdRun(parsed: Parsed) {
   if (!spawnParsed.flags.has("name")) spawnParsed.flags.set("name", `${agent}-${shortId()}`);
   const record = await cmdSpawn(spawnParsed);
 
-  // Give TUIs a short moment to draw their prompt before paste. This is not
-  // semantic waiting; v0 is a cockpit, not a transcript parser.
-  await sleep(Number(flag(parsed, "boot-ms") ?? 1200));
+  await waitForAgentReady(record, numberFlag(parsed, ["boot-ms"], record.agent === "claude" ? 15_000 : 1_200));
   await sendText(record.tmuxTarget, prompt);
   const now = new Date().toISOString();
   await saveSession({ ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
   await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, cwd: record.cwd, chars: prompt.length });
 
-  const waitMs = Number(flag(parsed, "wait-ms") ?? 1000);
-  if (waitMs > 0) await sleep(waitMs);
-  const lines = Number(flag(parsed, "n") ?? flag(parsed, "lines") ?? 80);
-  console.log(await capture(record.tmuxTarget, Number.isFinite(lines) ? lines : 80));
+  if (truthy(flag(parsed, "wait"))) {
+    await waitForIdle({
+      record: { ...record, lastPrompt: prompt, lastPromptAt: now },
+      idleMs: numberFlag(parsed, ["idle-ms", "idle"], 3_000),
+      timeoutMs: numberFlag(parsed, ["timeout-ms", "timeout"], 600_000),
+      pollMs: numberFlag(parsed, ["poll-ms", "poll"], 750),
+      output: truthy(flag(parsed, "last")) ? "last" : truthy(flag(parsed, "transcript")) ? "transcript" : "pane",
+      rows: numberFlag(parsed, ["n", "limit"], 0),
+      json: truthy(flag(parsed, "json")),
+    });
+  } else {
+    const waitMs = Number(flag(parsed, "wait-ms") ?? 1000);
+    if (waitMs > 0) await sleep(waitMs);
+    const lines = Number(flag(parsed, "n") ?? flag(parsed, "lines") ?? 80);
+    console.log(await capture(record.tmuxTarget, Number.isFinite(lines) ? lines : 80));
+  }
 
   if (!truthy(flag(parsed, "keep"))) {
     console.error(`\n(ap: session kept by default would be safer; pass 'ap kill ${record.name}' when done.)`);

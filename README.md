@@ -35,7 +35,7 @@ ap kill <session>
 One-shot cockpit launch:
 
 ```sh
-ap run claude -p "Review this frontend for polish. Plan only." --cwd ~/Projects/foo --keep
+ap run claude -p "Review this frontend for polish. Plan only." --cwd ~/Projects/foo --wait --last --keep
 ```
 
 Override an agent command with environment variables:
