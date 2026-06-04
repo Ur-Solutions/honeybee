@@ -1,8 +1,9 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+export { hasTranscriptProvider } from "./drivers.js";
 
-export type TranscriptProvider = "claude" | "codex" | "opencode";
+export type TranscriptProvider = "claude" | "codex" | "opencode" | "grok";
 
 export type TranscriptRow = Record<string, unknown> & {
   type?: string;
@@ -33,22 +34,32 @@ export type TranscriptLookupOptions = {
   prompt?: string;
   transcriptPath?: string;
   sessionId?: string;
+  homePath?: string;
+};
+
+const SCORE = {
+  path: 2_000,
+  sessionId: 1_000,
+  prompt: 500,
+  cwd: 200,
+  since: 10,
 };
 
 export async function latestTranscript(agent: string, cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
   if (agent === "claude") return latestClaudeTranscript(cwd, options);
   if (agent === "codex") return latestCodexTranscript(cwd, options);
   if (agent === "opencode") return latestOpenCodeTranscript(cwd, options);
+  if (agent === "grok") return latestGrokTranscript(cwd, options);
   return null;
 }
 
 export async function latestClaudeTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
+  const dir = claudeProjectFolder(cwd, options.homePath);
   if (options.transcriptPath) {
-    const direct = await loadClaudeTranscript(options.transcriptPath, options);
+    const direct = isPathInside(options.transcriptPath, dir) ? await loadClaudeTranscript(options.transcriptPath, options) : null;
     if (direct) return direct;
   }
 
-  const dir = claudeProjectFolder(cwd);
   let names: string[];
   try {
     names = await readdir(dir);
@@ -70,12 +81,12 @@ export async function latestClaudeTranscript(cwd: string, options: TranscriptLoo
 }
 
 export async function latestCodexTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
+  const root = join(options.homePath ?? join(homedir(), ".codex"), "sessions");
   if (options.transcriptPath) {
-    const direct = await loadCodexTranscript(options.transcriptPath, cwd, options);
+    const direct = isPathInside(options.transcriptPath, root) ? await loadCodexTranscript(options.transcriptPath, cwd, options) : null;
     if (direct) return direct;
   }
 
-  const root = join(homedir(), ".codex", "sessions");
   const sinceMs = sinceMillis(options);
   const files = await findFiles(root, (path) => path.endsWith(".jsonl"), 5).catch(() => []);
   const loaded: TranscriptFile[] = [];
@@ -91,12 +102,12 @@ export async function latestCodexTranscript(cwd: string, options: TranscriptLook
 }
 
 export async function latestOpenCodeTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
+  const sessionRoot = opencodeSessionRoot();
   if (options.transcriptPath) {
-    const direct = await loadOpenCodeTranscript(options.transcriptPath, cwd, options);
+    const direct = isPathInside(options.transcriptPath, sessionRoot) ? await loadOpenCodeTranscript(options.transcriptPath, cwd, options) : null;
     if (direct) return direct;
   }
 
-  const sessionRoot = join(homedir(), ".local", "share", "opencode", "storage", "session");
   const sinceMs = sinceMillis(options);
   const files = await findFiles(sessionRoot, (path) => path.endsWith(".json"), 3).catch(() => []);
   const loaded: TranscriptFile[] = [];
@@ -111,8 +122,30 @@ export async function latestOpenCodeTranscript(cwd: string, options: TranscriptL
   return bestTranscript(loaded);
 }
 
-export function claudeProjectFolder(cwd: string, home = process.env.HOME ?? "") {
-  return join(home, ".claude", "projects", projectKeyForCwd(cwd));
+export async function latestGrokTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
+  const workspaceRoot = join(options.homePath ?? join(homedir(), ".grok"), "sessions", encodeURIComponent(resolve(cwd)));
+  if (options.transcriptPath) {
+    const direct = isPathInside(options.transcriptPath, workspaceRoot) ? await loadGrokTranscript(options.transcriptPath, cwd, options) : null;
+    if (direct) return direct;
+  }
+
+  const sinceMs = sinceMillis(options);
+  const files = await findFiles(workspaceRoot, (path) => basename(path) === "summary.json", 2).catch(() => []);
+  const loaded: TranscriptFile[] = [];
+
+  for (const path of files) {
+    const chatPath = join(dirname(path), "chat_history.jsonl");
+    const info = await stat(chatPath).catch(() => null);
+    if (!info || info.mtimeMs < sinceMs) continue;
+    const tx = await loadGrokTranscript(chatPath, cwd, options, info.mtimeMs);
+    if (tx) loaded.push(tx);
+  }
+
+  return bestTranscript(loaded);
+}
+
+export function claudeProjectFolder(cwd: string, configDir = join(homedir(), ".claude")) {
+  return join(configDir, "projects", projectKeyForCwd(cwd));
 }
 
 export function projectKeyForCwd(cwd: string): string {
@@ -126,7 +159,8 @@ export async function readJsonl(path: string): Promise<TranscriptRow[]> {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
-      rows.push(JSON.parse(trimmed) as TranscriptRow);
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) rows.push(parsed as TranscriptRow);
     } catch {
       // Ignore partial/corrupt final line while the provider is still writing.
     }
@@ -184,27 +218,38 @@ async function loadCodexTranscript(path: string, cwd: string, options: Transcrip
   const sessionId = String(sessionMeta?.payload?.id ?? basename(path).replace(/\.jsonl$/, ""));
   const rows = rawRows.flatMap(normalizeCodexRow);
   if (rows.length === 0) return null;
-  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, options });
   const metaCwd = String(sessionMeta?.payload?.cwd ?? sessionMeta?.payload?.original_cwd ?? "");
-  if (samePath(metaCwd, cwd)) {
-    return { provider: "codex", path, sessionId, mtimeMs, rows, score: score + 200, matchedBy: [...matchedBy, "cwd"] };
-  }
+  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options });
   return { provider: "codex", path, sessionId, mtimeMs, rows, score, matchedBy };
 }
 
 async function loadOpenCodeTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
   const mtimeMs = await getMtime(path, knownMtimeMs);
   if (mtimeMs === null) return null;
-  const session = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+  const session = await readJsonObject(path);
   const sessionId = String(session.id ?? basename(path).replace(/\.json$/, ""));
   const directory = String(session.directory ?? "");
   const rows = await readOpenCodeRows(sessionId);
   if (rows.length === 0) return null;
-  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, options });
-  if (samePath(directory, cwd)) {
-    return { provider: "opencode", path, sessionId, mtimeMs, rows, score: score + 200, matchedBy: [...matchedBy, "cwd"] };
-  }
+  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: directory, options });
   return { provider: "opencode", path, sessionId, mtimeMs, rows, score, matchedBy };
+}
+
+async function loadGrokTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
+  const sessionDir = basename(path) === "chat_history.jsonl" || basename(path) === "summary.json" ? dirname(path) : path;
+  const chatPath = join(sessionDir, "chat_history.jsonl");
+  const summaryPath = join(sessionDir, "summary.json");
+  const mtimeMs = await getMtime(chatPath, knownMtimeMs);
+  if (mtimeMs === null) return null;
+  const rawRows = await readJsonl(chatPath);
+  const rows = rawRows.flatMap(normalizeGrokRow);
+  if (rows.length === 0) return null;
+  const summary = await readJsonObject(summaryPath);
+  const info = (summary.info && typeof summary.info === "object" ? summary.info : {}) as Record<string, unknown>;
+  const sessionId = String(info.id ?? summary.id ?? basename(sessionDir));
+  const metaCwd = String(info.cwd ?? summary.cwd ?? "");
+  const { score, matchedBy } = scoreTranscript({ rows, path: chatPath, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options });
+  return { provider: "grok", path: chatPath, sessionId, mtimeMs, rows, score, matchedBy };
 }
 
 function normalizeCodexRow(row: TranscriptRow): TranscriptRow[] {
@@ -228,22 +273,32 @@ function normalizeCodexRow(row: TranscriptRow): TranscriptRow[] {
   return [];
 }
 
+function normalizeGrokRow(row: TranscriptRow): TranscriptRow[] {
+  const role = row.message?.role ?? row.type;
+  if (role !== "user" && role !== "assistant") return [];
+  const content = textFromContent(row.message?.content ?? row.content);
+  if (!content) return [];
+  return [{ type: role, timestamp: row.timestamp, message: { role, content } }];
+}
+
 async function readOpenCodeRows(sessionId: string): Promise<TranscriptRow[]> {
-  const storageRoot = join(homedir(), ".local", "share", "opencode", "storage");
+  if (!isSafeStorageId(sessionId)) return [];
+  const storageRoot = opencodeStorageRoot();
   const msgDir = join(storageRoot, "message", sessionId);
   const messageFiles = await readdir(msgDir).catch(() => []);
   const rows: TranscriptRow[] = [];
 
   for (const file of messageFiles.filter((name) => name.endsWith(".json"))) {
     const msgPath = join(msgDir, file);
-    const msg = JSON.parse(await readFile(msgPath, "utf8")) as Record<string, unknown>;
+    const msg = await readJsonObject(msgPath);
     const messageId = String(msg.id ?? basename(file, ".json"));
+    if (!isSafeStorageId(messageId)) continue;
     const role = String(msg.role ?? "event");
     const partDir = join(storageRoot, "part", messageId);
     const partFiles = await readdir(partDir).catch(() => []);
     const parts: string[] = [];
     for (const partFile of partFiles.filter((name) => name.endsWith(".json"))) {
-      const part = JSON.parse(await readFile(join(partDir, partFile), "utf8")) as Record<string, unknown>;
+      const part = await readJsonObject(join(partDir, partFile));
       if (typeof part.text === "string") parts.push(part.text);
       else if (typeof part.content === "string") parts.push(part.content);
     }
@@ -254,25 +309,29 @@ async function readOpenCodeRows(sessionId: string): Promise<TranscriptRow[]> {
   return rows;
 }
 
-function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId: string; mtimeMs: number; options: TranscriptLookupOptions }) {
-  const { rows, path, sessionId, mtimeMs, options } = input;
+function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId: string; mtimeMs: number; cwd?: string; transcriptCwd?: string; options: TranscriptLookupOptions }) {
+  const { rows, path, sessionId, mtimeMs, cwd, transcriptCwd, options } = input;
   let score = mtimeMs / 1_000_000_000_000;
   const matchedBy: string[] = ["mtime"];
 
   if (options.transcriptPath && samePath(options.transcriptPath, path)) {
-    score += 2_000;
+    score += SCORE.path;
     matchedBy.push("path");
   }
   if (options.sessionId && options.sessionId === sessionId) {
-    score += 1_000;
+    score += SCORE.sessionId;
     matchedBy.push("session-id");
   }
   if (options.prompt && rowsContainPrompt(rows, options.prompt)) {
-    score += 500;
+    score += SCORE.prompt;
     matchedBy.push("prompt");
   }
+  if (cwd && transcriptCwd && samePath(transcriptCwd, cwd)) {
+    score += SCORE.cwd;
+    matchedBy.push("cwd");
+  }
   if (options.sinceIso && mtimeMs >= Date.parse(options.sinceIso) - 5_000) {
-    score += 10;
+    score += SCORE.since;
     matchedBy.push("since");
   }
 
@@ -312,9 +371,35 @@ async function getMtime(path: string, knownMtimeMs?: number): Promise<number | n
   return info?.mtimeMs ?? null;
 }
 
+async function readJsonObject(path: string): Promise<Record<string, unknown>> {
+  try {
+    const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
 function samePath(a: string, b: string): boolean {
   if (!a || !b) return false;
   return resolve(a) === resolve(b);
+}
+
+function isPathInside(path: string, root: string): boolean {
+  const relativePath = relative(resolve(root), resolve(path));
+  return relativePath === "" || (relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+function isSafeStorageId(value: string): boolean {
+  return Boolean(value) && value !== "." && value !== ".." && !value.includes("/") && !value.includes("\\");
+}
+
+function opencodeStorageRoot(): string {
+  return join(homedir(), ".local", "share", "opencode", "storage");
+}
+
+function opencodeSessionRoot(): string {
+  return join(opencodeStorageRoot(), "session");
 }
 
 function normalizeForMatch(value: string): string {

@@ -1,43 +1,140 @@
-export type AgentKind = "claude" | "codex" | "opencode" | "pi" | "droid" | string;
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { beeConfig } from "./config.js";
+import { homeEnvForAgent } from "./drivers.js";
+import { allocateBeeIdentity } from "./ids.js";
+import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
+import { safeName, saveSession, type SessionRecord } from "./store.js";
+import { localSubstrate, substrateForRecord } from "./substrates/index.js";
+
+export type AgentKind = "claude" | "codex" | "opencode" | "grok" | "pi" | "droid" | string;
 
 export type AgentSpec = {
   kind: AgentKind;
   command: string;
   args: string[];
+  env: Record<string, string>;
+  homePath?: string;
+  requestedKind: string;
+};
+
+const DROID_YOLO_SETTINGS_PATH = resolve(homedir(), ".factory/hive-droid-yolo-settings.json");
+const DROID_YOLO_SETTINGS = {
+  autonomyMode: "auto-high",
+  interactionMode: "auto",
 };
 
 const DEFAULT_COMMANDS: Record<string, string> = {
   claude: "claude",
   codex: "codex",
-  opencode: "opencode run --interactive --dangerously-skip-permissions",
+  opencode: "opencode run --interactive",
+  grok: "grok --tools= --disable-web-search --no-subagents",
+  // Pi's interactive CLI has no approval/yolo flag in --help; full tools are enabled by default.
   pi: "pi",
   droid: "droid",
 };
 
-export function resolveAgent(kind: AgentKind, extraArgs: string[] = []): AgentSpec {
-  const envKey = `AP_${kind.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_CMD`;
-  const configured = process.env[envKey] ?? DEFAULT_COMMANDS[kind] ?? kind;
-  const parts = splitShellWords(configured);
-  if (parts.length === 0) throw new Error(`Empty command for agent ${kind}`);
+const YOLO_COMMANDS: Record<string, string> = {
+  claude: "claude --dangerously-skip-permissions",
+  codex: "codex --dangerously-bypass-approvals-and-sandbox",
+  opencode: "opencode run --interactive --dangerously-skip-permissions",
+  grok: "grok --permission-mode bypassPermissions --always-approve --tools= --disable-web-search --no-subagents",
+  pi: "pi",
+  // Droid interactive TUI has no --auto/--skip-permissions startup flag, but --settings can seed Auto (High).
+  droid: `droid --settings ${DROID_YOLO_SETTINGS_PATH}`,
+};
+
+export type ResolveAgentOptions = {
+  home?: string | true | string[];
+  yolo?: boolean;
+};
+
+export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options: ResolveAgentOptions = {}): AgentSpec {
+  const requestedCfg = beeConfig(String(kind));
+  const profile = resolveProfile(kind, options.home ?? requestedCfg.home);
+  const canonicalCfg = profile.kind !== kind ? beeConfig(profile.kind) : requestedCfg;
+  const envSuffix = profile.kind.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const envKey = `HIVE_${envSuffix}_CMD`;
+  const legacyEnvKey = `AP_${envSuffix}_CMD`;
+  const yoloEnvKey = `HIVE_${envSuffix}_YOLO`;
+  const commandOverride = process.env[envKey] ?? process.env[legacyEnvKey] ?? canonicalCfg.command ?? requestedCfg.command;
+  const yolo = options.yolo || truthyEnv(process.env[yoloEnvKey]) || truthyEnv(process.env.HIVE_YOLO) || canonicalCfg.yolo === true || requestedCfg.yolo === true;
+  const configured = commandOverride ?? (yolo ? YOLO_COMMANDS[profile.kind] : DEFAULT_COMMANDS[profile.kind]) ?? profile.kind;
+  if (profile.kind === "droid" && yolo && commandOverride === undefined) ensureDroidYoloSettings();
+  const parts = splitShellWords(configured).map(expandTildeWord);
+  if (parts.length === 0) throw new Error(`Empty command for agent ${profile.kind}`);
   return {
-    kind,
+    kind: profile.kind,
     command: parts[0]!,
     args: [...parts.slice(1), ...extraArgs],
+    env: profile.homePath && profile.homeEnv ? { [profile.homeEnv]: profile.homePath } : {},
+    homePath: profile.homePath,
+    requestedKind: kind,
   };
 }
 
 export function shellCommand(spec: AgentSpec): string {
-  return [spec.command, ...spec.args].map(shellQuote).join(" ");
+  const env = Object.entries(spec.env).map(([key, value]) => `${key}=${shellQuoteIfNeeded(value)}`);
+  return [...env, ...[spec.command, ...spec.args].map(shellQuoteIfNeeded)].join(" ");
 }
 
-function shellQuote(value: string): string {
+function resolveProfile(kind: string, explicitHome: string | true | string[] | undefined) {
+  const alias = profileAlias(kind);
+  const canonicalKind = alias?.kind ?? kind;
+  const homeEnv = homeEnvForAgent(canonicalKind);
+  const selectedHome = typeof explicitHome === "string" ? explicitHome : alias?.home;
+  const homePath = selectedHome && homeEnv ? resolveHome(canonicalKind, selectedHome) : undefined;
+  return { kind: canonicalKind, homeEnv, homePath };
+}
+
+function profileAlias(kind: string): { kind: string; home: string } | undefined {
+  const normalized = kind.toLowerCase().replace(/[ _-]/g, "");
+  const codex = normalized.match(/^codex([123])$/);
+  if (codex) return { kind: "codex", home: codex[1]! };
+  const claude = normalized.match(/^(?:cc|claude)([123])$/);
+  if (claude) return { kind: "claude", home: claude[1]! };
+  return undefined;
+}
+
+function resolveHome(kind: string, value: string): string {
+  const trimmed = value.trim();
+  if (/^[123]$/.test(trimmed)) {
+    if (kind === "claude") return resolve(homedir(), `.claude-${trimmed}`);
+    if (kind === "codex") return resolve(homedir(), `.codex-${trimmed}`);
+  }
+  if (trimmed.startsWith("~/")) return resolve(homedir(), trimmed.slice(2));
+  if (trimmed === "~") return homedir();
+  return resolve(trimmed);
+}
+
+function ensureDroidYoloSettings(): void {
+  mkdirSync(dirname(DROID_YOLO_SETTINGS_PATH), { recursive: true });
+
+  let existing: Record<string, unknown> = {};
+  if (existsSync(DROID_YOLO_SETTINGS_PATH)) {
+    try {
+      const parsed = JSON.parse(readFileSync(DROID_YOLO_SETTINGS_PATH, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>;
+    } catch {
+      const backupPath = `${DROID_YOLO_SETTINGS_PATH}.invalid-${Date.now()}`;
+      renameSync(DROID_YOLO_SETTINGS_PATH, backupPath);
+    }
+  }
+
+  const next = { ...existing, ...DROID_YOLO_SETTINGS };
+  if (JSON.stringify(existing) === JSON.stringify(next)) return;
+  writeFileSync(DROID_YOLO_SETTINGS_PATH, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+}
+
+function shellQuoteIfNeeded(value: string): string {
   if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) return value;
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 // Small shell-ish splitter for env command overrides. Not a full shell parser;
 // enough for quoted binary paths/flags without executing arbitrary expansion.
-function splitShellWords(input: string): string[] {
+export function splitShellWords(input: string): string[] {
   const out: string[] = [];
   let current = "";
   let quote: "'" | '"' | null = null;
@@ -73,4 +170,88 @@ function splitShellWords(input: string): string[] {
   if (escaping) current += "\\";
   if (current) out.push(current);
   return out;
+}
+
+function expandTildeWord(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/")) return resolve(homedir(), value.slice(2));
+  return value;
+}
+
+function truthyEnv(value: string | undefined): boolean {
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// spawnBeeForFlow — pure SessionRecord-returning spawn used by the flow
+// runtime. No printing, no I/O outside substrate+store.
+// ──────────────────────────────────────────────────────────────────────────
+
+export type SpawnBeeOptions = {
+  agent: string;
+  extraArgs: string[];
+  cwd: string;
+  yolo: boolean;
+  home?: string | true | string[];
+  name?: string;
+  colony?: string;
+  swarmId?: string;
+  caste?: string;
+  brief?: string;
+  node?: NodeRecord;
+  runId?: string;
+  flowName?: string;
+};
+
+function safeTmuxTargetForFlow(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]/g, "-");
+}
+
+/**
+ * Spawn a bee in a tmux session and persist its SessionRecord. No printing,
+ * no CLI side-effects. Used by HiveFacade to keep flow runs side-effect free.
+ *
+ * Mirrors the spawn logic in src/cli.ts but tagged with runId+flowName so
+ * the run aggregator can later inventory which bees were spawned by which
+ * flow run.
+ */
+export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRecord> {
+  const spec = resolveAgent(opts.agent, opts.extraArgs, { home: opts.home, yolo: opts.yolo });
+  const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
+  const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
+  const name = safeName(opts.name ?? identity.id);
+  const tmuxTarget = safeTmuxTargetForFlow(name);
+  const nodeName = opts.node?.name ?? LOCAL_NODE_NAME;
+  const substrate = opts.node ? substrateForRecord(opts.node) : localSubstrate();
+  if (await substrate.hasSession(tmuxTarget)) {
+    throw new Error(`tmux session already exists${isRemote && opts.node ? ` on ${opts.node.name}` : ""}: ${tmuxTarget}`);
+  }
+  await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env });
+  const command = shellCommand(spec);
+
+  const now = new Date().toISOString();
+  const record: SessionRecord = {
+    name,
+    agent: spec.kind,
+    cwd: opts.cwd,
+    command,
+    tmuxTarget,
+    createdAt: now,
+    updatedAt: now,
+    status: "running",
+    id: identity.id,
+    prefix: identity.prefix,
+    uuid: identity.uuid,
+    requestedAgent: spec.requestedKind,
+    ...(spec.homePath ? { homePath: spec.homePath } : {}),
+    ...(opts.colony ? { colony: opts.colony } : {}),
+    ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
+    ...(opts.caste ? { caste: opts.caste } : {}),
+    ...(opts.brief ? { brief: opts.brief } : {}),
+    ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+    ...(opts.runId ? { runId: opts.runId } : {}),
+    ...(opts.flowName ? { flowName: opts.flowName } : {}),
+  };
+  await saveSession(record);
+  return record;
 }

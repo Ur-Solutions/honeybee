@@ -1,23 +1,25 @@
 {
-  "name": "agentpit",
+  "name": "honeybee",
   "version": "0.0.1",
-  "description": "On-demand tmux cockpit for interactive agent CLIs.",
+  "description": "On-demand tmux cockpit for interactive AI bees; CLI: hive.",
   "type": "module",
   "bin": {
+    "hive": "dist/cli.js",
     "ap": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
     "dev": "tsx src/cli.ts",
-    "ap": "node dist/cli.js"
+    "hive": "node dist/cli.js"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "tsx": "latest",
-    "typescript": "latest"
+    "@types/node": "25.7.0",
+    "tsx": "4.21.0",
+    "typescript": "6.0.3"
   }
 }
