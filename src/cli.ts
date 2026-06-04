@@ -263,6 +263,8 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   else console.log(`${record.name}\t${agent}\t${cwd}\t${node.name}`);
   if (truthy(flag(parsed, "briefed")) && briefText) {
     record = await deliverBrief(parsed, record, briefText);
+  } else {
+    await confirmSpawnReady(parsed, record);
   }
   return record;
 }
@@ -287,6 +289,8 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
     if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`@${swarmId}`), ...nodeSuffix]));
     else console.log(`${record.name}\t${agent}\t${cwd}\t@${swarmId}\t${node.name}`);
   }
+
+  await confirmSpawnReadyAll(parsed, records);
 
   await createSwarm({
     id: swarmId,
@@ -332,6 +336,8 @@ async function spawnFromFrame(parsed: Parsed, frameName: string): Promise<Sessio
       else console.log(`${record.name}\t${caste.bee}\t${cwd}\t${caste.name}\t@${swarmId}`);
     }
   }
+
+  await confirmSpawnReadyAll(parsed, records);
 
   await createSwarm({
     id: swarmId,
@@ -405,6 +411,35 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
   if (isPretty()) console.log(actionLine("ok", "brief", [bold(record.name), `${briefText.length} chars`]));
   else console.log(`briefed\t${record.name}\t${briefText.length} chars`);
   return updated;
+}
+
+/**
+ * After a bare spawn, wait for the freshly spawned bee to reach its prompt,
+ * auto-accepting any startup trust/safety prompt along the way (e.g. codex's
+ * "Do you trust the contents of this directory?"). Without this, a plain
+ * `hive spawn codex` sits forever at the trust prompt with nobody to press
+ * Enter. The bee is already spawned and persisted, so readiness problems are
+ * surfaced as warnings rather than failing the spawn. Opt out of the wait with
+ * `--no-wait`, or out of trust acceptance specifically with `--no-accept-trust`.
+ */
+async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise<void> {
+  if (truthy(flag(parsed, "no-wait"))) return;
+  try {
+    await waitForAgentReady(record, {
+      timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+      acceptTrust: acceptsTrust(parsed),
+      raiseDroidAutonomy: dangerousMode(parsed, record.agent),
+    });
+  } catch (error) {
+    if (!(error instanceof AgentReadinessError)) throw error;
+    if (isPretty()) console.error(actionLine("warn", "spawn", [`${bold(record.name)} not confirmed ready (${error.reason})`]));
+    else console.error(`warn\tspawn\t${record.name}\t${error.reason}`);
+  }
+}
+
+async function confirmSpawnReadyAll(parsed: Parsed, records: SessionRecord[]): Promise<void> {
+  if (truthy(flag(parsed, "no-wait"))) return;
+  await Promise.all(records.map((record) => confirmSpawnReady(parsed, record)));
 }
 
 function augmentBrief(parsed: Parsed, briefText: string): string {
@@ -2694,7 +2729,7 @@ function printHelp() {
   const env = (name: string) => (pretty ? cyan(name) : name);
 
   const commands: Array<[string, string, string]> = [
-    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--colony <name>] [--count <n>] [--node <name>] [--yolo] [-- <bee-args...>]", "start one or more bees in detached tmux sessions"],
+    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--colony <name>] [--count <n>] [--node <name>] [--yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start one or more bees in detached tmux sessions (waits for the prompt, auto-accepting trust)"],
     ["spawn --frame", "<name> [--colony <name>] [--swarm-id <id>]", "spawn a swarm from a registered frame"],
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],

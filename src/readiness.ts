@@ -40,11 +40,11 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
     const pane = await substrate.capture(record.tmuxTarget, 100).catch(() => "");
     lastPane = pane;
 
-    if (isMcpWarningPane(pane)) {
+    if (isMcpWarningPane(recentPane(pane))) {
       throw new AgentReadinessError("blocked", `Agent startup is blocked by an MCP warning in ${record.name}`, pane);
     }
 
-    if (isTrustPromptPane(pane)) {
+    if (isTrustPromptPane(recentPane(pane))) {
       if (!acceptTrust) {
         throw new AgentReadinessError("trust", `Agent startup is waiting for a trust/safety confirmation in ${record.name}; rerun without --no-accept-trust to acknowledge it`, pane);
       }
@@ -86,8 +86,20 @@ export function shouldRaiseDroidAutonomy(pane: string): boolean {
 }
 
 export function isAgentReadyPane(agent: string, pane: string): boolean {
-  if (isTrustPromptPane(pane) || isMcpWarningPane(pane)) return false;
+  const recent = recentPane(pane);
+  if (isTrustPromptPane(recent) || isMcpWarningPane(recent)) return false;
   return isDriverReady(agent, pane);
+}
+
+// A trust/safety/MCP prompt only needs handling while it is the *current*
+// interaction at the bottom of the pane. Some agents (notably codex) print the
+// trust prompt in the normal screen buffer and then switch to an alternate
+// screen for their main UI, stranding the prompt text up in scrollback. Scoping
+// these checks to the tail keeps stale prompt text from masking a ready agent.
+const RECENT_PROMPT_LINES = 15;
+
+function recentPane(pane: string): string {
+  return pane.trimEnd().split("\n").slice(-RECENT_PROMPT_LINES).join("\n");
 }
 
 function sleep(ms: number) {

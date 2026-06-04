@@ -59,6 +59,8 @@ hive run claude -p "Inspect this repo." --accept-trust
 hive run codex -p "Try anyway." --force-send
 ```
 
+`hive spawn` also waits for the bee to reach its prompt, automatically accepting a startup trust/safety prompt (e.g. codex's "Do you trust the contents of this directory?") so the session is usable instead of stuck. Pass `--no-accept-trust` to leave the prompt untouched, or `--no-wait` to return immediately without waiting.
+
 Override a bee command with environment variables:
 
 ```sh
