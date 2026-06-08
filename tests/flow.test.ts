@@ -7,6 +7,7 @@ import {
   defineFlow,
   defineFlowFromFile,
   flowExists,
+  BUILTIN_FLOW_NAMES,
   listFlows,
   loadFlow,
   loadFlowSource,
@@ -342,7 +343,8 @@ test("defineFlowFromFile imports a JSON flow and listFlows returns it", async ()
     assert.equal(await flowExists("review"), true);
 
     const list = await listFlows();
-    assert.deepEqual(list.map((f) => f.name), ["review"]);
+    const builtins = new Set(BUILTIN_FLOW_NAMES);
+    assert.deepEqual(list.map((f) => f.name).filter((n) => !builtins.has(n)), ["review"]);
   });
 });
 
@@ -473,7 +475,12 @@ test("listFlows mixes .ts and .json registry entries", async () => {
     await defineFlowFromFile(tsSource);
 
     const flows = await listFlows();
-    assert.deepEqual(flows.map((f) => f.name), ["a-json", "b-ts"]);
+    // listFlows() also surfaces built-in flows (e.g. `loop`); filter them out
+    // to assert the on-disk .ts/.json mixing behavior this test covers.
+    const builtins = new Set(BUILTIN_FLOW_NAMES);
+    assert.deepEqual(flows.map((f) => f.name).filter((n) => !builtins.has(n)), ["a-json", "b-ts"]);
+    // The built-in loop flow is always present.
+    assert.ok(flows.some((f) => f.name === "loop"));
   });
 });
 

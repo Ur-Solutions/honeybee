@@ -14,7 +14,7 @@ import { listTmuxSessions } from "./tmux.js";
 const COMMANDS = [
   "spawn", "send", "tail", "transcript", "last", "wait",
   "list", "ls", "ps", "kill", "clean", "run", "attach",
-  "colony", "frame", "swarm", "node", "substrate", "flow",
+  "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
   "search", "seals",
@@ -28,6 +28,7 @@ const NODE_SUBCOMMANDS = ["list", "ls", "register", "inspect", "update", "unregi
 const SUBSTRATE_SUBCOMMANDS = ["list", "ls"];
 const SEALS_SUBCOMMANDS = ["find"];
 const FLOW_SUBCOMMANDS = ["list", "ls", "define", "inspect", "remove", "run", "runs", "logs", "status", "cancel"];
+const LOOP_SUBCOMMANDS = ["start", "status", "logs", "stop", "list", "ls"];
 const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "purge", "config"];
 const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
 
@@ -88,6 +89,12 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ],
   daemon: ["--tick-ms", "--json", "--label", "--force", "--follow", "--lines", "-n"],
   flow: ["--arg", "--foreground", "--background", "--flow", "--json"],
+  loop: [
+    "--bee", "--cwd", "--context", "--prompt", "--prompt-file",
+    "--until", "--max", "--max-duration", "--forever",
+    "--stop-on-seal", "--stop-on-sentinel", "--judge", "--summarizer",
+    "--yolo", "--iter", "-n", "--follow", "-f", "--now", "--json",
+  ],
 };
 
 export type CompletionState = {
@@ -102,7 +109,10 @@ export type CompletionState = {
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run";
+type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer";
+
+const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
+const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
 
 // Global fallback: flags whose value-completion is unambiguous regardless
 // of the current verb (e.g. --colony always refers to a colony).
@@ -127,6 +137,12 @@ const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagValueKind>
     "--tier": "buz-tier",
     "--accept": "buz-accept",
   },
+  loop: {
+    "--bee": "bee",
+    "--context": "loop-context",
+    "--summarizer": "loop-summarizer",
+    "--stop-on-seal": "seal-status",
+  },
 };
 
 const NOUN_COMMAND_SUBS: Record<string, string[]> = {
@@ -137,6 +153,7 @@ const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   substrate: SUBSTRATE_SUBCOMMANDS,
   seals: SEALS_SUBCOMMANDS,
   flow: FLOW_SUBCOMMANDS,
+  loop: LOOP_SUBCOMMANDS,
   buz: BUZ_SUBCOMMANDS,
   daemon: DAEMON_SUBCOMMANDS,
 };
@@ -228,6 +245,10 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return BUZ_ACCEPT_VALUES;
     case "run":
       return (state.runs ?? []).map((r) => r.runId);
+    case "loop-context":
+      return LOOP_CONTEXT_VALUES;
+    case "loop-summarizer":
+      return LOOP_SUMMARIZER_VALUES;
   }
 }
 

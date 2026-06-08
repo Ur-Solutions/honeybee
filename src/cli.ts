@@ -26,6 +26,19 @@ import { defineFrameFromFile, frameExists, listFrames, loadFrame, loadFrameSourc
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
 import { executeFlow } from "./flow/run.js";
 import { cancelRun, spawnDetachedRun } from "./flow/background.js";
+import { loopFlow } from "./loop/flow.js";
+import { buildLoopConfig } from "./loop/context.js";
+import {
+  ensureLoopDir,
+  type LoopConfig,
+  listLoops,
+  loopIterLogPath,
+  loopProgressPath,
+  readLoopConfig,
+  requestStop,
+  updateLoopConfig,
+  writeLoopConfig,
+} from "./loop/state.js";
 import {
   findRunById,
   generateRunId,
@@ -150,6 +163,9 @@ async function main(argv: string[]) {
       break;
     case "flow":
       await cmdFlow(parsed);
+      break;
+    case "loop":
+      await cmdLoop(parsed);
       break;
     case "buz":
       await cmdBuz(parsed);
@@ -1918,6 +1934,259 @@ async function flowRemove(parsed: Parsed) {
   else console.log(`removed\t${name}`);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Loops — `hive loop <start|status|logs|stop|list>`. A loop is the built-in
+// `loop` flow run detached (runId === loopId); state lives under
+// ~/.hive/loops/<loopId>/.
+// ──────────────────────────────────────────────────────────────────────────
+
+async function cmdLoop(parsed: Parsed) {
+  const sub = parsed.args[0];
+  switch (sub) {
+    case undefined:
+    case "list":
+    case "ls":
+      return loopListCmd();
+    case "start":
+      return loopStartCmd(parsed);
+    case "status":
+      return loopStatusCmd(parsed);
+    case "logs":
+      return loopLogsCmd(parsed);
+    case "stop":
+      return loopStopCmd(parsed);
+    default:
+      throw new Error(`Unknown loop subcommand: ${sub}\nUsage: hive loop <start|status|logs|stop|list> [id]`);
+  }
+}
+
+function loopArgsFromFlags(parsed: Parsed, prompt: string): Record<string, unknown> {
+  return {
+    bee: typeof flag(parsed, "bee") === "string" ? String(flag(parsed, "bee")) : "",
+    cwd: typeof flag(parsed, "cwd") === "string" ? String(flag(parsed, "cwd")) : "",
+    context: typeof flag(parsed, "context") === "string" ? String(flag(parsed, "context")) : "",
+    prompt,
+    until: typeof flag(parsed, "until") === "string" ? String(flag(parsed, "until")) : "",
+    max: typeof flag(parsed, "max") === "string" ? String(flag(parsed, "max")) : undefined,
+    maxDuration: typeof flag(parsed, "max-duration") === "string" ? String(flag(parsed, "max-duration")) : "",
+    forever: truthy(flag(parsed, "forever")),
+    stopOnSeal: typeof flag(parsed, "stop-on-seal") === "string" ? String(flag(parsed, "stop-on-seal")) : "",
+    stopOnSentinel: typeof flag(parsed, "stop-on-sentinel") === "string" ? String(flag(parsed, "stop-on-sentinel")) : "",
+    judge: typeof flag(parsed, "judge") === "string" ? String(flag(parsed, "judge")) : "",
+    summarizer: typeof flag(parsed, "summarizer") === "string" ? String(flag(parsed, "summarizer")) : "",
+    yolo: truthy(flag(parsed, "yolo")),
+  };
+}
+
+async function loopStartCmd(parsed: Parsed) {
+  // Resolve the prompt from --prompt or --prompt-file.
+  let prompt = typeof flag(parsed, "prompt") === "string" ? String(flag(parsed, "prompt")) : "";
+  const promptFile = typeof flag(parsed, "prompt-file") === "string" ? String(flag(parsed, "prompt-file")) : undefined;
+  if (promptFile) {
+    if (prompt) throw new Error("Provide either --prompt or --prompt-file, not both.");
+    prompt = (await readFile(resolve(promptFile), "utf8")).trim();
+  }
+
+  const rawArgs = loopArgsFromFlags(parsed, prompt);
+  // Validate eagerly so errors surface BEFORE we spawn a detached process.
+  const loopId = generateRunId();
+  const cfg = buildLoopConfig({ ...rawArgs, loopId });
+  cfg.loopId = loopId;
+
+  if (process.platform === "win32") {
+    throw new Error("hive loop start is not supported on Windows (POSIX process groups are required to stop).");
+  }
+
+  await ensureLoopDir(loopId);
+  await writeLoopConfig(cfg);
+  const args = { ...rawArgs, loopId };
+  const { pid, pgid } = await spawnDetachedRun(loopFlow, args, { runId: loopId });
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "loop", [bold("loop"), dim(`id ${loopId}`), dim(`pid:${pid}`)]));
+    console.error(dim(`Loop started. Inspect: hive loop status ${loopId} / hive loop logs ${loopId} / hive loop stop ${loopId}`));
+  } else {
+    console.log(`loop.start\t${loopId}\t${pid}\t${pgid}`);
+  }
+}
+
+async function loopStatusCmd(parsed: Parsed) {
+  const loopId = parsed.args[1];
+  if (!loopId) return loopListCmd();
+  const cfg = await readLoopConfig(loopId);
+  if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(cfg, null, 2));
+    return;
+  }
+  if (!isPretty()) {
+    console.log(
+      [
+        cfg.loopId,
+        cfg.context,
+        cfg.status,
+        cfg.iteration,
+        cfg.lastSealStatus ?? "",
+        cfg.startedAt,
+        cfg.endedAt ?? "",
+      ].join("\t"),
+    );
+    return;
+  }
+  console.log(`${bold("loop")} ${dim(cfg.loopId)} ${colorLoopStatus(cfg.status)}`);
+  console.log(`  context    ${cfg.context} ${dim(`(carrier=${cfg.carrier} memory=${cfg.memory})`)}`);
+  console.log(`  bee        ${cfg.bee}`);
+  console.log(`  iteration  ${cfg.iteration}${cfg.stop.max != null ? dim(` / ${cfg.stop.max}`) : ""}`);
+  if (cfg.lastSealStatus) console.log(`  lastSeal   ${cfg.lastSealStatus}`);
+  if (cfg.lastStopCheck) {
+    console.log(`  stopCheck  ${cfg.lastStopCheck.condition}=${cfg.lastStopCheck.result} ${dim(cfg.lastStopCheck.at)}`);
+  }
+  if (cfg.stopReason) console.log(`  stopReason ${cfg.stopReason}`);
+  console.log(`  elapsed    ${formatLoopElapsed(cfg)}`);
+  if (cfg.pid !== undefined) console.log(`  pid        ${cfg.pid}`);
+  const progress = await readFile(loopProgressPath(loopId), "utf8").catch(() => "");
+  if (progress.trim()) {
+    const head = progress.split("\n").slice(0, 8).join("\n");
+    console.log(`\n${dim("progress.md (head):")}\n${head}`);
+  }
+}
+
+async function loopLogsCmd(parsed: Parsed) {
+  const loopId = parsed.args[1];
+  if (!loopId) throw new Error("Usage: hive loop logs <loopId> [--iter <n>] [-n <lines>] [-f|--follow]");
+  const cfg = await readLoopConfig(loopId);
+  if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
+
+  const iterRaw = flag(parsed, "iter");
+  if (typeof iterRaw === "string") {
+    const n = Number(iterRaw);
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`Invalid --iter "${iterRaw}": expected a positive integer.`);
+    const path = loopIterLogPath(loopId, n);
+    const text = await readFile(path, "utf8").catch(() => "");
+    await emitLogText(text, path);
+    return;
+  }
+
+  const path = runLogPath("loop", loopId);
+  const follow = truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
+  const lines = numberFlag(parsed, ["n", "lines"], 0);
+  if (follow) {
+    await followLoopLog(loopId);
+    return;
+  }
+  let text = await readLogFull("loop", loopId);
+  if (lines > 0) {
+    text = text.split("\n").slice(-lines - 1).join("\n");
+  }
+  await emitLogText(text, path);
+}
+
+async function emitLogText(text: string, path: string): Promise<void> {
+  process.stdout.write(text);
+  if (text.length > 0 && !text.endsWith("\n")) process.stdout.write("\n");
+  if (isPretty(process.stderr)) console.error(dim(`# ${path}`));
+}
+
+async function followLoopLog(loopId: string): Promise<void> {
+  let previous = "";
+  while (true) {
+    const next = await readLogFull("loop", loopId);
+    if (next.length > previous.length) {
+      process.stdout.write(next.slice(previous.length));
+    } else if (next !== previous) {
+      // Log was rotated/rewritten — reprint from scratch.
+      process.stdout.write(next);
+    }
+    previous = next;
+    const cfg = await readLoopConfig(loopId).catch(() => null);
+    if (cfg && cfg.status !== "running") break;
+    await sleep(1_000);
+  }
+}
+
+async function loopStopCmd(parsed: Parsed) {
+  const loopId = parsed.args[1];
+  if (!loopId) throw new Error("Usage: hive loop stop <loopId> [--now]");
+  const cfg = await readLoopConfig(loopId);
+  if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
+  const now = truthy(flag(parsed, "now"));
+  if (now) {
+    const outcome = await cancelRun("loop", loopId);
+    // cancelRun SIGKILLs the driver's process group, so the driver's own
+    // finalize() may never run and loop.json would be stuck at "running".
+    // Reconcile it here so `hive loop status/list` reports a terminal state.
+    if (cfg.status === "running") {
+      await updateLoopConfig(loopId, { status: "stopped", stopReason: "stopped:now", endedAt: new Date().toISOString() }).catch(
+        () => undefined,
+      );
+    }
+    if (isPretty()) {
+      const tag = outcome.signalled === "already-dead" ? dim(outcome.signalled) : yellow(outcome.signalled);
+      console.log(actionLine("ok", "loop", [bold(loopId), dim("now"), tag]));
+    } else {
+      console.log(`loop.stop\t${loopId}\tnow\t${outcome.signalled}`);
+    }
+    return;
+  }
+  await requestStop(loopId);
+  if (isPretty()) {
+    console.log(actionLine("ok", "loop", [bold(loopId), dim("queued"), dim("stops after current iteration")]));
+  } else {
+    console.log(`loop.stop\t${loopId}\tqueued`);
+  }
+}
+
+async function loopListCmd() {
+  const loops = await listLoops();
+  if (!isPretty()) {
+    for (const l of loops) {
+      console.log(["loop.run", l.loopId, l.context, l.status, l.iteration, l.startedAt].join("\t"));
+    }
+    return;
+  }
+  if (loops.length === 0) {
+    console.log(dim("No loops yet. Start one with: hive loop start --bee <kind> --cwd <dir> --context <mode> --prompt \"...\""));
+    return;
+  }
+  console.log(formatTable(
+    [
+      { header: "LOOP" },
+      { header: "CONTEXT" },
+      { header: "STATUS" },
+      { header: "ITER", align: "right" },
+      { header: "STARTED" },
+    ],
+    loops.map((l) => [
+      bold(l.loopId),
+      l.context,
+      colorLoopStatus(l.status),
+      String(l.iteration),
+      dim(l.startedAt),
+    ]),
+  ));
+}
+
+function colorLoopStatus(status: LoopConfig["status"]): string {
+  if (status === "running") return cyan(status);
+  if (status === "done") return green(status);
+  if (status === "paused") return yellow(status);
+  if (status === "stopped") return yellow(status);
+  if (status === "errored") return red(status);
+  return dim(status);
+}
+
+function formatLoopElapsed(cfg: LoopConfig): string {
+  const start = Date.parse(cfg.startedAt);
+  const end = cfg.endedAt ? Date.parse(cfg.endedAt) : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return "?";
+  const secs = Math.max(0, Math.floor((end - start) / 1000));
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ${secs % 60}s`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ${mins % 60}m`;
+}
+
 async function cmdDaemon(parsed: Parsed) {
   const sub = parsed.args[0];
   switch (sub) {
@@ -2715,6 +2984,7 @@ function printHelp() {
     ["node", "<list|register|inspect|update|unregister> [name]", "manage substrate endpoints (local + ssh-tmux)"],
     ["substrate", "list", "show available substrate kinds"],
     ["flow", "<list|define|inspect|remove|run|runs|logs|status|cancel> [name|path|runId] [--arg k=v]... [--background]", "manage and run flow definitions; --background detaches, cancel signals the pgid"],
+    ["loop", "<start|status|logs|stop|list> [id] [--bee --cwd --context --prompt ...]", "Run a bee repeatedly until a stop condition"],
     ["buz", "<send|inbox|outbox|queue|read|purge|config> [--tier <interrupt|queue|passive>] [--sender <bee>|--sender-human <name>]", "addressed messaging: three-tier delivery + per-bee policy"],
     ["daemon", "<install|uninstall|start|stop|restart|status|logs|run> [--label <id>] [--tick-ms <n>] [--lines N] [--follow] [--json]", "manage the hive daemon LaunchAgent + inspect state/logs"],
     ["search", "<query> [--type seals,ledger,sessions] [--colony X] [--swarm X] [--bee X] [--status X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals, ledger, and session records"],

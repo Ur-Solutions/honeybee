@@ -152,6 +152,27 @@ function normalizeArgs(value: unknown, flowName: string): FlowArg[] {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Built-in flow registry                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Built-in flows ship with hive itself rather than living on disk under
+ * ~/.hive/flows. They are resolved by loadFlow() BEFORE the disk lookup so a
+ * fresh `__flow-exec` child can resolve them too (the single most important
+ * seam for loops). The loaders use a function-level dynamic import to avoid the
+ * static cycle flow/index ↔ loop/flow.
+ */
+const BUILTIN_FLOW_LOADERS: Record<string, () => Promise<Flow>> = {
+  loop: async () => (await import("../loop/index.js")).loopFlow,
+};
+
+export const BUILTIN_FLOW_NAMES = Object.keys(BUILTIN_FLOW_LOADERS);
+
+function isBuiltinFlow(name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(BUILTIN_FLOW_LOADERS, name);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Registry CRUD — mirrors src/frame.ts                              */
 /* ------------------------------------------------------------------ */
 
@@ -160,6 +181,13 @@ export async function listFlows(): Promise<Flow[]> {
   const files = await readdir(flowsDir()).catch(() => []);
   const seen = new Set<string>();
   const flows: Flow[] = [];
+  // Built-in flows first so they always appear even with no on-disk flows.
+  for (const name of BUILTIN_FLOW_NAMES) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const flow = await loadFlow(name).catch(() => null);
+    if (flow) flows.push(flow);
+  }
   for (const file of files) {
     const ext = extname(file);
     if (ext !== ".json" && ext !== ".ts") continue;
@@ -173,6 +201,8 @@ export async function listFlows(): Promise<Flow[]> {
 }
 
 export async function loadFlow(name: string): Promise<Flow | null> {
+  const builtin = BUILTIN_FLOW_LOADERS[name];
+  if (builtin) return builtin();
   const tsPath = flowFilePath(name, ".ts");
   if (await pathExists(tsPath)) return validateFlow(await loadTsModule(tsPath), name);
   const jsonPath = flowFilePath(name, ".json");
@@ -208,6 +238,9 @@ export async function defineFlowFromFile(sourcePath: string, nameOverride?: stri
   const draft = validateFlow(loaded);
   const finalName = nameOverride ?? draft.name;
   if (!validFlowName(finalName)) throw new Error(`Invalid flow name: ${finalName}`);
+  if (isBuiltinFlow(finalName)) {
+    throw new Error(`Cannot define flow "${finalName}": it is a built-in flow.`);
+  }
   if (ext === ".ts" && nameOverride && nameOverride !== draft.name) {
     throw new Error(
       `cannot rename TS flows via nameOverride (got '${nameOverride}', source defines '${draft.name}'). ` +
@@ -243,6 +276,9 @@ export async function loadFlowSource(name: string): Promise<string | null> {
 }
 
 export async function removeFlow(name: string): Promise<boolean> {
+  if (isBuiltinFlow(name)) {
+    throw new Error(`Cannot remove flow "${name}": it is a built-in flow.`);
+  }
   let removed = false;
   for (const ext of [".ts", ".json"] as const) {
     const path = flowFilePath(name, ext);

@@ -28,7 +28,18 @@ import { appendLedger, loadSession, saveSession, type SessionRecord } from "../s
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
 import { spawnBeeForFlow, type SpawnBeeOptions } from "../agents.js";
 import { waitForIdle } from "../wait.js";
+import { buildLoopConfig } from "../loop/context.js";
+import { loopFlow } from "../loop/flow.js";
+import {
+  ensureLoopDir,
+  type LoopConfig,
+  readLoopConfig,
+  requestStop,
+  writeLoopConfig,
+} from "../loop/state.js";
 import type { BeeHandle, FlowSpawnInput } from "./index.js";
+import { cancelRun, spawnDetachedRun } from "./background.js";
+import { generateRunId } from "./runs.js";
 import { runLogPath } from "./runs.js";
 
 /** Identifier for a bee that the facade can resolve to a SessionRecord. */
@@ -59,6 +70,23 @@ export type FacadeWaitOptions = {
 export type FacadeSealOptions = {
   timeoutMs?: number;
   pollMs?: number;
+};
+
+/** Input to HiveFacade.loop() — the programmatic surface for starting a loop. */
+export type LoopSpawnInput = {
+  bee: string;
+  cwd: string;
+  context: "persistent" | "ralph" | "rolling";
+  prompt: string;
+  until?: string;
+  max?: number;
+  maxDuration?: string;
+  forever?: boolean;
+  stopOnSeal?: string;
+  stopOnSentinel?: string;
+  judge?: string;
+  summarizer?: "self" | "bee";
+  yolo?: boolean;
 };
 
 /**
@@ -298,6 +326,48 @@ export class HiveFacade {
     throw new Error(`Timed out waiting for buz message to ${record.name} after ${timeoutMs}ms`);
   }
 
+  /** ---------------------- loop ---------------------- */
+
+  /**
+   * Start a detached loop — the in-flow / in-agent surface mirroring
+   * `hive loop start`. Pre-allocates a loopId (== runId), writes the initial
+   * loop.json, then spawns the built-in `loop` flow as a detached background
+   * run. Returns the loopId immediately; the while-loop driver runs in the
+   * child, not inline. Validates the spec eagerly so callers surface bad input
+   * before a process is forked.
+   */
+  async loop(spec: LoopSpawnInput): Promise<string> {
+    const loopId = generateRunId();
+    // Build/validate the config eagerly; buildLoopConfig throws on bad input.
+    const cfg = buildLoopConfig({ ...(spec as Record<string, unknown>), loopId });
+    cfg.loopId = loopId;
+    await ensureLoopDir(loopId);
+    await writeLoopConfig(cfg);
+    const args = loopArgsFromSpec(spec, loopId);
+    await spawnDetachedRun(loopFlow, args, { runId: loopId });
+    await appendLedger({ type: "loop.start", loopId, bee: cfg.bee, context: cfg.context });
+    return loopId;
+  }
+
+  /** Read a loop's current config + live state, or null if unknown. */
+  async loopStatus(loopId: string): Promise<LoopConfig | null> {
+    return readLoopConfig(loopId);
+  }
+
+  /**
+   * Stop a loop. Default is graceful (write the stop-request sentinel; the
+   * driver halts after the current iteration). `now:true` cancels the detached
+   * run immediately (SIGTERM→SIGKILL on the process group), killing the
+   * in-flight bee.
+   */
+  async loopStop(loopId: string, opts: { now?: boolean } = {}): Promise<void> {
+    if (opts.now) {
+      await cancelRun("loop", loopId);
+      return;
+    }
+    await requestStop(loopId);
+  }
+
   /** ---------------------- killAll ---------------------- */
 
   /**
@@ -369,6 +439,30 @@ function resolveNode(name: string | undefined): NodeRecord | undefined {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Translate a LoopSpawnInput into the flow arg record consumed by loopFlow.
+ * Only defined fields are forwarded so loopFlow's arg defaults still apply.
+ */
+function loopArgsFromSpec(spec: LoopSpawnInput, loopId: string): Record<string, unknown> {
+  const args: Record<string, unknown> = {
+    bee: spec.bee,
+    cwd: spec.cwd,
+    context: spec.context,
+    prompt: spec.prompt,
+    loopId,
+  };
+  if (spec.until !== undefined) args.until = spec.until;
+  if (spec.max !== undefined) args.max = spec.max;
+  if (spec.maxDuration !== undefined) args.maxDuration = spec.maxDuration;
+  if (spec.forever !== undefined) args.forever = spec.forever;
+  if (spec.stopOnSeal !== undefined) args.stopOnSeal = spec.stopOnSeal;
+  if (spec.stopOnSentinel !== undefined) args.stopOnSentinel = spec.stopOnSentinel;
+  if (spec.judge !== undefined) args.judge = spec.judge;
+  if (spec.summarizer !== undefined) args.summarizer = spec.summarizer;
+  if (spec.yolo !== undefined) args.yolo = spec.yolo;
+  return args;
 }
 
 // Re-export for cli/tests so callers don't have to import substrateForRecord
