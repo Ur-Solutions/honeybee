@@ -3,7 +3,8 @@ import { access, readFile, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
-import { deadSessionAge, deadSessionRecords, olderThanMillis, parseAge } from "./clean.js";
+import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis, idleSessionAge, olderThanMillis, parseAge } from "./clean.js";
+import { chooseCleanTargets, type CleanTuiCleanOutcome, type CleanTuiItem } from "./cleanTui.js";
 import { archiveColony, createColony, listColonies, loadColony, renameColony, updateColony } from "./colony.js";
 import {
   BUZ_TIERS,
@@ -745,8 +746,18 @@ async function listSealedBeeNames(): Promise<Set<string>> {
 }
 
 async function cmdClean(parsed: Parsed) {
-  if (!truthy(flag(parsed, "dead"))) throw new Error("Usage: hive clean --dead [--older-than <age>] [--dry-run|-n]");
+  const interactive = hasFlag(parsed, "interactive") || hasFlag(parsed, "i");
+  const wantsDead = truthy(flag(parsed, "dead"));
+  const wantsIdle = hasFlag(parsed, "idle");
 
+  if (interactive) return cmdCleanInteractive(parsed);
+  if (wantsDead && wantsIdle) throw new Error("Choose either hive clean --dead or hive clean --idle, not both.");
+  if (wantsIdle) return cmdCleanIdle(parsed);
+  if (wantsDead) return cmdCleanDead(parsed);
+  throw new Error("Usage: hive clean (--dead|--idle|-i|--interactive) [--older-than <age>] [--dry-run|-n]");
+}
+
+async function cmdCleanDead(parsed: Parsed) {
   const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
   const probe = await liveTargetsAcrossNodes(nodes);
   // Records on an unreachable node are NOT dead — we genuinely don't know their state.
@@ -797,6 +808,271 @@ async function cmdClean(parsed: Parsed) {
     await deleteSession(record.name);
     if (isPretty()) console.log(actionLine("ok", "clean", [bold(record.name), record.agent, dim(tildify(record.cwd))]));
     else console.log(`cleaned\t${record.name}`);
+  }
+}
+
+async function cmdCleanIdle(parsed: Parsed) {
+  const { candidates } = await collectCleanCandidates();
+  let idle = candidates.filter((candidate) => candidate.state === "idle_with_output" && candidate.mode === "kill");
+  const olderThan = ageFlag(parsed, ["older-than", "older"]);
+  if (olderThan !== undefined) {
+    const oldEnough = new Set(idleOlderThanMillis(idle.map((candidate) => candidate.record), olderThan).map((record) => record.name));
+    idle = idle.filter((candidate) => oldEnough.has(candidate.record.name));
+  }
+  const dryRun = truthy(flag(parsed, "dry-run")) || truthy(flag(parsed, "n"));
+
+  if (idle.length === 0) {
+    if (isPretty()) console.log(dim("No idle bees to clean."));
+    else console.log("cleaned\t0");
+    return;
+  }
+
+  if (dryRun) {
+    printIdleDryRun(idle);
+    return;
+  }
+
+  await cleanCandidates(idle);
+}
+
+async function cmdCleanInteractive(_parsed: Parsed) {
+  const { candidates } = await collectCleanCandidates();
+  if (candidates.length === 0) {
+    console.log(dim("No bees in the hive. Nothing to clean."));
+    return;
+  }
+  const candidateByName = new Map(candidates.map((candidate) => [candidate.record.name, candidate] as const));
+  const result = await chooseCleanTargets(candidates.map(cleanTuiItem), {
+    loadPreview: async (item) => {
+      const candidate = candidateByName.get(item.name);
+      if (!candidate) return "No matching bee record found.";
+      return cleanPreview(candidate.record);
+    },
+    clean: async (items) => {
+      const targets = items.flatMap((item) => {
+        const candidate = candidateByName.get(item.name);
+        return candidate && candidate.mode !== "disabled" ? [candidate] : [];
+      });
+      const outcomes = await cleanCandidatesForTui(targets);
+      for (const outcome of outcomes) {
+        if (!outcome.ok) continue;
+        candidateByName.delete(outcome.name);
+      }
+      return outcomes;
+    },
+  });
+  if (result.failed > 0) process.exitCode = 1;
+}
+
+async function cleanPreview(record: SessionRecord): Promise<string> {
+  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record)).catch(() => null);
+  if (tx) {
+    const rendered = renderTranscript(tx.rows, { limit: 8 }).trim();
+    if (rendered) return [`transcript ${tx.provider} ${tildify(tx.path)}`, "", rendered].join("\n");
+  }
+
+  try {
+    if (await substrateFor(record).hasSession(record.tmuxTarget)) {
+      const pane = await substrateFor(record).capture(record.tmuxTarget, 80);
+      if (pane.trim()) return [`pane tail ${record.tmuxTarget}`, "", pane.trimEnd()].join("\n");
+    }
+  } catch {
+    // Fall through to the metadata fallback; preview should not make selection brittle.
+  }
+
+  if (record.lastPrompt) return ["last prompt", "", record.lastPrompt].join("\n");
+  if (record.brief) return ["brief", "", record.brief].join("\n");
+  return "No transcript or pane tail available.";
+}
+
+type CleanMode = "delete" | "kill" | "disabled";
+
+type CleanCandidate = CleanTuiItem & {
+  record: SessionRecord;
+  mode: CleanMode;
+  ageMs: number;
+};
+
+async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; candidates: CleanCandidate[] }> {
+  const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const probe = await liveTargetsAcrossNodes(nodes);
+  const panes = await capturePanesFor(records, probe.liveTargets);
+  const seals = await listSealedBeeNames();
+  const context: StateContext = {
+    liveTargets: probe.liveTargets,
+    panes,
+    seals,
+    unreachableNodes: probe.unreachableNodes,
+    now: Date.now(),
+  };
+  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(record.tmuxTarget), context.now!));
+  candidates.sort(compareCleanCandidates);
+  return { records, candidates };
+}
+
+function cleanCandidateFor(record: SessionRecord, records: SessionRecord[], derived: DerivedState, live: boolean, now: number): CleanCandidate {
+  const disabledReason = cleanDisabledReason(derived.state);
+  const mode: CleanMode = disabledReason ? "disabled" : live ? "kill" : "delete";
+  const ageSource = cleanCandidateAgeSource(record, derived.state);
+  const ageTs = Date.parse(ageSource);
+  const ageMs = Number.isFinite(ageTs) ? Math.max(0, now - ageTs) : 0;
+  return {
+    record,
+    mode,
+    ageMs,
+    name: record.name,
+    ref: highlightUniqueSessionReference(records, record),
+    agent: record.agent,
+    state: derived.state,
+    detail: derived.detail,
+    age: cleanCandidateAge(record, derived.state, now),
+    cwd: record.cwd,
+    ...(disabledReason ? { disabledReason } : {}),
+  };
+}
+
+function cleanDisabledReason(state: BeeState): string | undefined {
+  switch (state) {
+    case "active":
+      return "active";
+    case "booting":
+      return "booting";
+    case "node_unreachable":
+      return "offline";
+    default:
+      return undefined;
+  }
+}
+
+function cleanCandidateAge(record: SessionRecord, state: BeeState, now: number): string {
+  return formatRelativeTime(cleanCandidateAgeSource(record, state), now);
+}
+
+function cleanCandidateAgeSource(record: SessionRecord, state: BeeState): string {
+  if (state === "idle_with_output") return idleAgeSource(record);
+  if (isTerminalState(state)) return record.updatedAt;
+  return record.createdAt;
+}
+
+function cleanTuiItem(candidate: CleanCandidate): CleanTuiItem {
+  const { name, ref, agent, state, detail, age, cwd, disabledReason } = candidate;
+  return { name, ref, agent, state, detail, age, cwd, ...(disabledReason ? { disabledReason } : {}) };
+}
+
+function printIdleDryRun(idle: CleanCandidate[]) {
+  if (!isPretty()) {
+    for (const candidate of idle) {
+      const record = candidate.record;
+      console.log(`idle\t${record.id ?? record.name}\t${record.name}\t${record.agent}\t${idleSessionAge(record)}\t${record.cwd}`);
+    }
+    return;
+  }
+  console.log(formatTable(
+    [
+      { header: "REF" },
+      { header: "NAME" },
+      { header: "BEE" },
+      { header: "IDLE", align: "right" },
+      { header: "CWD" },
+      { header: "LAST PROMPT" },
+    ],
+    idle.map((candidate) => {
+      const record = candidate.record;
+      return [
+        truncate(candidate.ref, 16),
+        truncate(record.name, 22),
+        truncate(record.agent, 12),
+        dim(idleSessionAge(record)),
+        dim(truncate(tildify(record.cwd), Math.max(20, Math.min(50, (process.stdout.columns ?? 100) - 86)))),
+        dim(truncate(record.lastPrompt?.split("\n")[0] ?? "", Math.max(20, Math.min(60, (process.stdout.columns ?? 100) - 90)))),
+      ];
+    }),
+  ));
+  console.error(note("dry run; remove these with: hive clean --idle"));
+}
+
+async function cleanCandidates(candidates: CleanCandidate[]): Promise<void> {
+  let failed = 0;
+  for (const candidate of candidates) {
+    if (candidate.mode === "disabled") continue;
+    const outcome = await cleanCandidate(candidate);
+    if (!outcome.ok) {
+      failed += 1;
+      if (isPretty()) {
+        console.log(actionLine("warn", "clean", [bold(candidate.record.name), dim(outcome.detail)]));
+        console.error(note(`bee may still be running; retry: hive kill ${candidate.record.name}`));
+      } else {
+        console.log(`clean_failed\t${candidate.record.name}\t${outcome.detail}`);
+      }
+      continue;
+    }
+    printCleanSuccess(candidate.record, outcome.detail);
+  }
+  if (failed > 0) process.exitCode = 1;
+}
+
+async function cleanCandidatesForTui(candidates: CleanCandidate[]): Promise<CleanTuiCleanOutcome[]> {
+  const outcomes: CleanTuiCleanOutcome[] = [];
+  for (const candidate of candidates) {
+    try {
+      outcomes.push(await cleanCandidate(candidate));
+    } catch (error) {
+      outcomes.push({
+        name: candidate.record.name,
+        ok: false,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return outcomes;
+}
+
+async function cleanCandidate(candidate: CleanCandidate): Promise<CleanTuiCleanOutcome> {
+  const record = candidate.record;
+  if (candidate.mode === "delete") {
+    await deleteSession(record.name);
+    return { name: record.name, ok: true, detail: "removed stale" };
+  }
+  const outcome = await transactionalKill(record);
+  if (!outcome.ok) return { name: record.name, ok: false, detail: outcome.lastError };
+  return { name: record.name, ok: true, detail: outcome.alreadyGone ? "gone" : "killed" };
+}
+
+function printCleanSuccess(record: SessionRecord, detail: string) {
+  if (isPretty()) console.log(actionLine("ok", "clean", [bold(record.name), record.agent, dim(detail), dim(tildify(record.cwd))]));
+  else console.log(`cleaned\t${record.name}`);
+}
+
+function compareCleanCandidates(a: CleanCandidate, b: CleanCandidate): number {
+  const age = b.ageMs - a.ageMs;
+  if (age !== 0) return age;
+  const priority = cleanStatePriority(a.state) - cleanStatePriority(b.state);
+  if (priority !== 0) return priority;
+  return a.record.name.localeCompare(b.record.name);
+}
+
+function cleanStatePriority(state: BeeState): number {
+  switch (state) {
+    case "idle_with_output":
+      return 0;
+    case "dead":
+      return 1;
+    case "sealed":
+      return 2;
+    case "kill_failed":
+      return 3;
+    case "ready":
+      return 4;
+    case "blocked":
+      return 5;
+    case "error":
+      return 6;
+    case "booting":
+      return 7;
+    case "active":
+      return 8;
+    case "node_unreachable":
+      return 9;
   }
 }
 
@@ -2973,6 +3249,10 @@ function cleanupAfterRun(parsed: Parsed): boolean {
   return truthy(flag(parsed, "rm")) || truthy(flag(parsed, "cleanup"));
 }
 
+function hasFlag(parsed: Parsed, key: string): boolean {
+  return flag(parsed, key) !== undefined;
+}
+
 function ageFlag(parsed: Parsed, keys: string[]): number | undefined {
   for (const key of keys) {
     const value = flag(parsed, key);
@@ -3062,7 +3342,7 @@ function printHelp() {
     ["list", "[--colony <name>] [--swarm <id>] [--node <name>] [--wide]", "show all known sessions with state (pretty mode adds NODE column when >1 node)"],
     ["ps", "[--colony <name>] [--swarm <id>] [--node <name>] [--wide]", "alias for list"],
     ["kill", "<session>", "stop a session and remove its metadata"],
-    ["clean", "--dead [--older-than <age>] [--dry-run|-n]", "remove metadata for sessions no longer in tmux"],
+    ["clean", "(--dead|--idle|-i) [--older-than <age>] [--dry-run|-n]", "remove dead metadata, kill idle bees, or pick targets in an interactive cleanup TUI"],
     ["attach", "<session> [--print]", "attach to the tmux session (or print the command)"],
     ["colony", "<list|create|inspect|archive|update|rename> [name]", "manage project-scoped namespaces"],
     ["frame", "<list|define|update|reload|edit|inspect|remove> [name|path]", "manage reusable swarm blueprints"],

@@ -81,7 +81,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   cat: ["-n", "--lines"],
   transcript: ["-n", "--limit", "--json"],
   tx: ["-n", "--limit", "--json"],
-  clean: ["--dead", "--older-than", "--older", "--dry-run", "-n"],
+  clean: ["--dead", "--idle", "--interactive", "-i", "--older-than", "--older", "--dry-run", "-n"],
   list: ["--colony", "--swarm", "--node", "--wide"],
   ps: ["--colony", "--swarm", "--node", "--wide"],
   attach: ["--print"],

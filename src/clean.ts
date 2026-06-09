@@ -16,6 +16,21 @@ export function deadSessionAge(record: SessionRecord, now = Date.now()): string 
   return formatRelativeTime(record.updatedAt, now);
 }
 
+export function idleSessionAge(record: SessionRecord, now = Date.now()): string {
+  return formatRelativeTime(idleAgeSource(record), now);
+}
+
+export function idleOlderThanMillis(records: SessionRecord[], ageMs: number, now = Date.now()): SessionRecord[] {
+  return records.filter((record) => {
+    const ts = Date.parse(idleAgeSource(record));
+    return Number.isFinite(ts) && now - ts >= ageMs;
+  });
+}
+
+export function idleAgeSource(record: SessionRecord): string {
+  return record.lastPromptAt ?? record.updatedAt;
+}
+
 export function parseAge(value: string): number {
   const match = value.trim().match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d|w|mo|y)$/i);
   if (!match) throw new Error(`Invalid age duration: ${value}. Use values like 30m, 2h, 7d, or 4w.`);

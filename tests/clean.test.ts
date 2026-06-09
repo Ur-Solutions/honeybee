@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { deadSessionRecords, olderThanMillis, parseAge } from "../src/clean.js";
+import { deadSessionRecords, idleOlderThanMillis, olderThanMillis, parseAge } from "../src/clean.js";
 import type { SessionRecord } from "../src/store.js";
+import { hasSession as tmuxHasSession, kill as tmuxKill, newSession as tmuxNewSession } from "../src/tmux.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,10 +31,101 @@ test("olderThanMillis filters by last update age", () => {
   assert.deepEqual(olderThanMillis([fresh, stale], 60 * 60 * 1000, now).map((record) => record.name), ["stale"]);
 });
 
+test("idleOlderThanMillis filters by last prompt age", () => {
+  const now = Date.parse("2026-05-28T12:00:00.000Z");
+  const fresh = session("fresh", "fresh-target");
+  fresh.updatedAt = "2026-05-28T00:00:00.000Z";
+  fresh.lastPromptAt = "2026-05-28T11:45:00.000Z";
+  const stale = session("stale", "stale-target");
+  stale.updatedAt = "2026-05-28T11:55:00.000Z";
+  stale.lastPromptAt = "2026-05-28T09:30:00.000Z";
+
+  assert.deepEqual(idleOlderThanMillis([fresh, stale], 60 * 60 * 1000, now).map((record) => record.name), ["stale"]);
+});
+
 test("parseAge accepts compact duration strings", () => {
   assert.equal(parseAge("30m"), 30 * 60 * 1000);
   assert.equal(parseAge("2h"), 2 * 60 * 60 * 1000);
   assert.equal(parseAge("7d"), 7 * 24 * 60 * 60 * 1000);
+});
+
+test("hive clean --idle kills idle local tmux sessions and leaves active sessions alone", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-idle-"));
+  const oldIdleTarget = `hive-clean-idle-old-${process.pid}`;
+  const newIdleTarget = `hive-clean-idle-new-${process.pid}`;
+  const activeTarget = `hive-clean-active-${process.pid}`;
+  try {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    await tmuxNewSession(oldIdleTarget, "/tmp", { command: "sleep", args: ["30"] });
+    await tmuxNewSession(newIdleTarget, "/tmp", { command: "sleep", args: ["30"] });
+    await tmuxNewSession(activeTarget, "/tmp", { command: "sleep", args: ["30"] });
+
+    const oldIdle = session(oldIdleTarget, oldIdleTarget);
+    oldIdle.id = "CO.old";
+    oldIdle.lastPrompt = "done with the older task";
+    oldIdle.lastPromptAt = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+    oldIdle.updatedAt = oldIdle.lastPromptAt;
+    const newIdle = session(newIdleTarget, newIdleTarget);
+    newIdle.id = "CO.new";
+    newIdle.lastPrompt = "done with the newer task";
+    newIdle.lastPromptAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    newIdle.updatedAt = newIdle.lastPromptAt;
+    const active = session(activeTarget, activeTarget);
+    active.id = "CO.actv";
+    active.lastPrompt = "still working";
+    active.lastPromptAt = new Date().toISOString();
+    active.updatedAt = active.lastPromptAt;
+    await writeFile(join(dir, "sessions", `${oldIdle.name}.json`), `${JSON.stringify(oldIdle)}\n`);
+    await writeFile(join(dir, "sessions", `${newIdle.name}.json`), `${JSON.stringify(newIdle)}\n`);
+    await writeFile(join(dir, "sessions", `${active.name}.json`), `${JSON.stringify(active)}\n`);
+
+    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--idle", "--dry-run"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+    assert.match(dryRun.stdout, new RegExp(`idle\\tCO\\.old\\t${oldIdleTarget}`));
+    assert.match(dryRun.stdout, new RegExp(`idle\\tCO\\.new\\t${newIdleTarget}`));
+    assert.ok(dryRun.stdout.indexOf(oldIdleTarget) < dryRun.stdout.indexOf(newIdleTarget), "oldest idle session should be listed first");
+    assert.doesNotMatch(dryRun.stdout, new RegExp(activeTarget));
+
+    const cleaned = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--idle"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+    assert.match(cleaned.stdout, new RegExp(`cleaned\\t${oldIdleTarget}`));
+    assert.match(cleaned.stdout, new RegExp(`cleaned\\t${newIdleTarget}`));
+    assert.doesNotMatch(cleaned.stdout, new RegExp(activeTarget));
+    assert.equal(await tmuxHasSession(oldIdleTarget), false);
+    assert.equal(await tmuxHasSession(newIdleTarget), false);
+    assert.equal(await tmuxHasSession(activeTarget), true);
+    await assert.rejects(readFile(join(dir, "sessions", `${oldIdle.name}.json`), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(dir, "sessions", `${newIdle.name}.json`), "utf8"), /ENOENT/);
+    await readFile(join(dir, "sessions", `${active.name}.json`), "utf8");
+  } finally {
+    await tmuxKill(oldIdleTarget).catch(() => undefined);
+    await tmuxKill(newIdleTarget).catch(() => undefined);
+    await tmuxKill(activeTarget).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive clean --interactive requires a TTY when there are targets", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-interactive-"));
+  try {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    const dead = session("dead", "dead-target");
+    await writeFile(join(dir, "sessions", "dead.json"), `${JSON.stringify(dead)}\n`);
+
+    await assert.rejects(
+      execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--interactive"], {
+        cwd: process.cwd(),
+        env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+      }),
+      /requires a TTY/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("hive clean --dead removes dead session metadata", async () => {

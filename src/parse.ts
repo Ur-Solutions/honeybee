@@ -23,6 +23,8 @@ const BOOLEAN_FLAGS = new Set([
   "foreground",
   "forever",
   "help",
+  "i",
+  "interactive",
   "json",
   "keep",
   "last",
