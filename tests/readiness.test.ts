@@ -23,3 +23,18 @@ test("generic enter prompts are not treated as trust prompts", () => {
   assert.equal(isTrustPromptPane("Press enter to continue"), false);
   assert.equal(shouldRaiseDroidAutonomy("Auto (Low)"), true);
 });
+
+test("stale trust text in scrollback does not mask a ready agent", () => {
+  // codex prints the trust prompt in the normal buffer, then switches to an
+  // alternate screen for its main UI — the accepted prompt lingers up in
+  // scrollback while the composer prompt sits at the bottom. The agent is ready.
+  const pane = [
+    "> You are in /tmp/project",
+    "  Do you trust the contents of this directory? Trusting allows config to load.",
+    "› 1. Yes, continue",
+    "  Press enter to continue",
+    ...Array.from({ length: 16 }, (_, i) => `  banner line ${i}`),
+    "› Improve documentation in @filename",
+  ].join("\n");
+  assert.equal(isAgentReadyPane("codex", pane), true);
+});
