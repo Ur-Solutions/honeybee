@@ -55,7 +55,7 @@ const BEE_FIRST_ARG = new Set(["spawn", "run", "x"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 
 const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--home", "--profile", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--dangerous"],
+  spawn: ["--name", "--cwd", "--home", "--profile", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
   node: ["--kind", "--endpoint", "--capabilities", "--description", "--ssh-command", "--ssh-args"],
   run: [
     "--prompt", "-p", "--cwd", "--home", "--profile",

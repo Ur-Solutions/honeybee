@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { cyan, dim, isPretty, tildify } from "./format.js";
+import { isPermissionPromptPane } from "./readiness.js";
 import { appendLedger, saveSession, type SessionRecord } from "./store.js";
 import { substrateFor } from "./substrates/index.js";
 import { lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
@@ -44,6 +45,13 @@ export async function waitForIdle(options: WaitForIdleOptions) {
         });
       }
     } else if (Date.now() - stableSince >= idleMs) {
+      // A stable pane that is sitting on a permission/approval prompt is not
+      // "done" — the bee is blocked waiting for a human. Surface that clearly
+      // instead of letting the caller read the stall as a completed turn.
+      if (isPermissionPromptPane(lastPane)) {
+        const hint = `${record.name} is waiting for permission — approve it with: hive attach ${record.name}`;
+        console.error(isPretty(process.stderr) ? dim(`⚠ ${hint}`) : `warn\tpermission\t${record.name}`);
+      }
       if (options.output === "last" && tx) {
         const text = lastAssistantText(tx.rows);
         if (text) console.log(text);

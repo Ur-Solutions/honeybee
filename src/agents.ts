@@ -45,8 +45,26 @@ const YOLO_COMMANDS: Record<string, string> = {
   droid: `droid --settings ${DROID_YOLO_SETTINGS_PATH}`,
 };
 
+// Bees that run in full-permission ("yolo") mode by default. The default is
+// applied by the CLI layer (dangerousMode in cli.ts) so resolveAgent stays
+// policy-free: it only produces the yolo command when explicitly told to.
+const DEFAULT_YOLO_AGENTS = new Set<string>(["claude"]);
+
+// Map a requested bee kind (including auth-profile aliases like cc3/codex2) to
+// its canonical agent kind. Unknown/arbitrary kinds pass through unchanged.
+export function canonicalAgentKind(kind: string): string {
+  return profileAlias(kind)?.kind ?? kind;
+}
+
+// Whether this bee kind should run permissionless unless explicitly opted out.
+export function agentDefaultsToYolo(kind: string): boolean {
+  return DEFAULT_YOLO_AGENTS.has(canonicalAgentKind(kind).toLowerCase());
+}
+
 export type ResolveAgentOptions = {
   home?: string | true | string[];
+  // Authoritative when defined: `true`/`false` overrides env/config signals.
+  // When omitted, yolo is decided from env/config.
   yolo?: boolean;
 };
 
@@ -59,7 +77,11 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   const legacyEnvKey = `AP_${envSuffix}_CMD`;
   const yoloEnvKey = `HIVE_${envSuffix}_YOLO`;
   const commandOverride = process.env[envKey] ?? process.env[legacyEnvKey] ?? canonicalCfg.command ?? requestedCfg.command;
-  const yolo = options.yolo || truthyEnv(process.env[yoloEnvKey]) || truthyEnv(process.env.HIVE_YOLO) || canonicalCfg.yolo === true || requestedCfg.yolo === true;
+  const yoloFallback = truthyEnv(process.env[yoloEnvKey]) || truthyEnv(process.env.HIVE_YOLO) || canonicalCfg.yolo === true || requestedCfg.yolo === true;
+  // A caller-supplied yolo decision (e.g. from the CLI's dangerousMode, which
+  // applies per-agent defaults and opt-outs) is authoritative; only fall back
+  // to env/config when the caller has no opinion.
+  const yolo = options.yolo ?? yoloFallback;
   const configured = commandOverride ?? (yolo ? YOLO_COMMANDS[profile.kind] : DEFAULT_COMMANDS[profile.kind]) ?? profile.kind;
   if (profile.kind === "droid" && yolo && commandOverride === undefined) ensureDroidYoloSettings();
   const parts = splitShellWords(configured).map(expandTildeWord);

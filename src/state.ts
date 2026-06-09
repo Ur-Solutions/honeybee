@@ -1,4 +1,4 @@
-import { isMcpWarningPane, isTrustPromptPane } from "./readiness.js";
+import { isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "./readiness.js";
 import type { SessionRecord } from "./store.js";
 
 export type BeeState =
@@ -55,6 +55,7 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   if (pane) {
     if (isMcpWarningPane(pane)) return { state: "blocked", detail: "MCP warning" };
     if (isTrustPromptPane(pane)) return { state: "blocked", detail: "trust prompt" };
+    if (isPermissionPromptPane(pane)) return { state: "blocked", detail: "awaiting permission" };
   }
 
   const now = context.now ?? Date.now();

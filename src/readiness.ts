@@ -85,9 +85,24 @@ export function shouldRaiseDroidAutonomy(pane: string): boolean {
   return /Auto \((?:Off|Low|Med)\)/i.test(pane);
 }
 
+// Detects an interactive permission/approval prompt that has halted the agent
+// mid-task waiting for a human decision — distinct from the one-time startup
+// trust prompt (isTrustPromptPane). Anchored on Claude Code's approval UI
+// ("Do you want to proceed?", edit/command confirmations, and the very stable
+// "tell Claude what to do differently" reject option). Scoped to the pane tail
+// so a resolved-and-scrolled-away prompt does not keep a bee marked blocked.
+export function isPermissionPromptPane(pane: string): boolean {
+  const recent = recentPane(pane);
+  return (
+    /tell Claude what to do differently/i.test(recent) ||
+    /Do you want to (?:proceed|make this edit|create|run|apply|continue)\b/i.test(recent) ||
+    /Would you like to proceed\?/i.test(recent)
+  );
+}
+
 export function isAgentReadyPane(agent: string, pane: string): boolean {
   const recent = recentPane(pane);
-  if (isTrustPromptPane(recent) || isMcpWarningPane(recent)) return false;
+  if (isTrustPromptPane(recent) || isMcpWarningPane(recent) || isPermissionPromptPane(recent)) return false;
   return isDriverReady(agent, pane);
 }
 

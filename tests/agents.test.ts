@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { resolveAgent, splitShellWords } from "../src/agents.js";
+import { agentDefaultsToYolo, resolveAgent, splitShellWords } from "../src/agents.js";
 
 test("grok does not use numbered profile aliases", () => {
   const oldHive = process.env.HIVE_GROK_CMD;
@@ -50,6 +50,33 @@ test("agent defaults are safe unless yolo mode is explicit", () => {
     else process.env.HIVE_CLAUDE_YOLO = oldYolo;
     if (oldGlobalYolo === undefined) delete process.env.HIVE_YOLO;
     else process.env.HIVE_YOLO = oldGlobalYolo;
+  }
+});
+
+test("claude (and its aliases) default to yolo; other bees do not", () => {
+  assert.equal(agentDefaultsToYolo("claude"), true);
+  assert.equal(agentDefaultsToYolo("cc3"), true);
+  assert.equal(agentDefaultsToYolo("claude2"), true);
+  assert.equal(agentDefaultsToYolo("codex"), false);
+  assert.equal(agentDefaultsToYolo("codex2"), false);
+  assert.equal(agentDefaultsToYolo("grok"), false);
+});
+
+test("an explicit yolo decision is authoritative over env signals", () => {
+  const oldYolo = process.env.HIVE_CLAUDE_YOLO;
+  const oldCmd = process.env.HIVE_CLAUDE_CMD;
+  delete process.env.HIVE_CLAUDE_CMD;
+  process.env.HIVE_CLAUDE_YOLO = "1";
+  try {
+    // env asks for yolo, but an explicit yolo:false (e.g. --no-yolo) wins.
+    assert.deepEqual(resolveAgent("claude", [], { yolo: false }).args, []);
+    // explicit yolo:true yields the permissionless command.
+    assert.deepEqual(resolveAgent("claude", [], { yolo: true }).args, ["--dangerously-skip-permissions"]);
+  } finally {
+    if (oldYolo === undefined) delete process.env.HIVE_CLAUDE_YOLO;
+    else process.env.HIVE_CLAUDE_YOLO = oldYolo;
+    if (oldCmd === undefined) delete process.env.HIVE_CLAUDE_CMD;
+    else process.env.HIVE_CLAUDE_CMD = oldCmd;
   }
 });
 

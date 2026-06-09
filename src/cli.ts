@@ -2,7 +2,7 @@
 import { access, readFile, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
-import { resolveAgent, shellCommand } from "./agents.js";
+import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
 import { deadSessionAge, deadSessionRecords, olderThanMillis, parseAge } from "./clean.js";
 import { archiveColony, createColony, listColonies, loadColony, renameColony, updateColony } from "./colony.js";
 import {
@@ -20,7 +20,7 @@ import {
   sendBuzMessage,
   senderDisplay,
 } from "./buz.js";
-import { briefFooter, configPath, loadConfig, resetConfigCache } from "./config.js";
+import { beeConfig, briefFooter, configPath, loadConfig, resetConfigCache } from "./config.js";
 import { getCompletions, shellScript } from "./completion.js";
 import { defineFrameFromFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, type Frame } from "./frame.js";
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
@@ -3006,8 +3006,21 @@ function defaultBootMs(agent: string): number {
 }
 
 function dangerousMode(parsed: Parsed, agent?: string): boolean {
-  const envSuffix = agent?.toUpperCase().replace(/[^A-Z0-9]/g, "_");
-  return truthy(flag(parsed, "yolo")) || truthy(flag(parsed, "dangerous")) || truthyEnv(process.env.HIVE_YOLO) || Boolean(envSuffix && truthyEnv(process.env[`HIVE_${envSuffix}_YOLO`]));
+  // Explicit per-spawn opt-out always wins.
+  if (truthy(flag(parsed, "no-yolo"))) return false;
+  const canonical = agent ? canonicalAgentKind(agent) : undefined;
+  // Persistent opt-out via `hive config set-bee <bee> --no-yolo`.
+  if (canonical && beeConfig(canonical).yolo === false) return false;
+  const envSuffix = canonical?.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  if (
+    truthy(flag(parsed, "yolo")) ||
+    truthy(flag(parsed, "dangerous")) ||
+    truthyEnv(process.env.HIVE_YOLO) ||
+    Boolean(envSuffix && truthyEnv(process.env[`HIVE_${envSuffix}_YOLO`]))
+  ) return true;
+  if (canonical && beeConfig(canonical).yolo === true) return true;
+  // Per-agent default: claude runs permissionless unless opted out above.
+  return agent ? agentDefaultsToYolo(agent) : false;
 }
 
 function truthyEnv(value: string | undefined): boolean {
@@ -3041,7 +3054,7 @@ function printHelp() {
   const env = (name: string) => (pretty ? cyan(name) : name);
 
   const commands: Array<[string, string, string]> = [
-    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--colony <name>] [--count <n>] [--node <name>] [--yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start one or more bees in detached tmux sessions (waits for the prompt, auto-accepting trust)"],
+    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--colony <name>] [--count <n>] [--node <name>] [--yolo|--no-yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start bees in detached tmux sessions (claude is permissionless by default — --no-yolo to opt out; waits for the prompt, auto-accepting trust)"],
     ["spawn --frame", "<name> [--colony <name>] [--swarm-id <id>]", "spawn a swarm from a registered frame"],
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],

@@ -55,6 +55,24 @@ test("blocked: MCP warning", () => {
   assert.equal(result.state, "blocked");
 });
 
+test("blocked: awaiting a permission prompt", () => {
+  const panes = new Map([["alpha-target", "Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently"]]);
+  const result = deriveState(bee(), { liveTargets: new Set(["alpha-target"]), panes, now: NOW });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.detail, "awaiting permission");
+});
+
+test("blocked: a permission prompt outranks a recent prompt (not 'active')", () => {
+  const recent = new Date(NOW - 5_000).toISOString();
+  const panes = new Map([["alpha-target", "Do you want to make this edit to ids.ts?\n❯ 1. Yes"]]);
+  const result = deriveState(bee({ lastPromptAt: recent, lastPrompt: "edit ids.ts" }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes,
+    now: NOW,
+  });
+  assert.equal(result.state, "blocked");
+});
+
 test("active: lastPromptAt is recent", () => {
   const recent = new Date(NOW - 5_000).toISOString();
   const result = deriveState(bee({ lastPromptAt: recent, lastPrompt: "Refactor auth flow" }), {

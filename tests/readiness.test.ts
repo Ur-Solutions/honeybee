@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isAgentReadyPane, isMcpWarningPane, isTrustPromptPane, shouldRaiseDroidAutonomy } from "../src/readiness.js";
+import { isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane, shouldRaiseDroidAutonomy } from "../src/readiness.js";
 
 test("agent readiness rejects trust and MCP blocker panes", () => {
   const trustPane = "Do you trust the contents of this directory?\nEnter to confirm";
@@ -17,6 +17,19 @@ test("agent readiness recognizes known provider prompts", () => {
   assert.equal(isAgentReadyPane("codex", "What can I help with?"), true);
   assert.equal(isAgentReadyPane("opencode", "Ask anything"), true);
   assert.equal(isAgentReadyPane("grok", "Grok Build\n❯ "), true);
+});
+
+test("mid-task permission prompts are detected and block readiness", () => {
+  const proceed = "Bash(rm -rf build)\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently (esc)";
+  const edit = "Do you want to make this edit to ids.ts?\n❯ 1. Yes\n  2. Yes, allow all edits this session";
+
+  assert.equal(isPermissionPromptPane(proceed), true);
+  assert.equal(isPermissionPromptPane(edit), true);
+  // A plain ready prompt or composer is not an approval prompt.
+  assert.equal(isPermissionPromptPane("\n❯ "), false);
+  assert.equal(isPermissionPromptPane("What can I help with?"), false);
+  // A bee sitting on a permission prompt must not be reported ready.
+  assert.equal(isAgentReadyPane("claude", `${proceed}\n❯ `), false);
 });
 
 test("generic enter prompts are not treated as trust prompts", () => {
