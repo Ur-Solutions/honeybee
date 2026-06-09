@@ -9,6 +9,8 @@ export type TranscriptRow = Record<string, unknown> & {
   type?: string;
   timestamp?: string;
   content?: unknown;
+  aiTitle?: string;
+  payload?: unknown;
   message?: {
     role?: string;
     content?: unknown;
@@ -27,6 +29,7 @@ export type TranscriptFile = {
   rows: TranscriptRow[];
   score: number;
   matchedBy: string[];
+  title?: string;
 };
 
 export type TranscriptLookupOptions = {
@@ -206,7 +209,8 @@ async function loadClaudeTranscript(path: string, options: TranscriptLookupOptio
   if (rows.length === 0) return null;
   const sessionId = basename(path).replace(/\.jsonl$/, "");
   const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, options });
-  return { provider: "claude", path, sessionId, mtimeMs, rows, score, matchedBy };
+  const title = extractClaudeTitle(rows);
+  return { provider: "claude", path, sessionId, mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
 }
 
 async function loadCodexTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
@@ -220,7 +224,8 @@ async function loadCodexTranscript(path: string, cwd: string, options: Transcrip
   if (rows.length === 0) return null;
   const metaCwd = String(sessionMeta?.payload?.cwd ?? sessionMeta?.payload?.original_cwd ?? "");
   const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options });
-  return { provider: "codex", path, sessionId, mtimeMs, rows, score, matchedBy };
+  const title = extractCodexTitle(rawRows, rows);
+  return { provider: "codex", path, sessionId, mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
 }
 
 async function loadOpenCodeTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
@@ -359,6 +364,66 @@ function bestTranscript(loaded: TranscriptFile[]): TranscriptFile | null {
     return b.mtimeMs - a.mtimeMs;
   });
   return loaded[0] ?? null;
+}
+
+const TITLE_MAX_CHARS = 80;
+
+function extractClaudeTitle(rows: TranscriptRow[]): string | undefined {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i]!;
+    if (row.type !== "ai-title") continue;
+    const title = normalizeTitleCandidate(row.aiTitle);
+    if (title) return title;
+  }
+  return firstUserPromptTitle(rows);
+}
+
+function extractCodexTitle(rawRows: TranscriptRow[], rows: TranscriptRow[]): string | undefined {
+  for (let i = rawRows.length - 1; i >= 0; i -= 1) {
+    const payload = objectPayload(rawRows[i]);
+    const title = firstTitleField(payload, ["title", "conversation_title", "conversationTitle", "thread_title", "threadTitle"]);
+    if (title) return title;
+  }
+
+  for (let i = rawRows.length - 1; i >= 0; i -= 1) {
+    const row = rawRows[i]!;
+    if (row.type !== "turn_context" && row.type !== "session_meta") continue;
+    const summary = normalizeTitleCandidate(objectPayload(row)?.summary);
+    if (summary) return summary;
+  }
+
+  return firstUserPromptTitle(rows);
+}
+
+function firstTitleField(object: Record<string, unknown> | undefined, keys: string[]): string | undefined {
+  if (!object) return undefined;
+  for (const key of keys) {
+    const title = normalizeTitleCandidate(object[key]);
+    if (title) return title;
+  }
+  return undefined;
+}
+
+function firstUserPromptTitle(rows: TranscriptRow[]): string | undefined {
+  for (const row of rows) {
+    const role = row.message?.role ?? row.type;
+    if (role !== "user") continue;
+    const title = normalizeTitleCandidate(row.message?.content ?? row.content);
+    if (title) return title;
+  }
+  return undefined;
+}
+
+function normalizeTitleCandidate(value: unknown): string | undefined {
+  const raw = textFromContent(value).replace(/\s+/g, " ").trim();
+  if (!raw) return undefined;
+  if (raw.length <= TITLE_MAX_CHARS) return raw;
+  return `${raw.slice(0, TITLE_MAX_CHARS - 3).trimEnd()}...`;
+}
+
+function objectPayload(row: TranscriptRow | undefined): Record<string, unknown> | undefined {
+  const payload = row?.payload;
+  return payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>) : undefined;
 }
 
 function sinceMillis(options: TranscriptLookupOptions): number {

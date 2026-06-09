@@ -66,12 +66,13 @@ import { tailDaemonLog } from "./daemon/logs.js";
 import { renderSystemdUnit } from "./daemon/plist.js";
 import { listSeals, loadLatestSeal, recordSeal, sealedBeeNames as sealedBeeNamesImpl, validateSealArtifact } from "./seal.js";
 import { search, type SearchHit, type SearchOptions, type SearchTypeFilter } from "./search.js";
+import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
 import { resolveSelector } from "./selectors.js";
-import { type BeeState, deriveState, isTerminalState, stateLabel, type StateContext } from "./state.js";
+import { type BeeState, type DerivedState, deriveState, isTerminalState, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
-import { shouldShowNodeColumn } from "./listView.js";
+import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
@@ -576,7 +577,7 @@ async function cmdList(parsed: Parsed) {
     for (const record of records) {
       const derived = states.get(record.name)!;
       const ref = highlightUniqueSessionReference(records, record, marker);
-      console.log(`${derived.state}\t${ref}\t${record.name}\t${record.agent}\t${record.cwd}\t${record.command}`);
+      console.log(`${derived.state}\t${ref}\t${sessionDisplayName(record, { collapseDefaultId: false })}\t${record.agent}\t${record.cwd}\t${record.command}`);
     }
     if (probe.unreachableNodes.size > 0) {
       console.error(`# ${probe.unreachableNodes.size} node(s) unreachable: ${[...probe.unreachableNodes].join(", ")}`);
@@ -597,7 +598,8 @@ async function cmdList(parsed: Parsed) {
   const rows = records.map((record) => {
     const derived = states.get(record.name)!;
     const ref = truncate(highlightUniqueSessionReference(records, record), 16);
-    const name = record.name === record.id ? dim("=") : truncate(record.name, 22);
+    const displayName = sessionDisplayName(record);
+    const name = displayName === "=" ? dim("=") : truncate(displayName, 22);
     const ageSource = isTerminalState(derived.state) ? record.updatedAt : record.createdAt;
     const ageText = formatRelativeTime(ageSource, now);
     const age = isTerminalState(derived.state) ? dim(ageText) : ageText;
@@ -801,9 +803,10 @@ async function cmdClean(parsed: Parsed) {
 async function cmdTranscript(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive transcript <session> [-n rows] [--json]");
-  const record = await resolveSession(target);
-  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookup(record));
+  let record = await resolveSession(target);
+  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record));
   if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
+  record = await persistSessionTranscriptMetadata(record, tx);
   const limitRaw = flag(parsed, "n") ?? flag(parsed, "limit");
   const limit = limitRaw ? Number(limitRaw) : undefined;
   const json = truthy(flag(parsed, "json"));
@@ -814,7 +817,7 @@ async function cmdTranscript(parsed: Parsed) {
 async function cmdLast(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive last <session> [--seal]");
-  const record = await resolveSession(target);
+  let record = await resolveSession(target);
 
   if (truthy(flag(parsed, "seal"))) {
     const seal = await loadLatestSeal(record.name);
@@ -823,7 +826,7 @@ async function cmdLast(parsed: Parsed) {
     return;
   }
 
-  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookup(record));
+  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record));
   if (!tx && !hasTranscriptProvider(record.agent)) {
     await ensureLive(record);
     console.error(isPretty() ? note(`no transcript provider for ${record.agent}; falling back to pane capture`) : `# no transcript provider for ${record.agent}; falling back to pane capture`);
@@ -831,6 +834,7 @@ async function cmdLast(parsed: Parsed) {
     return;
   }
   if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
+  record = await persistSessionTranscriptMetadata(record, tx);
   const text = lastAssistantText(tx.rows);
   if (!text) throw new Error(`No assistant text found in transcript: ${tx.path}`);
   console.error(transcriptBanner(tx.provider, tx.path));
@@ -2963,16 +2967,6 @@ async function assertExecutableAvailable(command: string) {
     }
   }
   throw new Error(`Executable not found on PATH: ${command}`);
-}
-
-function transcriptLookup(record: SessionRecord) {
-  return {
-    sinceIso: record.lastPromptAt ?? record.createdAt,
-    prompt: record.lastPrompt,
-    transcriptPath: record.transcriptPath,
-    sessionId: record.providerSessionId,
-    homePath: record.homePath,
-  };
 }
 
 function cleanupAfterRun(parsed: Parsed): boolean {

@@ -20,6 +20,7 @@ test("store root is read at call time and session files are private", async () =
       createdAt: "2026-05-28T00:00:00.000Z",
       updatedAt: "2026-05-28T00:00:00.000Z",
       status: "running",
+      title: "Repair Title Inheritance",
     };
 
     await saveSession(record);

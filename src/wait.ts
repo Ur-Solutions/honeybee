@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { cyan, dim, isPretty, tildify } from "./format.js";
 import { isPermissionPromptPane } from "./readiness.js";
-import { appendLedger, saveSession, type SessionRecord } from "./store.js";
+import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
+import { appendLedger, type SessionRecord } from "./store.js";
 import { substrateFor } from "./substrates/index.js";
 import { lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
 
@@ -16,7 +17,8 @@ export type WaitForIdleOptions = {
 };
 
 export async function waitForIdle(options: WaitForIdleOptions) {
-  const { record, idleMs, timeoutMs, pollMs } = options;
+  let { record } = options;
+  const { idleMs, timeoutMs, pollMs } = options;
   const started = Date.now();
   let lastFingerprint = "";
   let stableSince = Date.now();
@@ -26,7 +28,7 @@ export async function waitForIdle(options: WaitForIdleOptions) {
   const substrate = substrateFor(record);
   while (Date.now() - started < timeoutMs) {
     const pane = await substrate.capture(record.tmuxTarget, 200).catch(() => "");
-    const tx = await latestTranscript(record.agent, record.cwd, transcriptLookup(record)).catch(() => null);
+    const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record)).catch(() => null);
     const assistant = tx ? lastAssistantText(tx.rows) : "";
     const fingerprint = hashParts([pane, tx?.path ?? "", String(tx?.mtimeMs ?? 0), assistant]);
 
@@ -35,15 +37,7 @@ export async function waitForIdle(options: WaitForIdleOptions) {
       stableSince = Date.now();
       lastPane = pane;
       lastTxPath = tx?.path;
-      if (tx && tx.path !== record.transcriptPath) {
-        await saveSession({
-          ...record,
-          transcriptPath: tx.path,
-          providerSessionId: tx.sessionId,
-          updatedAt: new Date().toISOString(),
-          status: "running",
-        });
-      }
+      if (tx) record = await persistSessionTranscriptMetadata(record, tx, { markRunning: true });
     } else if (Date.now() - stableSince >= idleMs) {
       // A stable pane that is sitting on a permission/approval prompt is not
       // "done" — the bee is blocked waiting for a human. Surface that clearly
@@ -69,16 +63,6 @@ export async function waitForIdle(options: WaitForIdleOptions) {
   }
 
   throw new Error(`Timed out waiting for idle session after ${timeoutMs}ms: ${record.name}`);
-}
-
-function transcriptLookup(record: SessionRecord) {
-  return {
-    sinceIso: record.lastPromptAt ?? record.createdAt,
-    prompt: record.lastPrompt,
-    transcriptPath: record.transcriptPath,
-    sessionId: record.providerSessionId,
-    homePath: record.homePath,
-  };
 }
 
 function hashParts(parts: string[]): string {

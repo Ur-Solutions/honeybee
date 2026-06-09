@@ -36,6 +36,7 @@ function makeSessionRecord(overrides: Partial<SessionRecord> & { name: string })
     ...(overrides.swarmId ? { swarmId: overrides.swarmId } : {}),
     ...(overrides.brief ? { brief: overrides.brief } : {}),
     ...(overrides.notes ? { notes: overrides.notes } : {}),
+    ...(overrides.title ? { title: overrides.title } : {}),
     ...(overrides.lastPrompt ? { lastPrompt: overrides.lastPrompt } : {}),
     ...(overrides.id ? { id: overrides.id } : {}),
   };
@@ -89,6 +90,15 @@ test("search --colony filter matches sessions by colony and skips others", async
     const result = await search({ query: "parser", colony: "alpha", types: new Set(["sessions"]) });
     assert.equal(result.hits.length, 1);
     assert.equal(result.hits[0]!.beeName, "CL.aaa");
+  });
+});
+
+test("search matches inherited session titles", async () => {
+  await withTempStore(async () => {
+    await saveSession(makeSessionRecord({ name: "CO.aaa", title: "Repair Title Inheritance" }));
+    const result = await search({ query: "Inheritance", types: new Set(["sessions"]) });
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0]!.beeName, "CO.aaa");
   });
 });
 

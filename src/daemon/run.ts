@@ -2,6 +2,7 @@ import { readFileSync, unlinkSync } from "node:fs";
 import { acquireLongLivedLock, type LongLivedLock, LockBusyError } from "../fsx.js";
 import { listNodes, type NodeRecord } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
+import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { deriveState, type BeeState, type StateContext } from "../state.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
@@ -35,6 +36,8 @@ export type TickDeps = {
   sealedBeeNames: () => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
+  /** Best-effort transcript path/provider title discovery. */
+  refreshTranscriptMetadata?: (record: SessionRecord) => Promise<SessionRecord | null>;
   /** Append a single event to the ledger (used for state.transition). */
   appendLedger: (event: Record<string, unknown>) => Promise<void>;
   /**
@@ -114,6 +117,12 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
         lastObservedState: derived.state,
         lastObservedStateAt: observedAtIso,
       });
+    } catch (error) {
+      errors.push(toError(error));
+    }
+
+    try {
+      await deps.refreshTranscriptMetadata?.(record);
     } catch (error) {
       errors.push(toError(error));
     }
@@ -410,6 +419,7 @@ export function buildDefaultDeps(): TickDeps {
     capturePanes: defaultCapturePanes,
     sealedBeeNames,
     touchSession,
+    refreshTranscriptMetadata: refreshSessionTranscriptMetadata,
     appendLedger,
     dispatchBuzDrain: (records, transitions) => dispatchBuzDrains(records, transitions),
     now: () => Date.now(),

@@ -113,6 +113,28 @@ test("tick: detects state transition into idle_with_output and emits ledger", as
   });
 });
 
+test("tick: invokes transcript metadata refresh for observed records", async () => {
+  await withTempStore(async () => {
+    const record = bee({ lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const refreshed: string[] = [];
+    const deps = buildDeps({
+      records: [record],
+      liveTargets: new Set([record.tmuxTarget]),
+      panes: new Map([[record.tmuxTarget, "done\n\n› next task"]]),
+      capture,
+    });
+    deps.refreshTranscriptMetadata = async (candidate) => {
+      refreshed.push(candidate.name);
+      return candidate;
+    };
+
+    await tick(deps, new Map());
+
+    assert.deepEqual(refreshed, ["alpha"]);
+  });
+});
+
 test("tick: first observation (no prev) does NOT emit state.transition ledger", async () => {
   await withTempStore(async () => {
     const NOW = Date.parse("2026-06-03T10:00:00.000Z");

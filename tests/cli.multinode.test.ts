@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { shouldShowNodeColumn } from "../src/listView.js";
+import { sessionDisplayName, shouldShowNodeColumn } from "../src/listView.js";
 import type { SessionRecord } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
@@ -100,6 +100,14 @@ test("shouldShowNodeColumn shows the node column when --wide is forced, even on 
 test("shouldShowNodeColumn handles an empty node list gracefully", () => {
   assert.equal(shouldShowNodeColumn([], false), false);
   assert.equal(shouldShowNodeColumn([], true), true);
+});
+
+test("sessionDisplayName prefers inherited title without changing identity", () => {
+  const record = seed({ name: "CO.aaa", tmuxTarget: "CO-aaa", id: "CO.aaa" });
+  assert.equal(sessionDisplayName(record), "=");
+  assert.equal(sessionDisplayName(record, { collapseDefaultId: false }), "CO.aaa");
+  assert.equal(sessionDisplayName({ ...record, title: "Repair Title Inheritance" }), "Repair Title Inheritance");
+  assert.equal(sessionDisplayName({ ...record, name: "custom-reviewer", title: "" }), "custom-reviewer");
 });
 
 test("hive clean --dead does NOT sweep records whose node is unreachable", { timeout: 30_000 }, async () => {

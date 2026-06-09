@@ -24,6 +24,7 @@ export type SessionRecord = {
   lastPromptAt?: string;
   transcriptPath?: string;
   providerSessionId?: string;
+  title?: string;
   colony?: string;
   swarmId?: string;
   caste?: string;
@@ -167,7 +168,7 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
         : "dead",
   };
 
-  for (const key of ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName"] as const) {
+  for (const key of ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName"] as const) {
     if (typeof object[key] === "string") record[key] = object[key];
   }
 

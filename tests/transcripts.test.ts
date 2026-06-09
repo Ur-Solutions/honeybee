@@ -3,7 +3,87 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "../src/transcripts.js";
+import { hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript } from "../src/transcripts.js";
+
+test("latestTranscript inherits Claude ai-title metadata", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-claude-title-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const projectDir = join(dir, "projects", projectKeyForCwd(cwd));
+    const chatPath = join(projectDir, "session-1.jsonl");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: "Please repair title inheritance." } }),
+        JSON.stringify({ type: "ai-title", sessionId: "session-1", aiTitle: "Repair Title Inheritance" }),
+        JSON.stringify({ type: "assistant", message: { role: "assistant", content: "Done." } }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("claude", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(tx.title, "Repair Title Inheritance");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("latestTranscript derives Codex title from summary metadata before prompt fallback", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-title-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "06", "09");
+    const chatPath = join(sessionDir, "rollout-2026-06-09T10-00-00-session.jsonl");
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd } }),
+        JSON.stringify({ type: "turn_context", payload: { summary: "Implement inherited bee titles" } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Fallback prompt text should not win" } }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("codex", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(tx.title, "Implement inherited bee titles");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("latestTranscript falls back to the start of the Codex user prompt", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-prompt-title-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "06", "09");
+    const chatPath = join(sessionDir, "rollout-2026-06-09T11-00-00-session.jsonl");
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd } }),
+        JSON.stringify({
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "Implement proper name inheritance for bees so the generated session title is visible in hive list",
+          },
+        }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("codex", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(tx.title, "Implement proper name inheritance for bees so the generated session title is...");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("latestTranscript reads Grok chat history from the encoded workspace session folder", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-grok-tx-"));

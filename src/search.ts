@@ -294,6 +294,7 @@ function sessionHaystack(record: SessionRecord): string {
     record.agent,
     record.command,
     record.cwd,
+    record.title ?? "",
     record.lastPrompt ?? "",
     record.brief ?? "",
     record.notes ?? "",
