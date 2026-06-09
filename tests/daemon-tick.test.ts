@@ -96,7 +96,7 @@ test("tick: detects state transition into idle_with_output and emits ledger", as
     const deps = buildDeps({
       records: [record],
       liveTargets: new Set([record.tmuxTarget]),
-      panes: new Map([[record.tmuxTarget, "some output"]]),
+      panes: new Map([[record.tmuxTarget, "done\n\n› next task"]]),
       now: NOW,
       capture,
     });
@@ -122,7 +122,7 @@ test("tick: first observation (no prev) does NOT emit state.transition ledger", 
     const deps = buildDeps({
       records: [record],
       liveTargets: new Set([record.tmuxTarget]),
-      panes: new Map([[record.tmuxTarget, "some output"]]),
+      panes: new Map([[record.tmuxTarget, "done\n\n› next task"]]),
       now: NOW,
       capture,
     });

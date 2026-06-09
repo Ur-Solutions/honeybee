@@ -3,6 +3,7 @@ export type AgentDriver = {
   homeEnv?: string;
   hasTranscriptProvider?: boolean;
   isReady?: (pane: string) => boolean;
+  isActive?: (pane: string) => boolean;
 };
 
 const AGENT_DRIVERS: Record<string, AgentDriver> = {
@@ -17,6 +18,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     homeEnv: "CODEX_HOME",
     hasTranscriptProvider: true,
     isReady: (pane) => /(?:^|\n)[›>]\s/.test(pane) || /What can I help with|Ask Codex/i.test(pane),
+    isActive: (pane) => /\b(?:Working|Starting MCP servers)\b[^\n]*(?:esc to interrupt|ctrl[-+ ]?c)/i.test(pane),
   },
   opencode: {
     kind: "opencode",
@@ -58,6 +60,14 @@ export function isDriverReady(kind: string, pane: string): boolean {
   return (agentDriver(kind)?.isReady ?? genericReadyCheck)(pane);
 }
 
+export function isDriverActive(kind: string, pane: string): boolean {
+  return (agentDriver(kind)?.isActive ?? genericActiveCheck)(pane);
+}
+
 function genericReadyCheck(pane: string): boolean {
   return /(?:^|\n)[❯›>]\s/.test(pane);
+}
+
+function genericActiveCheck(pane: string): boolean {
+  return /\b(?:Working|Thinking|Running|Processing)\b[^\n]*(?:esc to interrupt|ctrl[-+ ]?c)/i.test(pane);
 }

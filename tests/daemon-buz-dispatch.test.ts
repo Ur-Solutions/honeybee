@@ -372,7 +372,7 @@ test("tick invokes dispatchBuzDrain with records + transitions and surfaces outc
     const deps = buildTickDeps({
       records: [record],
       liveTargets: new Set([record.tmuxTarget]),
-      panes: new Map([[record.tmuxTarget, "some output"]]),
+      panes: new Map([[record.tmuxTarget, "done\n\n❯ next task"]]),
       now: NOW,
       observedDispatchInputs: observedInputs,
       outcomes: [{ recipient: "alpha", result: { delivered: ["m-1"], quarantined: [], errors: [] } }],
@@ -399,7 +399,7 @@ test("tick: dispatchBuzDrain throw is captured into errors[] and does not abort"
       listSessions: async () => [record],
       listNodes: async () => [],
       probeNodes: async () => ({ liveTargets: new Set([record.tmuxTarget]), unreachableNodes: new Set() }),
-      capturePanes: async () => new Map([[record.tmuxTarget, "some output"]]),
+      capturePanes: async () => new Map([[record.tmuxTarget, "done\n\n❯ next task"]]),
       sealedBeeNames: async () => new Set(),
       touchSession: async () => null,
       appendLedger: async () => undefined,
@@ -424,7 +424,7 @@ test("tick with no dispatchBuzDrain dep does not call buz drainer (default deps 
     const deps = buildTickDeps({
       records: [record],
       liveTargets: new Set([record.tmuxTarget]),
-      panes: new Map([[record.tmuxTarget, "some output"]]),
+      panes: new Map([[record.tmuxTarget, "done\n\n❯ next task"]]),
       now: NOW,
     });
     const previous = new Map<string, BeeState>([[record.name, "active"]]);

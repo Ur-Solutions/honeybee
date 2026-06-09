@@ -1,4 +1,4 @@
-import { hasAgentDriver, isDriverReady } from "./drivers.js";
+import { hasAgentDriver, isDriverActive, isDriverReady } from "./drivers.js";
 import type { SessionRecord } from "./store.js";
 import { substrateFor } from "./substrates/index.js";
 
@@ -104,6 +104,12 @@ export function isAgentReadyPane(agent: string, pane: string): boolean {
   const recent = recentPane(pane);
   if (isTrustPromptPane(recent) || isMcpWarningPane(recent) || isPermissionPromptPane(recent)) return false;
   return isDriverReady(agent, pane);
+}
+
+export function isAgentActivePane(agent: string, pane: string): boolean {
+  const recent = recentPane(pane);
+  if (isTrustPromptPane(recent) || isMcpWarningPane(recent) || isPermissionPromptPane(recent)) return false;
+  return isDriverActive(agent, recent);
 }
 
 // A trust/safety/MCP prompt only needs handling while it is the *current*

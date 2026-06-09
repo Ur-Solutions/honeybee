@@ -84,21 +84,51 @@ test("active: lastPromptAt is recent", () => {
   assert.match(result.detail, /Refactor auth/);
 });
 
-test("idle_with_output: previously prompted but quiet", () => {
+test("active: old prompted known-agent pane without a ready prompt does not age into idle", () => {
   const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
   const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go" }), {
     liveTargets: new Set(["alpha-target"]),
-    panes: new Map([["alpha-target", "x".repeat(500)]]),
+    panes: new Map([["alpha-target", "some in-progress output"]]),
+    now: NOW,
+  });
+  assert.equal(result.state, "active");
+});
+
+test("active: Codex working marker is recognized after the active window", () => {
+  const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
+  const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go" }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map([["alpha-target", "• Working (57s • esc to interrupt)\n\n› go"]]),
+    now: NOW,
+  });
+  assert.equal(result.state, "active");
+});
+
+test("idle_with_output: known agent is ready after a previous prompt", () => {
+  const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
+  const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go" }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map([["alpha-target", "Codex finished\n\n› next task"]]),
     now: NOW,
   });
   assert.equal(result.state, "idle_with_output");
   assert.match(result.detail, /idle 10m/);
 });
 
+test("idle_with_output: unknown agents keep timestamp fallback", () => {
+  const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
+  const result = deriveState(bee({ agent: "custom", lastPromptAt: oldPrompt, lastPrompt: "go" }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map([["alpha-target", "x".repeat(500)]]),
+    now: NOW,
+  });
+  assert.equal(result.state, "idle_with_output");
+});
+
 test("ready: live with output but no prompt sent yet", () => {
   const result = deriveState(bee(), {
     liveTargets: new Set(["alpha-target"]),
-    panes: new Map([["alpha-target", "Claude Code ready\n".repeat(20)]]),
+    panes: new Map([["alpha-target", "Codex\n\n› "]]),
     now: NOW,
   });
   assert.equal(result.state, "ready");
@@ -107,7 +137,7 @@ test("ready: live with output but no prompt sent yet", () => {
 test("ready (briefed): brief set but no prompt yet", () => {
   const result = deriveState(bee({ brief: "you are reviewer", briefedAt: "2026-05-28T11:30:00.000Z" }), {
     liveTargets: new Set(["alpha-target"]),
-    panes: new Map([["alpha-target", "Claude Code ready\n".repeat(20)]]),
+    panes: new Map([["alpha-target", "Codex\n\n› "]]),
     now: NOW,
   });
   assert.equal(result.state, "ready");

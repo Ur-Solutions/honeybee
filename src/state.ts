@@ -1,4 +1,5 @@
-import { isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "./readiness.js";
+import { hasAgentDriver } from "./drivers.js";
+import { isAgentActivePane, isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "./readiness.js";
 import type { SessionRecord } from "./store.js";
 
 export type BeeState =
@@ -63,17 +64,27 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   const briefedAt = record.briefedAt ? Date.parse(record.briefedAt) : NaN;
   const lastActivityAt = pickMax(promptAt, briefedAt);
   const hasOutput = pane.length >= READY_PANE_MIN_BYTES;
+  const knownAgent = hasAgentDriver(record.agent);
+  const paneReady = pane ? isAgentReadyPane(record.agent, pane) : false;
+  const paneActive = pane ? isAgentActivePane(record.agent, pane) : false;
 
   if (Number.isFinite(lastActivityAt) && now - lastActivityAt < ACTIVE_WINDOW_MS) {
     return { state: "active", detail: describeActivity(record) };
   }
 
-  if (!Number.isFinite(promptAt) && !record.brief && !hasOutput) {
-    return { state: "booting", detail: "starting up" };
+  if (!Number.isFinite(promptAt)) {
+    if (paneReady) return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
+    if (!record.brief && !hasOutput) return { state: "booting", detail: "starting up" };
+    if (pane && knownAgent && !paneReady) return { state: "booting", detail: "starting up" };
+    return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
   }
 
-  if (!Number.isFinite(promptAt)) {
-    return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
+  if (paneActive) {
+    return { state: "active", detail: describeActivity(record) };
+  }
+
+  if (pane && knownAgent && !paneReady) {
+    return { state: "active", detail: describeActivity(record) };
   }
 
   return { state: "idle_with_output", detail: describeIdle(record, now) };
