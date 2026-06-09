@@ -73,7 +73,12 @@ export function matchesSessionReference(record: { id?: string; uuid?: string; na
   if (record.name === normalized) return true;
   const full = fullReference(record);
   const minLength = record.id?.length ?? 1;
-  return Boolean(full?.startsWith(normalized) && normalized.length >= minLength);
+  if (full?.startsWith(normalized) && normalized.length >= minLength) return true;
+  // Also target by the suffix (UUID) portion of the id, e.g. `abc` (or `123`) for `CO.abc`.
+  // The query must be at least as long as the displayed suffix so short, ambiguous
+  // fragments don't resolve to a bee.
+  const suffix = suffixReference(record);
+  return Boolean(suffix && suffix.full.startsWith(normalized) && normalized.length >= suffix.display.length);
 }
 
 export function highlightUniqueSessionReference<T extends { id?: string; uuid?: string; name?: string }>(
@@ -90,6 +95,16 @@ export function highlightUniqueSessionReference<T extends { id?: string; uuid?: 
 function fullReference(record: { id?: string; uuid?: string; name?: string }): string | undefined {
   if (record.id) return record.uuid ? `${record.id}${record.uuid.slice(record.id.replace(/^[^.]*\./, "").length)}` : record.id;
   return record.name;
+}
+
+// The suffix is the part of an id after its agent prefix (e.g. `abc` for `CO.abc`).
+// `display` is the shortest unique suffix shown to the user; `full` is the backing
+// UUID (or the display suffix when no UUID is recorded) so longer queries still match.
+function suffixReference(record: { id?: string; uuid?: string }): { display: string; full: string } | undefined {
+  if (!record.id) return undefined;
+  const display = record.id.replace(/^[^.]*\./, "");
+  if (!display) return undefined;
+  return { display, full: record.uuid ?? display };
 }
 
 function shortestUnusedUuidPrefixLength(uuid: string, used: Set<string>): number {

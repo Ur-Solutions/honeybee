@@ -48,6 +48,16 @@ test("resolves a bee by id prefix when unique", () => {
   if (target.kind === "bee") assert.equal(target.record.id, "CO.abc");
 });
 
+test("resolves a bee by the suffix of its id (without the agent prefix)", () => {
+  const records = [
+    bee("brave-otter", { id: "CO.123", uuid: "12300000000040008000000000000000" }),
+    bee("dead-bee", { id: "CL.456", uuid: "45600000000040008000000000000000" }),
+  ];
+  const target = resolveSelectorFromState({ kind: "bee", query: "123" }, { records });
+  assert.equal(target.kind, "bee");
+  if (target.kind === "bee") assert.equal(target.record.id, "CO.123");
+});
+
 test("rejects ambiguous bee selectors", () => {
   const records = [
     bee("my-cool-bee", { id: undefined }),

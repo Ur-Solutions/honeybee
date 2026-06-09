@@ -43,3 +43,24 @@ test("shortestUniqueSessionPrefix resolves to the least leading characters uniqu
   assert.equal(matchesSessionReference(records[0], "CO.abc0"), true);
   assert.equal(highlightUniqueSessionReference(records, records[0], { start: "<b>", end: "</b>" }), "CO.<b>abc</b>");
 });
+
+test("matchesSessionReference targets the suffix portion of an id", () => {
+  const bee = { name: "brave-otter", id: "CO.123", uuid: "12300000000040008000000000000000" };
+
+  // The suffix shown in the id resolves the bee without its agent prefix.
+  assert.equal(matchesSessionReference(bee, "123"), true);
+  // Longer queries that extend into the backing UUID still match.
+  assert.equal(matchesSessionReference(bee, "1230"), true);
+  // The full prefixed form keeps working.
+  assert.equal(matchesSessionReference(bee, "CO.123"), true);
+  // Fragments shorter than the displayed suffix are too ambiguous to resolve.
+  assert.equal(matchesSessionReference(bee, "12"), false);
+  // A suffix that is not a prefix of this bee's UUID must not match.
+  assert.equal(matchesSessionReference(bee, "999"), false);
+});
+
+test("matchesSessionReference targets the suffix even without a recorded uuid", () => {
+  const bee = { name: "brave-otter", id: "CO.abc" };
+  assert.equal(matchesSessionReference(bee, "abc"), true);
+  assert.equal(matchesSessionReference(bee, "ab"), false);
+});
