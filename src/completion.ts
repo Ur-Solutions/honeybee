@@ -13,7 +13,7 @@ import { listTmuxSessions } from "./tmux.js";
 
 const COMMANDS = [
   "spawn", "send", "tail", "transcript", "last", "wait",
-  "list", "ls", "ps", "kill", "clean", "run", "attach",
+  "list", "ls", "ps", "kill", "clean", "run", "x", "attach",
   "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
@@ -51,7 +51,7 @@ const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach"]);
 const SESSION_ANY = new Set(["kill", "last", "seal"]);
-const BEE_FIRST_ARG = new Set(["spawn", "run"]);
+const BEE_FIRST_ARG = new Set(["spawn", "run", "x"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 
 const FLAGS_BY_COMMAND: Record<string, string[]> = {
@@ -66,6 +66,11 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--idle-ms", "--timeout-ms", "--poll-ms", "--boot-ms", "--wait-ms",
     "--node", "--substrate",
     "-n", "--limit", "--json",
+  ],
+  x: [
+    "--prompt", "-p", "--cwd", "--home", "--profile", "--name", "--colony",
+    "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
+    "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate",
   ],
   send: ["--prompt", "-p"],
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],

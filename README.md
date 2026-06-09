@@ -59,6 +59,21 @@ hive run claude -p "Inspect this repo." --accept-trust
 hive run codex -p "Try anyway." --force-send
 ```
 
+Fire-and-forget shorthand:
+
+```sh
+hive x claude "Fix the failing test in ids.ts"
+hive x codex2 "Summarize this repo"
+```
+
+`hive x <bee> <prompt>` is the quick way to spawn a bee of a given type and hand it
+a prompt in one command. It waits for the bee to be ready, delivers the prompt, prints
+the bee id, and returns immediately — unlike `hive run`, it does not block to capture
+output. Inspect the bee later with `hive tail`, `hive attach`, or `hive wait`. The
+prompt is positional (everything after the bee), and spawn flags pass through
+(`--cwd`, `--home`, `--name`, `--colony`, `--node`, `--yolo`); `--force-send` overrides
+a readiness timeout. For a whole swarm, use `hive spawn ... --count <n>` then `hive send`.
+
 Override a bee command with environment variables:
 
 ```sh

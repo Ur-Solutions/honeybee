@@ -46,6 +46,18 @@ test("completes bees as first arg of spawn and run", () => {
 
   const runCandidates = getCompletionsFromState(["hive", "run", ""], empty);
   assert.ok(runCandidates.includes("droid"));
+
+  const xCandidates = getCompletionsFromState(["hive", "x", ""], empty);
+  assert.ok(xCandidates.includes("claude"));
+  assert.ok(xCandidates.includes("codex2"));
+});
+
+test("lists x in top-level commands and completes its flags", () => {
+  assert.ok(getCompletionsFromState(["hive", ""], empty).includes("x"));
+  const flags = getCompletionsFromState(["hive", "x", "claude", "--"], empty);
+  assert.ok(flags.includes("--prompt"));
+  assert.ok(flags.includes("--force-send"));
+  assert.ok(flags.includes("--cwd"));
 });
 
 test("completes shells as first arg of completion", () => {

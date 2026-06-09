@@ -80,6 +80,40 @@ test("run --rm cleans up when known driver readiness fails", async () => {
   }
 });
 
+test("x spawns, delivers the prompt, and keeps the session (fire-and-forget)", async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-x-store-"));
+  const cwd = await mkdtemp(join(tmpdir(), "honeybee-x-cwd-"));
+  const name = `hive-test-x-${process.pid}`;
+  try {
+    const result = await runCli(
+      ["x", "sh", "--name", name, "--cwd", cwd, "--boot-ms", "500", "echo HIVE_X_OK", "--", "-i"],
+      { HIVE_STORE_ROOT: storeRoot },
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`sent\\s+${name}`));
+    // fire-and-forget: unlike `run --rm`, the bee is kept for later inspection.
+    assert.equal(await hasSession(name), true);
+
+    // the prompt was actually delivered — interactive sh runs `echo HIVE_X_OK` in the pane.
+    let pane = "";
+    for (let i = 0; i < 5 && !/HIVE_X_OK/.test(pane); i += 1) {
+      pane = (await runCli(["tail", name, "-n", "20"], { HIVE_STORE_ROOT: storeRoot })).stdout;
+    }
+    assert.match(pane, /HIVE_X_OK/);
+  } finally {
+    await kill(name);
+    await rm(storeRoot, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("x rejects swarm flags with a helpful hint", async () => {
+  const result = await runCli(["x", "sh", "do something", "--count", "3"], {});
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /hive x spawns a single bee/);
+});
+
 async function runCli(args: string[], env: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
     const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {

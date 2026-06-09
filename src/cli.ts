@@ -131,6 +131,9 @@ async function main(argv: string[]) {
     case "run":
       await cmdRun(parsed);
       break;
+    case "x":
+      await cmdX(parsed);
+      break;
     case "attach":
       await cmdAttach(parsed);
       break;
@@ -934,6 +937,46 @@ async function cleanupRunSession(record: SessionRecord): Promise<void> {
     return;
   }
   console.error(note(`${outcome.alreadyGone ? "removed stale" : "killed"} ${record.name} (--rm/--cleanup)`));
+}
+
+// Shorthand: spawn a single bee of <bee> and hand it <prompt> in one command, then
+// return immediately (fire-and-forget). It is the front half of `run` — spawn, wait
+// for the prompt to be ready, deliver it — without `run`'s blocking wait/capture/cleanup.
+// Inspect later with `hive tail|attach|wait`.
+async function cmdX(parsed: Parsed) {
+  const agent = parsed.args[0];
+  const prompt = String(flag(parsed, "prompt") ?? flag(parsed, "p") ?? parsed.args.slice(1).join(" "));
+  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo]");
+  if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
+    throw new Error("hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
+  }
+
+  const spawnParsed: Parsed = {
+    command: "spawn",
+    args: [agent],
+    flags: new Map(parsed.flags),
+    rest: parsed.rest,
+  };
+  const record = await cmdSpawn(spawnParsed);
+
+  try {
+    await waitForAgentReady(record, {
+      timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+      acceptTrust: acceptsTrust(parsed),
+      raiseDroidAutonomy: dangerousMode(parsed, record.agent),
+    });
+  } catch (error) {
+    if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
+    console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
+    if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+  }
+
+  await substrateFor(record).sendText(record.tmuxTarget, prompt);
+  const now = new Date().toISOString();
+  await saveSession({ ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+  await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
+  if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
+  else console.log(`sent\t${record.name}\t${prompt.length} chars`);
 }
 
 async function cmdConfig(parsed: Parsed) {
@@ -2966,6 +3009,7 @@ function printHelp() {
     ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--colony <name>] [--count <n>] [--node <name>] [--yolo] [-- <bee-args...>]", "start one or more bees in detached tmux sessions"],
     ["spawn --frame", "<name> [--colony <name>] [--swarm-id <id>]", "spawn a swarm from a registered frame"],
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
+    ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
     ["seal", "<selector> --from <path.json>", "record a typed handoff artifact"],
