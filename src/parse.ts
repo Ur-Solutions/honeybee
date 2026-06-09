@@ -45,6 +45,7 @@ const BOOLEAN_FLAGS = new Set([
   "no-trust",
   "no-wait-footer",
   "no-footer",
+  "no-wait",
 ]);
 
 export function parse(argv: string[]): Parsed {
