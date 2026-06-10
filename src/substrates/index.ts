@@ -24,7 +24,7 @@ export function substrateForNode(nodeName: string | undefined): Substrate {
     const overlay = loadNodeSync(LOCAL_NODE_NAME);
     if (overlay && overlay.kind === "ssh-tmux") {
       // User explicitly aliased "local" to a remote endpoint. Honor it.
-      return getOrCache(`ssh-tmux::${overlay.endpoint}`, () => createSshTmuxSubstrate({ node: overlay }));
+      return getOrCache(sshCacheKey(overlay), () => createSshTmuxSubstrate({ node: overlay }));
     }
     return localSubstrate();
   }
@@ -40,7 +40,15 @@ export function substrateForRecord(node: NodeRecord): Substrate {
   if (node.kind === "local-tmux") {
     return getOrCache(`local-tmux::${node.name}`, createLocalTmuxSubstrate);
   }
-  return getOrCache(`ssh-tmux::${node.endpoint}`, () => createSshTmuxSubstrate({ node }));
+  return getOrCache(sshCacheKey(node), () => createSshTmuxSubstrate({ node }));
+}
+
+// Key on every field that shapes the ssh transport, not just the endpoint:
+// `hive node update --ssh-args/--ssh-command` with an unchanged endpoint must
+// not leave long-lived processes (the daemon) reusing a stale substrate, and
+// two nodes sharing an endpoint must not collapse into one cache entry.
+function sshCacheKey(node: NodeRecord): string {
+  return ["ssh-tmux", node.name, node.endpoint, node.sshCommand ?? "", ...(node.sshArgs ?? [])].join("::");
 }
 
 function getOrCache(key: string, build: () => Substrate): Substrate {

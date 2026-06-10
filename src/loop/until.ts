@@ -31,19 +31,35 @@ export async function runStopPredicate(
 
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(cmd, { cwd, shell: true, stdio: "ignore" });
+      // detached:true puts the /bin/sh AND everything it spawns into a fresh
+      // process group so timeout/abort can kill the whole tree — SIGKILLing
+      // only the shell would leak compound commands' children every iteration.
+      child = spawn(cmd, { cwd, shell: true, stdio: "ignore", detached: true });
     } catch {
       // Spawn itself failed (e.g. invalid cwd) — treat as not satisfied.
       resolve(false);
       return;
     }
 
-    const onAbort = () => {
+    const killTree = () => {
+      const pid = child.pid;
+      if (typeof pid === "number" && pid > 0) {
+        try {
+          process.kill(-pid, "SIGKILL");
+          return;
+        } catch {
+          // group already gone or unsupported — fall back to the leader.
+        }
+      }
       try {
         child.kill("SIGKILL");
       } catch {
         // ignore
       }
+    };
+
+    const onAbort = () => {
+      killTree();
       finish(false);
     };
     if (opts.signal) {
@@ -55,11 +71,7 @@ export async function runStopPredicate(
     }
 
     timer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // ignore
-      }
+      killTree();
       finish(false);
     }, timeoutMs);
 

@@ -1,6 +1,6 @@
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
 
@@ -57,28 +57,106 @@ export async function withSessionLock<T>(name: string, fn: () => Promise<T>): Pr
 }
 
 export async function saveSession(record: SessionRecord) {
+  // Serialize against touchSession/updateSession so a concurrent merge can't
+  // interleave with this full-record overwrite.
+  await withSessionLock(record.name, async () => {
+    await saveSessionLocked(record);
+  });
+}
+
+/**
+ * Write a full record WITHOUT acquiring the session lock. Only for callers
+ * already inside withSessionLock for the same record — the lock is not
+ * reentrant, so calling saveSession there would deadlock.
+ */
+export async function saveSessionLocked(record: SessionRecord) {
   await ensureStore();
   await atomicWriteFile(recordPath(record.name), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-  await appendLedger({ type: "session.save", ...record });
+  await appendLedger(compactSaveEvent(record));
 }
+
+// The ledger keeps a compact audit row per save instead of the full record:
+// brief/lastPrompt can be kilobytes each, and `hive search` only filters
+// ledger lines on name/colony/swarmId (plus the always-present ts).
+function compactSaveEvent(record: SessionRecord): Record<string, unknown> {
+  return {
+    type: "session.save",
+    name: record.name,
+    status: record.status,
+    updatedAt: record.updatedAt,
+    ...(record.id ? { id: record.id } : {}),
+    ...(record.agent ? { agent: record.agent } : {}),
+    ...(record.colony ? { colony: record.colony } : {}),
+    ...(record.swarmId ? { swarmId: record.swarmId } : {}),
+    ...(record.title ? { title: record.title } : {}),
+  };
+}
+
+// How often a pure `lastObservedStateAt` heartbeat is allowed to hit disk.
+// The daemon touches every session every ~2s; without this gate each tick
+// rewrites every record file even when nothing observable changed.
+const TOUCH_HEARTBEAT_MS = 60_000;
 
 /**
  * touchSession atomically merges a subset of fields into a session record without
  * appending a ledger entry. Designed for the daemon's per-tick `lastObservedState`
- * updates so we don't drown the ledger in noise. Callers MUST hold withSessionLock
- * around touchSession+saveSession for the same record to avoid torn writes; the
- * helper acquires the lock internally.
+ * updates so we don't drown the ledger in noise. touchSession is self-locking
+ * (it acquires withSessionLock internally, and the lock is NOT reentrant) — do
+ * not wrap calls to it in withSessionLock for the same record or they deadlock.
+ *
+ * Writes are skipped when the merge changes nothing but `lastObservedStateAt`,
+ * unless the stored timestamp is older than TOUCH_HEARTBEAT_MS.
  *
  * Returns the merged record, or null when the record no longer exists on disk.
  */
 export async function touchSession(name: string, fields: Partial<SessionRecord>): Promise<SessionRecord | null> {
+  return mergeSessionFields(name, fields, { skipNoopWrites: true });
+}
+
+/**
+ * updateSession is the locked read-merge-write counterpart to saveSession for
+ * callers that mutate a few fields: it re-reads the record under the session
+ * lock, applies the patch field-level, and persists the result, so concurrent
+ * writers (e.g. the daemon's touchSession) can't be clobbered by a stale
+ * load→modify→save cycle. Appends a compact ledger row like saveSession.
+ *
+ * Returns the merged record, or null when the record no longer exists on disk.
+ */
+export async function updateSession(name: string, patch: Partial<SessionRecord>): Promise<SessionRecord | null> {
+  const merged = await mergeSessionFields(name, patch);
+  if (merged) await appendLedger(compactSaveEvent(merged));
+  return merged;
+}
+
+async function mergeSessionFields(
+  name: string,
+  fields: Partial<SessionRecord>,
+  options: { skipNoopWrites?: boolean } = {},
+): Promise<SessionRecord | null> {
   return withSessionLock(name, async () => {
     const existing = await loadSession(name);
     if (!existing) return null;
     const merged: SessionRecord = { ...existing, ...fields, name: existing.name };
+    if (options.skipNoopWrites && sessionFingerprint(existing) === sessionFingerprint(merged)) {
+      if (existing.lastObservedStateAt === merged.lastObservedStateAt) return merged;
+      const previousAt = Date.parse(existing.lastObservedStateAt ?? "");
+      const nextAt = Date.parse(merged.lastObservedStateAt ?? "");
+      if (Number.isFinite(previousAt) && Number.isFinite(nextAt) && nextAt - previousAt < TOUCH_HEARTBEAT_MS) {
+        return merged;
+      }
+    }
     await atomicWriteFile(recordPath(existing.name), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
     return merged;
   });
+}
+
+// Order-insensitive serialization of every persisted field except the
+// `lastObservedStateAt` heartbeat, used to detect no-op touches.
+function sessionFingerprint(record: SessionRecord): string {
+  const entries = Object.entries(record as Record<string, unknown>)
+    .filter(([key, value]) => key !== "lastObservedStateAt" && value !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify(entries);
 }
 
 export async function loadSession(name: string): Promise<SessionRecord | null> {
@@ -97,8 +175,13 @@ export async function loadSession(name: string): Promise<SessionRecord | null> {
 }
 
 export async function deleteSession(name: string) {
-  await rm(recordPath(name), { force: true });
-  await rm(legacyRecordPath(name), { force: true });
+  // Take the session lock so an in-flight touchSession/updateSession (the
+  // daemon persists observed state constantly) can't recreate the record file
+  // right after we remove it, resurrecting a zombie bee in `hive ls`.
+  await withSessionLock(name, async () => {
+    await rm(recordPath(name), { force: true });
+    await rm(legacyRecordPath(name), { force: true });
+  });
   await appendLedger({ type: "session.delete", name, ts: new Date().toISOString() });
 }
 
@@ -151,6 +234,14 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId"] as const;
+
+const KNOWN_SESSION_KEYS = new Set<string>([
+  "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
+  ...OPTIONAL_STRING_SESSION_KEYS,
+  "buzAccept",
+]);
+
 function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid session record shape: ${path}`);
   const object = value as Record<string, unknown>;
@@ -172,7 +263,7 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
         : "dead",
   };
 
-  for (const key of ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId"] as const) {
+  for (const key of OPTIONAL_STRING_SESSION_KEYS) {
     if (typeof object[key] === "string") record[key] = object[key];
   }
 
@@ -187,6 +278,14 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
         value === "interrupt" || value === "queue" || value === "passive",
     );
     if (tiers.length > 0) record.buzAccept = tiers;
+  }
+
+  // Carry unknown keys through untouched so an older binary's load→save cycle
+  // does not destroy fields written by a newer version. They ride along as
+  // extra runtime properties (invisible to the SessionRecord type) and are
+  // serialized back out on the next save.
+  for (const [key, raw] of Object.entries(object)) {
+    if (!KNOWN_SESSION_KEYS.has(key)) (record as Record<string, unknown>)[key] = raw;
   }
 
   return record;
@@ -217,4 +316,28 @@ async function rotateLedgerIfNeeded(): Promise<void> {
   if (!info || info.size < maxBytes) return;
   const suffix = new Date().toISOString().replace(/[:.]/g, "-");
   await rename(path, `${path}.${suffix}`).catch(() => undefined);
+  await pruneLedgerRotations();
+}
+
+// Rotation suffixes are ISO timestamps with `:`/`.` replaced by `-`, e.g.
+// `ledger.jsonl.2026-06-10T12-34-56-789Z`. The strict pattern keeps the lock
+// file (`ledger.jsonl.lock`) and stray temp files out of the prune sweep.
+const LEDGER_ROTATION_SUFFIX_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/;
+
+const DEFAULT_LEDGER_KEEP_ROTATIONS = 5;
+
+async function pruneLedgerRotations(): Promise<void> {
+  const keep = Number(process.env.HIVE_LEDGER_KEEP_ROTATIONS ?? DEFAULT_LEDGER_KEEP_ROTATIONS);
+  if (!Number.isFinite(keep) || keep < 0) return;
+  const path = ledgerPath();
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.`;
+  const entries = await readdir(dir).catch(() => [] as string[]);
+  const rotations = entries
+    .filter((entry) => entry.startsWith(prefix) && LEDGER_ROTATION_SUFFIX_RE.test(entry.slice(prefix.length)))
+    .sort()
+    .reverse();
+  for (const stale of rotations.slice(Math.floor(keep))) {
+    await rm(join(dir, stale), { force: true }).catch(() => undefined);
+  }
 }

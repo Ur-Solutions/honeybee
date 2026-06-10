@@ -1,9 +1,8 @@
 import { execFile } from "node:child_process";
 import { mkdir, readFile, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
 import { promisify } from "node:util";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
-import { daemonRoot, daemonLogPath } from "./log.js";
+import { daemonLaunchdErrPath, daemonLaunchdOutPath, daemonRoot } from "./log.js";
 import {
   DEFAULT_LAUNCH_LABEL,
   launchAgentsDir,
@@ -16,11 +15,11 @@ export { DEFAULT_LAUNCH_LABEL };
 const execFileAsync = promisify(execFile);
 
 /**
- * Default error stream path. Kept beside log.txt under ~/.hive/daemon/.
+ * Fallback PATH burned into the plist when the installing shell has none.
+ * Must include the Homebrew prefixes — user-domain launchd defaults to
+ * /usr/bin:/bin:/usr/sbin:/sbin, where tmux is typically absent.
  */
-export function daemonLogErrPath(): string {
-  return join(daemonRoot(), "log.err.txt");
-}
+const DEFAULT_LAUNCHD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 export type InstallOptions = {
   label?: string;
@@ -77,12 +76,14 @@ const defaultLaunchctlRunner: LaunchctlRunner = async (args) => {
     const result = await execFileAsync("launchctl", args, { maxBuffer: 4 * 1024 * 1024 });
     return { ok: true, stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
   } catch (error) {
-    const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; status?: number };
+    // Promisified execFile puts the numeric exit code on err.code (err.code
+    // is a string like ENOENT for spawn failures, so guard on typeof).
+    const err = error as Error & { stdout?: string; stderr?: string; code?: number | string };
     return {
       ok: false,
       stdout: err.stdout ?? "",
       stderr: err.stderr ?? err.message,
-      exitCode: typeof err.status === "number" ? err.status : 1,
+      exitCode: typeof err.code === "number" ? err.code : 1,
     };
   }
 };
@@ -161,51 +162,67 @@ export async function isAgentInstalled(label: string = DEFAULT_LAUNCH_LABEL): Pr
 }
 
 /**
- * Install the LaunchAgent: write the plist + bootstrap into the user's
- * launchctl domain. Idempotent — calling twice without --force returns
- * `installed=false` with an explanatory message.
+ * Render the plist installAgent would write for the given options. Exposed
+ * so install/status flows can compare the candidate against what's on disk.
  */
-export async function installAgent(options: InstallOptions = {}): Promise<InstallResult> {
+export async function renderCandidatePlist(options: InstallOptions = {}): Promise<string> {
   const label = options.label ?? DEFAULT_LAUNCH_LABEL;
-  const plistPath = plistPathForLabel(label);
-
-  if (!options.force && await exists(plistPath)) {
-    return {
-      label,
-      plistPath,
-      installed: false,
-      bootstrapped: false,
-      message: `already installed at ${plistPath}`,
-    };
-  }
-
   const cliEntry = await resolveCliEntry(options.cliEntry);
   const nodeBinary = options.nodeBinary ?? process.execPath;
   const extraArgs = options.extraArgs ?? [];
-
-  const stdoutPath = daemonLogPath();
-  const stderrPath = daemonLogErrPath();
-
-  // Make sure ~/.hive/daemon/ exists so launchd can open the log files.
-  await mkdir(daemonRoot(), { recursive: true });
-  await mkdir(launchAgentsDir(), { recursive: true });
 
   const env: Record<string, string> = {};
   if (process.env.HIVE_STORE_ROOT) env.HIVE_STORE_ROOT = process.env.HIVE_STORE_ROOT;
   // We want the storeRoot to remain stable even if the user runs the daemon
   // without HIVE_STORE_ROOT — burn the resolved value in.
   if (!env.HIVE_STORE_ROOT) env.HIVE_STORE_ROOT = storeRoot();
+  // Burn PATH in too: user-domain launchd defaults to /usr/bin:/bin:/usr/sbin:/sbin,
+  // where Homebrew-installed tmux does not exist — the daemon would "run" while
+  // every tmux probe ENOENTs.
+  env.PATH = process.env.PATH || DEFAULT_LAUNCHD_PATH;
 
-  const plist = renderPlist({
+  return renderPlist({
     label,
     programArguments: [nodeBinary, cliEntry, "daemon", "run", ...extraArgs],
     workingDirectory: storeRoot(),
-    stdOutPath: stdoutPath,
-    stdErrPath: stderrPath,
-    keepAlive: true,
+    // Dedicated launchd stream files — NOT daemonLogPath(): launchd's open fd
+    // would follow our rotation rename and stdout would land in the rotated file.
+    stdOutPath: daemonLaunchdOutPath(),
+    stdErrPath: daemonLaunchdErrPath(),
+    // Relaunch only after unsuccessful exits so a clean deliberate exit
+    // (e.g. `hive daemon stop`) does not loop forever.
+    keepAlive: { successfulExit: false },
     runAtLoad: true,
     environmentVariables: env,
   });
+}
+
+/**
+ * Install the LaunchAgent: write the plist + bootstrap into the user's
+ * launchctl domain. Idempotent — calling twice without --force returns
+ * `installed=false` with an explanatory message; if the on-disk plist no
+ * longer matches what we would write (e.g. the CLI moved), the message says
+ * so and directs the user to --force. With --force the existing service is
+ * booted out first so the rewritten plist actually takes effect.
+ */
+export async function installAgent(options: InstallOptions = {}): Promise<InstallResult> {
+  const label = options.label ?? DEFAULT_LAUNCH_LABEL;
+  const plistPath = plistPathForLabel(label);
+  const plist = await renderCandidatePlist(options);
+
+  if (!options.force) {
+    const existing = await readPlistFile(plistPath);
+    if (existing !== null) {
+      const message = existing === plist
+        ? `already installed at ${plistPath}`
+        : `already installed at ${plistPath} but stale (plist differs from what install would write; re-run with --force)`;
+      return { label, plistPath, installed: false, bootstrapped: false, message };
+    }
+  }
+
+  // Make sure ~/.hive/daemon/ exists so launchd can open the log files.
+  await mkdir(daemonRoot(), { recursive: true });
+  await mkdir(launchAgentsDir(), { recursive: true });
 
   await atomicWriteFile(plistPath, plist, { mode: 0o644 });
 
@@ -215,6 +232,17 @@ export async function installAgent(options: InstallOptions = {}): Promise<Instal
     if (!isLaunchctlSupported()) {
       message = `${message}; launchctl bootstrap skipped (platform=${process.platform})`;
     } else {
+      if (options.force) {
+        // An old service may still be running with the old plist; bootstrap
+        // alone would fail "already loaded" and leave it running until reboot.
+        // Boot it out first; "not loaded" is fine to ignore.
+        const bootout = await currentRunner(["bootout", userDomain(), plistPath]);
+        if (bootout.ok) {
+          message = `${message}; booted out existing service`;
+        } else if (!isNotLoadedError(bootout)) {
+          message = `${message}; bootout failed (exit ${bootout.exitCode}): ${bootout.stderr.trim() || bootout.stdout.trim()}`;
+        }
+      }
       const result = await currentRunner(["bootstrap", userDomain(), plistPath]);
       if (result.ok) {
         bootstrapped = true;
@@ -228,6 +256,15 @@ export async function installAgent(options: InstallOptions = {}): Promise<Instal
   }
 
   return { label, plistPath, installed: true, bootstrapped, message };
+}
+
+/**
+ * True when a launchctl bootout failure just means "service was not loaded"
+ * (exit 3 = ESRCH, or the human-readable equivalents).
+ */
+function isNotLoadedError(result: LaunchctlResult): boolean {
+  if (result.exitCode === 3) return true;
+  return /no such process|not loaded|could not find service/i.test(`${result.stderr} ${result.stdout}`);
 }
 
 /**
@@ -274,9 +311,9 @@ export async function startAgent(label: string = DEFAULT_LAUNCH_LABEL): Promise<
 }
 
 /**
- * Stop the LaunchAgent via SIGTERM. KeepAlive will normally relaunch it,
- * but stop is intended as a quick restart primitive — pair with uninstall
- * for a permanent stop.
+ * Stop the LaunchAgent via SIGTERM. The daemon handles SIGTERM and exits 0,
+ * and KeepAlive.SuccessfulExit=false only relaunches after unsuccessful
+ * exits — so this is a real stop until the next start/kickstart or login.
  */
 export async function stopAgent(label: string = DEFAULT_LAUNCH_LABEL): Promise<LaunchctlResult> {
   return currentRunner(["kill", "SIGTERM", userServiceTarget(label)]);

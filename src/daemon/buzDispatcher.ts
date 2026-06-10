@@ -1,27 +1,35 @@
 // Buz queue dispatcher (tier-B drain).
 //
-// The daemon's only Phase 2 dispatcher: when a bee transitions into
-// idle_with_output the dispatcher drains the bee's queue/ mailbox, pasting
-// each message into the tmux pane via the recipient's substrate and moving
-// the file to inbox/ on success.
+// The daemon's only Phase 2 dispatcher: every tick, any bee whose CURRENT
+// observed state is idle_with_output and whose queue/ mailbox is non-empty
+// gets drained — each message is pasted into the tmux pane via the
+// recipient's substrate and the file moved to inbox/ on success.
+//
+// Triggering on the current state (not just the active->idle_with_output
+// transition) matters: a message queued while the recipient is ALREADY idle
+// must not wait for the bee to become active again, and after a daemon
+// restart the first observation (from === undefined) must still drain idle
+// bees with queued messages.
 //
 // Drain behavior is implemented in buz.processQueueForBee. This module is
-// the thin daemon seam: it filters transitions, resolves substrates from
-// the daemon substrate cache (substrateFor), and calls processQueueForBee
-// with stopOnFirstFailure so a broken substrate cannot burn through every
-// queued message in a single tick.
+// the thin daemon seam: it selects the bees to drain, resolves substrates
+// from the daemon substrate cache (substrateFor), and calls
+// processQueueForBee with stopOnFirstFailure so a broken substrate cannot
+// burn through every queued message in a single tick.
 //
 // Per-bee locking is enforced inside processQueueForBee (withFileLock on
 // senderLockPath), so racing drains for the same bee serialize safely.
 
-import { processQueueForBee, type DrainResult } from "../buz.js";
+import { readdir } from "node:fs/promises";
+import { beeMailboxDir, processQueueForBee, type DrainResult } from "../buz.js";
 import type { SessionRecord } from "../store.js";
 import { substrateFor, type Substrate } from "../substrates/index.js";
 import type { TickTransition } from "./run.js";
 
 export type BuzDispatchTrigger = {
   record: SessionRecord;
-  transition: TickTransition;
+  /** The transition that accompanied this tick's observation, if any. */
+  transition?: TickTransition;
 };
 
 export type BuzDispatchOutcome = {
@@ -41,47 +49,59 @@ export type BuzDispatchDeps = {
    * storage layer.
    */
   drain?: typeof processQueueForBee;
+  /**
+   * Probe whether a bee has queued messages. Defaults to a readdir on the
+   * bee's queue/ mailbox. Injectable for tests.
+   */
+  hasQueuedMessages?: (record: SessionRecord) => Promise<boolean>;
 };
 
 /**
- * Filter the tick transitions to those that should trigger a queue drain
- * (any prev !== idle_with_output && next === idle_with_output) and pair
- * each with its matching SessionRecord.
+ * Select the bees whose queue/ should be drained this tick: every record
+ * whose CURRENT observed state is idle_with_output and whose queue/ mailbox
+ * is non-empty.
  *
- * The first-observation case (from === undefined) is intentionally
- * excluded — we don't have evidence that the bee actually transitioned;
- * waiting one more tick costs ~2s and avoids spurious drains right after
- * daemon start.
+ * The current state is the transition target when the bee transitioned this
+ * tick (including first observations, where from === undefined), otherwise
+ * the lastObservedState persisted by the previous tick. The non-empty-queue
+ * check keeps the steady state cheap: one readdir per idle bee per tick,
+ * and only bees with pending messages take the per-bee drain lock.
  */
-export function selectBuzDispatchTriggers(
+export async function selectBuzDispatchTriggers(
   records: SessionRecord[],
   transitions: TickTransition[],
-): BuzDispatchTrigger[] {
-  const byName = new Map<string, SessionRecord>();
-  for (const record of records) byName.set(record.name, record);
+  hasQueuedMessages: (record: SessionRecord) => Promise<boolean> = defaultHasQueuedMessages,
+): Promise<BuzDispatchTrigger[]> {
+  const byName = new Map<string, TickTransition>();
+  for (const transition of transitions) byName.set(transition.name, transition);
   const triggers: BuzDispatchTrigger[] = [];
-  for (const transition of transitions) {
-    if (transition.to !== "idle_with_output") continue;
-    if (transition.from === undefined) continue;
-    const record = byName.get(transition.name);
-    if (!record) continue;
-    triggers.push({ record, transition });
+  for (const record of records) {
+    const transition = byName.get(record.name);
+    const current = transition ? transition.to : record.lastObservedState;
+    if (current !== "idle_with_output") continue;
+    if (!(await hasQueuedMessages(record))) continue;
+    triggers.push({ record, ...(transition ? { transition } : {}) });
   }
   return triggers;
 }
 
+async function defaultHasQueuedMessages(record: SessionRecord): Promise<boolean> {
+  const entries = await readdir(beeMailboxDir(record.name, "queue")).catch(() => [] as string[]);
+  return entries.some((name) => name.endsWith(".md"));
+}
+
 /**
- * Drain queue/ for every bee that transitioned into idle_with_output.
- * Errors from a single drain do not abort the dispatcher — each bee's
- * drain runs independently and any thrown error is captured into the
- * returned outcomes (via a synthetic empty DrainResult with errors[]).
+ * Drain queue/ for every bee currently observed idle_with_output with
+ * queued messages. Errors from a single drain do not abort the dispatcher —
+ * each bee's drain runs independently and any thrown error is captured into
+ * the returned outcomes (via a synthetic empty DrainResult with errors[]).
  */
 export async function dispatchBuzDrains(
   records: SessionRecord[],
   transitions: TickTransition[],
   deps: BuzDispatchDeps = {},
 ): Promise<BuzDispatchOutcome[]> {
-  const triggers = selectBuzDispatchTriggers(records, transitions);
+  const triggers = await selectBuzDispatchTriggers(records, transitions, deps.hasQueuedMessages);
   if (triggers.length === 0) return [];
 
   const resolveSubstrate = deps.resolveSubstrate ?? substrateFor;

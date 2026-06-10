@@ -27,6 +27,20 @@ export function daemonLogPath(): string {
   return join(daemonRoot(), "log.txt");
 }
 
+/**
+ * Dedicated launchd StandardOutPath/StandardErrorPath targets. These MUST be
+ * distinct from daemonLogPath(): launchd keeps an open fd on its stdout file,
+ * so if it pointed at log.txt our rotation rename would silently redirect
+ * launchd's writes into the rotated file.
+ */
+export function daemonLaunchdOutPath(): string {
+  return join(daemonRoot(), "launchd.out.txt");
+}
+
+export function daemonLaunchdErrPath(): string {
+  return join(daemonRoot(), "launchd.err.txt");
+}
+
 export function logMaxBytes(): number {
   const raw = Number(process.env.HIVE_DAEMON_LOG_MAX_BYTES ?? DEFAULT_MAX_BYTES);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_MAX_BYTES;
@@ -60,6 +74,16 @@ export async function rotateDaemonLogIfNeeded(path = daemonLogPath()): Promise<b
   return true;
 }
 
+/**
+ * Rotate the launchd-owned stdout/stderr capture files if oversized. launchd
+ * keeps its fd on the renamed inode until the next service start, so growth
+ * is bounded per daemon lifetime and pruned across restarts.
+ */
+export async function rotateLaunchdLogsIfNeeded(): Promise<void> {
+  await rotateDaemonLogIfNeeded(daemonLaunchdOutPath());
+  await rotateDaemonLogIfNeeded(daemonLaunchdErrPath());
+}
+
 async function pruneRotatedLogs(basePath: string): Promise<void> {
   const keep = logKeepCount();
   const dir = dirname(basePath);
@@ -89,6 +113,9 @@ export async function appendDaemonLog(entry: LogInput, path = daemonLogPath()): 
   try {
     await mkdir(dirname(path), { recursive: true });
     await rotateDaemonLogIfNeeded(path);
+    // The launchd stream files are written by launchd, not us — piggyback
+    // their rotation on the daemon's own log appends so they stay bounded.
+    if (path === daemonLogPath()) await rotateLaunchdLogsIfNeeded();
     const { level, msg, ts, ...rest } = entry;
     const full: LogEntry = {
       ts: ts ?? new Date().toISOString(),

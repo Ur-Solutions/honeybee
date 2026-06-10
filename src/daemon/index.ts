@@ -1,4 +1,5 @@
 import { readFile, stat } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "../fsx.js";
 import type { LockMeta } from "../fsx.js";
@@ -30,6 +31,12 @@ export type DaemonState = {
 export type DaemonStatusReport = {
   running: boolean;
   lock: LockMeta | null;
+  /**
+   * True when a lock exists but was written by a different host (shared or
+   * synced store roots). Such locks never count as "running" here — we
+   * cannot validate a foreign PID against the local PID table.
+   */
+  lockHeldByOtherHost: boolean;
   state: DaemonState | null;
   installed: boolean;
   plistPath: string | null;
@@ -111,11 +118,17 @@ export async function readDaemonStatus(
     readDaemonState(),
     readInstallStatus(options.label),
   ]);
-  const running = !!lock && isPidLikelyAlive(lock.pid);
+  // A shared/synced store root can carry a lock from another machine; a
+  // foreign PID must not be validated against the local PID table. Missing
+  // or empty hostname counts as foreign (matches the lock-steal refusal in
+  // fsx.acquireLongLivedLock).
+  const lockHeldByOtherHost = !!lock && (!lock.hostname || lock.hostname !== hostname());
+  const running = !!lock && !lockHeldByOtherHost && isPidLikelyAlive(lock.pid);
   void now;
   return {
     running,
     lock,
+    lockHeldByOtherHost,
     state,
     installed: install.plistExists,
     plistPath: install.plistExists ? install.plistPath : null,

@@ -28,6 +28,7 @@ import {
   type BuzSender,
   type BuzTier,
 } from "../src/buz.js";
+import { parseBuzDocument } from "../src/buz_format.js";
 import type { SessionRecord } from "../src/store.js";
 import type { Substrate } from "../src/substrates/index.js";
 
@@ -78,9 +79,16 @@ function fakeSubstrate(impl: Partial<Substrate> = {}): Substrate {
   return { ...base, ...impl };
 }
 
-test("generateMessageId returns a 13+4+1 char sortable id", () => {
+test("generateMessageId returns a 13-base32 + 6-hex sortable id", () => {
   const id = generateMessageId(1700000000000);
-  assert.match(id, /^[0-9A-Z]{13}-[0-9a-f]{4}$/);
+  assert.match(id, /^[0-9A-Z]{13}-[0-9a-f]{6}$/);
+});
+
+test("generateMessageId does not collide within the same millisecond (broadcasts)", () => {
+  const now = 1700000000000;
+  const ids = new Set<string>();
+  for (let i = 0; i < 50; i += 1) ids.add(generateMessageId(now));
+  assert.equal(ids.size, 50, "same-millisecond ids must be unique");
 });
 
 test("generateMessageId is collision-free and sortable across 1000 generations", () => {
@@ -190,6 +198,18 @@ test("parse round-trips a message with CRLF in the body", () => {
   assert.deepEqual(parsed.body, m.body);
 });
 
+test("parseBuzDocument: closing fence as final line without trailing newline yields empty body", () => {
+  const text = "---\nid: ABCDEFGHIJKLM-1a2b3c\n---";
+  const { frontmatter, body } = parseBuzDocument(text);
+  assert.equal(frontmatter.id, "ABCDEFGHIJKLM-1a2b3c");
+  assert.equal(body, "");
+});
+
+test("parseBuzDocument: closing fence followed by trailing newline also yields empty body", () => {
+  const { body } = parseBuzDocument("---\nid: x\n---\n");
+  assert.equal(body, "");
+});
+
 test("sendBuzMessage tier=passive writes inbox/, outbox/, no live delivery", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa");
@@ -282,6 +302,47 @@ test("interrupt -> passive when policy only allows passive", async () => {
   });
 });
 
+test("outbox audit copy records the FINAL tier after an interrupt transport failure downgrade", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa", { buzAccept: ["interrupt", "queue"] });
+    const sub = fakeSubstrate({ sendText: async () => { throw new Error("pane gone"); } });
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.cc9" },
+      tier: "interrupt",
+      body: "x",
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(result.message.deliveredAs, "queue");
+    const outboxDir = beeMailboxDir("CL.cc9", "outbox");
+    const files = await readdir(outboxDir);
+    assert.equal(files.length, 1);
+    const parsed = parseBuzMessage(await readFile(join(outboxDir, files[0]!), "utf8"));
+    assert.equal(parsed.deliveredAs, "queue", "audit copy must record the downgraded tier");
+    assert.equal(parsed.tier, "interrupt", "requested tier stays interrupt");
+  });
+});
+
+test("outbox audit copy records deliveredAt for a successful interrupt", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa", { buzAccept: ["interrupt"] });
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.cc9" },
+      tier: "interrupt",
+      body: "x",
+      transport: { substrate: fakeSubstrate(), tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(result.message.deliveredAs, "interrupt");
+    const outboxDir = beeMailboxDir("CL.cc9", "outbox");
+    const files = await readdir(outboxDir);
+    assert.equal(files.length, 1);
+    const parsed = parseBuzMessage(await readFile(join(outboxDir, files[0]!), "utf8"));
+    assert.equal(parsed.deliveredAs, "interrupt");
+    assert.ok(parsed.deliveredAt, "audit copy must include deliveredAt");
+  });
+});
+
 test("sender-human routes outbox via _external/<sanitized>/", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa");
@@ -295,7 +356,7 @@ test("sender-human routes outbox via _external/<sanitized>/", async () => {
     const files = await readdir(dir);
     assert.equal(files.length, 1);
     // Filename uses safe-stamped name: <ts>-to-<recipient>-<id>.md
-    assert.match(files[0]!, /-to-CO\.aaa-[0-9A-Z]{13}-[0-9a-f]{4}\.md$/);
+    assert.match(files[0]!, /-to-CO\.aaa-[0-9A-Z]{13}-[0-9a-f]{6}\.md$/);
   });
 });
 

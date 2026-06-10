@@ -3,7 +3,7 @@ import { cyan, dim, isPretty, tildify } from "./format.js";
 import { isPermissionPromptPane } from "./readiness.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
 import { appendLedger, type SessionRecord } from "./store.js";
-import { substrateFor } from "./substrates/index.js";
+import { substrateFor, type Substrate } from "./substrates/index.js";
 import { lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
 
 export type WaitForIdleOptions = {
@@ -14,9 +14,22 @@ export type WaitForIdleOptions = {
   output: "pane" | "last" | "transcript";
   rows: number;
   json: boolean;
+  /** Substrate override (used by tests); defaults to substrateFor(record). */
+  substrate?: Pick<Substrate, "capture" | "hasSession">;
 };
 
-export async function waitForIdle(options: WaitForIdleOptions) {
+export type WaitForIdleResult = {
+  /**
+   * "idle"    — the bee settled and the requested output was printed.
+   * "blocked" — the pane settled on a permission/approval prompt; output was
+   *             still printed, but the bee is stalled waiting for a human
+   *             decision (do not treat the turn as completed, e.g. before
+   *             killing the bee).
+   */
+  state: "idle" | "blocked";
+};
+
+export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForIdleResult> {
   let { record } = options;
   const { idleMs, timeoutMs, pollMs } = options;
   const started = Date.now();
@@ -25,9 +38,17 @@ export async function waitForIdle(options: WaitForIdleOptions) {
   let lastPane = "";
   let lastTxPath: string | undefined;
 
-  const substrate = substrateFor(record);
+  const substrate = options.substrate ?? substrateFor(record);
   while (Date.now() - started < timeoutMs) {
-    const pane = await substrate.capture(record.tmuxTarget, 200).catch(() => "");
+    const captured = await substrate.capture(record.tmuxTarget, 200).catch(() => null);
+    if (captured === null || captured === "") {
+      // A failed/empty capture is indistinguishable from a dead session: an
+      // empty pane plus an unchanged transcript would read as "stable" and
+      // the wait would succeed with empty output. Verify the session lives.
+      const alive = await substrate.hasSession(record.tmuxTarget).catch(() => false);
+      if (!alive) throw new Error(`Session died while waiting for idle: ${record.name}`);
+    }
+    const pane = captured ?? "";
     const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record)).catch(() => null);
     const assistant = tx ? lastAssistantText(tx.rows) : "";
     const fingerprint = hashParts([pane, tx?.path ?? "", String(tx?.mtimeMs ?? 0), assistant]);
@@ -42,7 +63,8 @@ export async function waitForIdle(options: WaitForIdleOptions) {
       // A stable pane that is sitting on a permission/approval prompt is not
       // "done" — the bee is blocked waiting for a human. Surface that clearly
       // instead of letting the caller read the stall as a completed turn.
-      if (isPermissionPromptPane(lastPane)) {
+      const blocked = isPermissionPromptPane(lastPane);
+      if (blocked) {
         const hint = `${record.name} is waiting for permission — approve it with: hive attach ${record.name}`;
         console.error(isPretty(process.stderr) ? dim(`⚠ ${hint}`) : `warn\tpermission\t${record.name}`);
       }
@@ -56,7 +78,7 @@ export async function waitForIdle(options: WaitForIdleOptions) {
         console.log(lastPane);
       }
       await appendLedger({ type: "session.wait", session: record.name, agent: record.agent, cwd: record.cwd, idleMs, timeoutMs, transcriptPath: lastTxPath });
-      return;
+      return { state: blocked ? "blocked" : "idle" };
     }
 
     await sleep(Math.max(100, pollMs));

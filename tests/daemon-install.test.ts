@@ -63,6 +63,15 @@ test("installAgent writes the plist to ~/Library/LaunchAgents/ and bootstraps vi
       assert.match(plistText, /<key>Label<\/key>\s+<string>dev\.honeybee\.hive<\/string>/);
       assert.match(plistText, /<string>\/usr\/local\/bin\/node<\/string>/);
       assert.match(plistText, /<string>\/usr\/local\/lib\/honeybee\/dist\/cli\.js<\/string>/);
+      // PATH must be burned in: user-domain launchd's default PATH lacks the
+      // Homebrew prefixes, so without this the daemon cannot find tmux.
+      assert.match(plistText, /<key>PATH<\/key>\s+<string>[^<]+<\/string>/);
+      // launchd stream files must be distinct from the rotated daemon log.
+      assert.match(plistText, /<key>StandardOutPath<\/key>\s+<string>[^<]*launchd\.out\.txt<\/string>/);
+      assert.match(plistText, /<key>StandardErrorPath<\/key>\s+<string>[^<]*launchd\.err\.txt<\/string>/);
+      assert.doesNotMatch(plistText, /<string>[^<]*daemon\/log\.txt<\/string>/);
+      // Relaunch only after unsuccessful exits — no crash loop on clean stop.
+      assert.match(plistText, /<key>KeepAlive<\/key>\s+<dict>\s+<key>SuccessfulExit<\/key>\s+<false\/>\s+<\/dict>/);
       // We only need to assert that the bootstrap call shape is correct on macOS.
       if (process.platform === "darwin") {
         assert.equal(calls.length, 1);
@@ -93,13 +102,34 @@ test("installAgent is idempotent: second install without --force is a noop", asy
       });
       assert.equal(second.installed, false);
       assert.match(second.message, /already installed/);
+      assert.doesNotMatch(second.message, /stale/);
     } finally {
       dispose();
     }
   });
 });
 
-test("installAgent --force overwrites an existing plist", async () => {
+test("installAgent without --force reports staleness when the on-disk plist differs", async () => {
+  await withTempHome(async () => {
+    const { dispose } = captureRunner();
+    try {
+      await installAgent({ cliEntry: "/abs/cli.js", nodeBinary: "/usr/bin/node" });
+      // Same label, but the CLI moved — the rendered candidate differs.
+      const second = await installAgent({
+        cliEntry: "/abs/elsewhere/cli.js",
+        nodeBinary: "/usr/bin/node",
+      });
+      assert.equal(second.installed, false);
+      assert.match(second.message, /already installed/);
+      assert.match(second.message, /stale/);
+      assert.match(second.message, /--force/);
+    } finally {
+      dispose();
+    }
+  });
+});
+
+test("installAgent --force overwrites an existing plist and boots out before bootstrap", async () => {
   await withTempHome(async () => {
     const { calls, dispose } = captureRunner();
     try {
@@ -112,7 +142,41 @@ test("installAgent --force overwrites an existing plist", async () => {
       });
       assert.equal(second.installed, true);
       if (process.platform === "darwin") {
-        assert.equal(calls.length, 1, "expected bootstrap to fire on force-install");
+        // bootout first (so the old daemon does not keep running with the
+        // old plist), then bootstrap.
+        assert.equal(calls.length, 2, "expected bootout + bootstrap on force-install");
+        assert.equal(calls[0]!.args[0], "bootout");
+        assert.equal(calls[1]!.args[0], "bootstrap");
+        assert.equal(second.bootstrapped, true);
+      }
+    } finally {
+      dispose();
+    }
+  });
+});
+
+test("installAgent --force ignores a 'not loaded' bootout failure", async () => {
+  await withTempHome(async () => {
+    const calls: RunnerCall[] = [];
+    const dispose = setLaunchctlRunner(async (args) => {
+      calls.push({ args });
+      if (args[0] === "bootout") {
+        return { ok: false, stdout: "", stderr: "Boot-out failed: 3: No such process", exitCode: 3 };
+      }
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    });
+    try {
+      await installAgent({ cliEntry: "/abs/cli.js", nodeBinary: "/usr/bin/node", skipBootstrap: true });
+      const result = await installAgent({
+        cliEntry: "/abs/cli.js",
+        nodeBinary: "/usr/bin/node",
+        force: true,
+      });
+      assert.equal(result.installed, true);
+      if (process.platform === "darwin") {
+        assert.equal(result.bootstrapped, true);
+        assert.doesNotMatch(result.message, /bootout failed/);
+        assert.deepEqual(calls.map((c) => c.args[0]), ["bootout", "bootstrap"]);
       }
     } finally {
       dispose();

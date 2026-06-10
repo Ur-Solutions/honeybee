@@ -79,3 +79,28 @@ test("briefFooter honors config override (including empty string for disable)", 
     assert.equal(briefFooter(), "");
   });
 });
+
+test("corrupt config.json warns once and falls back to empty config", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-config-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  await writeFile(join(dir, "config.json"), "{not valid json");
+  resetConfigCache();
+
+  const warnings: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => warnings.push(args.join(" "));
+  try {
+    assert.deepEqual(loadConfig(), {});
+    // Cached: a second call must not warn again.
+    assert.deepEqual(loadConfig(), {});
+    assert.equal(warnings.length, 1);
+    assert.ok(warnings[0]!.includes(join(dir, "config.json")), `warning should name the config path: ${warnings[0]}`);
+  } finally {
+    console.error = original;
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    resetConfigCache();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

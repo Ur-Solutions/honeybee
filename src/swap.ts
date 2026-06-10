@@ -1,6 +1,6 @@
 import { activateAccountIntoHome, type AccountRecord } from "./accounts.js";
 import { canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
-import { appendLedger, saveSession, withSessionLock, type SessionRecord } from "./store.js";
+import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -79,15 +79,19 @@ export async function swapAccount(
     });
     await substrate.newSession(record.tmuxTarget, record.cwd, { command: spec.command, args: spec.args, env: spec.env });
 
-    // 4. Persist the new binding and command.
+    // 4. Persist the new binding and command. Re-read under the lock so a
+    //    concurrent daemon merge (title, transcript metadata, observed state)
+    //    isn't clobbered by the pre-lock snapshot; saveSessionLocked avoids
+    //    re-acquiring the non-reentrant session lock we already hold.
+    const current = (await loadSession(record.name)) ?? record;
     const updated: SessionRecord = {
-      ...record,
+      ...current,
       accountId: account.id,
       command: shellCommand(spec),
       status: "running",
       updatedAt: new Date().toISOString(),
     };
-    await saveSession(updated);
+    await saveSessionLocked(updated);
     await appendLedger({
       type: "account.swap",
       session: record.name,

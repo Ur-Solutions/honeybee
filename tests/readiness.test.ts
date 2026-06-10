@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane, shouldRaiseDroidAutonomy } from "../src/readiness.js";
+import { AgentReadinessError, isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane, shouldRaiseDroidAutonomy, waitForAgentReady } from "../src/readiness.js";
+import type { SessionRecord } from "../src/store.js";
+
+function record(agent: string): SessionRecord {
+  return {
+    name: "test-bee",
+    agent,
+    cwd: "/tmp",
+    command: agent,
+    tmuxTarget: "test-bee-target",
+    createdAt: "2026-06-10T00:00:00.000Z",
+    updatedAt: "2026-06-10T00:00:00.000Z",
+    status: "running",
+  };
+}
 
 test("agent readiness rejects trust and MCP blocker panes", () => {
   const trustPane = "Do you trust the contents of this directory?\nEnter to confirm";
@@ -49,5 +63,58 @@ test("stale trust text in scrollback does not mask a ready agent", () => {
     ...Array.from({ length: 16 }, (_, i) => `  banner line ${i}`),
     "› Improve documentation in @filename",
   ].join("\n");
+  // The detectors are tail-scoped by construction, so every caller (state
+  // derivation included) sees the answered prompt as resolved.
+  assert.equal(isTrustPromptPane(pane), false);
   assert.equal(isAgentReadyPane("codex", pane), true);
+});
+
+test("stale MCP warning text in scrollback does not block the agent", () => {
+  const pane = [
+    "MCP server found in this project",
+    ...Array.from({ length: 16 }, (_, i) => `  banner line ${i}`),
+    "❯ ",
+  ].join("\n");
+  assert.equal(isMcpWarningPane(pane), false);
+  assert.equal(isAgentReadyPane("claude", pane), true);
+});
+
+test("assistant questions without a numbered option list are not permission prompts", () => {
+  const pane = "I reviewed the plan. Do you want to proceed with approach A, or should I run the tests first?\n\n❯ ";
+  assert.equal(isPermissionPromptPane(pane), false);
+  assert.equal(isAgentReadyPane("claude", pane), true);
+
+  const wouldYou = "Would you like to proceed? I can also split this into two PRs.\n\n❯ ";
+  assert.equal(isPermissionPromptPane(wouldYou), false);
+});
+
+test("waitForAgentReady reports an unclearable trust prompt as reason=trust", async () => {
+  const trustPane = "Do you trust the contents of this directory?\n❯ 1. Yes, continue\n  2. No, exit\nEnter to confirm";
+  let enters = 0;
+  const substrate = {
+    capture: async () => trustPane,
+    sendEnter: async () => {
+      enters += 1;
+    },
+    sendKey: async () => {},
+  };
+
+  await assert.rejects(
+    waitForAgentReady(record("claude"), { timeoutMs: 100, trustGraceMs: 0, substrate }),
+    (error: unknown) => error instanceof AgentReadinessError && error.reason === "trust" && /hive attach/.test(error.message),
+  );
+  assert.ok(enters >= 1, "should have tried to confirm the trust prompt");
+});
+
+test("waitForAgentReady still reports timeout when no trust prompt is visible", async () => {
+  const substrate = {
+    capture: async () => "still booting...",
+    sendEnter: async () => {},
+    sendKey: async () => {},
+  };
+
+  await assert.rejects(
+    waitForAgentReady(record("claude"), { timeoutMs: 50, substrate }),
+    (error: unknown) => error instanceof AgentReadinessError && error.reason === "timeout",
+  );
 });

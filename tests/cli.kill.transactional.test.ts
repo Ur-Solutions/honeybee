@@ -164,6 +164,30 @@ test("transactionalKill: substrate.kill throws → ok=false, record persisted wi
   });
 });
 
+test("transactionalKill: kill reports failure but the poll confirms gone → ok=true, record deleted (race)", async () => {
+  await withTempStore(async (dir) => {
+    const record = seed({ name: "race", tmuxTarget: "race" });
+    await saveSession(record);
+
+    // Race: the session dies between the fast-path hasSession (true) and the
+    // kill call, so kill fails with "can't find session" — but the post-kill
+    // poll CONFIRMS the session is gone, which must win.
+    let probes = 0;
+    const substrate = makeSubstrate({
+      hasSession: async () => {
+        probes += 1;
+        return probes === 1; // alive for the fast-path probe, gone afterwards
+      },
+      kill: async () => killErr("can't find session: race"),
+    });
+
+    const outcome = await transactionalKill(record, { substrate, pollIntervalMs: 0 });
+    assert.equal(outcome.ok, true, "poll-confirmed-gone must override the kill failure");
+    const after = await readFile(join(dir, "sessions", "race.json"), "utf8").catch(() => null);
+    assert.equal(after, null, "record should be deleted once the poll confirms the session is gone");
+  });
+});
+
 test("transactionalKill: session already gone (hasSession false from the start) → ok=true, alreadyGone=true, no substrate.kill call", async () => {
   await withTempStore(async (dir) => {
     const record = seed({ name: "ghost", tmuxTarget: "ghost" });

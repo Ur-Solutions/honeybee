@@ -1,4 +1,4 @@
-import { open, rm, stat } from "node:fs/promises";
+import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
 import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 
@@ -35,11 +35,34 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
 
   while (true) {
     try {
+      const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
       const handle = await open(path, "wx", 0o600);
-      await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+      try {
+        await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), token }));
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+      // Refresh the lock's mtime while held so a critical section longer than
+      // staleMs (e.g. a slow ssh drain) is not stolen mid-flight by a waiter.
+      const heartbeat = setInterval(() => {
+        const now = new Date();
+        void utimes(path, now, now).catch(() => undefined);
+      }, Math.max(50, Math.floor(staleMs / 3)));
+      heartbeat.unref?.();
       return {
         release: async () => {
-          await handle.close().catch(() => undefined);
+          clearInterval(heartbeat);
+          // Only remove the lock if our token is still in it. If a waiter
+          // declared us stale and stole the lock, the file now belongs to the
+          // new holder; deleting it would let a third party acquire in parallel.
+          const current = await readFile(path, "utf8").catch(() => null);
+          if (current === null) return;
+          try {
+            const parsed = JSON.parse(current) as { token?: unknown };
+            if (parsed?.token !== token) return;
+          } catch {
+            return;
+          }
           await rm(path, { force: true }).catch(() => undefined);
         },
       };
@@ -49,13 +72,53 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
 
       const info = await stat(path).catch(() => null);
       if (info && Date.now() - info.mtimeMs > staleMs) {
-        await rm(path, { force: true }).catch(() => undefined);
+        await stealStaleLock(path, staleMs);
+        if (Date.now() - started >= timeoutMs) throw new Error(`Timed out waiting for lock: ${path}`);
         continue;
       }
 
       if (Date.now() - started >= timeoutMs) throw new Error(`Timed out waiting for lock: ${path}`);
       await sleep(pollMs);
     }
+  }
+}
+
+// A stealer that crashes mid-steal leaves the guard behind; steals themselves
+// take microseconds, so anything older than this is debris.
+const STEAL_GUARD_STALE_MS = 10_000;
+
+/**
+ * Remove a stale lock so the caller can retry acquisition. Stealers serialize
+ * behind a `.steal` guard (open wx) and re-check staleness while holding it,
+ * so two waiters that both observed a stale lock can't take turns deleting
+ * each other's freshly recreated locks: only the first one in finds a stale
+ * file, the rest re-stat and see either nothing or the winner's fresh lock.
+ * The removal itself goes through rename so a racing legacy rm cannot make us
+ * delete a file we did not inspect.
+ */
+async function stealStaleLock(path: string, staleMs: number): Promise<void> {
+  const guardPath = `${path}.steal`;
+  let guard;
+  try {
+    guard = await open(guardPath, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Another stealer is mid-steal; clear its guard only if it clearly crashed.
+    const guardInfo = await stat(guardPath).catch(() => null);
+    if (guardInfo && Date.now() - guardInfo.mtimeMs > STEAL_GUARD_STALE_MS) {
+      await rm(guardPath, { force: true }).catch(() => undefined);
+    }
+    return;
+  }
+  try {
+    const current = await stat(path).catch(() => null);
+    if (!current || Date.now() - current.mtimeMs <= staleMs) return; // already stolen or refreshed
+    const stalePath = `${path}.stale.${process.pid}.${Math.random().toString(36).slice(2)}`;
+    await rename(path, stalePath).catch(() => undefined);
+    await rm(stalePath, { force: true }).catch(() => undefined);
+  } finally {
+    await guard.close().catch(() => undefined);
+    await rm(guardPath, { force: true }).catch(() => undefined);
   }
 }
 

@@ -1,15 +1,26 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript } from "../src/transcripts.js";
+import { hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript, type TranscriptRow } from "../src/transcripts.js";
+
+// Independent re-implementation of Claude Code's project-dir encoding so the
+// fixtures below do not circularly depend on projectKeyForCwd.
+function claudeEncode(cwd: string): string {
+  return resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+test("projectKeyForCwd matches Claude Code's project-dir encoding for dots and underscores", () => {
+  assert.equal(projectKeyForCwd("/tmp/.hidden/my_app"), "-tmp--hidden-my-app");
+  assert.equal(projectKeyForCwd("/Users/x/.openclaw/workspace"), "-Users-x--openclaw-workspace");
+});
 
 test("latestTranscript inherits Claude ai-title metadata", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-claude-title-"));
   try {
-    const cwd = join(dir, "workspace");
-    const projectDir = join(dir, "projects", projectKeyForCwd(cwd));
+    const cwd = join(dir, ".hidden", "my_app.v2");
+    const projectDir = join(dir, "projects", claudeEncode(cwd));
     const chatPath = join(projectDir, "session-1.jsonl");
     await mkdir(projectDir, { recursive: true });
     await writeFile(
@@ -30,19 +41,55 @@ test("latestTranscript inherits Claude ai-title metadata", async () => {
   }
 });
 
-test("latestTranscript derives Codex title from summary metadata before prompt fallback", async () => {
+test("latestTranscript reuses parsed rows while the transcript is unchanged", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-claude-cache-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const projectDir = join(dir, "projects", claudeEncode(cwd));
+    const chatPath = join(projectDir, "session-1.jsonl");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: "Cache me." } }),
+        JSON.stringify({ type: "assistant", message: { role: "assistant", content: "Cached." } }),
+      ].join("\n") + "\n",
+    );
+
+    const first = await latestTranscript("claude", cwd, { homePath: dir });
+    const second = await latestTranscript("claude", cwd, { homePath: dir });
+    assert.ok(first);
+    assert.ok(second);
+    // Same parsed array instance: the second call stat-short-circuited
+    // instead of re-reading and re-parsing the file.
+    assert.equal(second.rows, first.rows);
+
+    await appendFile(chatPath, JSON.stringify({ type: "assistant", message: { role: "assistant", content: "More." } }) + "\n");
+    const third = await latestTranscript("claude", cwd, { homePath: dir });
+    assert.ok(third);
+    assert.notEqual(third.rows, first.rows);
+    assert.equal(third.rows.length, first.rows.length + 1);
+    assert.equal(lastAssistantText(third.rows), "More.");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("latestTranscript ignores the Codex reasoning-summary mode when titling", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-title-"));
   try {
     const cwd = join(dir, "workspace");
     const sessionDir = join(dir, "sessions", "2026", "06", "09");
     const chatPath = join(sessionDir, "rollout-2026-06-09T10-00-00-session.jsonl");
     await mkdir(sessionDir, { recursive: true });
+    // In real rollouts turn_context/session_meta payload.summary is the
+    // reasoning-summary MODE ("auto"), not a conversation summary.
     await writeFile(
       chatPath,
       [
         JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd } }),
-        JSON.stringify({ type: "turn_context", payload: { summary: "Implement inherited bee titles" } }),
-        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Fallback prompt text should not win" } }),
+        JSON.stringify({ type: "turn_context", payload: { cwd, model: "gpt-5", summary: "auto" } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Implement inherited bee titles" } }),
       ].join("\n") + "\n",
     );
 
@@ -50,6 +97,66 @@ test("latestTranscript derives Codex title from summary metadata before prompt f
 
     assert.ok(tx);
     assert.equal(tx.title, "Implement inherited bee titles");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("latestTranscript dedupes Codex dual-format rollouts and filters injected context", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-dual-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "06", "09");
+    const chatPath = join(sessionDir, "rollout-2026-06-09T12-00-00-session.jsonl");
+    await mkdir(sessionDir, { recursive: true });
+    // Real rollouts carry each message twice: once as an event_msg and once
+    // as a response_item, plus harness-injected user/developer blobs.
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "# Instructions: you are Codex" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<user_instructions>\nfollow AGENTS.md\n</user_instructions>" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>\n<cwd>/tmp</cwd>\n</environment_context>" }] } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Fix the flaky test" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Fix the flaky test" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done, the test is deflaked." }] } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "Done, the test is deflaked." } }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("codex", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(renderTranscript(tx.rows), "## user\nFix the flaky test\n\n## assistant\nDone, the test is deflaked.");
+    assert.equal(tx.title, "Fix the flaky test");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("latestTranscript still renders Codex rollouts that only carry response_item messages", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-response-items-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "06", "09");
+    const chatPath = join(sessionDir, "rollout-2026-06-09T13-00-00-session.jsonl");
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>\n<cwd>/tmp</cwd>\n</environment_context>" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Refactor the parser" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Parser refactored." }] } }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("codex", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(renderTranscript(tx.rows), "## user\nRefactor the parser\n\n## assistant\nParser refactored.");
+    assert.equal(tx.title, "Refactor the parser");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -136,6 +243,60 @@ test("latestTranscript reads Grok chat history from the encoded workspace sessio
     assert.equal(renderTranscript(tx.rows), "## user\nFix the Grok transcript path\n\n## assistant\nDone. Grok transcript lookup works.");
     assert.equal(hasTranscriptProvider("grok"), true);
     assert.equal(hasTranscriptProvider("pi"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("renderTranscript applies the limit after filtering text-less rows", () => {
+  const toolRow: TranscriptRow = { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } };
+  const rows: TranscriptRow[] = [
+    { type: "user", message: { role: "user", content: "first prompt" } },
+    toolRow,
+    toolRow,
+    { type: "assistant", message: { role: "assistant", content: "interim answer" } },
+    toolRow,
+    toolRow,
+    toolRow,
+    { type: "assistant", message: { role: "assistant", content: "final answer" } },
+  ];
+
+  // The raw tail is dominated by text-less tool rows; the limit must apply
+  // to the rendered messages, not the raw rows.
+  assert.equal(renderTranscript(rows, { limit: 2 }), "## assistant\ninterim answer\n\n## assistant\nfinal answer");
+  // JSON mode keeps raw-row semantics.
+  assert.equal(renderTranscript(rows, { limit: 2, json: true }).split("\n").length, 2);
+});
+
+test("latestTranscript orders OpenCode messages by time.created and parts by filename", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-opencode-order-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "session", "global");
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(sessionDir, "ses_abc.json"), JSON.stringify({ id: "ses_abc", directory: cwd }));
+
+    const msgDir = join(dir, "message", "ses_abc");
+    await mkdir(msgDir, { recursive: true });
+    // Filename order contradicts time.created: msg_a is the *later* reply.
+    await writeFile(join(msgDir, "msg_a.json"), JSON.stringify({ id: "msg_a", role: "assistant", time: { created: 200 } }));
+    await writeFile(join(msgDir, "msg_b.json"), JSON.stringify({ id: "msg_b", role: "user", time: { created: 100 } }));
+
+    const partADir = join(dir, "part", "msg_a");
+    await mkdir(partADir, { recursive: true });
+    // Written out of name order; the render must sort by filename.
+    await writeFile(join(partADir, "prt_2.json"), JSON.stringify({ text: "part two" }));
+    await writeFile(join(partADir, "prt_1.json"), JSON.stringify({ text: "part one" }));
+    const partBDir = join(dir, "part", "msg_b");
+    await mkdir(partBDir, { recursive: true });
+    await writeFile(join(partBDir, "prt_1.json"), JSON.stringify({ text: "do the thing" }));
+
+    const tx = await latestTranscript("opencode", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(renderTranscript(tx.rows), "## user\ndo the thing\n\n## assistant\npart one\npart two");
+    assert.equal(lastAssistantText(tx.rows), "part one\npart two");
+    assert.equal(tx.matchedBy.includes("cwd"), true);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -17,9 +17,38 @@ import { ensureLoopDir, loopHistoryLogPath, loopHistoryMdPath, loopProgressPath 
 /** Above this many raw history.log lines, history.md elides the middle. */
 export const HISTORY_DIGEST_THRESHOLD = 20;
 
+/**
+ * Per-section byte budget for the rolling context injected into each prompt
+ * (PRD §10: "Injection size is budgeted"). progress.md and history.md are each
+ * truncated to this budget, keeping the MOST RECENT content (tail) behind an
+ * elision marker so an unbounded artifact can never grow the prompt unboundedly.
+ */
+export const INJECTION_BUDGET_BYTES = 16_384;
+
+/** Marker prepended when injected context was truncated to fit the budget. */
+const ELISION_MARKER = "(… earlier content elided to fit the injection budget …)";
+
+/** Soft cap stated in the fold-forward instruction so progress.md stays bounded. */
+export const PROGRESS_SUMMARY_MAX_CHARS = 8_000;
+
 /** Standing instruction appended so every iteration has a defined seal boundary. */
 const SEAL_INSTRUCTION =
   "When you have finished this iteration, record a seal (status + a one-line summary of what you did this pass) so the loop can detect the boundary.";
+
+/**
+ * Enforce the injection byte budget on a carried-forward artifact: when the
+ * text exceeds maxBytes, keep the most recent content (the tail) and prepend
+ * an elision marker. Truncation drops the partial first line of the kept tail
+ * so the output starts on a clean line boundary.
+ */
+export function truncateForInjection(text: string, maxBytes: number = INJECTION_BUDGET_BYTES): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const buf = Buffer.from(text, "utf8");
+  const tail = buf.subarray(buf.length - Math.max(0, maxBytes)).toString("utf8");
+  const firstNewline = tail.indexOf("\n");
+  const clean = firstNewline >= 0 ? tail.slice(firstNewline + 1) : tail;
+  return `${ELISION_MARKER}\n${clean}`;
+}
 
 export type BuildIterationPromptArgs = {
   task: string;
@@ -39,18 +68,21 @@ export type BuildIterationPromptArgs = {
  */
 export function buildIterationPrompt(args: BuildIterationPromptArgs): string {
   if (args.mode === "rolling") {
+    const progress = truncateForInjection(args.progress);
+    const history = truncateForInjection(args.history);
     const sections: string[] = [];
     sections.push(`# Loop iteration ${args.iteration} (loop ${args.loopId})`);
     sections.push(
       "You are a fresh bee continuing a long-running loop. The carried-forward context below is hive-maintained; treat it as authoritative state from prior iterations.",
     );
-    sections.push(`## Carried-forward progress (progress.md)\n${args.progress.trim() || "(none yet — this is the first iteration)"}`);
-    sections.push(`## History digest (history.md)\n${args.history.trim() || "(no prior iterations)"}`);
+    sections.push(`## Carried-forward progress (progress.md)\n${progress.trim() || "(none yet — this is the first iteration)"}`);
+    sections.push(`## History digest (history.md)\n${history.trim() || "(no prior iterations)"}`);
     sections.push(`## Task\n${args.task}`);
     sections.push(
       [
         "## Closing instruction (fold-forward summary)",
         "When you finish, your seal's `summary` MUST be an INTEGRATED, fold-forward progress report: take the carried-forward progress above and integrate what you just did into it, producing the new complete state — do NOT reset it or describe only this single iteration. The summary you write replaces progress.md for the next iteration, so it must stand on its own.",
+        `Keep the integrated summary under roughly ${PROGRESS_SUMMARY_MAX_CHARS} characters — prefer dropping the oldest, least relevant detail over growing it without bound.`,
         SEAL_INSTRUCTION,
       ].join("\n"),
     );

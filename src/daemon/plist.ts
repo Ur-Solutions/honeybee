@@ -13,7 +13,13 @@ export type RenderPlistOptions = {
   workingDirectory?: string;
   stdOutPath: string;
   stdErrPath: string;
-  keepAlive?: boolean;
+  /**
+   * KeepAlive policy. `true`/`false` render the plain boolean. The object
+   * form renders the `SuccessfulExit` sub-key — `{ successfulExit: false }`
+   * means "relaunch only after an unsuccessful (non-zero) exit", so a clean
+   * deliberate exit does not crash-loop.
+   */
+  keepAlive?: boolean | { successfulExit: boolean };
   runAtLoad?: boolean;
   /** Optional EnvironmentVariables dictionary (e.g. HIVE_STORE_ROOT). */
   environmentVariables?: Record<string, string>;
@@ -52,19 +58,9 @@ export function renderPlist(options: RenderPlistOptions): string {
     throw new Error(`renderPlist: workingDirectory must be absolute (got ${options.workingDirectory})`);
   }
 
-  const keepAlive = options.keepAlive !== false;
   const runAtLoad = options.runAtLoad !== false;
 
-  const args = options.programArguments
-    .map((arg) => `    <string>${escapeXml(arg)}</string>`)
-    .join("\n");
-
-  const envBlock = renderEnvironmentVariables(options.environmentVariables);
-  const wdBlock = options.workingDirectory
-    ? `  <key>WorkingDirectory</key>\n  <string>${escapeXml(options.workingDirectory)}</string>\n`
-    : "";
-
-  return [
+  const lines: string[] = [
     `<?xml version="1.0" encoding="UTF-8"?>`,
     `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
     `<plist version="1.0">`,
@@ -73,37 +69,52 @@ export function renderPlist(options: RenderPlistOptions): string {
     `  <string>${escapeXml(options.label)}</string>`,
     `  <key>ProgramArguments</key>`,
     `  <array>`,
-    args,
+  ];
+  for (const arg of options.programArguments) {
+    lines.push(`    <string>${escapeXml(arg)}</string>`);
+  }
+  lines.push(
     `  </array>`,
     `  <key>RunAtLoad</key>`,
     `  <${runAtLoad ? "true" : "false"}/>`,
     `  <key>KeepAlive</key>`,
-    `  <${keepAlive ? "true" : "false"}/>`,
+  );
+  const keepAlive = options.keepAlive ?? true;
+  if (typeof keepAlive === "boolean") {
+    lines.push(`  <${keepAlive ? "true" : "false"}/>`);
+  } else {
+    lines.push(
+      `  <dict>`,
+      `    <key>SuccessfulExit</key>`,
+      `    <${keepAlive.successfulExit ? "true" : "false"}/>`,
+      `  </dict>`,
+    );
+  }
+  lines.push(
     `  <key>StandardOutPath</key>`,
     `  <string>${escapeXml(options.stdOutPath)}</string>`,
     `  <key>StandardErrorPath</key>`,
     `  <string>${escapeXml(options.stdErrPath)}</string>`,
-    wdBlock.trimEnd(),
-    envBlock.trimEnd(),
-    `</dict>`,
-    `</plist>`,
-    ``,
-  ]
-    .filter((line) => line.length > 0 || line === "")
-    .join("\n");
-}
-
-function renderEnvironmentVariables(env: Record<string, string> | undefined): string {
-  if (!env) return "";
-  const entries = Object.entries(env).filter(([key, value]) => typeof key === "string" && typeof value === "string");
-  if (entries.length === 0) return "";
-  const lines: string[] = [`  <key>EnvironmentVariables</key>`, `  <dict>`];
-  for (const [key, value] of entries) {
-    lines.push(`    <key>${escapeXml(key)}</key>`);
-    lines.push(`    <string>${escapeXml(value)}</string>`);
+  );
+  if (options.workingDirectory) {
+    lines.push(
+      `  <key>WorkingDirectory</key>`,
+      `  <string>${escapeXml(options.workingDirectory)}</string>`,
+    );
   }
-  lines.push(`  </dict>`);
-  return `${lines.join("\n")}\n`;
+  const env = options.environmentVariables
+    ? Object.entries(options.environmentVariables).filter(([key, value]) => typeof key === "string" && typeof value === "string")
+    : [];
+  if (env.length > 0) {
+    lines.push(`  <key>EnvironmentVariables</key>`, `  <dict>`);
+    for (const [key, value] of env) {
+      lines.push(`    <key>${escapeXml(key)}</key>`);
+      lines.push(`    <string>${escapeXml(value)}</string>`);
+    }
+    lines.push(`  </dict>`);
+  }
+  lines.push(`</dict>`, `</plist>`, ``);
+  return lines.join("\n");
 }
 
 function escapeXml(value: string): string {

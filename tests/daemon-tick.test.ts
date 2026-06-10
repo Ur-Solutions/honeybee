@@ -135,6 +135,48 @@ test("tick: invokes transcript metadata refresh for observed records", async () 
   });
 });
 
+test("tick: skips transcript metadata refresh for dead and sealed records", async () => {
+  await withTempStore(async () => {
+    const dead = bee({ name: "dead-bee", tmuxTarget: "hive:dead" });
+    const sealed = bee({ name: "sealed-bee", tmuxTarget: "hive:sealed" });
+    const live = bee({ name: "live-bee", tmuxTarget: "hive:live", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const refreshed: string[] = [];
+    const deps = buildDeps({
+      records: [dead, sealed, live],
+      liveTargets: new Set([live.tmuxTarget]),
+      panes: new Map([[live.tmuxTarget, "done\n\n› next task"]]),
+      seals: new Set(["sealed-bee"]),
+      capture,
+    });
+    deps.refreshTranscriptMetadata = async (candidate) => {
+      refreshed.push(candidate.name);
+      return candidate;
+    };
+
+    await tick(deps, new Map());
+
+    assert.deepEqual(refreshed, ["live-bee"]);
+  });
+});
+
+test("tick: liveness keys qualified by node do not leak across nodes", async () => {
+  await withTempStore(async () => {
+    const NOW = Date.parse("2026-06-03T10:00:00.000Z");
+    // Local record whose target name collides with a live session on mini01.
+    const record = bee({ tmuxTarget: "hive:alpha" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({
+      records: [record],
+      liveTargets: new Set(["mini01 hive:alpha"]),
+      now: NOW,
+      capture,
+    });
+    const result = await tick(deps, new Map());
+    assert.equal(result.observed.get(record.name), "dead");
+  });
+});
+
 test("tick: first observation (no prev) does NOT emit state.transition ledger", async () => {
   await withTempStore(async () => {
     const NOW = Date.parse("2026-06-03T10:00:00.000Z");

@@ -25,6 +25,7 @@ import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
 import { isRecentlyExhausted, listUsageAccounts, usageSummary } from "./usage.js";
 import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis, idleSessionAge, olderThanMillis, parseAge } from "./clean.js";
 import { chooseCleanTargets, type CleanTuiCleanOutcome, type CleanTuiItem } from "./cleanTui.js";
+import { assertExecutableAvailable } from "./execCheck.js";
 import { archiveColony, createColony, listColonies, loadColony, renameColony, updateColony } from "./colony.js";
 import {
   BUZ_TIERS,
@@ -43,7 +44,7 @@ import {
 } from "./buz.js";
 import { beeConfig, briefFooter, configPath, loadConfig, resetConfigCache } from "./config.js";
 import { getCompletions, shellScript } from "./completion.js";
-import { defineFrameFromFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, type Frame } from "./frame.js";
+import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, type Frame } from "./frame.js";
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
 import { executeFlow } from "./flow/run.js";
 import { cancelRun, spawnDetachedRun } from "./flow/background.js";
@@ -56,6 +57,7 @@ import {
   loopIterLogPath,
   loopProgressPath,
   readLoopConfig,
+  reconcileLoopStatus,
   requestStop,
   updateLoopConfig,
   writeLoopConfig,
@@ -89,7 +91,7 @@ import { listSeals, loadLatestSeal, recordSeal, sealedBeeNames as sealedBeeNames
 import { search, type SearchHit, type SearchOptions, type SearchTypeFilter } from "./search.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
 import { resolveSelector } from "./selectors.js";
-import { type BeeState, type DerivedState, deriveState, isTerminalState, stateLabel, type StateContext } from "./state.js";
+import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
@@ -97,7 +99,7 @@ import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
-import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, type SessionRecord } from "./store.js";
+import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
 import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord } from "./substrates/index.js";
 import { attachCommand, attachSession, capture, formatShellCommand, hasSession, kill, listTmuxSessions, newSession, sendText } from "./tmux.js";
@@ -248,16 +250,24 @@ async function main(argv: string[]) {
 
 async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
   const frameName = typeof flag(parsed, "frame") === "string" ? String(flag(parsed, "frame")) : undefined;
-  const countRaw = numberFlag(parsed, ["count"], 1);
+  const count = resolveSpawnCount(parsed);
   if (frameName) {
     const records = await spawnFromFrame(parsed, frameName);
     return records[0]!;
   }
-  if (countRaw > 1) {
-    const records = await spawnHomogeneousSwarm(parsed, countRaw);
+  if (count > 1) {
+    const records = await spawnHomogeneousSwarm(parsed, count);
     return records[0]!;
   }
   return spawnSingleBee(parsed);
+}
+
+function resolveSpawnCount(parsed: Parsed): number {
+  const raw = flag(parsed, "count");
+  if (raw === undefined) return 1;
+  const value = typeof raw === "string" ? Number(raw) : NaN;
+  if (Number.isInteger(value) && value >= 1) return value;
+  throw new Error(`--count must be an integer >= 2 (got ${raw === true ? "no value" : String(raw)})`);
 }
 
 type SpawnOptions = {
@@ -362,6 +372,10 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> --count <n> [--colony name]");
   if (!Number.isInteger(count) || count < 2) throw new Error(`--count must be an integer >= 2 (got ${count})`);
+  if (hasFlag(parsed, "name")) throw new Error("--name cannot be combined with --count > 1; swarm bees are auto-named");
+  if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
+    throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
+  }
   const { agent, account } = await resolveSpawnAgent(requested);
   const cwd = await resolveSpawnCwd(parsed);
   const yolo = dangerousMode(parsed, agent);
@@ -393,6 +407,8 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
 }
 
 async function spawnFromFrame(parsed: Parsed, frameName: string): Promise<SessionRecord[]> {
+  if (hasFlag(parsed, "name")) throw new Error("--name cannot be combined with --frame; frame bees are auto-named");
+  if (hasFlag(parsed, "brief")) throw new Error("--brief cannot be combined with --frame; briefs come from the frame's castes");
   const frame: Frame | null = await loadFrame(frameName);
   if (!frame) throw new Error(`Unknown frame: ${frameName}. Define one with: hive frame define <file>`);
   const cwd = await resolveSpawnCwd(parsed);
@@ -402,6 +418,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string): Promise<Sessio
   const briefed = truthy(flag(parsed, "briefed"));
   const flagHome = flag(parsed, "home") ?? flag(parsed, "profile");
   const records: SessionRecord[] = [];
+  // deliverBrief already waits for readiness, so just-briefed bees are excluded
+  // from the post-spawn confirmation (mirrors spawnSingleBee's exclusivity).
+  const unbriefed: SessionRecord[] = [];
   for (const caste of frame.castes) {
     const yolo = dangerousMode(parsed, caste.bee);
     const home = caste.home ?? flagHome;
@@ -421,13 +440,14 @@ async function spawnFromFrame(parsed: Parsed, frameName: string): Promise<Sessio
         ...(caste.brief ? { brief: caste.brief } : {}),
       });
       if (briefed && caste.brief) record = await deliverBrief(parsed, record, caste.brief);
+      else unbriefed.push(record);
       records.push(record);
       if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`caste:${caste.name}`), dim(`@${swarmId}`)]));
       else console.log(`${record.name}\t${caste.bee}\t${cwd}\t${caste.name}\t@${swarmId}`);
     }
   }
 
-  await confirmSpawnReadyAll(parsed, records);
+  await confirmSpawnReadyAll(parsed, unbriefed);
 
   await createSwarm({
     id: swarmId,
@@ -468,16 +488,29 @@ async function cmdSeal(parsed: Parsed) {
 
 async function cmdBrief(parsed: Parsed) {
   const target = parsed.args[0];
-  const briefText = String(flag(parsed, "brief") ?? flag(parsed, "b") ?? parsed.args.slice(1).join(" "));
+  const briefText = stringFlag(parsed, ["brief", "b"]) ?? parsed.args.slice(1).join(" ");
   if (!target || !briefText) throw new Error("Usage: hive brief <selector> <text> OR hive brief <selector> --brief <text>");
 
   const resolved = await resolveSelector(target);
   const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  const isMulti = resolved.kind !== "bee";
   if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
 
+  let briefedCount = 0;
   for (const record of records) {
-    await ensureLive(record);
+    if (!(await substrateFor(record).hasSession(record.tmuxTarget))) {
+      if (!isMulti) throw new Error(`tmux session is not running: ${record.tmuxTarget}`);
+      if (isPretty()) console.error(note(`skip ${record.name} (dead)`));
+      else console.error(`skip\t${record.name}\tdead`);
+      continue;
+    }
     await deliverBrief(parsed, record, briefText);
+    briefedCount += 1;
+  }
+
+  if (isMulti) {
+    if (isPretty()) console.log(actionLine("ok", "brief", [bold(target), `${briefedCount}/${records.length} bees`]));
+    else console.log(`briefed\t${target}\t${briefedCount}/${records.length}`);
   }
 }
 
@@ -495,8 +528,9 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
   const delivered = augmentBrief(parsed, briefText);
   await substrateFor(record).sendText(record.tmuxTarget, delivered);
   const now = new Date().toISOString();
-  const updated: SessionRecord = { ...record, updatedAt: now, status: "running", brief: briefText, briefedAt: now };
-  await saveSession(updated);
+  const updated: SessionRecord =
+    (await updateSession(record.name, { updatedAt: now, status: "running", brief: briefText, briefedAt: now })) ??
+    { ...record, updatedAt: now, status: "running", brief: briefText, briefedAt: now };
   await appendLedger({ type: "brief", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, chars: delivered.length, briefChars: briefText.length });
   if (isPretty()) console.log(actionLine("ok", "brief", [bold(record.name), `${briefText.length} chars`]));
   else console.log(`briefed\t${record.name}\t${briefText.length} chars`);
@@ -541,7 +575,7 @@ function augmentBrief(parsed: Parsed, briefText: string): string {
 }
 
 async function resolveSpawnCwd(parsed: Parsed): Promise<string> {
-  const requested = resolve(String(flag(parsed, "cwd") ?? process.cwd()).replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
+  const requested = resolve((stringFlag(parsed, ["cwd"]) ?? process.cwd()).replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
   return realpath(requested);
 }
 
@@ -556,7 +590,7 @@ function resolveSwarmIdHint(parsed: Parsed, prefix?: string): string {
 
 async function cmdSend(parsed: Parsed) {
   const target = parsed.args[0];
-  const prompt = String(flag(parsed, "prompt") ?? flag(parsed, "p") ?? parsed.args.slice(1).join(" "));
+  const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
   if (!target || !prompt) throw new Error("Usage: hive send <selector> <prompt> OR hive send <selector> -p <prompt>");
 
   const resolved = await resolveSelector(target);
@@ -574,7 +608,7 @@ async function cmdSend(parsed: Parsed) {
     }
     await substrateFor(record).sendText(record.tmuxTarget, prompt);
     const now = new Date().toISOString();
-    await saveSession({ ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+    await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
     await appendLedger({ type: "prompt.send", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
     if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
     else console.log(`sent\t${record.name}\t${prompt.length} chars`);
@@ -656,7 +690,13 @@ async function cmdList(parsed: Parsed) {
   }
 
   if (records.length === 0) {
-    console.log(dim("No bees in the hive. Spawn one with: hive spawn <bee>"));
+    const filters = [
+      colonyFilter ? `colony:${colonyFilter}` : undefined,
+      swarmFilter ? `@${swarmFilter}` : undefined,
+      nodeFilter ? `node:${nodeFilter}` : undefined,
+    ].filter((part): part is string => part !== undefined);
+    if (filters.length > 0) console.log(dim(`No bees match ${filters.join(" ")}`));
+    else console.log(dim("No bees in the hive. Spawn one with: hive spawn <bee>"));
     return;
   }
 
@@ -717,6 +757,7 @@ async function cmdList(parsed: Parsed) {
 const DEFAULT_NODE_PROBE_TIMEOUT_MS = 2_500;
 
 export type MultiNodeLiveProbe = {
+  /** Live tmux sessions keyed by liveTargetKey(node, target). */
   liveTargets: Set<string>;
   unreachableNodes: Set<string>;
   perNode: Map<string, string[]>;
@@ -742,7 +783,7 @@ async function liveTargetsAcrossNodes(nodes: NodeRecord[], nodeFilter?: string):
       }
       const result = await withTimeout(substrate.listSessions(), timeoutMs);
       perNode.set(node.name, result);
-      for (const target of result) liveTargets.add(target);
+      for (const target of result) liveTargets.add(liveTargetKey(node.name, target));
     } catch {
       unreachableNodes.add(node.name);
     }
@@ -803,7 +844,7 @@ function formatStateCell(state: BeeState): string {
 }
 
 async function capturePanesFor(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
-  const liveRecords = records.filter((record) => liveTargets.has(record.tmuxTarget));
+  const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
   const entries = await Promise.all(
     liveRecords.map(async (record) => [record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80).catch(() => "")] as const),
   );
@@ -816,10 +857,15 @@ async function listSealedBeeNames(): Promise<Set<string>> {
 
 async function cmdClean(parsed: Parsed) {
   const interactive = hasFlag(parsed, "interactive") || hasFlag(parsed, "i");
-  const wantsDead = truthy(flag(parsed, "dead"));
+  const wantsDead = hasFlag(parsed, "dead");
   const wantsIdle = hasFlag(parsed, "idle");
 
-  if (interactive) return cmdCleanInteractive(parsed);
+  if (interactive) {
+    if (hasFlag(parsed, "dry-run") || hasFlag(parsed, "n") || hasFlag(parsed, "older-than") || hasFlag(parsed, "older")) {
+      throw new Error("hive clean -i/--interactive does not support --dry-run/--older-than; pick targets in the TUI instead.");
+    }
+    return cmdCleanInteractive(parsed);
+  }
   if (wantsDead && wantsIdle) throw new Error("Choose either hive clean --dead or hive clean --idle, not both.");
   if (wantsIdle) return cmdCleanIdle(parsed);
   if (wantsDead) return cmdCleanDead(parsed);
@@ -831,11 +877,26 @@ async function cmdCleanDead(parsed: Parsed) {
   const probe = await liveTargetsAcrossNodes(nodes);
   // Records on an unreachable node are NOT dead — we genuinely don't know their state.
   // Treat them as live so we don't sweep their metadata while their node is down.
+  // The same goes for records whose node is no longer registered: it was never
+  // probed, so we cannot tell whether the remote session is still running.
+  const knownNodes = new Set(nodes.map((node) => node.name));
+  const unknownNodes = new Set<string>();
   const recordsConsideredAlive = new Set(probe.liveTargets);
   for (const record of records) {
-    if (probe.unreachableNodes.has(record.node ?? LOCAL_NODE_NAME)) {
-      recordsConsideredAlive.add(record.tmuxTarget);
+    const nodeName = record.node ?? LOCAL_NODE_NAME;
+    if (!knownNodes.has(nodeName)) {
+      unknownNodes.add(nodeName);
+      recordsConsideredAlive.add(liveTargetKey(record.node, record.tmuxTarget));
+      continue;
     }
+    if (probe.unreachableNodes.has(nodeName)) {
+      recordsConsideredAlive.add(liveTargetKey(record.node, record.tmuxTarget));
+    }
+  }
+  if (unknownNodes.size > 0) {
+    const skipped = [...unknownNodes].join(", ");
+    if (isPretty()) console.error(note(`skipping bees on unregistered node(s): ${skipped} (re-register or kill them explicitly)`));
+    else console.error(`# skipping bees on unregistered node(s): ${skipped}`);
   }
   let dead = deadSessionRecords(records, recordsConsideredAlive);
   const olderThan = ageFlag(parsed, ["older-than", "older"]);
@@ -965,16 +1026,24 @@ type CleanCandidate = CleanTuiItem & {
 async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; candidates: CleanCandidate[] }> {
   const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
   const probe = await liveTargetsAcrossNodes(nodes);
+  // A record whose node is no longer registered was never probed; treat it as
+  // unreachable (not dead) so clean paths refuse to sweep a possibly-live bee.
+  const knownNodes = new Set(nodes.map((node) => node.name));
+  const unreachableNodes = new Set(probe.unreachableNodes);
+  for (const record of records) {
+    const nodeName = record.node ?? LOCAL_NODE_NAME;
+    if (!knownNodes.has(nodeName)) unreachableNodes.add(nodeName);
+  }
   const panes = await capturePanesFor(records, probe.liveTargets);
   const seals = await listSealedBeeNames();
   const context: StateContext = {
     liveTargets: probe.liveTargets,
     panes,
     seals,
-    unreachableNodes: probe.unreachableNodes,
+    unreachableNodes,
     now: Date.now(),
   };
-  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(record.tmuxTarget), context.now!));
+  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)), context.now!));
   candidates.sort(compareCleanCandidates);
   return { records, candidates };
 }
@@ -1196,7 +1265,7 @@ async function cmdWait(parsed: Parsed) {
   }
 
   await ensureLive(record);
-  await waitForIdle({
+  const outcome = await waitForIdle({
     record,
     idleMs: numberFlag(parsed, ["idle-ms", "idle"], 3_000),
     timeoutMs: numberFlag(parsed, ["timeout-ms", "timeout"], 600_000),
@@ -1205,6 +1274,9 @@ async function cmdWait(parsed: Parsed) {
     rows: numberFlag(parsed, ["n", "limit"], 0),
     json: truthy(flag(parsed, "json")),
   });
+  // A blocked bee did not finish its turn; exit non-zero so `hive wait && hive kill`
+  // chains do not kill a bee that is stalled on an approval prompt.
+  if (outcome.state === "blocked") process.exitCode = 1;
 }
 
 async function waitForSeal(record: SessionRecord, parsed: Parsed): Promise<void> {
@@ -1247,18 +1319,26 @@ async function cmdKill(parsed: Parsed) {
 
 async function cmdRun(parsed: Parsed) {
   const agent = parsed.args[0];
-  const prompt = String(flag(parsed, "prompt") ?? flag(parsed, "p") ?? parsed.args.slice(1).join(" "));
+  const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
   if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--wait] [--last] [--rm|--cleanup]");
   if (truthy(flag(parsed, "keep")) && cleanupAfterRun(parsed)) throw new Error("--keep cannot be combined with --rm/--cleanup");
+  if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
+    throw new Error("hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
+  }
 
+  // The waitForAgentReady below is authoritative; skip spawn's own readiness
+  // confirmation so a slow boot is only waited for once.
+  const spawnFlags = new Map(parsed.flags);
+  spawnFlags.set("no-wait", true);
   const spawnParsed: Parsed = {
     command: "spawn",
     args: [agent],
-    flags: new Map(parsed.flags),
+    flags: spawnFlags,
     rest: parsed.rest,
   };
   const record = await cmdSpawn(spawnParsed);
   const cleanup = cleanupAfterRun(parsed);
+  let blocked = false;
 
   try {
     try {
@@ -1274,11 +1354,11 @@ async function cmdRun(parsed: Parsed) {
     }
     await substrateFor(record).sendText(record.tmuxTarget, prompt);
     const now = new Date().toISOString();
-    await saveSession({ ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+    await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
     await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
 
     if (truthy(flag(parsed, "wait"))) {
-      await waitForIdle({
+      const outcome = await waitForIdle({
         record: { ...record, lastPrompt: prompt, lastPromptAt: now },
         idleMs: numberFlag(parsed, ["idle-ms", "idle"], 3_000),
         timeoutMs: numberFlag(parsed, ["timeout-ms", "timeout"], 600_000),
@@ -1287,6 +1367,7 @@ async function cmdRun(parsed: Parsed) {
         rows: numberFlag(parsed, ["n", "limit"], 0),
         json: truthy(flag(parsed, "json")),
       });
+      blocked = outcome.state === "blocked";
     } else {
       const waitMs = Number(flag(parsed, "wait-ms") ?? 1000);
       if (waitMs > 0) await sleep(waitMs);
@@ -1294,7 +1375,17 @@ async function cmdRun(parsed: Parsed) {
       console.log(await substrateFor(record).capture(record.tmuxTarget, Number.isFinite(lines) ? lines : 80));
     }
   } finally {
-    if (cleanup) await cleanupRunSession(record);
+    if (cleanup) {
+      if (blocked) {
+        // The bee is stalled on an approval prompt — killing it now would
+        // destroy the pending work. Keep it and let the human decide.
+        console.error("");
+        console.error(note(`kept ${record.name} (blocked on a permission prompt); resolve with: hive attach ${record.name}`));
+        process.exitCode = 1;
+      } else {
+        await cleanupRunSession(record);
+      }
+    }
   }
 
   const waited = truthy(flag(parsed, "wait"));
@@ -1318,6 +1409,7 @@ async function cleanupRunSession(record: SessionRecord): Promise<void> {
   console.error("");
   if (!outcome.ok) {
     console.error(note(`kill_failed ${record.name} (--rm/--cleanup): ${outcome.lastError}`));
+    process.exitCode = 1;
     return;
   }
   console.error(note(`${outcome.alreadyGone ? "removed stale" : "killed"} ${record.name} (--rm/--cleanup)`));
@@ -1329,16 +1421,20 @@ async function cleanupRunSession(record: SessionRecord): Promise<void> {
 // Inspect later with `hive tail|attach|wait`.
 async function cmdX(parsed: Parsed) {
   const agent = parsed.args[0];
-  const prompt = String(flag(parsed, "prompt") ?? flag(parsed, "p") ?? parsed.args.slice(1).join(" "));
+  const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
   if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo]");
   if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
     throw new Error("hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
   }
 
+  // The waitForAgentReady below is authoritative; skip spawn's own readiness
+  // confirmation so a slow boot is only waited for once.
+  const spawnFlags = new Map(parsed.flags);
+  spawnFlags.set("no-wait", true);
   const spawnParsed: Parsed = {
     command: "spawn",
     args: [agent],
-    flags: new Map(parsed.flags),
+    flags: spawnFlags,
     rest: parsed.rest,
   };
   const record = await cmdSpawn(spawnParsed);
@@ -1357,7 +1453,7 @@ async function cmdX(parsed: Parsed) {
 
   await substrateFor(record).sendText(record.tmuxTarget, prompt);
   const now = new Date().toISOString();
-  await saveSession({ ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+  await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
   await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
   if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
   else console.log(`sent\t${record.name}\t${prompt.length} chars`);
@@ -1606,7 +1702,7 @@ async function cascadeColonyRename(from: string, to: string): Promise<void> {
   const sessions = await listSessions();
   for (const record of sessions) {
     if (record.colony !== from) continue;
-    await saveSession({ ...record, colony: to, updatedAt: new Date().toISOString() });
+    await updateSession(record.name, { colony: to, updatedAt: new Date().toISOString() });
   }
   const swarms = await listSwarms();
   for (const swarm of swarms) {
@@ -1770,6 +1866,10 @@ async function frameEdit(parsed: Parsed) {
   if (!name) throw new Error("Usage: hive frame edit <name>");
   const existing = await loadFrame(name);
   if (!existing) throw new Error(`Unknown frame: ${name}`);
+  const backing = await frameDefinitionFile(name);
+  if (backing?.ext === ".ts") {
+    throw new Error(`Frame ${name} is backed by a TypeScript source (${backing.path}); edit that file, then run: hive frame reload ${name}`);
+  }
 
   const fs = await import("node:fs/promises");
   const path = await import("node:path");
@@ -1972,9 +2072,23 @@ function formatNodeStatus(status: NodeRecord["status"]): string {
   }
 }
 
+/**
+ * ssh args almost always start with "-", which the flag parser reads as the
+ * next flag (leaving --ssh-args === true). Silently dropping them would
+ * register the node without its ssh config, so demand the = form instead.
+ */
+function parseSshArgsFlag(parsed: Parsed): string[] | undefined {
+  const raw = flag(parsed, "ssh-args");
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") {
+    throw new Error('--ssh-args requires a value; use --ssh-args="-F /path/to/config" (the = form is required for values starting with -)');
+  }
+  return raw.split(/\s+/).filter(Boolean);
+}
+
 async function nodeRegister(parsed: Parsed) {
   const name = parsed.args[1];
-  if (!name) throw new Error("Usage: hive node register <name> --kind <local-tmux|ssh-tmux> --endpoint <addr> [--capabilities a,b,c] [--description \"...\"] [--ssh-command ssh] [--ssh-args \"-F /path/to/config\"]");
+  if (!name) throw new Error("Usage: hive node register <name> --kind <local-tmux|ssh-tmux> --endpoint <addr> [--capabilities a,b,c] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"-F /path/to/config\"]");
   const kindRaw = flag(parsed, "kind");
   if (typeof kindRaw !== "string") throw new Error("--kind is required (local-tmux or ssh-tmux)");
   const endpointRaw = flag(parsed, "endpoint");
@@ -1985,10 +2099,7 @@ async function nodeRegister(parsed: Parsed) {
     : undefined;
   const description = typeof flag(parsed, "description") === "string" ? String(flag(parsed, "description")) : undefined;
   const sshCommand = typeof flag(parsed, "ssh-command") === "string" ? String(flag(parsed, "ssh-command")) : undefined;
-  const sshArgsRaw = flag(parsed, "ssh-args");
-  const sshArgs = typeof sshArgsRaw === "string"
-    ? sshArgsRaw.split(/\s+/).filter(Boolean)
-    : undefined;
+  const sshArgs = parseSshArgsFlag(parsed);
   const record = await registerNode({
     name,
     kind: kindRaw as NodeRecord["kind"],
@@ -2013,7 +2124,7 @@ async function nodeInspect(parsed: Parsed) {
 
 async function nodeUpdate(parsed: Parsed) {
   const name = parsed.args[1];
-  if (!name) throw new Error("Usage: hive node update <name> [--endpoint addr] [--capabilities a,b] [--description \"...\"] [--ssh-command ssh] [--ssh-args \"...\"]");
+  if (!name) throw new Error("Usage: hive node update <name> [--endpoint addr] [--capabilities a,b] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"...\"]");
   const patch: Parameters<typeof updateNode>[1] = {};
   if (typeof flag(parsed, "endpoint") === "string") patch.endpoint = String(flag(parsed, "endpoint"));
   if (typeof flag(parsed, "description") === "string") patch.description = String(flag(parsed, "description"));
@@ -2021,9 +2132,8 @@ async function nodeUpdate(parsed: Parsed) {
   if (typeof flag(parsed, "capabilities") === "string") {
     patch.capabilities = String(flag(parsed, "capabilities")).split(",").map((c) => c.trim()).filter(Boolean);
   }
-  if (typeof flag(parsed, "ssh-args") === "string") {
-    patch.sshArgs = String(flag(parsed, "ssh-args")).split(/\s+/).filter(Boolean);
-  }
+  const sshArgs = parseSshArgsFlag(parsed);
+  if (sshArgs) patch.sshArgs = sshArgs;
   const record = await updateNode(name, patch);
   clearSubstrateCache();
   if (isPretty()) console.log(actionLine("ok", "node", [bold(record.name), dim("updated")]));
@@ -2032,7 +2142,15 @@ async function nodeUpdate(parsed: Parsed) {
 
 async function nodeUnregister(parsed: Parsed) {
   const name = parsed.args[1];
-  if (!name) throw new Error("Usage: hive node unregister <name>");
+  if (!name) throw new Error("Usage: hive node unregister <name> [--force]");
+  const sessions = await listSessions();
+  const affected = sessions.filter((record) => (record.node ?? LOCAL_NODE_NAME) === name);
+  if (affected.length > 0 && !truthy(flag(parsed, "force"))) {
+    throw new Error(
+      `Node ${name} still has ${affected.length} bee(s): ${affected.map((record) => record.name).join(", ")}.\n` +
+      `Kill or clean them first, or pass --force to unregister anyway (their records become unmanageable).`,
+    );
+  }
   await unregisterNode(name);
   clearSubstrateCache();
   if (isPretty()) console.log(actionLine("ok", "node", [bold(name), dim("unregistered")]));
@@ -2127,7 +2245,10 @@ async function flowRun(parsed: Parsed) {
   const flow = await loadFlow(name);
   if (!flow) throw new Error(`Unknown flow: ${name}`);
   const args = parseFlowRunArgs(parsed);
-  if (truthy(flag(parsed, "background"))) {
+  const foreground = truthy(flag(parsed, "foreground"));
+  const background = truthy(flag(parsed, "background"));
+  if (foreground && background) throw new Error("--foreground and --background are mutually exclusive");
+  if (background) {
     if (process.platform === "win32") {
       throw new Error("hive flow run --background is not supported on Windows.");
     }
@@ -2313,7 +2434,9 @@ async function flowStatus(parsed: Parsed) {
   const meta = await readMeta(summary.flowName, runId);
   const result = await readResult(summary.flowName, runId);
   if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify({ meta, result }, null, 2));
+    // summary.status is reconciled (running + dead pid → orphaned); the raw
+    // meta on disk may still say "running", so emit the reconciled view.
+    console.log(JSON.stringify({ meta: meta ? { ...meta, status: summary.status } : meta, result }, null, 2));
     return;
   }
   if (!isPretty()) {
@@ -2499,7 +2622,21 @@ async function loopStartCmd(parsed: Parsed) {
   await ensureLoopDir(loopId);
   await writeLoopConfig(cfg);
   const args = { ...rawArgs, loopId };
-  const { pid, pgid } = await spawnDetachedRun(loopFlow, args, { runId: loopId });
+  let pid: number;
+  let pgid: number;
+  try {
+    ({ pid, pgid } = await spawnDetachedRun(loopFlow, args, { runId: loopId }));
+  } catch (error) {
+    // loop.json was written status:"running" before the spawn; mark it errored
+    // so a failed spawn does not strand a phantom running loop.
+    const message = error instanceof Error ? error.message : String(error);
+    await updateLoopConfig(loopId, {
+      status: "errored",
+      stopReason: `spawn failed: ${message}`,
+      endedAt: new Date().toISOString(),
+    }).catch(() => undefined);
+    throw error;
+  }
 
   if (isPretty()) {
     console.log(actionLine("ok", "loop", [bold("loop"), dim(`id ${loopId}`), dim(`pid:${pid}`)]));
@@ -2514,8 +2651,9 @@ async function loopStatusCmd(parsed: Parsed) {
   if (!loopId) return loopListCmd();
   const cfg = await readLoopConfig(loopId);
   if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
+  const status = loopDisplayStatus(cfg);
   if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify(cfg, null, 2));
+    console.log(JSON.stringify({ ...cfg, status }, null, 2));
     return;
   }
   if (!isPretty()) {
@@ -2523,7 +2661,7 @@ async function loopStatusCmd(parsed: Parsed) {
       [
         cfg.loopId,
         cfg.context,
-        cfg.status,
+        status,
         cfg.iteration,
         cfg.lastSealStatus ?? "",
         cfg.startedAt,
@@ -2532,7 +2670,7 @@ async function loopStatusCmd(parsed: Parsed) {
     );
     return;
   }
-  console.log(`${bold("loop")} ${dim(cfg.loopId)} ${colorLoopStatus(cfg.status)}`);
+  console.log(`${bold("loop")} ${dim(cfg.loopId)} ${colorLoopStatus(status)}`);
   console.log(`  context    ${cfg.context} ${dim(`(carrier=${cfg.carrier} memory=${cfg.memory})`)}`);
   console.log(`  bee        ${cfg.bee}`);
   console.log(`  iteration  ${cfg.iteration}${cfg.stop.max != null ? dim(` / ${cfg.stop.max}`) : ""}`);
@@ -2556,18 +2694,23 @@ async function loopLogsCmd(parsed: Parsed) {
   const cfg = await readLoopConfig(loopId);
   if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
 
+  const follow = truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
   const iterRaw = flag(parsed, "iter");
-  if (typeof iterRaw === "string") {
+  if (iterRaw !== undefined) {
+    if (typeof iterRaw !== "string") throw new Error("--iter requires an iteration number (e.g. --iter 3)");
+    if (follow) throw new Error("--iter cannot be combined with -f/--follow; iteration logs are complete files");
     const n = Number(iterRaw);
     if (!Number.isInteger(n) || n <= 0) throw new Error(`Invalid --iter "${iterRaw}": expected a positive integer.`);
     const path = loopIterLogPath(loopId, n);
-    const text = await readFile(path, "utf8").catch(() => "");
+    const text = await readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") throw new Error(`No log for iteration ${n} of loop ${loopId}`);
+      throw error;
+    });
     await emitLogText(text, path);
     return;
   }
 
   const path = runLogPath("loop", loopId);
-  const follow = truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
   const lines = numberFlag(parsed, ["n", "lines"], 0);
   if (follow) {
     await followLoopLog(loopId);
@@ -2575,7 +2718,9 @@ async function loopLogsCmd(parsed: Parsed) {
   }
   let text = await readLogFull("loop", loopId);
   if (lines > 0) {
-    text = text.split("\n").slice(-lines - 1).join("\n");
+    const parts = text.split("\n");
+    if (parts[parts.length - 1] === "") parts.pop();
+    text = parts.slice(-lines).join("\n");
   }
   await emitLogText(text, path);
 }
@@ -2588,8 +2733,7 @@ async function emitLogText(text: string, path: string): Promise<void> {
 
 async function followLoopLog(loopId: string): Promise<void> {
   let previous = "";
-  while (true) {
-    const next = await readLogFull("loop", loopId);
+  const printDelta = (next: string) => {
     if (next.length > previous.length) {
       process.stdout.write(next.slice(previous.length));
     } else if (next !== previous) {
@@ -2597,9 +2741,27 @@ async function followLoopLog(loopId: string): Promise<void> {
       process.stdout.write(next);
     }
     previous = next;
+  };
+  while (true) {
+    printDelta(await readLogFull("loop", loopId));
     const cfg = await readLoopConfig(loopId).catch(() => null);
     if (cfg && cfg.status !== "running") break;
+    if (cfg && cfg.status === "running" && typeof cfg.pid === "number" && !processAlive(cfg.pid)) {
+      console.error(note(`loop driver (pid ${cfg.pid}) is gone but loop.json still says running; log will not grow`));
+      break;
+    }
     await sleep(1_000);
+  }
+  // One final read: catch lines appended between the last read and the status flip.
+  printDelta(await readLogFull("loop", loopId));
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -2639,7 +2801,7 @@ async function loopListCmd() {
   const loops = await listLoops();
   if (!isPretty()) {
     for (const l of loops) {
-      console.log(["loop.run", l.loopId, l.context, l.status, l.iteration, l.startedAt].join("\t"));
+      console.log(["loop.run", l.loopId, l.context, loopDisplayStatus(l), l.iteration, l.startedAt].join("\t"));
     }
     return;
   }
@@ -2658,19 +2820,27 @@ async function loopListCmd() {
     loops.map((l) => [
       bold(l.loopId),
       l.context,
-      colorLoopStatus(l.status),
+      colorLoopStatus(loopDisplayStatus(l)),
       String(l.iteration),
       dim(l.startedAt),
     ]),
   ));
 }
 
-function colorLoopStatus(status: LoopConfig["status"]): string {
+// Display-level only: a "running" loop whose driver pid is gone (e.g. SIGKILL)
+// can never finalize loop.json, so surface it as orphaned instead of running
+// forever. Delegates to the same reconciliation listLoops applies.
+function loopDisplayStatus(cfg: LoopConfig): LoopConfig["status"] {
+  return reconcileLoopStatus(cfg).status;
+}
+
+function colorLoopStatus(status: LoopConfig["status"] | "orphaned"): string {
   if (status === "running") return cyan(status);
   if (status === "done") return green(status);
   if (status === "paused") return yellow(status);
   if (status === "stopped") return yellow(status);
   if (status === "errored") return red(status);
+  if (status === "orphaned") return magenta(status);
   return dim(status);
 }
 
@@ -2733,13 +2903,14 @@ async function daemonInstall(parsed: Parsed) {
   ensureLaunchctlOrExit("install");
   const label = daemonLabel(parsed);
   const force = truthy(flag(parsed, "force"));
-  if (!force && (await isAgentInstalled(label))) {
-    const msg = `hive daemon already installed (${label})`;
-    if (isPretty()) console.error(`${errorPrefix()} ${msg}. Use --force to overwrite or uninstall first.`);
-    else console.error(msg);
+  const result = await installAgent({ label, force });
+  if (!result.installed) {
+    // Already installed; installAgent's message says whether the on-disk
+    // plist is stale (CLI moved, options changed) and to re-run with --force.
+    if (isPretty()) console.error(`${errorPrefix()} hive daemon ${result.message}. Use --force to overwrite or uninstall first.`);
+    else console.error(result.message);
     process.exit(3);
   }
-  const result = await installAgent({ label, force });
   if (isPretty()) {
     console.log(actionLine("ok", "daemon", [bold("install"), dim(result.message)]));
     console.log(dim(`  label: ${result.label}`));
@@ -2810,7 +2981,7 @@ async function daemonRestart(parsed: Parsed) {
 }
 
 async function daemonLogs(parsed: Parsed) {
-  const follow = truthy(flag(parsed, "follow"));
+  const follow = truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
   const linesRaw = flag(parsed, "lines");
   const linesN = (() => {
     if (typeof linesRaw !== "string") return undefined;
@@ -2950,7 +3121,7 @@ async function buzSend(parsed: Parsed) {
   const target = parsed.args[1];
   if (!target) throw new Error("Usage: hive buz send <selector> --sender <bee>|--sender-human <name> --tier <interrupt|queue|passive> -p <body>");
   const tier = parseBuzTier(flag(parsed, "tier") ?? "queue");
-  const body = String(flag(parsed, "prompt") ?? flag(parsed, "p") ?? "");
+  const body = stringFlag(parsed, ["prompt", "p"]) ?? "";
   if (body.length === 0) throw new Error("buz: --prompt|-p body is required");
   const subject = typeof flag(parsed, "subject") === "string" ? String(flag(parsed, "subject")) : undefined;
   const sender = await resolveBuzSender(parsed);
@@ -3018,6 +3189,7 @@ async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "queue") {
       }
       continue;
     }
+    if (records.length > 1) console.log(bold(record.name));
     console.log(formatTable(
       [
         { header: "ID" },
@@ -3055,8 +3227,10 @@ async function buzRead(parsed: Parsed) {
   }
   if (!found) throw new Error(`No buz message found with id: ${id}`);
 
+  let consumed = false;
   if (consume) {
     const moved = await consumeMessage(found.bee, id);
+    consumed = moved !== null;
     if (!moved) {
       // Was not in inbox/, so we can't consume it. Just print it.
       console.error(note(`message ${id} is in ${found.mailbox}/; --consume only applies to inbox/`));
@@ -3075,7 +3249,7 @@ async function buzRead(parsed: Parsed) {
     deliveredAt: found.message.deliveredAt,
     subject: found.message.subject,
     body: found.message.body,
-    consumed: consume,
+    consumed,
   }, null, 2));
 }
 
@@ -3124,12 +3298,7 @@ async function buzConfig(parsed: Parsed) {
   }
 
   const tiers = parseAcceptFlag(acceptRaw);
-  const updated: SessionRecord = {
-    ...record,
-    buzAccept: tiers,
-    updatedAt: new Date().toISOString(),
-  };
-  await saveSession(updated);
+  await updateSession(record.name, { buzAccept: tiers, updatedAt: new Date().toISOString() });
   await appendLedger({ type: "buz.config", bee: record.name, buzAccept: tiers });
   if (isPretty()) console.log(actionLine("ok", "buz", [bold(record.name), `accept:${tiers.join(",")}`]));
   else console.log(`buz.config\t${record.name}\t${tiers.join(",")}`);
@@ -3301,23 +3470,36 @@ function highlightSnippet(snippet: string, start: number, end: number): string {
   return `${before}${bold(yellow(match))}${after}`;
 }
 
-export function parseSubstrateAlias(value: string): string {
+export function parseSubstrateAlias(value: string): { kind?: NodeRecord["kind"]; node: string } {
   // Accepts both "<kind>:<node>" (e.g. "ssh:mini01", "local:local") and bare "<node>" forms.
-  // Returns the node name. Empty kind/node segments fall back to local.
   const trimmed = value.trim();
-  if (!trimmed) return LOCAL_NODE_NAME;
+  if (!trimmed) return { node: LOCAL_NODE_NAME };
   const idx = trimmed.indexOf(":");
-  if (idx === -1) return trimmed;
-  const after = trimmed.slice(idx + 1).trim();
-  return after || LOCAL_NODE_NAME;
+  if (idx === -1) return { node: trimmed };
+  const kindRaw = trimmed.slice(0, idx).trim();
+  const node = trimmed.slice(idx + 1).trim();
+  if (!node) throw new Error(`Invalid --substrate "${value}": missing node name after the kind prefix (e.g. ssh:mini01)`);
+  if (!kindRaw) return { node };
+  const kind = substrateKindForAlias(kindRaw);
+  if (!kind) throw new Error(`Invalid --substrate "${value}": unknown kind "${kindRaw}" (use local: or ssh:)`);
+  return { kind, node };
+}
+
+function substrateKindForAlias(alias: string): NodeRecord["kind"] | undefined {
+  if (alias === "ssh" || alias === "ssh-tmux") return "ssh-tmux";
+  if (alias === "local" || alias === "local-tmux") return "local-tmux";
+  return undefined;
 }
 
 async function resolveSpawnNode(parsed: Parsed, agentKind: string): Promise<NodeRecord> {
   const nodeFlag = flag(parsed, "node");
   const substrateFlag = flag(parsed, "substrate");
   let requested: string;
+  let requestedKind: NodeRecord["kind"] | undefined;
   if (typeof substrateFlag === "string" && substrateFlag.length > 0) {
-    requested = parseSubstrateAlias(substrateFlag);
+    const alias = parseSubstrateAlias(substrateFlag);
+    requested = alias.node;
+    requestedKind = alias.kind;
   } else if (typeof nodeFlag === "string" && nodeFlag.length > 0) {
     requested = nodeFlag;
   } else {
@@ -3325,6 +3507,9 @@ async function resolveSpawnNode(parsed: Parsed, agentKind: string): Promise<Node
   }
   const node = await loadNode(requested);
   if (!node) throw new Error(`Unknown node: ${requested}. Register it with: hive node register ${requested} --kind ssh-tmux --endpoint user@host`);
+  if (requestedKind && node.kind !== requestedKind) {
+    throw new Error(`--substrate ${substrateFlag} requests kind ${requestedKind}, but node "${node.name}" is ${node.kind}`);
+  }
   if (!supportsCapability(node, agentKind)) {
     throw new Error(
       `Node "${node.name}" does not list capability "${agentKind}". Either update it with: hive node update ${node.name} --capabilities ${[...node.capabilities.filter((c) => c !== "*"), agentKind].join(",")}, or pick a different node.`,
@@ -3374,25 +3559,29 @@ async function ensureLive(record: SessionRecord) {
   }
 }
 
-async function assertExecutableAvailable(command: string) {
-  const candidates = command.includes("/") ? [command] : (process.env.PATH ?? "").split(":").filter(Boolean).map((dir) => resolve(dir, command));
-  for (const candidate of candidates) {
-    try {
-      await access(candidate, constants.X_OK);
-      return;
-    } catch {
-      // keep looking
-    }
-  }
-  throw new Error(`Executable not found on PATH: ${command}`);
-}
-
 function cleanupAfterRun(parsed: Parsed): boolean {
   return truthy(flag(parsed, "rm")) || truthy(flag(parsed, "cleanup"));
 }
 
 function hasFlag(parsed: Parsed, key: string): boolean {
   return flag(parsed, key) !== undefined;
+}
+
+/**
+ * Resolve the first present flag among `keys` to its string value. A flag that
+ * is present without a value parses as boolean true (`String(true)` would
+ * otherwise leak a literal "true"), so reject anything that is not a string.
+ */
+function stringFlag(parsed: Parsed, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const raw = flag(parsed, key);
+    if (raw === undefined) continue;
+    const display = `${key.length === 1 ? "-" : "--"}${key}`;
+    if (raw === true) throw new Error(`${display} requires a value`);
+    if (Array.isArray(raw)) throw new Error(`${display} was given multiple times; pass it once`);
+    return raw;
+  }
+  return undefined;
 }
 
 function ageFlag(parsed: Parsed, keys: string[]): number | undefined {

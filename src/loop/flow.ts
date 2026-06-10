@@ -28,11 +28,14 @@ import {
   writeIterSeal,
   writeLoopConfig,
 } from "./state.js";
-import { buildIterationPrompt, foldForward } from "./summarizer.js";
+import { buildIterationPrompt, foldForward, truncateForInjection } from "./summarizer.js";
 import { runStopPredicate } from "./until.js";
 
-const SEAL_TIMEOUT_MS = 30 * 60_000; // generous per-iteration boundary timeout
-const IDLE_FALLBACK_MS = 3_000;
+const SEAL_TIMEOUT_MS = 30 * 60_000; // overall per-iteration boundary cap
+const HELPER_SEAL_TIMEOUT_MS = 5 * 60_000; // summarizer/judge bees get a much shorter leash
+const IDLE_FALLBACK_MS = 3_000; // pane stability window (PRD §14: idle detection ~3s)
+const BOUNDARY_GRACE_MS = 2_000; // extra slack after idle for a late-landing seal
+const BOUNDARY_POLL_MS = 500;
 
 /**
  * Test seam. When set, the driver uses this to obtain (and ready) the iteration
@@ -51,8 +54,16 @@ export type LoopTestHooks = {
    * after killing the bee, which is the bug this seam guards against.
    */
   scanSentinel?: (args: { handle: BeeHandle | undefined; pattern: string; iter: number }) => Promise<boolean>;
-  /** Optional override for the per-iteration seal timeout (keeps no-seal tests fast). */
+  /** Optional override for the per-iteration boundary cap (keeps no-seal tests fast). */
   sealTimeoutMs?: number;
+  /** Optional override for the boundary idle window (default IDLE_FALLBACK_MS). */
+  boundaryIdleMs?: number;
+  /** Optional override for the post-idle grace period (default BOUNDARY_GRACE_MS). */
+  boundaryGraceMs?: number;
+  /** Optional override for the boundary poll interval (default BOUNDARY_POLL_MS). */
+  boundaryPollMs?: number;
+  /** Optional override for the boundary's pane capture (avoids real tmux in tests). */
+  capturePane?: (args: { handle: BeeHandle; iter: number }) => Promise<string>;
 };
 let testHooks: LoopTestHooks | undefined;
 export function __setLoopTestHooks(hooks: LoopTestHooks | undefined): void {
@@ -127,10 +138,25 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
   let finalStatus: LoopStatus = "running";
   let stopReason = "";
 
-  const finalize = async (status: LoopStatus, reason: string): Promise<void> => {
+  // `keepBee` is set when pausing: loop.json keeps pointing at the bee the
+  // operator must attend (`hive attach <bee>`); everywhere else currentBee is
+  // cleared because the loop's bees are dead or about to be killed.
+  const finalize = async (status: LoopStatus, reason: string, opts: { keepBee?: string } = {}): Promise<void> => {
     finalStatus = status;
     stopReason = reason;
-    await updateLoopConfig(loopId, { status, stopReason: reason, endedAt: new Date().toISOString(), currentBee: undefined });
+    await updateLoopConfig(loopId, {
+      status,
+      stopReason: reason,
+      endedAt: new Date().toISOString(),
+      currentBee: opts.keepBee,
+    });
+  };
+
+  // Pausing means "a human must intervene on this bee" — exempt it from the
+  // flow's kill-on-end cleanup and keep it referenced in loop.json.
+  const pause = async (reason: string): Promise<void> => {
+    if (handle) facade.untrack(handle.name);
+    await finalize("paused", reason, handle ? { keepBee: handle.name } : {});
   };
 
   try {
@@ -181,7 +207,7 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
           } catch (error) {
             if (error instanceof AgentReadinessError && (error.reason === "trust" || error.reason === "blocked")) {
               await appendIterLog(loopId, cfg.iteration + 1, `paused: readiness:${error.reason}`);
-              await finalize("paused", `readiness:${error.reason}`);
+              await pause(`readiness:${error.reason}`);
               break;
             }
             // timeout (or anything else) — surface as errored.
@@ -212,34 +238,43 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       else await facade.send(handle, prompt); // injects AND submits (Enter included)
       await appendIterLog(loopId, iter, `sent prompt (${prompt.length} chars)`);
 
-      // ── Boundary: prefer the seal, fall back to idle + latest seal. ──
+      // ── Boundary: RACE seal detection against idle detection (PRD §14). ──
+      // A harness that never seals must conclude the boundary via ~3s idle
+      // detection, not after the 30-minute seal cap.
       let seal: SealRecord | null = null;
       try {
-        seal = await facade.waitForSeal(handle, { timeoutMs: testHooks?.sealTimeoutMs ?? SEAL_TIMEOUT_MS });
+        seal = await waitForIterationBoundary({
+          facade,
+          handle,
+          iter,
+          baselineSealedAt: sealBaseline,
+          timeoutMs: testHooks?.sealTimeoutMs ?? SEAL_TIMEOUT_MS,
+          idleMs: testHooks?.boundaryIdleMs ?? IDLE_FALLBACK_MS,
+          graceMs: testHooks?.boundaryGraceMs ?? BOUNDARY_GRACE_MS,
+          pollMs: testHooks?.boundaryPollMs ?? BOUNDARY_POLL_MS,
+          signal: ctx.signal,
+        });
       } catch {
-        // An aborted signal surfaces as a waitForSeal throw; do not convert it
-        // into a 10-minute idle wait that ignores the signal. End cleanly.
+        // An aborted signal surfaces as a boundary throw. End cleanly.
         if (ctx.signal?.aborted) {
           await finalize("stopped", "aborted");
           break;
         }
-        try {
-          await facade.wait(handle, { idleMs: IDLE_FALLBACK_MS });
-        } catch {
-          // ignore idle-wait failures; we still try to collect any seal.
-        }
-        const latest = await facade.collect(handle);
-        // Only accept a seal newer than the pre-send baseline; otherwise this
-        // turn produced no seal and we must not mis-attribute an old one.
+        seal = null;
+      }
+      if (!seal) {
+        // A seal may have landed in the final poll gap — one last collect
+        // against the pre-send baseline before declaring the turn unsealed.
+        const latest = await facade.collect(handle).catch(() => null);
         seal = latest && latest.sealedAt !== sealBaseline ? latest : null;
       }
       // Distinguish "the bee actually sealed" from "no seal observed this turn".
       // A non-sealing harness/task must NOT be synthesized into a `done` that
       // trips stop-on-seal; instead it falls through to the mechanical stops
       // (sentinel / until / judge / max), which are the documented fallbacks
-      // for harnesses without reliable seals.
-      const sealed = seal != null;
-      const status: SealStatus = seal?.status ?? "done";
+      // for harnesses without reliable seals. Observability records the
+      // distinct value "none" — never a fabricated seal status.
+      const statusLabel: SealStatus | "none" = seal?.status ?? "none";
 
       // ── Fold rolling memory forward. ──
       if (cfg.memory === "rolling" && seal) {
@@ -248,12 +283,12 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       }
 
       if (seal) await writeIterSeal(loopId, iter, seal);
-      await appendIterLog(loopId, iter, `status=${status}`);
+      await appendIterLog(loopId, iter, `status=${statusLabel}`);
 
       cfg.iteration = iter;
-      await updateLoopConfig(loopId, { iteration: iter, lastSealStatus: status, currentBee: handle?.name });
-      await appendLedger({ type: "loop.iteration", loopId, iteration: iter, status });
-      await ctx.hive.log(`iteration ${iter} status=${status}`);
+      await updateLoopConfig(loopId, { iteration: iter, lastSealStatus: statusLabel, currentBee: handle?.name });
+      await appendLedger({ type: "loop.iteration", loopId, iteration: iter, status: statusLabel });
+      await ctx.hive.log(`iteration ${iter} status=${statusLabel}`);
 
       // Scan the sentinel BEFORE the fresh-carrier kill: once the bee is killed
       // its tmux session is gone and the handle is cleared, so a post-kill scan
@@ -263,6 +298,47 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
           ? await testHooks.scanSentinel({ handle, pattern: cfg.stop.stopOnSentinel, iter })
           : await paneMatches(handle, cfg.stop.stopOnSentinel)
         : false;
+
+      // ── Stop menu (first hit wins). pause is distinct from stop. ──
+      // Evaluated BEFORE the fresh-carrier kill so a pause decision can leave
+      // the bee alive for the operator. Seal-derived stops only apply when the
+      // bee actually sealed; a no-seal turn is not a real `done` and must not
+      // stop the loop on its own. An explicit --stop-on-seal membership wins
+      // over the implicit blocked/needs_input pause: an operator who opted
+      // into stopping on those statuses gets a stop, not a pause.
+      let decision: { status: LoopStatus; reason: string } | null = null;
+      if (seal && cfg.stop.stopOnSeal.includes(seal.status)) {
+        await recordStopCheck(loopId, "stop-on-seal", true);
+        decision = { status: "done", reason: `seal:${seal.status}` };
+      } else if (seal && (seal.status === "blocked" || seal.status === "needs_input")) {
+        decision = { status: "paused", reason: `seal:${seal.status}` };
+      }
+      if (!decision && cfg.stop.stopOnSentinel) {
+        await recordStopCheck(loopId, "stop-on-sentinel", sentinelMatched);
+        if (sentinelMatched) decision = { status: "done", reason: "sentinel" };
+      }
+      // (--until is evaluated at the top of the loop, not here, to avoid a
+      // redundant second spawn of the same predicate across the boundary.)
+      if (!decision && cfg.stop.judge) {
+        const hit = await judgeSaysStop(facade, cfg, loopId, iter);
+        await recordStopCheck(loopId, "judge", hit);
+        if (hit) decision = { status: "done", reason: "judge" };
+      }
+      if (!decision && !cfg.stop.forever && cfg.stop.max != null && iter >= cfg.stop.max) {
+        await recordStopCheck(loopId, "max", true);
+        decision = { status: "done", reason: "max" };
+      }
+      if (!decision && cfg.stop.maxDurationMs != null && Date.now() - started >= cfg.stop.maxDurationMs) {
+        await recordStopCheck(loopId, "max-duration", true);
+        decision = { status: "done", reason: "max-duration" };
+      }
+
+      if (decision?.status === "paused") {
+        // PRD: pause-and-notify — the human must be able to attend THIS bee,
+        // so it is neither killed here nor by the flow's kill-on-end cleanup.
+        await pause(decision.reason);
+        break;
+      }
 
       // Fresh carrier: kill this iteration's bee before respawning a new one.
       if (cfg.carrier === "fresh" && handle) {
@@ -274,43 +350,8 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
         handle = undefined;
       }
 
-      // ── Stop menu (first hit wins). pause is distinct from stop. ──
-      // Seal-derived stops only apply when the bee actually sealed; a no-seal
-      // turn is not a real `done` and must not stop the loop on its own.
-      if (sealed && (status === "blocked" || status === "needs_input")) {
-        await finalize("paused", `seal:${status}`);
-        break;
-      }
-      if (sealed && cfg.stop.stopOnSeal.includes(status)) {
-        await recordStopCheck(loopId, "stop-on-seal", true);
-        await finalize("done", `seal:${status}`);
-        break;
-      }
-      if (cfg.stop.stopOnSentinel) {
-        await recordStopCheck(loopId, "stop-on-sentinel", sentinelMatched);
-        if (sentinelMatched) {
-          await finalize("done", "sentinel");
-          break;
-        }
-      }
-      // (--until is evaluated at the top of the loop, not here, to avoid a
-      // redundant second spawn of the same predicate across the boundary.)
-      if (cfg.stop.judge) {
-        const hit = await judgeSaysStop(facade, cfg, loopId, iter);
-        await recordStopCheck(loopId, "judge", hit);
-        if (hit) {
-          await finalize("done", "judge");
-          break;
-        }
-      }
-      if (!cfg.stop.forever && cfg.stop.max != null && iter >= cfg.stop.max) {
-        await recordStopCheck(loopId, "max", true);
-        await finalize("done", "max");
-        break;
-      }
-      if (cfg.stop.maxDurationMs != null && Date.now() - started >= cfg.stop.maxDurationMs) {
-        await recordStopCheck(loopId, "max-duration", true);
-        await finalize("done", "max-duration");
+      if (decision) {
+        await finalize(decision.status, decision.reason);
         break;
       }
       // else loop again
@@ -339,27 +380,80 @@ function handleOf(record: SessionRecord): BeeHandle {
 }
 
 /**
- * Spawn the iteration bee. Uses spawnBeeForFlow directly when yolo is requested
- * (the facade hardcodes yolo:false); otherwise routes through facade.spawn so
- * the bee is tracked for kill-on-end cleanup. Fresh-carrier names are unique per
- * iteration to avoid the "tmux session already exists" collision. The facade
- * tracks every bee we hand it; for the yolo path we push the record onto the
- * facade's spawned list so killAll/kill still find it.
+ * Iteration boundary detector — RACE seal detection against idle detection
+ * (PRD §14: prefer the seal; fall back to ~3s idle detection for
+ * harnesses/tasks that don't seal). One poll loop checks for a seal newer
+ * than the PRE-SEND baseline each pass while fingerprinting the bee's pane;
+ * once the pane has been stable for idleMs + graceMs with no new seal, the
+ * boundary is concluded unsealed. timeoutMs remains the overall cap so a
+ * never-idle, never-sealing bee cannot wedge an iteration forever.
  */
-async function spawnIterationBee(
+async function waitForIterationBoundary(args: {
+  facade: HiveFacade;
+  handle: BeeHandle;
+  iter: number;
+  baselineSealedAt: string | undefined;
+  timeoutMs: number;
+  idleMs: number;
+  graceMs: number;
+  pollMs: number;
+  signal?: AbortSignal | undefined;
+}): Promise<SealRecord | null> {
+  const { facade, handle, baselineSealedAt } = args;
+  const started = Date.now();
+  let lastPane: string | undefined;
+  let stableSince = Date.now();
+  while (Date.now() - started < args.timeoutMs) {
+    if (args.signal?.aborted) throw new Error(`loop boundary aborted: ${handle.name}`);
+    const latest = await facade.collect(handle).catch(() => null);
+    if (latest && latest.sealedAt !== baselineSealedAt) return latest;
+    const pane = await captureBoundaryPane(handle, args.iter);
+    if (pane !== lastPane) {
+      lastPane = pane;
+      stableSince = Date.now();
+    } else if (Date.now() - stableSince >= args.idleMs + args.graceMs) {
+      return null; // idle long enough with no new seal — unsealed boundary.
+    }
+    await sleep(args.pollMs);
+  }
+  return null; // overall cap reached — also an unsealed boundary.
+}
+
+/** Pane snapshot for the boundary's idleness fingerprint ("" on any failure). */
+async function captureBoundaryPane(handle: BeeHandle, iter: number): Promise<string> {
+  if (testHooks?.capturePane) return testHooks.capturePane({ handle, iter }).catch(() => "");
+  try {
+    const { loadSession } = await import("../store.js");
+    const record = await loadSession(handle.name);
+    if (!record) return "";
+    return await substrateFor(record).capture(record.tmuxTarget, 200);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Spawn a bee for this loop. Uses spawnBeeForFlow directly when yolo is
+ * requested (the facade hardcodes yolo:false); otherwise routes through
+ * facade.spawn so the bee is tracked for kill-on-end cleanup. The same
+ * yolo-aware path serves the iteration bee AND the summarizer/judge helper
+ * bees — a non-yolo helper inside a --yolo loop would stall on permission
+ * prompts and silently burn its whole seal timeout. For the yolo path we push
+ * the record onto the facade's spawned list so killAll/kill still find it.
+ */
+async function spawnLoopBee(
   facade: HiveFacade,
   cfg: LoopConfig,
   loopId: string,
-  iter: number,
+  name: string,
 ): Promise<SessionRecord> {
-  const uniqueName = cfg.carrier === "fresh" ? `loop-${loopId}-i${iter}` : `loop-${loopId}`;
   if (cfg.yolo) {
     const record = await spawnBeeForFlow({
       agent: cfg.bee,
       extraArgs: [],
       cwd: cfg.cwd,
       yolo: true,
-      name: uniqueName,
+      name,
       swarmId: `flow:loop:run:${loopId}`,
       runId: loopId,
       flowName: "loop",
@@ -368,12 +462,26 @@ async function spawnIterationBee(
     await appendLedger({ type: "flow.spawn", flowName: "loop", runId: loopId, session: record.name, agent: record.agent });
     return record;
   }
-  const handle = await facade.spawn({ bee: cfg.bee, cwd: cfg.cwd, name: uniqueName });
+  const handle = await facade.spawn({ bee: cfg.bee, cwd: cfg.cwd, name });
   // facade.spawn tracks internally; resolve the freshly-saved record.
   const { loadSession } = await import("../store.js");
   const record = await loadSession(handle.name);
   if (!record) throw new Error(`spawn produced no session record for ${handle.name}`);
   return record;
+}
+
+/**
+ * Spawn the iteration bee. Fresh-carrier names are unique per iteration to
+ * avoid the "tmux session already exists" collision.
+ */
+async function spawnIterationBee(
+  facade: HiveFacade,
+  cfg: LoopConfig,
+  loopId: string,
+  iter: number,
+): Promise<SessionRecord> {
+  const uniqueName = cfg.carrier === "fresh" ? `loop-${loopId}-i${iter}` : `loop-${loopId}`;
+  return spawnLoopBee(facade, cfg, loopId, uniqueName);
 }
 
 /** Push a record onto the facade's private spawned list (yolo bypass path). */
@@ -395,24 +503,24 @@ async function runSummarizerBee(
 ): Promise<SealRecord> {
   let handle: BeeHandle | undefined;
   try {
-    const name = `loop-${loopId}-sum${iter}`;
-    handle = await facade.spawn({ bee: cfg.bee, cwd: cfg.cwd, name });
-    const { loadSession } = await import("../store.js");
-    const record = await loadSession(handle.name);
-    if (record) {
-      await waitForAgentReady(record, { timeoutMs: bootMs(cfg.bee), acceptTrust: true, raiseDroidAutonomy: cfg.yolo }).catch(
-        () => undefined,
-      );
-    }
-    const progress = await readFileSafe(loopProgressPath(loopId));
+    const record = await spawnLoopBee(facade, cfg, loopId, `loop-${loopId}-sum${iter}`);
+    handle = handleOf(record);
+    await waitForAgentReady(record, { timeoutMs: bootMs(cfg.bee), acceptTrust: true, raiseDroidAutonomy: cfg.yolo }).catch(
+      () => undefined,
+    );
+    const progress = truncateForInjection(await readFileSafe(loopProgressPath(loopId)));
     const brief = [
       `# Summarizer for loop ${loopId} iteration ${iter}`,
-      "Integrate the iteration result below into the carried-forward progress, producing the new complete fold-forward progress, then seal with that as your summary.",
+      "Integrate the iteration result below into the carried-forward progress, producing the new complete fold-forward progress, then seal with that as your summary. Keep it concise — do not let the summary grow without bound.",
       `## Carried-forward progress\n${progress.trim() || "(none yet)"}`,
       `## This iteration's result (status=${loopSeal.status})\n${loopSeal.summary}`,
     ].join("\n\n");
+    const baseline = (await facade.collect(handle).catch(() => null))?.sealedAt ?? null;
     await facade.brief(handle, brief);
-    const seal = await facade.waitForSeal(handle, { timeoutMs: SEAL_TIMEOUT_MS });
+    const seal = await facade.waitForSeal(handle, {
+      timeoutMs: testHooks?.sealTimeoutMs ?? HELPER_SEAL_TIMEOUT_MS,
+      baselineSealedAt: baseline,
+    });
     return seal;
   } catch {
     return loopSeal;
@@ -435,24 +543,24 @@ async function runSummarizerBee(
 async function judgeSaysStop(facade: HiveFacade, cfg: LoopConfig, loopId: string, iter: number): Promise<boolean> {
   let handle: BeeHandle | undefined;
   try {
-    const name = `loop-${loopId}-judge${iter}`;
-    handle = await facade.spawn({ bee: cfg.bee, cwd: cfg.cwd, name });
-    const { loadSession } = await import("../store.js");
-    const record = await loadSession(handle.name);
-    if (record) {
-      await waitForAgentReady(record, { timeoutMs: bootMs(cfg.bee), acceptTrust: true, raiseDroidAutonomy: cfg.yolo }).catch(
-        () => undefined,
-      );
-    }
-    const progress = await readFileSafe(loopProgressPath(loopId));
+    const record = await spawnLoopBee(facade, cfg, loopId, `loop-${loopId}-judge${iter}`);
+    handle = handleOf(record);
+    await waitForAgentReady(record, { timeoutMs: bootMs(cfg.bee), acceptTrust: true, raiseDroidAutonomy: cfg.yolo }).catch(
+      () => undefined,
+    );
+    const progress = truncateForInjection(await readFileSafe(loopProgressPath(loopId)));
     const brief = [
       `# Loop ${loopId} judge`,
       cfg.stop.judge ?? "",
       `## Loop progress so far\n${progress.trim() || "(none yet)"}`,
       'Answer by sealing: status "done" with a summary that begins with "STOP" if the loop should stop, otherwise status "done" with a summary beginning "CONTINUE".',
     ].join("\n\n");
+    const baseline = (await facade.collect(handle).catch(() => null))?.sealedAt ?? null;
     await facade.brief(handle, brief);
-    const seal = await facade.waitForSeal(handle, { timeoutMs: SEAL_TIMEOUT_MS });
+    const seal = await facade.waitForSeal(handle, {
+      timeoutMs: testHooks?.sealTimeoutMs ?? HELPER_SEAL_TIMEOUT_MS,
+      baselineSealedAt: baseline,
+    });
     return /^\s*stop\b/i.test(seal.summary);
   } catch {
     return false;
@@ -496,4 +604,8 @@ async function recordStopCheck(loopId: string, condition: string, result: boolea
 async function readFileSafe(path: string): Promise<string> {
   const { readFile } = await import("node:fs/promises");
   return readFile(path, "utf8").catch(() => "");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

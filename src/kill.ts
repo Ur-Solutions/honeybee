@@ -1,4 +1,4 @@
-import { appendLedger, deleteSession, saveSession, type SessionRecord } from "./store.js";
+import { appendLedger, deleteSession, updateSession, type SessionRecord } from "./store.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 
@@ -38,8 +38,8 @@ function errorMessage(error: unknown): string {
 
 /**
  * Transactional kill: substrate.kill -> poll substrate.hasSession -> only then
- * deleteSession. On failure (substrate reports unable to kill, OR session still
- * exists after polling), the SessionRecord is updated with status='kill_failed'
+ * deleteSession. On failure (session still exists after polling, or its absence
+ * cannot be confirmed), the SessionRecord is updated with status='kill_failed'
  * and lastError. The record is NOT deleted while the bee may still be running.
  *
  * Returns a KillOutcome describing whether the bee is gone (ok=true) or still
@@ -104,17 +104,17 @@ export async function transactionalKill(
     if (i < pollAttempts - 1 && pollIntervalMs > 0) await sleep(pollIntervalMs);
   }
 
-  if (stillRunning || (killReturnedFailure && !alreadyGone)) {
-    const lastError = stillRunning
-      ? (lastProbeError ?? killStderr ?? "session still exists after kill")
-      : (killStderr ?? "kill failed");
-    const updated: SessionRecord = {
-      ...record,
+  // Only the poll verdict decides failure: when it confirmed the session is
+  // gone (stillRunning === false) we proceed to deleteSession even if the
+  // substrate's kill call reported failure — the session may have died
+  // between the hasSession fast-path and the kill (a benign race).
+  if (stillRunning) {
+    const lastError = lastProbeError ?? killStderr ?? "session still exists after kill";
+    await updateSession(record.name, {
       status: "kill_failed",
       lastError,
       updatedAt: new Date().toISOString(),
-    };
-    await saveSession(updated);
+    });
     if (emitLedger) {
       await appendLedger({
         type: "session.kill",

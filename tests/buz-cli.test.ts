@@ -171,6 +171,36 @@ test("hive buz read --consume moves the message from inbox/ to read/", async () 
   }
 });
 
+test("hive buz read --consume reports consumed:false when the message is not in inbox/", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    await seedSession(dir, "CL.cc9");
+    // tier queue lands in queue/, not inbox/, so --consume has nothing to move.
+    const send = await hive(dir, "buz", "send", "CO.aaa", "--sender", "CL.cc9", "--tier", "queue", "-p", "x");
+    const id = send.stdout.split("\t")[2]!;
+    const { stdout, stderr } = await hive(dir, "buz", "read", id, "--consume", "--bee", "CO.aaa");
+    const parsed = JSON.parse(stdout);
+    assert.equal(parsed.consumed, false);
+    assert.match(stderr, /--consume only applies to inbox/);
+    const queue = await readdir(join(dir, "buz", "CO.aaa", "queue"));
+    assert.equal(queue.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz send rejects a bare -p with no value", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    const stderr = await hiveExpectFail(dir, "buz", "send", "CO.aaa", "--sender-human", "t", "--tier", "passive", "-p");
+    assert.match(stderr, /-p requires a value/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hive buz purge --all clears every mailbox", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
   try {

@@ -92,6 +92,13 @@ export type Flow = {
   args?: FlowArg[];
   cleanup?: FlowCleanup;
   run: (ctx: FlowContext) => Promise<unknown> | unknown;
+  /**
+   * Set on placeholder entries returned by listFlows() for registry files
+   * that failed to load (e.g. a TS flow whose imports no longer resolve).
+   * Such a flow's run() throws; the marker lets `hive flow list` surface the
+   * breakage instead of silently hiding the flow.
+   */
+  loadError?: string;
 };
 
 /** User-facing input to defineFlow. `cleanup` defaults to 'keep' at parse time. */
@@ -194,17 +201,55 @@ export async function listFlows(): Promise<Flow[]> {
     const name = file.slice(0, -ext.length);
     if (seen.has(name)) continue;
     seen.add(name);
-    const flow = await loadFlow(name).catch(() => null);
-    if (flow) flows.push(flow);
+    try {
+      const flow = await loadFlow(name);
+      if (flow) flows.push(flow);
+    } catch (error) {
+      // A registered flow that fails to load must stay VISIBLE — silently
+      // dropping it makes `hive flow list` lie about the registry. Surface a
+      // placeholder whose loadError carries the diagnosis.
+      flows.push(unloadableFlow(name, error));
+    }
   }
   return flows.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function unloadableFlow(name: string, error: unknown): Flow {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    name,
+    description: `(unloadable: ${message})`,
+    cleanup: "keep",
+    loadError: message,
+    run: async () => {
+      throw new Error(`Flow ${name} failed to load: ${message}`);
+    },
+  };
 }
 
 export async function loadFlow(name: string): Promise<Flow | null> {
   const builtin = BUILTIN_FLOW_LOADERS[name];
   if (builtin) return builtin();
   const tsPath = flowFilePath(name, ".ts");
-  if (await pathExists(tsPath)) return validateFlow(await loadTsModule(tsPath), name);
+  if (await pathExists(tsPath)) {
+    try {
+      return validateFlow(await loadTsModule(tsPath), name);
+    } catch (registryError) {
+      // The registry copy is a SINGLE file — a TS flow with relative imports
+      // validates at define time (imported from its original location) but its
+      // registry copy cannot resolve those imports. Fall back to the recorded
+      // source path before giving up.
+      const source = await loadFlowSource(name).catch(() => null);
+      if (source && resolve(source) !== resolve(tsPath) && (await pathExists(source))) {
+        try {
+          return validateFlow(await loadTsModule(source), name);
+        } catch {
+          throw registryError;
+        }
+      }
+      throw registryError;
+    }
+  }
   const jsonPath = flowFilePath(name, ".json");
   if (await pathExists(jsonPath)) {
     const raw = await readFile(jsonPath, "utf8");

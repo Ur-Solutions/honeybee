@@ -1,4 +1,5 @@
 import { hasAgentDriver } from "./drivers.js";
+import { LOCAL_NODE_NAME } from "./node.js";
 import { isAgentActivePane, isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "./readiness.js";
 import type { SessionRecord } from "./store.js";
 
@@ -15,12 +16,23 @@ export type BeeState =
   | "node_unreachable";
 
 export type StateContext = {
+  /**
+   * Live tmux sessions keyed by liveTargetKey(node, target) so that targets
+   * with the same name on different nodes never shadow each other. Bare
+   * target names are still honored for single-node callers (back-compat).
+   */
   liveTargets: Set<string>;
   panes?: Map<string, string>;
   seals?: Set<string>;
   unreachableNodes?: Set<string>;
   now?: number;
 };
+
+/** Node-qualified liveness key; node defaults to the implicit local node. */
+export function liveTargetKey(node: string | undefined, target: string): string {
+  const nodeName = node && node.length > 0 ? node : LOCAL_NODE_NAME;
+  return `${nodeName} ${target}`;
+}
 
 export type DerivedState = {
   state: BeeState;
@@ -38,12 +50,14 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   // node_unreachable takes precedence over dead/sealed because we cannot trust the
   // liveTargets set when the bee's node failed to respond — we don't actually know
   // whether the session is alive.
-  const nodeName = record.node && record.node.length > 0 ? record.node : "local";
+  const nodeName = record.node && record.node.length > 0 ? record.node : LOCAL_NODE_NAME;
   if (context.unreachableNodes?.has(nodeName)) {
     return { state: "node_unreachable", detail: `node ${nodeName} offline` };
   }
 
-  if (!context.liveTargets.has(record.tmuxTarget)) {
+  const live = context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget))
+    || context.liveTargets.has(record.tmuxTarget);
+  if (!live) {
     if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
     return { state: "dead", detail: lastActivityHint(record, context) };
   }
@@ -123,7 +137,9 @@ export function isTerminalState(state: BeeState): boolean {
 function lastActivityHint(record: SessionRecord, _context: StateContext): string {
   const fields = [record.lastPromptAt, record.briefedAt, record.updatedAt].filter((value): value is string => typeof value === "string");
   if (fields.length === 0) return "no recorded activity";
-  return `last activity ${fields[0]}`;
+  const max = pickMax(...fields.map((value) => Date.parse(value)));
+  const latest = fields.find((value) => Date.parse(value) === max) ?? fields[0]!;
+  return `last activity ${latest}`;
 }
 
 function describeActivity(record: SessionRecord): string {

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { listSeals, loadLatestSeal, recordSeal, sealedBeeNames, validateSealArtifact } from "../src/seal.js";
+import { listSeals, loadLatestSeal, recordSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-seal-"));
@@ -82,6 +82,28 @@ test("loadLatestSeal returns the newest of multiple seals", async () => {
     await recordSeal("CL.cc9", validateSealArtifact({ status: "done", summary: "second" }));
     const latest = await loadLatestSeal("CL.cc9");
     assert.equal(latest?.summary, "second");
+  });
+});
+
+test("loadLatestSeal reads only the lexicographically-newest file and skips corrupt ones", async () => {
+  await withTempStore(async () => {
+    await recordSeal("CL.fast", validateSealArtifact({ status: "done", summary: "older valid" }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await recordSeal("CL.fast", validateSealArtifact({ status: "done", summary: "newest valid" }));
+    const latest = await loadLatestSeal("CL.fast");
+    assert.equal(latest?.summary, "newest valid");
+
+    // A corrupt file that sorts AFTER every real seal must be skipped,
+    // falling back to the newest valid one.
+    await writeFile(join(sealsRoot(), "CL.fast", "9999-corrupt.json"), "not json", { mode: 0o600 });
+    const fallback = await loadLatestSeal("CL.fast");
+    assert.equal(fallback?.summary, "newest valid");
+  });
+});
+
+test("loadLatestSeal returns null for a bee with no seals", async () => {
+  await withTempStore(async () => {
+    assert.equal(await loadLatestSeal("CL.none"), null);
   });
 });
 

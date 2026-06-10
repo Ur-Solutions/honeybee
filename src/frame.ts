@@ -54,11 +54,22 @@ export async function frameExists(name: string): Promise<boolean> {
   return (await loadFrame(name)) !== null;
 }
 
+/** Locate the on-disk definition backing a frame (.ts wins, mirroring loadFrame). */
+export async function frameDefinitionFile(name: string): Promise<{ path: string; ext: ".json" | ".ts" } | null> {
+  for (const ext of [".ts", ".json"] as const) {
+    const path = frameFilePath(name, ext);
+    if (await pathExists(path)) return { path, ext };
+  }
+  return null;
+}
+
 export async function writeFrameFromObject(frame: Frame): Promise<Frame> {
   const validated = validateFrame(frame);
   await ensureDir();
   const target = frameFilePath(validated.name, ".json");
   await atomicWriteFile(target, `${JSON.stringify(validated, null, 2)}\n`, { mode: 0o600 });
+  // loadFrame prefers .ts — remove a stale sibling so the write takes effect.
+  await rm(frameFilePath(validated.name, ".ts"), { force: true });
   return validated;
 }
 
@@ -71,6 +82,12 @@ export async function defineFrameFromFile(sourcePath: string, nameOverride?: str
 
   const loaded = ext === ".ts" ? await loadTsModule(absolute) : JSON.parse(await readFile(absolute, "utf8"));
   const draft = validateFrame(loaded);
+  // A .ts source is copied verbatim, so a renamed copy would always fail the
+  // "file declares <name>" check on load. Refuse instead of writing a frame
+  // that can never be loaded.
+  if (ext === ".ts" && nameOverride !== undefined && nameOverride !== draft.name) {
+    throw new Error(`Cannot rename a .ts frame at define time: the source declares "${draft.name}". Rename it in the source file, or use a .json frame.`);
+  }
   const finalName = nameOverride ?? draft.name;
   if (!validFrameName(finalName)) throw new Error(`Invalid frame name: ${finalName}`);
   const frame: Frame = { ...draft, name: finalName };
@@ -80,6 +97,9 @@ export async function defineFrameFromFile(sourcePath: string, nameOverride?: str
   await copyFile(absolute, target);
   // For TS frames there is no normalization step; for JSON we rewrite with the canonical name.
   if (ext === ".json") await atomicWriteFile(target, `${JSON.stringify(frame, null, 2)}\n`, { mode: 0o600 });
+  // Remove the other-extension sibling so it cannot shadow (loadFrame prefers
+  // .ts) or linger after a redefine from the other format.
+  await rm(frameFilePath(finalName, ext === ".json" ? ".ts" : ".json"), { force: true });
   await atomicWriteFile(frameSourcePath(finalName), `${absolute}\n`, { mode: 0o600 });
   await appendLedger({ type: "frame.define", name: finalName, source: absolute });
   return frame;

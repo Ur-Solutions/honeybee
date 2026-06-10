@@ -3,7 +3,7 @@ import { acquireLongLivedLock, type LongLivedLock, LockBusyError } from "../fsx.
 import { listNodes, type NodeRecord } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
-import { deriveState, type BeeState, type StateContext } from "../state.js";
+import { deriveState, liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
 import { dispatchAutoswaps, type AutoswapOutcome } from "./autoswap.js";
@@ -139,10 +139,13 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
       errors.push(toError(error));
     }
 
-    try {
-      await deps.refreshTranscriptMetadata?.(record);
-    } catch (error) {
-      errors.push(toError(error));
+    // Dead/sealed bees no longer produce transcript updates — skip the refresh.
+    if (derived.state !== "dead" && derived.state !== "sealed") {
+      try {
+        await deps.refreshTranscriptMetadata?.(record);
+      } catch (error) {
+        errors.push(toError(error));
+      }
     }
   }
 
@@ -504,7 +507,7 @@ async function defaultProbeNodes(nodes: NodeRecord[]): Promise<ProbeResult> {
         return;
       }
       const result = await withTimeout(substrate.listSessions(), timeoutMs);
-      for (const target of result) liveTargets.add(target);
+      for (const target of result) liveTargets.add(liveTargetKey(node.name, target));
     } catch {
       unreachableNodes.add(node.name);
     }
@@ -514,7 +517,7 @@ async function defaultProbeNodes(nodes: NodeRecord[]): Promise<ProbeResult> {
 }
 
 async function defaultCapturePanes(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
-  const liveRecords = records.filter((record) => liveTargets.has(record.tmuxTarget));
+  const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
   const entries = await Promise.all(
     liveRecords.map(async (record) => {
       try {

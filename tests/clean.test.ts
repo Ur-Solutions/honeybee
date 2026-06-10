@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { deadSessionRecords, idleOlderThanMillis, olderThanMillis, parseAge } from "../src/clean.js";
+import { liveTargetKey } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 import { hasSession as tmuxHasSession, kill as tmuxKill, newSession as tmuxNewSession } from "../src/tmux.js";
 
@@ -18,7 +19,17 @@ test("deadSessionRecords returns sessions whose tmux target is not live", () => 
     session("GR.ccc", "GR-ccc"),
   ];
 
-  assert.deepEqual(deadSessionRecords(records, new Set(["CO-aaa", "GR-ccc"])).map((record) => record.name), ["CL.bbb"]);
+  const live = new Set([liveTargetKey(undefined, "CO-aaa"), liveTargetKey(undefined, "GR-ccc")]);
+  assert.deepEqual(deadSessionRecords(records, live).map((record) => record.name), ["CL.bbb"]);
+});
+
+test("deadSessionRecords does not let a same-named session on another node protect a dead record", () => {
+  const localDead = session("CO.aaa", "CO-aaa");
+  const remoteLive = { ...session("CO.bbb", "CO-aaa"), node: "mini01" };
+
+  // Only mini01 has a live "CO-aaa" session; the local record is dead.
+  const live = new Set([liveTargetKey("mini01", "CO-aaa")]);
+  assert.deepEqual(deadSessionRecords([localDead, remoteLive], live).map((record) => record.name), ["CO.aaa"]);
 });
 
 test("olderThanMillis filters by last update age", () => {
@@ -105,6 +116,23 @@ test("hive clean --idle kills idle local tmux sessions and leaves active session
     await tmuxKill(oldIdleTarget).catch(() => undefined);
     await tmuxKill(newIdleTarget).catch(() => undefined);
     await tmuxKill(activeTarget).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive clean -i rejects --dry-run and --older-than", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-interactive-"));
+  try {
+    for (const extra of [["--dry-run"], ["--older-than", "1h"]]) {
+      await assert.rejects(
+        execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "-i", ...extra], {
+          cwd: process.cwd(),
+          env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+        }),
+        /does not support --dry-run\/--older-than/,
+      );
+    }
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

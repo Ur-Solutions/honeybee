@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
@@ -108,9 +108,10 @@ function suffixReference(record: { id?: string; uuid?: string }): { display: str
 }
 
 function shortestUnusedUuidPrefixLength(uuid: string, used: Set<string>): number {
+  const existingIds = [...used];
   for (let length = MIN_UUID_CHARS; length <= uuid.length; length += 1) {
     const candidate = uuid.slice(0, length);
-    if (![...used].some((existing) => existing.startsWith(candidate))) return length;
+    if (!existingIds.some((existing) => existing.startsWith(candidate))) return length;
   }
   return uuid.length;
 }
@@ -127,14 +128,41 @@ function normalizeUuid(value: string): string {
 }
 
 async function readIndex(storeRoot: string): Promise<IdIndex> {
+  const path = indexPath(storeRoot);
+  let raw: string;
   try {
-    const parsed = JSON.parse(await readFile(indexPath(storeRoot), "utf8")) as unknown;
-    const object = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
-    return { used: Array.isArray(object.used) ? object.used.map((value) => normalizeUuid(String(value))) : [] };
+    raw = await readFile(path, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { used: [] };
     throw error;
   }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    // A corrupt index must not brick spawning forever. Move the file aside for
+    // post-mortem and start over; historical short ids may collide with future
+    // allocations, but that beats a hive that can never spawn again.
+    const aside = `${path}.corrupt-${Date.now()}`;
+    await rename(path, aside).catch(() => undefined);
+    console.error(`hive: id-index.json is corrupt (${error instanceof Error ? error.message : String(error)}); moved it to ${aside} and starting a fresh index`);
+    return { used: [] };
+  }
+
+  const object = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  const used: string[] = [];
+  if (Array.isArray(object.used)) {
+    for (const value of object.used) {
+      try {
+        used.push(normalizeUuid(String(value)));
+      } catch {
+        // One malformed entry must not block allocation of every future id.
+        console.error(`hive: skipping invalid id-index entry: ${String(value)}`);
+      }
+    }
+  }
+  return { used };
 }
 
 async function writeIndex(root: string, index: IdIndex): Promise<void> {

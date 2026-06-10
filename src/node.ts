@@ -107,7 +107,9 @@ export async function registerNode(input: RegisterNodeInput): Promise<NodeRecord
   if (input.kind !== "local-tmux" && input.kind !== "ssh-tmux") throw new Error(`Invalid node kind: ${input.kind}. Use local-tmux or ssh-tmux.`);
   if (!input.endpoint || input.endpoint.length === 0) throw new Error("Node endpoint is required");
   if (input.sshCommand && /\s/.test(input.sshCommand)) {
-    throw new Error(`--ssh-command must be a single binary path with no whitespace. Use --ssh-args for flags (e.g. --ssh-args "-F /etc/ssh/config").`);
+    // The flag parser treats a value starting with "-" as a boolean unless the
+    // "=" form is used, so the hint must show --ssh-args="...".
+    throw new Error(`--ssh-command must be a single binary path with no whitespace. Use --ssh-args="..." for flags (e.g. --ssh-args="-F /path/to/config").`);
   }
 
   const fileExists = isFileNode(nodePath(input.name));
@@ -162,7 +164,7 @@ export async function updateNode(name: string, patch: UpdateNodePatch): Promise<
   if (patch.sshCommand !== undefined) {
     if (patch.sshCommand === "") delete updated.sshCommand;
     else {
-      if (/\s/.test(patch.sshCommand)) throw new Error(`--ssh-command must be a single binary path with no whitespace. Use --ssh-args for flags.`);
+      if (/\s/.test(patch.sshCommand)) throw new Error(`--ssh-command must be a single binary path with no whitespace. Use --ssh-args="..." for flags (e.g. --ssh-args="-F /path/to/config").`);
       updated.sshCommand = patch.sshCommand;
     }
   }

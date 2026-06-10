@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { defineFlow, type BeeHandle, type FlowContext, type FlowHive, type FlowS
 import { parseJsonFlow } from "../src/flow/json.js";
 import { executeFlow } from "../src/flow/run.js";
 import { HiveFacade } from "../src/flow/hive_facade.js";
-import { findRunById, generateRunId, listRuns, readMeta, readResult, runDir, writeMeta } from "../src/flow/runs.js";
+import { findRunById, generateRunId, listRuns, PIDLESS_RUNNING_GRACE_MS, readMeta, readResult, runDir, writeMeta } from "../src/flow/runs.js";
 import { saveSession, type SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> {
@@ -77,6 +78,49 @@ test("executeFlow records failure with stack in result.json", async () => {
     const result = await readResult("boom", outcome.runId);
     assert.equal(result?.status, "failed");
     assert.equal(result?.error?.message, "kaboom");
+  });
+});
+
+test("executeFlow survives an unserializable (circular) return value and persists terminal status", async () => {
+  await withTempStore(async () => {
+    const flow = defineFlow({
+      name: "circ",
+      run: async () => {
+        const value: Record<string, unknown> = { note: "circular" };
+        value.self = value;
+        return value;
+      },
+    });
+    const outcome = await executeFlow(flow, { installSignalHandlers: false });
+    assert.equal(outcome.status, "ok");
+    // meta.json must NOT be stranded on "running".
+    const meta = await readMeta("circ", outcome.runId);
+    assert.equal(meta?.status, "ok");
+    assert.ok(meta?.endedAt);
+    // result.json exists with the value substituted by a defensive string.
+    const result = await readResult("circ", outcome.runId);
+    assert.equal(result?.status, "ok");
+    assert.match(String(result?.value ?? ""), /unserializable flow result/);
+  });
+});
+
+test("executeFlow persists pgid derived from the detached-run env marker", async () => {
+  await withTempStore(async () => {
+    // Simulates the child of spawnDetachedRun whose startup write BEATS the
+    // parent's pid/pgid meta patch: no pre-existing meta, env marker set.
+    const previous = process.env.HIVE_FLOW_DETACHED;
+    process.env.HIVE_FLOW_DETACHED = "1";
+    try {
+      const flow = defineFlow({ name: "detached-env", run: async () => "ok" });
+      const outcome = await executeFlow(flow, { installSignalHandlers: false });
+      const meta = await readMeta("detached-env", outcome.runId);
+      // detached:true makes the child its own group leader ⇒ pgid === pid.
+      assert.equal(meta?.pgid, process.pid);
+      assert.equal(meta?.background, true);
+    } finally {
+      if (previous === undefined) delete process.env.HIVE_FLOW_DETACHED;
+      else process.env.HIVE_FLOW_DETACHED = previous;
+    }
   });
 });
 
@@ -318,6 +362,161 @@ test("listRuns downgrades running+dead-pid to orphaned in returned view", async 
     const match = all.find((r) => r.runId === runId);
     assert.ok(match);
     assert.equal(match?.status, "orphaned");
+  });
+});
+
+test("listRuns downgrades a STALE pid-less running record to orphaned, but not a fresh one", async () => {
+  await withTempStore(async () => {
+    // A "running" record with no pid can only mean the spawn died between the
+    // pre-write and the pid patch — but ONLY after a grace period, so the
+    // legitimate (milliseconds-long) pre-write→patch window never misfires.
+    const staleId = generateRunId();
+    await writeMeta("pidless", staleId, {
+      runId: staleId,
+      flowName: "pidless",
+      args: {},
+      status: "running",
+      startedAt: new Date(Date.now() - PIDLESS_RUNNING_GRACE_MS - 5_000).toISOString(),
+    });
+    const freshId = generateRunId();
+    await writeMeta("pidless", freshId, {
+      runId: freshId,
+      flowName: "pidless",
+      args: {},
+      status: "running",
+      startedAt: new Date().toISOString(),
+    });
+    const all = await listRuns({ flowName: "pidless" });
+    const stale = all.find((r) => r.runId === staleId);
+    const fresh = all.find((r) => r.runId === freshId);
+    assert.equal(stale?.status, "orphaned");
+    assert.equal(fresh?.status, "running");
+    // The downgrade is view-level only.
+    assert.equal((await readMeta("pidless", staleId))?.status, "running");
+  });
+});
+
+test("cancelRun persists a terminal status for a pid-less, pgid-less running record", async () => {
+  await withTempStore(async () => {
+    const runId = generateRunId();
+    await writeMeta("strand", runId, {
+      runId,
+      flowName: "strand",
+      args: {},
+      status: "running",
+      startedAt: new Date().toISOString(),
+      // no pid, no pgid: the spawn died before the patch.
+    });
+    const outcome = await cancelRun("strand", runId);
+    assert.equal(outcome.signalled, "already-dead");
+    // Regression: this used to return WITHOUT persisting, leaving the record
+    // "running" forever with nothing able to downgrade or cancel it.
+    const meta = await readMeta("strand", runId);
+    assert.equal(meta?.status, "cancelled");
+    assert.ok(meta?.endedAt);
+  });
+});
+
+test("cancelRun re-reads meta and does NOT clobber a concurrently-written terminal status", async () => {
+  await withTempStore(async () => {
+    const runId = generateRunId();
+    const base = {
+      runId,
+      flowName: "clobber",
+      args: {},
+      status: "running" as const,
+      startedAt: new Date().toISOString(),
+      pid: 1_000_000,
+      pgid: 1_000_000,
+      background: true,
+    };
+    await writeMeta("clobber", runId, base);
+    const outcome = await cancelRun("clobber", runId, {
+      graceMs: 50,
+      pollMs: 10,
+      killImpl: () => {
+        // Simulate the child finishing (writing "ok") concurrently with the
+        // cancel — between cancelRun's initial read and its final write. The
+        // write is synchronous so it deterministically lands before the
+        // re-read in cancelRun's final step.
+        writeFileSync(
+          join(runDir("clobber", runId), "meta.json"),
+          `${JSON.stringify({ ...base, status: "ok", endedAt: new Date().toISOString() }, null, 2)}\n`,
+        );
+      },
+      isAlive: () => false,
+    });
+    assert.equal(outcome.signalled, "SIGTERM");
+    const meta = await readMeta("clobber", runId);
+    assert.equal(meta?.status, "ok", "the child's terminal status must not be overwritten by a stale snapshot");
+  });
+});
+
+test("spawnDetachedRun persists status=failed when the spawn itself fails", async () => {
+  await withTempStore(async () => {
+    const flow = defineFlow({ name: "bg-spawnfail", run: async () => "x" });
+    const runId = generateRunId();
+    await assert.rejects(
+      () =>
+        spawnDetachedRun(flow, {}, {
+          runId,
+          entryOverride: "/tmp/whatever-entry.js",
+          execPath: "/nonexistent/honeybee-test-node-binary",
+        }),
+      /spawn failed/,
+    );
+    // Regression: the pre-written meta used to stay "running" with no pid.
+    const meta = await readMeta("bg-spawnfail", runId);
+    assert.equal(meta?.status, "failed");
+    assert.ok(meta?.endedAt);
+  });
+});
+
+test("spawnDetachedRun defaults execArgv to the parent's process.execArgv (minus test/watch flags)", async () => {
+  await withTempStore(async () => {
+    const fixtureDir = await mkdtemp(join(tmpdir(), "honeybee-bg-fix-"));
+    const originalExecArgv = process.execArgv;
+    try {
+      // Fixture dumps its own execArgv next to the meta so we can assert what
+      // the child actually received.
+      const fixture = join(fixtureDir, "fixture.cjs");
+      await writeFile(
+        fixture,
+        `
+const { mkdir, writeFile } = require('node:fs/promises');
+const { join } = require('node:path');
+async function main() {
+  const runId = process.argv[3];
+  let flowName;
+  for (let i = 4; i < process.argv.length; i += 1) {
+    if (process.argv[i] === '--flow') flowName = process.argv[i + 1];
+  }
+  const dir = join(process.env.HIVE_STORE_ROOT, 'flows', flowName, 'runs', runId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'execargv.json'), JSON.stringify(process.execArgv));
+}
+main().catch((e) => { console.error(e); process.exit(1); });
+`,
+        { mode: 0o600 },
+      );
+      // Loader-ish flag propagates; test-runner/watch flags are stripped.
+      process.execArgv = ["--no-warnings", "--test", "--watch"];
+      const flow = defineFlow({ name: "bg-execargv", run: async () => "x" });
+      const result = await spawnDetachedRun(flow, {}, { entryOverride: fixture });
+      const dumpPath = join(runDir("bg-execargv", result.runId), "execargv.json");
+      const deadline = Date.now() + 5_000;
+      let dumped: string | null = null;
+      while (Date.now() < deadline) {
+        dumped = await readFile(dumpPath, "utf8").catch(() => null);
+        if (dumped) break;
+        await sleep(50);
+      }
+      assert.ok(dumped, "child fixture must have written its execArgv");
+      assert.deepEqual(JSON.parse(dumped!), ["--no-warnings"]);
+    } finally {
+      process.execArgv = originalExecArgv;
+      await rm(fixtureDir, { recursive: true, force: true });
+    }
   });
 });
 

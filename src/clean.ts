@@ -1,8 +1,11 @@
 import type { SessionRecord } from "./store.js";
 import { formatRelativeTime } from "./format.js";
+import { liveTargetKey } from "./state.js";
 
 export function deadSessionRecords(records: SessionRecord[], liveTargets: Set<string>): SessionRecord[] {
-  return records.filter((record) => !liveTargets.has(record.tmuxTarget));
+  // liveTargets is keyed by liveTargetKey(node, target) so a session on one
+  // node never protects a same-named record on another.
+  return records.filter((record) => !liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
 }
 
 export function olderThanMillis(records: SessionRecord[], ageMs: number, now = Date.now()): SessionRecord[] {

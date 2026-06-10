@@ -11,7 +11,8 @@
 //
 // Tiers:
 //   interrupt — substrate.sendText immediately + copy in inbox/
-//   queue     — store in queue/ (drained by daemon on active->idle_with_output)
+//   queue     — store in queue/ (drained by the daemon whenever the
+//               recipient is observed idle_with_output)
 //   passive   — store in inbox/ only, no live delivery
 //
 // Per-recipient policy: SessionRecord.buzAccept lists allowed tiers. Missing
@@ -27,6 +28,7 @@
 // route via ~/.hive/buz/_external/<sanitized>/outbox/ so audit trails can
 // distinguish bee-from-bee from human-from-bee traffic.
 
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { parseBuzDocument, serializeBuzDocument, type BuzFrontmatter } from "./buz_format.js";
@@ -88,7 +90,7 @@ export type BuzSendResult = {
 };
 
 // ──────────────────────────────────────────────────────────────────────────
-// ID generation: 13-char base32 timestamp + 4-hex random, sortable.
+// ID generation: 13-char base32 timestamp + 6-hex random, sortable.
 // ──────────────────────────────────────────────────────────────────────────
 
 // Crockford-style base32 (no I, L, O, U). Sorts lexicographically the same
@@ -96,7 +98,7 @@ export type BuzSendResult = {
 const BASE32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 export function generateMessageId(now: number = Date.now()): string {
-  return `${encodeBase32(now, 13)}-${randomHex(4)}`;
+  return `${encodeBase32(now, 13)}-${randomHex(3)}`;
 }
 
 function encodeBase32(value: number, length: number): string {
@@ -114,12 +116,10 @@ function encodeBase32(value: number, length: number): string {
   return out.join("");
 }
 
+// crypto-strength randomness: Math.random suffixes collided across
+// same-millisecond sends (broadcasts), silently overwriting mailbox files.
 function randomHex(bytes: number): string {
-  let out = "";
-  for (let i = 0; i < bytes; i += 1) {
-    out += Math.floor(Math.random() * 16).toString(16);
-  }
-  return out;
+  return randomBytes(bytes).toString("hex");
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -296,9 +296,6 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
     ...(downgrade.reason ? { reason: downgrade.reason } : {}),
   };
 
-  // Always write the outbox copy (mirrored at the sender side for audit).
-  result.outboxPath = await writeOutbox(message);
-
   // Serialize per-bee writes so two concurrent senders cannot collide on
   // the same filename / mailbox. We have a single lock per recipient bee.
   await withFileLock(senderLockPath(input.recipient.name), async () => {
@@ -351,6 +348,11 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
       result.inboxPath = await writeMailbox(input.recipient.name, "inbox", message);
     }
   });
+
+  // Write the sender-side outbox audit copy AFTER the delivery block: an
+  // interrupt can downgrade to queue mid-delivery (missing transport,
+  // transport failure), so only now are deliveredAs/deliveredAt final.
+  result.outboxPath = await writeOutbox(message);
 
   await appendLedger({
     type: "buz.send",
@@ -543,8 +545,9 @@ export type DaemonDrainContext = {
    * Daemon dispatcher behavior: stop draining after the first substrate
    * failure (the broken substrate likely cannot deliver subsequent messages
    * either). Subsequent messages remain in queue and will be retried on the
-   * next tick. Retries/quarantine bookkeeping for the failing message still
-   * runs before the loop terminates.
+   * next tick the recipient is observed idle_with_output. Retries/quarantine
+   * bookkeeping for the failing message still runs before the loop
+   * terminates.
    */
   stopOnFirstFailure?: boolean;
 };
@@ -560,9 +563,13 @@ export type DrainResult = {
 // Quarantines on repeated substrate failures (counter held in a sidecar
 // .retries file per message so we survive restarts).
 //
-// This function is exported for daemon use (patch 9). It is intentionally
-// idempotent: calling it twice with the same queue contents results in the
-// same final inbox files.
+// This function is exported for daemon use (patch 9). Delivery semantics
+// are AT-LEAST-ONCE, not idempotent: the pane paste (sendText) and the
+// queue->inbox rename are two separate steps, so a crash between them
+// leaves the message in queue/ and the next drain pastes it again. We
+// accept the rare duplicate paste rather than build a staging protocol;
+// the inbox file itself is written at most once (rename preserves the
+// filename, so re-drains converge on the same final inbox state).
 export async function processQueueForBee(
   record: SessionRecord,
   context: DaemonDrainContext,

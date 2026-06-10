@@ -22,9 +22,9 @@ import {
 } from "../buz.js";
 import { transactionalKill } from "../kill.js";
 import { LOCAL_NODE_NAME, loadNodeSync, type NodeRecord } from "../node.js";
-import { listSeals, loadLatestSeal, recordSeal, type SealArtifact, type SealRecord } from "../seal.js";
+import { loadLatestSeal, recordSeal, type SealArtifact, type SealRecord } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
-import { appendLedger, loadSession, saveSession, type SessionRecord } from "../store.js";
+import { appendLedger, loadSession, updateSession, type SessionRecord } from "../store.js";
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
 import { spawnBeeForFlow, type SpawnBeeOptions } from "../agents.js";
 import { waitForIdle } from "../wait.js";
@@ -35,6 +35,7 @@ import {
   type LoopConfig,
   readLoopConfig,
   requestStop,
+  updateLoopConfig,
   writeLoopConfig,
 } from "../loop/state.js";
 import type { BeeHandle, FlowSpawnInput } from "./index.js";
@@ -70,6 +71,14 @@ export type FacadeWaitOptions = {
 export type FacadeSealOptions = {
   timeoutMs?: number;
   pollMs?: number;
+  /**
+   * Pre-captured baseline: the latest sealedAt observed BEFORE the triggering
+   * send (null when the bee had no seals yet). When provided, waitForSeal
+   * accepts any seal newer than this instead of taking its own baseline after
+   * the send — closing the race where a fast seal lands in the gap between the
+   * send and the wait and is then mistaken for the baseline.
+   */
+  baselineSealedAt?: string | null;
 };
 
 /** Input to HiveFacade.loop() — the programmatic surface for starting a loop. */
@@ -115,6 +124,21 @@ export class HiveFacade {
   /** Names of every bee spawned during this run. Useful for callers. */
   spawnedNames(): string[] {
     return this.spawned.map((r) => r.name);
+  }
+
+  /**
+   * Remove a bee from the spawned list WITHOUT killing it — killAll() and the
+   * kill-on-end cleanup will leave it alone afterwards. Used by the loop
+   * driver when pausing: the operator must be able to attach to the very bee
+   * that blocked, so end-of-flow cleanup must not destroy it.
+   */
+  untrack(name: string): boolean {
+    const idx = this.spawned.findIndex((r) => r.name === name);
+    if (idx >= 0) {
+      this.spawned.splice(idx, 1);
+      return true;
+    }
+    return false;
   }
 
   /** ---------------------- spawn ---------------------- */
@@ -167,7 +191,7 @@ export class HiveFacade {
     const record = await this.resolveRecord(target);
     await substrateFor(record).sendText(record.tmuxTarget, text);
     const now = new Date().toISOString();
-    await saveSession({ ...record, updatedAt: now, status: "running", lastPrompt: text, lastPromptAt: now });
+    await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: text, lastPromptAt: now });
     await appendLedger({
       type: "flow.send",
       flowName: this.flowName,
@@ -182,8 +206,7 @@ export class HiveFacade {
     const record = await this.resolveRecord(target);
     await substrateFor(record).sendText(record.tmuxTarget, text);
     const now = new Date().toISOString();
-    await saveSession({
-      ...record,
+    await updateSession(record.name, {
       updatedAt: now,
       status: "running",
       brief: text,
@@ -215,15 +238,17 @@ export class HiveFacade {
   }
 
   /**
-   * Poll listSeals for the bee until a new seal appears, or timeoutMs lapses.
-   * Mirrors waitForSeal() in cli.ts. Honors the facade abort signal.
+   * Poll the latest seal for the bee until a new one appears, or timeoutMs
+   * lapses. Mirrors waitForSeal() in cli.ts. Honors the facade abort signal.
    */
   async waitForSeal(target: BeeRef, options: FacadeSealOptions = {}): Promise<SealRecord> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
     const timeoutMs = options.timeoutMs ?? 600_000;
     const pollMs = Math.max(100, options.pollMs ?? 1_000);
-    const baseline = (await listSeals(record.name))[0]?.sealedAt;
+    const baseline = options.baselineSealedAt !== undefined
+      ? options.baselineSealedAt ?? undefined
+      : (await loadLatestSeal(record.name))?.sealedAt;
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       if (this.signal?.aborted) throw new Error(`waitForSeal aborted: ${record.name}`);
@@ -344,7 +369,19 @@ export class HiveFacade {
     await ensureLoopDir(loopId);
     await writeLoopConfig(cfg);
     const args = loopArgsFromSpec(spec, loopId);
-    await spawnDetachedRun(loopFlow, args, { runId: loopId });
+    try {
+      await spawnDetachedRun(loopFlow, args, { runId: loopId });
+    } catch (error) {
+      // The pre-written loop.json says "running" with no pid — nothing could
+      // ever reconcile it. Persist a terminal status before rethrowing.
+      const message = error instanceof Error ? error.message : String(error);
+      await updateLoopConfig(loopId, {
+        status: "errored",
+        stopReason: `spawn:${message}`,
+        endedAt: new Date().toISOString(),
+      }).catch(() => undefined);
+      throw error;
+    }
     await appendLedger({ type: "loop.start", loopId, bee: cfg.bee, context: cfg.context });
     return loopId;
   }

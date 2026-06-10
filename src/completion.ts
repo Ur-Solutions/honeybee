@@ -8,6 +8,7 @@ import { type Flow, listFlows } from "./flow/index.js";
 import { listRuns } from "./flow/runs.js";
 import { highlightUniqueSessionReference } from "./ids.js";
 import { listNodes, type NodeRecord } from "./node.js";
+import { BOOLEAN_FLAGS } from "./parse.js";
 import { listSessions, type SessionRecord } from "./store.js";
 import { listSwarms, type SwarmRecord } from "./swarm.js";
 import { listTmuxSessions } from "./tmux.js";
@@ -373,12 +374,19 @@ function expandTilde(value: string): string {
   return value;
 }
 
+// Boolean flags (--yolo, --json, ...) never consume a value; treating them as
+// value-taking would swallow the following positional during completion.
+function flagConsumesValue(token: string): boolean {
+  if (token.includes("=")) return false;
+  return !BOOLEAN_FLAGS.has(token.replace(/^-+/, ""));
+}
+
 function positionalAt(args: string[], index: number): string | undefined {
   let count = 0;
   for (let i = 1; i < args.length - 1; i += 1) {
     const token = args[i]!;
     if (token.startsWith("-")) {
-      if (i + 1 < args.length - 1 && !args[i + 1]!.startsWith("-")) i += 1;
+      if (flagConsumesValue(token) && i + 1 < args.length - 1 && !args[i + 1]!.startsWith("-")) i += 1;
       continue;
     }
     if (count === index) return token;
@@ -429,7 +437,7 @@ function positionalIndexOf(args: string[]): number {
   for (let i = 1; i < args.length - 1; i += 1) {
     const token = args[i]!;
     if (token.startsWith("-")) {
-      if (i + 1 < args.length - 1 && !args[i + 1]!.startsWith("-")) i += 1;
+      if (flagConsumesValue(token) && i + 1 < args.length - 1 && !args[i + 1]!.startsWith("-")) i += 1;
       continue;
     }
     index += 1;
