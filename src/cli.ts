@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { access, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
@@ -9,16 +9,16 @@ import {
   activateAccountIntoHome,
   addAccount,
   captureAccountFromHome,
-  defaultCaamVaultDir,
   defaultHomeForAccount,
   findAccount,
-  importCaam,
   listAccounts,
   removeAccount,
   resolveSpawnAgent,
   vaultRoot,
 } from "./accounts.js";
 import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
+import { credentialDigest, readClaudeKeychain } from "./keychain.js";
+import { accountLimits, paceDelta, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { swapAccount } from "./swap.js";
 import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
@@ -93,7 +93,7 @@ import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./
 import { resolveSelector } from "./selectors.js";
 import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
-import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
+import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
@@ -220,6 +220,9 @@ async function main(argv: string[]) {
       break;
     case "usage":
       await cmdUsage(parsed);
+      break;
+    case "limits":
+      await cmdLimits(parsed);
       break;
     case "sessions":
       await cmdSessions(parsed);
@@ -1491,13 +1494,13 @@ async function cmdXa(parsed: Parsed) {
 }
 
 // `hive open <bee>`: identity-launcher mode. Activates the account into its
-// home, then runs the agent DIRECTLY — in a new native terminal window (or
-// the current one with --here). Deliberately off-brand: no tmux session, no
-// SessionRecord, so list/tail/kill/daemon do not apply. The activation and
-// launch are still ledger-logged.
+// home, then runs the agent DIRECTLY in the CURRENT terminal — foreground,
+// where you called it. --window/--app launch a new native terminal window
+// instead. Deliberately off-brand: no tmux session, no SessionRecord, so
+// list/tail/kill/daemon do not apply. Activation and launch are ledger-logged.
 async function cmdOpen(parsed: Parsed) {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive open <bee> [--here] [--app <terminal>] [--cwd <dir>] [--account <a>] [--print]");
+  if (!requested) throw new Error("Usage: hive open <bee> [--window] [--app <terminal>] [--cwd <dir>] [--account <a>] [--print]");
   const { agent, account: aliasAccount } = await resolveSpawnAgent(requested);
   const yolo = dangerousMode(parsed, agent);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
@@ -1510,12 +1513,14 @@ async function cmdOpen(parsed: Parsed) {
   }
   const cwd = await resolveSpawnCwd(parsed);
   const command = shellCommand(spec);
+  const appFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
+  const wantsWindow = truthy(flag(parsed, "window")) || appFlag !== undefined;
   await appendLedger({
     type: "session.open",
     agent: spec.kind,
     account: account?.id ?? null,
     cwd,
-    mode: truthy(flag(parsed, "here")) ? "here" : "window",
+    mode: wantsWindow ? "window" : "here",
   });
 
   if (truthy(flag(parsed, "print"))) {
@@ -1523,15 +1528,15 @@ async function cmdOpen(parsed: Parsed) {
     return;
   }
 
-  if (truthy(flag(parsed, "here"))) {
-    process.exitCode = await runInCurrentTerminal(spec.command, spec.args, spec.env, cwd);
+  if (wantsWindow) {
+    const app = await openInNewTerminal(command, cwd, appFlag);
+    if (isPretty()) console.log(actionLine("ok", "open", [bold(spec.kind), ...(account ? [account.id] : []), dim(`${app} window`)]));
+    else console.log(`opened\t${spec.kind}\t${account?.id ?? "-"}\t${app}`);
     return;
   }
 
-  const appFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
-  const app = await openInNewTerminal(command, cwd, appFlag);
-  if (isPretty()) console.log(actionLine("ok", "open", [bold(spec.kind), ...(account ? [account.id] : []), dim(`${app} window`)]));
-  else console.log(`opened\t${spec.kind}\t${account?.id ?? "-"}\t${app}`);
+  // Default: take over THIS terminal, exactly where the user called from.
+  process.exitCode = await runInCurrentTerminal(spec.command, spec.args, spec.env, cwd);
 }
 
 async function cmdConfig(parsed: Parsed) {
@@ -3705,21 +3710,8 @@ async function cmdAccount(parsed: Parsed) {
       else console.log(`removed\t${account.id}`);
       break;
     }
-    case "import-caam": {
-      const from = typeof flag(parsed, "from") === "string" ? String(flag(parsed, "from")) : defaultCaamVaultDir();
-      const result = await importCaam(from);
-      for (const account of result.imported) {
-        if (isPretty()) console.log(actionLine("ok", "import", [bold(account.id), account.tool, account.label]));
-        else console.log(`imported\t${account.id}\t${account.tool}\t${account.label}`);
-      }
-      for (const skip of result.skipped) {
-        console.error(note(`skipped ${skip.tool}/${skip.label}: ${skip.reason}`));
-      }
-      console.log(note(`${result.imported.length} account(s) in ${tildify(vaultRoot())}`));
-      break;
-    }
     default:
-      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|remove|import-caam`);
+      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|remove`);
   }
 }
 
@@ -3751,7 +3743,7 @@ async function accountList(parsed: Parsed) {
     return;
   }
   if (rows.length === 0) {
-    console.log(note("no accounts registered; add one with: hive account add <tool> <label> or hive account import-caam"));
+    console.log(note("no accounts registered; add one with: hive account add <tool> <label>"));
     return;
   }
   console.log(formatTable(
@@ -3766,59 +3758,100 @@ async function accountList(parsed: Parsed) {
 async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
   const recipe = identityRecipeForAgent(account.tool);
   if (!recipe) throw new Error(`Tool ${account.tool} has no identity recipe`);
+  // Capture must gate on the PRIMARY credential: tools write supporting files
+  // (claude's .claude.json) the moment they boot, long before any login.
+  const primary = recipe.credentialFiles[0]!;
   const seatHome = resolve(storeRoot(), "login-homes", account.id);
   await mkdir(seatHome, { recursive: true, mode: 0o700 });
-  // Re-login starts from the existing creds when we have them.
-  if (await accountHasCredentials(account)) {
-    await activateAccountIntoHome(account, seatHome).catch(() => undefined);
-  }
-  const startedAt = Date.now();
-  const spec = resolveAgent(account.tool, [], { home: seatHome, identity: true, yolo: false });
   const target = safeTmuxTarget(`login-${account.id}`);
   const substrate = localSubstrate();
-  if (await substrate.hasSession(target)) throw new Error(`A login seat is already running: tmux attach -t ${target}`);
-  await substrate.newSession(target, process.cwd(), { command: spec.command, args: spec.args, env: spec.env });
+  const markerPath = resolve(seatHome, ".login-seat-started");
+
+  if (!(await substrate.hasSession(target))) {
+    // Re-login starts from the existing creds when we have them.
+    if (await accountHasCredentials(account)) {
+      await activateAccountIntoHome(account, seatHome).catch(() => undefined);
+    }
+    // The marker is the freshness baseline: its mtime for the credentials
+    // file, its recorded digest for the keychain entry (claude on macOS logs
+    // in to the Keychain, not the file). Written post-activation so re-seeded
+    // old creds stay stale.
+    const keychainBaseline = account.tool === "claude" ? await readClaudeKeychain(seatHome) : null;
+    const marker = { account: account.id, keychainDigest: keychainBaseline ? credentialDigest(keychainBaseline) : null };
+    await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+    const spec = resolveAgent(account.tool, [], { home: seatHome, identity: true, yolo: false });
+    await substrate.newSession(target, process.cwd(), { command: spec.command, args: spec.args, env: spec.env });
+  } else {
+    // A seat from a previous attempt is still up — rejoin it.
+    console.log(note(`rejoining the running login seat for ${account.id}`));
+  }
 
   const attachHint = `tmux attach -t ${target}`;
   if (isPretty()) console.log(actionLine("ok", "login-seat", [bold(account.id), dim(attachHint)]));
   else console.log(`login-seat\t${account.id}\t${target}`);
-  console.log(note(`complete the ${account.tool} login in the seat (${attachHint}); credentials are captured automatically`));
 
   if (truthy(flag(parsed, "no-wait"))) {
-    console.log(note(`then run: hive account capture ${account.id} --home ${seatHome}`));
+    console.log(note(`complete the ${account.tool} login in the seat (${attachHint}), then run: hive account capture ${account.id} --home ${seatHome}`));
     return;
   }
 
-  const timeoutMs = numberFlag(parsed, ["timeout-ms", "timeout"], 600_000);
-  const deadline = startedAt + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await loginCredentialsFresh(seatHome, recipe.credentialFiles, startedAt)) {
-      const captured = await captureAccountFromHome(account, seatHome);
-      await substrate.kill(target).catch(() => undefined);
-      if (isPretty()) console.log(actionLine("ok", "capture", [bold(account.id), `${captured.length} file(s)`]));
-      else console.log(`captured\t${account.id}\t${captured.join(",")}`);
-      return;
+  const baselineMs = (await stat(markerPath).catch(() => null))?.mtimeMs ?? Date.now();
+  const baselineDigest = await readMarkerKeychainDigest(markerPath);
+  const loggedIn = async (): Promise<boolean> => {
+    const info = await stat(resolve(seatHome, primary)).catch(() => null);
+    if (info?.isFile() && info.mtimeMs >= baselineMs) return true;
+    if (account.tool !== "claude") return false;
+    // claude on macOS logs in to the Keychain, not the credentials file.
+    const current = await readClaudeKeychain(seatHome);
+    return Boolean(current) && credentialDigest(current!) !== baselineDigest;
+  };
+  const captureIfLoggedIn = async (): Promise<boolean> => {
+    if (!(await loggedIn())) return false;
+    const captured = await captureAccountFromHome(account, seatHome);
+    await substrate.kill(target).catch(() => undefined);
+    if (isPretty()) console.log(actionLine("ok", "capture", [bold(account.id), `${captured.length} file(s)`]));
+    else console.log(`captured\t${account.id}\t${captured.join(",")}`);
+    return true;
+  };
+
+  // Interactive: put the user in the seat; capture when they detach or the
+  // tool exits. Inside an existing tmux client attach would nest — fall back
+  // to the headless poll loop there.
+  if (process.stdout.isTTY && process.stdin.isTTY && !process.env.TMUX) {
+    console.log(note(`complete the ${account.tool} login, then detach (ctrl-b d) or quit the tool`));
+    try {
+      await substrate.attachSession(target);
+    } catch {
+      // attach failed (no client?); fall through to polling
     }
-    if (!(await substrate.hasSession(target))) break;
+    if (await captureIfLoggedIn()) return;
+    if (await substrate.hasSession(target)) {
+      throw new Error(`Login not completed (no fresh credentials in ${primary} or the keychain); the seat is still running — rerun hive login ${account.id} or ${attachHint}`);
+    }
+    throw new Error(`Login seat exited without producing ${primary}; rerun: hive login ${account.id}`);
+  }
+
+  console.log(note(`complete the ${account.tool} login in the seat (${attachHint}); waiting for ${primary}`));
+  const timeoutMs = numberFlag(parsed, ["timeout-ms", "timeout"], 600_000);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await captureIfLoggedIn()) return;
+    if (!(await substrate.hasSession(target))) {
+      throw new Error(`Login seat exited without producing ${primary}; rerun: hive login ${account.id}`);
+    }
     await sleep(2_000);
   }
-  // Seat exited or timed out without fresh creds — try one best-effort capture.
-  try {
-    const captured = await captureAccountFromHome(account, seatHome);
-    console.log(note(`captured ${captured.length} file(s) from the seat home`));
-  } catch {
-    throw new Error(`No fresh credentials appeared in ${seatHome}; seat ${(await substrate.hasSession(target)) ? `still running (${attachHint})` : "exited"}`);
-  } finally {
-    await substrate.kill(target).catch(() => undefined);
-  }
+  throw new Error(`Timed out waiting for ${primary} in ${seatHome}; the seat is still running — ${attachHint}`);
 }
 
-async function loginCredentialsFresh(homePath: string, credentialFiles: string[], sinceMs: number): Promise<boolean> {
-  for (const relative of credentialFiles) {
-    const info = await stat(resolve(homePath, relative)).catch(() => null);
-    if (info?.isFile() && info.mtimeMs >= sinceMs) return true;
+async function readMarkerKeychainDigest(markerPath: string): Promise<string | null> {
+  try {
+    const parsed = JSON.parse(await readFile(markerPath, "utf8")) as { keychainDigest?: unknown };
+    return typeof parsed.keychainDigest === "string" ? parsed.keychainDigest : null;
+  } catch {
+    // Pre-keychain marker format (plain text) — no baseline recorded.
+    return null;
   }
-  return false;
 }
 
 async function cmdActivate(parsed: Parsed) {
@@ -3902,6 +3935,74 @@ function formatTokens(value: number): string {
   return String(value);
 }
 
+// `hive limits`: progress against the providers' REAL 5h/weekly windows.
+// claude is queried live (the same endpoint as Claude Code's /usage panel);
+// codex is the newest rate_limits snapshot its CLI wrote to disk (stamped).
+async function cmdLimits(parsed: Parsed) {
+  const query = parsed.args[0];
+  const accounts = query ? [await findAccount(query)] : await listAccounts();
+  if (accounts.length === 0) {
+    console.log(note("no accounts registered; add some with: hive account add <tool> <label> && hive login <account>"));
+    return;
+  }
+  const results = await accountLimits(accounts);
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(results, null, 2));
+    return;
+  }
+
+  const rows = results.map((result) => [
+    result.account,
+    result.plan ?? "-",
+    limitCell(result.fiveHour, result),
+    limitCell(result.weekly, result),
+    result.asOf ? formatRelativeTime(result.asOf) : result.ok ? "live" : "-",
+  ]);
+  console.log(formatTable(
+    [{ header: "ACCOUNT" }, { header: "PLAN" }, { header: "5H" }, { header: "WEEKLY" }, { header: "AS-OF" }],
+    rows,
+  ));
+  for (const result of results.filter((candidate) => !candidate.ok)) {
+    console.log(note(`${result.account}: ${result.error}`));
+  }
+  console.log(note("pace = used% − elapsed% of the window: ▲ burning faster than it refills, ▼ headroom, ● on pace"));
+}
+
+function limitCell(window: WindowUsage | undefined, result: AccountLimits): string {
+  if (!result.ok || !window) return "-";
+  const now = Date.now();
+  // A snapshot whose reset boundary has passed describes a window that has
+  // already rolled over: it's fresh (0%) and nothing is pending a reset.
+  if (windowRolledOver(window, now)) {
+    return `${limitBar(0)}   0%`;
+  }
+  const percent = Math.max(0, Math.min(100, window.usedPercent));
+  const pace = paceDelta(window, now);
+  const paceSuffix = pace === null ? "" : ` ${formatPace(pace)}`;
+  const reset = window.resetsAt ? ` ⟳ ${formatTimeUntil(window.resetsAt)}` : "";
+  return `${limitBar(percent)} ${String(Math.round(percent)).padStart(3)}%${reset}${paceSuffix}`;
+}
+
+function formatPace(delta: number): string {
+  const rounded = Math.round(delta);
+  if (Math.abs(rounded) <= 2) return isPretty() ? dim("●") : "=0";
+  const label = rounded > 0 ? `▲+${rounded}` : `▼${rounded}`;
+  if (!isPretty()) return rounded > 0 ? `+${rounded}` : `${rounded}`;
+  if (rounded > 0) return rounded >= 15 ? red(label) : yellow(label);
+  return green(label);
+}
+
+function limitBar(percent: number): string {
+  const width = 10;
+  const filled = Math.round((percent / 100) * width);
+  const bar = "█".repeat(filled) + "░".repeat(width - filled);
+  if (!isPretty()) return bar;
+  if (percent >= 90) return red(bar);
+  if (percent >= 70) return yellow(bar);
+  return green(bar);
+}
+
 async function cmdSessions(parsed: Parsed) {
   const sub = parsed.args[0];
   if (sub !== "reconcile") throw new Error("Usage: hive sessions reconcile [--home <path>]... [--json]");
@@ -3958,7 +4059,7 @@ function printHelp() {
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
     ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto)"],
-    ["open", "<bee> [--here] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print]", "identity launcher: run the agent directly in a terminal window (or --here), no tmux/session record"],
+    ["open", "<bee> [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print]", "identity launcher: run the agent right here in this terminal (--window for a new one), no tmux/session record"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
     ["seal", "<selector> --from <path.json>", "record a typed handoff artifact"],
@@ -3982,11 +4083,12 @@ function printHelp() {
     ["daemon", "<install|uninstall|start|stop|restart|status|logs|run> [--label <id>] [--tick-ms <n>] [--lines N] [--follow] [--json]", "manage the hive daemon LaunchAgent + inspect state/logs"],
     ["search", "<query> [--type seals,ledger,sessions] [--colony X] [--swarm X] [--bee X] [--status X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals, ledger, and session records"],
     ["seals find", "<query> [--status X] [--colony X] [--bee X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals only"],
-    ["account", "<list|add|login|capture|remove|import-caam> [tool] [label] [--email <addr>] [--home <path>] [--from <dir>]", "manage provider accounts in the local credential vault (~/.hive/vault, never synced)"],
+    ["account", "<list|add|login|capture|remove> [tool] [label] [--email <addr>] [--home <path>]", "manage provider accounts in the local credential vault (~/.hive/vault, never synced)"],
     ["activate", "<account> [--home <1|2|3|path>]", "seed an account's credentials into a home slot (fast login)"],
     ["login", "<account> [--no-wait] [--popup]", "interactive (re)login seat in tmux; captures fresh credentials into the vault"],
     ["swap-account", "<bee> <account>", "stop, re-credential the bee's home, and resume the same session on another account"],
     ["usage", "[<account>] [--json]", "factual per-account token usage and exhaustion state (estimates, not quota)"],
+    ["limits", "[<account>] [--json]", "progress against the providers' real 5h/weekly limits (claude live, codex from its last on-disk snapshot)"],
     ["sessions", "reconcile [--home <path>]... [--json]", "index sessions across all homes; flag duplicates and sync conflicts"],
     ["sync", "manifest [--json]", "write the syncthing include/exclude manifest (vault always excluded)"],
     ["config", "<show|path|set-bee <bee> [--yolo] [--home] [--command]>", "view or edit ~/.hive/config.json defaults"],

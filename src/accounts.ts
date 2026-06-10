@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { canonicalAgentKind } from "./agents.js";
 import { hasAgentDriver, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { keychainAvailable, readClaudeKeychain, writeClaudeKeychain } from "./keychain.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
 import { appendLedger, safeName } from "./store.js";
@@ -216,6 +217,22 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
       await atomicWriteFile(target, data, { mode: 0o600 });
       captured.push(relative);
     }
+    // On macOS, claude stores the primary credential in the Keychain rather
+    // than .credentials.json — and when both exist, the on-disk file is often
+    // a stale relic of an old login. Vault whichever is fresher.
+    const primary = recipe.credentialFiles[0]!;
+    if (account.tool === "claude" && keychainAvailable()) {
+      const keychainRaw = await readClaudeKeychain(homePath);
+      if (keychainRaw) {
+        const fileRaw = await readFile(join(homePath, primary), "utf8").catch(() => null);
+        if (!fileRaw || (claudeTokenExpiry(keychainRaw) ?? 0) > (claudeTokenExpiry(fileRaw) ?? 0)) {
+          const target = join(accountDir(account), primary);
+          await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+          await atomicWriteFile(target, `${keychainRaw}\n`, { mode: 0o600 });
+          if (!captured.includes(primary)) captured.push(primary);
+        }
+      }
+    }
     if (captured.length === 0) {
       throw new Error(
         `No credential files found in ${homePath} for ${account.id} (looked for: ${recipe.credentialFiles.join(", ")})`,
@@ -257,9 +274,32 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     if (written.length === 0) {
       throw new Error(`Vault has no credentials for ${account.id}. Capture them first: hive account login ${account.tool} ${account.label}`);
     }
+    // On macOS, claude prefers the per-config-dir Keychain entry over the
+    // credentials file — seed it so an activated home doesn't resolve a stale
+    // identity from an old entry.
+    if (account.tool === "claude" && keychainAvailable()) {
+      const credentials = (await readFile(join(accountDir(account), recipe.credentialFiles[0]!), "utf8")).trim();
+      const ok = await writeClaudeKeychain(homePath, credentials);
+      if (ok) {
+        written.push("keychain");
+      } else if (await readClaudeKeychain(homePath)) {
+        // A stale entry exists and we could not replace it: claude would keep
+        // using the OLD account. Refuse rather than activate a lie.
+        throw new Error(`Could not update the macOS Keychain entry for ${homePath}; claude would keep its previous identity`);
+      }
+    }
     await appendLedger({ type: "account.activate", account: account.id, tool: account.tool, home: homePath, files: written });
     return written;
   });
+}
+
+function claudeTokenExpiry(raw: string): number | null {
+  try {
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: { expiresAt?: unknown } };
+    return typeof parsed.claudeAiOauth?.expiresAt === "number" ? parsed.claudeAiOauth.expiresAt : null;
+  } catch {
+    return null;
+  }
 }
 
 /** True when the vault holds the account's PRIMARY credential file. */
@@ -275,74 +315,3 @@ export function defaultHomeForAccount(account: AccountRecord): string {
   return join(storeRoot(), "homes", account.id);
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// caam migration. caam's vault is ~/.local/share/caam/vault/<tool>/<label>/
-// with the credential files at the dir root plus a meta.json. Tools without a
-// honeybee identity recipe (e.g. gemini) are reported and skipped.
-// ──────────────────────────────────────────────────────────────────────────
-
-export type CaamImportResult = {
-  imported: AccountRecord[];
-  skipped: { tool: string; label: string; reason: string }[];
-};
-
-export function defaultCaamVaultDir(): string {
-  return join(homedir(), ".local", "share", "caam", "vault");
-}
-
-// caam stores every file at the profile dir root; honeybee's recipes may nest
-// them (opencode). Map caam basenames onto recipe-relative paths.
-function caamFileTarget(recipe: IdentityRecipe, file: string): string | undefined {
-  if (recipe.credentialFiles.includes(file)) return file;
-  return recipe.credentialFiles.find((relative) => relative.endsWith(`/${file}`));
-}
-
-export async function importCaam(caamVaultDir = defaultCaamVaultDir()): Promise<CaamImportResult> {
-  const tools = await readdir(caamVaultDir, { withFileTypes: true }).catch(() => null);
-  if (!tools) throw new Error(`No caam vault found at ${caamVaultDir}`);
-
-  const imported: AccountRecord[] = [];
-  const skipped: CaamImportResult["skipped"] = [];
-
-  for (const toolEntry of tools.filter((entry) => entry.isDirectory())) {
-    const tool = toolEntry.name;
-    const recipe = identityRecipeForAgent(tool);
-    const labels = await readdir(join(caamVaultDir, tool), { withFileTypes: true }).catch(() => []);
-    for (const labelEntry of labels.filter((entry) => entry.isDirectory())) {
-      const label = labelEntry.name;
-      if (!recipe) {
-        skipped.push({ tool, label, reason: `no identity recipe for tool ${tool}` });
-        continue;
-      }
-      const existing = (await listAccounts()).find((account) => account.id === accountIdFor(tool, label));
-      const account = existing ?? (await addAccount(tool, label));
-      const profileDir = join(caamVaultDir, tool, label);
-      const files = await readdir(profileDir).catch(() => []);
-      let copied = 0;
-      for (const file of files) {
-        if (file === "meta.json") continue;
-        const targetRelative = caamFileTarget(recipe, file);
-        if (!targetRelative) continue;
-        const target = join(accountDir(account), targetRelative);
-        await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-        const data = await readFile(join(profileDir, file), "utf8");
-        await atomicWriteFile(target, data, { mode: 0o600 });
-        copied += 1;
-      }
-      if (copied === 0 && !existing) {
-        skipped.push({ tool, label, reason: "no credential files matched the identity recipe" });
-        await removeAccount(account.id).catch(() => undefined);
-        continue;
-      }
-      imported.push(account);
-    }
-  }
-
-  await appendLedger({
-    type: "account.import-caam",
-    from: caamVaultDir,
-    imported: imported.map((account) => account.id),
-    skipped: skipped.length,
-  });
-  return { imported, skipped };
-}

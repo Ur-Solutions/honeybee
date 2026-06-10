@@ -36,9 +36,21 @@ export function formatRelativeTime(fromIso: string | undefined, now: number = Da
   if (hours < 24) return `${hours}h`;
   const days = Math.floor(hours / 24);
   if (days < 7) return `${days}d`;
+  // Boundaries align with the next unit's divisor so a ~4-week age never
+  // reads "0mo" and days 360-364 never read "0y".
   if (days < 30) return `${Math.floor(days / 7)}w`;
   if (days < 365) return `${Math.max(1, Math.floor(days / 30))}mo`;
   return `${Math.floor(days / 365)}y`;
+}
+
+/** Duration until a FUTURE instant ("2h", "5d"); "now" once passed. */
+export function formatTimeUntil(untilIso: string | undefined, now: number = Date.now()): string {
+  if (!untilIso) return "—";
+  const ts = Date.parse(untilIso);
+  if (!Number.isFinite(ts)) return "—";
+  if (ts <= now) return "now";
+  // Same bucketing as formatRelativeTime, opposite direction.
+  return formatRelativeTime(new Date(now - (ts - now)).toISOString(), now);
 }
 
 export function tildify(path: string): string {

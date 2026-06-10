@@ -11,7 +11,6 @@ import {
   addAccount,
   captureAccountFromHome,
   findAccount,
-  importCaam,
   listAccounts,
   removeAccount,
   resolveSpawnAgent,
@@ -19,13 +18,19 @@ import {
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
+  const oldKeychain = process.env.HIVE_NO_KEYCHAIN;
   const dir = await mkdtemp(join(tmpdir(), "honeybee-accounts-"));
   process.env.HIVE_STORE_ROOT = dir;
+  // Activating claude accounts against temp homes must not write entries
+  // into the developer's real macOS keychain.
+  process.env.HIVE_NO_KEYCHAIN = "1";
   try {
     return await fn(dir);
   } finally {
     if (oldRoot === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = oldRoot;
+    if (oldKeychain === undefined) delete process.env.HIVE_NO_KEYCHAIN;
+    else process.env.HIVE_NO_KEYCHAIN = oldKeychain;
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -158,37 +163,3 @@ test("resolveSpawnAgent maps bee specs to tool + account", async () => {
   });
 });
 
-test("import-caam migrates known tools and skips unknown ones", async () => {
-  await withTempStore(async (dir) => {
-    const caam = join(dir, "caam-vault");
-    await mkdir(join(caam, "claude", "tormod@a.b"), { recursive: true });
-    await writeFile(join(caam, "claude", "tormod@a.b", ".credentials.json"), `{"t":1}`);
-    await writeFile(join(caam, "claude", "tormod@a.b", "meta.json"), `{"profile":"tormod@a.b"}`);
-    await mkdir(join(caam, "codex", "tormod@a.b"), { recursive: true });
-    await writeFile(join(caam, "codex", "tormod@a.b", "auth.json"), `{"t":2}`);
-    // opencode's caam layout keeps auth.json at the root; the recipe nests it.
-    await mkdir(join(caam, "opencode", "oc1"), { recursive: true });
-    await writeFile(join(caam, "opencode", "oc1", "auth.json"), `{"t":3}`);
-    await mkdir(join(caam, "gemini", "g1"), { recursive: true });
-    await writeFile(join(caam, "gemini", "g1", "oauth_creds.json"), `{"t":4}`);
-
-    const result = await importCaam(caam);
-    assert.deepEqual(result.imported.map((account) => account.tool).sort(), ["claude", "codex", "opencode"]);
-    assert.equal(result.skipped.length, 1);
-    assert.equal(result.skipped[0]!.tool, "gemini");
-
-    const opencodeAccount = result.imported.find((account) => account.tool === "opencode")!;
-    const nested = join(accountDir(opencodeAccount), "xdg-data", "opencode", "auth.json");
-    assert.equal(await readFile(nested, "utf8"), `{"t":3}`);
-
-    const claudeAccount = result.imported.find((account) => account.tool === "claude")!;
-    assert.equal(await accountHasCredentials(claudeAccount), true);
-    // meta.json must not be vaulted.
-    await assert.rejects(() => readFile(join(accountDir(claudeAccount), "meta.json"), "utf8"));
-
-    // Re-import is idempotent (updates, no duplicates).
-    const again = await importCaam(caam);
-    assert.equal((await listAccounts()).length, 3);
-    assert.equal(again.imported.length, 3);
-  });
-});

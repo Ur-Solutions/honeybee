@@ -23,6 +23,7 @@ export const BOOLEAN_FLAGS = new Set([
   "force-send",
   "foreground",
   "here",
+  "window",
   "forever",
   "help",
   "i",
