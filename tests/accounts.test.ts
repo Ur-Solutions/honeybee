@@ -19,13 +19,19 @@ import {
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
+  const oldKeychain = process.env.HIVE_NO_KEYCHAIN;
   const dir = await mkdtemp(join(tmpdir(), "honeybee-accounts-"));
   process.env.HIVE_STORE_ROOT = dir;
+  // Activating claude accounts against temp homes must not write entries
+  // into the developer's real macOS keychain.
+  process.env.HIVE_NO_KEYCHAIN = "1";
   try {
     return await fn(dir);
   } finally {
     if (oldRoot === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = oldRoot;
+    if (oldKeychain === undefined) delete process.env.HIVE_NO_KEYCHAIN;
+    else process.env.HIVE_NO_KEYCHAIN = oldKeychain;
     await rm(dir, { recursive: true, force: true });
   }
 }

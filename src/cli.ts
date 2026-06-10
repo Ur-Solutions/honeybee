@@ -19,6 +19,7 @@ import {
   vaultRoot,
 } from "./accounts.js";
 import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
+import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { swapAccount } from "./swap.js";
 import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
@@ -1392,13 +1393,13 @@ async function cmdXa(parsed: Parsed) {
 }
 
 // `hive open <bee>`: identity-launcher mode. Activates the account into its
-// home, then runs the agent DIRECTLY — in a new native terminal window (or
-// the current one with --here). Deliberately off-brand: no tmux session, no
-// SessionRecord, so list/tail/kill/daemon do not apply. The activation and
-// launch are still ledger-logged.
+// home, then runs the agent DIRECTLY in the CURRENT terminal — foreground,
+// where you called it. --window/--app launch a new native terminal window
+// instead. Deliberately off-brand: no tmux session, no SessionRecord, so
+// list/tail/kill/daemon do not apply. Activation and launch are ledger-logged.
 async function cmdOpen(parsed: Parsed) {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive open <bee> [--here] [--app <terminal>] [--cwd <dir>] [--account <a>] [--print]");
+  if (!requested) throw new Error("Usage: hive open <bee> [--window] [--app <terminal>] [--cwd <dir>] [--account <a>] [--print]");
   const { agent, account: aliasAccount } = await resolveSpawnAgent(requested);
   const yolo = dangerousMode(parsed, agent);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
@@ -1411,12 +1412,14 @@ async function cmdOpen(parsed: Parsed) {
   }
   const cwd = await resolveSpawnCwd(parsed);
   const command = shellCommand(spec);
+  const appFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
+  const wantsWindow = truthy(flag(parsed, "window")) || appFlag !== undefined;
   await appendLedger({
     type: "session.open",
     agent: spec.kind,
     account: account?.id ?? null,
     cwd,
-    mode: truthy(flag(parsed, "here")) ? "here" : "window",
+    mode: wantsWindow ? "window" : "here",
   });
 
   if (truthy(flag(parsed, "print"))) {
@@ -1424,15 +1427,15 @@ async function cmdOpen(parsed: Parsed) {
     return;
   }
 
-  if (truthy(flag(parsed, "here"))) {
-    process.exitCode = await runInCurrentTerminal(spec.command, spec.args, spec.env, cwd);
+  if (wantsWindow) {
+    const app = await openInNewTerminal(command, cwd, appFlag);
+    if (isPretty()) console.log(actionLine("ok", "open", [bold(spec.kind), ...(account ? [account.id] : []), dim(`${app} window`)]));
+    else console.log(`opened\t${spec.kind}\t${account?.id ?? "-"}\t${app}`);
     return;
   }
 
-  const appFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
-  const app = await openInNewTerminal(command, cwd, appFlag);
-  if (isPretty()) console.log(actionLine("ok", "open", [bold(spec.kind), ...(account ? [account.id] : []), dim(`${app} window`)]));
-  else console.log(`opened\t${spec.kind}\t${account?.id ?? "-"}\t${app}`);
+  // Default: take over THIS terminal, exactly where the user called from.
+  process.exitCode = await runInCurrentTerminal(spec.command, spec.args, spec.env, cwd);
 }
 
 async function cmdConfig(parsed: Parsed) {
@@ -3588,10 +3591,13 @@ async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
     if (await accountHasCredentials(account)) {
       await activateAccountIntoHome(account, seatHome).catch(() => undefined);
     }
-    // The marker's mtime is the freshness baseline: only a primary credential
-    // written AFTER seat start counts as a login. Written post-activation so
-    // re-seeded old creds stay stale.
-    await writeFile(markerPath, `${account.id}\n`, { mode: 0o600 });
+    // The marker is the freshness baseline: its mtime for the credentials
+    // file, its recorded digest for the keychain entry (claude on macOS logs
+    // in to the Keychain, not the file). Written post-activation so re-seeded
+    // old creds stay stale.
+    const keychainBaseline = account.tool === "claude" ? await readClaudeKeychain(seatHome) : null;
+    const marker = { account: account.id, keychainDigest: keychainBaseline ? credentialDigest(keychainBaseline) : null };
+    await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
     const spec = resolveAgent(account.tool, [], { home: seatHome, identity: true, yolo: false });
     await substrate.newSession(target, process.cwd(), { command: spec.command, args: spec.args, env: spec.env });
   } else {
@@ -3609,9 +3615,17 @@ async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
   }
 
   const baselineMs = (await stat(markerPath).catch(() => null))?.mtimeMs ?? Date.now();
-  const captureIfLoggedIn = async (): Promise<boolean> => {
+  const baselineDigest = await readMarkerKeychainDigest(markerPath);
+  const loggedIn = async (): Promise<boolean> => {
     const info = await stat(resolve(seatHome, primary)).catch(() => null);
-    if (!info?.isFile() || info.mtimeMs < baselineMs) return false;
+    if (info?.isFile() && info.mtimeMs >= baselineMs) return true;
+    if (account.tool !== "claude") return false;
+    // claude on macOS logs in to the Keychain, not the credentials file.
+    const current = await readClaudeKeychain(seatHome);
+    return Boolean(current) && credentialDigest(current!) !== baselineDigest;
+  };
+  const captureIfLoggedIn = async (): Promise<boolean> => {
+    if (!(await loggedIn())) return false;
     const captured = await captureAccountFromHome(account, seatHome);
     await substrate.kill(target).catch(() => undefined);
     if (isPretty()) console.log(actionLine("ok", "capture", [bold(account.id), `${captured.length} file(s)`]));
@@ -3631,7 +3645,7 @@ async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
     }
     if (await captureIfLoggedIn()) return;
     if (await substrate.hasSession(target)) {
-      throw new Error(`Login not completed (no fresh ${primary}); the seat is still running — rerun hive login ${account.id} or ${attachHint}`);
+      throw new Error(`Login not completed (no fresh credentials in ${primary} or the keychain); the seat is still running — rerun hive login ${account.id} or ${attachHint}`);
     }
     throw new Error(`Login seat exited without producing ${primary}; rerun: hive login ${account.id}`);
   }
@@ -3647,6 +3661,16 @@ async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
     await sleep(2_000);
   }
   throw new Error(`Timed out waiting for ${primary} in ${seatHome}; the seat is still running — ${attachHint}`);
+}
+
+async function readMarkerKeychainDigest(markerPath: string): Promise<string | null> {
+  try {
+    const parsed = JSON.parse(await readFile(markerPath, "utf8")) as { keychainDigest?: unknown };
+    return typeof parsed.keychainDigest === "string" ? parsed.keychainDigest : null;
+  } catch {
+    // Pre-keychain marker format (plain text) — no baseline recorded.
+    return null;
+  }
 }
 
 async function cmdActivate(parsed: Parsed) {
@@ -3786,7 +3810,7 @@ function printHelp() {
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
     ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto)"],
-    ["open", "<bee> [--here] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print]", "identity launcher: run the agent directly in a terminal window (or --here), no tmux/session record"],
+    ["open", "<bee> [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print]", "identity launcher: run the agent right here in this terminal (--window for a new one), no tmux/session record"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
     ["seal", "<selector> --from <path.json>", "record a typed handoff artifact"],

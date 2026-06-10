@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { canonicalAgentKind } from "./agents.js";
 import { hasAgentDriver, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { keychainAvailable, readClaudeKeychain, writeClaudeKeychain } from "./keychain.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
 import { appendLedger, safeName } from "./store.js";
@@ -216,6 +217,18 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
       await atomicWriteFile(target, data, { mode: 0o600 });
       captured.push(relative);
     }
+    // On macOS, claude stores the primary credential in the Keychain rather
+    // than .credentials.json; pull it from there into the (file-based) vault.
+    const primary = recipe.credentialFiles[0]!;
+    if (account.tool === "claude" && !captured.includes(primary) && keychainAvailable()) {
+      const credentials = await readClaudeKeychain(homePath);
+      if (credentials) {
+        const target = join(accountDir(account), primary);
+        await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+        await atomicWriteFile(target, `${credentials}\n`, { mode: 0o600 });
+        captured.push(primary);
+      }
+    }
     if (captured.length === 0) {
       throw new Error(
         `No credential files found in ${homePath} for ${account.id} (looked for: ${recipe.credentialFiles.join(", ")})`,
@@ -256,6 +269,20 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     }
     if (written.length === 0) {
       throw new Error(`Vault has no credentials for ${account.id}. Capture them first: hive account login ${account.tool} ${account.label}`);
+    }
+    // On macOS, claude prefers the per-config-dir Keychain entry over the
+    // credentials file — seed it so an activated home doesn't resolve a stale
+    // identity from an old entry.
+    if (account.tool === "claude" && keychainAvailable()) {
+      const credentials = (await readFile(join(accountDir(account), recipe.credentialFiles[0]!), "utf8")).trim();
+      const ok = await writeClaudeKeychain(homePath, credentials);
+      if (ok) {
+        written.push("keychain");
+      } else if (await readClaudeKeychain(homePath)) {
+        // A stale entry exists and we could not replace it: claude would keep
+        // using the OLD account. Refuse rather than activate a lie.
+        throw new Error(`Could not update the macOS Keychain entry for ${homePath}; claude would keep its previous identity`);
+      }
     }
     await appendLedger({ type: "account.activate", account: account.id, tool: account.tool, home: homePath, files: written });
     return written;

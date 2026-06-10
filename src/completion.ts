@@ -71,7 +71,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
     "--yolo", "--no-yolo", "--dangerous", "--boot-ms",
   ],
-  open: ["--here", "--app", "--cwd", "--home", "--profile", "--account", "--print", "--yolo", "--no-yolo", "--dangerous"],
+  open: ["--window", "--app", "--cwd", "--home", "--profile", "--account", "--print", "--yolo", "--no-yolo", "--dangerous"],
   usage: ["--json"],
   sessions: ["--home", "--json"],
   sync: ["--json"],
