@@ -27,10 +27,27 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   let probeCache: { at: number; result: ProbeResult } | undefined;
 
   const sshBinary = node.sshCommand ?? "ssh";
-  const sshBaseArgs: string[] = node.sshArgs && node.sshArgs.length > 0 ? [...node.sshArgs] : [];
+  const userSshArgs = node.sshArgs && node.sshArgs.length > 0 ? [...node.sshArgs] : undefined;
+  const sshBaseArgs: string[] = userSshArgs ?? [];
+  // Connection multiplexing for the exec path: without it every remote op is a
+  // fresh ssh handshake (a daemon tick is O(bees) connections; sendText alone
+  // is three). ControlPersist keeps a master alive for 60s of idle; %C hashes
+  // local host + remote host/port/user into a short, user-unique socket name
+  // under ~/.ssh. Applied ONLY when the user supplied no sshArgs of their own —
+  // user-provided args replace the defaults wholesale. With ControlMaster=auto
+  // ssh degrades gracefully (plain connection) if the socket cannot be created.
+  const sshExecArgs: string[] = userSshArgs ?? [
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPath=~/.ssh/hive-%C",
+    "-o", "ControlPersist=60",
+  ];
 
   function buildSshArgv(extra: string[]): string[] {
-    return [sshBinary, ...sshBaseArgs, node.endpoint, ...extra];
+    // ssh joins the remote command words with spaces and hands the result to
+    // the remote login shell, which re-splits (and comment-strips: a bare
+    // `#{session_name}` degrades to nothing). Shell-quote every word destined
+    // for the remote shell so tmux receives exactly these argv elements.
+    return [sshBinary, ...sshExecArgs, node.endpoint, ...extra.map(shellQuote)];
   }
 
   function buildSshTmuxArgv(extra: string[]): string[] {
@@ -49,7 +66,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   async function probe(): Promise<ProbeResult> {
     const cached = probeCache;
     if (cached && now() - cached.at < PROBE_CACHE_TTL_MS) return cached.result;
-    const argv = [sshBinary, "-o", "BatchMode=yes", "-o", `ConnectTimeout=${Math.ceil(DEFAULT_PROBE_TIMEOUT_MS / 1000)}`, ...sshBaseArgs, node.endpoint, "true"];
+    const argv = [sshBinary, "-o", "BatchMode=yes", "-o", `ConnectTimeout=${Math.ceil(DEFAULT_PROBE_TIMEOUT_MS / 1000)}`, ...sshExecArgs, node.endpoint, "true"];
     try {
       const result = await exec(argv);
       const ok = result.exitCode === 0;
@@ -65,35 +82,47 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   }
 
   async function hasSession(target: string): Promise<boolean> {
-    const result = await runTmux(["has-session", "-t", target]);
-    return result.exitCode === 0;
+    const result = await runTmux(["has-session", "-t", `=${target}`]);
+    if (result.exitCode === 0) return true;
+    // Only a clean remote "no such session" answer means the bee is gone.
+    // ssh exits 255 on transport failures (unreachable host, auth, timeout);
+    // treating that as "session gone" would let callers (transactionalKill,
+    // clean --dead) delete records of live bees on unreachable nodes — throw
+    // instead so their error handling engages.
+    const noSession = result.exitCode === 1 || /can't find session|no server running/i.test(result.stderr);
+    if (noSession) return false;
+    throw new Error(`tmux has-session on ${node.name} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`);
   }
 
   async function newSession(target: string, cwd: string, spec: LaunchSpec): Promise<void> {
-    // Build the remote command. We do NOT use the local-tmux launcher trick because we
-    // cannot reliably ship a runner script across SSH in Phase 2 — the remote shell
-    // expands env variables and executes the command directly. Document that env
-    // passthrough is limited (Phase 2.1 enhancement).
-    const envPrefix = spec.env && Object.keys(spec.env).length > 0
-      ? Object.entries(spec.env).map(([k, v]) => `${k}=${shellQuote(v)}`).join(" ") + " "
-      : "";
-    const cmdline = envPrefix + [spec.command, ...spec.args].map(shellQuote).join(" ");
-    // cwd flows through ssh as an argv element to the remote tmux, but the
-    // remote login shell may see it through tmux's own argv parsing. Quote
-    // defensively so spaces and shell metacharacters in cwd cannot break it.
-    const argv = buildSshTmuxArgv(["new-session", "-d", "-s", target, "-c", shellQuote(cwd), cmdline]);
+    // Build the remote command as discrete words. buildSshArgv shell-quotes
+    // every word for the transit through the remote login shell, so tmux
+    // receives them as separate argv elements. Env vars ride on an `env`
+    // prefix: tmux >= 3.0 exec()s a multi-word command directly (no shell),
+    // where a `K=v cmd` assignment prefix would be execvp'd as a binary
+    // literally named "K=v" and the session would die instantly.
+    const envEntries = Object.entries(spec.env ?? {});
+    const commandWords = [
+      ...(envEntries.length > 0 ? ["env", ...envEntries.map(([k, v]) => `${k}=${v}`)] : []),
+      spec.command,
+      ...spec.args,
+    ];
+    const argv = buildSshTmuxArgv(["new-session", "-d", "-s", target, "-c", cwd, ...commandWords]);
     const result = await exec(argv);
     if (result.exitCode !== 0) throw new Error(`Remote tmux new-session failed: ${result.stderr.trim() || result.stdout.trim()}`);
   }
 
   async function kill(target: string): Promise<KillResult> {
-    const result = await runTmux(["kill-session", "-t", target]);
+    const result = await runTmux(["kill-session", "-t", `=${target}`]);
     return { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
   }
 
+  // Pane-target commands (capture-pane, paste-buffer, send-keys) only honor
+  // tmux's "=" exact-match prefix in the session part of a "session:" target,
+  // hence the `=name:` form (exact session, active pane).
   async function capture(target: string, lines = 80): Promise<string> {
     const start = Math.max(1, Math.floor(lines));
-    const result = await runTmux(["capture-pane", "-pt", target, "-S", `-${start}`]);
+    const result = await runTmux(["capture-pane", "-pt", `=${target}:`, "-S", `-${start}`]);
     return result.stdout.trimEnd();
   }
 
@@ -105,7 +134,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     if (loadResult.exitCode !== 0) {
       throw new Error(`Remote tmux load-buffer failed: ${loadResult.stderr.trim() || loadResult.stdout.trim()}`);
     }
-    const pasteArgv = buildSshTmuxArgv(["paste-buffer", "-p", "-b", buffer, "-t", target]);
+    const pasteArgv = buildSshTmuxArgv(["paste-buffer", "-p", "-b", buffer, "-t", `=${target}:`]);
     const pasteResult = await exec(pasteArgv);
     if (pasteResult.exitCode !== 0) {
       throw new Error(`Remote tmux paste-buffer failed: ${pasteResult.stderr.trim() || pasteResult.stdout.trim()}`);
@@ -118,7 +147,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   }
 
   async function sendKey(target: string, key: string): Promise<void> {
-    const result = await runTmux(["send-keys", "-t", target, key]);
+    const result = await runTmux(["send-keys", "-t", `=${target}:`, key]);
     if (result.exitCode !== 0) {
       throw new Error(`Remote tmux send-keys failed: ${result.stderr.trim() || result.stdout.trim()}`);
     }
@@ -131,7 +160,10 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   }
 
   function attachCommand(target: string): string[] {
-    return [sshBinary, "-t", ...sshBaseArgs, node.endpoint, "tmux", "attach-session", "-t", target];
+    // "=" pins tmux to an exact session name; without it tmux prefix-matching
+    // could attach a different session (e.g. CL-abcd when CL-abc is gone).
+    // Printed by `hive attach --print` (no multiplexing defaults).
+    return [sshBinary, "-t", ...sshBaseArgs, node.endpoint, ...["tmux", "attach-session", "-t", `=${target}`].map(shellQuote)];
   }
 
   async function attachSession(target: string): Promise<void> {
@@ -179,11 +211,13 @@ async function defaultExecHook(argv: string[], input?: string): Promise<{ stdout
       const result = await execFileAsync(command, args, { maxBuffer: 20 * 1024 * 1024, timeout: DEFAULT_OP_TIMEOUT_MS });
       return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
     } catch (error) {
-      const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; status?: number };
+      const err = error as { stdout?: string; stderr?: string; message?: string; code?: number | string };
       return {
         stdout: err.stdout ?? "",
         stderr: err.stderr ?? err.message ?? "",
-        exitCode: typeof err.status === "number" ? err.status : 1,
+        // execFile carries the exit code in err.code (err.status is spawnSync);
+        // string codes like ENOENT fall back to 1.
+        exitCode: typeof err.code === "number" ? err.code : 1,
       };
     }
   }
@@ -191,13 +225,29 @@ async function defaultExecHook(argv: string[], input?: string): Promise<{ stdout
     const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const settle = (result: { stdout: string; stderr: string; exitCode: number }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    // Mirror the argv path's timeout so a wedged ssh cannot hang callers.
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      settle({ stdout, stderr: stderr || `timed out after ${DEFAULT_OP_TIMEOUT_MS}ms`, exitCode: 1 });
+    }, DEFAULT_OP_TIMEOUT_MS);
     child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("error", () => resolve({ stdout, stderr: stderr || "spawn error", exitCode: 1 }));
+    child.on("error", () => settle({ stdout, stderr: stderr || "spawn error", exitCode: 1 }));
     child.on("exit", (code, signal) => {
       const exitCode = code ?? (signal ? 130 : 1);
-      resolve({ stdout, stderr, exitCode });
+      settle({ stdout, stderr, exitCode });
     });
+    // If ssh exits before consuming stdin the pending write surfaces as EPIPE;
+    // without a handler that becomes an uncaught exception that can take down
+    // the daemon. The failure itself is reported via the exit handler.
+    child.stdin.on("error", () => undefined);
     child.stdin.write(input);
     child.stdin.end();
   });

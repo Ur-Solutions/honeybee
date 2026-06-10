@@ -484,6 +484,61 @@ test("listFlows mixes .ts and .json registry entries", async () => {
   });
 });
 
+test("loadFlow falls back to the recorded .source path when the registry TS copy cannot import (relative imports)", async () => {
+  await withTempStore(async (dir) => {
+    // A TS flow with a RELATIVE import: defineFlowFromFile copies only the
+    // single .ts into the registry, so the registry copy's `./helper.js`
+    // cannot resolve — loadFlow must fall back to the recorded source path.
+    const helper = join(dir, "helper.ts");
+    await writeFile(helper, `export const PAYLOAD = "from-helper";\n`);
+    const source = join(dir, "with-import.ts");
+    await writeFile(
+      source,
+      `import { defineFlow } from "${join(process.cwd(), "src/flow/index.ts")}";\n` +
+      `import { PAYLOAD } from "./helper.js";\n` +
+      `export default defineFlow({ name: "with-import", run: async () => PAYLOAD });\n`,
+    );
+    await defineFlowFromFile(source);
+
+    const loaded = await loadFlow("with-import");
+    assert.ok(loaded, "flow must load via the source fallback");
+    assert.equal(loaded?.name, "with-import");
+    const result = await loaded!.run(makeCtx());
+    assert.equal(result, "from-helper");
+
+    // And it must not silently vanish from the flow list either.
+    const flows = await listFlows();
+    const entry = flows.find((f) => f.name === "with-import");
+    assert.ok(entry);
+    assert.equal(entry?.loadError, undefined);
+  });
+});
+
+test("listFlows surfaces an unloadable flow with a loadError marker instead of hiding it", async () => {
+  await withTempStore(async (dir) => {
+    // Write a broken TS flow straight into the registry (no .source recorded):
+    // its import can never resolve, so loadFlow throws.
+    const flowsDir = join(dir, "flows");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(flowsDir, { recursive: true });
+    await writeFile(
+      join(flowsDir, "broken.ts"),
+      `import { nope } from "./this-module-does-not-exist.js";\nexport default nope;\n`,
+    );
+
+    await assert.rejects(() => loadFlow("broken"));
+
+    const flows = await listFlows();
+    const broken = flows.find((f) => f.name === "broken");
+    assert.ok(broken, "the broken flow must still appear in the list");
+    assert.ok(broken?.loadError, "loadError marks the entry as unloadable");
+    assert.match(broken?.description ?? "", /unloadable/);
+    await assert.rejects(async () => {
+      await broken!.run(makeCtx());
+    }, /failed to load/);
+  });
+});
+
 test("loadFlow loads a TS flow via tsLoader (dynamic import)", async () => {
   await withTempStore(async (dir) => {
     const source = join(dir, "ts-flow.ts");

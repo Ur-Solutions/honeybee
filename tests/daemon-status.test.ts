@@ -59,11 +59,40 @@ test("readDaemonStatus reports running when a live lock exists for current proce
     try {
       const report = await readDaemonStatus();
       assert.equal(report.running, true);
+      assert.equal(report.lockHeldByOtherHost, false);
       assert.ok(report.lock);
       assert.equal(report.lock!.pid, process.pid);
     } finally {
       await lock.release();
     }
+  });
+});
+
+test("readDaemonStatus does not report running for a lock written by another host", async () => {
+  await withTempStore(async () => {
+    const lockPath = daemonLockPath();
+    await mkdir(dirname(lockPath), { recursive: true });
+    // A shared/synced store root can carry a foreign lock whose PID happens
+    // to be alive locally (here: our own PID). It must NOT count as running.
+    const meta = { pid: process.pid, hostname: "some-other-host.example", startedAt: new Date().toISOString(), token: "x" };
+    await writeFile(lockPath, JSON.stringify(meta));
+    const report = await readDaemonStatus();
+    assert.equal(report.running, false);
+    assert.equal(report.lockHeldByOtherHost, true);
+    assert.ok(report.lock, "the foreign lock meta is still surfaced");
+    assert.equal(report.lock!.pid, process.pid);
+  });
+});
+
+test("readDaemonStatus treats a lock with empty hostname as foreign", async () => {
+  await withTempStore(async () => {
+    const lockPath = daemonLockPath();
+    await mkdir(dirname(lockPath), { recursive: true });
+    const meta = { pid: process.pid, hostname: "", startedAt: new Date().toISOString(), token: "x" };
+    await writeFile(lockPath, JSON.stringify(meta));
+    const report = await readDaemonStatus();
+    assert.equal(report.running, false);
+    assert.equal(report.lockHeldByOtherHost, true);
   });
 });
 

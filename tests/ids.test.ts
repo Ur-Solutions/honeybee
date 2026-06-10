@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { allocateBeeIdentity, beePrefix, highlightUniqueSessionReference, matchesSessionReference, shortestUniqueSessionPrefix } from "../src/ids.js";
+
+function withSilencedStderr<T>(fn: () => Promise<T>): Promise<T> {
+  const original = console.error;
+  console.error = () => undefined;
+  return fn().finally(() => {
+    console.error = original;
+  });
+}
 
 test("beePrefix uses harness prefixes and alias initials", () => {
   assert.equal(beePrefix("codex", "codex"), "CO.");
@@ -63,4 +71,54 @@ test("matchesSessionReference targets the suffix even without a recorded uuid", 
   const bee = { name: "brave-otter", id: "CO.abc" };
   assert.equal(matchesSessionReference(bee, "abc"), true);
   assert.equal(matchesSessionReference(bee, "ab"), false);
+});
+
+test("allocateBeeIdentity skips invalid id-index entries instead of failing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-ids-"));
+  try {
+    await writeFile(
+      join(dir, "id-index.json"),
+      JSON.stringify({ used: ["not-a-uuid", "abc00000000040008000000000000000"] }, null, 2),
+    );
+
+    const warnings: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => warnings.push(args.join(" "));
+    let identity;
+    try {
+      identity = await allocateBeeIdentity({ storeRoot: dir, agent: "codex", requestedAgent: "codex", uuid: () => "abc11111-1111-4111-8111-111111111111" });
+    } finally {
+      console.error = original;
+    }
+
+    // The valid historical entry is still honored: the new id needs 4 chars.
+    assert.equal(identity.id, "CO.abc1");
+    assert.ok(warnings.some((line) => line.includes("not-a-uuid")), `expected a warning naming the bad entry, saw: ${warnings.join("; ")}`);
+
+    const index = JSON.parse(await readFile(join(dir, "id-index.json"), "utf8")) as { used: string[] };
+    assert.ok(index.used.includes("abc00000000040008000000000000000"));
+    assert.ok(index.used.includes("abc11111111141118111111111111111"));
+    assert.ok(!index.used.includes("not-a-uuid"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("allocateBeeIdentity recovers from a corrupt id-index.json by moving it aside", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-ids-"));
+  try {
+    await writeFile(join(dir, "id-index.json"), "{definitely not json");
+
+    const identity = await withSilencedStderr(() =>
+      allocateBeeIdentity({ storeRoot: dir, agent: "codex", requestedAgent: "codex", uuid: () => "abc00000-0000-4000-8000-000000000000" }),
+    );
+    assert.equal(identity.id, "CO.abc");
+
+    const entries = await readdir(dir);
+    assert.ok(entries.some((entry) => entry.startsWith("id-index.json.corrupt-")), `expected the corrupt index moved aside, saw: ${entries.join(", ")}`);
+    const index = JSON.parse(await readFile(join(dir, "id-index.json"), "utf8")) as { used: string[] };
+    assert.deepEqual(index.used, ["abc00000000040008000000000000000"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

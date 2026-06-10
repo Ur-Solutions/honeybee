@@ -162,21 +162,23 @@ test("registering 'local' as ssh-tmux overrides the implicit local node", async 
   });
 });
 
-test("registerNode rejects an ssh-command containing whitespace", async () => {
+test("registerNode rejects an ssh-command containing whitespace and hints the --ssh-args= form", async () => {
   await withTempStore(async () => {
+    // The hint must use the `=` form: the flag parser turns `--ssh-args "-F …"`
+    // into a boolean because the value starts with `-`.
     await assert.rejects(
       registerNode({ name: "weird", kind: "ssh-tmux", endpoint: "x", sshCommand: "ssh -F /etc/config" }),
-      /must be a single binary path/,
+      /must be a single binary path.*--ssh-args="-F \/path\/to\/config"/,
     );
   });
 });
 
-test("updateNode rejects an ssh-command containing whitespace", async () => {
+test("updateNode rejects an ssh-command containing whitespace and hints the --ssh-args= form", async () => {
   await withTempStore(async () => {
     await registerNode({ name: "mini01", kind: "ssh-tmux", endpoint: "x" });
     await assert.rejects(
       updateNode("mini01", { sshCommand: "ssh -F /etc/config" }),
-      /must be a single binary path/,
+      /must be a single binary path.*--ssh-args="-F \/path\/to\/config"/,
     );
   });
 });

@@ -24,6 +24,7 @@ export {
   loopStopRequestPath,
   loopsRoot,
   readLoopConfig,
+  reconcileLoopStatus,
   requestStop,
   updateLoopConfig,
   writeIterSeal,
@@ -39,6 +40,9 @@ export {
   buildIterationPrompt,
   foldForward,
   HISTORY_DIGEST_THRESHOLD,
+  INJECTION_BUDGET_BYTES,
+  PROGRESS_SUMMARY_MAX_CHARS,
   rederiveHistory,
+  truncateForInjection,
 } from "./summarizer.js";
 export { runStopPredicate } from "./until.js";

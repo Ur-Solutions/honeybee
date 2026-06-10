@@ -64,9 +64,11 @@ function fakeSubstrate(impl: Partial<Substrate> = {}): Substrate {
 
 const sender: BuzSender = { kind: "bee", id: "CL.x" };
 
-// ─── selectBuzDispatchTriggers (pure) ───────────────────────────────────
+// ─── selectBuzDispatchTriggers ────────────────────────────────────────────
 
-test("selectBuzDispatchTriggers picks transitions into idle_with_output", () => {
+const queueNonEmpty = async () => true;
+
+test("selectBuzDispatchTriggers picks transitions into idle_with_output", async () => {
   const a = makeRecord("alpha");
   const b = makeRecord("beta");
   const c = makeRecord("gamma");
@@ -75,26 +77,71 @@ test("selectBuzDispatchTriggers picks transitions into idle_with_output", () => 
     { name: "beta", from: "active", to: "active" },
     { name: "gamma", from: "ready", to: "idle_with_output" },
   ];
-  const triggers = selectBuzDispatchTriggers([a, b, c], transitions);
+  const triggers = await selectBuzDispatchTriggers([a, b, c], transitions, queueNonEmpty);
   assert.equal(triggers.length, 2);
   assert.equal(triggers[0]!.record.name, "alpha");
   assert.equal(triggers[1]!.record.name, "gamma");
 });
 
-test("selectBuzDispatchTriggers excludes first-observation transitions (from === undefined)", () => {
+test("selectBuzDispatchTriggers includes first observations (from === undefined) so a daemon restart drains idle bees", async () => {
   const a = makeRecord("alpha");
   const transitions: TickTransition[] = [
     { name: "alpha", from: undefined, to: "idle_with_output" },
   ];
-  const triggers = selectBuzDispatchTriggers([a], transitions);
+  const triggers = await selectBuzDispatchTriggers([a], transitions, queueNonEmpty);
+  assert.equal(triggers.length, 1);
+  assert.equal(triggers[0]!.record.name, "alpha");
+});
+
+test("selectBuzDispatchTriggers picks already-idle bees (no transition this tick) via lastObservedState", async () => {
+  const idle = makeRecord("alpha", { lastObservedState: "idle_with_output" });
+  const active = makeRecord("beta", { lastObservedState: "active" });
+  const unknown = makeRecord("gamma");
+  const triggers = await selectBuzDispatchTriggers([idle, active, unknown], [], queueNonEmpty);
+  assert.equal(triggers.length, 1);
+  assert.equal(triggers[0]!.record.name, "alpha");
+});
+
+test("selectBuzDispatchTriggers prefers this tick's transition over a stale lastObservedState", async () => {
+  // The bee left idle this tick; the persisted lastObservedState is stale.
+  const a = makeRecord("alpha", { lastObservedState: "idle_with_output" });
+  const transitions: TickTransition[] = [
+    { name: "alpha", from: "idle_with_output", to: "active" },
+  ];
+  const triggers = await selectBuzDispatchTriggers([a], transitions, queueNonEmpty);
   assert.equal(triggers.length, 0);
 });
 
-test("selectBuzDispatchTriggers ignores transitions for unknown records", () => {
+test("selectBuzDispatchTriggers trusts this tick's currentStates over a stale persisted lastObservedState", async () => {
+  // The previous tick's touchSession write failed, so the record on disk
+  // still says "active" — but the daemon derived idle_with_output THIS tick.
+  // With no transition (the in-memory observed map already updated last
+  // tick), only currentStates can see the bee is drainable.
+  const stale = makeRecord("alpha", { lastObservedState: "active" });
+  const currentStates = new Map([["alpha", "idle_with_output"]]);
+  const triggers = await selectBuzDispatchTriggers([stale], [], queueNonEmpty, currentStates);
+  assert.equal(triggers.length, 1);
+  assert.equal(triggers[0]!.record.name, "alpha");
+});
+
+test("selectBuzDispatchTriggers via currentStates skips a bee that went active despite a stale idle lastObservedState", async () => {
+  const stale = makeRecord("alpha", { lastObservedState: "idle_with_output" });
+  const currentStates = new Map([["alpha", "active"]]);
+  const triggers = await selectBuzDispatchTriggers([stale], [], queueNonEmpty, currentStates);
+  assert.equal(triggers.length, 0);
+});
+
+test("selectBuzDispatchTriggers skips idle bees with an empty queue", async () => {
+  const a = makeRecord("alpha", { lastObservedState: "idle_with_output" });
+  const triggers = await selectBuzDispatchTriggers([a], [], async () => false);
+  assert.equal(triggers.length, 0);
+});
+
+test("selectBuzDispatchTriggers ignores transitions for unknown records", async () => {
   const transitions: TickTransition[] = [
     { name: "ghost", from: "active", to: "idle_with_output" },
   ];
-  const triggers = selectBuzDispatchTriggers([], transitions);
+  const triggers = await selectBuzDispatchTriggers([], transitions, queueNonEmpty);
   assert.equal(triggers.length, 0);
 });
 
@@ -120,6 +167,58 @@ test("dispatchBuzDrains drains queue on active->idle_with_output and moves to in
     assert.deepEqual(calls, ["first", "second"]);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).length, 0);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 2);
+  });
+});
+
+test("dispatchBuzDrains drains a bee that is ALREADY idle when a message lands in queue/ (no transition)", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa", { lastObservedState: "idle_with_output" });
+    // The message arrives while the bee is already idle — no transition will
+    // ever fire, but the next tick must still deliver it.
+    const sent = await sendBuzMessage({ recipient, sender, tier: "queue", body: "while-idle" });
+
+    const calls: string[] = [];
+    const substrate = fakeSubstrate({ sendText: async (_t, text) => { calls.push(text); } });
+    const outcomes = await dispatchBuzDrains([recipient], [], { resolveSubstrate: () => substrate });
+
+    assert.equal(outcomes.length, 1);
+    assert.deepEqual(outcomes[0]!.result.delivered, [sent.message.id]);
+    assert.deepEqual(calls, ["while-idle"]);
+    assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).filter((f) => f.endsWith(".md")).length, 0);
+    assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 1);
+  });
+});
+
+test("dispatchBuzDrains drains on the daemon's first observation (from === undefined) of an idle bee", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    const sent = await sendBuzMessage({ recipient, sender, tier: "queue", body: "after-restart" });
+
+    const substrate = fakeSubstrate();
+    const outcomes = await dispatchBuzDrains(
+      [recipient],
+      [{ name: recipient.name, from: undefined, to: "idle_with_output" }],
+      { resolveSubstrate: () => substrate },
+    );
+
+    assert.equal(outcomes.length, 1);
+    assert.deepEqual(outcomes[0]!.result.delivered, [sent.message.id]);
+  });
+});
+
+test("dispatchBuzDrains skips idle bees with an empty queue (no lock churn, no outcomes)", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa", { lastObservedState: "idle_with_output" });
+    let drained = 0;
+    const outcomes = await dispatchBuzDrains([recipient], [], {
+      resolveSubstrate: () => fakeSubstrate(),
+      drain: async () => {
+        drained += 1;
+        return { delivered: [], quarantined: [], errors: [] };
+      },
+    });
+    assert.equal(outcomes.length, 0);
+    assert.equal(drained, 0);
   });
 });
 
@@ -201,9 +300,9 @@ test("dispatchBuzDrains stops on first failure; subsequent messages remain in qu
   });
 });
 
-test("dispatchBuzDrains: next tick retries previously failed message", async () => {
+test("dispatchBuzDrains: next tick retries a previously failed message while the bee stays idle", async () => {
   await withTempStore(async () => {
-    const recipient = makeRecord("CO.aaa");
+    const recipient = makeRecord("CO.aaa", { lastObservedState: "idle_with_output" });
     await sendBuzMessage({ recipient, sender, tier: "queue", body: "retry-me" });
 
     let fail = true;
@@ -213,7 +312,7 @@ test("dispatchBuzDrains: next tick retries previously failed message", async () 
       },
     });
 
-    // First tick: drain fails.
+    // First tick: the bee transitions into idle_with_output, drain fails.
     await dispatchBuzDrains(
       [recipient],
       [{ name: recipient.name, from: "active", to: "idle_with_output" }],
@@ -221,14 +320,10 @@ test("dispatchBuzDrains: next tick retries previously failed message", async () 
     );
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).filter((f) => f.endsWith(".md")).length, 1);
 
-    // Second tick: substrate recovers. The next active->idle_with_output
-    // transition retries and delivers the message.
+    // Second tick: substrate recovers. The bee is still idle — there is no
+    // new transition — and the drain retries on current state alone.
     fail = false;
-    const outcomes = await dispatchBuzDrains(
-      [recipient],
-      [{ name: recipient.name, from: "active", to: "idle_with_output" }],
-      { resolveSubstrate: () => substrate },
-    );
+    const outcomes = await dispatchBuzDrains([recipient], [], { resolveSubstrate: () => substrate });
     assert.equal(outcomes[0]!.result.delivered.length, 1);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).filter((f) => f.endsWith(".md")).length, 0);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 1);

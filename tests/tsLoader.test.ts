@@ -47,3 +47,37 @@ test("loadTsModule labels errors with the supplied kind", async () => {
     );
   });
 });
+
+test("loadTsModule preserves the original error for a missing import INSIDE the module", async () => {
+  await withTempDir(async (dir) => {
+    // Regression: any "Cannot find module" used to be rewritten into
+    // "TypeScript runtime not available", misdiagnosing a typo'd import in
+    // the user's module as a broken tsx runtime.
+    const target = join(dir, "typo-import.ts");
+    await writeFile(
+      target,
+      `import { nope } from "./this-module-does-not-exist.js";\nexport default nope;\n`,
+    );
+    await assert.rejects(
+      () => loadTsModule(target, { kind: "flow" }),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /Cannot find module/);
+        assert.match(message, /this-module-does-not-exist/);
+        assert.doesNotMatch(message, /TypeScript runtime not available/);
+        return true;
+      },
+    );
+  });
+});
+
+test("loadTsModule still maps unknown-extension failures to the runtime-unavailable message", async () => {
+  await withTempDir(async (dir) => {
+    const target = join(dir, "module.xyz");
+    await writeFile(target, `export default 1;\n`);
+    await assert.rejects(
+      () => loadTsModule(target, { kind: "flow" }),
+      /TypeScript runtime not available/,
+    );
+  });
+});

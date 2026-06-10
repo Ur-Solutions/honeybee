@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -26,31 +26,48 @@ export async function tmux(args: string[], options: { reject?: boolean } = {}): 
     const result = await execFileAsync("tmux", args, { maxBuffer: 20 * 1024 * 1024 });
     return { ok: true, stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
   } catch (error) {
-    const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; status?: number };
-    if (reject) throw new Error(err.stderr || err.message);
+    const err = error as { stdout?: string; stderr?: string; message?: string; code?: number | string };
+    if (reject) throw new Error(err.stderr || err.message || String(error));
     return {
       ok: false,
       stdout: err.stdout ?? "",
-      stderr: err.stderr ?? err.message,
-      exitCode: typeof err.status === "number" ? err.status : 1,
+      stderr: err.stderr ?? err.message ?? "",
+      // execFile carries the exit code in err.code (err.status is spawnSync);
+      // string codes like ENOENT fall back to 1.
+      exitCode: typeof err.code === "number" ? err.code : 1,
     };
   }
 }
 
+// "=" pins tmux to an exact session name; without it tmux prefix-matching can
+// hit the wrong session (the id allocator naturally produces prefix pairs like
+// CL-abc / CL-abcd, and `kill-session -t CL-abc` would kill CL-abcd once
+// CL-abc is gone). Pane-target commands (paste-buffer, send-keys,
+// capture-pane) only honor "=" in the session part of a "session:" target, so
+// those use the `=name:` form (exact session, active pane).
 export async function hasSession(target: string): Promise<boolean> {
-  const result = await tmux(["has-session", "-t", target], { reject: false });
+  const result = await tmux(["has-session", "-t", `=${target}`], { reject: false });
   return result.ok;
 }
 
 export async function newSession(name: string, cwd: string, spec: LaunchSpec): Promise<void> {
   const launcher = await createLauncher(spec);
-  await tmux(["new-session", "-d", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
+  try {
+    await tmux(["new-session", "-d", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
+  } catch (error) {
+    // The runner only deletes the payload tmpdir once it actually starts; if
+    // tmux itself refuses the session, clean up here instead of leaking it.
+    await rm(launcher.dir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function sendText(target: string, text: string): Promise<void> {
   const buffer = `hive-${target.replace(/[^A-Za-z0-9_.:-]/g, "-")}`;
-  await tmux(["set-buffer", "-b", buffer, text]);
-  await tmux(["paste-buffer", "-p", "-b", buffer, "-t", target]);
+  // Stream the payload via stdin (`load-buffer -`) instead of an argv element:
+  // prompts near ARG_MAX (~1MB on macOS) would fail set-buffer with E2BIG.
+  await tmuxWithStdin(["load-buffer", "-b", buffer, "-"], text);
+  await tmux(["paste-buffer", "-p", "-b", buffer, "-t", `=${target}:`]);
   await sendEnter(target);
 }
 
@@ -59,21 +76,23 @@ export async function sendEnter(target: string): Promise<void> {
 }
 
 export async function sendKey(target: string, key: string): Promise<void> {
-  await tmux(["send-keys", "-t", target, key]);
+  await tmux(["send-keys", "-t", `=${target}:`, key]);
 }
 
 export async function capture(target: string, lines = 80): Promise<string> {
   const start = Math.max(1, Math.floor(lines));
-  const result = await tmux(["capture-pane", "-pt", target, "-S", `-${start}`]);
+  const result = await tmux(["capture-pane", "-pt", `=${target}:`, "-S", `-${start}`]);
   return result.stdout.trimEnd();
 }
 
 export async function kill(target: string): Promise<KillResult> {
-  return tmux(["kill-session", "-t", target], { reject: false });
+  return tmux(["kill-session", "-t", `=${target}`], { reject: false });
 }
 
 export function attachCommand(target: string): string[] {
-  return process.env.TMUX ? ["tmux", "switch-client", "-t", target] : ["tmux", "attach-session", "-t", target];
+  // "=" pins tmux to an exact session name; without it tmux prefix-matching
+  // could attach a different session (e.g. CL-abcd when CL-abc is gone).
+  return process.env.TMUX ? ["tmux", "switch-client", "-t", `=${target}`] : ["tmux", "attach-session", "-t", `=${target}`];
 }
 
 export async function attachSession(target: string): Promise<void> {
@@ -95,6 +114,31 @@ export async function attachSession(target: string): Promise<void> {
   });
 }
 
+async function tmuxWithStdin(args: string[], input: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("tmux", args, { stdio: ["pipe", "ignore", "pipe"] });
+    let stderr = "";
+    let settled = false;
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.on("error", (error) => settle(error));
+    child.on("exit", (code, signal) => {
+      if (code === 0) settle();
+      else settle(new Error(stderr.trim() || `tmux ${args[0]} exited with ${signal ?? code}`));
+    });
+    // If tmux exits before consuming stdin the pending write surfaces as
+    // EPIPE; swallow it — the exit handler reports the real failure.
+    child.stdin.on("error", () => undefined);
+    child.stdin.write(input);
+    child.stdin.end();
+  });
+}
+
 export async function listSessions(): Promise<string[]> {
   const result = await tmux(["list-sessions", "-F", "#{session_name}"], { reject: false });
   if (!result.ok) return [];
@@ -113,7 +157,7 @@ export async function probe(): Promise<ProbeResult> {
   }
 }
 
-async function createLauncher(spec: LaunchSpec): Promise<{ runnerPath: string; payloadPath: string }> {
+async function createLauncher(spec: LaunchSpec): Promise<{ dir: string; runnerPath: string; payloadPath: string }> {
   const dir = await mkdtemp(join(tmpdir(), "hive-launch-"));
   const runnerPath = join(dir, "launch.mjs");
   const payloadPath = join(dir, "payload.json");
@@ -145,7 +189,7 @@ child.on("exit", (code, signal) => {
 `,
     { mode: 0o700 },
   );
-  return { runnerPath, payloadPath };
+  return { dir, runnerPath, payloadPath };
 }
 
 function shellCommand(parts: string[]): string {

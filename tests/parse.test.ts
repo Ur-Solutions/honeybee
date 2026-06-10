@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { flag, numberFlag, parse, truthy } from "../src/parse.js";
+import { BOOLEAN_FLAGS, flag, numberFlag, parse, truthy } from "../src/parse.js";
 
 test("parse separates command args flags and passthrough rest", () => {
   const parsed = parse(["run", "claude", "--cwd", "/tmp/work", "-p", "hello", "--", "--model", "sonnet"]);
@@ -28,6 +28,13 @@ test("parse leaves positional args after boolean flags", () => {
   const long = parse(["tail", "--follow", "CO.6e2"]);
   assert.equal(flag(long, "follow"), true);
   assert.deepEqual(long.args, ["CO.6e2"]);
+});
+
+test("BOOLEAN_FLAGS is exported so completion can skip value-less flags", () => {
+  assert.ok(BOOLEAN_FLAGS.has("json"));
+  assert.ok(BOOLEAN_FLAGS.has("yolo"));
+  assert.ok(BOOLEAN_FLAGS.has("f"));
+  assert.ok(!BOOLEAN_FLAGS.has("cwd"));
 });
 
 test("truthy accepts explicit opt-in values only", () => {

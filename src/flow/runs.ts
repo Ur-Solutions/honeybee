@@ -135,7 +135,28 @@ export async function readMeta(flowName: string, runId: string): Promise<FlowRun
 
 export async function writeResult(flowName: string, runId: string, result: FlowRunResult): Promise<void> {
   await mkdir(runDir(flowName, runId), { recursive: true });
-  await atomicWriteFile(runResultPath(flowName, runId), `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(result, null, 2);
+  } catch (error) {
+    // The flow's return value is author-controlled and may be circular or
+    // contain BigInt — a throw here must not strand the run without a result.
+    const note = error instanceof Error ? error.message : String(error);
+    const fallback: FlowRunResult = {
+      ...result,
+      value: `[unserializable flow result: ${note}] ${stringifyQuiet(result.value)}`,
+    };
+    serialized = JSON.stringify(fallback, null, 2);
+  }
+  await atomicWriteFile(runResultPath(flowName, runId), `${serialized}\n`, { mode: 0o600 });
+}
+
+function stringifyQuiet(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return "[unprintable]";
+  }
 }
 
 export async function readResult(flowName: string, runId: string): Promise<FlowRunResult | null> {
@@ -164,14 +185,24 @@ export async function readLogFull(flowName: string, runId: string): Promise<stri
 export type RunSummary = FlowRunMeta & { dir: string };
 
 /**
+ * Age past which a pid-less "running" record is presumed dead. The pre-write →
+ * pid-patch window in spawnDetachedRun is milliseconds long; a record still
+ * pid-less after this long means the spawn failed before the patch landed.
+ */
+export const PIDLESS_RUNNING_GRACE_MS = 30_000;
+
+/**
  * List all runs across all flows. When `flowName` is provided, scope to that
  * flow only. Returned newest-first by startedAt; missing/invalid meta files
  * are skipped. PID liveness check is applied: status==='running' with a dead
  * pid downgrades to 'orphaned' in the returned view (the on-disk file is
- * left as-is — callers can persist the downgrade if desired).
+ * left as-is — callers can persist the downgrade if desired). A pid-less
+ * "running" record older than PIDLESS_RUNNING_GRACE_MS is downgraded the same
+ * way — it can only mean the spawn died before the pid patch was written.
  */
-export async function listRuns(opts: { flowName?: string; isPidAlive?: (pid: number) => boolean } = {}): Promise<RunSummary[]> {
+export async function listRuns(opts: { flowName?: string; isPidAlive?: (pid: number) => boolean; now?: number } = {}): Promise<RunSummary[]> {
   const isAlive = opts.isPidAlive ?? defaultIsPidAlive;
+  const now = opts.now ?? Date.now();
   const flowsList = opts.flowName
     ? [opts.flowName]
     : await readdir(flowsRoot()).catch(() => [] as string[]);
@@ -188,8 +219,15 @@ export async function listRuns(opts: { flowName?: string; isPidAlive?: (pid: num
       const meta = await readMeta(flowName, runId).catch(() => null);
       if (!meta) continue;
       let view: FlowRunMeta = meta;
-      if (view.status === "running" && typeof view.pid === "number" && !isAlive(view.pid)) {
-        view = { ...view, status: "orphaned" };
+      if (view.status === "running") {
+        if (typeof view.pid === "number") {
+          if (!isAlive(view.pid)) view = { ...view, status: "orphaned" };
+        } else {
+          const age = now - Date.parse(view.startedAt);
+          if (Number.isFinite(age) && age > PIDLESS_RUNNING_GRACE_MS) {
+            view = { ...view, status: "orphaned" };
+          }
+        }
       }
       out.push({ ...view, dir: runDir(flowName, runId) });
     }

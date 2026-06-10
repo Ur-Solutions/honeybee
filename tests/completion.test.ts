@@ -125,6 +125,22 @@ test("skips a flag and its value when counting positional index", () => {
   assert.ok(candidates.includes("claude"), "should still suggest bees as first positional");
 });
 
+test("boolean flags do not swallow the following positional", () => {
+  // --yolo is boolean: "claude" is the first positional, so the next slot
+  // is the freeform prompt — not another bee suggestion.
+  assert.deepEqual(getCompletionsFromState(["hive", "run", "--yolo", "claude", ""], empty), []);
+  // And before the first positional, bees are still suggested.
+  assert.ok(getCompletionsFromState(["hive", "run", "--yolo", ""], empty).includes("claude"));
+
+  // Same accounting for noun subcommands: --json must not eat "run".
+  const state = {
+    records: [],
+    liveTargets: new Set<string>(),
+    flows: [{ name: "deploy", run: () => undefined }],
+  };
+  assert.deepEqual(getCompletionsFromState(["hive", "flow", "--json", "run", ""], state), ["deploy"]);
+});
+
 test("returns empty for unknown command", () => {
   assert.deepEqual(getCompletionsFromState(["hive", "nope", ""], empty), []);
 });

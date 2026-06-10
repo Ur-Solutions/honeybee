@@ -1,5 +1,5 @@
 import * as readline from "node:readline";
-import { bold, cyan, dim, gray, green, isPretty, magenta, red, tildify, truncate, visibleLength, yellow } from "./format.js";
+import { bold, cyan, dim, gray, graphemeWidth, green, isPretty, magenta, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
 import type { BeeState } from "./state.js";
 
 export type CleanTuiItem = {
@@ -60,6 +60,25 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
   stdin.resume();
   stdout.write("\x1b[?1049h\x1b[?25l");
 
+  // Restore the terminal exactly once, even if we exit through a signal or a
+  // crash rather than the happy path: leaving the alt screen in raw mode with
+  // a hidden cursor would wedge the user's shell.
+  let restored = false;
+  const restoreTerminal = () => {
+    if (restored) return;
+    restored = true;
+    stdout.write("\x1b[?25h\x1b[?1049l");
+    stdin.setRawMode(previousRaw);
+    stdin.pause();
+  };
+  const onSignal = (signal: NodeJS.Signals) => {
+    restoreTerminal();
+    process.exit(signal === "SIGTERM" ? 143 : 129);
+  };
+  process.once("exit", restoreTerminal);
+  process.once("SIGTERM", onSignal);
+  process.once("SIGHUP", onSignal);
+
   try {
     return await new Promise<CleanTuiResult>((resolve) => {
       let done = false;
@@ -67,6 +86,7 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
         if (done) return;
         done = true;
         stdin.off("keypress", onKey);
+        stdout.off("resize", onResize);
         resolve({ cleaned, failed, cancelled: cleaned === 0 && failed === 0 });
       };
 
@@ -149,8 +169,10 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
           message = `clean failed: ${error instanceof Error ? error.message : String(error)}`;
         } finally {
           cleaning = false;
-          render();
-          void requestPreview();
+          if (!done) {
+            render();
+            void requestPreview();
+          }
         }
       };
 
@@ -186,11 +208,14 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
       };
 
       const onKey = (_value: string, key: readline.Key) => {
-        if (cleaning) return;
+        // Ctrl+C must work even mid-clean: raw mode swallows SIGINT, so this
+        // is the only way out of a hung clean. The finally restores the
+        // terminal; the in-flight clean is guarded by `done`.
         if (key.ctrl && key.name === "c") {
           finish();
           return;
         }
+        if (cleaning) return;
         switch (key.name) {
           case "escape":
           case "q":
@@ -234,11 +259,13 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
       };
 
       const render = () => {
-        const width = Math.max(72, stdout.columns ?? 100);
-        const height = Math.max(12, stdout.rows ?? 24);
+        if (done) return;
+        const width = Math.max(1, stdout.columns || 100);
+        const height = Math.max(12, stdout.rows || 24);
         const previewRows = previewOpen ? Math.max(4, Math.min(12, Math.floor(height * 0.35))) : 0;
         const previewBlockRows = previewOpen ? previewRows + 2 : 0;
         const bodyRows = Math.max(4, height - 7 - previewBlockRows);
+        scroll = Math.min(scroll, Math.max(0, rows.length - bodyRows));
         if (cursor < scroll) scroll = cursor;
         if (cursor >= scroll + bodyRows) scroll = cursor - bodyRows + 1;
         const visible = rows.slice(scroll, scroll + bodyRows);
@@ -263,19 +290,24 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
         stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
       };
 
+      const onResize = () => render();
+
       render();
       stdin.on("keypress", onKey);
+      stdout.on("resize", onResize);
     });
   } finally {
-    stdout.write("\x1b[?25h\x1b[?1049l");
-    stdin.setRawMode(previousRaw);
+    process.off("exit", restoreTerminal);
+    process.off("SIGTERM", onSignal);
+    process.off("SIGHUP", onSignal);
+    restoreTerminal();
   }
 }
 
 function tableHeader(width: number): string {
   const cwdWidth = cwdColumnWidth(width);
   const cells = [
-    "  ",
+    " ",
     "   ",
     pad("REF", 12),
     pad("STATE", 10),
@@ -306,7 +338,10 @@ function renderRow(item: CleanTuiItem, index: number, cursor: number, selected: 
     disabled,
   ].join("  ");
   if (item.disabledReason) return dim(row);
-  return isCurrent ? reverse(row) : row;
+  // The selection bar must span the whole row: embedded SGR resets from
+  // colored cells would cancel the inverse attribute mid-row, so render the
+  // current row without inner colors.
+  return isCurrent ? reverse(stripAnsi(row)) : row;
 }
 
 function renderPreview(item: CleanTuiItem | undefined, cache: Map<string, PreviewCacheEntry>, rows: number, width: number, hasLoader: boolean): string[] {
@@ -325,9 +360,9 @@ function renderPreview(item: CleanTuiItem | undefined, cache: Map<string, Previe
   return [truncate(header, width), ...bodyLines.slice(0, contentRows)];
 }
 
-function wrapPreview(text: string, width: number, maxRows: number): string[] {
+export function wrapPreview(text: string, width: number, maxRows: number): string[] {
   const lines: string[] = [];
-  const usableWidth = Math.max(20, width);
+  const usableWidth = Math.max(1, width);
   for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
     const line = raw.trimEnd();
     if (line.length === 0) {
@@ -335,8 +370,9 @@ function wrapPreview(text: string, width: number, maxRows: number): string[] {
     } else {
       let rest = line;
       while (rest.length > 0) {
-        lines.push(rest.slice(0, usableWidth));
-        rest = rest.slice(usableWidth);
+        const end = sliceEndForWidth(rest, usableWidth);
+        lines.push(rest.slice(0, end));
+        rest = rest.slice(end);
       }
     }
     if (lines.length >= maxRows) break;
@@ -346,6 +382,22 @@ function wrapPreview(text: string, width: number, maxRows: number): string[] {
     lines[maxRows - 1] = truncate(`${lines[maxRows - 1]} ...`, usableWidth);
   }
   return lines;
+}
+
+// Index just past the last grapheme cluster that fits within maxWidth display
+// columns. Iterating by cluster means surrogate pairs, ZWJ sequences, and
+// modifier-based emoji never get split, and wide (CJK/emoji) glyphs count two.
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+function sliceEndForWidth(value: string, maxWidth: number): number {
+  let width = 0;
+  let end = 0;
+  for (const { segment, index } of GRAPHEMES.segment(value)) {
+    const charWidth = graphemeWidth(segment);
+    if (width + charWidth > maxWidth && width > 0) return index;
+    width += charWidth;
+    end = index + segment.length;
+  }
+  return end;
 }
 
 function blankLines(count: number): string[] {

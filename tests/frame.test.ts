@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { defineFrameFromFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame } from "../src/frame.js";
+import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject } from "../src/frame.js";
 
 async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-frame-"));
@@ -151,5 +151,48 @@ test("loadFrame loads TS frames via dynamic import when tsx is active", async ()
     assert.equal(defined.name, "deep-review");
     const loaded = await loadFrame("deep-review");
     assert.equal(loaded?.castes[0]!.brief, "Read architecture.");
+  });
+});
+
+test("defineFrameFromFile rejects a nameOverride that renames a .ts frame", async () => {
+  await withTempStore(async (dir) => {
+    const source = join(dir, "tsframe.ts");
+    await writeFile(source, `const frame = ${JSON.stringify(DEEP_REVIEW)}; export default frame;\n`);
+    // A verbatim .ts copy under another name would always fail validateFrame on load.
+    await assert.rejects(defineFrameFromFile(source, "renamed"), /Cannot rename a \.ts frame/);
+    // The declared name is still accepted (used by `hive frame reload`).
+    const defined = await defineFrameFromFile(source, "deep-review");
+    assert.equal(defined.name, "deep-review");
+  });
+});
+
+test("redefining a frame from the other extension removes the stale sibling", async () => {
+  await withTempStore(async (dir) => {
+    const tsSource = join(dir, "tsframe.ts");
+    await writeFile(tsSource, `const frame = ${JSON.stringify(DEEP_REVIEW)}; export default frame;\n`);
+    await defineFrameFromFile(tsSource);
+    assert.equal((await frameDefinitionFile("deep-review"))?.ext, ".ts");
+
+    // Redefine from JSON: the .ts sibling must go away, or it would keep
+    // shadowing the new definition (loadFrame prefers .ts).
+    const jsonSource = join(dir, "in.json");
+    const updated = { ...DEEP_REVIEW, description: "JSON wins now" };
+    await writeFile(jsonSource, JSON.stringify(updated));
+    await defineFrameFromFile(jsonSource);
+    assert.equal((await frameDefinitionFile("deep-review"))?.ext, ".json");
+    assert.equal((await loadFrame("deep-review"))?.description, "JSON wins now");
+  });
+});
+
+test("writeFrameFromObject removes a stale .ts sibling so the edit takes effect", async () => {
+  await withTempStore(async (dir) => {
+    const tsSource = join(dir, "tsframe.ts");
+    await writeFile(tsSource, `const frame = ${JSON.stringify(DEEP_REVIEW)}; export default frame;\n`);
+    await defineFrameFromFile(tsSource);
+
+    const edited = { ...validateFrame(DEEP_REVIEW), description: "edited" };
+    await writeFrameFromObject(edited);
+    assert.equal((await frameDefinitionFile("deep-review"))?.ext, ".json");
+    assert.equal((await loadFrame("deep-review"))?.description, "edited");
   });
 });

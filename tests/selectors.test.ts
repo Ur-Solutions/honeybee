@@ -1,7 +1,24 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { formatSelector, isSelectorMulti, parseSelector, resolveSelectorFromState } from "../src/selectors.js";
+import { createColony } from "../src/colony.js";
+import { formatSelector, isSelectorMulti, parseSelector, resolveSelector, resolveSelectorFromState } from "../src/selectors.js";
 import type { SessionRecord } from "../src/store.js";
+
+async function withTempStore(fn: () => Promise<void>): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-selectors-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  try {
+    await fn();
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
 
 function bee(name: string, overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -122,6 +139,24 @@ test("isSelectorMulti distinguishes cohort selectors from bee selectors", () => 
   assert.equal(isSelectorMulti({ kind: "bee", query: "CO.6e2" }), false);
   assert.equal(isSelectorMulti({ kind: "swarm", name: "review" }), true);
   assert.equal(isSelectorMulti({ kind: "colony", name: "ops" }), true);
+});
+
+test("resolveSelector accepts an existing colony with no member bees", async () => {
+  await withTempStore(async () => {
+    await createColony("fresh");
+    const target = await resolveSelector("colony:fresh");
+    assert.equal(target.kind, "colony");
+    if (target.kind === "colony") {
+      assert.equal(target.name, "fresh");
+      assert.deepEqual(target.records, []);
+    }
+  });
+});
+
+test("resolveSelector rejects colonies that do not exist in the store", async () => {
+  await withTempStore(async () => {
+    await assert.rejects(resolveSelector("colony:missing"), /Unknown colony: colony:missing/);
+  });
 });
 
 test("formatSelector roundtrips the canonical form", () => {

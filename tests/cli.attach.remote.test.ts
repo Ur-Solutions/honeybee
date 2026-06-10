@@ -67,7 +67,7 @@ test("hive attach --print emits ssh -t <endpoint> tmux attach-session for a remo
 
     const { stdout } = await hive(storeDir, stubDir, "attach", "--print", "remote-bee");
     // ensureLive succeeded via the stub; the printed command is the canonical ssh attachCommand.
-    assert.match(stdout, /\bssh -t trmd@mini01 tmux attach-session -t remote-bee\b/);
+    assert.match(stdout, /\bssh -t trmd@mini01 tmux attach-session -t =remote-bee\b/);
   } finally {
     await rm(storeDir, { recursive: true, force: true });
     await rm(stubDir, { recursive: true, force: true });
@@ -91,7 +91,7 @@ test("hive attach --print emits a local tmux attach-session (no ssh) for a local
       ["--import", "tsx", "src/cli.ts", "attach", "--print", name],
       { cwd: process.cwd(), env },
     );
-    assert.match(stdout, new RegExp(`\\btmux attach-session -t ${name}\\b`));
+    assert.match(stdout, new RegExp(`\\btmux attach-session -t =${name}\\b`));
     assert.ok(!/\bssh\b/.test(stdout), `expected no ssh in output, got: ${stdout}`);
   } finally {
     if (await tmuxHasSession(name)) await tmuxKill(name);

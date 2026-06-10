@@ -11,6 +11,7 @@
 
 import { appendFile, mkdir } from "node:fs/promises";
 import { appendLedger } from "../store.js";
+import { DETACHED_RUN_ENV } from "./background.js";
 import { HiveFacade } from "./hive_facade.js";
 import type { Flow, FlowContext } from "./index.js";
 import {
@@ -69,7 +70,11 @@ export async function executeFlow(flow: Flow, options: ExecuteFlowOptions = {}):
   // parent has already pre-written meta.json with `pgid` so cancelRun can
   // signal the process group even before the child reaches this line. Read
   // the existing meta (if any) so we preserve fields the parent owns —
-  // currently `pgid` and `background`.
+  // currently `pgid` and `background`. The parent's pid/pgid patch races this
+  // startup write, so a detached child (DETACHED_RUN_ENV set by
+  // spawnDetachedRun) also derives the pgid itself: detached:true makes the
+  // child the leader of its own process group, hence pgid === process.pid.
+  const detached = process.env[DETACHED_RUN_ENV] === "1";
   const existing = await readMeta(flow.name, runId);
   const initialMeta: FlowRunMeta = {
     runId,
@@ -79,8 +84,8 @@ export async function executeFlow(flow: Flow, options: ExecuteFlowOptions = {}):
     startedAt,
     pid: process.pid,
     cleanup,
-    background: options.background === true || existing?.background === true,
-    ...(existing?.pgid !== undefined ? { pgid: existing.pgid } : {}),
+    background: options.background === true || existing?.background === true || detached,
+    ...(existing?.pgid !== undefined ? { pgid: existing.pgid } : detached ? { pgid: process.pid } : {}),
   };
   await writeMeta(flow.name, runId, initialMeta);
   await appendLedger({ type: "flow.run.start", flowName: flow.name, runId, pid: process.pid, cleanup });
@@ -174,14 +179,19 @@ export async function executeFlow(flow: Flow, options: ExecuteFlowOptions = {}):
     ...(value !== undefined ? { value } : {}),
     ...(error ? { error } : {}),
   };
-  await writeResult(flow.name, runId, result);
-
   const finalMeta: FlowRunMeta = {
     ...initialMeta,
     status,
     endedAt,
   };
-  await writeMeta(flow.name, runId, finalMeta);
+  try {
+    // writeResult is defensive against unserializable values, but any residual
+    // failure must not strand meta.json on "running" — the terminal status is
+    // persisted regardless.
+    await writeResult(flow.name, runId, result);
+  } finally {
+    await writeMeta(flow.name, runId, finalMeta);
+  }
 
   await appendLedger({
     type: "flow.run.end",

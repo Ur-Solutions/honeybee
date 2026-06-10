@@ -38,6 +38,25 @@ test("readLastLines returns last N lines in source order", async () => {
   });
 });
 
+test("readLastLines does not corrupt multi-byte UTF-8 chars straddling chunk boundaries", async () => {
+  await withTempStore(async () => {
+    const path = join(process.env.HIVE_STORE_ROOT!, "daemon", "log.txt");
+    await mkdir(dirname(path), { recursive: true });
+    // Mix of 2-byte (é), 3-byte (✓) and 4-byte (🐝) characters; with a tiny
+    // chunk size every reverse-read boundary lands inside some character.
+    const lines = Array.from({ length: 20 }, (_, i) => `bee🐝-${i}-é✓`);
+    await writeFile(path, `${lines.join("\n")}\n`);
+
+    for (const chunkSize of [1, 2, 3, 5, 7]) {
+      const last4 = await readLastLines(path, 4, chunkSize);
+      assert.deepEqual(last4, lines.slice(-4), `chunkSize=${chunkSize}`);
+      for (const line of last4) {
+        assert.doesNotMatch(line, /�/, `chunkSize=${chunkSize} produced replacement chars`);
+      }
+    }
+  });
+});
+
 test("readLastLines returns empty list when file is missing", async () => {
   await withTempStore(async () => {
     const path = join(process.env.HIVE_STORE_ROOT!, "daemon", "missing.txt");

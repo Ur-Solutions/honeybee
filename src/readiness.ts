@@ -1,6 +1,6 @@
 import { hasAgentDriver, isDriverActive, isDriverReady } from "./drivers.js";
 import type { SessionRecord } from "./store.js";
-import { substrateFor } from "./substrates/index.js";
+import { substrateFor, type Substrate } from "./substrates/index.js";
 
 export type ReadinessFailureReason = "trust" | "blocked" | "timeout";
 
@@ -20,6 +20,8 @@ export type WaitForAgentReadyOptions = {
   acceptTrust?: boolean;
   raiseDroidAutonomy?: boolean;
   trustGraceMs?: number;
+  /** Substrate override (used by tests); defaults to substrateFor(record). */
+  substrate?: Pick<Substrate, "capture" | "sendEnter" | "sendKey">;
 };
 
 const DEFAULT_TRUST_GRACE_MS = 10_000;
@@ -34,17 +36,17 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
   let trustAttempts = 0;
   let droidYoloCycles = 0;
   let lastPane = "";
-  const substrate = substrateFor(record);
+  const substrate = options.substrate ?? substrateFor(record);
 
   while (Date.now() < deadline) {
     const pane = await substrate.capture(record.tmuxTarget, 100).catch(() => "");
     lastPane = pane;
 
-    if (isMcpWarningPane(recentPane(pane))) {
+    if (isMcpWarningPane(pane)) {
       throw new AgentReadinessError("blocked", `Agent startup is blocked by an MCP warning in ${record.name}`, pane);
     }
 
-    if (isTrustPromptPane(recentPane(pane))) {
+    if (isTrustPromptPane(pane)) {
       if (!acceptTrust) {
         throw new AgentReadinessError("trust", `Agent startup is waiting for a trust/safety confirmation in ${record.name}; rerun without --no-accept-trust to acknowledge it`, pane);
       }
@@ -70,15 +72,29 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
     await sleep(500);
   }
 
+  // A trust prompt that survived the confirmation attempts is not a generic
+  // timeout: callers honor --force-send for "timeout" and would type the
+  // prompt text straight into the trust dialog.
+  if (isTrustPromptPane(lastPane)) {
+    throw new AgentReadinessError(
+      "trust",
+      `Trust prompt in ${record.name} did not clear after ${trustAttempts} confirmation attempt(s); attach and resolve it manually: hive attach ${record.name}`,
+      lastPane,
+    );
+  }
+
   throw new AgentReadinessError("timeout", `Timed out waiting for ${record.agent} to become ready in ${record.name}`, lastPane);
 }
 
+// Tail-scoped by construction (see recentPane): an answered trust prompt can
+// linger in scrollback for the whole life of the pane and must not keep
+// reporting the bee as blocked.
 export function isTrustPromptPane(pane: string): boolean {
-  return /Do you trust the contents of this directory|Quick safety check: Is this a project|trust .*directory|(?:trust|safety|directory)[\s\S]{0,120}Enter to confirm/i.test(pane);
+  return /Do you trust the contents of this directory|Quick safety check: Is this a project|trust .*directory|(?:trust|safety|directory)[\s\S]{0,120}Enter to confirm/i.test(recentPane(pane));
 }
 
 export function isMcpWarningPane(pane: string): boolean {
-  return /MCP server found/i.test(pane);
+  return /MCP server found/i.test(recentPane(pane));
 }
 
 export function shouldRaiseDroidAutonomy(pane: string): boolean {
@@ -87,12 +103,14 @@ export function shouldRaiseDroidAutonomy(pane: string): boolean {
 
 // Detects an interactive permission/approval prompt that has halted the agent
 // mid-task waiting for a human decision — distinct from the one-time startup
-// trust prompt (isTrustPromptPane). Anchored on Claude Code's approval UI
-// ("Do you want to proceed?", edit/command confirmations, and the very stable
-// "tell Claude what to do differently" reject option). Scoped to the pane tail
+// trust prompt (isTrustPromptPane). The real approval UI always renders a
+// numbered option list ("❯ 1. Yes" / "2. No..."), so that shape is required:
+// question prose alone matches ordinary assistant questions sitting at the
+// pane bottom and must not flag the bee as blocked. Scoped to the pane tail
 // so a resolved-and-scrolled-away prompt does not keep a bee marked blocked.
 export function isPermissionPromptPane(pane: string): boolean {
   const recent = recentPane(pane);
+  if (!hasApprovalOptionList(recent)) return false;
   return (
     /tell Claude what to do differently/i.test(recent) ||
     /Do you want to (?:proceed|make this edit|create|run|apply|continue)\b/i.test(recent) ||
@@ -100,16 +118,20 @@ export function isPermissionPromptPane(pane: string): boolean {
   );
 }
 
+function hasApprovalOptionList(recent: string): boolean {
+  // A selected numbered option ("❯ 1. Yes") is the strongest signal; fall
+  // back to two numbered options for captures that lose the selector glyph.
+  return /(?:^|\n)\s*[❯›>]\s*\d+\.\s+\S/.test(recent) || (/(?:^|\n)\s*1\.\s+\S/.test(recent) && /(?:^|\n)\s*2\.\s+\S/.test(recent));
+}
+
 export function isAgentReadyPane(agent: string, pane: string): boolean {
-  const recent = recentPane(pane);
-  if (isTrustPromptPane(recent) || isMcpWarningPane(recent) || isPermissionPromptPane(recent)) return false;
+  if (isTrustPromptPane(pane) || isMcpWarningPane(pane) || isPermissionPromptPane(pane)) return false;
   return isDriverReady(agent, pane);
 }
 
 export function isAgentActivePane(agent: string, pane: string): boolean {
-  const recent = recentPane(pane);
-  if (isTrustPromptPane(recent) || isMcpWarningPane(recent) || isPermissionPromptPane(recent)) return false;
-  return isDriverActive(agent, recent);
+  if (isTrustPromptPane(pane) || isMcpWarningPane(pane) || isPermissionPromptPane(pane)) return false;
+  return isDriverActive(agent, recentPane(pane));
 }
 
 // A trust/safety/MCP prompt only needs handling while it is the *current*

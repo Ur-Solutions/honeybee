@@ -12,16 +12,25 @@ import {
   listLoops,
   loopHistoryLogPath,
   loopHistoryMdPath,
+  loopIterLogPath,
   loopProgressPath,
   type LoopConfig,
   readLoopConfig,
+  reconcileLoopStatus,
   requestStop,
   updateLoopConfig,
   writeIterSeal,
   writeLoopConfig,
 } from "../src/loop/state.js";
 import { runStopPredicate } from "../src/loop/until.js";
-import { buildIterationPrompt, foldForward, HISTORY_DIGEST_THRESHOLD, rederiveHistory } from "../src/loop/summarizer.js";
+import {
+  buildIterationPrompt,
+  foldForward,
+  HISTORY_DIGEST_THRESHOLD,
+  INJECTION_BUDGET_BYTES,
+  rederiveHistory,
+  truncateForInjection,
+} from "../src/loop/summarizer.js";
 import { __setLoopTestHooks, loopFlow } from "../src/loop/flow.js";
 import { listFlows, loadFlow } from "../src/flow/index.js";
 import { executeFlow } from "../src/flow/run.js";
@@ -96,6 +105,17 @@ test("buildLoopConfig requires --max unless --forever", () => {
   assert.throws(() => buildLoopConfig({ ...baseArgs, max: 0 }), /positive integer/);
 });
 
+test("buildLoopConfig: --forever ignores a supplied max (flow arg default of 100)", () => {
+  // Regression: the flow runtime applies the arg default max=100 even for
+  // --forever loops, which used to write a phantom stop.max=100 into loop.json.
+  const cfg = buildLoopConfig({ ...baseArgs, forever: true, max: 100 });
+  assert.equal(cfg.stop.forever, true);
+  assert.equal(cfg.stop.max, null);
+  // Even an invalid max is irrelevant under --forever.
+  const cfg2 = buildLoopConfig({ ...baseArgs, forever: true, max: "bogus" });
+  assert.equal(cfg2.stop.max, null);
+});
+
 test("buildLoopConfig validates --stop-on-seal CSV against seal statuses", () => {
   const cfg = buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: "done,failed" });
   assert.deepEqual(cfg.stop.stopOnSeal, ["done", "failed"]);
@@ -165,6 +185,42 @@ test("listLoops returns newest-first by startedAt", async () => {
   });
 });
 
+test("listLoops downgrades running loops with a dead driver pid to orphaned (view only)", async () => {
+  await withTempStore(async () => {
+    const dead = buildLoopConfig({ ...baseArgs, max: 1, loopId: "DEAD" });
+    dead.loopId = "DEAD";
+    dead.pid = 999_999_999;
+    await writeLoopConfig(dead);
+    const alive = buildLoopConfig({ ...baseArgs, max: 1, loopId: "ALIVE" });
+    alive.loopId = "ALIVE";
+    alive.pid = process.pid;
+    await writeLoopConfig(alive);
+    const noPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "NOPID" });
+    noPid.loopId = "NOPID";
+    await writeLoopConfig(noPid);
+
+    const loops = await listLoops({ isPidAlive: (pid) => pid === process.pid });
+    const byId = new Map(loops.map((l) => [l.loopId, l]));
+    assert.equal(byId.get("DEAD")?.status, "orphaned");
+    assert.equal(byId.get("ALIVE")?.status, "running");
+    // No pid yet (pre-driver write window) — left as-is.
+    assert.equal(byId.get("NOPID")?.status, "running");
+    // The on-disk file is untouched: this is a view-level downgrade.
+    const onDisk = await readLoopConfig("DEAD");
+    assert.equal(onDisk?.status, "running");
+  });
+});
+
+test("reconcileLoopStatus only downgrades running+dead-pid", () => {
+  const cfg = buildLoopConfig({ ...baseArgs, max: 1, loopId: "R" });
+  cfg.loopId = "R";
+  cfg.pid = 12345;
+  assert.equal(reconcileLoopStatus(cfg, () => false).status, "orphaned");
+  assert.equal(reconcileLoopStatus(cfg, () => true).status, "running");
+  const done = { ...cfg, status: "done" as const };
+  assert.equal(reconcileLoopStatus(done, () => false).status, "done");
+});
+
 test("stop-request sentinel write + detect", async () => {
   await withTempStore(async () => {
     await ensureLoopDir("S1");
@@ -201,6 +257,41 @@ test("runStopPredicate never throws and resolves false on timeout", async () => 
   const result = await runStopPredicate("sleep 5", process.cwd(), { timeoutMs: 100 });
   assert.equal(result, false);
 });
+
+test("runStopPredicate kills the WHOLE process group on timeout (no leaked children)", async () => {
+  // Regression: timeout/abort used to SIGKILL only the /bin/sh wrapper, so a
+  // compound command's children survived and leaked every iteration.
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-until-"));
+  let grandchild = 0;
+  try {
+    const pidFile = join(dir, "child.pid");
+    const result = await runStopPredicate(`sleep 30 & echo $! > ${pidFile}; wait`, dir, { timeoutMs: 300 });
+    assert.equal(result, false);
+    grandchild = Number((await readFile(pidFile, "utf8")).trim());
+    assert.ok(Number.isInteger(grandchild) && grandchild > 0, "pidfile must contain the grandchild pid");
+    // Give the SIGKILL a moment to be delivered/reaped.
+    await sleep(150);
+    assert.equal(pidAlive(grandchild), false, "grandchild `sleep` must die with the process group");
+  } finally {
+    if (grandchild > 0 && pidAlive(grandchild)) {
+      try {
+        process.kill(grandchild, "SIGKILL");
+      } catch {
+        // ignore
+      }
+    }
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 test("runStopPredicate resolves false (no throw) when the signal is ALREADY aborted", async () => {
   // Regression: an already-aborted signal used to throw a TDZ ReferenceError
@@ -251,6 +342,36 @@ test("buildIterationPrompt (ralph) does not prepend rolling context", () => {
   assert.match(prompt, /Take the next item\./);
   // Still appends the standing seal instruction.
   assert.match(prompt, /seal/i);
+});
+
+test("truncateForInjection keeps the most recent content behind an elision marker", () => {
+  // Under budget → untouched.
+  assert.equal(truncateForInjection("short", 100), "short");
+  // Over budget → tail kept, marker prepended, size bounded.
+  const lines = Array.from({ length: 5_000 }, (_, i) => `line-${i}`).join("\n");
+  const out = truncateForInjection(lines, 1_024);
+  assert.match(out, /elided to fit the injection budget/);
+  assert.ok(out.includes("line-4999"), "the newest content is retained");
+  assert.ok(!out.includes("line-0\n"), "the oldest content is dropped");
+  assert.ok(Buffer.byteLength(out, "utf8") < 1_024 + 200, "output stays near the budget");
+});
+
+test("buildIterationPrompt (rolling) budgets the injected progress/history (PRD §10)", () => {
+  const huge = `OLDEST-MARKER\n${"x".repeat(INJECTION_BUDGET_BYTES * 2)}\nNEWEST-MARKER`;
+  const prompt = buildIterationPrompt({
+    task: "Do the task.",
+    mode: "rolling",
+    progress: huge,
+    history: huge,
+    loopId: "L",
+    iteration: 2,
+  });
+  assert.doesNotMatch(prompt, /OLDEST-MARKER/);
+  assert.match(prompt, /NEWEST-MARKER/);
+  assert.match(prompt, /elided to fit the injection budget/);
+  assert.ok(prompt.length < INJECTION_BUDGET_BYTES * 3, "prompt size is bounded by the per-section budget");
+  // The fold-forward closing instruction now states a maximum length.
+  assert.match(prompt, /under roughly \d+ characters/);
 });
 
 test("foldForward overwrites progress, appends ONE history.log line, re-derives history.md", async () => {
@@ -335,6 +456,8 @@ function installDriverHooks(sealFor: (iter: number) => SealRecord["status"] | { 
         void recordSeal(handle.name, validateSealArtifact({ status, summary }));
       }, 15);
     },
+    // Tight boundary polling keeps the driver tests fast and deterministic.
+    boundaryPollMs: 10,
   });
 }
 
@@ -435,7 +558,7 @@ test("driver: rolling writes progress.md + history files", async () => {
   });
 });
 
-test("driver: blocked/needs_input seal pauses the loop", async () => {
+test("driver: blocked/needs_input seal pauses the loop, KEEPS the bee + currentBee", async () => {
   await withTempStore(async () => {
     installDriverHooks(() => "blocked");
     try {
@@ -449,6 +572,110 @@ test("driver: blocked/needs_input seal pauses the loop", async () => {
       assert.equal(cfg?.stopReason, "seal:blocked");
       // Paused after the FIRST blocked iteration — no spinning.
       assert.equal(cfg?.iteration, 1);
+      // PRD pause-and-notify: the operator must be able to attach to the very
+      // bee that blocked — loop.json keeps pointing at it…
+      assert.equal(cfg?.currentBee, "loop-bee-i1");
+      // …and neither the fresh-carrier kill nor the flow's kill-on-end cleanup
+      // destroyed it (an untracked bee survives killAll).
+      const { loadSession } = await import("../src/store.js");
+      const survivor = await loadSession("loop-bee-i1");
+      assert.ok(survivor, "the paused bee's session record must survive cleanup");
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
+test("driver: explicit --stop-on-seal blocked STOPS instead of pausing", async () => {
+  await withTempStore(async () => {
+    // Regression: the implicit pause branch used to fire before the explicit
+    // stop-on-seal membership check, so stopOnSeal=blocked could never trigger.
+    installDriverHooks(() => "blocked");
+    try {
+      const outcome = await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "ralph", max: 5, stopOnSeal: "blocked", loopId: "B2" },
+        runId: "B2",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("B2");
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "seal:blocked");
+      assert.equal(cfg?.iteration, 1);
+      assert.equal((outcome.value as { stopReason: string }).stopReason, "seal:blocked");
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
+test("driver: boundary races seal detection against idle — a never-sealing bee concludes via idle, not the seal cap", async () => {
+  await withTempStore(async () => {
+    const startedAt = Date.now();
+    __setLoopTestHooks({
+      ensureBee: async ({ facade, iter }) => {
+        const record = fakeRecord(`loop-idle-i${iter}`);
+        await saveSession(record);
+        (facade as unknown as { spawned: SessionRecord[] }).spawned.push(record);
+        return record;
+      },
+      send: async () => {
+        // never seals
+      },
+      // The seal cap is LONG — only the idle race can finish the iteration fast.
+      sealTimeoutMs: 60_000,
+      boundaryIdleMs: 40,
+      boundaryGraceMs: 40,
+      boundaryPollMs: 10,
+      capturePane: async () => "stable pane content",
+    });
+    try {
+      await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "ralph", max: 2, stopOnSeal: "done", loopId: "IDLE1" },
+        runId: "IDLE1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("IDLE1");
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "max");
+      assert.equal(cfg?.iteration, 2);
+      assert.ok(Date.now() - startedAt < 10_000, "idle detection must beat the 60s seal cap");
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
+test("driver: a seal landing BEFORE the boundary wait starts is still detected (pre-send baseline)", async () => {
+  await withTempStore(async () => {
+    // Regression: waitForSeal used to take its OWN baseline AFTER send, so a
+    // seal recorded synchronously during send was mistaken for the baseline
+    // and only the full timeout fallback could surface it.
+    const startedAt = Date.now();
+    __setLoopTestHooks({
+      ensureBee: async ({ facade, iter }) => {
+        const record = fakeRecord(`loop-fast-i${iter}`);
+        await saveSession(record);
+        (facade as unknown as { spawned: SessionRecord[] }).spawned.push(record);
+        return record;
+      },
+      send: async ({ handle, iter }) => {
+        // Seal SYNCHRONOUSLY — lands before the boundary wait begins.
+        await recordSeal(handle.name, validateSealArtifact({ status: "done", summary: `fast pass ${iter}` }));
+      },
+      sealTimeoutMs: 60_000,
+      boundaryPollMs: 10,
+    });
+    try {
+      await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "ralph", max: 5, stopOnSeal: "done", loopId: "FAST1" },
+        runId: "FAST1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("FAST1");
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "seal:done");
+      assert.equal(cfg?.iteration, 1);
+      assert.ok(Date.now() - startedAt < 10_000, "the fast seal must be seen immediately, not after the cap");
     } finally {
       __setLoopTestHooks(undefined);
     }
@@ -509,12 +736,13 @@ test("driver: a no-seal turn does NOT synthesize done; falls through to mechanic
         (facade as unknown as { spawned: SessionRecord[] }).spawned.push(record);
         return record;
       },
-      // No send hook → no seal is ever recorded. waitForSeal times out fast
+      // No send hook → no seal is ever recorded. The boundary cap is short
       // and collect() returns null, so the boundary observes NO seal.
       send: async () => {
         // intentionally records no seal
       },
       sealTimeoutMs: 150,
+      boundaryPollMs: 10,
     });
     try {
       await executeFlow(loopFlow, {
@@ -528,6 +756,12 @@ test("driver: a no-seal turn does NOT synthesize done; falls through to mechanic
       assert.equal(cfg?.status, "done");
       assert.equal(cfg?.stopReason, "max", "no-seal turns run to max, not a synthesized done");
       assert.equal(cfg?.iteration, 2);
+      // Observability must not claim a seal that never happened: the distinct
+      // value "none" is recorded, never a fabricated "done".
+      assert.equal(cfg?.lastSealStatus, "none");
+      const iterLog = await readFile(loopIterLogPath("NOSEAL1", 2), "utf8");
+      assert.match(iterLog, /status=none/);
+      assert.doesNotMatch(iterLog, /status=done/);
     } finally {
       __setLoopTestHooks(undefined);
     }
@@ -692,6 +926,29 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
     } finally {
       await rm(fixtureDir, { recursive: true, force: true });
     }
+  });
+});
+
+test("HiveFacade.loop persists an errored loop.json when the detached spawn fails", async () => {
+  await withTempStore(async () => {
+    // Regression: a spawn failure AFTER the loop.json pre-write used to strand
+    // the loop as "running" with no pid — nothing could ever reconcile it.
+    const facade = new HiveFacade({ flowName: "loop", runId: "facade-run-spawnfail" });
+    const original = process.argv[1];
+    process.argv[1] = ""; // resolveEntry() throws → spawnDetachedRun rejects
+    try {
+      await assert.rejects(
+        () => facade.loop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x", max: 1 }),
+        /could not resolve CLI entry path/,
+      );
+    } finally {
+      process.argv[1] = original;
+    }
+    const loops = await listLoops();
+    assert.equal(loops.length, 1);
+    assert.equal(loops[0]?.status, "errored");
+    assert.match(loops[0]?.stopReason ?? "", /^spawn:/);
+    assert.ok(loops[0]?.endedAt, "a terminal endedAt is persisted");
   });
 });
 

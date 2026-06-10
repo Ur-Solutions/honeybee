@@ -104,3 +104,47 @@ test("renameColony moves the record and refuses collisions", async () => {
     await assert.rejects(renameColony("ghost", "x"), /Unknown colony/);
   });
 });
+
+test("loadColony rejects path-traversal names without touching the filesystem", async () => {
+  await withTempStore(async () => {
+    assert.equal(await loadColony("../escape"), null);
+    assert.equal(await loadColony("nested/path"), null);
+    assert.equal(await colonyExists("../escape"), false);
+  });
+});
+
+test("mutating colony ops validate the name before resolving paths", async () => {
+  await withTempStore(async () => {
+    await assert.rejects(updateColony("../bad", { description: "x" }), /Invalid colony name/);
+    await assert.rejects(archiveColony("../bad"), /Invalid colony name/);
+    await assert.rejects(renameColony("../bad", "ok"), /Invalid colony name/);
+  });
+});
+
+test("concurrent createColony calls produce exactly one colony", async () => {
+  await withTempStore(async () => {
+    const results = await Promise.allSettled([
+      createColony("contested"),
+      createColony("contested"),
+      createColony("contested"),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    assert.equal(fulfilled.length, 1, `expected exactly one create to win, got ${fulfilled.length}`);
+    const list = await listColonies();
+    assert.deepEqual(list.map((record) => record.name), ["contested"]);
+  });
+});
+
+test("listColonies skips records whose embedded name disagrees with the file stem", async () => {
+  await withTempStore(async () => {
+    await createColony("real");
+    const { writeFile: write } = await import("node:fs/promises");
+    const dir = process.env.HIVE_STORE_ROOT!;
+    await write(
+      join(dir, "colonies", "imposter.json"),
+      JSON.stringify({ name: "real", createdAt: "2026-01-01T00:00:00.000Z" }),
+    );
+    const list = await listColonies();
+    assert.deepEqual(list.map((record) => record.name), ["real"]);
+  });
+});

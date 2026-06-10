@@ -48,6 +48,32 @@ test("renderPlist supports KeepAlive=false and RunAtLoad=false", () => {
   assert.match(xml, /<key>RunAtLoad<\/key>\s+<false\/>/);
 });
 
+test("renderPlist renders KeepAlive SuccessfulExit dict", () => {
+  const xml = renderPlist({
+    label: "dev.honeybee.hive",
+    programArguments: ["/usr/bin/node", "/abs/cli.js", "daemon", "run"],
+    stdOutPath: "/tmp/out",
+    stdErrPath: "/tmp/err",
+    keepAlive: { successfulExit: false },
+  });
+  assert.match(xml, /<key>KeepAlive<\/key>\s+<dict>\s+<key>SuccessfulExit<\/key>\s+<false\/>\s+<\/dict>/);
+});
+
+test("renderPlist emits no blank lines when workingDirectory and env are omitted", () => {
+  const xml = renderPlist({
+    label: "dev.honeybee.hive",
+    programArguments: ["/usr/bin/node", "/abs/cli.js", "daemon", "run"],
+    stdOutPath: "/tmp/out",
+    stdErrPath: "/tmp/err",
+  });
+  const lines = xml.split("\n");
+  // Only the trailing newline yields an empty final element.
+  assert.deepEqual(lines.filter((line) => line.length === 0), [""]);
+  assert.equal(lines[lines.length - 1], "");
+  assert.doesNotMatch(xml, /<key>WorkingDirectory<\/key>/);
+  assert.doesNotMatch(xml, /<key>EnvironmentVariables<\/key>/);
+});
+
 test("renderPlist refuses non-absolute paths", () => {
   assert.throws(
     () =>

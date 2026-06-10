@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { deriveState, isTerminalState, stateLabel } from "../src/state.js";
+import { deriveState, isTerminalState, liveTargetKey, stateLabel } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
 function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
@@ -206,6 +206,43 @@ test("node_unreachable defaults to 'local' when record.node is undefined", () =>
     now: NOW,
   });
   assert.equal(result.state, "node_unreachable");
+});
+
+test("liveTargetKey namespaces by node and defaults to local", () => {
+  assert.equal(liveTargetKey(undefined, "alpha-target"), "local alpha-target");
+  assert.equal(liveTargetKey("", "alpha-target"), "local alpha-target");
+  assert.equal(liveTargetKey("mini01", "alpha-target"), "mini01 alpha-target");
+});
+
+test("liveness honors node-qualified keys", () => {
+  const result = deriveState(bee({ node: "mini01" }), {
+    liveTargets: new Set([liveTargetKey("mini01", "alpha-target")]),
+    panes: new Map([["alpha-target", "Codex\n\n› "]]),
+    now: NOW,
+  });
+  assert.equal(result.state, "ready");
+});
+
+test("dead: a same-named live session on ANOTHER node does not mask a dead bee", () => {
+  const result = deriveState(bee(), {
+    // The bee is local; only node mini01 has a live "alpha-target" session.
+    liveTargets: new Set([liveTargetKey("mini01", "alpha-target")]),
+    now: NOW,
+  });
+  assert.equal(result.state, "dead");
+});
+
+test("dead detail reports the MOST RECENT activity timestamp", () => {
+  const result = deriveState(
+    bee({
+      lastPromptAt: "2026-05-28T10:00:00.000Z",
+      briefedAt: "2026-05-28T11:30:00.000Z",
+      updatedAt: "2026-05-28T11:00:00.000Z",
+    }),
+    { liveTargets: new Set(), now: NOW },
+  );
+  assert.equal(result.state, "dead");
+  assert.equal(result.detail, "last activity 2026-05-28T11:30:00.000Z");
 });
 
 test("kill_failed still wins over node_unreachable", () => {

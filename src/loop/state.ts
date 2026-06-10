@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import type { SealRecord, SealStatus } from "../seal.js";
 
-export type LoopStatus = "running" | "paused" | "stopped" | "done" | "errored";
+export type LoopStatus = "running" | "paused" | "stopped" | "done" | "errored" | "orphaned";
 export type LoopContextMode = "persistent" | "ralph" | "rolling";
 export type LoopCarrier = "same" | "fresh";
 export type LoopMemory = "harness" | "none" | "rolling";
@@ -133,17 +133,43 @@ export async function updateLoopConfig(id: string, patch: Partial<LoopConfig>): 
   return merged;
 }
 
-export async function listLoops(): Promise<LoopConfig[]> {
+/**
+ * Reconcile a loop's persisted status against driver-process liveness: a loop
+ * stuck on status "running" whose driver pid is dead (SIGKILLed, crashed,
+ * machine rebooted) is shown as "orphaned". The on-disk loop.json is left
+ * untouched — this is a view-level downgrade mirroring flow runs (runs.ts).
+ * Records with no pid yet (the pre-driver write window) are left as-is.
+ */
+export function reconcileLoopStatus(cfg: LoopConfig, isPidAlive: (pid: number) => boolean = defaultIsPidAlive): LoopConfig {
+  if (cfg.status !== "running") return cfg;
+  if (typeof cfg.pid !== "number" || cfg.pid <= 0) return cfg;
+  if (isPidAlive(cfg.pid)) return cfg;
+  return { ...cfg, status: "orphaned" };
+}
+
+export async function listLoops(opts: { isPidAlive?: (pid: number) => boolean } = {}): Promise<LoopConfig[]> {
+  const isAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const entries = await readdir(loopsRoot(), { withFileTypes: true }).catch(() => []);
   const out: LoopConfig[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const cfg = await readLoopConfig(entry.name).catch(() => null);
-    if (cfg) out.push(cfg);
+    if (cfg) out.push(reconcileLoopStatus(cfg, isAlive));
   }
   // Newest first — startedAt is ISO so lexical sort matches chronological.
   out.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
   return out;
+}
+
+function defaultIsPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "EPERM";
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

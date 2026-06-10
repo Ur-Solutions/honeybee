@@ -1,6 +1,6 @@
 import { activateAccountIntoHome, type AccountRecord } from "./accounts.js";
 import { canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
-import { appendLedger, saveSession, withSessionLock, type SessionRecord } from "./store.js";
+import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -49,6 +49,12 @@ export async function swapAccount(
   const activate = options.activate ?? activateAccountIntoHome;
 
   return withSessionLock(record.name, async () => {
+    // 0. Re-validate under the lock before any side effects: a concurrent
+    //    kill/clean may have deleted the record, and proceeding would respawn
+    //    the session and resurrect the deleted bee.
+    const current = await loadSession(record.name);
+    if (!current) throw new Error(`Session ${record.name} no longer exists; aborting swap`);
+
     // 1. Ensure the process is stopped. The tmux session must be fully gone
     //    before we relaunch into the same target.
     if (await substrate.hasSession(record.tmuxTarget)) {
@@ -79,15 +85,18 @@ export async function swapAccount(
     });
     await substrate.newSession(record.tmuxTarget, record.cwd, { command: spec.command, args: spec.args, env: spec.env });
 
-    // 4. Persist the new binding and command.
+    // 4. Persist the new binding and command from the under-lock snapshot so
+    //    a concurrent daemon merge (title, transcript metadata, observed
+    //    state) isn't clobbered; saveSessionLocked avoids re-acquiring the
+    //    non-reentrant session lock we already hold.
     const updated: SessionRecord = {
-      ...record,
+      ...current,
       accountId: account.id,
       command: shellCommand(spec),
       status: "running",
       updatedAt: new Date().toISOString(),
     };
-    await saveSession(updated);
+    await saveSessionLocked(updated);
     await appendLedger({
       type: "account.swap",
       session: record.name,

@@ -127,9 +127,24 @@ export async function listSeals(beeName: string): Promise<SealRecord[]> {
   return seals.sort((a, b) => b.sealedAt.localeCompare(a.sealedAt));
 }
 
+/**
+ * Efficient latest-seal lookup. Seal filenames embed sealedAt (with `:`/`.`
+ * mapped to `-`), so lexicographic filename order matches chronological order —
+ * pick the lexicographically-last filename and read just that one file instead
+ * of parsing every seal (long-running loops accumulate one seal per iteration,
+ * which made the read-everything approach O(N²) over a loop's life). Corrupt
+ * files are skipped, walking backwards, mirroring listSeals' skip semantics.
+ */
 export async function loadLatestSeal(beeName: string): Promise<SealRecord | null> {
-  const seals = await listSeals(beeName);
-  return seals[0] ?? null;
+  const dir = beeSealDir(beeName);
+  const files = (await readdir(dir).catch(() => [] as string[]))
+    .filter((f) => f.endsWith(".json"))
+    .sort();
+  for (let i = files.length - 1; i >= 0; i -= 1) {
+    const seal = await readSeal(join(dir, files[i]!)).catch(() => null);
+    if (seal) return seal;
+  }
+  return null;
 }
 
 export async function sealedBeeNames(): Promise<Set<string>> {

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { mkdtemp, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { agentDefaultsToYolo, resolveAgent, splitShellWords } from "../src/agents.js";
+import { agentDefaultsToYolo, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
+import { assertExecutableAvailable } from "../src/execCheck.js";
 
 test("grok does not use numbered profile aliases", () => {
   const oldHive = process.env.HIVE_GROK_CMD;
@@ -96,4 +98,27 @@ test("env command overrides are parsed as argv and expand tilde words", () => {
 
 test("splitShellWords does not treat shell metacharacters as syntax", () => {
   assert.deepEqual(splitShellWords("claude; curl https://example.test/$(whoami)"), ["claude;", "curl", "https://example.test/$(whoami)"]);
+});
+
+test("assertExecutableAvailable accepts a real executable and rejects a missing one", async () => {
+  await assertExecutableAvailable(process.execPath);
+  await assert.rejects(assertExecutableAvailable("hive-test-no-such-binary-xyz"), /Executable not found on PATH/);
+});
+
+test("spawnBeeForFlow refuses a local spawn when the agent executable is missing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-agents-spawn-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  try {
+    // Without the availability check this would create a tmux session that
+    // dies instantly while leaving a "running" record behind.
+    await assert.rejects(
+      spawnBeeForFlow({ agent: "hive-test-no-such-binary-xyz", extraArgs: [], cwd: "/tmp", yolo: false }),
+      /Executable not found on PATH: hive-test-no-such-binary-xyz/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
 });

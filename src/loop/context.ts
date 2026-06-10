@@ -117,8 +117,11 @@ function coerceBool(value: unknown): boolean {
 }
 
 function coerceMax(value: unknown, forever: boolean): number | null {
+  // --forever disables the iteration cap entirely. The flow arg default
+  // (max=100) is applied unconditionally by the runtime, so a forever loop
+  // would otherwise have a phantom cap written into loop.json ("N / 100").
+  if (forever) return null;
   if (value === undefined || value === null || value === "") {
-    if (forever) return null;
     throw new Error("Loop requires --max <N> (a positive integer) unless --forever is set.");
   }
   const n = typeof value === "number" ? value : Number(String(value));

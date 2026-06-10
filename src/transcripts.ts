@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -76,7 +77,7 @@ export async function latestClaudeTranscript(cwd: string, options: TranscriptLoo
     const path = join(dir, name);
     const info = await stat(path).catch(() => null);
     if (!info || info.mtimeMs < sinceMs) continue;
-    const tx = await loadClaudeTranscript(path, options, info.mtimeMs);
+    const tx = await loadClaudeTranscript(path, options, info);
     if (tx) loaded.push(tx);
   }
 
@@ -91,13 +92,13 @@ export async function latestCodexTranscript(cwd: string, options: TranscriptLook
   }
 
   const sinceMs = sinceMillis(options);
-  const files = await findFiles(root, (path) => path.endsWith(".jsonl"), 5).catch(() => []);
+  const files = await findFilesCached(root, (path) => path.endsWith(".jsonl"), 5, "codex-jsonl").catch(() => []);
   const loaded: TranscriptFile[] = [];
 
   for (const path of files) {
     const info = await stat(path).catch(() => null);
     if (!info || info.mtimeMs < sinceMs) continue;
-    const tx = await loadCodexTranscript(path, cwd, options, info.mtimeMs);
+    const tx = await loadCodexTranscript(path, cwd, options, info);
     if (tx) loaded.push(tx);
   }
 
@@ -105,14 +106,14 @@ export async function latestCodexTranscript(cwd: string, options: TranscriptLook
 }
 
 export async function latestOpenCodeTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
-  const sessionRoot = opencodeSessionRoot();
+  const sessionRoot = opencodeSessionRoot(options.homePath);
   if (options.transcriptPath) {
     const direct = isPathInside(options.transcriptPath, sessionRoot) ? await loadOpenCodeTranscript(options.transcriptPath, cwd, options) : null;
     if (direct) return direct;
   }
 
   const sinceMs = sinceMillis(options);
-  const files = await findFiles(sessionRoot, (path) => path.endsWith(".json"), 3).catch(() => []);
+  const files = await findFilesCached(sessionRoot, (path) => path.endsWith(".json"), 3, "opencode-json").catch(() => []);
   const loaded: TranscriptFile[] = [];
 
   for (const path of files) {
@@ -133,14 +134,14 @@ export async function latestGrokTranscript(cwd: string, options: TranscriptLooku
   }
 
   const sinceMs = sinceMillis(options);
-  const files = await findFiles(workspaceRoot, (path) => basename(path) === "summary.json", 2).catch(() => []);
+  const files = await findFilesCached(workspaceRoot, (path) => basename(path) === "summary.json", 2, "grok-summary").catch(() => []);
   const loaded: TranscriptFile[] = [];
 
   for (const path of files) {
     const chatPath = join(dirname(path), "chat_history.jsonl");
     const info = await stat(chatPath).catch(() => null);
     if (!info || info.mtimeMs < sinceMs) continue;
-    const tx = await loadGrokTranscript(chatPath, cwd, options, info.mtimeMs);
+    const tx = await loadGrokTranscript(chatPath, cwd, options, info);
     if (tx) loaded.push(tx);
   }
 
@@ -152,7 +153,9 @@ export function claudeProjectFolder(cwd: string, configDir = join(homedir(), ".c
 }
 
 export function projectKeyForCwd(cwd: string): string {
-  return resolve(cwd).normalize("NFC").replace(/[^a-zA-Z0-9._-]/g, "-");
+  // Claude Code encodes project dirs with [^a-zA-Z0-9] → "-": dots and
+  // underscores become dashes too (/Users/x/.openclaw → -Users-x--openclaw).
+  return resolve(cwd).normalize("NFC").replace(/[^a-zA-Z0-9]/g, "-");
 }
 
 export async function readJsonl(path: string): Promise<TranscriptRow[]> {
@@ -171,18 +174,72 @@ export async function readJsonl(path: string): Promise<TranscriptRow[]> {
   return rows;
 }
 
-export function renderTranscript(rows: TranscriptRow[], options: { limit?: number; json?: boolean } = {}): string {
-  const selected = typeof options.limit === "number" && options.limit > 0 ? rows.slice(-options.limit) : rows;
-  if (options.json) return selected.map((row) => JSON.stringify(row)).join("\n");
+// Transcript files grow to many MB and are re-read by the daemon every tick
+// and by waitForIdle every poll. A small mtime+size-keyed LRU lets repeat
+// loads short-circuit to the previously parsed rows (and per-file derived
+// data) after a single stat, instead of re-reading and re-parsing the file.
+type StatHint = { mtimeMs: number; size: number };
 
+type ParsedTranscriptCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  rows: TranscriptRow[];
+  promptMatches: Map<string, boolean>;
+  claude?: { title?: string };
+  codex?: { rows: TranscriptRow[]; sessionId: string; metaCwd: string; title?: string };
+};
+
+const PARSED_TRANSCRIPT_CACHE_LIMIT = 8;
+const parsedTranscriptCache = new Map<string, ParsedTranscriptCacheEntry>();
+
+const DIR_SCAN_TTL_MS = 1_500;
+const DIR_SCAN_CACHE_LIMIT = 16;
+const dirScanCache = new Map<string, { expiresAt: number; files: string[] }>();
+
+export function clearTranscriptCaches(): void {
+  parsedTranscriptCache.clear();
+  dirScanCache.clear();
+}
+
+async function readJsonlCached(path: string, knownStat?: StatHint): Promise<ParsedTranscriptCacheEntry | null> {
+  const info = knownStat ?? (await stat(path).catch(() => null));
+  if (!info) return null;
+  const cached = parsedTranscriptCache.get(path);
+  if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
+    parsedTranscriptCache.delete(path);
+    parsedTranscriptCache.set(path, cached);
+    return cached;
+  }
+  const rows = await readJsonl(path);
+  const entry: ParsedTranscriptCacheEntry = { mtimeMs: info.mtimeMs, size: info.size, rows, promptMatches: new Map() };
+  parsedTranscriptCache.delete(path);
+  parsedTranscriptCache.set(path, entry);
+  while (parsedTranscriptCache.size > PARSED_TRANSCRIPT_CACHE_LIMIT) {
+    const oldest = parsedTranscriptCache.keys().next().value;
+    if (oldest === undefined) break;
+    parsedTranscriptCache.delete(oldest);
+  }
+  return entry;
+}
+
+export function renderTranscript(rows: TranscriptRow[], options: { limit?: number; json?: boolean } = {}): string {
+  const limit = typeof options.limit === "number" && options.limit > 0 ? options.limit : 0;
+  if (options.json) {
+    const selected = limit ? rows.slice(-limit) : rows;
+    return selected.map((row) => JSON.stringify(row)).join("\n");
+  }
+
+  // Format first, then slice: raw tails are dominated by text-less rows
+  // (tool_use/tool_result), so limiting raw rows often renders nothing.
   const rendered: string[] = [];
-  for (const row of selected) {
+  for (const row of rows) {
     const role = row.message?.role ?? row.type ?? "event";
     const text = textFromContent(row.message?.content ?? row.content);
     if (!text) continue;
     rendered.push(`## ${role}\n${text}`);
   }
-  return rendered.join("\n\n");
+  const selected = limit ? rendered.slice(-limit) : rendered;
+  return selected.join("\n\n");
 }
 
 export function lastAssistantText(rows: TranscriptRow[]): string {
@@ -202,29 +259,50 @@ export function rowsContainPrompt(rows: TranscriptRow[], prompt: string): boolea
   return rows.some((row) => normalizeForMatch(textFromContent(row.message?.content ?? row.content)).includes(needle));
 }
 
-async function loadClaudeTranscript(path: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
-  const mtimeMs = await getMtime(path, knownMtimeMs);
-  if (mtimeMs === null) return null;
-  const rows = await readJsonl(path);
-  if (rows.length === 0) return null;
+function memoizedPromptMatch(rows: TranscriptRow[], prompt: string, memo?: Map<string, boolean>): boolean {
+  if (!memo) return rowsContainPrompt(rows, prompt);
+  const key = normalizeForMatch(prompt);
+  const cached = memo.get(key);
+  if (cached !== undefined) return cached;
+  const result = rowsContainPrompt(rows, prompt);
+  memo.set(key, result);
+  return result;
+}
+
+async function loadClaudeTranscript(path: string, options: TranscriptLookupOptions, knownStat?: StatHint): Promise<TranscriptFile | null> {
+  const entry = await readJsonlCached(path, knownStat);
+  if (!entry || entry.rows.length === 0) return null;
+  const { rows, mtimeMs } = entry;
   const sessionId = basename(path).replace(/\.jsonl$/, "");
-  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, options });
-  const title = extractClaudeTitle(rows);
+  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, options, promptMatches: entry.promptMatches });
+  entry.claude ??= { title: extractClaudeTitle(rows) };
+  const title = entry.claude.title;
   return { provider: "claude", path, sessionId, mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
 }
 
-async function loadCodexTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
-  const mtimeMs = await getMtime(path, knownMtimeMs);
-  if (mtimeMs === null) return null;
-  const rawRows = await readJsonl(path);
-  if (rawRows.length === 0) return null;
-  const sessionMeta = rawRows.find((row) => row.type === "session_meta") as { payload?: Record<string, unknown> } | undefined;
-  const sessionId = String(sessionMeta?.payload?.id ?? basename(path).replace(/\.jsonl$/, ""));
-  const rows = rawRows.flatMap(normalizeCodexRow);
+async function loadCodexTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownStat?: StatHint): Promise<TranscriptFile | null> {
+  const entry = await readJsonlCached(path, knownStat);
+  if (!entry || entry.rows.length === 0) return null;
+  const { rows: rawRows, mtimeMs } = entry;
+  if (!entry.codex) {
+    const sessionMeta = rawRows.find((row) => row.type === "session_meta") as { payload?: Record<string, unknown> } | undefined;
+    const sessionId = String(sessionMeta?.payload?.id ?? basename(path).replace(/\.jsonl$/, ""));
+    // Real rollouts carry each message twice: as an event_msg
+    // (user_message/agent_message) and as a response_item message. When the
+    // event stream is present, it wins and the response_item copies are
+    // dropped so transcripts do not render every message duplicated.
+    const hasEventMessages = rawRows.some((row) => {
+      if (row.type !== "event_msg") return false;
+      const payloadType = (row.payload as Record<string, unknown> | undefined)?.type;
+      return payloadType === "user_message" || payloadType === "agent_message";
+    });
+    const rows = rawRows.flatMap((row) => normalizeCodexRow(row, hasEventMessages));
+    const metaCwd = String(sessionMeta?.payload?.cwd ?? sessionMeta?.payload?.original_cwd ?? "");
+    entry.codex = { rows, sessionId, metaCwd, title: extractCodexTitle(rawRows, rows) };
+  }
+  const { rows, sessionId, metaCwd, title } = entry.codex;
   if (rows.length === 0) return null;
-  const metaCwd = String(sessionMeta?.payload?.cwd ?? sessionMeta?.payload?.original_cwd ?? "");
-  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options });
-  const title = extractCodexTitle(rawRows, rows);
+  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options, promptMatches: entry.promptMatches });
   return { provider: "codex", path, sessionId, mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
 }
 
@@ -234,34 +312,35 @@ async function loadOpenCodeTranscript(path: string, cwd: string, options: Transc
   const session = await readJsonObject(path);
   const sessionId = String(session.id ?? basename(path).replace(/\.json$/, ""));
   const directory = String(session.directory ?? "");
-  const rows = await readOpenCodeRows(sessionId);
+  const rows = await readOpenCodeRows(sessionId, opencodeStorageRoot(options.homePath));
   if (rows.length === 0) return null;
   const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: directory, options });
   return { provider: "opencode", path, sessionId, mtimeMs, rows, score, matchedBy };
 }
 
-async function loadGrokTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
+async function loadGrokTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownStat?: StatHint): Promise<TranscriptFile | null> {
   const sessionDir = basename(path) === "chat_history.jsonl" || basename(path) === "summary.json" ? dirname(path) : path;
   const chatPath = join(sessionDir, "chat_history.jsonl");
   const summaryPath = join(sessionDir, "summary.json");
-  const mtimeMs = await getMtime(chatPath, knownMtimeMs);
-  if (mtimeMs === null) return null;
-  const rawRows = await readJsonl(chatPath);
+  const entry = await readJsonlCached(chatPath, knownStat);
+  if (!entry) return null;
+  const { rows: rawRows, mtimeMs } = entry;
   const rows = rawRows.flatMap(normalizeGrokRow);
   if (rows.length === 0) return null;
   const summary = await readJsonObject(summaryPath);
   const info = (summary.info && typeof summary.info === "object" ? summary.info : {}) as Record<string, unknown>;
   const sessionId = String(info.id ?? summary.id ?? basename(sessionDir));
   const metaCwd = String(info.cwd ?? summary.cwd ?? "");
-  const { score, matchedBy } = scoreTranscript({ rows, path: chatPath, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options });
+  const { score, matchedBy } = scoreTranscript({ rows, path: chatPath, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options, promptMatches: entry.promptMatches });
   return { provider: "grok", path: chatPath, sessionId, mtimeMs, rows, score, matchedBy };
 }
 
-function normalizeCodexRow(row: TranscriptRow): TranscriptRow[] {
+function normalizeCodexRow(row: TranscriptRow, skipResponseItemMessages: boolean): TranscriptRow[] {
   const payload = row.payload as Record<string, unknown> | undefined;
   if (!payload) return [];
   if (row.type === "event_msg") {
     if (payload.type === "user_message" && typeof payload.message === "string") {
+      if (isInjectedCodexContext(payload.message)) return [];
       return [{ type: "user", timestamp: row.timestamp, message: { role: "user", content: payload.message } }];
     }
     if (payload.type === "agent_message" && typeof payload.message === "string") {
@@ -271,11 +350,24 @@ function normalizeCodexRow(row: TranscriptRow): TranscriptRow[] {
   }
   if (row.type === "response_item" && payload.type === "message") {
     const role = typeof payload.role === "string" ? payload.role : "event";
+    // developer/system rows carry harness instructions, not conversation.
+    if (role !== "user" && role !== "assistant") return [];
+    // The event_msg stream already carries these messages; keeping the
+    // response_item copies would duplicate every message in the render.
+    if (skipResponseItemMessages) return [];
     const content = textFromContent(payload.content);
     if (!content) return [];
+    if (role === "user" && isInjectedCodexContext(content)) return [];
     return [{ type: role, timestamp: row.timestamp, message: { role, content } }];
   }
   return [];
+}
+
+// response_item user rows embed harness-injected blobs that should never be
+// rendered (or win the first-user-prompt title fallback).
+function isInjectedCodexContext(text: string): boolean {
+  const trimmed = text.trimStart();
+  return trimmed.startsWith("<environment_context>") || trimmed.startsWith("<user_instructions>");
 }
 
 function normalizeGrokRow(row: TranscriptRow): TranscriptRow[] {
@@ -286,23 +378,34 @@ function normalizeGrokRow(row: TranscriptRow): TranscriptRow[] {
   return [{ type: role, timestamp: row.timestamp, message: { role, content } }];
 }
 
-async function readOpenCodeRows(sessionId: string): Promise<TranscriptRow[]> {
+async function readOpenCodeRows(sessionId: string, storageRoot: string): Promise<TranscriptRow[]> {
   if (!isSafeStorageId(sessionId)) return [];
-  const storageRoot = opencodeStorageRoot();
   const msgDir = join(storageRoot, "message", sessionId);
-  const messageFiles = await readdir(msgDir).catch(() => []);
-  const rows: TranscriptRow[] = [];
+  const messageFiles = (await readdir(msgDir).catch(() => [])).filter((name) => name.endsWith(".json")).sort();
 
-  for (const file of messageFiles.filter((name) => name.endsWith(".json"))) {
-    const msgPath = join(msgDir, file);
-    const msg = await readJsonObject(msgPath);
+  // readdir order is unspecified; order messages by time.created with the
+  // (sortable, id-prefixed) filename as tie-break so transcripts and
+  // lastAssistantText reflect the real conversation order.
+  const messages: { file: string; msg: Record<string, unknown>; created: number | null }[] = [];
+  for (const file of messageFiles) {
+    const msg = await readJsonObject(join(msgDir, file));
+    const created = Number((msg.time as { created?: unknown } | undefined)?.created);
+    messages.push({ file, msg, created: Number.isFinite(created) ? created : null });
+  }
+  messages.sort((a, b) => {
+    if (a.created !== null && b.created !== null && a.created !== b.created) return a.created - b.created;
+    return a.file.localeCompare(b.file);
+  });
+
+  const rows: TranscriptRow[] = [];
+  for (const { file, msg } of messages) {
     const messageId = String(msg.id ?? basename(file, ".json"));
     if (!isSafeStorageId(messageId)) continue;
     const role = String(msg.role ?? "event");
     const partDir = join(storageRoot, "part", messageId);
-    const partFiles = await readdir(partDir).catch(() => []);
+    const partFiles = (await readdir(partDir).catch(() => [])).filter((name) => name.endsWith(".json")).sort();
     const parts: string[] = [];
-    for (const partFile of partFiles.filter((name) => name.endsWith(".json"))) {
+    for (const partFile of partFiles) {
       const part = await readJsonObject(join(partDir, partFile));
       if (typeof part.text === "string") parts.push(part.text);
       else if (typeof part.content === "string") parts.push(part.content);
@@ -314,8 +417,8 @@ async function readOpenCodeRows(sessionId: string): Promise<TranscriptRow[]> {
   return rows;
 }
 
-function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId: string; mtimeMs: number; cwd?: string; transcriptCwd?: string; options: TranscriptLookupOptions }) {
-  const { rows, path, sessionId, mtimeMs, cwd, transcriptCwd, options } = input;
+function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId: string; mtimeMs: number; cwd?: string; transcriptCwd?: string; options: TranscriptLookupOptions; promptMatches?: Map<string, boolean> }) {
+  const { rows, path, sessionId, mtimeMs, cwd, transcriptCwd, options, promptMatches } = input;
   let score = mtimeMs / 1_000_000_000_000;
   const matchedBy: string[] = ["mtime"];
 
@@ -327,7 +430,7 @@ function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId
     score += SCORE.sessionId;
     matchedBy.push("session-id");
   }
-  if (options.prompt && rowsContainPrompt(rows, options.prompt)) {
+  if (options.prompt && memoizedPromptMatch(rows, options.prompt, promptMatches)) {
     score += SCORE.prompt;
     matchedBy.push("prompt");
   }
@@ -341,6 +444,25 @@ function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId
   }
 
   return { score, matchedBy };
+}
+
+// Provider session trees can hold thousands of directories; re-walking them
+// on every poll dwarfs the (now stat-cached) per-file loads. A short TTL keeps
+// repeat lookups cheap while still discovering new session files quickly.
+async function findFilesCached(root: string, predicate: (path: string) => boolean, maxDepth: number, tag: string): Promise<string[]> {
+  const key = `${root} ${maxDepth} ${tag}`;
+  const now = Date.now();
+  const cached = dirScanCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.files;
+  const files = await findFiles(root, predicate, maxDepth);
+  dirScanCache.delete(key);
+  dirScanCache.set(key, { expiresAt: now + DIR_SCAN_TTL_MS, files });
+  while (dirScanCache.size > DIR_SCAN_CACHE_LIMIT) {
+    const oldest = dirScanCache.keys().next().value;
+    if (oldest === undefined) break;
+    dirScanCache.delete(oldest);
+  }
+  return files;
 }
 
 async function findFiles(root: string, predicate: (path: string) => boolean, maxDepth: number): Promise<string[]> {
@@ -385,13 +507,8 @@ function extractCodexTitle(rawRows: TranscriptRow[], rows: TranscriptRow[]): str
     if (title) return title;
   }
 
-  for (let i = rawRows.length - 1; i >= 0; i -= 1) {
-    const row = rawRows[i]!;
-    if (row.type !== "turn_context" && row.type !== "session_meta") continue;
-    const summary = normalizeTitleCandidate(objectPayload(row)?.summary);
-    if (summary) return summary;
-  }
-
+  // Note: turn_context/session_meta payload.summary is the reasoning-summary
+  // MODE ("auto"), not a conversation summary — never use it as a title.
   return firstUserPromptTitle(rows);
 }
 
@@ -459,12 +576,21 @@ function isSafeStorageId(value: string): boolean {
   return Boolean(value) && value !== "." && value !== ".." && !value.includes("/") && !value.includes("\\");
 }
 
-function opencodeStorageRoot(): string {
-  return join(homedir(), ".local", "share", "opencode", "storage");
+function opencodeStorageRoot(homePath?: string): string {
+  // OpenCode's storage is an XDG data tree, NOT the bee's home directory.
+  // Identity/profile homes relocate it via XDG_DATA_HOME={home}/xdg-data
+  // (drivers.ts), so a bee with a homePath keeps its transcripts under
+  // {home}/xdg-data/opencode/storage. Plain --home spawns only move
+  // OPENCODE_CONFIG_DIR, leaving storage at the default XDG location — hence
+  // the existence check with the default as fallback.
+  const fallback = join(homedir(), ".local", "share", "opencode", "storage");
+  if (!homePath) return fallback;
+  const identity = join(homePath, "xdg-data", "opencode", "storage");
+  return existsSync(identity) ? identity : fallback;
 }
 
-function opencodeSessionRoot(): string {
-  return join(opencodeStorageRoot(), "session");
+function opencodeSessionRoot(homePath?: string): string {
+  return join(opencodeStorageRoot(homePath), "session");
 }
 
 function normalizeForMatch(value: string): string {

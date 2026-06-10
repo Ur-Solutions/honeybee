@@ -54,11 +54,32 @@ export type SpawnDetachedOptions = {
   entryOverride?: string;
   /** Override node binary (default = process.execPath). Used by tests. */
   execPath?: string;
-  /** Extra argv prepended to the entry (e.g. `["--import","tsx"]` for tsx dev). */
+  /**
+   * Extra argv prepended to the entry (e.g. `["--import","tsx"]` for tsx dev).
+   * Defaults to the parent's own process.execArgv (minus test-runner/watch
+   * flags) so loader flags propagate automatically — without this, the dev
+   * entry (`tsx src/cli.ts`) would fork detached children as plain
+   * `node src/cli.ts ...`, which die instantly on the .ts entry.
+   */
   execArgv?: string[];
   /** Extra env vars forwarded to the child. */
   env?: Record<string, string | undefined>;
 };
+
+/**
+ * Env var set on detached children. The child IS the leader of its own process
+ * group (detached:true ⇒ setsid), so executeFlow can persist pgid=process.pid
+ * itself instead of relying on the parent's post-spawn meta patch winning the
+ * race against the child's startup meta write.
+ */
+export const DETACHED_RUN_ENV = "HIVE_FLOW_DETACHED";
+
+/** process.execArgv minus flags that would change the child's execution mode. */
+function inheritableExecArgv(): string[] {
+  return process.execArgv.filter(
+    (arg) => arg !== "--test" && !arg.startsWith("--test=") && arg !== "--watch" && !arg.startsWith("--watch="),
+  );
+}
 
 export type SpawnDetachedResult = {
   runId: string;
@@ -108,9 +129,10 @@ export async function spawnDetachedRun(
   const logHandle = await open(logPath, "a", 0o600);
   const logFd = logHandle.fd;
 
+  let spawnedPid: number | undefined;
   try {
     const childArgv = [
-      ...(options.execArgv ?? []),
+      ...(options.execArgv ?? inheritableExecArgv()),
       entry,
       "__flow-exec",
       runId,
@@ -122,15 +144,22 @@ export async function spawnDetachedRun(
       stdio: ["ignore", logFd, logFd],
       env: {
         ...process.env,
+        [DETACHED_RUN_ENV]: "1",
         ...(options.env ?? {}),
       },
     });
+    // Async spawn failures (e.g. ENOENT exec path) surface via the 'error'
+    // event AFTER spawn() returns; without a listener they would crash the
+    // parent. The missing-pid check below already converts them into a thrown
+    // error + failed meta.
+    child.once("error", () => undefined);
     if (!child.pid) {
       throw new Error(`hive flow run --background: spawn failed (no pid for ${flow.name})`);
     }
     // detached:true on POSIX makes child its own process group with pgid == child.pid.
     const pid = child.pid;
     const pgid = child.pid;
+    spawnedPid = pid;
     child.unref();
 
     // Now patch meta.json with pid + pgid. The child's executeFlow will read
@@ -147,6 +176,23 @@ export async function spawnDetachedRun(
     });
 
     return { runId, pid, pgid };
+  } catch (error) {
+    // Persist a terminal status ONLY when no process is alive: if spawn
+    // succeeded and a later step threw (meta patch, ledger), the child runs
+    // on and its startup write may already carry the pid — overwriting with
+    // a failed pid-less meta would strand a live run as "failed" and
+    // uncancellable.
+    const current = await readMeta(flow.name, runId).catch(() => null);
+    const livePid = spawnedPid ?? (typeof current?.pid === "number" ? current.pid : undefined);
+    if (livePid === undefined) {
+      const failed: FlowRunMeta = { ...preMeta, status: "failed", endedAt: new Date().toISOString() };
+      await writeMeta(flow.name, runId, failed).catch(() => undefined);
+    } else if (current && typeof current.pid !== "number") {
+      // The patch write failed but the child is live — retry the patch so
+      // listRuns/cancelRun can track it.
+      await writeMeta(flow.name, runId, { ...current, pid: livePid, pgid: spawnedPid ?? current.pgid }).catch(() => undefined);
+    }
+    throw error;
   } finally {
     // The child inherited the fd; the parent no longer needs it.
     await logHandle.close().catch(() => undefined);
@@ -203,6 +249,12 @@ export async function cancelRun(
       }
       return { runId, flowName, signalled: "SIGTERM" };
     }
+    // No pid AND no pgid: there is no process that could ever flip this record
+    // to a terminal status (the spawn died before the pid patch). Persist
+    // cancelled so the run does not read as "running" forever.
+    const cancelledNoPid: FlowRunMeta = { ...meta, status: "cancelled", endedAt: new Date().toISOString() };
+    await writeMeta(flowName, runId, cancelledNoPid);
+    await appendLedger({ type: "flow.run.cancel", flowName, runId, signalled: "already-dead" });
     return { runId, flowName, signalled: "already-dead" };
   }
 
@@ -252,13 +304,16 @@ export async function cancelRun(
     }
   }
 
-  // Persist cancelled status. We don't wait for the child to write its own
-  // result.json — `hive flow status` will show cancelled regardless, and the
-  // child's eventual writeMeta will be a no-op since it would write the same
-  // status (or fail because we got it first).
+  // Persist cancelled status. Re-read meta first: a concurrently-finishing
+  // child may have written a terminal status (e.g. "ok") between our initial
+  // read and the signal — spreading the stale pre-signal snapshot would
+  // clobber it. Only a still-"running" record is flipped to cancelled.
   const endedAt = new Date().toISOString();
-  const cancelled: FlowRunMeta = { ...meta, status: "cancelled", endedAt };
-  await writeMeta(flowName, runId, cancelled);
+  const fresh = await readMeta(flowName, runId).catch(() => null);
+  if (!fresh || fresh.status === "running") {
+    const cancelled: FlowRunMeta = { ...(fresh ?? meta), status: "cancelled", endedAt };
+    await writeMeta(flowName, runId, cancelled);
+  }
 
   await appendLedger({
     type: "flow.run.cancel",

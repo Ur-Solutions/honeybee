@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { beeConfig } from "./config.js";
 import { homeEnvForAgent, identityEnvForAgent } from "./drivers.js";
+import { assertExecutableAvailable } from "./execCheck.js";
 import { allocateBeeIdentity } from "./ids.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
 import { safeName, saveSession, type SessionRecord } from "./store.js";
@@ -250,6 +251,9 @@ function safeTmuxTargetForFlow(value: string): string {
 export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRecord> {
   const spec = resolveAgent(opts.agent, opts.extraArgs, { home: opts.home, yolo: opts.yolo });
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
+  // Mirror cli.ts spawn: a typo'd agent command would otherwise become a tmux
+  // session that dies instantly while leaving a "running" record behind.
+  if (!isRemote) await assertExecutableAvailable(spec.command);
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(opts.name ?? identity.id);
   const tmuxTarget = safeTmuxTargetForFlow(name);

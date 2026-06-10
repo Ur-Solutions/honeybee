@@ -19,29 +19,36 @@ const READ_CHUNK = 64 * 1024;
 /**
  * Read the last N lines from the daemon log file. Returns the lines in
  * source order (oldest first). Used by `hive daemon logs --lines N`.
+ *
+ * `chunkBytes` controls the reverse-read chunk size (testing seam for the
+ * multi-byte boundary handling below).
  */
-export async function readLastLines(path: string, lines: number): Promise<string[]> {
+export async function readLastLines(path: string, lines: number, chunkBytes: number = READ_CHUNK): Promise<string[]> {
   if (lines <= 0) return [];
   const info = await stat(path).catch(() => null);
   if (!info || info.size === 0) return [];
   const handle = await open(path, "r");
   try {
     const fileSize = info.size;
-    // Read the whole file in reverse chunks, concatenating into an in-memory
-    // string until we have at least `lines + 1` newlines or hit BOF. The
-    // daemon log file is bounded by HIVE_DAEMON_LOG_MAX_BYTES (default 5MiB)
-    // so this is bounded.
+    // Read the file in reverse chunks, accumulating Buffers until we have at
+    // least `lines + 1` newlines or hit BOF, then decode ONCE — decoding each
+    // chunk independently would corrupt multi-byte UTF-8 characters that
+    // straddle a chunk boundary. Counting 0x0a bytes per chunk is safe: no
+    // UTF-8 continuation byte equals 0x0a. Memory stays bounded because the
+    // daemon log file is capped by HIVE_DAEMON_LOG_MAX_BYTES (default 5MiB).
     let position = fileSize;
-    let acc = "";
+    const chunks: Buffer[] = [];
+    let newlineCount = 0;
     while (position > 0) {
-      const chunkSize = Math.min(READ_CHUNK, position);
+      const chunkSize = Math.min(chunkBytes, position);
       position -= chunkSize;
       const buffer = Buffer.alloc(chunkSize);
       await handle.read(buffer, 0, chunkSize, position);
-      acc = buffer.toString("utf8") + acc;
-      const newlineCount = countNewlines(acc);
+      chunks.unshift(buffer);
+      newlineCount += countNewlineBytes(buffer);
       if (newlineCount > lines) break;
     }
+    const acc = Buffer.concat(chunks).toString("utf8");
     const split = acc.split("\n");
     // If the file ended with a newline, split() leaves a trailing "".
     // Drop it so it doesn't count as a "line".
@@ -53,9 +60,9 @@ export async function readLastLines(path: string, lines: number): Promise<string
   }
 }
 
-function countNewlines(s: string): number {
+function countNewlineBytes(buffer: Buffer): number {
   let count = 0;
-  for (let i = 0; i < s.length; i += 1) if (s.charCodeAt(i) === 0x0a) count += 1;
+  for (let i = 0; i < buffer.length; i += 1) if (buffer[i] === 0x0a) count += 1;
   return count;
 }
 

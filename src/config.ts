@@ -37,7 +37,10 @@ export function loadConfig(): HiveConfig {
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
     cached = normalizeConfig(parsed);
-  } catch {
+  } catch (error) {
+    // Warn (once per process — the result is cached) instead of silently
+    // dropping the user's yolo flags / home / command overrides on the floor.
+    console.error(`hive: ignoring unreadable config at ${path}: ${error instanceof Error ? error.message : String(error)}`);
     cached = {};
   }
   return cached;

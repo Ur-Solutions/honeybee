@@ -90,8 +90,10 @@ export async function resolveSelector(query: string): Promise<ResolvedTarget> {
   if (selector.kind === "colony") {
     const colonies = await listColonies();
     state.colonies = new Set(colonies.map((c) => c.name));
-    if (!state.colonies.has(selector.name) && !(await colonyExists(selector.name))) {
-      // fall through to throw in resolveSelectorFromState
+    // A colony created after the listColonies snapshot is still a valid
+    // target; recheck the store before resolveSelectorFromState rejects it.
+    if (!state.colonies.has(selector.name) && (await colonyExists(selector.name))) {
+      state.colonies.add(selector.name);
     }
   }
   return resolveSelectorFromState(selector, state);

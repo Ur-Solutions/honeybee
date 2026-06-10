@@ -5,7 +5,7 @@ export type Parsed = {
   rest: string[];
 };
 
-const BOOLEAN_FLAGS = new Set([
+export const BOOLEAN_FLAGS = new Set([
   "accept-trust",
   "all",
   "autoswap",

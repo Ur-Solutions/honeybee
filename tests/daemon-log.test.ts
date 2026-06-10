@@ -3,7 +3,14 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
-import { appendDaemonLog, daemonLogPath, rotateDaemonLogIfNeeded } from "../src/daemon/log.js";
+import {
+  appendDaemonLog,
+  daemonLaunchdErrPath,
+  daemonLaunchdOutPath,
+  daemonLogPath,
+  rotateDaemonLogIfNeeded,
+  rotateLaunchdLogsIfNeeded,
+} from "../src/daemon/log.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-daemon-log-"));
@@ -68,6 +75,57 @@ test("rotateDaemonLogIfNeeded rotates when size exceeds threshold", async () => 
       const entries = await readdir(dirname(path));
       const rotatedFiles = entries.filter((f) => f.startsWith(`${basename(path)}.`));
       assert.ok(rotatedFiles.length >= 1, "expected at least one rotated file");
+    } finally {
+      if (prev === undefined) delete process.env.HIVE_DAEMON_LOG_MAX_BYTES;
+      else process.env.HIVE_DAEMON_LOG_MAX_BYTES = prev;
+    }
+  });
+});
+
+test("launchd stream paths are distinct from the daemon log path", () => {
+  assert.notEqual(daemonLaunchdOutPath(), daemonLogPath());
+  assert.notEqual(daemonLaunchdErrPath(), daemonLogPath());
+  assert.notEqual(daemonLaunchdOutPath(), daemonLaunchdErrPath());
+  assert.ok(daemonLaunchdOutPath().endsWith("launchd.out.txt"));
+  assert.ok(daemonLaunchdErrPath().endsWith("launchd.err.txt"));
+});
+
+test("rotateLaunchdLogsIfNeeded rotates oversized launchd stream files", async () => {
+  await withTempStore(async () => {
+    const prev = process.env.HIVE_DAEMON_LOG_MAX_BYTES;
+    process.env.HIVE_DAEMON_LOG_MAX_BYTES = "64";
+    try {
+      const outPath = daemonLaunchdOutPath();
+      const errPath = daemonLaunchdErrPath();
+      await mkdir(dirname(outPath), { recursive: true });
+      await writeFile(outPath, "o".repeat(200));
+      await writeFile(errPath, "e".repeat(200));
+      await rotateLaunchdLogsIfNeeded();
+      for (const path of [outPath, errPath]) {
+        const stillThere = await stat(path).then(() => true).catch(() => false);
+        assert.equal(stillThere, false, `${basename(path)} should be moved aside`);
+      }
+      const entries = await readdir(dirname(outPath));
+      assert.ok(entries.some((f) => f.startsWith("launchd.out.txt.")), "expected rotated launchd.out.txt");
+      assert.ok(entries.some((f) => f.startsWith("launchd.err.txt.")), "expected rotated launchd.err.txt");
+    } finally {
+      if (prev === undefined) delete process.env.HIVE_DAEMON_LOG_MAX_BYTES;
+      else process.env.HIVE_DAEMON_LOG_MAX_BYTES = prev;
+    }
+  });
+});
+
+test("appendDaemonLog also rotates oversized launchd stream files", async () => {
+  await withTempStore(async () => {
+    const prev = process.env.HIVE_DAEMON_LOG_MAX_BYTES;
+    process.env.HIVE_DAEMON_LOG_MAX_BYTES = "64";
+    try {
+      const errPath = daemonLaunchdErrPath();
+      await mkdir(dirname(errPath), { recursive: true });
+      await writeFile(errPath, "e".repeat(200));
+      await appendDaemonLog({ level: "info", msg: "tick" });
+      const stillThere = await stat(errPath).then(() => true).catch(() => false);
+      assert.equal(stillThere, false, "launchd.err.txt should be rotated on append");
     } finally {
       if (prev === undefined) delete process.env.HIVE_DAEMON_LOG_MAX_BYTES;
       else process.env.HIVE_DAEMON_LOG_MAX_BYTES = prev;

@@ -69,7 +69,7 @@ export function parseBuzDocument(text: string): BuzFrontmatterDoc {
   // Rebuild the body verbatim. Walk afterOpen counting newlines until we
   // land just past the closing-fence line. This keeps any code-fenced
   // markdown (e.g. ```js ... ```) byte-identical on round-trip.
-  let bodyStart = 0;
+  let bodyStart = -1;
   let lineCount = 0;
   for (let i = 0; i < afterOpen.length; i += 1) {
     if (afterOpen[i] === "\n") {
@@ -80,7 +80,9 @@ export function parseBuzDocument(text: string): BuzFrontmatterDoc {
       }
     }
   }
-  return { frontmatter, body: afterOpen.slice(bodyStart) };
+  // If the walk never crossed the closing-fence boundary, the closing fence
+  // was the final line with no trailing newline — the body is empty.
+  return { frontmatter, body: bodyStart === -1 ? "" : afterOpen.slice(bodyStart) };
 }
 
 function isValidKey(key: string): boolean {
