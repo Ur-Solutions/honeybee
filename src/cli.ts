@@ -3780,11 +3780,10 @@ async function cmdLimits(parsed: Parsed) {
 function limitCell(window: WindowUsage | undefined, result: AccountLimits): string {
   if (!result.ok || !window) return "-";
   const now = Date.now();
-  // A snapshot whose reset boundary has passed no longer describes the
-  // current window — usage since the rollover is unknown (likely ~0 on this
-  // machine, or a newer snapshot would exist).
+  // A snapshot whose reset boundary has passed describes a window that has
+  // already rolled over: it's fresh (0%) and nothing is pending a reset.
   if (windowRolledOver(window, now)) {
-    return `${limitBar(0)}  ~0% ${dim(`rolled over (was ${Math.round(window.usedPercent)}%)`)}`;
+    return `${limitBar(0)}   0%`;
   }
   const percent = Math.max(0, Math.min(100, window.usedPercent));
   const pace = paceDelta(window, now);
