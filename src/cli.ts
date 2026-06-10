@@ -2910,7 +2910,8 @@ async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "queue") {
   if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
 
   for (const record of records) {
-    const listing = await listMessages(record.name, mailbox, {
+    const storageBee = mailbox === "outbox" ? (record.id || record.name) : record.name;
+    const listing = await listMessages(storageBee, mailbox, {
       ...(limit !== undefined ? { limit } : {}),
       ...(fromFilter ? { fromFilter } : {}),
     });

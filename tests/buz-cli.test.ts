@@ -137,6 +137,20 @@ test("hive buz outbox shows the sender's outbox", async () => {
   }
 });
 
+test("hive buz outbox resolves display-name bees to their id-backed outbox", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    await seedSession(dir, "chief-display", { id: "CL.chief" });
+    await hive(dir, "buz", "send", "CO.aaa", "--sender", "chief-display", "--tier", "queue", "-p", "x");
+    const { stdout } = await hive(dir, "buz", "outbox", "chief-display");
+    assert.match(stdout, /buz\.outbox\tchief-display\t/);
+    assert.match(stdout, /CL\.chief/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hive buz read --consume moves the message from inbox/ to read/", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
   try {
