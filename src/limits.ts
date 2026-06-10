@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -13,10 +14,11 @@ import { readClaudeKeychain } from "./keychain.js";
 //    (GET api.anthropic.com/api/oauth/usage) — live utilization + reset
 //    times. We query it with the freshest token we can find for the
 //    account across the vault, home credential files, and keychain.
-//  - codex: every session rollout carries the server's rate_limits snapshot
-//    (primary=5h, secondary=weekly, used_percent + resets_at); we read the
-//    newest snapshot from the account's homes. Facts from disk — only as
-//    fresh as the account's last activity, stamped asOf.
+//  - codex: live via `codex app-server`'s account/rateLimits/read RPC (run
+//    against the account's home). When the binary or RPC is unavailable we
+//    fall back to the newest rate_limits snapshot codex wrote into its
+//    session rollouts — only as fresh as the account's last local activity,
+//    stamped asOf.
 // ──────────────────────────────────────────────────────────────────────────
 
 export type WindowUsage = {
@@ -57,13 +59,15 @@ export type AccountLimits = {
   plan?: string;
   /** Snapshot time for disk-sourced data; undefined when live. */
   asOf?: string;
-  source: "oauth-api" | "session-snapshot" | "unsupported";
+  source: "oauth-api" | "app-server" | "session-snapshot" | "unsupported";
 };
 
 export type LimitsDeps = {
   fetchClaudeUsage?: (accessToken: string) => Promise<ClaudeUsageResponse>;
   /** Resolve the email a token actually belongs to (OAuth profile endpoint). */
   fetchClaudeProfileEmail?: (accessToken: string) => Promise<string | null>;
+  /** Live codex rate limits for a home via the app-server RPC; null on failure. */
+  codexLiveRateLimits?: (homePath: string) => Promise<CodexLiveRateLimits | null>;
   readKeychain?: typeof readClaudeKeychain;
   now?: () => number;
 };
@@ -73,7 +77,7 @@ export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps 
     accounts.map(async (account) => {
       try {
         if (account.tool === "claude") return await claudeLimits(account, deps);
-        if (account.tool === "codex") return await codexLimits(account);
+        if (account.tool === "codex") return await codexLimits(account, deps);
         return { account: account.id, tool: account.tool, ok: false, source: "unsupported" as const, error: `${account.tool} has no limits source yet` };
       } catch (error) {
         return {
@@ -303,10 +307,28 @@ type CodexRateLimits = {
   plan_type?: string | null;
 };
 
-async function codexLimits(account: AccountRecord): Promise<AccountLimits> {
+async function codexLimits(account: AccountRecord, deps: LimitsDeps = {}): Promise<AccountLimits> {
   const homes = await codexHomesForAccount(account);
   if (homes.length === 0) {
     return { account: account.id, tool: account.tool, ok: false, source: "session-snapshot", error: "no home found with this account's auth.json" };
+  }
+
+  // Live first: the app-server RPC answers with the server's current window
+  // state. Try each matched home until one authenticates.
+  const live = deps.codexLiveRateLimits ?? fetchCodexLiveRateLimits;
+  for (const home of homes) {
+    const limits = await live(home).catch(() => null);
+    if (!limits) continue;
+    const result: AccountLimits = {
+      account: account.id,
+      tool: account.tool,
+      ok: true,
+      source: "app-server",
+      ...(limits.planType ? { plan: limits.planType } : {}),
+    };
+    if (limits.primary) result.fiveHour = liveWindow(limits.primary);
+    if (limits.secondary) result.weekly = liveWindow(limits.secondary);
+    if (result.fiveHour || result.weekly) return result;
   }
 
   let best: { limits: CodexRateLimits; ts: string } | null = null;
@@ -341,6 +363,88 @@ async function codexLimits(account: AccountRecord): Promise<AccountLimits> {
     };
   }
   return result;
+}
+
+export type CodexLiveWindow = { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
+export type CodexLiveRateLimits = {
+  primary?: CodexLiveWindow | null;
+  secondary?: CodexLiveWindow | null;
+  planType?: string | null;
+};
+
+function liveWindow(window: CodexLiveWindow): WindowUsage {
+  return {
+    usedPercent: typeof window.usedPercent === "number" ? window.usedPercent : 0,
+    ...(window.resetsAt ? { resetsAt: new Date(window.resetsAt * 1000).toISOString() } : {}),
+    ...(typeof window.windowDurationMins === "number" ? { windowMinutes: window.windowDurationMins } : {}),
+  };
+}
+
+const CODEX_RPC_TIMEOUT_MS = 15_000;
+
+/**
+ * Query `codex app-server` (JSON-RPC over stdio) for the account's live rate
+ * limits, with CODEX_HOME pointed at the account's home. Returns null on any
+ * failure — missing binary, stale auth, protocol drift — so callers fall back
+ * to the on-disk snapshot.
+ */
+async function fetchCodexLiveRateLimits(homePath: string): Promise<CodexLiveRateLimits | null> {
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("codex", ["app-server"], {
+        stdio: ["pipe", "pipe", "ignore"],
+        env: { ...process.env, CODEX_HOME: homePath },
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    const finish = (value: CodexLiveRateLimits | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill();
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), CODEX_RPC_TIMEOUT_MS);
+    child.on("error", () => finish(null));
+    child.on("exit", () => finish(null));
+
+    let buffer = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString();
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        let message: { id?: number; result?: Record<string, unknown>; error?: unknown };
+        try {
+          message = JSON.parse(line) as typeof message;
+        } catch {
+          continue;
+        }
+        if (message.id === 1) {
+          if (message.error) {
+            finish(null);
+            return;
+          }
+          child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} })}\n`);
+        }
+        if (message.id === 2) {
+          const rateLimits = message.result?.rateLimits as CodexLiveRateLimits | undefined;
+          finish(rateLimits && (rateLimits.primary || rateLimits.secondary) ? rateLimits : null);
+          return;
+        }
+      }
+    });
+
+    child.stdin?.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "hive", title: "hive", version: "0.0.1" } } })}\n`,
+    );
+  });
 }
 
 async function codexHomesForAccount(account: AccountRecord): Promise<string[]> {

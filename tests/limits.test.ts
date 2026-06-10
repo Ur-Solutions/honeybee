@@ -154,6 +154,37 @@ test("claude limits report an expired token instead of calling the API", async (
   });
 });
 
+test("codex prefers live app-server limits and falls back to disk snapshots", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "live@a.b");
+    // A dedicated account home makes codexHomesForAccount match without auth.json.
+    await mkdir(join(dir, "homes", account.id), { recursive: true });
+
+    const [live] = await accountLimits([account], {
+      codexLiveRateLimits: async () => ({
+        primary: { usedPercent: 15, windowDurationMins: 300, resetsAt: 1781095703 },
+        secondary: { usedPercent: 38, windowDurationMins: 10080, resetsAt: 1781138732 },
+        planType: "pro",
+      }),
+    });
+    assert.equal(live!.ok, true);
+    assert.equal(live!.source, "app-server");
+    assert.equal(live!.plan, "pro");
+    assert.equal(live!.fiveHour?.usedPercent, 15);
+    assert.equal(live!.fiveHour?.windowMinutes, 300);
+    assert.equal(live!.weekly?.usedPercent, 38);
+    assert.equal(live!.asOf, undefined);
+
+    // Live unavailable → snapshot fallback (none on disk here → factual error).
+    const [fallback] = await accountLimits([account], {
+      codexLiveRateLimits: async () => null,
+    });
+    assert.equal(fallback!.ok, false);
+    assert.equal(fallback!.source, "session-snapshot");
+    assert.match(fallback!.error ?? "", /no rate-limit snapshot/);
+  });
+});
+
 test("unsupported tools and missing codex homes degrade to errors, not throws", async () => {
   await withTempStore(async () => {
     const opencode = await addAccount("opencode", "oc");
