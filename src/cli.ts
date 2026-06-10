@@ -531,9 +531,14 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
   const delivered = augmentBrief(parsed, briefText);
   await substrateFor(record).sendText(record.tmuxTarget, delivered);
   const now = new Date().toISOString();
-  const updated: SessionRecord =
-    (await updateSession(record.name, { updatedAt: now, status: "running", brief: briefText, briefedAt: now })) ??
-    { ...record, updatedAt: now, status: "running", brief: briefText, briefedAt: now };
+  const persisted = await updateSession(record.name, { updatedAt: now, status: "running", brief: briefText, briefedAt: now });
+  if (!persisted) {
+    // The record vanished mid-brief (concurrent kill/clean). The text was
+    // already delivered to the pane, but nothing recorded it — say so instead
+    // of silently returning an in-memory merge that looks persisted.
+    console.error(note(`warn ${record.name}: session record disappeared while briefing; brief delivered but not recorded`));
+  }
+  const updated: SessionRecord = persisted ?? { ...record, updatedAt: now, status: "running", brief: briefText, briefedAt: now };
   await appendLedger({ type: "brief", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, chars: delivered.length, briefChars: briefText.length });
   if (isPretty()) console.log(actionLine("ok", "brief", [bold(record.name), `${briefText.length} chars`]));
   else console.log(`briefed\t${record.name}\t${briefText.length} chars`);
