@@ -1,6 +1,7 @@
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { listAccounts, type AccountRecord } from "./accounts.js";
 import { listColonies, type ColonyRecord } from "./colony.js";
 import { type Frame, listFrames } from "./frame.js";
 import { type Flow, listFlows } from "./flow/index.js";
@@ -55,14 +56,21 @@ const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach"]);
 const SESSION_ANY = new Set(["kill", "last", "seal"]);
-const BEE_FIRST_ARG = new Set(["spawn", "run", "x"]);
+const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
+// Commands whose first positional is a vault account.
+const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage"]);
 
 const FLAGS_BY_COMMAND: Record<string, string[]> = {
   spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
   account: ["--email", "--home", "--from", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
+  xa: [
+    "--cwd", "--home", "--profile", "--account", "--name", "--colony", "--print",
+    "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
+    "--yolo", "--no-yolo", "--dangerous", "--boot-ms",
+  ],
   usage: ["--json"],
   sessions: ["--home", "--json"],
   sync: ["--json"],
@@ -121,10 +129,11 @@ export type CompletionState = {
   flows?: Flow[];
   nodes?: NodeRecord[];
   runs?: { runId: string; flowName: string }[];
+  accounts?: AccountRecord[];
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer";
+type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account";
 
 const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -142,6 +151,7 @@ const FLAG_VALUE_KINDS: Record<string, FlagValueKind> = {
   "--type": "search-type",
   "--status": "seal-status",
   "--flow": "flow",
+  "--account": "account",
 };
 
 // Per-command overrides + additions. These only apply when args[0] equals
@@ -176,12 +186,13 @@ const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   sync: SYNC_SUBCOMMANDS,
 };
 
-const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run">> = {
+const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run" | "account">> = {
   colony: { inspect: "colony", archive: "colony", update: "colony", rename: "colony" },
   frame: { inspect: "frame", remove: "frame", edit: "frame", update: "frame", reload: "frame" },
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },
   flow: { inspect: "flow", remove: "flow", run: "flow", logs: "run", status: "run", cancel: "run" },
+  account: { capture: "account", remove: "account", rm: "account" },
   // buz subcommands all take a selector as their first positional. We
   // accept any session (live or dead) since reading inbox/outbox/queue
   // is meaningful even for a sealed bee.
@@ -215,9 +226,20 @@ export function getCompletionsFromState(words: string[], state: CompletionState)
     return nounCommandCandidates(command, args, state);
   }
 
+  if (command === "swap-account") {
+    // <bee> then <account>.
+    const index = positionalIndexOf(args);
+    if (index === 0) return sessionRefs(state, "all");
+    if (index === 1) return resolveFlagValueCandidates("account", state);
+    return [];
+  }
+
   if (positionalIndexOf(args) !== 0) return [];
 
-  if (BEE_FIRST_ARG.has(command)) return BEES;
+  // Bee specs include account shorthands: the full account id is itself a
+  // valid `<tool>-<account>` spawn spec.
+  if (BEE_FIRST_ARG.has(command)) return [...BEES, ...(state.accounts ?? []).map((account) => account.id)];
+  if (ACCOUNT_FIRST_ARG.has(command)) return resolveFlagValueCandidates("account", state);
   if (SHELL_FIRST_ARG.has(command)) return SHELLS;
   if (SESSION_LIVE_ONLY.has(command)) return sessionRefs(state, "live");
   if (SESSION_ANY.has(command)) return sessionRefs(state, "all");
@@ -267,6 +289,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return LOOP_CONTEXT_VALUES;
     case "loop-summarizer":
       return LOOP_SUMMARIZER_VALUES;
+    case "account":
+      return (state.accounts ?? []).map((account) => account.id);
   }
 }
 
@@ -364,7 +388,7 @@ function positionalAt(args: string[], index: number): string | undefined {
 
 export async function getCompletions(words: string[]): Promise<string[]> {
   try {
-    const [records, live, colonies, swarms, frames, nodes, flows, runs] = await Promise.all([
+    const [records, live, colonies, swarms, frames, nodes, flows, runs, accounts] = await Promise.all([
       listSessions(),
       listTmuxSessions(),
       listColonies().catch(() => []),
@@ -373,6 +397,7 @@ export async function getCompletions(words: string[]): Promise<string[]> {
       listNodes().catch(() => []),
       listFlows().catch(() => []),
       listRuns().catch(() => []),
+      listAccounts().catch(() => []),
     ]);
     return getCompletionsFromState(words, {
       records,
@@ -383,6 +408,7 @@ export async function getCompletions(words: string[]): Promise<string[]> {
       nodes,
       flows,
       runs: runs.map((r) => ({ runId: r.runId, flowName: r.flowName })),
+      accounts,
       cwd: process.cwd(),
     });
   } catch {

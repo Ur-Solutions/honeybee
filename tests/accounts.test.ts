@@ -14,6 +14,7 @@ import {
   importCaam,
   listAccounts,
   removeAccount,
+  resolveSpawnAgent,
 } from "../src/accounts.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -113,6 +114,47 @@ test("activate fails when the vault is empty for the account", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("claude", "novault@a.b");
     await assert.rejects(() => activateAccountIntoHome(account, join(dir, "slot")), /no credentials/i);
+  });
+});
+
+test("findAccount resolves <tool>-<query> shorthands (codex-ur, claude-thto)", async () => {
+  await withTempStore(async () => {
+    await addAccount("codex", "tormod@ursolutions.no");
+    await addAccount("codex", "tormod@thto.no");
+    await addAccount("claude", "tormod@ursolutions.no");
+
+    assert.equal((await findAccount("codex-ur")).id, accountIdFor("codex", "tormod@ursolutions.no"));
+    assert.equal((await findAccount("codex-thto")).id, accountIdFor("codex", "tormod@thto.no"));
+    assert.equal((await findAccount("claude-ur")).tool, "claude");
+    // "ur" alone is ambiguous across tools; the prefix scopes it.
+    await assert.rejects(() => findAccount("ur"), /Ambiguous/);
+    // Verbatim ids still resolve first.
+    assert.equal((await findAccount(accountIdFor("codex", "tormod@thto.no"))).label, "tormod@thto.no");
+  });
+});
+
+test("resolveSpawnAgent maps bee specs to tool + account", async () => {
+  await withTempStore(async () => {
+    await addAccount("codex", "tormod@ursolutions.no");
+
+    // Plain tools and home aliases pass through untouched.
+    assert.deepEqual(await resolveSpawnAgent("claude"), { agent: "claude" });
+    assert.deepEqual(await resolveSpawnAgent("cc1"), { agent: "cc1" });
+    assert.deepEqual(await resolveSpawnAgent("codex2"), { agent: "codex2" });
+
+    // Account shorthand binds the vault account.
+    const spec = await resolveSpawnAgent("codex-ur");
+    assert.equal(spec.agent, "codex");
+    assert.equal(spec.account?.id, accountIdFor("codex", "tormod@ursolutions.no"));
+
+    // The full account id is itself a valid spec (used by tab completion).
+    const byId = await resolveSpawnAgent(accountIdFor("codex", "tormod@ursolutions.no"));
+    assert.equal(byId.agent, "codex");
+    assert.equal(byId.account?.label, "tormod@ursolutions.no");
+
+    // Unknown tokens fall through as arbitrary executables.
+    assert.deepEqual(await resolveSpawnAgent("my-agent"), { agent: "my-agent" });
+    assert.deepEqual(await resolveSpawnAgent("codex-nosuch"), { agent: "codex-nosuch" });
   });
 });
 

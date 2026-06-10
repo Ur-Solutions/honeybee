@@ -126,7 +126,58 @@ export async function removeAccount(idOrLabel: string): Promise<AccountRecord> {
 export async function findAccount(idOrLabel: string, tool?: string): Promise<AccountRecord> {
   const accounts = await listAccounts();
   const pool = tool ? accounts.filter((account) => account.tool === canonicalAgentKind(tool).toLowerCase()) : accounts;
-  return matchAccount(pool, idOrLabel);
+  try {
+    return matchAccount(pool, idOrLabel);
+  } catch (error) {
+    // `<tool>-<query>` shorthand (codex-ur, claude-thto): scope the fuzzy
+    // match to the tool named by the prefix. Only a fallback — a verbatim
+    // id/label match above always wins.
+    if (!tool) {
+      const shorthand = splitToolShorthand(idOrLabel);
+      if (shorthand) {
+        const scoped = accounts.filter((account) => account.tool === shorthand.tool);
+        try {
+          return matchAccount(scoped, shorthand.query);
+        } catch {
+          // fall through to the original error
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+function splitToolShorthand(value: string): { tool: string; query: string } | undefined {
+  const dash = value.indexOf("-");
+  if (dash <= 0 || dash === value.length - 1) return undefined;
+  const tool = canonicalAgentKind(value.slice(0, dash)).toLowerCase();
+  if (!hasAgentDriver(tool) || !identityRecipeForAgent(tool)) return undefined;
+  return { tool, query: value.slice(dash + 1) };
+}
+
+export type SpawnAgentSpec = {
+  agent: string;
+  account?: AccountRecord;
+};
+
+/**
+ * Resolve a spawn-spec token into an agent plus an optional vault account.
+ * Plain tools and home aliases pass through (`claude`, `cc1`, `codex2`);
+ * `<tool>-<query>` binds an account by tool-scoped fuzzy match (`codex-ur`,
+ * `claude-thto`). Unknown tokens pass through unchanged so arbitrary
+ * executables (`my-agent`) still spawn.
+ */
+export async function resolveSpawnAgent(kind: string): Promise<SpawnAgentSpec> {
+  if (hasAgentDriver(canonicalAgentKind(kind).toLowerCase())) return { agent: kind };
+  const shorthand = splitToolShorthand(kind);
+  if (shorthand) {
+    try {
+      return { agent: shorthand.tool, account: await findAccount(shorthand.query, shorthand.tool) };
+    } catch {
+      // not an account shorthand — treat as an arbitrary executable
+    }
+  }
+  return { agent: kind };
 }
 
 function matchAccount(accounts: AccountRecord[], query: string): AccountRecord {

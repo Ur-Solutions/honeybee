@@ -15,6 +15,7 @@ import {
   importCaam,
   listAccounts,
   removeAccount,
+  resolveSpawnAgent,
   vaultRoot,
 } from "./accounts.js";
 import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
@@ -153,6 +154,9 @@ async function main(argv: string[]) {
       break;
     case "x":
       await cmdX(parsed);
+      break;
+    case "xa":
+      await cmdXa(parsed);
       break;
     case "attach":
       await cmdAttach(parsed);
@@ -322,8 +326,10 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
 }
 
 async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
-  const agent = parsed.args[0];
-  if (!agent) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <a>] [-- <bee-args...>]");
+  const requested = parsed.args[0];
+  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <a>] [-- <bee-args...>]");
+  // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto.
+  const { agent, account: aliasAccount } = await resolveSpawnAgent(requested);
   const cwd = await resolveSpawnCwd(parsed);
   const yolo = dangerousMode(parsed, agent);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -333,9 +339,9 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : undefined;
   const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
-  const account = accountQuery ? await findAccount(accountQuery, spec.kind) : undefined;
+  const account = accountQuery ? await findAccount(accountQuery, spec.kind) : aliasAccount;
   const autoswap = truthy(flag(parsed, "autoswap"));
-  if (autoswap && !account) throw new Error("--autoswap requires --account (the daemon swaps between vault accounts)");
+  if (autoswap && !account) throw new Error("--autoswap requires an account (--account or a <tool>-<account> bee spec)");
   let record = await spawnBee({ agent, extraArgs: parsed.rest, cwd, yolo, home, name, colony, brief: briefText, node, account, autoswap });
   const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
@@ -349,9 +355,10 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
 }
 
 async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<SessionRecord[]> {
-  const agent = parsed.args[0];
-  if (!agent) throw new Error("Usage: hive spawn <bee> --count <n> [--colony name]");
+  const requested = parsed.args[0];
+  if (!requested) throw new Error("Usage: hive spawn <bee> --count <n> [--colony name]");
   if (!Number.isInteger(count) || count < 2) throw new Error(`--count must be an integer >= 2 (got ${count})`);
+  const { agent, account } = await resolveSpawnAgent(requested);
   const cwd = await resolveSpawnCwd(parsed);
   const yolo = dangerousMode(parsed, agent);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -362,7 +369,7 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
 
   const records: SessionRecord[] = [];
   for (let i = 0; i < count; i += 1) {
-    const record = await spawnBee({ agent, extraArgs: parsed.rest, cwd, yolo, home, colony, swarmId, node });
+    const record = await spawnBee({ agent, extraArgs: parsed.rest, cwd, yolo, home, colony, swarmId, node, account });
     records.push(record);
     const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
     if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`@${swarmId}`), ...nodeSuffix]));
@@ -1350,6 +1357,34 @@ async function cmdX(parsed: Parsed) {
   await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
   if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
   else console.log(`sent\t${record.name}\t${prompt.length} chars`);
+}
+
+// Shorthand: spawn a single bee and attach to it — the interactive front door
+// (`hive xa claude`, `hive xa cc1`, `hive xa codex-ur`). Spawn waits for the
+// agent prompt (confirmSpawnReady) so attach lands on a ready pane; detaching
+// leaves the bee running like any tmux session.
+async function cmdXa(parsed: Parsed) {
+  const agent = parsed.args[0];
+  if (!agent) throw new Error("Usage: hive xa <bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--name <id>] [--print]");
+  if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
+    throw new Error("hive xa attaches to a single bee; spawn cohorts with hive spawn --count/--frame");
+  }
+
+  const spawnParsed: Parsed = {
+    command: "spawn",
+    args: [agent],
+    flags: new Map(parsed.flags),
+    rest: parsed.rest,
+  };
+  const record = await cmdSpawn(spawnParsed);
+
+  const substrate = substrateFor(record);
+  if (truthy(flag(parsed, "print")) || !process.stdout.isTTY) {
+    if (isPretty()) console.error(note("attach with:"));
+    console.log(formatShellCommand(substrate.attachCommand(record.tmuxTarget)));
+    return;
+  }
+  await substrate.attachSession(record.tmuxTarget);
 }
 
 async function cmdConfig(parsed: Parsed) {
@@ -3682,6 +3717,7 @@ function printHelp() {
     ["spawn --frame", "<name> [--colony <name>] [--swarm-id <id>]", "spawn a swarm from a registered frame"],
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
+    ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto)"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
     ["seal", "<selector> --from <path.json>", "record a typed handoff artifact"],
@@ -3728,7 +3764,8 @@ function printHelp() {
 
   const bees = [
     "  claude, codex, opencode, grok, pi, droid, cursor",
-    `  ${dim("aliases: codex1, codex2, codex3, cc1, cc2, cc3")}`,
+    `  ${dim("home aliases: codex1, codex2, codex3, cc1, cc2, cc3")}`,
+    `  ${dim("account shorthands: <tool>-<account fragment> (codex-ur, claude-thto) — see hive account list")}`,
     `  ${dim("or any executable on PATH")}`,
   ].join("\n");
 
