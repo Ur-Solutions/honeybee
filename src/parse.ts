@@ -37,6 +37,7 @@ export const BOOLEAN_FLAGS = new Set([
   "read",
   "regex",
   "rm",
+  "samples",
   "seal",
   "transcript",
   "trust",

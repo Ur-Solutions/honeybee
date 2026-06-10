@@ -219,10 +219,12 @@ async function main(argv: string[]) {
       await cmdSwapAccount(parsed);
       break;
     case "usage":
-      await cmdUsage(parsed);
-      break;
     case "limits":
-      await cmdLimits(parsed);
+      // One question, one command: where do my accounts stand against the
+      // real provider windows. The daemon's local token samples (autoswap's
+      // raw material) sit behind --samples.
+      if (truthy(flag(parsed, "samples"))) await cmdUsageSamples(parsed);
+      else await cmdLimits(parsed);
       break;
     case "sessions":
       await cmdSessions(parsed);
@@ -3897,7 +3899,7 @@ async function cmdSwapAccount(parsed: Parsed) {
   else console.log(`swapped\t${updated.name}\t${account.id}`);
 }
 
-async function cmdUsage(parsed: Parsed) {
+async function cmdUsageSamples(parsed: Parsed) {
   const query = parsed.args[0];
   const now = Date.now();
   const accounts = await listAccounts();
@@ -4092,8 +4094,7 @@ function printHelp() {
     ["activate", "<account> [--home <1|2|3|path>]", "seed an account's credentials into a home slot (fast login)"],
     ["login", "<account> [--no-wait] [--popup]", "interactive (re)login seat in tmux; captures fresh credentials into the vault"],
     ["swap-account", "<bee> <account>", "stop, re-credential the bee's home, and resume the same session on another account"],
-    ["usage", "[<account>] [--json]", "factual per-account token usage and exhaustion state (estimates, not quota)"],
-    ["limits", "[<account>] [--json]", "progress against the providers' real 5h/weekly limits (claude live, codex from its last on-disk snapshot)"],
+    ["usage", "[<account>] [--samples] [--json]", "progress against the providers' real 5h/weekly limits with pace (alias: limits); --samples shows the daemon's local token samples"],
     ["sessions", "reconcile [--home <path>]... [--json]", "index sessions across all homes; flag duplicates and sync conflicts"],
     ["sync", "manifest [--json]", "write the syncthing include/exclude manifest (vault always excluded)"],
     ["config", "<show|path|set-bee <bee> [--yolo] [--home] [--command]>", "view or edit ~/.hive/config.json defaults"],
