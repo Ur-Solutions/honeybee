@@ -296,6 +296,12 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
     ...(downgrade.reason ? { reason: downgrade.reason } : {}),
   };
 
+  // Write the outbox audit copy up front so a failed delivery (e.g. the
+  // recipient lock times out and the block below throws) still leaves a
+  // sender-side record of the attempt; it is rewritten after delivery once
+  // the effective tier is final.
+  result.outboxPath = await writeOutbox(message);
+
   // Serialize per-bee writes so two concurrent senders cannot collide on
   // the same filename / mailbox. We have a single lock per recipient bee.
   await withFileLock(senderLockPath(input.recipient.name), async () => {
@@ -349,9 +355,10 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
     }
   });
 
-  // Write the sender-side outbox audit copy AFTER the delivery block: an
-  // interrupt can downgrade to queue mid-delivery (missing transport,
-  // transport failure), so only now are deliveredAs/deliveredAt final.
+  // Rewrite the outbox copy now that delivery settled: an interrupt can
+  // downgrade to queue mid-delivery (missing transport, transport failure),
+  // so only here are deliveredAs/deliveredAt final. Same filename — the
+  // message id is unchanged — so this replaces the pre-delivery copy.
   result.outboxPath = await writeOutbox(message);
 
   await appendLedger({

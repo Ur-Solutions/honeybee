@@ -205,6 +205,16 @@ export async function renderCandidatePlist(options: InstallOptions = {}): Promis
  * so and directs the user to --force. With --force the existing service is
  * booted out first so the rewritten plist actually takes effect.
  */
+// Staleness compare ignores the burned-in PATH value: it tracks the
+// installing shell (nvm, IDE shells prepend entries), so a byte-for-byte
+// compare would report "stale" on functionally identical installs and train
+// users to ignore the warning. ProgramArguments/label/log-path drift — the
+// changes that actually break the daemon — still flag.
+function plistsEquivalent(a: string, b: string): boolean {
+  const stripPath = (plist: string) => plist.replace(/(<key>PATH<\/key>\s*<string>)[^<]*(<\/string>)/, "$1$2");
+  return stripPath(a) === stripPath(b);
+}
+
 export async function installAgent(options: InstallOptions = {}): Promise<InstallResult> {
   const label = options.label ?? DEFAULT_LAUNCH_LABEL;
   const plistPath = plistPathForLabel(label);
@@ -213,7 +223,7 @@ export async function installAgent(options: InstallOptions = {}): Promise<Instal
   if (!options.force) {
     const existing = await readPlistFile(plistPath);
     if (existing !== null) {
-      const message = existing === plist
+      const message = plistsEquivalent(existing, plist)
         ? `already installed at ${plistPath}`
         : `already installed at ${plistPath} but stale (plist differs from what install would write; re-run with --force)`;
       return { label, plistPath, installed: false, bootstrapped: false, message };
