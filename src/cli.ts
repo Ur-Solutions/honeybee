@@ -21,6 +21,7 @@ import {
 import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { swapAccount } from "./swap.js";
+import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
 import { isRecentlyExhausted, listUsageAccounts, usageSummary } from "./usage.js";
 import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis, idleSessionAge, olderThanMillis, parseAge } from "./clean.js";
 import { chooseCleanTargets, type CleanTuiCleanOutcome, type CleanTuiItem } from "./cleanTui.js";
@@ -157,6 +158,9 @@ async function main(argv: string[]) {
       break;
     case "xa":
       await cmdXa(parsed);
+      break;
+    case "open":
+      await cmdOpen(parsed);
       break;
     case "attach":
       await cmdAttach(parsed);
@@ -1385,6 +1389,50 @@ async function cmdXa(parsed: Parsed) {
     return;
   }
   await substrate.attachSession(record.tmuxTarget);
+}
+
+// `hive open <bee>`: identity-launcher mode. Activates the account into its
+// home, then runs the agent DIRECTLY — in a new native terminal window (or
+// the current one with --here). Deliberately off-brand: no tmux session, no
+// SessionRecord, so list/tail/kill/daemon do not apply. The activation and
+// launch are still ledger-logged.
+async function cmdOpen(parsed: Parsed) {
+  const requested = parsed.args[0];
+  if (!requested) throw new Error("Usage: hive open <bee> [--here] [--app <terminal>] [--cwd <dir>] [--account <a>] [--print]");
+  const { agent, account: aliasAccount } = await resolveSpawnAgent(requested);
+  const yolo = dangerousMode(parsed, agent);
+  const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
+  const account = accountQuery ? await findAccount(accountQuery, canonicalAgentKind(agent)) : aliasAccount;
+  const home = (flag(parsed, "home") ?? flag(parsed, "profile")) ?? (account ? defaultHomeForAccount(account) : undefined);
+  const spec = resolveAgent(agent, parsed.rest, { home, yolo, identity: Boolean(account) });
+  if (account) {
+    if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
+    await activateAccountIntoHome(account, spec.homePath);
+  }
+  const cwd = await resolveSpawnCwd(parsed);
+  const command = shellCommand(spec);
+  await appendLedger({
+    type: "session.open",
+    agent: spec.kind,
+    account: account?.id ?? null,
+    cwd,
+    mode: truthy(flag(parsed, "here")) ? "here" : "window",
+  });
+
+  if (truthy(flag(parsed, "print"))) {
+    console.log(command);
+    return;
+  }
+
+  if (truthy(flag(parsed, "here"))) {
+    process.exitCode = await runInCurrentTerminal(spec.command, spec.args, spec.env, cwd);
+    return;
+  }
+
+  const appFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
+  const app = await openInNewTerminal(command, cwd, appFlag);
+  if (isPretty()) console.log(actionLine("ok", "open", [bold(spec.kind), ...(account ? [account.id] : []), dim(`${app} window`)]));
+  else console.log(`opened\t${spec.kind}\t${account?.id ?? "-"}\t${app}`);
 }
 
 async function cmdConfig(parsed: Parsed) {
@@ -3718,6 +3766,7 @@ function printHelp() {
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
     ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto)"],
+    ["open", "<bee> [--here] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print]", "identity launcher: run the agent directly in a terminal window (or --here), no tmux/session record"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
     ["seal", "<selector> --from <path.json>", "record a typed handoff artifact"],

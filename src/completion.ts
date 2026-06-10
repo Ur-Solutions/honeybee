@@ -18,7 +18,7 @@ const COMMANDS = [
   "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
-  "account", "activate", "login", "swap-account", "usage", "sessions", "sync",
+  "account", "activate", "login", "swap-account", "usage", "sessions", "sync", "open",
   "search", "seals",
   "brief", "seal", "config", "completion", "help",
 ];
@@ -56,7 +56,7 @@ const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach"]);
 const SESSION_ANY = new Set(["kill", "last", "seal"]);
-const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa"]);
+const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 // Commands whose first positional is a vault account.
 const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage"]);
@@ -71,6 +71,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
     "--yolo", "--no-yolo", "--dangerous", "--boot-ms",
   ],
+  open: ["--here", "--app", "--cwd", "--home", "--profile", "--account", "--print", "--yolo", "--no-yolo", "--dangerous"],
   usage: ["--json"],
   sessions: ["--home", "--json"],
   sync: ["--json"],

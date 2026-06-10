@@ -22,6 +22,7 @@ const BOOLEAN_FLAGS = new Set([
   "force",
   "force-send",
   "foreground",
+  "here",
   "forever",
   "help",
   "i",
