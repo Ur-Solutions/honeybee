@@ -151,6 +151,7 @@ const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x1f0cf, 0x1f0cf], // joker
   [0x1f18e, 0x1f18e], // AB button
   [0x1f191, 0x1f19a], // squared CL..VS
+  [0x1f1e6, 0x1f1ff], // regional indicators (flag pairs)
   [0x1f200, 0x1f2ff], // enclosed ideographic supplement
   [0x1f300, 0x1f64f], // misc pictographs, emoticons
   [0x1f680, 0x1f6ff], // transport and map symbols
@@ -165,9 +166,22 @@ export function codePointWidth(codePoint: number): number {
   return 1;
 }
 
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/**
+ * Display width of one grapheme cluster. A cluster renders as a single glyph,
+ * so its width is the widest of its code points — ZWJ sequences (family
+ * emoji), skin-tone modifiers, and combining marks never double-count.
+ */
+export function graphemeWidth(cluster: string): number {
+  let width = 0;
+  for (const char of cluster) width = Math.max(width, codePointWidth(char.codePointAt(0)!));
+  return width;
+}
+
 export function displayWidth(value: string): number {
   let width = 0;
-  for (const char of value) width += codePointWidth(char.codePointAt(0)!);
+  for (const { segment } of GRAPHEMES.segment(value)) width += graphemeWidth(segment);
   return width;
 }
 
@@ -238,13 +252,19 @@ function stripAnsiSlice(value: string, maxVisible: number): string {
       i += match[0].length;
       continue;
     }
-    const codePoint = value.codePointAt(i)!;
-    const char = String.fromCodePoint(codePoint);
-    const width = codePointWidth(codePoint);
+    // Advance one grapheme cluster at a time so truncation can never split a
+    // ZWJ sequence, skin-tone modifier, or combining mark off its base.
+    const cluster = firstGrapheme(value.slice(i));
+    const width = graphemeWidth(cluster);
     if (visible + width > maxVisible) break;
-    out += char;
+    out += cluster;
     visible += width;
-    i += char.length;
+    i += cluster.length;
   }
   return out;
+}
+
+function firstGrapheme(value: string): string {
+  for (const { segment } of GRAPHEMES.segment(value)) return segment;
+  return value;
 }

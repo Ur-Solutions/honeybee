@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -576,7 +577,16 @@ function isSafeStorageId(value: string): boolean {
 }
 
 function opencodeStorageRoot(homePath?: string): string {
-  return homePath ?? join(homedir(), ".local", "share", "opencode", "storage");
+  // OpenCode's storage is an XDG data tree, NOT the bee's home directory.
+  // Identity/profile homes relocate it via XDG_DATA_HOME={home}/xdg-data
+  // (drivers.ts), so a bee with a homePath keeps its transcripts under
+  // {home}/xdg-data/opencode/storage. Plain --home spawns only move
+  // OPENCODE_CONFIG_DIR, leaving storage at the default XDG location — hence
+  // the existence check with the default as fallback.
+  const fallback = join(homedir(), ".local", "share", "opencode", "storage");
+  if (!homePath) return fallback;
+  const identity = join(homePath, "xdg-data", "opencode", "storage");
+  return existsSync(identity) ? identity : fallback;
 }
 
 function opencodeSessionRoot(homePath?: string): string {

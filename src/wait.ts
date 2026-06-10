@@ -45,8 +45,11 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
       // A failed/empty capture is indistinguishable from a dead session: an
       // empty pane plus an unchanged transcript would read as "stable" and
       // the wait would succeed with empty output. Verify the session lives.
-      const alive = await substrate.hasSession(record.tmuxTarget).catch(() => false);
-      if (!alive) throw new Error(`Session died while waiting for idle: ${record.name}`);
+      // hasSession throwing means transport trouble (e.g. ssh exit 255), not
+      // a dead session — keep waiting in that case; only a clean "false"
+      // (tmux answered: no such session) is proof of death.
+      const alive = await substrate.hasSession(record.tmuxTarget).catch(() => null);
+      if (alive === false) throw new Error(`Session died while waiting for idle: ${record.name}`);
     }
     const pane = captured ?? "";
     const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record)).catch(() => null);

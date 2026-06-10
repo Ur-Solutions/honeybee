@@ -10,7 +10,7 @@
 import { spawnBeeForFlow } from "../agents.js";
 import { defineFlow, type BeeHandle, type FlowContext } from "../flow/index.js";
 import type { HiveFacade } from "../flow/hive_facade.js";
-import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
+import { AgentReadinessError, isPermissionPromptPane, waitForAgentReady } from "../readiness.js";
 import type { SealRecord, SealStatus } from "../seal.js";
 import { appendLedger, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
@@ -242,8 +242,9 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       // A harness that never seals must conclude the boundary via ~3s idle
       // detection, not after the 30-minute seal cap.
       let seal: SealRecord | null = null;
+      let boundaryBlocked = false;
       try {
-        seal = await waitForIterationBoundary({
+        const boundary = await waitForIterationBoundary({
           facade,
           handle,
           iter,
@@ -254,6 +255,8 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
           pollMs: testHooks?.boundaryPollMs ?? BOUNDARY_POLL_MS,
           signal: ctx.signal,
         });
+        seal = boundary.seal;
+        boundaryBlocked = boundary.blocked;
       } catch {
         // An aborted signal surfaces as a boundary throw. End cleanly.
         if (ctx.signal?.aborted) {
@@ -312,6 +315,10 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
         decision = { status: "done", reason: `seal:${seal.status}` };
       } else if (seal && (seal.status === "blocked" || seal.status === "needs_input")) {
         decision = { status: "paused", reason: `seal:${seal.status}` };
+      } else if (!seal && boundaryBlocked) {
+        // The idle boundary settled on a permission prompt — pause so the
+        // operator can approve/deny instead of advancing past a blocked bee.
+        decision = { status: "paused", reason: "boundary:permission_prompt" };
       }
       if (!decision && cfg.stop.stopOnSentinel) {
         await recordStopCheck(loopId, "stop-on-sentinel", sentinelMatched);
@@ -398,37 +405,67 @@ async function waitForIterationBoundary(args: {
   graceMs: number;
   pollMs: number;
   signal?: AbortSignal | undefined;
-}): Promise<SealRecord | null> {
+}): Promise<{ seal: SealRecord | null; blocked: boolean }> {
   const { facade, handle, baselineSealedAt } = args;
   const started = Date.now();
   let lastPane: string | undefined;
   let stableSince = Date.now();
+  let goneSince: number | undefined;
   while (Date.now() - started < args.timeoutMs) {
     if (args.signal?.aborted) throw new Error(`loop boundary aborted: ${handle.name}`);
     const latest = await facade.collect(handle).catch(() => null);
-    if (latest && latest.sealedAt !== baselineSealedAt) return latest;
-    const pane = await captureBoundaryPane(handle, args.iter);
-    if (pane !== lastPane) {
-      lastPane = pane;
-      stableSince = Date.now();
-    } else if (Date.now() - stableSince >= args.idleMs + args.graceMs) {
-      return null; // idle long enough with no new seal — unsealed boundary.
+    if (latest && latest.sealedAt !== baselineSealedAt) return { seal: latest, blocked: false };
+    const observed = await captureBoundaryPane(handle, args.iter);
+    if (observed === "gone") {
+      // The session verifiably ended. A one-shot bee may have written its
+      // seal moments before exiting, so keep polling collect for graceMs
+      // before concluding the boundary unsealed.
+      goneSince ??= Date.now();
+      if (Date.now() - goneSince >= args.graceMs) return { seal: null, blocked: false };
+    } else if (observed !== null) {
+      goneSince = undefined;
+      if (observed !== lastPane) {
+        lastPane = observed;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince >= args.idleMs + args.graceMs) {
+        // A stable pane sitting on an approval prompt is NOT a finished turn —
+        // the bee is blocked on a human decision. Advancing would kill it
+        // (fresh carrier) or paste the next prompt into the approval UI.
+        return { seal: null, blocked: isPermissionPromptPane(lastPane ?? "") };
+      }
     }
+    // observed === null: transient capture failure (e.g. an ssh hiccup) — skip
+    // the stability bookkeeping so it cannot masquerade as a stable idle pane.
     await sleep(args.pollMs);
   }
-  return null; // overall cap reached — also an unsealed boundary.
+  return { seal: null, blocked: false }; // overall cap reached — unsealed boundary.
 }
 
-/** Pane snapshot for the boundary's idleness fingerprint ("" on any failure). */
-async function captureBoundaryPane(handle: BeeHandle, iter: number): Promise<string> {
-  if (testHooks?.capturePane) return testHooks.capturePane({ handle, iter }).catch(() => "");
+/**
+ * Pane snapshot for the boundary's idleness fingerprint. Returns the pane
+ * text, "gone" when the session verifiably no longer exists, or null when the
+ * capture failed transiently (transport trouble) and nothing can be inferred.
+ */
+async function captureBoundaryPane(handle: BeeHandle, iter: number): Promise<string | "gone" | null> {
+  if (testHooks?.capturePane) return testHooks.capturePane({ handle, iter }).catch(() => null);
   try {
     const { loadSession } = await import("../store.js");
     const record = await loadSession(handle.name);
+    // No record: nothing to capture — an empty observable pane. The idle
+    // window still applies, so a seal that is about to land gets its chance
+    // before the boundary concludes.
     if (!record) return "";
-    return await substrateFor(record).capture(record.tmuxTarget, 200);
+    const substrate = substrateFor(record);
+    try {
+      return await substrate.capture(record.tmuxTarget, 200);
+    } catch {
+      // Clean "no such session" means the bee died; a transport throw means
+      // we simply don't know this pass.
+      const alive = await substrate.hasSession(record.tmuxTarget).catch(() => null);
+      return alive === false ? "gone" : null;
+    }
   } catch {
-    return "";
+    return null;
   }
 }
 

@@ -272,22 +272,25 @@ test("latestTranscript orders OpenCode messages by time.created and parts by fil
   const dir = await mkdtemp(join(tmpdir(), "honeybee-opencode-order-"));
   try {
     const cwd = join(dir, "workspace");
-    const sessionDir = join(dir, "session", "global");
+    // Realistic identity-home layout: storage lives under the relocated XDG
+    // data tree ({home}/xdg-data/opencode/storage), never the home itself.
+    const storage = join(dir, "xdg-data", "opencode", "storage");
+    const sessionDir = join(storage, "session", "global");
     await mkdir(sessionDir, { recursive: true });
     await writeFile(join(sessionDir, "ses_abc.json"), JSON.stringify({ id: "ses_abc", directory: cwd }));
 
-    const msgDir = join(dir, "message", "ses_abc");
+    const msgDir = join(storage, "message", "ses_abc");
     await mkdir(msgDir, { recursive: true });
     // Filename order contradicts time.created: msg_a is the *later* reply.
     await writeFile(join(msgDir, "msg_a.json"), JSON.stringify({ id: "msg_a", role: "assistant", time: { created: 200 } }));
     await writeFile(join(msgDir, "msg_b.json"), JSON.stringify({ id: "msg_b", role: "user", time: { created: 100 } }));
 
-    const partADir = join(dir, "part", "msg_a");
+    const partADir = join(storage, "part", "msg_a");
     await mkdir(partADir, { recursive: true });
     // Written out of name order; the render must sort by filename.
     await writeFile(join(partADir, "prt_2.json"), JSON.stringify({ text: "part two" }));
     await writeFile(join(partADir, "prt_1.json"), JSON.stringify({ text: "part one" }));
-    const partBDir = join(dir, "part", "msg_b");
+    const partBDir = join(storage, "part", "msg_b");
     await mkdir(partBDir, { recursive: true });
     await writeFile(join(partBDir, "prt_1.json"), JSON.stringify({ text: "do the thing" }));
 

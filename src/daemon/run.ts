@@ -47,8 +47,11 @@ export type TickDeps = {
    * detected this tick. The default implementation drains the buz queue/
    * mailbox for any bee that transitioned into idle_with_output. Tests
    * inject this to observe trigger inputs without exercising substrate IO.
+   * `currentStates` is this tick's freshly derived state per bee — the
+   * authoritative current state (the persisted lastObservedState lags a
+   * tick and goes stale when its touchSession write failed).
    */
-  dispatchBuzDrain?: (records: SessionRecord[], transitions: TickTransition[]) => Promise<BuzDispatchOutcome[]>;
+  dispatchBuzDrain?: (records: SessionRecord[], transitions: TickTransition[], currentStates: Map<string, BeeState>) => Promise<BuzDispatchOutcome[]>;
   /**
    * Optional usage sampler (Phase 3): observes panes/transcripts for
    * account-bound bees, appends usage samples and emits account.exhausted
@@ -139,8 +142,12 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
       errors.push(toError(error));
     }
 
-    // Dead/sealed bees no longer produce transcript updates — skip the refresh.
-    if (derived.state !== "dead" && derived.state !== "sealed") {
+    // Dead/sealed bees no longer produce transcript updates — skip the
+    // refresh once transcript metadata has been captured. A bee that exited
+    // before its first refresh (fast finish between ticks) still gets one
+    // pass so list/search/tail metadata is not permanently missing.
+    const terminal = derived.state === "dead" || derived.state === "sealed";
+    if (!terminal || !record.transcriptPath) {
       try {
         await deps.refreshTranscriptMetadata?.(record);
       } catch (error) {
@@ -173,7 +180,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   let buzDrains: BuzDispatchOutcome[] = [];
   if (deps.dispatchBuzDrain) {
     try {
-      buzDrains = await deps.dispatchBuzDrain(records, transitions);
+      buzDrains = await deps.dispatchBuzDrain(records, transitions, observed);
     } catch (error) {
       errors.push(toError(error));
     }
@@ -486,7 +493,7 @@ export function buildDefaultDeps(): TickDeps {
     touchSession,
     refreshTranscriptMetadata: refreshSessionTranscriptMetadata,
     appendLedger,
-    dispatchBuzDrain: (records, transitions) => dispatchBuzDrains(records, transitions),
+    dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),
     sampleUsage: createUsageSampler(),
     dispatchAutoswap: (records, usageOutcomes) => dispatchAutoswaps(records, usageOutcomes),
     now: () => Date.now(),

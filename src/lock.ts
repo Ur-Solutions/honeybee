@@ -55,6 +55,11 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
           // Only remove the lock if our token is still in it. If a waiter
           // declared us stale and stole the lock, the file now belongs to the
           // new holder; deleting it would let a third party acquire in parallel.
+          // The read->rm pair is not atomic (no flock), but a steal landing in
+          // that window requires staleMs of missed heartbeats first — the
+          // holder refreshes mtime every staleMs/3 — so the residual race is
+          // theoretical: it needs a process frozen long enough to be declared
+          // stale that resumes precisely between the read and the rm.
           const current = await readFile(path, "utf8").catch(() => null);
           if (current === null) return;
           try {

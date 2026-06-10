@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { AccountRecord } from "../src/accounts.js";
-import { loadSession, type SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { LaunchSpec, Substrate } from "../src/substrates/types.js";
 import { resumeArgs, swapAccount } from "../src/swap.js";
 
@@ -74,7 +74,9 @@ test("swapAccount stops, re-credentials, resumes the same session, and rebinds",
   await withTempStore(async () => {
     const { substrate, calls } = fakeSubstrate(true);
     const activated: string[] = [];
-    const updated = await swapAccount(record(), account, {
+    const existing = record();
+    await saveSession(existing);
+    const updated = await swapAccount(existing, account, {
       substrate,
       sleep: async () => undefined,
       activate: async (target, home) => {
@@ -125,8 +127,10 @@ test("swapAccount applies codex identity env on relaunch", async () => {
   await withTempStore(async () => {
     const { substrate, calls } = fakeSubstrate(false);
     const codexAccount: AccountRecord = { id: "codex-new", tool: "codex", label: "c@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
+    const existing = record({ agent: "codex", command: "CODEX_HOME=/tmp/home-c codex", homePath: "/tmp/home-c", accountId: "codex-old", providerSessionId: undefined });
+    await saveSession(existing);
     await swapAccount(
-      record({ agent: "codex", command: "CODEX_HOME=/tmp/home-c codex", homePath: "/tmp/home-c", accountId: "codex-old", providerSessionId: undefined }),
+      existing,
       codexAccount,
       { substrate, sleep: async () => undefined, activate: async () => ["auth.json"] },
     );

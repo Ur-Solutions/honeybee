@@ -358,8 +358,15 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
   // Rewrite the outbox copy now that delivery settled: an interrupt can
   // downgrade to queue mid-delivery (missing transport, transport failure),
   // so only here are deliveredAs/deliveredAt final. Same filename — the
-  // message id is unchanged — so this replaces the pre-delivery copy.
-  result.outboxPath = await writeOutbox(message);
+  // message id is unchanged — so this replaces the pre-delivery copy. A
+  // rewrite failure must not fail the send: delivery already happened, and a
+  // thrown error here would trigger retry-driven duplicates; the pre-delivery
+  // audit copy remains in place.
+  try {
+    result.outboxPath = await writeOutbox(message);
+  } catch {
+    // keep the pre-delivery outbox copy
+  }
 
   await appendLedger({
     type: "buz.send",

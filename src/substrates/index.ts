@@ -48,7 +48,7 @@ export function substrateForRecord(node: NodeRecord): Substrate {
 // not leave long-lived processes (the daemon) reusing a stale substrate, and
 // two nodes sharing an endpoint must not collapse into one cache entry.
 function sshCacheKey(node: NodeRecord): string {
-  return ["ssh-tmux", node.name, node.endpoint, node.sshCommand ?? "", ...(node.sshArgs ?? [])].join("::");
+  return JSON.stringify(["ssh-tmux", node.name, node.endpoint, node.sshCommand ?? "", node.sshArgs ?? []]);
 }
 
 function getOrCache(key: string, build: () => Substrate): Substrate {

@@ -60,7 +60,7 @@ export function logKeepCount(): number {
  *
  * Returns true if rotation occurred.
  */
-export async function rotateDaemonLogIfNeeded(path = daemonLogPath()): Promise<boolean> {
+export async function rotateDaemonLogIfNeeded(path = daemonLogPath(), options: { minKeep?: number } = {}): Promise<boolean> {
   const maxBytes = logMaxBytes();
   const info = await stat(path).catch(() => null);
   if (!info || info.size < maxBytes) return false;
@@ -70,7 +70,7 @@ export async function rotateDaemonLogIfNeeded(path = daemonLogPath()): Promise<b
   const renamed = await rename(path, rotatedPath).then(() => true).catch(() => false);
   if (!renamed) return false;
 
-  await pruneRotatedLogs(path);
+  await pruneRotatedLogs(path, options.minKeep ?? 0);
   return true;
 }
 
@@ -80,12 +80,16 @@ export async function rotateDaemonLogIfNeeded(path = daemonLogPath()): Promise<b
  * is bounded per daemon lifetime and pruned across restarts.
  */
 export async function rotateLaunchdLogsIfNeeded(): Promise<void> {
-  await rotateDaemonLogIfNeeded(daemonLaunchdOutPath());
-  await rotateDaemonLogIfNeeded(daemonLaunchdErrPath());
+  // minKeep 1: launchd's open fd follows the rename, so the newest rotation
+  // IS the live output file until the next service start — pruning it (e.g.
+  // HIVE_DAEMON_LOG_KEEP=0) would unlink an actively written inode and hide
+  // all further output.
+  await rotateDaemonLogIfNeeded(daemonLaunchdOutPath(), { minKeep: 1 });
+  await rotateDaemonLogIfNeeded(daemonLaunchdErrPath(), { minKeep: 1 });
 }
 
-async function pruneRotatedLogs(basePath: string): Promise<void> {
-  const keep = logKeepCount();
+async function pruneRotatedLogs(basePath: string, minKeep = 0): Promise<void> {
+  const keep = Math.max(minKeep, logKeepCount());
   const dir = dirname(basePath);
   const prefix = `${basePath.slice(dir.length + 1)}.`;
   const entries = await readdir(dir).catch(() => []);

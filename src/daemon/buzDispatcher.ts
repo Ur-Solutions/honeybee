@@ -54,6 +54,14 @@ export type BuzDispatchDeps = {
    * bee's queue/ mailbox. Injectable for tests.
    */
   hasQueuedMessages?: (record: SessionRecord) => Promise<boolean>;
+  /**
+   * This tick's freshly derived state per bee (the daemon's `observed` map).
+   * When provided it is the authoritative current state — the persisted
+   * `record.lastObservedState` is only a fallback, because that field is the
+   * PREVIOUS tick's value and goes stale whenever its touchSession write
+   * failed (those errors are deliberately non-fatal in the tick loop).
+   */
+  currentStates?: ReadonlyMap<string, string>;
 };
 
 /**
@@ -61,23 +69,30 @@ export type BuzDispatchDeps = {
  * whose CURRENT observed state is idle_with_output and whose queue/ mailbox
  * is non-empty.
  *
- * The current state is the transition target when the bee transitioned this
- * tick (including first observations, where from === undefined), otherwise
- * the lastObservedState persisted by the previous tick. The non-empty-queue
- * check keeps the steady state cheap: one readdir per idle bee per tick,
- * and only bees with pending messages take the per-bee drain lock.
+ * The current state is taken from `currentStates` (this tick's derived
+ * states) when supplied; otherwise the transition target when the bee
+ * transitioned this tick (including first observations, where from ===
+ * undefined), otherwise the lastObservedState persisted by the previous
+ * tick. The non-empty-queue check keeps the steady state cheap: one readdir
+ * per idle bee per tick, and only bees with pending messages take the
+ * per-bee drain lock.
  */
 export async function selectBuzDispatchTriggers(
   records: SessionRecord[],
   transitions: TickTransition[],
   hasQueuedMessages: (record: SessionRecord) => Promise<boolean> = defaultHasQueuedMessages,
+  currentStates?: ReadonlyMap<string, string>,
 ): Promise<BuzDispatchTrigger[]> {
   const byName = new Map<string, TickTransition>();
   for (const transition of transitions) byName.set(transition.name, transition);
   const triggers: BuzDispatchTrigger[] = [];
   for (const record of records) {
     const transition = byName.get(record.name);
-    const current = transition ? transition.to : record.lastObservedState;
+    const current = currentStates?.has(record.name)
+      ? currentStates.get(record.name)
+      : transition
+        ? transition.to
+        : record.lastObservedState;
     if (current !== "idle_with_output") continue;
     if (!(await hasQueuedMessages(record))) continue;
     triggers.push({ record, ...(transition ? { transition } : {}) });
@@ -86,7 +101,13 @@ export async function selectBuzDispatchTriggers(
 }
 
 async function defaultHasQueuedMessages(record: SessionRecord): Promise<boolean> {
-  const entries = await readdir(beeMailboxDir(record.name, "queue")).catch(() => [] as string[]);
+  // ENOENT means the bee has never received queued mail — legitimately empty.
+  // Any other fs error must surface (the tick captures it into recentErrors)
+  // instead of silently reading as "no messages" and stalling deliveries.
+  const entries = await readdir(beeMailboxDir(record.name, "queue")).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return [] as string[];
+    throw error;
+  });
   return entries.some((name) => name.endsWith(".md"));
 }
 
@@ -101,7 +122,7 @@ export async function dispatchBuzDrains(
   transitions: TickTransition[],
   deps: BuzDispatchDeps = {},
 ): Promise<BuzDispatchOutcome[]> {
-  const triggers = await selectBuzDispatchTriggers(records, transitions, deps.hasQueuedMessages);
+  const triggers = await selectBuzDispatchTriggers(records, transitions, deps.hasQueuedMessages, deps.currentStates);
   if (triggers.length === 0) return [];
 
   const resolveSubstrate = deps.resolveSubstrate ?? substrateFor;

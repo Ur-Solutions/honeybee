@@ -107,7 +107,11 @@ export async function acquireLongLivedLock(path: string, options: AcquireLockOpt
         const info = await stat(path).catch(() => null);
         if (!info) continue; // disappeared between open and stat; retry
         if (Date.now() - info.mtimeMs > UNREADABLE_LOCK_STALE_MS) {
-          await rm(path, { force: true }).catch(() => undefined);
+          await stealLongLivedLock(path, async () => {
+            if (await readLockMeta(path)) return false; // became readable; not stealable as debris
+            const again = await stat(path).catch(() => null);
+            return !!again && Date.now() - again.mtimeMs > UNREADABLE_LOCK_STALE_MS;
+          });
           continue;
         }
         throw new LockBusyError(`Lock busy: ${path}`, null);
@@ -120,7 +124,10 @@ export async function acquireLongLivedLock(path: string, options: AcquireLockOpt
         );
       }
       if (!aliveCheck(existing.pid)) {
-        await rm(path, { force: true }).catch(() => undefined);
+        await stealLongLivedLock(path, async () => {
+          const meta = await readLockMeta(path);
+          return !!meta && meta.hostname === currentHost && !aliveCheck(meta.pid);
+        });
         continue;
       }
       throw new LockBusyError(
@@ -155,6 +162,42 @@ async function releaseIfOwner(path: string, ourToken: string): Promise<void> {
   // a different token now sits at this path; do not clobber it.
   if (!meta || meta.token !== ourToken) return;
   await rm(path, { force: true }).catch(() => undefined);
+}
+
+// A stealer that crashes mid-steal leaves the guard behind; steals take
+// microseconds, so anything older than this is debris.
+const STEAL_GUARD_STALE_MS = 10_000;
+
+/**
+ * Remove a stealable lock so the caller can retry acquisition. Stealers
+ * serialize behind a `.steal` guard (open wx) and re-verify stealability
+ * while holding it — without this, two waiters that both observed a
+ * stale/dead lock can take turns deleting each other's freshly recreated
+ * locks (the same TOCTOU lock.ts guards against). The removal itself goes
+ * through rename so we never delete a file we did not inspect.
+ */
+async function stealLongLivedLock(path: string, stillStealable: () => Promise<boolean>): Promise<void> {
+  const guardPath = `${path}.steal`;
+  let guard;
+  try {
+    guard = await open(guardPath, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const info = await stat(guardPath).catch(() => null);
+    if (info && Date.now() - info.mtimeMs > STEAL_GUARD_STALE_MS) {
+      await rm(guardPath, { force: true }).catch(() => undefined);
+    }
+    return;
+  }
+  try {
+    if (!(await stillStealable())) return;
+    const stalePath = `${path}.stale.${process.pid}.${Math.random().toString(36).slice(2)}`;
+    await rename(path, stalePath).catch(() => undefined);
+    await rm(stalePath, { force: true }).catch(() => undefined);
+  } finally {
+    await guard.close().catch(() => undefined);
+    await rm(guardPath, { force: true }).catch(() => undefined);
+  }
 }
 
 export async function readLockMeta(path: string): Promise<LockMeta | null> {

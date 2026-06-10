@@ -112,6 +112,25 @@ test("selectBuzDispatchTriggers prefers this tick's transition over a stale last
   assert.equal(triggers.length, 0);
 });
 
+test("selectBuzDispatchTriggers trusts this tick's currentStates over a stale persisted lastObservedState", async () => {
+  // The previous tick's touchSession write failed, so the record on disk
+  // still says "active" — but the daemon derived idle_with_output THIS tick.
+  // With no transition (the in-memory observed map already updated last
+  // tick), only currentStates can see the bee is drainable.
+  const stale = makeRecord("alpha", { lastObservedState: "active" });
+  const currentStates = new Map([["alpha", "idle_with_output"]]);
+  const triggers = await selectBuzDispatchTriggers([stale], [], queueNonEmpty, currentStates);
+  assert.equal(triggers.length, 1);
+  assert.equal(triggers[0]!.record.name, "alpha");
+});
+
+test("selectBuzDispatchTriggers via currentStates skips a bee that went active despite a stale idle lastObservedState", async () => {
+  const stale = makeRecord("alpha", { lastObservedState: "idle_with_output" });
+  const currentStates = new Map([["alpha", "active"]]);
+  const triggers = await selectBuzDispatchTriggers([stale], [], queueNonEmpty, currentStates);
+  assert.equal(triggers.length, 0);
+});
+
 test("selectBuzDispatchTriggers skips idle bees with an empty queue", async () => {
   const a = makeRecord("alpha", { lastObservedState: "idle_with_output" });
   const triggers = await selectBuzDispatchTriggers([a], [], async () => false);

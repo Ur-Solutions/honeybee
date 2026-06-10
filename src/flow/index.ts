@@ -243,8 +243,10 @@ export async function loadFlow(name: string): Promise<Flow | null> {
       if (source && resolve(source) !== resolve(tsPath) && (await pathExists(source))) {
         try {
           return validateFlow(await loadTsModule(source), name);
-        } catch {
-          throw registryError;
+        } catch (sourceError) {
+          const registryMsg = registryError instanceof Error ? registryError.message : String(registryError);
+          const sourceMsg = sourceError instanceof Error ? sourceError.message : String(sourceError);
+          throw new Error(`Flow ${name}: registry copy failed (${registryMsg}); source ${source} also failed (${sourceMsg})`);
         }
       }
       throw registryError;

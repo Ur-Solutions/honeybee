@@ -129,6 +129,7 @@ export async function spawnDetachedRun(
   const logHandle = await open(logPath, "a", 0o600);
   const logFd = logHandle.fd;
 
+  let spawnedPid: number | undefined;
   try {
     const childArgv = [
       ...(options.execArgv ?? inheritableExecArgv()),
@@ -158,6 +159,7 @@ export async function spawnDetachedRun(
     // detached:true on POSIX makes child its own process group with pgid == child.pid.
     const pid = child.pid;
     const pgid = child.pid;
+    spawnedPid = pid;
     child.unref();
 
     // Now patch meta.json with pid + pgid. The child's executeFlow will read
@@ -175,10 +177,21 @@ export async function spawnDetachedRun(
 
     return { runId, pid, pgid };
   } catch (error) {
-    // The pre-written meta says "running" with no pid — nothing could ever
-    // downgrade or cancel it. Persist a terminal status before rethrowing.
-    const failed: FlowRunMeta = { ...preMeta, status: "failed", endedAt: new Date().toISOString() };
-    await writeMeta(flow.name, runId, failed).catch(() => undefined);
+    // Persist a terminal status ONLY when no process is alive: if spawn
+    // succeeded and a later step threw (meta patch, ledger), the child runs
+    // on and its startup write may already carry the pid — overwriting with
+    // a failed pid-less meta would strand a live run as "failed" and
+    // uncancellable.
+    const current = await readMeta(flow.name, runId).catch(() => null);
+    const livePid = spawnedPid ?? (typeof current?.pid === "number" ? current.pid : undefined);
+    if (livePid === undefined) {
+      const failed: FlowRunMeta = { ...preMeta, status: "failed", endedAt: new Date().toISOString() };
+      await writeMeta(flow.name, runId, failed).catch(() => undefined);
+    } else if (current && typeof current.pid !== "number") {
+      // The patch write failed but the child is live — retry the patch so
+      // listRuns/cancelRun can track it.
+      await writeMeta(flow.name, runId, { ...current, pid: livePid, pgid: spawnedPid ?? current.pgid }).catch(() => undefined);
+    }
     throw error;
   } finally {
     // The child inherited the fd; the parent no longer needs it.

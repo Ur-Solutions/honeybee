@@ -861,6 +861,9 @@ async function cmdClean(parsed: Parsed) {
   const wantsIdle = hasFlag(parsed, "idle");
 
   if (interactive) {
+    if (wantsDead || wantsIdle) {
+      throw new Error("hive clean -i/--interactive cannot be combined with --dead/--idle; pick targets in the TUI instead.");
+    }
     if (hasFlag(parsed, "dry-run") || hasFlag(parsed, "n") || hasFlag(parsed, "older-than") || hasFlag(parsed, "older")) {
       throw new Error("hive clean -i/--interactive does not support --dry-run/--older-than; pick targets in the TUI instead.");
     }

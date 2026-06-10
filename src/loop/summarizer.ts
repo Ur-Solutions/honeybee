@@ -44,7 +44,9 @@ const SEAL_INSTRUCTION =
 export function truncateForInjection(text: string, maxBytes: number = INJECTION_BUDGET_BYTES): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   const buf = Buffer.from(text, "utf8");
-  const tail = buf.subarray(buf.length - Math.max(0, maxBytes)).toString("utf8");
+  // The marker counts against the budget so the result never exceeds maxBytes.
+  const tailBudget = Math.max(0, maxBytes - Buffer.byteLength(ELISION_MARKER, "utf8") - 1);
+  const tail = buf.subarray(buf.length - tailBudget).toString("utf8");
   const firstNewline = tail.indexOf("\n");
   const clean = firstNewline >= 0 ? tail.slice(firstNewline + 1) : tail;
   return `${ELISION_MARKER}\n${clean}`;

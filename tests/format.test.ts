@@ -104,3 +104,24 @@ test("formatTable pads CJK and emoji cells to consistent visible widths", () => 
   const widths = new Set(lines.map((line) => visibleLength(line)));
   assert.equal(widths.size, 1, `misaligned rows: ${JSON.stringify([...widths])}`);
 });
+
+test("displayWidth counts grapheme clusters, not code points", () => {
+  // Skin-tone modifier: one glyph, width 2 (not 4).
+  assert.equal(visibleLength("👍🏽"), 2);
+  // ZWJ family sequence: one glyph, width 2 (not 6+).
+  assert.equal(visibleLength("👨‍👩‍👧"), 2);
+  // Combining mark stays attached to its base.
+  assert.equal(visibleLength("é"), 1);
+  // Regional-indicator flag pair renders as one wide glyph.
+  assert.equal(visibleLength("🇳🇴"), 2);
+});
+
+test("truncate never splits a ZWJ sequence or modifier off its base", () => {
+  const family = "👨‍👩‍👧";
+  const result = truncate(`${family}${family}${family}`, 4);
+  assert.ok(isWellFormedUtf16(result), `ill-formed result: ${JSON.stringify(result)}`);
+  assert.equal(result, `${family}…`);
+  const thumbs = truncate("👍🏽👍🏽👍🏽", 4);
+  assert.ok(isWellFormedUtf16(thumbs), `ill-formed result: ${JSON.stringify(thumbs)}`);
+  assert.equal(thumbs, "👍🏽…");
+});

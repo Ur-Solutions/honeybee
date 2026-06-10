@@ -1,5 +1,5 @@
 import * as readline from "node:readline";
-import { bold, codePointWidth, cyan, dim, gray, green, isPretty, magenta, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
+import { bold, cyan, dim, gray, graphemeWidth, green, isPretty, magenta, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
 import type { BeeState } from "./state.js";
 
 export type CleanTuiItem = {
@@ -384,20 +384,20 @@ export function wrapPreview(text: string, width: number, maxRows: number): strin
   return lines;
 }
 
-// Index just past the last code point that fits within maxWidth display
-// columns. Iterates by code point so surrogate pairs never get split, and
-// counts wide (CJK/emoji) characters as two columns.
+// Index just past the last grapheme cluster that fits within maxWidth display
+// columns. Iterating by cluster means surrogate pairs, ZWJ sequences, and
+// modifier-based emoji never get split, and wide (CJK/emoji) glyphs count two.
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 function sliceEndForWidth(value: string, maxWidth: number): number {
   let width = 0;
-  let i = 0;
-  while (i < value.length) {
-    const codePoint = value.codePointAt(i)!;
-    const charWidth = codePointWidth(codePoint);
-    if (width + charWidth > maxWidth && width > 0) break;
+  let end = 0;
+  for (const { segment, index } of GRAPHEMES.segment(value)) {
+    const charWidth = graphemeWidth(segment);
+    if (width + charWidth > maxWidth && width > 0) return index;
     width += charWidth;
-    i += codePoint > 0xffff ? 2 : 1;
+    end = index + segment.length;
   }
-  return i;
+  return end;
 }
 
 function blankLines(count: number): string[] {

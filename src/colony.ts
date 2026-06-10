@@ -86,12 +86,11 @@ export async function renameColony(oldName: string, newName: string): Promise<Co
     if (oldName === newName) return existing;
     if (await loadColony(newName)) throw new Error(`Colony already exists: ${newName}`);
     const updated: ColonyRecord = { ...existing, name: newName };
-    // Remove the old file before the new one becomes visible so a crash in
-    // between can never leave the colony alive under both names. The write is
-    // atomic, so the worst case is a missing (recreatable) record, not a
-    // split-brain duplicate.
-    await rm(colonyPath(oldName), { force: true });
+    // Write the new record before removing the old one: a crash in between
+    // leaves the colony alive under both names (an easily deleted duplicate),
+    // whereas delete-first would lose the record entirely on a failed write.
     await saveColony(updated);
+    await rm(colonyPath(oldName), { force: true });
     await appendLedger({ type: "colony.rename", from: oldName, to: newName });
     return updated;
   });
