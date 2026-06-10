@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { access, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
@@ -3574,59 +3574,79 @@ async function accountList(parsed: Parsed) {
 async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
   const recipe = identityRecipeForAgent(account.tool);
   if (!recipe) throw new Error(`Tool ${account.tool} has no identity recipe`);
+  // Capture must gate on the PRIMARY credential: tools write supporting files
+  // (claude's .claude.json) the moment they boot, long before any login.
+  const primary = recipe.credentialFiles[0]!;
   const seatHome = resolve(storeRoot(), "login-homes", account.id);
   await mkdir(seatHome, { recursive: true, mode: 0o700 });
-  // Re-login starts from the existing creds when we have them.
-  if (await accountHasCredentials(account)) {
-    await activateAccountIntoHome(account, seatHome).catch(() => undefined);
-  }
-  const startedAt = Date.now();
-  const spec = resolveAgent(account.tool, [], { home: seatHome, identity: true, yolo: false });
   const target = safeTmuxTarget(`login-${account.id}`);
   const substrate = localSubstrate();
-  if (await substrate.hasSession(target)) throw new Error(`A login seat is already running: tmux attach -t ${target}`);
-  await substrate.newSession(target, process.cwd(), { command: spec.command, args: spec.args, env: spec.env });
+  const markerPath = resolve(seatHome, ".login-seat-started");
+
+  if (!(await substrate.hasSession(target))) {
+    // Re-login starts from the existing creds when we have them.
+    if (await accountHasCredentials(account)) {
+      await activateAccountIntoHome(account, seatHome).catch(() => undefined);
+    }
+    // The marker's mtime is the freshness baseline: only a primary credential
+    // written AFTER seat start counts as a login. Written post-activation so
+    // re-seeded old creds stay stale.
+    await writeFile(markerPath, `${account.id}\n`, { mode: 0o600 });
+    const spec = resolveAgent(account.tool, [], { home: seatHome, identity: true, yolo: false });
+    await substrate.newSession(target, process.cwd(), { command: spec.command, args: spec.args, env: spec.env });
+  } else {
+    // A seat from a previous attempt is still up — rejoin it.
+    console.log(note(`rejoining the running login seat for ${account.id}`));
+  }
 
   const attachHint = `tmux attach -t ${target}`;
   if (isPretty()) console.log(actionLine("ok", "login-seat", [bold(account.id), dim(attachHint)]));
   else console.log(`login-seat\t${account.id}\t${target}`);
-  console.log(note(`complete the ${account.tool} login in the seat (${attachHint}); credentials are captured automatically`));
 
   if (truthy(flag(parsed, "no-wait"))) {
-    console.log(note(`then run: hive account capture ${account.id} --home ${seatHome}`));
+    console.log(note(`complete the ${account.tool} login in the seat (${attachHint}), then run: hive account capture ${account.id} --home ${seatHome}`));
     return;
   }
 
-  const timeoutMs = numberFlag(parsed, ["timeout-ms", "timeout"], 600_000);
-  const deadline = startedAt + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await loginCredentialsFresh(seatHome, recipe.credentialFiles, startedAt)) {
-      const captured = await captureAccountFromHome(account, seatHome);
-      await substrate.kill(target).catch(() => undefined);
-      if (isPretty()) console.log(actionLine("ok", "capture", [bold(account.id), `${captured.length} file(s)`]));
-      else console.log(`captured\t${account.id}\t${captured.join(",")}`);
-      return;
+  const baselineMs = (await stat(markerPath).catch(() => null))?.mtimeMs ?? Date.now();
+  const captureIfLoggedIn = async (): Promise<boolean> => {
+    const info = await stat(resolve(seatHome, primary)).catch(() => null);
+    if (!info?.isFile() || info.mtimeMs < baselineMs) return false;
+    const captured = await captureAccountFromHome(account, seatHome);
+    await substrate.kill(target).catch(() => undefined);
+    if (isPretty()) console.log(actionLine("ok", "capture", [bold(account.id), `${captured.length} file(s)`]));
+    else console.log(`captured\t${account.id}\t${captured.join(",")}`);
+    return true;
+  };
+
+  // Interactive: put the user in the seat; capture when they detach or the
+  // tool exits. Inside an existing tmux client attach would nest — fall back
+  // to the headless poll loop there.
+  if (process.stdout.isTTY && process.stdin.isTTY && !process.env.TMUX) {
+    console.log(note(`complete the ${account.tool} login, then detach (ctrl-b d) or quit the tool`));
+    try {
+      await substrate.attachSession(target);
+    } catch {
+      // attach failed (no client?); fall through to polling
     }
-    if (!(await substrate.hasSession(target))) break;
+    if (await captureIfLoggedIn()) return;
+    if (await substrate.hasSession(target)) {
+      throw new Error(`Login not completed (no fresh ${primary}); the seat is still running — rerun hive login ${account.id} or ${attachHint}`);
+    }
+    throw new Error(`Login seat exited without producing ${primary}; rerun: hive login ${account.id}`);
+  }
+
+  console.log(note(`complete the ${account.tool} login in the seat (${attachHint}); waiting for ${primary}`));
+  const timeoutMs = numberFlag(parsed, ["timeout-ms", "timeout"], 600_000);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await captureIfLoggedIn()) return;
+    if (!(await substrate.hasSession(target))) {
+      throw new Error(`Login seat exited without producing ${primary}; rerun: hive login ${account.id}`);
+    }
     await sleep(2_000);
   }
-  // Seat exited or timed out without fresh creds — try one best-effort capture.
-  try {
-    const captured = await captureAccountFromHome(account, seatHome);
-    console.log(note(`captured ${captured.length} file(s) from the seat home`));
-  } catch {
-    throw new Error(`No fresh credentials appeared in ${seatHome}; seat ${(await substrate.hasSession(target)) ? `still running (${attachHint})` : "exited"}`);
-  } finally {
-    await substrate.kill(target).catch(() => undefined);
-  }
-}
-
-async function loginCredentialsFresh(homePath: string, credentialFiles: string[], sinceMs: number): Promise<boolean> {
-  for (const relative of credentialFiles) {
-    const info = await stat(resolve(homePath, relative)).catch(() => null);
-    if (info?.isFile() && info.mtimeMs >= sinceMs) return true;
-  }
-  return false;
+  throw new Error(`Timed out waiting for ${primary} in ${seatHome}; the seat is still running — ${attachHint}`);
 }
 
 async function cmdActivate(parsed: Parsed) {
