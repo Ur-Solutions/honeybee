@@ -218,15 +218,19 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
       captured.push(relative);
     }
     // On macOS, claude stores the primary credential in the Keychain rather
-    // than .credentials.json; pull it from there into the (file-based) vault.
+    // than .credentials.json — and when both exist, the on-disk file is often
+    // a stale relic of an old login. Vault whichever is fresher.
     const primary = recipe.credentialFiles[0]!;
-    if (account.tool === "claude" && !captured.includes(primary) && keychainAvailable()) {
-      const credentials = await readClaudeKeychain(homePath);
-      if (credentials) {
-        const target = join(accountDir(account), primary);
-        await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-        await atomicWriteFile(target, `${credentials}\n`, { mode: 0o600 });
-        captured.push(primary);
+    if (account.tool === "claude" && keychainAvailable()) {
+      const keychainRaw = await readClaudeKeychain(homePath);
+      if (keychainRaw) {
+        const fileRaw = await readFile(join(homePath, primary), "utf8").catch(() => null);
+        if (!fileRaw || (claudeTokenExpiry(keychainRaw) ?? 0) > (claudeTokenExpiry(fileRaw) ?? 0)) {
+          const target = join(accountDir(account), primary);
+          await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+          await atomicWriteFile(target, `${keychainRaw}\n`, { mode: 0o600 });
+          if (!captured.includes(primary)) captured.push(primary);
+        }
       }
     }
     if (captured.length === 0) {
@@ -287,6 +291,15 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     await appendLedger({ type: "account.activate", account: account.id, tool: account.tool, home: homePath, files: written });
     return written;
   });
+}
+
+function claudeTokenExpiry(raw: string): number | null {
+  try {
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: { expiresAt?: unknown } };
+    return typeof parsed.claudeAiOauth?.expiresAt === "number" ? parsed.claudeAiOauth.expiresAt : null;
+  } catch {
+    return null;
+  }
 }
 
 /** True when the vault holds the account's PRIMARY credential file. */

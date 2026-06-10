@@ -38,10 +38,21 @@ export function formatRelativeTime(fromIso: string | undefined, now: number = Da
   if (days < 7) return `${days}d`;
   const weeks = Math.floor(days / 7);
   if (weeks < 4) return `${weeks}w`;
-  const months = Math.floor(days / 30);
+  // days 28-29 floor to 0 months; clamp so a ~4-week age never reads "0mo".
+  const months = Math.max(1, Math.floor(days / 30));
   if (months < 12) return `${months}mo`;
   const years = Math.floor(days / 365);
   return `${years}y`;
+}
+
+/** Duration until a FUTURE instant ("2h", "5d"); "now" once passed. */
+export function formatTimeUntil(untilIso: string | undefined, now: number = Date.now()): string {
+  if (!untilIso) return "—";
+  const ts = Date.parse(untilIso);
+  if (!Number.isFinite(ts)) return "—";
+  if (ts <= now) return "now";
+  // Same bucketing as formatRelativeTime, opposite direction.
+  return formatRelativeTime(new Date(now - (ts - now)).toISOString(), now);
 }
 
 export function tildify(path: string): string {

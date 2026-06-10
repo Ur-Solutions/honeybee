@@ -20,6 +20,7 @@ import {
 } from "./accounts.js";
 import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
+import { accountLimits, type AccountLimits } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { swapAccount } from "./swap.js";
 import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
@@ -92,7 +93,7 @@ import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./
 import { resolveSelector } from "./selectors.js";
 import { type BeeState, type DerivedState, deriveState, isTerminalState, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
-import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
+import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
@@ -219,6 +220,9 @@ async function main(argv: string[]) {
       break;
     case "usage":
       await cmdUsage(parsed);
+      break;
+    case "limits":
+      await cmdLimits(parsed);
       break;
     case "sessions":
       await cmdSessions(parsed);
@@ -3754,6 +3758,56 @@ function formatTokens(value: number): string {
   return String(value);
 }
 
+// `hive limits`: progress against the providers' REAL 5h/weekly windows.
+// claude is queried live (the same endpoint as Claude Code's /usage panel);
+// codex is the newest rate_limits snapshot its CLI wrote to disk (stamped).
+async function cmdLimits(parsed: Parsed) {
+  const query = parsed.args[0];
+  const accounts = query ? [await findAccount(query)] : await listAccounts();
+  if (accounts.length === 0) {
+    console.log(note("no accounts registered; add some with: hive account import-caam"));
+    return;
+  }
+  const results = await accountLimits(accounts);
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(results, null, 2));
+    return;
+  }
+
+  const rows = results.map((result) => [
+    result.account,
+    result.plan ?? "-",
+    limitCell(result.fiveHour, result),
+    limitCell(result.weekly, result),
+    result.asOf ? formatRelativeTime(result.asOf) : result.ok ? "live" : "-",
+  ]);
+  console.log(formatTable(
+    [{ header: "ACCOUNT" }, { header: "PLAN" }, { header: "5H" }, { header: "WEEKLY" }, { header: "AS-OF" }],
+    rows,
+  ));
+  for (const result of results.filter((candidate) => !candidate.ok)) {
+    console.log(note(`${result.account}: ${result.error}`));
+  }
+}
+
+function limitCell(window: { usedPercent: number; resetsAt?: string } | undefined, result: AccountLimits): string {
+  if (!result.ok || !window) return "-";
+  const percent = Math.max(0, Math.min(100, window.usedPercent));
+  const reset = window.resetsAt ? ` ⟳ ${formatTimeUntil(window.resetsAt)}` : "";
+  return `${limitBar(percent)} ${String(Math.round(percent)).padStart(3)}%${reset}`;
+}
+
+function limitBar(percent: number): string {
+  const width = 10;
+  const filled = Math.round((percent / 100) * width);
+  const bar = "█".repeat(filled) + "░".repeat(width - filled);
+  if (!isPretty()) return bar;
+  if (percent >= 90) return red(bar);
+  if (percent >= 70) return yellow(bar);
+  return green(bar);
+}
+
 async function cmdSessions(parsed: Parsed) {
   const sub = parsed.args[0];
   if (sub !== "reconcile") throw new Error("Usage: hive sessions reconcile [--home <path>]... [--json]");
@@ -3839,6 +3893,7 @@ function printHelp() {
     ["login", "<account> [--no-wait] [--popup]", "interactive (re)login seat in tmux; captures fresh credentials into the vault"],
     ["swap-account", "<bee> <account>", "stop, re-credential the bee's home, and resume the same session on another account"],
     ["usage", "[<account>] [--json]", "factual per-account token usage and exhaustion state (estimates, not quota)"],
+    ["limits", "[<account>] [--json]", "progress against the providers' real 5h/weekly limits (claude live, codex from its last on-disk snapshot)"],
     ["sessions", "reconcile [--home <path>]... [--json]", "index sessions across all homes; flag duplicates and sync conflicts"],
     ["sync", "manifest [--json]", "write the syncthing include/exclude manifest (vault always excluded)"],
     ["config", "<show|path|set-bee <bee> [--yolo] [--home] [--command]>", "view or edit ~/.hive/config.json defaults"],

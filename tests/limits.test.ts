@@ -1,0 +1,145 @@
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { addAccount, accountDir } from "../src/accounts.js";
+import { accountLimits, emailFromJwt, lastRateLimitsInFile } from "../src/limits.js";
+
+async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const oldRoot = process.env.HIVE_STORE_ROOT;
+  const oldKeychain = process.env.HIVE_NO_KEYCHAIN;
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-limits-"));
+  process.env.HIVE_STORE_ROOT = dir;
+  process.env.HIVE_NO_KEYCHAIN = "1";
+  try {
+    return await fn(dir);
+  } finally {
+    if (oldRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = oldRoot;
+    if (oldKeychain === undefined) delete process.env.HIVE_NO_KEYCHAIN;
+    else process.env.HIVE_NO_KEYCHAIN = oldKeychain;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+function fakeJwt(payload: Record<string, unknown>): string {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `eyJhbGciOiJSUzI1NiJ9.${body}.sig`;
+}
+
+test("emailFromJwt decodes the email claim without verification", () => {
+  assert.equal(emailFromJwt(fakeJwt({ email: "a@b.c", sub: "x" })), "a@b.c");
+  assert.equal(emailFromJwt(fakeJwt({ sub: "x" })), null);
+  assert.equal(emailFromJwt("not-a-jwt"), null);
+});
+
+test("lastRateLimitsInFile returns the newest snapshot and skips torn lines", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-rl-"));
+  try {
+    const path = join(dir, "rollout.jsonl");
+    const row = (ts: string, used: number) =>
+      JSON.stringify({
+        timestamp: ts,
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          rate_limits: {
+            primary: { used_percent: used, window_minutes: 300, resets_at: 1781037177 },
+            secondary: { used_percent: 35, window_minutes: 10080, resets_at: 1781138732 },
+            plan_type: "pro",
+          },
+        },
+      });
+    await writeFile(path, `${row("2026-06-09T10:00:00Z", 5)}\n${row("2026-06-09T11:00:00Z", 12)}\n{"torn`);
+    const snapshot = await lastRateLimitsInFile(path);
+    assert.equal(snapshot?.ts, "2026-06-09T11:00:00Z");
+    assert.equal(snapshot?.limits.primary?.used_percent, 12);
+    assert.equal(snapshot?.limits.plan_type, "pro");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("claude limits use the freshest unexpired token and map the usage windows", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "lim@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-vault", expiresAt: Date.now() + 3_600_000, subscriptionType: "max" } }),
+    );
+
+    const asked: string[] = [];
+    const [result] = await accountLimits([account], {
+      fetchClaudeUsage: async (token) => {
+        asked.push(token);
+        return {
+          five_hour: { utilization: 87.5, resets_at: "2026-06-10T09:30:00Z" },
+          seven_day: { utilization: 40, resets_at: "2026-06-16T17:00:00Z" },
+        };
+      },
+      fetchClaudeProfileEmail: async () => "lim@a.b",
+      readKeychain: async () => null,
+    });
+
+    assert.deepEqual(asked, ["tok-vault"]);
+    assert.equal(result!.ok, true);
+    assert.equal(result!.plan, "max");
+    assert.equal(result!.fiveHour?.usedPercent, 87.5);
+    assert.equal(result!.weekly?.resetsAt, "2026-06-16T17:00:00Z");
+  });
+});
+
+test("claude limits reject tokens whose profile email belongs to another account", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "right@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    // The vault token is fresh — but it's actually some other account's.
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-imposter", expiresAt: Date.now() + 3_600_000 } }),
+    );
+    const [result] = await accountLimits([account], {
+      fetchClaudeUsage: async () => {
+        throw new Error("must not query usage with an imposter token");
+      },
+      fetchClaudeProfileEmail: async () => "wrong@a.b",
+      readKeychain: async () => null,
+    });
+    assert.equal(result!.ok, false);
+    assert.match(result!.error ?? "", /none belong to right@a\.b/);
+    assert.match(result!.error ?? "", /wrong@a\.b/);
+  });
+});
+
+test("claude limits report an expired token instead of calling the API", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "old@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-old", expiresAt: Date.now() - 1000 } }),
+    );
+    const [result] = await accountLimits([account], {
+      fetchClaudeUsage: async () => {
+        throw new Error("should not be called");
+      },
+      readKeychain: async () => null,
+    });
+    assert.equal(result!.ok, false);
+    assert.match(result!.error ?? "", /expired/);
+  });
+});
+
+test("unsupported tools and missing codex homes degrade to errors, not throws", async () => {
+  await withTempStore(async () => {
+    const opencode = await addAccount("opencode", "oc");
+    const codex = await addAccount("codex", "cx@a.b");
+    const results = await accountLimits([opencode, codex]);
+    assert.equal(results[0]!.ok, false);
+    assert.equal(results[0]!.source, "unsupported");
+    assert.equal(results[1]!.ok, false);
+    assert.match(results[1]!.error ?? "", /no home found/);
+  });
+});
