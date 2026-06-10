@@ -199,7 +199,7 @@ export function buildSyncManifest(): SyncManifest {
       "**/.cache/**",
       "*.sync-conflict*",
     ],
-    note: "Credentials never sync; each machine builds its own vault via `hive account login` or `hive account import-caam`.",
+    note: "Credentials never sync; each machine builds its own vault via `hive account login` / `hive account capture`.",
   };
 }
 

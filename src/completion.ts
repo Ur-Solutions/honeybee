@@ -33,7 +33,7 @@ const FLOW_SUBCOMMANDS = ["list", "ls", "define", "inspect", "remove", "run", "r
 const LOOP_SUBCOMMANDS = ["start", "status", "logs", "stop", "list", "ls"];
 const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "purge", "config"];
 const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
-const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "remove", "import-caam"];
+const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "remove"];
 const SESSIONS_SUBCOMMANDS = ["reconcile"];
 const SYNC_SUBCOMMANDS = ["manifest"];
 
@@ -63,7 +63,7 @@ const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 const FLAGS_BY_COMMAND: Record<string, string[]> = {
   spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
-  account: ["--email", "--home", "--from", "--json", "--no-wait", "--timeout-ms"],
+  account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
   xa: [

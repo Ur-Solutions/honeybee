@@ -22,7 +22,30 @@ import { readClaudeKeychain } from "./keychain.js";
 export type WindowUsage = {
   usedPercent: number;
   resetsAt?: string;
+  /** Window length, when known (claude: implied 300/10080; codex: from the snapshot). */
+  windowMinutes?: number;
 };
+
+/**
+ * Pace: used% minus elapsed% of the window. Positive = burning faster than
+ * the window refills (on track to exhaust before reset); negative = headroom.
+ * Null when the window boundary is unknown or already passed.
+ */
+export function paceDelta(window: WindowUsage, now = Date.now()): number | null {
+  if (!window.resetsAt || !window.windowMinutes) return null;
+  const resetMs = Date.parse(window.resetsAt);
+  if (!Number.isFinite(resetMs) || resetMs <= now) return null;
+  const durationMs = window.windowMinutes * 60_000;
+  const elapsedPct = Math.min(100, Math.max(0, ((durationMs - (resetMs - now)) / durationMs) * 100));
+  return window.usedPercent - elapsedPct;
+}
+
+/** True when the snapshot's window boundary has passed — its used% no longer applies. */
+export function windowRolledOver(window: WindowUsage, now = Date.now()): boolean {
+  if (!window.resetsAt) return false;
+  const resetMs = Date.parse(window.resetsAt);
+  return Number.isFinite(resetMs) && resetMs <= now;
+}
 
 export type AccountLimits = {
   account: string;
@@ -144,10 +167,10 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
     ...(credential.subscriptionType ? { plan: credential.subscriptionType } : {}),
   };
   if (typeof usage.five_hour?.utilization === "number") {
-    result.fiveHour = { usedPercent: usage.five_hour.utilization, ...(usage.five_hour.resets_at ? { resetsAt: usage.five_hour.resets_at } : {}) };
+    result.fiveHour = { usedPercent: usage.five_hour.utilization, windowMinutes: 300, ...(usage.five_hour.resets_at ? { resetsAt: usage.five_hour.resets_at } : {}) };
   }
   if (typeof usage.seven_day?.utilization === "number") {
-    result.weekly = { usedPercent: usage.seven_day.utilization, ...(usage.seven_day.resets_at ? { resetsAt: usage.seven_day.resets_at } : {}) };
+    result.weekly = { usedPercent: usage.seven_day.utilization, windowMinutes: 10_080, ...(usage.seven_day.resets_at ? { resetsAt: usage.seven_day.resets_at } : {}) };
   }
   if (!result.fiveHour && !result.weekly) {
     result.ok = false;
@@ -275,8 +298,8 @@ async function candidateHomes(tool: string): Promise<string[]> {
 /* ------------------------------------------------------------------ */
 
 type CodexRateLimits = {
-  primary?: { used_percent?: number; resets_at?: number } | null;
-  secondary?: { used_percent?: number; resets_at?: number } | null;
+  primary?: { used_percent?: number; resets_at?: number; window_minutes?: number } | null;
+  secondary?: { used_percent?: number; resets_at?: number; window_minutes?: number } | null;
   plan_type?: string | null;
 };
 
@@ -307,12 +330,14 @@ async function codexLimits(account: AccountRecord): Promise<AccountLimits> {
     result.fiveHour = {
       usedPercent: best.limits.primary.used_percent,
       ...(best.limits.primary.resets_at ? { resetsAt: new Date(best.limits.primary.resets_at * 1000).toISOString() } : {}),
+      ...(typeof best.limits.primary.window_minutes === "number" ? { windowMinutes: best.limits.primary.window_minutes } : {}),
     };
   }
   if (typeof best.limits.secondary?.used_percent === "number") {
     result.weekly = {
       usedPercent: best.limits.secondary.used_percent,
       ...(best.limits.secondary.resets_at ? { resetsAt: new Date(best.limits.secondary.resets_at * 1000).toISOString() } : {}),
+      ...(typeof best.limits.secondary.window_minutes === "number" ? { windowMinutes: best.limits.secondary.window_minutes } : {}),
     };
   }
   return result;

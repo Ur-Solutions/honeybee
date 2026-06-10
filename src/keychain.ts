@@ -53,8 +53,8 @@ export async function writeClaudeKeychain(homePath: string, credentials: string)
   if (!keychainAvailable()) return false;
   try {
     // -U updates in place. The secret travels via argv, which is briefly
-    // visible in the local process list — same tradeoff caam made; the
-    // alternative interactive stdin mode is not scriptable.
+    // visible in the local process list; the alternative interactive stdin
+    // mode of `security` is not scriptable.
     await execFileAsync("security", [
       "add-generic-password",
       "-U",

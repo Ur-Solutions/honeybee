@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { addAccount, accountDir } from "../src/accounts.js";
-import { accountLimits, emailFromJwt, lastRateLimitsInFile } from "../src/limits.js";
+import { accountLimits, emailFromJwt, lastRateLimitsInFile, paceDelta, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -27,6 +27,28 @@ function fakeJwt(payload: Record<string, unknown>): string {
   const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
   return `eyJhbGciOiJSUzI1NiJ9.${body}.sig`;
 }
+
+test("paceDelta compares used% against elapsed% of the window", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  // 5h window, resets in 2.5h → 50% elapsed. Used 80% → +30 ahead of pace.
+  const hot = { usedPercent: 80, windowMinutes: 300, resetsAt: "2026-06-10T14:30:00Z" };
+  assert.equal(Math.round(paceDelta(hot, now)!), 30);
+  // Used 20% at 50% elapsed → -30 (headroom).
+  const cool = { ...hot, usedPercent: 20 };
+  assert.equal(Math.round(paceDelta(cool, now)!), -30);
+  // Unknown window length or boundary → no pace.
+  assert.equal(paceDelta({ usedPercent: 50, resetsAt: "2026-06-10T14:30:00Z" }, now), null);
+  assert.equal(paceDelta({ usedPercent: 50, windowMinutes: 300 }, now), null);
+  // Boundary already passed → no pace (the snapshot is stale).
+  assert.equal(paceDelta({ usedPercent: 50, windowMinutes: 300, resetsAt: "2026-06-10T11:00:00Z" }, now), null);
+});
+
+test("windowRolledOver flags snapshots whose reset boundary has passed", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  assert.equal(windowRolledOver({ usedPercent: 14, resetsAt: "2026-06-10T11:59:00Z" }, now), true);
+  assert.equal(windowRolledOver({ usedPercent: 14, resetsAt: "2026-06-10T12:01:00Z" }, now), false);
+  assert.equal(windowRolledOver({ usedPercent: 14 }, now), false);
+});
 
 test("emailFromJwt decodes the email claim without verification", () => {
   assert.equal(emailFromJwt(fakeJwt({ email: "a@b.c", sub: "x" })), "a@b.c");

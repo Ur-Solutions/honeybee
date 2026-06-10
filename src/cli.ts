@@ -9,10 +9,8 @@ import {
   activateAccountIntoHome,
   addAccount,
   captureAccountFromHome,
-  defaultCaamVaultDir,
   defaultHomeForAccount,
   findAccount,
-  importCaam,
   listAccounts,
   removeAccount,
   resolveSpawnAgent,
@@ -20,7 +18,7 @@ import {
 } from "./accounts.js";
 import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
-import { accountLimits, type AccountLimits } from "./limits.js";
+import { accountLimits, paceDelta, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { swapAccount } from "./swap.js";
 import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
@@ -3520,21 +3518,8 @@ async function cmdAccount(parsed: Parsed) {
       else console.log(`removed\t${account.id}`);
       break;
     }
-    case "import-caam": {
-      const from = typeof flag(parsed, "from") === "string" ? String(flag(parsed, "from")) : defaultCaamVaultDir();
-      const result = await importCaam(from);
-      for (const account of result.imported) {
-        if (isPretty()) console.log(actionLine("ok", "import", [bold(account.id), account.tool, account.label]));
-        else console.log(`imported\t${account.id}\t${account.tool}\t${account.label}`);
-      }
-      for (const skip of result.skipped) {
-        console.error(note(`skipped ${skip.tool}/${skip.label}: ${skip.reason}`));
-      }
-      console.log(note(`${result.imported.length} account(s) in ${tildify(vaultRoot())}`));
-      break;
-    }
     default:
-      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|remove|import-caam`);
+      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|remove`);
   }
 }
 
@@ -3566,7 +3551,7 @@ async function accountList(parsed: Parsed) {
     return;
   }
   if (rows.length === 0) {
-    console.log(note("no accounts registered; add one with: hive account add <tool> <label> or hive account import-caam"));
+    console.log(note("no accounts registered; add one with: hive account add <tool> <label>"));
     return;
   }
   console.log(formatTable(
@@ -3765,7 +3750,7 @@ async function cmdLimits(parsed: Parsed) {
   const query = parsed.args[0];
   const accounts = query ? [await findAccount(query)] : await listAccounts();
   if (accounts.length === 0) {
-    console.log(note("no accounts registered; add some with: hive account import-caam"));
+    console.log(note("no accounts registered; add some with: hive account add <tool> <label> && hive login <account>"));
     return;
   }
   const results = await accountLimits(accounts);
@@ -3789,13 +3774,32 @@ async function cmdLimits(parsed: Parsed) {
   for (const result of results.filter((candidate) => !candidate.ok)) {
     console.log(note(`${result.account}: ${result.error}`));
   }
+  console.log(note("pace = used% − elapsed% of the window: ▲ burning faster than it refills, ▼ headroom, ● on pace"));
 }
 
-function limitCell(window: { usedPercent: number; resetsAt?: string } | undefined, result: AccountLimits): string {
+function limitCell(window: WindowUsage | undefined, result: AccountLimits): string {
   if (!result.ok || !window) return "-";
+  const now = Date.now();
+  // A snapshot whose reset boundary has passed no longer describes the
+  // current window — usage since the rollover is unknown (likely ~0 on this
+  // machine, or a newer snapshot would exist).
+  if (windowRolledOver(window, now)) {
+    return `${limitBar(0)}  ~0% ${dim(`rolled over (was ${Math.round(window.usedPercent)}%)`)}`;
+  }
   const percent = Math.max(0, Math.min(100, window.usedPercent));
+  const pace = paceDelta(window, now);
+  const paceSuffix = pace === null ? "" : ` ${formatPace(pace)}`;
   const reset = window.resetsAt ? ` ⟳ ${formatTimeUntil(window.resetsAt)}` : "";
-  return `${limitBar(percent)} ${String(Math.round(percent)).padStart(3)}%${reset}`;
+  return `${limitBar(percent)} ${String(Math.round(percent)).padStart(3)}%${reset}${paceSuffix}`;
+}
+
+function formatPace(delta: number): string {
+  const rounded = Math.round(delta);
+  if (Math.abs(rounded) <= 2) return isPretty() ? dim("●") : "=0";
+  const label = rounded > 0 ? `▲+${rounded}` : `▼${rounded}`;
+  if (!isPretty()) return rounded > 0 ? `+${rounded}` : `${rounded}`;
+  if (rounded > 0) return rounded >= 15 ? red(label) : yellow(label);
+  return green(label);
 }
 
 function limitBar(percent: number): string {
@@ -3888,7 +3892,7 @@ function printHelp() {
     ["daemon", "<install|uninstall|start|stop|restart|status|logs|run> [--label <id>] [--tick-ms <n>] [--lines N] [--follow] [--json]", "manage the hive daemon LaunchAgent + inspect state/logs"],
     ["search", "<query> [--type seals,ledger,sessions] [--colony X] [--swarm X] [--bee X] [--status X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals, ledger, and session records"],
     ["seals find", "<query> [--status X] [--colony X] [--bee X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals only"],
-    ["account", "<list|add|login|capture|remove|import-caam> [tool] [label] [--email <addr>] [--home <path>] [--from <dir>]", "manage provider accounts in the local credential vault (~/.hive/vault, never synced)"],
+    ["account", "<list|add|login|capture|remove> [tool] [label] [--email <addr>] [--home <path>]", "manage provider accounts in the local credential vault (~/.hive/vault, never synced)"],
     ["activate", "<account> [--home <1|2|3|path>]", "seed an account's credentials into a home slot (fast login)"],
     ["login", "<account> [--no-wait] [--popup]", "interactive (re)login seat in tmux; captures fresh credentials into the vault"],
     ["swap-account", "<bee> <account>", "stop, re-credential the bee's home, and resume the same session on another account"],
