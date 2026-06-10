@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { beeConfig } from "./config.js";
-import { homeEnvForAgent } from "./drivers.js";
+import { homeEnvForAgent, identityEnvForAgent } from "./drivers.js";
 import { allocateBeeIdentity } from "./ids.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
 import { safeName, saveSession, type SessionRecord } from "./store.js";
@@ -33,6 +33,7 @@ const DEFAULT_COMMANDS: Record<string, string> = {
   // Pi's interactive CLI has no approval/yolo flag in --help; full tools are enabled by default.
   pi: "pi",
   droid: "droid",
+  cursor: "cursor-agent",
 };
 
 const YOLO_COMMANDS: Record<string, string> = {
@@ -43,6 +44,7 @@ const YOLO_COMMANDS: Record<string, string> = {
   pi: "pi",
   // Droid interactive TUI has no --auto/--skip-permissions startup flag, but --settings can seed Auto (High).
   droid: `droid --settings ${DROID_YOLO_SETTINGS_PATH}`,
+  cursor: "cursor-agent --force",
 };
 
 // Bees that run in full-permission ("yolo") mode by default. The default is
@@ -66,6 +68,12 @@ export type ResolveAgentOptions = {
   // Authoritative when defined: `true`/`false` overrides env/config signals.
   // When omitted, yolo is decided from env/config.
   yolo?: boolean;
+  /**
+   * Identity-activation spawn: merge the driver's explicit IdentityRecipe env
+   * (e.g. codex's HOME) into the spec env for the resolved home. Only the
+   * account/swap/activate paths set this — plain spawns never rewrite HOME.
+   */
+  identity?: boolean;
 };
 
 export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options: ResolveAgentOptions = {}): AgentSpec {
@@ -86,11 +94,15 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   if (profile.kind === "droid" && yolo && commandOverride === undefined) ensureDroidYoloSettings();
   const parts = splitShellWords(configured).map(expandTildeWord);
   if (parts.length === 0) throw new Error(`Empty command for agent ${profile.kind}`);
+  const env: Record<string, string> = profile.homePath && profile.homeEnv ? { [profile.homeEnv]: profile.homePath } : {};
+  if (options.identity && profile.homePath) {
+    Object.assign(env, identityEnvForAgent(profile.kind, profile.homePath));
+  }
   return {
     kind: profile.kind,
     command: parts[0]!,
     args: [...parts.slice(1), ...extraArgs],
-    env: profile.homePath && profile.homeEnv ? { [profile.homeEnv]: profile.homePath } : {},
+    env,
     homePath: profile.homePath,
     requestedKind: kind,
   };
@@ -119,12 +131,10 @@ function profileAlias(kind: string): { kind: string; home: string } | undefined 
   return undefined;
 }
 
-function resolveHome(kind: string, value: string): string {
+export function resolveHome(kind: string, value: string): string {
   const trimmed = value.trim();
-  if (/^[123]$/.test(trimmed)) {
-    if (kind === "claude") return resolve(homedir(), `.claude-${trimmed}`);
-    if (kind === "codex") return resolve(homedir(), `.codex-${trimmed}`);
-  }
+  // Numeric slots map to the per-tool home convention (~/.claude-2, ~/.codex-1, ...).
+  if (/^[1-9]$/.test(trimmed)) return resolve(homedir(), `.${kind}-${trimmed}`);
   if (trimmed.startsWith("~/")) return resolve(homedir(), trimmed.slice(2));
   if (trimmed === "~") return homedir();
   return resolve(trimmed);

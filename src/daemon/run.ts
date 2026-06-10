@@ -6,7 +6,9 @@ import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { deriveState, type BeeState, type StateContext } from "../state.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
+import { dispatchAutoswaps, type AutoswapOutcome } from "./autoswap.js";
 import { dispatchBuzDrains, type BuzDispatchOutcome } from "./buzDispatcher.js";
+import { createUsageSampler, type UsageSampler, type UsageTickOutcome } from "./usageSampler.js";
 import { appendDaemonLog } from "./log.js";
 import {
   DAEMON_VERSION,
@@ -47,6 +49,18 @@ export type TickDeps = {
    * inject this to observe trigger inputs without exercising substrate IO.
    */
   dispatchBuzDrain?: (records: SessionRecord[], transitions: TickTransition[]) => Promise<BuzDispatchOutcome[]>;
+  /**
+   * Optional usage sampler (Phase 3): observes panes/transcripts for
+   * account-bound bees, appends usage samples and emits account.exhausted
+   * events. Stateful across ticks — build once per daemon run.
+   */
+  sampleUsage?: UsageSampler;
+  /**
+   * Optional autoswap dispatcher (Phase 3): consumes the sampler's
+   * rising-edge exhaustion outcomes for autoswap-enabled bees and calls the
+   * swap-account primitive.
+   */
+  dispatchAutoswap?: (records: SessionRecord[], usageOutcomes: UsageTickOutcome[]) => Promise<AutoswapOutcome[]>;
   now: () => number;
 };
 
@@ -67,6 +81,10 @@ export type TickResult = {
    * was not wired.
    */
   buzDrains: BuzDispatchOutcome[];
+  /** Per-bee usage sampler outcomes (empty when no account-bound bees / not wired). */
+  usage: UsageTickOutcome[];
+  /** Autoswap dispatcher outcomes (empty when nothing exhausted / not wired). */
+  autoswaps: AutoswapOutcome[];
   durationMs: number;
 };
 
@@ -158,12 +176,34 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     }
   }
 
+  // Usage sampler: factual per-account token samples + exhaustion events.
+  let usage: UsageTickOutcome[] = [];
+  if (deps.sampleUsage) {
+    try {
+      usage = await deps.sampleUsage(records, panes, nowMs);
+    } catch (error) {
+      errors.push(toError(error));
+    }
+  }
+
+  // Autoswap: opt-in deterministic reaction to this tick's exhaustion edges.
+  let autoswaps: AutoswapOutcome[] = [];
+  if (deps.dispatchAutoswap && usage.some((outcome) => outcome.exhausted)) {
+    try {
+      autoswaps = await deps.dispatchAutoswap(records, usage);
+    } catch (error) {
+      errors.push(toError(error));
+    }
+  }
+
   return {
     transitions,
     observed,
     unreachableNodes: probe.unreachableNodes,
     errors,
     buzDrains,
+    usage,
+    autoswaps,
     durationMs: Math.max(0, deps.now() - start),
   };
 }
@@ -330,6 +370,28 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
             });
           }
         }
+        for (const outcome of result.usage) {
+          if (!outcome.exhausted) continue;
+          await appendDaemonLog({
+            level: "warn",
+            msg: "account.exhausted",
+            session: outcome.bee,
+            account: outcome.account,
+            resetHint: outcome.resetHint ?? null,
+          });
+        }
+        for (const outcome of result.autoswaps) {
+          await appendDaemonLog({
+            level: outcome.ok ? "info" : "warn",
+            msg: "account.autoswap",
+            session: outcome.bee,
+            from: outcome.from,
+            to: outcome.to ?? null,
+            ok: outcome.ok,
+            ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
+            ...(outcome.error ? { error: outcome.error } : {}),
+          });
+        }
         try {
           await writeDaemonState({ ...state, recentErrors: [...state.recentErrors] });
         } catch (error) {
@@ -422,6 +484,8 @@ export function buildDefaultDeps(): TickDeps {
     refreshTranscriptMetadata: refreshSessionTranscriptMetadata,
     appendLedger,
     dispatchBuzDrain: (records, transitions) => dispatchBuzDrains(records, transitions),
+    sampleUsage: createUsageSampler(),
+    dispatchAutoswap: (records, usageOutcomes) => dispatchAutoswaps(records, usageOutcomes),
     now: () => Date.now(),
   };
 }

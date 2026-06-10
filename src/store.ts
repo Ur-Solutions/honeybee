@@ -36,6 +36,10 @@ export type SessionRecord = {
   lastObservedStateAt?: string;
   runId?: string;
   flowName?: string;
+  /** Vault account bound to this bee's home (Phase 3 identity layer). */
+  accountId?: string;
+  /** Opt-in: the daemon's autoswap dispatcher may swap accounts on exhaustion. */
+  autoswap?: boolean;
 };
 
 export { storeRoot } from "./fsx.js";
@@ -168,9 +172,11 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
         : "dead",
   };
 
-  for (const key of ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName"] as const) {
+  for (const key of ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId"] as const) {
     if (typeof object[key] === "string") record[key] = object[key];
   }
+
+  if (object.autoswap === true) record.autoswap = true;
 
   // buzAccept is the per-bee acceptance policy for buz messages. The field
   // is forward-compatible: unknown tier values are dropped silently so an

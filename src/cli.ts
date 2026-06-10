@@ -1,8 +1,26 @@
 #!/usr/bin/env node
-import { access, readFile, realpath } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
-import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
+import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
+import {
+  type AccountRecord,
+  accountHasCredentials,
+  activateAccountIntoHome,
+  addAccount,
+  captureAccountFromHome,
+  defaultCaamVaultDir,
+  defaultHomeForAccount,
+  findAccount,
+  importCaam,
+  listAccounts,
+  removeAccount,
+  vaultRoot,
+} from "./accounts.js";
+import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
+import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
+import { swapAccount } from "./swap.js";
+import { isRecentlyExhausted, listUsageAccounts, usageSummary } from "./usage.js";
 import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis, idleSessionAge, olderThanMillis, parseAge } from "./clean.js";
 import { chooseCleanTargets, type CleanTuiCleanOutcome, type CleanTuiItem } from "./cleanTui.js";
 import { archiveColony, createColony, listColonies, loadColony, renameColony, updateColony } from "./colony.js";
@@ -77,7 +95,7 @@ import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
-import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, type SessionRecord } from "./store.js";
+import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
 import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord } from "./substrates/index.js";
 import { attachCommand, attachSession, capture, formatShellCommand, hasSession, kill, listTmuxSessions, newSession, sendText } from "./tmux.js";
@@ -178,6 +196,27 @@ async function main(argv: string[]) {
     case "daemon":
       await cmdDaemon(parsed);
       break;
+    case "account":
+      await cmdAccount(parsed);
+      break;
+    case "activate":
+      await cmdActivate(parsed);
+      break;
+    case "login":
+      await cmdLogin(parsed);
+      break;
+    case "swap-account":
+      await cmdSwapAccount(parsed);
+      break;
+    case "usage":
+      await cmdUsage(parsed);
+      break;
+    case "sessions":
+      await cmdSessions(parsed);
+      break;
+    case "sync":
+      await cmdSync(parsed);
+      break;
     case "search":
       await cmdSearch(parsed);
       break;
@@ -225,10 +264,23 @@ type SpawnOptions = {
   caste?: string;
   brief?: string;
   node?: NodeRecord;
+  /** Vault account to activate into the home before launch (Phase 3). */
+  account?: AccountRecord;
+  /** Opt this bee into the daemon's autoswap flow. Requires account. */
+  autoswap?: boolean;
 };
 
 async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
-  const spec = resolveAgent(opts.agent, opts.extraArgs, { home: opts.home, yolo: opts.yolo });
+  // An account-bound spawn gets a home (explicit or the account's dedicated
+  // slot), the account's credentials activated into it, and the driver's
+  // explicit identity env — never a blind HOME rewrite.
+  const home = opts.account ? (opts.home ?? defaultHomeForAccount(opts.account)) : opts.home;
+  const spec = resolveAgent(opts.agent, opts.extraArgs, { home, yolo: opts.yolo, identity: Boolean(opts.account) });
+  if (opts.account) {
+    if (opts.node && opts.node.kind !== "local-tmux") throw new Error("--account spawns are local-only (the vault never leaves this machine)");
+    if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${opts.account.id}`);
+    await activateAccountIntoHome(opts.account, spec.homePath);
+  }
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
   // Executable validation only applies to local spawns; we cannot reach the remote PATH cheaply.
   if (!isRemote) await assertExecutableAvailable(spec.command);
@@ -262,6 +314,8 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.caste ? { caste: opts.caste } : {}),
     ...(opts.brief ? { brief: opts.brief } : {}),
     ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+    ...(opts.account ? { accountId: opts.account.id } : {}),
+    ...(opts.autoswap ? { autoswap: true } : {}),
   };
   await saveSession(record);
   return record;
@@ -269,7 +323,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
 
 async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const agent = parsed.args[0];
-  if (!agent) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [-- <bee-args...>]");
+  if (!agent) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <a>] [-- <bee-args...>]");
   const cwd = await resolveSpawnCwd(parsed);
   const yolo = dangerousMode(parsed, agent);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -278,7 +332,11 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const node = await resolveSpawnNode(parsed, spec.kind);
   const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : undefined;
   const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
-  let record = await spawnBee({ agent, extraArgs: parsed.rest, cwd, yolo, home, name, colony, brief: briefText, node });
+  const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
+  const account = accountQuery ? await findAccount(accountQuery, spec.kind) : undefined;
+  const autoswap = truthy(flag(parsed, "autoswap"));
+  if (autoswap && !account) throw new Error("--autoswap requires --account (the daemon swaps between vault accounts)");
+  let record = await spawnBee({ agent, extraArgs: parsed.rest, cwd, yolo, home, name, colony, brief: briefText, node, account, autoswap });
   const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${node.name}`);
@@ -3319,6 +3377,297 @@ function safeTmuxTarget(value: string): string {
   return value.replace(/[^A-Za-z0-9_-]/g, "-");
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Phase 3: identity & accounts
+// ──────────────────────────────────────────────────────────────────────────
+
+async function cmdAccount(parsed: Parsed) {
+  const sub = parsed.args[0] ?? "list";
+  switch (sub) {
+    case "list":
+    case "ls":
+      await accountList(parsed);
+      break;
+    case "add": {
+      const [, tool, label] = parsed.args;
+      if (!tool || !label) throw new Error("Usage: hive account add <tool> <label> [--email <addr>]");
+      const email = typeof flag(parsed, "email") === "string" ? String(flag(parsed, "email")) : undefined;
+      const account = await addAccount(tool, label, { email });
+      if (isPretty()) console.log(actionLine("ok", "account", [bold(account.id), account.tool, account.label]));
+      else console.log(`${account.id}\t${account.tool}\t${account.label}`);
+      console.log(note(`vault dir ready; capture credentials with: hive account login ${account.tool} ${account.label}`));
+      break;
+    }
+    case "login": {
+      const [, tool, label] = parsed.args;
+      if (!tool || !label) throw new Error("Usage: hive account login <tool> <label>");
+      const kind = canonicalAgentKind(tool).toLowerCase();
+      const accounts = await listAccounts();
+      const existing = accounts.find((candidate) => candidate.tool === kind && candidate.label === label.trim());
+      const account = existing ?? (await addAccount(tool, label));
+      await runLoginSeat(parsed, account);
+      break;
+    }
+    case "capture": {
+      const query = parsed.args[1];
+      if (!query) throw new Error("Usage: hive account capture <account> --home <1|2|3|path>");
+      const account = await findAccount(query);
+      const homeFlag = flag(parsed, "home");
+      if (typeof homeFlag !== "string") throw new Error("--home <1|2|3|path> is required: which home should credentials be captured from?");
+      const homePath = resolveHome(account.tool, homeFlag);
+      const captured = await captureAccountFromHome(account, homePath);
+      if (isPretty()) console.log(actionLine("ok", "capture", [bold(account.id), dim(tildify(homePath)), `${captured.length} file(s)`]));
+      else console.log(`captured\t${account.id}\t${homePath}\t${captured.join(",")}`);
+      break;
+    }
+    case "remove":
+    case "rm": {
+      const query = parsed.args[1];
+      if (!query) throw new Error("Usage: hive account remove <account>");
+      const account = await removeAccount(query);
+      if (isPretty()) console.log(actionLine("ok", "remove", [bold(account.id)]));
+      else console.log(`removed\t${account.id}`);
+      break;
+    }
+    case "import-caam": {
+      const from = typeof flag(parsed, "from") === "string" ? String(flag(parsed, "from")) : defaultCaamVaultDir();
+      const result = await importCaam(from);
+      for (const account of result.imported) {
+        if (isPretty()) console.log(actionLine("ok", "import", [bold(account.id), account.tool, account.label]));
+        else console.log(`imported\t${account.id}\t${account.tool}\t${account.label}`);
+      }
+      for (const skip of result.skipped) {
+        console.error(note(`skipped ${skip.tool}/${skip.label}: ${skip.reason}`));
+      }
+      console.log(note(`${result.imported.length} account(s) in ${tildify(vaultRoot())}`));
+      break;
+    }
+    default:
+      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|remove|import-caam`);
+  }
+}
+
+async function accountList(parsed: Parsed) {
+  const accounts = await listAccounts();
+  const now = Date.now();
+  const rows: string[][] = [];
+  const jsonRows: Record<string, unknown>[] = [];
+  for (const account of accounts) {
+    const summary = await usageSummary(account.id, now);
+    const hasCreds = await accountHasCredentials(account);
+    const exhausted = isRecentlyExhausted(summary, now);
+    if (truthy(flag(parsed, "json"))) {
+      jsonRows.push({ ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null });
+      continue;
+    }
+    const state = !hasCreds ? yellow("no-creds") : exhausted ? red("exhausted") : green("ok");
+    rows.push([
+      account.id,
+      account.tool,
+      account.label,
+      isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
+      summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
+      summary.lastResetHint ?? "-",
+    ]);
+  }
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(jsonRows, null, 2));
+    return;
+  }
+  if (rows.length === 0) {
+    console.log(note("no accounts registered; add one with: hive account add <tool> <label> or hive account import-caam"));
+    return;
+  }
+  console.log(formatTable(
+    [{ header: "ACCOUNT" }, { header: "TOOL" }, { header: "LABEL" }, { header: "STATE" }, { header: "EXHAUSTED" }, { header: "RESET" }],
+    rows,
+  ));
+}
+
+// Interactive (re)login seat: a scratch home + the tool's own login flow in a
+// detached tmux session; once credential files land we capture them into the
+// vault and tear the seat down.
+async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
+  const recipe = identityRecipeForAgent(account.tool);
+  if (!recipe) throw new Error(`Tool ${account.tool} has no identity recipe`);
+  const seatHome = resolve(storeRoot(), "login-homes", account.id);
+  await mkdir(seatHome, { recursive: true, mode: 0o700 });
+  // Re-login starts from the existing creds when we have them.
+  if (await accountHasCredentials(account)) {
+    await activateAccountIntoHome(account, seatHome).catch(() => undefined);
+  }
+  const startedAt = Date.now();
+  const spec = resolveAgent(account.tool, [], { home: seatHome, identity: true, yolo: false });
+  const target = safeTmuxTarget(`login-${account.id}`);
+  const substrate = localSubstrate();
+  if (await substrate.hasSession(target)) throw new Error(`A login seat is already running: tmux attach -t ${target}`);
+  await substrate.newSession(target, process.cwd(), { command: spec.command, args: spec.args, env: spec.env });
+
+  const attachHint = `tmux attach -t ${target}`;
+  if (isPretty()) console.log(actionLine("ok", "login-seat", [bold(account.id), dim(attachHint)]));
+  else console.log(`login-seat\t${account.id}\t${target}`);
+  console.log(note(`complete the ${account.tool} login in the seat (${attachHint}); credentials are captured automatically`));
+
+  if (truthy(flag(parsed, "no-wait"))) {
+    console.log(note(`then run: hive account capture ${account.id} --home ${seatHome}`));
+    return;
+  }
+
+  const timeoutMs = numberFlag(parsed, ["timeout-ms", "timeout"], 600_000);
+  const deadline = startedAt + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await loginCredentialsFresh(seatHome, recipe.credentialFiles, startedAt)) {
+      const captured = await captureAccountFromHome(account, seatHome);
+      await substrate.kill(target).catch(() => undefined);
+      if (isPretty()) console.log(actionLine("ok", "capture", [bold(account.id), `${captured.length} file(s)`]));
+      else console.log(`captured\t${account.id}\t${captured.join(",")}`);
+      return;
+    }
+    if (!(await substrate.hasSession(target))) break;
+    await sleep(2_000);
+  }
+  // Seat exited or timed out without fresh creds — try one best-effort capture.
+  try {
+    const captured = await captureAccountFromHome(account, seatHome);
+    console.log(note(`captured ${captured.length} file(s) from the seat home`));
+  } catch {
+    throw new Error(`No fresh credentials appeared in ${seatHome}; seat ${(await substrate.hasSession(target)) ? `still running (${attachHint})` : "exited"}`);
+  } finally {
+    await substrate.kill(target).catch(() => undefined);
+  }
+}
+
+async function loginCredentialsFresh(homePath: string, credentialFiles: string[], sinceMs: number): Promise<boolean> {
+  for (const relative of credentialFiles) {
+    const info = await stat(resolve(homePath, relative)).catch(() => null);
+    if (info?.isFile() && info.mtimeMs >= sinceMs) return true;
+  }
+  return false;
+}
+
+async function cmdActivate(parsed: Parsed) {
+  const query = parsed.args[0];
+  if (!query) throw new Error("Usage: hive activate <account> [--home <1|2|3|path>]");
+  const account = await findAccount(query);
+  const homeFlag = flag(parsed, "home");
+  const homePath = typeof homeFlag === "string" ? resolveHome(account.tool, homeFlag) : defaultHomeForAccount(account);
+  const written = await activateAccountIntoHome(account, homePath);
+  if (isPretty()) console.log(actionLine("ok", "activate", [bold(account.id), dim(tildify(homePath)), `${written.length} file(s)`]));
+  else console.log(`activated\t${account.id}\t${homePath}\t${written.join(",")}`);
+  const identityEnv = identityEnvForAgent(account.tool, homePath);
+  const envHint = Object.entries(identityEnv).map(([key, value]) => `${key}=${value}`).join(" ");
+  console.log(note(`spawn with: hive spawn ${account.tool} --home ${homePath}${envHint ? ` (identity env: ${envHint})` : ""}`));
+}
+
+async function cmdLogin(parsed: Parsed) {
+  const query = parsed.args[0];
+  if (!query) throw new Error("Usage: hive login <account> [--no-wait] [--popup]");
+  const account = await findAccount(query);
+  if (truthy(flag(parsed, "popup"))) {
+    // The mesh tmux binding wraps this in display-popup; print the canonical form.
+    console.log(`tmux display-popup -E "hive login ${account.id}"`);
+    return;
+  }
+  await runLoginSeat(parsed, account);
+}
+
+async function cmdSwapAccount(parsed: Parsed) {
+  const [beeQuery, accountQuery] = parsed.args;
+  if (!beeQuery || !accountQuery) throw new Error("Usage: hive swap-account <bee> <account>");
+  const target = await resolveSelector(beeQuery);
+  if (target.kind !== "bee") throw new Error("swap-account targets a single bee");
+  const record = target.record;
+  const account = await findAccount(accountQuery, record.agent);
+  const updated = await swapAccount(record, account);
+  if (isPretty()) console.log(actionLine("ok", "swap", [bold(updated.name), `${record.accountId ?? "unbound"} → ${account.id}`, dim(updated.providerSessionId ?? "fresh session")]));
+  else console.log(`swapped\t${updated.name}\t${account.id}`);
+}
+
+async function cmdUsage(parsed: Parsed) {
+  const query = parsed.args[0];
+  const now = Date.now();
+  const accounts = await listAccounts();
+  const ids = query
+    ? [(await findAccount(query)).id]
+    : [...new Set([...accounts.map((account) => account.id), ...(await listUsageAccounts())])];
+
+  const summaries = [];
+  for (const id of ids) summaries.push(await usageSummary(id, now));
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(summaries, null, 2));
+    return;
+  }
+  if (summaries.length === 0) {
+    console.log(note("no usage recorded; usage accrues for account-bound bees (hive spawn <tool> --account <a>)"));
+    return;
+  }
+  const rows = summaries.map((summary) => {
+    const exhausted = isRecentlyExhausted(summary, now);
+    return [
+      summary.account,
+      `${formatTokens(summary.windowInputTokens)}/${formatTokens(summary.windowOutputTokens)}`,
+      summary.lastSample ? formatRelativeTime(summary.lastSample.ts) : "-",
+      summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
+      isPretty() ? (exhausted ? red("exhausted") : green("ok")) : exhausted ? "exhausted" : "ok",
+      summary.lastResetHint ?? "-",
+    ];
+  });
+  console.log(formatTable(
+    [{ header: "ACCOUNT" }, { header: "5H IN/OUT" }, { header: "SAMPLED" }, { header: "EXHAUSTED" }, { header: "STATE" }, { header: "RESET" }],
+    rows,
+  ));
+  console.log(note("token sums are directional estimates from transcripts, not authoritative quota"));
+}
+
+function formatTokens(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
+}
+
+async function cmdSessions(parsed: Parsed) {
+  const sub = parsed.args[0];
+  if (sub !== "reconcile") throw new Error("Usage: hive sessions reconcile [--home <path>]... [--json]");
+  const homeFlag = flag(parsed, "home");
+  const extraHomes = Array.isArray(homeFlag) ? homeFlag : typeof homeFlag === "string" ? [homeFlag] : [];
+  const index = await reconcileSessions({ extraHomes });
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(index, null, 2));
+    return;
+  }
+  if (isPretty()) {
+    console.log(actionLine("ok", "reconcile", [`${index.entries.length} sessions`, `${index.scannedHomes.length} homes`, dim(tildify(sessionIndexPath()))]));
+  } else {
+    console.log(`reconciled\t${index.entries.length}\t${index.scannedHomes.length}\t${sessionIndexPath()}`);
+  }
+  for (const duplicate of index.duplicates) {
+    const locations = duplicate.locations.map((location) => tildify(location.home)).join(", ");
+    console.log(note(`duplicate ${duplicate.sessionId} in: ${locations}`));
+  }
+  for (const conflict of index.conflicts) {
+    console.log(note(`sync conflict: ${tildify(conflict)}`));
+  }
+  if (index.duplicates.length === 0 && index.conflicts.length === 0) {
+    console.log(note("no cross-home duplicates or sync conflicts"));
+  }
+}
+
+async function cmdSync(parsed: Parsed) {
+  const sub = parsed.args[0];
+  if (sub !== "manifest") throw new Error("Usage: hive sync manifest [--json]");
+  const manifest = await writeSyncManifest();
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(manifest, null, 2));
+    return;
+  }
+  if (isPretty()) console.log(actionLine("ok", "manifest", [dim(tildify(syncManifestPath()))]));
+  else console.log(`manifest\t${syncManifestPath()}`);
+  for (const pattern of manifest.include) console.log(`  include ${pattern}`);
+  for (const pattern of manifest.exclude) console.log(`  exclude ${pattern}`);
+  console.log(note(manifest.note));
+}
+
 function printHelp() {
   const pretty = isPretty();
   const head = pretty ? `${bold(APP_NAME)} ${dim(VERSION)}` : `${APP_NAME} ${VERSION}`;
@@ -3328,7 +3677,7 @@ function printHelp() {
   const env = (name: string) => (pretty ? cyan(name) : name);
 
   const commands: Array<[string, string, string]> = [
-    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--colony <name>] [--count <n>] [--node <name>] [--yolo|--no-yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start bees in detached tmux sessions (claude is permissionless by default — --no-yolo to opt out; waits for the prompt, auto-accepting trust)"],
+    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--autoswap] [--colony <name>] [--count <n>] [--node <name>] [--yolo|--no-yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start bees in detached tmux sessions (claude is permissionless by default — --no-yolo to opt out; waits for the prompt, auto-accepting trust)"],
     ["spawn --frame", "<name> [--colony <name>] [--swarm-id <id>]", "spawn a swarm from a registered frame"],
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
@@ -3355,6 +3704,13 @@ function printHelp() {
     ["daemon", "<install|uninstall|start|stop|restart|status|logs|run> [--label <id>] [--tick-ms <n>] [--lines N] [--follow] [--json]", "manage the hive daemon LaunchAgent + inspect state/logs"],
     ["search", "<query> [--type seals,ledger,sessions] [--colony X] [--swarm X] [--bee X] [--status X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals, ledger, and session records"],
     ["seals find", "<query> [--status X] [--colony X] [--bee X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals only"],
+    ["account", "<list|add|login|capture|remove|import-caam> [tool] [label] [--email <addr>] [--home <path>] [--from <dir>]", "manage provider accounts in the local credential vault (~/.hive/vault, never synced)"],
+    ["activate", "<account> [--home <1|2|3|path>]", "seed an account's credentials into a home slot (fast login)"],
+    ["login", "<account> [--no-wait] [--popup]", "interactive (re)login seat in tmux; captures fresh credentials into the vault"],
+    ["swap-account", "<bee> <account>", "stop, re-credential the bee's home, and resume the same session on another account"],
+    ["usage", "[<account>] [--json]", "factual per-account token usage and exhaustion state (estimates, not quota)"],
+    ["sessions", "reconcile [--home <path>]... [--json]", "index sessions across all homes; flag duplicates and sync conflicts"],
+    ["sync", "manifest [--json]", "write the syncthing include/exclude manifest (vault always excluded)"],
     ["config", "<show|path|set-bee <bee> [--yolo] [--home] [--command]>", "view or edit ~/.hive/config.json defaults"],
     ["completion", "<bash|zsh|fish>", "print a shell completion script (eval to install)"],
   ];
@@ -3370,7 +3726,7 @@ function printHelp() {
     .join("\n");
 
   const bees = [
-    "  claude, codex, opencode, grok, pi, droid",
+    "  claude, codex, opencode, grok, pi, droid, cursor",
     `  ${dim("aliases: codex1, codex2, codex3, cc1, cc2, cc3")}`,
     `  ${dim("or any executable on PATH")}`,
   ].join("\n");

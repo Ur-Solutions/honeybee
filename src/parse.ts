@@ -8,6 +8,7 @@ export type Parsed = {
 const BOOLEAN_FLAGS = new Set([
   "accept-trust",
   "all",
+  "autoswap",
   "background",
   "briefed",
   "case",
@@ -29,6 +30,7 @@ const BOOLEAN_FLAGS = new Set([
   "keep",
   "last",
   "now",
+  "popup",
   "print",
   "read",
   "regex",

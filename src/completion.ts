@@ -17,6 +17,7 @@ const COMMANDS = [
   "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
+  "account", "activate", "login", "swap-account", "usage", "sessions", "sync",
   "search", "seals",
   "brief", "seal", "config", "completion", "help",
 ];
@@ -31,6 +32,9 @@ const FLOW_SUBCOMMANDS = ["list", "ls", "define", "inspect", "remove", "run", "r
 const LOOP_SUBCOMMANDS = ["start", "status", "logs", "stop", "list", "ls"];
 const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "purge", "config"];
 const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
+const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "remove", "import-caam"];
+const SESSIONS_SUBCOMMANDS = ["reconcile"];
+const SYNC_SUBCOMMANDS = ["manifest"];
 
 const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 const SEAL_STATUS_VALUES = ["done", "blocked", "needs_input", "failed"];
@@ -41,7 +45,7 @@ const BUZ_ACCEPT_VALUES = [
 ];
 
 const BEES = [
-  "claude", "codex", "opencode", "grok", "pi", "droid",
+  "claude", "codex", "opencode", "grok", "pi", "droid", "cursor",
   "codex1", "codex2", "codex3", "cc1", "cc2", "cc3",
 ];
 
@@ -55,7 +59,13 @@ const BEE_FIRST_ARG = new Set(["spawn", "run", "x"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 
 const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--home", "--profile", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
+  spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
+  account: ["--email", "--home", "--from", "--json", "--no-wait", "--timeout-ms"],
+  activate: ["--home"],
+  login: ["--no-wait", "--popup", "--timeout-ms"],
+  usage: ["--json"],
+  sessions: ["--home", "--json"],
+  sync: ["--json"],
   node: ["--kind", "--endpoint", "--capabilities", "--description", "--ssh-command", "--ssh-args"],
   run: [
     "--prompt", "-p", "--cwd", "--home", "--profile",
@@ -161,6 +171,9 @@ const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   loop: LOOP_SUBCOMMANDS,
   buz: BUZ_SUBCOMMANDS,
   daemon: DAEMON_SUBCOMMANDS,
+  account: ACCOUNT_SUBCOMMANDS,
+  sessions: SESSIONS_SUBCOMMANDS,
+  sync: SYNC_SUBCOMMANDS,
 };
 
 const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run">> = {
