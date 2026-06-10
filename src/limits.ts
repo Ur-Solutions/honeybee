@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { type AccountRecord, accountDir, listAccounts } from "./accounts.js";
-import { storeRoot } from "./fsx.js";
-import { readClaudeKeychain } from "./keychain.js";
+import { atomicWriteFile, storeRoot } from "./fsx.js";
+import { readClaudeKeychain, writeClaudeKeychain } from "./keychain.js";
+import { appendLedger } from "./store.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Provider limit windows (Phase 3 follow-up): remaining 5h/weekly usage
@@ -68,8 +69,19 @@ export type LimitsDeps = {
   fetchClaudeProfileEmail?: (accessToken: string) => Promise<string | null>;
   /** Live codex rate limits for a home via the app-server RPC; null on failure. */
   codexLiveRateLimits?: (homePath: string) => Promise<CodexLiveRateLimits | null>;
+  /** OAuth refresh; returns the new credential set or null when the refresh token is dead. */
+  refreshClaudeToken?: (refreshToken: string) => Promise<RefreshedClaudeToken | null>;
+  /** Persist a refreshed credential set (vault + the account's home keychains). */
+  persistRefreshedCredentials?: (account: AccountRecord, oauth: Record<string, unknown>) => Promise<void>;
   readKeychain?: typeof readClaudeKeychain;
   now?: () => number;
+};
+
+export type RefreshedClaudeToken = {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  scopes?: string[];
 };
 
 export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps = {}): Promise<AccountLimits[]> {
@@ -105,6 +117,11 @@ type ClaudeOauthCredentials = {
   accessToken: string;
   expiresAt: number;
   subscriptionType?: string;
+  refreshToken?: string;
+  /** The full claudeAiOauth object as found, for refresh persistence. */
+  oauth: Record<string, unknown>;
+  /** True when found in an account-attributed source (vault / email-matched home). */
+  attributed: boolean;
 };
 
 async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<AccountLimits> {
@@ -119,18 +136,6 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
       error: "no OAuth token found in vault, homes, or keychain",
     };
   }
-  const fresh = candidates.filter((candidate) => candidate.expiresAt > now);
-  if (fresh.length === 0) {
-    const newest = candidates[0]!;
-    return {
-      account: account.id,
-      tool: account.tool,
-      ok: false,
-      source: "oauth-api",
-      error: `OAuth token expired ${new Date(newest.expiresAt).toISOString()}; run: hive open ${account.id} once, then hive account capture ${account.id} --home <its home>`,
-    };
-  }
-
   // A token's location does NOT prove its identity: vaults get mislabeled,
   // homes get re-logged-in, refresh keeps a wrong token fresh forever. Ask
   // the profile endpoint who each candidate actually is and use the first
@@ -139,7 +144,7 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
   const expectedEmail = account.email ?? (account.label.includes("@") ? account.label : undefined);
   let credential: ClaudeOauthCredentials | undefined;
   const imposters = new Set<string>();
-  for (const candidate of fresh) {
+  for (const candidate of candidates.filter((entry) => entry.expiresAt > now)) {
     if (!expectedEmail) {
       credential = candidate;
       break;
@@ -151,13 +156,64 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
     }
     if (actualEmail) imposters.add(actualEmail);
   }
+
+  // No fresh matching token (access tokens live ~1-8h; only an actively
+  // running claude keeps them warm). Refresh a stale chain: the long-lived
+  // refreshToken mints a new token set. Refresh tokens ROTATE, so every
+  // successful refresh is persisted immediately — vault + the account's home
+  // keychains — or the chain would be orphaned. Only account-attributed
+  // candidates are refreshed: rotating a token found in some unrelated
+  // home's keychain would knife that login.
+  if (!credential) {
+    const refresh = deps.refreshClaudeToken ?? refreshClaudeTokenDefault;
+    const persist = deps.persistRefreshedCredentials ?? persistRefreshedCredentialsDefault;
+    const attempted = new Set<string>();
+    for (const candidate of candidates) {
+      if (!candidate.attributed || !candidate.refreshToken || attempted.has(candidate.refreshToken)) continue;
+      attempted.add(candidate.refreshToken);
+      const refreshed = await refresh(candidate.refreshToken).catch(() => null);
+      if (!refreshed) continue;
+      const oauth: Record<string, unknown> = {
+        ...candidate.oauth,
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken,
+        expiresAt: refreshed.expiresAt,
+        ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
+      };
+      const actualEmail = expectedEmail ? await profileOf(refreshed.accessToken).catch(() => null) : null;
+      if (expectedEmail && actualEmail && actualEmail !== expectedEmail) {
+        // The chain belongs to someone else (mislabeled source). Park the
+        // rotated tokens with their real owner so the chain isn't lost.
+        imposters.add(actualEmail);
+        const owner = (await listAccounts()).find(
+          (other) => other.tool === "claude" && (other.email ?? other.label) === actualEmail,
+        );
+        if (owner) await persist(owner, oauth).catch(() => undefined);
+        continue;
+      }
+      await persist(account, oauth).catch(() => undefined);
+      credential = {
+        accessToken: refreshed.accessToken,
+        expiresAt: refreshed.expiresAt,
+        ...(typeof candidate.oauth.subscriptionType === "string" ? { subscriptionType: candidate.oauth.subscriptionType } : {}),
+        oauth,
+        refreshToken: refreshed.refreshToken,
+        attributed: true,
+      };
+      break;
+    }
+  }
+
   if (!credential) {
     return {
       account: account.id,
       tool: account.tool,
       ok: false,
       source: "oauth-api",
-      error: `found ${fresh.length} fresh token(s) but none belong to ${expectedEmail}${imposters.size > 0 ? ` (they belong to: ${[...imposters].join(", ")})` : ""}; re-login with: hive login ${account.id}`,
+      error:
+        imposters.size > 0
+          ? `no token belongs to ${expectedEmail} (found: ${[...imposters].join(", ")}); re-login with: hive login ${account.id}`
+          : `all ${candidates.length} token(s) expired and refresh failed; re-login with: hive login ${account.id}`,
     };
   }
 
@@ -222,47 +278,92 @@ async function claudeCredentialCandidates(
 ): Promise<ClaudeOauthCredentials[]> {
   const candidates: ClaudeOauthCredentials[] = [];
   const seen = new Set<string>();
-  const push = (raw: string | null) => {
-    const parsed = parseClaudeCredentials(raw);
+  const push = (raw: string | null, attributed: boolean) => {
+    const parsed = parseClaudeCredentials(raw, attributed);
     if (parsed && !seen.has(parsed.accessToken)) {
       seen.add(parsed.accessToken);
       candidates.push(parsed);
     }
   };
 
-  push(await readFile(join(accountDir(account), ".credentials.json"), "utf8").catch(() => null));
+  push(await readFile(join(accountDir(account), ".credentials.json"), "utf8").catch(() => null), true);
 
   for (const home of await claudeHomesForAccount(account)) {
-    push(await readFile(join(home, ".credentials.json"), "utf8").catch(() => null));
-    push(await readKeychain(home));
+    push(await readFile(join(home, ".credentials.json"), "utf8").catch(() => null), true);
+    push(await readKeychain(home), true);
   }
 
   // The account's true login may live in a home we cannot attribute (the
   // default ~/.claude has no in-home .claude.json). Include every claude
   // home's keychain as a last-resort candidate pool — identity verification
-  // filters out the wrong ones.
+  // filters out the wrong ones, and these are never refresh-rotated.
   for (const home of await candidateHomes("claude")) {
-    push(await readKeychain(home));
+    push(await readKeychain(home), false);
   }
 
   candidates.sort((a, b) => b.expiresAt - a.expiresAt);
   return candidates;
 }
 
-function parseClaudeCredentials(raw: string | null): ClaudeOauthCredentials | null {
+function parseClaudeCredentials(raw: string | null, attributed: boolean): ClaudeOauthCredentials | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: unknown; expiresAt?: unknown; subscriptionType?: unknown } };
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: Record<string, unknown> };
     const oauth = parsed.claudeAiOauth;
     if (!oauth || typeof oauth.accessToken !== "string" || typeof oauth.expiresAt !== "number") return null;
     return {
       accessToken: oauth.accessToken,
       expiresAt: oauth.expiresAt,
       ...(typeof oauth.subscriptionType === "string" ? { subscriptionType: oauth.subscriptionType } : {}),
+      ...(typeof oauth.refreshToken === "string" ? { refreshToken: oauth.refreshToken } : {}),
+      oauth,
+      attributed,
     };
   } catch {
     return null;
   }
+}
+
+// Claude Code's public OAuth client id (the same one the CLI itself uses).
+const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+async function refreshClaudeTokenDefault(refreshToken: string): Promise<RefreshedClaudeToken | null> {
+  const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: CLAUDE_OAUTH_CLIENT_ID }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) return null;
+  const fresh = (await response.json()) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; scope?: unknown };
+  if (typeof fresh.access_token !== "string") return null;
+  return {
+    accessToken: fresh.access_token,
+    refreshToken: typeof fresh.refresh_token === "string" ? fresh.refresh_token : refreshToken,
+    expiresAt: Date.now() + (typeof fresh.expires_in === "number" ? fresh.expires_in : 3600) * 1000,
+    ...(typeof fresh.scope === "string" ? { scopes: fresh.scope.split(" ") } : {}),
+  };
+}
+
+/**
+ * Persist a refreshed (rotated!) credential set everywhere this account's
+ * chain lives: the vault file and the keychain entry of each email-matched
+ * home — merged into the existing keychain JSON so mcpOAuth etc. survive.
+ */
+async function persistRefreshedCredentialsDefault(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
+  const vaultPath = join(accountDir(account), ".credentials.json");
+  await mkdir(dirname(vaultPath), { recursive: true, mode: 0o700 });
+  await atomicWriteFile(vaultPath, `${JSON.stringify({ claudeAiOauth: oauth }, null, 2)}\n`, { mode: 0o600 });
+  for (const home of await claudeHomesForAccount(account)) {
+    try {
+      const existing = await readClaudeKeychain(home);
+      const merged = existing ? { ...(JSON.parse(existing) as Record<string, unknown>), claudeAiOauth: oauth } : { claudeAiOauth: oauth };
+      await writeClaudeKeychain(home, JSON.stringify(merged));
+    } catch {
+      // best effort per home
+    }
+  }
+  await appendLedger({ type: "account.token-refresh", account: account.id });
 }
 
 async function claudeHomesForAccount(account: AccountRecord): Promise<string[]> {

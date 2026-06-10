@@ -127,11 +127,81 @@ test("claude limits reject tokens whose profile email belongs to another account
         throw new Error("must not query usage with an imposter token");
       },
       fetchClaudeProfileEmail: async () => "wrong@a.b",
+      refreshClaudeToken: async () => null,
       readKeychain: async () => null,
     });
     assert.equal(result!.ok, false);
-    assert.match(result!.error ?? "", /none belong to right@a\.b/);
+    assert.match(result!.error ?? "", /no token belongs to right@a\.b/);
     assert.match(result!.error ?? "", /wrong@a\.b/);
+  });
+});
+
+test("an expired chain is refreshed, persisted (rotation!), and then used", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "stale@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "refresh-old", subscriptionType: "max" },
+      }),
+    );
+
+    const persisted: { account: string; oauth: Record<string, unknown> }[] = [];
+    const usageAskedWith: string[] = [];
+    const [result] = await accountLimits([account], {
+      refreshClaudeToken: async (refreshToken) => {
+        assert.equal(refreshToken, "refresh-old");
+        return { accessToken: "tok-new", refreshToken: "refresh-rotated", expiresAt: Date.now() + 8 * 3600_000 };
+      },
+      persistRefreshedCredentials: async (target, oauth) => {
+        persisted.push({ account: target.id, oauth });
+      },
+      fetchClaudeProfileEmail: async () => "stale@a.b",
+      fetchClaudeUsage: async (token) => {
+        usageAskedWith.push(token);
+        return { five_hour: { utilization: 5, resets_at: "2026-06-10T18:00:00Z" } };
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    assert.equal(result!.plan, "max");
+    assert.deepEqual(usageAskedWith, ["tok-new"]);
+    // The rotated refresh token MUST be persisted or the chain is orphaned.
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]!.account, account.id);
+    assert.equal(persisted[0]!.oauth.refreshToken, "refresh-rotated");
+    assert.equal(persisted[0]!.oauth.subscriptionType, "max");
+  });
+});
+
+test("refreshing a mislabeled chain parks the rotated tokens with their real owner", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "mine@a.b");
+    const owner = await addAccount("claude", "theirs@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "refresh-x" } }),
+    );
+
+    const persisted: string[] = [];
+    const [result] = await accountLimits([account], {
+      refreshClaudeToken: async () => ({ accessToken: "tok-new", refreshToken: "refresh-rotated", expiresAt: Date.now() + 3600_000 }),
+      persistRefreshedCredentials: async (target) => {
+        persisted.push(target.id);
+      },
+      fetchClaudeProfileEmail: async () => "theirs@a.b",
+      fetchClaudeUsage: async () => {
+        throw new Error("must not use the imposter token");
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, false);
+    assert.match(result!.error ?? "", /theirs@a\.b/);
+    assert.deepEqual(persisted, [owner.id]);
   });
 });
 
