@@ -12,8 +12,10 @@ import {
   captureAccountFromHome,
   findAccount,
   listAccounts,
+  mergeCredentialsJson,
   removeAccount,
   resolveSpawnAgent,
+  syncClaudeChainToVault,
 } from "../src/accounts.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -120,6 +122,134 @@ test("activate fails when the vault is empty for the account", async () => {
     const account = await addAccount("claude", "novault@a.b");
     await assert.rejects(() => activateAccountIntoHome(account, join(dir, "slot")), /no credentials/i);
   });
+});
+
+function chainJson(accessToken: string, expiresAt: number, refreshToken?: string): string {
+  return JSON.stringify({ claudeAiOauth: { accessToken, expiresAt, ...(refreshToken ? { refreshToken } : {}) } });
+}
+
+test("activation pulls a fresher home chain into the vault instead of stamping a stale one", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "rot@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-old", now + 3_600_000, "r-old"));
+    // The account's dedicated home holds the rotated, fresher link (a past
+    // session refreshed there; refresh tokens rotate, so r-old is dead).
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-live", now + 8 * 3_600_000, "r-live"));
+
+    await activateAccountIntoHome(account, home);
+
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-live");
+    assert.equal(vault.claudeAiOauth.refreshToken, "r-live");
+    // The home keeps the live link — the stale vault snapshot never lands.
+    const homeCreds = JSON.parse(await readFile(join(home, ".credentials.json"), "utf8"));
+    assert.equal(homeCreds.claudeAiOauth.accessToken, "tok-live");
+  });
+});
+
+test("activation refreshes an expired chain and persists the rotation before stamping", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "stale@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-dead", now - 1_000, "r1"));
+    const home = join(dir, "homes", account.id);
+
+    const refreshedWith: string[] = [];
+    await activateAccountIntoHome(account, home, {
+      refreshClaudeToken: async (refreshToken) => {
+        refreshedWith.push(refreshToken);
+        return { accessToken: "tok-new", refreshToken: "r2", expiresAt: now + 8 * 3_600_000 };
+      },
+    });
+
+    assert.deepEqual(refreshedWith, ["r1"]);
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-new");
+    // The rotated refresh token MUST be persisted or the chain is orphaned.
+    assert.equal(vault.claudeAiOauth.refreshToken, "r2");
+    const homeCreds = JSON.parse(await readFile(join(home, ".credentials.json"), "utf8"));
+    assert.equal(homeCreds.claudeAiOauth.accessToken, "tok-new");
+  });
+});
+
+test("activation warns but proceeds when the expired chain cannot be refreshed", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "dead@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-dead", now - 1_000, "r1"));
+    const home = join(dir, "homes", account.id);
+
+    const warnings: string[] = [];
+    await activateAccountIntoHome(account, home, {
+      refreshClaudeToken: async () => null,
+      onWarn: (message) => warnings.push(message),
+    });
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /could not be refreshed/);
+    // Still stamped: claude may yet recover (e.g. the refresh failed offline).
+    const homeCreds = JSON.parse(await readFile(join(home, ".credentials.json"), "utf8"));
+    assert.equal(homeCreds.claudeAiOauth.accessToken, "tok-dead");
+  });
+});
+
+test("activation rescues a foreign occupant's fresher chain into its own vault", async () => {
+  await withTempStore(async (dir) => {
+    const tenant = await addAccount("claude", "tenant@b.c");
+    const incoming = await addAccount("claude", "incoming@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(tenant), ".credentials.json"), chainJson("tok-tenant-old", now - 1_000));
+    await writeFile(join(accountDir(incoming), ".credentials.json"), chainJson("tok-incoming", now + 3_600_000));
+    // A shared home currently logged in as the tenant, holding the live link
+    // of the tenant's chain (which exists nowhere else).
+    const home = join(dir, "shared-home");
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-tenant-live", now + 8 * 3_600_000));
+    await writeFile(join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "tenant@b.c" } }));
+
+    await activateAccountIntoHome(incoming, home);
+
+    // The tenant's live link was evacuated before the stamp destroyed it.
+    const tenantVault = JSON.parse(await readFile(join(accountDir(tenant), ".credentials.json"), "utf8"));
+    assert.equal(tenantVault.claudeAiOauth.accessToken, "tok-tenant-live");
+    // And the home now belongs to the incoming account.
+    const homeCreds = JSON.parse(await readFile(join(home, ".credentials.json"), "utf8"));
+    assert.equal(homeCreds.claudeAiOauth.accessToken, "tok-incoming");
+  });
+});
+
+test("syncClaudeChainToVault pulls the freshest link from the account's homes", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "sync@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-old", now + 1_000));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-live", now + 8 * 3_600_000));
+
+    const first = await syncClaudeChainToVault(account);
+    assert.equal(first.vaultUpdated, true);
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-live");
+
+    const second = await syncClaudeChainToVault(account);
+    assert.equal(second.vaultUpdated, false);
+  });
+});
+
+test("mergeCredentialsJson overlays the new chain and preserves sibling keys", () => {
+  const merged = JSON.parse(mergeCredentialsJson(
+    JSON.stringify({ mcpOAuth: { server: "kept" }, claudeAiOauth: { accessToken: "old" } }),
+    JSON.stringify({ claudeAiOauth: { accessToken: "new" } }),
+  ));
+  assert.deepEqual(merged.mcpOAuth, { server: "kept" });
+  assert.equal(merged.claudeAiOauth.accessToken, "new");
+  // Unparseable or missing targets fall back to the source verbatim.
+  assert.equal(mergeCredentialsJson("not-json", `{"a":1}`), `{"a":1}`);
+  assert.equal(JSON.parse(mergeCredentialsJson(null, `{"a":1}`)).a, 1);
 });
 
 test("findAccount resolves <tool>-<query> shorthands (codex-ur, claude-thto)", async () => {

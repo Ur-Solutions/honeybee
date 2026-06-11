@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -202,6 +202,72 @@ test("refreshing a mislabeled chain parks the rotated tokens with their real own
     assert.equal(result!.ok, false);
     assert.match(result!.error ?? "", /theirs@a\.b/);
     assert.deepEqual(persisted, [owner.id]);
+  });
+});
+
+test("a fresh token with unverifiable identity blocks chain refresh (live-session protection)", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "live@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    // The vault holds an expired link with a refresh token — tempting to rotate.
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+    // The dedicated home holds a FRESH link (a live session), but the profile
+    // endpoint is unreachable so its identity cannot be confirmed.
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(
+      join(home, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-live", expiresAt: Date.now() + 3_600_000, refreshToken: "r-live" } }),
+    );
+
+    const [result] = await accountLimits([account], {
+      fetchClaudeProfileEmail: async () => null,
+      refreshClaudeToken: async () => {
+        throw new Error("must not rotate a chain while an unverifiable fresh token exists");
+      },
+      fetchClaudeUsage: async () => {
+        throw new Error("must not query usage with an unverified token");
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, false);
+    assert.match(result!.error ?? "", /could not be verified/);
+    assert.match(result!.error ?? "", /not refreshing/);
+  });
+});
+
+test("a verified fresher home token is mirrored into the vault", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "mirror@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-old", expiresAt: Date.now() + 1_000 } }),
+    );
+    // The live link sits in the dedicated home (claude refreshes on use).
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(
+      join(home, ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-live", expiresAt: Date.now() + 8 * 3_600_000, refreshToken: "r-live" } }),
+    );
+
+    const [result] = await accountLimits([account], {
+      fetchClaudeProfileEmail: async () => "mirror@a.b",
+      fetchClaudeUsage: async () => ({ five_hour: { utilization: 10, resets_at: "2026-06-11T18:00:00Z" } }),
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    // The vault caught up with the live link, so a later activation cannot
+    // stamp the older (possibly dead) link over it.
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-live");
+    assert.equal(vault.claudeAiOauth.refreshToken, "r-live");
   });
 });
 

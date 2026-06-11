@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
 import {
+  type AccountChainSyncOutcome,
   type AccountRecord,
   accountHasCredentials,
   activateAccountIntoHome,
@@ -14,6 +15,9 @@ import {
   listAccounts,
   removeAccount,
   resolveSpawnAgent,
+  seedClaudeHomeAcceptance,
+  syncAllClaudeChainsToVault,
+  syncClaudeChainToVault,
   vaultRoot,
 } from "./accounts.js";
 import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
@@ -302,7 +306,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   if (opts.account) {
     if (opts.node && opts.node.kind !== "local-tmux") throw new Error("--account spawns are local-only (the vault never leaves this machine)");
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${opts.account.id}`);
-    await activateAccountIntoHome(opts.account, spec.homePath);
+    await activateAccountIntoHome(opts.account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
   }
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
   // Executable validation only applies to local spawns; we cannot reach the remote PATH cheaply.
@@ -1505,20 +1509,50 @@ async function cmdXa(parsed: Parsed) {
 // where you called it. --window/--app launch a new native terminal window
 // instead. Deliberately off-brand: no tmux session, no SessionRecord, so
 // list/tail/kill/daemon do not apply. Activation and launch are ledger-logged.
+// Flags `open` consumes itself. Anything else on the command line is forwarded
+// to the agent CLI, so `hive open claude --resume <id>` works without the `--`
+// separator (which still works, and is the escape hatch for flags open owns,
+// e.g. `hive open claude -- --print`).
+const OPEN_OWN_FLAGS = new Set([
+  "window", "app", "cwd", "account", "home", "profile", "print",
+  "yolo", "dangerous", "no-yolo", "accept-trust", "trust", "no-accept-trust", "no-trust",
+]);
+
+function openPassthroughArgs(parsed: Parsed): string[] {
+  const out: string[] = [];
+  for (const [key, value] of parsed.flags) {
+    if (OPEN_OWN_FLAGS.has(key)) continue;
+    // Single-letter keys came in as `-x`; the parser strips dashes, so restore
+    // the form the agent CLI expects.
+    const name = key.length === 1 ? `-${key}` : `--${key}`;
+    for (const item of Array.isArray(value) ? value : [value]) {
+      out.push(name);
+      if (item !== true) out.push(String(item));
+    }
+  }
+  return out;
+}
+
 async function cmdOpen(parsed: Parsed) {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive open <bee> [--window] [--app <terminal>] [--cwd <dir>] [--account <a>] [--print]");
+  if (!requested) throw new Error("Usage: hive open <bee> [--window] [--app <terminal>] [--cwd <dir>] [--account <a>] [--print] [<bee-flags...>]");
   const { agent, account: aliasAccount } = await resolveSpawnAgent(requested);
   const yolo = dangerousMode(parsed, agent);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
   const account = accountQuery ? await findAccount(accountQuery, canonicalAgentKind(agent)) : aliasAccount;
   const home = (flag(parsed, "home") ?? flag(parsed, "profile")) ?? (account ? defaultHomeForAccount(account) : undefined);
-  const spec = resolveAgent(agent, parsed.rest, { home, yolo, identity: Boolean(account) });
+  const spec = resolveAgent(agent, [...openPassthroughArgs(parsed), ...parsed.rest], { home, yolo, identity: Boolean(account) });
   if (account) {
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
-    await activateAccountIntoHome(account, spec.homePath);
+    await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
   }
   const cwd = await resolveSpawnCwd(parsed);
+  // Re-merge the startup acceptances activation just clobbered (and seed them
+  // for fresh homes), so claude does not re-ask the bypass-permissions and
+  // folder-trust questions on every open.
+  if (spec.kind === "claude" && spec.homePath) {
+    await seedClaudeHomeAcceptance(spec.homePath, { yolo, trustCwd: acceptsTrust(parsed) ? cwd : undefined });
+  }
   const command = shellCommand(spec);
   const appFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
   const wantsWindow = truthy(flag(parsed, "window")) || appFlag !== undefined;
@@ -1544,6 +1578,12 @@ async function cmdOpen(parsed: Parsed) {
 
   // Default: take over THIS terminal, exactly where the user called from.
   process.exitCode = await runInCurrentTerminal(spec.command, spec.args, spec.env, cwd);
+  // The session may have rotated the OAuth chain (refresh tokens rotate, and
+  // the new link lands in the home, not the vault). Pull it back into the
+  // vault now so the next activation does not stamp a dead link over it.
+  if (account && spec.kind === "claude" && spec.homePath) {
+    await syncClaudeChainToVault(account, spec.homePath).catch(() => undefined);
+  }
 }
 
 async function cmdConfig(parsed: Parsed) {
@@ -3717,8 +3757,29 @@ async function cmdAccount(parsed: Parsed) {
       else console.log(`removed\t${account.id}`);
       break;
     }
+    case "sync": {
+      // Pull rotated OAuth chains from the accounts' homes back into the
+      // vault (refresh tokens rotate; the live link lands wherever the last
+      // refresh ran). One account when named, otherwise every claude account.
+      const query = parsed.args[1];
+      const outcomes: AccountChainSyncOutcome[] = query
+        ? await (async () => {
+            const account = await findAccount(query);
+            if (account.tool !== "claude") throw new Error(`chain sync only applies to claude accounts; ${account.id} is ${account.tool}`);
+            const result = await syncClaudeChainToVault(account);
+            return [{ account: account.id, vaultUpdated: result.vaultUpdated }];
+          })()
+        : await syncAllClaudeChainsToVault();
+      for (const outcome of outcomes) {
+        const state = outcome.error ? red(`error: ${outcome.error}`) : outcome.vaultUpdated ? green("vault updated") : dim("already fresh");
+        if (isPretty()) console.log(actionLine(outcome.error ? "warn" : "ok", "sync", [bold(outcome.account), state]));
+        else console.log(`synced\t${outcome.account}\t${outcome.error ?? (outcome.vaultUpdated ? "updated" : "fresh")}`);
+      }
+      if (outcomes.length === 0) console.log(note("no claude accounts registered; chain sync only applies to claude"));
+      break;
+    }
     default:
-      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|remove`);
+      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|sync|remove`);
   }
 }
 
@@ -3867,7 +3928,7 @@ async function cmdActivate(parsed: Parsed) {
   const account = await findAccount(query);
   const homeFlag = flag(parsed, "home");
   const homePath = typeof homeFlag === "string" ? resolveHome(account.tool, homeFlag) : defaultHomeForAccount(account);
-  const written = await activateAccountIntoHome(account, homePath);
+  const written = await activateAccountIntoHome(account, homePath, { onWarn: (message) => console.error(note(message)) });
   if (isPretty()) console.log(actionLine("ok", "activate", [bold(account.id), dim(tildify(homePath)), `${written.length} file(s)`]));
   else console.log(`activated\t${account.id}\t${homePath}\t${written.join(",")}`);
   const identityEnv = identityEnvForAgent(account.tool, homePath);
@@ -4066,7 +4127,7 @@ function printHelp() {
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
     ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto)"],
-    ["open", "<bee> [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print]", "identity launcher: run the agent right here in this terminal (--window for a new one), no tmux/session record"],
+    ["open", "<bee> [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print] [<bee-flags...>]", "identity launcher: run the agent right here in this terminal (--window for a new one), no tmux/session record; unknown flags (e.g. --resume <id>) pass through to the bee"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
     ["seal", "<selector> --from <path.json>", "record a typed handoff artifact"],
@@ -4090,7 +4151,7 @@ function printHelp() {
     ["daemon", "<install|uninstall|start|stop|restart|status|logs|run> [--label <id>] [--tick-ms <n>] [--lines N] [--follow] [--json]", "manage the hive daemon LaunchAgent + inspect state/logs"],
     ["search", "<query> [--type seals,ledger,sessions] [--colony X] [--swarm X] [--bee X] [--status X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals, ledger, and session records"],
     ["seals find", "<query> [--status X] [--colony X] [--bee X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals only"],
-    ["account", "<list|add|login|capture|remove> [tool] [label] [--email <addr>] [--home <path>]", "manage provider accounts in the local credential vault (~/.hive/vault, never synced)"],
+    ["account", "<list|add|login|capture|sync|remove> [tool] [label] [--email <addr>] [--home <path>]", "manage provider accounts in the local credential vault (~/.hive/vault, never synced); sync pulls rotated claude OAuth chains from homes back into the vault"],
     ["activate", "<account> [--home <1|2|3|path>]", "seed an account's credentials into a home slot (fast login)"],
     ["login", "<account> [--no-wait] [--popup]", "interactive (re)login seat in tmux; captures fresh credentials into the vault"],
     ["swap-account", "<bee> <account>", "stop, re-credential the bee's home, and resume the same session on another account"],

@@ -34,7 +34,7 @@ const FLOW_SUBCOMMANDS = ["list", "ls", "define", "inspect", "remove", "run", "r
 const LOOP_SUBCOMMANDS = ["start", "status", "logs", "stop", "list", "ls"];
 const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "purge", "config"];
 const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
-const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "remove"];
+const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "remove"];
 const SESSIONS_SUBCOMMANDS = ["reconcile"];
 const SYNC_SUBCOMMANDS = ["manifest"];
 
@@ -72,7 +72,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
     "--yolo", "--no-yolo", "--dangerous", "--boot-ms",
   ],
-  open: ["--window", "--app", "--cwd", "--home", "--profile", "--account", "--print", "--yolo", "--no-yolo", "--dangerous"],
+  open: ["--window", "--app", "--cwd", "--home", "--profile", "--account", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust"],
   usage: ["--samples", "--json"],
   limits: ["--samples", "--json"],
   sessions: ["--home", "--json"],
@@ -195,7 +195,7 @@ const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "swarm" | "frame" |
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },
   flow: { inspect: "flow", remove: "flow", run: "flow", logs: "run", status: "run", cancel: "run" },
-  account: { capture: "account", remove: "account", rm: "account" },
+  account: { capture: "account", sync: "account", remove: "account", rm: "account" },
   // buz subcommands all take a selector as their first positional. We
   // accept any session (live or dead) since reading inbox/outbox/queue
   // is meaningful even for a sealed bee.

@@ -1,4 +1,5 @@
 import { readFileSync, unlinkSync } from "node:fs";
+import { listAccounts, syncAllClaudeChainsToVault, syncClaudeChainToVault } from "../accounts.js";
 import { acquireLongLivedLock, type LongLivedLock, LockBusyError } from "../fsx.js";
 import { listNodes, type NodeRecord } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
@@ -64,6 +65,13 @@ export type TickDeps = {
    * swap-account primitive.
    */
   dispatchAutoswap?: (records: SessionRecord[], usageOutcomes: UsageTickOutcome[]) => Promise<AutoswapOutcome[]>;
+  /**
+   * Optional credential-chain sync: pulls rotated claude OAuth chains from
+   * the accounts' homes back into the vault (refresh tokens rotate; the live
+   * link lands wherever the last refresh ran). The default wiring throttles
+   * itself — most ticks are a no-op.
+   */
+  syncChains?: () => Promise<void>;
   now: () => number;
 };
 
@@ -201,6 +209,16 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   if (deps.dispatchAutoswap && usage.some((outcome) => outcome.exhausted)) {
     try {
       autoswaps = await deps.dispatchAutoswap(records, usage);
+    } catch (error) {
+      errors.push(toError(error));
+    }
+  }
+
+  // Chain sync: keep the vault tracking rotated OAuth chains. Self-throttled
+  // by the default wiring; errors are captured, never fatal to the tick.
+  if (deps.syncChains) {
+    try {
+      await deps.syncChains();
     } catch (error) {
       errors.push(toError(error));
     }
@@ -483,7 +501,13 @@ function sleep(ms: number, shouldStop: () => boolean): Promise<void> {
 /* Default dependency wiring                                           */
 /* ------------------------------------------------------------------ */
 
+// Chain sync reads every claude home's keychain (a `security` subprocess per
+// home) — far too heavy per tick. Every few minutes is plenty: the sweep only
+// has to beat the NEXT activation, not the next tick.
+const CHAIN_SYNC_INTERVAL_MS = 5 * 60_000;
+
 export function buildDefaultDeps(): TickDeps {
+  let lastChainSyncAt = 0;
   return {
     listSessions,
     listNodes,
@@ -496,6 +520,23 @@ export function buildDefaultDeps(): TickDeps {
     dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),
     sampleUsage: createUsageSampler(),
     dispatchAutoswap: (records, usageOutcomes) => dispatchAutoswaps(records, usageOutcomes),
+    syncChains: async () => {
+      const now = Date.now();
+      if (now - lastChainSyncAt < CHAIN_SYNC_INTERVAL_MS) return;
+      lastChainSyncAt = now;
+      await syncAllClaudeChainsToVault();
+      // Account-bound bees may run in homes the sweep cannot find on its own
+      // (arbitrary --home paths outside ~/.claude*); the session records know
+      // them. syncClaudeChainToVault still verifies the home's login email
+      // before trusting its chain.
+      const accounts = new Map((await listAccounts()).map((account) => [account.id, account]));
+      for (const record of await listSessions()) {
+        if (!record.accountId || !record.homePath) continue;
+        const account = accounts.get(record.accountId);
+        if (account?.tool !== "claude") continue;
+        await syncClaudeChainToVault(account, record.homePath).catch(() => undefined);
+      }
+    },
     now: () => Date.now(),
   };
 }

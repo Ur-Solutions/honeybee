@@ -1,11 +1,21 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, readdir, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { type AccountRecord, accountDir, listAccounts } from "./accounts.js";
-import { atomicWriteFile, storeRoot } from "./fsx.js";
-import { readClaudeKeychain, writeClaudeKeychain } from "./keychain.js";
-import { appendLedger } from "./store.js";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { join } from "node:path";
+import {
+  type AccountRecord,
+  type RefreshedClaudeToken,
+  accountDir,
+  candidateHomes,
+  claudeHomesForAccount,
+  listAccounts,
+  persistClaudeChain,
+  refreshClaudeOauthChain,
+  saveClaudeOauthToVault,
+} from "./accounts.js";
+import { storeRoot } from "./fsx.js";
+import { readClaudeKeychain } from "./keychain.js";
+
+export type { RefreshedClaudeToken } from "./accounts.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Provider limit windows (Phase 3 follow-up): remaining 5h/weekly usage
@@ -71,17 +81,12 @@ export type LimitsDeps = {
   codexLiveRateLimits?: (homePath: string) => Promise<CodexLiveRateLimits | null>;
   /** OAuth refresh; returns the new credential set or null when the refresh token is dead. */
   refreshClaudeToken?: (refreshToken: string) => Promise<RefreshedClaudeToken | null>;
-  /** Persist a refreshed credential set (vault + the account's home keychains). */
+  /** Persist a refreshed credential set (vault + the account's homes). */
   persistRefreshedCredentials?: (account: AccountRecord, oauth: Record<string, unknown>) => Promise<void>;
+  /** Mirror a verified fresher credential into the vault file (no rotation). */
+  persistVaultCredentials?: (account: AccountRecord, oauth: Record<string, unknown>) => Promise<void>;
   readKeychain?: typeof readClaudeKeychain;
   now?: () => number;
-};
-
-export type RefreshedClaudeToken = {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
-  scopes?: string[];
 };
 
 export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps = {}): Promise<AccountLimits[]> {
@@ -122,6 +127,8 @@ type ClaudeOauthCredentials = {
   oauth: Record<string, unknown>;
   /** True when found in an account-attributed source (vault / email-matched home). */
   attributed: boolean;
+  /** Where the candidate was found ("vault" or a home-derived label). */
+  source: string;
 };
 
 async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<AccountLimits> {
@@ -144,6 +151,7 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
   const expectedEmail = account.email ?? (account.label.includes("@") ? account.label : undefined);
   let credential: ClaudeOauthCredentials | undefined;
   const imposters = new Set<string>();
+  let unverifiableFresh = 0;
   for (const candidate of candidates.filter((entry) => entry.expiresAt > now)) {
     if (!expectedEmail) {
       credential = candidate;
@@ -155,20 +163,47 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
       break;
     }
     if (actualEmail) imposters.add(actualEmail);
+    else unverifiableFresh += 1;
+  }
+
+  // Mirror a verified fresher home token into the vault: claude refreshes on
+  // use, so the live link usually sits in a home while the vault snapshot
+  // ages. Catching the vault up here means activation never stamps the older
+  // (possibly dead) link over the live one.
+  if (credential && credential.source !== "vault" && (expectedEmail || credential.attributed)) {
+    const vault = candidates.find((entry) => entry.source === "vault");
+    if (!vault || credential.expiresAt > vault.expiresAt) {
+      const persistVault = deps.persistVaultCredentials ?? saveClaudeOauthToVault;
+      await persistVault(account, credential.oauth).catch(() => undefined);
+    }
   }
 
   // No fresh matching token (access tokens live ~1-8h; only an actively
   // running claude keeps them warm). Refresh a stale chain: the long-lived
   // refreshToken mints a new token set. Refresh tokens ROTATE, so every
-  // successful refresh is persisted immediately — vault + the account's home
-  // keychains — or the chain would be orphaned. Only account-attributed
-  // candidates are refreshed: rotating a token found in some unrelated
-  // home's keychain would knife that login.
+  // successful refresh is persisted immediately — vault + the account's
+  // homes — or the chain would be orphaned. Two hard safety rails:
+  //  - a fresh token whose identity could not be verified (profile endpoint
+  //    unreachable) blocks ALL refreshing — it may be the live link of the
+  //    very chain we'd rotate, and rotating it logs that session out;
+  //  - only EXPIRED, account-attributed candidates are ever refreshed —
+  //    rotating a fresh token, or one found in an unrelated home's keychain,
+  //    would knife a live login.
   if (!credential) {
-    const refresh = deps.refreshClaudeToken ?? refreshClaudeTokenDefault;
-    const persist = deps.persistRefreshedCredentials ?? persistRefreshedCredentialsDefault;
+    if (unverifiableFresh > 0) {
+      return {
+        account: account.id,
+        tool: account.tool,
+        ok: false,
+        source: "oauth-api",
+        error: `found ${unverifiableFresh} fresh token(s) whose identity could not be verified (profile endpoint unreachable?); not refreshing — rotating a live session's chain would log it out`,
+      };
+    }
+    const refresh = deps.refreshClaudeToken ?? refreshClaudeOauthChain;
+    const persist = deps.persistRefreshedCredentials ?? persistClaudeChain;
     const attempted = new Set<string>();
     for (const candidate of candidates) {
+      if (candidate.expiresAt > now) continue;
       if (!candidate.attributed || !candidate.refreshToken || attempted.has(candidate.refreshToken)) continue;
       attempted.add(candidate.refreshToken);
       const refreshed = await refresh(candidate.refreshToken).catch(() => null);
@@ -199,6 +234,7 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
         oauth,
         refreshToken: refreshed.refreshToken,
         attributed: true,
+        source: "refresh",
       };
       break;
     }
@@ -278,19 +314,19 @@ async function claudeCredentialCandidates(
 ): Promise<ClaudeOauthCredentials[]> {
   const candidates: ClaudeOauthCredentials[] = [];
   const seen = new Set<string>();
-  const push = (raw: string | null, attributed: boolean) => {
-    const parsed = parseClaudeCredentials(raw, attributed);
+  const push = (raw: string | null, attributed: boolean, source: string) => {
+    const parsed = parseClaudeCredentials(raw, attributed, source);
     if (parsed && !seen.has(parsed.accessToken)) {
       seen.add(parsed.accessToken);
       candidates.push(parsed);
     }
   };
 
-  push(await readFile(join(accountDir(account), ".credentials.json"), "utf8").catch(() => null), true);
+  push(await readFile(join(accountDir(account), ".credentials.json"), "utf8").catch(() => null), true, "vault");
 
   for (const home of await claudeHomesForAccount(account)) {
-    push(await readFile(join(home, ".credentials.json"), "utf8").catch(() => null), true);
-    push(await readKeychain(home), true);
+    push(await readFile(join(home, ".credentials.json"), "utf8").catch(() => null), true, `${home}:file`);
+    push(await readKeychain(home), true, `${home}:keychain`);
   }
 
   // The account's true login may live in a home we cannot attribute (the
@@ -298,14 +334,14 @@ async function claudeCredentialCandidates(
   // home's keychain as a last-resort candidate pool — identity verification
   // filters out the wrong ones, and these are never refresh-rotated.
   for (const home of await candidateHomes("claude")) {
-    push(await readKeychain(home), false);
+    push(await readKeychain(home), false, `${home}:keychain`);
   }
 
   candidates.sort((a, b) => b.expiresAt - a.expiresAt);
   return candidates;
 }
 
-function parseClaudeCredentials(raw: string | null, attributed: boolean): ClaudeOauthCredentials | null {
+function parseClaudeCredentials(raw: string | null, attributed: boolean, source: string): ClaudeOauthCredentials | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as { claudeAiOauth?: Record<string, unknown> };
@@ -318,84 +354,11 @@ function parseClaudeCredentials(raw: string | null, attributed: boolean): Claude
       ...(typeof oauth.refreshToken === "string" ? { refreshToken: oauth.refreshToken } : {}),
       oauth,
       attributed,
+      source,
     };
   } catch {
     return null;
   }
-}
-
-// Claude Code's public OAuth client id (the same one the CLI itself uses).
-const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-
-async function refreshClaudeTokenDefault(refreshToken: string): Promise<RefreshedClaudeToken | null> {
-  const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: CLAUDE_OAUTH_CLIENT_ID }),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) return null;
-  const fresh = (await response.json()) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; scope?: unknown };
-  if (typeof fresh.access_token !== "string") return null;
-  return {
-    accessToken: fresh.access_token,
-    refreshToken: typeof fresh.refresh_token === "string" ? fresh.refresh_token : refreshToken,
-    expiresAt: Date.now() + (typeof fresh.expires_in === "number" ? fresh.expires_in : 3600) * 1000,
-    ...(typeof fresh.scope === "string" ? { scopes: fresh.scope.split(" ") } : {}),
-  };
-}
-
-/**
- * Persist a refreshed (rotated!) credential set everywhere this account's
- * chain lives: the vault file and the keychain entry of each email-matched
- * home — merged into the existing keychain JSON so mcpOAuth etc. survive.
- */
-async function persistRefreshedCredentialsDefault(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
-  const vaultPath = join(accountDir(account), ".credentials.json");
-  await mkdir(dirname(vaultPath), { recursive: true, mode: 0o700 });
-  await atomicWriteFile(vaultPath, `${JSON.stringify({ claudeAiOauth: oauth }, null, 2)}\n`, { mode: 0o600 });
-  for (const home of await claudeHomesForAccount(account)) {
-    try {
-      const existing = await readClaudeKeychain(home);
-      const merged = existing ? { ...(JSON.parse(existing) as Record<string, unknown>), claudeAiOauth: oauth } : { claudeAiOauth: oauth };
-      await writeClaudeKeychain(home, JSON.stringify(merged));
-    } catch {
-      // best effort per home
-    }
-  }
-  await appendLedger({ type: "account.token-refresh", account: account.id });
-}
-
-async function claudeHomesForAccount(account: AccountRecord): Promise<string[]> {
-  const matched: string[] = [];
-  // The account's dedicated slots are theirs by construction.
-  for (const dir of [join(storeRoot(), "homes", account.id), join(storeRoot(), "login-homes", account.id)]) {
-    if ((await stat(dir).catch(() => null))?.isDirectory()) matched.push(dir);
-  }
-  // Shared/legacy homes are claimed by the logged-in email in .claude.json.
-  const email = account.email ?? (account.label.includes("@") ? account.label : undefined);
-  if (!email) return matched;
-  for (const home of await candidateHomes("claude")) {
-    const raw = await readFile(join(home, ".claude.json"), "utf8").catch(() => null);
-    if (!raw) continue;
-    try {
-      const parsed = JSON.parse(raw) as { oauthAccount?: { emailAddress?: unknown } };
-      if (parsed.oauthAccount?.emailAddress === email) matched.push(home);
-    } catch {
-      // unparseable .claude.json — skip
-    }
-  }
-  return matched;
-}
-
-async function candidateHomes(tool: string): Promise<string[]> {
-  const homes: string[] = [];
-  const candidates = [join(homedir(), `.${tool}`)];
-  for (let slot = 1; slot <= 9; slot += 1) candidates.push(join(homedir(), `.${tool}-${slot}`));
-  for (const candidate of candidates) {
-    if ((await stat(candidate).catch(() => null))?.isDirectory()) homes.push(candidate);
-  }
-  return homes;
 }
 
 /* ------------------------------------------------------------------ */
