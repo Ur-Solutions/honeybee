@@ -1,3 +1,4 @@
+import { writeHiveTitle } from "./hiveState.js";
 import { canWriteTitle } from "./naming.js";
 import { touchSession, type SessionRecord } from "./store.js";
 import { latestTranscript, type TranscriptFile, type TranscriptLookupOptions } from "./transcripts.js";
@@ -42,5 +43,8 @@ export async function persistSessionTranscriptMetadata(
 
   fields.updatedAt = new Date().toISOString();
   const updated = await touchSession(record.name, fields);
+  // Only when the title actually changed this call — this path runs on every
+  // wait-loop fingerprint change and most daemon ticks.
+  if (typeof fields.title === "string") await writeHiveTitle(record, fields.title);
   return updated ?? { ...record, ...fields };
 }

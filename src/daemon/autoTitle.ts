@@ -6,6 +6,7 @@
 // one subprocess in flight, and outcomes surface on a later tick.
 
 import { namingConfig } from "../config.js";
+import { writeHiveTitle } from "../hiveState.js";
 import { canWriteTitle, gatherTitleContext, generateTitle, type TitleContext } from "../naming.js";
 import { loadSession, touchSession, updateSession, type SessionRecord } from "../store.js";
 
@@ -25,6 +26,8 @@ export type AutoTitleDeps = {
   /** null = initial exchange not observable yet; the bee stays a candidate. */
   contextFor: (record: SessionRecord) => Promise<TitleContext | null>;
   generate: (context: TitleContext) => Promise<string>;
+  /** Best-effort mirror of the title onto the bee's tmux session (@hive_title). */
+  mirrorTitle: (record: SessionRecord, title: string) => Promise<void>;
   now: () => number;
 };
 
@@ -38,6 +41,7 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
     updateSession,
     contextFor: (record) => gatherTitleContext(record, { requireExchange: true }),
     generate: (context) => generateTitle(context),
+    mirrorTitle: (record, title) => writeHiveTitle(record, title),
     now: () => Date.now(),
     ...overrides,
   };
@@ -78,6 +82,9 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
             return;
           }
           await deps.updateSession(record.name, { title, titleSource: "auto", updatedAt: new Date(deps.now()).toISOString() });
+          // Fire-and-forget: the tmux mirror is best-effort and must not delay
+          // (or fail) the outcome report.
+          void deps.mirrorTitle(fresh, title).catch(() => undefined);
           finished.push({ bee: record.name, ok: true, title });
         })
         .catch((error) => {

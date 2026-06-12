@@ -101,7 +101,7 @@ import { resolveSelector } from "./selectors.js";
 import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
-import { writeHiveState, writeSpawnOptions } from "./hiveState.js";
+import { writeHiveState, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { gatherTitleContext, generateTitle } from "./naming.js";
@@ -600,6 +600,7 @@ async function cmdRename(parsed: Parsed) {
     if (clear) {
       // Dropping autoTitleAt too makes the bee a daemon auto-title candidate again.
       await updateSession(record.name, { title: undefined, titleSource: undefined, autoTitleAt: undefined, updatedAt: now });
+      await writeHiveTitle(record, "");
       if (isPretty()) console.log(actionLine("ok", "rename", [bold(record.name), dim("title cleared")]));
       else console.log(`renamed\t${record.name}\t`);
       continue;
@@ -625,6 +626,7 @@ async function cmdRename(parsed: Parsed) {
       // An explicit --auto also counts as this bee's one automatic attempt.
       ...(auto ? { autoTitleAt: now } : {}),
     });
+    await writeHiveTitle(record, title);
     if (isPretty()) console.log(actionLine("ok", "rename", [bold(record.name), title, dim(source)]));
     else console.log(`renamed\t${record.name}\t${title}\t${source}`);
   }

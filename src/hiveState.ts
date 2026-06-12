@@ -52,6 +52,15 @@ export async function writeHiveState(record: SessionRef, state: HiveTmuxState): 
   }
 }
 
+/** Mirror the bee's display title (rename/auto/provider); "" clears it. */
+export async function writeHiveTitle(record: SessionRef, title: string): Promise<void> {
+  try {
+    await substrateFor(record).setUserOptions(record.tmuxTarget, { "@hive_title": title });
+  } catch {
+    // best-effort
+  }
+}
+
 /** Stamp a freshly spawned bee's session with its hive identity + working state. */
 export async function writeSpawnOptions(record: SessionRecord): Promise<void> {
   try {
@@ -59,6 +68,7 @@ export async function writeSpawnOptions(record: SessionRecord): Promise<void> {
       "@hive_id": record.id ?? record.name,
       "@hive_colony": record.colony ?? "",
       "@hive_swarm": record.swarmId ?? "",
+      "@hive_title": record.title ?? "",
       [HIVE_STATE_OPTION]: "working",
     });
   } catch {
