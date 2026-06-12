@@ -56,6 +56,8 @@ function fakeSubstrate(impl: Partial<Substrate> = {}): Substrate {
     sendEnter: async () => undefined,
     sendKey: async () => undefined,
     listSessions: async () => [],
+    listSessionStates: async () => new Map<string, string>(),
+    setUserOptions: async () => undefined,
     attachCommand: () => ["tmux", "attach"],
     attachSession: async () => undefined,
   };

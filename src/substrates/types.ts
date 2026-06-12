@@ -30,6 +30,16 @@ export type Substrate = {
   sendEnter(target: string): Promise<void>;
   sendKey(target: string, key: string): Promise<void>;
   listSessions(): Promise<string[]>;
+  /**
+   * One list-sessions call: live session name → its @hive_state user option
+   * (empty string when unset). Returns an empty map when the server is down.
+   */
+  listSessionStates(): Promise<Map<string, string>>;
+  /**
+   * Best-effort write of tmux session user options (@key value). A missing
+   * session or server must never break the caller — failures are swallowed.
+   */
+  setUserOptions(target: string, options: Record<string, string>): Promise<void>;
   attachCommand(target: string): string[];
   attachSession(target: string): Promise<void>;
 };

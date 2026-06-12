@@ -160,6 +160,32 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
   }
 
+  async function listSessionStates(): Promise<Map<string, string>> {
+    const states = new Map<string, string>();
+    const result = await runTmux(["list-sessions", "-F", "#{session_name}\t#{@hive_state}"]).catch(() => null);
+    if (!result || result.exitCode !== 0) return states;
+    for (const line of result.stdout.split("\n")) {
+      const tab = line.indexOf("\t");
+      if (tab <= 0) continue;
+      states.set(line.slice(0, tab), line.slice(tab + 1).trim());
+    }
+    return states;
+  }
+
+  async function setUserOptions(target: string, options: Record<string, string>): Promise<void> {
+    const entries = Object.entries(options);
+    if (entries.length === 0) return;
+    // One ssh round-trip: a literal ";" argv element separates tmux commands
+    // (shellQuote keeps it inert through the remote shell). Best-effort by
+    // contract — transport or tmux failures are swallowed.
+    const args: string[] = [];
+    entries.forEach(([key, value], index) => {
+      if (index > 0) args.push(";");
+      args.push("set-option", "-t", `=${target}`, key, value);
+    });
+    await runTmux(args).catch(() => undefined);
+  }
+
   function attachCommand(target: string): string[] {
     // No multiplexing defaults on the interactive path (printed by --print).
     // Inside tmux this becomes a new-window wrapping of the ssh attach.
@@ -202,6 +228,8 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     sendEnter,
     sendKey,
     listSessions,
+    listSessionStates,
+    setUserOptions,
     attachCommand,
     attachSession,
   };

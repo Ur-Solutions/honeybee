@@ -1,6 +1,7 @@
 import { readFileSync, unlinkSync } from "node:fs";
 import { listAccounts, syncAllClaudeChainsToVault, syncClaudeChainToVault } from "../accounts.js";
 import { acquireLongLivedLock, type LongLivedLock, LockBusyError } from "../fsx.js";
+import { hiveStateFor, writeHiveState } from "../hiveState.js";
 import { listNodes, type NodeRecord } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
@@ -40,6 +41,12 @@ export type TickDeps = {
   sealedBeeNames: () => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
+  /**
+   * Optional mirror of state transitions onto the bee's tmux session as the
+   * @hive_state user option (status bars read it live). Best-effort: only
+   * invoked on transitions, never on steady state.
+   */
+  mirrorHiveState?: (record: SessionRecord, state: BeeState) => Promise<void>;
   /** Best-effort transcript path/provider title discovery. */
   refreshTranscriptMetadata?: (record: SessionRecord) => Promise<SessionRecord | null>;
   /** Append a single event to the ledger (used for state.transition). */
@@ -148,6 +155,13 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     const prev = previousObserved.get(record.name);
     if (prev !== derived.state) {
       transitions.push({ name: record.name, from: prev, to: derived.state });
+      if (deps.mirrorHiveState) {
+        try {
+          await deps.mirrorHiveState(record, derived.state);
+        } catch (error) {
+          errors.push(toError(error));
+        }
+      }
     }
 
     // Persist the latest observed state. Errors are captured but do not abort the loop.
@@ -548,6 +562,10 @@ export function buildDefaultDeps(): TickDeps {
     capturePanes: defaultCapturePanes,
     sealedBeeNames,
     touchSession,
+    mirrorHiveState: async (record, state) => {
+      const mapped = hiveStateFor(state);
+      if (mapped) await writeHiveState(record, mapped);
+    },
     refreshTranscriptMetadata: refreshSessionTranscriptMetadata,
     appendLedger,
     dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),

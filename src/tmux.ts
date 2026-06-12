@@ -9,12 +9,14 @@ export {
   formatShellCommand,
   hasSession,
   kill,
+  listSessionStates,
   listTmuxSessions,
   newSession,
   probe,
   sendEnter,
   sendKey,
   sendText,
+  setUserOptions,
   tmux,
 } from "./substrates/local-tmux.js";
 export type { LaunchSpec } from "./substrates/local-tmux.js";

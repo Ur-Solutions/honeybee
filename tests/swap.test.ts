@@ -45,6 +45,8 @@ function fakeSubstrate(initiallyAlive: boolean) {
     sendEnter: async () => undefined,
     sendKey: async () => undefined,
     listSessions: async () => [],
+    listSessionStates: async () => new Map<string, string>(),
+    setUserOptions: async () => undefined,
     attachCommand: () => [],
     attachSession: async () => undefined,
   };

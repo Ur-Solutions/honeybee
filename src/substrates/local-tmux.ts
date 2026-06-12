@@ -146,6 +146,36 @@ export async function listSessions(): Promise<string[]> {
 
 export const listTmuxSessions = listSessions;
 
+export async function listSessionStates(): Promise<Map<string, string>> {
+  const states = new Map<string, string>();
+  const result = await tmux(["list-sessions", "-F", "#{session_name}\t#{@hive_state}"], { reject: false });
+  if (!result.ok) return states;
+  for (const line of result.stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab <= 0) continue;
+    states.set(line.slice(0, tab), line.slice(tab + 1).trim());
+  }
+  return states;
+}
+
+export async function setUserOptions(target: string, options: Record<string, string>): Promise<void> {
+  const entries = Object.entries(options);
+  if (entries.length === 0) return;
+  // One invocation: tmux parses a literal ";" argv element as a command
+  // separator. Best-effort by contract — reject:false swallows a missing
+  // session/server, and the catch guards everything else (e.g. ENOENT).
+  const args: string[] = [];
+  entries.forEach(([key, value], index) => {
+    if (index > 0) args.push(";");
+    args.push("set-option", "-t", `=${target}`, key, value);
+  });
+  try {
+    await tmux(args, { reject: false });
+  } catch {
+    // best-effort
+  }
+}
+
 export async function probe(): Promise<ProbeResult> {
   try {
     await execFileAsync("tmux", ["-V"], { maxBuffer: 64 * 1024 });
@@ -219,6 +249,8 @@ export function createLocalTmuxSubstrate(): Substrate {
     sendEnter,
     sendKey,
     listSessions,
+    listSessionStates,
+    setUserOptions,
     attachCommand,
     attachSession,
   };

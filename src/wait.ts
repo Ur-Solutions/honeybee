@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { cyan, dim, isPretty, tildify } from "./format.js";
+import { writeHiveState } from "./hiveState.js";
 import { isPermissionPromptPane } from "./readiness.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
 import { appendLedger, type SessionRecord } from "./store.js";
@@ -81,6 +82,8 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
         console.log(lastPane);
       }
       await appendLedger({ type: "session.wait", session: record.name, agent: record.agent, cwd: record.cwd, idleMs, timeoutMs, transcriptPath: lastTxPath });
+      // blocked = stalled on a human decision (waiting); idle = turn finished (done).
+      await writeHiveState(record, blocked ? "waiting" : "done");
       return { state: blocked ? "blocked" : "idle" };
     }
 

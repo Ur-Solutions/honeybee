@@ -101,6 +101,7 @@ import { resolveSelector } from "./selectors.js";
 import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
+import { writeHiveState, writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { gatherTitleContext, generateTitle } from "./naming.js";
@@ -352,6 +353,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.autoswap ? { autoswap: true } : {}),
   };
   await saveSession(record);
+  await writeSpawnOptions(record);
   return record;
 }
 
@@ -543,6 +545,7 @@ async function cmdSeal(parsed: Parsed) {
 
   for (const record of records) {
     const stored = await recordSeal(record.name, artifact);
+    await writeHiveState(record, "done");
     if (isPretty()) console.log(actionLine("ok", "seal", [bold(record.name), dim(stored.status), dim(stored.type ?? "")]));
     else console.log(`sealed\t${record.name}\t${stored.status}\t${stored.type ?? ""}\t${stored.sealedAt}`);
   }
@@ -640,6 +643,7 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
   }
   const delivered = augmentBrief(parsed, briefText);
   await substrateFor(record).sendText(record.tmuxTarget, delivered);
+  await writeHiveState(record, "working");
   const now = new Date().toISOString();
   const persisted = await updateSession(record.name, { updatedAt: now, status: "running", brief: briefText, briefedAt: now });
   if (!persisted) {
@@ -672,6 +676,8 @@ async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise
       acceptTrust: acceptsTrust(parsed),
       raiseDroidAutonomy: dangerousMode(parsed, record.agent),
     });
+    // The agent reached its prompt: it is waiting for input until briefed/prompted.
+    await writeHiveState(record, "waiting");
   } catch (error) {
     if (!(error instanceof AgentReadinessError)) throw error;
     if (isPretty()) console.error(actionLine("warn", "spawn", [`${bold(record.name)} not confirmed ready (${error.reason})`]));
@@ -727,6 +733,7 @@ async function cmdSend(parsed: Parsed) {
     await substrateFor(record).sendText(record.tmuxTarget, prompt);
     const now = new Date().toISOString();
     await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+    await writeHiveState(record, "working");
     await appendLedger({ type: "prompt.send", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
     if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
     else console.log(`sent\t${record.name}\t${prompt.length} chars`);
@@ -794,12 +801,19 @@ async function cmdList(parsed: Parsed) {
   };
   const states = new Map(records.map((record) => [record.name, deriveState(record, context)] as const));
 
+  // Live @hive_state (set by hive itself and by agent hooks) wins over the
+  // store-derived state — the tmux server is the source of truth for live bees.
+  const liveHiveState = (record: SessionRecord): string | undefined => {
+    const state = probe.states.get(liveTargetKey(record.node, record.tmuxTarget));
+    return state && state.length > 0 ? state : undefined;
+  };
+
   if (!isPretty()) {
     const marker = { start: "", end: "" };
     for (const record of records) {
       const derived = states.get(record.name)!;
       const ref = highlightUniqueSessionReference(records, record, marker);
-      console.log(`${derived.state}\t${ref}\t${sessionDisplayName(record, { collapseDefaultId: false })}\t${record.agent}\t${record.cwd}\t${record.command}`);
+      console.log(`${liveHiveState(record) ?? derived.state}\t${ref}\t${sessionDisplayName(record, { collapseDefaultId: false })}\t${record.agent}\t${record.cwd}\t${record.command}`);
     }
     if (probe.unreachableNodes.size > 0) {
       console.error(`# ${probe.unreachableNodes.size} node(s) unreachable: ${[...probe.unreachableNodes].join(", ")}`);
@@ -832,8 +846,9 @@ async function cmdList(parsed: Parsed) {
     const ageText = formatRelativeTime(ageSource, now);
     const age = isTerminalState(derived.state) ? dim(ageText) : ageText;
     const nodeName = record.node ?? LOCAL_NODE_NAME;
+    const live = liveHiveState(record);
     const base = [
-      formatStateCell(derived.state),
+      live ? formatHiveStateCell(live) : formatStateCell(derived.state),
       ref,
       name,
       truncate(record.agent, 12),
@@ -879,6 +894,8 @@ export type MultiNodeLiveProbe = {
   liveTargets: Set<string>;
   unreachableNodes: Set<string>;
   perNode: Map<string, string[]>;
+  /** Live @hive_state per session, keyed like liveTargets (empty string when unset). */
+  states: Map<string, string>;
 };
 
 async function liveTargetsAcrossNodes(nodes: NodeRecord[], nodeFilter?: string): Promise<MultiNodeLiveProbe> {
@@ -887,6 +904,7 @@ async function liveTargetsAcrossNodes(nodes: NodeRecord[], nodeFilter?: string):
   const liveTargets = new Set<string>();
   const unreachableNodes = new Set<string>();
   const perNode = new Map<string, string[]>();
+  const states = new Map<string, string>();
   const targetNodes = nodeFilter ? nodes.filter((n) => n.name === nodeFilter) : nodes;
   const queries = targetNodes.map(async (node) => {
     try {
@@ -899,15 +917,20 @@ async function liveTargetsAcrossNodes(nodes: NodeRecord[], nodeFilter?: string):
         unreachableNodes.add(node.name);
         return;
       }
-      const result = await withTimeout(substrate.listSessions(), timeoutMs);
-      perNode.set(node.name, result);
-      for (const target of result) liveTargets.add(liveTargetKey(node.name, target));
+      // One list-sessions call per node delivers liveness AND live @hive_state.
+      const result = await withTimeout(substrate.listSessionStates(), timeoutMs);
+      perNode.set(node.name, [...result.keys()]);
+      for (const [target, state] of result) {
+        const key = liveTargetKey(node.name, target);
+        liveTargets.add(key);
+        states.set(key, state);
+      }
     } catch {
       unreachableNodes.add(node.name);
     }
   });
   await Promise.allSettled(queries);
-  return { liveTargets, unreachableNodes, perNode };
+  return { liveTargets, unreachableNodes, perNode, states };
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -933,6 +956,21 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
       },
     );
   });
+}
+
+function formatHiveStateCell(state: string): string {
+  switch (state) {
+    case "working":
+      return `${green("●")} ${green(state)}`;
+    case "waiting":
+      return `${yellow("●")} ${yellow(state)}`;
+    case "done":
+      return `${dim("●")} ${state}`;
+    case "failed":
+      return `${red("●")} ${red(state)}`;
+    default:
+      return `${dim("●")} ${state}`;
+  }
 }
 
 function formatStateCell(state: BeeState): string {
@@ -1476,6 +1514,7 @@ async function cmdRun(parsed: Parsed) {
     await substrateFor(record).sendText(record.tmuxTarget, prompt);
     const now = new Date().toISOString();
     await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+    await writeHiveState(record, "working");
     await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
 
     if (truthy(flag(parsed, "wait"))) {
@@ -1575,6 +1614,7 @@ async function cmdX(parsed: Parsed) {
   await substrateFor(record).sendText(record.tmuxTarget, prompt);
   const now = new Date().toISOString();
   await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+  await writeHiveState(record, "working");
   await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
   if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
   else console.log(`sent\t${record.name}\t${prompt.length} chars`);

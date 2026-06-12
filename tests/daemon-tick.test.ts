@@ -287,3 +287,30 @@ test("tick: unreachable node yields node_unreachable state and is reported on re
     assert.equal(result.unreachableNodes.has("mini01"), true);
   });
 });
+
+test("tick: mirrors hive state onto tmux only on transitions", async () => {
+  await withTempStore(async () => {
+    const NOW = Date.parse("2026-06-03T10:00:00.000Z");
+    const record = bee({ lastPromptAt: new Date(NOW - 60_000).toISOString() });
+    const capture: Capture = { ledger: [], touches: [] };
+    const mirrored: Array<{ name: string; state: BeeState }> = [];
+    const deps: TickDeps = {
+      ...buildDeps({
+        records: [record],
+        liveTargets: new Set([record.tmuxTarget]),
+        panes: new Map([[record.tmuxTarget, "done\n\n› next task"]]),
+        now: NOW,
+        capture,
+      }),
+      mirrorHiveState: async (rec, state) => {
+        mirrored.push({ name: rec.name, state });
+      },
+    };
+    // active -> idle_with_output mirrors exactly once...
+    await tick(deps, new Map([[record.name, "active"]]));
+    assert.deepEqual(mirrored, [{ name: record.name, state: "idle_with_output" }]);
+    // ...and a steady-state tick mirrors nothing.
+    await tick(deps, new Map([[record.name, "idle_with_output"]]));
+    assert.equal(mirrored.length, 1);
+  });
+});
