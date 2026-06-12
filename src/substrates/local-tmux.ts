@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { buildAttachArgv } from "../attach.js";
 import {
   LOCAL_NODE,
   type KillResult,
@@ -90,9 +91,7 @@ export async function kill(target: string): Promise<KillResult> {
 }
 
 export function attachCommand(target: string): string[] {
-  // "=" pins tmux to an exact session name; without it tmux prefix-matching
-  // could attach a different session (e.g. CL-abcd when CL-abc is gone).
-  return process.env.TMUX ? ["tmux", "switch-client", "-t", `=${target}`] : ["tmux", "attach-session", "-t", `=${target}`];
+  return buildAttachArgv({ sessionName: target, insideTmux: Boolean(process.env.TMUX) });
 }
 
 export async function attachSession(target: string): Promise<void> {

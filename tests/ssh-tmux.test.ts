@@ -109,10 +109,40 @@ test("newSession shell-quotes cwd when it contains spaces or shell metacharacter
   assert.equal(argv[argv.indexOf("-c") + 1], "'/tmp/path with spaces'");
 });
 
+/** attachCommand branches on $TMUX at call time — pin it so the test suite
+ * behaves identically inside and outside a tmux client. */
+function withTmuxEnv<T>(value: string | undefined, fn: () => T): T {
+  const previous = process.env.TMUX;
+  if (value === undefined) delete process.env.TMUX;
+  else process.env.TMUX = value;
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) delete process.env.TMUX;
+    else process.env.TMUX = previous;
+  }
+}
+
 test("attachCommand returns ssh -t <endpoint> tmux attach-session -t <target>", () => {
   const cap = captureExec();
   const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
-  assert.deepEqual(s.attachCommand("alpha"), ["ssh", "-t", "trmd@mini01", "tmux", "attach-session", "-t", "=alpha"]);
+  withTmuxEnv(undefined, () => {
+    assert.deepEqual(s.attachCommand("alpha"), ["ssh", "-t", "trmd@mini01", "tmux", "attach-session", "-t", "=alpha"]);
+  });
+});
+
+test("attachCommand inside tmux opens the ssh attach as a new window (never nests)", () => {
+  const cap = captureExec();
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  withTmuxEnv("/tmp/tmux-501/default,1,0", () => {
+    assert.deepEqual(s.attachCommand("alpha"), [
+      "tmux",
+      "new-window",
+      "-n",
+      "alpha",
+      "ssh -t trmd@mini01 tmux attach-session -t =alpha",
+    ]);
+  });
 });
 
 test("attachCommand respects NodeRecord.sshCommand and sshArgs", () => {
@@ -121,19 +151,21 @@ test("attachCommand respects NodeRecord.sshCommand and sshArgs", () => {
     node: mini({ sshCommand: "/usr/local/bin/ssh", sshArgs: ["-F", "/etc/ssh/config", "-p", "2222"] }),
     execHook: cap.hook,
   });
-  assert.deepEqual(s.attachCommand("alpha"), [
-    "/usr/local/bin/ssh",
-    "-t",
-    "-F",
-    "/etc/ssh/config",
-    "-p",
-    "2222",
-    "trmd@mini01",
-    "tmux",
-    "attach-session",
-    "-t",
-    "=alpha",
-  ]);
+  withTmuxEnv(undefined, () => {
+    assert.deepEqual(s.attachCommand("alpha"), [
+      "/usr/local/bin/ssh",
+      "-t",
+      "-F",
+      "/etc/ssh/config",
+      "-p",
+      "2222",
+      "trmd@mini01",
+      "tmux",
+      "attach-session",
+      "-t",
+      "=alpha",
+    ]);
+  });
 });
 
 test("attachSession spawns ssh with an exact-match (=) target", async () => {
@@ -145,7 +177,13 @@ test("attachSession spawns ssh with an exact-match (=) target", async () => {
     await chmod(stubPath, 0o755);
     const cap = captureExec();
     const s = createSshTmuxSubstrate({ node: mini({ sshCommand: stubPath }), execHook: cap.hook });
-    await s.attachSession("alpha");
+    const previousTmux = process.env.TMUX;
+    delete process.env.TMUX;
+    try {
+      await s.attachSession("alpha");
+    } finally {
+      if (previousTmux !== undefined) process.env.TMUX = previousTmux;
+    }
     const argv = (await readFile(argvLog, "utf8")).trim().split("\n");
     assert.deepEqual(argv, ["-t", "trmd@mini01", "tmux", "attach-session", "-t", "=alpha"]);
   } finally {

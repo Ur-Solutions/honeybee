@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import { buildAttachArgv } from "../attach.js";
 import type { NodeRecord } from "../node.js";
 import { formatShellCommand } from "./local-tmux.js";
 import type { KillResult, LaunchSpec, ProbeResult, Substrate } from "./types.js";
@@ -160,10 +161,13 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   }
 
   function attachCommand(target: string): string[] {
-    // "=" pins tmux to an exact session name; without it tmux prefix-matching
-    // could attach a different session (e.g. CL-abcd when CL-abc is gone).
-    // Printed by `hive attach --print` (no multiplexing defaults).
-    return [sshBinary, "-t", ...sshBaseArgs, node.endpoint, ...["tmux", "attach-session", "-t", `=${target}`].map(shellQuote)];
+    // No multiplexing defaults on the interactive path (printed by --print).
+    // Inside tmux this becomes a new-window wrapping of the ssh attach.
+    return buildAttachArgv({
+      sessionName: target,
+      insideTmux: Boolean(process.env.TMUX),
+      remote: { endpoint: node.endpoint, sshBinary, sshArgs: sshBaseArgs },
+    });
   }
 
   async function attachSession(target: string): Promise<void> {
