@@ -40,6 +40,16 @@ test("identity recipes exist for the phase-3 tool set", () => {
   assert.equal(identityRecipeForAgent("pi"), undefined);
 });
 
+test("codex login seats start credential-less; claude seats keep seeding", () => {
+  // Codex only shows its sign-in flow when auth.json is absent, and its
+  // boot-time token refresh rewrites a seeded auth.json — which would trip
+  // the seat's mtime freshness check and capture the old account instantly.
+  assert.equal(identityRecipeForAgent("codex")!.seedLoginSeat, false);
+  // Claude re-login intentionally starts from existing state (/login,
+  // onboarding files); absence of the flag means "seed".
+  assert.notEqual(identityRecipeForAgent("claude")!.seedLoginSeat, false);
+});
+
 test("numeric home slots follow the per-tool convention for every tool", () => {
   assert.equal(resolveHome("claude", "2"), join(homedir(), ".claude-2"));
   assert.equal(resolveHome("codex", "3"), join(homedir(), ".codex-3"));

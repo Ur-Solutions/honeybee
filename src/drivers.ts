@@ -22,6 +22,15 @@ export type IdentityRecipe = {
   activationMirrors?: Record<string, string>;
   /** Explicit extra env for activated spawns. "{home}" expands to the home path. */
   extraEnv?: Record<string, string>;
+  /**
+   * Whether a (re)login seat starts from the account's existing credentials.
+   * Defaults to true: claude keeps its onboarding state and offers /login.
+   * Set false for tools whose sign-in flow only triggers when the primary
+   * credential is absent — codex with a seeded auth.json boots a normal
+   * authenticated session, and its boot-time token refresh rewrites the file,
+   * tripping the seat's mtime freshness check.
+   */
+  seedLoginSeat?: boolean;
 };
 
 export type ExhaustionHit = {
@@ -64,6 +73,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
       // so activation mirrors auth.json there and declares the explicit HOME.
       activationMirrors: { "auth.json": ".codex/auth.json" },
       extraEnv: { HOME: "{home}" },
+      seedLoginSeat: false,
     },
     isExhausted: (pane) => matchExhaustion(pane, /You've hit your usage limit|usage limit reached|rate limit reached/i),
   },

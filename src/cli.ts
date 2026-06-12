@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { access, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
@@ -20,7 +20,7 @@ import {
   syncClaudeChainToVault,
   vaultRoot,
 } from "./accounts.js";
-import { identityEnvForAgent, identityRecipeForAgent } from "./drivers.js";
+import { identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { accountLimits, paceDelta, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
@@ -3836,8 +3836,13 @@ async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
   const markerPath = resolve(seatHome, ".login-seat-started");
 
   if (!(await substrate.hasSession(target))) {
-    // Re-login starts from the existing creds when we have them.
-    if (await accountHasCredentials(account)) {
+    if (recipe.seedLoginSeat === false) {
+      // The tool's sign-in flow only triggers when the primary credential is
+      // absent; the seat home persists across attempts, so stale creds from a
+      // previous seat must go too.
+      await clearSeatCredentials(recipe, seatHome);
+    } else if (await accountHasCredentials(account)) {
+      // Re-login starts from the existing creds when we have them.
       await activateAccountIntoHome(account, seatHome).catch(() => undefined);
     }
     // The marker is the freshness baseline: its mtime for the credentials
@@ -3910,6 +3915,13 @@ async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
     await sleep(2_000);
   }
   throw new Error(`Timed out waiting for ${primary} in ${seatHome}; the seat is still running — ${attachHint}`);
+}
+
+async function clearSeatCredentials(recipe: IdentityRecipe, seatHome: string): Promise<void> {
+  const files = [...recipe.credentialFiles, ...Object.values(recipe.activationMirrors ?? {})];
+  for (const file of files) {
+    await rm(resolve(seatHome, file), { force: true });
+  }
 }
 
 async function readMarkerKeychainDigest(markerPath: string): Promise<string | null> {
