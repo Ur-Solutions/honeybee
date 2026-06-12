@@ -164,10 +164,13 @@ export async function setUserOptions(target: string, options: Record<string, str
   // One invocation: tmux parses a literal ";" argv element as a command
   // separator. Best-effort by contract — reject:false swallows a missing
   // session/server, and the catch guards everything else (e.g. ENOENT).
+  // set-option rejects a bare "=name" target (and silently prefix-matches
+  // without "="!); only the pane-style "=name:" form is both accepted and
+  // exact.
   const args: string[] = [];
   entries.forEach(([key, value], index) => {
     if (index > 0) args.push(";");
-    args.push("set-option", "-t", `=${target}`, key, value);
+    args.push("set-option", "-t", `=${target}:`, key, value);
   });
   try {
     await tmux(args, { reject: false });

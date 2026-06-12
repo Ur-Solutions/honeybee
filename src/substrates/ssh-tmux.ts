@@ -177,11 +177,12 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     if (entries.length === 0) return;
     // One ssh round-trip: a literal ";" argv element separates tmux commands
     // (shellQuote keeps it inert through the remote shell). Best-effort by
-    // contract — transport or tmux failures are swallowed.
+    // contract — transport or tmux failures are swallowed. set-option only
+    // honors "=" exact matching in the pane-style "=name:" target form.
     const args: string[] = [];
     entries.forEach(([key, value], index) => {
       if (index > 0) args.push(";");
-      args.push("set-option", "-t", `=${target}`, key, value);
+      args.push("set-option", "-t", `=${target}:`, key, value);
     });
     await runTmux(args).catch(() => undefined);
   }
