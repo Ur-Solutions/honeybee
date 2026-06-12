@@ -174,6 +174,7 @@ hive list ...
 hive kill ...
 hive clean ...
 hive attach ...
+hive view ...
 hive colony ...
 hive frame ...
 hive swarm ...
@@ -209,7 +210,7 @@ hive spawn <bee> [--name <id>] [--cwd <dir>] [--home|--profile <1|2|3|path>]
   [--account <account>] [--autoswap] [--colony <name>]
   [--brief <text>] [--briefed] [--count <n>]
   [--swarm-id <id>|--swarm <id>] [--node <name>]
-  [--substrate <local:name|ssh:name>] [--yolo|--no-yolo]
+  [--substrate <local:name|ssh:name>] [--here] [--yolo|--no-yolo]
   [--accept-trust|--no-accept-trust] [--no-wait] [--boot-ms <ms>]
   [-- <bee-args...>]
 ```
@@ -221,7 +222,22 @@ hive spawn claude --cwd ~/Projects/app
 hive spawn codex --name review-a --home 2 --cwd .
 hive spawn codex -- --model gpt-5
 hive spawn claude --brief "Context only" --briefed
+hive spawn claude --here     # also link the bee's window into your current tmux session
 ```
+
+`--here` (also on `x`/`xa`): after the normal detached spawn, link the bee's
+window into the tmux session you are calling from and select it (a single
+bee); `--count > 1` links all windows without stealing focus. Purely
+presentational — identity, store record, and lifecycle are unchanged, and the
+bee survives the link being closed. Outside tmux the flag warns and is
+ignored. Local bees only (`link-window` cannot cross tmux servers).
+
+On spawn the bee's tmux session is also stamped with user options —
+`@hive_id`, `@hive_colony`, `@hive_swarm`, `@hive_title`, and `@hive_state`
+(`working`/`waiting`/`done`/`failed`, kept current through readiness, prompts,
+waits, seals, renames, and daemon observations) — so status bars and scripts
+can render hive state straight from `tmux list-sessions -F '#{@hive_state}'`
+without touching the store.
 
 Account-bound spawn:
 
@@ -360,11 +376,20 @@ Cleanup behavior:
 
 ### `hive open`
 
-Identity launcher mode. Run the agent directly in the current terminal or a new
-terminal window. This does not create a tmux session or session record.
+Run an agent where you are. **Contract changed**: `open` now performs a
+*registered* spawn presented in place — inside tmux the bee's window is linked
+into your current session (`--here` semantics); outside tmux it spawns and
+attaches (`xa` semantics). Either way the bee has a tmux session and a store
+record (list/tail/kill/daemon all apply).
+
+The previous behavior — run the agent raw in this terminal, no tmux session,
+no record — is now explicit via `--raw`. `--window`/`--app` imply `--raw`
+(they target external terminal apps by nature). The old default silently
+produced persistent-but-unregistered ghost processes once the daily driver
+moved inside tmux.
 
 ```sh
-hive open <bee> [--window] [--app <terminal>] [--cwd <dir>]
+hive open <bee> [--raw] [--window] [--app <terminal>] [--cwd <dir>]
   [--account <account>] [--home|--profile <1|2|3|path>] [--print]
   [--yolo|--no-yolo] [<bee-flags...>]
 ```
@@ -372,17 +397,17 @@ hive open <bee> [--window] [--app <terminal>] [--cwd <dir>]
 Examples:
 
 ```sh
-hive open claude --account claude-work
+hive open claude --account claude-work   # registered bee, linked/attached here
 hive open claude --account auto          # least-loaded account pick
-hive open codex --window --cwd .
-hive open claude --resume abc123
+hive open claude --resume abc123         # unknown flags still reach the agent
+hive open claude --raw                   # old behavior: raw in this terminal, no record
+hive open codex --window --cwd .         # external window (implies --raw)
 hive open claude -- --print
-hive open codex --print
 ```
 
 `open` consumes only its own flags. Unknown flags are forwarded to the agent, so
-agent-native flags like `--resume` work without `--`. Use `--` when you need to
-pass a flag that `open` itself owns.
+agent-native flags like `--resume` work without `--` in every mode. Use `--`
+when you need to pass a flag that `open` itself owns.
 
 Supported terminal apps depend on `src/terminal.ts`; help lists:
 
@@ -543,7 +568,17 @@ machine shape:
 
 ### `hive attach`
 
-Attach to a bee's tmux session, or print the attach command.
+Attach to a bee's tmux session, or print the attach command. Nesting-safe and
+node-aware — every path picks the right command for where you are:
+
+- Local bee, outside tmux → `tmux attach-session`
+- Local bee, inside tmux → `tmux switch-client` (repoints your current client;
+  attaching inside an existing client would nest and is never emitted)
+- Remote bee, outside tmux → `ssh -t <endpoint> tmux attach-session ...`
+- Remote bee, inside tmux → the ssh attach opens as a new window in your
+  current session
+
+`--print` prints the context-appropriate command instead of executing it.
 
 ```sh
 hive attach <session> [--print]
@@ -555,6 +590,47 @@ Examples:
 hive attach CO.a3f
 hive attach CO.a3f --print
 ```
+
+### `hive view`
+
+Colony cockpit: link live bees' windows into one ephemeral tmux session
+(`view-<name>`) and enter it. Windows are server-level objects — a link is a
+second handle onto the same window, so the view renders many bees without
+copying or moving anything, and bells/activity flags show up per window.
+
+```sh
+hive view <selector> [--name <name>] [--new-client] [--print]
+hive view --close <name>
+```
+
+Examples:
+
+```sh
+hive view @t1                  # cockpit for swarm t1 → view-t1
+hive view colony:fe --name fe  # explicit name → view-fe
+hive view @t1                  # re-run after the swarm grew: links only new bees
+hive view @t1 --new-client     # grouped session (view-t1-2): same windows, independent focus
+hive view --close t1           # unlink everything, remove the view
+```
+
+Behavior and guarantees:
+
+- Views are ephemeral and tmux-derived: no store records. They are invisible
+  to selectors, `list`, and `clean`.
+- Re-running `view` dedupes by window id — only bees not already in the view
+  are linked.
+- `--new-client` creates a grouped session sharing the same windows with
+  independent focus (two screens browsing one colony).
+- `--close` unlinks every bee window (never `kill-window`, never
+  `unlink-window -k`) and then kills only the view session itself. Every bee
+  window keeps its home link in the bee's own session, so closing a view is
+  provably incapable of killing a bee; if anything refuses to unlink the close
+  aborts instead of killing.
+- Local bees only — `link-window` cannot cross tmux servers; remote bees are
+  skipped with a warning.
+- Caveat: `hive kill` on a bee whose window is linked in a view removes the
+  bee's session, but the linked window (and the agent process) survives in the
+  view until the view is closed.
 
 ### `hive kill`
 

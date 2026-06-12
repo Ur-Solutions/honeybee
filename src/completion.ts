@@ -15,7 +15,7 @@ import { listTmuxSessions } from "./tmux.js";
 
 const COMMANDS = [
   "spawn", "send", "tail", "transcript", "last", "wait",
-  "list", "ls", "ps", "kill", "clean", "run", "x", "attach",
+  "list", "ls", "ps", "kill", "clean", "run", "x", "xa", "attach", "view",
   "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
@@ -55,7 +55,7 @@ const SHELLS = ["bash", "zsh", "fish"];
 
 const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
-const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach"]);
+const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach", "view"]);
 const SESSION_ANY = new Set(["kill", "last", "seal", "rename"]);
 const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
@@ -63,16 +63,17 @@ const SHELL_FIRST_ARG = new Set(["completion"]);
 const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
+  spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
   xa: [
     "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony", "--print",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
-    "--yolo", "--no-yolo", "--dangerous", "--boot-ms",
+    "--yolo", "--no-yolo", "--dangerous", "--boot-ms", "--here",
   ],
-  open: ["--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust"],
+  open: ["--raw", "--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust"],
+  view: ["--name", "--new-client", "--close", "--print"],
   usage: ["--samples", "--json", "--ttl"],
   limits: ["--samples", "--json", "--ttl"],
   sessions: ["--home", "--json"],
@@ -91,7 +92,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   x: [
     "--prompt", "-p", "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
-    "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate",
+    "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate", "--here",
   ],
   send: ["--prompt", "-p"],
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],
