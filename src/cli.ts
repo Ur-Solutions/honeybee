@@ -102,6 +102,7 @@ import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTar
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { writeHiveState, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
+import { buildView, closeView, createGroupedView, deriveViewName, viewSessionName } from "./view.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { gatherTitleContext, generateTitle } from "./naming.js";
@@ -175,6 +176,9 @@ async function main(argv: string[]) {
       break;
     case "attach":
       await cmdAttach(parsed);
+      break;
+    case "view":
+      await cmdView(parsed);
       break;
     case "completion":
       await cmdCompletion(parsed);
@@ -3754,6 +3758,58 @@ async function resolveSpawnColony(parsed: Parsed): Promise<string | undefined> {
   return record.name;
 }
 
+// Colony cockpit: an ephemeral tmux session whose windows are links to live
+// bees' windows. tmux-derived, no store records; closing a view is provably
+// incapable of killing a bee (see src/view.ts).
+async function cmdView(parsed: Parsed) {
+  const closeName = flag(parsed, "close");
+  if (closeName !== undefined) {
+    if (typeof closeName !== "string" || closeName.length === 0) throw new Error("Usage: hive view --close <name>");
+    const result = await closeView(closeName);
+    if (isPretty()) console.log(actionLine("ok", "view", [bold(viewSessionName(closeName)), dim(`closed, ${result.unlinked} window(s) unlinked`)]));
+    else console.log(`view-closed\t${viewSessionName(closeName)}\t${result.unlinked}`);
+    return;
+  }
+
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: hive view <selector> [--name <name>] [--new-client]  |  hive view --close <name>");
+  const nameFlag = flag(parsed, "name");
+  const name = typeof nameFlag === "string" && nameFlag.length > 0 ? nameFlag : deriveViewName(target);
+
+  const resolved = await resolveSelector(target);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
+
+  const local = records.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
+  if (local.length < records.length) {
+    console.error(note(`skip ${records.length - local.length} remote bee(s) — link-window cannot cross tmux servers`));
+  }
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const live = local.filter((record) => liveNames.has(record.tmuxTarget));
+  if (live.length < local.length) console.error(note(`skip ${local.length - live.length} dead bee(s)`));
+  if (live.length === 0) throw new Error(`No live local bees match selector: ${target}`);
+
+  const result = await buildView(name, live.map((record) => record.tmuxTarget));
+  const parts = [bold(result.session), `${result.linked.length} bee(s) linked`];
+  if (result.alreadyLinked > 0) parts.push(dim(`${result.alreadyLinked} already linked`));
+  if (isPretty()) console.log(actionLine("ok", "view", parts));
+  else console.log(`view\t${result.session}\t${result.linked.length}\t${result.alreadyLinked}`);
+
+  let enterTarget = result.session;
+  if (truthy(flag(parsed, "new-client"))) {
+    enterTarget = await createGroupedView(name);
+    if (isPretty()) console.error(note(`grouped session ${enterTarget} — independent focus on the same windows`));
+  }
+
+  const substrate = localSubstrate();
+  if (truthy(flag(parsed, "print")) || !process.stdout.isTTY) {
+    if (isPretty()) console.error(note("enter with:"));
+    console.log(formatShellCommand(substrate.attachCommand(enterTarget)));
+    return;
+  }
+  await substrate.attachSession(enterTarget);
+}
+
 async function cmdAttach(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive attach <session> [--print]");
@@ -4327,7 +4383,8 @@ function printHelp() {
     ["ps", "[--colony <name>] [--swarm <id>] [--node <name>] [--wide]", "alias for list"],
     ["kill", "<session>", "stop a session and remove its metadata"],
     ["clean", "(--dead|--idle|-i) [--older-than <age>] [--dry-run|-n]", "remove dead metadata, kill idle bees, or pick targets in an interactive cleanup TUI"],
-    ["attach", "<session> [--print]", "attach to the tmux session (or print the command)"],
+    ["attach", "<session> [--print]", "attach to the tmux session (or print the command); nesting-safe inside tmux"],
+    ["view", "<selector> [--name <n>] [--new-client] | --close <n>", "colony cockpit: link live bees' windows into an ephemeral view-<n> session (re-run to pick up new bees; --close unlinks and removes the view, bees untouched)"],
     ["colony", "<list|create|inspect|archive|update|rename> [name]", "manage project-scoped namespaces"],
     ["frame", "<list|define|update|reload|edit|inspect|remove> [name|path]", "manage reusable swarm blueprints"],
     ["swarm", "<list|inspect|destroy> [@id]", "manage live or destroyed bee cohorts"],

@@ -153,13 +153,14 @@ export async function closeView(name: string): Promise<CloseViewResult> {
   // Grouped sessions share the window set; enumerate the whole group so the
   // final kill sweeps view-<name>-<n> clients too.
   const groupResult = await tmux(["list-sessions", "-F", "#{session_name}\t#{session_group}"], { reject: false });
-  const lines = groupResult.ok ? groupResult.stdout.split("\n").filter(Boolean) : [];
-  const groupOf = new Map(lines.map((line) => line.split("\t") as [string, string]));
-  const group = groupOf.get(session) ?? "";
-  const sessions = lines
-    .filter(([, g]) => (group ? g === group : false))
-    .map(([s]) => s)
-    .filter((s) => s === session || s.startsWith(`${session}-`));
+  const pairs = (groupResult.ok ? groupResult.stdout.split("\n").filter(Boolean) : []).map((line) => {
+    const tab = line.indexOf("\t");
+    return [tab >= 0 ? line.slice(0, tab) : line, tab >= 0 ? line.slice(tab + 1) : ""] as const;
+  });
+  const group = pairs.find(([s]) => s === session)?.[1] ?? "";
+  const sessions = pairs
+    .filter(([s, g]) => s === session || (group.length > 0 && g === group && s.startsWith(`${session}-`)))
+    .map(([s]) => s);
   if (!sessions.includes(session)) sessions.unshift(session);
 
   const listResult = await tmux(["list-windows", "-t", `=${session}`, "-F", "#{window_id}"]);
