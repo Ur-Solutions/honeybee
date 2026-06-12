@@ -65,3 +65,21 @@ test("view: link, dedupe on re-run, grouped client, close leaves bees alive", { 
   assert.equal(await hasSession("CL-v2"), true, "bee CL-v2 must survive --close");
   assert.equal(await hasSession("CL-v3"), true, "bee CL-v3 must survive --close");
 });
+
+test("linkHere links into the current session and selects single bees", { timeout: 60_000 }, async () => {
+  const { linkHere } = await import("../src/view.js");
+  await tmux(["new-session", "-d", "-s", "driver", "sleep 120"]);
+  await tmux(["new-session", "-d", "-s", "CL-h1", "sleep 120"]);
+  const result = await linkHere(["CL-h1"], { select: true, currentSession: "driver" });
+  assert.equal(result.session, "driver");
+  assert.equal(result.linked, 1);
+  const wid = (await tmux(["display-message", "-p", "-t", "=CL-h1:", "#{window_id}"])).stdout.trim();
+  const driverWindows = (await tmux(["list-windows", "-t", "=driver", "-F", "#{window_id} #{window_active}"])).stdout;
+  assert.ok(driverWindows.includes(wid), "bee window linked into driver session");
+  assert.ok(driverWindows.includes(`${wid} 1`), "linked window selected");
+  // Idempotent: re-linking is a no-op.
+  const again = await linkHere(["CL-h1"], { select: true, currentSession: "driver" });
+  assert.equal(again.linked, 0);
+  // The bee's own session is untouched.
+  assert.equal(await hasSession("CL-h1"), true);
+});

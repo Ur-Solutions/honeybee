@@ -28,6 +28,7 @@ export const BOOLEAN_FLAGS = new Set([
   "window",
   "forever",
   "help",
+  "here",
   "i",
   "interactive",
   "json",

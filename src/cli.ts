@@ -102,7 +102,7 @@ import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTar
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { writeHiveState, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
-import { buildView, closeView, createGroupedView, deriveViewName, viewSessionName } from "./view.js";
+import { buildView, closeView, createGroupedView, deriveViewName, linkHere, viewSessionName } from "./view.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { gatherTitleContext, generateTitle } from "./naming.js";
@@ -272,15 +272,45 @@ async function main(argv: string[]) {
 async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
   const frameName = typeof flag(parsed, "frame") === "string" ? String(flag(parsed, "frame")) : undefined;
   const count = resolveSpawnCount(parsed);
+  let records: SessionRecord[];
   if (frameName) {
-    const records = await spawnFromFrame(parsed, frameName);
-    return records[0]!;
+    records = await spawnFromFrame(parsed, frameName);
+  } else if (count > 1) {
+    records = await spawnHomogeneousSwarm(parsed, count);
+  } else {
+    records = [await spawnSingleBee(parsed)];
   }
-  if (count > 1) {
-    const records = await spawnHomogeneousSwarm(parsed, count);
-    return records[0]!;
+  await maybeLinkHere(parsed, records);
+  return records[0]!;
+}
+
+/**
+ * `--here`: after the normal detached spawn (registration, readiness, briefs
+ * all unchanged), link the bee's window into the caller's current session —
+ * presentation only. A single bee gets selected; swarms link without focus.
+ */
+async function maybeLinkHere(parsed: Parsed, records: SessionRecord[]): Promise<void> {
+  if (!truthy(flag(parsed, "here"))) return;
+  if (!process.env.TMUX) {
+    console.error(note("--here ignored: not inside tmux (plain spawn done)"));
+    return;
   }
-  return spawnSingleBee(parsed);
+  const local = records.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
+  if (local.length < records.length) {
+    console.error(note(`--here skips ${records.length - local.length} remote bee(s) — link-window cannot cross tmux servers`));
+  }
+  if (local.length === 0) return;
+  try {
+    const result = await linkHere(
+      local.map((record) => record.tmuxTarget),
+      { select: records.length === 1 },
+    );
+    if (isPretty()) console.log(actionLine("ok", "here", [bold(result.session), `${result.linked} window(s) linked`]));
+    else console.log(`here\t${result.session}\t${result.linked}`);
+  } catch (error) {
+    // Presentation only: the spawn itself already succeeded and is recorded.
+    console.error(note(`--here failed: ${error instanceof Error ? error.message : String(error)}`));
+  }
 }
 
 function resolveSpawnCount(parsed: Parsed): number {
@@ -4365,7 +4395,7 @@ function printHelp() {
   const env = (name: string) => (pretty ? cyan(name) : name);
 
   const commands: Array<[string, string, string]> = [
-    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--autoswap] [--colony <name>] [--count <n>] [--node <name>] [--yolo|--no-yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start bees in detached tmux sessions (claude is permissionless by default — --no-yolo to opt out; waits for the prompt, auto-accepting trust)"],
+    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--autoswap] [--colony <name>] [--count <n>] [--node <name>] [--here] [--yolo|--no-yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start bees in detached tmux sessions (claude is permissionless by default — --no-yolo to opt out; waits for the prompt, auto-accepting trust; --here also links the window into your current tmux session)"],
     ["spawn --frame", "<name> [--colony <name>] [--swarm-id <id>]", "spawn a swarm from a registered frame"],
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],

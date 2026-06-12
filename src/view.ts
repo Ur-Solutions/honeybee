@@ -115,6 +115,35 @@ export async function buildView(name: string, targets: string[]): Promise<BuildV
   return { session, created, linked, alreadyLinked: bees.length - plan.length };
 }
 
+export type LinkHereResult = { session: string; linked: number };
+
+/**
+ * `--here`: link bee windows into the caller's current tmux session — purely
+ * presentational, the bees' own sessions/records are untouched. For a single
+ * bee the linked window is selected; swarms link without stealing focus.
+ */
+export async function linkHere(
+  targets: string[],
+  opts: { select: boolean; currentSession?: string },
+): Promise<LinkHereResult> {
+  const current = opts.currentSession ?? (await tmux(["display-message", "-p", "#{session_name}"])).stdout.trim();
+  if (!current) throw new Error("Could not discover the current tmux session");
+  const inventory = await windowInventory();
+  const bees: Array<{ session: string; windowId: string }> = [];
+  for (const target of targets) {
+    const windowId = inventory.active.get(target);
+    if (windowId) bees.push({ session: target, windowId });
+  }
+  const plan = planViewLinks(inventory.windows.get(current) ?? [], bees);
+  for (const bee of plan) {
+    await tmux(["link-window", "-s", bee.windowId, "-t", `=${current}:`]);
+  }
+  if (opts.select && bees.length === 1) {
+    await tmux(["select-window", "-t", `=${current}:${bees[0]!.windowId}`], { reject: false });
+  }
+  return { session: current, linked: plan.length };
+}
+
 /** First free `view-<name>-<n>` grouped-session name (independent focus). */
 export async function groupedViewSessionName(name: string): Promise<string> {
   const session = viewSessionName(name);
