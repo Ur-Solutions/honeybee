@@ -47,6 +47,7 @@ function fakeSubstrate(initiallyAlive: boolean) {
     listSessions: async () => [],
     listSessionStates: async () => new Map<string, string>(),
     setUserOptions: async () => undefined,
+    renameWindow: async () => undefined,
     attachCommand: () => [],
     attachSession: async () => undefined,
   };

@@ -187,6 +187,10 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     await runTmux(args).catch(() => undefined);
   }
 
+  async function renameWindow(target: string, name: string): Promise<void> {
+    await runTmux(["rename-window", "-t", `=${target}:`, name]).catch(() => undefined);
+  }
+
   function attachCommand(target: string): string[] {
     // No multiplexing defaults on the interactive path (printed by --print).
     // Inside tmux this becomes a new-window wrapping of the ssh attach.
@@ -231,6 +235,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     listSessions,
     listSessionStates,
     setUserOptions,
+    renameWindow,
     attachCommand,
     attachSession,
   };

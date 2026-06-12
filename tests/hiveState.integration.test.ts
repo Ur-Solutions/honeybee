@@ -34,3 +34,17 @@ test("setUserOptions writes exactly and listSessionStates reads back", { timeout
     await tmux(["kill-session", "-t", "=CL-abcd"], { reject: false });
   }
 });
+
+test("renameWindow renames the bee's window exactly", { timeout: 30_000 }, async () => {
+  const { renameWindow } = await import("../src/substrates/local-tmux.js");
+  await tmux(["new-session", "-d", "-s", "CL-title", "sleep 30"]);
+  try {
+    await renameWindow("CL-title", "fix the flaky auth test");
+    const name = (await tmux(["display-message", "-p", "-t", "=CL-title:", "#{window_name}"])).stdout.trim();
+    assert.equal(name, "fix the flaky auth test");
+    // Missing session: silent no-op.
+    await renameWindow("CL-nope", "x");
+  } finally {
+    await tmux(["kill-session", "-t", "=CL-title"], { reject: false });
+  }
+});

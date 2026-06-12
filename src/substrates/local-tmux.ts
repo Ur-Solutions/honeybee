@@ -179,6 +179,14 @@ export async function setUserOptions(target: string, options: Record<string, str
   }
 }
 
+export async function renameWindow(target: string, name: string): Promise<void> {
+  try {
+    await tmux(["rename-window", "-t", `=${target}:`, name], { reject: false });
+  } catch {
+    // best-effort
+  }
+}
+
 export async function probe(): Promise<ProbeResult> {
   try {
     await execFileAsync("tmux", ["-V"], { maxBuffer: 64 * 1024 });
@@ -254,6 +262,7 @@ export function createLocalTmuxSubstrate(): Substrate {
     listSessions,
     listSessionStates,
     setUserOptions,
+    renameWindow,
     attachCommand,
     attachSession,
   };

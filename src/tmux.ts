@@ -13,6 +13,7 @@ export {
   listTmuxSessions,
   newSession,
   probe,
+  renameWindow,
   sendEnter,
   sendKey,
   sendText,

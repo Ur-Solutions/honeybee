@@ -40,6 +40,11 @@ export type Substrate = {
    * session or server must never break the caller — failures are swallowed.
    */
   setUserOptions(target: string, options: Record<string, string>): Promise<void>;
+  /**
+   * Best-effort rename of the session's active window (what choose-tree,
+   * window strips, and views display). Never throws.
+   */
+  renameWindow(target: string, name: string): Promise<void>;
   attachCommand(target: string): string[];
   attachSession(target: string): Promise<void>;
 };

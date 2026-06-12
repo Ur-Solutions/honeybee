@@ -52,10 +52,17 @@ export async function writeHiveState(record: SessionRef, state: HiveTmuxState): 
   }
 }
 
-/** Mirror the bee's display title (rename/auto/provider); "" clears it. */
+/**
+ * Mirror the bee's display title (rename/auto/provider); "" clears it. The
+ * window is renamed too — that is what choose-tree, the window strip, and
+ * view cockpits actually display (a cleared title falls back to the bee's
+ * session name).
+ */
 export async function writeHiveTitle(record: SessionRef, title: string): Promise<void> {
   try {
-    await substrateFor(record).setUserOptions(record.tmuxTarget, { "@hive_title": title });
+    const substrate = substrateFor(record);
+    await substrate.setUserOptions(record.tmuxTarget, { "@hive_title": title });
+    await substrate.renameWindow(record.tmuxTarget, title.length > 0 ? title : record.tmuxTarget);
   } catch {
     // best-effort
   }
@@ -64,13 +71,17 @@ export async function writeHiveTitle(record: SessionRef, title: string): Promise
 /** Stamp a freshly spawned bee's session with its hive identity + working state. */
 export async function writeSpawnOptions(record: SessionRecord): Promise<void> {
   try {
-    await substrateFor(record).setUserOptions(record.tmuxTarget, {
+    const substrate = substrateFor(record);
+    await substrate.setUserOptions(record.tmuxTarget, {
       "@hive_id": record.id ?? record.name,
       "@hive_colony": record.colony ?? "",
       "@hive_swarm": record.swarmId ?? "",
       "@hive_title": record.title ?? "",
       [HIVE_STATE_OPTION]: "working",
     });
+    // Name the window after the bee (instead of the launcher command) so
+    // views and choose-tree are legible before a real title lands.
+    await substrate.renameWindow(record.tmuxTarget, record.title ?? record.id ?? record.name);
   } catch {
     // best-effort
   }
