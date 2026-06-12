@@ -21,7 +21,7 @@ const COMMANDS = [
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
-  "brief", "seal", "config", "completion", "help",
+  "brief", "rename", "seal", "config", "completion", "help",
 ];
 
 const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
@@ -56,7 +56,7 @@ const SHELLS = ["bash", "zsh", "fish"];
 const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach"]);
-const SESSION_ANY = new Set(["kill", "last", "seal"]);
+const SESSION_ANY = new Set(["kill", "last", "seal", "rename"]);
 const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 // Commands whose first positional is a vault account.
@@ -95,6 +95,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ],
   send: ["--prompt", "-p"],
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],
+  rename: ["--auto", "--clear"],
   seal: ["--from"],
   last: ["-n", "--lines", "--seal"],
   wait: ["--idle-ms", "--idle", "--timeout-ms", "--timeout", "--poll-ms", "--poll", "--last", "--transcript", "--seal", "-n", "--limit", "--json"],

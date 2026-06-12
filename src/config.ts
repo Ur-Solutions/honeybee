@@ -8,9 +8,21 @@ export type BeeConfig = {
   command?: string;
 };
 
+export type NamingConfig = {
+  /** Daemon auto-titles untitled bees from their initial transcript (default: true). */
+  auto?: boolean;
+  /** Builtin generator CLI: "claude" (default) or "codex". */
+  tool?: "claude" | "codex";
+  /** Model passed to the generator (default: "haiku" for claude; codex uses its configured default). */
+  model?: string;
+  /** Custom generator command, run via sh -c: prompt on stdin, title on stdout. Overrides tool/model. */
+  command?: string;
+};
+
 export type HiveConfig = {
   bees?: Record<string, BeeConfig>;
   briefFooter?: string;
+  naming?: NamingConfig;
 };
 
 export const DEFAULT_BRIEF_FOOTER =
@@ -55,11 +67,40 @@ export function beeConfig(kind: string): BeeConfig {
   return bees[kind] ?? {};
 }
 
+export type ResolvedNamingConfig = {
+  auto: boolean;
+  tool: "claude" | "codex";
+  model?: string;
+  command?: string;
+};
+
+export function namingConfig(): ResolvedNamingConfig {
+  const naming = loadConfig().naming ?? {};
+  const tool = naming.tool ?? "claude";
+  // Cheap models on purpose: titles are a few words, never worth a frontier call.
+  const model = naming.model ?? (tool === "claude" ? "haiku" : undefined);
+  return {
+    auto: naming.auto !== false,
+    tool,
+    ...(model ? { model } : {}),
+    ...(naming.command ? { command: naming.command } : {}),
+  };
+}
+
 function normalizeConfig(value: unknown): HiveConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const object = value as Record<string, unknown>;
   const config: HiveConfig = {};
   if (typeof object.briefFooter === "string") config.briefFooter = object.briefFooter;
+  if (object.naming && typeof object.naming === "object" && !Array.isArray(object.naming)) {
+    const r = object.naming as Record<string, unknown>;
+    const naming: NamingConfig = {};
+    if (typeof r.auto === "boolean") naming.auto = r.auto;
+    if (r.tool === "claude" || r.tool === "codex") naming.tool = r.tool;
+    if (typeof r.model === "string" && r.model.length > 0) naming.model = r.model;
+    if (typeof r.command === "string" && r.command.length > 0) naming.command = r.command;
+    config.naming = naming;
+  }
   if (object.bees && typeof object.bees === "object" && !Array.isArray(object.bees)) {
     const bees: Record<string, BeeConfig> = {};
     for (const [key, raw] of Object.entries(object.bees as Record<string, unknown>)) {

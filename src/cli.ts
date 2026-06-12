@@ -103,6 +103,7 @@ import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, save
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
+import { gatherTitleContext, generateTitle } from "./naming.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
@@ -188,6 +189,9 @@ async function main(argv: string[]) {
       break;
     case "brief":
       await cmdBrief(parsed);
+      break;
+    case "rename":
+      await cmdRename(parsed);
       break;
     case "seal":
       await cmdSeal(parsed);
@@ -569,6 +573,57 @@ async function cmdBrief(parsed: Parsed) {
   if (isMulti) {
     if (isPretty()) console.log(actionLine("ok", "brief", [bold(target), `${briefedCount}/${records.length} bees`]));
     else console.log(`briefed\t${target}\t${briefedCount}/${records.length}`);
+  }
+}
+
+async function cmdRename(parsed: Parsed) {
+  const target = parsed.args[0];
+  const auto = truthy(flag(parsed, "auto"));
+  const clear = truthy(flag(parsed, "clear"));
+  const explicit = parsed.args.slice(1).join(" ").trim();
+  const usage = "Usage: hive rename <selector> <title>  |  hive rename <selector> --auto  |  hive rename <selector> --clear";
+  if (!target || (auto && clear) || ((auto || clear) === Boolean(explicit))) throw new Error(usage);
+
+  const resolved = await resolveSelector(target);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  const isMulti = resolved.kind !== "bee";
+  if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
+  if (explicit && isMulti) {
+    throw new Error("Refusing to set the same title on multiple bees; use --auto or --clear for swarm/colony selectors");
+  }
+
+  for (const record of records) {
+    const now = new Date().toISOString();
+    if (clear) {
+      // Dropping autoTitleAt too makes the bee a daemon auto-title candidate again.
+      await updateSession(record.name, { title: undefined, titleSource: undefined, autoTitleAt: undefined, updatedAt: now });
+      if (isPretty()) console.log(actionLine("ok", "rename", [bold(record.name), dim("title cleared")]));
+      else console.log(`renamed\t${record.name}\t`);
+      continue;
+    }
+
+    let title = explicit;
+    let source: SessionRecord["titleSource"] = "user";
+    if (auto) {
+      const context = await gatherTitleContext(record);
+      if (!context) {
+        const reason = "no brief and no transcript to derive a title from";
+        if (!isMulti) throw new Error(`${record.name}: ${reason}`);
+        console.error(note(`skip ${record.name} (${reason})`));
+        continue;
+      }
+      title = await generateTitle(context);
+      source = "auto";
+    }
+    await updateSession(record.name, {
+      title,
+      titleSource: source,
+      updatedAt: now,
+      // An explicit --auto also counts as this bee's one automatic attempt.
+      ...(auto ? { autoTitleAt: now } : {}),
+    });
+    if (isPretty()) console.log(actionLine("ok", "rename", [bold(record.name), title, dim(source)]));
+    else console.log(`renamed\t${record.name}\t${title}\t${source}`);
   }
 }
 
@@ -1649,8 +1704,10 @@ async function cmdConfig(parsed: Parsed) {
       return;
     case "set-bee":
       return configSetBee(parsed);
+    case "set-naming":
+      return configSetNaming(parsed);
     default:
-      throw new Error(`Unknown config subcommand: ${sub}\nUsage: hive config <show|path|set-bee>`);
+      throw new Error(`Unknown config subcommand: ${sub}\nUsage: hive config <show|path|set-bee|set-naming>`);
   }
 }
 
@@ -1677,6 +1734,30 @@ async function configSetBee(parsed: Parsed) {
   resetConfigCache();
   if (isPretty()) console.log(actionLine("ok", "config", [bold(name), dim("updated")]));
   else console.log(`config\t${name}\tupdated`);
+}
+
+async function configSetNaming(parsed: Parsed) {
+  const auto = truthy(flag(parsed, "auto")) ? true : truthy(flag(parsed, "no-auto")) ? false : undefined;
+  const toolRaw = flag(parsed, "tool");
+  if (toolRaw !== undefined && toolRaw !== "claude" && toolRaw !== "codex") throw new Error("--tool must be claude or codex");
+  const tool = toolRaw as "claude" | "codex" | undefined;
+  const modelRaw = flag(parsed, "model");
+  const model = typeof modelRaw === "string" ? modelRaw : undefined;
+  const commandRaw = flag(parsed, "command");
+  const command = typeof commandRaw === "string" ? commandRaw : undefined;
+  if (auto === undefined && tool === undefined && model === undefined && command === undefined) {
+    throw new Error('hive config set-naming needs at least one of --auto/--no-auto, --tool <claude|codex>, --model <m>, --command "..."');
+  }
+  const config = loadConfig();
+  const naming = { ...(config.naming ?? {}) };
+  if (auto !== undefined) naming.auto = auto;
+  if (tool !== undefined) naming.tool = tool;
+  if (model !== undefined) naming.model = model;
+  if (command !== undefined) naming.command = command;
+  await writeConfigFile({ ...config, naming });
+  resetConfigCache();
+  if (isPretty()) console.log(actionLine("ok", "config", [bold("naming"), dim("updated")]));
+  else console.log("config\tnaming\tupdated");
 }
 
 async function writeConfigFile(config: unknown): Promise<void> {
@@ -4194,6 +4275,7 @@ function printHelp() {
     ["open", "<bee> [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print] [<bee-flags...>]", "identity launcher: run the agent right here in this terminal (--window for a new one), no tmux/session record; unknown flags (e.g. --resume <id>) pass through to the bee"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
+    ["rename", "<selector> <title> | --auto | --clear", "set a bee's display title; --auto derives one from its brief/initial transcript via a cheap model (the daemon also does this automatically — see config set-naming)"],
     ["seal", "<selector> --from <path.json>", "record a typed handoff artifact"],
     ["tail", "<session> [-n <lines>] [-f|--follow]", "capture or follow pane content"],
     ["transcript", "<session> [-n <rows>] [--json]", "render structured transcript rows"],
@@ -4222,7 +4304,7 @@ function printHelp() {
     ["usage", "[<account>] [--ttl <age>] [--samples] [--json]", "progress against the providers' real 5h/weekly limits with pace (alias: limits); live reads refresh a local cache, --ttl <age> serves cache entries younger than that (0 = force live); --samples shows the daemon's local token samples"],
     ["sessions", "reconcile [--home <path>]... [--json]", "index sessions across all homes; flag duplicates and sync conflicts"],
     ["sync", "manifest [--json]", "write the syncthing include/exclude manifest (vault always excluded)"],
-    ["config", "<show|path|set-bee <bee> [--yolo] [--home] [--command]>", "view or edit ~/.hive/config.json defaults"],
+    ["config", "<show|path|set-bee <bee> [--yolo] [--home] [--command]|set-naming [--auto|--no-auto] [--tool claude|codex] [--model <m>] [--command \"...\"]>", "view or edit ~/.hive/config.json defaults (set-naming controls auto-titling; default: claude + haiku)"],
     ["completion", "<bash|zsh|fish>", "print a shell completion script (eval to install)"],
   ];
 

@@ -25,6 +25,10 @@ export type SessionRecord = {
   transcriptPath?: string;
   providerSessionId?: string;
   title?: string;
+  /** Who set `title`: user beats auto beats provider (see naming.ts). */
+  titleSource?: "user" | "auto" | "provider";
+  /** Set when the daemon's auto-titler claims this bee — one attempt per bee. */
+  autoTitleAt?: string;
   colony?: string;
   swarmId?: string;
   caste?: string;
@@ -234,11 +238,12 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
   ...OPTIONAL_STRING_SESSION_KEYS,
+  "titleSource",
   "buzAccept",
 ]);
 
@@ -268,6 +273,10 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
 
   if (object.autoswap === true) record.autoswap = true;
+
+  if (object.titleSource === "user" || object.titleSource === "auto" || object.titleSource === "provider") {
+    record.titleSource = object.titleSource;
+  }
 
   // buzAccept is the per-bee acceptance policy for buz messages. The field
   // is forward-compatible: unknown tier values are dropped silently so an

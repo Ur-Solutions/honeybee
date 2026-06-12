@@ -242,6 +242,16 @@ export function renderTranscript(rows: TranscriptRow[], options: { limit?: numbe
   return selected.join("\n\n");
 }
 
+export function firstUserText(rows: TranscriptRow[]): string {
+  for (const row of rows) {
+    const role = row.message?.role ?? row.type;
+    if (role !== "user") continue;
+    const text = textFromContent(row.message?.content ?? row.content).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
 export function lastAssistantText(rows: TranscriptRow[]): string {
   for (let i = rows.length - 1; i >= 0; i -= 1) {
     const row = rows[i]!;

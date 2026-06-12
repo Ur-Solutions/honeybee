@@ -1,3 +1,4 @@
+import { canWriteTitle } from "./naming.js";
 import { touchSession, type SessionRecord } from "./store.js";
 import { latestTranscript, type TranscriptFile, type TranscriptLookupOptions } from "./transcripts.js";
 
@@ -31,7 +32,10 @@ export async function persistSessionTranscriptMetadata(
 
   if (tx.path !== record.transcriptPath) fields.transcriptPath = tx.path;
   if (tx.sessionId !== record.providerSessionId) fields.providerSessionId = tx.sessionId;
-  if (tx.title && tx.title !== record.title) fields.title = tx.title;
+  if (tx.title && tx.title !== record.title && canWriteTitle(record, "provider")) {
+    fields.title = tx.title;
+    fields.titleSource = "provider";
+  }
   if (options.markRunning && record.status !== "running") fields.status = "running";
 
   if (Object.keys(fields).length === 0) return record;

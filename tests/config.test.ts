@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { resolveAgent } from "../src/agents.js";
-import { beeConfig, briefFooter, DEFAULT_BRIEF_FOOTER, loadConfig, resetConfigCache } from "../src/config.js";
+import { beeConfig, briefFooter, DEFAULT_BRIEF_FOOTER, loadConfig, namingConfig, resetConfigCache } from "../src/config.js";
 
 async function withTempConfig(contents: object | null, fn: () => Promise<void> | void): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-config-"));
@@ -77,6 +77,27 @@ test("briefFooter honors config override (including empty string for disable)", 
   });
   await withTempConfig({ briefFooter: "" }, () => {
     assert.equal(briefFooter(), "");
+  });
+});
+
+test("namingConfig defaults: auto-titling on, claude with haiku", async () => {
+  await withTempConfig(null, () => {
+    assert.deepEqual(namingConfig(), { auto: true, tool: "claude", model: "haiku" });
+  });
+});
+
+test("namingConfig honors overrides; codex gets no default model", async () => {
+  await withTempConfig({ naming: { auto: false, tool: "codex" } }, () => {
+    assert.deepEqual(namingConfig(), { auto: false, tool: "codex" });
+  });
+  await withTempConfig({ naming: { tool: "codex", model: "gpt-5.1-codex-mini", command: "my-titler" } }, () => {
+    assert.deepEqual(namingConfig(), { auto: true, tool: "codex", model: "gpt-5.1-codex-mini", command: "my-titler" });
+  });
+});
+
+test("namingConfig drops invalid values", async () => {
+  await withTempConfig({ naming: { auto: "yes", tool: "grok", model: 7, command: "" } }, () => {
+    assert.deepEqual(namingConfig(), { auto: true, tool: "claude", model: "haiku" });
   });
 });
 

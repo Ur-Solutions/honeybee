@@ -7,6 +7,7 @@ import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { deriveState, liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
+import { createAutoTitleDispatcher, type AutoTitleOutcome } from "./autoTitle.js";
 import { dispatchAutoswaps, type AutoswapOutcome } from "./autoswap.js";
 import { dispatchBuzDrains, type BuzDispatchOutcome } from "./buzDispatcher.js";
 import { createUsageSampler, type UsageSampler, type UsageTickOutcome } from "./usageSampler.js";
@@ -66,6 +67,13 @@ export type TickDeps = {
    */
   dispatchAutoswap?: (records: SessionRecord[], usageOutcomes: UsageTickOutcome[]) => Promise<AutoswapOutcome[]>;
   /**
+   * Optional auto-titler: names untitled bees from their initial transcript
+   * exchange using the configured cheap-model CLI. Stateful across ticks —
+   * build once per daemon run (generation runs in the background; outcomes
+   * surface on a later tick).
+   */
+  dispatchAutoTitle?: (records: SessionRecord[]) => Promise<AutoTitleOutcome[]>;
+  /**
    * Optional credential-chain sync: pulls rotated claude OAuth chains from
    * the accounts' homes back into the vault (refresh tokens rotate; the live
    * link lands wherever the last refresh ran). The default wiring throttles
@@ -96,6 +104,8 @@ export type TickResult = {
   usage: UsageTickOutcome[];
   /** Autoswap dispatcher outcomes (empty when nothing exhausted / not wired). */
   autoswaps: AutoswapOutcome[];
+  /** Auto-title dispatcher outcomes (empty when nothing finished / not wired). */
+  autoTitles: AutoTitleOutcome[];
   durationMs: number;
 };
 
@@ -214,6 +224,17 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     }
   }
 
+  // Auto-titler: kick off (or collect) background title generation for
+  // untitled bees whose initial exchange is now visible.
+  let autoTitles: AutoTitleOutcome[] = [];
+  if (deps.dispatchAutoTitle) {
+    try {
+      autoTitles = await deps.dispatchAutoTitle(records);
+    } catch (error) {
+      errors.push(toError(error));
+    }
+  }
+
   // Chain sync: keep the vault tracking rotated OAuth chains. Self-throttled
   // by the default wiring; errors are captured, never fatal to the tick.
   if (deps.syncChains) {
@@ -232,6 +253,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     buzDrains,
     usage,
     autoswaps,
+    autoTitles,
     durationMs: Math.max(0, deps.now() - start),
   };
 }
@@ -420,6 +442,17 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
             ...(outcome.error ? { error: outcome.error } : {}),
           });
         }
+        for (const outcome of result.autoTitles) {
+          await appendDaemonLog({
+            level: outcome.ok ? "info" : "warn",
+            msg: "title.auto",
+            session: outcome.bee,
+            ok: outcome.ok,
+            ...(outcome.title ? { title: outcome.title } : {}),
+            ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
+            ...(outcome.error ? { error: outcome.error } : {}),
+          });
+        }
         try {
           await writeDaemonState({ ...state, recentErrors: [...state.recentErrors] });
         } catch (error) {
@@ -520,6 +553,7 @@ export function buildDefaultDeps(): TickDeps {
     dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),
     sampleUsage: createUsageSampler(),
     dispatchAutoswap: (records, usageOutcomes) => dispatchAutoswaps(records, usageOutcomes),
+    dispatchAutoTitle: createAutoTitleDispatcher(),
     syncChains: async () => {
       const now = Date.now();
       if (now - lastChainSyncAt < CHAIN_SYNC_INTERVAL_MS) return;
