@@ -1687,21 +1687,28 @@ async function cmdXa(parsed: Parsed) {
 // `hive open <bee>`: identity-launcher mode. Activates the account into its
 // home, then runs the agent DIRECTLY in the CURRENT terminal — foreground,
 // where you called it. --window/--app launch a new native terminal window
-// instead. Deliberately off-brand: no tmux session, no SessionRecord, so
-// list/tail/kill/daemon do not apply. Activation and launch are ledger-logged.
 // Flags `open` consumes itself. Anything else on the command line is forwarded
 // to the agent CLI, so `hive open claude --resume <id>` works without the `--`
 // separator (which still works, and is the escape hatch for flags open owns,
 // e.g. `hive open claude -- --print`).
 const OPEN_OWN_FLAGS = new Set([
-  "window", "app", "cwd", "account", "ttl", "home", "profile", "print",
+  "raw", "window", "app", "cwd", "account", "ttl", "home", "profile", "print",
   "yolo", "dangerous", "no-yolo", "accept-trust", "trust", "no-accept-trust", "no-trust",
 ]);
 
-function openPassthroughArgs(parsed: Parsed): string[] {
+// In the registered (non-raw) modes these are spawn-pipeline controls, not
+// agent flags — they ride the delegated spawn instead of the passthrough.
+const OPEN_SPAWN_CONTROL_FLAGS = new Set([
+  "name", "colony", "swarm", "swarm-id", "count", "frame", "node", "substrate",
+  "brief", "briefed", "autoswap", "boot-ms", "no-wait", "force-send", "here",
+]);
+
+const OPEN_DELEGATED_FLAGS = new Set([...OPEN_OWN_FLAGS, ...OPEN_SPAWN_CONTROL_FLAGS]);
+
+function openPassthroughArgs(parsed: Parsed, exclude: Set<string> = OPEN_OWN_FLAGS): string[] {
   const out: string[] = [];
   for (const [key, value] of parsed.flags) {
-    if (OPEN_OWN_FLAGS.has(key)) continue;
+    if (exclude.has(key)) continue;
     // Single-letter keys came in as `-x`; the parser strips dashes, so restore
     // the form the agent CLI expects.
     const name = key.length === 1 ? `-${key}` : `--${key}`;
@@ -1713,9 +1720,55 @@ function openPassthroughArgs(parsed: Parsed): string[] {
   return out;
 }
 
+// `open` = run an agent where you are. Since the daily driver moved inside
+// tmux, the default contract is a REGISTERED spawn presented in place:
+//   inside tmux  → spawn + --here (window linked into your current session)
+//   outside tmux → spawn + attach (xa semantics)
+// `--raw` is the old behavior — agent runs directly in this terminal, no tmux
+// session, no SessionRecord (list/tail/kill/daemon do not apply). --window/
+// --app imply --raw: they target external terminal apps by nature.
 async function cmdOpen(parsed: Parsed) {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive open <bee> [--window] [--app <terminal>] [--cwd <dir>] [--account <a|auto>] [--print] [<bee-flags...>]");
+  if (!requested) throw new Error("Usage: hive open <bee> [--raw] [--window] [--app <terminal>] [--cwd <dir>] [--account <a|auto>] [--print] [<bee-flags...>]");
+
+  const rawAppFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
+  const raw = truthy(flag(parsed, "raw")) || truthy(flag(parsed, "window")) || rawAppFlag !== undefined;
+  if (!raw) {
+    const spawnFlags = new Map(parsed.flags);
+    for (const key of [...spawnFlags.keys()]) {
+      // Unknown flags reach the agent via the spawn rest, not as spawn flags.
+      if (!OPEN_DELEGATED_FLAGS.has(key)) spawnFlags.delete(key);
+    }
+    spawnFlags.delete("raw");
+    spawnFlags.delete("print");
+    if (process.env.TMUX) spawnFlags.set("here", true);
+    const spawnParsed: Parsed = {
+      command: "spawn",
+      args: [requested],
+      flags: spawnFlags,
+      rest: [...openPassthroughArgs(parsed, OPEN_DELEGATED_FLAGS), ...parsed.rest],
+    };
+    const record = await cmdSpawn(spawnParsed);
+    const substrate = substrateFor(record);
+    if (truthy(flag(parsed, "print")) || !process.stdout.isTTY) {
+      if (isPretty()) console.error(note("attach with:"));
+      console.log(formatShellCommand(substrate.attachCommand(record.tmuxTarget)));
+      return;
+    }
+    // Inside tmux --here already linked and selected the window right here.
+    if (process.env.TMUX) return;
+    await substrate.attachSession(record.tmuxTarget);
+    return;
+  }
+
+  await cmdOpenRaw(parsed);
+}
+
+// The pre-tmux-era contract, now explicit: agent runs raw in this terminal
+// (or a new terminal window via --window/--app). Off-brand on purpose — no
+// tmux session, no SessionRecord. Activation and launch are ledger-logged.
+async function cmdOpenRaw(parsed: Parsed) {
+  const requested = parsed.args[0]!;
   const { agent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
   const yolo = dangerousMode(parsed, agent);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
@@ -4400,7 +4453,7 @@ function printHelp() {
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
     ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto, claude-auto)"],
-    ["open", "<bee> [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print] [<bee-flags...>]", "identity launcher: run the agent right here in this terminal (--window for a new one), no tmux/session record; unknown flags (e.g. --resume <id>) pass through to the bee"],
+    ["open", "<bee> [--raw] [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print] [<bee-flags...>]", "registered spawn presented where you are: inside tmux links the bee's window here, outside attaches (CHANGED: was raw-in-terminal — that is now --raw; --window/--app imply --raw); unknown flags (e.g. --resume <id>) still pass through to the bee"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
     ["rename", "<selector> <title> | --auto | --clear", "set a bee's display title; --auto derives one from its brief/initial transcript via a cheap model (the daemon also does this automatically — see config set-naming)"],
