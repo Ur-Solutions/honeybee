@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { addAccount, accountDir } from "../src/accounts.js";
-import { accountLimits, emailFromJwt, lastRateLimitsInFile, paceDelta, windowRolledOver } from "../src/limits.js";
+import { accountLimits, cachedAccountLimits, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -330,5 +330,223 @@ test("unsupported tools and missing codex homes degrade to errors, not throws", 
     assert.equal(results[0]!.source, "unsupported");
     assert.equal(results[1]!.ok, false);
     assert.match(results[1]!.error ?? "", /no home found/);
+  });
+});
+
+function pickAccount(id: string, addedAt: string): import("../src/accounts.js").AccountRecord {
+  return { id, tool: "claude", label: id, addedAt };
+}
+
+function okLimits(id: string, weekly: number, fiveHour: number, resetsAt = "2026-06-10T18:00:00Z"): import("../src/limits.js").AccountLimits {
+  return {
+    account: id,
+    tool: "claude",
+    ok: true,
+    source: "oauth-api",
+    fiveHour: { usedPercent: fiveHour, windowMinutes: 300, resetsAt },
+    weekly: { usedPercent: weekly, windowMinutes: 10_080, resetsAt },
+  };
+}
+
+test("selectLeastLoadedAccount picks the least weekly usage", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  const choice = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: okLimits("a", 60, 10) },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 20, 50) },
+      { account: pickAccount("c", "2026-01-03"), limits: okLimits("c", 40, 5) },
+    ],
+    now,
+  );
+  assert.equal(choice?.account.id, "b");
+  assert.equal(choice?.reason, "least weekly usage");
+});
+
+test("selectLeastLoadedAccount pushes 5h-saturated accounts behind ones with headroom", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  // b has the lowest weekly but its 5h window is nearly exhausted.
+  const choice = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: okLimits("a", 55, 30) },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 10, 95) },
+    ],
+    now,
+  );
+  assert.equal(choice?.account.id, "a");
+
+  // All saturated → least weekly among them, and the reason says why.
+  const allHot = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: okLimits("a", 55, 92) },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 10, 95) },
+    ],
+    now,
+  );
+  assert.equal(allHot?.account.id, "b");
+  assert.match(allHot?.reason ?? "", /5h limit/);
+});
+
+test("selectLeastLoadedAccount treats rolled-over windows as fresh and unreadable limits as last resort", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  // a's snapshot says 99% but its windows already reset → counts as 0%.
+  const rolled = okLimits("a", 99, 99, "2026-06-10T11:00:00Z");
+  const choice = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: rolled },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 5, 5) },
+    ],
+    now,
+  );
+  assert.equal(choice?.account.id, "a");
+
+  // Readable-but-high beats unreadable; all unreadable → oldest registration.
+  const failed: import("../src/limits.js").AccountLimits = { account: "c", tool: "claude", ok: false, source: "oauth-api", error: "boom" };
+  const mixed = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("c", "2026-01-01"), limits: failed },
+      { account: pickAccount("d", "2026-01-02"), limits: okLimits("d", 97, 10) },
+    ],
+    now,
+  );
+  assert.equal(mixed?.account.id, "d");
+  const blind = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("e", "2026-01-02"), limits: { ...failed, account: "e" } },
+      { account: pickAccount("c", "2026-01-01"), limits: failed },
+    ],
+    now,
+  );
+  assert.equal(blind?.account.id, "c");
+  assert.match(blind?.reason ?? "", /unreadable/);
+});
+
+test("pickLeastLoadedAccount filters to credentialed accounts of the tool and shortcuts a lone candidate", async () => {
+  await withTempStore(async () => {
+    const one = await addAccount("claude", "one@a.b");
+    const two = await addAccount("claude", "two@a.b");
+    const dry = await addAccount("claude", "dry@a.b");
+    await addAccount("codex", "cx@a.b");
+
+    let fetched: string[] = [];
+    const choice = await pickLeastLoadedAccount("claude", {
+      hasCredentials: async (account) => account.id !== dry.id,
+      fetchLimits: async (accounts) => {
+        fetched = accounts.map((account) => account.id);
+        return [okLimits(one.id, 70, 10), okLimits(two.id, 30, 10)];
+      },
+      now: () => Date.parse("2026-06-10T12:00:00Z"),
+    });
+    assert.deepEqual(fetched, [one.id, two.id]);
+    assert.equal(choice.account.id, two.id);
+    assert.equal(choice.limits?.account, two.id);
+
+    // A single credentialed account wins without any limits round-trip.
+    const lone = await pickLeastLoadedAccount("claude", {
+      hasCredentials: async (account) => account.id === one.id,
+      fetchLimits: async () => {
+        throw new Error("should not fetch limits for a lone candidate");
+      },
+    });
+    assert.equal(lone.account.id, one.id);
+    assert.match(lone.reason, /only claude account/);
+
+    await assert.rejects(() => pickLeastLoadedAccount("grok"), /No grok accounts registered/);
+    await assert.rejects(
+      () => pickLeastLoadedAccount("claude", { hasCredentials: async () => false }),
+      /vaulted credentials/,
+    );
+  });
+});
+
+test("cachedAccountLimits serves fresh cache entries and refetches stale or failed ones", async () => {
+  await withTempStore(async (dir) => {
+    const one = await addAccount("claude", "c1@a.b");
+    const two = await addAccount("claude", "c2@a.b");
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+    let calls: string[][] = [];
+    const fetchLimits = (results: Record<string, import("../src/limits.js").AccountLimits>) =>
+      async (accounts: import("../src/accounts.js").AccountRecord[]) => {
+        calls.push(accounts.map((account) => account.id));
+        return accounts.map((account) => results[account.id]!);
+      };
+
+    // First read: empty cache → both fetched live; only the ok result is cached.
+    const failed: import("../src/limits.js").AccountLimits = { account: two.id, tool: "claude", ok: false, source: "oauth-api", error: "boom" };
+    const first = await cachedAccountLimits([one, two], {
+      ttlMs: 60 * 60 * 1000,
+      fetchLimits: fetchLimits({ [one.id]: okLimits(one.id, 40, 10), [two.id]: failed }),
+      now: () => t0,
+    });
+    assert.deepEqual(calls, [[one.id, two.id]]);
+    assert.equal(first[0]!.cached, undefined);
+    const cacheRaw = JSON.parse(await readFile(join(dir, "limits-cache.json"), "utf8"));
+    assert.ok(cacheRaw[one.id]);
+    assert.equal(cacheRaw[two.id], undefined);
+
+    // Within ttl: the ok entry is served cached (asOf = fetch time), the
+    // failed one is refetched.
+    calls = [];
+    const second = await cachedAccountLimits([one, two], {
+      ttlMs: 60 * 60 * 1000,
+      fetchLimits: fetchLimits({ [two.id]: okLimits(two.id, 20, 5) }),
+      now: () => t0 + 30 * 60 * 1000,
+    });
+    assert.deepEqual(calls, [[two.id]]);
+    assert.equal(second[0]!.account, one.id);
+    assert.equal(second[0]!.cached, true);
+    assert.equal(second[0]!.asOf, new Date(t0).toISOString());
+    assert.equal(second[1]!.cached, undefined);
+
+    // Past ttl (now - ttl > fetchedAt): everything is fetched live again.
+    calls = [];
+    await cachedAccountLimits([one, two], {
+      ttlMs: 60 * 60 * 1000,
+      fetchLimits: fetchLimits({ [one.id]: okLimits(one.id, 41, 11), [two.id]: okLimits(two.id, 21, 6) }),
+      now: () => t0 + 2 * 60 * 60 * 1000,
+    });
+    assert.deepEqual(calls, [[one.id, two.id]]);
+
+    // No ttl → always live, but the cache still gets refreshed.
+    calls = [];
+    await cachedAccountLimits([one], {
+      fetchLimits: fetchLimits({ [one.id]: okLimits(one.id, 42, 12) }),
+      now: () => t0 + 2 * 60 * 60 * 1000 + 1000,
+    });
+    assert.deepEqual(calls, [[one.id]]);
+  });
+});
+
+test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl", async () => {
+  await withTempStore(async () => {
+    const one = await addAccount("claude", "one@a.b");
+    const two = await addAccount("claude", "two@a.b");
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+    let fetchCount = 0;
+    const deps = (now: number) => ({
+      hasCredentials: async () => true,
+      fetchLimits: async (accounts: import("../src/accounts.js").AccountRecord[]) => {
+        fetchCount += 1;
+        return accounts.map((account) => okLimits(account.id, account.id === two.id ? 10 : 50, 5));
+      },
+      now: () => now,
+    });
+
+    const first = await pickLeastLoadedAccount("claude", deps(t0));
+    assert.equal(first.account.id, two.id);
+    assert.equal(fetchCount, 1);
+
+    // Second pick 10 minutes later rides the cache.
+    const second = await pickLeastLoadedAccount("claude", deps(t0 + 10 * 60 * 1000));
+    assert.equal(second.account.id, two.id);
+    assert.equal(second.limits?.cached, true);
+    assert.equal(fetchCount, 1);
+
+    // ttlMs 0 forces a live read.
+    await pickLeastLoadedAccount("claude", { ...deps(t0 + 20 * 60 * 1000), ttlMs: 0 });
+    assert.equal(fetchCount, 2);
+
+    // Past the default 1h ttl the pick refetches on its own.
+    await pickLeastLoadedAccount("claude", deps(t0 + 90 * 60 * 1000));
+    assert.equal(fetchCount, 3);
   });
 });

@@ -158,6 +158,20 @@ function splitToolShorthand(value: string): { tool: string; query: string } | un
   return { tool, query: value.slice(dash + 1) };
 }
 
+/**
+ * Reserved account query: `--account auto` / `<tool>-auto` ask for the tool's
+ * least-loaded account instead of naming one. The pick itself lives in
+ * limits.ts (it needs the provider windows); this module only reserves the
+ * word so it never falls through to fuzzy matching.
+ */
+export const AUTO_ACCOUNT_QUERY = "auto";
+
+/** `<tool>-auto` spawn alias → the tool whose least-loaded account to pick, else undefined. */
+export function autoAccountTool(value: string): string | undefined {
+  const shorthand = splitToolShorthand(value);
+  return shorthand?.query === AUTO_ACCOUNT_QUERY ? shorthand.tool : undefined;
+}
+
 export type SpawnAgentSpec = {
   agent: string;
   account?: AccountRecord;

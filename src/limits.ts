@@ -5,6 +5,7 @@ import {
   type AccountRecord,
   type RefreshedClaudeToken,
   accountDir,
+  accountHasCredentials,
   candidateHomes,
   claudeHomesForAccount,
   listAccounts,
@@ -12,8 +13,10 @@ import {
   refreshClaudeOauthChain,
   saveClaudeOauthToVault,
 } from "./accounts.js";
-import { storeRoot } from "./fsx.js";
+import { canonicalAgentKind } from "./agents.js";
+import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { readClaudeKeychain } from "./keychain.js";
+import { withFileLock } from "./lock.js";
 
 export type { RefreshedClaudeToken } from "./accounts.js";
 
@@ -71,6 +74,8 @@ export type AccountLimits = {
   /** Snapshot time for disk-sourced data; undefined when live. */
   asOf?: string;
   source: "oauth-api" | "app-server" | "session-snapshot" | "unsupported";
+  /** True when served from the on-disk limits cache rather than fetched now. */
+  cached?: boolean;
 };
 
 export type LimitsDeps = {
@@ -600,4 +605,188 @@ async function walk(dir: string, maxDepth: number, visit: (path: string) => Prom
 
 export async function allAccountLimits(deps: LimitsDeps = {}): Promise<AccountLimits[]> {
   return accountLimits(await listAccounts(), deps);
+}
+
+/* ------------------------------------------------------------------ */
+/* limits cache — every live read is snapshotted; readers may accept   */
+/* an entry younger than their ttl instead of paying the round-trips   */
+/* ------------------------------------------------------------------ */
+
+export type LimitsCacheEntry = { fetchedAt: string; limits: AccountLimits };
+type LimitsCache = Record<string, LimitsCacheEntry>;
+
+export function limitsCachePath(): string {
+  return join(storeRoot(), "limits-cache.json");
+}
+
+async function readLimitsCache(): Promise<LimitsCache> {
+  const raw = await readFile(limitsCachePath(), "utf8").catch(() => null);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const cache: LimitsCache = {};
+    for (const [account, entry] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!entry || typeof entry !== "object") continue;
+      const candidate = entry as LimitsCacheEntry;
+      if (typeof candidate.fetchedAt !== "string" || !candidate.limits || typeof candidate.limits !== "object") continue;
+      cache[account] = candidate;
+    }
+    return cache;
+  } catch {
+    return {};
+  }
+}
+
+/** Snapshot successful reads into the cache; failures are never cached (they should retry, not stick). */
+async function updateLimitsCache(results: AccountLimits[], now: number): Promise<void> {
+  const fresh = results.filter((result) => result.ok);
+  if (fresh.length === 0) return;
+  await withFileLock(`${limitsCachePath()}.lock`, async () => {
+    const cache = await readLimitsCache();
+    for (const result of fresh) {
+      const { cached: _cached, ...limits } = result;
+      cache[result.account] = { fetchedAt: new Date(now).toISOString(), limits };
+    }
+    await atomicWriteFile(limitsCachePath(), `${JSON.stringify(cache, null, 2)}\n`, { mode: 0o600 });
+  });
+}
+
+export type CachedLimitsOptions = LimitsDeps & {
+  /** Serve cache entries younger than this; missing/0 → always fetch live. */
+  ttlMs?: number;
+  /** Live fetch override (tests). Defaults to accountLimits. */
+  fetchLimits?: typeof accountLimits;
+};
+
+/**
+ * accountLimits behind the on-disk cache. Per account: a cache entry younger
+ * than ttlMs is served as-is (flagged `cached`, asOf falling back to fetch
+ * time); anything older or missing is fetched live, and every successful live
+ * read refreshes the cache — including ttl-less calls, so a plain
+ * `hive limits` keeps the cache warm for later cached readers.
+ */
+export async function cachedAccountLimits(accounts: AccountRecord[], options: CachedLimitsOptions = {}): Promise<AccountLimits[]> {
+  const now = (options.now ?? Date.now)();
+  const ttlMs = options.ttlMs ?? 0;
+  const cache = ttlMs > 0 ? await readLimitsCache() : {};
+  const hits = new Map<string, AccountLimits>();
+  const misses: AccountRecord[] = [];
+  for (const account of accounts) {
+    const entry = cache[account.id];
+    const age = entry ? now - Date.parse(entry.fetchedAt) : Number.NaN;
+    if (entry && Number.isFinite(age) && age >= 0 && age <= ttlMs) {
+      hits.set(account.id, { ...entry.limits, cached: true, asOf: entry.limits.asOf ?? entry.fetchedAt });
+    } else {
+      misses.push(account);
+    }
+  }
+  const fetchLimits = options.fetchLimits ?? accountLimits;
+  const fetched = misses.length > 0 ? await fetchLimits(misses, options) : [];
+  if (fetched.length > 0) await updateLimitsCache(fetched, now).catch(() => undefined);
+  const fetchedById = new Map(fetched.map((result) => [result.account, result]));
+  return accounts
+    .map((account) => hits.get(account.id) ?? fetchedById.get(account.id))
+    .filter((result): result is AccountLimits => result !== undefined);
+}
+
+/* ------------------------------------------------------------------ */
+/* auto account pick — least-loaded account of a tool                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A 5h window at/above this used% is "really close to the limit": the account
+ * is deprioritized even when its weekly usage is the lowest, so a fresh bee
+ * does not land on an account about to hit the short-window wall. Matches the
+ * red zone of the usage bars.
+ */
+export const AUTO_FIVE_HOUR_SATURATION_PERCENT = 90;
+
+export type AutoAccountCandidate = { account: AccountRecord; limits?: AccountLimits };
+
+export type AutoAccountChoice = {
+  account: AccountRecord;
+  /** The winning account's limits, when they were readable. */
+  limits?: AccountLimits;
+  /** Why this account won, for display. */
+  reason: string;
+};
+
+/**
+ * Order: readable limits before unreadable; 5h headroom before 5h-saturated;
+ * then least weekly used% (a rolled-over window counts as 0; a missing weekly
+ * window falls back to the 5h one); registration order as the deterministic
+ * tie-break. Null only for an empty candidate list.
+ */
+export function selectLeastLoadedAccount(candidates: AutoAccountCandidate[], now = Date.now()): AutoAccountChoice | null {
+  const score = (window: WindowUsage | undefined): number | null =>
+    window ? (windowRolledOver(window, now) ? 0 : window.usedPercent) : null;
+  const scored = candidates.map(({ account, limits }) => {
+    const ok = limits?.ok === true;
+    const fiveHour = ok ? score(limits?.fiveHour) : null;
+    const weekly = ok ? (score(limits?.weekly) ?? fiveHour) : null;
+    return {
+      account,
+      limits,
+      ok,
+      weekly: weekly ?? 0,
+      fiveHour: fiveHour ?? 0,
+      saturated: ok && fiveHour !== null && fiveHour >= AUTO_FIVE_HOUR_SATURATION_PERCENT,
+    };
+  });
+  scored.sort(
+    (a, b) =>
+      Number(!a.ok) - Number(!b.ok) ||
+      Number(a.saturated) - Number(b.saturated) ||
+      a.weekly - b.weekly ||
+      a.fiveHour - b.fiveHour ||
+      a.account.addedAt.localeCompare(b.account.addedAt) ||
+      a.account.id.localeCompare(b.account.id),
+  );
+  const best = scored[0];
+  if (!best) return null;
+  const reason = !best.ok
+    ? "limits unreadable for every account; oldest registration"
+    : best.saturated
+      ? "every account is close to its 5h limit; least weekly usage"
+      : "least weekly usage";
+  return { account: best.account, ...(best.ok && best.limits ? { limits: best.limits } : {}), reason };
+}
+
+/** Default freshness budget for the auto pick: cached limits younger than this are good enough. */
+export const AUTO_ACCOUNT_TTL_MS = 60 * 60 * 1000;
+
+export type PickAccountDeps = CachedLimitsOptions & {
+  hasCredentials?: typeof accountHasCredentials;
+};
+
+/**
+ * Resolve the `auto` account query: among the tool's accounts with vaulted
+ * credentials, pick the one with the least weekly usage, pushing accounts
+ * whose 5h window is nearly exhausted to the back. Limits come through the
+ * cache with a 1h default ttl, so back-to-back auto spawns do not re-pay the
+ * provider round-trips; pass ttlMs (0 = always live) to override.
+ */
+export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps = {}): Promise<AutoAccountChoice> {
+  const kind = canonicalAgentKind(tool).toLowerCase();
+  const registered = (await listAccounts()).filter((account) => account.tool === kind);
+  if (registered.length === 0) {
+    throw new Error(`No ${kind} accounts registered; add one with: hive account add ${kind} <label>`);
+  }
+  const hasCredentials = deps.hasCredentials ?? accountHasCredentials;
+  const candidates: AccountRecord[] = [];
+  for (const account of registered) {
+    if (await hasCredentials(account)) candidates.push(account);
+  }
+  if (candidates.length === 0) {
+    throw new Error(`No ${kind} account has vaulted credentials; capture some with: hive login <account>`);
+  }
+  // A single candidate wins regardless of usage — skip the limits round-trips.
+  if (candidates.length === 1) {
+    return { account: candidates[0]!, reason: `only ${kind} account with credentials` };
+  }
+  const results = await cachedAccountLimits(candidates, { ...deps, ttlMs: deps.ttlMs ?? AUTO_ACCOUNT_TTL_MS });
+  const byId = new Map(results.map((result) => [result.account, result]));
+  const now = (deps.now ?? Date.now)();
+  return selectLeastLoadedAccount(candidates.map((account) => ({ account, limits: byId.get(account.id) })), now)!;
 }

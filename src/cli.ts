@@ -4,11 +4,14 @@ import { constants } from "node:fs";
 import { resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
 import {
+  AUTO_ACCOUNT_QUERY,
   type AccountChainSyncOutcome,
   type AccountRecord,
+  type SpawnAgentSpec,
   accountHasCredentials,
   activateAccountIntoHome,
   addAccount,
+  autoAccountTool,
   captureAccountFromHome,
   defaultHomeForAccount,
   findAccount,
@@ -22,7 +25,7 @@ import {
 } from "./accounts.js";
 import { identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
-import { accountLimits, paceDelta, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
+import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { swapAccount } from "./swap.js";
 import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
@@ -348,11 +351,57 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   return record;
 }
 
+/**
+ * `--ttl <age>`: maximum acceptable age for cached provider limits (e.g. 30m,
+ * 2h; 0 forces a live read). Undefined when the flag is absent, so callers
+ * keep their own defaults (limits: live; auto pick: 1h).
+ */
+function ttlFlagMs(parsed: Parsed): number | undefined {
+  const raw = flag(parsed, "ttl");
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") throw new Error("--ttl needs a duration (e.g. 30m, 2h; 0 forces a live read)");
+  if (raw.trim() === "0") return 0;
+  return parseAge(raw);
+}
+
+/**
+ * resolveSpawnAgent plus the reserved `<tool>-auto` alias: instead of naming
+ * an account, pick the tool's account with the least weekly usage (accounts
+ * near their 5h limit, then accounts with unreadable limits, sort last).
+ */
+async function resolveSpawnAgentWithAuto(requested: string, parsed: Parsed): Promise<SpawnAgentSpec> {
+  const tool = autoAccountTool(requested);
+  if (tool) return { agent: tool, account: await pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  return resolveSpawnAgent(requested);
+}
+
+/** `--account <query>` resolution; the reserved query `auto` invokes the least-loaded pick. */
+async function resolveAccountFlag(query: string, tool: string, ttlMs: number | undefined): Promise<AccountRecord> {
+  if (query === AUTO_ACCOUNT_QUERY) return pickAutoAccount(tool, ttlMs);
+  return findAccount(query, tool);
+}
+
+async function pickAutoAccount(tool: string, ttlMs: number | undefined): Promise<AccountRecord> {
+  const choice = await pickLeastLoadedAccount(tool, ttlMs !== undefined ? { ttlMs } : {});
+  const usage = autoPickUsage(choice.limits);
+  const freshness = choice.limits?.cached && choice.limits.asOf ? `, cached ${formatRelativeTime(choice.limits.asOf)} ago` : "";
+  console.error(note(`account auto → ${choice.account.id}${usage ? ` (${usage}${freshness})` : ""} — ${choice.reason}`));
+  return choice.account;
+}
+
+function autoPickUsage(limits: AccountLimits | undefined): string {
+  if (!limits?.ok) return "";
+  const now = Date.now();
+  const cell = (label: string, window?: WindowUsage) =>
+    window ? `${label} ${Math.round(windowRolledOver(window, now) ? 0 : window.usedPercent)}%` : null;
+  return [cell("weekly", limits.weekly), cell("5h", limits.fiveHour)].filter(Boolean).join(", ");
+}
+
 async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <a>] [-- <bee-args...>]");
-  // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto.
-  const { agent, account: aliasAccount } = await resolveSpawnAgent(requested);
+  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <a|auto>] [-- <bee-args...>]");
+  // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
+  const { agent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
   const cwd = await resolveSpawnCwd(parsed);
   const yolo = dangerousMode(parsed, agent);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -362,7 +411,7 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : undefined;
   const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
-  const account = accountQuery ? await findAccount(accountQuery, spec.kind) : aliasAccount;
+  const account = accountQuery ? await resolveAccountFlag(accountQuery, spec.kind, ttlFlagMs(parsed)) : aliasAccount;
   const autoswap = truthy(flag(parsed, "autoswap"));
   if (autoswap && !account) throw new Error("--autoswap requires an account (--account or a <tool>-<account> bee spec)");
   let record = await spawnBee({ agent, extraArgs: parsed.rest, cwd, yolo, home, name, colony, brief: briefText, node, account, autoswap });
@@ -385,7 +434,7 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
     throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
   }
-  const { agent, account } = await resolveSpawnAgent(requested);
+  const { agent, account } = await resolveSpawnAgentWithAuto(requested, parsed);
   const cwd = await resolveSpawnCwd(parsed);
   const yolo = dangerousMode(parsed, agent);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -1482,7 +1531,7 @@ async function cmdX(parsed: Parsed) {
 // leaves the bee running like any tmux session.
 async function cmdXa(parsed: Parsed) {
   const agent = parsed.args[0];
-  if (!agent) throw new Error("Usage: hive xa <bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--name <id>] [--print]");
+  if (!agent) throw new Error("Usage: hive xa <bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--name <id>] [--print]");
   if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
     throw new Error("hive xa attaches to a single bee; spawn cohorts with hive spawn --count/--frame");
   }
@@ -1514,7 +1563,7 @@ async function cmdXa(parsed: Parsed) {
 // separator (which still works, and is the escape hatch for flags open owns,
 // e.g. `hive open claude -- --print`).
 const OPEN_OWN_FLAGS = new Set([
-  "window", "app", "cwd", "account", "home", "profile", "print",
+  "window", "app", "cwd", "account", "ttl", "home", "profile", "print",
   "yolo", "dangerous", "no-yolo", "accept-trust", "trust", "no-accept-trust", "no-trust",
 ]);
 
@@ -1535,11 +1584,11 @@ function openPassthroughArgs(parsed: Parsed): string[] {
 
 async function cmdOpen(parsed: Parsed) {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive open <bee> [--window] [--app <terminal>] [--cwd <dir>] [--account <a>] [--print] [<bee-flags...>]");
-  const { agent, account: aliasAccount } = await resolveSpawnAgent(requested);
+  if (!requested) throw new Error("Usage: hive open <bee> [--window] [--app <terminal>] [--cwd <dir>] [--account <a|auto>] [--print] [<bee-flags...>]");
+  const { agent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
   const yolo = dangerousMode(parsed, agent);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
-  const account = accountQuery ? await findAccount(accountQuery, canonicalAgentKind(agent)) : aliasAccount;
+  const account = accountQuery ? await resolveAccountFlag(accountQuery, canonicalAgentKind(agent), ttlFlagMs(parsed)) : aliasAccount;
   const home = (flag(parsed, "home") ?? flag(parsed, "profile")) ?? (account ? defaultHomeForAccount(account) : undefined);
   const spec = resolveAgent(agent, [...openPassthroughArgs(parsed), ...parsed.rest], { home, yolo, identity: Boolean(account) });
   if (account) {
@@ -4025,7 +4074,10 @@ async function cmdLimits(parsed: Parsed) {
     console.log(note("no accounts registered; add some with: hive account add <tool> <label> && hive login <account>"));
     return;
   }
-  const results = await accountLimits(accounts);
+  // Live reads refresh the on-disk cache; --ttl serves entries younger than
+  // the given age instead of paying the provider round-trips.
+  const ttlMs = ttlFlagMs(parsed);
+  const results = await cachedAccountLimits(accounts, ttlMs !== undefined ? { ttlMs } : {});
 
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(results, null, 2));
@@ -4037,7 +4089,7 @@ async function cmdLimits(parsed: Parsed) {
     result.plan ?? "-",
     limitCell(result.fiveHour, result),
     limitCell(result.weekly, result),
-    result.asOf ? formatRelativeTime(result.asOf) : result.ok ? "live" : "-",
+    result.cached ? `cache ${formatRelativeTime(result.asOf)}` : result.asOf ? formatRelativeTime(result.asOf) : result.ok ? "live" : "-",
   ]);
   console.log(formatTable(
     [{ header: "ACCOUNT" }, { header: "PLAN" }, { header: "5H" }, { header: "WEEKLY" }, { header: "AS-OF" }],
@@ -4134,11 +4186,11 @@ function printHelp() {
   const env = (name: string) => (pretty ? cyan(name) : name);
 
   const commands: Array<[string, string, string]> = [
-    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--autoswap] [--colony <name>] [--count <n>] [--node <name>] [--yolo|--no-yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start bees in detached tmux sessions (claude is permissionless by default — --no-yolo to opt out; waits for the prompt, auto-accepting trust)"],
+    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--autoswap] [--colony <name>] [--count <n>] [--node <name>] [--yolo|--no-yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start bees in detached tmux sessions (claude is permissionless by default — --no-yolo to opt out; waits for the prompt, auto-accepting trust)"],
     ["spawn --frame", "<name> [--colony <name>] [--swarm-id <id>]", "spawn a swarm from a registered frame"],
     ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
     ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
-    ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto)"],
+    ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto, claude-auto)"],
     ["open", "<bee> [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print] [<bee-flags...>]", "identity launcher: run the agent right here in this terminal (--window for a new one), no tmux/session record; unknown flags (e.g. --resume <id>) pass through to the bee"],
     ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
     ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
@@ -4167,7 +4219,7 @@ function printHelp() {
     ["activate", "<account> [--home <1|2|3|path>]", "seed an account's credentials into a home slot (fast login)"],
     ["login", "<account> [--no-wait] [--popup]", "interactive (re)login seat in tmux; captures fresh credentials into the vault"],
     ["swap-account", "<bee> <account>", "stop, re-credential the bee's home, and resume the same session on another account"],
-    ["usage", "[<account>] [--samples] [--json]", "progress against the providers' real 5h/weekly limits with pace (alias: limits); --samples shows the daemon's local token samples"],
+    ["usage", "[<account>] [--ttl <age>] [--samples] [--json]", "progress against the providers' real 5h/weekly limits with pace (alias: limits); live reads refresh a local cache, --ttl <age> serves cache entries younger than that (0 = force live); --samples shows the daemon's local token samples"],
     ["sessions", "reconcile [--home <path>]... [--json]", "index sessions across all homes; flag duplicates and sync conflicts"],
     ["sync", "manifest [--json]", "write the syncthing include/exclude manifest (vault always excluded)"],
     ["config", "<show|path|set-bee <bee> [--yolo] [--home] [--command]>", "view or edit ~/.hive/config.json defaults"],
@@ -4188,6 +4240,8 @@ function printHelp() {
     "  claude, codex, opencode, grok, pi, droid, cursor",
     `  ${dim("home aliases: codex1, codex2, codex3, cc1, cc2, cc3")}`,
     `  ${dim("account shorthands: <tool>-<account fragment> (codex-ur, claude-thto) — see hive account list")}`,
+    `  ${dim("<tool>-auto / --account auto: pick the account with the least weekly usage (accounts ≥90% into their 5h window go last);")}`,
+    `  ${dim("the pick reuses limits cached up to 1h old — override with --ttl <age> (0 = always live)")}`,
     `  ${dim("or any executable on PATH")}`,
   ].join("\n");
 

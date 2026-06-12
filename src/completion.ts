@@ -63,23 +63,23 @@ const SHELL_FIRST_ARG = new Set(["completion"]);
 const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
+  spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
   xa: [
-    "--cwd", "--home", "--profile", "--account", "--name", "--colony", "--print",
+    "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony", "--print",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
     "--yolo", "--no-yolo", "--dangerous", "--boot-ms",
   ],
-  open: ["--window", "--app", "--cwd", "--home", "--profile", "--account", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust"],
-  usage: ["--samples", "--json"],
-  limits: ["--samples", "--json"],
+  open: ["--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust"],
+  usage: ["--samples", "--json", "--ttl"],
+  limits: ["--samples", "--json", "--ttl"],
   sessions: ["--home", "--json"],
   sync: ["--json"],
   node: ["--kind", "--endpoint", "--capabilities", "--description", "--ssh-command", "--ssh-args"],
   run: [
-    "--prompt", "-p", "--cwd", "--home", "--profile",
+    "--prompt", "-p", "--cwd", "--home", "--profile", "--account", "--ttl",
     "--wait", "--last", "--transcript",
     "--rm", "--cleanup", "--keep",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
@@ -89,7 +89,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "-n", "--limit", "--json",
   ],
   x: [
-    "--prompt", "-p", "--cwd", "--home", "--profile", "--name", "--colony",
+    "--prompt", "-p", "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
     "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate",
   ],
@@ -136,7 +136,7 @@ export type CompletionState = {
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account";
+type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto";
 
 const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -154,7 +154,9 @@ const FLAG_VALUE_KINDS: Record<string, FlagValueKind> = {
   "--type": "search-type",
   "--status": "seal-status",
   "--flow": "flow",
-  "--account": "account",
+  // --account only appears on spawn-side verbs, where the reserved query
+  // `auto` (least-loaded pick) is valid alongside real account ids.
+  "--account": "account-or-auto",
 };
 
 // Per-command overrides + additions. These only apply when args[0] equals
@@ -240,8 +242,13 @@ export function getCompletionsFromState(words: string[], state: CompletionState)
   if (positionalIndexOf(args) !== 0) return [];
 
   // Bee specs include account shorthands: the full account id is itself a
-  // valid `<tool>-<account>` spawn spec.
-  if (BEE_FIRST_ARG.has(command)) return [...BEES, ...(state.accounts ?? []).map((account) => account.id)];
+  // valid `<tool>-<account>` spawn spec, and `<tool>-auto` picks the
+  // least-loaded account of that tool.
+  if (BEE_FIRST_ARG.has(command)) {
+    const accounts = state.accounts ?? [];
+    const autoAliases = [...new Set(accounts.map((account) => `${account.tool}-auto`))];
+    return [...BEES, ...accounts.map((account) => account.id), ...autoAliases];
+  }
   if (ACCOUNT_FIRST_ARG.has(command)) return resolveFlagValueCandidates("account", state);
   if (SHELL_FIRST_ARG.has(command)) return SHELLS;
   if (SESSION_LIVE_ONLY.has(command)) return sessionRefs(state, "live");
@@ -294,6 +301,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return LOOP_SUMMARIZER_VALUES;
     case "account":
       return (state.accounts ?? []).map((account) => account.id);
+    case "account-or-auto":
+      return ["auto", ...(state.accounts ?? []).map((account) => account.id)];
   }
 }
 
