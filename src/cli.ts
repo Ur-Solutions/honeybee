@@ -4442,102 +4442,136 @@ async function cmdSync(parsed: Parsed) {
 function printHelp() {
   const pretty = isPretty();
   const head = pretty ? `${bold(APP_NAME)} ${dim(VERSION)}` : `${APP_NAME} ${VERSION}`;
-  const heading = (label: string) => (pretty ? bold(label) : label);
+  const heading = (label: string) => (pretty ? bold(yellow(label)) : label);
   const cmd = (name: string) => (pretty ? cyan(name) : name);
   const arg = (text: string) => (pretty ? gray(text) : text);
   const env = (name: string) => (pretty ? cyan(name) : name);
 
-  const commands: Array<[string, string, string]> = [
-    ["spawn", "<bee> [--name <id>] [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--autoswap] [--colony <name>] [--count <n>] [--node <name>] [--here] [--yolo|--no-yolo] [--no-accept-trust] [--no-wait] [-- <bee-args...>]", "start bees in detached tmux sessions (claude is permissionless by default — --no-yolo to opt out; waits for the prompt, auto-accepting trust; --here also links the window into your current tmux session)"],
-    ["spawn --frame", "<name> [--colony <name>] [--swarm-id <id>]", "spawn a swarm from a registered frame"],
-    ["run", "<bee> -p <prompt> [--cwd <dir>] [--node <name>] [--wait] [--last] [--rm] [--no-accept-trust] [--force-send]", "spawn, send a prompt, optionally wait and clean up"],
-    ["x", "<bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo] [--force-send]", "shorthand: spawn a bee and hand it a prompt, then return (fire-and-forget)"],
-    ["xa", "<bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--print]", "shorthand: spawn a bee and attach to it (bee specs: claude, cc1, codex2, codex-ur, claude-thto, claude-auto)"],
-    ["open", "<bee> [--raw] [--window] [--app wezterm|ghostty|kitty|alacritty|iterm|terminal] [--cwd <dir>] [--print] [<bee-flags...>]", "registered spawn presented where you are: inside tmux links the bee's window here, outside attaches (CHANGED: was raw-in-terminal — that is now --raw; --window/--app imply --raw); unknown flags (e.g. --resume <id>) still pass through to the bee"],
-    ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
-    ["brief", "<selector> <text> [--no-wait-footer] [--wait-footer \"...\"]", "send a one-time context brief (appends halt-and-wait footer unless suppressed)"],
-    ["rename", "<selector> <title> | --auto | --clear", "set a bee's display title; --auto derives one from its brief/initial transcript via a cheap model (the daemon also does this automatically — see config set-naming)"],
-    ["seal", "<selector> --from <path.json>", "record a typed handoff artifact"],
-    ["tail", "<session> [-n <lines>] [-f|--follow]", "capture or follow pane content"],
-    ["transcript", "<session> [-n <rows>] [--json]", "render structured transcript rows"],
-    ["last", "<session> [--seal]", "print the bee's most recent assistant message or seal"],
-    ["wait", "<session> [--idle-ms 3000] [--last|--transcript|--seal]", "block until the bee goes idle or seals"],
-    ["list", "[--colony <name>] [--swarm <id>] [--node <name>] [--wide]", "show all known sessions with state (pretty mode adds NODE column when >1 node)"],
-    ["ps", "[--colony <name>] [--swarm <id>] [--node <name>] [--wide]", "alias for list"],
-    ["kill", "<session>", "stop a session and remove its metadata"],
-    ["clean", "(--dead|--idle|-i) [--older-than <age>] [--dry-run|-n]", "remove dead metadata, kill idle bees, or pick targets in an interactive cleanup TUI"],
-    ["attach", "<session> [--print]", "attach to the tmux session (or print the command); nesting-safe inside tmux"],
-    ["view", "<selector> [--name <n>] [--new-client] | --close <n>", "colony cockpit: link live bees' windows into an ephemeral view-<n> session (re-run to pick up new bees; --close unlinks and removes the view, bees untouched)"],
-    ["colony", "<list|create|inspect|archive|update|rename> [name]", "manage project-scoped namespaces"],
-    ["frame", "<list|define|update|reload|edit|inspect|remove> [name|path]", "manage reusable swarm blueprints"],
-    ["swarm", "<list|inspect|destroy> [@id]", "manage live or destroyed bee cohorts"],
-    ["node", "<list|register|inspect|update|unregister> [name]", "manage substrate endpoints (local + ssh-tmux)"],
-    ["substrate", "list", "show available substrate kinds"],
-    ["flow", "<list|define|inspect|remove|run|runs|logs|status|cancel> [name|path|runId] [--arg k=v]... [--background]", "manage and run flow definitions; --background detaches, cancel signals the pgid"],
-    ["loop", "<start|status|logs|stop|list> [id] [--bee --cwd --context --prompt ...]", "Run a bee repeatedly until a stop condition"],
-    ["buz", "<send|inbox|outbox|queue|read|purge|config> [--tier <interrupt|queue|passive>] [--sender <bee>|--sender-human <name>]", "addressed messaging: three-tier delivery + per-bee policy"],
-    ["daemon", "<install|uninstall|start|stop|restart|status|logs|run> [--label <id>] [--tick-ms <n>] [--lines N] [--follow] [--json]", "manage the hive daemon LaunchAgent + inspect state/logs"],
-    ["search", "<query> [--type seals,ledger,sessions] [--colony X] [--swarm X] [--bee X] [--status X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals, ledger, and session records"],
-    ["seals find", "<query> [--status X] [--colony X] [--bee X] [--since 7d] [--regex] [--case] [--limit N] [--json]", "search seals only"],
-    ["account", "<list|add|login|capture|sync|remove> [tool] [label] [--email <addr>] [--home <path>]", "manage provider accounts in the local credential vault (~/.hive/vault, never synced); sync pulls rotated claude OAuth chains from homes back into the vault"],
-    ["activate", "<account> [--home <1|2|3|path>]", "seed an account's credentials into a home slot (fast login)"],
-    ["login", "<account> [--no-wait] [--popup]", "interactive (re)login seat in tmux; captures fresh credentials into the vault"],
-    ["swap-account", "<bee> <account>", "stop, re-credential the bee's home, and resume the same session on another account"],
-    ["usage", "[<account>] [--ttl <age>] [--samples] [--json]", "progress against the providers' real 5h/weekly limits with pace (alias: limits); live reads refresh a local cache, --ttl <age> serves cache entries younger than that (0 = force live); --samples shows the daemon's local token samples"],
-    ["sessions", "reconcile [--home <path>]... [--json]", "index sessions across all homes; flag duplicates and sync conflicts"],
-    ["sync", "manifest [--json]", "write the syncthing include/exclude manifest (vault always excluded)"],
-    ["config", "<show|path|set-bee <bee> [--yolo] [--home] [--command]|set-naming [--auto|--no-auto] [--tool claude|codex] [--model <m>] [--command \"...\"]>", "view or edit ~/.hive/config.json defaults (set-naming controls auto-titling; default: claude + haiku)"],
-    ["completion", "<bash|zsh|fish>", "print a shell completion script (eval to install)"],
+  // Grouped overview. Each row is [name, synopsis, one-line description].
+  // The synopsis shows only the leading positionals — full flag signatures
+  // live in each command's own `Usage:` (run the command with no/invalid args).
+  const groups: Array<{ title: string; rows: Array<[string, string, string]> }> = [
+    {
+      title: "Spawn & run",
+      rows: [
+        ["spawn", "<bee>", "start bees in detached tmux sessions (--frame to spawn a swarm)"],
+        ["run", "<bee> -p <prompt>", "spawn, send a prompt, optionally wait and clean up"],
+        ["x", "<bee> <prompt>", "spawn a bee and hand it a prompt, then return (fire-and-forget)"],
+        ["xa", "<bee>", "spawn a bee and attach to it"],
+        ["open", "<bee>", "registered spawn presented where you are (link window or attach)"],
+      ],
+    },
+    {
+      title: "Message",
+      rows: [
+        ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
+        ["brief", "<selector> <text>", "send a one-time context brief"],
+        ["buz", "<send|inbox|read|…>", "addressed messaging: three-tier delivery + per-bee policy"],
+        ["rename", "<selector> <title>", "set a bee's display title (--auto to derive one, --clear)"],
+        ["seal", "<selector> --from <p>", "record a typed handoff artifact"],
+      ],
+    },
+    {
+      title: "Observe",
+      rows: [
+        ["list", "", "show all known sessions with state (alias: ps)"],
+        ["tail", "<session>", "capture or follow pane content"],
+        ["transcript", "<session>", "render structured transcript rows"],
+        ["last", "<session>", "print the bee's most recent assistant message or seal"],
+        ["wait", "<session>", "block until the bee goes idle or seals"],
+        ["view", "<selector>", "colony cockpit: link live bees' windows into a view session"],
+        ["search", "<query>", "search seals, ledger, and session records (seals find: seals only)"],
+        ["usage", "[<account>]", "progress against providers' real 5h/weekly limits (alias: limits)"],
+      ],
+    },
+    {
+      title: "Manage bees",
+      rows: [
+        ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
+        ["kill", "<session>", "stop a session and remove its metadata"],
+        ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],
+        ["loop", "<start|status|stop|…>", "run a bee repeatedly until a stop condition"],
+      ],
+    },
+    {
+      title: "Organize",
+      rows: [
+        ["colony", "<list|create|…>", "manage project-scoped namespaces"],
+        ["swarm", "<list|inspect|destroy>", "manage live or destroyed bee cohorts"],
+        ["frame", "<list|define|…>", "manage reusable swarm blueprints"],
+        ["flow", "<list|run|runs|…>", "manage and run flow definitions"],
+      ],
+    },
+    {
+      title: "Accounts",
+      rows: [
+        ["account", "<list|add|sync|…>", "manage provider accounts in the local credential vault"],
+        ["activate", "<account>", "seed an account's credentials into a home slot (fast login)"],
+        ["login", "<account>", "interactive (re)login seat in tmux; captures fresh credentials"],
+        ["swap-account", "<bee> <account>", "re-credential a bee's home and resume on another account"],
+      ],
+    },
+    {
+      title: "Substrate & daemon",
+      rows: [
+        ["node", "<list|register|…>", "manage substrate endpoints (local + ssh-tmux)"],
+        ["substrate", "list", "show available substrate kinds"],
+        ["daemon", "<status|logs|…>", "manage the hive daemon LaunchAgent + inspect state/logs"],
+        ["sessions", "reconcile", "index sessions across all homes; flag dupes and conflicts"],
+        ["sync", "manifest", "write the syncthing include/exclude manifest"],
+      ],
+    },
+    {
+      title: "Setup",
+      rows: [
+        ["config", "<show|set-bee|…>", "view or edit ~/.hive/config.json defaults"],
+        ["completion", "<bash|zsh|fish>", "print a shell completion script (eval to install)"],
+      ],
+    },
   ];
 
-  const width = Math.max(...commands.map(([name]) => name.length));
-  const pad = (name: string) => name.padEnd(width, " ");
+  // One alignment width across all groups, so the description column lines up.
+  const invocation = (name: string, syn: string) => `hive ${name}${syn ? ` ${syn}` : ""}`;
+  const width = Math.max(
+    ...groups.flatMap((g) => g.rows.map(([name, syn]) => invocation(name, syn).length)),
+  );
 
-  const usage = commands
-    .map(([name, args, desc]) => {
-      const left = `  hive ${cmd(pad(name))}  ${arg(args)}`.trimEnd();
-      return `${left}\n      ${dim(desc)}`;
-    })
-    .join("\n");
+  const renderRow = ([name, syn, desc]: [string, string, string]) => {
+    const plain = invocation(name, syn);
+    const colored = `hive ${cmd(name)}${syn ? ` ${arg(syn)}` : ""}`;
+    const padded = colored + " ".repeat(Math.max(0, width - plain.length));
+    return `  ${padded}   ${dim(desc)}`;
+  };
+
+  const sections = groups
+    .map((g) => `${heading(g.title)}\n${g.rows.map(renderRow).join("\n")}`)
+    .join("\n\n");
 
   const bees = [
-    "  claude, codex, opencode, grok, pi, droid, cursor",
+    "  claude, codex, opencode, grok, pi, droid, cursor — or any executable on PATH",
     `  ${dim("home aliases: codex1, codex2, codex3, cc1, cc2, cc3")}`,
     `  ${dim("account shorthands: <tool>-<account fragment> (codex-ur, claude-thto) — see hive account list")}`,
-    `  ${dim("<tool>-auto / --account auto: pick the account with the least weekly usage (accounts ≥90% into their 5h window go last);")}`,
-    `  ${dim("the pick reuses limits cached up to 1h old — override with --ttl <age> (0 = always live)")}`,
-    `  ${dim("or any executable on PATH")}`,
+    `  ${dim("<tool>-auto / --account auto: pick the account with the least weekly usage")}`,
   ].join("\n");
 
   const envs = [
     `  ${env("HIVE_CLAUDE_CMD")}=${arg(`"claude --model sonnet"`)} hive spawn claude`,
     `  ${env("HIVE_CODEX_YOLO")}=${arg("1")} hive spawn codex`,
-    `  ${env("HIVE_GROK_CMD")}=${arg(`"grok --model grok-code-fast-1"`)} hive spawn grok`,
-    `  ${env("HIVE_DROID_CMD")}=${arg(`"python3 ~/bin/droid.py"`)} hive spawn droid`,
+    `  ${dim("hive spawn codex2 · hive spawn claude --home ~/.claude-3 · hive spawn cc3")}`,
   ].join("\n");
 
-  const profiles = [
-    "  hive spawn codex --home 2",
-    "  hive spawn codex2",
-    "  hive spawn claude --home ~/.claude-3",
-    "  hive spawn cc3",
-  ]
-    .map((line) => (pretty ? dim(line) : line))
-    .join("\n");
+  console.log(`${head}  ${dim("— run any command with no/invalid args for its full usage")}
 
-  console.log(`${head}
+${heading("Usage")}
+  ${cmd("hive")} ${arg("<command> [args]")}
 
-${heading("Commands")}
-${usage}
+${sections}
 
 ${heading("Bees")}
 ${bees}
 
 ${heading("Env overrides")}
 ${envs}
-
-${heading("Home/profile examples")}
-${profiles}
 `);
 }
 
