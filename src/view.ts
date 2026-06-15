@@ -4,13 +4,17 @@
  * objects — a link is a second handle, not a copy — so a view renders many
  * bees in one session without touching their lifecycle.
  *
- * Hard invariant: nothing in this module ever calls kill-window or passes -k
- * to unlink-window. A bee window always keeps its home link in the bee's own
- * session, so unlinking it from a view can never be fatal (tmux refuses to
- * remove a window's last link). The only kill here is kill-session on the
- * view itself, and only after every bee window was verifiably unlinked — the
- * view's own lobby window (tagged at creation in @hive_view_lobby) is the
- * sole window a dying view may take with it.
+ * Hard invariant: closing a view is provably incapable of killing a bee.
+ * --close only ever calls unlink-window WITHOUT -k, which tmux refuses when it
+ * would remove a window's last link — so an orphaned bee (its home session
+ * gone) aborts the close rather than dying. A bee window otherwise always keeps
+ * its home link, so unlinking it from a view just drops the view's handle.
+ *
+ * The one kill-window in this module is at BUILD time only: tmux requires a new
+ * session to own a window, so we spawn a throwaway placeholder shell, link the
+ * bees in, then kill that placeholder by the exact window id we just created.
+ * It is single-linked and provably never a bee, so the cockpit ends up being
+ * only bees (no anchor window cluttering the strip).
  *
  * Views are tmux-derived and ephemeral: no store records, invisible to
  * selectors/clean (those only operate on store records).
@@ -89,13 +93,12 @@ export async function buildView(name: string, targets: string[]): Promise<BuildV
   const inventory = await windowInventory();
 
   let created = false;
+  let placeholder = "";
   if (!(await hasSession(session))) {
-    // The lobby shell anchors the session: links come and go, the view stays.
-    // Its window id is tagged on the session so --close can prove what it owns.
+    // tmux requires a new session to own a window. Spawn a throwaway shell; we
+    // link the bees in, then remove it so the cockpit is only bees.
     await tmux(["new-session", "-d", "-s", session, "-n", "hive"]);
-    const lobby = await tmux(["display-message", "-p", "-t", `=${session}:`, "#{window_id}"]);
-    // set/show-options only honor "=" exact matching in the "=name:" form.
-    await tmux(["set-option", "-t", `=${session}:`, "@hive_view_lobby", lobby.stdout.trim()]);
+    placeholder = (await tmux(["display-message", "-p", "-t", `=${session}:`, "#{window_id}"])).stdout.trim();
     created = true;
   }
 
@@ -105,13 +108,30 @@ export async function buildView(name: string, targets: string[]): Promise<BuildV
     const windowId = fresh.active.get(target);
     if (windowId) bees.push({ session: target, windowId });
   }
-  const plan = planViewLinks(fresh.windows.get(session) ?? [], bees);
+  // Dedupe against bees already linked into the view; the placeholder is not a
+  // bee, so it must never count as "already linked".
+  const existing = (fresh.windows.get(session) ?? []).filter((id) => id !== placeholder);
+  const plan = planViewLinks(existing, bees);
 
   const linked: string[] = [];
   for (const bee of plan) {
     await tmux(["link-window", "-s", bee.windowId, "-t", `=${session}:`]);
     linked.push(bee.session);
   }
+
+  // Drop the placeholder now that real windows exist. kill-window targets the
+  // exact id we created moments ago — single-linked, provably never a bee — so
+  // it cannot affect any bee. Guarded on having linked ≥1 window so the session
+  // is never emptied (which would auto-destroy it).
+  if (placeholder && linked.length > 0) {
+    await tmux(["kill-window", "-t", `=${session}:${placeholder}`], { reject: false });
+  }
+
+  // On first build, land on the first bee rather than wherever tmux left focus.
+  if (created && plan[0]) {
+    await tmux(["select-window", "-t", `=${session}:${plan[0].windowId}`], { reject: false });
+  }
+
   return { session, created, linked, alreadyLinked: bees.length - plan.length };
 }
 
@@ -168,16 +188,14 @@ export type CloseViewResult = {
 };
 
 /**
- * Unlink every bee window from the view (never -k), then kill the empty view
- * session(s). If any non-lobby window refuses to unlink, abort before the
- * kill — kill-session must only ever destroy the lobby.
+ * Unlink every window from the view (never -k), then kill the (now-empty) view
+ * session(s). If any window refuses to unlink, abort before the kill: a refusal
+ * means that window's only link is this view — an orphaned bee whose home
+ * session died — and we must never force it.
  */
 export async function closeView(name: string): Promise<CloseViewResult> {
   const session = viewSessionName(name);
   if (!(await hasSession(session))) throw new Error(`No such view: ${session}`);
-
-  const lobbyResult = await tmux(["show-options", "-v", "-t", `=${session}:`, "@hive_view_lobby"], { reject: false });
-  const lobbyId = lobbyResult.ok ? lobbyResult.stdout.trim() : "";
 
   // Grouped sessions share the window set; enumerate the whole group so the
   // final kill sweeps view-<name>-<n> clients too.
@@ -197,14 +215,13 @@ export async function closeView(name: string): Promise<CloseViewResult> {
 
   let unlinked = 0;
   for (const windowId of windows) {
-    if (windowId === lobbyId) continue;
     // Session-qualified window id: immune to renumber-windows shifting
     // indexes under the loop, and unambiguous about WHICH link is removed.
     const result = await tmux(["unlink-window", "-t", `=${session}:${windowId}`], { reject: false });
     if (!result.ok) {
       throw new Error(
         `Refusing to close ${session}: window ${windowId} would not unlink (${result.stderr.trim() || "last link?"}). ` +
-          `It may be a bee whose own session is gone — re-attach it first: tmux attach -t ${session}`,
+          `It is a bee whose own session is gone — re-attach it first: tmux attach -t ${session}`,
       );
     }
     unlinked += 1;

@@ -26,7 +26,7 @@ test("view: link, dedupe on re-run, grouped client, close leaves bees alive", { 
   await tmux(["new-session", "-d", "-s", "CL-v1", "sleep 120"]);
   await tmux(["new-session", "-d", "-s", "CL-v2", "sleep 120"]);
 
-  // Build: both bees' windows linked into view-t1 (plus its lobby).
+  // Build: the cockpit contains exactly the two bees — no anchor/lobby window.
   const built = await buildView("t1", ["CL-v1", "CL-v2"]);
   assert.equal(built.session, "view-t1");
   assert.equal(built.created, true);
@@ -36,6 +36,12 @@ test("view: link, dedupe on re-run, grouped client, close leaves bees alive", { 
   const v2Window = after1.find((l) => l.endsWith(" CL-v2"))!.split(" ")[0];
   assert.ok(after1.includes(`${v1Window} view-t1`), "CL-v1 window linked into view");
   assert.ok(after1.includes(`${v2Window} view-t1`), "CL-v2 window linked into view");
+  // The throwaway placeholder must be gone: view-t1 has exactly 2 windows,
+  // both of them bees (no leftover "hive" shell occupying a slot).
+  const viewWindows = (await tmux(["list-windows", "-t", "=view-t1", "-F", "#{window_id}"])).stdout
+    .split("\n").map((s) => s.trim()).filter(Boolean);
+  assert.equal(viewWindows.length, 2, "view holds only the 2 bees, no placeholder");
+  assert.deepEqual(viewWindows.sort(), [v1Window, v2Window].sort(), "every view window is a bee");
 
   // Dedupe: re-running links nothing new.
   const again = await buildView("t1", ["CL-v1", "CL-v2"]);
