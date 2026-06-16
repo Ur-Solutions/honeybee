@@ -189,7 +189,7 @@ export class HiveFacade {
   async send(target: BeeRef, text: string): Promise<void> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
-    await substrateFor(record).sendText(record.tmuxTarget, text);
+    await substrateFor(record).sendText(record.tmuxTarget, text, record.agentPaneId);
     const now = new Date().toISOString();
     await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: text, lastPromptAt: now });
     await appendLedger({
@@ -204,7 +204,7 @@ export class HiveFacade {
   async brief(target: BeeRef, text: string): Promise<void> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
-    await substrateFor(record).sendText(record.tmuxTarget, text);
+    await substrateFor(record).sendText(record.tmuxTarget, text, record.agentPaneId);
     const now = new Date().toISOString();
     await updateSession(record.name, {
       updatedAt: now,
@@ -313,7 +313,7 @@ export class HiveFacade {
     const record = await this.resolveRecord(target);
     const tier: BuzTier = options.tier ?? "queue";
     const transport = tier === "interrupt"
-      ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget }
+      ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId }
       : undefined;
     await sendBuzMessage({
       recipient: record,

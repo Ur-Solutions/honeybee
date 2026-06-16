@@ -77,6 +77,7 @@ export async function writeSpawnOptions(record: SessionRecord): Promise<void> {
       "@hive_colony": record.colony ?? "",
       "@hive_swarm": record.swarmId ?? "",
       "@hive_title": record.title ?? "",
+      "@hive_pane": record.agentPaneId ?? "",
       [HIVE_STATE_OPTION]: "working",
     });
     // Name the window after the bee (instead of the launcher command) so

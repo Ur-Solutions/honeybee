@@ -360,7 +360,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const substrate = opts.node ? substrateForRecord(opts.node) : localSubstrate();
   const locationHint = isRemote && opts.node ? ` on ${opts.node.name}` : "";
   if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
-  await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env });
+  const { paneId } = await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env });
   const command = shellCommand(spec);
 
   const now = new Date().toISOString();
@@ -370,6 +370,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     cwd: opts.cwd,
     command,
     tmuxTarget,
+    ...(paneId ? { agentPaneId: paneId } : {}),
     createdAt: now,
     updatedAt: now,
     status: "running",
@@ -678,7 +679,7 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
     console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, briefing anyway`]));
   }
   const delivered = augmentBrief(parsed, briefText);
-  await substrateFor(record).sendText(record.tmuxTarget, delivered);
+  await substrateFor(record).sendText(record.tmuxTarget, delivered, record.agentPaneId);
   await writeHiveState(record, "working");
   const now = new Date().toISOString();
   const persisted = await updateSession(record.name, { updatedAt: now, status: "running", brief: briefText, briefedAt: now });
@@ -766,7 +767,7 @@ async function cmdSend(parsed: Parsed) {
       else console.error(`skip\t${record.name}\tdead`);
       continue;
     }
-    await substrateFor(record).sendText(record.tmuxTarget, prompt);
+    await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
     const now = new Date().toISOString();
     await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
     await writeHiveState(record, "working");
@@ -792,14 +793,14 @@ async function cmdTail(parsed: Parsed) {
     await followTail(record, options.lines, options.pollMs);
     return;
   }
-  console.log(await substrateFor(record).capture(record.tmuxTarget, options.lines));
+  console.log(await substrateFor(record).capture(record.tmuxTarget, options.lines, record.agentPaneId));
 }
 
 async function followTail(record: SessionRecord, lines: number, pollMs: number): Promise<void> {
   let previous = "";
   while (true) {
     await ensureLive(record);
-    const next = await substrateFor(record).capture(record.tmuxTarget, lines);
+    const next = await substrateFor(record).capture(record.tmuxTarget, lines, record.agentPaneId);
     const delta = appendedPaneText(previous, next);
     if (delta) {
       if (previous && !next.startsWith(previous)) process.stdout.write("\n");
@@ -828,8 +829,10 @@ async function cmdList(parsed: Parsed) {
 
   const panes = await capturePanesFor(records, probe.liveTargets);
   const seals = await listSealedBeeNames();
+  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
   const context: StateContext = {
     liveTargets: probe.liveTargets,
+    livePanes,
     panes,
     seals,
     unreachableNodes: probe.unreachableNodes,
@@ -1038,7 +1041,7 @@ function formatStateCell(state: BeeState): string {
 async function capturePanesFor(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
   const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
   const entries = await Promise.all(
-    liveRecords.map(async (record) => [record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80).catch(() => "")] as const),
+    liveRecords.map(async (record) => [record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const),
   );
   return new Map(entries);
 }
@@ -1198,7 +1201,7 @@ async function cleanPreview(record: SessionRecord): Promise<string> {
 
   try {
     if (await substrateFor(record).hasSession(record.tmuxTarget)) {
-      const pane = await substrateFor(record).capture(record.tmuxTarget, 80);
+      const pane = await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId);
       if (pane.trim()) return [`pane tail ${record.tmuxTarget}`, "", pane.trimEnd()].join("\n");
     }
   } catch {
@@ -1231,8 +1234,10 @@ async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; can
   }
   const panes = await capturePanesFor(records, probe.liveTargets);
   const seals = await listSealedBeeNames();
+  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
   const context: StateContext = {
     liveTargets: probe.liveTargets,
+    livePanes,
     panes,
     seals,
     unreachableNodes,
@@ -1439,7 +1444,7 @@ async function cmdLast(parsed: Parsed) {
   if (!tx && !hasTranscriptProvider(record.agent)) {
     await ensureLive(record);
     console.error(isPretty() ? note(`no transcript provider for ${record.agent}; falling back to pane capture`) : `# no transcript provider for ${record.agent}; falling back to pane capture`);
-    console.log(await substrateFor(record).capture(record.tmuxTarget, numberFlag(parsed, ["n", "lines"], 120)));
+    console.log(await substrateFor(record).capture(record.tmuxTarget, numberFlag(parsed, ["n", "lines"], 120), record.agentPaneId));
     return;
   }
   if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
@@ -1547,7 +1552,7 @@ async function cmdRun(parsed: Parsed) {
       console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
       if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
     }
-    await substrateFor(record).sendText(record.tmuxTarget, prompt);
+    await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
     const now = new Date().toISOString();
     await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
     await writeHiveState(record, "working");
@@ -1568,7 +1573,7 @@ async function cmdRun(parsed: Parsed) {
       const waitMs = Number(flag(parsed, "wait-ms") ?? 1000);
       if (waitMs > 0) await sleep(waitMs);
       const lines = Number(flag(parsed, "n") ?? flag(parsed, "lines") ?? 80);
-      console.log(await substrateFor(record).capture(record.tmuxTarget, Number.isFinite(lines) ? lines : 80));
+      console.log(await substrateFor(record).capture(record.tmuxTarget, Number.isFinite(lines) ? lines : 80, record.agentPaneId));
     }
   } finally {
     if (cleanup) {
@@ -3449,7 +3454,7 @@ async function buzSend(parsed: Parsed) {
 
   for (const record of records) {
     const transport = tier === "interrupt"
-      ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget }
+      ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId }
       : undefined;
     const result = await sendBuzMessage({
       recipient: record,

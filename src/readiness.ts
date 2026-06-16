@@ -39,7 +39,7 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
   const substrate = options.substrate ?? substrateFor(record);
 
   while (Date.now() < deadline) {
-    const pane = await substrate.capture(record.tmuxTarget, 100).catch(() => "");
+    const pane = await substrate.capture(record.tmuxTarget, 100, record.agentPaneId).catch(() => "");
     lastPane = pane;
 
     if (isMcpWarningPane(pane)) {
@@ -51,7 +51,7 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
         throw new AgentReadinessError("trust", `Agent startup is waiting for a trust/safety confirmation in ${record.name}; rerun without --no-accept-trust to acknowledge it`, pane);
       }
       if (trustAttempts < 3) {
-        await substrate.sendEnter(record.tmuxTarget);
+        await substrate.sendEnter(record.tmuxTarget, record.agentPaneId);
         trustAttempts += 1;
         deadline = Math.max(deadline, Date.now() + grace);
         await sleep(1000);
@@ -61,7 +61,7 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
     }
 
     if (record.agent === "droid" && options.raiseDroidAutonomy && shouldRaiseDroidAutonomy(pane) && droidYoloCycles < 4) {
-      await substrate.sendKey(record.tmuxTarget, "C-l");
+      await substrate.sendKey(record.tmuxTarget, "C-l", record.agentPaneId);
       droidYoloCycles += 1;
       await sleep(700);
       continue;

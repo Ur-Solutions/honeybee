@@ -83,7 +83,9 @@ export async function swapAccount(
       yolo: sniffYolo(record.command),
       identity: true,
     });
-    await substrate.newSession(record.tmuxTarget, record.cwd, { command: spec.command, args: spec.args, env: spec.env });
+    // The swap re-creates the session, so the agent runs in a fresh pane —
+    // re-pin to it (the old agentPaneId is now dead).
+    const { paneId } = await substrate.newSession(record.tmuxTarget, record.cwd, { command: spec.command, args: spec.args, env: spec.env });
 
     // 4. Persist the new binding and command from the under-lock snapshot so
     //    a concurrent daemon merge (title, transcript metadata, observed
@@ -93,6 +95,7 @@ export async function swapAccount(
       ...current,
       accountId: account.id,
       command: shellCommand(spec),
+      ...(paneId ? { agentPaneId: paneId } : {}),
       status: "running",
       updatedAt: new Date().toISOString(),
     };

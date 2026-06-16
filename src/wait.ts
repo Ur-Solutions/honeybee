@@ -41,7 +41,7 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
 
   const substrate = options.substrate ?? substrateFor(record);
   while (Date.now() - started < timeoutMs) {
-    const captured = await substrate.capture(record.tmuxTarget, 200).catch(() => null);
+    const captured = await substrate.capture(record.tmuxTarget, 200, record.agentPaneId).catch(() => null);
     if (captured === null || captured === "") {
       // A failed/empty capture is indistinguishable from a dead session: an
       // empty pane plus an unchanged transcript would read as "stable" and

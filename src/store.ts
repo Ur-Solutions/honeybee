@@ -10,6 +10,13 @@ export type SessionRecord = {
   cwd: string;
   command: string;
   tmuxTarget: string;
+  /**
+   * The tmux pane id (e.g. "%7") this bee's agent actually runs in. Pins all
+   * agent I/O and liveness to that pane instead of "whatever pane is active",
+   * so splitting/adding panes no longer hijacks the bee. Absent on legacy
+   * records → they keep the active-pane fallback.
+   */
+  agentPaneId?: string;
   createdAt: string;
   updatedAt: string;
   status: "running" | "dead" | "kill_failed";
@@ -238,7 +245,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",

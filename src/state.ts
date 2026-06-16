@@ -22,6 +22,13 @@ export type StateContext = {
    * target names are still honored for single-node callers (back-compat).
    */
   liveTargets: Set<string>;
+  /**
+   * Server-wide live pane ids (e.g. "%7") on the LOCAL tmux server. When a bee
+   * is pane-pinned (agentPaneId) and local, liveness is the pane's presence
+   * here — so killing the agent pane reports the bee dead even while its
+   * session survives. Absent → fall back to session liveness for everyone.
+   */
+  livePanes?: Set<string>;
   panes?: Map<string, string>;
   seals?: Set<string>;
   unreachableNodes?: Set<string>;
@@ -55,8 +62,14 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
     return { state: "node_unreachable", detail: `node ${nodeName} offline` };
   }
 
-  const live = context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget))
-    || context.liveTargets.has(record.tmuxTarget);
+  // Pane-pinned local bees: liveness is the PANE, not the session. This is the
+  // fix for "agent pane killed but the session lives on" reporting false-alive.
+  // Only applied locally — livePanes is the local server's pane set; a remote
+  // bee's pane isn't in it, so remote bees keep session liveness.
+  const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
+  const live = record.agentPaneId && context.livePanes && isLocal
+    ? context.livePanes.has(record.agentPaneId)
+    : context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.liveTargets.has(record.tmuxTarget);
   if (!live) {
     if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
     return { state: "dead", detail: lastActivityHint(record, context) };

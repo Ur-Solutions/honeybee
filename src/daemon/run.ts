@@ -7,7 +7,7 @@ import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { deriveState, liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
-import { substrateFor, substrateForRecord } from "../substrates/index.js";
+import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
 import { createAutoTitleDispatcher, type AutoTitleOutcome } from "./autoTitle.js";
 import { dispatchAutoswaps, type AutoswapOutcome } from "./autoswap.js";
 import { dispatchBuzDrains, type BuzDispatchOutcome } from "./buzDispatcher.js";
@@ -38,6 +38,8 @@ export type TickDeps = {
   probeNodes: (nodes: NodeRecord[]) => Promise<ProbeResult>;
   /** Captures panes for the subset of live records. */
   capturePanes: (records: SessionRecord[], liveTargets: Set<string>) => Promise<Map<string, string>>;
+  /** Live pane ids on the local server, for pane-pinned liveness (problem c). */
+  livePanes?: () => Promise<Set<string>>;
   sealedBeeNames: () => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
@@ -135,10 +137,12 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   );
   const panes: Map<string, string> = await guard(deps.capturePanes(records, probe.liveTargets), errors, new Map());
   const seals: Set<string> = await guard(deps.sealedBeeNames(), errors, new Set());
+  const livePanes: Set<string> = deps.livePanes ? await guard(deps.livePanes(), errors, new Set<string>()) : new Set<string>();
 
   const nowMs = deps.now();
   const context: StateContext = {
     liveTargets: probe.liveTargets,
+    livePanes,
     panes,
     seals,
     unreachableNodes: probe.unreachableNodes,
@@ -560,6 +564,7 @@ export function buildDefaultDeps(): TickDeps {
     listNodes,
     probeNodes: defaultProbeNodes,
     capturePanes: defaultCapturePanes,
+    livePanes: () => localSubstrate().listPanes(),
     sealedBeeNames,
     touchSession,
     mirrorHiveState: async (record, state) => {
@@ -621,7 +626,7 @@ async function defaultCapturePanes(records: SessionRecord[], liveTargets: Set<st
   const entries = await Promise.all(
     liveRecords.map(async (record) => {
       try {
-        const text = await substrateFor(record).capture(record.tmuxTarget, 80);
+        const text = await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId);
         return [record.tmuxTarget, text] as const;
       } catch {
         return [record.tmuxTarget, ""] as const;

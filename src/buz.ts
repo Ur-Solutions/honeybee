@@ -68,6 +68,8 @@ export type BuzMessage = {
 export type BuzTransportContext = {
   substrate: Substrate;
   tmuxTarget: string;
+  /** The recipient bee's pinned pane, so an interrupt hits the agent pane. */
+  agentPaneId?: string;
 };
 
 export type BuzSendInput = {
@@ -317,7 +319,7 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
         return;
       }
       try {
-        await input.transport.substrate.sendText(input.transport.tmuxTarget, input.body);
+        await input.transport.substrate.sendText(input.transport.tmuxTarget, input.body, input.transport.agentPaneId);
         message.deliveredAt = new Date().toISOString();
       } catch (error) {
         // Transport failure on interrupt: downgrade to queue and let the
@@ -623,7 +625,7 @@ export async function processQueueForBee(
       }
 
       try {
-        await context.transport.substrate.sendText(context.transport.tmuxTarget, message.body);
+        await context.transport.substrate.sendText(context.transport.tmuxTarget, message.body, context.transport.agentPaneId);
       } catch (error) {
         const retriesPath = `${entry.path}.retries`;
         const prev = Number((await readFile(retriesPath, "utf8").catch(() => "0")).trim()) || 0;

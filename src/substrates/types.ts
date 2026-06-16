@@ -10,6 +10,9 @@ export type LaunchSpec = {
 
 export type ProbeResult = { ok: true } | { ok: false; reason: string };
 
+/** newSession returns the id of the pane it created, so spawn can pin the bee. */
+export type NewSessionResult = { paneId: string };
+
 export type KillResult = {
   ok: boolean;
   stdout: string;
@@ -23,13 +26,19 @@ export type Substrate = {
   readonly endpoint?: string;
   probe(): Promise<ProbeResult>;
   hasSession(target: string): Promise<boolean>;
-  newSession(target: string, cwd: string, spec: LaunchSpec): Promise<void>;
+  newSession(target: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult>;
   kill(target: string): Promise<KillResult>;
-  capture(target: string, lines?: number): Promise<string>;
-  sendText(target: string, text: string): Promise<void>;
-  sendEnter(target: string): Promise<void>;
-  sendKey(target: string, key: string): Promise<void>;
+  // Pane-scoped I/O: when paneId (e.g. "%7") is given, target that exact pane;
+  // otherwise fall back to "=name:" (the session's active pane) for legacy
+  // bees that were never pinned. This is the fix for I/O following the wrong
+  // pane after a window is split.
+  capture(target: string, lines?: number, paneId?: string): Promise<string>;
+  sendText(target: string, text: string, paneId?: string): Promise<void>;
+  sendEnter(target: string, paneId?: string): Promise<void>;
+  sendKey(target: string, key: string, paneId?: string): Promise<void>;
   listSessions(): Promise<string[]>;
+  /** Server-wide set of live pane ids (e.g. "%7") — pane-pinned liveness. */
+  listPanes(): Promise<Set<string>>;
   /**
    * One list-sessions call: live session name → its @hive_state user option
    * (empty string when unset). Returns an empty map when the server is down.

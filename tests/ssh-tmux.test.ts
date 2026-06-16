@@ -84,7 +84,9 @@ test("newSession sends an env-prefixed argv with every word quoted for the remot
   // multi-word command directly and would execvp a binary named "K=v".
   assert.deepEqual(argv, [
     "ssh", ...MUX, "trmd@mini01",
-    "tmux", "new-session", "-d", "-s", "alpha", "-c", "/remote/path",
+    // -P -F '#{pane_id}' prints the new pane id; the format is shell-quoted for
+    // the remote shell (the bare '#' would otherwise be a comment).
+    "tmux", "new-session", "-d", "-P", "-F", "'#{pane_id}'", "-s", "alpha", "-c", "/remote/path",
     "env", "'FOO=bar baz'", "codex", "--cwd", "/work/space",
   ]);
 });

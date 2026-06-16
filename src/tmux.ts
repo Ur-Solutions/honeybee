@@ -9,6 +9,7 @@ export {
   formatShellCommand,
   hasSession,
   kill,
+  listPanes,
   listSessionStates,
   listTmuxSessions,
   newSession,

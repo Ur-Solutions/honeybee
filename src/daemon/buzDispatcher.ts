@@ -134,7 +134,7 @@ export async function dispatchBuzDrains(
     try {
       const substrate = resolveSubstrate(record);
       const result = await drain(record, {
-        transport: { substrate, tmuxTarget: record.tmuxTarget },
+        transport: { substrate, tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId },
         stopOnFirstFailure: true,
       });
       outcomes.push({ recipient: record.name, result });

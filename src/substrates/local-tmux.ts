@@ -8,6 +8,7 @@ import {
   LOCAL_NODE,
   type KillResult,
   type LaunchSpec,
+  type NewSessionResult,
   type ProbeResult,
   type Substrate,
 } from "./types.js";
@@ -51,10 +52,19 @@ export async function hasSession(target: string): Promise<boolean> {
   return result.ok;
 }
 
-export async function newSession(name: string, cwd: string, spec: LaunchSpec): Promise<void> {
+// A pane id (e.g. "%7") is globally unique on a tmux server, so "-t %7" is exact
+// on its own; the "=name:" form (exact session, active pane) is the fallback for
+// unpinned (legacy) bees that have no recorded pane.
+export function paneArg(target: string, paneId?: string): string {
+  return paneId && paneId.length > 0 ? paneId : `=${target}:`;
+}
+
+export async function newSession(name: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult> {
   const launcher = await createLauncher(spec);
   try {
-    await tmux(["new-session", "-d", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
+    // -P -F prints the new pane's id so spawn can pin the bee to it.
+    const result = await tmux(["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
+    return { paneId: result.stdout.trim() };
   } catch (error) {
     // The runner only deletes the payload tmpdir once it actually starts; if
     // tmux itself refuses the session, clean up here instead of leaking it.
@@ -63,26 +73,26 @@ export async function newSession(name: string, cwd: string, spec: LaunchSpec): P
   }
 }
 
-export async function sendText(target: string, text: string): Promise<void> {
+export async function sendText(target: string, text: string, paneId?: string): Promise<void> {
   const buffer = `hive-${target.replace(/[^A-Za-z0-9_.:-]/g, "-")}`;
   // Stream the payload via stdin (`load-buffer -`) instead of an argv element:
   // prompts near ARG_MAX (~1MB on macOS) would fail set-buffer with E2BIG.
   await tmuxWithStdin(["load-buffer", "-b", buffer, "-"], text);
-  await tmux(["paste-buffer", "-p", "-b", buffer, "-t", `=${target}:`]);
-  await sendEnter(target);
+  await tmux(["paste-buffer", "-p", "-b", buffer, "-t", paneArg(target, paneId)]);
+  await sendEnter(target, paneId);
 }
 
-export async function sendEnter(target: string): Promise<void> {
-  await sendKey(target, "Enter");
+export async function sendEnter(target: string, paneId?: string): Promise<void> {
+  await sendKey(target, "Enter", paneId);
 }
 
-export async function sendKey(target: string, key: string): Promise<void> {
-  await tmux(["send-keys", "-t", `=${target}:`, key]);
+export async function sendKey(target: string, key: string, paneId?: string): Promise<void> {
+  await tmux(["send-keys", "-t", paneArg(target, paneId), key]);
 }
 
-export async function capture(target: string, lines = 80): Promise<string> {
+export async function capture(target: string, lines = 80, paneId?: string): Promise<string> {
   const start = Math.max(1, Math.floor(lines));
-  const result = await tmux(["capture-pane", "-pt", `=${target}:`, "-S", `-${start}`]);
+  const result = await tmux(["capture-pane", "-pt", paneArg(target, paneId), "-S", `-${start}`]);
   return result.stdout.trimEnd();
 }
 
@@ -145,6 +155,12 @@ export async function listSessions(): Promise<string[]> {
 }
 
 export const listTmuxSessions = listSessions;
+
+export async function listPanes(): Promise<Set<string>> {
+  const result = await tmux(["list-panes", "-a", "-F", "#{pane_id}"], { reject: false });
+  if (!result.ok) return new Set();
+  return new Set(result.stdout.split("\n").map((s) => s.trim()).filter(Boolean));
+}
 
 export async function listSessionStates(): Promise<Map<string, string>> {
   const states = new Map<string, string>();
@@ -260,6 +276,7 @@ export function createLocalTmuxSubstrate(): Substrate {
     sendEnter,
     sendKey,
     listSessions,
+    listPanes,
     listSessionStates,
     setUserOptions,
     renameWindow,

@@ -457,7 +457,7 @@ async function captureBoundaryPane(handle: BeeHandle, iter: number): Promise<str
     if (!record) return "";
     const substrate = substrateFor(record);
     try {
-      return await substrate.capture(record.tmuxTarget, 200);
+      return await substrate.capture(record.tmuxTarget, 200, record.agentPaneId);
     } catch {
       // Clean "no such session" means the bee died; a transport throw means
       // we simply don't know this pass.
@@ -619,7 +619,7 @@ async function paneMatches(handle: BeeHandle | undefined, pattern: string): Prom
     const { loadSession } = await import("../store.js");
     const record = await loadSession(handle.name);
     if (!record) return false;
-    const pane = await substrateFor(record).capture(record.tmuxTarget, 200);
+    const pane = await substrateFor(record).capture(record.tmuxTarget, 200, record.agentPaneId);
     let re: RegExp;
     try {
       re = new RegExp(pattern, "m");

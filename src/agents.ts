@@ -280,7 +280,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   if (await substrate.hasSession(tmuxTarget)) {
     throw new Error(`tmux session already exists${isRemote && opts.node ? ` on ${opts.node.name}` : ""}: ${tmuxTarget}`);
   }
-  await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env });
+  const { paneId } = await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env });
   const command = shellCommand(spec);
 
   const now = new Date().toISOString();
@@ -290,6 +290,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     cwd: opts.cwd,
     command,
     tmuxTarget,
+    ...(paneId ? { agentPaneId: paneId } : {}),
     createdAt: now,
     updatedAt: now,
     status: "running",

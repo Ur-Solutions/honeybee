@@ -34,6 +34,7 @@ function fakeSubstrate(initiallyAlive: boolean) {
     newSession: async (target, _cwd, spec) => {
       calls.push({ method: "newSession", target, spec });
       alive = true;
+      return { paneId: "%0" };
     },
     kill: async (target) => {
       calls.push({ method: "kill", target });
@@ -45,6 +46,7 @@ function fakeSubstrate(initiallyAlive: boolean) {
     sendEnter: async () => undefined,
     sendKey: async () => undefined,
     listSessions: async () => [],
+    listPanes: async () => new Set<string>(),
     listSessionStates: async () => new Map<string, string>(),
     setUserOptions: async () => undefined,
     renameWindow: async () => undefined,

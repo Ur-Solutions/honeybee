@@ -2,8 +2,8 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
 import type { NodeRecord } from "../node.js";
-import { formatShellCommand } from "./local-tmux.js";
-import type { KillResult, LaunchSpec, ProbeResult, Substrate } from "./types.js";
+import { formatShellCommand, paneArg } from "./local-tmux.js";
+import type { KillResult, LaunchSpec, NewSessionResult, ProbeResult, Substrate } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -95,7 +95,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     throw new Error(`tmux has-session on ${node.name} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`);
   }
 
-  async function newSession(target: string, cwd: string, spec: LaunchSpec): Promise<void> {
+  async function newSession(target: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult> {
     // Build the remote command as discrete words. buildSshArgv shell-quotes
     // every word for the transit through the remote login shell, so tmux
     // receives them as separate argv elements. Env vars ride on an `env`
@@ -108,9 +108,11 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
       spec.command,
       ...spec.args,
     ];
-    const argv = buildSshTmuxArgv(["new-session", "-d", "-s", target, "-c", cwd, ...commandWords]);
+    // -P -F prints the new pane id so spawn can pin the bee to it.
+    const argv = buildSshTmuxArgv(["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", target, "-c", cwd, ...commandWords]);
     const result = await exec(argv);
     if (result.exitCode !== 0) throw new Error(`Remote tmux new-session failed: ${result.stderr.trim() || result.stdout.trim()}`);
+    return { paneId: result.stdout.trim() };
   }
 
   async function kill(target: string): Promise<KillResult> {
@@ -121,13 +123,13 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   // Pane-target commands (capture-pane, paste-buffer, send-keys) only honor
   // tmux's "=" exact-match prefix in the session part of a "session:" target,
   // hence the `=name:` form (exact session, active pane).
-  async function capture(target: string, lines = 80): Promise<string> {
+  async function capture(target: string, lines = 80, paneId?: string): Promise<string> {
     const start = Math.max(1, Math.floor(lines));
-    const result = await runTmux(["capture-pane", "-pt", `=${target}:`, "-S", `-${start}`]);
+    const result = await runTmux(["capture-pane", "-pt", paneArg(target, paneId), "-S", `-${start}`]);
     return result.stdout.trimEnd();
   }
 
-  async function sendText(target: string, text: string): Promise<void> {
+  async function sendText(target: string, text: string, paneId?: string): Promise<void> {
     const buffer = `hive-${target.replace(/[^A-Za-z0-9_.:-]/g, "-")}`;
     // Stream payload via stdin so we are not bound by argv ARG_MAX limits over SSH.
     const loadArgv = buildSshTmuxArgv(["load-buffer", "-b", buffer, "-"]);
@@ -135,20 +137,20 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     if (loadResult.exitCode !== 0) {
       throw new Error(`Remote tmux load-buffer failed: ${loadResult.stderr.trim() || loadResult.stdout.trim()}`);
     }
-    const pasteArgv = buildSshTmuxArgv(["paste-buffer", "-p", "-b", buffer, "-t", `=${target}:`]);
+    const pasteArgv = buildSshTmuxArgv(["paste-buffer", "-p", "-b", buffer, "-t", paneArg(target, paneId)]);
     const pasteResult = await exec(pasteArgv);
     if (pasteResult.exitCode !== 0) {
       throw new Error(`Remote tmux paste-buffer failed: ${pasteResult.stderr.trim() || pasteResult.stdout.trim()}`);
     }
-    await sendEnter(target);
+    await sendEnter(target, paneId);
   }
 
-  async function sendEnter(target: string): Promise<void> {
-    await sendKey(target, "Enter");
+  async function sendEnter(target: string, paneId?: string): Promise<void> {
+    await sendKey(target, "Enter", paneId);
   }
 
-  async function sendKey(target: string, key: string): Promise<void> {
-    const result = await runTmux(["send-keys", "-t", `=${target}:`, key]);
+  async function sendKey(target: string, key: string, paneId?: string): Promise<void> {
+    const result = await runTmux(["send-keys", "-t", paneArg(target, paneId), key]);
     if (result.exitCode !== 0) {
       throw new Error(`Remote tmux send-keys failed: ${result.stderr.trim() || result.stdout.trim()}`);
     }
@@ -158,6 +160,12 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     const result = await runTmux(["list-sessions", "-F", "#{session_name}"]);
     if (result.exitCode !== 0) return [];
     return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  }
+
+  async function listPanes(): Promise<Set<string>> {
+    const result = await runTmux(["list-panes", "-a", "-F", "#{pane_id}"]).catch(() => null);
+    if (!result || result.exitCode !== 0) return new Set();
+    return new Set(result.stdout.split("\n").map((s) => s.trim()).filter(Boolean));
   }
 
   async function listSessionStates(): Promise<Map<string, string>> {
@@ -233,6 +241,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     sendEnter,
     sendKey,
     listSessions,
+    listPanes,
     listSessionStates,
     setUserOptions,
     renameWindow,
