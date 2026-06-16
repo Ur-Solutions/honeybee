@@ -1842,14 +1842,16 @@ async function cmdConfig(parsed: Parsed) {
 
 async function configSetBee(parsed: Parsed) {
   const name = parsed.args[1];
-  if (!name) throw new Error("Usage: hive config set-bee <bee> [--yolo] [--no-yolo] [--home <value>] [--command \"...\"]");
+  if (!name) throw new Error("Usage: hive config set-bee <bee> [--kind <agent>] [--yolo] [--no-yolo] [--home <value>] [--command \"...\"]");
   const yolo = truthy(flag(parsed, "yolo")) ? true : truthy(flag(parsed, "no-yolo")) ? false : undefined;
   const homeRaw = flag(parsed, "home");
   const home = typeof homeRaw === "string" ? homeRaw : undefined;
   const commandRaw = flag(parsed, "command");
   const command = typeof commandRaw === "string" ? commandRaw : undefined;
-  if (yolo === undefined && home === undefined && command === undefined) {
-    throw new Error("hive config set-bee needs at least one of --yolo/--no-yolo, --home, --command");
+  const kindRaw = flag(parsed, "kind");
+  const kind = typeof kindRaw === "string" ? kindRaw : undefined;
+  if (yolo === undefined && home === undefined && command === undefined && kind === undefined) {
+    throw new Error("hive config set-bee needs at least one of --kind, --yolo/--no-yolo, --home, --command");
   }
   const config = loadConfig();
   const next = { ...config, bees: { ...(config.bees ?? {}) } };
@@ -1858,6 +1860,7 @@ async function configSetBee(parsed: Parsed) {
   if (yolo !== undefined) beeEntry.yolo = yolo;
   if (home !== undefined) beeEntry.home = home;
   if (command !== undefined) beeEntry.command = command;
+  if (kind !== undefined) beeEntry.kind = kind;
   next.bees[name] = beeEntry;
   await writeConfigFile(next);
   resetConfigCache();

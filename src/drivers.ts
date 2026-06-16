@@ -91,14 +91,25 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
   },
   grok: {
     kind: "grok",
+    homeEnv: "GROK_HOME",
     hasTranscriptProvider: true,
     isReady: (pane) => /Grok Build|(?:^|\n)\s*❯\s/.test(pane),
-    // Open question in the Phase 3 plan: grok's CLI has no verified home env
-    // var, so grok gets no homeEnv (numbered slots stay rejected — see
-    // agents.test.ts). Credentials can still be vaulted from / activated into
-    // the default ~/.grok via the identity recipe.
+    // grok relocates its entire config dir (auth.json, sessions, agent_id) when
+    // GROK_HOME is set, so numbered slots and per-account homes work like codex.
+    // The OAuth credential lives at $GROK_HOME/auth.json.
     identity: {
-      credentialFiles: ["user-settings.json"],
+      credentialFiles: ["auth.json"],
+    },
+  },
+  kimi: {
+    kind: "kimi",
+    homeEnv: "KIMI_CODE_HOME",
+    // kimi-code keeps its sessions in a private store with no honeybee
+    // transcript provider yet, so auto-titling stays off until one exists.
+    isReady: (pane) => /context:\s*\d+(?:\.\d+)?%/i.test(pane) || /Next-Gen Agents|\bCode (?:thinking|planning)\b/i.test(pane),
+    identity: {
+      // KIMI_CODE_HOME relocates the whole dir; the OAuth token lives under it.
+      credentialFiles: ["credentials/kimi-code.json"],
     },
   },
   cursor: {

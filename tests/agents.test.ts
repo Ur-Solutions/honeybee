@@ -6,32 +6,43 @@ import { test } from "node:test";
 import { agentDefaultsToYolo, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
 import { assertExecutableAvailable } from "../src/execCheck.js";
 
-test("grok does not use numbered profile aliases", () => {
+test("grok supports numbered profile aliases and GROK_HOME isolation", () => {
   const oldHive = process.env.HIVE_GROK_CMD;
   const oldLegacy = process.env.AP_GROK_CMD;
   delete process.env.HIVE_GROK_CMD;
   delete process.env.AP_GROK_CMD;
 
   try {
+    // grok2 canonicalizes to the grok driver, bound to the ~/.grok-2 home slot.
     const spec = resolveAgent("grok2");
-
-    assert.equal(spec.kind, "grok2");
+    assert.equal(spec.kind, "grok");
     assert.equal(spec.requestedKind, "grok2");
-    assert.equal(spec.command, "grok2");
-    assert.deepEqual(spec.env, {});
-    assert.equal(spec.homePath, undefined);
-    assert.deepEqual(spec.args, []);
+    assert.equal(spec.command, "grok");
+    assert.equal(spec.env.GROK_HOME, join(homedir(), ".grok-2"));
+    assert.equal(spec.homePath, join(homedir(), ".grok-2"));
 
+    // The base kind with an explicit home slot gets the same GROK_HOME env.
     const baseGrokWithProfileHome = resolveAgent("grok", [], { home: "2" });
     assert.equal(baseGrokWithProfileHome.kind, "grok");
-    assert.deepEqual(baseGrokWithProfileHome.env, {});
-    assert.equal(baseGrokWithProfileHome.homePath, undefined);
+    assert.equal(baseGrokWithProfileHome.env.GROK_HOME, join(homedir(), ".grok-2"));
   } finally {
     if (oldHive === undefined) delete process.env.HIVE_GROK_CMD;
     else process.env.HIVE_GROK_CMD = oldHive;
     if (oldLegacy === undefined) delete process.env.AP_GROK_CMD;
     else process.env.AP_GROK_CMD = oldLegacy;
   }
+});
+
+test("kimi resolves to the kimi-code CLI with its own home env and yolo flag", () => {
+  // Numbered slots follow the generic ~/.<kind>-<n> convention; the default
+  // (unslotted) `kimi` bee uses the CLI's own ~/.kimi-code via no home override.
+  const spec = resolveAgent("kimi", [], { home: "1" });
+  assert.equal(spec.kind, "kimi");
+  assert.equal(spec.command, "kimi");
+  assert.equal(spec.env.KIMI_CODE_HOME, join(homedir(), ".kimi-1"));
+
+  const yolo = resolveAgent("kimi", [], { yolo: true });
+  assert.deepEqual(yolo.args, ["--yolo"]);
 });
 
 test("agent defaults are safe unless yolo mode is explicit", () => {

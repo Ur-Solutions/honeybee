@@ -31,6 +31,7 @@ const DEFAULT_COMMANDS: Record<string, string> = {
   codex: "codex",
   opencode: "opencode run --interactive",
   grok: "grok --tools= --disable-web-search --no-subagents",
+  kimi: "kimi",
   // Pi's interactive CLI has no approval/yolo flag in --help; full tools are enabled by default.
   pi: "pi",
   droid: "droid",
@@ -42,6 +43,7 @@ const YOLO_COMMANDS: Record<string, string> = {
   codex: "codex --dangerously-bypass-approvals-and-sandbox",
   opencode: "opencode run --interactive --dangerously-skip-permissions",
   grok: "grok --permission-mode bypassPermissions --always-approve --tools= --disable-web-search --no-subagents",
+  kimi: "kimi --yolo",
   pi: "pi",
   // Droid interactive TUI has no --auto/--skip-permissions startup flag, but --settings can seed Auto (High).
   droid: `droid --settings ${DROID_YOLO_SETTINGS_PATH}`,
@@ -81,12 +83,22 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   const requestedCfg = beeConfig(String(kind));
   const profile = resolveProfile(kind, options.home ?? requestedCfg.home);
   const canonicalCfg = profile.kind !== kind ? beeConfig(profile.kind) : requestedCfg;
-  const envSuffix = profile.kind.toUpperCase().replace(/[^A-Z0-9]/g, "_");
-  const envKey = `HIVE_${envSuffix}_CMD`;
-  const legacyEnvKey = `AP_${envSuffix}_CMD`;
-  const yoloEnvKey = `HIVE_${envSuffix}_YOLO`;
-  const commandOverride = process.env[envKey] ?? process.env[legacyEnvKey] ?? canonicalCfg.command ?? requestedCfg.command;
-  const yoloFallback = truthyEnv(process.env[yoloEnvKey]) || truthyEnv(process.env.HIVE_YOLO) || canonicalCfg.yolo === true || requestedCfg.yolo === true;
+  // Per-profile env keys (HIVE_MINIMAX_CMD) win over the canonical kind's keys
+  // (HIVE_OPENCODE_CMD) so aliased profiles override independently. For a plain
+  // (non-aliased) kind both suffixes are identical, so the order is a no-op.
+  const requestedSuffix = String(kind).toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const canonicalSuffix = profile.kind.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const cmdEnv = (suffix: string) => process.env[`HIVE_${suffix}_CMD`] ?? process.env[`AP_${suffix}_CMD`];
+  const yoloEnv = (suffix: string) => truthyEnv(process.env[`HIVE_${suffix}_YOLO`]);
+  // The requested (profile) command wins over the canonical kind's command:
+  // the whole point of a profile is its own command (e.g. model selection).
+  const commandOverride = cmdEnv(requestedSuffix) ?? cmdEnv(canonicalSuffix) ?? requestedCfg.command ?? canonicalCfg.command;
+  const yoloFallback =
+    yoloEnv(requestedSuffix) ||
+    yoloEnv(canonicalSuffix) ||
+    truthyEnv(process.env.HIVE_YOLO) ||
+    requestedCfg.yolo === true ||
+    canonicalCfg.yolo === true;
   // A caller-supplied yolo decision (e.g. from the CLI's dangerousMode, which
   // applies per-agent defaults and opt-outs) is authoritative; only fall back
   // to env/config when the caller has no opinion.
@@ -123,12 +135,18 @@ function resolveProfile(kind: string, explicitHome: string | true | string[] | u
   return { kind: canonicalKind, homeEnv, homePath };
 }
 
-function profileAlias(kind: string): { kind: string; home: string } | undefined {
+function profileAlias(kind: string): { kind: string; home?: string } | undefined {
   const normalized = kind.toLowerCase().replace(/[ _-]/g, "");
   const codex = normalized.match(/^codex([123])$/);
   if (codex) return { kind: "codex", home: codex[1]! };
   const claude = normalized.match(/^(?:cc|claude)([123])$/);
   if (claude) return { kind: "claude", home: claude[1]! };
+  const grok = normalized.match(/^grok([123])$/);
+  if (grok) return { kind: "grok", home: grok[1]! };
+  // Config-declared alias: `bees.<name>.kind` names the canonical (driver) kind.
+  // The home comes from the profile's own `home` config, not the alias.
+  const configured = beeConfig(kind).kind;
+  if (configured && configured !== kind) return { kind: configured };
   return undefined;
 }
 

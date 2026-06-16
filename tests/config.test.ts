@@ -65,6 +65,52 @@ test("explicit --yolo flag still wins over absent config", async () => {
   });
 });
 
+test("config kind alias canonicalizes to the driver's kind, home env, and own command", async () => {
+  await withTempConfig(
+    {
+      bees: {
+        minimax: {
+          kind: "opencode",
+          home: "~/.opencode-minimax",
+          command: "opencode run --interactive --model minimax/MiniMax-M2",
+        },
+      },
+    },
+    () => {
+      const spec = resolveAgent("minimax");
+      // Canonicalized onto the opencode driver, but remembers it was requested as minimax.
+      assert.equal(spec.kind, "opencode");
+      assert.equal(spec.requestedKind, "minimax");
+      // Profile-specific command (model selection) wins.
+      assert.equal(spec.command, "opencode");
+      assert.deepEqual(spec.args, ["run", "--interactive", "--model", "minimax/MiniMax-M2"]);
+      // opencode's home env points at the profile's own config dir.
+      assert.match(spec.homePath ?? "", /\.opencode-minimax$/);
+      assert.equal(spec.env.OPENCODE_CONFIG_DIR, spec.homePath);
+    },
+  );
+});
+
+test("config kind alias without a command falls back to the canonical default command", async () => {
+  const oldCmd = process.env.HIVE_OPENCODE_CMD;
+  const oldReq = process.env.HIVE_GLM_CMD;
+  delete process.env.HIVE_OPENCODE_CMD;
+  delete process.env.HIVE_GLM_CMD;
+  try {
+    await withTempConfig({ bees: { glm: { kind: "opencode", home: "~/.opencode-glm" } } }, () => {
+      const spec = resolveAgent("glm");
+      assert.equal(spec.kind, "opencode");
+      assert.equal(spec.command, "opencode");
+      assert.match(spec.homePath ?? "", /\.opencode-glm$/);
+    });
+  } finally {
+    if (oldCmd === undefined) delete process.env.HIVE_OPENCODE_CMD;
+    else process.env.HIVE_OPENCODE_CMD = oldCmd;
+    if (oldReq === undefined) delete process.env.HIVE_GLM_CMD;
+    else process.env.HIVE_GLM_CMD = oldReq;
+  }
+});
+
 test("briefFooter returns default when not configured", async () => {
   await withTempConfig(null, () => {
     assert.equal(briefFooter(), DEFAULT_BRIEF_FOOTER);

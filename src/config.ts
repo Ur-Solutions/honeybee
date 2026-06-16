@@ -6,6 +6,13 @@ export type BeeConfig = {
   yolo?: boolean;
   home?: string;
   command?: string;
+  /**
+   * Canonical agent kind this bee is an alias of. Lets an arbitrary bee name
+   * (e.g. "minimax", "kimi", "glm") inherit another kind's driver — readiness,
+   * transcripts, home env, identity recipe — while carrying its own command and
+   * home. Used by canonicalAgentKind/resolveProfile in agents.ts.
+   */
+  kind?: string;
 };
 
 export type NamingConfig = {
@@ -110,6 +117,7 @@ function normalizeConfig(value: unknown): HiveConfig {
       if (typeof r.yolo === "boolean") bee.yolo = r.yolo;
       if (typeof r.home === "string" && r.home.length > 0) bee.home = r.home;
       if (typeof r.command === "string" && r.command.length > 0) bee.command = r.command;
+      if (typeof r.kind === "string" && r.kind.length > 0) bee.kind = r.kind;
       bees[key] = bee;
     }
     config.bees = bees;
