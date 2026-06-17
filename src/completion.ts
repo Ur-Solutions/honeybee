@@ -22,7 +22,7 @@ const COMMANDS = [
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
   "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
-  "split", "here", "revive",
+  "split", "fork", "here", "revive",
 ];
 
 const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
@@ -57,7 +57,7 @@ const SHELLS = ["bash", "zsh", "fish"];
 const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach", "view"]);
-const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "own", "move", "split", "revive"]);
+const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "own", "move", "split", "fork", "revive"]);
 const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 // Commands whose first positional is a vault account.
@@ -100,6 +100,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   kill: ["--comb"],
   here: ["--id", "--json"],
   split: ["--brief", "--dir", "--cwd", "--home", "--profile", "--account", "--ttl", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--briefed"],
+  fork: ["--agent", "--model", "--node", "--cwd", "--seed", "--read-log", "--name", "--account", "--here", "--print"],
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],
   rename: ["--auto", "--clear"],
   tag: ["--remove", "--list"],
@@ -147,10 +148,11 @@ export type CompletionState = {
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto";
+type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto" | "fork-seed";
 
 const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
+const FORK_SEED_VALUES = ["resume", "seal", "summary", "log", "none"];
 
 // Global fallback: flags whose value-completion is unambiguous regardless
 // of the current verb (e.g. --colony always refers to a colony).
@@ -185,6 +187,9 @@ const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagValueKind>
     "--context": "loop-context",
     "--summarizer": "loop-summarizer",
     "--stop-on-seal": "seal-status",
+  },
+  fork: {
+    "--seed": "fork-seed",
   },
 };
 
@@ -320,6 +325,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return (state.accounts ?? []).map((account) => account.id);
     case "account-or-auto":
       return ["auto", ...(state.accounts ?? []).map((account) => account.id)];
+    case "fork-seed":
+      return FORK_SEED_VALUES;
   }
 }
 

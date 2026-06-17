@@ -44,6 +44,7 @@ export const BOOLEAN_FLAGS = new Set([
   "print",
   "raw",
   "read",
+  "read-log",
   "regex",
   "rm",
   "samples",

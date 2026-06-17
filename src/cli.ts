@@ -28,6 +28,7 @@ import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { resumeArgs, sniffYolo, swapAccount } from "./swap.js";
+import { modelArgsFor, pickForkSeed, type ForkSeedInput, type SeedMode } from "./fork.js";
 import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
 import { isRecentlyExhausted, listUsageAccounts, usageSummary } from "./usage.js";
 import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis, idleSessionAge, olderThanMillis, parseAge } from "./clean.js";
@@ -167,6 +168,9 @@ async function main(argv: string[]) {
       break;
     case "split":
       await cmdSplit(parsed);
+      break;
+    case "fork":
+      await cmdFork(parsed);
       break;
     case "revive":
       await cmdRevive(parsed);
@@ -2055,6 +2059,264 @@ async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
   if (briefText) return deliverBrief(parsed, record, briefText);
   await confirmSpawnReady(parsed, record);
   return record;
+}
+
+const FORK_SEED_MODES = new Set<SeedMode>(["resume", "seal", "summary", "log", "none"]);
+
+/**
+ * Account-safety gate for `hive fork` (fork-and-pane §7.1, the crux). Two live
+ * processes must never share one account: Anthropic rotates OAuth refresh
+ * tokens per-account, so two live bees on one account (even in separate homes)
+ * log each other out. Returns the account (if any) the fork should use — for an
+ * account-bound parent the fork's account is NEVER === source.accountId (which
+ * also guarantees its defaultHomeForAccount home differs from the parent's).
+ */
+async function resolveForkAccountSafety(
+  parsed: Parsed,
+  source: SessionRecord,
+  context: { targetTool: string; requestedSeed?: SeedMode },
+): Promise<{ account?: AccountRecord }> {
+  const accountQuery = stringFlag(parsed, ["account"]);
+  const wantsResume = context.requestedSeed === "resume";
+
+  if (accountQuery) {
+    const account = await resolveAccountFlag(accountQuery, context.targetTool, ttlFlagMs(parsed));
+    // The fork's account must DIFFER from a live account-bound parent's. The
+    // OAuth refresh token rotates per-ACCOUNT (not per-home), so two live bees
+    // on one account log each other out even in separate homes — and when the
+    // account's home IS the parent's (the common `defaultHomeForAccount`
+    // layout), this also reuses the parent's exact live home. `--account auto`
+    // can silently land on the parent's own account, so this guard covers it too.
+    if (source.accountId && account.id === source.accountId) {
+      throw new Error(
+        `fork would run on ${source.name}'s own account (${account.id}); two live bees on one ` +
+          `account rotate the shared OAuth chain and log each other out. Pass a different ` +
+          `--account (fork-and-pane §7.1).`,
+      );
+    }
+    // The (different) account brings its own dedicated home
+    // (defaultHomeForAccount), so the fork never touches the parent's home.
+    // Native resume needs the parent's provider session, which lives in the
+    // parent's home — a different account/home can't see it.
+    if (wantsResume) {
+      throw new Error(
+        `--seed resume needs ${source.name}'s home to see its provider session; ` +
+          `account ${account.id} has its own home — fork with a seal instead`,
+      );
+    }
+    return { account };
+  }
+
+  if (source.accountId) {
+    // Account-bound parent with no --account: refuse. A fork must get its own
+    // account/home; sharing the parent's live home rotates the OAuth chain and
+    // logs both bees out.
+    throw new Error(
+      `${source.name} is account-bound (${source.accountId}); a fork must get its own account — ` +
+        `pass --account <a> (or --account auto). Sharing a live home rotates the OAuth chain and ` +
+        `logs both bees out (fork-and-pane §7.1).`,
+    );
+  }
+
+  // Default-home parent (no accountId): allow a plain spawn (own fresh tmux
+  // session in the default home — same risk profile as a second default bee).
+  if (wantsResume) {
+    console.error(
+      note(
+        `warn: --seed resume reuses ${source.name}'s provider session in a shared home; ` +
+          `the two processes may fight over the OAuth chain. Prefer --seed seal, or --account.`,
+      ),
+    );
+  }
+  return {};
+}
+
+/**
+ * hive fork <bee> [checkpoint]
+ *   [--agent <kind>] [--model <m>] [--node <n>] [--cwd <dir>]
+ *   [--seed resume|seal|summary|log|none] [--read-log]
+ *   [--name <n>] [--account <a>] [--here] [--print]
+ *
+ * Branch an existing bee into a FRESH comb (its own session) seeded from the
+ * source's state. fork-and-pane Phase C: layered seeding (resume → seal →
+ * summary(deferred) → log → refuse), cross-harness forcing non-resume, account
+ * safety, and anti-cross-match. See docs/fork-and-pane.md §7.1.
+ */
+async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
+  const selector = parsed.args[0];
+  if (!selector) {
+    throw new Error(
+      "Usage: hive fork <bee> [checkpoint] [--agent <kind>] [--model <m>] [--node <n>] " +
+        "[--cwd <dir>] [--seed resume|seal|summary|log|none] [--read-log] [--name <n>] [--account <a>] [--here] [--print]",
+    );
+  }
+
+  // 1. Resolve source (single bee only — never fork a set).
+  const resolved = await resolveSelector(selector);
+  if (resolved.kind !== "bee") {
+    throw new Error(`hive fork: ${selector} matched multiple bees; pick one`);
+  }
+  const source = resolved.record;
+
+  // 2. Resolve the checkpoint seal.
+  const checkpointArg = parsed.args[1];
+  const seal = await resolveForkCheckpoint(source.name, checkpointArg);
+
+  // 3. Resolve fork agent / model / node / cwd.
+  const requestedAgent = stringFlag(parsed, ["agent"]) ?? source.requestedAgent ?? source.agent;
+  const targetTool = canonicalAgentKind(requestedAgent);
+  const sourceTool = canonicalAgentKind(source.agent);
+  const model = stringFlag(parsed, ["model"]);
+  const cwd = hasFlag(parsed, "cwd") ? await resolveSpawnCwd(parsed) : source.cwd;
+
+  // 4. Validate the --seed value (if any).
+  const seedFlag = stringFlag(parsed, ["seed"]);
+  if (seedFlag !== undefined && !FORK_SEED_MODES.has(seedFlag as SeedMode)) {
+    throw new Error(`hive fork: invalid --seed ${seedFlag} (use resume|seal|summary|log|none)`);
+  }
+  const requestedSeed = seedFlag as SeedMode | undefined;
+  const readLog = truthy(flag(parsed, "read-log"));
+
+  // 5. Account safety (the crux). Yields the account whose dedicated home the
+  //    fork will use; for a default-home parent it returns no account.
+  const { account } = await resolveForkAccountSafety(parsed, source, { targetTool, requestedSeed });
+
+  // 6. Pick the seed mode (pure decision).
+  const seedInput: ForkSeedInput = {
+    source,
+    seal,
+    requestedSeed,
+    readLog,
+    targetTool,
+    sourceTool,
+    forkName: source.name,
+  };
+  const decision = pickForkSeed(seedInput);
+  if (decision.mode === "refuse") throw new Error(`hive fork: ${decision.reason}`);
+
+  // 7. Build the spawn spec and create the new comb. Resume args are baked into
+  //    the spawn command (§7.1); seal/log/none seed via a brief after spawn.
+  const modelArgs = modelArgsFor(targetTool, model);
+  const resumeArgsList = decision.mode === "resume" ? decision.resumeArgs : [];
+  const extraArgs = [...resumeArgsList, ...modelArgs, ...parsed.rest];
+
+  const yolo = dangerousMode(parsed, targetTool, requestedAgent);
+  const node = await resolveSpawnNode(parsed, targetTool);
+  const isRemote = node.kind === "ssh-tmux";
+  if (account && isRemote) throw new Error("--account forks are local-only (the vault never leaves this machine)");
+
+  // The account brings its own dedicated home; otherwise the fork boots in the
+  // default home (never the parent's exact home for an account-bound parent —
+  // resolveForkAccountSafety already enforced that).
+  const home = account ? defaultHomeForAccount(account) : undefined;
+  const spec = resolveAgent(requestedAgent, extraArgs, { home, yolo, identity: Boolean(account) });
+  if (account) {
+    if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
+    await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+  }
+  if (!isRemote) await assertExecutableAvailable(spec.command);
+
+  const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
+  const name = safeName(stringFlag(parsed, ["name"]) ?? identity.id);
+  const tmuxTarget = safeTmuxTarget(name);
+  const nodeName = node.name;
+  const substrate = node.name !== LOCAL_NODE_NAME ? substrateForRecord(node) : localSubstrate();
+  const locationHint = isRemote ? ` on ${node.name}` : "";
+  if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
+
+  const { paneId } = await substrate.newSession(tmuxTarget, cwd, { command: spec.command, args: spec.args, env: spec.env });
+  const command = shellCommand(spec);
+
+  // 8. Build the record with fork lineage + anti-cross-match fields.
+  //    ANTI-CROSS-MATCH (§7.1): lastPromptAt set at creation, and NO inherited
+  //    providerSessionId / transcriptPath — the fork is a new session with no
+  //    transcript of its own yet, so the daemon's scorer can never assign the
+  //    parent's transcript to the fork.
+  const now = new Date().toISOString();
+  const record: SessionRecord = {
+    name,
+    agent: spec.kind,
+    cwd,
+    command,
+    tmuxTarget,
+    ...(paneId ? { agentPaneId: paneId } : {}),
+    combId: tmuxTarget, // fork is its own comb (new session)
+    forkedFromId: source.id ?? source.name,
+    forkedAt: now,
+    seedMode: decision.mode,
+    forkCheckpoint: decision.checkpoint,
+    ...(model ? { model } : {}),
+    createdAt: now,
+    updatedAt: now,
+    lastPromptAt: now, // anti-cross-match anchor
+    status: "running",
+    id: identity.id,
+    prefix: identity.prefix,
+    uuid: identity.uuid,
+    requestedAgent: spec.requestedKind,
+    homePath: spec.homePath,
+    ...(account ? { accountId: account.id } : {}),
+    ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+    ...(source.colony ? { colony: source.colony } : {}),
+  };
+  await saveSession(record);
+  await writeSpawnOptions(record);
+
+  // 9. Ledger.
+  await appendLedger({
+    type: "fork.create",
+    name,
+    forkedFromId: record.forkedFromId,
+    seedMode: record.seedMode,
+    forkCheckpoint: record.forkCheckpoint,
+    ...(model ? { model } : {}),
+    ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+  });
+
+  // Print the success line. The trailing `command` field on the tab form makes
+  // the resume-args / model-args assertion trivial in the non-TTY test harness.
+  if (isPretty()) {
+    console.log(actionLine("ok", "fork", [bold(name), spec.kind, dim(`from ${source.name}`), dim(decision.mode)]));
+  } else {
+    console.log(`fork\t${name}\t${spec.kind}\t${source.name}\t${decision.mode}\t${record.command}`);
+  }
+
+  // 10. Seed: resume/none carry the seed in the spawn command (or boot cold);
+  //     seal/log deliver a brief once ready.
+  let finalRecord = record;
+  if (decision.mode === "seal" || decision.mode === "log") {
+    finalRecord = await deliverBrief(parsed, record, decision.brief);
+  } else {
+    await confirmSpawnReady(parsed, record);
+  }
+
+  // 11. --print / --here behave like spawn's interactive affordances.
+  if (truthy(flag(parsed, "print"))) {
+    if (isPretty()) console.error(note("attach with:"));
+    console.log(formatShellCommand(substrate.attachCommand(record.tmuxTarget)));
+  }
+  await maybeLinkHere(parsed, [finalRecord]);
+  return finalRecord;
+}
+
+/**
+ * Resolve the fork's checkpoint seal: absent/`latest` → the latest seal;
+ * `seal:<ISO>` → that specific seal; `msg:N` → deferred.
+ */
+async function resolveForkCheckpoint(beeName: string, checkpointArg: string | undefined): Promise<import("./seal.js").SealRecord | null> {
+  if (!checkpointArg || checkpointArg === "latest") return loadLatestSeal(beeName);
+  if (checkpointArg.startsWith("msg:")) {
+    throw new Error("hive fork: message-offset checkpoints are deferred (§9/§11); use a seal");
+  }
+  if (checkpointArg.startsWith("seal:")) {
+    const wanted = checkpointArg.slice("seal:".length);
+    const normalized = wanted.replace(/[:.]/g, "-");
+    const seals = await listSeals(beeName);
+    const match = seals.find((s) => s.sealedAt === wanted || s.sealedAt.replace(/[:.]/g, "-") === normalized);
+    if (!match) throw new Error(`hive fork: no seal ${wanted} for ${beeName}`);
+    return match;
+  }
+  throw new Error(`hive fork: unrecognized checkpoint "${checkpointArg}" (use latest or seal:<ISO>)`);
 }
 
 /**
@@ -5252,6 +5514,7 @@ function printHelp() {
         ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
         ["next", "", "switch to the next bee needing attention (--state, --prev, --print)"],
         ["split", "[<bee>] [<agent>]", "spawn a sub-bee into the bee's comb (adjacent pane)"],
+        ["fork", "<bee> [checkpoint]", "branch a bee into a fresh comb, seeded from its state"],
         ["here", "", "resolve the bee owning the current pane (--id, --json)"],
         ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--all, --fresh, --session <id>)"],

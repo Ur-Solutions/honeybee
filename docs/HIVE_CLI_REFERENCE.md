@@ -881,6 +881,82 @@ it budded from) and sharing the parent's `combId` and `tmuxTarget`, with its own
 `agentPaneId`. A `bee.split` ledger event records the lineage. `hive list` shows
 both bees sharing one comb.
 
+### `hive fork`
+
+Branch an existing bee into a **fresh comb** (its own new tmux session,
+optionally a different harness/model/node), seeded from the source bee's state.
+Where `split` grows a comb (siblings share a window), `fork` branches a lineage
+into a new comb elsewhere.
+
+```sh
+hive fork <bee> [checkpoint]
+          [--agent <kind>] [--model <m>]
+          [--node <n>] [--cwd <dir>]
+          [--seed resume|seal|summary|log|none]
+          [--read-log] [--name <n>] [--account <a>] [--here] [--print]
+```
+
+- `<bee>` — the source bee to fork (a single bee selector; forking a set is
+  refused).
+- `[checkpoint]` — the seed anchor: a **seal**. Default `latest` (the most
+  recent seal); `seal:<ISO>` selects a specific one. `msg:N` (transcript offset)
+  is deferred.
+- `--agent <kind>` — fork into a different harness (defaults to the source's
+  agent). Cross-harness forks cannot use native resume (see below).
+- `--model <m>` — first-class model, also baked into the spawned command via the
+  per-harness flag (claude `--model <m>`, codex `-m <m>`).
+- `--node <n>` / `--cwd <dir>` — node and working directory (cwd defaults to the
+  source's).
+- `--seed <mode>` — force a seeding rung; `--read-log` is shorthand for log
+  seeding and overrides the ladder.
+- `--name <n>` — name for the fork (defaults to a fresh auto-allocated id).
+- `--account <a>` — the account whose dedicated home the fork uses (required for
+  an account-bound source; see Account safety).
+- `--here` / `--print` — behave like `hive spawn`: link the fork's window into
+  your current tmux session, or print the attach command.
+
+**Seeding ladder** (best fidelity available, in order; the chosen rung is
+recorded in `seedMode`):
+
+1. **resume** — `--seed resume` (or default) **and** same harness **and** a
+   known source `providerSessionId` → the fork spawns with native resume args
+   (claude `--resume <id>`, codex `resume <id>`, opencode `--session <id>`)
+   baked into its command. Exact continuation.
+2. **seal** — the latest/selected seal → a brief: *"You are a fork of `<bee>`.
+   State: `<summary>`; files changed: …; next: …. Continue from here."*
+3. **summary** — deferred in v1 (no standalone summarizer); falls through to log.
+4. **log** — `--read-log` (or the fallthrough) → a brief pointing at the
+   source's `transcriptPath`. If there is no resume session, no seal, and no
+   transcript, the fork is **refused** with a clear message.
+
+**Cross-harness rule:** native resume is same-harness only. A cross-harness fork
+(`--agent codex` from a claude source) **must** seed from a seal or log; an
+explicit `--seed resume` that is cross-harness is **refused** loudly rather than
+silently downgraded.
+
+**Account safety (critical):** a fork must never share a live home with its
+parent — Anthropic rotates OAuth refresh tokens, so two bees on one home log
+each other out. Therefore:
+
+- An **account-bound** source (`accountId` set) **must** be forked with
+  `--account <a>` (or `--account auto`); without it the fork is refused. The
+  account brings its own dedicated home.
+- A **default-home** source may be forked without `--account` — the fork gets
+  its own fresh session in the default home (the same risk profile as spawning a
+  second default bee).
+- `--seed resume` needs the parent's home to see its provider session, so it is
+  only honored for a default-home source (with a loud warning about the shared
+  home); combining `--seed resume` with `--account` is refused.
+
+**Anti-cross-match:** the fork is a new session with no `providerSessionId` of
+its own and a `lastPromptAt` stamped at creation, so the daemon's transcript
+scorer can never assign the **parent's** transcript to the fork.
+
+**Lineage:** the fork records `forkedFromId` (source id), `forkedAt`, `seedMode`,
+`forkCheckpoint` (`seal:<ISO>` | `resume:<id>` | `log:<path>` | `none`), and
+`model`, and emits a `fork.create` ledger event. The `forks-of:<bee>` selector
+lists a bee's forks.
+
 ### `hive here`
 
 Resolve the bee that owns the current tmux pane — useful for scripts and

@@ -33,6 +33,24 @@ export type SessionRecord = {
    * Phase C; added now so `forks-of:` can read it. (Tags PRD Phase 2)
    */
   forkedFromId?: string;
+  /** ISO timestamp when this bee was forked from its source. (Phase C) */
+  forkedAt?: string;
+  /**
+   * How the fork was seeded: "resume" | "seal" | "summary" | "log" | "none".
+   * Stored as a plain string for forward-compat with the deserializer's
+   * string allow-list (the §5.1 union is aspirational). (Phase C)
+   */
+  seedMode?: string;
+  /**
+   * The seed anchor, e.g. "seal:<ISO>" | "resume:<providerSessionId>" |
+   * "log:<path>" | "none". (Phase C)
+   */
+  forkCheckpoint?: string;
+  /**
+   * First-class model, independent of the frozen `command` string, so a later
+   * resume/revive can re-derive it. e.g. "sonnet", "opus". (Phase C)
+   */
+  model?: string;
   /**
    * Free-form user tags (first-class). Holds ONLY bare or power-user-namespaced
    * labels, e.g. ["migration", "waiting-review", "prio:p1"]. Reserved-namespace
@@ -270,7 +288,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "forkedFromId"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
