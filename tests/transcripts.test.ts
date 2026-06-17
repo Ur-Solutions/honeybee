@@ -3,7 +3,7 @@ import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript, type TranscriptRow } from "../src/transcripts.js";
+import { firstUserText, hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript, stripCommandNoise, type TranscriptRow } from "../src/transcripts.js";
 
 // Independent re-implementation of Claude Code's project-dir encoding so the
 // fixtures below do not circularly depend on projectKeyForCwd.
@@ -246,6 +246,39 @@ test("latestTranscript reads Grok chat history from the encoded workspace sessio
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("stripCommandNoise removes slash-command and harness blocks, keeps the real prompt", () => {
+  const raw = [
+    "<local-command-caveat>Caveat: messages below were generated while running local commands.</local-command-caveat>",
+    "<command-name>/model</command-name>",
+    "<command-message>model</command-message>",
+    "<command-args></command-args>",
+    "<local-command-stdout>Set model to Opus</local-command-stdout>",
+    "Some of my latest bees didn't get a semantic title",
+  ].join("\n");
+  assert.equal(stripCommandNoise(raw), "Some of my latest bees didn't get a semantic title");
+  // A pure slash-command invocation strips to nothing.
+  assert.equal(stripCommandNoise("<command-name>/effort</command-name>\n<command-args>ultracode</command-args>"), "");
+  // system-reminder injections are dropped too.
+  assert.equal(stripCommandNoise("<system-reminder>be careful</system-reminder>\nFix the parser"), "Fix the parser");
+});
+
+test("firstUserText skips noise-only rows and returns the first real user message", () => {
+  const rows: TranscriptRow[] = [
+    { type: "user", message: { role: "user", content: "<command-name>/model</command-name>\n<command-args></command-args>" } },
+    { type: "assistant", message: { role: "assistant", content: "Model set." } },
+    { type: "user", message: { role: "user", content: "<local-command-caveat>noise</local-command-caveat>\nMigrate the store to SQLite" } },
+  ];
+  assert.equal(firstUserText(rows), "Migrate the store to SQLite");
+});
+
+test("firstUserText returns empty when every user row is pure command noise", () => {
+  const rows: TranscriptRow[] = [
+    { type: "user", message: { role: "user", content: "<command-name>/clear</command-name>" } },
+    { type: "assistant", message: { role: "assistant", content: "What would you like to work on?" } },
+  ];
+  assert.equal(firstUserText(rows), "");
 });
 
 test("renderTranscript applies the limit after filtering text-less rows", () => {

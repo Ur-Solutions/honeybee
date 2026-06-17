@@ -242,11 +242,25 @@ export function renderTranscript(rows: TranscriptRow[], options: { limit?: numbe
   return selected.join("\n\n");
 }
 
+// Claude wraps slash-command runs and harness injections in pseudo-XML blocks
+// that carry no task intent (`<local-command-caveat>`, `<command-name>`, the
+// `/model` and `/effort` plumbing, `<system-reminder>`, …). Left in, they
+// become the "first user message" a titler sees and get echoed back as a
+// title. Strip them so the real prompt underneath wins.
+const COMMAND_NOISE_RE =
+  /<(local-command-caveat|command-name|command-message|command-args|command-contents|local-command-stdout|system-reminder)>[\s\S]*?<\/\1>/gi;
+
+export function stripCommandNoise(text: string): string {
+  return text.replace(COMMAND_NOISE_RE, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 export function firstUserText(rows: TranscriptRow[]): string {
   for (const row of rows) {
     const role = row.message?.role ?? row.type;
     if (role !== "user") continue;
-    const text = textFromContent(row.message?.content ?? row.content).trim();
+    // Skip rows that are pure command/harness noise; strip residual noise from
+    // the first row that carries a real message.
+    const text = stripCommandNoise(textFromContent(row.message?.content ?? row.content));
     if (text) return text;
   }
   return "";
