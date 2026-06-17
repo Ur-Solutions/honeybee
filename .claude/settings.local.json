@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(codex --version)",
+      "Bash(echo \"\\(exit $?\\)\")"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "cubic"
+  ]
+}
