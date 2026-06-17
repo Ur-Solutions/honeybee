@@ -11,13 +11,14 @@ import { listNodes, type NodeRecord } from "./node.js";
 import { BOOLEAN_FLAGS } from "./parse.js";
 import { listSessions, type SessionRecord } from "./store.js";
 import { listSwarms, type SwarmRecord } from "./swarm.js";
+import { listQuests, type QuestRecord } from "./quest.js";
 import { listWorkspaces, type WorkspaceRecord } from "./workspace.js";
 import { listTmuxSessions } from "./tmux.js";
 
 const COMMANDS = [
   "spawn", "send", "tail", "transcript", "last", "wait",
   "list", "ls", "ps", "kill", "clean", "run", "x", "xa", "attach", "next", "view",
-  "colony", "workspace", "ws", "frame", "swarm", "node", "substrate", "flow", "loop",
+  "colony", "workspace", "ws", "quest", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
@@ -28,6 +29,7 @@ const COMMANDS = [
 
 const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
 const WORKSPACE_SUBCOMMANDS = ["open", "list", "ls", "add", "add-pane", "snapshot", "restore", "close", "rename", "archive"];
+const QUEST_SUBCOMMANDS = ["create", "start", "list", "ls", "inspect", "done", "archive"];
 const FRAME_SUBCOMMANDS = ["list", "ls", "define", "update", "reload", "edit", "inspect", "remove"];
 const SWARM_SUBCOMMANDS = ["list", "ls", "inspect", "destroy"];
 const NODE_SUBCOMMANDS = ["list", "ls", "register", "inspect", "update", "unregister"];
@@ -81,6 +83,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   view: ["--name", "--new-client", "--close", "--print"],
   workspace: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
   ws: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
+  quest: ["--colony", "--root", "--linear", "--description", "--frame", "--flow", "--status", "--json"],
   usage: ["--samples", "--json", "--ttl"],
   limits: ["--samples", "--json", "--ttl"],
   sessions: ["--home", "--json"],
@@ -146,6 +149,7 @@ export type CompletionState = {
   colonies?: ColonyRecord[];
   workspaces?: WorkspaceRecord[];
   swarms?: SwarmRecord[];
+  quests?: QuestRecord[];
   frames?: Frame[];
   flows?: Flow[];
   nodes?: NodeRecord[];
@@ -154,7 +158,7 @@ export type CompletionState = {
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "workspace" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto" | "fork-seed";
+type FlagValueKind = "colony" | "workspace" | "quest" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto" | "fork-seed";
 
 const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -203,6 +207,7 @@ const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   colony: COLONY_SUBCOMMANDS,
   workspace: WORKSPACE_SUBCOMMANDS,
   ws: WORKSPACE_SUBCOMMANDS,
+  quest: QUEST_SUBCOMMANDS,
   frame: FRAME_SUBCOMMANDS,
   swarm: SWARM_SUBCOMMANDS,
   node: NODE_SUBCOMMANDS,
@@ -217,10 +222,12 @@ const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   sync: SYNC_SUBCOMMANDS,
 };
 
-const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "workspace" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run" | "account">> = {
+const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "workspace" | "quest" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run" | "account">> = {
   colony: { inspect: "colony", archive: "colony", update: "colony", rename: "colony" },
   workspace: { open: "workspace", add: "workspace", "add-pane": "workspace", snapshot: "workspace", restore: "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
   ws: { open: "workspace", add: "workspace", "add-pane": "workspace", snapshot: "workspace", restore: "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
+  // `start`/`inspect` take a quest id; `create` takes a free-form title (uncompleted).
+  quest: { start: "quest", inspect: "quest" },
   frame: { inspect: "frame", remove: "frame", edit: "frame", update: "frame", reload: "frame" },
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },
@@ -301,6 +308,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return (state.colonies ?? []).filter((c) => !c.archived).map((c) => c.name);
     case "workspace":
       return (state.workspaces ?? []).filter((w) => !w.archived).map((w) => w.name);
+    case "quest":
+      return (state.quests ?? []).filter((q) => q.status !== "archived").map((q) => q.id);
     case "swarm":
       return (state.swarms ?? []).filter((s) => !s.destroyed).map((s) => s.id);
     case "frame":
@@ -447,12 +456,13 @@ function positionalAt(args: string[], index: number): string | undefined {
 
 export async function getCompletions(words: string[]): Promise<string[]> {
   try {
-    const [records, live, colonies, workspaces, swarms, frames, nodes, flows, runs, accounts] = await Promise.all([
+    const [records, live, colonies, workspaces, swarms, quests, frames, nodes, flows, runs, accounts] = await Promise.all([
       listSessions(),
       listTmuxSessions(),
       listColonies().catch(() => []),
       listWorkspaces().catch(() => []),
       listSwarms().catch(() => []),
+      listQuests().catch(() => []),
       listFrames().catch(() => []),
       listNodes().catch(() => []),
       listFlows().catch(() => []),
@@ -465,6 +475,7 @@ export async function getCompletions(words: string[]): Promise<string[]> {
       colonies,
       workspaces,
       swarms,
+      quests,
       frames,
       nodes,
       flows,

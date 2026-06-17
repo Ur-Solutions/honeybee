@@ -203,6 +203,7 @@ hive clean ...
 hive attach ...
 hive view ...
 hive colony ...
+hive quest ...
 hive frame ...
 hive swarm ...
 hive node ...
@@ -930,6 +931,61 @@ Behavior and guarantees:
 - `hive restore --all [--resume]` sweeps every non-archived workspace and
   restores it (the post-reboot reconcile; install it as a login hook to rebuild
   your arrangement on boot). Without `--all` it prints usage.
+
+### `hive quest`
+
+A **tracked task** with a beginning and a completion (`QuestRecord`). A quest
+lives in a colony, owns a dedicated workspace while active, and spawns one or
+more swarms to do the work. Its lifecycle is `open → active → done → archived`;
+this build covers `create` and `start` (open → active) plus `list`/`inspect`.
+
+```sh
+hive quest create "<title>" [--colony <c>] [--root <dir>] [--linear <issue>] [--description <text>]
+hive quest start  <id> --frame <f>
+hive quest list   [--colony <c>] [--status <s>] [--json]
+hive quest inspect <id> [--json]
+```
+
+Examples:
+
+```sh
+hive quest create "review #1255" --colony reviews   # → quest q-ab12cd + ws-q-ab12cd
+hive quest start q-ab12cd --frame review            # spawn the review swarm into it
+hive quest list --status active                     # the in-flight quests
+hive quest inspect q-ab12cd                          # rolled-up status + its bees
+```
+
+Behavior and guarantees:
+
+- **Record:** stored as a directory at `~/.hive/quests/<id>/quest.json` (the
+  folder also holds the completion archive in a later increment). The id is an
+  `<prefix>-<hex>` token like a swarm id (`generateQuestId`, default prefix `q`).
+  CRUD + ledger (`quest.create` / `quest.activate`) mirror `swarm.ts`/
+  `workspace.ts`.
+- **A quest always lives in a colony** (PRD §8.2): `--colony` uses or creates the
+  named colony; without it, a colony is auto-created from a slug of the title.
+- **Dedicated workspace:** the quest owns a workspace named after the quest id
+  (`ws-<id>`), NOT the colony's shared workspace — so completing a quest can
+  close its workspace without ever touching a colony-shared one. Its file root
+  resolves from `--root` › the colony's `rootDir` › cwd.
+- `start` spawns the frame's swarm with the quest's colony injected, then **stamps
+  every spawned bee** with `record.questId` (and `colony`/`workspaceId`) so the
+  derived `quest:<id>` selector lights up, and **links each bee's window** into
+  the quest's workspace (the shared `workspace add` link path — never reinvented).
+  The quest flips to `status:"active"` with `activatedAt` set and the swarm id
+  appended to `swarmIds`.
+- `inspect` rolls up the quest's bees by filtering the store for
+  `questId===<id>` (the same set `quest:<id>` resolves), printing each bee's
+  name, caste/agent, and state — a cheap store-only read. `--json` dumps the
+  record plus the bee summary.
+- `list` filters by `--colony` / `--status` and excludes archived quests by
+  default. `--json` dumps the records.
+
+`hive quest done`, `hive quest archive`, the `--flow` variant of `start`, and
+Linear issue enrichment land in later increments — they fail loud with a "lands
+in a later increment" message rather than partially executing. `--linear <issue>`
+on `create` is accepted and stored verbatim (offline-safe); issue fetch/seed is
+deferred.
 
 ### `hive split`
 

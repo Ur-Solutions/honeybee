@@ -48,6 +48,16 @@ import {
   type WorkspaceMember,
   type WorkspaceRecord,
 } from "./workspace.js";
+import {
+  createQuest,
+  generateQuestId,
+  listQuests,
+  loadQuest,
+  updateQuest,
+  validQuestId,
+  type QuestRecord,
+  type QuestStatus,
+} from "./quest.js";
 import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, windowInventory } from "./tmuxLink.js";
 import {
   BUZ_TIERS,
@@ -222,6 +232,9 @@ async function main(argv: string[]) {
     case "workspace":
     case "ws":
       await cmdWorkspace(parsed);
+      break;
+    case "quest":
+      await cmdQuest(parsed);
       break;
     case "restore":
       await cmdRestore(parsed);
@@ -3504,6 +3517,326 @@ async function cmdRestore(parsed: Parsed) {
   }
   if (isPretty()) console.log(note(`restored ${restored} workspace(s) · ${bees} bee(s), ${panes} pane(s)`));
   else console.log(`restore\tall\t${restored}\t${bees}\t${panes}`);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// QUESTS (WORKSPACES_AND_QUESTS_PRD §8, increment 9a — create/start/list/inspect)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async function cmdQuest(parsed: Parsed) {
+  const sub = parsed.args[0];
+  switch (sub) {
+    case "create":
+      return questCreate(parsed);
+    case "start":
+      return questStart(parsed);
+    case undefined:
+    case "list":
+    case "ls":
+      return questList(parsed);
+    case "inspect":
+      return questInspect(parsed);
+    case "done":
+    case "archive":
+      // 9b/9c: completion, archive, and Linear write-back land in a later
+      // increment. Fail loud rather than pretend.
+      throw new Error(`hive quest ${sub}: lands in a later increment (completion/archive is increment 9b)`);
+    default:
+      throw new Error(`Unknown quest subcommand: ${sub}\nUsage: hive quest <create|start|list|inspect>`);
+  }
+}
+
+/**
+ * Slugify a quest title into a colony name (COLONY_NAME_RE:
+ * /^[A-Za-z0-9][A-Za-z0-9_-]*$/): lowercase, collapse runs of unsafe chars into
+ * a single dash, trim leading/trailing dashes. Falls back to "quest" if nothing
+ * usable survives (e.g. a title of only punctuation).
+ */
+function colonySlugFromTitle(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : "quest";
+}
+
+/** Ensure a colony exists by name, creating it if missing; return its name. */
+async function ensureColony(name: string): Promise<string> {
+  const existing = await loadColony(name);
+  if (existing) {
+    if (existing.archived) throw new Error(`Colony is archived: ${name}`);
+    return existing.name;
+  }
+  const created = await createColony(name);
+  return created.name;
+}
+
+async function questCreate(parsed: Parsed) {
+  const title = parsed.args[1];
+  if (!title) throw new Error('Usage: hive quest create "<title>" [--colony <c>] [--root <dir>] [--linear <issue>]');
+
+  // A quest ALWAYS lives in a colony (PRD §8.2 / open-question #5 decided yes):
+  // use/create the named one, else auto-create from the title slug.
+  const colonyFlag = stringFlag(parsed, ["colony"]);
+  const colony = colonyFlag ? await ensureColony(colonyFlag) : await ensureColony(colonySlugFromTitle(title));
+
+  const linear = stringFlag(parsed, ["linear"]);
+  const description = stringFlag(parsed, ["description"]);
+
+  const id = generateQuestId();
+
+  // The quest OWNS A DEDICATED workspace named after the quest id — NOT the
+  // colony's shared workspace, so a later `quest done` that closes the quest's
+  // workspace can never nuke a colony-shared one. Resolve the file root from
+  // --root › colony.rootDir › cwd.
+  const rootDir = await resolveQuestRoot(stringFlag(parsed, ["root"]), colony);
+  await createWorkspace({ name: id, rootDir, colony });
+  await updateWorkspace(id, { questId: id });
+
+  const record = await createQuest({
+    id,
+    title,
+    colony,
+    workspace: id,
+    status: "open",
+    ...(linear ? { linearIssueId: linear } : {}),
+    ...(description ? { description } : {}),
+  });
+
+  if (linear) {
+    // Linear enrichment (fetch title/description from the issue) is increment 9c;
+    // store the id verbatim and stay offline-safe.
+    console.error(note(`linear ${linear} recorded — issue enrichment lands in a later increment`));
+  }
+
+  const session = workspaceSessionName(record.workspace);
+  if (isPretty()) {
+    console.log(actionLine("ok", "quest", [bold(record.id), dim(`"${record.title}"`), dim(`colony:${record.colony}`), dim(session)]));
+    console.error(note(`start work with: hive quest start ${record.id} --frame <frame>`));
+  } else {
+    console.log(`quest-created\t${record.id}\t${record.colony}\t${record.workspace}`);
+  }
+}
+
+/** Resolve a quest workspace's file root: --root › colony.rootDir › cwd. */
+async function resolveQuestRoot(rootFlag: string | undefined, colony: string): Promise<string> {
+  if (rootFlag) {
+    return realpath(resolve(rootFlag.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"))).catch(() => resolve(rootFlag));
+  }
+  const record = await loadColony(colony);
+  if (record?.rootDir && record.rootDir.length > 0) return record.rootDir;
+  return process.cwd();
+}
+
+/** Resolve a quest by exact id, then by unique prefix (the swarm/colony nicety). */
+async function resolveQuestRecord(idArg: string): Promise<QuestRecord | null> {
+  const direct = await loadQuest(idArg);
+  if (direct) return direct;
+  if (!validQuestId(idArg)) return null;
+  const quests = await listQuests();
+  const matches = quests.filter((q) => q.id.startsWith(idArg));
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+async function questStart(parsed: Parsed) {
+  const idArg = parsed.args[1];
+  if (!idArg) throw new Error("Usage: hive quest start <id> --frame <f>");
+
+  if (hasFlag(parsed, "flow")) {
+    throw new Error("hive quest start --flow: lands in a later increment (flow-driven quests are increment 9b)");
+  }
+  const frameName = stringFlag(parsed, ["frame"]);
+  if (!frameName) throw new Error("hive quest start requires --frame <f> (--flow lands in a later increment)");
+
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+  if (quest.status === "archived" || quest.status === "done") {
+    throw new Error(`Quest ${quest.id} is ${quest.status}; cannot start work on it`);
+  }
+
+  // Spawn the swarm with the quest's colony injected — the bees MUST carry the
+  // quest's colony (PRD §8.2), not whatever --colony the user typed. We clone the
+  // Parsed and overwrite the colony/frame flags, then call the existing
+  // spawnFromFrame: this needs NO change to that hot path (it already reads
+  // --colony via resolveSpawnColony and --frame), and keeps swarm-record
+  // creation, readiness waiting, and the swarmId hint all in one place.
+  const questFlags = new Map(parsed.flags);
+  questFlags.set("colony", quest.colony);
+  questFlags.set("frame", frameName);
+  // A quest-level --brief override lands with the flow/Linear increment; for now
+  // briefs come from the frame's castes, so drop any stray --brief rather than let
+  // spawnFromFrame reject the whole spawn (it forbids --brief with --frame).
+  questFlags.delete("brief");
+  const questParsed: Parsed = { ...parsed, flags: questFlags };
+
+  const records = await spawnFromFrame(questParsed, frameName);
+  if (records.length === 0) throw new Error(`Frame ${frameName} spawned no bees`);
+
+  // Stamp every spawned bee with the quest id (and re-stamp colony defensively)
+  // so the derived quest:<id> tag lights up, and link each bee's window into the
+  // quest's workspace — reusing the workspace link path, never reinventing it.
+  const session = workspaceSessionName(quest.workspace);
+  const ensured = await ensureLinkSession(session);
+  await setWorkspaceOptions(session);
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+
+  const inventory = await windowInventory();
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const wsRecord = await loadWorkspace(quest.workspace);
+  const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
+  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const beeTargets: string[] = [];
+  for (const bee of records) {
+    await stampQuestMembership(bee, quest.id, quest.colony, quest.workspace);
+    // Only local + live windows can be link-window'd (the workspaceAdd discipline).
+    if (bee.node && bee.node !== LOCAL_NODE_NAME) continue;
+    if (!liveNames.has(bee.tmuxTarget)) continue;
+    const windowId = inventory.active.get(bee.tmuxTarget);
+    if (!windowId) continue; // no live window to link — never record a phantom member
+    beeTargets.push(bee.tmuxTarget);
+    const beeId = bee.id ?? bee.name;
+    if (!memberIds.has(beeId)) {
+      members.push({ kind: "bee", beeId });
+      memberIds.add(beeId);
+    }
+  }
+  await linkTargetsInto(session, beeTargets, ensured);
+  // Persist the bee membership on the workspace so a later restore brings them
+  // back (converges with the workspace add/open invariant).
+  await updateWorkspace(quest.workspace, { members });
+
+  // Flip the quest to active: stamp activatedAt (first activation only) and
+  // append the swarm id. The swarm id is the frame's swarm hint (spawnFromFrame
+  // created it); read it off the freshly spawned bees.
+  const swarmId = records.find((r) => r.swarmId)?.swarmId;
+  const swarmIds = swarmId && !quest.swarmIds.includes(swarmId) ? [...quest.swarmIds, swarmId] : quest.swarmIds;
+  await updateQuest(quest.id, {
+    status: "active",
+    swarmIds,
+    ...(quest.activatedAt ? {} : { activatedAt: new Date().toISOString() }),
+  });
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(swarmId ? `@${swarmId}` : ""), `${records.length} bee(s)`, dim(session)]));
+  } else {
+    console.log(`quest-started\t${quest.id}\t${swarmId ?? ""}\t${records.length}`);
+  }
+}
+
+/**
+ * Stamp a bee's questId (+ colony) so the derived quest:<id> / colony: tags
+ * refresh (the stampWorkspaceMembership pattern). A quest never silently fails to
+ * stamp a bee — that is the heart of acceptance Q1.
+ */
+async function stampQuestMembership(bee: SessionRecord, questId: string, colony: string, workspaceName: string): Promise<void> {
+  const patch: Partial<SessionRecord> = {};
+  if (bee.questId !== questId) patch.questId = questId;
+  if (bee.colony !== colony) patch.colony = colony;
+  if (bee.workspaceId !== workspaceName) patch.workspaceId = workspaceName;
+  if (Object.keys(patch).length === 0) return;
+  await updateSession(bee.name, { ...patch, updatedAt: new Date().toISOString() });
+  await writeHiveTags({ ...bee, ...patch });
+}
+
+async function questList(parsed: Parsed) {
+  const colonyFilter = stringFlag(parsed, ["colony"]);
+  const statusFilter = stringFlag(parsed, ["status"]);
+  let quests = await listQuests();
+  // Archived quests are excluded from default listings (archive handling proper
+  // is increment 9b); a `--status archived` request can still surface them.
+  if (statusFilter !== "archived") quests = quests.filter((q) => q.status !== "archived");
+  if (colonyFilter) quests = quests.filter((q) => q.colony === colonyFilter);
+  if (statusFilter) quests = quests.filter((q) => q.status === statusFilter);
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(quests, null, 2));
+    return;
+  }
+  if (!isPretty()) {
+    for (const q of quests) {
+      console.log(`${q.status}\t${q.id}\t${q.colony}\t${q.workspace}\t${q.swarmIds.length}\t${q.title}`);
+    }
+    return;
+  }
+  if (quests.length === 0) {
+    console.log(dim('No quests. Create one with: hive quest create "<title>" [--colony <c>]'));
+    return;
+  }
+  console.log(formatTable(
+    [
+      { header: "STATUS" },
+      { header: "ID" },
+      { header: "COLONY" },
+      { header: "WORKSPACE" },
+      { header: "SWARMS", align: "right" },
+      { header: "TITLE" },
+      { header: "AGE", align: "right" },
+    ],
+    quests.map((q) => [
+      questStatusColor(q.status),
+      bold(q.id),
+      dim(q.colony),
+      dim(q.workspace),
+      String(q.swarmIds.length),
+      truncate(q.title, 40),
+      dim(formatRelativeTime(q.createdAt)),
+    ]),
+  ));
+}
+
+function questStatusColor(status: QuestStatus): string {
+  switch (status) {
+    case "active":
+      return green("active");
+    case "open":
+      return cyan("open");
+    case "done":
+      return gray("done");
+    case "archived":
+      return gray("archived");
+  }
+}
+
+async function questInspect(parsed: Parsed) {
+  const idArg = parsed.args[1];
+  if (!idArg) throw new Error("Usage: hive quest inspect <id>");
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+
+  // Roll up the quest's bees by filtering the store for questId===id (the same
+  // set the quest:<id> selector resolves, but read directly so inspect stays a
+  // cheap store-only read with no live tmux probe).
+  const bees = (await listSessions()).filter((b) => b.questId === quest.id);
+  const beeSummary = bees.map((b) => ({
+    name: b.name,
+    agent: b.agent,
+    caste: b.caste,
+    status: b.status,
+    state: b.lastObservedState,
+  }));
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify({ ...quest, bees: beeSummary }, null, 2));
+    return;
+  }
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(`"${quest.title}"`), questStatusColor(quest.status)]));
+    console.log(`  ${dim("colony")}    ${quest.colony}`);
+    console.log(`  ${dim("workspace")} ${workspaceSessionName(quest.workspace)}`);
+    console.log(`  ${dim("swarms")}    ${quest.swarmIds.length > 0 ? quest.swarmIds.map((s) => `@${s}`).join(" ") : dim("none")}`);
+    if (quest.linearIssueId) console.log(`  ${dim("linear")}    ${quest.linearIssueId}`);
+    console.log(`  ${dim("bees")}      ${bees.length}`);
+    for (const b of beeSummary) {
+      const state = b.status === "running" ? green(b.state ?? "running") : gray(b.status);
+      console.log(`    ${bold(b.name)} ${dim(b.caste ? `caste:${b.caste}` : b.agent)} ${state}`);
+    }
+  } else {
+    console.log(`quest\t${quest.id}\t${quest.status}\t${quest.colony}\t${quest.workspace}\t${quest.swarmIds.join(",")}\t${quest.linearIssueId ?? ""}`);
+    for (const b of beeSummary) {
+      console.log(`bee\t${b.name}\t${b.caste ?? b.agent}\t${b.status}\t${b.state ?? ""}`);
+    }
+  }
 }
 
 async function workspaceClose(parsed: Parsed) {
