@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { launchEnv } from "./env.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Local terminal launching for `hive open` — the identity-launcher escape
@@ -140,7 +141,7 @@ export function runInCurrentTerminal(command: string, args: string[], env: Recor
     const child = spawn(command, args, {
       stdio: "inherit",
       cwd,
-      env: { ...process.env, ...env },
+      env: launchEnv(env),
     });
     child.on("error", reject);
     child.on("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));

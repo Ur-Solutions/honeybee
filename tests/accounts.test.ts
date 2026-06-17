@@ -101,7 +101,7 @@ test("capture fails when the home has no credential files", async () => {
   });
 });
 
-test("activate seeds creds into a home; codex mirrors $HOME/.codex/auth.json", async () => {
+test("activate seeds creds into a home; codex keeps a legacy .codex auth mirror", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("codex", "codex@a.b");
     const sourceHome = join(dir, "codex-src");

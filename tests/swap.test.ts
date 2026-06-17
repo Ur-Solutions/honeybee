@@ -136,7 +136,7 @@ test("swapAccount refuses tool mismatch and no-op swaps", async () => {
   });
 });
 
-test("swapAccount applies codex identity env on relaunch", async () => {
+test("swapAccount relaunches codex with CODEX_HOME but not HOME", async () => {
   await withTempStore(async () => {
     const { substrate, calls } = fakeSubstrate(false);
     const codexAccount: AccountRecord = { id: "codex-new", tool: "codex", label: "c@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
@@ -150,8 +150,7 @@ test("swapAccount applies codex identity env on relaunch", async () => {
     const relaunch = calls.find((call) => call.method === "newSession")!;
     assert.deepEqual(relaunch.spec!.args.slice(-2), ["resume", "--last"]);
     assert.equal(relaunch.spec!.env?.CODEX_HOME, "/tmp/home-c");
-    // The driver's explicit identity env (stress-report fix) is applied.
-    assert.equal(relaunch.spec!.env?.HOME, "/tmp/home-c");
+    assert.equal(relaunch.spec!.env?.HOME, undefined);
   });
 });
 

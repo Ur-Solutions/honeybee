@@ -73,8 +73,8 @@ export type ResolveAgentOptions = {
   yolo?: boolean;
   /**
    * Identity-activation spawn: merge the driver's explicit IdentityRecipe env
-   * (e.g. codex's HOME) into the spec env for the resolved home. Only the
-   * account/swap/activate paths set this — plain spawns never rewrite HOME.
+   * into the spec env for the resolved home. Only account/swap/activate paths
+   * set this — plain spawns never apply identity-only env.
    */
   identity?: boolean;
 };

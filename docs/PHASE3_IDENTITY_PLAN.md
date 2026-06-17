@@ -84,20 +84,25 @@ hive spawn claude --autoswap      # opt into the default autoswap flow for this 
 hive sessions reconcile           # index/dedupe sessions across all homes (req 8)
 ```
 
-## 6. Driver identity recipes (closes the Codex `HOME` bug)
+## 6. Driver identity recipes
 
-Per `stress-reports/codex-home-auth-bug-2026-05-17.md`: setting `CODEX_HOME` alone is **insufficient** — Codex auth discovery also reads `$HOME`. The fix the report prescribes is **explicit, declarative per-profile env**, never a blind global `HOME` rewrite. So credential injection is driver-specific, expressed on the §16 `AgentProfile`:
+The old Codex `HOME` workaround isolated auth but leaked a fake home into every
+developer tool Codex ran. The current rule is: provider identity lives in the
+provider-specific home env (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, etc.); general
+`HOME` remains the developer's OS home unless a driver has an explicit,
+audited exception. Credential injection is driver-specific, expressed on the
+§16 `AgentProfile`:
 
 ```ts
 type IdentityRecipe = {
   credentialFiles: string[];        // copied from vault/<account>/ into the home
   homeEnv?: string;                 // CLAUDE_CONFIG_DIR | CODEX_HOME | OPENCODE_CONFIG_DIR
-  env?: Record<string, string>;     // explicit extras ONLY (e.g. codex HOME) — opt-in, logged
+  env?: Record<string, string>;     // explicit extras ONLY — opt-in, logged
 };
 ```
 
 - **claude** — `homeEnv: CLAUDE_CONFIG_DIR`, copy `.credentials.json` into `homePath`. Clean.
-- **codex** — `homeEnv: CODEX_HOME` + **explicit** `env.HOME` pointing at the account home (validated against current codex CLI). Default still inherits `HOME` unchanged; override only when the profile declares it.
+- **codex** — `homeEnv: CODEX_HOME`, copy `auth.json` and keep the legacy `.codex/auth.json` mirror for older discovery paths. Do **not** set `HOME`; Git, SSH, npm, and similar tools must see the real user home.
 - **opencode** — `OPENCODE_CONFIG_DIR` + `XDG_DATA_HOME` (matches existing legacy launch).
 - **cursor / grok** — new recipes (open question: grok CLI auth dir — see §11).
 
@@ -147,7 +152,7 @@ mesh provisions, honeybee runs:
 
 | # | Size | Depends | What |
 |---|---|---|---|
-| 3.1 | M | P2 §16 | Driver `IdentityRecipe` + explicit per-profile `env`; fixes the Codex `HOME` bug |
+| 3.1 | M | P2 §16 | Driver `IdentityRecipe` + explicit per-profile `env`; isolates provider auth without global `HOME` rewrites |
 | 3.2 | M | 3.1, P1 | Vault + `accounts.json` + `hive account add/login/list/import-caam` |
 | 3.3 | S | 3.2 | `hive activate` (req 4) + `hive login` interactive seat (req 3) |
 | 3.4 | M | 3.2 | `hive swap-account` primitive + `SessionRecord.accountId` (req 1 mechanism) |
@@ -169,7 +174,7 @@ mesh provisions, honeybee runs:
 ## 14. Risks / open questions
 
 1. **Limit-message detection** is version/provider-sensitive (heuristic). Mitigate: keep matchers in drivers, easy to update; corroborate with transcript usage + the CLI's own limit event.
-2. **Codex `HOME` isolation** — validate the explicit `env.HOME` per-account approach against the current Codex CLI before relying on it (acceptance test from the stress report).
+2. **Codex home isolation** — validate `CODEX_HOME`-only auth against the current Codex CLI; keep the `.codex/auth.json` mirror only as a compatibility file, not as a reason to rewrite `HOME`.
 3. **grok identity** — which CLI / where does it store auth? Needs investigation; may be cursor/opencode-provider rather than a standalone binary.
 4. **Same account in two homes** simultaneously is allowed but shares that account's quota; the autoswap selector should prefer distinct non-exhausted accounts.
 5. **UUID divergence** when the same session is resumed in two homes / two machines (syncthing). Define last-writer vs keep-both; handle `.sync-conflict` files in `reconcile`.

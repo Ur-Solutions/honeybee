@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
+import { realUserHome } from "../env.js";
 import {
   LOCAL_NODE,
   type KillResult,
@@ -281,7 +282,7 @@ async function createLauncher(spec: LaunchSpec): Promise<{ dir: string; runnerPa
   const dir = await mkdtemp(join(tmpdir(), "hive-launch-"));
   const runnerPath = join(dir, "launch.mjs");
   const payloadPath = join(dir, "payload.json");
-  await writeFile(payloadPath, `${JSON.stringify(spec)}\n`, { mode: 0o600 });
+  await writeFile(payloadPath, `${JSON.stringify({ ...spec, realHome: realUserHome() })}\n`, { mode: 0o600 });
   await writeFile(
     runnerPath,
     `import { spawn } from "node:child_process";
@@ -292,8 +293,13 @@ const payloadPath = process.argv[2];
 const payload = JSON.parse(await readFile(payloadPath, "utf8"));
 await rm(dirname(payloadPath), { recursive: true, force: true }).catch(() => undefined);
 
+const baseEnv = { ...process.env };
+if (typeof payload.realHome === "string" && payload.realHome.length > 0) {
+  baseEnv.HOME = payload.realHome;
+}
+
 const child = spawn(payload.command, Array.isArray(payload.args) ? payload.args : [], {
-  env: { ...process.env, ...(payload.env && typeof payload.env === "object" ? payload.env : {}) },
+  env: { ...baseEnv, ...(payload.env && typeof payload.env === "object" ? payload.env : {}) },
   stdio: "inherit",
 });
 

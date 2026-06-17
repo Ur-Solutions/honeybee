@@ -2,10 +2,9 @@
  * IdentityRecipe describes how a provider's login materializes on disk so the
  * vault can capture credentials out of a home and activate them into another.
  *
- * Per the codex HOME stress report (stress-reports/codex-home-auth-bug-2026-05-17.md)
- * the recipe's extraEnv is explicit and opt-in: it is applied ONLY on identity
- * activation paths (spawn --account, swap-account, activate) and logged — never
- * as a blind global HOME rewrite on plain spawns.
+ * Recipe env is explicit and opt-in: it is applied ONLY on identity activation
+ * paths (spawn --account, swap-account, activate) and logged — never as a blind
+ * global HOME rewrite on plain spawns.
  */
 export type IdentityRecipe = {
   /**
@@ -16,8 +15,7 @@ export type IdentityRecipe = {
   credentialFiles: string[];
   /**
    * Extra home-relative copies written on activation, keyed by canonical
-   * credential file. Covers CLIs with more than one auth discovery path
-   * (codex reads both $CODEX_HOME/auth.json and $HOME/.codex/auth.json).
+   * credential file. Covers CLIs with more than one auth discovery path.
    */
   activationMirrors?: Record<string, string>;
   /**
@@ -75,11 +73,10 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     isActive: (pane) => /\b(?:Working|Starting MCP servers)\b[^\n]*(?:esc to interrupt|ctrl[-+ ]?c)/i.test(pane),
     identity: {
       credentialFiles: ["auth.json"],
-      // Codex auth discovery also walks $HOME/.codex (stress report 2026-05-17),
-      // so activation mirrors auth.json there and declares the explicit HOME.
+      // Keep the legacy mirror for older Codex auth discovery, but do not set
+      // HOME: developer tools inside Codex must see the user's real home.
       activationMirrors: { "auth.json": ".codex/auth.json" },
       configFiles: ["config.toml"],
-      extraEnv: { HOME: "{home}" },
       seedLoginSeat: false,
     },
     isExhausted: (pane) => matchExhaustion(pane, /You've hit your usage limit|usage limit reached|rate limit reached/i),

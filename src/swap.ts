@@ -76,8 +76,7 @@ export async function swapAccount(
     // 2. Activate the target account's credentials into the bee's home.
     await activate(account, record.homePath!);
 
-    // 3. Resume the same provider session in the same home, with the driver's
-    //    explicit identity env.
+    // 3. Resume the same provider session in the same provider home.
     const spec = resolveAgent(record.requestedAgent ?? record.agent, resumeArgs(tool, record.providerSessionId), {
       home: record.homePath,
       yolo: sniffYolo(record.command),

@@ -14,6 +14,7 @@ import {
   saveClaudeOauthToVault,
 } from "./accounts.js";
 import { canonicalAgentKind } from "./agents.js";
+import { launchEnv } from "./env.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { readClaudeKeychain } from "./keychain.js";
 import { withFileLock } from "./lock.js";
@@ -463,7 +464,7 @@ async function fetchCodexLiveRateLimits(homePath: string): Promise<CodexLiveRate
     try {
       child = spawn("codex", ["app-server"], {
         stdio: ["pipe", "pipe", "ignore"],
-        env: { ...process.env, CODEX_HOME: homePath },
+        env: launchEnv({ CODEX_HOME: homePath }),
       });
     } catch {
       resolve(null);

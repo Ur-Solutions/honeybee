@@ -5,16 +5,16 @@ import { test } from "node:test";
 import { resolveAgent, resolveHome } from "../src/agents.js";
 import { identityEnvForAgent, identityRecipeForAgent } from "../src/drivers.js";
 
-test("plain spawns never rewrite HOME (codex stress-report contract)", () => {
+test("plain spawns never rewrite HOME", () => {
   const spec = resolveAgent("codex", [], { home: "/tmp/slot", yolo: false });
   assert.equal(spec.env.CODEX_HOME, "/tmp/slot");
   assert.equal(spec.env.HOME, undefined);
 });
 
-test("identity spawns apply the driver's explicit extra env", () => {
+test("identity spawns apply only the driver's explicit extra env", () => {
   const codex = resolveAgent("codex", [], { home: "/tmp/slot", yolo: false, identity: true });
   assert.equal(codex.env.CODEX_HOME, "/tmp/slot");
-  assert.equal(codex.env.HOME, "/tmp/slot");
+  assert.equal(codex.env.HOME, undefined);
 
   const opencode = resolveAgent("opencode", [], { home: "/tmp/oc", yolo: false, identity: true });
   assert.equal(opencode.env.OPENCODE_CONFIG_DIR, "/tmp/oc");
@@ -26,7 +26,7 @@ test("identity spawns apply the driver's explicit extra env", () => {
 });
 
 test("identityEnvForAgent expands {home} and is empty for recipe-less extras", () => {
-  assert.deepEqual(identityEnvForAgent("codex", "/x"), { HOME: "/x" });
+  assert.deepEqual(identityEnvForAgent("codex", "/x"), {});
   assert.deepEqual(identityEnvForAgent("claude", "/x"), {});
   assert.deepEqual(identityEnvForAgent("pi", "/x"), {});
 });

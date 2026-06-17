@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -154,3 +154,50 @@ test("local newSession cleans up its hive-launch tmpdir when tmux refuses the se
     await rm(isolatedTmp, { recursive: true, force: true });
   }
 });
+
+test("local launcher restores real HOME from a fake parent env unless explicitly overridden", { timeout: 30_000 }, async () => {
+  const targetA = `hive-launch-home-a-${process.pid}`;
+  const targetB = `hive-launch-home-b-${process.pid}`;
+  const dir = await mkdtemp(join(tmpdir(), "hive-launch-home-"));
+  const outA = join(dir, "a.txt");
+  const outB = join(dir, "b.txt");
+  const previousHome = process.env.HOME;
+  const previousRealHome = process.env.HIVE_REAL_HOME;
+
+  const writeHome = (path: string) => [
+    "-e",
+    `require("node:fs").writeFileSync(${JSON.stringify(path)}, process.env.HOME || "")`,
+  ];
+  try {
+    process.env.HOME = "/tmp/hive-fake-account-home";
+    process.env.HIVE_REAL_HOME = "/tmp/hive-real-user-home";
+
+    await newSession(targetA, "/tmp", { command: process.execPath, args: writeHome(outA) });
+    await newSession(targetB, "/tmp", { command: process.execPath, args: writeHome(outB), env: { HOME: "/tmp/hive-driver-home" } });
+
+    assert.equal(await waitForFile(outA), "/tmp/hive-real-user-home");
+    assert.equal(await waitForFile(outB), "/tmp/hive-driver-home");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousRealHome === undefined) delete process.env.HIVE_REAL_HOME;
+    else process.env.HIVE_REAL_HOME = previousRealHome;
+    await tmuxKillSession(targetA).catch(() => undefined);
+    await tmuxKillSession(targetB).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+async function waitForFile(path: string): Promise<string> {
+  const deadline = Date.now() + 5_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      return await readFile(path, "utf8");
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`timed out waiting for ${path}`);
+}
