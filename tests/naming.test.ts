@@ -6,9 +6,11 @@ import { test } from "node:test";
 import {
   buildTitlePrompt,
   canWriteTitle,
+  failureDetail,
   gatherTitleContext,
   generateTitle,
   normalizeGeneratedTitle,
+  sanitizeContextField,
   titleRank,
 } from "../src/naming.js";
 import { persistSessionTranscriptMetadata } from "../src/sessionMetadata.js";
@@ -97,12 +99,38 @@ test("normalizeGeneratedTitle clamps runaway output and rejects empties", () => 
 
 /* ------------------------------- prompt --------------------------------- */
 
-test("buildTitlePrompt includes only the sections present", () => {
+test("buildTitlePrompt includes only the sections present and fences the content", () => {
   const prompt = buildTitlePrompt({ brief: "Fix the bug", lastAssistant: "Done, the bug was X" });
-  assert.match(prompt, /ONLY the title/);
+  assert.match(prompt, /Output ONLY a 3-8 word title/);
+  assert.match(prompt, /BEGIN SESSION CONTENT/);
+  assert.match(prompt, /END SESSION CONTENT/);
   assert.match(prompt, /Task brief:\nFix the bug/);
   assert.match(prompt, /Latest assistant reply:\nDone, the bug was X/);
   assert.doesNotMatch(prompt, /First user message:/);
+});
+
+test("buildTitlePrompt defangs @-mentions inside the embedded content", () => {
+  const prompt = buildTitlePrompt({ firstUser: "read @hive-tmux-ux-prompt.md and @./src/foo.ts" });
+  assert.doesNotMatch(prompt, /@hive-tmux/);
+  assert.doesNotMatch(prompt, /@\.\/src/);
+  assert.match(prompt, /read hive-tmux-ux-prompt\.md and \.\/src\/foo\.ts/);
+});
+
+test("sanitizeContextField strips @ only from mentions, leaving emails/text intact", () => {
+  assert.equal(sanitizeContextField("ping @alice and @bob/team"), "ping alice and bob/team");
+  // A mid-token @ (email) is not a mention sigil — left alone.
+  assert.equal(sanitizeContextField("mail me at user@example.com"), "mail me at user@example.com");
+});
+
+test("failureDetail prefers the real error and drops the benign stdin warning", () => {
+  const stdout = "Claude usage limit reached. Resets at 5pm.";
+  const stderr = "Warning: no stdin data received in 3s, proceeding without it.";
+  assert.match(failureDetail(stdout, stderr), /usage limit reached/);
+  assert.doesNotMatch(failureDetail(stdout, stderr), /no stdin data/);
+});
+
+test("failureDetail falls back to an auth/quota hint when there is no output", () => {
+  assert.match(failureDetail("", "Warning: no stdin data received in 3s, proceeding without it."), /auth\/quota/);
 });
 
 /* ------------------------------- context -------------------------------- */
