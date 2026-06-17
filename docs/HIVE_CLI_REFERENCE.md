@@ -101,8 +101,9 @@ Built-in agent defaults:
 | `droid` | `droid` | `droid --settings ~/.factory/hive-droid-yolo-settings.json` |
 | `cursor` | `cursor-agent` | `cursor-agent --force` |
 
-Claude defaults to yolo mode unless explicitly opted out. Other built-in
-agents use safer defaults unless yolo is requested.
+Claude defaults to yolo mode unless explicitly opted out. The reserved
+`codex-auto` account-picking alias also defaults to yolo; plain `codex` and
+other built-in agents use safer defaults unless yolo is requested.
 
 Yolo controls:
 
@@ -314,7 +315,7 @@ Examples:
 ```sh
 hive x claude "Review this repo and seal with findings"
 hive x codex2 "Summarize the architecture"
-hive x codex-auto "Run the test suite"   # least-loaded account pick
+hive x codex-auto "Run the test suite"   # least-loaded account pick, yolo by default
 ```
 
 Use `hive tail`, `hive attach`, `hive wait`, or `hive last` later to inspect.
@@ -632,13 +633,60 @@ Behavior and guarantees:
   bee's session, but the linked window (and the agent process) survives in the
   view until the view is closed.
 
-### `hive kill`
+### `hive split`
 
-Stop a session and remove its metadata.
+Spawn a new sub-bee into the current bee's comb (its tmux session), in an
+adjacent pane. This is the "decompose into sub-bees" verb.
 
 ```sh
-hive kill <session>
+hive split [<bee>] [<agent>] [--brief <text>] [--dir v|h|window] [--cwd <dir>] [--home <h>]
 ```
+
+- `<bee>` — the parent bee to split from. Omit it (or run from inside a bee's
+  pane) to split the **current** bee's comb (resolved via `hive here`).
+- `<agent>` — agent kind for the sub-bee (defaults to the parent's agent).
+- `--dir v|h|window` — pane placement: `v` (vertical split, default), `h`
+  (horizontal split), or `window` (a new window in the same session).
+- `--brief <text>` — deliver a brief to the sub-bee once it is ready.
+- `--cwd <dir>` — working directory (defaults to the parent's cwd).
+- `--home <h>` / `--profile <h>` — home/profile for the sub-bee.
+
+The sub-bee is registered as a **new bee record** carrying `parentId` (the bee
+it budded from) and sharing the parent's `combId` and `tmuxTarget`, with its own
+`agentPaneId`. A `bee.split` ledger event records the lineage. `hive list` shows
+both bees sharing one comb.
+
+### `hive here`
+
+Resolve the bee that owns the current tmux pane — useful for scripts and
+keybindings (e.g. `hive split "$(hive here --id)"`).
+
+```sh
+hive here [--id] [--json]
+```
+
+- `--id` — print only the bee's id.
+- `--json` — print full metadata (id, name, agent, cwd, combId, parentId,
+  agentPaneId) as JSON.
+
+Resolution prefers `$TMUX_PANE` (matching a bee by `agentPaneId`) and falls back
+to the current session name (matching `tmuxTarget`, for solo combs and legacy
+bees). Errors cleanly when not inside tmux or when no bee matches.
+
+### `hive kill`
+
+Stop a bee or an entire comb and remove the relevant metadata.
+
+```sh
+hive kill <bee> [--comb]
+```
+
+- A pane-pinned bee that shares its comb with at least one live sibling is
+  dropped with `kill-pane` — **only its pane** goes; siblings keep running and
+  the session survives. The record is deleted and a `bee.kill_pane` ledger event
+  is emitted.
+- A sole/last bee in its comb (or any bee with `--comb`) takes the whole tmux
+  session via the transactional kill path.
 
 The kill path is transactional and records `kill_failed` if tmux/session cleanup
 does not complete cleanly.

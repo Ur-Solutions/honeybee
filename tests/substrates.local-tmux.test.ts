@@ -50,7 +50,7 @@ test("substrateForNode rejects unknown nodes with a registration hint", () => {
 test("tmux.js shim exposes the same callable names as the substrate's methods", () => {
   const s = createLocalTmuxSubstrate();
   // Spot-check the method/function names that callers depend on.
-  for (const name of ["hasSession", "newSession", "sendText", "sendEnter", "sendKey", "capture", "kill", "listTmuxSessions", "attachCommand", "attachSession"] as const) {
+  for (const name of ["hasSession", "newSession", "newPane", "sendText", "sendEnter", "sendKey", "capture", "kill", "killPane", "listTmuxSessions", "attachCommand", "attachSession"] as const) {
     if (name === "listTmuxSessions") {
       assert.equal(typeof (legacyTmux as Record<string, unknown>)[name], "function");
       assert.equal(typeof s.listSessions, "function");

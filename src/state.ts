@@ -79,7 +79,9 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
     return { state: "sealed", detail: "seal recorded" };
   }
 
-  const pane = context.panes?.get(record.tmuxTarget) ?? "";
+  // Content is keyed by the bee's own pane (agentPaneId) so sub-bees sharing a
+  // comb's tmuxTarget don't collide; legacy solo bees fall back to tmuxTarget.
+  const pane = context.panes?.get(record.agentPaneId ?? record.tmuxTarget) ?? "";
   if (pane) {
     if (isMcpWarningPane(pane)) return { state: "blocked", detail: "MCP warning" };
     if (isTrustPromptPane(pane)) return { state: "blocked", detail: "trust prompt" };

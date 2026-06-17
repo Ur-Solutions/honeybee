@@ -223,6 +223,7 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
   const recipe = recipeFor(account);
   return withAccountsLock(async () => {
     const captured: string[] = [];
+    const capturedCredentials: string[] = [];
     for (const relative of recipe.credentialFiles) {
       const source = join(homePath, relative);
       const info = await stat(source).catch(() => null);
@@ -232,6 +233,7 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
       const data = await readFile(source, "utf8");
       await atomicWriteFile(target, data, { mode: 0o600 });
       captured.push(relative);
+      capturedCredentials.push(relative);
     }
     // On macOS, claude stores the primary credential in the Keychain rather
     // than .credentials.json — and when both exist, the on-disk file is often
@@ -246,10 +248,21 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
           await mkdir(dirname(target), { recursive: true, mode: 0o700 });
           await atomicWriteFile(target, `${keychainRaw}\n`, { mode: 0o600 });
           if (!captured.includes(primary)) captured.push(primary);
+          if (!capturedCredentials.includes(primary)) capturedCredentials.push(primary);
         }
       }
     }
-    if (captured.length === 0) {
+    for (const relative of recipe.configFiles ?? []) {
+      const source = join(homePath, relative);
+      const info = await stat(source).catch(() => null);
+      if (!info?.isFile()) continue;
+      const target = join(accountDir(account), relative);
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      const data = await readFile(source, "utf8");
+      await atomicWriteFile(target, data, { mode: 0o600 });
+      captured.push(relative);
+    }
+    if (capturedCredentials.length === 0) {
       throw new Error(
         `No credential files found in ${homePath} for ${account.id} (looked for: ${recipe.credentialFiles.join(", ")})`,
       );
@@ -324,6 +337,19 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     if (written.length === 0) {
       throw new Error(`Vault has no credentials for ${account.id}. Capture them first: hive account login ${account.tool} ${account.label}`);
     }
+    for (const relative of recipe.configFiles ?? []) {
+      const source = join(accountDir(account), relative);
+      const info = await stat(source).catch(() => null);
+      if (!info?.isFile()) continue;
+      const target = join(homePath, relative);
+      await mkdir(dirname(target), { recursive: true });
+      const data = await readFile(source, "utf8");
+      await atomicWriteFile(target, data, { mode: 0o600 });
+      written.push(relative);
+    }
+    if (account.tool === "codex" && await seedCodexHomeDefaults(homePath)) {
+      if (!written.includes("config.toml")) written.push("config.toml");
+    }
     // On macOS, claude prefers the per-config-dir Keychain entry over the
     // credentials file — seed it so an activated home doesn't resolve a stale
     // identity from an old entry. Merged, not replaced: home-local sibling
@@ -343,6 +369,82 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     await appendLedger({ type: "account.activate", account: account.id, tool: account.tool, home: homePath, files: written });
     return written;
   });
+}
+
+const CODEX_HOME_DEFAULTS: Record<string, string> = {
+  model: `"gpt-5.5"`,
+  model_reasoning_effort: `"xhigh"`,
+  service_tier: `"fast"`,
+};
+
+const CODEX_NOTICE_DEFAULTS: Record<string, string> = {
+  hide_full_access_warning: "true",
+};
+
+async function seedCodexHomeDefaults(homePath: string): Promise<boolean> {
+  const path = join(homePath, "config.toml");
+  const existing = await readFile(path, "utf8").catch(() => "");
+  const next = mergeCodexConfigDefaults(existing);
+  if (next === existing) return false;
+  await mkdir(homePath, { recursive: true, mode: 0o700 });
+  await atomicWriteFile(path, next, { mode: 0o600 });
+  return true;
+}
+
+function mergeCodexConfigDefaults(input: string): string {
+  let lines = tomlLines(input);
+  lines = withTopLevelTomlDefaults(lines, CODEX_HOME_DEFAULTS);
+  lines = withTomlSectionDefaults(lines, "notice", CODEX_NOTICE_DEFAULTS);
+  return `${lines.join("\n")}\n`;
+}
+
+function tomlLines(input: string): string[] {
+  const trimmed = input.replace(/\s+$/u, "");
+  return trimmed.length === 0 ? [] : trimmed.split(/\r?\n/u);
+}
+
+function withTopLevelTomlDefaults(lines: string[], defaults: Record<string, string>): string[] {
+  const insertAt = firstTomlSectionIndex(lines);
+  const topLevel = lines.slice(0, insertAt === -1 ? lines.length : insertAt);
+  const existing = new Set<string>();
+  for (const line of topLevel) {
+    const match = line.match(/^\s*([A-Za-z0-9_-]+)\s*=/u);
+    if (match) existing.add(match[1]!);
+  }
+  const missing = Object.entries(defaults)
+    .filter(([key]) => !existing.has(key))
+    .map(([key, value]) => `${key} = ${value}`);
+  if (missing.length === 0) return lines;
+  if (insertAt === -1) return [...lines, ...missing];
+  return [...lines.slice(0, insertAt), ...missing, ...lines.slice(insertAt)];
+}
+
+function withTomlSectionDefaults(lines: string[], section: string, defaults: Record<string, string>): string[] {
+  const header = `[${section}]`;
+  const start = lines.findIndex((line) => line.trim() === header);
+  if (start === -1) {
+    return [...lines, ...(lines.length > 0 && lines[lines.length - 1] !== "" ? [""] : []), header, ...formatTomlDefaults(defaults)];
+  }
+  const nextSection = lines.findIndex((line, index) => index > start && /^\s*\[/.test(line));
+  const end = nextSection === -1 ? lines.length : nextSection;
+  const existing = new Set<string>();
+  for (const line of lines.slice(start + 1, end)) {
+    const match = line.match(/^\s*([A-Za-z0-9_-]+)\s*=/u);
+    if (match) existing.add(match[1]!);
+  }
+  const missing = Object.entries(defaults)
+    .filter(([key]) => !existing.has(key))
+    .map(([key, value]) => `${key} = ${value}`);
+  if (missing.length === 0) return lines;
+  return [...lines.slice(0, start + 1), ...missing, ...lines.slice(start + 1)];
+}
+
+function firstTomlSectionIndex(lines: string[]): number {
+  return lines.findIndex((line) => /^\s*\[/.test(line));
+}
+
+function formatTomlDefaults(defaults: Record<string, string>): string[] {
+  return Object.entries(defaults).map(([key, value]) => `${key} = ${value}`);
 }
 
 /**
@@ -689,4 +791,3 @@ export async function accountHasCredentials(account: AccountRecord): Promise<boo
 export function defaultHomeForAccount(account: AccountRecord): string {
   return join(storeRoot(), "homes", account.id);
 }
-

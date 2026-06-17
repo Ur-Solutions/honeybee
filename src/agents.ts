@@ -291,6 +291,8 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     command,
     tmuxTarget,
     ...(paneId ? { agentPaneId: paneId } : {}),
+    // Solo combs: every bee gets combId == tmuxTarget at spawn (§12 Q3).
+    combId: tmuxTarget,
     createdAt: now,
     updatedAt: now,
     status: "running",

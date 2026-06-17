@@ -5,13 +5,19 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { listSessionStates, setUserOptions, tmux } from "../src/substrates/local-tmux.js";
+import { listSessionStates, setTmuxSocket, setUserOptions, tmux } from "../src/substrates/local-tmux.js";
 
 process.env.TMUX_TMPDIR = mkdtempSync(join(tmpdir(), "hive-state-itest-"));
 delete process.env.TMUX;
+// Pin a throwaway socket: scopes every tmux call here with `-S` and is what
+// allows kill-server past the safety guard (never the developer's real server).
+process.env.HIVE_TMUX_SOCKET = join(process.env.TMUX_TMPDIR, "s.sock");
+setTmuxSocket(process.env.HIVE_TMUX_SOCKET);
 
 after(async () => {
   await tmux(["kill-server"], { reject: false });
+  setTmuxSocket(undefined);
+  delete process.env.HIVE_TMUX_SOCKET;
   rmSync(process.env.TMUX_TMPDIR!, { recursive: true, force: true });
 });
 

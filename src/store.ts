@@ -17,6 +17,14 @@ export type SessionRecord = {
    * records → they keep the active-pane fallback.
    */
   agentPaneId?: string;
+  /**
+   * The comb (tmux session) this bee shares. For a solo bee this equals
+   * tmuxTarget; sub-bees split into the same comb share the parent's combId.
+   * (fork-and-pane Phase B)
+   */
+  combId?: string;
+  /** The bee this one was split from (intra-comb lineage). (Phase B) */
+  parentId?: string;
   createdAt: string;
   updatedAt: string;
   status: "running" | "dead" | "kill_failed";
@@ -245,7 +253,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",

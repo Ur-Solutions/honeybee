@@ -111,9 +111,37 @@ test("activate seeds creds into a home; codex mirrors $HOME/.codex/auth.json", a
 
     const slot = join(dir, "codex-slot");
     const written = await activateAccountIntoHome(account, slot);
-    assert.deepEqual(written.sort(), [".codex/auth.json", "auth.json"]);
+    assert.deepEqual(written.sort(), [".codex/auth.json", "auth.json", "config.toml"]);
     assert.equal(await readFile(join(slot, "auth.json"), "utf8"), `{"id":"codex-token"}`);
     assert.equal(await readFile(join(slot, ".codex", "auth.json"), "utf8"), `{"id":"codex-token"}`);
+    const config = await readFile(join(slot, "config.toml"), "utf8");
+    assert.match(config, /model = "gpt-5\.5"/);
+    assert.match(config, /model_reasoning_effort = "xhigh"/);
+    assert.match(config, /service_tier = "fast"/);
+    assert.match(config, /\[notice\]\nhide_full_access_warning = true/);
+  });
+});
+
+test("codex activation preserves vaulted config and fills missing standard defaults", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "codex-config@a.b");
+    const sourceHome = join(dir, "codex-src");
+    await mkdir(sourceHome, { recursive: true });
+    await writeFile(join(sourceHome, "auth.json"), `{"id":"codex-token"}`);
+    await writeFile(
+      join(sourceHome, "config.toml"),
+      `model = "custom-codex"\n\n[projects."/repo"]\ntrust_level = "trusted"\n`,
+    );
+    assert.deepEqual((await captureAccountFromHome(account, sourceHome)).sort(), ["auth.json", "config.toml"]);
+
+    const slot = join(dir, "codex-slot");
+    await activateAccountIntoHome(account, slot);
+
+    const config = await readFile(join(slot, "config.toml"), "utf8");
+    assert.match(config, /model = "custom-codex"/);
+    assert.match(config, /model_reasoning_effort = "xhigh"/);
+    assert.match(config, /service_tier = "fast"/);
+    assert.match(config, /\[projects\."\/repo"\]\ntrust_level = "trusted"/);
   });
 });
 
@@ -292,4 +320,3 @@ test("resolveSpawnAgent maps bee specs to tool + account", async () => {
     assert.deepEqual(await resolveSpawnAgent("codex-nosuch"), { agent: "codex-nosuch" });
   });
 });
-

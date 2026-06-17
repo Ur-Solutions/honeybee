@@ -22,10 +22,44 @@ export type TmuxResult = {
   exitCode: number;
 };
 
+// TEST-ONLY isolation + a production safety net. When a throwaway socket is
+// pinned — in-process via setTmuxSocket(), or for child processes via
+// $HIVE_TMUX_SOCKET — every tmux invocation is scoped to it with `-S`, and that
+// is the ONLY context in which hive's own code may run `tmux kill-server`.
+// Without a pinned socket the guard in tmux() refuses kill-server outright, so a
+// bug, a stray cleanup, or a test run from inside the developer's real tmux
+// server can never tear it (and every live bee) down. Production never issues
+// kill-server, so this is invisible there. A human typing `tmux kill-server` in
+// their own shell bypasses this code path entirely and is unaffected.
+let pinnedSocket: string | undefined;
+
+/** TEST-ONLY: pin (or clear with undefined) the throwaway socket every tmux call targets. */
+export function setTmuxSocket(socketPath: string | undefined): void {
+  pinnedSocket = socketPath;
+}
+
+function tmuxSocket(): string | undefined {
+  return pinnedSocket ?? (process.env.HIVE_TMUX_SOCKET || undefined);
+}
+
+function socketArgs(): string[] {
+  const socket = tmuxSocket();
+  return socket ? ["-S", socket] : [];
+}
+
 export async function tmux(args: string[], options: { reject?: boolean } = {}): Promise<TmuxResult> {
   const reject = options.reject ?? true;
+  if (args[0] === "kill-server" && !tmuxSocket()) {
+    // Hard stop: never let hive's own code kill the ambient tmux server. Tests
+    // that legitimately need kill-server must pin a throwaway socket first
+    // (setTmuxSocket / $HIVE_TMUX_SOCKET); production never calls this.
+    throw new Error(
+      "hive: refusing to run `tmux kill-server` without a pinned test socket — " +
+        "this guard protects live bees on the ambient tmux server.",
+    );
+  }
   try {
-    const result = await execFileAsync("tmux", args, { maxBuffer: 20 * 1024 * 1024 });
+    const result = await execFileAsync("tmux", [...socketArgs(), ...args], { maxBuffer: 20 * 1024 * 1024 });
     return { ok: true, stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
   } catch (error) {
     const err = error as { stdout?: string; stderr?: string; message?: string; code?: number | string };
@@ -73,6 +107,29 @@ export async function newSession(name: string, cwd: string, spec: LaunchSpec): P
   }
 }
 
+export async function newPane(target: string, cwd: string, spec: LaunchSpec, opts?: { dir?: "h" | "v" | "window" }): Promise<NewSessionResult> {
+  const launcher = await createLauncher(spec);
+  const command = shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath]);
+  try {
+    if (opts?.dir === "window") {
+      // A fresh window in the same session. -P -F prints the new pane id.
+      const result = await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${target}:`, "-c", cwd, command]);
+      return { paneId: result.stdout.trim() };
+    }
+    // Split the comb's active window. -h = horizontal (side-by-side); default
+    // (no -h) is vertical (stacked). -P -F prints the new pane's id so the
+    // sub-bee can be pinned to it.
+    const direction = opts?.dir === "h" ? ["-h"] : [];
+    const result = await tmux(["split-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${target}:`, "-c", cwd, ...direction, command]);
+    return { paneId: result.stdout.trim() };
+  } catch (error) {
+    // The runner only deletes the payload tmpdir once it actually starts; if
+    // tmux itself refuses the split, clean up here instead of leaking it.
+    await rm(launcher.dir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function sendText(target: string, text: string, paneId?: string): Promise<void> {
   const buffer = `hive-${target.replace(/[^A-Za-z0-9_.:-]/g, "-")}`;
   // Stream the payload via stdin (`load-buffer -`) instead of an argv element:
@@ -100,6 +157,13 @@ export async function kill(target: string): Promise<KillResult> {
   return tmux(["kill-session", "-t", `=${target}`], { reject: false });
 }
 
+// A pane id ("%7") is globally unique on the server, so "-t %7" is exact on its
+// own — no "=name:" wrapping needed. Used by comb-aware `hive kill` to drop one
+// sub-bee without taking the whole session.
+export async function killPane(paneId: string): Promise<KillResult> {
+  return tmux(["kill-pane", "-t", paneId], { reject: false });
+}
+
 export function attachCommand(target: string): string[] {
   return buildAttachArgv({ sessionName: target, insideTmux: Boolean(process.env.TMUX) });
 }
@@ -125,7 +189,7 @@ export async function attachSession(target: string): Promise<void> {
 
 async function tmuxWithStdin(args: string[], input: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("tmux", args, { stdio: ["pipe", "ignore", "pipe"] });
+    const child = spawn("tmux", [...socketArgs(), ...args], { stdio: ["pipe", "ignore", "pipe"] });
     let stderr = "";
     let settled = false;
     const settle = (error?: Error) => {
@@ -270,7 +334,9 @@ export function createLocalTmuxSubstrate(): Substrate {
     probe,
     hasSession,
     newSession,
+    newPane,
     kill,
+    killPane,
     capture,
     sendText,
     sendEnter,

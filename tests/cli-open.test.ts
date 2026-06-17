@@ -39,6 +39,24 @@ test("open keeps -- passthrough for flags open itself owns", async () => {
   });
 });
 
+test("open codex-auto defaults to yolo", async () => {
+  await withStore(async (dir) => {
+    await mkdir(join(dir, "vault", "codex", "codex-one"), { recursive: true });
+    await writeFile(
+      join(dir, "vault", "accounts.json"),
+      JSON.stringify([{ id: "codex-one", tool: "codex", label: "one", addedAt: "2026-06-17T00:00:00.000Z" }]),
+    );
+    await writeFile(join(dir, "vault", "codex", "codex-one", "auth.json"), `{"id":"codex-token"}`);
+
+    const { stdout } = await hive(dir, "open", "codex-auto", "--raw", "--print");
+
+    assert.match(stdout, /codex --dangerously-bypass-approvals-and-sandbox/);
+
+    const optedOut = await hive(dir, "open", "codex-auto", "--raw", "--no-yolo", "--print");
+    assert.doesNotMatch(optedOut.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+  });
+});
+
 test("open seeds claude home acceptances (bypass, onboarding, folder trust)", async () => {
   await withStore(async (dir) => {
     const home = join(dir, "home");

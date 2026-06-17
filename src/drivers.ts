@@ -20,6 +20,12 @@ export type IdentityRecipe = {
    * (codex reads both $CODEX_HOME/auth.json and $HOME/.codex/auth.json).
    */
   activationMirrors?: Record<string, string>;
+  /**
+   * Non-credential, home-relative config files to preserve with an account.
+   * These are copied when present, but they do not make an account "logged in"
+   * and their absence must not block activation.
+   */
+  configFiles?: string[];
   /** Explicit extra env for activated spawns. "{home}" expands to the home path. */
   extraEnv?: Record<string, string>;
   /**
@@ -72,6 +78,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
       // Codex auth discovery also walks $HOME/.codex (stress report 2026-05-17),
       // so activation mirrors auth.json there and declares the explicit HOME.
       activationMirrors: { "auth.json": ".codex/auth.json" },
+      configFiles: ["config.toml"],
       extraEnv: { HOME: "{home}" },
       seedLoginSeat: false,
     },

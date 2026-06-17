@@ -27,7 +27,7 @@ import { identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
-import { swapAccount } from "./swap.js";
+import { resumeArgs, sniffYolo, swapAccount } from "./swap.js";
 import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
 import { isRecentlyExhausted, listUsageAccounts, usageSummary } from "./usage.js";
 import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis, idleSessionAge, olderThanMillis, parseAge } from "./clean.js";
@@ -112,7 +112,7 @@ import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, su
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
 import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord } from "./substrates/index.js";
-import { attachCommand, attachSession, capture, formatShellCommand, hasSession, kill, listTmuxSessions, newSession, sendText } from "./tmux.js";
+import { attachCommand, attachSession, capture, formatShellCommand, hasSession, kill, listTmuxSessions, newSession, sendText, tmux } from "./tmux.js";
 import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
 import { waitForIdle } from "./wait.js";
 
@@ -158,6 +158,15 @@ async function main(argv: string[]) {
       break;
     case "kill":
       await cmdKill(parsed);
+      break;
+    case "here":
+      await cmdHere(parsed);
+      break;
+    case "split":
+      await cmdSplit(parsed);
+      break;
+    case "revive":
+      await cmdRevive(parsed);
       break;
     case "clean":
       await cmdClean(parsed);
@@ -371,6 +380,8 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     command,
     tmuxTarget,
     ...(paneId ? { agentPaneId: paneId } : {}),
+    // Solo combs: every bee gets combId == tmuxTarget at spawn (§12 Q3).
+    combId: tmuxTarget,
     createdAt: now,
     updatedAt: now,
     status: "running",
@@ -444,7 +455,7 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
   const { agent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
   const cwd = await resolveSpawnCwd(parsed);
-  const yolo = dangerousMode(parsed, agent);
+  const yolo = dangerousMode(parsed, agent, requested);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const colony = await resolveSpawnColony(parsed);
   const spec = resolveAgent(agent, parsed.rest, { home, yolo });
@@ -477,7 +488,7 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   }
   const { agent, account } = await resolveSpawnAgentWithAuto(requested, parsed);
   const cwd = await resolveSpawnCwd(parsed);
-  const yolo = dangerousMode(parsed, agent);
+  const yolo = dangerousMode(parsed, agent, requested);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const colony = await resolveSpawnColony(parsed);
   const spec = resolveAgent(agent, parsed.rest, { home, yolo });
@@ -521,7 +532,7 @@ async function spawnFromFrame(parsed: Parsed, frameName: string): Promise<Sessio
   // from the post-spawn confirmation (mirrors spawnSingleBee's exclusivity).
   const unbriefed: SessionRecord[] = [];
   for (const caste of frame.castes) {
-    const yolo = dangerousMode(parsed, caste.bee);
+    const yolo = dangerousMode(parsed, caste.bee, caste.bee);
     const home = caste.home ?? flagHome;
     const casteSpec = resolveAgent(caste.bee, parsed.rest, { home, yolo });
     const casteNode = await resolveSpawnNode(parsed, casteSpec.kind);
@@ -672,7 +683,7 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
     await waitForAgentReady(record, {
       timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
       acceptTrust: acceptsTrust(parsed),
-      raiseDroidAutonomy: dangerousMode(parsed, record.agent),
+      raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
     });
   } catch (error) {
     if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
@@ -711,7 +722,7 @@ async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise
     await waitForAgentReady(record, {
       timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
       acceptTrust: acceptsTrust(parsed),
-      raiseDroidAutonomy: dangerousMode(parsed, record.agent),
+      raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
     });
     // The agent reached its prompt: it is waiting for input until briefed/prompted.
     await writeHiveState(record, "waiting");
@@ -1041,7 +1052,10 @@ function formatStateCell(state: BeeState): string {
 async function capturePanesFor(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
   const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
   const entries = await Promise.all(
-    liveRecords.map(async (record) => [record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const),
+    // Re-key by the bee's own pane (agentPaneId) so sub-bees sharing one comb's
+    // tmuxTarget keep distinct captures; legacy solo bees with no pane fall back
+    // to tmuxTarget. deriveState reads with the same `agentPaneId ?? tmuxTarget`.
+    liveRecords.map(async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const),
   );
   return new Map(entries);
 }
@@ -1097,6 +1111,27 @@ async function cmdCleanDead(parsed: Parsed) {
     else console.error(`# skipping bees on unregistered node(s): ${skipped}`);
   }
   let dead = deadSessionRecords(records, recordsConsideredAlive);
+  // Phase B: a local sub-bee whose pane died (agentPaneId ∉ live panes) is dead
+  // even though its comb/session survives via a sibling pane. Mirror
+  // deriveState's pane-pinned liveness so `hive clean --dead` sweeps it too.
+  // Guard against a transient empty listPanes() (server hiccup): only sweep
+  // panes when at least one pane responded — an empty set can't be trusted to
+  // mean "all panes dead" while sessions are live.
+  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
+  if (livePanes.size > 0) {
+    const deadNames = new Set(dead.map((record) => record.name));
+    for (const record of records) {
+      if (deadNames.has(record.name)) continue;
+      const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
+      // Only a bee whose comb is otherwise considered alive can be "pane-dead";
+      // if its session is gone it is already in `dead`.
+      const sessionLive = recordsConsideredAlive.has(liveTargetKey(record.node, record.tmuxTarget));
+      if (isLocal && sessionLive && record.agentPaneId && !livePanes.has(record.agentPaneId)) {
+        dead.push(record);
+        deadNames.add(record.name);
+      }
+    }
+  }
   const olderThan = ageFlag(parsed, ["older-than", "older"]);
   if (olderThan !== undefined) dead = olderThanMillis(dead, olderThan);
   const dryRun = truthy(flag(parsed, "dry-run")) || truthy(flag(parsed, "n"));
@@ -1497,8 +1532,29 @@ async function waitForSeal(record: SessionRecord, parsed: Parsed): Promise<void>
 
 async function cmdKill(parsed: Parsed) {
   const target = parsed.args[0];
-  if (!target) throw new Error("Usage: hive kill <session>");
+  if (!target) throw new Error("Usage: hive kill <session> [--comb]");
   const record = await resolveSession(target);
+  const forceComb = truthy(flag(parsed, "comb"));
+
+  // Comb-aware kill: a pane-pinned bee that shares its comb (tmuxTarget) with at
+  // least one live sibling is dropped with killPane — its siblings keep running.
+  // --comb (or a sole/last bee in the comb) takes the whole session via the
+  // existing transactional path. Killing a sub-bee MUST NEVER kill a sibling.
+  if (!forceComb && record.agentPaneId) {
+    const all = await listSessions();
+    const siblings = all.filter(
+      (other) =>
+        other.name !== record.name &&
+        other.tmuxTarget === record.tmuxTarget &&
+        (other.node ?? LOCAL_NODE_NAME) === (record.node ?? LOCAL_NODE_NAME) &&
+        other.agentPaneId, // only pane-pinned siblings would survive a pane kill
+    );
+    if (siblings.length > 0) {
+      await killSubBeePane(record);
+      return;
+    }
+  }
+
   const outcome = await transactionalKill(record);
   if (!outcome.ok) {
     if (isPretty()) {
@@ -1515,6 +1571,315 @@ async function cmdKill(parsed: Parsed) {
   } else {
     console.log(`${outcome.alreadyGone ? "gone" : "killed"}\t${record.name}`);
   }
+}
+
+/**
+ * Drop one sub-bee by killing only its pane (not the comb). On a clean kill the
+ * record is deleted and a `bee.kill_pane` ledger event is emitted; on failure
+ * the record is marked kill_failed (mirroring transactionalKill's discipline).
+ */
+async function killSubBeePane(record: SessionRecord): Promise<void> {
+  const substrate = substrateFor(record);
+  const result = await substrate.killPane(record.agentPaneId!).catch((error) => ({
+    ok: false,
+    exitCode: 1,
+    stdout: "",
+    stderr: error instanceof Error ? error.message : String(error),
+  }));
+  if (!result.ok) {
+    const lastError = result.stderr.trim() || `kill-pane exited with code ${result.exitCode}`;
+    await updateSession(record.name, { status: "kill_failed", lastError, updatedAt: new Date().toISOString() });
+    if (isPretty()) {
+      console.log(actionLine("warn", "kill_failed", [bold(record.name), dim(lastError)]));
+      console.error(note(`bee may still be running; retry: hive kill ${record.name}`));
+    } else {
+      console.log(`kill_failed\t${record.name}\t${lastError}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+  await deleteSession(record.name);
+  await appendLedger({
+    type: "bee.kill_pane",
+    session: record.name,
+    node: record.node ?? LOCAL_NODE_NAME,
+    parentId: record.parentId,
+    combId: record.combId ?? record.tmuxTarget,
+    agentPaneId: record.agentPaneId,
+  });
+  if (isPretty()) {
+    console.log(actionLine("ok", "kill", [bold(record.name), dim("pane removed")]));
+  } else {
+    console.log(`killed\t${record.name}\tpane removed`);
+  }
+}
+
+/**
+ * Resolve the bee owning the current tmux pane:
+ *   1. $TMUX_PANE → match a record by agentPaneId (the precise, pane-pinned path)
+ *   2. fallback: tmux display-message → the bee whose tmuxTarget is this session
+ *      (solo combs / legacy bees that were never pinned)
+ * Returns undefined when not inside tmux or no record matches.
+ */
+async function resolveBeeInCurrentPane(): Promise<SessionRecord | undefined> {
+  if (!process.env.TMUX) return undefined;
+  const records = await listSessions();
+  const paneId = process.env.TMUX_PANE;
+  if (paneId && paneId.length > 0) {
+    const byPane = records.find((record) => record.agentPaneId === paneId);
+    if (byPane) return byPane;
+  }
+  const sessionName = await currentTmuxSessionName();
+  if (sessionName) {
+    const bySession = records.find((record) => record.tmuxTarget === sessionName && !record.node);
+    if (bySession) return bySession;
+  }
+  return undefined;
+}
+
+/** The session name of the current pane, via `tmux display-message`. */
+async function currentTmuxSessionName(): Promise<string | undefined> {
+  if (!process.env.TMUX) return undefined;
+  const result = await tmux(["display-message", "-p", "#{session_name}"], { reject: false });
+  if (result.ok) {
+    const name = result.stdout.trim();
+    return name.length > 0 ? name : undefined;
+  }
+  return undefined;
+}
+
+async function cmdHere(parsed: Parsed): Promise<void> {
+  if (!process.env.TMUX) throw new Error("hive here: not inside tmux");
+  const bee = await resolveBeeInCurrentPane();
+  if (!bee) throw new Error("hive here: no matching bee for the current pane/session");
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify({
+      id: bee.id ?? bee.name,
+      name: bee.name,
+      agent: bee.agent,
+      cwd: bee.cwd,
+      combId: bee.combId ?? bee.tmuxTarget,
+      parentId: bee.parentId ?? null,
+      agentPaneId: bee.agentPaneId ?? null,
+    }, null, 2));
+    return;
+  }
+  if (truthy(flag(parsed, "id"))) {
+    console.log(bee.id ?? bee.name);
+    return;
+  }
+  if (isPretty()) console.log(actionLine("ok", "here", [bold(bee.name), bee.agent, dim(tildify(bee.cwd))]));
+  else console.log(`here\t${bee.name}\t${bee.agent}\t${bee.cwd}`);
+}
+
+async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
+  // hive split [<bee>] [<agent>] [--brief <text>] [--dir v|h|window] [--cwd <dir>] [--home <h>]
+  // No <bee> (or --here) → split the current bee's comb (via hive here resolution).
+  //
+  // The first positional is ambiguous: it can be a parent bee selector OR (when
+  // run from inside a bee, e.g. `hive split codex`) the sub-bee's agent. We
+  // disambiguate by trying to resolve it as an existing session; if that fails
+  // we treat it as the agent and split the current bee's comb.
+  const useHere = truthy(flag(parsed, "here"));
+  const pos0 = parsed.args[0] && !parsed.args[0]!.startsWith("-") ? parsed.args[0]! : undefined;
+  const pos1 = parsed.args[1] && !parsed.args[1]!.startsWith("-") ? parsed.args[1]! : undefined;
+
+  let parent: SessionRecord | undefined;
+  let agentArg: string | undefined;
+  if (useHere || pos0 === undefined) {
+    // Current-pane parent; pos0 (if any) is the agent.
+    parent = await resolveBeeInCurrentPane();
+    agentArg = pos0;
+  } else {
+    // pos0 is a bee selector if it resolves to a session, else it's the agent.
+    parent = await resolveSession(pos0).catch(() => undefined);
+    if (parent) {
+      agentArg = pos1;
+    } else {
+      parent = await resolveBeeInCurrentPane();
+      agentArg = pos0;
+    }
+  }
+  if (!parent) {
+    throw new Error(
+      "hive split: no parent bee specified and not inside a bee pane. " +
+        "Usage: hive split [<bee>] [<agent>] [--brief <text>] [--dir v|h|window] [--cwd <dir>] [--home <h>]",
+    );
+  }
+
+  const substrate = substrateFor(parent);
+  if (!(await substrate.hasSession(parent.tmuxTarget))) {
+    throw new Error(`hive split: parent bee ${parent.name} is not running`);
+  }
+
+  const requestedAgent = agentArg ?? parent.agent;
+  const { agent } = await resolveSpawnAgentWithAuto(requestedAgent, parsed);
+
+  const dirRaw = typeof flag(parsed, "dir") === "string" ? String(flag(parsed, "dir")) : "v";
+  if (!["h", "v", "window"].includes(dirRaw)) throw new Error(`hive split: invalid --dir ${dirRaw} (use v|h|window)`);
+  const dir = dirRaw as "h" | "v" | "window";
+
+  const cwd = typeof flag(parsed, "cwd") === "string"
+    ? await resolveSpawnCwd(parsed)
+    : parent.cwd;
+  const home = flag(parsed, "home") ?? flag(parsed, "profile");
+  const yolo = dangerousMode(parsed, agent, requestedAgent);
+  const spec = resolveAgent(agent, parsed.rest, { home, yolo });
+  if (!(parent.node)) await assertExecutableAvailable(spec.command);
+
+  const { paneId } = await substrate.newPane(parent.tmuxTarget, cwd, {
+    command: spec.command,
+    args: spec.args,
+    env: spec.env,
+  }, { dir });
+
+  const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
+  const name = safeName(identity.id);
+  const now = new Date().toISOString();
+  const combId = parent.combId ?? parent.tmuxTarget;
+  const record: SessionRecord = {
+    name,
+    agent: spec.kind,
+    cwd,
+    command: shellCommand(spec),
+    tmuxTarget: parent.tmuxTarget, // shared comb
+    agentPaneId: paneId,           // own pane
+    combId,
+    parentId: parent.id ?? parent.name,
+    createdAt: now,
+    updatedAt: now,
+    status: "running",
+    id: identity.id,
+    prefix: identity.prefix,
+    uuid: identity.uuid,
+    requestedAgent: spec.requestedKind,
+    ...(spec.homePath ? { homePath: spec.homePath } : {}),
+    ...(parent.colony ? { colony: parent.colony } : {}),
+    ...(parent.node ? { node: parent.node } : {}),
+  };
+  await saveSession(record);
+  await writeSpawnOptions(record);
+  await appendLedger({ type: "bee.split", name: record.name, parentId: record.parentId, combId, agentPaneId: paneId });
+
+  if (isPretty()) console.log(actionLine("ok", "split", [bold(record.name), record.agent, dim(`from ${parent.name}`)]));
+  else console.log(`split\t${record.name}\t${record.agent}\t${parent.name}`);
+
+  const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
+  if (briefText) return deliverBrief(parsed, record, briefText);
+  await confirmSpawnReady(parsed, record);
+  return record;
+}
+
+/**
+ * hive revive <bee> [--all] [--fresh]
+ *
+ * Bring a dead bee back: re-create its tmux session in the same cwd/home and
+ * resume the same provider session (claude --resume / codex resume / opencode
+ * --session) so it picks up where it left off. The record is reused in place —
+ * same id, name, colony, account binding. This is the swap-account relaunch
+ * recipe minus the account switch.
+ *
+ *   --all     revive every dead local bee that has a precise providerSessionId
+ *   --fresh   start a new session instead of resuming the old transcript
+ */
+async function cmdRevive(parsed: Parsed): Promise<void> {
+  if (truthy(flag(parsed, "all"))) {
+    if (stringFlag(parsed, ["session"])) throw new Error("hive revive --all cannot take --session (one id can't apply to many bees)");
+    const records = await listSessions();
+    const local = records.filter((r) => !r.node || r.node === LOCAL_NODE_NAME);
+    let revived = 0;
+    let alive = 0;
+    const skipped: string[] = [];
+    for (const record of local) {
+      if (await substrateFor(record).hasSession(record.tmuxTarget)) {
+        alive += 1;
+        continue;
+      }
+      // --all only auto-revives bees we can resume precisely; resuming "the
+      // latest session in the home" would grab a sibling's when homes are shared.
+      if (!record.providerSessionId && !truthy(flag(parsed, "fresh"))) {
+        skipped.push(record.name);
+        continue;
+      }
+      await reviveOne(record, parsed);
+      revived += 1;
+    }
+    if (isPretty()) {
+      const parts = [`revived ${revived}`, `${alive} already alive`];
+      if (skipped.length > 0) parts.push(`${skipped.length} skipped (no resumable session id: ${skipped.join(", ")})`);
+      console.log(note(parts.join(" · ")));
+    } else {
+      console.log(`revive\tall\t${revived}\t${alive}\t${skipped.length}`);
+    }
+    return;
+  }
+
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: hive revive <bee> [--all] [--fresh] [--session <id>]");
+  const record = await resolveSession(target);
+  await reviveOne(record, parsed);
+}
+
+/** Relaunch one dead bee and resume (or, with --fresh, start anew) its session. */
+async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<SessionRecord> {
+  const substrate = substrateFor(record);
+  if (await substrate.hasSession(record.tmuxTarget)) {
+    throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
+  }
+  const tool = canonicalAgentKind(record.agent).toLowerCase();
+  const fresh = truthy(flag(parsed, "fresh"));
+  // --session <id> resumes (and persists) a specific provider session — used to
+  // recover bees whose providerSessionId was never recorded but whose session
+  // still exists on disk (claude/codex keep sessions keyed by project dir).
+  const sessionOverride = stringFlag(parsed, ["session"]);
+  const providerSessionId = fresh ? undefined : (sessionOverride ?? record.providerSessionId);
+  if (!fresh && !providerSessionId) {
+    console.error(
+      note(
+        `${record.name}: no recorded provider session id — resuming the most recent ${tool} session in its home, ` +
+          `which may belong to a sibling bee if the home is shared. Pass --session <id> to target a specific one, or --fresh to start anew.`,
+      ),
+    );
+  }
+
+  // Mirror the swap relaunch: rebuild the agent command from the configured
+  // kind (preserving the original permission mode) and append the resume args.
+  const spec = resolveAgent(record.requestedAgent ?? record.agent, fresh ? [] : resumeArgs(tool, providerSessionId), {
+    home: record.homePath,
+    yolo: sniffYolo(record.command),
+    identity: true,
+  });
+  if (!record.node) await assertExecutableAvailable(spec.command);
+
+  const { paneId } = await substrate.newSession(record.tmuxTarget, record.cwd, {
+    command: spec.command,
+    args: spec.args,
+    env: spec.env,
+  });
+
+  const updated =
+    (await updateSession(record.name, {
+      status: "running",
+      command: shellCommand(spec),
+      combId: record.combId ?? record.tmuxTarget,
+      ...(paneId ? { agentPaneId: paneId } : {}),
+      ...(sessionOverride ? { providerSessionId: sessionOverride } : {}),
+      updatedAt: new Date().toISOString(),
+    })) ?? record;
+  await writeSpawnOptions(updated);
+  await appendLedger({
+    type: "bee.revive",
+    session: record.name,
+    providerSessionId: providerSessionId ?? null,
+    agentPaneId: paneId,
+    fresh,
+  });
+
+  const how = providerSessionId ? `resumed ${providerSessionId}` : fresh ? "fresh session" : "resumed latest";
+  if (isPretty()) console.log(actionLine("ok", "revive", [bold(record.name), record.agent, dim(how)]));
+  else console.log(`revived\t${record.name}\t${record.agent}\t${how}`);
+  return updated;
 }
 
 async function cmdRun(parsed: Parsed) {
@@ -1545,7 +1910,7 @@ async function cmdRun(parsed: Parsed) {
       await waitForAgentReady(record, {
         timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
         acceptTrust: acceptsTrust(parsed),
-        raiseDroidAutonomy: dangerousMode(parsed, record.agent),
+        raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
       });
     } catch (error) {
       if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
@@ -1644,7 +2009,7 @@ async function cmdX(parsed: Parsed) {
     await waitForAgentReady(record, {
       timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
       acceptTrust: acceptsTrust(parsed),
-      raiseDroidAutonomy: dangerousMode(parsed, record.agent),
+      raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
     });
   } catch (error) {
     if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
@@ -1775,7 +2140,7 @@ async function cmdOpen(parsed: Parsed) {
 async function cmdOpenRaw(parsed: Parsed) {
   const requested = parsed.args[0]!;
   const { agent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
-  const yolo = dangerousMode(parsed, agent);
+  const yolo = dangerousMode(parsed, agent, requested);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
   const account = accountQuery ? await resolveAccountFlag(accountQuery, canonicalAgentKind(agent), ttlFlagMs(parsed)) : aliasAccount;
   const home = (flag(parsed, "home") ?? flag(parsed, "profile")) ?? (account ? defaultHomeForAccount(account) : undefined);
@@ -3984,22 +4349,38 @@ function defaultBootMs(agent: string): number {
   }
 }
 
-function dangerousMode(parsed: Parsed, agent?: string): boolean {
+function dangerousMode(parsed: Parsed, agent?: string, requested?: string): boolean {
   // Explicit per-spawn opt-out always wins.
   if (truthy(flag(parsed, "no-yolo"))) return false;
-  const canonical = agent ? canonicalAgentKind(agent) : undefined;
+  const names = yoloDecisionNames(agent, requested);
   // Persistent opt-out via `hive config set-bee <bee> --no-yolo`.
-  if (canonical && beeConfig(canonical).yolo === false) return false;
-  const envSuffix = canonical?.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  if (names.some((name) => beeConfig(name).yolo === false)) return false;
   if (
     truthy(flag(parsed, "yolo")) ||
     truthy(flag(parsed, "dangerous")) ||
     truthyEnv(process.env.HIVE_YOLO) ||
-    Boolean(envSuffix && truthyEnv(process.env[`HIVE_${envSuffix}_YOLO`]))
+    names.some((name) => truthyEnv(process.env[`HIVE_${envSuffix(name)}_YOLO`]))
   ) return true;
-  if (canonical && beeConfig(canonical).yolo === true) return true;
+  if (names.some((name) => beeConfig(name).yolo === true)) return true;
+  if (requested && autoAccountTool(requested) === "codex") return true;
   // Per-agent default: claude runs permissionless unless opted out above.
-  return agent ? agentDefaultsToYolo(agent) : false;
+  return agent || requested ? agentDefaultsToYolo(agent ?? requested!) : false;
+}
+
+function yoloDecisionNames(agent?: string, requested?: string): string[] {
+  const names: string[] = [];
+  const add = (value: string | undefined) => {
+    if (value && !names.includes(value)) names.push(value);
+  };
+  add(requested);
+  add(agent);
+  add(requested ? canonicalAgentKind(requested) : undefined);
+  add(agent ? canonicalAgentKind(agent) : undefined);
+  return names;
+}
+
+function envSuffix(value: string): string {
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, "_");
 }
 
 function truthyEnv(value: string | undefined): boolean {
@@ -4496,7 +4877,10 @@ function printHelp() {
       title: "Manage bees",
       rows: [
         ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
-        ["kill", "<session>", "stop a session and remove its metadata"],
+        ["split", "[<bee>] [<agent>]", "spawn a sub-bee into the bee's comb (adjacent pane)"],
+        ["here", "", "resolve the bee owning the current pane (--id, --json)"],
+        ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],
+        ["revive", "<bee>", "relaunch a dead bee and resume its session (--all, --fresh, --session <id>)"],
         ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],
         ["loop", "<start|status|stop|…>", "run a bee repeatedly until a stop condition"],
       ],

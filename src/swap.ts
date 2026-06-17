@@ -121,7 +121,7 @@ export function resumeArgs(tool: string, providerSessionId: string | undefined):
 }
 
 // The original spawn's yolo decision is baked into the stored command; sniff it
-// back so the resumed process keeps the same permission mode.
-function sniffYolo(command: string): boolean {
+// back so the resumed (or revived) process keeps the same permission mode.
+export function sniffYolo(command: string): boolean {
   return /dangerously|bypass|--force\b/.test(command);
 }

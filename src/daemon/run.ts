@@ -625,11 +625,15 @@ async function defaultCapturePanes(records: SessionRecord[], liveTargets: Set<st
   const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
   const entries = await Promise.all(
     liveRecords.map(async (record) => {
+      // Key by the bee's own pane so sub-bees sharing one comb's tmuxTarget keep
+      // distinct captures; legacy solo bees fall back to tmuxTarget. deriveState
+      // reads with the same `agentPaneId ?? tmuxTarget`.
+      const key = record.agentPaneId ?? record.tmuxTarget;
       try {
         const text = await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId);
-        return [record.tmuxTarget, text] as const;
+        return [key, text] as const;
       } catch {
-        return [record.tmuxTarget, ""] as const;
+        return [key, ""] as const;
       }
     }),
   );
