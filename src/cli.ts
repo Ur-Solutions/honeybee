@@ -644,8 +644,9 @@ async function cmdRename(parsed: Parsed) {
   for (const record of records) {
     const now = new Date().toISOString();
     if (clear) {
-      // Dropping autoTitleAt too makes the bee a daemon auto-title candidate again.
-      await updateSession(record.name, { title: undefined, titleSource: undefined, autoTitleAt: undefined, updatedAt: now });
+      // Dropping autoTitleAt + the attempt counter makes the bee a fresh daemon
+      // auto-title candidate again.
+      await updateSession(record.name, { title: undefined, titleSource: undefined, autoTitleAt: undefined, autoTitleAttempts: undefined, updatedAt: now });
       await writeHiveTitle(record, "");
       if (isPretty()) console.log(actionLine("ok", "rename", [bold(record.name), dim("title cleared")]));
       else console.log(`renamed\t${record.name}\t`);

@@ -42,8 +42,10 @@ export type SessionRecord = {
   title?: string;
   /** Who set `title`: user beats auto beats provider (see naming.ts). */
   titleSource?: "user" | "auto" | "provider";
-  /** Set when the daemon's auto-titler claims this bee — one attempt per bee. */
+  /** Timestamp of the auto-titler's most recent attempt (claim + backoff key). */
   autoTitleAt?: string;
+  /** How many times the auto-titler has attempted this bee (retry cap). */
+  autoTitleAttempts?: number;
   colony?: string;
   swarmId?: string;
   caste?: string;
@@ -259,6 +261,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
   ...OPTIONAL_STRING_SESSION_KEYS,
   "titleSource",
+  "autoTitleAttempts",
   "buzAccept",
 ]);
 
@@ -291,6 +294,10 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
 
   if (object.titleSource === "user" || object.titleSource === "auto" || object.titleSource === "provider") {
     record.titleSource = object.titleSource;
+  }
+
+  if (typeof object.autoTitleAttempts === "number" && Number.isFinite(object.autoTitleAttempts)) {
+    record.autoTitleAttempts = object.autoTitleAttempts;
   }
 
   // buzAccept is the per-bee acceptance policy for buz messages. The field

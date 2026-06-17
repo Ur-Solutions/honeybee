@@ -33,6 +33,26 @@ export type AutoTitleDeps = {
 
 export type AutoTitleDispatcher = (records: SessionRecord[]) => Promise<AutoTitleOutcome[]>;
 
+// A failed generation (auth blip, rate limit, transient CLI error) must not
+// brand a bee untitled forever. We retry a few times with a backoff between
+// attempts, then give up so a genuinely un-nameable bee stops burning calls.
+// `hive rename --auto` is always available as a manual override past the cap.
+export const MAX_AUTO_TITLE_ATTEMPTS = 3;
+export const AUTO_TITLE_RETRY_BACKOFF_MS = 10 * 60_000;
+
+/**
+ * Is this bee eligible for an auto-title attempt right now? Already-titled bees
+ * (any source) are done. Otherwise it must be under the attempt cap and, if a
+ * prior attempt was made, past the backoff window.
+ */
+export function isAutoTitleCandidate(record: SessionRecord, now: number, backoffMs = AUTO_TITLE_RETRY_BACKOFF_MS): boolean {
+  if (record.title || record.titleSource) return false;
+  if ((record.autoTitleAttempts ?? 0) >= MAX_AUTO_TITLE_ATTEMPTS) return false;
+  if (!record.autoTitleAt) return true;
+  const last = Date.parse(record.autoTitleAt);
+  return !Number.isFinite(last) || now - last >= backoffMs;
+}
+
 export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}): AutoTitleDispatcher {
   const deps: AutoTitleDeps = {
     enabled: () => namingConfig().auto,
@@ -53,19 +73,23 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
     const outcomes = finished.splice(0);
     if (inFlight || !deps.enabled()) return outcomes;
 
+    const now = deps.now();
     for (const candidate of records) {
-      if (candidate.title || candidate.titleSource || candidate.autoTitleAt) continue;
+      if (!isAutoTitleCandidate(candidate, now)) continue;
       // Re-read before deciding: this tick's transcript refresh may have just
       // written a provider title that the in-memory record predates.
       const record = await deps.loadSession(candidate.name);
-      if (!record || record.title || record.titleSource || record.autoTitleAt) continue;
+      if (!record || !isAutoTitleCandidate(record, now)) continue;
       const context = await deps.contextFor(record);
       if (!context) continue;
 
-      // Claim before the slow call so a crash or wedged generator cannot
-      // become one subprocess per tick. One attempt per bee — `hive rename
-      // --auto` is the manual retry.
-      const claimed = await deps.touchSession(record.name, { autoTitleAt: new Date(deps.now()).toISOString() });
+      // Claim before the slow call (bump the attempt counter and stamp the
+      // attempt time) so a crash or wedged generator can't become one
+      // subprocess per tick, and so a failure counts toward the retry cap.
+      const claimed = await deps.touchSession(record.name, {
+        autoTitleAt: new Date(now).toISOString(),
+        autoTitleAttempts: (record.autoTitleAttempts ?? 0) + 1,
+      });
       if (!claimed) continue;
 
       inFlight = true;

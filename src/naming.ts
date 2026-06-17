@@ -62,10 +62,18 @@ export async function gatherTitleContext(
 
   const firstUser = clampContext(tx ? firstUserText(tx.rows) : "");
   const lastAssistant = clampContext(tx ? lastAssistantText(tx.rows) : "");
-  if (options.requireExchange && (!firstUser || !lastAssistant)) return null;
-
   const brief = clampContext(record.brief ?? "");
-  if (!brief && !firstUser && !lastAssistant) return null;
+
+  // A real task signal is a brief or a genuine first user message (firstUserText
+  // already drops slash-command/caveat noise). The daemon waits for one before
+  // titling so bees that have only greeted ("What would you like to work on?")
+  // defer instead of getting the greeting echoed back as their name.
+  const hasTaskSignal = Boolean(brief || firstUser);
+  if (options.requireExchange) {
+    if (!hasTaskSignal || !lastAssistant) return null;
+  } else if (!brief && !firstUser && !lastAssistant) {
+    return null;
+  }
 
   return {
     ...(brief ? { brief } : {}),

@@ -124,6 +124,18 @@ test("gatherTitleContext: nothing to derive from yields null and clamps long bri
   });
 });
 
+test("gatherTitleContext: a brief is a task signal even without a transcript first-user message", async () => {
+  await withTempStore(async () => {
+    // agent "shell" has no transcript provider, so firstUser/lastAssistant are
+    // empty; the brief alone must still satisfy the non-strict path.
+    const record = bee({ agent: "shell", brief: "Wire up the webhook retry" });
+    const ctx = await gatherTitleContext(record);
+    assert.deepEqual(ctx, { brief: "Wire up the webhook retry" });
+    // …but requireExchange still needs an assistant reply, which "shell" can't provide.
+    assert.equal(await gatherTitleContext(record, { requireExchange: true }), null);
+  });
+});
+
 /* ------------------------------ generation ------------------------------ */
 
 test("generateTitle normalizes runner output and threads the prompt through", async () => {

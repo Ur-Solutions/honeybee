@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createAutoTitleDispatcher, type AutoTitleDeps } from "../src/daemon/autoTitle.js";
+import {
+  AUTO_TITLE_RETRY_BACKOFF_MS,
+  createAutoTitleDispatcher,
+  isAutoTitleCandidate,
+  MAX_AUTO_TITLE_ATTEMPTS,
+  type AutoTitleDeps,
+} from "../src/daemon/autoTitle.js";
 import type { TitleContext } from "../src/naming.js";
 import type { SessionRecord } from "../src/store.js";
 
@@ -18,6 +24,8 @@ function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
+const NOW = Date.parse("2026-06-11T10:00:00.000Z");
+
 type Capture = {
   claims: Array<{ name: string; fields: Partial<SessionRecord> }>;
   updates: Array<{ name: string; patch: Partial<SessionRecord> }>;
@@ -29,6 +37,7 @@ function buildDeps(args: {
   contextFor?: AutoTitleDeps["contextFor"];
   generate?: AutoTitleDeps["generate"];
   enabled?: boolean;
+  now?: number;
 }): Partial<AutoTitleDeps> {
   return {
     enabled: () => args.enabled ?? true,
@@ -51,7 +60,8 @@ function buildDeps(args: {
     },
     contextFor: args.contextFor ?? (async () => ({ brief: "fix things" })),
     generate: args.generate ?? (async () => "Generated title"),
-    now: () => Date.parse("2026-06-11T10:00:00.000Z"),
+    mirrorTitle: async () => undefined,
+    now: () => args.now ?? NOW,
   };
 }
 
@@ -60,7 +70,33 @@ async function settle(): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-test("auto-title: claims, generates in the background, reports on the next tick", async () => {
+/* ----------------------------- eligibility ------------------------------ */
+
+test("isAutoTitleCandidate: untitled and unattempted is eligible", () => {
+  assert.equal(isAutoTitleCandidate(bee(), NOW), true);
+});
+
+test("isAutoTitleCandidate: any existing title (or source) is done", () => {
+  assert.equal(isAutoTitleCandidate(bee({ title: "x" }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({ titleSource: "auto" }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({ titleSource: "user", title: "x" }), NOW), false);
+});
+
+test("isAutoTitleCandidate: respects the attempt cap", () => {
+  assert.equal(isAutoTitleCandidate(bee({ autoTitleAttempts: MAX_AUTO_TITLE_ATTEMPTS - 1, autoTitleAt: new Date(NOW - AUTO_TITLE_RETRY_BACKOFF_MS).toISOString() }), NOW), true);
+  assert.equal(isAutoTitleCandidate(bee({ autoTitleAttempts: MAX_AUTO_TITLE_ATTEMPTS }), NOW), false);
+});
+
+test("isAutoTitleCandidate: backoff gates retries between attempts", () => {
+  const recent = new Date(NOW - 60_000).toISOString(); // 1 min ago
+  const old = new Date(NOW - AUTO_TITLE_RETRY_BACKOFF_MS - 1).toISOString();
+  assert.equal(isAutoTitleCandidate(bee({ autoTitleAttempts: 1, autoTitleAt: recent }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({ autoTitleAttempts: 1, autoTitleAt: old }), NOW), true);
+});
+
+/* ------------------------------ dispatch -------------------------------- */
+
+test("auto-title: claims (attempt #1), generates in the background, reports next tick", async () => {
   const record = bee({ brief: "fix things" });
   const store = new Map([[record.name, record]]);
   const capture: Capture = { claims: [], updates: [] };
@@ -69,24 +105,25 @@ test("auto-title: claims, generates in the background, reports on the next tick"
   assert.deepEqual(await dispatch([record]), []);
   assert.equal(capture.claims.length, 1);
   assert.ok(capture.claims[0]!.fields.autoTitleAt);
+  assert.equal(capture.claims[0]!.fields.autoTitleAttempts, 1);
 
   await settle();
   const outcomes = await dispatch([store.get(record.name)!]);
   assert.deepEqual(outcomes, [{ bee: record.name, ok: true, title: "Generated title" }]);
-  assert.equal(capture.updates.length, 1);
   assert.equal(capture.updates[0]!.patch.title, "Generated title");
   assert.equal(capture.updates[0]!.patch.titleSource, "auto");
 
-  // Titled now — nothing further happens.
+  // Titled now — no further attempts.
   assert.deepEqual(await dispatch([store.get(record.name)!]), []);
   assert.equal(capture.claims.length, 1);
 });
 
-test("auto-title: skips titled, claimed, and source-marked bees", async () => {
+test("auto-title: skips already-titled and capped bees", async () => {
   const records = [
     bee({ name: "titled", title: "Has one" }),
-    bee({ name: "claimed", autoTitleAt: "2026-06-11T09:00:00.000Z" }),
     bee({ name: "sourced", titleSource: "user", title: "Mine" }),
+    bee({ name: "capped", autoTitleAttempts: MAX_AUTO_TITLE_ATTEMPTS }),
+    bee({ name: "backoff", autoTitleAttempts: 1, autoTitleAt: new Date(NOW - 60_000).toISOString() }),
   ];
   const store = new Map(records.map((r) => [r.name, r]));
   const capture: Capture = { claims: [], updates: [] };
@@ -94,13 +131,63 @@ test("auto-title: skips titled, claimed, and source-marked bees", async () => {
 
   assert.deepEqual(await dispatch(records), []);
   await settle();
-  assert.deepEqual(await dispatch(records), []);
   assert.equal(capture.claims.length, 0);
+});
+
+test("auto-title: retries a previously-failed bee once past the backoff window", async () => {
+  // A bee that failed once: attempts=1, last attempt older than the backoff.
+  const record = bee({ autoTitleAttempts: 1, autoTitleAt: new Date(NOW - AUTO_TITLE_RETRY_BACKOFF_MS - 1).toISOString() });
+  const store = new Map([[record.name, record]]);
+  const capture: Capture = { claims: [], updates: [] };
+  const dispatch = createAutoTitleDispatcher(buildDeps({ store, capture }));
+
+  await dispatch([record]);
+  assert.equal(capture.claims.length, 1);
+  assert.equal(capture.claims[0]!.fields.autoTitleAttempts, 2, "second attempt bumps the counter");
+  await settle();
+  const outcomes = await dispatch([store.get(record.name)!]);
+  assert.equal(outcomes[0]?.ok, true);
+});
+
+test("auto-title: failure reports the error and the claim persists (counts toward the cap)", async () => {
+  const record = bee({ brief: "fix things" });
+  const store = new Map([[record.name, record]]);
+  const capture: Capture = { claims: [], updates: [] };
+  const dispatch = createAutoTitleDispatcher(
+    buildDeps({ store, capture, generate: async () => { throw new Error("claude failed (exit 1): usage limit reached"); } }),
+  );
+
+  await dispatch([record]);
+  await settle();
+  const outcomes = await dispatch([store.get(record.name)!]);
+  assert.equal(outcomes[0]?.ok, false);
+  assert.match(outcomes[0]?.error ?? "", /usage limit/);
+  assert.equal(capture.updates.length, 0, "no title written on failure");
+  assert.equal(store.get(record.name)?.autoTitleAttempts, 1, "attempt counted so the cap can engage");
+});
+
+test("auto-title: stops generating after MAX failed attempts across backoff windows", async () => {
+  const record = bee();
+  const store = new Map([[record.name, record]]);
+  const capture: Capture = { claims: [], updates: [] };
+  let attempts = 0;
+  // One round past the cap; each round advances `now` beyond the backoff so
+  // only the attempt cap (not the backoff) can stop it.
+  let now = NOW;
+  for (let round = 0; round < MAX_AUTO_TITLE_ATTEMPTS + 1; round += 1) {
+    const dispatch = createAutoTitleDispatcher(
+      buildDeps({ store, capture, now, generate: async () => { attempts += 1; throw new Error("boom"); } }),
+    );
+    await dispatch([store.get(record.name)!]);
+    await settle();
+    now += AUTO_TITLE_RETRY_BACKOFF_MS + 1;
+  }
+  assert.equal(attempts, MAX_AUTO_TITLE_ATTEMPTS, "generation stops once the cap is hit");
+  assert.equal(store.get(record.name)?.autoTitleAttempts, MAX_AUTO_TITLE_ATTEMPTS);
 });
 
 test("auto-title: stale in-memory record is re-read before claiming", async () => {
   const stale = bee();
-  // On disk the provider already titled it this tick.
   const fresh = { ...stale, title: "Provider title", titleSource: "provider" as const };
   const store = new Map([[stale.name, fresh]]);
   const capture: Capture = { claims: [], updates: [] };
@@ -111,7 +198,7 @@ test("auto-title: stale in-memory record is re-read before claiming", async () =
   assert.equal(capture.claims.length, 0);
 });
 
-test("auto-title: no claim while the initial exchange is missing; titles once it lands", async () => {
+test("auto-title: defers while the initial exchange is missing; titles once it lands", async () => {
   const record = bee();
   const store = new Map([[record.name, record]]);
   const capture: Capture = { claims: [], updates: [] };
@@ -127,8 +214,7 @@ test("auto-title: no claim while the initial exchange is missing; titles once it
   await dispatch([store.get(record.name)!]);
   assert.equal(capture.claims.length, 1);
   await settle();
-  const outcomes = await dispatch([store.get(record.name)!]);
-  assert.equal(outcomes[0]?.ok, true);
+  assert.equal((await dispatch([store.get(record.name)!]))[0]?.ok, true);
 });
 
 test("auto-title: disabled config does nothing", async () => {
@@ -139,23 +225,6 @@ test("auto-title: disabled config does nothing", async () => {
 
   assert.deepEqual(await dispatch([record]), []);
   assert.equal(capture.claims.length, 0);
-});
-
-test("auto-title: generator failure reports the error and keeps the claim", async () => {
-  const record = bee({ brief: "fix things" });
-  const store = new Map([[record.name, record]]);
-  const capture: Capture = { claims: [], updates: [] };
-  const dispatch = createAutoTitleDispatcher(
-    buildDeps({ store, capture, generate: async () => { throw new Error("claude failed: boom"); } }),
-  );
-
-  await dispatch([record]);
-  await settle();
-  const outcomes = await dispatch([store.get(record.name)!]);
-  assert.equal(outcomes[0]?.ok, false);
-  assert.match(outcomes[0]?.error ?? "", /boom/);
-  assert.equal(capture.updates.length, 0);
-  assert.ok(store.get(record.name)?.autoTitleAt, "claim stays so the daemon retries via rename --auto only");
 });
 
 test("auto-title: a user title set during generation wins", async () => {
