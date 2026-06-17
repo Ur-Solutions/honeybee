@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   AUTO_TITLE_RETRY_BACKOFF_MS,
+  AUTO_TITLE_WATCHDOG_MS,
   createAutoTitleDispatcher,
   isAutoTitleCandidate,
   MAX_AUTO_TITLE_ATTEMPTS,
@@ -244,6 +245,55 @@ test("auto-title: a user title set during generation wins", async () => {
   assert.equal(outcomes[0]?.ok, false);
   assert.match(outcomes[0]?.skipped ?? "", /user title/);
   assert.equal(store.get(record.name)?.title, "Mine");
+});
+
+test("auto-title: a never-settling generation is freed by the watchdog, not wedged forever", async () => {
+  const a = bee({ name: "a", tmuxTarget: "hive:a", brief: "task a" });
+  const b = bee({ name: "b", tmuxTarget: "hive:b", brief: "task b" });
+  const store = new Map([[a.name, a], [b.name, b]]);
+  const capture: Capture = { claims: [], updates: [] };
+  // Single dispatcher (the watchdog state is per-instance) with a mutable clock.
+  let clock = NOW;
+  let calls = 0;
+  const dispatch = createAutoTitleDispatcher({
+    ...buildDeps({ store, capture }),
+    now: () => clock,
+    // The first generation hangs forever; the next resolves.
+    generate: () => { calls += 1; return calls === 1 ? new Promise<string>(() => {}) : Promise.resolve("Title"); },
+  });
+  const args = () => [store.get(a.name)!, store.get(b.name)!];
+
+  await dispatch(args()); // claims `a`; its generation never settles
+  assert.equal(capture.claims.length, 1);
+
+  clock += AUTO_TITLE_WATCHDOG_MS - 1; // still inside the window
+  await dispatch(args());
+  assert.equal(capture.claims.length, 1, "still in-flight within the watchdog window");
+
+  clock += 2; // past the window
+  const outcomes = await dispatch(args());
+  assert.ok(outcomes.some((o) => o.bee === "a" && /watchdog/.test(o.error ?? "")), "stale slot is reported");
+  assert.equal(capture.claims.length, 2, "the slot is freed so another bee can be claimed");
+});
+
+test("auto-title: mirrorTitle receives the fresh record + title, and a throwing mirror still yields ok", async () => {
+  const record = bee({ brief: "fix things" });
+  const store = new Map([[record.name, record]]);
+  const capture: Capture = { claims: [], updates: [] };
+  const mirrored: Array<{ name: string; title: string }> = [];
+  const deps = buildDeps({ store, capture });
+  deps.mirrorTitle = async (rec, title) => {
+    mirrored.push({ name: rec.name, title });
+    throw new Error("tmux mirror failed");
+  };
+  const dispatch = createAutoTitleDispatcher(deps);
+
+  await dispatch([record]);
+  await settle();
+  const outcomes = await dispatch([store.get(record.name)!]);
+  assert.deepEqual(outcomes, [{ bee: record.name, ok: true, title: "Generated title" }], "a throwing mirror does not break the outcome");
+  assert.deepEqual(mirrored, [{ name: record.name, title: "Generated title" }]);
+  assert.equal(store.get(record.name)?.title, "Generated title");
 });
 
 test("auto-title: one generation in flight at a time", async () => {

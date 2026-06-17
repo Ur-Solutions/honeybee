@@ -40,6 +40,14 @@ export type AutoTitleDispatcher = (records: SessionRecord[]) => Promise<AutoTitl
 export const MAX_AUTO_TITLE_ATTEMPTS = 3;
 export const AUTO_TITLE_RETRY_BACKOFF_MS = 10 * 60_000;
 
+// Watchdog for the single-in-flight guard. The generator subprocess is capped
+// at 60s, but if it spawns a descendant that keeps the stdio pipes open, Node
+// never fires the execFile callback and the generation promise never settles —
+// which would wedge `inFlight=true` and silently disable ALL auto-titling for
+// the daemon's lifetime. After this long we consider the in-flight slot stale,
+// report it, and free the slot so titling recovers without a daemon restart.
+export const AUTO_TITLE_WATCHDOG_MS = 2 * 60_000;
+
 /**
  * Is this bee eligible for an auto-title attempt right now? Already-titled bees
  * (any source) are done. Otherwise it must be under the attempt cap and, if a
@@ -67,13 +75,23 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
   };
 
   let inFlight = false;
+  let inFlightSince = 0;
+  let inFlightBee = "";
   const finished: AutoTitleOutcome[] = [];
 
   return async (records) => {
     const outcomes = finished.splice(0);
-    if (inFlight || !deps.enabled()) return outcomes;
+    if (!deps.enabled()) return outcomes;
 
     const now = deps.now();
+    if (inFlight) {
+      // A generation that never settled (wedged subprocess) must not disable
+      // titling forever — free the slot once it's clearly stale.
+      if (now - inFlightSince < AUTO_TITLE_WATCHDOG_MS) return outcomes;
+      inFlight = false;
+      outcomes.push({ bee: inFlightBee, ok: false, error: `generation watchdog fired after ${AUTO_TITLE_WATCHDOG_MS}ms; freeing the slot` });
+    }
+
     for (const candidate of records) {
       if (!isAutoTitleCandidate(candidate, now)) continue;
       // Re-read before deciding: this tick's transcript refresh may have just
@@ -93,8 +111,13 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
       if (!claimed) continue;
 
       inFlight = true;
-      void deps
-        .generate(context)
+      inFlightSince = now;
+      inFlightBee = record.name;
+      // Promise.resolve().then(...) so even a synchronously-throwing generate
+      // dep becomes a rejection routed through .catch/.finally — inFlight is
+      // always reset, never stranded.
+      void Promise.resolve()
+        .then(() => deps.generate(context))
         .then(async (title) => {
           const fresh = await deps.loadSession(record.name);
           if (!fresh) {

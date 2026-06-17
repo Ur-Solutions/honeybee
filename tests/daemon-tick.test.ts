@@ -164,6 +164,44 @@ test("tick: skips transcript metadata refresh for dead/sealed records whose tran
   });
 });
 
+test("tick: invokes dispatchAutoTitle and surfaces its outcomes on the result", async () => {
+  await withTempStore(async () => {
+    const record = bee({ lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({
+      records: [record],
+      liveTargets: new Set([record.tmuxTarget]),
+      panes: new Map([[record.tmuxTarget, "done\n\n› next task"]]),
+      capture,
+    });
+    let seen: string[] | null = null;
+    deps.dispatchAutoTitle = async (records) => {
+      seen = records.map((r) => r.name);
+      return [{ bee: record.name, ok: true, title: "Generated title" }];
+    };
+
+    const result = await tick(deps, new Map());
+    assert.deepEqual(seen, [record.name]);
+    assert.deepEqual(result.autoTitles, [{ bee: record.name, ok: true, title: "Generated title" }]);
+  });
+});
+
+test("tick: a throwing dispatchAutoTitle is captured and the tick still completes", async () => {
+  await withTempStore(async () => {
+    const record = bee({ lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records: [record], liveTargets: new Set([record.tmuxTarget]), capture });
+    deps.dispatchAutoTitle = async () => {
+      throw new Error("titler boom");
+    };
+
+    const result = await tick(deps, new Map());
+    assert.deepEqual(result.autoTitles, []);
+    assert.ok(result.errors.some((e) => /titler boom/.test(e.message)));
+    assert.equal(result.observed.size, 1);
+  });
+});
+
 test("tick: liveness keys qualified by node do not leak across nodes", async () => {
   await withTempStore(async () => {
     const NOW = Date.parse("2026-06-03T10:00:00.000Z");
