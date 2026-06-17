@@ -154,6 +154,37 @@ test("swapAccount relaunches codex with CODEX_HOME but not HOME", async () => {
   });
 });
 
+test("swapAccount threads the new account's model into the resumed opencode command (fix #4)", async () => {
+  await withTempStore(async () => {
+    const { substrate, calls } = fakeSubstrate(false);
+    const opencodeAccount: AccountRecord = {
+      id: "opencode-minimax",
+      tool: "opencode",
+      label: "minimax",
+      provider: "minimax-coding-plan",
+      model: "MiniMax-M3",
+      addedAt: "2026-06-01T00:00:00.000Z",
+    };
+    const existing = record({
+      agent: "opencode",
+      command: "OPENCODE_CONFIG_DIR=/tmp/home-o opencode run --interactive",
+      homePath: "/tmp/home-o",
+      accountId: "opencode-glm",
+      providerSessionId: "sess-1",
+    });
+    await saveSession(existing);
+    await swapAccount(existing, opencodeAccount, { substrate, sleep: async () => undefined, activate: async () => ["xdg-data/opencode/auth.json"] });
+    const relaunch = calls.find((call) => call.method === "newSession")!;
+    // The swapped bee keeps its --model selector built from the NEW account.
+    const args = relaunch.spec!.args;
+    const modelIdx = args.indexOf("--model");
+    assert.notEqual(modelIdx, -1);
+    assert.equal(args[modelIdx + 1], "minimax-coding-plan/MiniMax-M3");
+    // ...and still resumes the same provider session.
+    assert.deepEqual(args.slice(-2), ["--session", "sess-1"]);
+  });
+});
+
 test("resumeArgs picks per-provider resume forms", () => {
   assert.deepEqual(resumeArgs("claude", "abc"), ["--resume", "abc"]);
   assert.deepEqual(resumeArgs("claude", undefined), ["--continue"]);

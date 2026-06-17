@@ -11,8 +11,25 @@ export type BeeConfig = {
    * (e.g. "minimax", "kimi", "glm") inherit another kind's driver — readiness,
    * transcripts, home env, identity recipe — while carrying its own command and
    * home. Used by canonicalAgentKind/resolveProfile in agents.ts.
+   *
+   * Kept for back-compat; superseded by the thin-profile `account` field below
+   * (account-first spawn supplies the driver from the account's CLI). Removal
+   * is deferred to S5.
    */
   kind?: string;
+  /**
+   * Thin profile (S2): this bee name is spawn-sugar referencing a vault
+   * account by id. The account supplies the CLI + provider + default model and
+   * isolated home; the fields below override the account's defaults with
+   * precedence FLAG > PROFILE > ACCOUNT.
+   */
+  account?: string;
+  /** Profile model override (wins over the account's default model). */
+  model?: string;
+  /** Extra CLI args appended for this profile's spawns. */
+  args?: string[];
+  /** Working directory override for this profile's spawns. */
+  cwd?: string;
 };
 
 export type NamingConfig = {
@@ -127,6 +144,14 @@ function normalizeConfig(value: unknown): HiveConfig {
       if (typeof r.home === "string" && r.home.length > 0) bee.home = r.home;
       if (typeof r.command === "string" && r.command.length > 0) bee.command = r.command;
       if (typeof r.kind === "string" && r.kind.length > 0) bee.kind = r.kind;
+      // Thin-profile fields (S2): reference an account + override its defaults.
+      if (typeof r.account === "string" && r.account.length > 0) bee.account = r.account;
+      if (typeof r.model === "string" && r.model.length > 0) bee.model = r.model;
+      if (Array.isArray(r.args)) {
+        const args = r.args.filter((value): value is string => typeof value === "string");
+        if (args.length > 0) bee.args = args;
+      }
+      if (typeof r.cwd === "string" && r.cwd.length > 0) bee.cwd = r.cwd;
       bees[key] = bee;
     }
     config.bees = bees;

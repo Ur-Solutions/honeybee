@@ -231,13 +231,27 @@ export type SpawnAgentSpec = {
 
 /**
  * Resolve a spawn-spec token into an agent plus an optional vault account.
- * Plain tools and home aliases pass through (`claude`, `cc1`, `codex2`);
- * `<tool>-<query>` binds an account by tool-scoped fuzzy match (`codex-ur`,
- * `claude-thto`). Unknown tokens pass through unchanged so arbitrary
- * executables (`my-agent`) still spawn.
+ * An exact account id binds the account directly (`minimax`,
+ * `claude-ursolutions`) — the account-first keystone. Plain tools and home
+ * aliases pass through (`claude`, `cc1`, `codex2`); `<tool>-<query>` binds an
+ * account by tool-scoped fuzzy match (`codex-ur`, `claude-thto`). Unknown
+ * tokens pass through unchanged so arbitrary executables (`my-agent`) still
+ * spawn.
  */
 export async function resolveSpawnAgent(kind: string): Promise<SpawnAgentSpec> {
+  // 1. Account-first (the keystone): an exact account-id match resolves the
+  //    spawn to that account's CLI + account record, so every account-spawned
+  //    bee is account-bound by construction. Matched on `id` ONLY — never on
+  //    the free-form `label` (adversarial review fix #2). A label may legally
+  //    be "claude"/"cc1"/"codex2"; matching it here would hijack the bare
+  //    driver-kind token away from branch 2. Account ids are always
+  //    `<tool>-<label>`, so a bare driver kind ("claude") is never an id and
+  //    correctly falls through to branch 2.
+  const exact = (await listAccounts()).find((account) => account.id === kind.trim());
+  if (exact) return { agent: exact.tool, account: exact };
+  // 2. Plain driver kind passthrough (claude, cc1, codex2) — unchanged.
   if (hasAgentDriver(canonicalAgentKind(kind).toLowerCase())) return { agent: kind };
+  // 3. `<tool>-<query>` shorthand — tool-scoped fuzzy account bind — unchanged.
   const shorthand = splitToolShorthand(kind);
   if (shorthand) {
     try {

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { beeConfig } from "./config.js";
-import { homeEnvForAgent, identityEnvForAgent } from "./drivers.js";
+import { homeEnvForAgent, identityEnvForAgent, modelArgsForAgent } from "./drivers.js";
 import { assertExecutableAvailable } from "./execCheck.js";
 import { allocateBeeIdentity } from "./ids.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
@@ -77,6 +77,17 @@ export type ResolveAgentOptions = {
    * set this — plain spawns never apply identity-only env.
    */
   identity?: boolean;
+  /**
+   * Account default model to embed as a CLI model selector (`--model …`).
+   * Threaded from the spawn account. Undefined for plain spawns → no model
+   * args → byte-identical command.
+   */
+  model?: string;
+  /**
+   * Provider for the model selector. opencode needs it to build
+   * `--model <provider>/<model>`; single-provider CLIs ignore it.
+   */
+  provider?: string;
 };
 
 export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options: ResolveAgentOptions = {}): AgentSpec {
@@ -111,10 +122,16 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   if (options.identity && profile.homePath) {
     Object.assign(env, identityEnvForAgent(profile.kind, profile.homePath));
   }
+  // The account's model selector is appended ONLY when the base command came
+  // from the driver default — never when a config/env `command` override is in
+  // play, since such a command may already embed `--model …` and appending
+  // again would double the flag (adversarial review fix #5). When model is
+  // undefined the hook returns [] → byte-identical to today.
+  const modelArgs = commandOverride === undefined ? modelArgsForAgent(profile.kind, options.model, options.provider) : [];
   return {
     kind: profile.kind,
     command: parts[0]!,
-    args: [...parts.slice(1), ...extraArgs],
+    args: [...parts.slice(1), ...modelArgs, ...extraArgs],
     env,
     homePath: profile.homePath,
     requestedKind: kind,
@@ -267,6 +284,10 @@ function safeTmuxTargetForFlow(value: string): string {
  * flow run.
  */
 export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRecord> {
+  // DEFERRED (adversarial review #1): flow-spawn account-binding is out of
+  // scope for S2. Binding an account here would require importing
+  // activateAccountIntoHome (which lives in cli.ts) and risks an import cycle;
+  // flow-spawned bees stay account-less until a later stage wires it cleanly.
   const spec = resolveAgent(opts.agent, opts.extraArgs, { home: opts.home, yolo: opts.yolo });
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
   // Mirror cli.ts spawn: a typo'd agent command would otherwise become a tmux

@@ -111,6 +111,62 @@ test("splitShellWords does not treat shell metacharacters as syntax", () => {
   assert.deepEqual(splitShellWords("claude; curl https://example.test/$(whoami)"), ["claude;", "curl", "https://example.test/$(whoami)"]);
 });
 
+// ──────────────────────────────────────────────────────────────────────────
+// S2 — model selector args (account-first spawn)
+// ──────────────────────────────────────────────────────────────────────────
+
+test("resolveAgent: opencode embeds the qualified --model <provider>/<model> selector", () => {
+  const spec = resolveAgent("opencode", [], { model: "MiniMax-M3", provider: "minimax-coding-plan" });
+  assert.equal(spec.command, "opencode");
+  assert.deepEqual(spec.args, ["run", "--interactive", "--model", "minimax-coding-plan/MiniMax-M3"]);
+});
+
+test("resolveAgent: opencode with a model but no provider emits no selector (no `--model undefined/...`)", () => {
+  // A provider-less opencode account (e.g. un-migrated) must not produce a
+  // malformed `--model undefined/<model>`; it falls back to opencode's default.
+  const spec = resolveAgent("opencode", [], { model: "MiniMax-M3" });
+  assert.deepEqual(spec.args, ["run", "--interactive"]);
+  assert.ok(!spec.args.includes("--model"));
+});
+
+test("resolveAgent: claude embeds a bare --model selector", () => {
+  const spec = resolveAgent("claude", [], { model: "opus" });
+  assert.equal(spec.command, "claude");
+  assert.deepEqual(spec.args, ["--model", "opus"]);
+});
+
+test("resolveAgent: no model means no model args (byte-identical to today)", () => {
+  // Snapshot equality: omitting model/provider must reproduce the pre-S2 args.
+  assert.deepEqual(resolveAgent("opencode").args, ["run", "--interactive"]);
+  assert.deepEqual(resolveAgent("claude").args, []);
+  assert.deepEqual(resolveAgent("codex").args, []);
+});
+
+test("resolveAgent: model args precede user extraArgs so `-- …` still overrides", () => {
+  const spec = resolveAgent("claude", ["--foo"], { model: "opus" });
+  assert.deepEqual(spec.args, ["--model", "opus", "--foo"]);
+});
+
+test("resolveAgent: a config/env command override suppresses modelArgs (no double --model, fix #5)", () => {
+  const oldCmd = process.env.HIVE_CLAUDE_CMD;
+  // A command that already embeds --model must NOT get a second one appended.
+  process.env.HIVE_CLAUDE_CMD = "claude --model sonnet";
+  try {
+    const spec = resolveAgent("claude", [], { model: "opus" });
+    assert.equal(spec.command, "claude");
+    assert.deepEqual(spec.args, ["--model", "sonnet"]);
+  } finally {
+    if (oldCmd === undefined) delete process.env.HIVE_CLAUDE_CMD;
+    else process.env.HIVE_CLAUDE_CMD = oldCmd;
+  }
+});
+
+test("resolveAgent: drivers without a modelArgs hook (grok) ignore model — no model args", () => {
+  const spec = resolveAgent("grok", [], { model: "grok-4", provider: "xai" });
+  // grok's command is unchanged; no --model is appended (hook is undefined).
+  assert.ok(!spec.args.includes("--model"));
+});
+
 test("assertExecutableAvailable accepts a real executable and rejects a missing one", async () => {
   await assertExecutableAvailable(process.execPath);
   await assert.rejects(assertExecutableAvailable("hive-test-no-such-binary-xyz"), /Executable not found on PATH/);

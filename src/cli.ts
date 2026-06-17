@@ -355,6 +355,10 @@ type SpawnOptions = {
   node?: NodeRecord;
   /** Vault account to activate into the home before launch (Phase 3). */
   account?: AccountRecord;
+  /** Default model to embed as the CLI model selector (account/profile). */
+  model?: string;
+  /** Provider for the model selector (opencode `--model <provider>/<model>`). */
+  provider?: string;
   /** Opt this bee into the daemon's autoswap flow. Requires account. */
   autoswap?: boolean;
 };
@@ -364,7 +368,13 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // slot), the account's credentials activated into it, and the driver's
   // explicit identity env — never a blind HOME rewrite.
   const home = opts.account ? (opts.home ?? defaultHomeForAccount(opts.account)) : opts.home;
-  const spec = resolveAgent(opts.agent, opts.extraArgs, { home, yolo: opts.yolo, identity: Boolean(opts.account) });
+  const spec = resolveAgent(opts.agent, opts.extraArgs, {
+    home,
+    yolo: opts.yolo,
+    identity: Boolean(opts.account),
+    ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.provider ? { provider: opts.provider } : {}),
+  });
   if (opts.account) {
     if (opts.node && opts.node.kind !== "local-tmux") throw new Error("--account spawns are local-only (the vault never leaves this machine)");
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${opts.account.id}`);
@@ -444,6 +454,11 @@ async function resolveAccountFlag(query: string, tool: string, ttlMs: number | u
   return findAccount(query, tool);
 }
 
+// TODO (adversarial review #6, S3/S4): `<tool>-auto` / `--account auto` picks
+// the least-loaded account scoped by CLI only, never by provider. Once opencode
+// hosts multiple providers (minimax + glm + kimi), an auto-pick for `opencode`
+// is provider-blind and may select a different provider than the user meant.
+// Account-first resolution (exact id) sidesteps this; left unchanged in S2.
 async function pickAutoAccount(tool: string, ttlMs: number | undefined): Promise<AccountRecord> {
   const choice = await pickLeastLoadedAccount(tool, ttlMs !== undefined ? { ttlMs } : {});
   const usage = autoPickUsage(choice.limits);
@@ -460,24 +475,75 @@ function autoPickUsage(limits: AccountLimits | undefined): string {
   return [cell("weekly", limits.weekly), cell("5h", limits.fiveHour)].filter(Boolean).join(", ");
 }
 
+/**
+ * A resolved thin profile (config `bees.<name>` with an `account` field): the
+ * referenced vault account plus its model/args/cwd/yolo overrides. Precedence
+ * is FLAG > PROFILE > ACCOUNT — the caller layers an explicit CLI flag over
+ * what this returns, and falls back to the account default below it.
+ */
+type ProfileOverlay = {
+  account: AccountRecord;
+  /** Profile model override; falls back to the account's default model. */
+  model?: string;
+  /** Extra args declared by the profile (appended to user `-- …` args). */
+  args: string[];
+  /** Profile cwd override (FLAG still wins above it). */
+  cwd?: string;
+  /** Profile yolo override (FLAG still wins above it). */
+  yolo?: boolean;
+};
+
+/**
+ * Resolve a requested spawn token that names a thin profile referencing an
+ * account. Returns undefined when the token is not such a profile (no
+ * `account` field) so callers fall through to today's path. A profile naming
+ * a missing account fails loudly via findAccount.
+ */
+async function resolveProfileOverlay(requested: string): Promise<ProfileOverlay | undefined> {
+  const profile = beeConfig(requested);
+  if (!profile.account) return undefined;
+  const account = await findAccount(profile.account);
+  return {
+    account,
+    // Precedence: profile model wins over the account default (the CLI flag is
+    // layered on top by the caller).
+    ...(profile.model ?? account.model ? { model: profile.model ?? account.model } : {}),
+    args: profile.args ?? [],
+    ...(profile.cwd ? { cwd: profile.cwd } : {}),
+    ...(profile.yolo !== undefined ? { yolo: profile.yolo } : {}),
+  };
+}
+
 async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <a|auto>] [-- <bee-args...>]");
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
-  const { agent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
-  const cwd = await resolveSpawnCwd(parsed);
-  const yolo = dangerousMode(parsed, agent, requested);
+  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
+  // Thin profile: a config bee referencing an account supplies the CLI from the
+  // account, plus model/args/cwd/yolo overrides (precedence FLAG > PROFILE >
+  // ACCOUNT).
+  const profile = await resolveProfileOverlay(requested);
+  const agent = profile ? profile.account.tool : resolvedAgent;
+  const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
+  const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
+  const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const colony = await resolveSpawnColony(parsed);
-  const spec = resolveAgent(agent, parsed.rest, { home, yolo });
+  const spec = resolveAgent(agent, extraArgs, { home, yolo });
   const node = await resolveSpawnNode(parsed, spec.kind);
   const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : undefined;
   const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
-  const account = accountQuery ? await resolveAccountFlag(accountQuery, spec.kind, ttlFlagMs(parsed)) : aliasAccount;
+  // Account binding precedence: explicit --account flag > profile account >
+  // <tool>-<account> shorthand / account-id resolution.
+  const account = accountQuery ? await resolveAccountFlag(accountQuery, spec.kind, ttlFlagMs(parsed)) : (profile?.account ?? aliasAccount);
+  // Model selector precedence: profile model override > the account's default
+  // model. Only meaningful when an account is bound.
+  const model = account ? (profile?.model ?? account.model) : undefined;
+  const provider = account?.provider;
   const autoswap = truthy(flag(parsed, "autoswap"));
   if (autoswap && !account) throw new Error("--autoswap requires an account (--account or a <tool>-<account> bee spec)");
-  let record = await spawnBee({ agent, extraArgs: parsed.rest, cwd, yolo, home, name, colony, brief: briefText, node, account, autoswap });
+  let record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap });
   const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${node.name}`);
@@ -637,18 +703,32 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
     throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
   }
-  const { agent, account } = await resolveSpawnAgentWithAuto(requested, parsed);
-  const cwd = await resolveSpawnCwd(parsed);
-  const yolo = dangerousMode(parsed, agent, requested);
+  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
+  // Thin profile → account (same overlay as spawnSingleBee).
+  const profile = await resolveProfileOverlay(requested);
+  const agent = profile ? profile.account.tool : resolvedAgent;
+  const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
+  const account = profile?.account ?? aliasAccount;
+  // Model selector precedence: profile model override > the account default.
+  const model = account ? (profile?.model ?? account.model) : undefined;
+  const provider = account?.provider;
+  const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
+  const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const colony = await resolveSpawnColony(parsed);
-  const spec = resolveAgent(agent, parsed.rest, { home, yolo });
+  const spec = resolveAgent(agent, extraArgs, { home, yolo });
   const node = await resolveSpawnNode(parsed, spec.kind);
   const swarmId = resolveSwarmIdHint(parsed, agent);
 
+  // PRESERVE (adversarial review fix #11): an account-first swarm behaves
+  // exactly like an `--account` swarm does today — all N bees share ONE
+  // accountId and ONE isolated home (spawnBee derives it from
+  // defaultHomeForAccount(account) since no per-bee --home is given). This is
+  // the existing shared-home reality; S2 deliberately adds no per-bee homes
+  // and no new --count restriction.
   const records: SessionRecord[] = [];
   for (let i = 0; i < count; i += 1) {
-    const record = await spawnBee({ agent, extraArgs: parsed.rest, cwd, yolo, home, colony, swarmId, node, account });
+    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account, model, provider });
     records.push(record);
     const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
     if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`@${swarmId}`), ...nodeSuffix]));
@@ -900,8 +980,9 @@ function augmentBrief(parsed: Parsed, briefText: string): string {
   return briefText.endsWith(footer) ? briefText : `${briefText}${footer}`;
 }
 
-async function resolveSpawnCwd(parsed: Parsed): Promise<string> {
-  const requested = resolve((stringFlag(parsed, ["cwd"]) ?? process.cwd()).replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
+async function resolveSpawnCwd(parsed: Parsed, profileCwd?: string): Promise<string> {
+  // Precedence FLAG > PROFILE > process cwd.
+  const requested = resolve((stringFlag(parsed, ["cwd"]) ?? profileCwd ?? process.cwd()).replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
   return realpath(requested);
 }
 
@@ -2496,17 +2577,29 @@ async function cmdOpen(parsed: Parsed) {
 // tmux session, no SessionRecord. Activation and launch are ledger-logged.
 async function cmdOpenRaw(parsed: Parsed) {
   const requested = parsed.args[0]!;
-  const { agent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
-  const yolo = dangerousMode(parsed, agent, requested);
+  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
+  // Thin profile → account (same overlay as spawnSingleBee).
+  const profile = await resolveProfileOverlay(requested);
+  const agent = profile ? profile.account.tool : resolvedAgent;
+  const profileArgs = profile?.args ?? [];
+  const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
-  const account = accountQuery ? await resolveAccountFlag(accountQuery, canonicalAgentKind(agent), ttlFlagMs(parsed)) : aliasAccount;
+  const account = accountQuery ? await resolveAccountFlag(accountQuery, canonicalAgentKind(agent), ttlFlagMs(parsed)) : (profile?.account ?? aliasAccount);
+  const model = account ? (profile?.model ?? account.model) : undefined;
+  const provider = account?.provider;
   const home = (flag(parsed, "home") ?? flag(parsed, "profile")) ?? (account ? defaultHomeForAccount(account) : undefined);
-  const spec = resolveAgent(agent, [...openPassthroughArgs(parsed), ...parsed.rest], { home, yolo, identity: Boolean(account) });
+  const spec = resolveAgent(agent, [...openPassthroughArgs(parsed), ...parsed.rest, ...profileArgs], {
+    home,
+    yolo,
+    identity: Boolean(account),
+    ...(model ? { model } : {}),
+    ...(provider ? { provider } : {}),
+  });
   if (account) {
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
     await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
   }
-  const cwd = await resolveSpawnCwd(parsed);
+  const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
   // Re-merge the startup acceptances activation just clobbered (and seed them
   // for fresh homes), so claude does not re-ask the bypass-permissions and
   // folder-trust questions on every open.
@@ -4720,7 +4813,7 @@ function defaultBootMs(agent: string): number {
   }
 }
 
-function dangerousMode(parsed: Parsed, agent?: string, requested?: string): boolean {
+function dangerousMode(parsed: Parsed, agent?: string, requested?: string, profileYolo?: boolean): boolean {
   // Explicit per-spawn opt-out always wins.
   if (truthy(flag(parsed, "no-yolo"))) return false;
   const names = yoloDecisionNames(agent, requested);
@@ -4734,6 +4827,9 @@ function dangerousMode(parsed: Parsed, agent?: string, requested?: string): bool
   ) return true;
   if (names.some((name) => beeConfig(name).yolo === true)) return true;
   if (requested && autoAccountTool(requested) === "codex") return true;
+  // Thin-profile yolo override (precedence FLAG > config bee yolo > PROFILE >
+  // per-agent default).
+  if (profileYolo !== undefined) return profileYolo;
   // Per-agent default: claude runs permissionless unless opted out above.
   return agent || requested ? agentDefaultsToYolo(agent ?? requested!) : false;
 }

@@ -111,6 +111,48 @@ test("config kind alias without a command falls back to the canonical default co
   }
 });
 
+test("normalizeConfig parses thin-profile fields (account/model/args/cwd)", async () => {
+  await withTempConfig(
+    {
+      bees: {
+        minimax: {
+          account: "opencode-minimax",
+          model: "MiniMax-M3",
+          args: ["--foo", "--bar", 7, "--baz"],
+          cwd: "/work/minimax",
+          yolo: true,
+        },
+      },
+    },
+    () => {
+      const profile = beeConfig("minimax");
+      assert.equal(profile.account, "opencode-minimax");
+      assert.equal(profile.model, "MiniMax-M3");
+      // Non-string array entries are dropped (string validation like other fields).
+      assert.deepEqual(profile.args, ["--foo", "--bar", "--baz"]);
+      assert.equal(profile.cwd, "/work/minimax");
+      assert.equal(profile.yolo, true);
+    },
+  );
+});
+
+test("normalizeConfig keeps the kind alias working alongside thin-profile fields", async () => {
+  await withTempConfig({ bees: { glm: { kind: "opencode", account: "opencode-glm" } } }, () => {
+    const profile = beeConfig("glm");
+    assert.equal(profile.kind, "opencode");
+    assert.equal(profile.account, "opencode-glm");
+  });
+});
+
+test("normalizeConfig drops a non-array args field and an empty cwd", async () => {
+  await withTempConfig({ bees: { x: { account: "a", args: "not-an-array", cwd: "" } } }, () => {
+    const profile = beeConfig("x");
+    assert.equal(profile.account, "a");
+    assert.equal(profile.args, undefined);
+    assert.equal(profile.cwd, undefined);
+  });
+});
+
 test("briefFooter returns default when not configured", async () => {
   await withTempConfig(null, () => {
     assert.equal(briefFooter(), DEFAULT_BRIEF_FOOTER);

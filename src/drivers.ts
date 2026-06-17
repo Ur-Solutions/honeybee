@@ -51,6 +51,15 @@ export type AgentDriver = {
   identity?: IdentityRecipe;
   /** Detects the provider's rate-limit/exhaustion message on a pane. Fact, not judgment. */
   isExhausted?: (pane: string) => ExhaustionHit | null;
+  /**
+   * CLI-specific model selector args for a spawn. Single-provider CLIs take a
+   * bare model (`--model <model>`); opencode multiplexes providers, so it needs
+   * the qualified `<provider>/<model>` form. Returns [] when no model is given —
+   * so a spawn without a model is byte-identical to today. CLIs whose model
+   * flag is unverified (grok/kimi/cursor/pi/droid) leave this undefined (no
+   * model args yet; refined in S4).
+   */
+  modelArgs?: (model?: string, provider?: string) => string[];
 };
 
 const AGENT_DRIVERS: Record<string, AgentDriver> = {
@@ -64,6 +73,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
       credentialFiles: [".credentials.json", ".claude.json", "settings.json"],
     },
     isExhausted: (pane) => matchExhaustion(pane, /(?:usage|5-hour|weekly) limit reached|You've reached your usage limit/i),
+    modelArgs: (model) => (model ? ["--model", model] : []),
   },
   codex: {
     kind: "codex",
@@ -80,6 +90,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
       seedLoginSeat: false,
     },
     isExhausted: (pane) => matchExhaustion(pane, /You've hit your usage limit|usage limit reached|rate limit reached/i),
+    modelArgs: (model) => (model ? ["--model", model] : []),
   },
   opencode: {
     kind: "opencode",
@@ -92,6 +103,11 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
       credentialFiles: ["xdg-data/opencode/auth.json"],
       extraEnv: { XDG_DATA_HOME: "{home}/xdg-data" },
     },
+    // opencode multiplexes providers in one binary, so the model selector must
+    // name the provider: `--model <provider>/<model>`. Both halves are required
+    // — a provider-less account yields no selector (falls back to opencode's
+    // config default) rather than the malformed `--model undefined/<model>`.
+    modelArgs: (model, provider) => (model && provider ? ["--model", `${provider}/${model}`] : []),
   },
   grok: {
     kind: "grok",
@@ -193,6 +209,16 @@ export function identityEnvForAgent(kind: string, homePath: string): Record<stri
 
 export function exhaustionForAgent(kind: string, pane: string): ExhaustionHit | null {
   return agentDriver(kind)?.isExhausted?.(pane) ?? null;
+}
+
+/**
+ * The CLI's model selector args for a spawn, or [] when the driver has no
+ * model hook or no model was requested. Drivers without a `modelArgs` hook
+ * (grok/kimi/cursor/pi/droid) always yield [] — byte-identical to a spawn
+ * with no model.
+ */
+export function modelArgsForAgent(kind: string, model?: string, provider?: string): string[] {
+  return agentDriver(kind)?.modelArgs?.(model, provider) ?? [];
 }
 
 // Shared matcher: provider limit message + a best-effort verbatim reset hint

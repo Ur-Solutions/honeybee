@@ -327,6 +327,61 @@ test("resolveSpawnAgent maps bee specs to tool + account", async () => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────
+// S2 — account-first spawn resolution
+// ──────────────────────────────────────────────────────────────────────────
+
+test("resolveSpawnAgent: an exact account id binds the account (account-first keystone)", async () => {
+  await withTempStore(async () => {
+    const created = await addAccount("codex", "tormod@ursolutions.no");
+    const spec = await resolveSpawnAgent(created.id);
+    assert.equal(spec.agent, "codex");
+    assert.equal(spec.account?.id, created.id);
+    assert.equal(spec.account?.label, "tormod@ursolutions.no");
+  });
+});
+
+test("resolveSpawnAgent: a bare driver kind never binds an account", async () => {
+  await withTempStore(async () => {
+    await addAccount("codex", "tormod@ursolutions.no");
+    // `claude` is a driver kind, not an account id — it must pass through with
+    // NO account even though accounts exist.
+    assert.deepEqual(await resolveSpawnAgent("claude"), { agent: "claude" });
+  });
+});
+
+test("resolveSpawnAgent: an account LABELED 'claude' does NOT hijack the bare 'claude' token (fix #2)", async () => {
+  await withTempStore(async () => {
+    // Free-form label collides with a driver kind. Its id is `claude-claude`,
+    // so the bare token `claude` must still resolve as the driver kind with no
+    // account — matching is id-only, never label.
+    const labeled = await addAccount("claude", "claude");
+    assert.equal(labeled.label, "claude");
+    assert.notEqual(labeled.id, "claude");
+    assert.deepEqual(await resolveSpawnAgent("claude"), { agent: "claude" });
+    // The account is still reachable by its exact id.
+    const byId = await resolveSpawnAgent(labeled.id);
+    assert.equal(byId.account?.id, labeled.id);
+  });
+});
+
+test("resolveSpawnAgent: driver-kind aliases (cc1/codex2) pass through with no account", async () => {
+  await withTempStore(async () => {
+    await addAccount("codex", "tormod@ursolutions.no");
+    assert.deepEqual(await resolveSpawnAgent("cc1"), { agent: "cc1" });
+    assert.deepEqual(await resolveSpawnAgent("codex2"), { agent: "codex2" });
+  });
+});
+
+test("resolveSpawnAgent: <tool>-<query> shorthand still binds an account", async () => {
+  await withTempStore(async () => {
+    const created = await addAccount("codex", "tormod@ursolutions.no");
+    const spec = await resolveSpawnAgent("codex-ur");
+    assert.equal(spec.agent, "codex");
+    assert.equal(spec.account?.id, created.id);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
 // S1 — accounts data model (provider + model)
 // ──────────────────────────────────────────────────────────────────────────
 
