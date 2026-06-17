@@ -23,8 +23,10 @@ import {
   syncClaudeChainToVault,
   vaultRoot,
 } from "./accounts.js";
-import { identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
+import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
+import { listProRepos } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { resumeArgs, sniffYolo, swapAccount } from "./swap.js";
@@ -49,7 +51,7 @@ import {
   sendBuzMessage,
   senderDisplay,
 } from "./buz.js";
-import { beeConfig, briefFooter, configPath, loadConfig, resetConfigCache } from "./config.js";
+import { beeConfig, briefFooter, configPath, loadConfig, NAMING_EFFORTS, resetConfigCache, type NamingEffort } from "./config.js";
 import { getCompletions, shellScript } from "./completion.js";
 import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, type Frame } from "./frame.js";
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
@@ -133,6 +135,9 @@ async function main(argv: string[]) {
   switch (parsed.command) {
     case "spawn":
       await cmdSpawn(parsed);
+      break;
+    case "new":
+      await cmdNew(parsed);
       break;
     case "send":
       await cmdSend(parsed);
@@ -476,6 +481,90 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
     await confirmSpawnReady(parsed, record);
   }
   return record;
+}
+
+/**
+ * `hive new`: interactive, column-by-column spawn picker (type → account →
+ * config → project). Designed to be bound to a tmux popup (M-n). It only
+ * gathers choices, then funnels them through the normal spawn path so account
+ * activation, yolo resolution, swarms, and `--here` window linking all behave
+ * exactly as the flag-driven `hive spawn`. A single bee gets selected in the
+ * caller's tmux client via `--here`; a swarm links without stealing focus.
+ */
+async function cmdNew(parsed: Parsed): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('hive new needs a TTY — bind it to a tmux popup: bind -n M-n display-popup -E "hive new"');
+  }
+  const here = await resolveBeeInCurrentPane();
+  const defaultCwd = here?.cwd ?? (await resolveSpawnCwd(parsed));
+  const defaultKind = here ? canonicalAgentKind(here.agent) : undefined;
+
+  const plan = await chooseNewBee({
+    types: agentKinds().map((kind) => ({ kind })),
+    defaultKind,
+    defaultCwd,
+    defaultCwdLabel: tildify(defaultCwd),
+    defaultYolo: (kind) => agentDefaultsToYolo(kind),
+    loadAccounts: (kind) => newBeeAccountRows(kind),
+    loadProjects: async () =>
+      (await listProRepos()).map((repo) => ({ label: repo.label, path: repo.path, project: repo.project })),
+    validatePath: async (input) => {
+      try {
+        const abs = resolve(input.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
+        const real = await realpath(abs);
+        if (!(await stat(real)).isDirectory()) return { ok: false, error: "not a directory" };
+        return { ok: true, path: real };
+      } catch {
+        return { ok: false, error: "path does not exist" };
+      }
+    },
+  });
+
+  if (!plan) {
+    if (isPretty()) console.error(note("new: cancelled"));
+    return;
+  }
+
+  const flags = new Map<string, string | true | string[]>();
+  if (plan.account) flags.set("account", plan.account);
+  flags.set("cwd", plan.cwd);
+  flags.set(plan.yolo ? "yolo" : "no-yolo", true);
+  if (plan.autoswap) flags.set("autoswap", true);
+  if (plan.count > 1) flags.set("count", String(plan.count));
+  if (process.env.TMUX) flags.set("here", true);
+
+  await cmdSpawn({ command: "spawn", args: [plan.kind], flags, rest: [] });
+}
+
+/** Accounts for one tool, enriched with a cached-usage cell for the picker. */
+async function newBeeAccountRows(kind: string): Promise<SpawnTuiAccount[]> {
+  const mine = (await listAccounts()).filter((account) => account.tool === kind);
+  if (mine.length === 0) return [];
+  let limits: AccountLimits[] = [];
+  try {
+    limits = await cachedAccountLimits(mine, { ttlMs: 3_600_000 });
+  } catch {
+    limits = [];
+  }
+  const byId = new Map(limits.map((entry) => [entry.account, entry]));
+  const now = Date.now();
+  return mine.map((account) => {
+    const entry = byId.get(account.id);
+    const usage = newBeeUsageCell(entry, now);
+    const saturated = Boolean(
+      entry?.ok && entry.fiveHour && !windowRolledOver(entry.fiveHour, now) && entry.fiveHour.usedPercent >= 90,
+    );
+    return { id: account.id, label: account.label, usage, saturated };
+  });
+}
+
+function newBeeUsageCell(limits: AccountLimits | undefined, now: number): string | undefined {
+  if (!limits) return undefined;
+  if (!limits.ok) return "limits n/a";
+  const cell = (label: string, window?: WindowUsage) =>
+    window ? `${label} ${Math.round(windowRolledOver(window, now) ? 0 : window.usedPercent)}%` : null;
+  const parts = [cell("5h", limits.fiveHour), cell("wk", limits.weekly)].filter(Boolean);
+  return parts.length ? parts.join(" · ") : undefined;
 }
 
 async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<SessionRecord[]> {
@@ -2250,8 +2339,13 @@ async function configSetNaming(parsed: Parsed) {
   const model = typeof modelRaw === "string" ? modelRaw : undefined;
   const commandRaw = flag(parsed, "command");
   const command = typeof commandRaw === "string" ? commandRaw : undefined;
-  if (auto === undefined && tool === undefined && model === undefined && command === undefined) {
-    throw new Error('hive config set-naming needs at least one of --auto/--no-auto, --tool <claude|codex>, --model <m>, --command "..."');
+  const effortRaw = flag(parsed, "effort");
+  if (effortRaw !== undefined && !(NAMING_EFFORTS as readonly string[]).includes(String(effortRaw))) {
+    throw new Error(`--effort must be one of: ${NAMING_EFFORTS.join(", ")}`);
+  }
+  const effort = typeof effortRaw === "string" ? (effortRaw as NamingEffort) : undefined;
+  if (auto === undefined && tool === undefined && model === undefined && command === undefined && effort === undefined) {
+    throw new Error('hive config set-naming needs at least one of --auto/--no-auto, --tool <claude|codex>, --model <m>, --effort <minimal|low|medium|high|xhigh>, --command "..."');
   }
   const config = loadConfig();
   const naming = { ...(config.naming ?? {}) };
@@ -2259,6 +2353,7 @@ async function configSetNaming(parsed: Parsed) {
   if (tool !== undefined) naming.tool = tool;
   if (model !== undefined) naming.model = model;
   if (command !== undefined) naming.command = command;
+  if (effort !== undefined) naming.effort = effort;
   await writeConfigFile({ ...config, naming });
   resetConfigCache();
   if (isPretty()) console.log(actionLine("ok", "config", [bold("naming"), dim("updated")]));
@@ -4847,6 +4942,7 @@ function printHelp() {
       title: "Spawn & run",
       rows: [
         ["spawn", "<bee>", "start bees in detached tmux sessions (--frame to spawn a swarm)"],
+        ["new", "", "interactive picker: choose type, account, config & folder, then spawn"],
         ["run", "<bee> -p <prompt>", "spawn, send a prompt, optionally wait and clean up"],
         ["x", "<bee> <prompt>", "spawn a bee and hand it a prompt, then return (fire-and-forget)"],
         ["xa", "<bee>", "spawn a bee and attach to it"],

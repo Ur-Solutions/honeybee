@@ -138,6 +138,20 @@ export function agentDriver(kind: string): AgentDriver | undefined {
   return AGENT_DRIVERS[kind];
 }
 
+/**
+ * Canonical agent kinds in a human-friendly display order (most-used first).
+ * Drives the type column of the interactive `hive new` spawn picker; any driver
+ * added to AGENT_DRIVERS but missing from the order list still appears, after
+ * the curated ones, so the picker never silently drops a tool.
+ */
+export function agentKinds(): string[] {
+  const order = ["claude", "codex", "kimi", "grok", "opencode", "cursor", "droid", "pi"];
+  const known = Object.keys(AGENT_DRIVERS);
+  const ranked = order.filter((kind) => kind in AGENT_DRIVERS);
+  const rest = known.filter((kind) => !ranked.includes(kind));
+  return [...ranked, ...rest];
+}
+
 export function hasAgentDriver(kind: string): boolean {
   return agentDriver(kind) !== undefined;
 }

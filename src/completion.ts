@@ -14,7 +14,7 @@ import { listSwarms, type SwarmRecord } from "./swarm.js";
 import { listTmuxSessions } from "./tmux.js";
 
 const COMMANDS = [
-  "spawn", "send", "tail", "transcript", "last", "wait",
+  "spawn", "new", "send", "tail", "transcript", "last", "wait",
   "list", "ls", "ps", "kill", "clean", "run", "x", "xa", "attach", "view",
   "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
