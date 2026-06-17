@@ -110,8 +110,8 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   transcript: ["-n", "--limit", "--json"],
   tx: ["-n", "--limit", "--json"],
   clean: ["--dead", "--idle", "--interactive", "-i", "--older-than", "--older", "--dry-run", "-n"],
-  list: ["--colony", "--swarm", "--node", "--wide"],
-  ps: ["--colony", "--swarm", "--node", "--wide"],
+  list: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--json", "--wide"],
+  ps: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--json", "--wide"],
   attach: ["--print"],
   search: ["--colony", "--swarm", "--bee", "--type", "--status", "--since", "--regex", "--case", "--limit", "--json"],
   seals: ["--colony", "--swarm", "--bee", "--status", "--since", "--regex", "--case", "--limit", "--json"],
@@ -143,7 +143,7 @@ export type CompletionState = {
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto";
+type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto";
 
 const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -158,6 +158,7 @@ const FLAG_VALUE_KINDS: Record<string, FlagValueKind> = {
   "--node": "node",
   "--kind": "node-kind",
   "--bee": "bee",
+  "--agent": "agent",
   "--type": "search-type",
   "--status": "seal-status",
   "--flow": "flow",
@@ -290,6 +291,10 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return ["local-tmux", "ssh-tmux"];
     case "bee":
       return state.records.map((r) => r.name);
+    case "agent":
+      // Distinct agent kinds in play plus the well-known tool names, so
+      // `hive list --agent <TAB>` offers what is actually spawnable/present.
+      return [...new Set([...state.records.map((r) => r.agent), ...BEES])];
     case "search-type":
       return SEARCH_TYPE_VALUES;
     case "seal-status":

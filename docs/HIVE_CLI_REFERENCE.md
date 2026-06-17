@@ -544,9 +544,43 @@ from killing a bee that still needs human approval.
 Show known sessions with derived state.
 
 ```sh
-hive list [--colony <name>] [--swarm <id>] [--node <name>] [--wide]
+hive list [selector] [--colony <name>] [--swarm <id>] [--node <name>]
+          [--state <s>] [--agent <a>] [--repo <name>] [--json] [--wide]
 hive ps --wide
 ```
+
+**Faceted filters (conjunctive).** Every filter is an AND: `hive list --colony
+frontend --agent claude --state waiting` returns only the bees matching *all*
+three. The facets:
+
+- `--colony <name>` / `--swarm <id>` / `--node <name>`: the existing reserved
+  facets (swarm accepts a leading `@`).
+- `--agent <a>`: exact match on the bee's agent (`claude`, `codex`, ...).
+- `--repo <name>`: match on the bee's repo facet — the basename of the bee
+  cwd's git top-level (or the cwd basename outside a repo). Two repos sharing a
+  basename collide; this is an accepted lossy facet.
+- `--state <s>`: match on the bee's state. Accepts the live `@hive_state`
+  vocabulary (`working`/`waiting`/`done`/`failed`), the fine-grained `BeeState`
+  (`active`, `idle_with_output`, ...), or its display label (`idle`, `offline`).
+- positional `[selector]`: a bee / `@swarm` / `colony:<name>` selector applied
+  as a filter alongside the flags (an unknown colony/swarm errors, consistent
+  with other commands).
+
+**`--json`** emits a machine array regardless of TTY, after all filters are
+applied. Each element has the shape:
+
+```json
+{
+  "ref": "ab12", "name": "...", "id": "...", "title": "...",
+  "agent": "claude", "state": "working", "beeState": "active",
+  "detail": "...", "colony": "...", "swarm": "...", "comb": "...",
+  "node": "local", "repo": "honeybee-build", "cwd": "/abs/path",
+  "createdAt": "...", "updatedAt": "..."
+}
+```
+
+`state` is the live `@hive_state` when the bee is live, else the derived
+`BeeState`; `beeState` is always the derived `BeeState`.
 
 States:
 

@@ -101,7 +101,8 @@ import { resolveSelector } from "./selectors.js";
 import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
-import { writeHiveState, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
+import { hiveStateFor, writeHiveState, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
+import { repoTagFor } from "./repoTag.js";
 import { buildView, closeView, createGroupedView, deriveViewName, linkHere, viewSessionName } from "./view.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
@@ -829,6 +830,11 @@ async function cmdList(parsed: Parsed) {
   const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
   const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")).replace(/^@/, "") : undefined;
   const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
+  const stateFilter = stringFlag(parsed, ["state"]);
+  const agentFilter = stringFlag(parsed, ["agent"]);
+  const repoFilter = stringFlag(parsed, ["repo"]);
+  const jsonOut = truthy(flag(parsed, "json"));
+  const positionalSel = parsed.args[0];
   if (nodeFilter) {
     const node = await loadNode(nodeFilter);
     if (!node) throw new Error(`Unknown node: ${nodeFilter}. Register it with: hive node register ${nodeFilter} --kind ssh-tmux --endpoint user@host`);
@@ -838,6 +844,15 @@ async function cmdList(parsed: Parsed) {
   if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
   if (swarmFilter) records = records.filter((r) => r.swarmId === swarmFilter);
   if (nodeFilter) records = records.filter((r) => (r.node ?? LOCAL_NODE_NAME) === nodeFilter);
+  if (agentFilter) records = records.filter((r) => r.agent === agentFilter);
+  if (repoFilter) records = records.filter((r) => repoTagFor(r.cwd) === repoFilter);
+  if (positionalSel) {
+    // Let resolveSelector throw on a genuinely unknown colony/swarm, consistent
+    // with the other commands; an empty colony/swarm just filters to nothing.
+    const resolved = await resolveSelector(positionalSel);
+    const names = new Set(resolved.kind === "bee" ? [resolved.record.name] : resolved.records.map((r) => r.name));
+    records = records.filter((r) => names.has(r.name));
+  }
 
   const panes = await capturePanesFor(records, probe.liveTargets);
   const seals = await listSealedBeeNames();
@@ -859,6 +874,48 @@ async function cmdList(parsed: Parsed) {
     return state && state.length > 0 ? state : undefined;
   };
 
+  // --state matches the live @hive_state, the coarse hive mapping of the derived
+  // BeeState, the BeeState itself, or its display label — so `--state waiting`,
+  // `--state idle_with_output`, and `--state idle` all resolve.
+  if (stateFilter) {
+    records = records.filter((r) => {
+      const beeState = states.get(r.name)!.state;
+      return (
+        (liveHiveState(r) ?? hiveStateFor(beeState)) === stateFilter ||
+        beeState === stateFilter ||
+        stateLabel(beeState) === stateFilter
+      );
+    });
+  }
+
+  if (jsonOut) {
+    console.log(
+      JSON.stringify(
+        records.map((r) => ({
+          ref: highlightUniqueSessionReference(records, r, { start: "", end: "" }),
+          name: r.name,
+          id: r.id,
+          title: r.title,
+          agent: r.agent,
+          state: liveHiveState(r) ?? states.get(r.name)!.state,
+          beeState: states.get(r.name)!.state,
+          detail: states.get(r.name)!.detail,
+          colony: r.colony,
+          swarm: r.swarmId,
+          comb: r.combId,
+          node: r.node ?? LOCAL_NODE_NAME,
+          repo: repoTagFor(r.cwd),
+          cwd: r.cwd,
+          createdAt: r.createdAt,
+          updatedAt: r.updatedAt,
+        })),
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
   if (!isPretty()) {
     const marker = { start: "", end: "" };
     for (const record of records) {
@@ -874,9 +931,13 @@ async function cmdList(parsed: Parsed) {
 
   if (records.length === 0) {
     const filters = [
+      positionalSel ? positionalSel : undefined,
       colonyFilter ? `colony:${colonyFilter}` : undefined,
       swarmFilter ? `@${swarmFilter}` : undefined,
       nodeFilter ? `node:${nodeFilter}` : undefined,
+      stateFilter ? `state:${stateFilter}` : undefined,
+      agentFilter ? `agent:${agentFilter}` : undefined,
+      repoFilter ? `repo:${repoFilter}` : undefined,
     ].filter((part): part is string => part !== undefined);
     if (filters.length > 0) console.log(dim(`No bees match ${filters.join(" ")}`));
     else console.log(dim("No bees in the hive. Spawn one with: hive spawn <bee>"));

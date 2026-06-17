@@ -13,6 +13,7 @@
  * All writes are best-effort: a missing session or unreachable node must
  * never break spawn/wait/seal/daemon flows.
  */
+import { repoTagFor } from "./repoTag.js";
 import type { BeeState } from "./state.js";
 import type { SessionRecord } from "./store.js";
 import { substrateFor } from "./substrates/index.js";
@@ -78,6 +79,8 @@ export async function writeSpawnOptions(record: SessionRecord): Promise<void> {
       "@hive_swarm": record.swarmId ?? "",
       "@hive_title": record.title ?? "",
       "@hive_pane": record.agentPaneId ?? "",
+      "@hive_agent": record.agent,
+      "@hive_repo": repoTagFor(record.cwd),
       [HIVE_STATE_OPTION]: "working",
     });
     // Name the window after the bee (instead of the launcher command) so
