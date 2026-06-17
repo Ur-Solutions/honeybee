@@ -26,6 +26,13 @@ export type SessionRecord = {
   combId?: string;
   /** The bee this one was split from (intra-comb lineage). (Phase B) */
   parentId?: string;
+  /** Operator-set owned-by/reports-to edge → target bee id. (Tags PRD Phase 2) */
+  reportsToId?: string;
+  /**
+   * Cross-comb fork lineage → source bee id. Written later by fork-and-pane
+   * Phase C; added now so `forks-of:` can read it. (Tags PRD Phase 2)
+   */
+  forkedFromId?: string;
   /**
    * Free-form user tags (first-class). Holds ONLY bare or power-user-namespaced
    * labels, e.g. ["migration", "waiting-review", "prio:p1"]. Reserved-namespace
@@ -263,7 +270,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "forkedFromId"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",

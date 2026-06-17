@@ -86,9 +86,19 @@ Selector forms:
   Reserved namespaces are `colony`, `swarm`, `caste`, `node`, `agent`, `repo`,
   `quest`, `workspace`, `comb`. Reserved tags are *derived on read* from the
   bee's canonical fields — no migration is needed for existing bees.
+- `owns:<bee>` / `owned-by:<bee>` / `reports-to:<bee>`: all bees whose
+  `reportsToId` resolves to `<bee>` (the owned-by/reports-to edge, set by
+  `hive own`). The three spellings are aliases.
+- `children-of:<bee>`: all bees split from `<bee>` (their `parentId`).
+- `forks-of:<bee>`: all bees forked from `<bee>` (their `forkedFromId`).
+  These reverse-relationship selectors match by raw id and TOLERATE a dead
+  anchor: `owns:<killed-owner>` still returns surviving bees that carry the dead
+  owner's id (no cascade — relationships are reference-only).
 
-`@`, `colony:`, `#`, and `tag:` are **reserved selector prefixes**: a string
-beginning with one is parsed as that selector kind, not a bee name. Bee names
+`@`, `colony:`, `#`, `tag:`, and the relationship prefixes
+`owns:`/`owned-by:`/`reports-to:`/`children-of:`/`forks-of:` are **reserved
+selector prefixes**: a string beginning with one is parsed as that selector
+kind, not a bee name. Bee names
 are auto-generated (e.g. `CL.a3f`) and never use these prefixes; if you force a
 bee name that starts with one (via `--name`), it won't be addressable by that
 literal name — pick a different name.
@@ -526,6 +536,67 @@ hive list --tag colony:fe                  # derived reserved facet
 hive list '#migration'                     # positional tag selector
 hive send '#migration' "status?"           # tag selector as a target
 ```
+
+### `hive own`
+
+Set the **owned-by / reports-to** edge between bees: every `<bee-selector>`'s
+`reportsToId` is pointed at the single bee resolved from `<owner-selector>`.
+
+```sh
+hive own <owner-selector> <bee-selector>...  # set the reports-to edge
+hive own <bee-selector> --clear              # unset the edge
+```
+
+Examples:
+
+```sh
+hive own CL.lead CO.a3f CO.b1c   # both bees now report to CL.lead
+hive own CL.lead colony:fe       # everyone in colony fe reports to CL.lead
+hive own CO.a3f --clear          # drop CO.a3f's reports-to edge
+```
+
+The owner selector must resolve to exactly one bee (0 or >1 is an error). Each
+bee selector may be a multi-bee selector, so one command can wire a whole
+cohort; the result reports a count. Each write emits a `rel.set` /  `rel.clear`
+ledger event. Relationships are **reference-only**: clearing an edge never kills
+a bee, and the edge has no tmux mirror in v1.
+
+Query the edge via the reverse selectors:
+
+```sh
+hive list owns:CL.lead          # bees that report to CL.lead
+hive list owned-by:CL.lead      # alias of owns:
+hive list reports-to:CL.lead    # alias of owns:
+hive list children-of:CO.a3f    # bees split from CO.a3f (parentId)
+hive list forks-of:CO.a3f       # bees forked from CO.a3f (forkedFromId)
+```
+
+A reverse selector tolerates a dead anchor: `owns:<killed-owner>` still returns
+the surviving bees that carry the dead owner's id (no cascade).
+
+### `hive move`
+
+Reassign a bee's colony, or its owner (an alias for `hive own` on one bee).
+
+```sh
+hive move <bee> --colony <c>     # rewrite record.colony (derived colony: follows)
+hive move <bee> --owner <o>      # alias for: hive own <o> <bee>
+hive move <bee> --owner ''       # clear ownership (same as hive own <bee> --clear)
+```
+
+Examples:
+
+```sh
+hive move CO.a3f --colony backend   # move CO.a3f into colony backend
+hive move colony:fe --colony be      # bulk-move a whole colony
+hive move CO.a3f --owner CL.lead     # point CO.a3f's reports-to at CL.lead
+hive move CO.a3f --owner ''          # clear CO.a3f's reports-to edge
+```
+
+Pass exactly one of `--colony` / `--owner`. `--colony` refreshes the bee's
+`@hive_tags` tmux option (because `colony:` is a derived reserved tag); the
+`--owner` path does not (relationships have no tmux mirror). This is the verb the
+`hive tag` reserved-namespace rejection redirects to for `colony:`.
 
 ## Observing Output
 

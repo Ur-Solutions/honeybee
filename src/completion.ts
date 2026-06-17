@@ -21,7 +21,7 @@ const COMMANDS = [
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
-  "brief", "rename", "seal", "config", "completion", "help", "tag",
+  "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
   "split", "here", "revive",
 ];
 
@@ -57,7 +57,7 @@ const SHELLS = ["bash", "zsh", "fish"];
 const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach", "view"]);
-const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "split", "revive"]);
+const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "own", "move", "split", "revive"]);
 const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 // Commands whose first positional is a vault account.
@@ -103,6 +103,8 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],
   rename: ["--auto", "--clear"],
   tag: ["--remove", "--list"],
+  own: ["--clear"],
+  move: ["--colony", "--owner"],
   seal: ["--from"],
   last: ["-n", "--lines", "--seal"],
   wait: ["--idle-ms", "--idle", "--timeout-ms", "--timeout", "--poll-ms", "--poll", "--last", "--transcript", "--seal", "-n", "--limit", "--json"],
@@ -160,6 +162,7 @@ const FLAG_VALUE_KINDS: Record<string, FlagValueKind> = {
   "--node": "node",
   "--kind": "node-kind",
   "--bee": "bee",
+  "--owner": "bee",
   "--agent": "agent",
   "--type": "search-type",
   "--status": "seal-status",

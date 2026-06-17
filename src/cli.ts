@@ -216,6 +216,12 @@ async function main(argv: string[]) {
     case "tag":
       await cmdTag(parsed);
       break;
+    case "own":
+      await cmdOwn(parsed);
+      break;
+    case "move":
+      await cmdMove(parsed);
+      break;
     case "seal":
       await cmdSeal(parsed);
       break;
@@ -774,6 +780,117 @@ async function cmdTag(parsed: Parsed) {
   if (isMulti) {
     if (isPretty()) console.log(actionLine("ok", "tag", [bold(target), `added to ${changed}/${records.length} bees`]));
     else console.log(`tag.add\t${target}\t${changed}/${records.length} bees`);
+  }
+}
+
+// Resolve the owner selector to EXACTLY ONE bee, then point every bee resolved
+// from each beeSelector at it (reportsToId edge). Shared by cmdOwn's set path
+// and cmdMove's --owner alias (Risk 5: avoids synthesizing a fake Parsed).
+async function setOwnership(ownerSel: string, beeSelectors: string[]): Promise<void> {
+  const ownerResolved = await resolveSelector(ownerSel);
+  const ownerRecords = ownerResolved.kind === "bee" ? [ownerResolved.record] : ownerResolved.records;
+  if (ownerRecords.length === 0) throw new Error(`hive own: owner selector matched no bee: ${ownerSel}`);
+  if (ownerRecords.length > 1) {
+    throw new Error(`hive own: owner selector ${ownerSel} matched ${ownerRecords.length} bees; pick one`);
+  }
+  const owner = ownerRecords[0]!;
+  const ownerId = owner.id ?? owner.name;
+
+  let changed = 0;
+  let total = 0;
+  for (const sel of beeSelectors) {
+    const resolved = await resolveSelector(sel);
+    const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+    for (const record of records) {
+      total += 1;
+      const now = new Date().toISOString();
+      await updateSession(record.name, { reportsToId: ownerId, updatedAt: now });
+      await appendLedger({ type: "rel.set", bee: record.name, kind: "reports-to", to: ownerId });
+      changed += 1;
+      if (isPretty()) console.log(actionLine("ok", "own", [bold(record.name), dim("reports-to"), ownerId]));
+      else console.log(`${record.name}\trel.set\treports-to\t${ownerId}`);
+    }
+  }
+  if (isPretty()) console.log(actionLine("ok", "own", [bold(ownerId), `${changed}/${total} bees`]));
+  else console.log(`own\t${ownerId}\t${changed}/${total} bees`);
+}
+
+// Clear the reportsToId edge on every bee resolved from beeSel. NEVER kills a
+// bee — relationships are reference-only (§9.4 / R3).
+async function clearOwnership(beeSel: string): Promise<void> {
+  const resolved = await resolveSelector(beeSel);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${beeSel}`);
+  for (const record of records) {
+    const now = new Date().toISOString();
+    await updateSession(record.name, { reportsToId: undefined, updatedAt: now });
+    await appendLedger({ type: "rel.clear", bee: record.name, kind: "reports-to" });
+    if (isPretty()) console.log(actionLine("ok", "own", [bold(record.name), dim("cleared")]));
+    else console.log(`${record.name}\trel.clear\treports-to`);
+  }
+}
+
+// `hive own <owner-selector> <bee-selector>...` sets the owned-by/reports-to
+// edge; `hive own <bee-selector> --clear` unsets it. No @hive_tags refresh:
+// relationships have no tmux mirror in v1 (§9.4).
+async function cmdOwn(parsed: Parsed) {
+  const ownerSel = parsed.args[0];
+  const usage =
+    "Usage: hive own <owner-selector> <bee-selector>...  |  hive own <bee-selector> --clear";
+  if (!ownerSel) throw new Error(usage);
+
+  if (truthy(flag(parsed, "clear"))) {
+    if (parsed.args.length > 1) throw new Error("hive own --clear takes exactly one <bee-selector>");
+    await clearOwnership(ownerSel);
+    return;
+  }
+
+  const beeSelectors = parsed.args.slice(1);
+  if (beeSelectors.length === 0) throw new Error(usage);
+  await setOwnership(ownerSel, beeSelectors);
+}
+
+// `hive move <bee> --colony <c>` reassigns a bee's colony (the derived colony:
+// tag follows on read); `hive move <bee> --owner <o>` is an alias for hive own
+// on one bee, and `--owner ''` clears ownership.
+async function cmdMove(parsed: Parsed) {
+  const beeSel = parsed.args[0];
+  const usage =
+    "Usage: hive move <bee> --colony <c>  |  hive move <bee> --owner <o>  (--owner '' clears)";
+  if (!beeSel) throw new Error(usage);
+
+  const colonyRaw = flag(parsed, "colony");
+  const ownerRaw = flag(parsed, "owner");
+  if (colonyRaw === undefined && ownerRaw === undefined) throw new Error(usage);
+  if (colonyRaw !== undefined && ownerRaw !== undefined) {
+    throw new Error("hive move: pass either --colony or --owner, not both");
+  }
+
+  // --owner: alias for hive own on a single bee; --owner '' clears ownership.
+  if (ownerRaw !== undefined) {
+    const owner = typeof ownerRaw === "string" ? ownerRaw.trim() : "";
+    if (owner === "") {
+      await clearOwnership(beeSel);
+      return;
+    }
+    await setOwnership(owner, [beeSel]);
+    return;
+  }
+
+  // --colony: rewrite record.colony on each resolved bee (derived colony: tag
+  // follows). Refresh @hive_tags because colony: is a derived reserved tag.
+  if (colonyRaw === true) throw new Error("--colony requires a value");
+  const colony = String(colonyRaw);
+  const resolved = await resolveSelector(beeSel);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${beeSel}`);
+  for (const record of records) {
+    const now = new Date().toISOString();
+    const next = colony.trim() === "" ? undefined : colony;
+    await updateSession(record.name, { colony: next, updatedAt: now });
+    await writeHiveTags({ ...record, colony: next });
+    if (isPretty()) console.log(actionLine("ok", "move", [bold(record.name), dim("colony"), next ?? "(none)"]));
+    else console.log(`${record.name}\tmove\tcolony\t${next ?? ""}`);
   }
 }
 
@@ -5149,6 +5266,8 @@ function printHelp() {
         ["swarm", "<list|inspect|destroy>", "manage live or destroyed bee cohorts"],
         ["frame", "<list|define|…>", "manage reusable swarm blueprints"],
         ["flow", "<list|run|runs|…>", "manage and run flow definitions"],
+        ["own", "<owner> <bee>...", "set the owned-by/reports-to edge (--clear to unset)"],
+        ["move", "<bee> --colony <c>", "reassign a bee's colony (or --owner <o> alias)"],
       ],
     },
     {

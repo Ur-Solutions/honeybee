@@ -189,7 +189,7 @@ export function renderTags(record: SessionRecord): string {
 
 // Per-namespace redirect to the canonical write verb, used by `hive tag`.
 const RESERVED_REDIRECTS: Record<string, string> = {
-  colony: "set it via hive spawn --colony / hive move, not hive tag",
+  colony: "set it via hive spawn --colony / hive move <bee> --colony, not hive tag",
   swarm: "swarm is set at spawn; move bees via swarm destroy/spawn, not hive tag",
   caste: "set it via hive spawn --frame at spawn (immutable), not hive tag",
   node: "set it via hive spawn --node at spawn (immutable), not hive tag",

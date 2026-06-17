@@ -4,17 +4,26 @@ import { listSessions, type SessionRecord } from "./store.js";
 import { swarmIds } from "./swarm.js";
 import { effectiveTags, isReservedNamespace } from "./tags.js";
 
+/**
+ * Reverse-relationship verbs. owns/owned-by/reports-to are aliases reading the
+ * same `reportsToId` edge; children-of reads `parentId`; forks-of reads
+ * `forkedFromId`. (TAGS_AND_RELATIONSHIPS_PRD Phase 2)
+ */
+export type RelVerb = "owns" | "owned-by" | "reports-to" | "children-of" | "forks-of";
+
 export type Selector =
   | { kind: "bee"; query: string }
   | { kind: "swarm"; name: string } // @x — kept, now also expressible as tag:swarm:x
   | { kind: "colony"; name: string } // colony:x — kept, now also expressible as tag:colony:x
-  | { kind: "tag"; namespace?: string; value: string }; // facet / user-tag match
+  | { kind: "tag"; namespace?: string; value: string } // facet / user-tag match
+  | { kind: "rel"; verb: RelVerb; target: string }; // reverse relationship traversal
 
 export type ResolvedTarget =
   | { kind: "bee"; record: SessionRecord }
   | { kind: "swarm"; name: string; records: SessionRecord[] }
   | { kind: "colony"; name: string; records: SessionRecord[] }
-  | { kind: "tag"; namespace?: string; value: string; records: SessionRecord[] };
+  | { kind: "tag"; namespace?: string; value: string; records: SessionRecord[] }
+  | { kind: "rel"; verb: RelVerb; target: string; records: SessionRecord[] };
 
 export type SelectorState = {
   records: SessionRecord[];
@@ -26,6 +35,7 @@ const SWARM_PREFIX = "@";
 const COLONY_PREFIX = "colony:";
 const TAG_PREFIX = "tag:";
 const TAG_HASH = "#";
+const REL_VERBS: RelVerb[] = ["owns", "owned-by", "reports-to", "children-of", "forks-of"];
 
 export function parseSelector(query: string): Selector {
   const trimmed = query.trim();
@@ -66,6 +76,19 @@ export function parseSelector(query: string): Selector {
 
   if (!trimmed) throw new Error("Empty selector");
 
+  // owns:/owned-by:/reports-to:/children-of:/forks-of:<bee> → rel kind (reverse
+  // relationship traversal). RESERVED selector prefixes alongside @/colony:/#/tag:.
+  // Checked BEFORE the generic <ns>:<val> reserved-namespace branch so the rel
+  // verbs (which are not reserved tag namespaces) never fall into the tag path.
+  for (const verb of REL_VERBS) {
+    const prefix = `${verb}:`;
+    if (trimmed.startsWith(prefix)) {
+      const target = trimmed.slice(prefix.length).trim();
+      if (!target) throw new Error(`Empty relationship selector: ${query}`);
+      return { kind: "rel", verb, target };
+    }
+  }
+
   // <ns>:<val> where <ns> is a known reserved namespace (e.g. quest:q-ab,
   // caste:reviewer) → tag kind. A non-reserved namespace (e.g. prio:p1) is a
   // bare-token user tag stored verbatim, so it falls through to the bee branch
@@ -81,6 +104,37 @@ export function parseSelector(query: string): Selector {
   }
 
   return { kind: "bee", query: trimmed };
+}
+
+// Resolve a bee anchor token to a RAW id for relationship matching. Mirrors the
+// bee resolver's exact→prefix→ambiguity logic, but returns the matched record's
+// id (or name) on a hit and undefined on a miss — so rel resolution can fall
+// back to the raw token for a DEAD/removed anchor (§8.2 dead-anchor policy).
+function resolveBeeId(state: SelectorState, token: string): string | undefined {
+  const exact = state.records.find((r) => r.name === token);
+  if (exact) return exact.id ?? exact.name;
+  const matches = state.records.filter((r) => matchesSessionReference(r, token));
+  if (matches.length === 1) return matches[0]!.id ?? matches[0]!.name;
+  if (matches.length > 1) {
+    const ids = matches.map((m) => m.id ?? m.name).join(", ");
+    throw new Error(`Ambiguous bee selector ${token}: ${ids}`);
+  }
+  return undefined; // dead/unknown anchor → caller falls back to the raw token
+}
+
+// Which SessionRecord field a rel verb reverse-queries. owns/owned-by/reports-to
+// are aliases for the operator-set reportsToId edge.
+function fieldFor(verb: RelVerb): "reportsToId" | "parentId" | "forkedFromId" {
+  switch (verb) {
+    case "owns":
+    case "owned-by":
+    case "reports-to":
+      return "reportsToId";
+    case "children-of":
+      return "parentId";
+    case "forks-of":
+      return "forkedFromId";
+  }
 }
 
 export function resolveSelectorFromState(selector: Selector, state: SelectorState): ResolvedTarget {
@@ -119,6 +173,17 @@ export function resolveSelectorFromState(selector: Selector, state: SelectorStat
     return { kind: "tag", namespace: selector.namespace, value: selector.value, records };
   }
 
+  if (selector.kind === "rel") {
+    // Resolve the anchor to a raw id; a DEAD/unknown anchor falls back to the
+    // raw token (§8.2 dead-anchor policy) so reverse queries still match the
+    // surviving bees that carry the now-dead id. A live but AMBIGUOUS anchor
+    // still throws (user error) inside resolveBeeId.
+    const targetId = resolveBeeId(state, selector.target) ?? selector.target;
+    const field = fieldFor(selector.verb);
+    const records = state.records.filter((record) => record[field] === targetId);
+    return { kind: "rel", verb: selector.verb, target: selector.target, records };
+  }
+
   const exact = state.records.find((record) => record.name === selector.query);
   if (exact) return { kind: "bee", record: exact };
 
@@ -132,7 +197,7 @@ export function resolveSelectorFromState(selector: Selector, state: SelectorStat
 }
 
 export function isSelectorMulti(selector: Selector): boolean {
-  return selector.kind === "swarm" || selector.kind === "colony" || selector.kind === "tag";
+  return selector.kind === "swarm" || selector.kind === "colony" || selector.kind === "tag" || selector.kind === "rel";
 }
 
 export function formatSelector(selector: Selector): string {
@@ -145,6 +210,8 @@ export function formatSelector(selector: Selector): string {
       return `colony:${selector.name}`;
     case "tag":
       return selector.namespace ? `${selector.namespace}:${selector.value}` : `#${selector.value}`;
+    case "rel":
+      return `${selector.verb}:${selector.target}`;
   }
 }
 
