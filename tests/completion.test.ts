@@ -33,6 +33,23 @@ test("completes commands with no args at all", () => {
   assert.ok(getCompletionsFromState(["hive"], empty).includes("send"));
 });
 
+test("registers the Phase-1 keybinding verbs and their flags/subs", () => {
+  const top = getCompletionsFromState(["hive", ""], empty);
+  for (const cmd of ["spawn-picker", "urls", "keys"]) {
+    assert.ok(top.includes(cmd), `top-level completion includes ${cmd}`);
+  }
+  // keys subcommands.
+  assert.deepEqual(getCompletionsFromState(["hive", "keys", ""], empty), ["print", "path", "check"]);
+  // spawn-picker flags.
+  assert.deepEqual(getCompletionsFromState(["hive", "spawn-picker", "--"], empty), ["--frame", "--flow", "--here"]);
+  // urls flags.
+  assert.deepEqual(getCompletionsFromState(["hive", "urls", "--"], empty), ["--lines", "--open", "--json"]);
+  // rename gains --here alongside --auto/--clear.
+  assert.deepEqual(getCompletionsFromState(["hive", "rename", "--"], empty), ["--auto", "--clear", "--here"]);
+  // workspace here subcommand.
+  assert.ok(getCompletionsFromState(["hive", "workspace", ""], empty).includes("here"));
+});
+
 test("completes top-level flags when current word starts with dash", () => {
   assert.deepEqual(getCompletionsFromState(["hive", "--"], empty), ["--version", "--help"]);
 });

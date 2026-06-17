@@ -137,13 +137,21 @@ import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { gatherTitleContext, generateTitle } from "./naming.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
-import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
+import { LOCAL_NODE_NAME, listNodes, loadNode, loadNodeSync, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
 import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord } from "./substrates/index.js";
 import { attachCommand, attachSession, capture, formatShellCommand, hasSession, kill, listTmuxSessions, newSession, sendText, tmux } from "./tmux.js";
 import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
 import { waitForIdle } from "./wait.js";
+import {
+  CANONICAL_TMUX_CONF,
+  CANONICAL_WEZTERM_BLOCK,
+  RECOMMENDED_BINDS,
+  extractUrls,
+  reshapeRenameHereArgs,
+} from "./keybindings.js";
+import { fileURLToPath } from "node:url";
 
 const VERSION = "0.0.1";
 const APP_NAME = "hive";
@@ -190,6 +198,15 @@ async function main(argv: string[]) {
       break;
     case "here":
       await cmdHere(parsed);
+      break;
+    case "spawn-picker":
+      await cmdSpawnPicker(parsed);
+      break;
+    case "urls":
+      await cmdUrls(parsed);
+      break;
+    case "keys":
+      await cmdKeys(parsed);
       break;
     case "split":
       await cmdSplit(parsed);
@@ -679,7 +696,35 @@ async function cmdBrief(parsed: Parsed) {
   }
 }
 
+/**
+ * Reshape `hive rename --here <title>` into the selector-then-title form
+ * `cmdRename` expects (KEYBINDINGS_PRD §9.2). The bare positionals are the title;
+ * the current bee's id becomes args[0] (the selector). --auto/--clear keep their
+ * positionals as-is (those paths take no explicit title). Returns a CLONED Parsed
+ * so the caller's flags/rest are untouched.
+ */
+async function reshapeRenameHere(parsed: Parsed): Promise<Parsed> {
+  if (!process.env.TMUX) throw new Error("hive rename --here: not inside tmux");
+  const bee = await resolveBeeInCurrentPane();
+  if (!bee) throw new Error("hive rename --here: no matching bee for the current pane/session");
+  const id = bee.id ?? bee.name;
+  const args = reshapeRenameHereArgs(id, parsed.args, {
+    auto: truthy(flag(parsed, "auto")),
+    clear: truthy(flag(parsed, "clear")),
+  });
+  return { ...parsed, args, flags: new Map(parsed.flags), rest: [...parsed.rest] };
+}
+
 async function cmdRename(parsed: Parsed) {
+  // `hive rename --here <title>` is an argv-reshaping wrapper (KEYBINDINGS_PRD
+  // §9.2): the bare positionals are the TITLE, the selector is the current bee.
+  // We resolve the current bee → its id, inject it as args[0] (the selector) and
+  // shift the title to args[1..], THEN fall through to the normal path so the
+  // title is never mistaken for a selector. --auto/--clear pass through
+  // unchanged, and the non-here behavior below stays byte-identical.
+  if (truthy(flag(parsed, "here"))) {
+    parsed = await reshapeRenameHere(parsed);
+  }
   const target = parsed.args[0];
   const auto = truthy(flag(parsed, "auto"));
   const clear = truthy(flag(parsed, "clear"));
@@ -2016,6 +2061,287 @@ async function cmdHere(parsed: Parsed): Promise<void> {
   else console.log(`here\t${bee.name}\t${bee.agent}\t${bee.cwd}`);
 }
 
+/**
+ * Whether the DEFAULT substrate (the implicit/aliased "local" node) is ssh-tmux.
+ *
+ * The pickers and explicit-selector verbs read the LOCAL store but, run from a
+ * `display-popup` under `ssh-tmux`, execute in the *remote* shell — so they must
+ * hard-error rather than target the wrong fleet (KEYBINDINGS_PRD §8.1/§13).
+ *
+ * The ONLY reliable runtime signal is the same one `substrateForNode` honors:
+ * the operator explicitly aliasing the local node to a remote endpoint
+ * (`hive node register local --kind ssh-tmux …`). hive running on the local box
+ * always otherwise sees `local-tmux`; there is no in-band signal that a given
+ * tmux client is itself the far end of someone else's ssh-tmux popup. We guard
+ * on the alias signal and accept that limitation (documented here per §13): a
+ * popup opened on a remote host whose local node is plain local-tmux is not
+ * detectable from inside hive and is the operator's collision call.
+ */
+function defaultSubstrateIsSshTmux(): boolean {
+  const overlay = loadNodeSync(LOCAL_NODE_NAME);
+  return overlay?.kind === "ssh-tmux";
+}
+
+function assertLocalFleetReadable(verb: string): void {
+  if (defaultSubstrateIsSshTmux()) {
+    // dim stderr + non-zero so a popup's `xargs -r` no-ops and the popup closes.
+    throw new Error(
+      `hive ${verb}: refusing to run under an ssh-tmux default substrate — ` +
+        `pickers read the LOCAL store and would target the wrong fleet (§13).`,
+    );
+  }
+}
+
+// hive spawn-picker [--frame | --flow] [--here]
+// A PURE stdout list verb: prints candidate names one-per-line and does NOTHING
+// else (no spawn/switch/store-write). The action lives in the binding (§8.2).
+async function cmdSpawnPicker(parsed: Parsed): Promise<void> {
+  assertLocalFleetReadable("spawn-picker");
+  // --here is a passthrough hint for the binding (it appends `--here` to the
+  // spawn action unconditionally); it does NOT change the printed candidate set.
+  // hasFlag (presence) not truthy(flag): `flow` is not a BOOLEAN_FLAG (it takes a
+  // value on `spawn`), so a stray `--flow <x>` would otherwise parse the value and
+  // mis-route; presence is the correct boolean intent for the picker.
+  const useFlow = hasFlag(parsed, "flow");
+  const names = useFlow
+    ? (await listFlows()).map((flow) => flow.name)
+    : (await listFrames()).map((frame) => frame.name);
+  // The selectable machine token is the first whitespace/TAB field. Frame/flow
+  // names have no spaces, so a bare name per line is the token. Empty candidate
+  // set → exit 0 with empty stdout so the binding's `xargs -r` no-ops.
+  for (const name of names) console.log(name);
+}
+
+// hive urls [<bee>] [--lines <n>] [--open] [--json]
+// Lists website URLs printed in a bee's pane. Side-effect-free unless --open.
+async function cmdUrls(parsed: Parsed): Promise<void> {
+  const selector = parsed.args[0];
+  let record: SessionRecord | undefined;
+  if (selector) {
+    // Explicit selector → grab from another bee. These read the LOCAL store, so
+    // they must hard-error under an ssh-tmux default substrate (§13).
+    assertLocalFleetReadable("urls");
+    const resolved = await resolveSelector(selector);
+    if (resolved.kind !== "bee") {
+      throw new Error(`hive urls: ${selector} selects multiple bees; pass a single bee`);
+    }
+    record = resolved.record;
+  } else {
+    if (!process.env.TMUX) throw new Error("hive urls: not inside tmux and no bee selector given");
+    record = await resolveBeeInCurrentPane();
+    if (!record) throw new Error("hive urls: no matching bee for the current pane/session");
+  }
+
+  const lines = numberFlag(parsed, ["lines"], 2000);
+  const text = await substrateFor(record).capture(record.tmuxTarget, lines, record.agentPaneId);
+  const urls = extractUrls(text);
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(urls));
+    return;
+  }
+  if (urls.length === 0) {
+    // dim stderr note so the popup closes cleanly; exit 0 (no URLs is not an error).
+    console.error(dim("no URLs"));
+    return;
+  }
+  if (truthy(flag(parsed, "open"))) {
+    await openUrl(urls[0]!);
+    return;
+  }
+  for (const url of urls) console.log(url);
+}
+
+/** Open a URL via the platform opener (open on darwin, xdg-open on linux). */
+async function openUrl(url: string): Promise<void> {
+  const opener = process.platform === "darwin" ? "open" : "xdg-open";
+  const { execFile } = await import("node:child_process");
+  await new Promise<void>((resolveOpen, rejectOpen) => {
+    execFile(opener, [url], (error) => (error ? rejectOpen(error) : resolveOpen()));
+  });
+}
+
+// hive keys print [--tmux | --wezterm] | path | check [--against-recommended]
+async function cmdKeys(parsed: Parsed): Promise<void> {
+  const sub = parsed.args[0];
+  switch (sub) {
+    case undefined:
+    case "print":
+      return keysPrint(parsed);
+    case "path":
+      return keysPath();
+    case "check":
+      return keysCheck(parsed);
+    case "doctor":
+      // OPTIONAL Phase 2 — the runtime popup-env probe. Not yet implemented.
+      throw new Error("hive keys doctor: not yet implemented (Phase 2). Use `hive keys check` for static checks.");
+    default:
+      throw new Error(`Unknown keys subcommand: ${sub}\nUsage: hive keys <print|path|check>`);
+  }
+}
+
+function keysPrint(parsed: Parsed): void {
+  // `--tmux` (default) prints the recommended tmux block VERBATIM (the same
+  // source-of-truth string written to docs/honeybee.tmux.conf). `--wezterm`
+  // prints the cmd→Meta additions.
+  if (truthy(flag(parsed, "wezterm"))) {
+    process.stdout.write(CANONICAL_WEZTERM_BLOCK);
+    return;
+  }
+  process.stdout.write(CANONICAL_TMUX_CONF);
+}
+
+/**
+ * The absolute path of the shipped docs/honeybee.tmux.conf, resolved relative to
+ * this module (which lives at dist/cli.js when packaged, src/cli.ts under tsx).
+ * Both are exactly one directory below the repo root, so `..` from the module dir
+ * reaches the root and `docs/honeybee.tmux.conf` from there is the artifact.
+ *
+ * Path-stability caveat (KEYBINDINGS_PRD §16 Q2): this resolves relative to the
+ * install location, so it is brittle across reinstall/relocation. The robust
+ * `source-file` recipe is `source-file "$(hive keys path)"`, re-evaluated by the
+ * shell; a bare paste (`hive keys print --tmux >> ~/.tmux.conf`) goes stale
+ * silently. `hive keys check` audits presence either way.
+ */
+function keybindingsConfPath(): string {
+  const moduleDir = fileURLToPath(new URL(".", import.meta.url));
+  return resolve(moduleDir, "..", "docs", "honeybee.tmux.conf");
+}
+
+function keysPath(): void {
+  console.log(keybindingsConfPath());
+}
+
+async function keysCheck(parsed: Parsed): Promise<void> {
+  // PURE READ. Reports recommended binds present/absent, flags tmux-layer
+  // collisions, and runs the static PATH/substrate checks.
+  //
+  // LIMITATION (KEYBINDINGS_PRD §6/§13): `check` reads `tmux list-keys`, so it is
+  // STRUCTURALLY BLIND to the WezTerm ALT/cmd layer in ~/.wezterm.lua — that must
+  // be eyeballed. The collision report below is necessary but not sufficient.
+  const pretty = isPretty();
+  let hardFailures = 0;
+  let warnings = 0;
+
+  // The live root-table key bindings, as a key → command map.
+  const liveBinds = await liveTmuxRootBinds();
+
+  // Per-recommended-bind: present / absent / collision (bound to something else).
+  for (const bind of RECOMMENDED_BINDS) {
+    const live = liveBinds.get(bind.key);
+    const wired = live !== undefined && live.includes(`hive ${bind.verb}`);
+    const collision = live !== undefined && !wired;
+    if (wired) {
+      if (pretty) console.log(actionLine("ok", "keys", [bold(bind.key), dim(`→ hive ${bind.verb}`), dim(bind.note)]));
+      else console.log(`bind\tpresent\t${bind.key}\t${bind.verb}`);
+    } else if (collision) {
+      warnings += 1;
+      if (pretty) console.log(actionLine("warn", "keys", [bold(bind.key), yellow("collision"), dim(truncate(live!, 50))]));
+      else console.log(`bind\tcollision\t${bind.key}\t${live!.replace(/\s+/g, " ").trim()}`);
+    } else {
+      // Absent. A delegated bind whose verb may not be shipped yet is only a
+      // note; a non-delegated recommended bind absent is also just informational
+      // (the operator may not have pasted the block) — not a hard failure.
+      if (pretty) console.log(actionLine("info", "keys", [bold(bind.key), dim("absent"), dim(bind.delegated ? "(delegated)" : "")]));
+      else console.log(`bind\tabsent\t${bind.key}\t${bind.delegated ? "delegated" : ""}`);
+    }
+  }
+
+  // --against-recommended: report live binds on our recommended keys that differ
+  // from the shipped set (drift after a stale paste + hive upgrade).
+  if (truthy(flag(parsed, "against-recommended"))) {
+    for (const bind of RECOMMENDED_BINDS) {
+      const live = liveBinds.get(bind.key);
+      if (live !== undefined && !live.includes(`hive ${bind.verb}`)) {
+        if (pretty) console.log(actionLine("warn", "drift", [bold(bind.key), dim(truncate(live, 60))]));
+        else console.log(`drift\t${bind.key}\t${live.replace(/\s+/g, " ").trim()}`);
+        warnings += 1;
+      }
+    }
+  }
+
+  // Static checks: fzf, a browser opener, the substrate, and `hive` reachability.
+  const fzf = await binaryOnPath("fzf");
+  reportCheck(pretty, fzf, "fzf on PATH", "fzf missing — popups can't filter candidates");
+  if (!fzf) warnings += 1;
+
+  const opener = process.platform === "darwin" ? "open" : "xdg-open";
+  const openerOk = await binaryOnPath(opener);
+  reportCheck(pretty, openerOk, `${opener} on PATH`, `${opener} missing — \`hive urls\` --open / the M-u binding can't open a browser`);
+  if (!openerOk) warnings += 1;
+
+  // Substrate: warn under ssh-tmux (the pickers/affordances target the wrong fleet, §13).
+  const ssh = defaultSubstrateIsSshTmux();
+  if (ssh) {
+    warnings += 1;
+    if (pretty) console.log(actionLine("warn", "check", [yellow("substrate is ssh-tmux"), dim("pickers/affordances read the LOCAL store (§13)")]));
+    else console.log(`check\tsubstrate\tssh-tmux`);
+  } else {
+    if (pretty) console.log(actionLine("ok", "check", [dim("substrate is local-tmux")]));
+    else console.log(`check\tsubstrate\tlocal-tmux`);
+  }
+
+  // `hive` itself reachable (recommended verbs are unreachable otherwise → HARD fail).
+  const hiveOk = await binaryOnPath("hive");
+  if (!hiveOk) {
+    hardFailures += 1;
+    if (pretty) console.log(actionLine("err", "check", [red("hive not on PATH"), dim("bindings invoke `hive` inside popups — they will all fail")]));
+    else console.log(`check\thive\tunreachable`);
+  } else {
+    if (pretty) console.log(actionLine("ok", "check", [dim("hive on PATH")]));
+    else console.log(`check\thive\treachable`);
+  }
+
+  // The list-keys blind-spot, surfaced every run so it is never forgotten.
+  if (pretty) console.log(note("check covers the tmux layer only; the WezTerm ALT/cmd layer (~/.wezterm.lua) is list-keys-invisible and must be eyeballed (§6)."));
+  else console.log(`check\tlimitation\twezterm-alt-cmd-layer-not-checked`);
+
+  if (hardFailures > 0) process.exitCode = 1;
+  else if (warnings > 0 && pretty) console.log(dim(`${warnings} warning(s) — see above`));
+}
+
+/** Live root-table (no-prefix) bindings: tmux key spec → bound command string. */
+async function liveTmuxRootBinds(): Promise<Map<string, string>> {
+  const binds = new Map<string, string>();
+  // `-T root` is the no-prefix table where `bind -n` binds land.
+  const result = await tmux(["list-keys", "-T", "root"], { reject: false });
+  if (!result.ok) return binds;
+  for (const line of result.stdout.split("\n")) {
+    // Format: `bind-key -T root M-b <command...>`. Find the table+key, take the rest.
+    const match = line.match(/^bind-key\s+(?:-r\s+)?-T\s+root\s+(\S+)\s+(.*)$/);
+    if (!match) continue;
+    const key = match[1]!;
+    const command = match[2]!.trim();
+    binds.set(key, command);
+  }
+  return binds;
+}
+
+function reportCheck(pretty: boolean, ok: boolean, label: string, failHint: string): void {
+  if (ok) {
+    if (pretty) console.log(actionLine("ok", "check", [dim(label)]));
+    else console.log(`check\tok\t${label}`);
+  } else {
+    if (pretty) console.log(actionLine("warn", "check", [yellow(label), dim(failHint)]));
+    else console.log(`check\twarn\t${label}`);
+  }
+}
+
+/** Whether `name` resolves on PATH (via the platform `which`/`command -v`). */
+async function binaryOnPath(name: string): Promise<boolean> {
+  const { execFile } = await import("node:child_process");
+  return new Promise<boolean>((resolveCheck) => {
+    const probe = process.platform === "win32" ? "where" : "command";
+    const args = process.platform === "win32" ? [name] : ["-v", name];
+    // `command -v` needs a shell; `which` is also fine but less portable.
+    if (process.platform === "win32") {
+      execFile(probe, args, (error) => resolveCheck(!error));
+    } else {
+      execFile("sh", ["-c", `command -v ${JSON.stringify(name)}`], (error) => resolveCheck(!error));
+    }
+  });
+}
+
 async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
   // hive split [<bee>] [<agent>] [--brief <text>] [--dir v|h|window] [--cwd <dir>] [--home <h>]
   // No <bee> (or --here) → split the current bee's comb (via hive here resolution).
@@ -3046,11 +3372,49 @@ async function cmdWorkspace(parsed: Parsed) {
       return workspaceClose(parsed);
     case "rename":
       return workspaceRename(parsed);
+    case "here":
+      return workspaceHere(parsed);
     case "archive":
       return workspaceArchive(parsed);
     default:
-      throw new Error(`Unknown workspace subcommand: ${sub}\nUsage: hive workspace <open|list|add|add-pane|snapshot|restore|close|rename|archive>`);
+      throw new Error(`Unknown workspace subcommand: ${sub}\nUsage: hive workspace <open|list|add|add-pane|snapshot|restore|close|rename|here|archive>`);
   }
+}
+
+/**
+ * Resolve the current pane's OWNING workspace bare name (KEYBINDINGS_PRD §9.1 /
+ * §10 — unblocks the M-R binding). If $TMUX's session is a ws-* session, print
+ * its bare workspace name; else resolve the current bee → its workspaceId.
+ * Errors to stderr + non-zero if not inside tmux or no owning workspace.
+ */
+async function workspaceHere(_parsed: Parsed): Promise<void> {
+  if (!process.env.TMUX) throw new Error("hive workspace here: not inside tmux");
+  const sessionName = await currentTmuxSessionName();
+  if (sessionName && sessionName.startsWith(WORKSPACE_PREFIX)) {
+    const bare = sessionName.slice(WORKSPACE_PREFIX.length);
+    // A grouped ws-* client carries a `-N` suffix (ws-fe-2). Disambiguate against
+    // a workspace literally named `fe-2`: if a record with the exact bare name
+    // exists, that is it; otherwise strip a trailing `-<digits>` grouping suffix
+    // and re-check, so the M-R rename chord resolves `fe` from a `ws-fe-2` client.
+    if (await loadWorkspace(bare)) {
+      console.log(bare);
+      return;
+    }
+    const ungrouped = bare.replace(/-\d+$/, "");
+    if (ungrouped !== bare && (await loadWorkspace(ungrouped))) {
+      console.log(ungrouped);
+      return;
+    }
+    // No record either way (an ad-hoc ws- session with no record): the bare
+    // prefix-stripped name is the best we can do and round-trips when un-grouped.
+    console.log(bare);
+    return;
+  }
+  const bee = await resolveBeeInCurrentPane();
+  if (!bee || !bee.workspaceId) {
+    throw new Error("hive workspace here: the current pane has no owning workspace");
+  }
+  console.log(bee.workspaceId);
 }
 
 /**
@@ -6721,6 +7085,9 @@ function printHelp() {
         ["split", "[<bee>] [<agent>]", "spawn a sub-bee into the bee's comb (adjacent pane)"],
         ["fork", "<bee> [checkpoint]", "branch a bee into a fresh comb, seeded from its state"],
         ["here", "", "resolve the bee owning the current pane (--id, --json)"],
+        ["spawn-picker", "[--frame|--flow]", "print frame/flow names for a display-popup spawn chord"],
+        ["urls", "[<bee>]", "list URLs printed in a bee's pane (--lines, --open, --json)"],
+        ["keys", "<print|path|check>", "print/verify the recommended tmux keybinding set"],
         ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--all, --fresh, --session <id>)"],
         ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],

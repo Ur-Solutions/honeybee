@@ -883,6 +883,7 @@ hive workspace snapshot <name>                 # refresh saved layout from the l
 hive workspace restore <name> [--resume]       # rebuild after a reboot
 hive workspace close <name>                    # tear down the session, KEEP the record
 hive workspace rename <old> <new>
+hive workspace here                            # print the current pane's owning workspace name
 hive workspace archive <name>
 
 hive restore --all [--resume]                  # rebuild every non-archived workspace
@@ -934,6 +935,11 @@ Behavior and guarantees:
 - `hive restore --all [--resume]` sweeps every non-archived workspace and
   restores it (the post-reboot reconcile; install it as a login hook to rebuild
   your arrangement on boot). Without `--all` it prints usage.
+- `hive workspace here` resolves the **current pane's owning workspace** for
+  keybindings (the `M-R`/cmd+shift+r rename chord). If `$TMUX`'s session is a
+  `ws-*` session it prints the bare workspace name; otherwise it resolves the
+  current bee (via `hive here`) and prints its `workspaceId`. Errors when not in
+  tmux or when the pane has no owning workspace.
 
 ### `hive quest`
 
@@ -1137,6 +1143,100 @@ hive here [--id] [--json]
 Resolution prefers `$TMUX_PANE` (matching a bee by `agentPaneId`) and falls back
 to the current session name (matching `tmuxTarget`, for solo combs and legacy
 bees). Errors cleanly when not inside tmux or when no bee matches.
+
+## Keybindings and In-tmux Affordances
+
+The keybinding LAYER — picker verbs the `display-popup` chords invoke, the
+standalone in-tmux affordances, and the recommended binding set — is specified in
+`docs/KEYBINDINGS_PRD.md`. These verbs are thin, testable, and side-effect-free
+(the action lives in the binding). The canonical copy-pasteable tmux block is
+`docs/honeybee.tmux.conf`, emitted byte-for-byte by `hive keys print --tmux`.
+
+### `hive spawn-picker`
+
+A **pure stdout list verb** for a `display-popup` "spawn something here" chord: it
+prints candidate names one-per-line and does nothing else (no spawn/switch/store
+write). The binding wraps it: `display-popup -E "hive spawn-picker --frame | fzf
+| xargs -r -I{} hive spawn --frame {} --here"`.
+
+```sh
+hive spawn-picker [--frame | --flow] [--here]
+```
+
+- `--frame` (default) — one frame name per line (via `listFrames()`).
+- `--flow` — one flow name per line (via `listFlows()`).
+- `--here` — a passthrough hint for the binding (so it appends `--here` to the
+  spawn action). It does **not** change the printed candidate set.
+- Empty candidate set → exit 0 with empty stdout (the binding's `xargs -r`
+  no-ops). The first whitespace/TAB field is the selectable machine token.
+- Reads the LOCAL store: hard-errors (non-zero) when the default substrate is
+  `ssh-tmux`, to avoid targeting the wrong fleet (KEYBINDINGS_PRD §8.1/§13).
+
+### `hive urls`
+
+Lists website URLs printed in a bee's pane, for an `fzf` + open-in-browser chord.
+Side-effect-free unless `--open`.
+
+```sh
+hive urls [<bee>] [--lines <n>] [--open] [--json]
+```
+
+- Default bee is the current pane (via `hive here` resolution); an explicit
+  selector grabs from another bee.
+- Captures pane scrollback via the substrate (`--lines` defaults to ~2000).
+- Extracts `http(s)` URLs, strips trailing punctuation, dedupes preserving
+  first-seen (recency) order.
+- Default output is one URL per line; `--json` emits a JSON array; `--open` opens
+  the **first** match via the platform opener (`open` on macOS, `xdg-open` on
+  Linux).
+- Empty → exit 0 with a dim "no URLs" note on stderr (so the popup closes
+  cleanly). An explicit selector hard-errors under an `ssh-tmux` default
+  substrate (it reads the LOCAL store).
+
+### `hive rename --here`
+
+An argv-reshaping convenience wrapper over `hive rename` for the cmd+r chord. It
+pulls the bare positional(s) as the **title**, resolves the current bee via `hive
+here`, and injects that id as the selector before delegating — so the title is
+never mistaken for a selector.
+
+```sh
+hive rename --here <new-title>
+```
+
+The non-`--here` behavior of `hive rename` is unchanged: `hive rename <selector>
+<title>`, `--auto` (daemon-style auto-title), `--clear`. Rename sets `@hive_title`
+(not the tmux session name), so the status bar and the `M-s` switcher line update
+without re-attach.
+
+### `hive keys`
+
+Print and verify the recommended binding set. Zero config mutation: hive ships a
+documented snippet plus verify tooling; the operator owns the bindings.
+
+```sh
+hive keys print [--tmux | --wezterm]    # emit the recommended block to stdout
+hive keys path                          # print the abs path of docs/honeybee.tmux.conf
+hive keys check [--against-recommended] # diagnose live binds, collisions, static checks
+```
+
+- `print` — `--tmux` (default) prints the tmux block **verbatim** from the same
+  source-of-truth string backing `docs/honeybee.tmux.conf`; `--wezterm` prints
+  the `cmd→Meta` additions for `~/.wezterm.lua`.
+- `path` — the absolute path of the shipped `docs/honeybee.tmux.conf` (resolved
+  relative to the hive install), for `source-file "$(hive keys path)"`. Path
+  stability caveat: it tracks the install location, so it is brittle across
+  reinstall/relocation (KEYBINDINGS_PRD §16 Q2).
+- `check` — a **pure read** that reports which recommended binds are present /
+  absent / collide (against `tmux list-keys -T root`), and runs static checks:
+  `fzf` on PATH, a browser opener on PATH, the substrate is `local-tmux` (warns
+  under `ssh-tmux`), and `hive` itself is reachable. Exits non-zero only on a hard
+  failure (`hive` unreachable); warnings otherwise. `--against-recommended` flags
+  live binds that drift from the shipped set.
+- **Limitation**: `check` reads `tmux list-keys`, so it is blind to the WezTerm
+  ALT/cmd layer in `~/.wezterm.lua` — that must be eyeballed (KEYBINDINGS_PRD §6).
+- `hive keys doctor` is an optional Phase 2 runtime popup-probe; it currently
+  reports "not yet implemented".
 
 ### `hive kill`
 

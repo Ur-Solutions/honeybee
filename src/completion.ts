@@ -24,11 +24,11 @@ const COMMANDS = [
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
   "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
-  "split", "fork", "here", "revive", "restore",
+  "split", "fork", "here", "spawn-picker", "urls", "keys", "revive", "restore",
 ];
 
 const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
-const WORKSPACE_SUBCOMMANDS = ["open", "list", "ls", "add", "add-pane", "snapshot", "restore", "close", "rename", "archive"];
+const WORKSPACE_SUBCOMMANDS = ["open", "list", "ls", "add", "add-pane", "snapshot", "restore", "close", "rename", "here", "archive"];
 const QUEST_SUBCOMMANDS = ["create", "start", "list", "ls", "inspect", "done", "archive"];
 const FRAME_SUBCOMMANDS = ["list", "ls", "define", "update", "reload", "edit", "inspect", "remove"];
 const SWARM_SUBCOMMANDS = ["list", "ls", "inspect", "destroy"];
@@ -40,6 +40,7 @@ const LOOP_SUBCOMMANDS = ["start", "status", "logs", "stop", "list", "ls"];
 const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "purge", "config"];
 const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
 const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "remove"];
+const KEYS_SUBCOMMANDS = ["print", "path", "check"];
 const SESSIONS_SUBCOMMANDS = ["reconcile"];
 const SYNC_SUBCOMMANDS = ["manifest"];
 
@@ -61,7 +62,7 @@ const SHELLS = ["bash", "zsh", "fish"];
 const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach", "view"]);
-const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "own", "move", "split", "fork", "revive"]);
+const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "own", "move", "split", "fork", "revive", "urls"]);
 const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 // Commands whose first positional is a vault account.
@@ -107,10 +108,13 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   send: ["--prompt", "-p"],
   kill: ["--comb"],
   here: ["--id", "--json"],
+  "spawn-picker": ["--frame", "--flow", "--here"],
+  urls: ["--lines", "--open", "--json"],
+  keys: ["--tmux", "--wezterm", "--against-recommended"],
   split: ["--brief", "--dir", "--cwd", "--home", "--profile", "--account", "--ttl", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--briefed"],
   fork: ["--agent", "--model", "--node", "--cwd", "--seed", "--read-log", "--name", "--account", "--here", "--print"],
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],
-  rename: ["--auto", "--clear"],
+  rename: ["--auto", "--clear", "--here"],
   tag: ["--remove", "--list"],
   own: ["--clear"],
   move: ["--colony", "--owner"],
@@ -220,6 +224,7 @@ const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   account: ACCOUNT_SUBCOMMANDS,
   sessions: SESSIONS_SUBCOMMANDS,
   sync: SYNC_SUBCOMMANDS,
+  keys: KEYS_SUBCOMMANDS,
 };
 
 const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "workspace" | "quest" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run" | "account">> = {
