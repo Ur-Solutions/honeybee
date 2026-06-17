@@ -36,6 +36,19 @@ import { chooseCleanTargets, type CleanTuiCleanOutcome, type CleanTuiItem } from
 import { assertExecutableAvailable } from "./execCheck.js";
 import { archiveColony, createColony, listColonies, loadColony, renameColony, updateColony } from "./colony.js";
 import {
+  archiveWorkspace,
+  createWorkspace,
+  listWorkspaces,
+  loadWorkspace,
+  renameWorkspace,
+  updateWorkspace,
+  WORKSPACE_PREFIX,
+  workspaceSessionName,
+  type WorkspaceMember,
+  type WorkspaceRecord,
+} from "./workspace.js";
+import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, windowInventory } from "./tmuxLink.js";
+import {
   BUZ_TIERS,
   type BuzMessage,
   type BuzSender,
@@ -106,7 +119,7 @@ import { hiveStateFor, writeHiveState, writeHiveTags, writeHiveTitle, writeSpawn
 import { type AttentionCandidate, parseAttentionStates, pickNextAttentionTarget } from "./attentionQueue.js";
 import { repoTagFor } from "./repoTag.js";
 import { dedupeTags, effectiveTags, isValidTagValue, normalizeTagArg, rejectReservedNamespaceTag } from "./tags.js";
-import { buildView, closeView, createGroupedView, deriveViewName, linkHere, viewSessionName } from "./view.js";
+import { buildView, closeView, createGroupedView, deriveViewName, linkHere, VIEW_PREFIX, viewSessionName } from "./view.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { gatherTitleContext, generateTitle } from "./naming.js";
@@ -204,6 +217,10 @@ async function main(argv: string[]) {
       break;
     case "colony":
       await cmdColony(parsed);
+      break;
+    case "workspace":
+    case "ws":
+      await cmdWorkspace(parsed);
       break;
     case "frame":
       await cmdFrame(parsed);
@@ -2946,6 +2963,425 @@ async function cascadeColonyRename(from: string, to: string): Promise<void> {
   }
 }
 
+async function cmdWorkspace(parsed: Parsed) {
+  const sub = parsed.args[0];
+  switch (sub) {
+    case undefined:
+    case "list":
+    case "ls":
+      return workspaceList(parsed);
+    case "open":
+      return workspaceOpen(parsed);
+    case "add":
+      return workspaceAdd(parsed);
+    case "add-pane":
+      return workspaceAddPane(parsed);
+    case "close":
+      return workspaceClose(parsed);
+    case "rename":
+      return workspaceRename(parsed);
+    case "archive":
+      return workspaceArchive(parsed);
+    default:
+      throw new Error(`Unknown workspace subcommand: ${sub}\nUsage: hive workspace <open|list|add|add-pane|close|rename|archive>`);
+  }
+}
+
+/**
+ * Resolve the workspace record for `name`, falling back to a same-named colony's
+ * auto-workspace. Returns null when neither exists.
+ */
+async function resolveWorkspaceRecord(name: string): Promise<WorkspaceRecord | null> {
+  const direct = await loadWorkspace(name);
+  if (direct) return direct;
+  // Fall back to a colony of the same name whose auto-workspace wasn't
+  // provisioned yet (or was created before this feature) — create it lazily.
+  const colony = await loadColony(name);
+  if (!colony) return null;
+  try {
+    return await createWorkspace({ name, rootDir: colony.rootDir ?? "", members: [], colony: name });
+  } catch {
+    // A concurrent create won the race; re-read.
+    return loadWorkspace(name);
+  }
+}
+
+/**
+ * Resolve-or-create the workspace record for `name`. A bare `open <name>` for a
+ * name that is neither a workspace nor a colony creates a stand-alone ad-hoc
+ * workspace (the PRD allows these alongside colony auto-workspaces).
+ */
+async function ensureWorkspaceRecord(name: string): Promise<WorkspaceRecord> {
+  const resolved = await resolveWorkspaceRecord(name);
+  if (resolved) return resolved;
+  try {
+    return await createWorkspace({ name, rootDir: "", members: [] });
+  } catch {
+    const reread = await loadWorkspace(name);
+    if (reread) return reread;
+    throw new Error(`Could not create workspace: ${name}`);
+  }
+}
+
+/** Resolve a workspace's file root: --root › record.rootDir › colony.rootDir › cwd. */
+async function resolveWorkspaceRoot(parsed: Parsed, record: WorkspaceRecord): Promise<string> {
+  const rootFlag = stringFlag(parsed, ["root"]);
+  if (rootFlag) return realpath(resolve(rootFlag.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"))).catch(() => resolve(rootFlag));
+  if (record.rootDir && record.rootDir.length > 0) return record.rootDir;
+  if (record.colony) {
+    const colony = await loadColony(record.colony);
+    if (colony?.rootDir) return colony.rootDir;
+  }
+  return process.cwd();
+}
+
+async function workspaceList(parsed: Parsed) {
+  const colonyFilter = stringFlag(parsed, ["colony"]);
+  const showArchived = truthy(flag(parsed, "archived"));
+  let workspaces = await listWorkspaces();
+  if (!showArchived) workspaces = workspaces.filter((w) => !w.archived);
+  if (colonyFilter) workspaces = workspaces.filter((w) => w.colony === colonyFilter);
+
+  if (!isPretty()) {
+    for (const w of workspaces) {
+      console.log(`${w.archived ? "archived" : "active"}\t${w.name}\t${w.rootDir}\t${w.colony ?? ""}\t${w.members.length}`);
+    }
+    return;
+  }
+  if (workspaces.length === 0) {
+    console.log(dim("No workspaces. Create one with: hive workspace open <name> --root <dir>"));
+    return;
+  }
+  console.log(formatTable(
+    [
+      { header: "STATUS" },
+      { header: "NAME" },
+      { header: "ROOT" },
+      { header: "COLONY" },
+      { header: "MEMBERS", align: "right" },
+      { header: "AGE", align: "right" },
+    ],
+    workspaces.map((w) => [
+      w.archived ? gray("archived") : green("active"),
+      bold(w.name),
+      dim(w.rootDir ? tildify(w.rootDir) : "(unset)"),
+      dim(w.colony ?? ""),
+      String(w.members.length),
+      dim(formatRelativeTime(w.createdAt)),
+    ]),
+  ));
+}
+
+/** Active window ids per local tmux session, for de-dupe on add/open. */
+async function workspaceWindowsOf(session: string): Promise<string[]> {
+  const inventory = await windowInventory();
+  return inventory.windows.get(session) ?? [];
+}
+
+async function workspaceOpen(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace open <name|colony> [--root <dir>] [--new-client] [--print]");
+  // open create-or-reuses: a colony's auto-workspace, an existing record, or a
+  // fresh stand-alone workspace for an unknown name.
+  const record = await ensureWorkspaceRecord(name);
+
+  const rootDir = await resolveWorkspaceRoot(parsed, record);
+  // Persist the resolved root on first open (when it was empty or --root given).
+  if (record.rootDir !== rootDir) {
+    await updateWorkspace(record.name, { rootDir });
+  }
+
+  const session = workspaceSessionName(record.name);
+  const ensured = await ensureLinkSession(session);
+  // Workspaces persist across terminal close — unlike views, never auto-destroyed.
+  await setWorkspaceOptions(session);
+  // The placeholder shell is the workspace's own window — mark it so `close`
+  // may kill-window it (it survives as the anchor of an empty/pane-only ws).
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+
+  // Materialize bee members: resolve each bee's live session, link its window in.
+  const records = await listSessions();
+  const byId = new Map(records.map((r) => [r.id ?? r.name, r] as const));
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const beeTargets: string[] = [];
+  for (const member of record.members) {
+    if (member.kind !== "bee") continue;
+    const bee = byId.get(member.beeId) ?? records.find((r) => r.name === member.beeId);
+    if (!bee) continue;
+    if (bee.node && bee.node !== LOCAL_NODE_NAME) continue;
+    if (!liveNames.has(bee.tmuxTarget)) continue;
+    beeTargets.push(bee.tmuxTarget);
+    // Converge with `add`: a member bee must carry workspaceId so ws:<name>
+    // (derived from bee.workspaceId) and record.members never disagree.
+    if (bee.workspaceId !== record.name) {
+      await updateSession(bee.name, { workspaceId: record.name });
+      await writeHiveTags({ ...bee, workspaceId: record.name });
+    }
+  }
+  const linkResult = await linkTargetsInto(session, beeTargets, ensured);
+
+  // Materialize pane members: a window at rootDir running the member's command
+  // (or a shell). Only when the session was freshly created this call — a
+  // re-open of a live session keeps its existing panes (native persistence).
+  if (ensured.created) {
+    for (const member of record.members) {
+      if (member.kind !== "pane") continue;
+      await openWorkspacePane(session, rootDir, member.command);
+    }
+    // If we created bee links, the placeholder is already gone; otherwise it
+    // remains as the single (shell) window — which is fine for an empty/pane-only
+    // workspace.
+  }
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "workspace", [bold(session), dim(`root ${tildify(rootDir)}`), `${linkResult.linked.length} bee(s) linked`]));
+  } else {
+    console.log(`workspace\t${session}\t${rootDir}\t${linkResult.linked.length}`);
+  }
+
+  let enterTarget = session;
+  if (truthy(flag(parsed, "new-client"))) {
+    enterTarget = await createGroupedSession(session);
+    if (isPretty()) console.error(note(`grouped session ${enterTarget} — independent focus on the same windows`));
+  }
+
+  const substrate = localSubstrate();
+  if (truthy(flag(parsed, "print")) || !process.stdout.isTTY) {
+    if (isPretty()) console.error(note("enter with:"));
+    console.log(formatShellCommand(substrate.attachCommand(enterTarget)));
+    return;
+  }
+  await substrate.attachSession(enterTarget);
+}
+
+/**
+ * Make a workspace session persist across terminal close (PRD §6/§7.2): never
+ * auto-destroyed when the last client detaches, and clients survive a window
+ * close. tmux's `set-option` does NOT accept the `=name` exact-match prefix
+ * (unlike has-session/kill-session/window targets), so the session is targeted
+ * by its bare exact name (freshly created, no prefix-collision risk).
+ */
+async function setWorkspaceOptions(session: string): Promise<void> {
+  await tmux(["set-option", "-t", session, "destroy-unattached", "off"], { reject: false });
+  await tmux(["set-option", "-t", session, "detach-on-destroy", "off"], { reject: false });
+}
+
+/** Open a window at `rootDir` running `command` (or the user's shell). */
+const WS_OWN_OPTION = "@hive_ws_own";
+
+// Mark a window the workspace itself created (the placeholder shell or an
+// add-pane shell) so `close` may kill-window it. A linked BEE window is NEVER
+// marked, so close can only ever safe-unlink (no -k) those — which is what makes
+// closing a workspace provably incapable of killing a bee, even one orphaned by
+// a prior `hive kill` (home session gone, window still linked here).
+async function markWorkspaceOwnWindow(session: string, windowId: string): Promise<void> {
+  if (!windowId) return;
+  await tmux(["set-option", "-w", "-t", `${session}:${windowId}`, WS_OWN_OPTION, "1"], { reject: false });
+}
+
+async function openWorkspacePane(session: string, rootDir: string, command?: string): Promise<void> {
+  const args = ["new-window", "-d", "-P", "-F", "#{window_id}", "-t", `=${session}:`, "-c", rootDir];
+  if (command && command.length > 0) args.push(command);
+  const result = await tmux(args, { reject: false });
+  await markWorkspaceOwnWindow(session, result.stdout.trim());
+}
+
+async function workspaceAdd(parsed: Parsed) {
+  const name = parsed.args[1];
+  const sel = parsed.args[2];
+  if (!name || !sel) throw new Error("Usage: hive workspace add <name> <bee-selector>");
+  const record = await ensureWorkspaceRecord(name);
+
+  const session = workspaceSessionName(record.name);
+  // Ensure the session exists so `add` works standalone (without a prior open).
+  const ensured = await ensureLinkSession(session);
+  if (ensured.created) {
+    await setWorkspaceOptions(session);
+  }
+
+  const resolved = await resolveSelector(sel);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${sel}`);
+
+  const local = records.filter((r) => !r.node || r.node === LOCAL_NODE_NAME);
+  if (local.length < records.length) {
+    console.error(note(`skip ${records.length - local.length} remote bee(s) — link-window cannot cross tmux servers`));
+  }
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const live = local.filter((r) => liveNames.has(r.tmuxTarget));
+  if (live.length < local.length) console.error(note(`skip ${local.length - live.length} dead bee(s)`));
+  if (live.length === 0) throw new Error(`No live local bees match selector: ${sel}`);
+
+  const members: WorkspaceMember[] = [...record.members];
+  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const inventory = await windowInventory();
+  let linkedCount = 0;
+  for (const bee of live) {
+    const windowId = inventory.active.get(bee.tmuxTarget);
+    if (!windowId) continue;
+    const currentWindows = await workspaceWindowsOf(session);
+    const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
+    linkedCount += linked;
+    const beeId = bee.id ?? bee.name;
+    if (!memberIds.has(beeId)) {
+      members.push({ kind: "bee", beeId });
+      memberIds.add(beeId);
+    }
+    // Stamp workspaceId on the live bee so the derived ws: tag refreshes
+    // (cmdMove colony pattern).
+    const now = new Date().toISOString();
+    await updateSession(bee.name, { workspaceId: record.name, updatedAt: now });
+    await writeHiveTags({ ...bee, workspaceId: record.name });
+  }
+  await updateWorkspace(record.name, { members });
+
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), `${linkedCount} bee(s) linked`]));
+  else console.log(`workspace-add\t${session}\t${linkedCount}`);
+}
+
+async function workspaceAddPane(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace add-pane <name> [--cmd \"...\"] [--name <label>]");
+  const record = await ensureWorkspaceRecord(name);
+
+  const command = stringFlag(parsed, ["cmd"]);
+  const label = stringFlag(parsed, ["name"]) ?? "pane";
+
+  const session = workspaceSessionName(record.name);
+  const ensured = await ensureLinkSession(session);
+  if (ensured.created) {
+    await setWorkspaceOptions(session);
+  }
+  const rootDir = await resolveWorkspaceRoot(parsed, record);
+  await openWorkspacePane(session, rootDir, command);
+
+  const members: WorkspaceMember[] = [...record.members, { kind: "pane", name: label, ...(command ? { command } : {}) }];
+  await updateWorkspace(record.name, { members });
+
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), dim(`pane ${label}`), command ? dim(command) : dim("shell")]));
+  else console.log(`workspace-add-pane\t${session}\t${label}`);
+}
+
+async function workspaceClose(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace close <name>");
+  const session = workspaceSessionName(name);
+  if (!(await hasSession(session))) throw new Error(`No such workspace session: ${session}`);
+  const result = await closeWorkspaceSession(session);
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), dim(`closed, ${result.unlinked} bee window(s) unlinked`)]));
+  else console.log(`workspace-closed\t${session}\t${result.unlinked}`);
+}
+
+/**
+ * Tear down a workspace session WITHOUT ever killing a bee (the view invariant,
+ * PRD §13), while still removing the workspace's OWN windows (the throwaway
+ * placeholder and shell/command panes we created).
+ *
+ * The discriminator is PROVENANCE, not link topology: only a window WE created
+ * carries the `@hive_ws_own` marker, so only those are kill-window'd. EVERY other
+ * window is treated as a bee link and is only ever safe-unlinked WITHOUT -k — and
+ * if that refuses (the ws is the window's last link, i.e. an orphaned bee whose
+ * home session is gone) we ABORT the whole close, leaving the workspace intact and
+ * the bee alive. An earlier "linked outside this group ⇒ bee" heuristic was unsound:
+ * an orphaned bee has no outside link either, so it would have been kill-window'd.
+ * view's uniform safe-unlink (a view holds only bees, no own windows) stays simpler;
+ * this preserves the same guarantee — a bee never loses its home to a workspace close.
+ */
+async function closeWorkspaceSession(session: string): Promise<{ sessions: string[]; unlinked: number }> {
+  const groupSet = new Set(await tmuxGroupSessions(session));
+
+  // Classify by PROVENANCE (the @hive_ws_own window marker), never by link
+  // topology. A window the workspace created is marked and may be kill-window'd;
+  // EVERY other window is a bee link and is only ever safe-unlinked WITHOUT -k,
+  // aborting if it is the window's last link (an orphaned bee whose home session
+  // is gone). The old "no link outside the group ⇒ ours" heuristic was unsound:
+  // an orphaned bee also has no outside link, so it would have been killed.
+  const listResult = await tmux(
+    ["list-windows", "-t", `=${session}`, "-F", "#{window_id}\t#{@hive_ws_own}"],
+    { reject: false },
+  );
+  const rows = listResult.ok ? listResult.stdout.split("\n").map((l) => l.trim()).filter(Boolean) : [];
+  const ownWindows: string[] = [];
+  const beeWindows: string[] = [];
+  for (const row of rows) {
+    const tab = row.indexOf("\t");
+    const wid = tab >= 0 ? row.slice(0, tab) : row;
+    const ownFlag = tab >= 0 ? row.slice(tab + 1).trim() : "";
+    (ownFlag === "1" ? ownWindows : beeWindows).push(wid);
+  }
+
+  // First: safe-unlink every (potential) bee window, and ABORT before any
+  // destruction if one refuses — so an aborted close leaves the workspace fully
+  // intact and the orphaned bee alive.
+  let unlinked = 0;
+  for (const wid of beeWindows) {
+    const result = await tmux(["unlink-window", "-t", `=${session}:${wid}`], { reject: false });
+    if (!result.ok) {
+      throw new Error(
+        `Refusing to close ${session}: window ${wid} is a bee whose own session is gone ` +
+          `(${result.stderr.trim() || "last link"}); re-home it first (hive workspace add <ws> <bee>) ` +
+          `or attach to rescue it: tmux attach -t ${session}.`,
+      );
+    }
+    unlinked += 1;
+  }
+  // Then: kill the windows the workspace owns, and the (now empty) group.
+  for (const wid of ownWindows) {
+    await tmux(["kill-window", "-t", `=${session}:${wid}`], { reject: false });
+  }
+  for (const s of groupSet) {
+    await tmux(["kill-session", "-t", `=${s}`], { reject: false });
+  }
+  return { sessions: [...groupSet], unlinked };
+}
+
+/** The session group for `session` (itself + grouped `<session>-<n>` clients). */
+async function tmuxGroupSessions(session: string): Promise<string[]> {
+  const groupResult = await tmux(["list-sessions", "-F", "#{session_name}\t#{session_group}"], { reject: false });
+  const pairs = (groupResult.ok ? groupResult.stdout.split("\n").filter(Boolean) : []).map((line) => {
+    const tab = line.indexOf("\t");
+    return [tab >= 0 ? line.slice(0, tab) : line, tab >= 0 ? line.slice(tab + 1) : ""] as const;
+  });
+  const group = pairs.find(([s]) => s === session)?.[1] ?? "";
+  const sessions = pairs
+    .filter(([s, g]) => s === session || (group.length > 0 && g === group && s.startsWith(`${session}-`)))
+    .map(([s]) => s);
+  if (!sessions.includes(session)) sessions.unshift(session);
+  return sessions;
+}
+
+async function workspaceRename(parsed: Parsed) {
+  const from = parsed.args[1];
+  const to = parsed.args[2];
+  if (!from || !to) throw new Error("Usage: hive workspace rename <old> <new>");
+  const record = await renameWorkspace(from, to);
+  // Rename the live ws- session if present.
+  const oldSession = workspaceSessionName(from);
+  const newSession = workspaceSessionName(to);
+  if (await hasSession(oldSession)) {
+    // rename-session does not accept the `=name` exact prefix; target the bare
+    // session name (it exists and is ws- prefixed, so no collision risk).
+    await tmux(["rename-session", "-t", oldSession, newSession], { reject: false });
+  }
+  // Cascade workspaceId on member bees (cascadeColonyRename pattern).
+  const sessions = await listSessions();
+  for (const bee of sessions) {
+    if (bee.workspaceId !== from) continue;
+    await updateSession(bee.name, { workspaceId: to, updatedAt: new Date().toISOString() });
+    await writeHiveTags({ ...bee, workspaceId: to });
+  }
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(record.name), dim(`renamed from ${from}`)]));
+  else console.log(`workspace-renamed\t${from}\t${to}`);
+}
+
+async function workspaceArchive(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace archive <name>");
+  const record = await archiveWorkspace(name);
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(record.name), dim("archived")]));
+  else console.log(`workspace-archived\t${record.name}`);
+}
+
 async function cmdFrame(parsed: Parsed) {
   const sub = parsed.args[0];
   switch (sub) {
@@ -4859,6 +5295,9 @@ async function cmdNext(parsed: Parsed): Promise<void> {
   const candidates: AttentionCandidate[] = [];
   for (const [session, state] of liveStates) {
     if (!state || state.length === 0) continue; // unset @hive_state → not tracked
+    // view-/ws- cockpits are link-window hosts, not bees: never surface them as
+    // attention targets even if a stray @hive_state leaked onto one (W4 defense).
+    if (session.startsWith(VIEW_PREFIX) || session.startsWith(WORKSPACE_PREFIX)) continue;
     const record = recordByTarget.get(session);
     candidates.push({
       session,

@@ -33,6 +33,7 @@ export type SelectorState = {
 
 const SWARM_PREFIX = "@";
 const COLONY_PREFIX = "colony:";
+const WORKSPACE_PREFIX = "ws:";
 const TAG_PREFIX = "tag:";
 const TAG_HASH = "#";
 const REL_VERBS: RelVerb[] = ["owns", "owned-by", "reports-to", "children-of", "forks-of"];
@@ -46,6 +47,15 @@ export function parseSelector(query: string): Selector {
     const name = trimmed.slice(COLONY_PREFIX.length);
     if (!name) throw new Error(`Empty colony selector: ${query}`);
     return { kind: "colony", name };
+  }
+
+  // ws:x → workspace membership, an alias for tag:workspace:x. The reserved
+  // `workspace:` getter derives the value from record.workspaceId, so this
+  // matches every bee whose home workspace is x. (WORKSPACES_AND_QUESTS §9)
+  if (trimmed.startsWith(WORKSPACE_PREFIX)) {
+    const name = trimmed.slice(WORKSPACE_PREFIX.length);
+    if (!name) throw new Error(`Empty workspace selector: ${query}`);
+    return { kind: "tag", namespace: "workspace", value: name };
   }
 
   // @x → swarm kind (kept for compat; same set as tag:swarm:x).

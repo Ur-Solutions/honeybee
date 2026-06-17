@@ -79,6 +79,9 @@ Selector forms:
 - `<bee>`: exact session name or unique session/id prefix.
 - `@<swarm-id>`: all sessions in a swarm.
 - `colony:<name>`: all sessions in a colony.
+- `ws:<name>`: all sessions whose home workspace is `<name>`. Resolves via the
+  derived `workspace:` reserved tag (from `record.workspaceId`), so `ws:fe` and
+  `tag:workspace:fe` resolve to the same set — exactly like `colony:`/`tag:colony:`.
 - `#<tag>` or `tag:<tag>`: all sessions carrying the bare user tag `<tag>`.
 - `tag:<ns>:<val>` or `<ns>:<val>` (reserved `<ns>`): all sessions carrying that
   namespaced tag, including the derived reserved facets. `colony:fe` and
@@ -857,6 +860,55 @@ Behavior and guarantees:
 - Caveat: `hive kill` on a bee whose window is linked in a view removes the
   bee's session, but the linked window (and the agent process) survives in the
   view until the view is closed.
+
+### `hive workspace` (alias `hive ws`)
+
+A **persisted** cockpit: a first-class store record (`WorkspaceRecord`) backing a
+`ws-<name>` tmux session with a file root, an optional colony, and a set of
+members — linked bee windows (like `view`) plus ordinary shell/command panes.
+Unlike a view it survives terminal close natively (the session is detached and
+`detach-on-destroy off`) and is never auto-destroyed. Every colony auto-gets a
+workspace of the same name; stand-alone workspaces are allowed.
+
+```sh
+hive workspace open <name|colony> [--root <dir>] [--new-client] [--print]
+hive workspace list [--colony <c>] [--archived]
+hive workspace add <name> <bee-selector>      # link existing bee(s) in, persist membership
+hive workspace add-pane <name> [--cmd "..."] [--name <label>]
+hive workspace close <name>                    # tear down the session, KEEP the record
+hive workspace rename <old> <new>
+hive workspace archive <name>
+```
+
+Examples:
+
+```sh
+hive workspace open fe --root ~/code/frontend  # create/enter ws-fe rooted there
+hive workspace add fe @review                  # link a swarm's windows into ws-fe
+hive workspace add-pane fe --cmd lazygit --name git
+hive workspace close fe                         # leaves every linked bee alive
+```
+
+Behavior and guarantees:
+
+- **Persisted**, unlike `view`: a `WorkspaceRecord` at
+  `~/.hive/workspaces/<name>.json` (CRUD + ledger `workspace.create|update|
+  rename|archive`). Closing the terminal does not lose it — reopening is a
+  re-attach.
+- `add` links each resolved bee's window into the session (shared link-window
+  core), records a `{kind:"bee",beeId}` member, and stamps the bee's
+  `record.workspaceId` so the derived `ws:<name>` selector lights up.
+- `add-pane` opens a window at the workspace's `rootDir` running `--cmd` (or a
+  shell) and records a `{kind:"pane"}` member.
+- `close` uses the same safe-unlink discipline as `view --close` (never `-k`,
+  aborts on a bee's last link, sweeps `ws-<name>-<n>` grouped clients) and keeps
+  the record. Closing a workspace is provably incapable of killing a bee.
+- A workspace session (`ws-*`) has **no** `SessionRecord`, so it never appears in
+  bee `list`/selectors/`clean` — the same exclusion discipline as `view-*`.
+- Local bees only — `link-window` cannot cross tmux servers; remote bees are
+  skipped with a warning.
+- Restore after a reboot (`hive workspace restore`) is Phase 2; Phase 1 covers
+  persisted sessions with native terminal-close persistence.
 
 ### `hive split`
 
