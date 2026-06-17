@@ -60,6 +60,12 @@ export type HiveFacadeOptions = {
    * Defaults to `flow:<flowName>:run:<runId>` so the cohort is addressable.
    */
   defaultSwarmId?: string;
+  /**
+   * When present, every spawned bee is stamped into this quest and its window
+   * linked into ws-<id>. Absent for non-quest runs — the spawn path is then
+   * byte-identical (the per-spawn `if (this.onSpawned)` branch is skipped).
+   */
+  onSpawned?: (record: SessionRecord) => Promise<void>;
 };
 
 export type FacadeWaitOptions = {
@@ -110,6 +116,8 @@ export class HiveFacade {
   readonly cleanup: "keep" | "kill-on-end";
   readonly defaultSwarmId: string;
   private readonly signal: AbortSignal | undefined;
+  /** Per-spawn hook (quest adoption). Undefined for non-quest runs. */
+  private readonly onSpawned: ((record: SessionRecord) => Promise<void>) | undefined;
   /** Bees the facade has spawned during this run — used for killAll. */
   private readonly spawned: SessionRecord[] = [];
 
@@ -118,6 +126,7 @@ export class HiveFacade {
     this.runId = options.runId;
     this.cleanup = options.cleanup ?? "keep";
     this.signal = options.signal;
+    this.onSpawned = options.onSpawned;
     this.defaultSwarmId = options.defaultSwarmId ?? `flow:${options.flowName}:run:${options.runId}`;
   }
 
@@ -172,6 +181,9 @@ export class HiveFacade {
     };
     if (record.node) handle.node = record.node;
 
+    // Record the spawn BEFORE the quest-adoption hook: the bee's tmux session is
+    // already live, so it must be ledgered even if onSpawned (the quest stamp/
+    // link) rejects — otherwise a live bee would exist with no flow.spawn entry.
     await appendLedger({
       type: "flow.spawn",
       flowName: this.flowName,
@@ -180,6 +192,12 @@ export class HiveFacade {
       agent: record.agent,
       node: record.node ?? LOCAL_NODE_NAME,
     });
+
+    // Quest adoption: stamp questId/workspaceId + link the window into ws-<id>.
+    // Runs after the push (so the bee is in the killAll snapshot path) and after
+    // the ledger (so a live bee is always recorded); a rejection still surfaces by
+    // failing spawn(). For non-quest runs this is undefined → identical flow.
+    if (this.onSpawned) await this.onSpawned(record);
 
     return handle;
   }

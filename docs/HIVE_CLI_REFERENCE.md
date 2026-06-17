@@ -951,7 +951,7 @@ this build covers `create`/`start` (open → active), `list`/`inspect`, and
 
 ```sh
 hive quest create "<title>" [--colony <c>] [--root <dir>] [--linear <issue>] [--description <text>]
-hive quest start  <id> --frame <f>
+hive quest start  <id> (--frame <f> | --flow <f>) [--arg key=value]...
 hive quest list   [--colony <c>] [--status <s>] [--json]
 hive quest inspect <id> [--json]
 hive quest done   <id> [--keep-bees] [--close-linear]
@@ -1023,10 +1023,17 @@ Behavior and guarantees:
   It requires the quest to be `done` first, is idempotent, and surfaces the quest
   in `quest list --status archived`. Ledger: `quest.archive`.
 
-The `--flow` variant of `start` and Linear issue enrichment land in later
-increments — they fail loud with a "lands in a later increment" message rather
-than partially executing. `--linear <issue>` on `create` is accepted and stored
-verbatim (offline-safe); issue fetch/seed is deferred.
+`start --flow <f>` runs a registered flow in the FOREGROUND into the quest's
+workspace: every bee the flow spawns is stamped `questId`/`colony`/`workspaceId`
+and its window linked into `ws-<id>` as it spawns, the quest's `swarmIds` record
+the flow's cohort (`flow:<name>:run:<runId>`), and the quest flips to `active`
+only on a successful run. `--arg key=value` is forwarded to the flow like
+`hive flow run`. The flow's `kill-on-end` cleanup is overridden to `keep` (the
+quest owns its bees); `start --flow --background` is not yet supported.
+
+Linear issue enrichment lands in a later increment — `--linear <issue>` on
+`create` is accepted and stored verbatim (offline-safe), and `--close-linear` on
+`done` is a no-op note; issue fetch/seed and write-back are deferred.
 
 ### `hive split`
 

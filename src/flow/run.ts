@@ -10,7 +10,7 @@
 // that re-execs this process under __flow-exec.
 
 import { appendFile, mkdir } from "node:fs/promises";
-import { appendLedger } from "../store.js";
+import { appendLedger, type SessionRecord } from "../store.js";
 import { DETACHED_RUN_ENV } from "./background.js";
 import { HiveFacade } from "./hive_facade.js";
 import type { Flow, FlowContext } from "./index.js";
@@ -37,6 +37,18 @@ export type ExecuteFlowOptions = {
   installSignalHandlers?: boolean;
   /** Mark this run as backgrounded (meta.background=true). */
   background?: boolean;
+  /**
+   * Per-spawn hook forwarded to HiveFacade.onSpawned. Used by
+   * `hive quest start --flow` to stamp + link each spawned bee into the quest.
+   */
+  onSpawned?: (record: SessionRecord) => Promise<void>;
+  /**
+   * Override the flow's own cleanup policy. `hive quest start --flow` passes
+   * "keep" so a flow authored with cleanup=kill-on-end does NOT tear down the
+   * bees the quest just adopted. Absent for all other callers → the flow's
+   * declared cleanup runs unchanged.
+   */
+  cleanupOverride?: "keep" | "kill-on-end";
 };
 
 export type ExecuteFlowResult = {
@@ -60,7 +72,7 @@ export type ExecuteFlowResult = {
 export async function executeFlow(flow: Flow, options: ExecuteFlowOptions = {}): Promise<ExecuteFlowResult> {
   const runId = options.runId ?? generateRunId();
   const args = applyDefaults(flow, options.args ?? {});
-  const cleanup = flow.cleanup ?? "keep";
+  const cleanup = options.cleanupOverride ?? flow.cleanup ?? "keep";
   const startedAt = new Date().toISOString();
 
   await createRunDir(flow.name, runId);
@@ -96,6 +108,7 @@ export async function executeFlow(flow: Flow, options: ExecuteFlowOptions = {}):
     runId,
     cleanup,
     signal: controller.signal,
+    ...(options.onSpawned ? { onSpawned: options.onSpawned } : {}),
   });
 
   let cancelled = false;

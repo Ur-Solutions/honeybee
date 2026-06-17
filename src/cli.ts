@@ -4024,11 +4024,10 @@ async function questStart(parsed: Parsed) {
   const idArg = parsed.args[1];
   if (!idArg) throw new Error("Usage: hive quest start <id> --frame <f>");
 
-  if (hasFlag(parsed, "flow")) {
-    throw new Error("hive quest start --flow: lands in a later increment (flow-driven quests are increment 9b)");
-  }
+  // --flow and --frame are mutually exclusive; --flow wins its own branch.
+  if (hasFlag(parsed, "flow")) return questStartFlow(parsed, idArg);
   const frameName = stringFlag(parsed, ["frame"]);
-  if (!frameName) throw new Error("hive quest start requires --frame <f> (--flow lands in a later increment)");
+  if (!frameName) throw new Error("hive quest start requires --frame <f> or --flow <f>");
 
   const quest = await resolveQuestRecord(idArg);
   if (!quest) throw new Error(`Unknown quest: ${idArg}`);
@@ -4103,6 +4102,121 @@ async function questStart(parsed: Parsed) {
   } else {
     console.log(`quest-started\t${quest.id}\t${swarmId ?? ""}\t${records.length}`);
   }
+}
+
+/**
+ * `hive quest start <id> --flow <name>` — run a flow in the FOREGROUND and adopt
+ * every bee it spawns into the quest, reaching the SAME end state as the --frame
+ * path: each bee carries questId + the quest's colony + workspaceId, each live
+ * local window is linked into ws-<id>, the workspace members are persisted, the
+ * flow's swarm cohort is appended to quest.swarmIds, and the quest is flipped to
+ * active (on success only).
+ *
+ * Foreground-only in this increment: the per-spawn stamp/link happens in-process
+ * via the onSpawned hook, which closes over the ensured link session + members
+ * accumulator. A --background child re-execs in a different process where that
+ * closure does not exist (spawnDetachedRun cannot carry a JS callback across the
+ * fork), so --flow --background is an explicit, guarded later-increment throw.
+ */
+async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
+  if (hasFlag(parsed, "background")) {
+    throw new Error("hive quest start --flow --background lands in a later increment");
+  }
+  const flowName = stringFlag(parsed, ["flow"]);
+  if (!flowName) throw new Error("Usage: hive quest start <id> --flow <name> [--arg key=value]...");
+
+  // Resolve + validate the quest BEFORE loading the flow so a bad id fails fast.
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+  if (quest.status === "archived" || quest.status === "done") {
+    throw new Error(`Quest ${quest.id} is ${quest.status}; cannot start work on it`);
+  }
+
+  const flow = await loadFlow(flowName);
+  if (!flow) throw new Error(`Unknown flow: ${flowName}`);
+  const args = parseFlowRunArgs(parsed);
+
+  // Prepare the quest's link session ONCE up front (mirror the --frame path) so
+  // ws-<id> exists before the first bee spawns and has a host for the link.
+  const session = workspaceSessionName(quest.workspace);
+  const ensured = await ensureLinkSession(session);
+  await setWorkspaceOptions(session);
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+
+  // Seed the members accumulator from the existing workspace record. The
+  // onSpawned hook appends to `members` as each bee spawns; we persist it once
+  // after the flow returns (members are records, so they survive kill-on-end).
+  const wsRecord = await loadWorkspace(quest.workspace);
+  const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
+  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+
+  // Per-spawn hook: replicate the --frame loop body for ONE bee. Liveness +
+  // the window inventory MUST be re-read per spawn — bees spawn over time, so a
+  // single up-front snapshot (as in the --frame path) would miss later windows.
+  const onSpawned = async (bee: SessionRecord): Promise<void> => {
+    await stampQuestMembership(bee, quest.id, quest.colony, quest.workspace);
+    // Only local + live windows can be link-window'd (the workspaceAdd discipline).
+    if (bee.node && bee.node !== LOCAL_NODE_NAME) return;
+    if (!(await localSubstrate().hasSession(bee.tmuxTarget))) return;
+    const inventory = await windowInventory();
+    const windowId = inventory.active.get(bee.tmuxTarget);
+    if (!windowId) return; // no live window to link — never record a phantom member
+    await linkTargetsInto(session, [bee.tmuxTarget], ensured);
+    const beeId = bee.id ?? bee.name;
+    if (!memberIds.has(beeId)) {
+      members.push({ kind: "bee", beeId });
+      memberIds.add(beeId);
+    }
+  };
+
+  // The flow's cohort swarmId is the facade default `flow:<name>:run:<runId>`.
+  // Reconstruct it (don't read it off a bee) so a zero-spawn flow still records
+  // the cohort and it never depends on a bee surviving cleanup.
+  const runId = generateRunId();
+  const swarmId = `flow:${flow.name}:run:${runId}`;
+  if (isPretty()) {
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(`flow ${flow.name}`), dim(`run ${runId}`)]));
+  } else {
+    console.log(`quest-flow\t${quest.id}\t${flow.name}\t${runId}`);
+  }
+
+  let outcome: Awaited<ReturnType<typeof executeFlow>>;
+  try {
+    // cleanupOverride:"keep" defeats a flow's kill-on-end — the quest owns its
+    // bees. Foreground (no installSignalHandlers override) so SIGINT aborts the
+    // run exactly like `hive flow run`.
+    outcome = await executeFlow(flow, { args, runId, onSpawned, cleanupOverride: "keep" });
+  } finally {
+    // Persist members REGARDLESS of outcome so the workspace reflects whatever
+    // bees were spawned + linked, even on a failed/cancelled run (the safe
+    // partial state — these bees are real quest members, not orphans).
+    await updateWorkspace(quest.workspace, { members });
+  }
+
+  // Flip the quest active ONLY on success: a crashed/aborted flow must never
+  // leave a phantom-active quest. Append the cohort swarmId either way is wrong
+  // — only record it when we actually activate.
+  if (outcome.status === "ok") {
+    const swarmIds = quest.swarmIds.includes(swarmId) ? quest.swarmIds : [...quest.swarmIds, swarmId];
+    await updateQuest(quest.id, {
+      status: "active",
+      swarmIds,
+      ...(quest.activatedAt ? {} : { activatedAt: new Date().toISOString() }),
+    });
+  }
+
+  if (isPretty()) {
+    const colored = outcome.status === "ok" ? green("ok")
+      : outcome.status === "cancelled" ? yellow("cancelled")
+      : outcome.status === "failed" ? red("failed")
+      : dim(outcome.status);
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(`@${swarmId}`), dim(`${members.length} bee(s)`), colored]));
+    if (outcome.error?.message) console.error(dim(`error: ${outcome.error.message}`));
+  } else {
+    console.log(`quest-started\t${quest.id}\t${swarmId}\t${members.length}\t${outcome.status}`);
+  }
+  if (outcome.status === "failed") process.exitCode = 1;
+  if (outcome.status === "cancelled") process.exitCode = 130;
 }
 
 /**

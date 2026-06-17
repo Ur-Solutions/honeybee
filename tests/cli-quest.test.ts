@@ -42,6 +42,21 @@ async function seedFrame(store: string, name: string, bee = "claude"): Promise<v
   await writeFile(join(framesDir, `${name}.json`), `${JSON.stringify(frame, null, 2)}\n`);
 }
 
+// A minimal JSON flow whose only step spawns ONE held-shell bee — the simplest
+// real flow that exercises the onSpawned adoption hook (spawnBeeForFlow does not
+// wait on readiness, so a held shell spawns hermetically). Extra steps can be
+// appended (e.g. a {{spawned.id}}-less "return" to fail) by the caller.
+async function seedFlow(
+  store: string,
+  name: string,
+  steps: Array<Record<string, unknown>> = [{ op: "spawn", as: "worker", bee: "claude", cwd: store }],
+): Promise<void> {
+  const flowsDir = join(store, "flows");
+  await mkdir(flowsDir, { recursive: true });
+  const flow = { name, description: `${name} (test flow)`, steps };
+  await writeFile(join(flowsDir, `${name}.json`), `${JSON.stringify(flow, null, 2)}\n`);
+}
+
 function hive(store: string, socket: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ stdout: string; stderr: string }> {
   return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
     cwd: process.cwd(),
@@ -199,20 +214,169 @@ test("Q1c: quest create without --colony auto-creates a colony from the title sl
   });
 });
 
-test("quest start --flow fails loud as later-increment work", { skip: !tmuxAvailable() }, async () => {
+test("Q1b-flow: quest start --flow adopts every flow-spawned bee into ws-<id>, all tagged", { skip: !tmuxAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
-    const created = await hive(store, socket, ["quest", "create", "later 1"]);
+    await seedFlow(store, "adopt");
+    const created = await hive(store, socket, ["quest", "create", "review 9001", "--colony", "reviews"]);
     const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
 
-    // --flow on start is deferred to a later increment.
-    let flowErr: (Error & { stderr?: string }) | undefined;
-    try {
-      await hive(store, socket, ["quest", "start", id, "--flow", "x"]);
-    } catch (e) {
-      flowErr = e as Error & { stderr?: string };
+    const started = await hive(store, socket, ["quest", "start", id, "--flow", "adopt"], CLAUDE_ENV);
+    // plain output: quest-started\t<id>\t<swarmId>\t<members>\t<status>
+    const sm = started.stdout.match(/quest-started\t(\S+)\t(\S*)\t(\d+)\t(\S+)/);
+    assert.ok(sm, `quest start --flow prints quest-started line: ${started.stdout}`);
+    const [, startedId, swarmId, beeCountStr, status] = sm!;
+    assert.equal(startedId, id);
+    assert.equal(status, "ok", "the flow ran to completion");
+    assert.equal(swarmId, `flow:adopt:run:${swarmId!.split(":run:")[1]}`, "swarm id is the flow cohort scheme");
+    assert.equal(Number(beeCountStr), 1, "the one-spawn flow adopted exactly one bee");
+
+    // ws-<id> session exists.
+    const session = `ws-${id}`;
+    assert.equal(await hasSessionLocal(session), true, "ws-<id> session exists");
+
+    // The flow-spawned bee carries questId=<id>, colony, workspaceId.
+    const bees = await listBeeRecords(store);
+    const questBees = bees.filter((b) => b.questId === id);
+    assert.equal(questBees.length, 1, "exactly one bee stamped with the quest id");
+    const bee = questBees[0]!;
+    assert.equal(bee.colony, "reviews", "flow bee carries the quest's colony");
+    assert.equal(bee.workspaceId, id, "flow bee carries the quest's workspace");
+    assert.ok(String(bee.runId).length > 0, "the bee is stamped with the flow runId");
+
+    // The bee's window is actually linked into ws-<id>.
+    const beeWindow = (await tmux(["display-message", "-p", "-t", `=${String(bee.tmuxTarget)}:`, "#{window_id}"], { reject: false })).stdout.trim();
+    assert.ok(beeWindow.length > 0, "bee window id resolved");
+    assert.ok((await sessionWindowIds(session)).includes(beeWindow), "the bee's window is linked into ws-<id>");
+
+    // Workspace membership persisted.
+    const ws = await readWs(store, id);
+    const members = ws.members as Array<{ kind: string; beeId?: string }>;
+    assert.ok(members.some((m) => m.kind === "bee" && m.beeId === bee.id), "bee membership persisted on the workspace");
+
+    // hive list quest:<id> --json resolves exactly those bees.
+    const rows = JSON.parse((await hive(store, socket, ["list", `quest:${id}`, "--json"])).stdout) as Array<{ name: string }>;
+    assert.deepEqual(rows.map((r) => r.name).sort(), questBees.map((b) => String(b.name)).sort(), "quest:<id> resolves exactly the flow's bees");
+
+    // Quest flipped active with the flow cohort recorded.
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "active", "quest is active after a successful flow start");
+    assert.deepEqual(quest.swarmIds, [swarmId], "the flow cohort swarm id is recorded on the quest");
+    assert.ok(typeof quest.activatedAt === "string" && (quest.activatedAt as string).length > 0, "activatedAt stamped");
+  });
+});
+
+test("plain `hive flow run` spawns bees WITHOUT a questId and never touches a workspace", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    await seedFlow(store, "plain");
+    await hive(store, socket, ["flow", "run", "plain", "--foreground"], CLAUDE_ENV);
+    const bees = await listBeeRecords(store);
+    assert.ok(bees.length >= 1, "the plain flow spawned a bee");
+    for (const b of bees) {
+      assert.equal(b.questId, undefined, "a non-quest flow bee carries NO questId");
+      assert.equal(b.workspaceId, undefined, "a non-quest flow bee carries NO workspaceId");
     }
-    assert.ok(flowErr, "quest start --flow exits non-zero");
-    assert.match(`${flowErr?.stderr ?? ""}${flowErr?.message ?? ""}`, /later increment/, "start --flow explains it is deferred");
+    // No workspaces directory artifacts were created by a plain flow run.
+    const wsFiles = await readdir(join(store, "workspaces")).catch(() => [] as string[]);
+    assert.equal(wsFiles.length, 0, "a plain flow run never creates a workspace record");
+  });
+});
+
+test("quest start --flow rejects an unknown flow and leaves the quest open", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "no such flow", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    let err: (Error & { stderr?: string }) | undefined;
+    try {
+      await hive(store, socket, ["quest", "start", id, "--flow", "ghost"], CLAUDE_ENV);
+    } catch (e) {
+      err = e as Error & { stderr?: string };
+    }
+    assert.ok(err, "unknown flow exits non-zero");
+    assert.match(`${err?.stderr ?? ""}${err?.message ?? ""}`, /Unknown flow: ghost/);
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "open", "the quest is NOT flipped active when the flow is unknown");
+  });
+});
+
+test("quest start --flow --background is a guarded later-increment throw", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    await seedFlow(store, "bg");
+    const created = await hive(store, socket, ["quest", "create", "bg quest", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    let err: (Error & { stderr?: string }) | undefined;
+    try {
+      await hive(store, socket, ["quest", "start", id, "--flow", "bg", "--background"], CLAUDE_ENV);
+    } catch (e) {
+      err = e as Error & { stderr?: string };
+    }
+    assert.ok(err, "--flow --background exits non-zero");
+    assert.match(`${err?.stderr ?? ""}${err?.message ?? ""}`, /later increment/, "explains it is deferred");
+  });
+});
+
+test("quest start --flow on an archived quest is rejected before the flow loads", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "arch quest", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    // Drive the quest into a terminal status directly on disk (no seedFlow on
+    // purpose: rejection must happen BEFORE the flow loads).
+    const questPath = join(store, "quests", id, "quest.json");
+    const q = JSON.parse(await readFile(questPath, "utf8")) as Record<string, unknown>;
+    q.status = "archived";
+    await writeFile(questPath, `${JSON.stringify(q, null, 2)}\n`);
+    let err: (Error & { stderr?: string }) | undefined;
+    try {
+      await hive(store, socket, ["quest", "start", id, "--flow", "adopt"], CLAUDE_ENV);
+    } catch (e) {
+      err = e as Error & { stderr?: string };
+    }
+    assert.ok(err, "archived quest --flow exits non-zero");
+    assert.match(`${err?.stderr ?? ""}${err?.message ?? ""}`, /is archived; cannot start/);
+  });
+});
+
+test("quest start --flow failure: bee is adopted + linked, quest NOT active, bee not killed", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    // A flow that spawns one bee then references an undefined binding in a brief
+    // — the second step throws at runtime, failing the flow AFTER the spawn.
+    await seedFlow(store, "halffail", [
+      { op: "spawn", as: "worker", bee: "claude", cwd: store },
+      { op: "brief", to: "{{missing.id}}", text: "unreachable target" },
+    ]);
+    const created = await hive(store, socket, ["quest", "create", "half fail", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+
+    let err: (Error & { stderr?: string; stdout?: string }) | undefined;
+    let startStdout = "";
+    try {
+      const r = await hive(store, socket, ["quest", "start", id, "--flow", "halffail"], CLAUDE_ENV);
+      startStdout = r.stdout;
+    } catch (e) {
+      err = e as Error & { stderr?: string; stdout?: string };
+      startStdout = err.stdout ?? "";
+    }
+    // The flow failed → exit code 1 (subprocess rejects), but the start line was
+    // still printed and the partial adoption happened.
+    assert.ok(err, "a failed flow exits non-zero (exitCode 1)");
+
+    // The already-spawned bee IS adopted: stamped + present, and NOT killed.
+    const bees = await listBeeRecords(store);
+    const questBees = bees.filter((b) => b.questId === id);
+    assert.equal(questBees.length, 1, "the bee spawned before the failure is still adopted");
+    const bee = questBees[0]!;
+    assert.equal(bee.colony, "reviews");
+    assert.equal(bee.workspaceId, id);
+    assert.equal(await hasSessionLocal(String(bee.tmuxTarget)), true, "the partially-adopted bee is NOT killed (cleanup=keep)");
+
+    // The bee is in workspace.members (the safe partial state was persisted).
+    const ws = await readWs(store, id);
+    const members = ws.members as Array<{ kind: string; beeId?: string }>;
+    assert.ok(members.some((m) => m.kind === "bee" && m.beeId === bee.id), "the partially-adopted bee is recorded as a member");
+
+    // The quest is NOT flipped active on failure.
+    const quest = await readQuestRecord(store, id);
+    assert.notEqual(quest.status, "active", "a failed flow must not leave a phantom-active quest");
+    assert.deepEqual(quest.swarmIds, [], "no swarm cohort recorded on a failed start");
   });
 });
 

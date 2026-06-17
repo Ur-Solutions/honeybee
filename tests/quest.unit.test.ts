@@ -14,6 +14,20 @@ import {
   validQuestId,
 } from "../src/quest.js";
 import { ledgerPath } from "../src/store.js";
+import { HiveFacade } from "../src/flow/hive_facade.js";
+
+// quest start --flow reconstructs the flow's cohort swarmId as
+// `flow:<name>:run:<runId>` (rather than reading it off a bee, so a zero-spawn
+// flow still records the cohort). This must stay byte-identical to the facade's
+// own default — assert against the real HiveFacade so a future rename of the
+// facade's scheme breaks loudly here instead of silently desyncing quest.swarmIds.
+test("quest --flow swarmId reconstruction matches HiveFacade.defaultSwarmId", () => {
+  const flowName = "review";
+  const runId = "20240101-abcd";
+  const reconstructed = `flow:${flowName}:run:${runId}`;
+  const facade = new HiveFacade({ flowName, runId });
+  assert.equal(reconstructed, facade.defaultSwarmId);
+});
 
 async function ledgerTypes(): Promise<string[]> {
   const raw = await readFile(ledgerPath(), "utf8").catch(() => "");
