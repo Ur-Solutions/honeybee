@@ -147,9 +147,13 @@ async function zaiLimits(account: AccountRecord, deps: LimitsDeps = {}): Promise
     Authorization: `Bearer ${token}`,
   })) as ZaiResponse;
   const limits = body?.data?.limits ?? [];
-  // TIME_LIMIT ~ the 5-hour window; TOKENS_LIMIT ~ the weekly window.
-  // `percentage` is USED percent (0-100); nextResetTime is epoch MS.
-  const time = limits.find((w) => w.type === "TIME_LIMIT");
+  // Verified against live data (2026-06-17): TOKENS_LIMIT is the rolling TOKEN
+  // cycle — the coding-capacity gate — and is the window that matters; map it
+  // to fiveHour. TIME_LIMIT is a SEPARATE MCP web-tools budget (its
+  // usageDetails list search-prime/web-reader/zread) on a longer reset; it is
+  // NOT a token-weekly quota, so we do not surface it as `weekly` — doing so
+  // would mislabel tool-call usage as token usage. `percentage` is USED percent
+  // (0-100); nextResetTime is epoch MS.
   const tokens = limits.find((w) => w.type === "TOKENS_LIMIT");
   const result: AccountLimits = {
     account: account.id,
@@ -158,8 +162,7 @@ async function zaiLimits(account: AccountRecord, deps: LimitsDeps = {}): Promise
     source: "oauth-api",
     ...(body?.data?.level ? { plan: body.data.level } : {}),
   };
-  if (time) result.fiveHour = zaiWindow(time, 300);
-  if (tokens) result.weekly = zaiWindow(tokens, 10_080);
+  if (tokens) result.fiveHour = zaiWindow(tokens, 300);
   if (!result.fiveHour && !result.weekly) {
     result.ok = false;
     result.error = "usage endpoint returned no windows";

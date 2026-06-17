@@ -92,14 +92,13 @@ test("zai fetcher parses the real fixture into 5h/weekly used% + resetsAt", asyn
     assert.equal(result!.tool, "opencode");
     assert.equal(result!.source, "oauth-api");
     assert.equal(result!.plan, "max");
-    // TIME_LIMIT -> 5h window; percentage is USED% directly.
-    assert.equal(result!.fiveHour?.usedPercent, 0);
+    // TOKENS_LIMIT (the rolling token cycle) -> fiveHour; percentage is USED%.
+    assert.equal(result!.fiveHour?.usedPercent, 1);
     assert.equal(result!.fiveHour?.windowMinutes, 300);
-    assert.equal(result!.fiveHour?.resetsAt, new Date(1781889695981).toISOString());
-    // TOKENS_LIMIT -> weekly window.
-    assert.equal(result!.weekly?.usedPercent, 1);
-    assert.equal(result!.weekly?.windowMinutes, 10_080);
-    assert.equal(result!.weekly?.resetsAt, new Date(1781613343588).toISOString());
+    assert.equal(result!.fiveHour?.resetsAt, new Date(1781613343588).toISOString());
+    // TIME_LIMIT is the separate MCP web-tools budget — NOT surfaced as a token
+    // weekly window (that would mislabel tool-call usage as token usage).
+    assert.equal(result!.weekly, undefined);
   });
 });
 
