@@ -62,6 +62,14 @@ export type AgentDriver = {
   modelArgs?: (model?: string, provider?: string) => string[];
 };
 
+// Rate-limit / exhaustion phrasing for the multi-provider coding CLIs
+// (opencode/grok/kimi). A resolution verb must sit adjacent to the limit phrase
+// — either before ("hit your usage limit") or after ("rate limit exceeded") —
+// so benign mentions like "increase your usage limit" or "the speed limit is
+// 60" never trip a false exhaustion. Refined against real panes in S4.
+const RATE_LIMIT_EXHAUSTED =
+  /(?:reached|hit|exceeded)\s+(?:your\s+)?(?:usage|rate)\s+limit|(?:usage|rate)\s+limit\s+(?:reached|hit|exceeded)|quota\s+(?:reached|exceeded)/i;
+
 const AGENT_DRIVERS: Record<string, AgentDriver> = {
   claude: {
     kind: "claude",
@@ -108,6 +116,9 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     // — a provider-less account yields no selector (falls back to opencode's
     // config default) rather than the malformed `--model undefined/<model>`.
     modelArgs: (model, provider) => (model && provider ? ["--model", `${provider}/${model}`] : []),
+    // opencode surfaces several providers' limit messages; the shared
+    // verb-anchored matcher keeps it narrow to avoid false positives.
+    isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
   },
   grok: {
     kind: "grok",
@@ -120,6 +131,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     identity: {
       credentialFiles: ["auth.json"],
     },
+    isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
   },
   kimi: {
     kind: "kimi",
@@ -131,6 +143,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
       // KIMI_CODE_HOME relocates the whole dir; the OAuth token lives under it.
       credentialFiles: ["credentials/kimi-code.json"],
     },
+    isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
   },
   cursor: {
     kind: "cursor",

@@ -136,6 +136,42 @@ test("swapAccount refuses tool mismatch and no-op swaps", async () => {
   });
 });
 
+test("swapAccount rejects a provider mismatch (opencode: glm bee -> minimax account)", async () => {
+  await withTempStore(async () => {
+    const { substrate } = fakeSubstrate(true);
+    const glmCurrent: AccountRecord = { id: "zai-current", tool: "opencode", label: "zai", addedAt: "2026-06-01T00:00:00.000Z", provider: "zai-coding-plan" };
+    const minimaxTarget: AccountRecord = { id: "mm-target", tool: "opencode", label: "mm", addedAt: "2026-06-01T00:00:00.000Z", provider: "minimax-coding-plan" };
+    const beeRecord = record({ agent: "opencode", accountId: "zai-current", homePath: "/tmp/home-oc" });
+    await assert.rejects(
+      () =>
+        swapAccount(beeRecord, minimaxTarget, {
+          substrate,
+          sleep: async () => undefined,
+          listAccounts: async () => [glmCurrent, minimaxTarget],
+        }),
+      /minimax-coding-plan account; bee .* runs on zai-coding-plan/,
+    );
+  });
+});
+
+test("swapAccount tolerates undefined provider (legacy claude swap still allowed)", async () => {
+  await withTempStore(async () => {
+    const { substrate, calls } = fakeSubstrate(true);
+    // Legacy current account carries no provider; the guard must be skipped.
+    const legacyCurrent: AccountRecord = { id: "claude-old", tool: "claude", label: "old@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
+    const existing = record();
+    await saveSession(existing);
+    const updated = await swapAccount(existing, account, {
+      substrate,
+      sleep: async () => undefined,
+      activate: async () => ["auth"],
+      listAccounts: async () => [legacyCurrent, account],
+    });
+    assert.equal(updated.accountId, "claude-new");
+    assert.ok(calls.some((call) => call.method === "newSession"));
+  });
+});
+
 test("swapAccount relaunches codex with CODEX_HOME but not HOME", async () => {
   await withTempStore(async () => {
     const { substrate, calls } = fakeSubstrate(false);

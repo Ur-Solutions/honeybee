@@ -83,8 +83,18 @@ export async function dispatchAutoswaps(
     const outcome: AutoswapOutcome = { bee: record.name, from: record.accountId, ok: false };
     try {
       const tool = canonicalAgentKind(record.agent).toLowerCase();
-      const accounts = (await resolveAccounts()).filter(
-        (account) => account.tool === tool && account.id !== record.accountId,
+      const all = await resolveAccounts();
+      // The bee's current account's provider scopes the candidate pool so a glm
+      // bee never swaps to a minimax account that merely shares the opencode
+      // CLI. TOLERATE undefined (fix #9): require provider equality only when
+      // BOTH sides are defined; otherwise fall back to tool-only (legacy
+      // single-provider-per-cli back-compat).
+      const fromProvider = all.find((account) => account.id === record.accountId)?.provider;
+      const accounts = all.filter(
+        (account) =>
+          account.tool === tool &&
+          account.id !== record.accountId &&
+          (fromProvider === undefined || account.provider === undefined || account.provider === fromProvider),
       );
       const candidates: AutoswapCandidate[] = [];
       for (const account of accounts) {

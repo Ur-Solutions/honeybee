@@ -34,11 +34,19 @@ test("providerAdapter / hasProviderAdapter reject unknown and undefined ids", ()
   assert.equal(providerAdapter(undefined), undefined);
 });
 
-test("S1 provider adapters are scaffold-only: no fetchLimits/isExhausted/login wired", () => {
+test("S3 wires fetchLimits for zai/minimax only; isExhausted/login stay unwired", () => {
+  // S3: the two opencode-hosted providers with documented quota endpoints get
+  // a fetchLimits; everyone else stays unsupported (degrades gracefully).
+  const FETCH_PROVIDERS = new Set<ProviderId>(["zai-coding-plan", "minimax-coding-plan"]);
   for (const id of ALL_IDS) {
     const adapter = providerAdapter(id)!;
-    assert.equal(adapter.fetchLimits, undefined, `${id}.fetchLimits unimplemented in S1`);
-    assert.equal(adapter.isExhausted, undefined, `${id}.isExhausted unimplemented in S1`);
-    assert.equal(adapter.login, undefined, `${id}.login unimplemented in S1`);
+    if (FETCH_PROVIDERS.has(id)) {
+      assert.equal(typeof adapter.fetchLimits, "function", `${id}.fetchLimits wired in S3`);
+    } else {
+      assert.equal(adapter.fetchLimits, undefined, `${id}.fetchLimits stays unsupported`);
+    }
+    // Pane signals stay on the DRIVER (CLI-keyed), not the provider adapter.
+    assert.equal(adapter.isExhausted, undefined, `${id}.isExhausted unwired`);
+    assert.equal(adapter.login, undefined, `${id}.login unwired`);
   }
 });

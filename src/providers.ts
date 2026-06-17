@@ -14,8 +14,12 @@
 // into a runtime import cycle.
 // ──────────────────────────────────────────────────────────────────────────
 
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { accountDir } from "./accounts.js";
+import { storeRoot } from "./fsx.js";
 import type { AccountRecord } from "./accounts.js";
-import type { AccountLimits, LimitsDeps } from "./limits.js";
+import type { AccountLimits, LimitsDeps, WindowUsage } from "./limits.js";
 import type { ExhaustionHit } from "./drivers.js";
 
 export type ProviderId =
@@ -49,8 +53,10 @@ const PROVIDERS: Record<string, ProviderAdapter> = {
   openai: { id: "openai" },
   xai: { id: "xai" },
   moonshot: { id: "moonshot" },
-  "minimax-coding-plan": { id: "minimax-coding-plan" },
-  "zai-coding-plan": { id: "zai-coding-plan" },
+  "minimax-coding-plan": { id: "minimax-coding-plan", fetchLimits: minimaxLimits },
+  "zai-coding-plan": { id: "zai-coding-plan", fetchLimits: zaiLimits },
+  // kimi-for-coding / moonshot have no documented quota endpoint → fetchLimits
+  // stays undefined → the dispatch degrades to `unsupported` (graceful).
   "kimi-for-coding": { id: "kimi-for-coding" },
 };
 
@@ -62,4 +68,181 @@ export function providerAdapter(id: string | undefined): ProviderAdapter | undef
 /** True when a provider id has a registered adapter. */
 export function hasProviderAdapter(id: string | undefined): boolean {
   return id ? id in PROVIDERS : false;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Provider quota fetchers (S3). Self-contained here so providers.ts imports
+// NOTHING from limits.ts at runtime (AccountLimits/WindowUsage/LimitsDeps are
+// type-only imports). Each fetcher:
+//   1. locates the account's opencode auth token (xdg-data/opencode/auth.json,
+//      keyed by provider id) across the vault + the account's dedicated homes;
+//   2. GETs the provider endpoint via deps.httpGetJson (injectable; tests mock
+//      it — NO real network in tests; production passes the global-fetch impl);
+//   3. parses the REAL response shape into fiveHour/weekly WindowUsage.
+// Live network validation is GATED ON S4 (the user's provider re-logins); the
+// token location may need adjustment once each opencode provider is re-logged
+// into its isolated store.
+// ──────────────────────────────────────────────────────────────────────────
+
+type OpencodeAuthEntry = { type?: string; key?: string; access?: string; token?: string };
+
+/**
+ * Read the opencode auth token for an account's provider. opencode keeps a
+ * single auth.json under $XDG_DATA_HOME/opencode/ keyed by provider id; the
+ * vault mirrors it at <accountDir>/xdg-data/opencode/auth.json and each
+ * dedicated home carries its own under <home>/xdg-data/opencode/auth.json.
+ * Returns the first token found (vault first, then homes), or null.
+ */
+async function opencodeProviderToken(account: AccountRecord): Promise<string | null> {
+  const rel = join("xdg-data", "opencode", "auth.json");
+  const candidates = [
+    join(accountDir(account), rel),
+    join(storeRoot(), "homes", account.id, rel),
+    join(storeRoot(), "login-homes", account.id, rel),
+  ];
+  for (const path of candidates) {
+    const raw = await readFile(path, "utf8").catch(() => null);
+    if (!raw) continue;
+    let parsed: Record<string, OpencodeAuthEntry>;
+    try {
+      parsed = JSON.parse(raw) as Record<string, OpencodeAuthEntry>;
+    } catch {
+      continue;
+    }
+    const entry = account.provider ? parsed[account.provider] : undefined;
+    const token = entry?.key ?? entry?.access ?? entry?.token;
+    if (typeof token === "string" && token.length > 0) return token;
+  }
+  return null;
+}
+
+const defaultHttpGetJson: NonNullable<LimitsDeps["httpGetJson"]> = async (url, headers) => {
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+  if (!response.ok) throw new Error(`${new URL(url).pathname}: HTTP ${response.status}`);
+  return response.json();
+};
+
+function unsupported(account: AccountRecord, source: AccountLimits["source"], error: string): AccountLimits {
+  return { account: account.id, tool: account.tool, ok: false, source, error };
+}
+
+/* ------------------------------------------------------------------ */
+/* z.ai (zai-coding-plan) — GET monitor/usage/quota/limit              */
+/* ------------------------------------------------------------------ */
+
+type ZaiLimitWindow = {
+  type?: string;
+  percentage?: number;
+  nextResetTime?: number;
+};
+type ZaiResponse = { data?: { limits?: ZaiLimitWindow[]; level?: string } };
+
+async function zaiLimits(account: AccountRecord, deps: LimitsDeps = {}): Promise<AccountLimits> {
+  const token = await opencodeProviderToken(account);
+  if (!token) {
+    return unsupported(account, "unsupported", "no zai-coding-plan token in opencode auth.json (vault or account home)");
+  }
+  const get = deps.httpGetJson ?? defaultHttpGetJson;
+  const body = (await get("https://api.z.ai/api/monitor/usage/quota/limit", {
+    Authorization: `Bearer ${token}`,
+  })) as ZaiResponse;
+  const limits = body?.data?.limits ?? [];
+  // TIME_LIMIT ~ the 5-hour window; TOKENS_LIMIT ~ the weekly window.
+  // `percentage` is USED percent (0-100); nextResetTime is epoch MS.
+  const time = limits.find((w) => w.type === "TIME_LIMIT");
+  const tokens = limits.find((w) => w.type === "TOKENS_LIMIT");
+  const result: AccountLimits = {
+    account: account.id,
+    tool: account.tool,
+    ok: true,
+    source: "oauth-api",
+    ...(body?.data?.level ? { plan: body.data.level } : {}),
+  };
+  if (time) result.fiveHour = zaiWindow(time, 300);
+  if (tokens) result.weekly = zaiWindow(tokens, 10_080);
+  if (!result.fiveHour && !result.weekly) {
+    result.ok = false;
+    result.error = "usage endpoint returned no windows";
+  }
+  return result;
+}
+
+function zaiWindow(window: ZaiLimitWindow, windowMinutes: number): WindowUsage {
+  return {
+    usedPercent: typeof window.percentage === "number" ? window.percentage : 0,
+    windowMinutes,
+    ...(typeof window.nextResetTime === "number" ? { resetsAt: new Date(window.nextResetTime).toISOString() } : {}),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* minimax (minimax-coding-plan) — GET v1/token_plan/remains           */
+/* ------------------------------------------------------------------ */
+
+type MinimaxModelRemains = {
+  current_interval_total_count?: number;
+  current_interval_usage_count?: number;
+  current_interval_remaining_percent?: number;
+  end_time?: number;
+  current_weekly_total_count?: number;
+  current_weekly_usage_count?: number;
+  weekly_end_time?: number;
+};
+type MinimaxResponse = { model_remains?: MinimaxModelRemains[] };
+
+async function minimaxLimits(account: AccountRecord, deps: LimitsDeps = {}): Promise<AccountLimits> {
+  const token = await opencodeProviderToken(account);
+  if (!token) {
+    return unsupported(account, "unsupported", "no minimax-coding-plan token in opencode auth.json (vault or account home)");
+  }
+  const get = deps.httpGetJson ?? defaultHttpGetJson;
+  // The .io host accepts the coding-plan key (.com rejects it).
+  const body = (await get("https://api.minimax.io/v1/token_plan/remains", {
+    Authorization: `Bearer ${token}`,
+  })) as MinimaxResponse;
+  const plan = body?.model_remains?.[0];
+  if (!plan) {
+    return { account: account.id, tool: account.tool, ok: false, source: "oauth-api", error: "token_plan/remains returned no model_remains" };
+  }
+  const result: AccountLimits = { account: account.id, tool: account.tool, ok: true, source: "oauth-api" };
+  // current_interval_* is the 5-hour window; current_weekly_* the weekly one.
+  // Percentages here are REMAINING — derive USED% from usage/total (preferred)
+  // and fall back to inverting remaining_percent.
+  result.fiveHour = minimaxWindow(
+    plan.current_interval_usage_count,
+    plan.current_interval_total_count,
+    plan.current_interval_remaining_percent,
+    plan.end_time,
+    300,
+  );
+  result.weekly = minimaxWindow(
+    plan.current_weekly_usage_count,
+    plan.current_weekly_total_count,
+    undefined,
+    plan.weekly_end_time,
+    10_080,
+  );
+  return result;
+}
+
+function minimaxWindow(
+  usage: number | undefined,
+  total: number | undefined,
+  remainingPercent: number | undefined,
+  endTime: number | undefined,
+  windowMinutes: number,
+): WindowUsage {
+  let usedPercent = 0;
+  if (typeof total === "number" && total > 0 && typeof usage === "number") {
+    usedPercent = Math.min(100, Math.max(0, (usage / total) * 100));
+  } else if (typeof remainingPercent === "number") {
+    // remaining_percent may arrive as a fraction (0-1) or a percent (0-100).
+    const remaining = remainingPercent <= 1 ? remainingPercent * 100 : remainingPercent;
+    usedPercent = Math.min(100, Math.max(0, 100 - remaining));
+  }
+  return {
+    usedPercent,
+    windowMinutes,
+    ...(typeof endTime === "number" ? { resetsAt: new Date(endTime).toISOString() } : {}),
+  };
 }

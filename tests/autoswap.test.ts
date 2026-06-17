@@ -123,3 +123,54 @@ test("dispatchAutoswaps skips bees without opt-in and reports no-candidate cases
   assert.equal(failing[0]!.ok, false);
   assert.equal(failing[0]!.error, "tmux exploded");
 });
+
+function providerAccount(id: string, addedAt: string, provider: string): AccountRecord {
+  return { id, tool: "opencode", label: id, addedAt, provider };
+}
+
+test("dispatchAutoswaps narrows candidates to the bee's provider (glm stays within zai)", async () => {
+  const swaps: string[] = [];
+  // A glm (zai) bee on opencode; the pool has another zai account + a minimax
+  // account that shares the opencode CLI. Only the zai one is a valid target.
+  const accounts: AccountRecord[] = [
+    providerAccount("zai-current", "2026-01-01T00:00:00Z", "zai-coding-plan"),
+    providerAccount("zai-spare", "2026-01-02T00:00:00Z", "zai-coding-plan"),
+    providerAccount("mm-other", "2026-01-01T00:00:00Z", "minimax-coding-plan"),
+  ];
+  const beeRecord = record({ name: "OC.a", agent: "opencode", accountId: "zai-current" });
+  const outcomes = await dispatchAutoswaps([beeRecord], [{ bee: "OC.a", account: "zai-current", sampled: false, exhausted: true }], {
+    listAccounts: async () => accounts,
+    accountHasCredentials: async () => true,
+    usageSummary: async (id) => summary(id),
+    swapAccount: async (target, next) => {
+      swaps.push(`${target.name}->${next.id}`);
+      return { ...target, accountId: next.id };
+    },
+    now: () => NOW,
+  });
+  // minimax must be excluded; only the same-provider zai spare is chosen.
+  assert.deepEqual(swaps, ["OC.a->zai-spare"]);
+  assert.equal(outcomes[0]!.to, "zai-spare");
+});
+
+test("dispatchAutoswaps tolerates undefined provider (legacy claude account still swaps)", async () => {
+  const swaps: string[] = [];
+  // Legacy accounts carry no provider; the narrowing must fall back to
+  // tool-only so claude bees keep swapping exactly as before.
+  const accounts = [
+    account("claude-current", "2026-01-01T00:00:00Z"),
+    account("claude-spare", "2026-01-02T00:00:00Z"),
+  ];
+  const outcomes = await dispatchAutoswaps([record()], [outcome("CL.a")], {
+    listAccounts: async () => accounts,
+    accountHasCredentials: async () => true,
+    usageSummary: async (id) => summary(id),
+    swapAccount: async (target, next) => {
+      swaps.push(`${target.name}->${next.id}`);
+      return { ...target, accountId: next.id };
+    },
+    now: () => NOW,
+  });
+  assert.deepEqual(swaps, ["CL.a->claude-spare"]);
+  assert.equal(outcomes[0]!.to, "claude-spare");
+});

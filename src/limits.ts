@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   type AccountRecord,
   type RefreshedClaudeToken,
+  PROVIDER_BY_CLI,
   accountDir,
   accountHasCredentials,
   candidateHomes,
@@ -18,6 +19,7 @@ import { launchEnv } from "./env.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { readClaudeKeychain } from "./keychain.js";
 import { withFileLock } from "./lock.js";
+import { providerAdapter } from "./providers.js";
 
 export type { RefreshedClaudeToken } from "./accounts.js";
 
@@ -67,6 +69,12 @@ export function windowRolledOver(window: WindowUsage, now = Date.now()): boolean
 export type AccountLimits = {
   account: string;
   tool: string;
+  /**
+   * The provider this account's quota belongs to (anthropic/openai/zai-coding-plan/…).
+   * Additive: populated from account.provider. `tool` stays populated for the
+   * table/back-compat; `provider` is the quota-source key.
+   */
+  provider?: string;
   ok: boolean;
   error?: string;
   fiveHour?: WindowUsage;
@@ -92,24 +100,59 @@ export type LimitsDeps = {
   /** Mirror a verified fresher credential into the vault file (no rotation). */
   persistVaultCredentials?: (account: AccountRecord, oauth: Record<string, unknown>) => Promise<void>;
   readKeychain?: typeof readClaudeKeychain;
+  /**
+   * Injectable JSON GET for provider quota endpoints (zai/minimax). Tests pass
+   * a mock; production falls back to the provider's own global-fetch impl. NO
+   * real network in tests. The provider fetchers read this off deps.
+   */
+  httpGetJson?: (url: string, headers: Record<string, string>) => Promise<unknown>;
   now?: () => number;
 };
 
+/**
+ * Provider-keyed limits dispatch. A CYCLE-FREE hybrid: self-contained provider
+ * fetchers (zai/minimax) live on the registry adapter in providers.ts (which
+ * imports limits.ts as TYPES ONLY); the heavyweight anthropic/openai paths stay
+ * in this module and are reached by an explicit provider check, so the registry
+ * never has to import claudeLimits/codexLimits at runtime. Output for existing
+ * claude/codex accounts is identical except for the additive `provider` field,
+ * which is stamped uniformly below.
+ */
 export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps = {}): Promise<AccountLimits[]> {
   return Promise.all(
     accounts.map(async (account) => {
+      // Dispatch on the effective provider: the record's own provider when
+      // present, else inferred from its cli. Belt-and-suspenders so the dispatch
+      // is robust even for a raw AccountRecord that never flowed through
+      // listAccounts' backfill (callers normally pass normalized records). The
+      // `provider` field is still STAMPED only from the literal account.provider,
+      // so a normalized record's output is byte-identical and an un-normalized
+      // one routes correctly without gaining a synthesized field.
+      const provider = account.provider ?? PROVIDER_BY_CLI[account.tool];
+      const stampProvider = (limits: AccountLimits): AccountLimits =>
+        account.provider ? { ...limits, provider: account.provider } : limits;
       try {
-        if (account.tool === "claude") return await claudeLimits(account, deps);
-        if (account.tool === "codex") return await codexLimits(account, deps);
-        return { account: account.id, tool: account.tool, ok: false, source: "unsupported" as const, error: `${account.tool} has no limits source yet` };
-      } catch (error) {
-        return {
+        const adapter = providerAdapter(provider);
+        if (adapter?.fetchLimits) return stampProvider(await adapter.fetchLimits(account, deps));
+        if (provider === "anthropic") return stampProvider(await claudeLimits(account, deps));
+        if (provider === "openai") return stampProvider(await codexLimits(account, deps));
+        return stampProvider({
           account: account.id,
           tool: account.tool,
           ok: false,
-          source: account.tool === "claude" ? ("oauth-api" as const) : ("session-snapshot" as const),
+          source: "unsupported" as const,
+          // fix #8: never print "undefined …" for a provider-less (legacy
+          // opencode) account.
+          error: provider ? `${provider} has no limits source` : "account has no provider",
+        });
+      } catch (error) {
+        return stampProvider({
+          account: account.id,
+          tool: account.tool,
+          ok: false,
+          source: provider === "anthropic" ? ("oauth-api" as const) : ("session-snapshot" as const),
           error: error instanceof Error ? error.message : String(error),
-        };
+        });
       }
     }),
   );

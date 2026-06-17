@@ -1,4 +1,4 @@
-import { activateAccountIntoHome, type AccountRecord } from "./accounts.js";
+import { activateAccountIntoHome, listAccounts, type AccountRecord } from "./accounts.js";
 import { canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
@@ -18,6 +18,8 @@ export type SwapAccountOptions = {
   pollIntervalMs?: number;
   /** Activation override (tests). Defaults to activateAccountIntoHome. */
   activate?: typeof activateAccountIntoHome;
+  /** Registry reader (tests). Defaults to listAccounts; used for the provider-match guard. */
+  listAccounts?: typeof listAccounts;
 };
 
 const DEFAULT_POLL_ATTEMPTS = 8;
@@ -31,6 +33,19 @@ export async function swapAccount(
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   if (tool !== account.tool) {
     throw new Error(`Account ${account.id} is a ${account.tool} account; bee ${record.name} runs ${tool}`);
+  }
+  // Provider-match guard with undefined-tolerance (fix #9): once a CLI hosts
+  // several providers (opencode → minimax/glm/kimi), a swap must stay within
+  // the bee's current provider. Skip the check when EITHER side's provider is
+  // undefined (legacy claude/codex accounts have no provider on the record).
+  if (record.accountId && account.provider) {
+    const fromProvider = (await (options.listAccounts ?? listAccounts)())
+      .find((other) => other.id === record.accountId)?.provider;
+    if (fromProvider && fromProvider !== account.provider) {
+      throw new Error(
+        `Account ${account.id} is a ${account.provider} account; bee ${record.name} runs on ${fromProvider}`,
+      );
+    }
   }
   if (!record.homePath) {
     throw new Error(
