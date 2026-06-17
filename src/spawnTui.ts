@@ -60,6 +60,12 @@ export type SpawnTuiHooks = {
   loadProjects: () => Promise<SpawnTuiProject[]>;
   /** Validate a typed path; ok=false surfaces `error` inline. */
   validatePath: (input: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
+  /**
+   * List directories up to two levels deep under `base` (junk like
+   * node_modules/dist/.git filtered out), for the path-mode live completion.
+   * Returns the resolved absolute base and absolute dir paths.
+   */
+  listSubdirs: (base: string) => Promise<{ ok: boolean; base: string; dirs: string[]; error?: string }>;
   /** Initial yolo state for a freshly chosen type. */
   defaultYolo: (kind: string) => boolean;
 };
@@ -91,6 +97,58 @@ export function resolveAccountStep(real: SpawnTuiAccount[]): {
   return { showColumn: false, account: undefined, label: "no account", rows: [] };
 }
 
+/**
+ * fzf-style incremental filter (kept pure for testing). Empty query keeps the
+ * original order; otherwise items are ranked: exact substring beats a scattered
+ * subsequence, earlier and more contiguous matches score higher, ties break on
+ * the shorter candidate. Non-matches are dropped.
+ */
+export function fuzzyFilter<T>(query: string, items: T[], key: (item: T) => string): T[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return items;
+  const scored: Array<{ item: T; score: number; len: number }> = [];
+  for (const item of items) {
+    const text = key(item);
+    const score = fuzzyScore(q, text.toLowerCase());
+    if (score >= 0) scored.push({ item, score, len: text.length });
+  }
+  scored.sort((a, b) => b.score - a.score || a.len - b.len);
+  return scored.map((entry) => entry.item);
+}
+
+function fuzzyScore(query: string, text: string): number {
+  const idx = text.indexOf(query);
+  if (idx >= 0) return 2000 - idx; // contiguous substring wins decisively
+  let from = 0;
+  let score = 0;
+  let streak = 0;
+  for (const ch of query) {
+    const found = text.indexOf(ch, from);
+    if (found < 0) return -1;
+    streak = found === from ? streak + 1 : 0;
+    score += 1 + streak;
+    from = found + 1;
+  }
+  return score;
+}
+
+/** Split a typed path into the directory to list and the trailing fuzzy query. */
+export function splitPathQuery(buffer: string): { base: string; query: string } {
+  const slash = buffer.lastIndexOf("/");
+  if (slash < 0) return { base: ".", query: buffer };
+  return { base: buffer.slice(0, slash) || "/", query: buffer.slice(slash + 1) };
+}
+
+function expandTilde(value: string): string {
+  return value.replace(/^~(?=\/|$)/, process.env.HOME ?? "~");
+}
+
+/** Display an absolute dir relative to `base` (falls back to the abs path). */
+export function relativeTo(base: string, abs: string): string {
+  const prefix = base.endsWith("/") ? base : `${base}/`;
+  return abs.startsWith(prefix) ? abs.slice(prefix.length) : abs;
+}
+
 export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult | null> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("hive new requires a TTY — run it from a tmux popup binding (e.g. M-n) or an interactive terminal.");
@@ -119,14 +177,20 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
   let cursorProjectMenu = 0;
   let cursorBrowse = 0;
   let browseScroll = 0;
+  let cursorPath = 0;
+  let pathScroll = 0;
 
   // ── async-loaded data ───────────────────────────────────────────────────
   let accounts: AsyncState<SpawnTuiAccount[]> = { state: "idle" };
   let accountRows: SpawnTuiAccount[] = []; // [auto, ...real] once loaded
   let projects: AsyncState<SpawnTuiProject[]> = { state: "idle" };
   let projectView: ProjectView = "menu";
-  let pathBuffer = "";
+  let browseQuery = "";                     // fzf filter for the pro repo list
+  let pathBuffer = "";                      // typed path (path mode)
   let pathError = "";
+  // Live subdir completion for path mode, keyed by the base dir being listed.
+  let subdirs: AsyncState<{ base: string; dirs: string[] }> = { state: "idle" };
+  let subdirsBase = "";                     // raw base string we last requested
   let message = "↑↓ pick · → enter advance · ← back · q cancel";
 
   readline.emitKeypressEvents(stdin);
@@ -244,6 +308,17 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       };
 
       // ── project column actions ────────────────────────────────────────────
+      const filteredProjects = (): SpawnTuiProject[] =>
+        projects.state === "loaded" ? fuzzyFilter(browseQuery, projects.items, (repo) => repo.label) : [];
+
+      const filteredSubdirs = (): Array<{ abs: string; rel: string }> => {
+        if (subdirs.state !== "loaded") return [];
+        const { base, dirs } = subdirs.items;
+        const { query } = splitPathQuery(expandTilde(pathBuffer));
+        const rows = dirs.map((abs) => ({ abs, rel: relativeTo(base, abs) }));
+        return fuzzyFilter(query, rows, (row) => row.rel);
+      };
+
       const activateProjectMenu = () => {
         const choice = PROJECT_MENU[cursorProjectMenu];
         if (choice === "here") {
@@ -251,30 +326,79 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
           spawn();
         } else if (choice === "project") {
           projectView = "browse";
+          browseQuery = "";
           cursorBrowse = 0;
           browseScroll = 0;
-          message = "↑↓ pick repo · enter spawn here · ← back to project menu";
+          message = "type to filter · ↑↓ pick · enter spawn · esc back";
+          stdout.write("\x1b[?25h"); // show cursor for the filter field
           void loadProjectsIfNeeded();
           render();
         } else {
           projectView = "path";
-          pathBuffer = hooks.defaultCwd;
+          pathBuffer = hooks.defaultCwd.endsWith("/") ? hooks.defaultCwd : `${hooks.defaultCwd}/`;
           pathError = "";
-          message = "type a path · enter to validate & spawn · esc to go back";
-          stdout.write("\x1b[?25h"); // show cursor for typing
-          render();
+          subdirs = { state: "idle" };
+          subdirsBase = "";
+          cursorPath = 0;
+          pathScroll = 0;
+          message = "type to filter · ↑↓ pick · tab drills in · enter spawn · esc back";
+          stdout.write("\x1b[?25h");
+          refreshPathCompletion();
         }
       };
 
       const chooseBrowse = () => {
-        if (projects.state !== "loaded") return;
-        const repo = projects.items[cursorBrowse];
+        const repo = filteredProjects()[cursorBrowse];
         if (!repo) return;
         selCwd = repo.path;
         spawn();
       };
 
+      // Reload the subdir list whenever the directory portion of the buffer
+      // changes; editing only the trailing query reuses the loaded list.
+      const refreshPathCompletion = () => {
+        const { base } = splitPathQuery(expandTilde(pathBuffer));
+        if (base === subdirsBase && subdirs.state !== "idle") { render(); return; }
+        subdirsBase = base;
+        subdirs = { state: "loading" };
+        cursorPath = 0;
+        pathScroll = 0;
+        render();
+        void hooks
+          .listSubdirs(base)
+          .then((res) => {
+            if (done) return;
+            if (splitPathQuery(expandTilde(pathBuffer)).base !== base) return; // stale
+            subdirs = res.ok
+              ? { state: "loaded", items: { base: res.base, dirs: res.dirs } }
+              : { state: "error", error: res.error ?? "cannot read directory" };
+            render();
+          })
+          .catch((error) => {
+            if (done) return;
+            subdirs = { state: "error", error: error instanceof Error ? error.message : String(error) };
+            render();
+          });
+      };
+
+      const drillPath = () => {
+        const pick = filteredSubdirs()[cursorPath];
+        if (!pick) return;
+        pathBuffer = pick.abs.endsWith("/") ? pick.abs : `${pick.abs}/`;
+        pathError = "";
+        cursorPath = 0;
+        refreshPathCompletion();
+      };
+
       const submitPath = async () => {
+        const pick = filteredSubdirs()[cursorPath];
+        if (pick) {
+          stdout.write("\x1b[?25l");
+          selCwd = pick.abs;
+          spawn();
+          return;
+        }
+        // Nothing matched the completion — fall back to validating the literal text.
         const input = pathBuffer.trim();
         if (!input) { pathError = "enter a path"; render(); return; }
         const result = await hooks.validatePath(input);
@@ -313,15 +437,17 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       };
 
       const moveCursor = (delta: number) => {
+        // Browse/path modes capture their own up/down in the typing handler
+        // (j/k are literal text there), so this only covers menu-style stages.
         if (stage === "type") cursorType = clamp(cursorType + delta, hooks.types.length);
         else if (stage === "account") cursorAccount = clamp(cursorAccount + delta, accountRows.length);
         else if (stage === "config") cursorConfig = clamp(cursorConfig + delta, configRows().length);
-        else if (stage === "project") {
-          if (projectView === "menu") cursorProjectMenu = clamp(cursorProjectMenu + delta, PROJECT_MENU.length);
-          else if (projectView === "browse" && projects.state === "loaded") cursorBrowse = clamp(cursorBrowse + delta, projects.items.length);
-        }
+        else if (stage === "project" && projectView === "menu") cursorProjectMenu = clamp(cursorProjectMenu + delta, PROJECT_MENU.length);
         render();
       };
+
+      const moveBrowse = (delta: number) => { cursorBrowse = clamp(cursorBrowse + delta, filteredProjects().length); render(); };
+      const movePath = (delta: number) => { cursorPath = clamp(cursorPath + delta, filteredSubdirs().length); render(); };
 
       const advance = () => {
         if (stage === "type") { void chooseType(); return; }
@@ -355,20 +481,40 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         }
       };
 
-      // ── path-input typing ─────────────────────────────────────────────────
+      // ── type-to-filter modes ──────────────────────────────────────────────
+      // Both the pro-repo browser and the path completer are fzf-style: letters
+      // edit a query, arrows move the highlight (j/k would be literal text).
+      const isPrintable = (value: string, key: readline.Key) =>
+        Boolean(value) && value.length === 1 && value >= " " && !key.ctrl && !key.meta;
+
+      const handleBrowseKey = (value: string, key: readline.Key): boolean => {
+        if (!(stage === "project" && projectView === "browse")) return false;
+        if (key.name === "return" || key.name === "enter") { chooseBrowse(); return true; }
+        if (key.name === "escape" || key.name === "left") { goBack(); return true; }
+        if (key.name === "up") { moveBrowse(-1); return true; }
+        if (key.name === "down") { moveBrowse(1); return true; }
+        if (key.name === "backspace") { browseQuery = browseQuery.slice(0, -1); cursorBrowse = 0; render(); return true; }
+        if (key.ctrl && key.name === "u") { browseQuery = ""; cursorBrowse = 0; render(); return true; }
+        if (isPrintable(value, key)) { browseQuery += value; cursorBrowse = 0; render(); return true; }
+        return true; // consume everything else while filtering
+      };
+
       const handlePathKey = (value: string, key: readline.Key): boolean => {
         if (!(stage === "project" && projectView === "path")) return false;
         if (key.name === "return" || key.name === "enter") { void submitPath(); return true; }
-        if (key.name === "escape") { goBack(); return true; }
-        if (key.name === "backspace") { pathBuffer = pathBuffer.slice(0, -1); pathError = ""; render(); return true; }
-        if (key.ctrl && key.name === "u") { pathBuffer = ""; pathError = ""; render(); return true; }
-        if (key.ctrl || key.meta) return true; // swallow other control keys
-        if (value && value.length === 1 && value >= " ") { pathBuffer += value; pathError = ""; render(); return true; }
-        return true; // in path mode, consume everything else
+        if (key.name === "escape" || key.name === "left") { goBack(); return true; }
+        if (key.name === "tab") { drillPath(); return true; }
+        if (key.name === "up") { movePath(-1); return true; }
+        if (key.name === "down") { movePath(1); return true; }
+        if (key.name === "backspace") { pathBuffer = pathBuffer.slice(0, -1); pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
+        if (key.ctrl && key.name === "u") { pathBuffer = ""; pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
+        if (isPrintable(value, key)) { pathBuffer += value; pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
+        return true;
       };
 
       const onKey = (value: string, key: readline.Key) => {
         if (key.ctrl && key.name === "c") { finish(null); return; }
+        if (handleBrowseKey(value, key)) return;
         if (handlePathKey(value, key)) return;
         switch (key.name) {
           case "q":
@@ -423,14 +569,17 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         // pad body
         while (lines.length < height - 2) lines.push("");
         lines.push(truncate(pathError ? red(pathError) : message, width));
-        lines.push(dim("j/k move · h/l columns · enter advance · +/- count · q quit"));
+        const footer = inBrowse || inPath
+          ? "type to filter · ↑↓ move · enter select · esc back"
+          : "j/k move · h/l columns · enter advance · +/- count · q quit";
+        lines.push(dim(footer));
         stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
-        if (inPath) {
-          // Park the real cursor at the end of the input line. Body starts on
-          // the 3rd line (header, blank, then "  <buffer>"); the buffer is
-          // indented two columns.
-          const promptRow = 3;
-          stdout.write(`\x1b[${promptRow};${2 + visibleLength(pathBuffer) + 1}H`);
+        if (inPath || inBrowse) {
+          // Park the real cursor at the end of the "> " filter field. Body
+          // starts on the 3rd screen line (header, blank, then "> <text>"),
+          // and the "> " prompt is two columns wide.
+          const text = inPath ? pathBuffer : browseQuery;
+          stdout.write(`\x1b[3;${2 + visibleLength(text) + 1}H`);
         }
       };
 
@@ -509,29 +658,44 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       };
 
       const renderFull = (width: number, bodyRows: number, inBrowse: boolean): string[] => {
+        const listRows = Math.max(1, bodyRows - 2);
         if (inBrowse) {
-          if (projects.state === "loading") return [dim("loading projects from `pro`…")];
-          if (projects.state === "error") return [red(projects.error), "", dim("press ← to go back and choose another option")];
-          if (projects.state !== "loaded" || projects.items.length === 0) return [dim("no pro repos found"), "", dim("press ← to go back")];
-          const items = projects.items;
+          const total = projects.state === "loaded" ? projects.items.length : 0;
+          const list = filteredProjects();
+          const out: string[] = [`${cyan("> ")}${browseQuery}`];
+          if (projects.state === "loading") { out.push(dim("loading repos from `pro`…")); return out; }
+          if (projects.state === "error") { out.push(red(projects.error)); return out; }
+          out.push(dim(`${list.length}/${total} repos`));
+          if (list.length === 0) { out.push(dim(total === 0 ? "no pro repos found" : "no match")); return out; }
           if (cursorBrowse < browseScroll) browseScroll = cursorBrowse;
-          if (cursorBrowse >= browseScroll + bodyRows) browseScroll = cursorBrowse - bodyRows + 1;
-          const visible = items.slice(browseScroll, browseScroll + bodyRows);
-          return visible.map((repo, i) => {
+          if (cursorBrowse >= browseScroll + listRows) browseScroll = cursorBrowse - listRows + 1;
+          for (let i = 0; i < Math.min(listRows, list.length - browseScroll); i += 1) {
             const idx = browseScroll + i;
+            const repo = list[idx]!;
             const pointer = idx === cursorBrowse ? green("›") : " ";
             const label = truncate(repo.label, Math.max(10, Math.floor(width * 0.5)));
             const path = dim(truncate(repo.path, Math.max(10, width - visibleLength(label) - 6)));
             const line = `${pointer} ${idx === cursorBrowse ? bold(label) : label}  ${path}`;
-            return idx === cursorBrowse && isPretty() ? reverse(stripAnsi(line)) : line;
-          });
+            out.push(idx === cursorBrowse && isPretty() ? reverse(stripAnsi(line)) : line);
+          }
+          return out;
         }
-        // path input
-        return [
-          `  ${pathBuffer}`,
-          "",
-          dim("enter to validate & spawn · esc to go back · ctrl-u clears"),
-        ];
+        // path completion
+        const list = filteredSubdirs();
+        const out: string[] = [`${cyan("> ")}${pathBuffer}`];
+        if (subdirs.state === "loading") { out.push(dim("scanning…")); return out; }
+        if (subdirs.state === "error") { out.push(dim(`${subdirs.error} — enter spawns the typed path`)); return out; }
+        out.push(dim(list.length === 0 ? "no subfolders match — enter spawns the typed path" : `${list.length} folder${list.length === 1 ? "" : "s"} · tab drills in`));
+        if (cursorPath < pathScroll) pathScroll = cursorPath;
+        if (cursorPath >= pathScroll + listRows) pathScroll = cursorPath - listRows + 1;
+        for (let i = 0; i < Math.min(listRows, list.length - pathScroll); i += 1) {
+          const idx = pathScroll + i;
+          const row = list[idx]!;
+          const pointer = idx === cursorPath ? green("›") : " ";
+          const line = `${pointer} ${row.rel}`;
+          out.push(idx === cursorPath && isPretty() ? reverse(stripAnsi(line)) : truncate(line, width));
+        }
+        return out;
       };
 
       const onResize = () => render();

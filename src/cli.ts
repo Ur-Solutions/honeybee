@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { access, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
@@ -518,6 +518,7 @@ async function cmdNew(parsed: Parsed): Promise<void> {
         return { ok: false, error: "path does not exist" };
       }
     },
+    listSubdirs: (base) => listNewBeeSubdirs(base),
   });
 
   if (!plan) {
@@ -565,6 +566,52 @@ function newBeeUsageCell(limits: AccountLimits | undefined, now: number): string
     window ? `${label} ${Math.round(windowRolledOver(window, now) ? 0 : window.usedPercent)}%` : null;
   const parts = [cell("5h", limits.fiveHour), cell("wk", limits.weekly)].filter(Boolean);
   return parts.length ? parts.join(" · ") : undefined;
+}
+
+/** Junk dir names never worth offering as a spawn cwd. */
+const NEW_BEE_SUBDIR_IGNORE = new Set([
+  "node_modules", "dist", "build", "out", "target", "vendor", "coverage",
+  ".git", ".next", ".turbo", ".cache", ".venv", "__pycache__", ".idea", ".vscode",
+]);
+const NEW_BEE_SUBDIR_CAP = 800;
+
+/**
+ * Directories up to two levels deep under `base`, for the `hive new` path
+ * completer. Junk (node_modules/dist/.git/…) and dotdirs are skipped; the list
+ * is capped so a huge tree can't stall the picker. Errors come back as
+ * `{ ok: false }` rather than throwing, so the TUI degrades to literal-path entry.
+ */
+async function listNewBeeSubdirs(
+  base: string,
+): Promise<{ ok: boolean; base: string; dirs: string[]; error?: string }> {
+  const keep = (name: string) => !name.startsWith(".") && !NEW_BEE_SUBDIR_IGNORE.has(name);
+  try {
+    const abs = await realpath(resolve(base.replace(/^~(?=\/|$)/, process.env.HOME ?? "~")));
+    const dirs: string[] = [];
+    const level1: string[] = [];
+    for (const entry of await readdir(abs, { withFileTypes: true })) {
+      if (entry.isDirectory() && keep(entry.name)) level1.push(`${abs}/${entry.name}`);
+    }
+    level1.sort();
+    dirs.push(...level1);
+    for (const dir of level1) {
+      if (dirs.length >= NEW_BEE_SUBDIR_CAP) break;
+      let children: import("node:fs").Dirent[] = [];
+      try {
+        children = await readdir(dir, { withFileTypes: true });
+      } catch {
+        continue; // unreadable subdir (perms) — skip its children
+      }
+      const grand = children
+        .filter((entry) => entry.isDirectory() && keep(entry.name))
+        .map((entry) => `${dir}/${entry.name}`)
+        .sort();
+      dirs.push(...grand);
+    }
+    return { ok: true, base: abs, dirs: dirs.slice(0, NEW_BEE_SUBDIR_CAP) };
+  } catch {
+    return { ok: false, base, dirs: [], error: "cannot read directory" };
+  }
 }
 
 async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<SessionRecord[]> {
