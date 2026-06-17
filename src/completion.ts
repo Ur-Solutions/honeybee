@@ -21,7 +21,7 @@ const COMMANDS = [
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
-  "brief", "rename", "seal", "config", "completion", "help",
+  "brief", "rename", "seal", "config", "completion", "help", "tag",
   "split", "here", "revive",
 ];
 
@@ -57,7 +57,7 @@ const SHELLS = ["bash", "zsh", "fish"];
 const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach", "view"]);
-const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "split", "revive"]);
+const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "split", "revive"]);
 const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 const SHELL_FIRST_ARG = new Set(["completion"]);
 // Commands whose first positional is a vault account.
@@ -102,6 +102,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   split: ["--brief", "--dir", "--cwd", "--home", "--profile", "--account", "--ttl", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--briefed"],
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],
   rename: ["--auto", "--clear"],
+  tag: ["--remove", "--list"],
   seal: ["--from"],
   last: ["-n", "--lines", "--seal"],
   wait: ["--idle-ms", "--idle", "--timeout-ms", "--timeout", "--poll-ms", "--poll", "--last", "--transcript", "--seal", "-n", "--limit", "--json"],
@@ -110,8 +111,8 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   transcript: ["-n", "--limit", "--json"],
   tx: ["-n", "--limit", "--json"],
   clean: ["--dead", "--idle", "--interactive", "-i", "--older-than", "--older", "--dry-run", "-n"],
-  list: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--json", "--wide"],
-  ps: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--json", "--wide"],
+  list: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--tag", "--json", "--wide"],
+  ps: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--tag", "--json", "--wide"],
   attach: ["--print"],
   search: ["--colony", "--swarm", "--bee", "--type", "--status", "--since", "--regex", "--case", "--limit", "--json"],
   seals: ["--colony", "--swarm", "--bee", "--status", "--since", "--regex", "--case", "--limit", "--json"],

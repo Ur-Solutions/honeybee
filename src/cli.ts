@@ -101,8 +101,9 @@ import { resolveSelector } from "./selectors.js";
 import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
-import { hiveStateFor, writeHiveState, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
+import { hiveStateFor, writeHiveState, writeHiveTags, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
 import { repoTagFor } from "./repoTag.js";
+import { dedupeTags, effectiveTags, isValidTagValue, normalizeTagArg, rejectReservedNamespaceTag } from "./tags.js";
 import { buildView, closeView, createGroupedView, deriveViewName, linkHere, viewSessionName } from "./view.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
@@ -207,6 +208,9 @@ async function main(argv: string[]) {
       break;
     case "rename":
       await cmdRename(parsed);
+      break;
+    case "tag":
+      await cmdTag(parsed);
       break;
     case "seal":
       await cmdSeal(parsed);
@@ -680,6 +684,95 @@ async function cmdRename(parsed: Parsed) {
   }
 }
 
+async function cmdTag(parsed: Parsed) {
+  const target = parsed.args[0];
+  const usage =
+    "Usage: hive tag <selector> <tag>...  |  hive tag <selector> --remove <tag>...  |  hive tag <selector> --list";
+  if (!target) throw new Error(usage);
+
+  const listMode = truthy(flag(parsed, "list"));
+  const removeArgs = arrayFlag(parsed, "remove");
+  const removeMode = removeArgs.length > 0 || flag(parsed, "remove") === true;
+  // Positional tags after the selector are the add set (unless we're in
+  // list/remove mode, where positionals are ignored).
+  const addArgs = !listMode && !removeMode ? parsed.args.slice(1) : [];
+
+  if (!listMode && !removeMode && addArgs.length === 0) {
+    throw new Error("hive tag: pass tag names to add, --remove <tag>... to remove, or --list to display");
+  }
+
+  const resolved = await resolveSelector(target);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
+  const isMulti = resolved.kind !== "bee";
+
+  if (listMode) {
+    for (const record of records) {
+      const tags = Array.from(effectiveTags(record)).sort();
+      const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
+      if (isPretty()) console.log(actionLine("ok", "tag", [bold(record.name), dim(tagStr)]));
+      else console.log(`${record.name}\ttags\t${tagStr}`);
+    }
+    return;
+  }
+
+  if (removeMode) {
+    if (removeArgs.length === 0) throw new Error("hive tag --remove: pass tag names to remove");
+    let changed = 0;
+    for (const record of records) {
+      const before = record.tags ?? [];
+      const after = before.filter((tag) => !removeArgs.includes(tag));
+      if (before.length === after.length) {
+        if (!isMulti) console.error(note(`${record.name}: no matching tags to remove`));
+        continue;
+      }
+      changed += 1;
+      const now = new Date().toISOString();
+      await updateSession(record.name, { tags: after.length > 0 ? after : undefined, updatedAt: now });
+      await writeHiveTags({ ...record, tags: after.length > 0 ? after : undefined });
+      await appendLedger({ type: "tag.remove", bee: record.name, tags: removeArgs });
+      if (isPretty()) console.log(actionLine("ok", "tag", [bold(record.name), dim("removed"), removeArgs.join(", ")]));
+      else console.log(`${record.name}\ttag.remove\t${removeArgs.join(", ")}`);
+    }
+    if (isMulti) {
+      if (isPretty()) console.log(actionLine("ok", "tag", [bold(target), `removed from ${changed}/${records.length} bees`]));
+      else console.log(`tag.remove\t${target}\t${changed}/${records.length} bees`);
+    }
+    return;
+  }
+
+  // ADD mode: validate every tag (reject reserved namespaces, enforce grammar)
+  // BEFORE mutating any record, so a bad tag never half-applies.
+  for (const tag of addArgs) {
+    const rejection = rejectReservedNamespaceTag(tag);
+    if (rejection) throw new Error(`hive tag ${tag}: ${rejection}`);
+    if (!isValidTagValue(tag)) {
+      throw new Error(`Invalid tag: ${tag} (forbid whitespace/comma/tab/newline, max 64 chars)`);
+    }
+  }
+
+  let changed = 0;
+  for (const record of records) {
+    const before = record.tags ?? [];
+    const after = dedupeTags([...before, ...addArgs]);
+    if (before.length === after.length && before.every((t, i) => t === after[i])) {
+      if (!isMulti) console.error(note(`${record.name}: already has those tags`));
+      continue;
+    }
+    changed += 1;
+    const now = new Date().toISOString();
+    await updateSession(record.name, { tags: after, updatedAt: now });
+    await writeHiveTags({ ...record, tags: after });
+    await appendLedger({ type: "tag.add", bee: record.name, tags: addArgs });
+    if (isPretty()) console.log(actionLine("ok", "tag", [bold(record.name), dim("added"), addArgs.join(", ")]));
+    else console.log(`${record.name}\ttag.add\t${addArgs.join(", ")}`);
+  }
+  if (isMulti) {
+    if (isPretty()) console.log(actionLine("ok", "tag", [bold(target), `added to ${changed}/${records.length} bees`]));
+    else console.log(`tag.add\t${target}\t${changed}/${records.length} bees`);
+  }
+}
+
 async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: string): Promise<SessionRecord> {
   try {
     await waitForAgentReady(record, {
@@ -833,6 +926,7 @@ async function cmdList(parsed: Parsed) {
   const stateFilter = stringFlag(parsed, ["state"]);
   const agentFilter = stringFlag(parsed, ["agent"]);
   const repoFilter = stringFlag(parsed, ["repo"]);
+  const tagFilters = arrayFlag(parsed, "tag");
   const jsonOut = truthy(flag(parsed, "json"));
   const positionalSel = parsed.args[0];
   if (nodeFilter) {
@@ -846,6 +940,14 @@ async function cmdList(parsed: Parsed) {
   if (nodeFilter) records = records.filter((r) => (r.node ?? LOCAL_NODE_NAME) === nodeFilter);
   if (agentFilter) records = records.filter((r) => r.agent === agentFilter);
   if (repoFilter) records = records.filter((r) => repoTagFor(r.cwd) === repoFilter);
+  // --tag repeats conjunctively (AND): every filter (bare user tag or ns:val)
+  // must be present in the bee's effective tag set (PRD §8.3, T4).
+  if (tagFilters.length > 0) {
+    records = records.filter((r) => {
+      const tags = effectiveTags(r);
+      return tagFilters.every((arg) => tags.has(normalizeTagArg(arg)));
+    });
+  }
   if (positionalSel) {
     // Let resolveSelector throw on a genuinely unknown colony/swarm, consistent
     // with the other commands; an empty colony/swarm just filters to nothing.
@@ -938,6 +1040,7 @@ async function cmdList(parsed: Parsed) {
       stateFilter ? `state:${stateFilter}` : undefined,
       agentFilter ? `agent:${agentFilter}` : undefined,
       repoFilter ? `repo:${repoFilter}` : undefined,
+      ...tagFilters.map((t) => `tag:${t}`),
     ].filter((part): part is string => part !== undefined);
     if (filters.length > 0) console.log(dim(`No bees match ${filters.join(" ")}`));
     else console.log(dim("No bees in the hive. Spawn one with: hive spawn <bee>"));
@@ -4385,6 +4488,17 @@ function stringFlag(parsed: Parsed, keys: string[]): string | undefined {
   return undefined;
 }
 
+// A repeatable value flag (e.g. `--tag a --tag b`): the parser arrays repeats,
+// keeps a single value as a string, and a value-less `--tag` as `true`. Coerce
+// all three to a string[] (dropping a value-less use with an error).
+function arrayFlag(parsed: Parsed, key: string): string[] {
+  const raw = flag(parsed, key);
+  if (raw === undefined) return [];
+  if (raw === true) throw new Error(`--${key} requires a value`);
+  if (Array.isArray(raw)) return raw;
+  return [raw];
+}
+
 function ageFlag(parsed: Parsed, keys: string[]): number | undefined {
   for (const key of keys) {
     const value = flag(parsed, key);
@@ -4919,6 +5033,7 @@ function printHelp() {
         ["brief", "<selector> <text>", "send a one-time context brief"],
         ["buz", "<send|inbox|read|…>", "addressed messaging: three-tier delivery + per-bee policy"],
         ["rename", "<selector> <title>", "set a bee's display title (--auto to derive one, --clear)"],
+        ["tag", "<selector> <tag>...", "add/remove user tags on bees (--remove, --list)"],
         ["seal", "<selector> --from <p>", "record a typed handoff artifact"],
       ],
     },

@@ -2,16 +2,19 @@ import { colonyExists, listColonies } from "./colony.js";
 import { matchesSessionReference } from "./ids.js";
 import { listSessions, type SessionRecord } from "./store.js";
 import { swarmIds } from "./swarm.js";
+import { effectiveTags, isReservedNamespace } from "./tags.js";
 
 export type Selector =
   | { kind: "bee"; query: string }
-  | { kind: "swarm"; name: string }
-  | { kind: "colony"; name: string };
+  | { kind: "swarm"; name: string } // @x — kept, now also expressible as tag:swarm:x
+  | { kind: "colony"; name: string } // colony:x — kept, now also expressible as tag:colony:x
+  | { kind: "tag"; namespace?: string; value: string }; // facet / user-tag match
 
 export type ResolvedTarget =
   | { kind: "bee"; record: SessionRecord }
   | { kind: "swarm"; name: string; records: SessionRecord[] }
-  | { kind: "colony"; name: string; records: SessionRecord[] };
+  | { kind: "colony"; name: string; records: SessionRecord[] }
+  | { kind: "tag"; namespace?: string; value: string; records: SessionRecord[] };
 
 export type SelectorState = {
   records: SessionRecord[];
@@ -21,20 +24,62 @@ export type SelectorState = {
 
 const SWARM_PREFIX = "@";
 const COLONY_PREFIX = "colony:";
+const TAG_PREFIX = "tag:";
+const TAG_HASH = "#";
 
 export function parseSelector(query: string): Selector {
   const trimmed = query.trim();
+
+  // colony:x → colony kind (kept for compat; resolves to the same set as
+  // tag:colony:x, but preserves its dedicated unknown-colony throw).
   if (trimmed.startsWith(COLONY_PREFIX)) {
     const name = trimmed.slice(COLONY_PREFIX.length);
     if (!name) throw new Error(`Empty colony selector: ${query}`);
     return { kind: "colony", name };
   }
+
+  // @x → swarm kind (kept for compat; same set as tag:swarm:x).
   if (trimmed.startsWith(SWARM_PREFIX)) {
     const name = trimmed.slice(SWARM_PREFIX.length);
     if (!name) throw new Error(`Empty swarm selector: ${query}`);
     return { kind: "swarm", name };
   }
+
+  // #migration → user tag (no namespace).
+  if (trimmed.startsWith(TAG_HASH)) {
+    const value = trimmed.slice(TAG_HASH.length);
+    if (!value) throw new Error(`Empty tag selector: ${query}`);
+    return { kind: "tag", value };
+  }
+
+  // tag:migration → user tag; tag:ns:val → namespaced tag.
+  if (trimmed.startsWith(TAG_PREFIX)) {
+    const rest = trimmed.slice(TAG_PREFIX.length);
+    if (!rest) throw new Error(`Empty tag selector: ${query}`);
+    const colonIdx = rest.indexOf(":");
+    if (colonIdx === -1) return { kind: "tag", value: rest };
+    const namespace = rest.slice(0, colonIdx);
+    const value = rest.slice(colonIdx + 1);
+    if (!namespace || !value) throw new Error(`Invalid tag selector: ${query}`);
+    return { kind: "tag", namespace, value };
+  }
+
   if (!trimmed) throw new Error("Empty selector");
+
+  // <ns>:<val> where <ns> is a known reserved namespace (e.g. quest:q-ab,
+  // caste:reviewer) → tag kind. A non-reserved namespace (e.g. prio:p1) is a
+  // bare-token user tag stored verbatim, so it falls through to the bee branch
+  // only if it doesn't look like ns:val — but a user tag with a namespace is a
+  // legitimate selector too, so route any `ns:val` we recognize as a tag.
+  const colonIdx = trimmed.indexOf(":");
+  if (colonIdx > 0) {
+    const namespace = trimmed.slice(0, colonIdx);
+    const value = trimmed.slice(colonIdx + 1);
+    if (value && isReservedNamespace(namespace)) {
+      return { kind: "tag", namespace, value };
+    }
+  }
+
   return { kind: "bee", query: trimmed };
 }
 
@@ -55,6 +100,25 @@ export function resolveSelectorFromState(selector: Selector, state: SelectorStat
     return { kind: "colony", name: selector.name, records };
   }
 
+  if (selector.kind === "tag") {
+    // One predicate for every membership/tag selector: effective-tag-set
+    // membership. The unknown-value THROW bifurcates per reserved namespace —
+    // colony:/swarm: check their existence sets (matching legacy behavior),
+    // while quest:/workspace: have no set yet (match 0..N) and user tags never
+    // throw (PRD §8.2).
+    const want = selector.namespace ? `${selector.namespace}:${selector.value}` : selector.value;
+    const records = state.records.filter((record) => effectiveTags(record).has(want));
+    if (records.length === 0 && selector.namespace) {
+      if (selector.namespace === "colony" && state.colonies && !state.colonies.has(selector.value)) {
+        throw new Error(`Unknown colony: ${want}`);
+      }
+      if (selector.namespace === "swarm" && state.swarms && !state.swarms.has(selector.value)) {
+        throw new Error(`Unknown swarm: ${want}`);
+      }
+    }
+    return { kind: "tag", namespace: selector.namespace, value: selector.value, records };
+  }
+
   const exact = state.records.find((record) => record.name === selector.query);
   if (exact) return { kind: "bee", record: exact };
 
@@ -68,7 +132,7 @@ export function resolveSelectorFromState(selector: Selector, state: SelectorStat
 }
 
 export function isSelectorMulti(selector: Selector): boolean {
-  return selector.kind === "swarm" || selector.kind === "colony";
+  return selector.kind === "swarm" || selector.kind === "colony" || selector.kind === "tag";
 }
 
 export function formatSelector(selector: Selector): string {
@@ -79,6 +143,8 @@ export function formatSelector(selector: Selector): string {
       return `@${selector.name}`;
     case "colony":
       return `colony:${selector.name}`;
+    case "tag":
+      return selector.namespace ? `${selector.namespace}:${selector.value}` : `#${selector.value}`;
   }
 }
 
@@ -86,14 +152,22 @@ export async function resolveSelector(query: string): Promise<ResolvedTarget> {
   const selector = parseSelector(query);
   const records = await listSessions();
   const state: SelectorState = { records };
-  if (selector.kind === "swarm") state.swarms = await swarmIds();
-  if (selector.kind === "colony") {
+
+  // The tag kind reuses colony:/swarm: existence sets for its unknown-value
+  // throw, so a `tag:colony:x` / `tag:swarm:x` selector loads the same sets a
+  // legacy colony:/@swarm selector would (PRD §8.2).
+  const wantsSwarmSet = selector.kind === "swarm" || (selector.kind === "tag" && selector.namespace === "swarm");
+  const wantsColonySet = selector.kind === "colony" || (selector.kind === "tag" && selector.namespace === "colony");
+  const colonyName = selector.kind === "colony" ? selector.name : selector.kind === "tag" ? selector.value : undefined;
+
+  if (wantsSwarmSet) state.swarms = await swarmIds();
+  if (wantsColonySet) {
     const colonies = await listColonies();
     state.colonies = new Set(colonies.map((c) => c.name));
     // A colony created after the listColonies snapshot is still a valid
     // target; recheck the store before resolveSelectorFromState rejects it.
-    if (!state.colonies.has(selector.name) && (await colonyExists(selector.name))) {
-      state.colonies.add(selector.name);
+    if (colonyName && !state.colonies.has(colonyName) && (await colonyExists(colonyName))) {
+      state.colonies.add(colonyName);
     }
   }
   return resolveSelectorFromState(selector, state);

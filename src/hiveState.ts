@@ -17,6 +17,7 @@ import { repoTagFor } from "./repoTag.js";
 import type { BeeState } from "./state.js";
 import type { SessionRecord } from "./store.js";
 import { substrateFor } from "./substrates/index.js";
+import { renderTags } from "./tags.js";
 
 export type HiveTmuxState = "working" | "waiting" | "done" | "failed";
 
@@ -69,6 +70,25 @@ export async function writeHiveTitle(record: SessionRef, title: string): Promise
   }
 }
 
+/**
+ * Mirror the bee's effective tag set to @hive_tags for store-free, tmux-native
+ * filtering (PRD §9.1/§9.2). Follows the best-effort discipline of
+ * writeHiveState / writeHiveTitle: a missing session never breaks the command.
+ *
+ * §9.3 solo-comb caveat: @hive_* options are session-scoped, but a multi-bee
+ * comb shares one session, so only one @hive_tags string can exist. The store
+ * scan in `hive list --tag` is authoritative; this mirror is a best-effort
+ * fast-path hint for solo combs. No special multi-bee logic is needed in Phase
+ * 1 — the store is the source of truth.
+ */
+export async function writeHiveTags(record: SessionRecord): Promise<void> {
+  try {
+    await substrateFor(record).setUserOptions(record.tmuxTarget, { "@hive_tags": renderTags(record) });
+  } catch {
+    // best-effort
+  }
+}
+
 /** Stamp a freshly spawned bee's session with its hive identity + working state. */
 export async function writeSpawnOptions(record: SessionRecord): Promise<void> {
   try {
@@ -81,6 +101,7 @@ export async function writeSpawnOptions(record: SessionRecord): Promise<void> {
       "@hive_pane": record.agentPaneId ?? "",
       "@hive_agent": record.agent,
       "@hive_repo": repoTagFor(record.cwd),
+      "@hive_tags": renderTags(record),
       [HIVE_STATE_OPTION]: "working",
     });
     // Name the window after the bee (instead of the launcher command) so

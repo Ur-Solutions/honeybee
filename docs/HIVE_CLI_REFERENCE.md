@@ -79,6 +79,19 @@ Selector forms:
 - `<bee>`: exact session name or unique session/id prefix.
 - `@<swarm-id>`: all sessions in a swarm.
 - `colony:<name>`: all sessions in a colony.
+- `#<tag>` or `tag:<tag>`: all sessions carrying the bare user tag `<tag>`.
+- `tag:<ns>:<val>` or `<ns>:<val>` (reserved `<ns>`): all sessions carrying that
+  namespaced tag, including the derived reserved facets. `colony:fe` and
+  `tag:colony:fe` resolve to the same set; `@t1` and `tag:swarm:t1` likewise.
+  Reserved namespaces are `colony`, `swarm`, `caste`, `node`, `agent`, `repo`,
+  `quest`, `workspace`, `comb`. Reserved tags are *derived on read* from the
+  bee's canonical fields — no migration is needed for existing bees.
+
+`@`, `colony:`, `#`, and `tag:` are **reserved selector prefixes**: a string
+beginning with one is parsed as that selector kind, not a bee name. Bee names
+are auto-generated (e.g. `CL.a3f`) and never use these prefixes; if you force a
+bee name that starts with one (via `--name`), it won't be addressable by that
+literal name — pick a different name.
 
 Session references use UUID-backed bee IDs. The visible ID is the shortest
 currently unique prefix, never shorter than three hex characters after the
@@ -471,6 +484,49 @@ hive brief CO.a3f "..." --footer "Custom footer"
 hive brief CO.a3f "..." --force-send
 ```
 
+### `hive tag`
+
+Add or remove free-form user tags on one or more bees. A tag is a label: a bare
+token like `migration` or a `namespace:value` like `prio:p1`, stored verbatim.
+Reserved namespaces (`colony`, `swarm`, `caste`, `node`, `agent`, `repo`,
+`quest`, `workspace`, `comb`) cannot be written via `hive tag` — they are
+*derived on read* from the bee's canonical fields; use the canonical verb
+instead (e.g. `hive spawn --colony` / `hive move`).
+
+```sh
+hive tag <selector> <tag>...          # add user tags (stored verbatim)
+hive tag <selector> --remove <tag>... # remove user tags (idempotent)
+hive tag <selector> --list            # show the bee's full effective tag set
+```
+
+Examples:
+
+```sh
+hive tag CO.a3f migration prio:p1     # add two tags
+hive tag @review-swarm waiting-review # tag a whole swarm
+hive tag colony:fe migration          # bulk-tag a colony
+hive tag CO.a3f --remove migration    # remove a tag
+hive tag CO.a3f --list                # list effective tags (reserved + user)
+hive tag CO.a3f colony:other          # rejected: reserved facet, use hive move
+```
+
+`<selector>` may be any selector (bee / `@swarm` / `colony:` / `tag:` / `#tag`),
+so a single `hive tag` can label an entire cohort; the result reports a count.
+Each add/remove writes the record atomically (a `tag.add` / `tag.remove` ledger
+event) and best-effort refreshes the session's `@hive_tags` tmux option for
+store-free `tmux ls -f` filtering. Tag values forbid whitespace, comma, tab, and
+newline; a bee carries at most 32 tags of at most 64 characters each.
+
+Tags are queryable via `hive list --tag` and the `#` / `tag:` selectors:
+
+```sh
+hive list --tag migration                 # bees with the user tag migration
+hive list --tag migration --tag prio:p1   # conjunctive (AND)
+hive list --tag colony:fe                  # derived reserved facet
+hive list '#migration'                     # positional tag selector
+hive send '#migration' "status?"           # tag selector as a target
+```
+
 ## Observing Output
 
 ### `hive tail` / `hive cat`
@@ -545,7 +601,8 @@ Show known sessions with derived state.
 
 ```sh
 hive list [selector] [--colony <name>] [--swarm <id>] [--node <name>]
-          [--state <s>] [--agent <a>] [--repo <name>] [--json] [--wide]
+          [--state <s>] [--agent <a>] [--repo <name>] [--tag <ns:val>]...
+          [--json] [--wide]
 hive ps --wide
 ```
 
@@ -562,9 +619,13 @@ three. The facets:
 - `--state <s>`: match on the bee's state. Accepts the live `@hive_state`
   vocabulary (`working`/`waiting`/`done`/`failed`), the fine-grained `BeeState`
   (`active`, `idle_with_output`, ...), or its display label (`idle`, `offline`).
-- positional `[selector]`: a bee / `@swarm` / `colony:<name>` selector applied
-  as a filter alongside the flags (an unknown colony/swarm errors, consistent
-  with other commands).
+- `--tag <ns:val>`: match on the bee's effective tag set — a bare user tag
+  (`--tag migration`) or a namespaced/reserved tag (`--tag prio:p1`,
+  `--tag colony:fe`). Repeats conjunctively: `--tag migration --tag prio:p1`
+  returns bees carrying *both*. Composes with every other facet flag.
+- positional `[selector]`: a bee / `@swarm` / `colony:<name>` / `#tag` /
+  `tag:<...>` selector applied as a filter alongside the flags (an unknown
+  colony/swarm errors, consistent with other commands).
 
 **`--json`** emits a machine array regardless of TTY, after all filters are
 applied. Each element has the shape:

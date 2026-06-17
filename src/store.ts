@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
+import { dedupeTags, isValidSessionTag, MAX_TAGS_PER_BEE } from "./tags.js";
 
 export type SessionRecord = {
   name: string;
@@ -25,6 +26,13 @@ export type SessionRecord = {
   combId?: string;
   /** The bee this one was split from (intra-comb lineage). (Phase B) */
   parentId?: string;
+  /**
+   * Free-form user tags (first-class). Holds ONLY bare or power-user-namespaced
+   * labels, e.g. ["migration", "waiting-review", "prio:p1"]. Reserved-namespace
+   * tags (colony:/swarm:/…) are NEVER stored here — they are derived on read by
+   * src/tags.ts effectiveTags(). (TAGS_AND_RELATIONSHIPS_PRD Phase 1)
+   */
+  tags?: string[];
   createdAt: string;
   updatedAt: string;
   status: "running" | "dead" | "kill_failed";
@@ -263,6 +271,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "titleSource",
   "autoTitleAttempts",
   "buzAccept",
+  "tags",
 ]);
 
 function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
@@ -309,6 +318,19 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
         value === "interrupt" || value === "queue" || value === "passive",
     );
     if (tiers.length > 0) record.buzAccept = tiers;
+  }
+
+  // tags is the array of free-form user labels (bare or power-user namespaced,
+  // e.g. ["migration", "prio:p1"]). Like buzAccept, it is forward-compatible:
+  // grammar-invalid OR reserved-namespace entries are DROPPED on load — not
+  // thrown — so a hand-edited file that smuggles `colony:x` into tags, or a
+  // record written by a newer binary, never crashes a load (PRD §13, S1). The
+  // list is deduped and capped (MAX_TAGS_PER_BEE).
+  if (Array.isArray(object.tags)) {
+    const validated = dedupeTags(
+      object.tags.filter((item): item is string => typeof item === "string").filter((tag) => isValidSessionTag(tag)),
+    ).slice(0, MAX_TAGS_PER_BEE);
+    if (validated.length > 0) record.tags = validated;
   }
 
   // Carry unknown keys through untouched so an older binary's load→save cycle
