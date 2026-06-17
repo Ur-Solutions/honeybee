@@ -4789,21 +4789,30 @@ async function cmdAccount(parsed: Parsed) {
       break;
     case "add": {
       const [, tool, label] = parsed.args;
-      if (!tool || !label) throw new Error("Usage: hive account add <tool> <label> [--email <addr>]");
+      if (!tool || !label) throw new Error("Usage: hive account add <tool> <label> [--email <addr>] [--provider <id>] [--model <id>]");
       const email = typeof flag(parsed, "email") === "string" ? String(flag(parsed, "email")) : undefined;
-      const account = await addAccount(tool, label, { email });
-      if (isPretty()) console.log(actionLine("ok", "account", [bold(account.id), account.tool, account.label]));
-      else console.log(`${account.id}\t${account.tool}\t${account.label}`);
+      const provider = typeof flag(parsed, "provider") === "string" ? String(flag(parsed, "provider")) : undefined;
+      const model = typeof flag(parsed, "model") === "string" ? String(flag(parsed, "model")) : undefined;
+      const account = await addAccount(tool, label, { email, provider, model });
+      if (isPretty()) console.log(actionLine("ok", "account", [bold(account.id), account.tool, account.provider ?? "?", account.label]));
+      else console.log(`${account.id}\t${account.tool}\t${account.provider ?? ""}\t${account.label}`);
       console.log(note(`vault dir ready; capture credentials with: hive account login ${account.tool} ${account.label}`));
       break;
     }
     case "login": {
       const [, tool, label] = parsed.args;
-      if (!tool || !label) throw new Error("Usage: hive account login <tool> <label>");
+      if (!tool || !label) throw new Error("Usage: hive account login <tool> <label> [--provider <id>] [--model <id>]");
       const kind = canonicalAgentKind(tool).toLowerCase();
       const accounts = await listAccounts();
       const existing = accounts.find((candidate) => candidate.tool === kind && candidate.label === label.trim());
-      const account = existing ?? (await addAccount(tool, label));
+      // Auto-create path: a CLI with no canonical provider (opencode) makes
+      // addAccount throw unless --provider is supplied. Thread the flags so a
+      // first-time `account login` of such a CLI can name its provider; for
+      // single-provider CLIs (claude/codex/grok/kimi) they default and this is
+      // byte-identical to before.
+      const provider = typeof flag(parsed, "provider") === "string" ? String(flag(parsed, "provider")) : undefined;
+      const model = typeof flag(parsed, "model") === "string" ? String(flag(parsed, "model")) : undefined;
+      const account = existing ?? (await addAccount(tool, label, { provider, model }));
       await runLoginSeat(parsed, account);
       break;
     }
@@ -4871,6 +4880,7 @@ async function accountList(parsed: Parsed) {
     rows.push([
       account.id,
       account.tool,
+      account.provider ?? "-",
       account.label,
       isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
       summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
@@ -4886,7 +4896,7 @@ async function accountList(parsed: Parsed) {
     return;
   }
   console.log(formatTable(
-    [{ header: "ACCOUNT" }, { header: "TOOL" }, { header: "LABEL" }, { header: "STATE" }, { header: "EXHAUSTED" }, { header: "RESET" }],
+    [{ header: "ACCOUNT" }, { header: "TOOL" }, { header: "PROVIDER" }, { header: "LABEL" }, { header: "STATE" }, { header: "EXHAUSTED" }, { header: "RESET" }],
     rows,
   ));
 }

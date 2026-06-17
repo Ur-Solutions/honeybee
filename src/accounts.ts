@@ -16,11 +16,47 @@ import { appendLedger, safeName } from "./store.js";
 
 export type AccountRecord = {
   id: string;
-  tool: string;
+  tool: string; // == cli; kept under the name `tool` on disk for back-compat (see `accountCli`)
   label: string;
+  provider?: string; // NEW: required after normalization; legacy entries backfill on read
+  model?: string; // NEW: optional default model for spawns
   email?: string;
   addedAt: string;
 };
+
+/**
+ * Read the account's CLI (driver kind). On disk the field is still named
+ * `tool`; new code should read intent through this accessor so a later rename
+ * is a one-line change.
+ */
+export function accountCli(a: Pick<AccountRecord, "tool">): string {
+  return a.tool;
+}
+
+/**
+ * Canonical provider for each single-provider CLI. opencode is intentionally
+ * absent — it multiplexes several provider logins, so its provider is
+ * ambiguous and must be supplied explicitly (`--provider`).
+ */
+export const PROVIDER_BY_CLI: Record<string, string> = {
+  claude: "anthropic",
+  codex: "openai",
+  grok: "xai",
+  kimi: "moonshot",
+};
+
+/**
+ * Read-time backfill: a legacy record with no `provider` gets the canonical
+ * provider inferred from its CLI. Non-mutating (returns a copy only when it
+ * adds a field) and a no-op when `provider` is already set or the CLI is not
+ * inferable (opencode) — those records come back provider-less and are
+ * excluded from provider-keyed features until set explicitly.
+ */
+export function normalizeAccountRecord(a: AccountRecord): AccountRecord {
+  if (a.provider) return a;
+  const inferred = PROVIDER_BY_CLI[a.tool];
+  return inferred ? { ...a, provider: inferred } : a;
+}
 
 export function vaultRoot(): string {
   return join(storeRoot(), "vault");
@@ -67,7 +103,11 @@ export async function listAccounts(): Promise<AccountRecord[]> {
     throw new Error(`Invalid JSON in account registry: ${accountsRegistryPath()}`);
   }
   if (!Array.isArray(parsed)) return [];
-  return parsed.filter(isAccountRecord);
+  // Read-time provider backfill. listAccounts is the SOLE registry reader, so
+  // every account flows through normalizeAccountRecord exactly once. It is
+  // non-destructive — nothing is written back here; the on-disk file keeps its
+  // legacy (provider-less) shape until addAccount/removeAccount rewrite it.
+  return parsed.filter(isAccountRecord).map(normalizeAccountRecord);
 }
 
 function isAccountRecord(value: unknown): value is AccountRecord {
@@ -88,6 +128,8 @@ async function writeRegistry(accounts: AccountRecord[]): Promise<void> {
 
 export type AddAccountOptions = {
   email?: string;
+  provider?: string;
+  model?: string;
 };
 
 export async function addAccount(tool: string, label: string, options: AddAccountOptions = {}): Promise<AccountRecord> {
@@ -95,6 +137,14 @@ export async function addAccount(tool: string, label: string, options: AddAccoun
   if (!hasAgentDriver(kind)) throw new Error(`Unknown tool: ${tool}. Accounts need an agent driver.`);
   if (!identityRecipeForAgent(kind)) throw new Error(`Tool ${kind} has no identity recipe; cannot vault its credentials.`);
   if (!label.trim()) throw new Error("Account label must not be empty");
+
+  // Resolve the provider: explicit flag wins, else the CLI's canonical
+  // provider. A CLI with no canonical provider (opencode multiplexes several)
+  // must be told which one — refuse rather than write a provider-less record.
+  const provider = options.provider ?? PROVIDER_BY_CLI[kind];
+  if (!provider) {
+    throw new Error(`Cannot infer a provider for CLI ${kind}; pass --provider <id> (e.g. minimax-coding-plan, zai-coding-plan, kimi-for-coding).`);
+  }
 
   return withAccountsLock(async () => {
     const accounts = await listAccounts();
@@ -105,12 +155,14 @@ export async function addAccount(tool: string, label: string, options: AddAccoun
       id,
       tool: kind,
       label: label.trim(),
+      provider,
+      ...(options.model ? { model: options.model } : {}),
       ...(email ? { email } : {}),
       addedAt: new Date().toISOString(),
     };
     await writeRegistry([...accounts, record]);
     await mkdir(accountDir(record), { recursive: true, mode: 0o700 });
-    await appendLedger({ type: "account.add", account: record.id, tool: record.tool, label: record.label });
+    await appendLedger({ type: "account.add", account: record.id, tool: record.tool, provider: record.provider, label: record.label });
     return record;
   });
 }
@@ -121,7 +173,7 @@ export async function removeAccount(idOrLabel: string): Promise<AccountRecord> {
     const account = matchAccount(accounts, idOrLabel);
     await writeRegistry(accounts.filter((candidate) => candidate.id !== account.id));
     await rm(accountDir(account), { recursive: true, force: true });
-    await appendLedger({ type: "account.remove", account: account.id, tool: account.tool });
+    await appendLedger({ type: "account.remove", account: account.id, tool: account.tool, ...(account.provider ? { provider: account.provider } : {}) });
     return account;
   });
 }

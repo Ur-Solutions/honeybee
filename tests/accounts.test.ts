@@ -4,18 +4,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  accountCli,
   accountDir,
   accountHasCredentials,
   accountIdFor,
+  accountsRegistryPath,
   activateAccountIntoHome,
   addAccount,
   captureAccountFromHome,
   findAccount,
   listAccounts,
   mergeCredentialsJson,
+  normalizeAccountRecord,
+  PROVIDER_BY_CLI,
   removeAccount,
   resolveSpawnAgent,
   syncClaudeChainToVault,
+  type AccountRecord,
 } from "../src/accounts.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -318,5 +323,149 @@ test("resolveSpawnAgent maps bee specs to tool + account", async () => {
     // Unknown tokens fall through as arbitrary executables.
     assert.deepEqual(await resolveSpawnAgent("my-agent"), { agent: "my-agent" });
     assert.deepEqual(await resolveSpawnAgent("codex-nosuch"), { agent: "codex-nosuch" });
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// S1 — accounts data model (provider + model)
+// ──────────────────────────────────────────────────────────────────────────
+
+function legacyRecord(over: Partial<AccountRecord> & { id: string; tool: string }): AccountRecord {
+  return { label: over.id, addedAt: "2026-01-01T00:00:00.000Z", ...over };
+}
+
+test("normalizeAccountRecord infers a provider from the CLI for single-provider tools", () => {
+  assert.equal(normalizeAccountRecord(legacyRecord({ id: "claude-a", tool: "claude" })).provider, "anthropic");
+  assert.equal(normalizeAccountRecord(legacyRecord({ id: "codex-a", tool: "codex" })).provider, "openai");
+  assert.equal(normalizeAccountRecord(legacyRecord({ id: "grok-a", tool: "grok" })).provider, "xai");
+  assert.equal(normalizeAccountRecord(legacyRecord({ id: "kimi-a", tool: "kimi" })).provider, "moonshot");
+});
+
+test("normalizeAccountRecord leaves opencode provider-less (ambiguous) and preserves an explicit provider", () => {
+  // opencode multiplexes providers — nothing to infer.
+  const oc = normalizeAccountRecord(legacyRecord({ id: "opencode-x", tool: "opencode" }));
+  assert.equal(oc.provider, undefined);
+
+  // An explicit provider is never overwritten, even where one could be inferred.
+  const explicit = normalizeAccountRecord(legacyRecord({ id: "opencode-glm", tool: "opencode", provider: "zai-coding-plan" }));
+  assert.equal(explicit.provider, "zai-coding-plan");
+  const explicitClaude = normalizeAccountRecord(legacyRecord({ id: "claude-b", tool: "claude", provider: "custom" }));
+  assert.equal(explicitClaude.provider, "custom");
+
+  // PROVIDER_BY_CLI is the source of truth and excludes opencode.
+  assert.equal(PROVIDER_BY_CLI.opencode, undefined);
+  assert.deepEqual(Object.keys(PROVIDER_BY_CLI).sort(), ["claude", "codex", "grok", "kimi"]);
+});
+
+test("normalizeAccountRecord leaves an unknown/future CLI provider-less and untouched", () => {
+  // Any CLI without a PROVIDER_BY_CLI entry (a typo, or a not-yet-mapped tool)
+  // is treated like opencode: no inference, returned unchanged, excluded from
+  // provider-keyed features rather than mis-tagged.
+  const rec = legacyRecord({ id: "weird-x", tool: "some-future-cli" });
+  const out = normalizeAccountRecord(rec);
+  assert.equal(out.provider, undefined);
+  assert.equal(out, rec); // returned by reference (no copy) when there is nothing to backfill
+});
+
+test("accountCli reads the on-disk tool field", () => {
+  assert.equal(accountCli({ tool: "opencode" }), "opencode");
+});
+
+test("listAccounts backfills providers for a legacy fixture WITHOUT mutating the file on disk", async () => {
+  await withTempStore(async () => {
+    // A legacy registry: no `provider` field anywhere on disk.
+    const legacy = [
+      { id: "claude-old", tool: "claude", label: "old@a.b", addedAt: "2025-01-01T00:00:00.000Z" },
+      { id: "codex-old", tool: "codex", label: "old@c.d", addedAt: "2025-01-02T00:00:00.000Z" },
+      { id: "opencode-opencode1", tool: "opencode", label: "opencode1", addedAt: "2025-01-03T00:00:00.000Z" },
+    ];
+    await mkdir(join(accountsRegistryPath(), ".."), { recursive: true });
+    const onDiskBefore = `${JSON.stringify(legacy, null, 2)}\n`;
+    await writeFile(accountsRegistryPath(), onDiskBefore);
+
+    const accounts = await listAccounts();
+    const byId = Object.fromEntries(accounts.map((a) => [a.id, a]));
+    assert.equal(byId["claude-old"]!.provider, "anthropic");
+    assert.equal(byId["codex-old"]!.provider, "openai");
+    // opencode stays provider-less — surfaced/excluded by provider-keyed features.
+    assert.equal(byId["opencode-opencode1"]!.provider, undefined);
+
+    // The backfill is read-only: disk is untouched (still has no provider).
+    const onDiskAfter = await readFile(accountsRegistryPath(), "utf8");
+    assert.equal(onDiskAfter, onDiskBefore);
+    assert.equal(onDiskAfter.includes("provider"), false);
+  });
+});
+
+test("addAccount writes provider+model, defaults provider from cli, and throws for opencode without --provider", async () => {
+  await withTempStore(async () => {
+    // Default provider inferred from the CLI.
+    const claude = await addAccount("claude", "p@a.b");
+    assert.equal(claude.provider, "anthropic");
+    assert.equal(claude.model, undefined);
+
+    // Explicit provider + model are written.
+    const oc = await addAccount("opencode", "minimax", { provider: "minimax-coding-plan", model: "MiniMax-M3" });
+    assert.equal(oc.provider, "minimax-coding-plan");
+    assert.equal(oc.model, "MiniMax-M3");
+
+    // The written record round-trips through listAccounts with provider+model.
+    const reloaded = (await listAccounts()).find((a) => a.id === oc.id)!;
+    assert.equal(reloaded.provider, "minimax-coding-plan");
+    assert.equal(reloaded.model, "MiniMax-M3");
+
+    // opencode with no provider is refused — never writes a provider-less record.
+    await assert.rejects(() => addAccount("opencode", "glm"), /Cannot infer a provider for CLI opencode/);
+
+    // Duplicate ids still rejected (unchanged behavior).
+    await assert.rejects(() => addAccount("opencode", "minimax", { provider: "minimax-coding-plan" }), /already exists/);
+  });
+});
+
+test("the registry validator stays permissive: accepts legacy (no-provider) and v2 records, drops malformed ones", async () => {
+  await withTempStore(async () => {
+    // Mix: a legacy record (no provider), a full v2 record (with provider+model),
+    // and a malformed record (missing required `addedAt`) that must be dropped.
+    const entries = [
+      { id: "claude-legacy", tool: "claude", label: "legacy@a.b", addedAt: "2025-01-01T00:00:00.000Z" },
+      { id: "opencode-v2", tool: "opencode", label: "minimax", provider: "minimax-coding-plan", model: "MiniMax-M3", addedAt: "2025-01-02T00:00:00.000Z" },
+      { id: "broken", tool: "claude", label: "no-addedAt" },
+    ];
+    await mkdir(join(accountsRegistryPath(), ".."), { recursive: true });
+    await writeFile(accountsRegistryPath(), `${JSON.stringify(entries, null, 2)}\n`);
+
+    const accounts = await listAccounts();
+    // Both valid shapes survive; the malformed one is dropped (not crashed on).
+    assert.deepEqual(accounts.map((a) => a.id).sort(), ["claude-legacy", "opencode-v2"]);
+    const byId = Object.fromEntries(accounts.map((a) => [a.id, a]));
+    assert.equal(byId["claude-legacy"]!.provider, "anthropic"); // legacy backfilled
+    assert.equal(byId["opencode-v2"]!.provider, "minimax-coding-plan"); // v2 preserved
+  });
+});
+
+test("addAccount on a legacy registry lazily upgrades siblings; mixed legacy+v2 still loads", async () => {
+  await withTempStore(async () => {
+    // Pre-seed a legacy entry, then addAccount a v2 entry: the file now mixes shapes.
+    const legacy = [{ id: "claude-legacy", tool: "claude", label: "legacy@a.b", addedAt: "2025-01-01T00:00:00.000Z" }];
+    await mkdir(join(accountsRegistryPath(), ".."), { recursive: true });
+    await writeFile(accountsRegistryPath(), `${JSON.stringify(legacy, null, 2)}\n`);
+
+    const v2 = await addAccount("opencode", "glm", { provider: "zai-coding-plan", model: "glm-5.2" });
+
+    const accounts = await listAccounts();
+    assert.equal(accounts.length, 2);
+    const byId = Object.fromEntries(accounts.map((a) => [a.id, a]));
+    // Legacy backfilled on read; v2 keeps its explicit provider/model.
+    assert.equal(byId["claude-legacy"]!.provider, "anthropic");
+    assert.equal(byId[v2.id]!.provider, "zai-coding-plan");
+    assert.equal(byId[v2.id]!.model, "glm-5.2");
+
+    // addAccount rewrites the whole registry from the (already-normalized) read,
+    // so a sibling legacy entry is lazily upgraded on this touch — a desirable
+    // one-way migration, never a downgrade. Both entries now carry providers on
+    // disk and the mixed file still loads cleanly.
+    const raw = JSON.parse(await readFile(accountsRegistryPath(), "utf8")) as Array<Record<string, unknown>>;
+    assert.equal(raw.find((r) => r.id === "claude-legacy")!.provider, "anthropic");
+    assert.equal(raw.find((r) => r.id === v2.id)!.provider, "zai-coding-plan");
   });
 });

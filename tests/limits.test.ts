@@ -323,7 +323,7 @@ test("codex prefers live app-server limits and falls back to disk snapshots", as
 
 test("unsupported tools and missing codex homes degrade to errors, not throws", async () => {
   await withTempStore(async () => {
-    const opencode = await addAccount("opencode", "oc");
+    const opencode = await addAccount("opencode", "oc", { provider: "minimax-coding-plan" });
     const codex = await addAccount("codex", "cx@a.b");
     const results = await accountLimits([opencode, codex]);
     assert.equal(results[0]!.ok, false);
