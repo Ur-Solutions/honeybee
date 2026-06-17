@@ -875,9 +875,13 @@ hive workspace open <name|colony> [--root <dir>] [--new-client] [--print]
 hive workspace list [--colony <c>] [--archived]
 hive workspace add <name> <bee-selector>      # link existing bee(s) in, persist membership
 hive workspace add-pane <name> [--cmd "..."] [--name <label>]
+hive workspace snapshot <name>                 # refresh saved layout from the live session
+hive workspace restore <name> [--resume]       # rebuild after a reboot
 hive workspace close <name>                    # tear down the session, KEEP the record
 hive workspace rename <old> <new>
 hive workspace archive <name>
+
+hive restore --all [--resume]                  # rebuild every non-archived workspace
 ```
 
 Examples:
@@ -907,8 +911,25 @@ Behavior and guarantees:
   bee `list`/selectors/`clean` — the same exclusion discipline as `view-*`.
 - Local bees only — `link-window` cannot cross tmux servers; remote bees are
   skipped with a warning.
-- Restore after a reboot (`hive workspace restore`) is Phase 2; Phase 1 covers
-  persisted sessions with native terminal-close persistence.
+- `snapshot` refreshes the record's saved geometry from the live session,
+  capturing each window's tmux `window_layout` keyed by `window_name`
+  (`tmux list-windows -F '#{window_name}\t#{window_layout}'`), persisted as
+  `record.layout`. Run it before a reboot so `restore` can re-apply the layout.
+- `restore` rebuilds `ws-<name>` after a reboot (the tmux server + every bee
+  process are gone, but the records persist): it ensures the session, recreates
+  each `{kind:"pane"}` member at `rootDir`, and brings back each `{kind:"bee"}`
+  member. A dead bee with a record is **re-spawned** into its OWN home (no
+  account switch — same creds, no cross-account hazard); `--resume` continues it
+  from its `providerSessionId` (`claude --resume` / `codex resume` / `opencode
+  --session`) instead of starting fresh. A bee with no record left becomes a
+  dead placeholder window the user can re-spawn into. Finally the saved
+  `window_layout` is re-applied via `select-layout` (best-effort, matched by
+  `window_name`). Restore is **idempotent** (PRD §13): a bee that is already
+  live is linked in but never re-spawned, and re-restoring a live workspace keeps
+  its existing panes — restore is purely additive and never kills a bee.
+- `hive restore --all [--resume]` sweeps every non-archived workspace and
+  restores it (the post-reboot reconcile; install it as a login hook to rebuild
+  your arrangement on boot). Without `--all` it prints usage.
 
 ### `hive split`
 

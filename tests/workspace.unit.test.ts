@@ -125,6 +125,50 @@ test("readWorkspace drops malformed members", async () => {
   });
 });
 
+test("updateWorkspace({layout}) round-trips and readWorkspace drops malformed entries", async () => {
+  await withTempStore(async () => {
+    await createWorkspace({ name: "geo", rootDir: "/tmp/geo" });
+    const updated = await updateWorkspace("geo", {
+      layout: [
+        { windowName: "git", layout: "abcd,80x24,0,0,1" },
+        { windowName: "CL-x", layout: "efgh,80x24,0,0,2" },
+      ],
+    });
+    assert.deepEqual(updated.layout, [
+      { windowName: "git", layout: "abcd,80x24,0,0,1" },
+      { windowName: "CL-x", layout: "efgh,80x24,0,0,2" },
+    ]);
+    const reloaded = await loadWorkspace("geo");
+    assert.deepEqual(reloaded?.layout, updated.layout, "layout survives load");
+
+    // An empty array clears the snapshot (mirrors the members pattern).
+    const cleared = await updateWorkspace("geo", { layout: [] });
+    assert.equal(cleared.layout, undefined, "empty layout clears the snapshot");
+
+    // Malformed entries written directly to disk are dropped on read.
+    const dir = process.env.HIVE_STORE_ROOT!;
+    await writeFile(
+      join(dir, "workspaces", "geo.json"),
+      JSON.stringify({
+        name: "geo",
+        rootDir: "/tmp/geo",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        members: [],
+        layout: [
+          { windowName: "ok", layout: "good" },
+          { windowName: "missing-layout" }, // no layout → dropped
+          { layout: "missing-name" }, // no windowName → dropped
+          { windowName: 1, layout: "non-string-name" }, // wrong type → dropped
+          "not-an-object", // → dropped
+        ],
+      }),
+    );
+    const dropped = await loadWorkspace("geo");
+    assert.deepEqual(dropped?.layout, [{ windowName: "ok", layout: "good" }], "malformed layout entries dropped");
+  });
+});
+
 test("updateWorkspace patches members/rootDir/description and bumps updatedAt", async () => {
   await withTempStore(async () => {
     const created = await createWorkspace({ name: "u", rootDir: "" });

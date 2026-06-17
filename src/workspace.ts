@@ -35,7 +35,9 @@ export type WorkspaceRecord = {
   archived?: boolean;
   archivedAt?: string;
   description?: string;
-  // Geometry snapshot (Phase 2): per-window tmux window_layout strings — omitted here.
+  // Geometry snapshot (Phase 2): per-window tmux window_layout strings, captured
+  // by `snapshot` and re-applied by `restore` via `select-layout`.
+  layout?: Array<{ windowName: string; layout: string }>;
 };
 
 export const WORKSPACE_PREFIX = "ws-";
@@ -118,12 +120,15 @@ export async function createWorkspace(input: CreateWorkspaceInput): Promise<Work
   });
 }
 
+export type WorkspaceLayoutEntry = { windowName: string; layout: string };
+
 export type WorkspacePatch = {
   rootDir?: string;
   colony?: string;
   questId?: string;
   description?: string;
   members?: WorkspaceMember[];
+  layout?: WorkspaceLayoutEntry[];
 };
 
 export async function updateWorkspace(name: string, patch: WorkspacePatch): Promise<WorkspaceRecord> {
@@ -136,6 +141,12 @@ export async function updateWorkspace(name: string, patch: WorkspacePatch): Prom
     const updated: WorkspaceRecord = { ...existing, updatedAt: new Date().toISOString() };
     if (patch.rootDir !== undefined) updated.rootDir = patch.rootDir;
     if (patch.members !== undefined) updated.members = sanitizeMembers(patch.members);
+    if (patch.layout !== undefined) {
+      // An empty array clears the geometry snapshot (mirrors the members pattern).
+      const layout = sanitizeLayout(patch.layout);
+      if (layout.length === 0) delete updated.layout;
+      else updated.layout = layout;
+    }
     if (patch.colony !== undefined) {
       if (patch.colony === "") delete updated.colony;
       else updated.colony = patch.colony;
@@ -217,6 +228,20 @@ function sanitizeMembers(members: unknown): WorkspaceMember[] {
   return result;
 }
 
+/** Keep only well-formed {windowName, layout} pairs; drop malformed ones (members pattern). */
+function sanitizeLayout(layout: unknown): WorkspaceLayoutEntry[] {
+  if (!Array.isArray(layout)) return [];
+  const result: WorkspaceLayoutEntry[] = [];
+  for (const raw of layout) {
+    if (!raw || typeof raw !== "object") continue;
+    const entry = raw as Record<string, unknown>;
+    if (typeof entry.windowName === "string" && typeof entry.layout === "string") {
+      result.push({ windowName: entry.windowName, layout: entry.layout });
+    }
+  }
+  return result;
+}
+
 export async function readWorkspace(path: string): Promise<WorkspaceRecord> {
   const raw = await readFile(path, "utf8");
   const parsed = JSON.parse(raw) as unknown;
@@ -245,6 +270,10 @@ export async function readWorkspace(path: string): Promise<WorkspaceRecord> {
   if (object.archived === true) record.archived = true;
   if (typeof object.archivedAt === "string") record.archivedAt = object.archivedAt;
   if (typeof object.description === "string") record.description = object.description;
+  // Additive allow-list (the OPTIONAL_STRING_SESSION_KEYS lesson): only carry a
+  // layout snapshot through when it is a well-formed array of {windowName, layout}.
+  const layout = sanitizeLayout(object.layout);
+  if (layout.length > 0) record.layout = layout;
   return record;
 }
 

@@ -23,11 +23,11 @@ const COMMANDS = [
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
   "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
-  "split", "fork", "here", "revive",
+  "split", "fork", "here", "revive", "restore",
 ];
 
 const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
-const WORKSPACE_SUBCOMMANDS = ["open", "list", "ls", "add", "add-pane", "close", "rename", "archive"];
+const WORKSPACE_SUBCOMMANDS = ["open", "list", "ls", "add", "add-pane", "snapshot", "restore", "close", "rename", "archive"];
 const FRAME_SUBCOMMANDS = ["list", "ls", "define", "update", "reload", "edit", "inspect", "remove"];
 const SWARM_SUBCOMMANDS = ["list", "ls", "inspect", "destroy"];
 const NODE_SUBCOMMANDS = ["list", "ls", "register", "inspect", "update", "unregister"];
@@ -71,6 +71,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
   revive: ["--all", "--fresh", "--session"],
+  restore: ["--all", "--resume"],
   xa: [
     "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony", "--print",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
@@ -78,8 +79,8 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ],
   open: ["--raw", "--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust"],
   view: ["--name", "--new-client", "--close", "--print"],
-  workspace: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name"],
-  ws: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name"],
+  workspace: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
+  ws: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
   usage: ["--samples", "--json", "--ttl"],
   limits: ["--samples", "--json", "--ttl"],
   sessions: ["--home", "--json"],
@@ -218,8 +219,8 @@ const NOUN_COMMAND_SUBS: Record<string, string[]> = {
 
 const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "workspace" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run" | "account">> = {
   colony: { inspect: "colony", archive: "colony", update: "colony", rename: "colony" },
-  workspace: { open: "workspace", add: "workspace", "add-pane": "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
-  ws: { open: "workspace", add: "workspace", "add-pane": "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
+  workspace: { open: "workspace", add: "workspace", "add-pane": "workspace", snapshot: "workspace", restore: "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
+  ws: { open: "workspace", add: "workspace", "add-pane": "workspace", snapshot: "workspace", restore: "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
   frame: { inspect: "frame", remove: "frame", edit: "frame", update: "frame", reload: "frame" },
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },

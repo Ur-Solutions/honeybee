@@ -24,7 +24,7 @@ function tmuxAvailable(): boolean {
   }
 }
 
-async function seedBee(store: string, name: string): Promise<void> {
+async function seedBee(store: string, name: string, overrides: Record<string, unknown> = {}): Promise<void> {
   const sessionsDir = join(store, "sessions");
   await mkdir(sessionsDir, { recursive: true });
   const now = "2026-06-17T00:00:00.000Z";
@@ -38,6 +38,7 @@ async function seedBee(store: string, name: string): Promise<void> {
     createdAt: now,
     updatedAt: now,
     status: "running" as const,
+    ...overrides,
   };
   await writeFile(join(sessionsDir, `${name}.json`), `${JSON.stringify(record, null, 2)}\n`);
 }
@@ -52,7 +53,7 @@ async function readWs(store: string, name: string): Promise<Record<string, unkno
   return JSON.parse(raw) as Record<string, unknown>;
 }
 
-function hive(store: string, socket: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+function hive(store: string, socket: string, args: string[], extraEnv: Record<string, string> = {}): Promise<{ stdout: string; stderr: string }> {
   return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
     cwd: process.cwd(),
     env: {
@@ -62,9 +63,20 @@ function hive(store: string, socket: string, args: string[]): Promise<{ stdout: 
       HIVE_NO_KEYCHAIN: "1",
       NO_COLOR: "1",
       TERM: "dumb",
+      ...extraEnv,
     },
   });
 }
+
+// Restore re-spawns a dead bee by resolving its agent ("claude" as seeded) and
+// running it. claude is not installed in CI, so we override the resolver's
+// command for that kind (HIVE_CLAUDE_CMD, honored by resolveAgent) to a harmless
+// held shell. `sh -c 'sleep 120' --` keeps the tmux window alive AND absorbs any
+// trailing resume args (resumeArgs → `--resume <id>`/`--continue`) as ignored
+// positional params ($1, $2 …) of the script, so the --resume path stays
+// hermetic too. This lets restore exercise the real reviveRecord path end-to-end
+// (session re-created, record flipped to running) without a real agent binary.
+const RESTORE_ENV = { HIVE_CLAUDE_CMD: "sh -c 'sleep 120' --" } as const;
 
 async function sessionWindowIds(session: string): Promise<string[]> {
   const r = await tmux(["list-windows", "-t", `=${session}`, "-F", "#{window_id}"], { reject: false });
@@ -231,5 +243,142 @@ test("rename moves the record + live session; archive flips the flag", { skip: !
     assert.doesNotMatch(def, /frontend/, "archived workspace hidden by default");
     const all = (await hive(store, socket, ["workspace", "list", "--archived"])).stdout;
     assert.match(all, /frontend/, "archived workspace shown with --archived");
+  });
+});
+
+test("W3: snapshot + restore rebuilds panes and re-spawns bee members after a reboot", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const bee = "CL-fe";
+    await seedBee(store, bee);
+    await newSession(bee, "/tmp", { command: "sh", args: ["-c", "sleep 120"] });
+    const root = store;
+
+    // Build ws-fe: a pane member + a linked bee member.
+    await hive(store, socket, ["workspace", "open", "fe", "--root", root, "--print"]);
+    await hive(store, socket, ["workspace", "add-pane", "fe", "--cmd", "sleep 120", "--name", "shell"]);
+    await hive(store, socket, ["workspace", "add", "fe", bee]);
+    assert.equal(await hasSession("ws-fe"), true);
+
+    // snapshot: record per-window geometry so restore can re-apply it.
+    const snap = await hive(store, socket, ["workspace", "snapshot", "fe"]);
+    assert.match(snap.stdout, /workspace-snapshot\tws-fe\t\d+/, "snapshot prints a window count");
+    const layout = (await readWs(store, "fe")).layout as Array<{ windowName: string; layout: string }>;
+    assert.ok(Array.isArray(layout) && layout.length >= 1, "layout snapshot persisted");
+    for (const entry of layout) {
+      assert.equal(typeof entry.windowName, "string");
+      assert.match(entry.layout, /,/, "layout looks like a tmux window_layout string");
+    }
+
+    // Simulate a reboot: kill the whole tmux server. The socket is gone; the
+    // next hive call starts a fresh server on the same pinned socket. The store
+    // records (ws-fe + the bee) survive on disk.
+    await tmux(["kill-server"], { reject: false }).catch(() => undefined);
+    assert.equal(await hasSession("ws-fe"), false, "ws-fe gone after kill-server");
+    assert.equal(await hasSession(bee), false, "bee session gone after kill-server");
+
+    // restore: rebuild ws-fe, recreate the pane, re-spawn the dead bee.
+    const restored = await hive(store, socket, ["workspace", "restore", "fe"], RESTORE_ENV);
+    assert.match(restored.stdout, /workspace-restored\tws-fe\t1\t1/, "restore reports 1 bee + 1 pane");
+
+    assert.equal(await hasSession("ws-fe"), true, "ws-fe rebuilt");
+    // The bee's own session is live again (reviveRecord re-created it).
+    assert.equal(await hasSession(bee), true, "the dead bee member is re-spawned");
+    // Its window is linked into ws-fe.
+    const beeWindow = (await tmux(["display-message", "-p", "-t", `=${bee}:`, "#{window_id}"])).stdout.trim();
+    assert.ok((await sessionWindowIds("ws-fe")).includes(beeWindow), "the re-spawned bee window is linked into ws-fe");
+
+    // ws-fe has at least the pane window + the bee window (≥2 windows).
+    assert.ok((await sessionWindowIds("ws-fe")).length >= 2, "ws-fe has the pane and bee windows");
+
+    // The bee record is flipped back to running and re-stamped with workspaceId.
+    const beeRecord = await readBee(store, bee);
+    assert.equal(beeRecord.status, "running", "revived bee record is running again");
+    assert.equal(beeRecord.workspaceId, "fe", "revived bee re-stamped with workspaceId=fe");
+  });
+});
+
+test("W3 --resume: restore --resume re-spawns the bee via the resume path", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const bee = "CL-rs";
+    // A providerSessionId makes --resume take the `--resume <id>` arg path.
+    await seedBee(store, bee, { providerSessionId: "sess-abc123" });
+    await newSession(bee, "/tmp", { command: "sh", args: ["-c", "sleep 120"] });
+    const root = store;
+
+    await hive(store, socket, ["workspace", "open", "fe", "--root", root, "--print"]);
+    await hive(store, socket, ["workspace", "add", "fe", bee]);
+
+    await tmux(["kill-server"], { reject: false }).catch(() => undefined);
+    assert.equal(await hasSession(bee), false, "bee gone after kill-server");
+
+    await hive(store, socket, ["workspace", "restore", "fe", "--resume"], RESTORE_ENV);
+
+    // The bee is live again and its persisted command reflects the resume path
+    // (resumeArgs("claude", "sess-abc123") → `--resume sess-abc123`, appended to
+    // the held shell so the args are inert but observable in the record).
+    assert.equal(await hasSession(bee), true, "bee re-spawned on restore --resume");
+    const beeRecord = await readBee(store, bee);
+    assert.match(String(beeRecord.command), /--resume sess-abc123/, "restore --resume used the resume args");
+    assert.equal(beeRecord.status, "running", "resumed bee record is running");
+  });
+});
+
+test("W3 idempotency: restoring a workspace whose bee is already live does not double-spawn", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const bee = "CL-idem";
+    await seedBee(store, bee);
+    await newSession(bee, "/tmp", { command: "sh", args: ["-c", "sleep 120"] });
+    const root = store;
+
+    await hive(store, socket, ["workspace", "open", "fe", "--root", root, "--print"]);
+    await hive(store, socket, ["workspace", "add", "fe", bee]);
+
+    // The bee is STILL live (no reboot). The record carries the original command.
+    const before = await readBee(store, bee);
+    const beforeWindows = (await sessionWindowIds("ws-fe")).length;
+
+    // restore must NOT relaunch a live bee (PRD §13) — no second window/session.
+    await hive(store, socket, ["workspace", "restore", "fe"], RESTORE_ENV);
+
+    assert.equal(await hasSession(bee), true, "the live bee stays alive");
+    const afterWindows = (await sessionWindowIds("ws-fe")).length;
+    assert.equal(afterWindows, beforeWindows, "no extra window created for an already-live bee");
+
+    const after = await readBee(store, bee);
+    assert.equal(after.command, before.command, "live bee was not relaunched (command unchanged)");
+    assert.equal(after.updatedAt, before.updatedAt, "live bee record not rewritten by reviveRecord");
+  });
+});
+
+test("restore --all rebuilds every non-archived workspace after a reboot", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const root = store;
+    // Two pane-only workspaces (no bees needed — exercises the sweep + pane path).
+    await hive(store, socket, ["workspace", "open", "fe", "--root", root, "--print"]);
+    await hive(store, socket, ["workspace", "add-pane", "fe", "--cmd", "sleep 120", "--name", "shell"]);
+    await hive(store, socket, ["workspace", "open", "be", "--root", root, "--print"]);
+    await hive(store, socket, ["workspace", "add-pane", "be", "--cmd", "sleep 120", "--name", "shell"]);
+
+    await tmux(["kill-server"], { reject: false }).catch(() => undefined);
+    assert.equal(await hasSession("ws-fe"), false);
+    assert.equal(await hasSession("ws-be"), false);
+
+    const out = await hive(store, socket, ["restore", "--all"], RESTORE_ENV);
+    assert.match(out.stdout, /restore\tall\t2\t/, "restore --all reports both workspaces");
+    assert.equal(await hasSession("ws-fe"), true, "ws-fe rebuilt by restore --all");
+    assert.equal(await hasSession("ws-be"), true, "ws-be rebuilt by restore --all");
+  });
+});
+
+test("restore without --all prints usage and does nothing", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    let err: (Error & { stderr?: string }) | undefined;
+    try {
+      await hive(store, socket, ["restore"]);
+    } catch (e) {
+      err = e as Error & { stderr?: string };
+    }
+    assert.ok(err, "hive restore (no --all) exits non-zero");
+    assert.match(`${err?.stderr ?? ""}${err?.message ?? ""}`, /Usage: hive restore --all/, "prints the --all usage hint");
   });
 });

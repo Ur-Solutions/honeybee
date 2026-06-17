@@ -44,6 +44,7 @@ import {
   updateWorkspace,
   WORKSPACE_PREFIX,
   workspaceSessionName,
+  type WorkspaceLayoutEntry,
   type WorkspaceMember,
   type WorkspaceRecord,
 } from "./workspace.js";
@@ -221,6 +222,9 @@ async function main(argv: string[]) {
     case "workspace":
     case "ws":
       await cmdWorkspace(parsed);
+      break;
+    case "restore":
+      await cmdRestore(parsed);
       break;
     case "frame":
       await cmdFrame(parsed);
@@ -2386,27 +2390,27 @@ async function cmdRevive(parsed: Parsed): Promise<void> {
   await reviveOne(record, parsed);
 }
 
-/** Relaunch one dead bee and resume (or, with --fresh, start anew) its session. */
-async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<SessionRecord> {
+/**
+ * Pure relaunch core: re-create a bee's tmux session in its OWN cwd/home and
+ * resume (or, with `fresh`, start anew) its provider session. No `parsed`, no
+ * console output — it does only the resolveAgent/newSession/updateSession/
+ * appendLedger work and returns the updated record. It does NOT guard liveness
+ * (the caller does, so `restore` can decide per-bee whether to skip a live one).
+ *
+ * ACCOUNT SAFETY: this re-spawns into `record.homePath` with NO account switch
+ * (no activateAccountIntoHome) — the same home whose creds are already there, so
+ * there is no cross-account OAuth-logout hazard. `reviveOne`/`restore` both rely
+ * on this invariant.
+ */
+async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessionOverride?: string }): Promise<SessionRecord> {
   const substrate = substrateFor(record);
-  if (await substrate.hasSession(record.tmuxTarget)) {
-    throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
-  }
   const tool = canonicalAgentKind(record.agent).toLowerCase();
-  const fresh = truthy(flag(parsed, "fresh"));
-  // --session <id> resumes (and persists) a specific provider session — used to
+  const fresh = opts.fresh;
+  // sessionOverride resumes (and persists) a specific provider session — used to
   // recover bees whose providerSessionId was never recorded but whose session
   // still exists on disk (claude/codex keep sessions keyed by project dir).
-  const sessionOverride = stringFlag(parsed, ["session"]);
+  const sessionOverride = opts.sessionOverride;
   const providerSessionId = fresh ? undefined : (sessionOverride ?? record.providerSessionId);
-  if (!fresh && !providerSessionId) {
-    console.error(
-      note(
-        `${record.name}: no recorded provider session id — resuming the most recent ${tool} session in its home, ` +
-          `which may belong to a sibling bee if the home is shared. Pass --session <id> to target a specific one, or --fresh to start anew.`,
-      ),
-    );
-  }
 
   // Mirror the swap relaunch: rebuild the agent command from the configured
   // kind (preserving the original permission mode) and append the resume args.
@@ -2440,6 +2444,32 @@ async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<Session
     agentPaneId: paneId,
     fresh,
   });
+  return updated;
+}
+
+/** Relaunch one dead bee and resume (or, with --fresh, start anew) its session. */
+async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<SessionRecord> {
+  const substrate = substrateFor(record);
+  if (await substrate.hasSession(record.tmuxTarget)) {
+    throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
+  }
+  const tool = canonicalAgentKind(record.agent).toLowerCase();
+  const fresh = truthy(flag(parsed, "fresh"));
+  // --session <id> resumes (and persists) a specific provider session — used to
+  // recover bees whose providerSessionId was never recorded but whose session
+  // still exists on disk (claude/codex keep sessions keyed by project dir).
+  const sessionOverride = stringFlag(parsed, ["session"]);
+  const providerSessionId = fresh ? undefined : (sessionOverride ?? record.providerSessionId);
+  if (!fresh && !providerSessionId) {
+    console.error(
+      note(
+        `${record.name}: no recorded provider session id — resuming the most recent ${tool} session in its home, ` +
+          `which may belong to a sibling bee if the home is shared. Pass --session <id> to target a specific one, or --fresh to start anew.`,
+      ),
+    );
+  }
+
+  const updated = await reviveRecord(record, { fresh, sessionOverride });
 
   const how = providerSessionId ? `resumed ${providerSessionId}` : fresh ? "fresh session" : "resumed latest";
   if (isPretty()) console.log(actionLine("ok", "revive", [bold(record.name), record.agent, dim(how)]));
@@ -2976,6 +3006,10 @@ async function cmdWorkspace(parsed: Parsed) {
       return workspaceAdd(parsed);
     case "add-pane":
       return workspaceAddPane(parsed);
+    case "snapshot":
+      return workspaceSnapshot(parsed);
+    case "restore":
+      return workspaceRestore(parsed);
     case "close":
       return workspaceClose(parsed);
     case "rename":
@@ -2983,7 +3017,7 @@ async function cmdWorkspace(parsed: Parsed) {
     case "archive":
       return workspaceArchive(parsed);
     default:
-      throw new Error(`Unknown workspace subcommand: ${sub}\nUsage: hive workspace <open|list|add|add-pane|close|rename|archive>`);
+      throw new Error(`Unknown workspace subcommand: ${sub}\nUsage: hive workspace <open|list|add|add-pane|snapshot|restore|close|rename|archive>`);
   }
 }
 
@@ -3024,8 +3058,7 @@ async function ensureWorkspaceRecord(name: string): Promise<WorkspaceRecord> {
 }
 
 /** Resolve a workspace's file root: --root › record.rootDir › colony.rootDir › cwd. */
-async function resolveWorkspaceRoot(parsed: Parsed, record: WorkspaceRecord): Promise<string> {
-  const rootFlag = stringFlag(parsed, ["root"]);
+async function resolveWorkspaceRoot(rootFlag: string | undefined, record: WorkspaceRecord): Promise<string> {
   if (rootFlag) return realpath(resolve(rootFlag.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"))).catch(() => resolve(rootFlag));
   if (record.rootDir && record.rootDir.length > 0) return record.rootDir;
   if (record.colony) {
@@ -3085,7 +3118,7 @@ async function workspaceOpen(parsed: Parsed) {
   // fresh stand-alone workspace for an unknown name.
   const record = await ensureWorkspaceRecord(name);
 
-  const rootDir = await resolveWorkspaceRoot(parsed, record);
+  const rootDir = await resolveWorkspaceRoot(stringFlag(parsed, ["root"]), record);
   // Persist the resolved root on first open (when it was empty or --root given).
   if (record.rootDir !== rootDir) {
     await updateWorkspace(record.name, { rootDir });
@@ -3252,7 +3285,7 @@ async function workspaceAddPane(parsed: Parsed) {
   if (ensured.created) {
     await setWorkspaceOptions(session);
   }
-  const rootDir = await resolveWorkspaceRoot(parsed, record);
+  const rootDir = await resolveWorkspaceRoot(stringFlag(parsed, ["root"]), record);
   await openWorkspacePane(session, rootDir, command);
 
   const members: WorkspaceMember[] = [...record.members, { kind: "pane", name: label, ...(command ? { command } : {}) }];
@@ -3260,6 +3293,217 @@ async function workspaceAddPane(parsed: Parsed) {
 
   if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), dim(`pane ${label}`), command ? dim(command) : dim("shell")]));
   else console.log(`workspace-add-pane\t${session}\t${label}`);
+}
+
+/**
+ * `hive workspace snapshot <name>` — refresh the record's geometry from the live
+ * `ws-<name>` session so `restore` can rebuild it after a reboot (PRD §7.2/§11).
+ * Captures each window's tmux `window_layout` string keyed by `window_name`.
+ */
+async function workspaceSnapshot(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace snapshot <name>");
+  const record = await ensureWorkspaceRecord(name);
+  const session = workspaceSessionName(record.name);
+  if (!(await hasSession(session))) throw new Error(`No such workspace session: ${session}`);
+
+  // Capture per-window geometry. Tab-separate name from layout (layout strings
+  // never contain a tab); skip blank rows defensively.
+  const result = await tmux(["list-windows", "-t", `=${session}:`, "-F", "#{window_name}\t#{window_layout}"], { reject: false });
+  const layout: WorkspaceLayoutEntry[] = [];
+  for (const line of (result.ok ? result.stdout.split("\n") : []).filter(Boolean)) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    const windowName = line.slice(0, tab);
+    const value = line.slice(tab + 1);
+    if (!windowName || !value) continue;
+    layout.push({ windowName, layout: value });
+  }
+  await updateWorkspace(record.name, { layout });
+
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), dim(`snapshot · ${layout.length} window(s)`)]));
+  else console.log(`workspace-snapshot\t${session}\t${layout.length}`);
+}
+
+/**
+ * `hive workspace restore <name> [--resume]` — rebuild `ws-<name>` from the
+ * record after a reboot (tmux server + bee processes gone, records persist),
+ * PRD §7.3/§11. Idempotent: restoring a live workspace re-attaches/links without
+ * double-spawning (PRD §13). Delegates to the shared restore core.
+ */
+async function workspaceRestore(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace restore <name> [--resume]");
+  const record = await resolveWorkspaceRecord(name);
+  if (!record) throw new Error(`Unknown workspace: ${name}`);
+  const result = await restoreWorkspaceRecord(record, { resume: truthy(flag(parsed, "resume")) });
+  if (isPretty()) {
+    console.log(actionLine("ok", "workspace", [bold(result.session), dim(`restored · ${result.beeCount} bee(s), ${result.paneCount} pane(s)`)]));
+  } else {
+    console.log(`workspace-restored\t${result.session}\t${result.beeCount}\t${result.paneCount}`);
+  }
+}
+
+/**
+ * Shared restore core for `workspace restore <name>` and `restore --all`. Rebuilds
+ * `ws-<name>` from the record, reusing the same open/add helpers (no duplicated
+ * link logic): ensure the session, recreate pane members at rootDir, re-spawn or
+ * (idempotently) re-link bee members, then re-apply the saved layout geometry.
+ *
+ * Restore is purely additive — it NEVER kills a bee, and never double-spawns one
+ * that is already alive (PRD §13). `reviveRecord` re-spawns each bee into ITS OWN
+ * home with no account switch, so there is no cross-account hazard.
+ */
+async function restoreWorkspaceRecord(record: WorkspaceRecord, opts: { resume: boolean }): Promise<{ session: string; beeCount: number; paneCount: number }> {
+  const rootDir = await resolveWorkspaceRoot(undefined, record);
+  // Persist the resolved root on first restore (when it was empty and resolved
+  // from the colony or cwd), exactly as workspaceOpen does — so the record and
+  // the rebuilt session agree on the file root.
+  if (record.rootDir !== rootDir) {
+    await updateWorkspace(record.name, { rootDir });
+  }
+  const session = workspaceSessionName(record.name);
+
+  // Same session bootstrap as workspaceOpen: ensure it, make it persist, and
+  // mark the placeholder shell own so `close` can later reap it.
+  const ensured = await ensureLinkSession(session);
+  await setWorkspaceOptions(session);
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+
+  // Pane members: recreate a window at rootDir per pane — only when the session
+  // was freshly created this call. A re-restore of a LIVE ws keeps its existing
+  // panes (idempotency; native persistence already holds them).
+  let paneCount = 0;
+  if (ensured.created) {
+    for (const member of record.members) {
+      if (member.kind !== "pane") continue;
+      await openWorkspacePane(session, rootDir, member.command);
+      paneCount += 1;
+    }
+  } else {
+    paneCount = record.members.filter((m) => m.kind === "pane").length;
+  }
+
+  // Bee members: same resolution as workspaceOpen (records keyed by id ?? name).
+  const records = await listSessions();
+  const byId = new Map(records.map((r) => [r.id ?? r.name, r] as const));
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const beeTargets: string[] = [];
+  const seenBees = new Set<string>();
+  let beeCount = 0;
+  for (const member of record.members) {
+    if (member.kind !== "bee") continue;
+    // Defensive against a hand-edited record with a duplicate bee member: process
+    // each beeId once so we never revive (or double-count) the same bee twice.
+    if (seenBees.has(member.beeId)) continue;
+    seenBees.add(member.beeId);
+    const bee = byId.get(member.beeId) ?? records.find((r) => r.name === member.beeId);
+    if (bee && bee.node && bee.node !== LOCAL_NODE_NAME) {
+      // link-window cannot cross tmux servers; leave a remote bee for its node.
+      console.error(note(`skip remote bee ${member.beeId} — restore links local windows only`));
+      continue;
+    }
+    if (bee && liveNames.has(bee.tmuxTarget)) {
+      // ALREADY live — never double-spawn (PRD §13). Just link it in + stamp.
+      beeTargets.push(bee.tmuxTarget);
+      beeCount += 1;
+      await stampWorkspaceMembership(bee, record.name);
+      continue;
+    }
+    if (bee) {
+      // Dead bee with a record: re-spawn it into its own home. Default re-spawns
+      // fresh; --resume continues from providerSessionId via resumeArgs.
+      const revived = await reviveRecord(bee, { fresh: !opts.resume });
+      // Re-read liveness: the freshly created session's window links in below.
+      beeTargets.push(revived.tmuxTarget);
+      beeCount += 1;
+      await stampWorkspaceMembership(revived, record.name);
+      continue;
+    }
+    // No record for beeId: a dead placeholder. Open a held shell window at the
+    // root named after the bee so the user can re-spawn into it; mark it own so
+    // `close` can reap it (it carries no live agent).
+    await openWorkspacePlaceholder(session, rootDir, member.beeId);
+    console.error(note(`could not revive bee ${member.beeId} — no record; left a placeholder window`));
+  }
+  // Link freshly-live bee windows into the session (the workspaceOpen path —
+  // never reinvent link logic).
+  await linkTargetsInto(session, beeTargets, ensured);
+
+  // Phase 2 geometry: re-apply each window's saved window_layout by matching
+  // window_name. Best-effort — a missing window is skipped; on a name collision
+  // entries apply in order to whichever windows currently match.
+  await applyWorkspaceLayout(session, record.layout ?? []);
+
+  return { session, beeCount, paneCount };
+}
+
+/** Stamp a bee's workspaceId (and refresh its derived ws: tag) — workspaceOpen pattern. */
+async function stampWorkspaceMembership(bee: SessionRecord, workspaceName: string): Promise<void> {
+  if (bee.workspaceId === workspaceName) return;
+  await updateSession(bee.name, { workspaceId: workspaceName });
+  await writeHiveTags({ ...bee, workspaceId: workspaceName });
+}
+
+/** A dead bee with no record: a window the user can re-spawn into (held shell, marked own). */
+async function openWorkspacePlaceholder(session: string, rootDir: string, label: string): Promise<void> {
+  // A bare interactive shell holds the window open without a live agent.
+  await openWorkspacePane(session, rootDir);
+  // Best-effort label so the user recognizes which bee it stands in for.
+  const result = await tmux(["list-windows", "-t", `=${session}:`, "-F", "#{window_id}"], { reject: false });
+  const last = (result.ok ? result.stdout.split("\n").filter(Boolean) : []).at(-1);
+  if (last) await tmux(["rename-window", "-t", `=${session}:${last}`, label], { reject: false });
+}
+
+/** Re-apply saved per-window geometry by matching window_name (best-effort). */
+async function applyWorkspaceLayout(session: string, layout: WorkspaceLayoutEntry[]): Promise<void> {
+  if (layout.length === 0) return;
+  const result = await tmux(["list-windows", "-t", `=${session}:`, "-F", "#{window_id}\t#{window_name}"], { reject: false });
+  // window_name → ordered window_ids (a name may map to several windows).
+  const byName = new Map<string, string[]>();
+  for (const line of (result.ok ? result.stdout.split("\n") : []).filter(Boolean)) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    const windowId = line.slice(0, tab);
+    const windowName = line.slice(tab + 1);
+    const ids = byName.get(windowName);
+    if (ids) ids.push(windowId);
+    else byName.set(windowName, [windowId]);
+  }
+  for (const entry of layout) {
+    const windowId = byName.get(entry.windowName)?.shift();
+    if (!windowId) continue; // missing window — skip
+    await tmux(["select-layout", "-t", `=${session}:${windowId}`, entry.layout], { reject: false });
+  }
+}
+
+/**
+ * `hive restore --all [--resume]` — sweep every NON-archived workspace and
+ * rebuild it after a reboot (PRD §7.3/§11). Idempotent across the sweep (live
+ * bees are skipped, never re-spawned). Without `--all`, prints usage.
+ */
+async function cmdRestore(parsed: Parsed) {
+  if (!truthy(flag(parsed, "all"))) {
+    throw new Error("Usage: hive restore --all [--resume]   (or: hive workspace restore <name> [--resume])");
+  }
+  const resume = truthy(flag(parsed, "resume"));
+  const workspaces = (await listWorkspaces()).filter((w) => !w.archived);
+  let restored = 0;
+  let bees = 0;
+  let panes = 0;
+  for (const record of workspaces) {
+    const result = await restoreWorkspaceRecord(record, { resume });
+    restored += 1;
+    bees += result.beeCount;
+    panes += result.paneCount;
+    if (isPretty()) {
+      console.log(actionLine("ok", "workspace", [bold(result.session), dim(`restored · ${result.beeCount} bee(s), ${result.paneCount} pane(s)`)]));
+    } else {
+      console.log(`workspace-restored\t${result.session}\t${result.beeCount}\t${result.paneCount}`);
+    }
+  }
+  if (isPretty()) console.log(note(`restored ${restored} workspace(s) · ${bees} bee(s), ${panes} pane(s)`));
+  else console.log(`restore\tall\t${restored}\t${bees}\t${panes}`);
 }
 
 async function workspaceClose(parsed: Parsed) {
