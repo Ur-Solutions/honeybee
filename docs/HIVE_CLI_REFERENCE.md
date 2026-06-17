@@ -687,6 +687,65 @@ hive attach CO.a3f
 hive attach CO.a3f --print
 ```
 
+### `hive next`
+
+Jump to the next local bee that needs attention. This is the *attention queue*
+(navigation Tier 1, "push, not pull"): instead of scanning the full list, you
+walk only the bees whose live state says they want you — `M-n` to step forward,
+`M-N` (`--prev`) to step back, cycling through the set.
+
+```sh
+hive next [--state <comma-list>] [--prev] [--print]
+```
+
+The attention set:
+
+- It is the LOCAL bees whose live `@hive_state` is one of the attention states.
+  The default attention states are `waiting,done,failed` — everything tracked
+  that is NOT actively `working`.
+- `@hive_state` is read straight from the local tmux server (one
+  `tmux list-sessions` over the option — no per-bee store read). hive writes it
+  on its own spawn/brief/send/seal transitions, and the daemon and agent
+  Stop/Notification hooks keep it current; a bee with no `@hive_state` set (or
+  one that is `working`) is never in the set.
+- `--state waiting` (or a comma list like `--state waiting,blocked`) overrides
+  the default set. The order you list states in is the order they are visited.
+- Remote bees are never in the queue — the attention queue is the local tmux
+  server (a remote bee lives on a different server and cannot be
+  `switch-client`'ed to).
+
+Ordering and cycling:
+
+- Bees are grouped by attention-state priority (the order given to `--state`;
+  default `waiting` → `done` → `failed`), and within each group oldest-first
+  (longest in that state), using each bee's last observed state time.
+- `hive next` finds your current session in the ordered queue and jumps to the
+  NEXT entry, wrapping around at the end; `--prev` jumps to the previous one. If
+  your current pane is not itself a bee in the set, `next` enters at the front
+  and `--prev` at the back.
+- When the set is empty, it prints `no bees need attention` and exits 0 — there
+  is nothing to switch to and that is not an error.
+
+Switching (nesting-safe):
+
+- Inside tmux the current client is repointed with `tmux switch-client` (via the
+  same nesting-safe attach helper as `hive attach` — `attach-session` inside an
+  existing client is never emitted).
+- `--print` prints the context-appropriate command instead of switching.
+- Outside tmux there is no current client to repoint, so `hive next` prints the
+  attach command for the target (run it, or run `hive next` from inside tmux to
+  switch directly) instead of crashing.
+
+Examples:
+
+```sh
+hive next                       # → the oldest waiting bee, then cycle on repeat
+hive next --prev                # step backward through the queue
+hive next --state waiting       # only bees waiting on input
+hive next --state waiting,done  # waiting first, then done
+hive next --print               # emit the switch-client command, don't switch
+```
+
 ### `hive view`
 
 Colony cockpit: link live bees' windows into one ephemeral tmux session

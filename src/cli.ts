@@ -102,6 +102,7 @@ import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTar
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { hiveStateFor, writeHiveState, writeHiveTags, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
+import { type AttentionCandidate, parseAttentionStates, pickNextAttentionTarget } from "./attentionQueue.js";
 import { repoTagFor } from "./repoTag.js";
 import { dedupeTags, effectiveTags, isValidTagValue, normalizeTagArg, rejectReservedNamespaceTag } from "./tags.js";
 import { buildView, closeView, createGroupedView, deriveViewName, linkHere, viewSessionName } from "./view.js";
@@ -187,6 +188,9 @@ async function main(argv: string[]) {
       break;
     case "attach":
       await cmdAttach(parsed);
+      break;
+    case "next":
+      await cmdNext(parsed);
       break;
     case "view":
       await cmdView(parsed);
@@ -4446,6 +4450,81 @@ async function cmdAttach(parsed: Parsed) {
   await substrate.attachSession(record.tmuxTarget);
 }
 
+/**
+ * `hive next [--state <comma-list>] [--prev] [--print]` — the attention queue
+ * (PRD §9, Tier 1). Walk only the LOCAL bees whose live @hive_state says they
+ * need attention (default waiting → done → failed; everything tracked that is
+ * NOT actively "working"), oldest-first, cycling with wraparound. The current
+ * client is repointed with the nesting-safe attach helper (switch-client inside
+ * tmux); `--print` emits the command instead.
+ *
+ * This is the tmux-native fast path the PRD wants: live state comes from
+ * listSessionStates() (one `tmux list-sessions -F` over @hive_state — no
+ * per-bee store read), joined to the store only for the ordering timestamp and
+ * the display ref. The attention queue is the LOCAL tmux server (remote bees
+ * live on other servers and cannot be switch-client'ed to).
+ */
+async function cmdNext(parsed: Parsed): Promise<void> {
+  const attentionStates = parseAttentionStates(stringFlag(parsed, ["state"]));
+  const prev = truthy(flag(parsed, "prev"));
+  const printOnly = truthy(flag(parsed, "print"));
+
+  const substrate = localSubstrate();
+  // Live @hive_state per LOCAL session — the source of truth for "needs me".
+  const liveStates = await substrate.listSessionStates();
+  const records = await listSessions();
+  // Store record per local session name, for the ordering timestamp + ref.
+  const localRecords = records.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
+  const recordByTarget = new Map(localRecords.map((record) => [record.tmuxTarget, record] as const));
+
+  const candidates: AttentionCandidate[] = [];
+  for (const [session, state] of liveStates) {
+    if (!state || state.length === 0) continue; // unset @hive_state → not tracked
+    const record = recordByTarget.get(session);
+    candidates.push({
+      session,
+      state,
+      ...(record ? { stateSince: record.lastObservedStateAt ?? record.updatedAt } : {}),
+      ref: record ? highlightUniqueSessionReference(localRecords, record, { start: "", end: "" }) : session,
+    });
+  }
+
+  const currentSession = await currentTmuxSessionName();
+  const pick = pickNextAttentionTarget(candidates, attentionStates, currentSession, { prev });
+
+  if (!pick) {
+    const label = attentionStates.join(", ");
+    if (isPretty()) console.log(note(`no bees need attention (${label})`));
+    else console.log(`next\tnone\tno bees need attention (${label})`);
+    return;
+  }
+
+  const { target } = pick;
+  const ref = target.ref && target.ref.length > 0 ? target.ref : target.session;
+  const command = formatShellCommand(substrate.attachCommand(target.session));
+
+  // Outside tmux there is no current client to repoint: there is nothing to
+  // switch-client. Print the attach command (always, even without --print) so
+  // the human can run it — never attach-session inside, never crash.
+  if (!process.env.TMUX) {
+    if (isPretty()) console.error(note("not inside tmux — run this to jump there:"));
+    console.log(command);
+    return;
+  }
+
+  if (printOnly) {
+    if (isPretty()) console.error(note("switch with:"));
+    console.log(command);
+    return;
+  }
+
+  // Inside tmux: attachSession emits switch-client (the Workstream-1 helper),
+  // never attach-session — nesting-safe by construction.
+  await substrate.attachSession(target.session);
+  if (isPretty()) console.log(actionLine("ok", "next", [bold(ref), dim(target.state)]));
+  else console.log(`next\t${ref}\t${target.state}`);
+}
+
 async function resolveSession(name: string): Promise<SessionRecord> {
   const exact = await loadSession(name);
   if (exact) return exact;
@@ -5054,6 +5133,7 @@ function printHelp() {
       title: "Manage bees",
       rows: [
         ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
+        ["next", "", "switch to the next bee needing attention (--state, --prev, --print)"],
         ["split", "[<bee>] [<agent>]", "spawn a sub-bee into the bee's comb (adjacent pane)"],
         ["here", "", "resolve the bee owning the current pane (--id, --json)"],
         ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],
