@@ -540,14 +540,117 @@ test("Q2: quest archive before done is rejected; quest done is idempotent-guarde
   });
 });
 
-test("Q2 --close-linear: succeeds and prints the deferred-Linear note on stderr", { skip: !tmuxAvailable() }, async () => {
+// --- Q3: optional Linear adapter, OFFLINE path (no LINEAR_API_KEY) ----------
+// These assert the cardinal offline-safe property end-to-end: with no key set,
+// create/done behave exactly as before (no network), with clear notes. The live
+// network path is covered (with a stub fetch) in tests/linear.unit.test.ts — we
+// never make a real network call here. We force LINEAR_API_KEY empty in the
+// child env so a developer's own real key can never leak into these tests.
+const NO_LINEAR_ENV = { LINEAR_API_KEY: "" } as const;
+
+test("Q3 offline create: --linear with no LINEAR_API_KEY records the id + prints the offline note; quest works", { skip: !tmuxAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
-    const created = await hive(store, socket, ["quest", "create", "linear later", "--colony", "reviews"]);
+    const created = await hive(store, socket, ["quest", "create", "review 7", "--colony", "reviews", "--linear", "ENG-7"], NO_LINEAR_ENV);
+    assert.match(created.stderr, /Linear not configured \(set LINEAR_API_KEY\) — recorded ENG-7, no enrichment/, "prints the offline no-op note");
     const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
-    const done = await hive(store, socket, ["quest", "done", id, "--close-linear"]);
-    assert.match(done.stderr, /Linear write-back lands in a later increment/, "prints the deferred Linear note");
     const quest = await readQuestRecord(store, id);
-    assert.equal(quest.status, "done", "quest done with --close-linear still completes");
+    assert.equal(quest.linearIssueId, "ENG-7", "the Linear id is recorded verbatim offline");
+    assert.equal(quest.title, "review 7", "the positional title is used (no enrichment offline)");
+    assert.equal(quest.status, "open", "the quest is fully usable");
+  });
+});
+
+test("Q3 offline create: --linear with no positional title and no key is a clean usage error", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    let err: (Error & { stderr?: string }) | undefined;
+    try {
+      await hive(store, socket, ["quest", "create", "--linear", "ENG-8"], NO_LINEAR_ENV);
+    } catch (e) {
+      err = e as Error & { stderr?: string };
+    }
+    assert.ok(err, "missing title with no Linear enrichment exits non-zero");
+    assert.match(`${err?.stderr ?? ""}${err?.message ?? ""}`, /a title is required/, "explains a title is required without Linear");
+  });
+});
+
+test("Q3 offline create: a malformed --linear identifier is rejected cleanly", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    let err: (Error & { stderr?: string }) | undefined;
+    try {
+      await hive(store, socket, ["quest", "create", "t", "--colony", "reviews", "--linear", "not-an-issue"], NO_LINEAR_ENV);
+    } catch (e) {
+      err = e as Error & { stderr?: string };
+    }
+    assert.ok(err, "a bad --linear value exits non-zero");
+    assert.match(`${err?.stderr ?? ""}${err?.message ?? ""}`, /issue identifier like ENG-1234/, "explains the expected shape");
+  });
+});
+
+test("Q3 offline done: --close-linear with no key prints the offline no-op and still completes the quest", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "linear close", "--colony", "reviews", "--linear", "ENG-9"], NO_LINEAR_ENV);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    const done = await hive(store, socket, ["quest", "done", id, "--close-linear"], NO_LINEAR_ENV);
+    assert.match(done.stderr, /Linear not configured \(set LINEAR_API_KEY\) — left ENG-9 untouched/, "prints the offline no-op note");
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "done", "quest done with --close-linear still completes offline");
+  });
+});
+
+test("Q3 offline done: --close-linear on a quest with no Linear issue says there's nothing to close", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "no linear", "--colony", "reviews"], NO_LINEAR_ENV);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    const done = await hive(store, socket, ["quest", "done", id, "--close-linear"], NO_LINEAR_ENV);
+    assert.match(done.stderr, /no Linear issue — nothing to close/, "clear note when there's no issue to close");
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "done", "quest still completes");
+  });
+});
+
+// --- Q3: adapter-PRESENT path, end-to-end via the test-only fixture adapter ---
+// HIVE_LINEAR_FIXTURE (gated on a non-blank LINEAR_API_KEY) swaps the live
+// GraphQL transport for a canned adapter, so the CLI wiring (create-seeding,
+// done close-back) runs end-to-end with NO network. The live GraphQL protocol is
+// covered separately in tests/linear.unit.test.ts with an injected fetchImpl.
+const FIXTURE_ISSUE = {
+  issue: { id: "u1", identifier: "ENG-1234", title: "Fix the auth flow", description: "Repro and patch", url: "https://linear.app/x" },
+  close: true,
+} as const;
+const LINEAR_FIXTURE_ENV = { LINEAR_API_KEY: "test-key", HIVE_LINEAR_FIXTURE: JSON.stringify(FIXTURE_ISSUE) } as const;
+
+test("Q3 create --linear seeds the title + description from the issue when no positional title is given", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "--colony", "reviews", "--linear", "ENG-1234"], LINEAR_FIXTURE_ENV);
+    assert.match(created.stderr, /seeded from ENG-1234 \(title, description\)/, "reports both fields seeded");
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.title, "Fix the auth flow", "title seeded from the issue");
+    assert.equal(quest.description, "Repro and patch", "description seeded from the issue");
+    assert.equal(quest.linearIssueId, "ENG-1234", "linear id recorded");
+  });
+});
+
+test("Q3 create --linear: an explicit positional title wins over the issue title", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "My own title", "--colony", "reviews", "--linear", "ENG-1234"], LINEAR_FIXTURE_ENV);
+    // description still seeded (no --description), but title is NOT.
+    assert.match(created.stderr, /seeded from ENG-1234 \(description\)/, "only description is reported seeded");
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.title, "My own title", "explicit positional title wins");
+    assert.equal(quest.description, "Repro and patch", "description still seeded from the issue");
+  });
+});
+
+test("Q3 done --close-linear transitions the issue via the adapter", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "--colony", "reviews", "--linear", "ENG-1234"], LINEAR_FIXTURE_ENV);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    const done = await hive(store, socket, ["quest", "done", id, "--close-linear"], LINEAR_FIXTURE_ENV);
+    assert.match(done.stderr, /transitioned ENG-1234 to Done/, "reports the issue transitioned");
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "done", "the quest is done");
   });
 });
 

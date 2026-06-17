@@ -59,6 +59,7 @@ import {
   type QuestRecord,
   type QuestStatus,
 } from "./quest.js";
+import { isLinearIdentifier, loadLinearAdapter } from "./linear.js";
 import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, windowInventory } from "./tmuxLink.js";
 import {
   BUZ_TIERS,
@@ -3954,16 +3955,61 @@ async function ensureColony(name: string): Promise<string> {
 }
 
 async function questCreate(parsed: Parsed) {
-  const title = parsed.args[1];
-  if (!title) throw new Error('Usage: hive quest create "<title>" [--colony <c>] [--root <dir>] [--linear <issue>]');
+  const positionalTitle = parsed.args[1];
+  const linear = stringFlag(parsed, ["linear"]);
+  let description = stringFlag(parsed, ["description"]);
+
+  // LINEAR ENRICHMENT (PRD §8.2/§8.3, side-effect-gated READ): only when
+  // `--linear` is given, and only via the adapter the gate hands us. With no
+  // LINEAR_API_KEY the adapter is null and we stay fully OFFLINE — the id is
+  // recorded verbatim and nothing is fetched. The fetch result seeds the title
+  // (only when no positional title was given — an explicit positional ALWAYS
+  // wins) and the description (only when --description did not override it).
+  let title = positionalTitle;
+  let linearSeededNote: string | undefined;
+  if (linear) {
+    if (!isLinearIdentifier(linear)) {
+      throw new Error(`--linear expects an issue identifier like ENG-1234 (got: ${linear})`);
+    }
+    const adapter = loadLinearAdapter();
+    if (adapter) {
+      const issue = await adapter.fetchIssue(linear);
+      if (issue) {
+        // Track what we ACTUALLY seeded at the assignment site (don't infer it by
+        // value-comparing afterward — an explicit --description that happens to
+        // equal the issue's would otherwise be misreported as seeded).
+        const seeded: string[] = [];
+        if (!positionalTitle && issue.title) { title = issue.title; seeded.push("title"); }
+        if (!description && issue.description) { description = issue.description; seeded.push("description"); }
+        linearSeededNote = `seeded from ${linear}${seeded.length ? ` (${seeded.join(", ")})` : ""}`;
+      } else {
+        // A configured adapter that misses (not found / API error already warned
+        // by the adapter): no enrichment, fall through to the title requirement.
+        linearSeededNote = `${linear}: no issue fetched — recorded id, no enrichment`;
+      }
+    } else {
+      // OFFLINE NO-OP: no LINEAR_API_KEY. Record the id verbatim, no network.
+      linearSeededNote = `Linear not configured (set LINEAR_API_KEY) — recorded ${linear}, no enrichment`;
+    }
+  }
+
+  // Title is required UNLESS Linear enrichment supplied one. A missing title with
+  // no usable Linear title (no positional AND (no adapter OR a fetch miss)) is a
+  // clean usage error — we never invent a title.
+  if (!title) {
+    if (linear) {
+      throw new Error(
+        `hive quest create --linear ${linear}: a title is required because Linear did not supply one ` +
+          `(no LINEAR_API_KEY, or the issue was not found). Pass a positional title.`,
+      );
+    }
+    throw new Error('Usage: hive quest create "<title>" [--colony <c>] [--root <dir>] [--linear <issue>]');
+  }
 
   // A quest ALWAYS lives in a colony (PRD §8.2 / open-question #5 decided yes):
   // use/create the named one, else auto-create from the title slug.
   const colonyFlag = stringFlag(parsed, ["colony"]);
   const colony = colonyFlag ? await ensureColony(colonyFlag) : await ensureColony(colonySlugFromTitle(title));
-
-  const linear = stringFlag(parsed, ["linear"]);
-  const description = stringFlag(parsed, ["description"]);
 
   const id = generateQuestId();
 
@@ -3985,11 +4031,7 @@ async function questCreate(parsed: Parsed) {
     ...(description ? { description } : {}),
   });
 
-  if (linear) {
-    // Linear enrichment (fetch title/description from the issue) is increment 9c;
-    // store the id verbatim and stay offline-safe.
-    console.error(note(`linear ${linear} recorded — issue enrichment lands in a later increment`));
-  }
+  if (linearSeededNote) console.error(note(`linear ${linearSeededNote}`));
 
   const session = workspaceSessionName(record.workspace);
   if (isPretty()) {
@@ -4463,9 +4505,23 @@ async function questDone(parsed: Parsed) {
   // 8. Flip the quest to done (emits the quest.done ledger event).
   const updated = await updateQuest(quest.id, { status: "done", completedAt: new Date().toISOString() });
 
-  // 9. --close-linear: Linear write-back lands in a later increment (9c).
+  // 9. --close-linear (side-effect-gated WRITE, best-effort): transition the
+  //    quest's Linear issue to Done. The quest is ALREADY done by this point, so
+  //    a Linear failure is a side effect that NEVER fails `quest done`.
   if (truthy(flag(parsed, "close-linear"))) {
-    console.error(note("--close-linear: Linear write-back lands in a later increment"));
+    if (!updated.linearIssueId) {
+      console.error(note("--close-linear: this quest has no Linear issue — nothing to close"));
+    } else {
+      const adapter = loadLinearAdapter();
+      if (!adapter) {
+        // OFFLINE NO-OP: no LINEAR_API_KEY.
+        console.error(note(`--close-linear: Linear not configured (set LINEAR_API_KEY) — left ${updated.linearIssueId} untouched`));
+      } else {
+        const closed = await adapter.closeIssue(updated.linearIssueId);
+        if (closed) console.error(note(`--close-linear: transitioned ${updated.linearIssueId} to Done`));
+        else console.error(note(`--close-linear: could not close ${updated.linearIssueId} (best-effort; quest is still done)`));
+      }
+    }
   }
 
   const killFailed = outcomes.filter((o) => o.result === "kill_failed").map((o) => o.name);

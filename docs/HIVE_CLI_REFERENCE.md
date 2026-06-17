@@ -1008,8 +1008,12 @@ Behavior and guarantees:
   - `--keep-bees` skips the kill: the bees **stay alive** (`status:"running"`,
     still visible in `hive list`) and the workspace is safe-closed around them;
     seals + snapshot are still filed and the quest still completes.
-  - `--close-linear` is a no-op that prints a deferred-Linear note (Linear
-    write-back lands in a later increment).
+  - `--close-linear` transitions the quest's Linear issue to a completed state
+    (see "Linear integration" below). It is **side-effect-gated** (no Linear
+    write without the flag) and **best-effort**: the quest is already `done` by
+    this point, so a Linear failure never fails `done` — it warns and moves on.
+    With no `LINEAR_API_KEY` it is a clear offline no-op; with no Linear issue on
+    the quest it prints "nothing to close".
   - A second `done` on an already-done/archived quest is rejected (idempotency
     guard).
 - An **archived bee** (`status:"archived"`) is *filed, not dead*: it is a terminal
@@ -1031,9 +1035,40 @@ only on a successful run. `--arg key=value` is forwarded to the flow like
 `hive flow run`. The flow's `kill-on-end` cleanup is overridden to `keep` (the
 quest owns its bees); `start --flow --background` is not yet supported.
 
-Linear issue enrichment lands in a later increment — `--linear <issue>` on
-`create` is accepted and stored verbatim (offline-safe), and `--close-linear` on
-`done` is a no-op note; issue fetch/seed and write-back are deferred.
+#### Linear integration (optional, offline-safe, side-effect-gated)
+
+Linear is wired through a single pluggable adapter (`src/linear.ts`) — it is the
+**only** Linear-aware module; hive core never imports Linear directly. The
+transport is an **API token**: the adapter POSTs GraphQL to
+`https://api.linear.app/graphql` with `Authorization: <token>`. It is gated on
+one environment variable:
+
+- **`LINEAR_API_KEY`** — set it to enable Linear. Get a Personal API key from
+  Linear (Settings → Security & access → Personal API keys). When it is unset (or
+  blank), the adapter is `null` and **everything works fully offline** — this is
+  the cardinal property: `quest create`/`done` behave exactly as without Linear,
+  with no network and a clear note.
+
+Behavior:
+
+- **Read on create** — `hive quest create --linear ENG-1234`: with a key set, the
+  adapter fetches the issue and **seeds the quest title from the issue title when
+  no positional title is given** (an explicit positional title always wins) and
+  the **description from the issue description** (unless `--description`
+  overrides). The Linear id is stored on the quest either way. A title is
+  required when none can be resolved (no positional title AND no
+  key/fetch-miss) — that case is a clean usage error. With no key, the id is
+  recorded verbatim and a "Linear not configured (set `LINEAR_API_KEY`)" note is
+  printed (no network). The identifier shape (`ENG-1234`) is validated before any
+  call; a malformed value is rejected.
+- **Write on done** — `hive quest done --close-linear` (see above): transitions
+  the linked issue to its team's first `completed`-type workflow state (or one
+  named "Done"). Side-effect-gated and best-effort — never fails `done`.
+
+The adapter's transport is **injectable** (`fetchImpl`), so the GraphQL request
+construction, response parsing, and the offline/no-key path are all unit-tested
+with a stub (`tests/linear.unit.test.ts`); the **live API path is not exercised
+in CI** (no token) and is the operator's to verify with a real key.
 
 ### `hive split`
 
