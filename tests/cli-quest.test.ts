@@ -199,23 +199,12 @@ test("Q1c: quest create without --colony auto-creates a colony from the title sl
   });
 });
 
-test("quest done/archive and --flow fail loud as later-increment work", { skip: !tmuxAvailable() }, async () => {
+test("quest start --flow fails loud as later-increment work", { skip: !tmuxAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const created = await hive(store, socket, ["quest", "create", "later 1"]);
     const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
 
-    for (const sub of ["done", "archive"]) {
-      let err: (Error & { stderr?: string }) | undefined;
-      try {
-        await hive(store, socket, ["quest", sub, id]);
-      } catch (e) {
-        err = e as Error & { stderr?: string };
-      }
-      assert.ok(err, `quest ${sub} exits non-zero`);
-      assert.match(`${err?.stderr ?? ""}${err?.message ?? ""}`, /later increment/, `quest ${sub} explains it is deferred`);
-    }
-
-    // --flow on start is also deferred.
+    // --flow on start is deferred to a later increment.
     let flowErr: (Error & { stderr?: string }) | undefined;
     try {
       await hive(store, socket, ["quest", "start", id, "--flow", "x"]);
@@ -224,6 +213,177 @@ test("quest done/archive and --flow fail loud as later-increment work", { skip: 
     }
     assert.ok(flowErr, "quest start --flow exits non-zero");
     assert.match(`${flowErr?.stderr ?? ""}${flowErr?.message ?? ""}`, /later increment/, "start --flow explains it is deferred");
+  });
+});
+
+// A seal on disk under HIVE_STORE_ROOT/seals/<bee>/, matching seal.ts's stamp
+// scheme (sealedAt with `:`/`.` mapped to `-`) so quest done's copyBeeSeals
+// files it. Driving `hive seal` would need a live agent pane; writing the file
+// directly is the documented test shortcut (testPlan E).
+async function seedSeal(store: string, beeName: string, summary = "done"): Promise<string> {
+  const dir = join(store, "seals", beeName);
+  await mkdir(dir, { recursive: true });
+  const sealedAt = new Date().toISOString();
+  const stamp = sealedAt.replace(/[:.]/g, "-");
+  const file = join(dir, `${stamp}.json`);
+  await writeFile(file, `${JSON.stringify({ beeName, sealedAt, status: "done", summary }, null, 2)}\n`);
+  return `${stamp}.json`;
+}
+
+test("Q2: quest done files seals + snapshot, kills + archives the bee, hides it from list/clean, completes the quest", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    await seedFrame(store, "review");
+    const created = await hive(store, socket, ["quest", "create", "finish me", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    await hive(store, socket, ["quest", "start", id, "--frame", "review", "--no-wait"], CLAUDE_ENV);
+
+    const bees = (await listBeeRecords(store)).filter((b) => b.questId === id);
+    assert.equal(bees.length, 1, "one quest bee spawned");
+    const bee = bees[0]!;
+    const beeName = String(bee.name);
+
+    // Seed a seal on disk so done files a COPY of it.
+    const sealFile = await seedSeal(store, beeName);
+
+    const done = await hive(store, socket, ["quest", "done", id]);
+    assert.match(done.stdout, /quest-done\t/, `quest done prints quest-done line: ${done.stdout}`);
+
+    // Filed COPY exists under quests/<id>/seals/<bee>/<stamp>.json AND the
+    // original sealsRoot copy still exists (never moved).
+    const filedSeal = await readFile(join(store, "quests", id, "seals", beeName, sealFile), "utf8");
+    assert.match(filedSeal, /"summary": "done"/, "the seal was filed as a copy");
+    const origSeal = await readFile(join(store, "seals", beeName, sealFile), "utf8");
+    assert.match(origSeal, /"summary": "done"/, "the original seal is left intact (copy, not move)");
+
+    // quests/<id>/workspace.json exists with a members snapshot.
+    const filedWs = JSON.parse(await readFile(join(store, "quests", id, "workspace.json"), "utf8")) as { name: string; members: unknown[] };
+    assert.equal(filedWs.name, id, "filed workspace snapshot is the quest's ws");
+
+    // The bee's tmux session is gone (transactional kill happened).
+    assert.equal(await hasSessionLocal(String(bee.tmuxTarget)), false, "the bee session was killed");
+
+    // The bee's SessionRecord still exists with status archived (in-place index).
+    const afterBee = (await listBeeRecords(store)).find((b) => b.name === beeName);
+    assert.ok(afterBee, "the bee record still exists (filed in place, not deleted)");
+    assert.equal(afterBee!.status, "archived", "the bee record is marked archived");
+
+    // `hive list` (default) hides the archived bee; --archived re-includes it.
+    const listDefault = JSON.parse((await hive(store, socket, ["list", "--json"])).stdout) as Array<{ name: string }>;
+    assert.ok(!listDefault.some((r) => r.name === beeName), "default list hides the archived bee");
+    const listArchived = JSON.parse((await hive(store, socket, ["list", "--archived", "--json"])).stdout) as Array<{ name: string; beeState: string }>;
+    assert.ok(listArchived.some((r) => r.name === beeName && r.beeState === "archived"), "--archived re-includes the archived bee with state archived");
+
+    // `hive clean --dead --dry-run` does NOT list the archived bee (skipped).
+    const cleanDry = await hive(store, socket, ["clean", "--dead", "--dry-run"]);
+    assert.ok(!cleanDry.stdout.includes(beeName), "clean --dead does not offer the archived bee");
+
+    // quest.json status done + completedAt; ws session closed; WorkspaceRecord.archived true.
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "done", "quest is done");
+    assert.ok(typeof quest.completedAt === "string" && (quest.completedAt as string).length > 0, "completedAt stamped");
+    assert.equal(await hasSessionLocal(`ws-${id}`), false, "the quest workspace session was closed");
+    const ws = await readWs(store, id);
+    assert.equal(ws.archived, true, "the workspace record is archived");
+
+    // quest inspect STILL surfaces the archived bee (questId direct read).
+    const inspected = JSON.parse((await hive(store, socket, ["quest", "inspect", id, "--json"])).stdout) as { bees: Array<{ name: string; status: string }> };
+    assert.ok(inspected.bees.some((b) => b.name === beeName && b.status === "archived"), "quest inspect still shows the filed bee");
+
+    // Default SELECTOR resolution (resolveSelector, used by list <sel>/send/view)
+    // excludes the archived bee: `list quest:<id>` returns nothing because the
+    // selector path filters status==="archived" (Chokepoint 3), even though the
+    // bee is still in the store and inspect (questId direct read) shows it.
+    const selRows = JSON.parse((await hive(store, socket, ["list", `quest:${id}`, "--json"])).stdout) as Array<{ name: string }>;
+    assert.ok(!selRows.some((r) => r.name === beeName), "the archived bee is excluded from default selector resolution");
+  });
+});
+
+test("Q2 --keep-bees: bee stays alive (status running, in default list), seals filed, quest done", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    await seedFrame(store, "review");
+    const created = await hive(store, socket, ["quest", "create", "keep them", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    await hive(store, socket, ["quest", "start", id, "--frame", "review", "--no-wait"], CLAUDE_ENV);
+
+    const bee = (await listBeeRecords(store)).find((b) => b.questId === id)!;
+    const beeName = String(bee.name);
+    await seedSeal(store, beeName);
+
+    await hive(store, socket, ["quest", "done", id, "--keep-bees"]);
+
+    // The bee session is STILL alive and the record is STILL running (never hide a live bee).
+    assert.equal(await hasSessionLocal(String(bee.tmuxTarget)), true, "the bee session stays alive with --keep-bees");
+    const afterBee = (await listBeeRecords(store)).find((b) => b.name === beeName)!;
+    assert.equal(afterBee.status, "running", "a kept bee is NOT marked archived");
+
+    // It STILL appears in the default list.
+    const listDefault = JSON.parse((await hive(store, socket, ["list", "--json"])).stdout) as Array<{ name: string }>;
+    assert.ok(listDefault.some((r) => r.name === beeName), "a kept bee is still visible in the default list");
+
+    // Seals were STILL filed; quest is done.
+    await readFile(join(store, "quests", id, "workspace.json"), "utf8");
+    const filedSeals = await readdir(join(store, "quests", id, "seals", beeName)).catch(() => []);
+    assert.ok(filedSeals.length > 0, "seals are filed even with --keep-bees");
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "done", "quest is done even with --keep-bees");
+  });
+});
+
+test("Q2: quest archive after done flips the quest to archived + archivedAt", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "archive me", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    await hive(store, socket, ["quest", "done", id]);
+
+    // archive flips done → archived.
+    await hive(store, socket, ["quest", "archive", id]);
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "archived", "quest is archived");
+    assert.ok(typeof quest.archivedAt === "string" && (quest.archivedAt as string).length > 0, "archivedAt stamped");
+
+    // Default quest list hides it; --status archived surfaces it.
+    const listDefault = JSON.parse((await hive(store, socket, ["quest", "list", "--json"])).stdout) as Array<{ id: string }>;
+    assert.ok(!listDefault.some((q) => q.id === id), "archived quest hidden from default quest list");
+    const listArchived = JSON.parse((await hive(store, socket, ["quest", "list", "--status", "archived", "--json"])).stdout) as Array<{ id: string }>;
+    assert.ok(listArchived.some((q) => q.id === id), "--status archived surfaces the archived quest");
+  });
+});
+
+test("Q2: quest archive before done is rejected; quest done is idempotent-guarded", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "guard me", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+
+    // archive before done is rejected.
+    let archiveErr: (Error & { stderr?: string }) | undefined;
+    try {
+      await hive(store, socket, ["quest", "archive", id]);
+    } catch (e) {
+      archiveErr = e as Error & { stderr?: string };
+    }
+    assert.ok(archiveErr, "archive before done exits non-zero");
+
+    // done, then a second done is rejected as already-done.
+    await hive(store, socket, ["quest", "done", id]);
+    let doneErr: (Error & { stderr?: string }) | undefined;
+    try {
+      await hive(store, socket, ["quest", "done", id]);
+    } catch (e) {
+      doneErr = e as Error & { stderr?: string };
+    }
+    assert.ok(doneErr, "a second quest done exits non-zero (already done)");
+    assert.match(`${doneErr?.stderr ?? ""}${doneErr?.message ?? ""}`, /already done/, "explains it is already done");
+  });
+});
+
+test("Q2 --close-linear: succeeds and prints the deferred-Linear note on stderr", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const created = await hive(store, socket, ["quest", "create", "linear later", "--colony", "reviews"]);
+    const id = created.stdout.match(/quest-created\t(\S+)\t/)![1]!;
+    const done = await hive(store, socket, ["quest", "done", id, "--close-linear"]);
+    assert.match(done.stderr, /Linear write-back lands in a later increment/, "prints the deferred Linear note");
+    const quest = await readQuestRecord(store, id);
+    assert.equal(quest.status, "done", "quest done with --close-linear still completes");
   });
 });
 

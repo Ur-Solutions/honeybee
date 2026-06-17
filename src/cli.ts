@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { access, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
 import {
   AUTO_ACCOUNT_QUERY,
@@ -53,6 +53,7 @@ import {
   generateQuestId,
   listQuests,
   loadQuest,
+  questDir,
   updateQuest,
   validQuestId,
   type QuestRecord,
@@ -119,7 +120,7 @@ import {
 } from "./daemon/install.js";
 import { tailDaemonLog } from "./daemon/logs.js";
 import { renderSystemdUnit } from "./daemon/plist.js";
-import { listSeals, loadLatestSeal, recordSeal, sealedBeeNames as sealedBeeNamesImpl, validateSealArtifact } from "./seal.js";
+import { copyBeeSeals, listSeals, loadLatestSeal, recordSeal, sealedBeeNames as sealedBeeNamesImpl, validateSealArtifact } from "./seal.js";
 import { search, type SearchHit, type SearchOptions, type SearchTypeFilter } from "./search.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
 import { resolveSelector } from "./selectors.js";
@@ -1094,6 +1095,12 @@ async function cmdList(parsed: Parsed) {
   }
   const probe = await liveTargetsAcrossNodes(nodes, nodeFilter);
   let records = allRecords;
+  // Filed (archived) bees are hidden from the default list — a `quest done`-filed
+  // bee is no longer a working bee (PRD §16 #4). Re-include them with --archived
+  // (mirrors `workspace list --archived`), and auto-include when the user targets
+  // them explicitly with `--state archived` so that query is never empty.
+  const showArchived = truthy(flag(parsed, "archived")) || stateFilter === "archived";
+  if (!showArchived) records = records.filter((r) => r.status !== "archived");
   if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
   if (swarmFilter) records = records.filter((r) => r.swarmId === swarmFilter);
   if (nodeFilter) records = records.filter((r) => (r.node ?? LOCAL_NODE_NAME) === nodeFilter);
@@ -1362,6 +1369,8 @@ function formatStateCell(state: BeeState): string {
       return `${dim("●")} ${label}`;
     case "sealed":
       return `${magenta("●")} ${magenta(label)}`;
+    case "archived":
+      return `${gray("○")} ${gray(label)}`;
     case "error":
       return `${red("●")} ${red(label)}`;
     case "kill_failed":
@@ -1409,7 +1418,11 @@ async function cmdClean(parsed: Parsed) {
 }
 
 async function cmdCleanDead(parsed: Parsed) {
-  const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
+  // A filed (archived) bee is filed, not dead — `clean` must never reap it (PRD
+  // §13); only an explicit `hive kill` deletes a filed bee. Exclude it at the
+  // source so neither the dead-sweep nor the pane-dead loop below can touch it.
+  const records = allRecords.filter((r) => r.status !== "archived");
   const probe = await liveTargetsAcrossNodes(nodes);
   // Records on an unreachable node are NOT dead — we genuinely don't know their state.
   // Treat them as live so we don't sweep their metadata while their node is down.
@@ -1581,7 +1594,11 @@ type CleanCandidate = CleanTuiItem & {
 };
 
 async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; candidates: CleanCandidate[] }> {
-  const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
+  // A filed (archived) bee derives to the "archived" terminal state but must NOT
+  // be offered as an idle/dead clean candidate (PRD §13) — exclude it up front so
+  // `clean --idle`/interactive never lists it.
+  const records = allRecords.filter((r) => r.status !== "archived");
   const probe = await liveTargetsAcrossNodes(nodes);
   // A record whose node is no longer registered was never probed; treat it as
   // unreachable (not dead) so clean paths refuse to sweep a possibly-live bee.
@@ -1753,6 +1770,8 @@ function cleanStatePriority(state: BeeState): number {
     case "idle_with_output":
       return 0;
     case "dead":
+      return 1;
+    case "archived":
       return 1;
     case "sealed":
       return 2;
@@ -3537,12 +3556,11 @@ async function cmdQuest(parsed: Parsed) {
     case "inspect":
       return questInspect(parsed);
     case "done":
+      return questDone(parsed);
     case "archive":
-      // 9b/9c: completion, archive, and Linear write-back land in a later
-      // increment. Fail loud rather than pretend.
-      throw new Error(`hive quest ${sub}: lands in a later increment (completion/archive is increment 9b)`);
+      return questArchive(parsed);
     default:
-      throw new Error(`Unknown quest subcommand: ${sub}\nUsage: hive quest <create|start|list|inspect>`);
+      throw new Error(`Unknown quest subcommand: ${sub}\nUsage: hive quest <create|start|list|inspect|done|archive>`);
   }
 }
 
@@ -3828,7 +3846,9 @@ async function questInspect(parsed: Parsed) {
     if (quest.linearIssueId) console.log(`  ${dim("linear")}    ${quest.linearIssueId}`);
     console.log(`  ${dim("bees")}      ${bees.length}`);
     for (const b of beeSummary) {
-      const state = b.status === "running" ? green(b.state ?? "running") : gray(b.status);
+      // A filed bee shows `archived` (it stays in the live store by questId, so
+      // inspect surfaces it even though the default selector path excludes it).
+      const state = b.status === "archived" ? gray("archived") : b.status === "running" ? green(b.state ?? "running") : gray(b.status);
       console.log(`    ${bold(b.name)} ${dim(b.caste ? `caste:${b.caste}` : b.agent)} ${state}`);
     }
   } else {
@@ -3837,6 +3857,175 @@ async function questInspect(parsed: Parsed) {
       console.log(`bee\t${b.name}\t${b.caste ?? b.agent}\t${b.status}\t${b.state ?? ""}`);
     }
   }
+}
+
+/**
+ * `hive quest done <id> [--keep-bees] [--close-linear]` — file the quest's work
+ * and complete it (PRD §8.4, acceptance Q2). The strict ordering is the safety
+ * spine: FILE (copy seals + the final workspace snapshot) BEFORE any destructive
+ * step, so a crash never loses a seal or the geometry; SNAPSHOT the workspace
+ * BEFORE closing it; KILL transactionally; mark archived ONLY the bees we
+ * confirmed killed (a kill_failed or a kept-alive bee is NEVER marked archived —
+ * the cardinal invariant: never hide a live bee from `list`); then CLOSE the
+ * workspace with the safe close (which never kills a bee, and aborts rather than
+ * orphan one); finally flip the quest to done. The whole flow is restartable.
+ */
+async function questDone(parsed: Parsed) {
+  const idArg = parsed.args[1];
+  if (!idArg) throw new Error("Usage: hive quest done <id> [--keep-bees] [--close-linear]");
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+  // Idempotency guard (mirrors questStart): a quest that is already done/archived
+  // has already been filed; don't re-run the destructive flow.
+  if (quest.status === "done" || quest.status === "archived") {
+    throw new Error(`Quest ${quest.id} is already ${quest.status}`);
+  }
+
+  const keepBees = truthy(flag(parsed, "keep-bees"));
+
+  // 1. Gather members directly from the store by questId (NOT resolveSelector —
+  //    some may already be archived from a prior partial run, and the selector
+  //    path excludes archived).
+  const bees = (await listSessions()).filter((b) => b.questId === quest.id);
+
+  // 3. SNAPSHOT the quest workspace geometry (before close) so the filed
+  //    workspace.json carries live window layouts.
+  const wsSession = workspaceSessionName(quest.workspace);
+  if (await hasSession(wsSession)) {
+    const result = await tmux(["list-windows", "-t", `=${wsSession}:`, "-F", "#{window_name}\t#{window_layout}"], { reject: false });
+    const layout: WorkspaceLayoutEntry[] = [];
+    for (const line of (result.ok ? result.stdout.split("\n") : []).filter(Boolean)) {
+      const tab = line.indexOf("\t");
+      if (tab < 0) continue;
+      const windowName = line.slice(0, tab);
+      const value = line.slice(tab + 1);
+      if (!windowName || !value) continue;
+      layout.push({ windowName, layout: value });
+    }
+    await updateWorkspace(quest.workspace, { layout });
+  }
+  const wsRecord = await loadWorkspace(quest.workspace);
+
+  // 4. FILE ARCHIVE under quests/<id>/ — a COPY, BEFORE any destructive step.
+  const dir = questDir(quest.id);
+  await mkdir(dir, { recursive: true });
+  // 4a. Seals: copy every member's seals (read-only collection — bees seal
+  //     themselves; absence of a seal is not an error). The live sealsRoot is
+  //     never moved, so a crash here leaves seals duplicated (benign), not lost.
+  let filedSealBees = 0;
+  for (const bee of bees) {
+    const copied = await copyBeeSeals(bee.name, join(dir, "seals"));
+    if (copied > 0) filedSealBees += 1;
+  }
+  // 4b. Final workspace snapshot (geometry + members) for reconstruction.
+  if (wsRecord) {
+    await writeFile(join(dir, "workspace.json"), `${JSON.stringify(wsRecord, null, 2)}\n`, { mode: 0o600 });
+  }
+  // 4c. Manifest: each member's final SessionRecord so a filed bee is
+  //     reconstructable even after its live record is later kill-deleted.
+  await writeFile(
+    join(dir, "manifest.json"),
+    `${JSON.stringify({ questId: quest.id, filedAt: new Date().toISOString(), bees }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+
+  // 5./6. KILL (unless --keep-bees) + mark ONLY confirmed-killed bees archived.
+  // A quest bee's window is LINKED into ws-<id> (quest start link-window'd it):
+  // killing the bee's own session leaves that window orphaned in the ws (its only
+  // remaining link), which the safe close would then refuse as a "last link". So
+  // for each CONFIRMED-killed bee we reap its now-dead orphan window from the ws
+  // with `unlink-window -k` — killing a confirmed-dead window is debris cleanup,
+  // never killing a live bee. A kept/kill_failed (live) bee's window is left for
+  // the safe close to safe-unlink (it survives via the bee's own session).
+  const inventory = (await hasSession(wsSession)) ? await windowInventory() : undefined;
+  const outcomes: Array<{ name: string; result: "archived" | "kept" | "kill_failed" }> = [];
+  if (!keepBees) {
+    for (const bee of bees) {
+      if (bee.status === "archived") {
+        // Already filed by a prior partial run — leave it archived.
+        outcomes.push({ name: bee.name, result: "archived" });
+        continue;
+      }
+      // Capture the record + ws window id BEFORE the kill: transactionalKill
+      // deletes the record on confirmed death, and the window id is needed to
+      // reap the orphan afterwards.
+      const snapshot = { ...bee };
+      const wsWindowId = inventory?.active.get(bee.tmuxTarget);
+      const outcome = await transactionalKill(bee);
+      if (outcome.ok) {
+        // Re-create the index record with status:"archived" — the live store
+        // stays the index (PRD §16 #4), the bee is filed not deleted.
+        await saveSession({ ...snapshot, status: "archived", updatedAt: new Date().toISOString() });
+        // Reap the now-dead orphan window from the ws (the bee is confirmed gone).
+        if (wsWindowId) await tmux(["unlink-window", "-k", "-t", wsWindowId], { reject: false });
+        outcomes.push({ name: bee.name, result: "archived" });
+      } else {
+        // A kill_failed bee may still be running — leave it kill_failed, do NOT
+        // archive it (never hide a possibly-live bee), and leave its window for
+        // the safe close to safe-unlink.
+        outcomes.push({ name: bee.name, result: "kill_failed" });
+      }
+    }
+  } else {
+    // --keep-bees: bees stay alive → NEVER mark them archived (that would hide a
+    // live bee from `list`, the cardinal invariant). They keep status:"running".
+    for (const bee of bees) outcomes.push({ name: bee.name, result: "kept" });
+  }
+
+  // 7. CLOSE the quest workspace with the safe close (never kills a bee; aborts
+  //    rather than orphan a still-live --keep-bees window). If it throws, the
+  //    quest is left NOT-done and surfaces the error — no silent bee loss. The
+  //    confirmed-dead orphan windows were already reaped above, so the safe close
+  //    sees only our own windows + any live (kept/kill_failed) bee windows.
+  if (await hasSession(wsSession)) {
+    await closeWorkspaceSession(wsSession);
+  }
+  await archiveWorkspace(quest.workspace).catch(() => undefined);
+
+  // 8. Flip the quest to done (emits the quest.done ledger event).
+  const updated = await updateQuest(quest.id, { status: "done", completedAt: new Date().toISOString() });
+
+  // 9. --close-linear: Linear write-back lands in a later increment (9c).
+  if (truthy(flag(parsed, "close-linear"))) {
+    console.error(note("--close-linear: Linear write-back lands in a later increment"));
+  }
+
+  const killFailed = outcomes.filter((o) => o.result === "kill_failed").map((o) => o.name);
+  if (killFailed.length > 0) {
+    console.error(note(`${killFailed.length} bee(s) failed to die and stay visible (kill_failed): ${killFailed.join(", ")}`));
+  }
+  if (isPretty()) {
+    const beeNote = keepBees ? `${bees.length} bee(s) kept` : `${outcomes.filter((o) => o.result === "archived").length} bee(s) filed`;
+    console.log(actionLine("ok", "quest", [bold(updated.id), dim("done"), dim(beeNote), dim(`${filedSealBees} sealed`)]));
+  } else {
+    console.log(`quest-done\t${updated.id}\t${outcomes.filter((o) => o.result === "archived").length}\t${killFailed.length}`);
+  }
+}
+
+/**
+ * `hive quest archive <id>` — the post-done filing flip (done → archived, PRD
+ * §8.4). A pure quest-record state flip: it does NOT re-touch bees or the
+ * workspace (already handled by `done`). Idempotent: archiving an archived quest
+ * is a no-op. Surfaces in `quest list --status archived`.
+ */
+async function questArchive(parsed: Parsed) {
+  const idArg = parsed.args[1];
+  if (!idArg) throw new Error("Usage: hive quest archive <id>");
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+  if (quest.status === "archived") {
+    if (isPretty()) console.log(actionLine("ok", "quest", [bold(quest.id), dim("already archived")]));
+    else console.log(`quest-archived\t${quest.id}`);
+    return;
+  }
+  // Archive is the lifecycle flip after done; require done first so the work was
+  // filed (quest done copies seals + snapshot before archiving is meaningful).
+  if (quest.status !== "done") {
+    throw new Error(`Quest ${quest.id} is ${quest.status}; run 'hive quest done ${quest.id}' before archiving`);
+  }
+  const updated = await updateQuest(quest.id, { status: "archived", archivedAt: new Date().toISOString() });
+  if (isPretty()) console.log(actionLine("ok", "quest", [bold(updated.id), dim("archived")]));
+  else console.log(`quest-archived\t${updated.id}`);
 }
 
 async function workspaceClose(parsed: Parsed) {

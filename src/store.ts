@@ -60,7 +60,7 @@ export type SessionRecord = {
   tags?: string[];
   createdAt: string;
   updatedAt: string;
-  status: "running" | "dead" | "kill_failed";
+  status: "running" | "dead" | "kill_failed" | "archived";
   lastError?: string;
   notes?: string;
   id?: string;
@@ -319,7 +319,7 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
     createdAt: object.createdAt as string,
     updatedAt: object.updatedAt as string,
     status:
-      object.status === "running" || object.status === "dead" || object.status === "kill_failed"
+      object.status === "running" || object.status === "dead" || object.status === "kill_failed" || object.status === "archived"
         ? object.status
         : "dead",
   };

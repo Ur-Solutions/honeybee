@@ -677,7 +677,7 @@ Show known sessions with derived state.
 ```sh
 hive list [selector] [--colony <name>] [--swarm <id>] [--node <name>]
           [--state <s>] [--agent <a>] [--repo <name>] [--tag <ns:val>]...
-          [--json] [--wide]
+          [--archived] [--json] [--wide]
 hive ps --wide
 ```
 
@@ -701,6 +701,9 @@ three. The facets:
 - positional `[selector]`: a bee / `@swarm` / `colony:<name>` / `#tag` /
   `tag:<...>` selector applied as a filter alongside the flags (an unknown
   colony/swarm errors, consistent with other commands).
+- `--archived`: include **filed** bees (`status:"archived"`, filed by
+  `hive quest done`). They are **hidden by default**; `--archived` (or an explicit
+  `--state archived`) re-includes them.
 
 **`--json`** emits a machine array regardless of TTY, after all filters are
 applied. Each element has the shape:
@@ -937,13 +940,16 @@ Behavior and guarantees:
 A **tracked task** with a beginning and a completion (`QuestRecord`). A quest
 lives in a colony, owns a dedicated workspace while active, and spawns one or
 more swarms to do the work. Its lifecycle is `open → active → done → archived`;
-this build covers `create` and `start` (open → active) plus `list`/`inspect`.
+this build covers `create`/`start` (open → active), `list`/`inspect`, and
+`done`/`archive` (the completion + filing flow).
 
 ```sh
 hive quest create "<title>" [--colony <c>] [--root <dir>] [--linear <issue>] [--description <text>]
 hive quest start  <id> --frame <f>
 hive quest list   [--colony <c>] [--status <s>] [--json]
 hive quest inspect <id> [--json]
+hive quest done   <id> [--keep-bees] [--close-linear]
+hive quest archive <id>
 ```
 
 Examples:
@@ -953,6 +959,9 @@ hive quest create "review #1255" --colony reviews   # → quest q-ab12cd + ws-q-
 hive quest start q-ab12cd --frame review            # spawn the review swarm into it
 hive quest list --status active                     # the in-flight quests
 hive quest inspect q-ab12cd                          # rolled-up status + its bees
+hive quest done q-ab12cd                             # file seals + snapshot, kill bees, close ws
+hive quest done q-ab12cd --keep-bees                 # complete but leave the bees alive
+hive quest archive q-ab12cd                          # done → archived (post-completion filing flip)
 ```
 
 Behavior and guarantees:
@@ -980,12 +989,38 @@ Behavior and guarantees:
   record plus the bee summary.
 - `list` filters by `--colony` / `--status` and excludes archived quests by
   default. `--json` dumps the records.
+- `done` **files the work, then completes the quest** in a strict, restartable
+  order: snapshot the workspace geometry → **file a COPY** of every member bee's
+  seals + the final workspace snapshot + a member manifest under
+  `~/.hive/quests/<id>/` (a copy, BEFORE any destructive step — a crash never
+  loses a seal) → **transactionally kill** each member (`src/kill.ts`) and mark
+  **only the confirmed-killed bees** `status:"archived"` in place (the live store
+  stays the index) → close the quest workspace (the safe close, which **never
+  kills a bee**) → flip the quest to `done` with `completedAt`. A `kill_failed`
+  bee (still suspected running) is **left `kill_failed`, never archived** and is
+  reported on stderr — a possibly-live bee is never hidden. Ledger: `quest.done`.
+  - `--keep-bees` skips the kill: the bees **stay alive** (`status:"running"`,
+    still visible in `hive list`) and the workspace is safe-closed around them;
+    seals + snapshot are still filed and the quest still completes.
+  - `--close-linear` is a no-op that prints a deferred-Linear note (Linear
+    write-back lands in a later increment).
+  - A second `done` on an already-done/archived quest is rejected (idempotency
+    guard).
+- An **archived bee** (`status:"archived"`) is *filed, not dead*: it is a terminal
+  state that is **excluded from the default `hive list`** (re-include with
+  `hive list --archived` or `--state archived`), is **never swept by `hive clean`**
+  (only an explicit `hive kill` deletes it), and is **excluded from default
+  selector resolution** (`send`/`view`/`list <sel>`) — yet `quest inspect <id>`
+  still surfaces it (it reads the store directly by `questId`).
+- `archive` is the post-completion flip `done → archived` (a pure quest-record
+  state change with `archivedAt`; it does not re-touch bees or the workspace).
+  It requires the quest to be `done` first, is idempotent, and surfaces the quest
+  in `quest list --status archived`. Ledger: `quest.archive`.
 
-`hive quest done`, `hive quest archive`, the `--flow` variant of `start`, and
-Linear issue enrichment land in later increments — they fail loud with a "lands
-in a later increment" message rather than partially executing. `--linear <issue>`
-on `create` is accepted and stored verbatim (offline-safe); issue fetch/seed is
-deferred.
+The `--flow` variant of `start` and Linear issue enrichment land in later
+increments — they fail loud with a "lands in a later increment" message rather
+than partially executing. `--linear <issue>` on `create` is accepted and stored
+verbatim (offline-safe); issue fetch/seed is deferred.
 
 ### `hive split`
 

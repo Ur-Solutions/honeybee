@@ -13,6 +13,15 @@ import {
   updateQuest,
   validQuestId,
 } from "../src/quest.js";
+import { ledgerPath } from "../src/store.js";
+
+async function ledgerTypes(): Promise<string[]> {
+  const raw = await readFile(ledgerPath(), "utf8").catch(() => "");
+  return raw
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => (JSON.parse(line) as { type?: string }).type ?? "");
+}
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-quest-"));
@@ -175,5 +184,38 @@ test("questFile/questDir compose the per-quest directory path", async () => {
     const dir = process.env.HIVE_STORE_ROOT!;
     assert.equal(questDir("q-x"), join(dir, "quests", "q-x"));
     assert.equal(questFile("q-x"), join(dir, "quests", "q-x", "quest.json"));
+  });
+});
+
+test("updateQuest persists completedAt on done and emits a quest.done ledger event", async () => {
+  await withTempStore(async () => {
+    await createQuest({ id: "q-done", title: "t", colony: "c", workspace: "q-done", status: "active" });
+    const at = "2026-06-17T01:00:00.000Z";
+    const updated = await updateQuest("q-done", { status: "done", completedAt: at });
+    assert.equal(updated.status, "done");
+    assert.equal(updated.completedAt, at, "completedAt persisted on the returned record");
+
+    const reloaded = await loadQuest("q-done");
+    assert.equal(reloaded?.completedAt, at, "completedAt reads back from disk");
+
+    const types = await ledgerTypes();
+    assert.ok(types.includes("quest.done"), "a distinct quest.done ledger event was emitted");
+    assert.ok(!types.includes("quest.archive"), "no quest.archive event yet");
+  });
+});
+
+test("updateQuest persists archivedAt on archive and emits a quest.archive ledger event", async () => {
+  await withTempStore(async () => {
+    await createQuest({ id: "q-arch", title: "t", colony: "c", workspace: "q-arch", status: "done" });
+    const at = "2026-06-17T02:00:00.000Z";
+    const updated = await updateQuest("q-arch", { status: "archived", archivedAt: at });
+    assert.equal(updated.status, "archived");
+    assert.equal(updated.archivedAt, at, "archivedAt persisted on the returned record");
+
+    const reloaded = await loadQuest("q-arch");
+    assert.equal(reloaded?.archivedAt, at, "archivedAt reads back from disk");
+
+    const types = await ledgerTypes();
+    assert.ok(types.includes("quest.archive"), "a distinct quest.archive ledger event was emitted");
   });
 });

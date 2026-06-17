@@ -227,7 +227,12 @@ export function formatSelector(selector: Selector): string {
 
 export async function resolveSelector(query: string): Promise<ResolvedTarget> {
   const selector = parseSelector(query);
-  const records = await listSessions();
+  // Filed (archived) bees are excluded from DEFAULT selector resolution
+  // (send/view/kill/list <sel>): a `quest done`-filed bee is no longer a live
+  // send/kill target (PRD §16 #4). `quest inspect` deliberately bypasses this
+  // chokepoint — it reads listSessions() directly by questId — so a done quest's
+  // archived bees stay visible there.
+  const records = (await listSessions()).filter((r) => r.status !== "archived");
   const state: SelectorState = { records };
 
   // The tag kind reuses colony:/swarm: existence sets for its unknown-value

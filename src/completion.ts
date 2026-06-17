@@ -83,7 +83,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   view: ["--name", "--new-client", "--close", "--print"],
   workspace: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
   ws: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
-  quest: ["--colony", "--root", "--linear", "--description", "--frame", "--flow", "--status", "--json"],
+  quest: ["--colony", "--root", "--linear", "--description", "--frame", "--flow", "--status", "--keep-bees", "--close-linear", "--json"],
   usage: ["--samples", "--json", "--ttl"],
   limits: ["--samples", "--json", "--ttl"],
   sessions: ["--home", "--json"],
@@ -122,8 +122,8 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   transcript: ["-n", "--limit", "--json"],
   tx: ["-n", "--limit", "--json"],
   clean: ["--dead", "--idle", "--interactive", "-i", "--older-than", "--older", "--dry-run", "-n"],
-  list: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--tag", "--json", "--wide"],
-  ps: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--tag", "--json", "--wide"],
+  list: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--tag", "--archived", "--json", "--wide"],
+  ps: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--tag", "--archived", "--json", "--wide"],
   attach: ["--print"],
   next: ["--state", "--prev", "--print"],
   search: ["--colony", "--swarm", "--bee", "--type", "--status", "--since", "--regex", "--case", "--limit", "--json"],
@@ -226,8 +226,9 @@ const NOUN_SUB_ARG: Record<string, Record<string, "colony" | "workspace" | "ques
   colony: { inspect: "colony", archive: "colony", update: "colony", rename: "colony" },
   workspace: { open: "workspace", add: "workspace", "add-pane": "workspace", snapshot: "workspace", restore: "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
   ws: { open: "workspace", add: "workspace", "add-pane": "workspace", snapshot: "workspace", restore: "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
-  // `start`/`inspect` take a quest id; `create` takes a free-form title (uncompleted).
-  quest: { start: "quest", inspect: "quest" },
+  // `start`/`inspect`/`done`/`archive` take a quest id; `create` takes a
+  // free-form title (uncompleted).
+  quest: { start: "quest", inspect: "quest", done: "quest", archive: "quest" },
   frame: { inspect: "frame", remove: "frame", edit: "frame", update: "frame", reload: "frame" },
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },

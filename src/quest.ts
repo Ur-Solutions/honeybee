@@ -119,6 +119,8 @@ export type QuestPatch = {
   status?: QuestStatus;
   swarmIds?: string[];
   activatedAt?: string;
+  completedAt?: string;
+  archivedAt?: string;
   description?: string;
   linearIssueId?: string;
   workspace?: string;
@@ -131,9 +133,13 @@ export async function updateQuest(id: string, patch: QuestPatch): Promise<QuestR
     if (!existing) throw new Error(`Unknown quest: ${id}`);
     const updated: QuestRecord = { ...existing };
     const wasActive = existing.status === "active";
+    const wasDone = existing.status === "done";
+    const wasArchived = existing.status === "archived";
     if (patch.status !== undefined) updated.status = patch.status;
     if (patch.swarmIds !== undefined) updated.swarmIds = sanitizeSwarmIds(patch.swarmIds);
     if (patch.activatedAt !== undefined) updated.activatedAt = patch.activatedAt;
+    if (patch.completedAt !== undefined) updated.completedAt = patch.completedAt;
+    if (patch.archivedAt !== undefined) updated.archivedAt = patch.archivedAt;
     if (patch.workspace !== undefined) updated.workspace = patch.workspace;
     if (patch.description !== undefined) {
       if (patch.description === "") delete updated.description;
@@ -144,10 +150,15 @@ export async function updateQuest(id: string, patch: QuestPatch): Promise<QuestR
       else updated.linearIssueId = patch.linearIssueId;
     }
     await saveQuest(updated);
-    // A status flip into "active" is the lifecycle event swarms hang off of;
-    // record it distinctly (like swarm.create/swarm.destroy) for `hive search`.
+    // A status flip is the lifecycle event swarms/completion hang off of; record
+    // each distinct edge (like swarm.create/swarm.destroy) for `hive search`.
     const becameActive = !wasActive && updated.status === "active";
-    await appendLedger(becameActive ? { type: "quest.activate", id, workspace: updated.workspace } : { type: "quest.update", id });
+    const becameDone = !wasDone && updated.status === "done";
+    const becameArchived = !wasArchived && updated.status === "archived";
+    if (becameActive) await appendLedger({ type: "quest.activate", id, workspace: updated.workspace });
+    else if (becameDone) await appendLedger({ type: "quest.done", id, workspace: updated.workspace });
+    else if (becameArchived) await appendLedger({ type: "quest.archive", id, workspace: updated.workspace });
+    else await appendLedger({ type: "quest.update", id });
     return updated;
   });
 }
