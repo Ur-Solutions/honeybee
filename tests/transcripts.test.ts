@@ -262,6 +262,8 @@ test("stripCommandNoise removes slash-command and harness blocks, keeps the real
   assert.equal(stripCommandNoise("<command-name>/effort</command-name>\n<command-args>ultracode</command-args>"), "");
   // system-reminder injections are dropped too.
   assert.equal(stripCommandNoise("<system-reminder>be careful</system-reminder>\nFix the parser"), "Fix the parser");
+  // Tags carrying attributes are still stripped (opening tag is not anchored to a bare `<tag>`).
+  assert.equal(stripCommandNoise('<system-reminder priority="high">hidden</system-reminder>visible'), "visible");
 });
 
 test("firstUserText skips noise-only rows and returns the first real user message", () => {

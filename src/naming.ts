@@ -197,7 +197,11 @@ async function runClaudeGenerator(prompt: string, model?: string): Promise<strin
   const cwd = await generatorCwd();
   const args = [
     "--append-system-prompt", TITLE_SYSTEM_PROMPT,
+    // Deny built-in tools by name AND block the user's globally-configured MCP
+    // servers (--strict-mcp-config with no --mcp-config loads none): a title
+    // needs no tools, and the embedded transcript is untrusted.
     "--disallowed-tools", ...CLAUDE_DISALLOWED_TOOLS,
+    "--strict-mcp-config",
     ...(model ? ["--model", model] : []),
     "-p", prompt,
   ];
@@ -213,7 +217,9 @@ async function runCodexGenerator(prompt: string, model?: string): Promise<string
   const outDir = await mkdtemp(join(tmpdir(), "hive-naming-"));
   const outFile = join(outDir, "last-message.txt");
   try {
-    const args = ["exec", "--skip-git-repo-check", "-s", "read-only", ...(model ? ["-m", model] : []), "--output-last-message", outFile, prompt];
+    // Force low reasoning for the title: a few words never needs the user's
+    // configured effort (often xhigh), which would burn quota and stall the tick.
+    const args = ["exec", "--skip-git-repo-check", "-s", "read-only", "-c", 'model_reasoning_effort="low"', ...(model ? ["-m", model] : []), "--output-last-message", outFile, prompt];
     await execFileAsync("codex", args, cwd);
     return await readFile(outFile, "utf8");
   } finally {
@@ -244,10 +250,7 @@ function execFileAsync(file: string, args: string[], cwd: string, stdin?: string
       },
       (error, stdout, stderr) => {
         if (error) {
-          // claude -p writes its real failure (usage limit, auth, permission)
-          // to STDOUT, not stderr — surface both so the daemon log is useful
-          // instead of echoing the benign stdin warning.
-          reject(new Error(`${file} failed${error.code !== undefined ? ` (exit ${error.code})` : ""}: ${failureDetail(stdout, stderr)}`));
+          reject(new Error(`${file} ${describeExecError(error, stdout, stderr)}`));
           return;
         }
         resolve({ stdout });
@@ -262,6 +265,30 @@ function execFileAsync(file: string, args: string[], cwd: string, stdin?: string
       child.stdin.end();
     }
   });
+}
+
+// Turn an execFile error into a diagnosis an operator can act on. The Node
+// error object distinguishes the failure modes the child's output cannot:
+// a missing binary (ENOENT) and a timeout kill (signal, code === null) would
+// otherwise both collapse into the empty-output "check auth/quota" fallback.
+type ExecError = Error & { code?: string | number | null; killed?: boolean; signal?: NodeJS.Signals | null };
+
+export function describeExecError(error: ExecError, stdout: string, stderr: string): string {
+  if (error.code === "ENOENT") {
+    return "not found on PATH — install it or set a naming.command override";
+  }
+  if (error.killed || error.signal) {
+    return `timed out after ${GENERATOR_TIMEOUT_MS}ms (killed${error.signal ? ` ${error.signal}` : ""})`;
+  }
+  // claude -p writes its real failure (usage limit, auth, permission) to STDOUT,
+  // not stderr — surface both so the log is useful, not the benign stdin warning.
+  const exit = typeof error.code === "number" ? ` (exit ${error.code})` : "";
+  const detail = failureDetail(stdout, stderr);
+  // When the child said nothing, the Node message ("Command failed: …") is all
+  // we have — keep it rather than guessing at auth/quota.
+  return detail.startsWith("no output")
+    ? `failed${exit}: ${detail}${error.message ? ` — ${error.message.split("\n")[0]}` : ""}`
+    : `failed${exit}: ${detail}`;
 }
 
 export function failureDetail(stdout: string, stderr: string): string {

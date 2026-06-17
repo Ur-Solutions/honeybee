@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
   buildTitlePrompt,
   canWriteTitle,
+  describeExecError,
   failureDetail,
   gatherTitleContext,
   generateTitle,
@@ -131,6 +132,27 @@ test("failureDetail prefers the real error and drops the benign stdin warning", 
 
 test("failureDetail falls back to an auth/quota hint when there is no output", () => {
   assert.match(failureDetail("", "Warning: no stdin data received in 3s, proceeding without it."), /auth\/quota/);
+});
+
+test("describeExecError names a missing binary instead of blaming auth/quota", () => {
+  const err = Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" });
+  const msg = describeExecError(err, "", "");
+  assert.match(msg, /not found on PATH/);
+  assert.doesNotMatch(msg, /auth\/quota/);
+});
+
+test("describeExecError reports a timeout kill, not '(exit null)'", () => {
+  const err = Object.assign(new Error("killed"), { code: null, killed: true, signal: "SIGKILL" as const });
+  const msg = describeExecError(err, "", "");
+  assert.match(msg, /timed out after \d+ms \(killed SIGKILL\)/);
+  assert.doesNotMatch(msg, /exit null/);
+});
+
+test("describeExecError surfaces a real exit code + stdout error, and appends the node message when output is empty", () => {
+  const withOutput = describeExecError(Object.assign(new Error("Command failed"), { code: 1 }), "Credit balance too low", "");
+  assert.match(withOutput, /\(exit 1\): Credit balance too low/);
+  const empty = describeExecError(Object.assign(new Error("Command failed: claude -p"), { code: 2 }), "", "");
+  assert.match(empty, /\(exit 2\): no output.*— Command failed/);
 });
 
 /* ------------------------------- context -------------------------------- */

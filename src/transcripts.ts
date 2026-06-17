@@ -248,7 +248,7 @@ export function renderTranscript(rows: TranscriptRow[], options: { limit?: numbe
 // become the "first user message" a titler sees and get echoed back as a
 // title. Strip them so the real prompt underneath wins.
 const COMMAND_NOISE_RE =
-  /<(local-command-caveat|command-name|command-message|command-args|command-contents|local-command-stdout|system-reminder)>[\s\S]*?<\/\1>/gi;
+  /<(local-command-caveat|command-name|command-message|command-args|command-contents|local-command-stdout|system-reminder)\b[^>]*>[\s\S]*?<\/\1>/gi;
 
 export function stripCommandNoise(text: string): string {
   return text.replace(COMMAND_NOISE_RE, "").replace(/\n{3,}/g, "\n\n").trim();
