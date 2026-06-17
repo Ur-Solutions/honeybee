@@ -670,7 +670,9 @@ async function cmdRename(parsed: Parsed) {
       title,
       titleSource: source,
       updatedAt: now,
-      // An explicit --auto also counts as this bee's one automatic attempt.
+      // Stamp autoTitleAt so the daemon's backoff sees a recent attempt; the bee
+      // is no longer a candidate once title+titleSource are set, so the attempt
+      // counter is intentionally left unbumped (this is the manual override).
       ...(auto ? { autoTitleAt: now } : {}),
     });
     await writeHiveTitle(record, title);

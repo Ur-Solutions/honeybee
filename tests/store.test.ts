@@ -139,6 +139,32 @@ test("unknown session record fields survive a load→merge→save round-trip", a
   });
 });
 
+test("autoTitleAttempts round-trips, and invalid on-disk values are dropped", async () => {
+  await withTempStore(async (dir) => {
+    await saveSession(makeRecord(dir, { autoTitleAttempts: 2 }));
+    assert.equal((await loadSession("CO.abc"))?.autoTitleAttempts, 2);
+
+    // A non-finite / wrong-typed value on disk normalizes away (treated as 0 by callers).
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    for (const bad of ["3x", null, "NaN"]) {
+      await writeFile(join(dir, "sessions", "CO.abc.json"), JSON.stringify({ ...makeRecord(dir), autoTitleAttempts: bad }));
+      assert.equal((await loadSession("CO.abc"))?.autoTitleAttempts, undefined, `bad value ${JSON.stringify(bad)} should drop`);
+    }
+  });
+});
+
+test("updateSession can clear autoTitleAttempts (rename --clear path)", async () => {
+  await withTempStore(async (dir) => {
+    await saveSession(makeRecord(dir, { title: "x", titleSource: "auto", autoTitleAt: "2026-06-10T00:00:00.000Z", autoTitleAttempts: 3 }));
+    await updateSession("CO.abc", { title: undefined, titleSource: undefined, autoTitleAt: undefined, autoTitleAttempts: undefined });
+    const cleared = await loadSession("CO.abc");
+    assert.equal(cleared?.title, undefined);
+    assert.equal(cleared?.titleSource, undefined);
+    assert.equal(cleared?.autoTitleAt, undefined);
+    assert.equal(cleared?.autoTitleAttempts, undefined);
+  });
+});
+
 test("saveSession appends a compact ledger event without brief/lastPrompt payloads", async () => {
   await withTempStore(async (dir) => {
     await saveSession(makeRecord(dir, {
