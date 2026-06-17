@@ -532,9 +532,17 @@ async function cmdNew(parsed: Parsed): Promise<void> {
   flags.set(plan.yolo ? "yolo" : "no-yolo", true);
   if (plan.autoswap) flags.set("autoswap", true);
   if (plan.count > 1) flags.set("count", String(plan.count));
-  if (process.env.TMUX) flags.set("here", true);
 
-  await cmdSpawn({ command: "spawn", args: [plan.kind], flags, rest: [] });
+  const record = await cmdSpawn({ command: "spawn", args: [plan.kind], flags, rest: [] });
+
+  // Land in the new bee. Each bee is its own tmux session, so switch the client
+  // to it — the same primitive the M-s switcher uses, which (unlike --here's
+  // link-window/select-window) reliably repoints the underlying client from
+  // inside a display-popup. Local single-bee only: a remote bee lives on another
+  // tmux server, and a swarm shouldn't yank focus to an arbitrary member.
+  if (process.env.TMUX && plan.count <= 1 && !record.node) {
+    await tmux(["switch-client", "-t", `=${record.tmuxTarget}`], { reject: false });
+  }
 }
 
 /** Accounts for one tool, enriched with a cached-usage cell for the picker. */
