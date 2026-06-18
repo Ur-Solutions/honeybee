@@ -154,13 +154,16 @@ export async function toggleBeesSidebar(requestedWidth?: number): Promise<"opene
 export async function syncBeesSidebarLayout(
   opts: { pruneOthers?: boolean; windowTarget?: string; width?: number } = {},
 ): Promise<string | undefined> {
-  if (!process.env.TMUX) return undefined;
   const width = opts.width ?? (await readGlobalSidebarWidth());
   if (width === undefined) return undefined;
-  // Default to the caller's window, but callers that just switch-client'd to a
-  // bee MUST pass the bee's window explicitly: display-message resolves to the
-  // calling pane's window (the old one), not the freshly-focused one.
-  const windowTarget = opts.windowTarget ?? (await currentWindowTarget());
+  // An explicit window target works against the server with no attached client
+  // (so we can pre-build the strip before attaching from outside tmux). Without
+  // one we need display-message, which requires a client.
+  let windowTarget = opts.windowTarget;
+  if (!windowTarget) {
+    if (!process.env.TMUX) return undefined;
+    windowTarget = await currentWindowTarget();
+  }
   const panes = await listWindowPanes(windowTarget);
   let navPaneId = panes.find((pane) => pane.nav)?.paneId;
   if (!navPaneId) navPaneId = await openNavPane(windowTarget, width);
@@ -202,6 +205,26 @@ export async function showBeeBesideSidebar(record: SessionRecord): Promise<void>
   const beeWindow = record.agentPaneId ? await windowTargetForPane(record.agentPaneId) : undefined;
   await syncBeesSidebarLayout({ pruneOthers: false, windowTarget: beeWindow, width });
   await selectBeePane(record);
+}
+
+/**
+ * Outside tmux: pre-build the sidebar on the bee's window (against the server,
+ * no client needed), enable it by default, then attach the bee's session so the
+ * operator lands inside tmux with the strip already up and the bee focused.
+ */
+export async function attachBeeWithSidebar(record: SessionRecord): Promise<void> {
+  let width = await readGlobalSidebarWidth();
+  if (width === undefined) {
+    width = DEFAULT_SIDEBAR_WIDTH;
+    await setGlobalSidebarWidth(width);
+  }
+  const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
+  if (isLocal) {
+    const beeWindow = record.agentPaneId ? await windowTargetForPane(record.agentPaneId) : `=${record.tmuxTarget}`;
+    await syncBeesSidebarLayout({ pruneOthers: false, windowTarget: beeWindow, width });
+    await selectBeePane(record);
+  }
+  await substrateFor(record).attachSession(record.tmuxTarget);
 }
 
 async function switchClientToBee(record: SessionRecord): Promise<void> {

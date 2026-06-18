@@ -25,7 +25,7 @@ import {
 } from "./accounts.js";
 import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
-import { readBeesGroupMode, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
+import { attachBeeWithSidebar, readBeesGroupMode, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
 import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
 import { listProRepoEntries, listProRepos, resolveProForCwd, type ProRepoEntry } from "./proProjects.js";
@@ -1130,6 +1130,12 @@ async function cmdBees(parsed: Parsed): Promise<void> {
       await ensureLive(record);
       if (sidebar) {
         await showBeeBesideSidebar(record);
+        return;
+      }
+      if (!process.env.TMUX) {
+        // Launched from a bare terminal: attach the bee's session with the
+        // sidebar already materialized, so you land in the cockpit.
+        await attachBeeWithSidebar(record);
         return;
       }
       const substrate = substrateFor(record);
