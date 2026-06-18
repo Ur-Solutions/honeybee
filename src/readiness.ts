@@ -46,18 +46,29 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
       throw new AgentReadinessError("blocked", `Agent startup is blocked by an MCP warning in ${record.name}`, pane);
     }
 
-    if (isTrustPromptPane(pane)) {
+    const bypass = isBypassPermissionsPane(pane);
+    const trust = !bypass && isTrustPromptPane(pane);
+    if (bypass || trust) {
       if (!acceptTrust) {
         throw new AgentReadinessError("trust", `Agent startup is waiting for a trust/safety confirmation in ${record.name}; rerun without --no-accept-trust to acknowledge it`, pane);
       }
       if (trustAttempts < 3) {
-        await substrate.sendEnter(record.tmuxTarget, record.agentPaneId);
+        if (bypass) {
+          // claude's bypass-permissions dialog defaults its selector to
+          // "1. No, exit", so a bare Enter would KILL the bee. The digit key
+          // jumps straight to and confirms "2. Yes, I accept".
+          await substrate.sendKey(record.tmuxTarget, "2", record.agentPaneId);
+        } else {
+          // The directory-trust prompt pre-selects the affirmative option, so
+          // Enter accepts it.
+          await substrate.sendEnter(record.tmuxTarget, record.agentPaneId);
+        }
         trustAttempts += 1;
         deadline = Math.max(deadline, Date.now() + grace);
         await sleep(1000);
         continue;
       }
-      // Three Enters didn't clear it — keep polling but don't loop sending Enter.
+      // Three attempts didn't clear it — keep polling but stop sending keys.
     }
 
     if (record.agent === "droid" && options.raiseDroidAutonomy && shouldRaiseDroidAutonomy(pane) && droidYoloCycles < 4) {
@@ -72,13 +83,13 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
     await sleep(500);
   }
 
-  // A trust prompt that survived the confirmation attempts is not a generic
-  // timeout: callers honor --force-send for "timeout" and would type the
-  // prompt text straight into the trust dialog.
-  if (isTrustPromptPane(lastPane)) {
+  // A startup confirmation (directory-trust or bypass-permissions) that
+  // survived the attempts is not a generic timeout: callers honor --force-send
+  // for "timeout" and would type the prompt text straight into the dialog.
+  if (isStartupConfirmationPane(lastPane)) {
     throw new AgentReadinessError(
       "trust",
-      `Trust prompt in ${record.name} did not clear after ${trustAttempts} confirmation attempt(s); attach and resolve it manually: hive attach ${record.name}`,
+      `Startup confirmation in ${record.name} did not clear after ${trustAttempts} attempt(s); attach and resolve it manually: hive attach ${record.name}`,
       lastPane,
     );
   }
@@ -91,6 +102,25 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
 // reporting the bee as blocked.
 export function isTrustPromptPane(pane: string): boolean {
   return /Do you trust the contents of this directory|Quick safety check: Is this a project|trust .*directory|(?:trust|safety|directory)[\s\S]{0,120}Enter to confirm/i.test(recentPane(pane));
+}
+
+// claude launched with --dangerously-skip-permissions shows a one-time "Bypass
+// Permissions mode" acceptance dialog ("❯ 2. Yes, I accept" pre-selected) when
+// the config dir has not recorded acceptance. Activated account homes are
+// re-stamped from the vault on every spawn, so the flag never persists and the
+// dialog reappears each launch — without auto-accept the bee sits here until
+// the boot-ms timeout. Required "Yes, I accept" keeps this off the steady-state
+// "bypass permissions on" footer of an already-ready pane. Tail-scoped so a
+// dismissed dialog in scrollback does not keep reporting the bee as blocked.
+export function isBypassPermissionsPane(pane: string): boolean {
+  const recent = recentPane(pane);
+  return /Bypass Permissions mode/i.test(recent) && /\bYes, I accept\b/i.test(recent);
+}
+
+// Startup confirmations the readiness loop auto-accepts with Enter: the
+// directory-trust prompt and claude's bypass-permissions warning.
+export function isStartupConfirmationPane(pane: string): boolean {
+  return isTrustPromptPane(pane) || isBypassPermissionsPane(pane);
 }
 
 export function isMcpWarningPane(pane: string): boolean {
@@ -125,12 +155,12 @@ function hasApprovalOptionList(recent: string): boolean {
 }
 
 export function isAgentReadyPane(agent: string, pane: string): boolean {
-  if (isTrustPromptPane(pane) || isMcpWarningPane(pane) || isPermissionPromptPane(pane)) return false;
+  if (isStartupConfirmationPane(pane) || isMcpWarningPane(pane) || isPermissionPromptPane(pane)) return false;
   return isDriverReady(agent, pane);
 }
 
 export function isAgentActivePane(agent: string, pane: string): boolean {
-  if (isTrustPromptPane(pane) || isMcpWarningPane(pane) || isPermissionPromptPane(pane)) return false;
+  if (isStartupConfirmationPane(pane) || isMcpWarningPane(pane) || isPermissionPromptPane(pane)) return false;
   return isDriverActive(agent, recentPane(pane));
 }
 

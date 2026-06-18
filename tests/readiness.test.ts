@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AgentReadinessError, isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane, shouldRaiseDroidAutonomy, waitForAgentReady } from "../src/readiness.js";
+import { AgentReadinessError, isAgentReadyPane, isBypassPermissionsPane, isMcpWarningPane, isPermissionPromptPane, isStartupConfirmationPane, isTrustPromptPane, shouldRaiseDroidAutonomy, waitForAgentReady } from "../src/readiness.js";
 import type { SessionRecord } from "../src/store.js";
 
 function record(agent: string): SessionRecord {
@@ -44,6 +44,36 @@ test("mid-task permission prompts are detected and block readiness", () => {
   assert.equal(isPermissionPromptPane("What can I help with?"), false);
   // A bee sitting on a permission prompt must not be reported ready.
   assert.equal(isAgentReadyPane("claude", `${proceed}\n❯ `), false);
+});
+
+test("claude bypass-permissions dialog is an auto-accepted startup confirmation", () => {
+  // Verbatim capture of a fresh account-home claude launched with
+  // --dangerously-skip-permissions: the "Yes, I accept" option is pre-selected.
+  const dialog = [
+    "  WARNING: Claude Code running in Bypass Permissions mode",
+    "  In Bypass Permissions mode, Claude Code will not ask for your approval before running potentially dangerous commands.",
+    "  This mode should only be used in a sandboxed container/VM that has restricted internet access.",
+    "  By proceeding, you accept all responsibility for actions taken while running in Bypass Permissions mode.",
+    "  https://code.claude.com/docs/en/security",
+    "  ❯ 1. No, exit",
+    "    2. Yes, I accept",
+    "  Enter to confirm · Esc to cancel",
+  ].join("\n");
+
+  assert.equal(isBypassPermissionsPane(dialog), true);
+  // Folded into the auto-accept path so the readiness loop presses Enter.
+  assert.equal(isStartupConfirmationPane(dialog), true);
+  // A bee sitting on the dialog must not be reported ready.
+  assert.equal(isAgentReadyPane("claude", dialog), false);
+
+  // The steady-state "bypass permissions on" footer of an already-ready pane
+  // must NOT be mistaken for the dialog, or every ready bee looks blocked.
+  const readyFooter = [
+    "❯ Try \"write a test for flow.ts\"",
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+  ].join("\n");
+  assert.equal(isBypassPermissionsPane(readyFooter), false);
+  assert.equal(isAgentReadyPane("claude", readyFooter), true);
 });
 
 test("generic enter prompts are not treated as trust prompts", () => {
@@ -104,6 +134,46 @@ test("waitForAgentReady reports an unclearable trust prompt as reason=trust", as
     (error: unknown) => error instanceof AgentReadinessError && error.reason === "trust" && /hive attach/.test(error.message),
   );
   assert.ok(enters >= 1, "should have tried to confirm the trust prompt");
+});
+
+test("waitForAgentReady accepts the bypass-permissions dialog with the '2' key, never Enter", async () => {
+  // The dialog defaults its selector to "1. No, exit", so a bare Enter would
+  // kill the bee — acceptance MUST go through the "2. Yes, I accept" digit key.
+  const dialog = "WARNING: Claude Code running in Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\nEnter to confirm";
+  let enters = 0;
+  const keys: string[] = [];
+  const substrate = {
+    // Show the dialog until the first accept key, then render the ready prompt.
+    capture: async () => (keys.length === 0 ? dialog : "\n❯ "),
+    sendEnter: async () => {
+      enters += 1;
+    },
+    sendKey: async (_target: string, key: string) => {
+      keys.push(key);
+    },
+  };
+
+  await waitForAgentReady(record("claude"), { timeoutMs: 2000, trustGraceMs: 0, substrate });
+  assert.deepEqual(keys, ["2"], "should confirm via the '2' key exactly once");
+  assert.equal(enters, 0, "must never press Enter on the bypass dialog (Enter = 'No, exit')");
+});
+
+test("waitForAgentReady honors --no-accept-trust on the bypass dialog", async () => {
+  const dialog = "WARNING: Claude Code running in Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\nEnter to confirm";
+  const keys: string[] = [];
+  const substrate = {
+    capture: async () => dialog,
+    sendEnter: async () => {},
+    sendKey: async (_target: string, key: string) => {
+      keys.push(key);
+    },
+  };
+
+  await assert.rejects(
+    waitForAgentReady(record("claude"), { timeoutMs: 100, acceptTrust: false, substrate }),
+    (error: unknown) => error instanceof AgentReadinessError && error.reason === "trust",
+  );
+  assert.deepEqual(keys, [], "must not send any accept key when acceptance is opted out");
 });
 
 test("waitForAgentReady still reports timeout when no trust prompt is visible", async () => {
