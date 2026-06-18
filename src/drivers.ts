@@ -136,8 +136,10 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
   kimi: {
     kind: "kimi",
     homeEnv: "KIMI_CODE_HOME",
-    // kimi-code keeps its sessions in a private store with no honeybee
-    // transcript provider yet, so auto-titling stays off until one exists.
+    // kimi-code keeps its sessions in a file-based store under KIMI_CODE_HOME
+    // (session_index.jsonl + per-session state.json/wire.jsonl), read by the
+    // "kimi" transcript provider — so auto-titling/usage sampling work.
+    hasTranscriptProvider: true,
     isReady: (pane) => /context:\s*\d+(?:\.\d+)?%/i.test(pane) || /Next-Gen Agents|\bCode (?:thinking|planning)\b/i.test(pane),
     identity: {
       // KIMI_CODE_HOME relocates the whole dir; the OAuth token lives under it.

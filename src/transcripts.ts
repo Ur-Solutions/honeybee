@@ -1,10 +1,11 @@
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 export { hasTranscriptProvider } from "./drivers.js";
 
-export type TranscriptProvider = "claude" | "codex" | "opencode" | "grok";
+export type TranscriptProvider = "claude" | "codex" | "opencode" | "grok" | "kimi";
 
 export type TranscriptRow = Record<string, unknown> & {
   type?: string;
@@ -54,6 +55,7 @@ export async function latestTranscript(agent: string, cwd: string, options: Tran
   if (agent === "codex") return latestCodexTranscript(cwd, options);
   if (agent === "opencode") return latestOpenCodeTranscript(cwd, options);
   if (agent === "grok") return latestGrokTranscript(cwd, options);
+  if (agent === "kimi") return latestKimiTranscript(cwd, options);
   return null;
 }
 
@@ -106,6 +108,15 @@ export async function latestCodexTranscript(cwd: string, options: TranscriptLook
 }
 
 export async function latestOpenCodeTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
+  // opencode 1.17.7+ stores sessions in a single SQLite db (opencode.db); older
+  // versions used a storage/session/*.json file tree. Try SQLite first and fall
+  // back to the file tree so both layouts keep working.
+  const fromDb = await latestOpenCodeSqliteTranscript(cwd, options).catch(() => null);
+  if (fromDb) return fromDb;
+  return latestOpenCodeFileTranscript(cwd, options);
+}
+
+async function latestOpenCodeFileTranscript(cwd: string, options: TranscriptLookupOptions): Promise<TranscriptFile | null> {
   const sessionRoot = opencodeSessionRoot(options.homePath);
   if (options.transcriptPath) {
     const direct = isPathInside(options.transcriptPath, sessionRoot) ? await loadOpenCodeTranscript(options.transcriptPath, cwd, options) : null;
@@ -146,6 +157,109 @@ export async function latestGrokTranscript(cwd: string, options: TranscriptLooku
   }
 
   return bestTranscript(loaded);
+}
+
+// --- kimi-code reader ------------------------------------------------------
+//
+// kimi-code keeps a flat, file-based store under KIMI_CODE_HOME (~/.kimi-code by
+// default). session_index.jsonl maps each session to its workDir (the cwd) and
+// sessionDir; per-session state.json carries title/updatedAt and
+// agents/main/wire.jsonl is the append-only event log we reconstruct rows from.
+
+type KimiIndexEntry = { sessionId: string; sessionDir: string; workDir: string };
+
+export async function latestKimiTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
+  const home = options.homePath ?? join(homedir(), ".kimi-code");
+  const indexPath = join(home, "session_index.jsonl");
+  const entries = (await readJsonl(indexPath).catch(() => [])) as KimiIndexEntry[];
+  if (entries.length === 0) return null;
+
+  const targetCwd = resolve(cwd);
+  const sinceMs = sinceMillis(options);
+  const loaded: TranscriptFile[] = [];
+  for (const entry of entries) {
+    const sessionDir = typeof entry.sessionDir === "string" ? entry.sessionDir : "";
+    if (!sessionDir) continue;
+    const workDir = typeof entry.workDir === "string" ? entry.workDir : "";
+    const wirePath = join(sessionDir, "agents", "main", "wire.jsonl");
+    const tx = await loadKimiTranscript(wirePath, cwd, options, {
+      sessionId: typeof entry.sessionId === "string" ? entry.sessionId : basename(sessionDir),
+      sessionDir,
+      workDir,
+    });
+    if (!tx) continue;
+    if (tx.mtimeMs < sinceMs) continue;
+    // workDir is the authoritative cwd for a kimi session; only keep sessions
+    // whose workDir matches (mirrors how the other readers gate on cwd before
+    // scoring, since kimi's store is not partitioned by cwd on disk).
+    if (workDir && samePath(workDir, targetCwd)) loaded.push(tx);
+    else if (options.transcriptPath && samePath(options.transcriptPath, wirePath)) loaded.push(tx);
+    else if (options.sessionId && options.sessionId === tx.sessionId) loaded.push(tx);
+  }
+
+  return bestTranscript(loaded);
+}
+
+async function loadKimiTranscript(
+  wirePath: string,
+  cwd: string,
+  options: TranscriptLookupOptions,
+  meta: KimiIndexEntry,
+): Promise<TranscriptFile | null> {
+  const statePath = join(meta.sessionDir, "state.json");
+  const state = await readJsonObject(statePath);
+  const updatedAt = typeof state.updatedAt === "string" ? Date.parse(state.updatedAt) : NaN;
+  // Fall back to the wire file's mtime when state.json lacks a parseable
+  // updatedAt, so a session still scores by recency.
+  let mtimeMs = Number.isFinite(updatedAt) ? updatedAt : null;
+  if (mtimeMs === null) mtimeMs = await getMtime(wirePath).catch(() => null);
+  if (mtimeMs === null) return null;
+
+  const rows = await readKimiRows(wirePath);
+  if (rows.length === 0) return null;
+
+  const sessionId = meta.sessionId || basename(meta.sessionDir);
+  const { score, matchedBy } = scoreTranscript({ rows, path: wirePath, sessionId, mtimeMs, cwd, transcriptCwd: meta.workDir, options });
+  const title = normalizeTitleCandidate(state.title);
+  return { provider: "kimi", path: wirePath, sessionId, mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
+}
+
+async function readKimiRows(wirePath: string): Promise<TranscriptRow[]> {
+  const events = await readJsonl(wirePath).catch(() => []);
+  const rows: TranscriptRow[] = [];
+  for (const event of events) {
+    for (const row of normalizeKimiEvent(event)) {
+      // turn.prompt and context.append_message both carry the same user text;
+      // skip a row that exactly repeats the previous one to avoid doubling it.
+      const prev = rows[rows.length - 1];
+      if (prev && prev.message?.role === row.message?.role && textFromContent(prev.message?.content) === textFromContent(row.message?.content)) continue;
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
+function normalizeKimiEvent(event: TranscriptRow): TranscriptRow[] {
+  const type = typeof event.type === "string" ? event.type : "";
+  const timestamp = String((event as { time?: unknown }).time ?? "");
+  if (type === "turn.prompt") {
+    // The user's prompt for the turn; origin.kind is "user" for human input.
+    const origin = (event as { origin?: { kind?: unknown } }).origin;
+    if (origin && typeof origin.kind === "string" && origin.kind !== "user") return [];
+    const content = textFromContent((event as { input?: unknown }).input);
+    if (!content) return [];
+    return [{ type: "user", timestamp, message: { role: "user", content } }];
+  }
+  if (type === "context.append_message") {
+    const message = (event as { message?: { role?: unknown; content?: unknown } }).message;
+    if (!message) return [];
+    const role = typeof message.role === "string" ? message.role : "";
+    if (role !== "user" && role !== "assistant") return [];
+    const content = textFromContent(message.content);
+    if (!content) return [];
+    return [{ type: role, timestamp, message: { role, content } }];
+  }
+  return [];
 }
 
 export function claudeProjectFolder(cwd: string, configDir = join(homedir(), ".claude")) {
@@ -342,6 +456,104 @@ async function loadOpenCodeTranscript(path: string, cwd: string, options: Transc
   return { provider: "opencode", path, sessionId, mtimeMs, rows, score, matchedBy };
 }
 
+// --- opencode 1.17.7+ SQLite reader ---------------------------------------
+//
+// opencode keeps the db open in WAL mode while running, so every read MUST use
+// the sqlite3 CLI in -readonly mode (no write lock, no journal). We shell out
+// (zero runtime dep) and JSON.parse the -json output. Any failure — sqlite3
+// missing, db absent/locked, unparseable output — resolves to null so the
+// caller transparently falls back to the file-tree reader.
+
+type OpenCodeSessionRow = { id: string; directory: string; title: string; time_updated: number };
+type OpenCodePartRow = { m_id: string; role: string; type: string; text: string | null; m_created: number; p_created: number };
+
+async function latestOpenCodeSqliteTranscript(cwd: string, options: TranscriptLookupOptions): Promise<TranscriptFile | null> {
+  const dbPath = opencodeDbPath(options.homePath);
+  if (!dbPath) return null;
+
+  const sessions = await querySqliteJson<OpenCodeSessionRow>(
+    dbPath,
+    "SELECT id, directory, title, time_updated FROM session ORDER BY time_updated DESC;",
+  );
+  if (!sessions) return null;
+
+  const sinceMs = sinceMillis(options);
+  const loaded: TranscriptFile[] = [];
+  for (const session of sessions) {
+    const mtimeMs = Number(session.time_updated);
+    if (!Number.isFinite(mtimeMs) || mtimeMs < sinceMs) continue;
+    const tx = await loadOpenCodeSqliteTranscript(dbPath, session, cwd, options);
+    if (tx) loaded.push(tx);
+  }
+  return bestTranscript(loaded);
+}
+
+async function loadOpenCodeSqliteTranscript(
+  dbPath: string,
+  session: OpenCodeSessionRow,
+  cwd: string,
+  options: TranscriptLookupOptions,
+): Promise<TranscriptFile | null> {
+  const sessionId = String(session.id ?? "");
+  if (!sessionId) return null;
+  const rows = await readOpenCodeSqliteRows(dbPath, sessionId);
+  if (rows.length === 0) return null;
+  const mtimeMs = Number(session.time_updated) || 0;
+  const directory = String(session.directory ?? "");
+  // A db:<sessionId> pseudo-path keeps transcriptPath/path semantics meaningful
+  // without pointing at a file (the SQLite store has no per-session file).
+  const path = `${dbPath}:${sessionId}`;
+  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: directory, options });
+  const title = normalizeTitleCandidate(session.title);
+  return { provider: "opencode", path, sessionId, mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
+}
+
+async function readOpenCodeSqliteRows(dbPath: string, sessionId: string): Promise<TranscriptRow[]> {
+  // Pull every text part for the session joined to its message role in one
+  // query, ordered by message then part time so reconstruction matches the
+  // real conversation order. reasoning/step-* parts are dropped (text only).
+  const parts = await querySqliteJson<OpenCodePartRow>(
+    dbPath,
+    "SELECT m.id AS m_id, json_extract(m.data,'$.role') AS role, json_extract(p.data,'$.type') AS type, json_extract(p.data,'$.text') AS text, " +
+      "m.time_created AS m_created, p.time_created AS p_created " +
+      "FROM message m JOIN part p ON p.message_id = m.id " +
+      `WHERE m.session_id = ${sqlQuote(sessionId)} ` +
+      "ORDER BY m.time_created, m.id, p.time_created, p.id;",
+  );
+  if (!parts) return [];
+
+  // Concatenate consecutive text parts of the same message into one row,
+  // preserving message order. Each message becomes a single user/assistant row.
+  const rows: TranscriptRow[] = [];
+  let currentRole: string | null = null;
+  let currentCreated = 0;
+  let currentMid: string | null = null;
+  let buffer: string[] = [];
+  const flush = () => {
+    if (currentRole === null) return;
+    const content = buffer.join("\n").trim();
+    if (content) rows.push({ type: currentRole, message: { role: currentRole, content }, timestamp: String(currentCreated) });
+    buffer = [];
+  };
+  for (const part of parts) {
+    if (part.type !== "text" || typeof part.text !== "string") continue;
+    const role = String(part.role ?? "event");
+    const created = Number(part.m_created) || 0;
+    const mid = String(part.m_id ?? "");
+    // Flush on a new message: two distinct same-role messages can share a
+    // time_created, so the message id is the authoritative row boundary.
+    if (mid !== currentMid || role !== currentRole || created !== currentCreated) {
+      flush();
+      currentRole = role;
+      currentCreated = created;
+      currentMid = mid;
+    }
+    buffer.push(part.text);
+  }
+  flush();
+  return rows;
+}
+
 async function loadGrokTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownStat?: StatHint): Promise<TranscriptFile | null> {
   const sessionDir = basename(path) === "chat_history.jsonl" || basename(path) === "summary.json" ? dirname(path) : path;
   const chatPath = join(sessionDir, "chat_history.jsonl");
@@ -474,7 +686,7 @@ function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId
 // on every poll dwarfs the (now stat-cached) per-file loads. A short TTL keeps
 // repeat lookups cheap while still discovering new session files quickly.
 async function findFilesCached(root: string, predicate: (path: string) => boolean, maxDepth: number, tag: string): Promise<string[]> {
-  const key = `${root} ${maxDepth} ${tag}`;
+  const key = `${root}\u0000${maxDepth}\u0000${tag}`;
   const now = Date.now();
   const cached = dirScanCache.get(key);
   if (cached && cached.expiresAt > now) return cached.files;
@@ -609,12 +821,92 @@ function opencodeStorageRoot(homePath?: string): string {
   // the existence check with the default as fallback.
   const fallback = join(homedir(), ".local", "share", "opencode", "storage");
   if (!homePath) return fallback;
-  const identity = join(homePath, "xdg-data", "opencode", "storage");
-  return existsSync(identity) ? identity : fallback;
+  const opencodeDir = join(homePath, "xdg-data", "opencode");
+  const identity = join(opencodeDir, "storage");
+  if (existsSync(identity)) return identity;
+  // Mirror opencodeDbPath's scoping: a home that owns a relocated xdg-data/
+  // opencode tree is an isolated store — it must NEVER fall back to the global
+  // default store (that would surface a different bee's history when this home's
+  // own session lookup comes up empty). Only a home with no opencode tree at all
+  // (a plain --home spawn that never relocated XDG) uses the default.
+  return existsSync(opencodeDir) ? identity : fallback;
 }
 
 function opencodeSessionRoot(homePath?: string): string {
   return join(opencodeStorageRoot(homePath), "session");
+}
+
+// opencode 1.17.7+ keeps everything in {XDG_DATA}/opencode/opencode.db. Identity
+// homes relocate XDG_DATA_HOME to {home}/xdg-data; plain spawns leave it at the
+// default ~/.local/share. Prefer the home-relative db when it exists, else the
+// default — but only reach the global default when this home does NOT have its
+// own relocated XDG opencode tree. A homePath whose xdg-data/opencode exists is
+// an isolated store: if it has no db it is an older file-tree store for THIS
+// home, and we must not leak into another bee's default db. Returns null when
+// no db is found (callers fall back to the file-tree reader).
+function opencodeDbPath(homePath?: string): string | null {
+  const defaultDb = join(homedir(), ".local", "share", "opencode", "opencode.db");
+  if (homePath) {
+    const opencodeDir = join(homePath, "xdg-data", "opencode");
+    const identityDb = join(opencodeDir, "opencode.db");
+    if (existsSync(identityDb)) return identityDb;
+    // The home owns a relocated opencode tree but no db (old file-tree store) —
+    // stay scoped to this home rather than reaching the global default.
+    if (existsSync(opencodeDir)) return null;
+  }
+  return existsSync(defaultDb) ? defaultDb : null;
+}
+
+// Single-quote a SQL string literal (SQLite escapes ' by doubling it). Used for
+// the session id, which is provider-generated (ses_…) but quoted defensively so
+// the read-only query can never be derailed by an unexpected value.
+function sqlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+// Run a read-only SQL query through the sqlite3 CLI and JSON.parse its output.
+// Returns null on any failure (binary missing, db locked/absent, non-zero exit,
+// unparseable/non-array output) so callers fall back gracefully and never throw.
+function querySqliteJson<T>(dbPath: string, sql: string): Promise<T[] | null> {
+  return new Promise((resolveResult) => {
+    let child;
+    try {
+      child = spawn("sqlite3", ["-readonly", "-json", dbPath, sql], { stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      resolveResult(null);
+      return;
+    }
+    let out = "";
+    let settled = false;
+    const finish = (value: T[] | null) => {
+      if (settled) return;
+      settled = true;
+      resolveResult(value);
+    };
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      out += chunk;
+    });
+    child.on("error", () => finish(null));
+    child.on("close", (code) => {
+      if (code !== 0) {
+        finish(null);
+        return;
+      }
+      const trimmed = out.trim();
+      // sqlite3 -json emits nothing for an empty result set; treat as [].
+      if (!trimmed) {
+        finish([] as T[]);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        finish(Array.isArray(parsed) ? (parsed as T[]) : null);
+      } catch {
+        finish(null);
+      }
+    });
+  });
 }
 
 function normalizeForMatch(value: string): string {
