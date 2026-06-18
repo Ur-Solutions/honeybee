@@ -112,6 +112,7 @@ import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { gatherTitleContext, generateTitle } from "./naming.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
+import { startSpawnTimer, type SpawnTimer } from "./spawnTiming.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
@@ -361,9 +362,21 @@ type SpawnOptions = {
   provider?: string;
   /** Opt this bee into the daemon's autoswap flow. Requires account. */
   autoswap?: boolean;
+  /**
+   * Opt-in phase timer (HIVE_DEBUG_SPAWN). When passed, spawnBee marks its
+   * internal phases on it and leaves reporting to the caller (so resolve/ready
+   * phases measured outside spawnBee join the same line). When absent, spawnBee
+   * owns a self-reporting timer covering just its internal phases.
+   */
+  timer?: SpawnTimer;
 };
 
 async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
+  // When the caller threads a timer it also owns reporting (it has resolve/ready
+  // phases to fold in); a bare spawnBee gets its own self-reporting timer so
+  // swarm bees still emit their internal breakdown under HIVE_DEBUG_SPAWN.
+  const timer = opts.timer ?? startSpawnTimer(opts.agent);
+  const ownsTimer = !opts.timer;
   // An account-bound spawn gets a home (explicit or the account's dedicated
   // slot), the account's credentials activated into it, and the driver's
   // explicit identity env — never a blind HOME rewrite.
@@ -380,10 +393,15 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${opts.account.id}`);
     await activateAccountIntoHome(opts.account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
   }
+  // "activate" folds in resolveAgent + account activation (the OAuth-refresh
+  // network call and accounts-lock wait live here); near-zero without --account.
+  timer.mark("activate");
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
   // Executable validation only applies to local spawns; we cannot reach the remote PATH cheaply.
   if (!isRemote) await assertExecutableAvailable(spec.command);
+  timer.mark("exec-check");
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
+  timer.mark("allocate");
   const name = safeName(opts.name ?? identity.id);
   const tmuxTarget = safeTmuxTarget(name);
   const nodeName = opts.node?.name ?? LOCAL_NODE_NAME;
@@ -391,6 +409,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const locationHint = isRemote && opts.node ? ` on ${opts.node.name}` : "";
   if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
   const { paneId } = await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env });
+  timer.mark("session-create");
   const command = shellCommand(spec);
 
   const now = new Date().toISOString();
@@ -421,6 +440,10 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   };
   await saveSession(record);
   await writeSpawnOptions(record);
+  timer.mark("persist");
+  // Owned timers (swarm/internal callers) report here; a caller-threaded timer
+  // is reported by the caller once the readiness wait has also been measured.
+  if (ownsTimer) timer.report(record.name);
   return record;
 }
 
@@ -517,6 +540,8 @@ async function resolveProfileOverlay(requested: string): Promise<ProfileOverlay 
 async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <a|auto>] [-- <bee-args...>]");
+  // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
+  const timer = startSpawnTimer(requested);
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
   const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
   // Thin profile: a config bee referencing an account supplies the CLI from the
@@ -543,15 +568,21 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const provider = account?.provider;
   const autoswap = truthy(flag(parsed, "autoswap"));
   if (autoswap && !account) throw new Error("--autoswap requires an account (--account or a <tool>-<account> bee spec)");
-  let record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap });
+  // "resolve" folds in account/profile/node resolution above (remote node probe
+  // lives here); spawnBee marks its own internal phases on the same timer.
+  timer.mark("resolve");
+  let record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer });
   const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${node.name}`);
   if (truthy(flag(parsed, "briefed")) && briefText) {
     record = await deliverBrief(parsed, record, briefText);
+    timer.mark("brief");
   } else {
     await confirmSpawnReady(parsed, record);
+    timer.mark("ready");
   }
+  timer.report(record.name);
   return record;
 }
 
@@ -5353,7 +5384,7 @@ function printHelp() {
         ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
         ["brief", "<selector> <text>", "send a one-time context brief"],
         ["buz", "<send|inbox|read|…>", "addressed messaging: three-tier delivery + per-bee policy"],
-        ["rename", "<selector> <title>", "set a bee's display title (--auto to derive one, --clear)"],
+        ["rename", "<selector> <title>", "set a bee's display title (--here for current bee, --auto to derive one, --clear)"],
         ["seal", "<selector> --from <p>", "record a typed handoff artifact"],
       ],
     },
@@ -5447,6 +5478,7 @@ function printHelp() {
   const envs = [
     `  ${env("HIVE_CLAUDE_CMD")}=${arg(`"claude --model sonnet"`)} hive spawn claude`,
     `  ${env("HIVE_CODEX_YOLO")}=${arg("1")} hive spawn codex`,
+    `  ${env("HIVE_DEBUG_SPAWN")}=${arg("1")} hive spawn claude  ${dim("— print a per-phase spawn timing breakdown to stderr")}`,
     `  ${dim("hive spawn codex2 · hive spawn claude --home ~/.claude-3 · hive spawn cc3")}`,
   ].join("\n");
 
