@@ -39,6 +39,14 @@ export type TranscriptLookupOptions = {
   transcriptPath?: string;
   sessionId?: string;
   homePath?: string;
+  /**
+   * The bee's spawn time. An unanchored bee (no transcriptPath/sessionId match)
+   * may not adopt a transcript whose session STARTED before it was spawned —
+   * that file belongs to an older sibling sharing the cwd. This is the
+   * provider-agnostic guard against cross-matching for CLIs (codex/opencode/
+   * grok) that, unlike claude, expose no flag to pin a fresh session id.
+   */
+  notBeforeIso?: string;
 };
 
 const SCORE = {
@@ -81,7 +89,7 @@ export async function latestClaudeTranscript(cwd: string, options: TranscriptLoo
     if (tx) loaded.push(tx);
   }
 
-  return bestTranscript(loaded);
+  return bestTranscript(loaded, options);
 }
 
 export async function latestCodexTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
@@ -102,7 +110,7 @@ export async function latestCodexTranscript(cwd: string, options: TranscriptLook
     if (tx) loaded.push(tx);
   }
 
-  return bestTranscript(loaded);
+  return bestTranscript(loaded, options);
 }
 
 export async function latestOpenCodeTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
@@ -123,7 +131,7 @@ export async function latestOpenCodeTranscript(cwd: string, options: TranscriptL
     if (tx) loaded.push(tx);
   }
 
-  return bestTranscript(loaded);
+  return bestTranscript(loaded, options);
 }
 
 export async function latestGrokTranscript(cwd: string, options: TranscriptLookupOptions = {}): Promise<TranscriptFile | null> {
@@ -145,7 +153,7 @@ export async function latestGrokTranscript(cwd: string, options: TranscriptLooku
     if (tx) loaded.push(tx);
   }
 
-  return bestTranscript(loaded);
+  return bestTranscript(loaded, options);
 }
 
 export function claudeProjectFolder(cwd: string, configDir = join(homedir(), ".claude")) {
@@ -504,12 +512,56 @@ async function findFiles(root: string, predicate: (path: string) => boolean, max
   return out;
 }
 
-function bestTranscript(loaded: TranscriptFile[]): TranscriptFile | null {
-  loaded.sort((a, b) => {
+function bestTranscript(loaded: TranscriptFile[], options: TranscriptLookupOptions = {}): TranscriptFile | null {
+  const eligible = loaded.filter((tx) => passesCreatedFloor(tx, options));
+  eligible.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     return b.mtimeMs - a.mtimeMs;
   });
-  return loaded[0] ?? null;
+  return eligible[0] ?? null;
+}
+
+// Clock-skew / boot-latency cushion: the agent writes its first transcript row
+// shortly AFTER we stamp the bee's createdAt, so a real own-transcript clears
+// the floor comfortably; the cushion only forgives sub-second skew.
+const CREATED_FLOOR_GRACE_MS = 5_000;
+
+/**
+ * A transcript clears the floor when the bee was spawned no later than the
+ * session's first activity. An explicit id/path match is authoritative
+ * (resumed/anchored bees legitimately reopen an older session), so it always
+ * passes regardless of the floor.
+ */
+function passesCreatedFloor(tx: TranscriptFile, options: TranscriptLookupOptions): boolean {
+  if (!options.notBeforeIso) return true;
+  if (tx.matchedBy.includes("session-id") || tx.matchedBy.includes("path")) return true;
+  const floor = Date.parse(options.notBeforeIso) - CREATED_FLOOR_GRACE_MS;
+  if (!Number.isFinite(floor)) return true;
+  const start = transcriptStartMs(tx.rows);
+  return start === null || start >= floor;
+}
+
+/** Earliest parseable row timestamp = when the provider session began. */
+function transcriptStartMs(rows: TranscriptRow[]): number | null {
+  let min: number | null = null;
+  for (const row of rows) {
+    const ms = parseTimestampMs(row.timestamp);
+    if (ms === null) continue;
+    if (min === null || ms < min) min = ms;
+  }
+  return min;
+}
+
+function parseTimestampMs(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string" || value.length === 0) return null;
+  // OpenCode stamps epoch-ms as a string; everything else is ISO-8601.
+  if (/^\d+$/.test(value)) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 const TITLE_MAX_CHARS = 80;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -14,6 +14,56 @@ function claudeEncode(cwd: string): string {
 test("projectKeyForCwd matches Claude Code's project-dir encoding for dots and underscores", () => {
   assert.equal(projectKeyForCwd("/tmp/.hidden/my_app"), "-tmp--hidden-my-app");
   assert.equal(projectKeyForCwd("/Users/x/.openclaw/workspace"), "-Users-x--openclaw-workspace");
+});
+
+test("latestTranscript: notBeforeIso refuses an older sibling's transcript that wins on mtime", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-floor-"));
+  try {
+    const cwd = join(dir, "repo");
+    const projectDir = join(dir, "projects", claudeEncode(cwd));
+    await mkdir(projectDir, { recursive: true });
+
+    // The earlier sibling: its session started an hour before the bee spawned,
+    // but its file carries the NEWEST mtime (it is actively being written).
+    const siblingPath = join(projectDir, "sibling.jsonl");
+    await writeFile(
+      siblingPath,
+      [
+        JSON.stringify({ type: "user", timestamp: "2026-06-18T11:00:00.000Z", message: { role: "user", content: "investigate slow claude bee spawning" } }),
+        JSON.stringify({ type: "assistant", timestamp: "2026-06-18T11:00:05.000Z", message: { role: "assistant", content: "looking" } }),
+      ].join("\n") + "\n",
+    );
+
+    // The bee's own session, started just after it spawned, older file mtime.
+    const ownPath = join(projectDir, "own.jsonl");
+    await writeFile(
+      ownPath,
+      [
+        JSON.stringify({ type: "user", timestamp: "2026-06-18T12:00:10.000Z", message: { role: "user", content: "fix bee renaming" } }),
+        JSON.stringify({ type: "assistant", timestamp: "2026-06-18T12:00:15.000Z", message: { role: "assistant", content: "on it" } }),
+      ].join("\n") + "\n",
+    );
+
+    await utimes(ownPath, new Date("2026-06-18T12:00:15.000Z"), new Date("2026-06-18T12:00:15.000Z"));
+    await utimes(siblingPath, new Date("2026-06-18T13:00:00.000Z"), new Date("2026-06-18T13:00:00.000Z"));
+
+    const spawnedAt = "2026-06-18T12:00:00.000Z";
+
+    // Without the floor, the newest-mtime sibling wins — the cross-match bug.
+    const unguarded = await latestTranscript("claude", cwd, { homePath: dir });
+    assert.equal(unguarded?.sessionId, "sibling");
+
+    // With the floor, the bee can only land on its own session.
+    const guarded = await latestTranscript("claude", cwd, { homePath: dir, notBeforeIso: spawnedAt });
+    assert.equal(guarded?.sessionId, "own");
+
+    // An explicit session-id anchor is authoritative and bypasses the floor
+    // (a resumed bee legitimately reopens its pre-spawn session).
+    const anchored = await latestTranscript("claude", cwd, { homePath: dir, notBeforeIso: spawnedAt, sessionId: "sibling" });
+    assert.equal(anchored?.sessionId, "sibling");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("latestTranscript inherits Claude ai-title metadata", async () => {

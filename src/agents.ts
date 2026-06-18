@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { beeConfig } from "./config.js";
@@ -141,6 +142,20 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
 export function shellCommand(spec: AgentSpec): string {
   const env = Object.entries(spec.env).map(([key, value]) => `${key}=${shellQuoteIfNeeded(value)}`);
   return [...env, ...[spec.command, ...spec.args].map(shellQuoteIfNeeded)].join(" ");
+}
+
+/**
+ * Args that pin a FRESH spawn to a caller-chosen provider session id, so the
+ * bee is anchored to its own transcript from birth. The transcript matcher is
+ * cwd-blind for claude (every claude transcript already lives in the cwd-keyed
+ * project folder), so sibling bees in one repo would otherwise cross-match on
+ * mtime alone — mis-titling and mis-resuming each other. A forced session id
+ * scores the bee's own file +1000, which no sibling can beat. Returns null for
+ * providers with no stable `--session-id` flag (they keep cwd disambiguation).
+ */
+export function forcedSessionIdArgs(kind: string, sessionId: string): string[] | null {
+  if (kind === "claude") return ["--session-id", sessionId];
+  return null;
 }
 
 function resolveProfile(kind: string, explicitHome: string | true | string[] | undefined) {
@@ -289,6 +304,18 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   // activateAccountIntoHome (which lives in cli.ts) and risks an import cycle;
   // flow-spawned bees stay account-less until a later stage wires it cleanly.
   const spec = resolveAgent(opts.agent, opts.extraArgs, { home: opts.home, yolo: opts.yolo });
+  // Pin the bee to its own provider session id from birth (see forcedSessionIdArgs):
+  // flow runs spawn many siblings in one cwd, the exact case the cwd-blind claude
+  // transcript matcher would otherwise cross-match by mtime.
+  let pinnedSessionId: string | undefined;
+  if (!opts.extraArgs?.includes("--session-id")) {
+    const sid = randomUUID();
+    const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
+    if (sessionArgs) {
+      spec.args = [...spec.args, ...sessionArgs];
+      pinnedSessionId = sid;
+    }
+  }
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
   // Mirror cli.ts spawn: a typo'd agent command would otherwise become a tmux
   // session that dies instantly while leaving a "running" record behind.
@@ -322,6 +349,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     uuid: identity.uuid,
     requestedAgent: spec.requestedKind,
     ...(spec.homePath ? { homePath: spec.homePath } : {}),
+    ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
     ...(opts.colony ? { colony: opts.colony } : {}),
     ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
     ...(opts.caste ? { caste: opts.caste } : {}),

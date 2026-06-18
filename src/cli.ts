@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import { agentDefaultsToYolo, canonicalAgentKind, resolveAgent, resolveHome, shellCommand } from "./agents.js";
+import { agentDefaultsToYolo, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, resolveHome, shellCommand } from "./agents.js";
 import {
   AUTO_ACCOUNT_QUERY,
   type AccountChainSyncOutcome,
@@ -400,6 +401,19 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // "activate" folds in resolveAgent + account activation (the OAuth-refresh
   // network call and accounts-lock wait live here); near-zero without --account.
   timer.mark("activate");
+  // Pin the bee to its own provider session id from birth so the transcript
+  // matcher anchors on it (+1000) instead of cross-matching a sibling's file by
+  // mtime — the auto-titler and resume/swap all key off providerSessionId. Skip
+  // when the caller already supplied --session-id in extra args.
+  let pinnedSessionId: string | undefined;
+  if (!opts.extraArgs?.includes("--session-id")) {
+    const sid = randomUUID();
+    const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
+    if (sessionArgs) {
+      spec.args = [...spec.args, ...sessionArgs];
+      pinnedSessionId = sid;
+    }
+  }
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
   // Executable validation only applies to local spawns; we cannot reach the remote PATH cheaply.
   if (!isRemote) await assertExecutableAvailable(spec.command);
@@ -434,6 +448,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     uuid: identity.uuid,
     requestedAgent: spec.requestedKind,
     homePath: spec.homePath,
+    ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
     ...(opts.colony ? { colony: opts.colony } : {}),
     ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
     ...(opts.caste ? { caste: opts.caste } : {}),

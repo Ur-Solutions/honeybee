@@ -58,6 +58,9 @@ export async function gatherTitleContext(
     transcriptPath: record.transcriptPath,
     sessionId: record.providerSessionId,
     homePath: record.homePath,
+    // Don't let an untitled bee borrow an older sibling's transcript (the
+    // cwd-shared cross-match that mis-titles bees). See notBeforeIso.
+    notBeforeIso: record.createdAt,
   }).catch(() => null);
 
   const firstUser = clampContext(tx ? firstUserText(tx.rows) : "");

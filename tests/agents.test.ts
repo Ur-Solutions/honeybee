@@ -3,8 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { agentDefaultsToYolo, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
+import { agentDefaultsToYolo, forcedSessionIdArgs, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
 import { assertExecutableAvailable } from "../src/execCheck.js";
+
+test("forcedSessionIdArgs: claude pins a fresh session id; other providers do not", () => {
+  assert.deepEqual(forcedSessionIdArgs("claude", "abc-123"), ["--session-id", "abc-123"]);
+  assert.equal(forcedSessionIdArgs("codex", "abc-123"), null);
+  assert.equal(forcedSessionIdArgs("opencode", "abc-123"), null);
+  assert.equal(forcedSessionIdArgs("grok", "abc-123"), null);
+});
 
 test("grok supports numbered profile aliases and GROK_HOME isolation", () => {
   const oldHive = process.env.HIVE_GROK_CMD;

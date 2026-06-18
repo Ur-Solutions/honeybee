@@ -14,6 +14,9 @@ export function transcriptLookupForSession(record: SessionRecord): TranscriptLoo
     transcriptPath: record.transcriptPath,
     sessionId: record.providerSessionId,
     homePath: record.homePath,
+    // An unanchored bee never adopts a sibling's older transcript (see
+    // TranscriptLookupOptions.notBeforeIso).
+    notBeforeIso: record.createdAt,
   };
 }
 
