@@ -171,7 +171,7 @@ const GENERATOR_TIMEOUT_MS = 60_000;
 
 export async function runTitleGenerator(prompt: string, config: ResolvedNamingConfig): Promise<string> {
   if (config.command) return runCustomGenerator(config.command, prompt);
-  if (config.tool === "codex") return runCodexGenerator(prompt, config.model);
+  if (config.tool === "codex") return runCodexGenerator(prompt, config.model, config.effort);
   return runClaudeGenerator(prompt, config.model);
 }
 
@@ -209,7 +209,7 @@ async function runClaudeGenerator(prompt: string, model?: string): Promise<strin
   return stdout;
 }
 
-async function runCodexGenerator(prompt: string, model?: string): Promise<string> {
+async function runCodexGenerator(prompt: string, model?: string, effort = "low"): Promise<string> {
   const cwd = await generatorCwd();
   // codex exec interleaves progress logging on stdout; --output-last-message
   // is the stable channel for the final agent message. read-only sandbox keeps
@@ -217,9 +217,10 @@ async function runCodexGenerator(prompt: string, model?: string): Promise<string
   const outDir = await mkdtemp(join(tmpdir(), "hive-naming-"));
   const outFile = join(outDir, "last-message.txt");
   try {
-    // Force low reasoning for the title: a few words never needs the user's
-    // configured effort (often xhigh), which would burn quota and stall the tick.
-    const args = ["exec", "--skip-git-repo-check", "-s", "read-only", "-c", 'model_reasoning_effort="low"', ...(model ? ["-m", model] : []), "--output-last-message", outFile, prompt];
+    // Reasoning effort is configurable (naming.effort) but defaults low: a few
+    // words never needs the user's configured effort (often xhigh), which would
+    // burn quota and stall the tick.
+    const args = ["exec", "--skip-git-repo-check", "-s", "read-only", "-c", `model_reasoning_effort="${effort}"`, ...(model ? ["-m", model] : []), "--output-last-message", outFile, prompt];
     await execFileAsync("codex", args, cwd);
     return await readFile(outFile, "utf8");
   } finally {

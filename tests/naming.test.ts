@@ -193,7 +193,7 @@ test("generateTitle normalizes runner output and threads the prompt through", as
   const title = await generateTitle(
     { brief: "Fix the parser" },
     {
-      config: { auto: true, tool: "claude", model: "haiku" },
+      config: { auto: true, tool: "claude", model: "haiku", effort: "low" },
       runner: async (prompt) => {
         prompts.push(prompt);
         return '"Fix parser tokenizer bug"\n';
@@ -206,7 +206,7 @@ test("generateTitle normalizes runner output and threads the prompt through", as
 
 test("generateTitle throws when the runner yields nothing usable", async () => {
   await assert.rejects(
-    generateTitle({ brief: "x" }, { config: { auto: true, tool: "codex" }, runner: async () => "\n\n" }),
+    generateTitle({ brief: "x" }, { config: { auto: true, tool: "codex", effort: "low" }, runner: async () => "\n\n" }),
     /no usable title/,
   );
 });

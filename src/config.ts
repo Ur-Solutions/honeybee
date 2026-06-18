@@ -24,7 +24,12 @@ export type NamingConfig = {
   model?: string;
   /** Custom generator command, run via sh -c: prompt on stdin, title on stdout. Overrides tool/model. */
   command?: string;
+  /** Reasoning effort for the codex generator (default: "low"). Ignored by claude. */
+  effort?: NamingEffort;
 };
+
+export const NAMING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"] as const;
+export type NamingEffort = (typeof NAMING_EFFORTS)[number];
 
 export type HiveConfig = {
   bees?: Record<string, BeeConfig>;
@@ -79,6 +84,7 @@ export type ResolvedNamingConfig = {
   tool: "claude" | "codex";
   model?: string;
   command?: string;
+  effort: NamingEffort;
 };
 
 export function namingConfig(): ResolvedNamingConfig {
@@ -89,6 +95,8 @@ export function namingConfig(): ResolvedNamingConfig {
   return {
     auto: naming.auto !== false,
     tool,
+    // A title never needs deep reasoning; keep codex off the user's (often xhigh) default.
+    effort: naming.effort ?? "low",
     ...(model ? { model } : {}),
     ...(naming.command ? { command: naming.command } : {}),
   };
@@ -106,6 +114,7 @@ function normalizeConfig(value: unknown): HiveConfig {
     if (r.tool === "claude" || r.tool === "codex") naming.tool = r.tool;
     if (typeof r.model === "string" && r.model.length > 0) naming.model = r.model;
     if (typeof r.command === "string" && r.command.length > 0) naming.command = r.command;
+    if (typeof r.effort === "string" && (NAMING_EFFORTS as readonly string[]).includes(r.effort)) naming.effort = r.effort as NamingEffort;
     config.naming = naming;
   }
   if (object.bees && typeof object.bees === "object" && !Array.isArray(object.bees)) {

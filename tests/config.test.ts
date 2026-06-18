@@ -126,24 +126,24 @@ test("briefFooter honors config override (including empty string for disable)", 
   });
 });
 
-test("namingConfig defaults: auto-titling on, claude with haiku", async () => {
+test("namingConfig defaults: auto-titling on, claude with haiku, low effort", async () => {
   await withTempConfig(null, () => {
-    assert.deepEqual(namingConfig(), { auto: true, tool: "claude", model: "haiku" });
+    assert.deepEqual(namingConfig(), { auto: true, tool: "claude", model: "haiku", effort: "low" });
   });
 });
 
 test("namingConfig honors overrides; codex gets no default model", async () => {
   await withTempConfig({ naming: { auto: false, tool: "codex" } }, () => {
-    assert.deepEqual(namingConfig(), { auto: false, tool: "codex" });
+    assert.deepEqual(namingConfig(), { auto: false, tool: "codex", effort: "low" });
   });
-  await withTempConfig({ naming: { tool: "codex", model: "gpt-5.1-codex-mini", command: "my-titler" } }, () => {
-    assert.deepEqual(namingConfig(), { auto: true, tool: "codex", model: "gpt-5.1-codex-mini", command: "my-titler" });
+  await withTempConfig({ naming: { tool: "codex", model: "gpt-5.5", command: "my-titler", effort: "high" } }, () => {
+    assert.deepEqual(namingConfig(), { auto: true, tool: "codex", model: "gpt-5.5", command: "my-titler", effort: "high" });
   });
 });
 
-test("namingConfig drops invalid values", async () => {
-  await withTempConfig({ naming: { auto: "yes", tool: "grok", model: 7, command: "" } }, () => {
-    assert.deepEqual(namingConfig(), { auto: true, tool: "claude", model: "haiku" });
+test("namingConfig drops invalid values, including an unknown effort", async () => {
+  await withTempConfig({ naming: { auto: "yes", tool: "grok", model: 7, command: "", effort: "turbo" } }, () => {
+    assert.deepEqual(namingConfig(), { auto: true, tool: "claude", model: "haiku", effort: "low" });
   });
 });
 
