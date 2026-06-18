@@ -30,6 +30,8 @@ import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, 
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
 import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
 import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
+import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
+import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
 import { listProRepoEntries, listProRepos, resolveProForCwd, type ProRepoEntry } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
@@ -6137,6 +6139,10 @@ async function cmdLoop(parsed: Parsed) {
       return loopListCmd();
     case "start":
       return loopStartCmd(parsed);
+    case "launch":
+      return cmdLoopLaunch(parsed);
+    case "template":
+      return cmdLoopTemplate(parsed);
     case "status":
       return loopStatusCmd(parsed);
     case "logs":
@@ -6144,7 +6150,7 @@ async function cmdLoop(parsed: Parsed) {
     case "stop":
       return loopStopCmd(parsed);
     default:
-      throw new Error(`Unknown loop subcommand: ${sub}\nUsage: hive loop <start|status|logs|stop|list> [id]`);
+      throw new Error(`Unknown loop subcommand: ${sub}\nUsage: hive loop <launch|template|start|status|logs|stop|list> [id]`);
   }
 }
 
@@ -6175,7 +6181,16 @@ async function loopStartCmd(parsed: Parsed) {
     prompt = (await readFile(resolve(promptFile), "utf8")).trim();
   }
 
-  const rawArgs = loopArgsFromFlags(parsed, prompt);
+  await startLoopDetached(loopArgsFromFlags(parsed, prompt));
+}
+
+/**
+ * Spawn a loop driver detached (so it survives the calling popup/shell). Shared
+ * by `hive loop start` and `hive loop launch`: validate eagerly, write loop.json,
+ * then hand off to the background runner. `rawArgs` is the loose flag record both
+ * loopArgsFromFlags and loopStartArgs produce.
+ */
+async function startLoopDetached(rawArgs: Record<string, unknown>) {
   // Validate eagerly so errors surface BEFORE we spawn a detached process.
   const loopId = generateRunId();
   const cfg = buildLoopConfig({ ...rawArgs, loopId });
@@ -6210,6 +6225,170 @@ async function loopStartCmd(parsed: Parsed) {
   } else {
     console.log(`loop.start\t${loopId}\t${pid}\t${pgid}`);
   }
+  return loopId;
+}
+
+// ── hive loop launch — the interactive dialog (⌘⇧L) ──────────────────────────
+
+async function cmdLoopLaunch(parsed: Parsed): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('hive loop launch needs a TTY — bind it to a tmux popup: bind -n M-L display-popup -E "hive loop launch"');
+  }
+  const here = await resolveBeeInCurrentPane();
+  const defaultCwd = here?.cwd ?? (await resolveSpawnCwd(parsed));
+
+  const result = await chooseLoop({
+    templates: await listLoopTemplates(),
+    defaultCwd,
+    defaultCwdLabel: tildify(defaultCwd),
+    loadProjects: async () => (await listProRepos()).map((repo) => ({ label: repo.label, path: repo.path, project: repo.project })),
+    validatePath: async (input) => {
+      try {
+        const abs = resolve(input.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
+        const real = await realpath(abs);
+        if (!(await stat(real)).isDirectory()) return { ok: false, error: "not a directory" };
+        return { ok: true, path: real };
+      } catch {
+        return { ok: false, error: "path does not exist" };
+      }
+    },
+    listSubdirs: (base) => listNewBeeSubdirs(base),
+    loadBeeOptions: loadLoopBeeOptions,
+  });
+
+  if (!result) {
+    if (isPretty()) console.error(note("loop launch: cancelled"));
+    return;
+  }
+
+  if (result.action === "save-template") {
+    await saveLoopTemplate(loopTemplateInputFromResult(result));
+    if (isPretty()) console.log(actionLine("ok", "loop", [bold("template"), dim(result.templateName ?? "")]));
+    else console.log(`loop.template.save\t${result.templateName ?? ""}`);
+    return;
+  }
+
+  // Launch: run the loop detached so it survives the popup. The flag map mirrors
+  // what `hive loop start` would build from CLI flags, plus the chosen cwd.
+  await startLoopDetached({ ...loopStartArgs(result.values), cwd: result.cwd });
+}
+
+/** The account-aware agent shorthands the loop's bee picker offers. */
+async function loadLoopBeeOptions(): Promise<Array<{ value: string; label: string; detail?: string }>> {
+  const out: Array<{ value: string; label: string; detail?: string }> = [];
+  for (const kind of agentKinds()) {
+    const accounts = await newBeeAccountRows(kind).catch(() => []);
+    if (accounts.length >= 1) out.push({ value: `${kind}-auto`, label: `${kind} · auto`, detail: "least-loaded account" });
+    for (const acct of accounts) {
+      out.push({ value: `${kind}-${acct.id}`, label: `${kind} · ${acct.label}`, ...(acct.usage ? { detail: acct.usage } : {}) });
+    }
+    if (accounts.length === 0) out.push({ value: kind, label: `${kind} · (no account)` });
+  }
+  return out;
+}
+
+/** Map a save-as-template dialog result into the loopTemplate input record. */
+function loopTemplateInputFromResult(result: LoopLaunchResult): LoopTemplateInput {
+  const v = result.values;
+  const input: LoopTemplateInput = { name: result.templateName ?? "", prompt: v.prompt };
+  const put = (key: keyof LoopTemplateInput, value: string) => {
+    if (value.trim().length > 0) (input as Record<string, unknown>)[key] = value.trim();
+  };
+  put("context", v.context);
+  put("bee", v.bee);
+  put("until", v.until);
+  put("max", v.max);
+  put("maxDuration", v.maxDuration);
+  put("stopOnSeal", v.stopOnSeal);
+  put("stopOnSentinel", v.stopOnSentinel);
+  put("judge", v.judge);
+  put("summarizer", v.summarizer);
+  if (v.forever) input.forever = true;
+  if (v.yolo) input.yolo = true;
+  return input;
+}
+
+// ── hive loop template <list|save|remove> ────────────────────────────────────
+
+async function cmdLoopTemplate(parsed: Parsed): Promise<void> {
+  const sub = parsed.args[1];
+  switch (sub) {
+    case undefined:
+    case "list":
+    case "ls":
+      return loopTemplateListCmd(parsed);
+    case "save":
+      return loopTemplateSaveCmd(parsed);
+    case "remove":
+    case "rm":
+      return loopTemplateRemoveCmd(parsed);
+    default:
+      throw new Error(`Unknown loop template subcommand: ${sub}\nUsage: hive loop template <list|save|remove>`);
+  }
+}
+
+async function loopTemplateListCmd(parsed: Parsed): Promise<void> {
+  const templates = await listLoopTemplates();
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(templates, null, 2));
+    return;
+  }
+  if (!isPretty()) {
+    for (const t of templates) console.log(["loop.template", t.name, t.context ?? "", t.bee ?? "", t.prompt.replace(/\s+/g, " ")].join("\t"));
+    return;
+  }
+  if (templates.length === 0) {
+    console.log(dim('No loop templates yet. Save one with: hive loop template save --name <name> --prompt "..." [--context …]'));
+    return;
+  }
+  console.log(formatTable(
+    [{ header: "NAME" }, { header: "TYPE" }, { header: "BEE" }, { header: "PROMPT" }],
+    templates.map((t) => [bold(t.name), t.context ?? dim("—"), t.bee ?? dim("—"), dim(truncate(t.prompt.replace(/\s+/g, " "), 60))]),
+  ));
+}
+
+async function loopTemplateSaveCmd(parsed: Parsed): Promise<void> {
+  const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : "";
+  if (!name) throw new Error("Usage: hive loop template save --name <name> --prompt \"...\" [--context …]");
+  let prompt = typeof flag(parsed, "prompt") === "string" ? String(flag(parsed, "prompt")) : "";
+  const promptFile = typeof flag(parsed, "prompt-file") === "string" ? String(flag(parsed, "prompt-file")) : undefined;
+  if (promptFile) {
+    if (prompt) throw new Error("Provide either --prompt or --prompt-file, not both.");
+    prompt = (await readFile(resolve(promptFile), "utf8")).trim();
+  }
+  if (!prompt) throw new Error("hive loop template save needs --prompt or --prompt-file.");
+
+  const input: LoopTemplateInput = { name, prompt };
+  const putStr = (key: keyof LoopTemplateInput, flagName: string) => {
+    const value = flag(parsed, flagName);
+    if (typeof value === "string" && value.length > 0) (input as Record<string, unknown>)[key] = value;
+  };
+  putStr("bee", "bee");
+  putStr("context", "context");
+  putStr("until", "until");
+  putStr("max", "max");
+  putStr("maxDuration", "max-duration");
+  putStr("stopOnSeal", "stop-on-seal");
+  putStr("stopOnSentinel", "stop-on-sentinel");
+  putStr("judge", "judge");
+  putStr("summarizer", "summarizer");
+  putStr("description", "description");
+  if (truthy(flag(parsed, "forever"))) input.forever = true;
+  if (truthy(flag(parsed, "yolo"))) input.yolo = true;
+
+  const record = await saveLoopTemplate(input);
+  if (isPretty()) console.log(actionLine("ok", "loop", [bold("template"), dim(record.name)]));
+  else console.log(`loop.template.save\t${record.name}`);
+}
+
+async function loopTemplateRemoveCmd(parsed: Parsed): Promise<void> {
+  const name = parsed.args[2];
+  if (!name) throw new Error("Usage: hive loop template remove <name>");
+  const existing = await loadLoopTemplate(name);
+  if (!existing) throw new Error(`Unknown loop template: ${name}`);
+  await removeLoopTemplate(name);
+  if (isPretty()) console.log(actionLine("ok", "loop", [bold("template"), dim(name), red("removed")]));
+  else console.log(`loop.template.remove\t${name}`);
 }
 
 async function loopStatusCmd(parsed: Parsed) {
@@ -7850,7 +8029,7 @@ function printHelp() {
         ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--all, --fresh, --session <id>)"],
         ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],
-        ["loop", "<start|status|stop|…>", "run a bee repeatedly until a stop condition"],
+        ["loop", "<launch|start|status|stop|…>", "run a bee repeatedly until a stop condition (launch = interactive dialog)"],
       ],
     },
     {

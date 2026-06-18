@@ -36,7 +36,7 @@ const NODE_SUBCOMMANDS = ["list", "ls", "register", "inspect", "update", "unregi
 const SUBSTRATE_SUBCOMMANDS = ["list", "ls"];
 const SEALS_SUBCOMMANDS = ["find"];
 const FLOW_SUBCOMMANDS = ["list", "ls", "define", "inspect", "remove", "run", "runs", "logs", "status", "cancel"];
-const LOOP_SUBCOMMANDS = ["start", "status", "logs", "stop", "list", "ls"];
+const LOOP_SUBCOMMANDS = ["launch", "template", "start", "status", "logs", "stop", "list", "ls"];
 const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "purge", "config"];
 const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
 const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "remove"];
@@ -146,6 +146,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--until", "--max", "--max-duration", "--forever",
     "--stop-on-seal", "--stop-on-sentinel", "--judge", "--summarizer",
     "--yolo", "--iter", "-n", "--follow", "-f", "--now", "--json",
+    "--name", "--description",
   ],
 };
 
