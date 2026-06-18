@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseProRepoEntries, parseProRepos, resolveProForCwd } from "../src/proProjects.js";
+import { parseProRepoEntries, parseProRepos, resolveProEntryForCwd, resolveProForCwd, toProSlug } from "../src/proProjects.js";
 
 test("parseProRepos turns tab-separated rows into labelled repos", () => {
   const out = [
@@ -35,4 +35,25 @@ test("resolveProForCwd matches the longest path prefix (cwd may be a subdir)", (
   assert.deepEqual(resolveProForCwd(entries, "/p/oss/forge/repos/forge/src/deep"), { area: "oss", project: "forge", repo: "forge" });
   assert.deepEqual(resolveProForCwd(entries, "/p/oss/forge/repos/forge"), { area: "oss", project: "forge", repo: "forge" });
   assert.equal(resolveProForCwd(entries, "/somewhere/else"), undefined);
+});
+
+test("resolveProEntryForCwd returns the full entry (path included) for the isolation step", () => {
+  const entries = parseProRepoEntries([
+    "trmd/honeybee\thoneybee\t/p/trmd/honeybee/repos/honeybee",
+    "trmd/honeybee\thoneybee-build\t/p/trmd/honeybee/repos/honeybee-build",
+  ].join("\n"));
+  assert.deepEqual(resolveProEntryForCwd(entries, "/p/trmd/honeybee/repos/honeybee/src"), {
+    area: "trmd", project: "honeybee", repo: "honeybee", path: "/p/trmd/honeybee/repos/honeybee",
+  });
+  // A sibling repo's path must not be matched by the shorter-prefix repo.
+  assert.equal(resolveProEntryForCwd(entries, "/p/trmd/honeybee/repos/honeybee-build")!.repo, "honeybee-build");
+  assert.equal(resolveProEntryForCwd(entries, "/elsewhere"), undefined);
+});
+
+test("toProSlug lowercases and dashes free text into a pro-valid slug", () => {
+  assert.equal(toProSlug("Fix Login Bug"), "fix-login-bug");
+  assert.equal(toProSlug("  feature/Foo_Bar!  "), "feature-foo-bar");
+  assert.equal(toProSlug("--Edge--"), "edge");
+  assert.equal(toProSlug("claude"), "claude");
+  assert.equal(toProSlug("!!!"), ""); // nothing usable → caller surfaces a hint
 });

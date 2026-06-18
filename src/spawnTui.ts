@@ -68,14 +68,29 @@ export type SpawnTuiHooks = {
   listSubdirs: (base: string) => Promise<{ ok: boolean; base: string; dirs: string[]; error?: string }>;
   /** Initial yolo state for a freshly chosen type. */
   defaultYolo: (kind: string) => boolean;
+  /**
+   * Resolve which pro repo a chosen cwd lives in. `null` (not a pro repo, or no
+   * `pro` CLI) skips the worktree/checkout step and spawns in the cwd directly.
+   * The returned `path` is the repo root pro runs against; `label` is shown.
+   */
+  proRepoForCwd: (cwd: string) => Promise<{ label: string; path: string } | null>;
+  /** Suggested default slot name for a worktree/checkout (per agent kind). */
+  suggestDirName: (kind: string) => string;
+  /**
+   * Create (or reuse) a pro worktree/checkout beside the repo; resolves to its
+   * absolute path, which becomes the spawn cwd. ok=false surfaces `error` inline.
+   */
+  createProDir: (kind: "worktree" | "checkout", repoPath: string, name: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
 };
 
-type Stage = "type" | "account" | "config" | "project";
+type Stage = "type" | "account" | "config" | "project" | "isolation";
 type ProjectView = "menu" | "browse" | "path";
+type IsolationView = "menu" | "name";
 type AsyncState<T> = { state: "idle" } | { state: "loading" } | { state: "loaded"; items: T } | { state: "error"; error: string };
 
 const MAX_COUNT = 24;
 const PROJECT_MENU = ["here", "project", "path"] as const;
+const ISOLATION_MENU = ["here", "worktree", "checkout"] as const;
 
 /**
  * The account-column rule (kept pure for testing): with two or more real
@@ -201,6 +216,15 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
   // Live subdir completion for path mode, keyed by the base dir being listed.
   let subdirs: AsyncState<{ base: string; dirs: string[] }> = { state: "idle" };
   let subdirsBase = "";                     // raw base string we last requested
+  // ── isolation state (only when the chosen cwd is inside a pro repo) ───────
+  let proTarget: { label: string; path: string } | null = null;
+  let isolationView: IsolationView = "menu";
+  let isolationMode: "worktree" | "checkout" = "worktree";
+  let cursorIsolation = 0;
+  let nameBuffer = "";                       // typed worktree/checkout name
+  let nameError = "";
+  let isoBusy = false;                       // creating the slot (ignore input)
+  let resolvingCwd = false;                  // detecting pro repo (guards re-entry)
   let message = "↑↓ pick · → enter advance · ← back · q cancel";
 
   readline.emitKeypressEvents(stdin);
@@ -317,6 +341,73 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         finish({ kind: selKind, account: selAccount, yolo, autoswap, count, cwd: selCwd });
       };
 
+      // A cwd has been chosen (here / browse / path). If it lives inside a pro
+      // repo, offer the worktree/checkout step before spawning; otherwise spawn
+      // straight in the cwd (unchanged behavior for non-pro dirs).
+      const finalizeCwd = async (cwd: string) => {
+        if (resolvingCwd) return;
+        resolvingCwd = true;
+        selCwd = cwd;
+        message = "checking pro repo…";
+        render();
+        let target: { label: string; path: string } | null = null;
+        try {
+          target = await hooks.proRepoForCwd(cwd);
+        } catch {
+          target = null;
+        }
+        resolvingCwd = false;
+        if (done) return;
+        if (!target) { spawn(); return; }
+        proTarget = target;
+        stage = "isolation";
+        isolationView = "menu";
+        cursorIsolation = 0;
+        nameError = "";
+        isoBusy = false;
+        stdout.write("\x1b[?25l"); // menu mode: no typing cursor
+        message = "↑↓ pick · enter select · ← back";
+        render();
+      };
+
+      const enterIsolationName = (mode: "worktree" | "checkout") => {
+        isolationMode = mode;
+        isolationView = "name";
+        nameBuffer = hooks.suggestDirName(selKind);
+        nameError = "";
+        message = "type a name · enter create & spawn · esc back";
+        stdout.write("\x1b[?25h");
+        render();
+      };
+
+      const activateIsolationMenu = () => {
+        const choice = ISOLATION_MENU[cursorIsolation];
+        if (choice === "here") { spawn(); return; }
+        enterIsolationName(choice);
+      };
+
+      const submitIsolationName = async () => {
+        if (isoBusy) return;
+        const name = nameBuffer.trim();
+        if (!name) { nameError = "enter a name"; render(); return; }
+        if (!proTarget) { nameError = "no pro repo"; render(); return; }
+        isoBusy = true;
+        message = `creating ${isolationMode}…`;
+        render();
+        let res: { ok: boolean; path?: string; error?: string };
+        try {
+          res = await hooks.createProDir(isolationMode, proTarget.path, name);
+        } catch (error) {
+          res = { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+        isoBusy = false;
+        if (done) return;
+        if (!res.ok || !res.path) { nameError = res.error ?? `could not create ${isolationMode}`; render(); return; }
+        stdout.write("\x1b[?25l");
+        selCwd = res.path;
+        spawn();
+      };
+
       // ── project column actions ────────────────────────────────────────────
       const filteredProjects = (): SpawnTuiProject[] =>
         projects.state === "loaded" ? fuzzyFilter(browseQuery, projects.items, (repo) => repo.label) : [];
@@ -332,8 +423,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       const activateProjectMenu = () => {
         const choice = PROJECT_MENU[cursorProjectMenu];
         if (choice === "here") {
-          selCwd = hooks.defaultCwd;
-          spawn();
+          void finalizeCwd(hooks.defaultCwd);
         } else if (choice === "project") {
           projectView = "browse";
           browseQuery = "";
@@ -360,8 +450,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       const chooseBrowse = () => {
         const repo = filteredProjects()[cursorBrowse];
         if (!repo) return;
-        selCwd = repo.path;
-        spawn();
+        void finalizeCwd(repo.path);
       };
 
       // Reload the subdir list whenever the directory portion of the buffer
@@ -404,8 +493,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         const pick = filteredSubdirs()[cursorPath];
         if (pick) {
           stdout.write("\x1b[?25l");
-          selCwd = pick.abs;
-          spawn();
+          void finalizeCwd(pick.abs);
           return;
         }
         // Nothing matched the completion — fall back to validating the literal text.
@@ -419,12 +507,27 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
           return;
         }
         stdout.write("\x1b[?25l");
-        selCwd = result.path;
-        spawn();
+        void finalizeCwd(result.path);
       };
 
       // ── navigation ────────────────────────────────────────────────────────
       const goBack = () => {
+        if (stage === "isolation") {
+          if (isolationView === "name") {
+            isolationView = "menu";
+            nameError = "";
+            stdout.write("\x1b[?25l");
+            message = "↑↓ pick · enter select · ← back";
+            render();
+            return;
+          }
+          // back from the isolation menu to the project menu
+          stage = "project";
+          projectView = "menu";
+          message = "↑↓ pick · enter: spawn / browse / type a path · ← back";
+          render();
+          return;
+        }
         if (stage === "type") { finish(null); return; }
         if (stage === "account") { stage = "type"; message = "↑↓ pick type · → enter advance · q cancel"; render(); return; }
         if (stage === "config") {
@@ -453,6 +556,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         else if (stage === "account") cursorAccount = clamp(cursorAccount + delta, accountRows.length);
         else if (stage === "config") cursorConfig = clamp(cursorConfig + delta, configRows().length);
         else if (stage === "project" && projectView === "menu") cursorProjectMenu = clamp(cursorProjectMenu + delta, PROJECT_MENU.length);
+        else if (stage === "isolation" && isolationView === "menu") cursorIsolation = clamp(cursorIsolation + delta, ISOLATION_MENU.length);
         render();
       };
 
@@ -463,6 +567,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         if (stage === "type") { void chooseType(); return; }
         if (stage === "account") { chooseAccount(); return; }
         if (stage === "config") { enterProject(); return; }
+        if (stage === "isolation") { if (isolationView === "menu") activateIsolationMenu(); return; }
         // project
         if (projectView === "menu") { activateProjectMenu(); return; }
         if (projectView === "browse") { chooseBrowse(); return; }
@@ -522,10 +627,24 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         return true;
       };
 
+      // Name entry for a worktree/checkout — a single text field (no completion
+      // list). The isolation MENU is steered by the global nav handler below.
+      const handleIsolationNameKey = (value: string, key: readline.Key): boolean => {
+        if (!(stage === "isolation" && isolationView === "name")) return false;
+        if (isoBusy) return true; // creating — swallow input until it resolves
+        if (key.name === "return" || key.name === "enter") { void submitIsolationName(); return true; }
+        if (key.name === "escape" || key.name === "left") { goBack(); return true; }
+        if (key.name === "backspace") { nameBuffer = nameBuffer.slice(0, -1); nameError = ""; render(); return true; }
+        if (key.ctrl && key.name === "u") { nameBuffer = ""; nameError = ""; render(); return true; }
+        if (isPrintable(value, key)) { nameBuffer += value; nameError = ""; render(); return true; }
+        return true;
+      };
+
       const onKey = (value: string, key: readline.Key) => {
         if (key.ctrl && key.name === "c") { finish(null); return; }
         if (handleBrowseKey(value, key)) return;
         if (handlePathKey(value, key)) return;
+        if (handleIsolationNameKey(value, key)) return;
         switch (key.name) {
           case "q":
           case "escape":
@@ -566,11 +685,15 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
 
         const inBrowse = stage === "project" && projectView === "browse";
         const inPath = stage === "project" && projectView === "path";
+        const inIsolation = stage === "isolation";
+        const inIsoName = inIsolation && isolationView === "name";
 
         const header = `${bold("hive new")}  ${dim(breadcrumb())}`;
         const lines: string[] = [header, ""];
 
-        if (inBrowse || inPath) {
+        if (inIsolation) {
+          lines.push(...renderIsolation(width));
+        } else if (inBrowse || inPath) {
           lines.push(...renderFull(width, bodyRows, inBrowse));
         } else {
           lines.push(...renderColumns(width, bodyRows));
@@ -578,17 +701,20 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
 
         // pad body
         while (lines.length < height - 2) lines.push("");
-        lines.push(truncate(pathError ? red(pathError) : message, width));
-        const footer = inBrowse || inPath
-          ? "type to filter · ↑↓ move · enter select · esc back"
-          : "j/k move · h/l columns · enter advance · +/- count · q quit";
+        const errLine = pathError || nameError;
+        lines.push(truncate(errLine ? red(errLine) : message, width));
+        let footer: string;
+        if (inBrowse || inPath) footer = "type to filter · ↑↓ move · enter select · esc back";
+        else if (inIsoName) footer = "type a name · enter create & spawn · esc back";
+        else if (inIsolation) footer = "j/k move · enter select · ← back · q quit";
+        else footer = "j/k move · h/l columns · enter advance · +/- count · q quit";
         lines.push(dim(footer));
         stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
-        if (inPath || inBrowse) {
-          // Park the real cursor at the end of the "> " filter field. Body
+        if (inPath || inBrowse || inIsoName) {
+          // Park the real cursor at the end of the "> " filter/name field. Body
           // starts on the 3rd screen line (header, blank, then "> <text>"),
           // and the "> " prompt is two columns wide.
-          const text = inPath ? pathBuffer : browseQuery;
+          const text = inIsoName ? nameBuffer : inPath ? pathBuffer : browseQuery;
           stdout.write(`\x1b[3;${2 + visibleLength(text) + 1}H`);
         }
       };
@@ -705,6 +831,29 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
           const line = `${pointer} ${row.rel}`;
           out.push(idx === cursorPath && isPretty() ? reverse(stripAnsi(line)) : truncate(line, width));
         }
+        return out;
+      };
+
+      // Isolation step: a small menu (here / worktree / checkout), then a single
+      // name field. The name field is the first body line so the shared cursor
+      // parking in render() lands on it (screen line 3).
+      const renderIsolation = (width: number): string[] => {
+        const label = proTarget?.label ?? "";
+        if (isolationView === "name") {
+          const tool = isolationMode === "worktree" ? "pro wt" : "pro co";
+          return [`${cyan("> ")}${nameBuffer}`, dim(`${tool} · ${label}`)];
+        }
+        const rows = [
+          `here       ${dim("spawn in the repo as-is")}`,
+          `worktree   ${dim("pro wt — new git worktree (shared .git, own branch)")}`,
+          `checkout   ${dim("pro co — full --local clone")}`,
+        ];
+        const out: string[] = [dim(`pro repo: ${label}`), ""];
+        rows.forEach((text, i) => {
+          const pointer = i === cursorIsolation ? green("›") : " ";
+          const line = `${pointer} ${text}`;
+          out.push(i === cursorIsolation && isPretty() ? reverse(stripAnsi(line)) : truncate(line, width));
+        });
         return out;
       };
 

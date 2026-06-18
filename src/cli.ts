@@ -2,7 +2,7 @@
 import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, resolveHome, shellCommand } from "./agents.js";
 import {
   AUTO_ACCOUNT_QUERY,
@@ -32,7 +32,7 @@ import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
 import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
 import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
-import { listProRepoEntries, listProRepos, resolveProForCwd, type ProRepoEntry } from "./proProjects.js";
+import { createProSlot, listProRepoEntries, listProRepos, resolveProEntryForCwd, resolveProForCwd, toProSlug, type ProRepoEntry } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { resumeArgs, sniffYolo, swapAccount } from "./swap.js";
@@ -714,6 +714,26 @@ async function cmdNew(parsed: Parsed): Promise<void> {
       }
     },
     listSubdirs: (base) => listNewBeeSubdirs(base),
+    proRepoForCwd: async (cwd) => {
+      try {
+        const entry = resolveProEntryForCwd(await listProRepoEntries(), cwd);
+        if (!entry) return null;
+        const label = [entry.area, entry.project, entry.repo].filter((part) => part.length > 0).join("/") || entry.path;
+        return { label, path: entry.path };
+      } catch {
+        return null;
+      }
+    },
+    suggestDirName: (kind) => toProSlug(`${kind}-${basename(defaultCwd)}`) || toProSlug(kind) || "bee",
+    createProDir: async (kind, repoPath, name) => {
+      const slug = toProSlug(name);
+      if (!slug) return { ok: false, error: "use letters, digits, and dashes" };
+      try {
+        return { ok: true, path: await createProSlot(kind, repoPath, slug) };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    },
   });
 
   if (!plan) {
@@ -761,6 +781,17 @@ async function cmdLaunch(parsed: Parsed): Promise<void> {
       name: f.name,
       ...(f.description ? { description: f.description } : {}),
       beeCount: f.castes.reduce((sum, c) => sum + (c.count ?? 1), 0),
+      // One slot per spawned bee, in spawn order (caste order, then index) so
+      // the message form lines up with spawnFromFrame's expansion.
+      beeSlots: f.castes.flatMap((c) =>
+        Array.from({ length: c.count ?? 1 }, (_, i) => ({
+          caste: c.name,
+          bee: c.bee,
+          index: i + 1,
+          count: c.count ?? 1,
+          ...(c.brief ? { brief: c.brief } : {}),
+        })),
+      ),
     })),
     ...flows
       .filter((f) => !f.loadError) // a broken flow can't run; hide it from the picker
@@ -816,9 +847,13 @@ async function cmdLaunch(parsed: Parsed): Promise<void> {
 
   if (plan.kind === "frame") {
     // Spawn the frame's swarm detached at the chosen repo (no switch-client — a
-    // swarm shouldn't yank focus to an arbitrary member).
+    // swarm shouldn't yank focus to an arbitrary member). Per-bee messages from
+    // the composer (if any) are delivered after readiness, in spawn order.
     const flags = new Map<string, string | true | string[]>([["frame", plan.name], ["cwd", plan.cwd]]);
-    await spawnFromFrame({ command: "spawn", args: ["spawn"], flags, rest: [] }, plan.name);
+    // "start now" delivery (the composer default) suppresses the wait-footer so
+    // the message is acted on; "brief only" keeps it so bees wait for a follow-up.
+    if (plan.waitForGo === false) flags.set("no-wait-footer", true);
+    await spawnFromFrame({ command: "spawn", args: ["spawn"], flags, rest: [] }, plan.name, plan.messages);
     return;
   }
 
@@ -961,7 +996,16 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   return records;
 }
 
-async function spawnFromFrame(parsed: Parsed, frameName: string): Promise<SessionRecord[]> {
+/**
+ * Spawn every bee of a frame's castes (caste order, then index within a caste).
+ *
+ * `perBeeMessages`, when given, holds one initial message per spawned bee in
+ * that exact order (from the `hive launch` composer). A non-empty entry is
+ * delivered to its bee after readiness, overriding the caste's default brief; an
+ * empty entry sends nothing. When omitted, the legacy `--briefed` behavior
+ * applies (deliver each caste's own brief).
+ */
+async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?: string[]): Promise<SessionRecord[]> {
   if (hasFlag(parsed, "name")) throw new Error("--name cannot be combined with --frame; frame bees are auto-named");
   if (hasFlag(parsed, "brief")) throw new Error("--brief cannot be combined with --frame; briefs come from the frame's castes");
   const frame: Frame | null = await loadFrame(frameName);
@@ -976,12 +1020,22 @@ async function spawnFromFrame(parsed: Parsed, frameName: string): Promise<Sessio
   // deliverBrief already waits for readiness, so just-briefed bees are excluded
   // from the post-spawn confirmation (mirrors spawnSingleBee's exclusivity).
   const unbriefed: SessionRecord[] = [];
+  const hasComposerMessages = perBeeMessages !== undefined;
+  let slot = 0; // running bee index across all castes, aligned with perBeeMessages
   for (const caste of frame.castes) {
     const yolo = dangerousMode(parsed, caste.bee, caste.bee);
     const home = caste.home ?? flagHome;
     const casteSpec = resolveAgent(caste.bee, parsed.rest, { home, yolo });
     const casteNode = await resolveSpawnNode(parsed, casteSpec.kind);
     for (let i = 0; i < caste.count; i += 1) {
+      // A composer message (if non-blank) overrides this bee's caste brief.
+      const custom = hasComposerMessages ? perBeeMessages?.[slot] ?? "" : undefined;
+      slot += 1;
+      const hasCustom = typeof custom === "string" && custom.trim().length > 0;
+      const recordBrief = hasComposerMessages ? (hasCustom ? custom : undefined) : caste.brief;
+      // With composer messages present, a blank slot explicitly means no brief;
+      // otherwise fall back to the legacy "--briefed delivers caste brief" path.
+      const toDeliver = hasComposerMessages ? (hasCustom ? custom : undefined) : briefed && caste.brief ? caste.brief : undefined;
       let record = await spawnBee({
         agent: caste.bee,
         extraArgs: parsed.rest,
@@ -992,9 +1046,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string): Promise<Sessio
         swarmId,
         caste: caste.name,
         node: casteNode,
-        ...(caste.brief ? { brief: caste.brief } : {}),
+        ...(recordBrief ? { brief: recordBrief } : {}),
       });
-      if (briefed && caste.brief) record = await deliverBrief(parsed, record, caste.brief);
+      if (toDeliver) record = await deliverBrief(parsed, record, toDeliver);
       else unbriefed.push(record);
       records.push(record);
       if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`caste:${caste.name}`), dim(`@${swarmId}`)]));

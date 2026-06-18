@@ -4,7 +4,12 @@
  * A wizard for standing up work from inside an attached session: pick a FRAME
  * (a parameterless caste swarm) or a FLOW (a parameterized orchestration), pick
  * the repo to run it in (defaults to the current one), and — for flows — fill in
- * the declared arguments in editable input boxes. Enter launches (detached).
+ * the declared arguments in editable input boxes. For frames, an optional final
+ * step composes an initial message per bee: a "message to all" box seeds every
+ * field at once, and each bee's field (pre-filled from its caste brief) can then
+ * be edited individually. A delivery toggle (tab) chooses whether the message is
+ * a "start now" directive or context-only "brief" the bees wait on. Enter
+ * launches (detached).
  *
  * Presentation-only and dependency-free, mirroring src/spawnTui.ts: raw mode +
  * alt screen + signal-safe restore, one keypress handler, a full redraw per
@@ -37,6 +42,23 @@ export type BeeOption = {
   detail?: string;
 };
 
+/**
+ * One spawned bee of a frame, in spawn order (caste order, then index within a
+ * caste). Used to render the per-bee initial-message fields. Frames only.
+ */
+export type BeeSlot = {
+  /** Caste this bee belongs to. */
+  caste: string;
+  /** Agent kind/shorthand for the caste (display only). */
+  bee: string;
+  /** 1-based index within the caste (for "i/n" labels when count > 1). */
+  index: number;
+  /** Total bees in this caste. */
+  count: number;
+  /** Caste's default brief; seeds this bee's message field. */
+  brief?: string;
+};
+
 export type LaunchTemplate = {
   kind: "frame" | "flow";
   name: string;
@@ -45,6 +67,8 @@ export type LaunchTemplate = {
   beeCount?: number;
   /** Declared args (flows only). Frames have none. */
   args?: LaunchArg[];
+  /** Expanded bee slots (frames only) — one editable message field each. */
+  beeSlots?: BeeSlot[];
 };
 
 export type LaunchProject = { label: string; path: string; project?: string };
@@ -55,6 +79,18 @@ export type LaunchResult = {
   cwd: string;
   /** Filled flow args (name → value); empty for frames. */
   args: Record<string, string>;
+  /**
+   * Per-bee initial messages for a frame, in spawn order; absent for flows.
+   * An empty entry means "send nothing to that bee".
+   */
+  messages?: string[];
+  /**
+   * Frames only: when true, the delivered message carries the "context only —
+   * wait for a follow-up" footer (bees acknowledge and idle); when false, no
+   * footer is appended and the message is a directive to act on now. Undefined
+   * for flows / frames with no message step.
+   */
+  waitForGo?: boolean;
 };
 
 export type LaunchTuiHooks = {
@@ -68,7 +104,7 @@ export type LaunchTuiHooks = {
   loadBeeOptions: () => Promise<BeeOption[]>;
 };
 
-type Stage = "template" | "project" | "args";
+type Stage = "template" | "project" | "args" | "message";
 type ProjectView = "menu" | "browse" | "path";
 type AsyncState<T> = { state: "idle" } | { state: "loading" } | { state: "loaded"; items: T } | { state: "error"; error: string };
 
@@ -87,6 +123,23 @@ export function seedArgValues(template: LaunchTemplate): Record<string, string> 
   const out: Record<string, string> = {};
   for (const arg of template.args ?? []) out[arg.name] = arg.default ?? "";
   return out;
+}
+
+/**
+ * Seed the per-bee message buffers for a frame (pure, for testing): each
+ * spawned bee starts from its caste's brief (or "" when the caste has none).
+ * Returns one entry per bee slot, in spawn order.
+ */
+export function seedBeeMessages(template: LaunchTemplate): string[] {
+  return (template.beeSlots ?? []).map((slot) => slot.brief ?? "");
+}
+
+/**
+ * A human label for a bee slot (pure, for testing): the caste name, plus an
+ * "i/n" suffix when the caste spawns more than one bee.
+ */
+export function beeSlotLabel(slot: BeeSlot): string {
+  return slot.count > 1 ? `${slot.caste} ${slot.index}/${slot.count}` : slot.caste;
 }
 
 /**
@@ -130,6 +183,17 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
   let cursorPath = 0;
   let pathScroll = 0;
   let cursorArg = 0; // 0..args.length; args.length === the "Launch" row
+
+  // ── frame message form (optional per-bee initial messages) ───────────────
+  // Virtual rows: 0 = "message to all" template box, 1..N = per-bee fields,
+  // N+1 = the "Launch" row.
+  let msgValues: string[] = [];
+  let msgTemplate = "";
+  let cursorMsg = 0;
+  let msgScroll = 0;
+  // false → deliver the message as a "start now" directive (no wait-footer);
+  // true → deliver it as context with the footer so bees wait for a follow-up.
+  let waitForGo = false;
 
   // ── bee-picker overlay (a `bee` field opens an account-aware agent list) ──
   let beePicking = false;
@@ -241,12 +305,35 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
           render();
           return;
         }
+        // A frame with bee slots gets the optional per-bee message composer.
+        if (template && template.kind === "frame" && (template.beeSlots?.length ?? 0) > 0) {
+          enterMessage();
+          return;
+        }
         launch();
+      };
+
+      const enterMessage = () => {
+        if (!template) return;
+        stage = "message";
+        msgValues = seedBeeMessages(template);
+        msgTemplate = "";
+        cursorMsg = 0;
+        msgScroll = 0;
+        waitForGo = false;
+        message = "type a message for all (↵ applies to every bee) · ↓ edit each · tab: delivery · ↵ Launch";
+        stdout.write("\x1b[?25h");
+        render();
       };
 
       const launch = () => {
         if (!template) return;
-        finish({ kind: template.kind, name: template.name, cwd: selCwd, args: { ...argValues } });
+        const result: LaunchResult = { kind: template.kind, name: template.name, cwd: selCwd, args: { ...argValues } };
+        if (template.kind === "frame" && (template.beeSlots?.length ?? 0) > 0) {
+          result.messages = [...msgValues];
+          result.waitForGo = waitForGo;
+        }
+        finish(result);
       };
 
       const activateProjectMenu = () => {
@@ -406,10 +493,48 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
         return true; // consume everything else while in the form
       };
 
+      // ── frame message form ────────────────────────────────────────────────
+      const msgSlots = (): BeeSlot[] => template?.beeSlots ?? [];
+      const msgLaunchRow = () => msgSlots().length + 1; // 0 = template box, 1..N = bees, N+1 = Launch
+
+      const handleMessageKey = (value: string, key: readline.Key): boolean => {
+        if (stage !== "message") return false;
+        if (key.name === "escape" || key.name === "left") { enterProject(); return true; }
+        // tab flips delivery mode (start now ↔ brief only) from any field.
+        if (key.name === "tab") { waitForGo = !waitForGo; render(); return true; }
+        if (key.name === "up") { cursorMsg = clamp(cursorMsg - 1, msgLaunchRow() + 1); render(); return true; }
+        if (key.name === "down") { cursorMsg = clamp(cursorMsg + 1, msgLaunchRow() + 1); render(); return true; }
+        if (cursorMsg === msgLaunchRow()) {
+          if (key.name === "return" || key.name === "enter") { launch(); return true; }
+          return true; // Launch row consumes the rest
+        }
+        if (cursorMsg === 0) {
+          // The "message to all" box. Enter copies a non-empty template into
+          // every bee field (overwriting edits) and drops focus to the first bee.
+          if (key.name === "return" || key.name === "enter") {
+            if (msgTemplate.length > 0) msgValues = msgValues.map(() => msgTemplate);
+            cursorMsg = clamp(1, msgLaunchRow() + 1);
+            render();
+            return true;
+          }
+          if (key.name === "backspace") { msgTemplate = msgTemplate.slice(0, -1); render(); return true; }
+          if (key.ctrl && key.name === "u") { msgTemplate = ""; render(); return true; }
+          if (isPrintable(value, key)) { msgTemplate += value; render(); return true; }
+          return true;
+        }
+        // A per-bee field (cursorMsg 1..N → slot index cursorMsg-1).
+        const slot = cursorMsg - 1;
+        if (key.name === "return" || key.name === "enter") { cursorMsg = clamp(cursorMsg + 1, msgLaunchRow() + 1); render(); return true; }
+        if (key.name === "backspace") { msgValues[slot] = (msgValues[slot] ?? "").slice(0, -1); render(); return true; }
+        if (key.ctrl && key.name === "u") { msgValues[slot] = ""; render(); return true; }
+        if (isPrintable(value, key)) { msgValues[slot] = (msgValues[slot] ?? "") + value; render(); return true; }
+        return true; // consume everything else while in the form
+      };
+
       // ── navigation ────────────────────────────────────────────────────────
       const goBack = () => {
         if (stage === "template") { finish(null); return; }
-        if (stage === "args") { enterProject(); return; }
+        if (stage === "args" || stage === "message") { enterProject(); return; }
         // project
         if (projectView === "browse" || projectView === "path") {
           projectView = "menu";
@@ -470,6 +595,7 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
         if (handleTemplateKey(value, key)) return;
         if (handleBeePickerKey(value, key)) return;
         if (handleArgsKey(value, key)) return;
+        if (handleMessageKey(value, key)) return;
         if (handleBrowseKey(value, key)) return;
         if (handlePathKey(value, key)) return;
         // project menu
@@ -513,10 +639,11 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
 
         if (stage === "template") lines.push(...renderTemplates(width, bodyRows));
         else if (stage === "args") lines.push(...renderArgs(width, bodyRows));
+        else if (stage === "message") lines.push(...renderMessage(width, bodyRows));
         else lines.push(...renderProject(width, bodyRows));
 
         while (lines.length < height - 2) lines.push("");
-        const err = stage === "args" ? argError : pathError;
+        const err = stage === "args" ? argError : stage === "message" ? "" : pathError;
         lines.push(truncate(err ? red(err) : message, width));
         lines.push(dim(footer()));
         stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
@@ -527,6 +654,7 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
         if (stage === "template") return "type to filter · ↑↓ move · enter select · q quit";
         if (stage === "args" && beePicking) return "type to filter · ↑↓ move · enter pick · esc back";
         if (stage === "args") return "↑↓ field · type to edit · enter next/launch · ← back";
+        if (stage === "message") return "↑↓ field · type to edit · ↵ top box fills all · tab delivery · ↵ Launch · ← back";
         if (projectView === "browse" || projectView === "path") return "type to filter · ↑↓ move · enter select · esc back";
         return "↑↓ move · enter choose · ← back · q quit";
       };
@@ -635,6 +763,57 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
         out.push(arg?.description ? dim(`  ${truncate(arg.description, width - 4)}`) : "");
         const launchFocused = cursorArg === launchRow();
         const action = `▶ Launch ${template?.kind ?? ""} ${template?.name ?? ""} in ${relTilde(selCwd)}`;
+        out.push(`${launchFocused ? green("›") : " "}   ${launchFocused && isPretty() ? reverse(stripAnsi(action)) : bold(action)}`);
+        return out;
+      };
+
+      const renderMessage = (width: number, bodyRows: number): string[] => {
+        const slots = msgSlots();
+        const labels = slots.map(beeSlotLabel);
+        const labelW = Math.min(24, Math.max(8, ...labels.map((l) => l.length + 2)));
+        const fieldW = Math.max(10, width - labelW - 10);
+        const box = (text: string, focused: boolean): string => {
+          const shown = truncate(text, fieldW);
+          if (focused && isPretty()) return reverse(` ${padRight(shown, fieldW)} `);
+          if (shown.length > 0) return shown;
+          return dim("—");
+        };
+
+        const out: string[] = [dim(`${template?.name} — initial message per bee ${dim("(optional)")}`), ""];
+        // Row 0: the "message to all" template box.
+        const tplFocused = cursorMsg === 0;
+        out.push(`${tplFocused ? green("›") : " "} ${dim(padRight("message to all", labelW))}  ${box(msgTemplate, tplFocused)}`);
+        out.push(dim(`  ↵ here copies this into every bee field below`));
+        // Delivery mode (tab toggles) — controls the "wait for a follow-up" footer.
+        const mode = waitForGo
+          ? `brief only — bees acknowledge and wait for a follow-up`
+          : `${green("start now")} — bees act on the message immediately`;
+        out.push(dim(`  delivery: ${mode}  ${dim("(tab)")}`));
+        out.push("");
+
+        // Bee fields, windowed so a large swarm still fits.
+        const fixed = 8; // header, blank, template, hint, delivery, blank, help, launch
+        const listRows = Math.max(3, bodyRows - fixed);
+        const cursorSlot = cursorMsg >= 1 && cursorMsg <= slots.length ? cursorMsg - 1 : -1;
+        if (cursorSlot >= 0) {
+          if (cursorSlot < msgScroll) msgScroll = cursorSlot;
+          if (cursorSlot >= msgScroll + listRows) msgScroll = cursorSlot - listRows + 1;
+        }
+        if (msgScroll > Math.max(0, slots.length - listRows)) msgScroll = Math.max(0, slots.length - listRows);
+        for (let i = 0; i < Math.min(listRows, slots.length - msgScroll); i += 1) {
+          const idx = msgScroll + i;
+          const focused = cursorMsg === idx + 1;
+          const label = padRight(labels[idx]!, labelW);
+          out.push(`${focused ? green("›") : " "} ${focused ? label : dim(label)}  ${box(msgValues[idx] ?? "", focused)}`);
+        }
+        if (slots.length > msgScroll + listRows) out.push(dim(`  …${slots.length - msgScroll - listRows} more`));
+
+        // Help line: which bee/agent the focused field targets.
+        out.push("");
+        const fs = cursorSlot >= 0 ? slots[cursorSlot] : undefined;
+        out.push(fs ? dim(`  ${beeSlotLabel(fs)} · ${fs.bee}`) : "");
+        const launchFocused = cursorMsg === msgLaunchRow();
+        const action = `▶ Launch frame ${template?.name ?? ""} in ${relTilde(selCwd)} (${slots.length} bee${slots.length === 1 ? "" : "s"})`;
         out.push(`${launchFocused ? green("›") : " "}   ${launchFocused && isPretty() ? reverse(stripAnsi(action)) : bold(action)}`);
         return out;
       };

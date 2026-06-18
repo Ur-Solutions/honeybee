@@ -5,7 +5,7 @@
 // decisions the wizard makes.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { missingRequiredArgs, requiredArgNames, seedArgValues, type LaunchTemplate } from "../src/launchTui.js";
+import { beeSlotLabel, missingRequiredArgs, requiredArgNames, seedArgValues, seedBeeMessages, type LaunchTemplate } from "../src/launchTui.js";
 
 const frame: LaunchTemplate = { kind: "frame", name: "deep-review", beeCount: 4 };
 const flow: LaunchTemplate = {
@@ -45,4 +45,27 @@ test("missingRequiredArgs: blank/whitespace required args block launch; optional
   );
   // A frame is always launchable.
   assert.deepEqual(missingRequiredArgs(frame, {}), []);
+});
+
+const briefedFrame: LaunchTemplate = {
+  kind: "frame",
+  name: "review",
+  beeCount: 3,
+  beeSlots: [
+    { caste: "lead", bee: "claude", index: 1, count: 1, brief: "drive the review" },
+    { caste: "worker", bee: "claude", index: 1, count: 2 },
+    { caste: "worker", bee: "claude", index: 2, count: 2 },
+  ],
+};
+
+test("seedBeeMessages: each bee field seeds from its caste brief ('' when none)", () => {
+  assert.deepEqual(seedBeeMessages(briefedFrame), ["drive the review", "", ""]);
+  // A frame with no slots (e.g. a flow-shaped template) seeds nothing.
+  assert.deepEqual(seedBeeMessages(frame), []);
+});
+
+test("beeSlotLabel: bare caste name for singletons, 'i/n' when the caste fans out", () => {
+  assert.equal(beeSlotLabel(briefedFrame.beeSlots![0]!), "lead");
+  assert.equal(beeSlotLabel(briefedFrame.beeSlots![1]!), "worker 1/2");
+  assert.equal(beeSlotLabel(briefedFrame.beeSlots![2]!), "worker 2/2");
 });
