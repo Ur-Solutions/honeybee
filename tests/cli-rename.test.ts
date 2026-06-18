@@ -45,11 +45,11 @@ async function readBee(root: string, name: string): Promise<Record<string, unkno
   return JSON.parse(await readFile(join(root, "sessions", `${name}.json`), "utf8"));
 }
 
-async function runCli(args: string[], root: string): Promise<{ code: number; stdout: string; stderr: string }> {
+async function runCli(args: string[], root: string, extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
     const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
       cwd: process.cwd(),
-      env: { ...process.env, HIVE_STORE_ROOT: root, NO_COLOR: "1" },
+      env: { ...process.env, HIVE_STORE_ROOT: root, NO_COLOR: "1", ...extraEnv },
       timeout: 15_000,
       maxBuffer: 1024 * 1024,
     });
@@ -118,6 +118,33 @@ test("rename --clear: drops title, source, and the auto-title bookkeeping", asyn
     assert.equal(rec.titleSource, undefined);
     assert.equal(rec.autoTitleAt, undefined);
     assert.equal(rec.autoTitleAttempts, undefined, "cleared so the daemon treats it as a fresh candidate");
+  });
+});
+
+test("rename --here <title>: retitles the bee owning the current pane", async () => {
+  await withStore(async (root) => {
+    // resolveBeeInCurrentPane priority 1: $TMUX_PANE → record.agentPaneId (no tmux call).
+    const name = await writeBee(root, { agentPaneId: "%9" });
+    const result = await runCli(["rename", "--here", "Renamed", "via", "here"], root, {
+      TMUX: "/tmp/fake,1,0",
+      TMUX_PANE: "%9",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    const rec = await readBee(root, name);
+    assert.equal(rec.title, "Renamed via here");
+    assert.equal(rec.titleSource, "user");
+  });
+});
+
+test("rename --here: errors when no bee owns the current pane", async () => {
+  await withStore(async (root) => {
+    await writeBee(root, { agentPaneId: "%1" });
+    const result = await runCli(["rename", "--here", "Nope"], root, {
+      TMUX: "/tmp/fake,1,0",
+      TMUX_PANE: "%9", // matches no record
+    });
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /no matching bee for the current pane/);
   });
 });
 
