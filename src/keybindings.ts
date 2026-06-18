@@ -22,7 +22,7 @@ export const TMUX_BLOCK_END = "# <<< honeybee keybindings <<<";
  * collision-free keys (M-b is hive bees, so spawn-from-frame rides M-B):
  *
  *   M-B  spawn-picker --frame  → hive spawn --frame {} --here  (M-b is hive bees)
- *   M-F  spawn-picker --flow   → hive quest start --flow {}
+ *   M-F  spawn-picker --flow   → hive flow run {}  (most flows need --arg values)
  *   M-k  fork current bee      (M-f avoided: WezTerm ALT layer)
  *   M-x  split / decompose
  *   M-u  urls
@@ -54,7 +54,7 @@ ${TMUX_BLOCK_START}
 bind -n M-B display-popup -E -w 60% -h 50% \\
   "hive spawn-picker --frame | fzf --prompt='frame> ' | xargs -r -I{} hive spawn --frame {} --here"   # cmd+shift+b spawn from frame, here (M-b is hive bees)
 bind -n M-F display-popup -E -w 60% -h 50% \\
-  "hive spawn-picker --flow  | fzf --prompt='flow> '  | xargs -r -I{} hive quest start --flow {}"      # cmd+shift+f spawn swarm from flow (start → WORKSPACES)
+  "hive spawn-picker --flow  | fzf --prompt='flow> '  | xargs -r -I{} hive flow run {}"                 # cmd+shift+f run a flow (note: most flows need --arg values)
 bind -n M-k display-popup -E \\
   "hive fork \\"\$(hive here --id)\\" --here"                                                              # cmd+k fork current bee, here (M-f taken by WezTerm ALT layer)
 bind -n M-x display-popup -E \\
@@ -64,7 +64,7 @@ bind -n M-x display-popup -E \\
 bind -n M-u display-popup -E -w 70% -h 60% \\
   "hive urls | fzf --prompt='url> ' --no-sort | xargs -r open"                                          # cmd+u list+open URL (xdg-open on Linux)
 bind -n M-R display-popup -E -w 60% -h 20% \\
-  "read -p 'rename workspace> ' n && [ -n \\"\$n\\" ] && hive workspace rename \\"\$(hive workspace here)\\" \\"\$n\\""  # cmd+shift+r rename workspace (both verbs → WORKSPACES)
+  "read -p 'rename workspace> ' n && [ -n \\"\\$n\\" ] && hive workspace rename \\"\$(hive workspace here)\\" \\"\\$n\\""  # cmd+shift+r rename workspace (both verbs → WORKSPACES)
 
 ${TMUX_BLOCK_END}
 `;
