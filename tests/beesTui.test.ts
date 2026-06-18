@@ -117,6 +117,6 @@ test("nextBeesGroupMode cycles forward and wraps, and goes backward", () => {
 
 test("sidebar width clamp stays in tmux-friendly bounds", () => {
   assert.equal(__testOnlySidebarWidthClamp(5), 12);
-  assert.equal(__testOnlySidebarWidthClamp(42), 42);
-  assert.equal(__testOnlySidebarWidthClamp(80), 56);
+  assert.equal(__testOnlySidebarWidthClamp(54), 54);
+  assert.equal(__testOnlySidebarWidthClamp(80), 72);
 });

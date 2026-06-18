@@ -16,9 +16,9 @@ export const BEES_NAV_PANE_OPTION = "@hive_bees_nav";
 export const BEES_SIDEBAR_WIDTH_OPTION = "@hive_bees_sidebar_width";
 export const BEES_GROUP_OPTION = "@hive_bees_group";
 
-const DEFAULT_SIDEBAR_WIDTH = 42;
+const DEFAULT_SIDEBAR_WIDTH = 54;
 const MIN_SIDEBAR_WIDTH = 12;
-const MAX_SIDEBAR_WIDTH = 56;
+const MAX_SIDEBAR_WIDTH = 72;
 
 export function clampSidebarWidth(width: number | undefined): number {
   const raw = width ?? DEFAULT_SIDEBAR_WIDTH;
