@@ -113,6 +113,7 @@ import { gatherTitleContext, generateTitle } from "./naming.js";
 import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
 import { startSpawnTimer, type SpawnTimer } from "./spawnTiming.js";
+import { attentionCount, DEFAULT_ATTENTION_STATES, parseStateList, pickNextBee, type BeeStateEntry } from "./next.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
@@ -196,6 +197,9 @@ async function main(argv: string[]) {
       break;
     case "attach":
       await cmdAttach(parsed);
+      break;
+    case "next":
+      await cmdNext(parsed);
       break;
     case "view":
       await cmdView(parsed);
@@ -4792,6 +4796,55 @@ async function cmdAttach(parsed: Parsed) {
   await syncBeesSidebarLayout({ pruneOthers: true });
 }
 
+/**
+ * Jump the attached client to the next bee that needs attention — `waiting`,
+ * `done`, or `failed` by default (override with --state). Reads live @hive_state
+ * straight off the local tmux server (no store), so it stays O(1) at any fleet
+ * size. Repeated presses cycle through the attention set; --prev walks back.
+ *
+ * Local-only by design: switch-client cannot cross to a remote tmux server, so
+ * remote bees are out of scope (use `hive attach <bee>` for those).
+ */
+async function cmdNext(parsed: Parsed) {
+  const stateFlag = stringFlag(parsed, ["state"]);
+  const states = stateFlag ? parseStateList(stateFlag) : DEFAULT_ATTENTION_STATES;
+  const prev = truthy(flag(parsed, "prev"));
+
+  const substrate = localSubstrate();
+  const stateMap = await substrate.listSessionStates();
+  const sessions: BeeStateEntry[] = [...stateMap].map(([name, state]) => ({ name, state }));
+
+  const current = process.env.TMUX ? await currentTmuxSession() : undefined;
+  const target = pickNextBee(sessions, current, { states, prev });
+
+  if (!target) {
+    if (isPretty()) console.error(note(`No bees ${states.join("/")} — nothing needs you right now`));
+    return;
+  }
+
+  if (truthy(flag(parsed, "print"))) {
+    console.log(target);
+    return;
+  }
+
+  await substrate.attachSession(target);
+  await syncBeesSidebarLayout({ pruneOthers: true });
+
+  if (isPretty()) {
+    const remaining = attentionCount(sessions, states) - 1;
+    const tail = target === current ? "" : remaining > 0 ? `  ${dim(`· ${remaining} more need you`)}` : "";
+    console.error(note(`→ ${target}  ${dim(stateMap.get(target) ?? "")}${tail}`));
+  }
+}
+
+/** The session name of the attached client, or undefined outside tmux. */
+async function currentTmuxSession(): Promise<string | undefined> {
+  const result = await tmux(["display-message", "-p", "#{session_name}"], { reject: false });
+  if (!result.ok) return undefined;
+  const name = result.stdout.trim();
+  return name.length > 0 ? name : undefined;
+}
+
 async function resolveSession(name: string): Promise<SessionRecord> {
   const exact = await loadSession(name);
   if (exact) return exact;
@@ -5410,6 +5463,7 @@ function printHelp() {
       title: "Manage bees",
       rows: [
         ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
+        ["next", "", "jump to the next bee needing you (waiting/done/failed; --prev, --state)"],
         ["split", "[<bee>] [<agent>]", "spawn a sub-bee into the bee's comb (adjacent pane)"],
         ["here", "", "resolve the bee owning the current pane (--id, --json)"],
         ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],

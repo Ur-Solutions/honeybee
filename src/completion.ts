@@ -15,7 +15,7 @@ import { listTmuxSessions } from "./tmux.js";
 
 const COMMANDS = [
   "spawn", "new", "send", "tail", "transcript", "last", "wait",
-  "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "view",
+  "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "next", "view",
   "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
@@ -41,6 +41,7 @@ const SYNC_SUBCOMMANDS = ["manifest"];
 
 const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 const SEAL_STATUS_VALUES = ["done", "blocked", "needs_input", "failed"];
+const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
 const BUZ_TIERS = ["interrupt", "queue", "passive"];
 const BUZ_ACCEPT_VALUES = [
   "interrupt", "queue", "passive",
@@ -101,7 +102,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   here: ["--id", "--json"],
   split: ["--brief", "--dir", "--cwd", "--home", "--profile", "--account", "--ttl", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--briefed"],
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],
-  rename: ["--auto", "--clear"],
+  rename: ["--auto", "--clear", "--here"],
   seal: ["--from"],
   last: ["-n", "--lines", "--seal"],
   wait: ["--idle-ms", "--idle", "--timeout-ms", "--timeout", "--poll-ms", "--poll", "--last", "--transcript", "--seal", "-n", "--limit", "--json"],
@@ -114,6 +115,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ps: ["--colony", "--swarm", "--node", "--wide"],
   bees: ["--colony", "--swarm", "--node", "--sidebar", "--toggle-sidebar", "--width", "-w"],
   attach: ["--print"],
+  next: ["--state", "--prev", "--print"],
   search: ["--colony", "--swarm", "--bee", "--type", "--status", "--since", "--regex", "--case", "--limit", "--json"],
   seals: ["--colony", "--swarm", "--bee", "--status", "--since", "--regex", "--case", "--limit", "--json"],
   buz: [
@@ -144,7 +146,7 @@ export type CompletionState = {
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto";
+type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "search-type" | "seal-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto";
 
 const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -180,6 +182,9 @@ const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagValueKind>
     "--context": "loop-context",
     "--summarizer": "loop-summarizer",
     "--stop-on-seal": "seal-status",
+  },
+  next: {
+    "--state": "hive-state",
   },
 };
 
@@ -295,6 +300,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return SEARCH_TYPE_VALUES;
     case "seal-status":
       return SEAL_STATUS_VALUES;
+    case "hive-state":
+      return HIVE_STATE_VALUES;
     case "flow":
       return (state.flows ?? []).map((f) => f.name);
     case "buz-tier":
