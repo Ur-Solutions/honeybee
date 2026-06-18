@@ -573,15 +573,20 @@ function renderFlatRow(row: FlatRow, index: number, cursor: number, width: numbe
   } else if (width < 38) {
     line = `${pointer} ${stateGlyph(row.item.stateHeadline, row.item.live)} ${truncate(row.item.ref, 8)} ${truncate(title, Math.max(1, width - 14))}`;
   } else {
+    // ref + state + name. The name gets all remaining width; the noisy detail
+    // tail ("awaiting prompt", "last activity …") is dropped — it duplicates the
+    // state column and crowds out the name. Wide terminals still show the detail.
     const state = stateCell(row.item.stateHeadline, row.item.live);
-    const meta = [
-      pointer,
-      pad(truncate(row.item.ref, 10), 10),
-      pad(state, 12),
-      truncate(title, Math.max(8, Math.min(22, width - 50))),
-    ].join(" ");
-    const tail = truncate(row.item.detail || row.item.agent, Math.max(1, width - visibleLength(stripAnsi(meta)) - 2));
-    line = `${meta} ${dim(tail)}`;
+    const head = `${pointer} ${pad(truncate(row.item.ref, 10), 10)} ${pad(state, 12)}`;
+    const room = Math.max(8, width - visibleLength(stripAnsi(head)) - 1);
+    if (width >= 90) {
+      const nameCell = truncate(title, Math.min(40, room));
+      const detailRoom = room - visibleLength(nameCell) - 1;
+      const tail = detailRoom >= 12 ? ` ${dim(truncate(row.item.detail || row.item.agent, detailRoom))}` : "";
+      line = `${head} ${nameCell}${tail}`;
+    } else {
+      line = `${head} ${truncate(title, room)}`;
+    }
   }
   const fitted = truncate(line, width);
   return isCurrent ? reverse(stripAnsi(fitted)) : fitted;
