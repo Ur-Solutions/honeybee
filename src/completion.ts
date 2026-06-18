@@ -16,7 +16,7 @@ import { listWorkspaces, type WorkspaceRecord } from "./workspace.js";
 import { listTmuxSessions } from "./tmux.js";
 
 const COMMANDS = [
-  "spawn", "new", "send", "tail", "transcript", "last", "wait",
+  "spawn", "new", "launch", "send", "tail", "transcript", "last", "wait",
   "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "next", "view",
   "colony", "workspace", "ws", "quest", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",

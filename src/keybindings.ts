@@ -21,8 +21,8 @@ export const TMUX_BLOCK_END = "# <<< honeybee keybindings <<<";
  * this block adds the spawn/fork/split/urls/workspace-rename affordances on
  * collision-free keys (M-b is hive bees, so spawn-from-frame rides M-B):
  *
- *   M-B  spawn-picker --frame  → hive spawn --frame {} --here  (M-b is hive bees)
- *   M-F  spawn-picker --flow   → hive flow run {}  (most flows need --arg values)
+ *   M-B  hive launch           → interactive frame/flow launcher (M-b is hive bees)
+ *   M-F  hive launch           → same launcher (frames + flows in one wizard)
  *   M-k  fork current bee      (M-f avoided: WezTerm ALT layer)
  *   M-x  split / decompose
  *   M-u  urls
@@ -51,10 +51,8 @@ export const CANONICAL_TMUX_CONF = `# honeybee keybinding-layer affordances — 
 ${TMUX_BLOCK_START}
 
 # Spawn / decompose / fork (verbs: fork-and-pane Phase B/C/D; pickers: KEYBINDINGS_PRD)
-bind -n M-B display-popup -E -w 60% -h 50% \\
-  "hive spawn-picker --frame | fzf --prompt='frame> ' | xargs -r -I{} hive spawn --frame {} --here"   # cmd+shift+b spawn from frame, here (M-b is hive bees)
-bind -n M-F display-popup -E -w 60% -h 50% \\
-  "hive spawn-picker --flow  | fzf --prompt='flow> '  | xargs -r -I{} hive flow run {}"                 # cmd+shift+f run a flow (note: most flows need --arg values)
+bind -n M-B display-popup -E -w 80% -h 70% "hive launch"                                                # cmd+shift+b launch a frame/flow (interactive wizard)
+bind -n M-F display-popup -E -w 80% -h 70% "hive launch"                                                # cmd+shift+f launch a frame/flow (same wizard)
 bind -n M-k display-popup -E \\
   "hive fork \\"\$(hive here --id)\\" --here"                                                              # cmd+k fork current bee, here (M-f taken by WezTerm ALT layer)
 bind -n M-x display-popup -E \\
@@ -94,8 +92,8 @@ export const CANONICAL_WEZTERM_BLOCK = `-- honeybee cmd→Meta additions — app
 export type RecommendedBind = { key: string; verb: string; delegated?: boolean; note: string };
 
 export const RECOMMENDED_BINDS: RecommendedBind[] = [
-  { key: "M-B", verb: "spawn-picker", note: "spawn from frame, here (M-b is hive bees)" },
-  { key: "M-F", verb: "spawn-picker", delegated: true, note: "spawn swarm from flow (quest start → WORKSPACES)" },
+  { key: "M-B", verb: "launch", note: "interactive frame/flow launcher (M-b is hive bees)" },
+  { key: "M-F", verb: "launch", note: "interactive frame/flow launcher" },
   { key: "M-k", verb: "fork", note: "fork current bee, here" },
   { key: "M-x", verb: "split", note: "decompose / add sub-bee" },
   { key: "M-u", verb: "urls", note: "list + open URL" },

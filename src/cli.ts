@@ -29,6 +29,7 @@ import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
 import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
+import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { listProRepoEntries, listProRepos, resolveProForCwd, type ProRepoEntry } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
@@ -179,6 +180,9 @@ async function main(argv: string[]) {
       break;
     case "new":
       await cmdNew(parsed);
+      break;
+    case "launch":
+      await cmdLaunch(parsed);
       break;
     case "send":
       await cmdSend(parsed);
@@ -733,6 +737,81 @@ async function cmdNew(parsed: Parsed): Promise<void> {
     await tmux(["switch-client", "-t", `=${record.tmuxTarget}`], { reject: false });
     await syncBeesSidebarLayout({ pruneOthers: true });
   }
+}
+
+/**
+ * `hive launch` — the interactive frame/flow launcher (KEYBINDINGS: the ⌘⇧B/⌘⇧F
+ * target). Pick a frame or flow, pick the repo (defaults to the current one),
+ * fill a flow's args in editable boxes, and launch DETACHED: a frame spawns its
+ * swarm, a flow runs in the background. The repo picker reuses cmdNew's hooks.
+ */
+async function cmdLaunch(parsed: Parsed): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('hive launch needs a TTY — bind it to a tmux popup: bind -n M-B display-popup -E "hive launch"');
+  }
+  const here = await resolveBeeInCurrentPane();
+  const defaultCwd = here?.cwd ?? (await resolveSpawnCwd(parsed));
+
+  const [frames, flows] = await Promise.all([listFrames(), listFlows()]);
+  const templates: LaunchTemplate[] = [
+    ...frames.map((f): LaunchTemplate => ({
+      kind: "frame",
+      name: f.name,
+      ...(f.description ? { description: f.description } : {}),
+      beeCount: f.castes.reduce((sum, c) => sum + (c.count ?? 1), 0),
+    })),
+    ...flows
+      .filter((f) => !f.loadError) // a broken flow can't run; hide it from the picker
+      .map((f): LaunchTemplate => ({
+        kind: "flow",
+        name: f.name,
+        ...(f.description ? { description: f.description } : {}),
+        args: (f.args ?? []).map((a) => ({
+          name: a.name,
+          ...(a.default !== undefined ? { default: String(a.default) } : {}),
+        })),
+      })),
+  ];
+
+  const plan = await chooseLaunch({
+    templates,
+    defaultCwd,
+    defaultCwdLabel: tildify(defaultCwd),
+    loadProjects: async () => (await listProRepos()).map((repo) => ({ label: repo.label, path: repo.path, project: repo.project })),
+    validatePath: async (input) => {
+      try {
+        const abs = resolve(input.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
+        const real = await realpath(abs);
+        if (!(await stat(real)).isDirectory()) return { ok: false, error: "not a directory" };
+        return { ok: true, path: real };
+      } catch {
+        return { ok: false, error: "path does not exist" };
+      }
+    },
+    listSubdirs: (base) => listNewBeeSubdirs(base),
+  });
+
+  if (!plan) {
+    if (isPretty()) console.error(note("launch: cancelled"));
+    return;
+  }
+
+  if (plan.kind === "frame") {
+    // Spawn the frame's swarm detached at the chosen repo (no switch-client — a
+    // swarm shouldn't yank focus to an arbitrary member).
+    const flags = new Map<string, string | true | string[]>([["frame", plan.name], ["cwd", plan.cwd]]);
+    await spawnFromFrame({ command: "spawn", args: ["spawn"], flags, rest: [] }, plan.name);
+    return;
+  }
+
+  // Flow: run in the background so it survives the popup. Args go through --arg;
+  // the cwd arg (if any) was seeded with the chosen repo in the TUI.
+  const argEntries = Object.entries(plan.args)
+    .filter(([, value]) => value.length > 0)
+    .map(([key, value]) => `${key}=${value}`);
+  const flowFlags = new Map<string, string | true | string[]>([["background", true]]);
+  if (argEntries.length > 0) flowFlags.set("arg", argEntries);
+  await flowRun({ command: "flow", args: ["run", plan.name], flags: flowFlags, rest: [] });
 }
 
 /** Accounts for one tool, enriched with a cached-usage cell for the picker. */

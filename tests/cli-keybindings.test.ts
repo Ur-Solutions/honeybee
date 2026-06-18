@@ -203,12 +203,12 @@ test("keys check flags a tmux-layer collision on a recommended key", { skip: !tm
 test("keys check reports a recommended bind as present when wired to its verb", { skip: !tmuxAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     await tmux(["new-session", "-d", "-s", "probe", "sleep 120"], { reject: false });
-    // Bind M-B to a binding whose command dispatches `hive spawn-picker` (the
+    // Bind M-B to a binding whose command dispatches `hive launch` (the
     // wired-detection substring). The popup wrapper is irrelevant to detection.
-    await tmux(["bind-key", "-n", "M-B", "display-popup", "-E", "hive spawn-picker --frame | fzf"], { reject: false });
+    await tmux(["bind-key", "-n", "M-B", "display-popup", "-E", "hive launch"], { reject: false });
     const out = await hive(store, ["keys", "check"], {}, socket);
     assert.equal(out.code, 0);
-    assert.match(out.stdout, /bind\tpresent\tM-B\tspawn-picker/, "M-B reported present");
+    assert.match(out.stdout, /bind\tpresent\tM-B\tlaunch/, "M-B reported present");
   });
 });
 
