@@ -43,6 +43,22 @@ test("fuzzyFilter drops non-matches", () => {
   assert.deepEqual(fuzzyFilter("zzz", ["abc", "abd"], (x) => x), []);
 });
 
+test("fuzzyFilter rejects a sparse subsequence scattered across a long corpus", () => {
+  // The bees search corpus concatenates name+title+colony+agent+cwd+detail, so a
+  // garbage query could otherwise hop across it. The gap budget must reject it.
+  const corpus = "cl-ab12 my cool title trmd @swarm1 claude /users/trmd/projects/trmd/honeybee/repos/honeybee working on the parser refactor";
+  assert.deepEqual(fuzzyFilter("ebabaebaerba", [corpus], (x) => x), []);
+  assert.deepEqual(fuzzyFilter("xqzwk", [corpus], (x) => x), []);
+});
+
+test("fuzzyFilter still matches localized queries inside a long corpus", () => {
+  const corpus = "cl-ab12 my cool title trmd @swarm1 claude /users/trmd/projects/honeybee working on the parser";
+  assert.deepEqual(fuzzyFilter("parser", [corpus], (x) => x), [corpus]); // substring
+  assert.deepEqual(fuzzyFilter("claude", [corpus], (x) => x), [corpus]); // substring
+  assert.deepEqual(fuzzyFilter("cltitle", [corpus], (x) => x), [corpus]); // nearby subsequence still ok
+  assert.deepEqual(fuzzyFilter("clparser", [corpus], (x) => x), []);     // first→last spans the whole corpus → rejected
+});
+
 test("fuzzyFilter prefers the shorter candidate on score ties", () => {
   // both contain "for" as a contiguous substring at index 0 → tie on score
   const out = fuzzyFilter("for", ["forge", "forge-extended-name"], (x) => x);

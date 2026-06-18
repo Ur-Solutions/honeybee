@@ -25,8 +25,10 @@ import {
 } from "./accounts.js";
 import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
+import { readBeesGroupMode, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
+import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
 import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
-import { listProRepos } from "./proProjects.js";
+import { listProRepoEntries, listProRepos, resolveProForCwd, type ProRepoEntry } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { resumeArgs, sniffYolo, swapAccount } from "./swap.js";
@@ -150,6 +152,9 @@ async function main(argv: string[]) {
     case "ls":
     case "ps":
       await cmdList(parsed);
+      break;
+    case "bees":
+      await cmdBees(parsed);
       break;
     case "transcript":
     case "tx":
@@ -321,6 +326,7 @@ async function maybeLinkHere(parsed: Parsed, records: SessionRecord[]): Promise<
     );
     if (isPretty()) console.log(actionLine("ok", "here", [bold(result.session), `${result.linked} window(s) linked`]));
     else console.log(`here\t${result.session}\t${result.linked}`);
+    await syncBeesSidebarLayout({ pruneOthers: true });
   } catch (error) {
     // Presentation only: the spawn itself already succeeded and is recorded.
     console.error(note(`--here failed: ${error instanceof Error ? error.message : String(error)}`));
@@ -542,6 +548,7 @@ async function cmdNew(parsed: Parsed): Promise<void> {
   // tmux server, and a swarm shouldn't yank focus to an arbitrary member.
   if (process.env.TMUX && plan.count <= 1 && !record.node) {
     await tmux(["switch-client", "-t", `=${record.tmuxTarget}`], { reject: false });
+    await syncBeesSidebarLayout({ pruneOthers: true });
   }
 }
 
@@ -1084,6 +1091,149 @@ async function cmdList(parsed: Parsed) {
   }
 }
 
+async function cmdBees(parsed: Parsed): Promise<void> {
+  if (truthy(flag(parsed, "toggle-sidebar"))) {
+    const widthRaw = stringFlag(parsed, ["width", "w"]);
+    const width = widthRaw !== undefined ? Number(widthRaw) : undefined;
+    await toggleBeesSidebar(Number.isFinite(width) ? width : undefined);
+    return;
+  }
+
+  const items = await loadBeesTuiItems(parsed);
+  const sidebar = truthy(flag(parsed, "sidebar"));
+  const groupMode = (await readBeesGroupMode()) ?? undefined;
+
+  await runBeesTui({
+    items,
+    sidebar,
+    groupMode,
+    onGroupChange: async (mode) => {
+      // Persist globally so every sidebar (and the next launch) shares the facet.
+      await writeBeesGroupMode(mode);
+    },
+    // Sidebars live-update each other: poll the shared facet so cycling in one
+    // strip re-groups the rest. Skipped for the standalone full-screen TUI.
+    ...(sidebar ? { syncGroupMode: () => readBeesGroupMode() } : {}),
+    onPreview: async (item) => {
+      const record = await resolveSession(item.name).catch(() => undefined);
+      if (!record) return;
+      await openBeePreviewPopup(record);
+    },
+    onKill: async (item) => {
+      const record = await resolveSession(item.name).catch(() => undefined);
+      if (!record) return { ok: false, detail: "no matching bee record" };
+      const outcome = await transactionalKill(record);
+      return outcome.ok ? { ok: true } : { ok: false, detail: outcome.lastError };
+    },
+    onSelect: async (item) => {
+      const record = await resolveSession(item.name);
+      await ensureLive(record);
+      if (sidebar) {
+        await showBeeBesideSidebar(record);
+        return;
+      }
+      const substrate = substrateFor(record);
+      await substrate.attachSession(record.tmuxTarget);
+      await syncBeesSidebarLayout({ pruneOthers: true });
+    },
+  });
+}
+
+async function loadBeesTuiItems(parsed: Parsed): Promise<BeesTuiItem[]> {
+  const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
+  const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")) : undefined;
+  const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
+
+  const allRecords = await listSessions();
+  const nodes = await listNodes();
+  if (nodeFilter && !nodes.some((node) => node.name === nodeFilter)) {
+    throw new Error(`Unknown node: ${nodeFilter}. Register it with: hive node register ${nodeFilter} --kind ssh-tmux --endpoint user@host`);
+  }
+  const probe = await liveTargetsAcrossNodes(nodes, nodeFilter);
+  let records = allRecords;
+  if (colonyFilter) records = records.filter((record) => record.colony === colonyFilter);
+  if (swarmFilter) records = records.filter((record) => record.swarmId === swarmFilter);
+  if (nodeFilter) records = records.filter((record) => (record.node ?? LOCAL_NODE_NAME) === nodeFilter);
+
+  const panes = await capturePanesFor(records, probe.liveTargets);
+  const seals = await listSealedBeeNames();
+  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
+  const context: StateContext = {
+    liveTargets: probe.liveTargets,
+    livePanes,
+    panes,
+    seals,
+    unreachableNodes: probe.unreachableNodes,
+    now: Date.now(),
+  };
+
+  // Resolve each bee's cwd to its pro area/project/repo once, so the TUI can
+  // group by pro facets without shelling out. Best-effort: no pro CLI → no
+  // facets (those grouping modes just bucket everything under "no pro …").
+  const proEntries = await listProRepoEntries().catch(() => [] as ProRepoEntry[]);
+
+  const now = Date.now();
+  return records.map((record) => {
+    const derived = deriveState(record, context);
+    const live = derived.state !== "dead" && derived.state !== "sealed" && derived.state !== "node_unreachable";
+    const liveHive = probe.states.get(liveTargetKey(record.node, record.tmuxTarget));
+    const stateHeadline = liveHive && liveHive.length > 0 ? liveHive : stateLabel(derived.state);
+    const displayName = sessionDisplayName(record);
+    const ref = highlightUniqueSessionReference(records, record);
+    const ageSource = isTerminalState(derived.state) ? record.updatedAt : record.createdAt;
+    const detail = beeTuiDescription(record, derived);
+    const pro = resolveProForCwd(proEntries, record.cwd);
+    return {
+      name: record.name,
+      ref,
+      displayName: displayName === "=" ? record.name : displayName,
+      colony: record.colony ?? "",
+      swarmId: record.swarmId ?? "",
+      agent: record.agent,
+      cwd: record.cwd,
+      stateLabel: derived.state,
+      stateHeadline,
+      detail,
+      age: formatRelativeTime(ageSource, now),
+      tmuxTarget: record.tmuxTarget,
+      node: record.node,
+      live,
+      ...(pro ? { proArea: pro.area, proProject: pro.project, proRepo: pro.repo } : {}),
+      searchText: beesTuiSearchText({
+        name: record.name,
+        displayName: displayName === "=" ? record.name : displayName,
+        colony: record.colony,
+        swarmId: record.swarmId,
+        agent: record.agent,
+        cwd: record.cwd,
+        detail,
+        ref,
+      }),
+    };
+  });
+}
+
+function beeTuiDescription(record: SessionRecord, derived: DerivedState): string {
+  const candidates = [
+    record.notes,
+    record.brief,
+    record.lastPrompt,
+    derived.detail,
+    record.cwd,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeBeeTuiDescription(candidate);
+    if (normalized) return normalized;
+  }
+  return record.agent;
+}
+
+function normalizeBeeTuiDescription(value: string | undefined): string | undefined {
+  const normalized = value?.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.length > 400 ? `${normalized.slice(0, 400)}...` : normalized;
+}
+
 const DEFAULT_NODE_PROBE_TIMEOUT_MS = 2_500;
 
 export type MultiNodeLiveProbe = {
@@ -1374,16 +1524,21 @@ async function cmdCleanInteractive(_parsed: Parsed) {
   if (result.failed > 0) process.exitCode = 1;
 }
 
-async function cleanPreview(record: SessionRecord): Promise<string> {
+async function cleanPreview(
+  record: SessionRecord,
+  opts: { transcriptRows?: number; paneLines?: number } = {},
+): Promise<string> {
+  const transcriptRows = opts.transcriptRows ?? 8;
+  const paneLines = opts.paneLines ?? 80;
   const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record)).catch(() => null);
   if (tx) {
-    const rendered = renderTranscript(tx.rows, { limit: 8 }).trim();
+    const rendered = renderTranscript(tx.rows, { limit: transcriptRows }).trim();
     if (rendered) return [`transcript ${tx.provider} ${tildify(tx.path)}`, "", rendered].join("\n");
   }
 
   try {
     if (await substrateFor(record).hasSession(record.tmuxTarget)) {
-      const pane = await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId);
+      const pane = await substrateFor(record).capture(record.tmuxTarget, paneLines, record.agentPaneId);
       if (pane.trim()) return [`pane tail ${record.tmuxTarget}`, "", pane.trimEnd()].join("\n");
     }
   } catch {
@@ -1393,6 +1548,55 @@ async function cleanPreview(record: SessionRecord): Promise<string> {
   if (record.lastPrompt) return ["last prompt", "", record.lastPrompt].join("\n");
   if (record.brief) return ["brief", "", record.brief].join("\n");
   return "No transcript or pane tail available.";
+}
+
+/**
+ * Preview text for the popup: prefer the bee's actual *rendered* pane (colors
+ * intact) so the operator sees the live agent UI — not just the transcript log.
+ * Falls back to the transcript / pane tail for dead or remote bees.
+ */
+async function renderedBeeView(record: SessionRecord): Promise<string> {
+  const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
+  if (isLocal && process.env.TMUX) {
+    try {
+      if (await localSubstrate().hasSession(record.tmuxTarget)) {
+        // -e keeps SGR colors; capturing the visible screen reproduces the
+        // agent's current rendered frame (its TUI), not the scrollback log.
+        const paneTarget = record.agentPaneId ?? `=${record.tmuxTarget}`;
+        const captured = await tmux(["capture-pane", "-e", "-p", "-t", paneTarget], { reject: false });
+        const view = captured.ok ? captured.stdout.replace(/\s+$/, "") : "";
+        if (view.trim()) return view;
+      }
+    } catch {
+      // fall through to the transcript preview
+    }
+  }
+  return cleanPreview(record, { transcriptRows: 80, paneLines: 200 });
+}
+
+/**
+ * Open a bee's preview in a large, scrollable tmux popup — far more readable
+ * than an inline strip in the narrow sidebar. Blocks until the operator quits
+ * the pager; falls back to a plain print outside tmux.
+ */
+async function openBeePreviewPopup(record: SessionRecord): Promise<void> {
+  const text = await renderedBeeView(record);
+  if (!process.env.TMUX) {
+    console.log(text);
+    return;
+  }
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const file = path.join(os.tmpdir(), `hive-preview-${safeName(record.name)}.txt`);
+  const header = `${record.name}  ${record.agent}  ${tildify(record.cwd)}`;
+  await writeFile(file, `${header}\n\n${text}\n`, "utf8");
+  const quoted = `'${file.replaceAll("'", `'\\''`)}'`;
+  try {
+    // -R keeps the transcript's ANSI colors; q in less closes the popup.
+    await tmux(["display-popup", "-E", "-w", "85%", "-h", "85%", `less -R -- ${quoted}`], { reject: false });
+  } finally {
+    await rm(file, { force: true });
+  }
 }
 
 type CleanMode = "delete" | "kill" | "disabled";
@@ -4432,6 +4636,7 @@ async function cmdAttach(parsed: Parsed) {
     return;
   }
   await substrate.attachSession(record.tmuxTarget);
+  await syncBeesSidebarLayout({ pruneOthers: true });
 }
 
 async function resolveSession(name: string): Promise<SessionRecord> {
@@ -4448,6 +4653,13 @@ async function ensureLive(record: SessionRecord) {
   const substrate = substrateFor(record);
   if (!(await substrate.hasSession(record.tmuxTarget))) {
     throw new Error(`tmux session is not running: ${record.tmuxTarget}`);
+  }
+  const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
+  if (isLocal && record.agentPaneId) {
+    const panes = await localSubstrate().listPanes();
+    if (!panes.has(record.agentPaneId)) {
+      throw new Error(`tmux pane is not running for ${record.name}: ${record.agentPaneId}`);
+    }
   }
 }
 
@@ -5018,6 +5230,7 @@ function printHelp() {
       title: "Observe",
       rows: [
         ["list", "", "show all known sessions with state (alias: ps)"],
+        ["bees", "", "grouped fuzzy fleet TUI (^g cycles colony/pro/folder/type grouping, tab previews; --sidebar)"],
         ["tail", "<session>", "capture or follow pane content"],
         ["transcript", "<session>", "render structured transcript rows"],
         ["last", "<session>", "print the bee's most recent assistant message or seal"],

@@ -63,3 +63,49 @@ export function parseProRepos(stdout: string): ProRepo[] {
 export async function listProRepos(): Promise<ProRepo[]> {
   return parseProRepos(await run("pro", ["ls", "repos"]));
 }
+
+export type ProRepoEntry = {
+  area: string;
+  project: string;
+  repo: string;
+  /** Absolute repo path. */
+  path: string;
+};
+
+/**
+ * Parse `pro ls repos` into structured area/project/repo rows (pure). The first
+ * column is "area/project"; we split it so callers can group by either facet.
+ */
+export function parseProRepoEntries(stdout: string): ProRepoEntry[] {
+  const entries: ProRepoEntry[] = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    const [areaProject, repo, path] = line.split("\t");
+    if (!path || !path.startsWith("/")) continue;
+    const [area = "", project = ""] = (areaProject ?? "").split("/");
+    entries.push({ area, project, repo: repo ?? "", path });
+  }
+  return entries;
+}
+
+/** Structured repo inventory from `pro` (for grouping bees by pro facets). */
+export async function listProRepoEntries(): Promise<ProRepoEntry[]> {
+  return parseProRepoEntries(await run("pro", ["ls", "repos"]));
+}
+
+/**
+ * Resolve which pro repo a directory lives in by longest path-prefix match
+ * (a bee's cwd is often a subdir of the repo root). Pure — pass in the entries.
+ */
+export function resolveProForCwd(
+  entries: ProRepoEntry[],
+  cwd: string,
+): { area: string; project: string; repo: string } | undefined {
+  let best: ProRepoEntry | undefined;
+  for (const entry of entries) {
+    if (cwd === entry.path || cwd.startsWith(`${entry.path}/`)) {
+      if (!best || entry.path.length > best.path.length) best = entry;
+    }
+  }
+  return best ? { area: best.area, project: best.project, repo: best.repo } : undefined;
+}

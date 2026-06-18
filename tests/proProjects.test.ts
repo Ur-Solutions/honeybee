@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseProRepos } from "../src/proProjects.js";
+import { parseProRepoEntries, parseProRepos, resolveProForCwd } from "../src/proProjects.js";
 
 test("parseProRepos turns tab-separated rows into labelled repos", () => {
   const out = [
@@ -18,4 +18,21 @@ test("parseProRepos skips blank lines and rows without an absolute path", () => 
   assert.deepEqual(parseProRepos(out), [
     { label: "a/b/c", path: "/abs/c", project: "a/b" },
   ]);
+});
+
+test("parseProRepoEntries splits area/project and repo", () => {
+  const out = "digitech/digitech\tdigitech-backend\t/p/digitech/digitech/repos/digitech-backend";
+  assert.deepEqual(parseProRepoEntries(out), [
+    { area: "digitech", project: "digitech", repo: "digitech-backend", path: "/p/digitech/digitech/repos/digitech-backend" },
+  ]);
+});
+
+test("resolveProForCwd matches the longest path prefix (cwd may be a subdir)", () => {
+  const entries = parseProRepoEntries([
+    "oss/forge\tforge\t/p/oss/forge/repos/forge",
+    "digitech/dt\tbackend\t/p/digitech/dt/repos/backend",
+  ].join("\n"));
+  assert.deepEqual(resolveProForCwd(entries, "/p/oss/forge/repos/forge/src/deep"), { area: "oss", project: "forge", repo: "forge" });
+  assert.deepEqual(resolveProForCwd(entries, "/p/oss/forge/repos/forge"), { area: "oss", project: "forge", repo: "forge" });
+  assert.equal(resolveProForCwd(entries, "/somewhere/else"), undefined);
 });

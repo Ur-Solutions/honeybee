@@ -15,7 +15,7 @@ import { listTmuxSessions } from "./tmux.js";
 
 const COMMANDS = [
   "spawn", "new", "send", "tail", "transcript", "last", "wait",
-  "list", "ls", "ps", "kill", "clean", "run", "x", "xa", "attach", "view",
+  "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "view",
   "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
@@ -112,6 +112,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
   clean: ["--dead", "--idle", "--interactive", "-i", "--older-than", "--older", "--dry-run", "-n"],
   list: ["--colony", "--swarm", "--node", "--wide"],
   ps: ["--colony", "--swarm", "--node", "--wide"],
+  bees: ["--colony", "--swarm", "--node", "--sidebar", "--toggle-sidebar", "--width", "-w"],
   attach: ["--print"],
   search: ["--colony", "--swarm", "--bee", "--type", "--status", "--since", "--regex", "--case", "--limit", "--json"],
   seals: ["--colony", "--swarm", "--bee", "--status", "--since", "--regex", "--case", "--limit", "--json"],
