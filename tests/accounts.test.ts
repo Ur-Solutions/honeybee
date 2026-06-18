@@ -161,6 +161,47 @@ function chainJson(accessToken: string, expiresAt: number, refreshToken?: string
   return JSON.stringify({ claudeAiOauth: { accessToken, expiresAt, ...(refreshToken ? { refreshToken } : {}) } });
 }
 
+test("claude activation seeds skipDangerousModePermissionPrompt without clobbering other settings", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "bypass@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok", now + 3_600_000, "r"));
+    // The vault's settings.json carries model/theme but NOT the bypass flag —
+    // exactly the shape that re-stamps over (and wipes) a home's acceptance.
+    await writeFile(join(accountDir(account), "settings.json"), `{\n  "model": "claude-fable-5",\n  "theme": "dark"\n}\n`);
+
+    const home = join(dir, "homes", account.id);
+    const written = await activateAccountIntoHome(account, home);
+
+    assert.ok(written.includes("settings.json"), "settings.json should be reported as written");
+    const settings = JSON.parse(await readFile(join(home, "settings.json"), "utf8"));
+    // The flag is asserted so claude's bypass-permissions dialog never appears.
+    assert.equal(settings.skipDangerousModePermissionPrompt, true);
+    // ...and the vault's own keys are preserved (merged, not replaced).
+    assert.equal(settings.model, "claude-fable-5");
+    assert.equal(settings.theme, "dark");
+  });
+});
+
+test("claude activation re-asserts the bypass flag every time, surviving a vault copy that lacks it", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "reassert@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok", now + 3_600_000, "r"));
+    await writeFile(join(accountDir(account), "settings.json"), `{"theme":"dark"}`);
+    const home = join(dir, "homes", account.id);
+
+    // First activation seeds the flag; simulate claude later persisting more
+    // state, then a second activation re-stamping the flagless vault copy.
+    await activateAccountIntoHome(account, home);
+    await activateAccountIntoHome(account, home);
+
+    const settings = JSON.parse(await readFile(join(home, "settings.json"), "utf8"));
+    assert.equal(settings.skipDangerousModePermissionPrompt, true);
+    assert.equal(settings.theme, "dark");
+  });
+});
+
 test("activation pulls a fresher home chain into the vault instead of stamping a stale one", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("claude", "rot@a.b");

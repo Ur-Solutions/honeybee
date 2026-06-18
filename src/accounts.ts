@@ -416,6 +416,9 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     if (account.tool === "codex" && await seedCodexHomeDefaults(homePath)) {
       if (!written.includes("config.toml")) written.push("config.toml");
     }
+    if (account.tool === "claude" && await seedClaudeHomeDefaults(homePath)) {
+      if (!written.includes("settings.json")) written.push("settings.json");
+    }
     // On macOS, claude prefers the per-config-dir Keychain entry over the
     // credentials file — seed it so an activated home doesn't resolve a stale
     // identity from an old entry. Merged, not replaced: home-local sibling
@@ -446,6 +449,40 @@ const CODEX_HOME_DEFAULTS: Record<string, string> = {
 const CODEX_NOTICE_DEFAULTS: Record<string, string> = {
   hide_full_access_warning: "true",
 };
+
+// claude persists its one-time "Bypass Permissions mode" acceptance as
+// `skipDangerousModePermissionPrompt: true` in settings.json. settings.json is
+// a recipe credential file, so activation re-stamps the vault's copy over the
+// home on EVERY spawn — wiping the flag and resurfacing the dialog on every
+// launch (a bee then sits at it until the boot-ms timeout). Re-assert the flag
+// into the activated home so honeybee's bypass-mode bees never see the dialog.
+// Merged, not replaced: model/theme and any other keys the vault carries
+// survive. A malformed settings.json is left untouched rather than clobbered.
+async function seedClaudeHomeDefaults(homePath: string): Promise<boolean> {
+  const path = join(homePath, "settings.json");
+  const existing = await readFile(path, "utf8").catch(() => "");
+  const next = withClaudeSettingsDefaults(existing);
+  if (next === existing) return false;
+  await mkdir(homePath, { recursive: true, mode: 0o700 });
+  await atomicWriteFile(path, next, { mode: 0o600 });
+  return true;
+}
+
+function withClaudeSettingsDefaults(input: string): string {
+  let parsed: Record<string, unknown> = {};
+  if (input.trim()) {
+    try {
+      const value = JSON.parse(input);
+      if (!value || typeof value !== "object" || Array.isArray(value)) return input;
+      parsed = value as Record<string, unknown>;
+    } catch {
+      return input;
+    }
+  }
+  if (parsed.skipDangerousModePermissionPrompt === true) return input;
+  parsed.skipDangerousModePermissionPrompt = true;
+  return `${JSON.stringify(parsed, null, 2)}\n`;
+}
 
 async function seedCodexHomeDefaults(homePath: string): Promise<boolean> {
   const path = join(homePath, "config.toml");
