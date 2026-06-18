@@ -29,6 +29,8 @@ const DEFAULT_NODE_PROBE_TIMEOUT_MS = 2_500;
 export type ProbeResult = {
   liveTargets: Set<string>;
   unreachableNodes: Set<string>;
+  /** Live @hive_state values keyed by liveTargetKey(node, session). */
+  sessionStates?: Map<string, string>;
 };
 
 export type TickDeps = {
@@ -157,8 +159,15 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     const derived = deriveState(record, context);
     observed.set(record.name, derived.state);
     const prev = previousObserved.get(record.name);
-    if (prev !== derived.state) {
+    const mappedHiveState = hiveStateFor(derived.state);
+    const liveHiveState = liveHiveStateFor(record, probe);
+    const staleHiveState = mappedHiveState !== undefined && liveHiveState !== undefined && liveHiveState !== mappedHiveState;
+    const uncertainBooting = derived.state === "booting" && liveHiveState !== undefined && liveHiveState.length > 0;
+    const transitioned = prev !== derived.state;
+    if (transitioned) {
       transitions.push({ name: record.name, from: prev, to: derived.state });
+    }
+    if ((transitioned || staleHiveState) && !uncertainBooting) {
       if (deps.mirrorHiveState) {
         try {
           await deps.mirrorHiveState(record, derived.state);
@@ -603,6 +612,7 @@ async function defaultProbeNodes(nodes: NodeRecord[]): Promise<ProbeResult> {
   const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : DEFAULT_NODE_PROBE_TIMEOUT_MS;
   const liveTargets = new Set<string>();
   const unreachableNodes = new Set<string>();
+  const sessionStates = new Map<string, string>();
   const queries = nodes.map(async (node) => {
     try {
       const substrate = substrateForRecord(node);
@@ -611,14 +621,26 @@ async function defaultProbeNodes(nodes: NodeRecord[]): Promise<ProbeResult> {
         unreachableNodes.add(node.name);
         return;
       }
-      const result = await withTimeout(substrate.listSessions(), timeoutMs);
-      for (const target of result) liveTargets.add(liveTargetKey(node.name, target));
+      const result = await withTimeout(substrate.listSessionStates(), timeoutMs);
+      for (const [target, state] of result) {
+        const key = liveTargetKey(node.name, target);
+        liveTargets.add(key);
+        sessionStates.set(key, state);
+      }
     } catch {
       unreachableNodes.add(node.name);
     }
   });
   await Promise.allSettled(queries);
-  return { liveTargets, unreachableNodes };
+  return { liveTargets, unreachableNodes, sessionStates };
+}
+
+function liveHiveStateFor(record: SessionRecord, probe: ProbeResult): string | undefined {
+  if (!probe.sessionStates) return undefined;
+  const keyed = liveTargetKey(record.node, record.tmuxTarget);
+  if (probe.sessionStates.has(keyed)) return probe.sessionStates.get(keyed);
+  if (probe.sessionStates.has(record.tmuxTarget)) return probe.sessionStates.get(record.tmuxTarget);
+  return undefined;
 }
 
 async function defaultCapturePanes(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {

@@ -42,6 +42,7 @@ type Capture = {
 function buildDeps(args: {
   records: SessionRecord[];
   liveTargets: Set<string>;
+  sessionStates?: Map<string, string>;
   panes?: Map<string, string>;
   seals?: Set<string>;
   unreachableNodes?: Set<string>;
@@ -52,6 +53,7 @@ function buildDeps(args: {
   const probe: ProbeResult = {
     liveTargets: args.liveTargets,
     unreachableNodes: args.unreachableNodes ?? new Set(),
+    ...(args.sessionStates ? { sessionStates: args.sessionStates } : {}),
   };
   const panes = args.panes ?? new Map();
   const seals = args.seals ?? new Set<string>();
@@ -326,7 +328,7 @@ test("tick: unreachable node yields node_unreachable state and is reported on re
   });
 });
 
-test("tick: mirrors hive state onto tmux only on transitions", async () => {
+test("tick: mirrors hive state onto tmux on transitions", async () => {
   await withTempStore(async () => {
     const NOW = Date.parse("2026-06-03T10:00:00.000Z");
     const record = bee({ lastPromptAt: new Date(NOW - 60_000).toISOString() });
@@ -350,5 +352,59 @@ test("tick: mirrors hive state onto tmux only on transitions", async () => {
     // ...and a steady-state tick mirrors nothing.
     await tick(deps, new Map([[record.name, "idle_with_output"]]));
     assert.equal(mirrored.length, 1);
+  });
+});
+
+test("tick: repairs stale live hive state without recording a transition", async () => {
+  await withTempStore(async () => {
+    const NOW = Date.parse("2026-06-03T10:00:00.000Z");
+    const record = bee({ lastPromptAt: new Date(NOW - 60_000).toISOString() });
+    const capture: Capture = { ledger: [], touches: [] };
+    const mirrored: Array<{ name: string; state: BeeState }> = [];
+    const deps: TickDeps = {
+      ...buildDeps({
+        records: [record],
+        liveTargets: new Set([record.tmuxTarget]),
+        sessionStates: new Map([[record.tmuxTarget, "waiting"]]),
+        panes: new Map([[record.tmuxTarget, "Working... esc to interrupt"]]),
+        now: NOW,
+        capture,
+      }),
+      mirrorHiveState: async (rec, state) => {
+        mirrored.push({ name: rec.name, state });
+      },
+    };
+
+    const result = await tick(deps, new Map([[record.name, "active"]]));
+
+    assert.equal(result.observed.get(record.name), "active");
+    assert.equal(result.transitions.length, 0);
+    assert.deepEqual(mirrored, [{ name: record.name, state: "active" }]);
+  });
+});
+
+test("tick: does not mirror uncertain booting over an existing live hive state", async () => {
+  await withTempStore(async () => {
+    const record = bee({ agent: "claude", command: "claude" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const mirrored: Array<{ name: string; state: BeeState }> = [];
+    const deps: TickDeps = {
+      ...buildDeps({
+        records: [record],
+        liveTargets: new Set([record.tmuxTarget]),
+        sessionStates: new Map([[record.tmuxTarget, "waiting"]]),
+        panes: new Map([[record.tmuxTarget, ""]]),
+        capture,
+      }),
+      mirrorHiveState: async (rec, state) => {
+        mirrored.push({ name: rec.name, state });
+      },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.equal(result.observed.get(record.name), "booting");
+    assert.deepEqual(result.transitions, [{ name: record.name, from: undefined, to: "booting" }]);
+    assert.deepEqual(mirrored, []);
   });
 });

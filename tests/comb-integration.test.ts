@@ -305,6 +305,10 @@ test("hive clean --dead sweeps a sub-bee whose pane died while the comb survives
     assert.equal(await hasSession(parentName), true, "comb survives (parent pane holds it)");
     assert.ok(await readRecord(storeRoot, String(child.name)), "sub-bee record still present before clean");
 
+    const attachDead = await runCli(["attach", String(child.name), "--print"], env);
+    assert.notEqual(attachDead.code, 0, "dead sub-bee pane should not be selectable");
+    assert.match(attachDead.stderr, /tmux pane is not running/);
+
     const clean = await runCli(["clean", "--dead"], env);
     assert.equal(clean.code, 0, clean.stderr);
     assert.equal(await readRecord(storeRoot, String(child.name)), null, "dead sub-bee record swept");
