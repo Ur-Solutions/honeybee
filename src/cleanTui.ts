@@ -418,6 +418,8 @@ function stateCell(state: BeeState): string {
       return "idle";
     case "sealed":
       return magenta("sealed");
+    case "archived":
+      return gray("archived");
     case "error":
       return red("error");
     case "kill_failed":

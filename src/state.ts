@@ -6,6 +6,7 @@ import type { SessionRecord } from "./store.js";
 export type BeeState =
   | "dead"
   | "sealed"
+  | "archived"
   | "blocked"
   | "ready"
   | "active"
@@ -52,6 +53,14 @@ const READY_PANE_MIN_BYTES = 200;
 export function deriveState(record: SessionRecord, context: StateContext): DerivedState {
   if (record.status === "kill_failed") {
     return { state: "kill_failed", detail: record.lastError ?? "previous kill failed" };
+  }
+
+  // An archived bee is a settled terminal fact (filed on `quest done`): its tmux
+  // target is gone, but it is FILED, not dead, and must never flip to "offline"
+  // on an unreachable node. Short-circuit BEFORE the liveness/node probe so the
+  // archived status always wins — even over a stray live target of the same name.
+  if (record.status === "archived") {
+    return { state: "archived", detail: "filed on quest done" };
   }
 
   // node_unreachable takes precedence over dead/sealed because we cannot trust the
@@ -125,6 +134,8 @@ export function stateLabel(state: BeeState): string {
       return "dead";
     case "sealed":
       return "sealed";
+    case "archived":
+      return "archived";
     case "blocked":
       return "blocked";
     case "ready":
@@ -146,7 +157,7 @@ export function stateLabel(state: BeeState): string {
 
 export function isTerminalState(state: BeeState): boolean {
   // node_unreachable is transient — the node may come back online — and not terminal.
-  return state === "dead" || state === "sealed" || state === "error" || state === "kill_failed";
+  return state === "dead" || state === "sealed" || state === "archived" || state === "error" || state === "kill_failed";
 }
 
 function lastActivityHint(record: SessionRecord, _context: StateContext): string {

@@ -231,3 +231,24 @@ test("listSessions skips malformed session files", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("a status:archived record round-trips (not downgraded to dead) and carries questId/workspaceId", async () => {
+  await withTempStore(async (dir) => {
+    const record = makeRecord(dir, { status: "archived", questId: "q-abc", workspaceId: "q-abc" });
+    await saveSession(record);
+    const loaded = await loadSession(record.name);
+    assert.equal(loaded?.status, "archived", "archived survives a round-trip (validation allow-list)");
+    assert.equal(loaded?.questId, "q-abc", "questId is carried through");
+    assert.equal(loaded?.workspaceId, "q-abc", "workspaceId is carried through");
+  });
+});
+
+test("an unknown status still downgrades to dead (regression guard)", async () => {
+  await withTempStore(async (dir) => {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    const raw = makeRecord(dir);
+    await writeFile(join(dir, "sessions", "CO.abc.json"), JSON.stringify({ ...raw, status: "frozen" }));
+    const loaded = await loadSession("CO.abc");
+    assert.equal(loaded?.status, "dead", "an unknown status is coerced to dead, not preserved");
+  });
+});

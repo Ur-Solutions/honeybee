@@ -3,6 +3,7 @@ import { basename, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
 import { appendLedger } from "./store.js";
+import { createWorkspace } from "./workspace.js";
 
 export type ColonyRecord = {
   name: string;
@@ -10,6 +11,10 @@ export type ColonyRecord = {
   archived?: boolean;
   archivedAt?: string;
   description?: string;
+  /** The colony's canonical file root, inherited by its auto-workspace (lazy). */
+  rootDir?: string;
+  /** The name of the workspace auto-provisioned for this colony (= the colony name). */
+  workspace?: string;
 };
 
 const COLONY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -57,6 +62,18 @@ export async function createColony(name: string, description?: string): Promise<
     };
     await saveColony(record);
     await appendLedger({ type: "colony.create", name });
+    // Auto-provision the colony's workspace (PRD §7.2). rootDir stays empty —
+    // it is resolved lazily on first `hive workspace open <colony>`. Best-effort:
+    // a workspace failure must never abort colony creation.
+    try {
+      await createWorkspace({ name, rootDir: "", members: [], colony: name });
+      record.workspace = name;
+      await saveColony(record);
+    } catch {
+      // log-and-continue: the colony still exists; the workspace can be
+      // (re)created on first open. We deliberately swallow a pre-existing
+      // workspace or any provisioning hiccup here.
+    }
     return record;
   });
 }
@@ -143,6 +160,10 @@ async function readColony(path: string): Promise<ColonyRecord> {
   if (object.archived === true) record.archived = true;
   if (typeof object.archivedAt === "string") record.archivedAt = object.archivedAt;
   if (typeof object.description === "string") record.description = object.description;
+  // Additive allow-list (the §10 lesson): a new string field is silently dropped
+  // on load unless it is explicitly carried through.
+  if (typeof object.rootDir === "string") record.rootDir = object.rootDir;
+  if (typeof object.workspace === "string") record.workspace = object.workspace;
   return record;
 }
 

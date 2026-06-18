@@ -166,16 +166,38 @@ test("stateLabel returns human-readable forms", () => {
   assert.equal(stateLabel("idle_with_output"), "idle");
   assert.equal(stateLabel("kill_failed"), "kill_failed");
   assert.equal(stateLabel("node_unreachable"), "offline");
+  assert.equal(stateLabel("archived"), "archived");
 });
 
 test("isTerminalState recognizes end states", () => {
   assert.equal(isTerminalState("dead"), true);
   assert.equal(isTerminalState("sealed"), true);
   assert.equal(isTerminalState("kill_failed"), true);
+  assert.equal(isTerminalState("archived"), true);
   assert.equal(isTerminalState("active"), false);
   assert.equal(isTerminalState("ready"), false);
   // node_unreachable is transient: the node may come back online.
   assert.equal(isTerminalState("node_unreachable"), false);
+});
+
+test("archived: a filed bee is archived, NOT dead, even with its tmux target gone", () => {
+  const result = deriveState(bee({ status: "archived" }), { liveTargets: new Set(), now: NOW });
+  assert.equal(result.state, "archived", "filed, not dead");
+  assert.match(result.detail, /filed/);
+});
+
+test("archived wins over a stray live target (status is the settled fact)", () => {
+  const result = deriveState(bee({ status: "archived" }), { liveTargets: new Set(["alpha-target"]), now: NOW });
+  assert.equal(result.state, "archived");
+});
+
+test("archived precedes the node_unreachable check (a filed bee never flips to offline)", () => {
+  const result = deriveState(bee({ status: "archived", node: "remote" }), {
+    liveTargets: new Set(),
+    unreachableNodes: new Set(["remote"]),
+    now: NOW,
+  });
+  assert.equal(result.state, "archived", "archived guard precedes the node check");
 });
 
 test("node_unreachable: bee's node is in unreachableNodes", () => {

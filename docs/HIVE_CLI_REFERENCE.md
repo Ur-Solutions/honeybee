@@ -79,6 +79,32 @@ Selector forms:
 - `<bee>`: exact session name or unique session/id prefix.
 - `@<swarm-id>`: all sessions in a swarm.
 - `colony:<name>`: all sessions in a colony.
+- `ws:<name>`: all sessions whose home workspace is `<name>`. Resolves via the
+  derived `workspace:` reserved tag (from `record.workspaceId`), so `ws:fe` and
+  `tag:workspace:fe` resolve to the same set — exactly like `colony:`/`tag:colony:`.
+- `#<tag>` or `tag:<tag>`: all sessions carrying the bare user tag `<tag>`.
+- `tag:<ns>:<val>` or `<ns>:<val>` (reserved `<ns>`): all sessions carrying that
+  namespaced tag, including the derived reserved facets. `colony:fe` and
+  `tag:colony:fe` resolve to the same set; `@t1` and `tag:swarm:t1` likewise.
+  Reserved namespaces are `colony`, `swarm`, `caste`, `node`, `agent`, `repo`,
+  `quest`, `workspace`, `comb`. Reserved tags are *derived on read* from the
+  bee's canonical fields — no migration is needed for existing bees.
+- `owns:<bee>` / `owned-by:<bee>` / `reports-to:<bee>`: all bees whose
+  `reportsToId` resolves to `<bee>` (the owned-by/reports-to edge, set by
+  `hive own`). The three spellings are aliases.
+- `children-of:<bee>`: all bees split from `<bee>` (their `parentId`).
+- `forks-of:<bee>`: all bees forked from `<bee>` (their `forkedFromId`).
+  These reverse-relationship selectors match by raw id and TOLERATE a dead
+  anchor: `owns:<killed-owner>` still returns surviving bees that carry the dead
+  owner's id (no cascade — relationships are reference-only).
+
+`@`, `colony:`, `#`, `tag:`, and the relationship prefixes
+`owns:`/`owned-by:`/`reports-to:`/`children-of:`/`forks-of:` are **reserved
+selector prefixes**: a string beginning with one is parsed as that selector
+kind, not a bee name. Bee names
+are auto-generated (e.g. `CL.a3f`) and never use these prefixes; if you force a
+bee name that starts with one (via `--name`), it won't be addressable by that
+literal name — pick a different name.
 
 Session references use UUID-backed bee IDs. The visible ID is the shortest
 currently unique prefix, never shorter than three hex characters after the
@@ -177,6 +203,7 @@ hive clean ...
 hive attach ...
 hive view ...
 hive colony ...
+hive quest ...
 hive frame ...
 hive swarm ...
 hive node ...
@@ -471,6 +498,110 @@ hive brief CO.a3f "..." --footer "Custom footer"
 hive brief CO.a3f "..." --force-send
 ```
 
+### `hive tag`
+
+Add or remove free-form user tags on one or more bees. A tag is a label: a bare
+token like `migration` or a `namespace:value` like `prio:p1`, stored verbatim.
+Reserved namespaces (`colony`, `swarm`, `caste`, `node`, `agent`, `repo`,
+`quest`, `workspace`, `comb`) cannot be written via `hive tag` — they are
+*derived on read* from the bee's canonical fields; use the canonical verb
+instead (e.g. `hive spawn --colony` / `hive move`).
+
+```sh
+hive tag <selector> <tag>...          # add user tags (stored verbatim)
+hive tag <selector> --remove <tag>... # remove user tags (idempotent)
+hive tag <selector> --list            # show the bee's full effective tag set
+```
+
+Examples:
+
+```sh
+hive tag CO.a3f migration prio:p1     # add two tags
+hive tag @review-swarm waiting-review # tag a whole swarm
+hive tag colony:fe migration          # bulk-tag a colony
+hive tag CO.a3f --remove migration    # remove a tag
+hive tag CO.a3f --list                # list effective tags (reserved + user)
+hive tag CO.a3f colony:other          # rejected: reserved facet, use hive move
+```
+
+`<selector>` may be any selector (bee / `@swarm` / `colony:` / `tag:` / `#tag`),
+so a single `hive tag` can label an entire cohort; the result reports a count.
+Each add/remove writes the record atomically (a `tag.add` / `tag.remove` ledger
+event) and best-effort refreshes the session's `@hive_tags` tmux option for
+store-free `tmux ls -f` filtering. Tag values forbid whitespace, comma, tab, and
+newline; a bee carries at most 32 tags of at most 64 characters each.
+
+Tags are queryable via `hive list --tag` and the `#` / `tag:` selectors:
+
+```sh
+hive list --tag migration                 # bees with the user tag migration
+hive list --tag migration --tag prio:p1   # conjunctive (AND)
+hive list --tag colony:fe                  # derived reserved facet
+hive list '#migration'                     # positional tag selector
+hive send '#migration' "status?"           # tag selector as a target
+```
+
+### `hive own`
+
+Set the **owned-by / reports-to** edge between bees: every `<bee-selector>`'s
+`reportsToId` is pointed at the single bee resolved from `<owner-selector>`.
+
+```sh
+hive own <owner-selector> <bee-selector>...  # set the reports-to edge
+hive own <bee-selector> --clear              # unset the edge
+```
+
+Examples:
+
+```sh
+hive own CL.lead CO.a3f CO.b1c   # both bees now report to CL.lead
+hive own CL.lead colony:fe       # everyone in colony fe reports to CL.lead
+hive own CO.a3f --clear          # drop CO.a3f's reports-to edge
+```
+
+The owner selector must resolve to exactly one bee (0 or >1 is an error). Each
+bee selector may be a multi-bee selector, so one command can wire a whole
+cohort; the result reports a count. Each write emits a `rel.set` /  `rel.clear`
+ledger event. Relationships are **reference-only**: clearing an edge never kills
+a bee, and the edge has no tmux mirror in v1.
+
+Query the edge via the reverse selectors:
+
+```sh
+hive list owns:CL.lead          # bees that report to CL.lead
+hive list owned-by:CL.lead      # alias of owns:
+hive list reports-to:CL.lead    # alias of owns:
+hive list children-of:CO.a3f    # bees split from CO.a3f (parentId)
+hive list forks-of:CO.a3f       # bees forked from CO.a3f (forkedFromId)
+```
+
+A reverse selector tolerates a dead anchor: `owns:<killed-owner>` still returns
+the surviving bees that carry the dead owner's id (no cascade).
+
+### `hive move`
+
+Reassign a bee's colony, or its owner (an alias for `hive own` on one bee).
+
+```sh
+hive move <bee> --colony <c>     # rewrite record.colony (derived colony: follows)
+hive move <bee> --owner <o>      # alias for: hive own <o> <bee>
+hive move <bee> --owner ''       # clear ownership (same as hive own <bee> --clear)
+```
+
+Examples:
+
+```sh
+hive move CO.a3f --colony backend   # move CO.a3f into colony backend
+hive move colony:fe --colony be      # bulk-move a whole colony
+hive move CO.a3f --owner CL.lead     # point CO.a3f's reports-to at CL.lead
+hive move CO.a3f --owner ''          # clear CO.a3f's reports-to edge
+```
+
+Pass exactly one of `--colony` / `--owner`. `--colony` refreshes the bee's
+`@hive_tags` tmux option (because `colony:` is a derived reserved tag); the
+`--owner` path does not (relationships have no tmux mirror). This is the verb the
+`hive tag` reserved-namespace rejection redirects to for `colony:`.
+
 ## Observing Output
 
 ### `hive tail` / `hive cat`
@@ -544,9 +675,51 @@ from killing a bee that still needs human approval.
 Show known sessions with derived state.
 
 ```sh
-hive list [--colony <name>] [--swarm <id>] [--node <name>] [--wide]
+hive list [selector] [--colony <name>] [--swarm <id>] [--node <name>]
+          [--state <s>] [--agent <a>] [--repo <name>] [--tag <ns:val>]...
+          [--archived] [--json] [--wide]
 hive ps --wide
 ```
+
+**Faceted filters (conjunctive).** Every filter is an AND: `hive list --colony
+frontend --agent claude --state waiting` returns only the bees matching *all*
+three. The facets:
+
+- `--colony <name>` / `--swarm <id>` / `--node <name>`: the existing reserved
+  facets (swarm accepts a leading `@`).
+- `--agent <a>`: exact match on the bee's agent (`claude`, `codex`, ...).
+- `--repo <name>`: match on the bee's repo facet — the basename of the bee
+  cwd's git top-level (or the cwd basename outside a repo). Two repos sharing a
+  basename collide; this is an accepted lossy facet.
+- `--state <s>`: match on the bee's state. Accepts the live `@hive_state`
+  vocabulary (`working`/`waiting`/`done`/`failed`), the fine-grained `BeeState`
+  (`active`, `idle_with_output`, ...), or its display label (`idle`, `offline`).
+- `--tag <ns:val>`: match on the bee's effective tag set — a bare user tag
+  (`--tag migration`) or a namespaced/reserved tag (`--tag prio:p1`,
+  `--tag colony:fe`). Repeats conjunctively: `--tag migration --tag prio:p1`
+  returns bees carrying *both*. Composes with every other facet flag.
+- positional `[selector]`: a bee / `@swarm` / `colony:<name>` / `#tag` /
+  `tag:<...>` selector applied as a filter alongside the flags (an unknown
+  colony/swarm errors, consistent with other commands).
+- `--archived`: include **filed** bees (`status:"archived"`, filed by
+  `hive quest done`). They are **hidden by default**; `--archived` (or an explicit
+  `--state archived`) re-includes them.
+
+**`--json`** emits a machine array regardless of TTY, after all filters are
+applied. Each element has the shape:
+
+```json
+{
+  "ref": "ab12", "name": "...", "id": "...", "title": "...",
+  "agent": "claude", "state": "working", "beeState": "active",
+  "detail": "...", "colony": "...", "swarm": "...", "comb": "...",
+  "node": "local", "repo": "honeybee-build", "cwd": "/abs/path",
+  "createdAt": "...", "updatedAt": "..."
+}
+```
+
+`state` is the live `@hive_state` when the bee is live, else the derived
+`BeeState`; `beeState` is always the derived `BeeState`.
 
 States:
 
@@ -592,6 +765,65 @@ hive attach CO.a3f
 hive attach CO.a3f --print
 ```
 
+### `hive next`
+
+Jump to the next local bee that needs attention. This is the *attention queue*
+(navigation Tier 1, "push, not pull"): instead of scanning the full list, you
+walk only the bees whose live state says they want you — `M-n` to step forward,
+`M-N` (`--prev`) to step back, cycling through the set.
+
+```sh
+hive next [--state <comma-list>] [--prev] [--print]
+```
+
+The attention set:
+
+- It is the LOCAL bees whose live `@hive_state` is one of the attention states.
+  The default attention states are `waiting,done,failed` — everything tracked
+  that is NOT actively `working`.
+- `@hive_state` is read straight from the local tmux server (one
+  `tmux list-sessions` over the option — no per-bee store read). hive writes it
+  on its own spawn/brief/send/seal transitions, and the daemon and agent
+  Stop/Notification hooks keep it current; a bee with no `@hive_state` set (or
+  one that is `working`) is never in the set.
+- `--state waiting` (or a comma list like `--state waiting,blocked`) overrides
+  the default set. The order you list states in is the order they are visited.
+- Remote bees are never in the queue — the attention queue is the local tmux
+  server (a remote bee lives on a different server and cannot be
+  `switch-client`'ed to).
+
+Ordering and cycling:
+
+- Bees are grouped by attention-state priority (the order given to `--state`;
+  default `waiting` → `done` → `failed`), and within each group oldest-first
+  (longest in that state), using each bee's last observed state time.
+- `hive next` finds your current session in the ordered queue and jumps to the
+  NEXT entry, wrapping around at the end; `--prev` jumps to the previous one. If
+  your current pane is not itself a bee in the set, `next` enters at the front
+  and `--prev` at the back.
+- When the set is empty, it prints `no bees need attention` and exits 0 — there
+  is nothing to switch to and that is not an error.
+
+Switching (nesting-safe):
+
+- Inside tmux the current client is repointed with `tmux switch-client` (via the
+  same nesting-safe attach helper as `hive attach` — `attach-session` inside an
+  existing client is never emitted).
+- `--print` prints the context-appropriate command instead of switching.
+- Outside tmux there is no current client to repoint, so `hive next` prints the
+  attach command for the target (run it, or run `hive next` from inside tmux to
+  switch directly) instead of crashing.
+
+Examples:
+
+```sh
+hive next                       # → the oldest waiting bee, then cycle on repeat
+hive next --prev                # step backward through the queue
+hive next --state waiting       # only bees waiting on input
+hive next --state waiting,done  # waiting first, then done
+hive next --print               # emit the switch-client command, don't switch
+```
+
 ### `hive view`
 
 Colony cockpit: link live bees' windows into one ephemeral tmux session
@@ -633,6 +865,211 @@ Behavior and guarantees:
   bee's session, but the linked window (and the agent process) survives in the
   view until the view is closed.
 
+### `hive workspace` (alias `hive ws`)
+
+A **persisted** cockpit: a first-class store record (`WorkspaceRecord`) backing a
+`ws-<name>` tmux session with a file root, an optional colony, and a set of
+members — linked bee windows (like `view`) plus ordinary shell/command panes.
+Unlike a view it survives terminal close natively (the session is detached and
+`detach-on-destroy off`) and is never auto-destroyed. Every colony auto-gets a
+workspace of the same name; stand-alone workspaces are allowed.
+
+```sh
+hive workspace open <name|colony> [--root <dir>] [--new-client] [--print]
+hive workspace list [--colony <c>] [--archived]
+hive workspace add <name> <bee-selector>      # link existing bee(s) in, persist membership
+hive workspace add-pane <name> [--cmd "..."] [--name <label>]
+hive workspace snapshot <name>                 # refresh saved layout from the live session
+hive workspace restore <name> [--resume]       # rebuild after a reboot
+hive workspace close <name>                    # tear down the session, KEEP the record
+hive workspace rename <old> <new>
+hive workspace here                            # print the current pane's owning workspace name
+hive workspace archive <name>
+
+hive restore --all [--resume]                  # rebuild every non-archived workspace
+```
+
+Examples:
+
+```sh
+hive workspace open fe --root ~/code/frontend  # create/enter ws-fe rooted there
+hive workspace add fe @review                  # link a swarm's windows into ws-fe
+hive workspace add-pane fe --cmd lazygit --name git
+hive workspace close fe                         # leaves every linked bee alive
+```
+
+Behavior and guarantees:
+
+- **Persisted**, unlike `view`: a `WorkspaceRecord` at
+  `~/.hive/workspaces/<name>.json` (CRUD + ledger `workspace.create|update|
+  rename|archive`). Closing the terminal does not lose it — reopening is a
+  re-attach.
+- `add` links each resolved bee's window into the session (shared link-window
+  core), records a `{kind:"bee",beeId}` member, and stamps the bee's
+  `record.workspaceId` so the derived `ws:<name>` selector lights up.
+- `add-pane` opens a window at the workspace's `rootDir` running `--cmd` (or a
+  shell) and records a `{kind:"pane"}` member.
+- `close` uses the same safe-unlink discipline as `view --close` (never `-k`,
+  aborts on a bee's last link, sweeps `ws-<name>-<n>` grouped clients) and keeps
+  the record. Closing a workspace is provably incapable of killing a bee.
+- A workspace session (`ws-*`) has **no** `SessionRecord`, so it never appears in
+  bee `list`/selectors/`clean` — the same exclusion discipline as `view-*`.
+- Local bees only — `link-window` cannot cross tmux servers; remote bees are
+  skipped with a warning.
+- `snapshot` refreshes the record's saved geometry from the live session,
+  capturing each window's tmux `window_layout` keyed by `window_name`
+  (`tmux list-windows -F '#{window_name}\t#{window_layout}'`), persisted as
+  `record.layout`. Run it before a reboot so `restore` can re-apply the layout.
+- `restore` rebuilds `ws-<name>` after a reboot (the tmux server + every bee
+  process are gone, but the records persist): it ensures the session, recreates
+  each `{kind:"pane"}` member at `rootDir`, and brings back each `{kind:"bee"}`
+  member. A dead bee with a record is **re-spawned** into its OWN home (no
+  account switch — same creds, no cross-account hazard); `--resume` continues it
+  from its `providerSessionId` (`claude --resume` / `codex resume` / `opencode
+  --session`) instead of starting fresh. A bee with no record left becomes a
+  dead placeholder window the user can re-spawn into. Finally the saved
+  `window_layout` is re-applied via `select-layout` (best-effort, matched by
+  `window_name`). Restore is **idempotent** (PRD §13): a bee that is already
+  live is linked in but never re-spawned, and re-restoring a live workspace keeps
+  its existing panes — restore is purely additive and never kills a bee.
+- `hive restore --all [--resume]` sweeps every non-archived workspace and
+  restores it (the post-reboot reconcile; install it as a login hook to rebuild
+  your arrangement on boot). Without `--all` it prints usage.
+- `hive workspace here` resolves the **current pane's owning workspace** for
+  keybindings (the `M-R`/cmd+shift+r rename chord). If `$TMUX`'s session is a
+  `ws-*` session it prints the bare workspace name; otherwise it resolves the
+  current bee (via `hive here`) and prints its `workspaceId`. Errors when not in
+  tmux or when the pane has no owning workspace.
+
+### `hive quest`
+
+A **tracked task** with a beginning and a completion (`QuestRecord`). A quest
+lives in a colony, owns a dedicated workspace while active, and spawns one or
+more swarms to do the work. Its lifecycle is `open → active → done → archived`;
+this build covers `create`/`start` (open → active), `list`/`inspect`, and
+`done`/`archive` (the completion + filing flow).
+
+```sh
+hive quest create "<title>" [--colony <c>] [--root <dir>] [--linear <issue>] [--description <text>]
+hive quest start  <id> (--frame <f> | --flow <f>) [--arg key=value]...
+hive quest list   [--colony <c>] [--status <s>] [--json]
+hive quest inspect <id> [--json]
+hive quest done   <id> [--keep-bees] [--close-linear]
+hive quest archive <id>
+```
+
+Examples:
+
+```sh
+hive quest create "review #1255" --colony reviews   # → quest q-ab12cd + ws-q-ab12cd
+hive quest start q-ab12cd --frame review            # spawn the review swarm into it
+hive quest list --status active                     # the in-flight quests
+hive quest inspect q-ab12cd                          # rolled-up status + its bees
+hive quest done q-ab12cd                             # file seals + snapshot, kill bees, close ws
+hive quest done q-ab12cd --keep-bees                 # complete but leave the bees alive
+hive quest archive q-ab12cd                          # done → archived (post-completion filing flip)
+```
+
+Behavior and guarantees:
+
+- **Record:** stored as a directory at `~/.hive/quests/<id>/quest.json` (the
+  folder also holds the completion archive in a later increment). The id is an
+  `<prefix>-<hex>` token like a swarm id (`generateQuestId`, default prefix `q`).
+  CRUD + ledger (`quest.create` / `quest.activate`) mirror `swarm.ts`/
+  `workspace.ts`.
+- **A quest always lives in a colony** (PRD §8.2): `--colony` uses or creates the
+  named colony; without it, a colony is auto-created from a slug of the title.
+- **Dedicated workspace:** the quest owns a workspace named after the quest id
+  (`ws-<id>`), NOT the colony's shared workspace — so completing a quest can
+  close its workspace without ever touching a colony-shared one. Its file root
+  resolves from `--root` › the colony's `rootDir` › cwd.
+- `start` spawns the frame's swarm with the quest's colony injected, then **stamps
+  every spawned bee** with `record.questId` (and `colony`/`workspaceId`) so the
+  derived `quest:<id>` selector lights up, and **links each bee's window** into
+  the quest's workspace (the shared `workspace add` link path — never reinvented).
+  The quest flips to `status:"active"` with `activatedAt` set and the swarm id
+  appended to `swarmIds`.
+- `inspect` rolls up the quest's bees by filtering the store for
+  `questId===<id>` (the same set `quest:<id>` resolves), printing each bee's
+  name, caste/agent, and state — a cheap store-only read. `--json` dumps the
+  record plus the bee summary.
+- `list` filters by `--colony` / `--status` and excludes archived quests by
+  default. `--json` dumps the records.
+- `done` **files the work, then completes the quest** in a strict, restartable
+  order: snapshot the workspace geometry → **file a COPY** of every member bee's
+  seals + the final workspace snapshot + a member manifest under
+  `~/.hive/quests/<id>/` (a copy, BEFORE any destructive step — a crash never
+  loses a seal) → **transactionally kill** each member (`src/kill.ts`) and mark
+  **only the confirmed-killed bees** `status:"archived"` in place (the live store
+  stays the index) → close the quest workspace (the safe close, which **never
+  kills a bee**) → flip the quest to `done` with `completedAt`. A `kill_failed`
+  bee (still suspected running) is **left `kill_failed`, never archived** and is
+  reported on stderr — a possibly-live bee is never hidden. Ledger: `quest.done`.
+  - `--keep-bees` skips the kill: the bees **stay alive** (`status:"running"`,
+    still visible in `hive list`) and the workspace is safe-closed around them;
+    seals + snapshot are still filed and the quest still completes.
+  - `--close-linear` transitions the quest's Linear issue to a completed state
+    (see "Linear integration" below). It is **side-effect-gated** (no Linear
+    write without the flag) and **best-effort**: the quest is already `done` by
+    this point, so a Linear failure never fails `done` — it warns and moves on.
+    With no `LINEAR_API_KEY` it is a clear offline no-op; with no Linear issue on
+    the quest it prints "nothing to close".
+  - A second `done` on an already-done/archived quest is rejected (idempotency
+    guard).
+- An **archived bee** (`status:"archived"`) is *filed, not dead*: it is a terminal
+  state that is **excluded from the default `hive list`** (re-include with
+  `hive list --archived` or `--state archived`), is **never swept by `hive clean`**
+  (only an explicit `hive kill` deletes it), and is **excluded from default
+  selector resolution** (`send`/`view`/`list <sel>`) — yet `quest inspect <id>`
+  still surfaces it (it reads the store directly by `questId`).
+- `archive` is the post-completion flip `done → archived` (a pure quest-record
+  state change with `archivedAt`; it does not re-touch bees or the workspace).
+  It requires the quest to be `done` first, is idempotent, and surfaces the quest
+  in `quest list --status archived`. Ledger: `quest.archive`.
+
+`start --flow <f>` runs a registered flow in the FOREGROUND into the quest's
+workspace: every bee the flow spawns is stamped `questId`/`colony`/`workspaceId`
+and its window linked into `ws-<id>` as it spawns, the quest's `swarmIds` record
+the flow's cohort (`flow:<name>:run:<runId>`), and the quest flips to `active`
+only on a successful run. `--arg key=value` is forwarded to the flow like
+`hive flow run`. The flow's `kill-on-end` cleanup is overridden to `keep` (the
+quest owns its bees); `start --flow --background` is not yet supported.
+
+#### Linear integration (optional, offline-safe, side-effect-gated)
+
+Linear is wired through a single pluggable adapter (`src/linear.ts`) — it is the
+**only** Linear-aware module; hive core never imports Linear directly. The
+transport is an **API token**: the adapter POSTs GraphQL to
+`https://api.linear.app/graphql` with `Authorization: <token>`. It is gated on
+one environment variable:
+
+- **`LINEAR_API_KEY`** — set it to enable Linear. Get a Personal API key from
+  Linear (Settings → Security & access → Personal API keys). When it is unset (or
+  blank), the adapter is `null` and **everything works fully offline** — this is
+  the cardinal property: `quest create`/`done` behave exactly as without Linear,
+  with no network and a clear note.
+
+Behavior:
+
+- **Read on create** — `hive quest create --linear ENG-1234`: with a key set, the
+  adapter fetches the issue and **seeds the quest title from the issue title when
+  no positional title is given** (an explicit positional title always wins) and
+  the **description from the issue description** (unless `--description`
+  overrides). The Linear id is stored on the quest either way. A title is
+  required when none can be resolved (no positional title AND no
+  key/fetch-miss) — that case is a clean usage error. With no key, the id is
+  recorded verbatim and a "Linear not configured (set `LINEAR_API_KEY`)" note is
+  printed (no network). The identifier shape (`ENG-1234`) is validated before any
+  call; a malformed value is rejected.
+- **Write on done** — `hive quest done --close-linear` (see above): transitions
+  the linked issue to its team's first `completed`-type workflow state (or one
+  named "Done"). Side-effect-gated and best-effort — never fails `done`.
+
+The adapter's transport is **injectable** (`fetchImpl`), so the GraphQL request
+construction, response parsing, and the offline/no-key path are all unit-tested
+with a stub (`tests/linear.unit.test.ts`); the **live API path is not exercised
+in CI** (no token) and is the operator's to verify with a real key.
+
 ### `hive split`
 
 Spawn a new sub-bee into the current bee's comb (its tmux session), in an
@@ -656,6 +1093,82 @@ it budded from) and sharing the parent's `combId` and `tmuxTarget`, with its own
 `agentPaneId`. A `bee.split` ledger event records the lineage. `hive list` shows
 both bees sharing one comb.
 
+### `hive fork`
+
+Branch an existing bee into a **fresh comb** (its own new tmux session,
+optionally a different harness/model/node), seeded from the source bee's state.
+Where `split` grows a comb (siblings share a window), `fork` branches a lineage
+into a new comb elsewhere.
+
+```sh
+hive fork <bee> [checkpoint]
+          [--agent <kind>] [--model <m>]
+          [--node <n>] [--cwd <dir>]
+          [--seed resume|seal|summary|log|none]
+          [--read-log] [--name <n>] [--account <a>] [--here] [--print]
+```
+
+- `<bee>` — the source bee to fork (a single bee selector; forking a set is
+  refused).
+- `[checkpoint]` — the seed anchor: a **seal**. Default `latest` (the most
+  recent seal); `seal:<ISO>` selects a specific one. `msg:N` (transcript offset)
+  is deferred.
+- `--agent <kind>` — fork into a different harness (defaults to the source's
+  agent). Cross-harness forks cannot use native resume (see below).
+- `--model <m>` — first-class model, also baked into the spawned command via the
+  per-harness flag (claude `--model <m>`, codex `-m <m>`).
+- `--node <n>` / `--cwd <dir>` — node and working directory (cwd defaults to the
+  source's).
+- `--seed <mode>` — force a seeding rung; `--read-log` is shorthand for log
+  seeding and overrides the ladder.
+- `--name <n>` — name for the fork (defaults to a fresh auto-allocated id).
+- `--account <a>` — the account whose dedicated home the fork uses (required for
+  an account-bound source; see Account safety).
+- `--here` / `--print` — behave like `hive spawn`: link the fork's window into
+  your current tmux session, or print the attach command.
+
+**Seeding ladder** (best fidelity available, in order; the chosen rung is
+recorded in `seedMode`):
+
+1. **resume** — `--seed resume` (or default) **and** same harness **and** a
+   known source `providerSessionId` → the fork spawns with native resume args
+   (claude `--resume <id>`, codex `resume <id>`, opencode `--session <id>`)
+   baked into its command. Exact continuation.
+2. **seal** — the latest/selected seal → a brief: *"You are a fork of `<bee>`.
+   State: `<summary>`; files changed: …; next: …. Continue from here."*
+3. **summary** — deferred in v1 (no standalone summarizer); falls through to log.
+4. **log** — `--read-log` (or the fallthrough) → a brief pointing at the
+   source's `transcriptPath`. If there is no resume session, no seal, and no
+   transcript, the fork is **refused** with a clear message.
+
+**Cross-harness rule:** native resume is same-harness only. A cross-harness fork
+(`--agent codex` from a claude source) **must** seed from a seal or log; an
+explicit `--seed resume` that is cross-harness is **refused** loudly rather than
+silently downgraded.
+
+**Account safety (critical):** a fork must never share a live home with its
+parent — Anthropic rotates OAuth refresh tokens, so two bees on one home log
+each other out. Therefore:
+
+- An **account-bound** source (`accountId` set) **must** be forked with
+  `--account <a>` (or `--account auto`); without it the fork is refused. The
+  account brings its own dedicated home.
+- A **default-home** source may be forked without `--account` — the fork gets
+  its own fresh session in the default home (the same risk profile as spawning a
+  second default bee).
+- `--seed resume` needs the parent's home to see its provider session, so it is
+  only honored for a default-home source (with a loud warning about the shared
+  home); combining `--seed resume` with `--account` is refused.
+
+**Anti-cross-match:** the fork is a new session with no `providerSessionId` of
+its own and a `lastPromptAt` stamped at creation, so the daemon's transcript
+scorer can never assign the **parent's** transcript to the fork.
+
+**Lineage:** the fork records `forkedFromId` (source id), `forkedAt`, `seedMode`,
+`forkCheckpoint` (`seal:<ISO>` | `resume:<id>` | `log:<path>` | `none`), and
+`model`, and emits a `fork.create` ledger event. The `forks-of:<bee>` selector
+lists a bee's forks.
+
 ### `hive here`
 
 Resolve the bee that owns the current tmux pane — useful for scripts and
@@ -672,6 +1185,100 @@ hive here [--id] [--json]
 Resolution prefers `$TMUX_PANE` (matching a bee by `agentPaneId`) and falls back
 to the current session name (matching `tmuxTarget`, for solo combs and legacy
 bees). Errors cleanly when not inside tmux or when no bee matches.
+
+## Keybindings and In-tmux Affordances
+
+The keybinding LAYER — picker verbs the `display-popup` chords invoke, the
+standalone in-tmux affordances, and the recommended binding set — is specified in
+`docs/KEYBINDINGS_PRD.md`. These verbs are thin, testable, and side-effect-free
+(the action lives in the binding). The canonical copy-pasteable tmux block is
+`docs/honeybee.tmux.conf`, emitted byte-for-byte by `hive keys print --tmux`.
+
+### `hive spawn-picker`
+
+A **pure stdout list verb** for a `display-popup` "spawn something here" chord: it
+prints candidate names one-per-line and does nothing else (no spawn/switch/store
+write). The binding wraps it: `display-popup -E "hive spawn-picker --frame | fzf
+| xargs -r -I{} hive spawn --frame {} --here"`.
+
+```sh
+hive spawn-picker [--frame | --flow] [--here]
+```
+
+- `--frame` (default) — one frame name per line (via `listFrames()`).
+- `--flow` — one flow name per line (via `listFlows()`).
+- `--here` — a passthrough hint for the binding (so it appends `--here` to the
+  spawn action). It does **not** change the printed candidate set.
+- Empty candidate set → exit 0 with empty stdout (the binding's `xargs -r`
+  no-ops). The first whitespace/TAB field is the selectable machine token.
+- Reads the LOCAL store: hard-errors (non-zero) when the default substrate is
+  `ssh-tmux`, to avoid targeting the wrong fleet (KEYBINDINGS_PRD §8.1/§13).
+
+### `hive urls`
+
+Lists website URLs printed in a bee's pane, for an `fzf` + open-in-browser chord.
+Side-effect-free unless `--open`.
+
+```sh
+hive urls [<bee>] [--lines <n>] [--open] [--json]
+```
+
+- Default bee is the current pane (via `hive here` resolution); an explicit
+  selector grabs from another bee.
+- Captures pane scrollback via the substrate (`--lines` defaults to ~2000).
+- Extracts `http(s)` URLs, strips trailing punctuation, dedupes preserving
+  first-seen (recency) order.
+- Default output is one URL per line; `--json` emits a JSON array; `--open` opens
+  the **first** match via the platform opener (`open` on macOS, `xdg-open` on
+  Linux).
+- Empty → exit 0 with a dim "no URLs" note on stderr (so the popup closes
+  cleanly). An explicit selector hard-errors under an `ssh-tmux` default
+  substrate (it reads the LOCAL store).
+
+### `hive rename --here`
+
+An argv-reshaping convenience wrapper over `hive rename` for the cmd+r chord. It
+pulls the bare positional(s) as the **title**, resolves the current bee via `hive
+here`, and injects that id as the selector before delegating — so the title is
+never mistaken for a selector.
+
+```sh
+hive rename --here <new-title>
+```
+
+The non-`--here` behavior of `hive rename` is unchanged: `hive rename <selector>
+<title>`, `--auto` (daemon-style auto-title), `--clear`. Rename sets `@hive_title`
+(not the tmux session name), so the status bar and the `M-s` switcher line update
+without re-attach.
+
+### `hive keys`
+
+Print and verify the recommended binding set. Zero config mutation: hive ships a
+documented snippet plus verify tooling; the operator owns the bindings.
+
+```sh
+hive keys print [--tmux | --wezterm]    # emit the recommended block to stdout
+hive keys path                          # print the abs path of docs/honeybee.tmux.conf
+hive keys check [--against-recommended] # diagnose live binds, collisions, static checks
+```
+
+- `print` — `--tmux` (default) prints the tmux block **verbatim** from the same
+  source-of-truth string backing `docs/honeybee.tmux.conf`; `--wezterm` prints
+  the `cmd→Meta` additions for `~/.wezterm.lua`.
+- `path` — the absolute path of the shipped `docs/honeybee.tmux.conf` (resolved
+  relative to the hive install), for `source-file "$(hive keys path)"`. Path
+  stability caveat: it tracks the install location, so it is brittle across
+  reinstall/relocation (KEYBINDINGS_PRD §16 Q2).
+- `check` — a **pure read** that reports which recommended binds are present /
+  absent / collide (against `tmux list-keys -T root`), and runs static checks:
+  `fzf` on PATH, a browser opener on PATH, the substrate is `local-tmux` (warns
+  under `ssh-tmux`), and `hive` itself is reachable. Exits non-zero only on a hard
+  failure (`hive` unreachable); warnings otherwise. `--against-recommended` flags
+  live binds that drift from the shipped set.
+- **Limitation**: `check` reads `tmux list-keys`, so it is blind to the WezTerm
+  ALT/cmd layer in `~/.wezterm.lua` — that must be eyeballed (KEYBINDINGS_PRD §6).
+- `hive keys doctor` is an optional Phase 2 runtime popup-probe; it currently
+  reports "not yet implemented".
 
 ### `hive kill`
 

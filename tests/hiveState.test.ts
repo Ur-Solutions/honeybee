@@ -11,6 +11,7 @@ test("hiveStateFor maps every BeeState to the coarse @hive_state vocabulary", ()
     blocked: "waiting",
     idle_with_output: "done",
     sealed: "done",
+    archived: undefined,
     error: "failed",
     kill_failed: "failed",
     dead: undefined,

@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { appendLedger } from "./store.js";
@@ -145,6 +145,28 @@ export async function loadLatestSeal(beeName: string): Promise<SealRecord | null
     if (seal) return seal;
   }
   return null;
+}
+
+/**
+ * COPY every seal file for `beeName` into `destDir/<beeName>/`, preserving the
+ * stamp filename scheme — the filing step of `quest done` (PRD §8.4). This is a
+ * pure copy: the live sealsRoot stays intact (the seal index is never moved), so
+ * a crash after filing but before kill leaves seals duplicated (benign), never
+ * lost. Keeping the path scheme inside this module means cli.ts never reaches
+ * into seal internals. Returns the number of seal files copied.
+ */
+export async function copyBeeSeals(beeName: string, destDir: string): Promise<number> {
+  const srcDir = beeSealDir(beeName);
+  const files = (await readdir(srcDir).catch(() => [] as string[])).filter((f) => f.endsWith(".json"));
+  if (files.length === 0) return 0;
+  const target = join(destDir, beeName);
+  await mkdir(target, { recursive: true });
+  let copied = 0;
+  for (const file of files) {
+    await copyFile(join(srcDir, file), join(target, file));
+    copied += 1;
+  }
+  return copied;
 }
 
 export async function sealedBeeNames(): Promise<Set<string>> {

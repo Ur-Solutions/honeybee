@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { listSeals, loadLatestSeal, recordSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
+import { copyBeeSeals, listSeals, loadLatestSeal, recordSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-seal-"));
@@ -72,6 +72,42 @@ test("recordSeal stores a seal and listSeals returns it", async () => {
     const list = await listSeals("CL.cc9");
     assert.equal(list.length, 1);
     assert.equal(list[0]!.summary, VALID.summary);
+  });
+});
+
+test("copyBeeSeals copies every seal file with the same filename + content, leaving sealsRoot intact", async () => {
+  await withTempStore(async () => {
+    await recordSeal("CL.cp", validateSealArtifact({ status: "done", summary: "one" }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await recordSeal("CL.cp", validateSealArtifact({ status: "blocked", summary: "two" }));
+
+    const srcFiles = (await readdir(join(sealsRoot(), "CL.cp"))).filter((f) => f.endsWith(".json")).sort();
+    assert.equal(srcFiles.length, 2, "two seals recorded");
+
+    const destRoot = await mkdtemp(join(tmpdir(), "honeybee-seal-dest-"));
+    try {
+      await mkdir(destRoot, { recursive: true });
+      const copied = await copyBeeSeals("CL.cp", destRoot);
+      assert.equal(copied, 2, "both seals copied");
+
+      const destFiles = (await readdir(join(destRoot, "CL.cp"))).filter((f) => f.endsWith(".json")).sort();
+      assert.deepEqual(destFiles, srcFiles, "identical stamp filenames in the copy");
+
+      for (const f of srcFiles) {
+        const orig = await readFile(join(sealsRoot(), "CL.cp", f), "utf8");
+        const copy = await readFile(join(destRoot, "CL.cp", f), "utf8");
+        assert.equal(copy, orig, "copied seal content is byte-identical");
+      }
+
+      // sealsRoot is untouched (a copy, never a move).
+      const stillThere = (await readdir(join(sealsRoot(), "CL.cp"))).filter((f) => f.endsWith(".json")).sort();
+      assert.deepEqual(stillThere, srcFiles, "the original seals remain after copy");
+
+      // A bee with no seals copies nothing and does not throw.
+      assert.equal(await copyBeeSeals("CL.none", destRoot), 0, "zero seals copies nothing");
+    } finally {
+      await rm(destRoot, { recursive: true, force: true });
+    }
   });
 });
 

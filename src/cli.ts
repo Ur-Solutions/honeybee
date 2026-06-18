@@ -2,7 +2,7 @@
 import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { agentDefaultsToYolo, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, resolveHome, shellCommand } from "./agents.js";
 import {
   AUTO_ACCOUNT_QUERY,
@@ -33,12 +33,39 @@ import { listProRepoEntries, listProRepos, resolveProForCwd, type ProRepoEntry }
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { resumeArgs, sniffYolo, swapAccount } from "./swap.js";
+import { modelArgsFor, pickForkSeed, type ForkSeedInput, type SeedMode } from "./fork.js";
 import { openInNewTerminal, runInCurrentTerminal } from "./terminal.js";
 import { isRecentlyExhausted, listUsageAccounts, usageSummary } from "./usage.js";
 import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis, idleSessionAge, olderThanMillis, parseAge } from "./clean.js";
 import { chooseCleanTargets, type CleanTuiCleanOutcome, type CleanTuiItem } from "./cleanTui.js";
 import { assertExecutableAvailable } from "./execCheck.js";
 import { archiveColony, createColony, listColonies, loadColony, renameColony, updateColony } from "./colony.js";
+import {
+  archiveWorkspace,
+  createWorkspace,
+  listWorkspaces,
+  loadWorkspace,
+  renameWorkspace,
+  updateWorkspace,
+  WORKSPACE_PREFIX,
+  workspaceSessionName,
+  type WorkspaceLayoutEntry,
+  type WorkspaceMember,
+  type WorkspaceRecord,
+} from "./workspace.js";
+import {
+  createQuest,
+  generateQuestId,
+  listQuests,
+  loadQuest,
+  questDir,
+  updateQuest,
+  validQuestId,
+  type QuestRecord,
+  type QuestStatus,
+} from "./quest.js";
+import { isLinearIdentifier, loadLinearAdapter } from "./linear.js";
+import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, windowInventory } from "./tmuxLink.js";
 import {
   BUZ_TIERS,
   type BuzMessage,
@@ -99,15 +126,17 @@ import {
 } from "./daemon/install.js";
 import { tailDaemonLog } from "./daemon/logs.js";
 import { renderSystemdUnit } from "./daemon/plist.js";
-import { listSeals, loadLatestSeal, recordSeal, sealedBeeNames as sealedBeeNamesImpl, validateSealArtifact } from "./seal.js";
+import { copyBeeSeals, listSeals, loadLatestSeal, recordSeal, sealedBeeNames as sealedBeeNamesImpl, validateSealArtifact } from "./seal.js";
 import { search, type SearchHit, type SearchOptions, type SearchTypeFilter } from "./search.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
 import { resolveSelector } from "./selectors.js";
 import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
-import { writeHiveState, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
-import { buildView, closeView, createGroupedView, deriveViewName, linkHere, viewSessionName } from "./view.js";
+import { hiveStateFor, writeHiveState, writeHiveTags, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
+import { repoTagFor } from "./repoTag.js";
+import { dedupeTags, effectiveTags, isValidTagValue, normalizeTagArg, rejectReservedNamespaceTag } from "./tags.js";
+import { buildView, closeView, createGroupedView, deriveViewName, linkHere, VIEW_PREFIX, viewSessionName } from "./view.js";
 import { allocateBeeIdentity, highlightUniqueSessionReference, matchesSessionReference } from "./ids.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "./listView.js";
 import { gatherTitleContext, generateTitle } from "./naming.js";
@@ -115,13 +144,20 @@ import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
 import { startSpawnTimer, type SpawnTimer } from "./spawnTiming.js";
 import { attentionCount, DEFAULT_ATTENTION_STATES, parseStateList, pickNextBee, type BeeStateEntry } from "./next.js";
-import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
+import { LOCAL_NODE_NAME, listNodes, loadNode, loadNodeSync, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
 import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord } from "./substrates/index.js";
 import { attachCommand, attachSession, capture, formatShellCommand, hasSession, kill, listTmuxSessions, newSession, sendText, tmux } from "./tmux.js";
 import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
 import { waitForIdle } from "./wait.js";
+import {
+  CANONICAL_TMUX_CONF,
+  CANONICAL_WEZTERM_BLOCK,
+  RECOMMENDED_BINDS,
+  extractUrls,
+} from "./keybindings.js";
+import { fileURLToPath } from "node:url";
 
 const VERSION = "0.0.1";
 const APP_NAME = "hive";
@@ -175,8 +211,20 @@ async function main(argv: string[]) {
     case "here":
       await cmdHere(parsed);
       break;
+    case "spawn-picker":
+      await cmdSpawnPicker(parsed);
+      break;
+    case "urls":
+      await cmdUrls(parsed);
+      break;
+    case "keys":
+      await cmdKeys(parsed);
+      break;
     case "split":
       await cmdSplit(parsed);
+      break;
+    case "fork":
+      await cmdFork(parsed);
       break;
     case "revive":
       await cmdRevive(parsed);
@@ -211,6 +259,16 @@ async function main(argv: string[]) {
     case "colony":
       await cmdColony(parsed);
       break;
+    case "workspace":
+    case "ws":
+      await cmdWorkspace(parsed);
+      break;
+    case "quest":
+      await cmdQuest(parsed);
+      break;
+    case "restore":
+      await cmdRestore(parsed);
+      break;
     case "frame":
       await cmdFrame(parsed);
       break;
@@ -222,6 +280,15 @@ async function main(argv: string[]) {
       break;
     case "rename":
       await cmdRename(parsed);
+      break;
+    case "tag":
+      await cmdTag(parsed);
+      break;
+    case "own":
+      await cmdOwn(parsed);
+      break;
+    case "move":
+      await cmdMove(parsed);
       break;
     case "seal":
       await cmdSeal(parsed);
@@ -976,6 +1043,206 @@ async function cmdRename(parsed: Parsed) {
   }
 }
 
+async function cmdTag(parsed: Parsed) {
+  const target = parsed.args[0];
+  const usage =
+    "Usage: hive tag <selector> <tag>...  |  hive tag <selector> --remove <tag>...  |  hive tag <selector> --list";
+  if (!target) throw new Error(usage);
+
+  const listMode = truthy(flag(parsed, "list"));
+  const removeArgs = arrayFlag(parsed, "remove");
+  const removeMode = removeArgs.length > 0 || flag(parsed, "remove") === true;
+  // Positional tags after the selector are the add set (unless we're in
+  // list/remove mode, where positionals are ignored).
+  const addArgs = !listMode && !removeMode ? parsed.args.slice(1) : [];
+
+  if (!listMode && !removeMode && addArgs.length === 0) {
+    throw new Error("hive tag: pass tag names to add, --remove <tag>... to remove, or --list to display");
+  }
+
+  const resolved = await resolveSelector(target);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
+  const isMulti = resolved.kind !== "bee";
+
+  if (listMode) {
+    for (const record of records) {
+      const tags = Array.from(effectiveTags(record)).sort();
+      const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
+      if (isPretty()) console.log(actionLine("ok", "tag", [bold(record.name), dim(tagStr)]));
+      else console.log(`${record.name}\ttags\t${tagStr}`);
+    }
+    return;
+  }
+
+  if (removeMode) {
+    if (removeArgs.length === 0) throw new Error("hive tag --remove: pass tag names to remove");
+    let changed = 0;
+    for (const record of records) {
+      const before = record.tags ?? [];
+      const after = before.filter((tag) => !removeArgs.includes(tag));
+      if (before.length === after.length) {
+        if (!isMulti) console.error(note(`${record.name}: no matching tags to remove`));
+        continue;
+      }
+      changed += 1;
+      const now = new Date().toISOString();
+      await updateSession(record.name, { tags: after.length > 0 ? after : undefined, updatedAt: now });
+      await writeHiveTags({ ...record, tags: after.length > 0 ? after : undefined });
+      await appendLedger({ type: "tag.remove", bee: record.name, tags: removeArgs });
+      if (isPretty()) console.log(actionLine("ok", "tag", [bold(record.name), dim("removed"), removeArgs.join(", ")]));
+      else console.log(`${record.name}\ttag.remove\t${removeArgs.join(", ")}`);
+    }
+    if (isMulti) {
+      if (isPretty()) console.log(actionLine("ok", "tag", [bold(target), `removed from ${changed}/${records.length} bees`]));
+      else console.log(`tag.remove\t${target}\t${changed}/${records.length} bees`);
+    }
+    return;
+  }
+
+  // ADD mode: validate every tag (reject reserved namespaces, enforce grammar)
+  // BEFORE mutating any record, so a bad tag never half-applies.
+  for (const tag of addArgs) {
+    const rejection = rejectReservedNamespaceTag(tag);
+    if (rejection) throw new Error(`hive tag ${tag}: ${rejection}`);
+    if (!isValidTagValue(tag)) {
+      throw new Error(`Invalid tag: ${tag} (forbid whitespace/comma/tab/newline, max 64 chars)`);
+    }
+  }
+
+  let changed = 0;
+  for (const record of records) {
+    const before = record.tags ?? [];
+    const after = dedupeTags([...before, ...addArgs]);
+    if (before.length === after.length && before.every((t, i) => t === after[i])) {
+      if (!isMulti) console.error(note(`${record.name}: already has those tags`));
+      continue;
+    }
+    changed += 1;
+    const now = new Date().toISOString();
+    await updateSession(record.name, { tags: after, updatedAt: now });
+    await writeHiveTags({ ...record, tags: after });
+    await appendLedger({ type: "tag.add", bee: record.name, tags: addArgs });
+    if (isPretty()) console.log(actionLine("ok", "tag", [bold(record.name), dim("added"), addArgs.join(", ")]));
+    else console.log(`${record.name}\ttag.add\t${addArgs.join(", ")}`);
+  }
+  if (isMulti) {
+    if (isPretty()) console.log(actionLine("ok", "tag", [bold(target), `added to ${changed}/${records.length} bees`]));
+    else console.log(`tag.add\t${target}\t${changed}/${records.length} bees`);
+  }
+}
+
+// Resolve the owner selector to EXACTLY ONE bee, then point every bee resolved
+// from each beeSelector at it (reportsToId edge). Shared by cmdOwn's set path
+// and cmdMove's --owner alias (Risk 5: avoids synthesizing a fake Parsed).
+async function setOwnership(ownerSel: string, beeSelectors: string[]): Promise<void> {
+  const ownerResolved = await resolveSelector(ownerSel);
+  const ownerRecords = ownerResolved.kind === "bee" ? [ownerResolved.record] : ownerResolved.records;
+  if (ownerRecords.length === 0) throw new Error(`hive own: owner selector matched no bee: ${ownerSel}`);
+  if (ownerRecords.length > 1) {
+    throw new Error(`hive own: owner selector ${ownerSel} matched ${ownerRecords.length} bees; pick one`);
+  }
+  const owner = ownerRecords[0]!;
+  const ownerId = owner.id ?? owner.name;
+
+  let changed = 0;
+  let total = 0;
+  for (const sel of beeSelectors) {
+    const resolved = await resolveSelector(sel);
+    const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+    for (const record of records) {
+      total += 1;
+      const now = new Date().toISOString();
+      await updateSession(record.name, { reportsToId: ownerId, updatedAt: now });
+      await appendLedger({ type: "rel.set", bee: record.name, kind: "reports-to", to: ownerId });
+      changed += 1;
+      if (isPretty()) console.log(actionLine("ok", "own", [bold(record.name), dim("reports-to"), ownerId]));
+      else console.log(`${record.name}\trel.set\treports-to\t${ownerId}`);
+    }
+  }
+  if (isPretty()) console.log(actionLine("ok", "own", [bold(ownerId), `${changed}/${total} bees`]));
+  else console.log(`own\t${ownerId}\t${changed}/${total} bees`);
+}
+
+// Clear the reportsToId edge on every bee resolved from beeSel. NEVER kills a
+// bee — relationships are reference-only (§9.4 / R3).
+async function clearOwnership(beeSel: string): Promise<void> {
+  const resolved = await resolveSelector(beeSel);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${beeSel}`);
+  for (const record of records) {
+    const now = new Date().toISOString();
+    await updateSession(record.name, { reportsToId: undefined, updatedAt: now });
+    await appendLedger({ type: "rel.clear", bee: record.name, kind: "reports-to" });
+    if (isPretty()) console.log(actionLine("ok", "own", [bold(record.name), dim("cleared")]));
+    else console.log(`${record.name}\trel.clear\treports-to`);
+  }
+}
+
+// `hive own <owner-selector> <bee-selector>...` sets the owned-by/reports-to
+// edge; `hive own <bee-selector> --clear` unsets it. No @hive_tags refresh:
+// relationships have no tmux mirror in v1 (§9.4).
+async function cmdOwn(parsed: Parsed) {
+  const ownerSel = parsed.args[0];
+  const usage =
+    "Usage: hive own <owner-selector> <bee-selector>...  |  hive own <bee-selector> --clear";
+  if (!ownerSel) throw new Error(usage);
+
+  if (truthy(flag(parsed, "clear"))) {
+    if (parsed.args.length > 1) throw new Error("hive own --clear takes exactly one <bee-selector>");
+    await clearOwnership(ownerSel);
+    return;
+  }
+
+  const beeSelectors = parsed.args.slice(1);
+  if (beeSelectors.length === 0) throw new Error(usage);
+  await setOwnership(ownerSel, beeSelectors);
+}
+
+// `hive move <bee> --colony <c>` reassigns a bee's colony (the derived colony:
+// tag follows on read); `hive move <bee> --owner <o>` is an alias for hive own
+// on one bee, and `--owner ''` clears ownership.
+async function cmdMove(parsed: Parsed) {
+  const beeSel = parsed.args[0];
+  const usage =
+    "Usage: hive move <bee> --colony <c>  |  hive move <bee> --owner <o>  (--owner '' clears)";
+  if (!beeSel) throw new Error(usage);
+
+  const colonyRaw = flag(parsed, "colony");
+  const ownerRaw = flag(parsed, "owner");
+  if (colonyRaw === undefined && ownerRaw === undefined) throw new Error(usage);
+  if (colonyRaw !== undefined && ownerRaw !== undefined) {
+    throw new Error("hive move: pass either --colony or --owner, not both");
+  }
+
+  // --owner: alias for hive own on a single bee; --owner '' clears ownership.
+  if (ownerRaw !== undefined) {
+    const owner = typeof ownerRaw === "string" ? ownerRaw.trim() : "";
+    if (owner === "") {
+      await clearOwnership(beeSel);
+      return;
+    }
+    await setOwnership(owner, [beeSel]);
+    return;
+  }
+
+  // --colony: rewrite record.colony on each resolved bee (derived colony: tag
+  // follows). Refresh @hive_tags because colony: is a derived reserved tag.
+  if (colonyRaw === true) throw new Error("--colony requires a value");
+  const colony = String(colonyRaw);
+  const resolved = await resolveSelector(beeSel);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${beeSel}`);
+  for (const record of records) {
+    const now = new Date().toISOString();
+    const next = colony.trim() === "" ? undefined : colony;
+    await updateSession(record.name, { colony: next, updatedAt: now });
+    await writeHiveTags({ ...record, colony: next });
+    if (isPretty()) console.log(actionLine("ok", "move", [bold(record.name), dim("colony"), next ?? "(none)"]));
+    else console.log(`${record.name}\tmove\tcolony\t${next ?? ""}`);
+  }
+}
+
 async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: string): Promise<SessionRecord> {
   try {
     await waitForAgentReady(record, {
@@ -1127,15 +1394,44 @@ async function cmdList(parsed: Parsed) {
   const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
   const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")).replace(/^@/, "") : undefined;
   const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
+  const stateFilter = stringFlag(parsed, ["state"]);
+  const agentFilter = stringFlag(parsed, ["agent"]);
+  const repoFilter = stringFlag(parsed, ["repo"]);
+  const tagFilters = arrayFlag(parsed, "tag");
+  const jsonOut = truthy(flag(parsed, "json"));
+  const positionalSel = parsed.args[0];
   if (nodeFilter) {
     const node = await loadNode(nodeFilter);
     if (!node) throw new Error(`Unknown node: ${nodeFilter}. Register it with: hive node register ${nodeFilter} --kind ssh-tmux --endpoint user@host`);
   }
   const probe = await liveTargetsAcrossNodes(nodes, nodeFilter);
   let records = allRecords;
+  // Filed (archived) bees are hidden from the default list — a `quest done`-filed
+  // bee is no longer a working bee (PRD §16 #4). Re-include them with --archived
+  // (mirrors `workspace list --archived`), and auto-include when the user targets
+  // them explicitly with `--state archived` so that query is never empty.
+  const showArchived = truthy(flag(parsed, "archived")) || stateFilter === "archived";
+  if (!showArchived) records = records.filter((r) => r.status !== "archived");
   if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
   if (swarmFilter) records = records.filter((r) => r.swarmId === swarmFilter);
   if (nodeFilter) records = records.filter((r) => (r.node ?? LOCAL_NODE_NAME) === nodeFilter);
+  if (agentFilter) records = records.filter((r) => r.agent === agentFilter);
+  if (repoFilter) records = records.filter((r) => repoTagFor(r.cwd) === repoFilter);
+  // --tag repeats conjunctively (AND): every filter (bare user tag or ns:val)
+  // must be present in the bee's effective tag set (PRD §8.3, T4).
+  if (tagFilters.length > 0) {
+    records = records.filter((r) => {
+      const tags = effectiveTags(r);
+      return tagFilters.every((arg) => tags.has(normalizeTagArg(arg)));
+    });
+  }
+  if (positionalSel) {
+    // Let resolveSelector throw on a genuinely unknown colony/swarm, consistent
+    // with the other commands; an empty colony/swarm just filters to nothing.
+    const resolved = await resolveSelector(positionalSel);
+    const names = new Set(resolved.kind === "bee" ? [resolved.record.name] : resolved.records.map((r) => r.name));
+    records = records.filter((r) => names.has(r.name));
+  }
 
   const panes = await capturePanesFor(records, probe.liveTargets);
   const seals = await listSealedBeeNames();
@@ -1157,6 +1453,48 @@ async function cmdList(parsed: Parsed) {
     return state && state.length > 0 ? state : undefined;
   };
 
+  // --state matches the live @hive_state, the coarse hive mapping of the derived
+  // BeeState, the BeeState itself, or its display label — so `--state waiting`,
+  // `--state idle_with_output`, and `--state idle` all resolve.
+  if (stateFilter) {
+    records = records.filter((r) => {
+      const beeState = states.get(r.name)!.state;
+      return (
+        (liveHiveState(r) ?? hiveStateFor(beeState)) === stateFilter ||
+        beeState === stateFilter ||
+        stateLabel(beeState) === stateFilter
+      );
+    });
+  }
+
+  if (jsonOut) {
+    console.log(
+      JSON.stringify(
+        records.map((r) => ({
+          ref: highlightUniqueSessionReference(records, r, { start: "", end: "" }),
+          name: r.name,
+          id: r.id,
+          title: r.title,
+          agent: r.agent,
+          state: liveHiveState(r) ?? states.get(r.name)!.state,
+          beeState: states.get(r.name)!.state,
+          detail: states.get(r.name)!.detail,
+          colony: r.colony,
+          swarm: r.swarmId,
+          comb: r.combId,
+          node: r.node ?? LOCAL_NODE_NAME,
+          repo: repoTagFor(r.cwd),
+          cwd: r.cwd,
+          createdAt: r.createdAt,
+          updatedAt: r.updatedAt,
+        })),
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
   if (!isPretty()) {
     const marker = { start: "", end: "" };
     for (const record of records) {
@@ -1172,9 +1510,14 @@ async function cmdList(parsed: Parsed) {
 
   if (records.length === 0) {
     const filters = [
+      positionalSel ? positionalSel : undefined,
       colonyFilter ? `colony:${colonyFilter}` : undefined,
       swarmFilter ? `@${swarmFilter}` : undefined,
       nodeFilter ? `node:${nodeFilter}` : undefined,
+      stateFilter ? `state:${stateFilter}` : undefined,
+      agentFilter ? `agent:${agentFilter}` : undefined,
+      repoFilter ? `repo:${repoFilter}` : undefined,
+      ...tagFilters.map((t) => `tag:${t}`),
     ].filter((part): part is string => part !== undefined);
     if (filters.length > 0) console.log(dim(`No bees match ${filters.join(" ")}`));
     else console.log(dim("No bees in the hive. Spawn one with: hive spawn <bee>"));
@@ -1495,6 +1838,8 @@ function formatStateCell(state: BeeState): string {
       return `${dim("●")} ${label}`;
     case "sealed":
       return `${magenta("●")} ${magenta(label)}`;
+    case "archived":
+      return `${gray("○")} ${gray(label)}`;
     case "error":
       return `${red("●")} ${red(label)}`;
     case "kill_failed":
@@ -1542,7 +1887,11 @@ async function cmdClean(parsed: Parsed) {
 }
 
 async function cmdCleanDead(parsed: Parsed) {
-  const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
+  // A filed (archived) bee is filed, not dead — `clean` must never reap it (PRD
+  // §13); only an explicit `hive kill` deletes a filed bee. Exclude it at the
+  // source so neither the dead-sweep nor the pane-dead loop below can touch it.
+  const records = allRecords.filter((r) => r.status !== "archived");
   const probe = await liveTargetsAcrossNodes(nodes);
   // Records on an unreachable node are NOT dead — we genuinely don't know their state.
   // Treat them as live so we don't sweep their metadata while their node is down.
@@ -1768,7 +2117,11 @@ type CleanCandidate = CleanTuiItem & {
 };
 
 async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; candidates: CleanCandidate[] }> {
-  const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
+  // A filed (archived) bee derives to the "archived" terminal state but must NOT
+  // be offered as an idle/dead clean candidate (PRD §13) — exclude it up front so
+  // `clean --idle`/interactive never lists it.
+  const records = allRecords.filter((r) => r.status !== "archived");
   const probe = await liveTargetsAcrossNodes(nodes);
   // A record whose node is no longer registered was never probed; treat it as
   // unreachable (not dead) so clean paths refuse to sweep a possibly-live bee.
@@ -1940,6 +2293,8 @@ function cleanStatePriority(state: BeeState): number {
     case "idle_with_output":
       return 0;
     case "dead":
+      return 1;
+    case "archived":
       return 1;
     case "sealed":
       return 2;
@@ -2184,6 +2539,287 @@ async function cmdHere(parsed: Parsed): Promise<void> {
   else console.log(`here\t${bee.name}\t${bee.agent}\t${bee.cwd}`);
 }
 
+/**
+ * Whether the DEFAULT substrate (the implicit/aliased "local" node) is ssh-tmux.
+ *
+ * The pickers and explicit-selector verbs read the LOCAL store but, run from a
+ * `display-popup` under `ssh-tmux`, execute in the *remote* shell — so they must
+ * hard-error rather than target the wrong fleet (KEYBINDINGS_PRD §8.1/§13).
+ *
+ * The ONLY reliable runtime signal is the same one `substrateForNode` honors:
+ * the operator explicitly aliasing the local node to a remote endpoint
+ * (`hive node register local --kind ssh-tmux …`). hive running on the local box
+ * always otherwise sees `local-tmux`; there is no in-band signal that a given
+ * tmux client is itself the far end of someone else's ssh-tmux popup. We guard
+ * on the alias signal and accept that limitation (documented here per §13): a
+ * popup opened on a remote host whose local node is plain local-tmux is not
+ * detectable from inside hive and is the operator's collision call.
+ */
+function defaultSubstrateIsSshTmux(): boolean {
+  const overlay = loadNodeSync(LOCAL_NODE_NAME);
+  return overlay?.kind === "ssh-tmux";
+}
+
+function assertLocalFleetReadable(verb: string): void {
+  if (defaultSubstrateIsSshTmux()) {
+    // dim stderr + non-zero so a popup's `xargs -r` no-ops and the popup closes.
+    throw new Error(
+      `hive ${verb}: refusing to run under an ssh-tmux default substrate — ` +
+        `pickers read the LOCAL store and would target the wrong fleet (§13).`,
+    );
+  }
+}
+
+// hive spawn-picker [--frame | --flow] [--here]
+// A PURE stdout list verb: prints candidate names one-per-line and does NOTHING
+// else (no spawn/switch/store-write). The action lives in the binding (§8.2).
+async function cmdSpawnPicker(parsed: Parsed): Promise<void> {
+  assertLocalFleetReadable("spawn-picker");
+  // --here is a passthrough hint for the binding (it appends `--here` to the
+  // spawn action unconditionally); it does NOT change the printed candidate set.
+  // hasFlag (presence) not truthy(flag): `flow` is not a BOOLEAN_FLAG (it takes a
+  // value on `spawn`), so a stray `--flow <x>` would otherwise parse the value and
+  // mis-route; presence is the correct boolean intent for the picker.
+  const useFlow = hasFlag(parsed, "flow");
+  const names = useFlow
+    ? (await listFlows()).map((flow) => flow.name)
+    : (await listFrames()).map((frame) => frame.name);
+  // The selectable machine token is the first whitespace/TAB field. Frame/flow
+  // names have no spaces, so a bare name per line is the token. Empty candidate
+  // set → exit 0 with empty stdout so the binding's `xargs -r` no-ops.
+  for (const name of names) console.log(name);
+}
+
+// hive urls [<bee>] [--lines <n>] [--open] [--json]
+// Lists website URLs printed in a bee's pane. Side-effect-free unless --open.
+async function cmdUrls(parsed: Parsed): Promise<void> {
+  const selector = parsed.args[0];
+  let record: SessionRecord | undefined;
+  if (selector) {
+    // Explicit selector → grab from another bee. These read the LOCAL store, so
+    // they must hard-error under an ssh-tmux default substrate (§13).
+    assertLocalFleetReadable("urls");
+    const resolved = await resolveSelector(selector);
+    if (resolved.kind !== "bee") {
+      throw new Error(`hive urls: ${selector} selects multiple bees; pass a single bee`);
+    }
+    record = resolved.record;
+  } else {
+    if (!process.env.TMUX) throw new Error("hive urls: not inside tmux and no bee selector given");
+    record = await resolveBeeInCurrentPane();
+    if (!record) throw new Error("hive urls: no matching bee for the current pane/session");
+  }
+
+  const lines = numberFlag(parsed, ["lines"], 2000);
+  const text = await substrateFor(record).capture(record.tmuxTarget, lines, record.agentPaneId);
+  const urls = extractUrls(text);
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(urls));
+    return;
+  }
+  if (urls.length === 0) {
+    // dim stderr note so the popup closes cleanly; exit 0 (no URLs is not an error).
+    console.error(dim("no URLs"));
+    return;
+  }
+  if (truthy(flag(parsed, "open"))) {
+    await openUrl(urls[0]!);
+    return;
+  }
+  for (const url of urls) console.log(url);
+}
+
+/** Open a URL via the platform opener (open on darwin, xdg-open on linux). */
+async function openUrl(url: string): Promise<void> {
+  const opener = process.platform === "darwin" ? "open" : "xdg-open";
+  const { execFile } = await import("node:child_process");
+  await new Promise<void>((resolveOpen, rejectOpen) => {
+    execFile(opener, [url], (error) => (error ? rejectOpen(error) : resolveOpen()));
+  });
+}
+
+// hive keys print [--tmux | --wezterm] | path | check [--against-recommended]
+async function cmdKeys(parsed: Parsed): Promise<void> {
+  const sub = parsed.args[0];
+  switch (sub) {
+    case undefined:
+    case "print":
+      return keysPrint(parsed);
+    case "path":
+      return keysPath();
+    case "check":
+      return keysCheck(parsed);
+    case "doctor":
+      // OPTIONAL Phase 2 — the runtime popup-env probe. Not yet implemented.
+      throw new Error("hive keys doctor: not yet implemented (Phase 2). Use `hive keys check` for static checks.");
+    default:
+      throw new Error(`Unknown keys subcommand: ${sub}\nUsage: hive keys <print|path|check>`);
+  }
+}
+
+function keysPrint(parsed: Parsed): void {
+  // `--tmux` (default) prints the recommended tmux block VERBATIM (the same
+  // source-of-truth string written to docs/honeybee.tmux.conf). `--wezterm`
+  // prints the cmd→Meta additions.
+  if (truthy(flag(parsed, "wezterm"))) {
+    process.stdout.write(CANONICAL_WEZTERM_BLOCK);
+    return;
+  }
+  process.stdout.write(CANONICAL_TMUX_CONF);
+}
+
+/**
+ * The absolute path of the shipped docs/honeybee.tmux.conf, resolved relative to
+ * this module (which lives at dist/cli.js when packaged, src/cli.ts under tsx).
+ * Both are exactly one directory below the repo root, so `..` from the module dir
+ * reaches the root and `docs/honeybee.tmux.conf` from there is the artifact.
+ *
+ * Path-stability caveat (KEYBINDINGS_PRD §16 Q2): this resolves relative to the
+ * install location, so it is brittle across reinstall/relocation. The robust
+ * `source-file` recipe is `source-file "$(hive keys path)"`, re-evaluated by the
+ * shell; a bare paste (`hive keys print --tmux >> ~/.tmux.conf`) goes stale
+ * silently. `hive keys check` audits presence either way.
+ */
+function keybindingsConfPath(): string {
+  const moduleDir = fileURLToPath(new URL(".", import.meta.url));
+  return resolve(moduleDir, "..", "docs", "honeybee.tmux.conf");
+}
+
+function keysPath(): void {
+  console.log(keybindingsConfPath());
+}
+
+async function keysCheck(parsed: Parsed): Promise<void> {
+  // PURE READ. Reports recommended binds present/absent, flags tmux-layer
+  // collisions, and runs the static PATH/substrate checks.
+  //
+  // LIMITATION (KEYBINDINGS_PRD §6/§13): `check` reads `tmux list-keys`, so it is
+  // STRUCTURALLY BLIND to the WezTerm ALT/cmd layer in ~/.wezterm.lua — that must
+  // be eyeballed. The collision report below is necessary but not sufficient.
+  const pretty = isPretty();
+  let hardFailures = 0;
+  let warnings = 0;
+
+  // The live root-table key bindings, as a key → command map.
+  const liveBinds = await liveTmuxRootBinds();
+
+  // Per-recommended-bind: present / absent / collision (bound to something else).
+  for (const bind of RECOMMENDED_BINDS) {
+    const live = liveBinds.get(bind.key);
+    const wired = live !== undefined && live.includes(`hive ${bind.verb}`);
+    const collision = live !== undefined && !wired;
+    if (wired) {
+      if (pretty) console.log(actionLine("ok", "keys", [bold(bind.key), dim(`→ hive ${bind.verb}`), dim(bind.note)]));
+      else console.log(`bind\tpresent\t${bind.key}\t${bind.verb}`);
+    } else if (collision) {
+      warnings += 1;
+      if (pretty) console.log(actionLine("warn", "keys", [bold(bind.key), yellow("collision"), dim(truncate(live!, 50))]));
+      else console.log(`bind\tcollision\t${bind.key}\t${live!.replace(/\s+/g, " ").trim()}`);
+    } else {
+      // Absent. A delegated bind whose verb may not be shipped yet is only a
+      // note; a non-delegated recommended bind absent is also just informational
+      // (the operator may not have pasted the block) — not a hard failure.
+      if (pretty) console.log(actionLine("info", "keys", [bold(bind.key), dim("absent"), dim(bind.delegated ? "(delegated)" : "")]));
+      else console.log(`bind\tabsent\t${bind.key}\t${bind.delegated ? "delegated" : ""}`);
+    }
+  }
+
+  // --against-recommended: report live binds on our recommended keys that differ
+  // from the shipped set (drift after a stale paste + hive upgrade).
+  if (truthy(flag(parsed, "against-recommended"))) {
+    for (const bind of RECOMMENDED_BINDS) {
+      const live = liveBinds.get(bind.key);
+      if (live !== undefined && !live.includes(`hive ${bind.verb}`)) {
+        if (pretty) console.log(actionLine("warn", "drift", [bold(bind.key), dim(truncate(live, 60))]));
+        else console.log(`drift\t${bind.key}\t${live.replace(/\s+/g, " ").trim()}`);
+        warnings += 1;
+      }
+    }
+  }
+
+  // Static checks: fzf, a browser opener, the substrate, and `hive` reachability.
+  const fzf = await binaryOnPath("fzf");
+  reportCheck(pretty, fzf, "fzf on PATH", "fzf missing — popups can't filter candidates");
+  if (!fzf) warnings += 1;
+
+  const opener = process.platform === "darwin" ? "open" : "xdg-open";
+  const openerOk = await binaryOnPath(opener);
+  reportCheck(pretty, openerOk, `${opener} on PATH`, `${opener} missing — \`hive urls\` --open / the M-u binding can't open a browser`);
+  if (!openerOk) warnings += 1;
+
+  // Substrate: warn under ssh-tmux (the pickers/affordances target the wrong fleet, §13).
+  const ssh = defaultSubstrateIsSshTmux();
+  if (ssh) {
+    warnings += 1;
+    if (pretty) console.log(actionLine("warn", "check", [yellow("substrate is ssh-tmux"), dim("pickers/affordances read the LOCAL store (§13)")]));
+    else console.log(`check\tsubstrate\tssh-tmux`);
+  } else {
+    if (pretty) console.log(actionLine("ok", "check", [dim("substrate is local-tmux")]));
+    else console.log(`check\tsubstrate\tlocal-tmux`);
+  }
+
+  // `hive` itself reachable (recommended verbs are unreachable otherwise → HARD fail).
+  const hiveOk = await binaryOnPath("hive");
+  if (!hiveOk) {
+    hardFailures += 1;
+    if (pretty) console.log(actionLine("err", "check", [red("hive not on PATH"), dim("bindings invoke `hive` inside popups — they will all fail")]));
+    else console.log(`check\thive\tunreachable`);
+  } else {
+    if (pretty) console.log(actionLine("ok", "check", [dim("hive on PATH")]));
+    else console.log(`check\thive\treachable`);
+  }
+
+  // The list-keys blind-spot, surfaced every run so it is never forgotten.
+  if (pretty) console.log(note("check covers the tmux layer only; the WezTerm ALT/cmd layer (~/.wezterm.lua) is list-keys-invisible and must be eyeballed (§6)."));
+  else console.log(`check\tlimitation\twezterm-alt-cmd-layer-not-checked`);
+
+  if (hardFailures > 0) process.exitCode = 1;
+  else if (warnings > 0 && pretty) console.log(dim(`${warnings} warning(s) — see above`));
+}
+
+/** Live root-table (no-prefix) bindings: tmux key spec → bound command string. */
+async function liveTmuxRootBinds(): Promise<Map<string, string>> {
+  const binds = new Map<string, string>();
+  // `-T root` is the no-prefix table where `bind -n` binds land.
+  const result = await tmux(["list-keys", "-T", "root"], { reject: false });
+  if (!result.ok) return binds;
+  for (const line of result.stdout.split("\n")) {
+    // Format: `bind-key -T root M-b <command...>`. Find the table+key, take the rest.
+    const match = line.match(/^bind-key\s+(?:-r\s+)?-T\s+root\s+(\S+)\s+(.*)$/);
+    if (!match) continue;
+    const key = match[1]!;
+    const command = match[2]!.trim();
+    binds.set(key, command);
+  }
+  return binds;
+}
+
+function reportCheck(pretty: boolean, ok: boolean, label: string, failHint: string): void {
+  if (ok) {
+    if (pretty) console.log(actionLine("ok", "check", [dim(label)]));
+    else console.log(`check\tok\t${label}`);
+  } else {
+    if (pretty) console.log(actionLine("warn", "check", [yellow(label), dim(failHint)]));
+    else console.log(`check\twarn\t${label}`);
+  }
+}
+
+/** Whether `name` resolves on PATH (via the platform `which`/`command -v`). */
+async function binaryOnPath(name: string): Promise<boolean> {
+  const { execFile } = await import("node:child_process");
+  return new Promise<boolean>((resolveCheck) => {
+    const probe = process.platform === "win32" ? "where" : "command";
+    const args = process.platform === "win32" ? [name] : ["-v", name];
+    // `command -v` needs a shell; `which` is also fine but less portable.
+    if (process.platform === "win32") {
+      execFile(probe, args, (error) => resolveCheck(!error));
+    } else {
+      execFile("sh", ["-c", `command -v ${JSON.stringify(name)}`], (error) => resolveCheck(!error));
+    }
+  });
+}
+
 async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
   // hive split [<bee>] [<agent>] [--brief <text>] [--dir v|h|window] [--cwd <dir>] [--home <h>]
   // No <bee> (or --here) → split the current bee's comb (via hive here resolution).
@@ -2282,6 +2918,264 @@ async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
   return record;
 }
 
+const FORK_SEED_MODES = new Set<SeedMode>(["resume", "seal", "summary", "log", "none"]);
+
+/**
+ * Account-safety gate for `hive fork` (fork-and-pane §7.1, the crux). Two live
+ * processes must never share one account: Anthropic rotates OAuth refresh
+ * tokens per-account, so two live bees on one account (even in separate homes)
+ * log each other out. Returns the account (if any) the fork should use — for an
+ * account-bound parent the fork's account is NEVER === source.accountId (which
+ * also guarantees its defaultHomeForAccount home differs from the parent's).
+ */
+async function resolveForkAccountSafety(
+  parsed: Parsed,
+  source: SessionRecord,
+  context: { targetTool: string; requestedSeed?: SeedMode },
+): Promise<{ account?: AccountRecord }> {
+  const accountQuery = stringFlag(parsed, ["account"]);
+  const wantsResume = context.requestedSeed === "resume";
+
+  if (accountQuery) {
+    const account = await resolveAccountFlag(accountQuery, context.targetTool, ttlFlagMs(parsed));
+    // The fork's account must DIFFER from a live account-bound parent's. The
+    // OAuth refresh token rotates per-ACCOUNT (not per-home), so two live bees
+    // on one account log each other out even in separate homes — and when the
+    // account's home IS the parent's (the common `defaultHomeForAccount`
+    // layout), this also reuses the parent's exact live home. `--account auto`
+    // can silently land on the parent's own account, so this guard covers it too.
+    if (source.accountId && account.id === source.accountId) {
+      throw new Error(
+        `fork would run on ${source.name}'s own account (${account.id}); two live bees on one ` +
+          `account rotate the shared OAuth chain and log each other out. Pass a different ` +
+          `--account (fork-and-pane §7.1).`,
+      );
+    }
+    // The (different) account brings its own dedicated home
+    // (defaultHomeForAccount), so the fork never touches the parent's home.
+    // Native resume needs the parent's provider session, which lives in the
+    // parent's home — a different account/home can't see it.
+    if (wantsResume) {
+      throw new Error(
+        `--seed resume needs ${source.name}'s home to see its provider session; ` +
+          `account ${account.id} has its own home — fork with a seal instead`,
+      );
+    }
+    return { account };
+  }
+
+  if (source.accountId) {
+    // Account-bound parent with no --account: refuse. A fork must get its own
+    // account/home; sharing the parent's live home rotates the OAuth chain and
+    // logs both bees out.
+    throw new Error(
+      `${source.name} is account-bound (${source.accountId}); a fork must get its own account — ` +
+        `pass --account <a> (or --account auto). Sharing a live home rotates the OAuth chain and ` +
+        `logs both bees out (fork-and-pane §7.1).`,
+    );
+  }
+
+  // Default-home parent (no accountId): allow a plain spawn (own fresh tmux
+  // session in the default home — same risk profile as a second default bee).
+  if (wantsResume) {
+    console.error(
+      note(
+        `warn: --seed resume reuses ${source.name}'s provider session in a shared home; ` +
+          `the two processes may fight over the OAuth chain. Prefer --seed seal, or --account.`,
+      ),
+    );
+  }
+  return {};
+}
+
+/**
+ * hive fork <bee> [checkpoint]
+ *   [--agent <kind>] [--model <m>] [--node <n>] [--cwd <dir>]
+ *   [--seed resume|seal|summary|log|none] [--read-log]
+ *   [--name <n>] [--account <a>] [--here] [--print]
+ *
+ * Branch an existing bee into a FRESH comb (its own session) seeded from the
+ * source's state. fork-and-pane Phase C: layered seeding (resume → seal →
+ * summary(deferred) → log → refuse), cross-harness forcing non-resume, account
+ * safety, and anti-cross-match. See docs/fork-and-pane.md §7.1.
+ */
+async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
+  const selector = parsed.args[0];
+  if (!selector) {
+    throw new Error(
+      "Usage: hive fork <bee> [checkpoint] [--agent <kind>] [--model <m>] [--node <n>] " +
+        "[--cwd <dir>] [--seed resume|seal|summary|log|none] [--read-log] [--name <n>] [--account <a>] [--here] [--print]",
+    );
+  }
+
+  // 1. Resolve source (single bee only — never fork a set).
+  const resolved = await resolveSelector(selector);
+  if (resolved.kind !== "bee") {
+    throw new Error(`hive fork: ${selector} matched multiple bees; pick one`);
+  }
+  const source = resolved.record;
+
+  // 2. Resolve the checkpoint seal.
+  const checkpointArg = parsed.args[1];
+  const seal = await resolveForkCheckpoint(source.name, checkpointArg);
+
+  // 3. Resolve fork agent / model / node / cwd.
+  const requestedAgent = stringFlag(parsed, ["agent"]) ?? source.requestedAgent ?? source.agent;
+  const targetTool = canonicalAgentKind(requestedAgent);
+  const sourceTool = canonicalAgentKind(source.agent);
+  const model = stringFlag(parsed, ["model"]);
+  const cwd = hasFlag(parsed, "cwd") ? await resolveSpawnCwd(parsed) : source.cwd;
+
+  // 4. Validate the --seed value (if any).
+  const seedFlag = stringFlag(parsed, ["seed"]);
+  if (seedFlag !== undefined && !FORK_SEED_MODES.has(seedFlag as SeedMode)) {
+    throw new Error(`hive fork: invalid --seed ${seedFlag} (use resume|seal|summary|log|none)`);
+  }
+  const requestedSeed = seedFlag as SeedMode | undefined;
+  const readLog = truthy(flag(parsed, "read-log"));
+
+  // 5. Account safety (the crux). Yields the account whose dedicated home the
+  //    fork will use; for a default-home parent it returns no account.
+  const { account } = await resolveForkAccountSafety(parsed, source, { targetTool, requestedSeed });
+
+  // 6. Pick the seed mode (pure decision).
+  const seedInput: ForkSeedInput = {
+    source,
+    seal,
+    requestedSeed,
+    readLog,
+    targetTool,
+    sourceTool,
+    forkName: source.name,
+  };
+  const decision = pickForkSeed(seedInput);
+  if (decision.mode === "refuse") throw new Error(`hive fork: ${decision.reason}`);
+
+  // 7. Build the spawn spec and create the new comb. Resume args are baked into
+  //    the spawn command (§7.1); seal/log/none seed via a brief after spawn.
+  const modelArgs = modelArgsFor(targetTool, model);
+  const resumeArgsList = decision.mode === "resume" ? decision.resumeArgs : [];
+  const extraArgs = [...resumeArgsList, ...modelArgs, ...parsed.rest];
+
+  const yolo = dangerousMode(parsed, targetTool, requestedAgent);
+  const node = await resolveSpawnNode(parsed, targetTool);
+  const isRemote = node.kind === "ssh-tmux";
+  if (account && isRemote) throw new Error("--account forks are local-only (the vault never leaves this machine)");
+
+  // The account brings its own dedicated home; otherwise the fork boots in the
+  // default home (never the parent's exact home for an account-bound parent —
+  // resolveForkAccountSafety already enforced that).
+  const home = account ? defaultHomeForAccount(account) : undefined;
+  const spec = resolveAgent(requestedAgent, extraArgs, { home, yolo, identity: Boolean(account) });
+  if (account) {
+    if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
+    await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+  }
+  if (!isRemote) await assertExecutableAvailable(spec.command);
+
+  const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
+  const name = safeName(stringFlag(parsed, ["name"]) ?? identity.id);
+  const tmuxTarget = safeTmuxTarget(name);
+  const nodeName = node.name;
+  const substrate = node.name !== LOCAL_NODE_NAME ? substrateForRecord(node) : localSubstrate();
+  const locationHint = isRemote ? ` on ${node.name}` : "";
+  if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
+
+  const { paneId } = await substrate.newSession(tmuxTarget, cwd, { command: spec.command, args: spec.args, env: spec.env });
+  const command = shellCommand(spec);
+
+  // 8. Build the record with fork lineage + anti-cross-match fields.
+  //    ANTI-CROSS-MATCH (§7.1): lastPromptAt set at creation, and NO inherited
+  //    providerSessionId / transcriptPath — the fork is a new session with no
+  //    transcript of its own yet, so the daemon's scorer can never assign the
+  //    parent's transcript to the fork.
+  const now = new Date().toISOString();
+  const record: SessionRecord = {
+    name,
+    agent: spec.kind,
+    cwd,
+    command,
+    tmuxTarget,
+    ...(paneId ? { agentPaneId: paneId } : {}),
+    combId: tmuxTarget, // fork is its own comb (new session)
+    forkedFromId: source.id ?? source.name,
+    forkedAt: now,
+    seedMode: decision.mode,
+    forkCheckpoint: decision.checkpoint,
+    ...(model ? { model } : {}),
+    createdAt: now,
+    updatedAt: now,
+    lastPromptAt: now, // anti-cross-match anchor
+    status: "running",
+    id: identity.id,
+    prefix: identity.prefix,
+    uuid: identity.uuid,
+    requestedAgent: spec.requestedKind,
+    homePath: spec.homePath,
+    ...(account ? { accountId: account.id } : {}),
+    ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+    ...(source.colony ? { colony: source.colony } : {}),
+  };
+  await saveSession(record);
+  await writeSpawnOptions(record);
+
+  // 9. Ledger.
+  await appendLedger({
+    type: "fork.create",
+    name,
+    forkedFromId: record.forkedFromId,
+    seedMode: record.seedMode,
+    forkCheckpoint: record.forkCheckpoint,
+    ...(model ? { model } : {}),
+    ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+  });
+
+  // Print the success line. The trailing `command` field on the tab form makes
+  // the resume-args / model-args assertion trivial in the non-TTY test harness.
+  if (isPretty()) {
+    console.log(actionLine("ok", "fork", [bold(name), spec.kind, dim(`from ${source.name}`), dim(decision.mode)]));
+  } else {
+    console.log(`fork\t${name}\t${spec.kind}\t${source.name}\t${decision.mode}\t${record.command}`);
+  }
+
+  // 10. Seed: resume/none carry the seed in the spawn command (or boot cold);
+  //     seal/log deliver a brief once ready.
+  let finalRecord = record;
+  if (decision.mode === "seal" || decision.mode === "log") {
+    finalRecord = await deliverBrief(parsed, record, decision.brief);
+  } else {
+    await confirmSpawnReady(parsed, record);
+  }
+
+  // 11. --print / --here behave like spawn's interactive affordances.
+  if (truthy(flag(parsed, "print"))) {
+    if (isPretty()) console.error(note("attach with:"));
+    console.log(formatShellCommand(substrate.attachCommand(record.tmuxTarget)));
+  }
+  await maybeLinkHere(parsed, [finalRecord]);
+  return finalRecord;
+}
+
+/**
+ * Resolve the fork's checkpoint seal: absent/`latest` → the latest seal;
+ * `seal:<ISO>` → that specific seal; `msg:N` → deferred.
+ */
+async function resolveForkCheckpoint(beeName: string, checkpointArg: string | undefined): Promise<import("./seal.js").SealRecord | null> {
+  if (!checkpointArg || checkpointArg === "latest") return loadLatestSeal(beeName);
+  if (checkpointArg.startsWith("msg:")) {
+    throw new Error("hive fork: message-offset checkpoints are deferred (§9/§11); use a seal");
+  }
+  if (checkpointArg.startsWith("seal:")) {
+    const wanted = checkpointArg.slice("seal:".length);
+    const normalized = wanted.replace(/[:.]/g, "-");
+    const seals = await listSeals(beeName);
+    const match = seals.find((s) => s.sealedAt === wanted || s.sealedAt.replace(/[:.]/g, "-") === normalized);
+    if (!match) throw new Error(`hive fork: no seal ${wanted} for ${beeName}`);
+    return match;
+  }
+  throw new Error(`hive fork: unrecognized checkpoint "${checkpointArg}" (use latest or seal:<ISO>)`);
+}
+
 /**
  * hive revive <bee> [--all] [--fresh]
  *
@@ -2332,27 +3226,27 @@ async function cmdRevive(parsed: Parsed): Promise<void> {
   await reviveOne(record, parsed);
 }
 
-/** Relaunch one dead bee and resume (or, with --fresh, start anew) its session. */
-async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<SessionRecord> {
+/**
+ * Pure relaunch core: re-create a bee's tmux session in its OWN cwd/home and
+ * resume (or, with `fresh`, start anew) its provider session. No `parsed`, no
+ * console output — it does only the resolveAgent/newSession/updateSession/
+ * appendLedger work and returns the updated record. It does NOT guard liveness
+ * (the caller does, so `restore` can decide per-bee whether to skip a live one).
+ *
+ * ACCOUNT SAFETY: this re-spawns into `record.homePath` with NO account switch
+ * (no activateAccountIntoHome) — the same home whose creds are already there, so
+ * there is no cross-account OAuth-logout hazard. `reviveOne`/`restore` both rely
+ * on this invariant.
+ */
+async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessionOverride?: string }): Promise<SessionRecord> {
   const substrate = substrateFor(record);
-  if (await substrate.hasSession(record.tmuxTarget)) {
-    throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
-  }
   const tool = canonicalAgentKind(record.agent).toLowerCase();
-  const fresh = truthy(flag(parsed, "fresh"));
-  // --session <id> resumes (and persists) a specific provider session — used to
+  const fresh = opts.fresh;
+  // sessionOverride resumes (and persists) a specific provider session — used to
   // recover bees whose providerSessionId was never recorded but whose session
   // still exists on disk (claude/codex keep sessions keyed by project dir).
-  const sessionOverride = stringFlag(parsed, ["session"]);
+  const sessionOverride = opts.sessionOverride;
   const providerSessionId = fresh ? undefined : (sessionOverride ?? record.providerSessionId);
-  if (!fresh && !providerSessionId) {
-    console.error(
-      note(
-        `${record.name}: no recorded provider session id — resuming the most recent ${tool} session in its home, ` +
-          `which may belong to a sibling bee if the home is shared. Pass --session <id> to target a specific one, or --fresh to start anew.`,
-      ),
-    );
-  }
 
   // Mirror the swap relaunch: rebuild the agent command from the configured
   // kind (preserving the original permission mode) and append the resume args.
@@ -2386,6 +3280,32 @@ async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<Session
     agentPaneId: paneId,
     fresh,
   });
+  return updated;
+}
+
+/** Relaunch one dead bee and resume (or, with --fresh, start anew) its session. */
+async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<SessionRecord> {
+  const substrate = substrateFor(record);
+  if (await substrate.hasSession(record.tmuxTarget)) {
+    throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
+  }
+  const tool = canonicalAgentKind(record.agent).toLowerCase();
+  const fresh = truthy(flag(parsed, "fresh"));
+  // --session <id> resumes (and persists) a specific provider session — used to
+  // recover bees whose providerSessionId was never recorded but whose session
+  // still exists on disk (claude/codex keep sessions keyed by project dir).
+  const sessionOverride = stringFlag(parsed, ["session"]);
+  const providerSessionId = fresh ? undefined : (sessionOverride ?? record.providerSessionId);
+  if (!fresh && !providerSessionId) {
+    console.error(
+      note(
+        `${record.name}: no recorded provider session id — resuming the most recent ${tool} session in its home, ` +
+          `which may belong to a sibling bee if the home is shared. Pass --session <id> to target a specific one, or --fresh to start anew.`,
+      ),
+    );
+  }
+
+  const updated = await reviveRecord(record, { fresh, sessionOverride });
 
   const how = providerSessionId ? `resumed ${providerSessionId}` : fresh ? "fresh session" : "resumed latest";
   if (isPretty()) console.log(actionLine("ok", "revive", [bold(record.name), record.agent, dim(how)]));
@@ -2925,6 +3845,1336 @@ async function cascadeColonyRename(from: string, to: string): Promise<void> {
     if (swarm.colony !== from) continue;
     await saveSwarm({ ...swarm, colony: to });
   }
+}
+
+async function cmdWorkspace(parsed: Parsed) {
+  const sub = parsed.args[0];
+  switch (sub) {
+    case undefined:
+    case "list":
+    case "ls":
+      return workspaceList(parsed);
+    case "open":
+      return workspaceOpen(parsed);
+    case "add":
+      return workspaceAdd(parsed);
+    case "add-pane":
+      return workspaceAddPane(parsed);
+    case "snapshot":
+      return workspaceSnapshot(parsed);
+    case "restore":
+      return workspaceRestore(parsed);
+    case "close":
+      return workspaceClose(parsed);
+    case "rename":
+      return workspaceRename(parsed);
+    case "here":
+      return workspaceHere(parsed);
+    case "archive":
+      return workspaceArchive(parsed);
+    default:
+      throw new Error(`Unknown workspace subcommand: ${sub}\nUsage: hive workspace <open|list|add|add-pane|snapshot|restore|close|rename|here|archive>`);
+  }
+}
+
+/**
+ * Resolve the current pane's OWNING workspace bare name (KEYBINDINGS_PRD §9.1 /
+ * §10 — unblocks the M-R binding). If $TMUX's session is a ws-* session, print
+ * its bare workspace name; else resolve the current bee → its workspaceId.
+ * Errors to stderr + non-zero if not inside tmux or no owning workspace.
+ */
+async function workspaceHere(_parsed: Parsed): Promise<void> {
+  if (!process.env.TMUX) throw new Error("hive workspace here: not inside tmux");
+  const sessionName = await currentTmuxSessionName();
+  if (sessionName && sessionName.startsWith(WORKSPACE_PREFIX)) {
+    const bare = sessionName.slice(WORKSPACE_PREFIX.length);
+    // A grouped ws-* client carries a `-N` suffix (ws-fe-2). Disambiguate against
+    // a workspace literally named `fe-2`: if a record with the exact bare name
+    // exists, that is it; otherwise strip a trailing `-<digits>` grouping suffix
+    // and re-check, so the M-R rename chord resolves `fe` from a `ws-fe-2` client.
+    if (await loadWorkspace(bare)) {
+      console.log(bare);
+      return;
+    }
+    const ungrouped = bare.replace(/-\d+$/, "");
+    if (ungrouped !== bare && (await loadWorkspace(ungrouped))) {
+      console.log(ungrouped);
+      return;
+    }
+    // No record either way (an ad-hoc ws- session with no record): the bare
+    // prefix-stripped name is the best we can do and round-trips when un-grouped.
+    console.log(bare);
+    return;
+  }
+  const bee = await resolveBeeInCurrentPane();
+  if (!bee || !bee.workspaceId) {
+    throw new Error("hive workspace here: the current pane has no owning workspace");
+  }
+  console.log(bee.workspaceId);
+}
+
+/**
+ * Resolve the workspace record for `name`, falling back to a same-named colony's
+ * auto-workspace. Returns null when neither exists.
+ */
+async function resolveWorkspaceRecord(name: string): Promise<WorkspaceRecord | null> {
+  const direct = await loadWorkspace(name);
+  if (direct) return direct;
+  // Fall back to a colony of the same name whose auto-workspace wasn't
+  // provisioned yet (or was created before this feature) — create it lazily.
+  const colony = await loadColony(name);
+  if (!colony) return null;
+  try {
+    return await createWorkspace({ name, rootDir: colony.rootDir ?? "", members: [], colony: name });
+  } catch {
+    // A concurrent create won the race; re-read.
+    return loadWorkspace(name);
+  }
+}
+
+/**
+ * Resolve-or-create the workspace record for `name`. A bare `open <name>` for a
+ * name that is neither a workspace nor a colony creates a stand-alone ad-hoc
+ * workspace (the PRD allows these alongside colony auto-workspaces).
+ */
+async function ensureWorkspaceRecord(name: string): Promise<WorkspaceRecord> {
+  const resolved = await resolveWorkspaceRecord(name);
+  if (resolved) return resolved;
+  try {
+    return await createWorkspace({ name, rootDir: "", members: [] });
+  } catch {
+    const reread = await loadWorkspace(name);
+    if (reread) return reread;
+    throw new Error(`Could not create workspace: ${name}`);
+  }
+}
+
+/** Resolve a workspace's file root: --root › record.rootDir › colony.rootDir › cwd. */
+async function resolveWorkspaceRoot(rootFlag: string | undefined, record: WorkspaceRecord): Promise<string> {
+  if (rootFlag) return realpath(resolve(rootFlag.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"))).catch(() => resolve(rootFlag));
+  if (record.rootDir && record.rootDir.length > 0) return record.rootDir;
+  if (record.colony) {
+    const colony = await loadColony(record.colony);
+    if (colony?.rootDir) return colony.rootDir;
+  }
+  return process.cwd();
+}
+
+async function workspaceList(parsed: Parsed) {
+  const colonyFilter = stringFlag(parsed, ["colony"]);
+  const showArchived = truthy(flag(parsed, "archived"));
+  let workspaces = await listWorkspaces();
+  if (!showArchived) workspaces = workspaces.filter((w) => !w.archived);
+  if (colonyFilter) workspaces = workspaces.filter((w) => w.colony === colonyFilter);
+
+  if (!isPretty()) {
+    for (const w of workspaces) {
+      console.log(`${w.archived ? "archived" : "active"}\t${w.name}\t${w.rootDir}\t${w.colony ?? ""}\t${w.members.length}`);
+    }
+    return;
+  }
+  if (workspaces.length === 0) {
+    console.log(dim("No workspaces. Create one with: hive workspace open <name> --root <dir>"));
+    return;
+  }
+  console.log(formatTable(
+    [
+      { header: "STATUS" },
+      { header: "NAME" },
+      { header: "ROOT" },
+      { header: "COLONY" },
+      { header: "MEMBERS", align: "right" },
+      { header: "AGE", align: "right" },
+    ],
+    workspaces.map((w) => [
+      w.archived ? gray("archived") : green("active"),
+      bold(w.name),
+      dim(w.rootDir ? tildify(w.rootDir) : "(unset)"),
+      dim(w.colony ?? ""),
+      String(w.members.length),
+      dim(formatRelativeTime(w.createdAt)),
+    ]),
+  ));
+}
+
+/** Active window ids per local tmux session, for de-dupe on add/open. */
+async function workspaceWindowsOf(session: string): Promise<string[]> {
+  const inventory = await windowInventory();
+  return inventory.windows.get(session) ?? [];
+}
+
+async function workspaceOpen(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace open <name|colony> [--root <dir>] [--new-client] [--print]");
+  // open create-or-reuses: a colony's auto-workspace, an existing record, or a
+  // fresh stand-alone workspace for an unknown name.
+  const record = await ensureWorkspaceRecord(name);
+
+  const rootDir = await resolveWorkspaceRoot(stringFlag(parsed, ["root"]), record);
+  // Persist the resolved root on first open (when it was empty or --root given).
+  if (record.rootDir !== rootDir) {
+    await updateWorkspace(record.name, { rootDir });
+  }
+
+  const session = workspaceSessionName(record.name);
+  const ensured = await ensureLinkSession(session);
+  // Workspaces persist across terminal close — unlike views, never auto-destroyed.
+  await setWorkspaceOptions(session);
+  // The placeholder shell is the workspace's own window — mark it so `close`
+  // may kill-window it (it survives as the anchor of an empty/pane-only ws).
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+
+  // Materialize bee members: resolve each bee's live session, link its window in.
+  const records = await listSessions();
+  const byId = new Map(records.map((r) => [r.id ?? r.name, r] as const));
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const beeTargets: string[] = [];
+  for (const member of record.members) {
+    if (member.kind !== "bee") continue;
+    const bee = byId.get(member.beeId) ?? records.find((r) => r.name === member.beeId);
+    if (!bee) continue;
+    if (bee.node && bee.node !== LOCAL_NODE_NAME) continue;
+    if (!liveNames.has(bee.tmuxTarget)) continue;
+    beeTargets.push(bee.tmuxTarget);
+    // Converge with `add`: a member bee must carry workspaceId so ws:<name>
+    // (derived from bee.workspaceId) and record.members never disagree.
+    if (bee.workspaceId !== record.name) {
+      await updateSession(bee.name, { workspaceId: record.name });
+      await writeHiveTags({ ...bee, workspaceId: record.name });
+    }
+  }
+  const linkResult = await linkTargetsInto(session, beeTargets, ensured);
+
+  // Materialize pane members: a window at rootDir running the member's command
+  // (or a shell). Only when the session was freshly created this call — a
+  // re-open of a live session keeps its existing panes (native persistence).
+  if (ensured.created) {
+    for (const member of record.members) {
+      if (member.kind !== "pane") continue;
+      await openWorkspacePane(session, rootDir, member.command);
+    }
+    // If we created bee links, the placeholder is already gone; otherwise it
+    // remains as the single (shell) window — which is fine for an empty/pane-only
+    // workspace.
+  }
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "workspace", [bold(session), dim(`root ${tildify(rootDir)}`), `${linkResult.linked.length} bee(s) linked`]));
+  } else {
+    console.log(`workspace\t${session}\t${rootDir}\t${linkResult.linked.length}`);
+  }
+
+  let enterTarget = session;
+  if (truthy(flag(parsed, "new-client"))) {
+    enterTarget = await createGroupedSession(session);
+    if (isPretty()) console.error(note(`grouped session ${enterTarget} — independent focus on the same windows`));
+  }
+
+  const substrate = localSubstrate();
+  if (truthy(flag(parsed, "print")) || !process.stdout.isTTY) {
+    if (isPretty()) console.error(note("enter with:"));
+    console.log(formatShellCommand(substrate.attachCommand(enterTarget)));
+    return;
+  }
+  await substrate.attachSession(enterTarget);
+}
+
+/**
+ * Make a workspace session persist across terminal close (PRD §6/§7.2): never
+ * auto-destroyed when the last client detaches, and clients survive a window
+ * close. tmux's `set-option` does NOT accept the `=name` exact-match prefix
+ * (unlike has-session/kill-session/window targets), so the session is targeted
+ * by its bare exact name (freshly created, no prefix-collision risk).
+ */
+async function setWorkspaceOptions(session: string): Promise<void> {
+  await tmux(["set-option", "-t", session, "destroy-unattached", "off"], { reject: false });
+  await tmux(["set-option", "-t", session, "detach-on-destroy", "off"], { reject: false });
+}
+
+/** Open a window at `rootDir` running `command` (or the user's shell). */
+const WS_OWN_OPTION = "@hive_ws_own";
+
+// Mark a window the workspace itself created (the placeholder shell or an
+// add-pane shell) so `close` may kill-window it. A linked BEE window is NEVER
+// marked, so close can only ever safe-unlink (no -k) those — which is what makes
+// closing a workspace provably incapable of killing a bee, even one orphaned by
+// a prior `hive kill` (home session gone, window still linked here).
+async function markWorkspaceOwnWindow(session: string, windowId: string): Promise<void> {
+  if (!windowId) return;
+  await tmux(["set-option", "-w", "-t", `${session}:${windowId}`, WS_OWN_OPTION, "1"], { reject: false });
+}
+
+async function openWorkspacePane(session: string, rootDir: string, command?: string): Promise<void> {
+  const args = ["new-window", "-d", "-P", "-F", "#{window_id}", "-t", `=${session}:`, "-c", rootDir];
+  if (command && command.length > 0) args.push(command);
+  const result = await tmux(args, { reject: false });
+  await markWorkspaceOwnWindow(session, result.stdout.trim());
+}
+
+async function workspaceAdd(parsed: Parsed) {
+  const name = parsed.args[1];
+  const sel = parsed.args[2];
+  if (!name || !sel) throw new Error("Usage: hive workspace add <name> <bee-selector>");
+  const record = await ensureWorkspaceRecord(name);
+
+  const session = workspaceSessionName(record.name);
+  // Ensure the session exists so `add` works standalone (without a prior open).
+  const ensured = await ensureLinkSession(session);
+  if (ensured.created) {
+    await setWorkspaceOptions(session);
+  }
+
+  const resolved = await resolveSelector(sel);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`No bees match selector: ${sel}`);
+
+  const local = records.filter((r) => !r.node || r.node === LOCAL_NODE_NAME);
+  if (local.length < records.length) {
+    console.error(note(`skip ${records.length - local.length} remote bee(s) — link-window cannot cross tmux servers`));
+  }
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const live = local.filter((r) => liveNames.has(r.tmuxTarget));
+  if (live.length < local.length) console.error(note(`skip ${local.length - live.length} dead bee(s)`));
+  if (live.length === 0) throw new Error(`No live local bees match selector: ${sel}`);
+
+  const members: WorkspaceMember[] = [...record.members];
+  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const inventory = await windowInventory();
+  let linkedCount = 0;
+  for (const bee of live) {
+    const windowId = inventory.active.get(bee.tmuxTarget);
+    if (!windowId) continue;
+    const currentWindows = await workspaceWindowsOf(session);
+    const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
+    linkedCount += linked;
+    const beeId = bee.id ?? bee.name;
+    if (!memberIds.has(beeId)) {
+      members.push({ kind: "bee", beeId });
+      memberIds.add(beeId);
+    }
+    // Stamp workspaceId on the live bee so the derived ws: tag refreshes
+    // (cmdMove colony pattern).
+    const now = new Date().toISOString();
+    await updateSession(bee.name, { workspaceId: record.name, updatedAt: now });
+    await writeHiveTags({ ...bee, workspaceId: record.name });
+  }
+  await updateWorkspace(record.name, { members });
+
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), `${linkedCount} bee(s) linked`]));
+  else console.log(`workspace-add\t${session}\t${linkedCount}`);
+}
+
+async function workspaceAddPane(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace add-pane <name> [--cmd \"...\"] [--name <label>]");
+  const record = await ensureWorkspaceRecord(name);
+
+  const command = stringFlag(parsed, ["cmd"]);
+  const label = stringFlag(parsed, ["name"]) ?? "pane";
+
+  const session = workspaceSessionName(record.name);
+  const ensured = await ensureLinkSession(session);
+  if (ensured.created) {
+    await setWorkspaceOptions(session);
+  }
+  const rootDir = await resolveWorkspaceRoot(stringFlag(parsed, ["root"]), record);
+  await openWorkspacePane(session, rootDir, command);
+
+  const members: WorkspaceMember[] = [...record.members, { kind: "pane", name: label, ...(command ? { command } : {}) }];
+  await updateWorkspace(record.name, { members });
+
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), dim(`pane ${label}`), command ? dim(command) : dim("shell")]));
+  else console.log(`workspace-add-pane\t${session}\t${label}`);
+}
+
+/**
+ * `hive workspace snapshot <name>` — refresh the record's geometry from the live
+ * `ws-<name>` session so `restore` can rebuild it after a reboot (PRD §7.2/§11).
+ * Captures each window's tmux `window_layout` string keyed by `window_name`.
+ */
+async function workspaceSnapshot(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace snapshot <name>");
+  const record = await ensureWorkspaceRecord(name);
+  const session = workspaceSessionName(record.name);
+  if (!(await hasSession(session))) throw new Error(`No such workspace session: ${session}`);
+
+  // Capture per-window geometry. Tab-separate name from layout (layout strings
+  // never contain a tab); skip blank rows defensively.
+  const result = await tmux(["list-windows", "-t", `=${session}:`, "-F", "#{window_name}\t#{window_layout}"], { reject: false });
+  const layout: WorkspaceLayoutEntry[] = [];
+  for (const line of (result.ok ? result.stdout.split("\n") : []).filter(Boolean)) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    const windowName = line.slice(0, tab);
+    const value = line.slice(tab + 1);
+    if (!windowName || !value) continue;
+    layout.push({ windowName, layout: value });
+  }
+  await updateWorkspace(record.name, { layout });
+
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), dim(`snapshot · ${layout.length} window(s)`)]));
+  else console.log(`workspace-snapshot\t${session}\t${layout.length}`);
+}
+
+/**
+ * `hive workspace restore <name> [--resume]` — rebuild `ws-<name>` from the
+ * record after a reboot (tmux server + bee processes gone, records persist),
+ * PRD §7.3/§11. Idempotent: restoring a live workspace re-attaches/links without
+ * double-spawning (PRD §13). Delegates to the shared restore core.
+ */
+async function workspaceRestore(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace restore <name> [--resume]");
+  const record = await resolveWorkspaceRecord(name);
+  if (!record) throw new Error(`Unknown workspace: ${name}`);
+  const result = await restoreWorkspaceRecord(record, { resume: truthy(flag(parsed, "resume")) });
+  if (isPretty()) {
+    console.log(actionLine("ok", "workspace", [bold(result.session), dim(`restored · ${result.beeCount} bee(s), ${result.paneCount} pane(s)`)]));
+  } else {
+    console.log(`workspace-restored\t${result.session}\t${result.beeCount}\t${result.paneCount}`);
+  }
+}
+
+/**
+ * Shared restore core for `workspace restore <name>` and `restore --all`. Rebuilds
+ * `ws-<name>` from the record, reusing the same open/add helpers (no duplicated
+ * link logic): ensure the session, recreate pane members at rootDir, re-spawn or
+ * (idempotently) re-link bee members, then re-apply the saved layout geometry.
+ *
+ * Restore is purely additive — it NEVER kills a bee, and never double-spawns one
+ * that is already alive (PRD §13). `reviveRecord` re-spawns each bee into ITS OWN
+ * home with no account switch, so there is no cross-account hazard.
+ */
+async function restoreWorkspaceRecord(record: WorkspaceRecord, opts: { resume: boolean }): Promise<{ session: string; beeCount: number; paneCount: number }> {
+  const rootDir = await resolveWorkspaceRoot(undefined, record);
+  // Persist the resolved root on first restore (when it was empty and resolved
+  // from the colony or cwd), exactly as workspaceOpen does — so the record and
+  // the rebuilt session agree on the file root.
+  if (record.rootDir !== rootDir) {
+    await updateWorkspace(record.name, { rootDir });
+  }
+  const session = workspaceSessionName(record.name);
+
+  // Same session bootstrap as workspaceOpen: ensure it, make it persist, and
+  // mark the placeholder shell own so `close` can later reap it.
+  const ensured = await ensureLinkSession(session);
+  await setWorkspaceOptions(session);
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+
+  // Pane members: recreate a window at rootDir per pane — only when the session
+  // was freshly created this call. A re-restore of a LIVE ws keeps its existing
+  // panes (idempotency; native persistence already holds them).
+  let paneCount = 0;
+  if (ensured.created) {
+    for (const member of record.members) {
+      if (member.kind !== "pane") continue;
+      await openWorkspacePane(session, rootDir, member.command);
+      paneCount += 1;
+    }
+  } else {
+    paneCount = record.members.filter((m) => m.kind === "pane").length;
+  }
+
+  // Bee members: same resolution as workspaceOpen (records keyed by id ?? name).
+  const records = await listSessions();
+  const byId = new Map(records.map((r) => [r.id ?? r.name, r] as const));
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const beeTargets: string[] = [];
+  const seenBees = new Set<string>();
+  let beeCount = 0;
+  for (const member of record.members) {
+    if (member.kind !== "bee") continue;
+    // Defensive against a hand-edited record with a duplicate bee member: process
+    // each beeId once so we never revive (or double-count) the same bee twice.
+    if (seenBees.has(member.beeId)) continue;
+    seenBees.add(member.beeId);
+    const bee = byId.get(member.beeId) ?? records.find((r) => r.name === member.beeId);
+    if (bee && bee.node && bee.node !== LOCAL_NODE_NAME) {
+      // link-window cannot cross tmux servers; leave a remote bee for its node.
+      console.error(note(`skip remote bee ${member.beeId} — restore links local windows only`));
+      continue;
+    }
+    if (bee && liveNames.has(bee.tmuxTarget)) {
+      // ALREADY live — never double-spawn (PRD §13). Just link it in + stamp.
+      beeTargets.push(bee.tmuxTarget);
+      beeCount += 1;
+      await stampWorkspaceMembership(bee, record.name);
+      continue;
+    }
+    if (bee) {
+      // Dead bee with a record: re-spawn it into its own home. Default re-spawns
+      // fresh; --resume continues from providerSessionId via resumeArgs.
+      const revived = await reviveRecord(bee, { fresh: !opts.resume });
+      // Re-read liveness: the freshly created session's window links in below.
+      beeTargets.push(revived.tmuxTarget);
+      beeCount += 1;
+      await stampWorkspaceMembership(revived, record.name);
+      continue;
+    }
+    // No record for beeId: a dead placeholder. Open a held shell window at the
+    // root named after the bee so the user can re-spawn into it; mark it own so
+    // `close` can reap it (it carries no live agent).
+    await openWorkspacePlaceholder(session, rootDir, member.beeId);
+    console.error(note(`could not revive bee ${member.beeId} — no record; left a placeholder window`));
+  }
+  // Link freshly-live bee windows into the session (the workspaceOpen path —
+  // never reinvent link logic).
+  await linkTargetsInto(session, beeTargets, ensured);
+
+  // Phase 2 geometry: re-apply each window's saved window_layout by matching
+  // window_name. Best-effort — a missing window is skipped; on a name collision
+  // entries apply in order to whichever windows currently match.
+  await applyWorkspaceLayout(session, record.layout ?? []);
+
+  return { session, beeCount, paneCount };
+}
+
+/** Stamp a bee's workspaceId (and refresh its derived ws: tag) — workspaceOpen pattern. */
+async function stampWorkspaceMembership(bee: SessionRecord, workspaceName: string): Promise<void> {
+  if (bee.workspaceId === workspaceName) return;
+  await updateSession(bee.name, { workspaceId: workspaceName });
+  await writeHiveTags({ ...bee, workspaceId: workspaceName });
+}
+
+/** A dead bee with no record: a window the user can re-spawn into (held shell, marked own). */
+async function openWorkspacePlaceholder(session: string, rootDir: string, label: string): Promise<void> {
+  // A bare interactive shell holds the window open without a live agent.
+  await openWorkspacePane(session, rootDir);
+  // Best-effort label so the user recognizes which bee it stands in for.
+  const result = await tmux(["list-windows", "-t", `=${session}:`, "-F", "#{window_id}"], { reject: false });
+  const last = (result.ok ? result.stdout.split("\n").filter(Boolean) : []).at(-1);
+  if (last) await tmux(["rename-window", "-t", `=${session}:${last}`, label], { reject: false });
+}
+
+/** Re-apply saved per-window geometry by matching window_name (best-effort). */
+async function applyWorkspaceLayout(session: string, layout: WorkspaceLayoutEntry[]): Promise<void> {
+  if (layout.length === 0) return;
+  const result = await tmux(["list-windows", "-t", `=${session}:`, "-F", "#{window_id}\t#{window_name}"], { reject: false });
+  // window_name → ordered window_ids (a name may map to several windows).
+  const byName = new Map<string, string[]>();
+  for (const line of (result.ok ? result.stdout.split("\n") : []).filter(Boolean)) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    const windowId = line.slice(0, tab);
+    const windowName = line.slice(tab + 1);
+    const ids = byName.get(windowName);
+    if (ids) ids.push(windowId);
+    else byName.set(windowName, [windowId]);
+  }
+  for (const entry of layout) {
+    const windowId = byName.get(entry.windowName)?.shift();
+    if (!windowId) continue; // missing window — skip
+    await tmux(["select-layout", "-t", `=${session}:${windowId}`, entry.layout], { reject: false });
+  }
+}
+
+/**
+ * `hive restore --all [--resume]` — sweep every NON-archived workspace and
+ * rebuild it after a reboot (PRD §7.3/§11). Idempotent across the sweep (live
+ * bees are skipped, never re-spawned). Without `--all`, prints usage.
+ */
+async function cmdRestore(parsed: Parsed) {
+  if (!truthy(flag(parsed, "all"))) {
+    throw new Error("Usage: hive restore --all [--resume]   (or: hive workspace restore <name> [--resume])");
+  }
+  const resume = truthy(flag(parsed, "resume"));
+  const workspaces = (await listWorkspaces()).filter((w) => !w.archived);
+  let restored = 0;
+  let bees = 0;
+  let panes = 0;
+  for (const record of workspaces) {
+    const result = await restoreWorkspaceRecord(record, { resume });
+    restored += 1;
+    bees += result.beeCount;
+    panes += result.paneCount;
+    if (isPretty()) {
+      console.log(actionLine("ok", "workspace", [bold(result.session), dim(`restored · ${result.beeCount} bee(s), ${result.paneCount} pane(s)`)]));
+    } else {
+      console.log(`workspace-restored\t${result.session}\t${result.beeCount}\t${result.paneCount}`);
+    }
+  }
+  if (isPretty()) console.log(note(`restored ${restored} workspace(s) · ${bees} bee(s), ${panes} pane(s)`));
+  else console.log(`restore\tall\t${restored}\t${bees}\t${panes}`);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// QUESTS (WORKSPACES_AND_QUESTS_PRD §8, increment 9a — create/start/list/inspect)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async function cmdQuest(parsed: Parsed) {
+  const sub = parsed.args[0];
+  switch (sub) {
+    case "create":
+      return questCreate(parsed);
+    case "start":
+      return questStart(parsed);
+    case undefined:
+    case "list":
+    case "ls":
+      return questList(parsed);
+    case "inspect":
+      return questInspect(parsed);
+    case "done":
+      return questDone(parsed);
+    case "archive":
+      return questArchive(parsed);
+    default:
+      throw new Error(`Unknown quest subcommand: ${sub}\nUsage: hive quest <create|start|list|inspect|done|archive>`);
+  }
+}
+
+/**
+ * Slugify a quest title into a colony name (COLONY_NAME_RE:
+ * /^[A-Za-z0-9][A-Za-z0-9_-]*$/): lowercase, collapse runs of unsafe chars into
+ * a single dash, trim leading/trailing dashes. Falls back to "quest" if nothing
+ * usable survives (e.g. a title of only punctuation).
+ */
+function colonySlugFromTitle(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : "quest";
+}
+
+/** Ensure a colony exists by name, creating it if missing; return its name. */
+async function ensureColony(name: string): Promise<string> {
+  const existing = await loadColony(name);
+  if (existing) {
+    if (existing.archived) throw new Error(`Colony is archived: ${name}`);
+    return existing.name;
+  }
+  const created = await createColony(name);
+  return created.name;
+}
+
+async function questCreate(parsed: Parsed) {
+  const positionalTitle = parsed.args[1];
+  const linear = stringFlag(parsed, ["linear"]);
+  let description = stringFlag(parsed, ["description"]);
+
+  // LINEAR ENRICHMENT (PRD §8.2/§8.3, side-effect-gated READ): only when
+  // `--linear` is given, and only via the adapter the gate hands us. With no
+  // LINEAR_API_KEY the adapter is null and we stay fully OFFLINE — the id is
+  // recorded verbatim and nothing is fetched. The fetch result seeds the title
+  // (only when no positional title was given — an explicit positional ALWAYS
+  // wins) and the description (only when --description did not override it).
+  let title = positionalTitle;
+  let linearSeededNote: string | undefined;
+  if (linear) {
+    if (!isLinearIdentifier(linear)) {
+      throw new Error(`--linear expects an issue identifier like ENG-1234 (got: ${linear})`);
+    }
+    const adapter = loadLinearAdapter();
+    if (adapter) {
+      const issue = await adapter.fetchIssue(linear);
+      if (issue) {
+        // Track what we ACTUALLY seeded at the assignment site (don't infer it by
+        // value-comparing afterward — an explicit --description that happens to
+        // equal the issue's would otherwise be misreported as seeded).
+        const seeded: string[] = [];
+        if (!positionalTitle && issue.title) { title = issue.title; seeded.push("title"); }
+        if (!description && issue.description) { description = issue.description; seeded.push("description"); }
+        linearSeededNote = `seeded from ${linear}${seeded.length ? ` (${seeded.join(", ")})` : ""}`;
+      } else {
+        // A configured adapter that misses (not found / API error already warned
+        // by the adapter): no enrichment, fall through to the title requirement.
+        linearSeededNote = `${linear}: no issue fetched — recorded id, no enrichment`;
+      }
+    } else {
+      // OFFLINE NO-OP: no LINEAR_API_KEY. Record the id verbatim, no network.
+      linearSeededNote = `Linear not configured (set LINEAR_API_KEY) — recorded ${linear}, no enrichment`;
+    }
+  }
+
+  // Title is required UNLESS Linear enrichment supplied one. A missing title with
+  // no usable Linear title (no positional AND (no adapter OR a fetch miss)) is a
+  // clean usage error — we never invent a title.
+  if (!title) {
+    if (linear) {
+      throw new Error(
+        `hive quest create --linear ${linear}: a title is required because Linear did not supply one ` +
+          `(no LINEAR_API_KEY, or the issue was not found). Pass a positional title.`,
+      );
+    }
+    throw new Error('Usage: hive quest create "<title>" [--colony <c>] [--root <dir>] [--linear <issue>]');
+  }
+
+  // A quest ALWAYS lives in a colony (PRD §8.2 / open-question #5 decided yes):
+  // use/create the named one, else auto-create from the title slug.
+  const colonyFlag = stringFlag(parsed, ["colony"]);
+  const colony = colonyFlag ? await ensureColony(colonyFlag) : await ensureColony(colonySlugFromTitle(title));
+
+  const id = generateQuestId();
+
+  // The quest OWNS A DEDICATED workspace named after the quest id — NOT the
+  // colony's shared workspace, so a later `quest done` that closes the quest's
+  // workspace can never nuke a colony-shared one. Resolve the file root from
+  // --root › colony.rootDir › cwd.
+  const rootDir = await resolveQuestRoot(stringFlag(parsed, ["root"]), colony);
+  await createWorkspace({ name: id, rootDir, colony });
+  await updateWorkspace(id, { questId: id });
+
+  const record = await createQuest({
+    id,
+    title,
+    colony,
+    workspace: id,
+    status: "open",
+    ...(linear ? { linearIssueId: linear } : {}),
+    ...(description ? { description } : {}),
+  });
+
+  if (linearSeededNote) console.error(note(`linear ${linearSeededNote}`));
+
+  const session = workspaceSessionName(record.workspace);
+  if (isPretty()) {
+    console.log(actionLine("ok", "quest", [bold(record.id), dim(`"${record.title}"`), dim(`colony:${record.colony}`), dim(session)]));
+    console.error(note(`start work with: hive quest start ${record.id} --frame <frame>`));
+  } else {
+    console.log(`quest-created\t${record.id}\t${record.colony}\t${record.workspace}`);
+  }
+}
+
+/** Resolve a quest workspace's file root: --root › colony.rootDir › cwd. */
+async function resolveQuestRoot(rootFlag: string | undefined, colony: string): Promise<string> {
+  if (rootFlag) {
+    return realpath(resolve(rootFlag.replace(/^~(?=\/|$)/, process.env.HOME ?? "~"))).catch(() => resolve(rootFlag));
+  }
+  const record = await loadColony(colony);
+  if (record?.rootDir && record.rootDir.length > 0) return record.rootDir;
+  return process.cwd();
+}
+
+/** Resolve a quest by exact id, then by unique prefix (the swarm/colony nicety). */
+async function resolveQuestRecord(idArg: string): Promise<QuestRecord | null> {
+  const direct = await loadQuest(idArg);
+  if (direct) return direct;
+  if (!validQuestId(idArg)) return null;
+  const quests = await listQuests();
+  const matches = quests.filter((q) => q.id.startsWith(idArg));
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+async function questStart(parsed: Parsed) {
+  const idArg = parsed.args[1];
+  if (!idArg) throw new Error("Usage: hive quest start <id> --frame <f>");
+
+  // --flow and --frame are mutually exclusive; --flow wins its own branch.
+  if (hasFlag(parsed, "flow")) return questStartFlow(parsed, idArg);
+  const frameName = stringFlag(parsed, ["frame"]);
+  if (!frameName) throw new Error("hive quest start requires --frame <f> or --flow <f>");
+
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+  if (quest.status === "archived" || quest.status === "done") {
+    throw new Error(`Quest ${quest.id} is ${quest.status}; cannot start work on it`);
+  }
+
+  // Spawn the swarm with the quest's colony injected — the bees MUST carry the
+  // quest's colony (PRD §8.2), not whatever --colony the user typed. We clone the
+  // Parsed and overwrite the colony/frame flags, then call the existing
+  // spawnFromFrame: this needs NO change to that hot path (it already reads
+  // --colony via resolveSpawnColony and --frame), and keeps swarm-record
+  // creation, readiness waiting, and the swarmId hint all in one place.
+  const questFlags = new Map(parsed.flags);
+  questFlags.set("colony", quest.colony);
+  questFlags.set("frame", frameName);
+  // A quest-level --brief override lands with the flow/Linear increment; for now
+  // briefs come from the frame's castes, so drop any stray --brief rather than let
+  // spawnFromFrame reject the whole spawn (it forbids --brief with --frame).
+  questFlags.delete("brief");
+  const questParsed: Parsed = { ...parsed, flags: questFlags };
+
+  const records = await spawnFromFrame(questParsed, frameName);
+  if (records.length === 0) throw new Error(`Frame ${frameName} spawned no bees`);
+
+  // Stamp every spawned bee with the quest id (and re-stamp colony defensively)
+  // so the derived quest:<id> tag lights up, and link each bee's window into the
+  // quest's workspace — reusing the workspace link path, never reinventing it.
+  const session = workspaceSessionName(quest.workspace);
+  const ensured = await ensureLinkSession(session);
+  await setWorkspaceOptions(session);
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+
+  const inventory = await windowInventory();
+  const liveNames = new Set(await localSubstrate().listSessions());
+  const wsRecord = await loadWorkspace(quest.workspace);
+  const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
+  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const beeTargets: string[] = [];
+  for (const bee of records) {
+    await stampQuestMembership(bee, quest.id, quest.colony, quest.workspace);
+    // Only local + live windows can be link-window'd (the workspaceAdd discipline).
+    if (bee.node && bee.node !== LOCAL_NODE_NAME) continue;
+    if (!liveNames.has(bee.tmuxTarget)) continue;
+    const windowId = inventory.active.get(bee.tmuxTarget);
+    if (!windowId) continue; // no live window to link — never record a phantom member
+    beeTargets.push(bee.tmuxTarget);
+    const beeId = bee.id ?? bee.name;
+    if (!memberIds.has(beeId)) {
+      members.push({ kind: "bee", beeId });
+      memberIds.add(beeId);
+    }
+  }
+  await linkTargetsInto(session, beeTargets, ensured);
+  // Persist the bee membership on the workspace so a later restore brings them
+  // back (converges with the workspace add/open invariant).
+  await updateWorkspace(quest.workspace, { members });
+
+  // Flip the quest to active: stamp activatedAt (first activation only) and
+  // append the swarm id. The swarm id is the frame's swarm hint (spawnFromFrame
+  // created it); read it off the freshly spawned bees.
+  const swarmId = records.find((r) => r.swarmId)?.swarmId;
+  const swarmIds = swarmId && !quest.swarmIds.includes(swarmId) ? [...quest.swarmIds, swarmId] : quest.swarmIds;
+  await updateQuest(quest.id, {
+    status: "active",
+    swarmIds,
+    ...(quest.activatedAt ? {} : { activatedAt: new Date().toISOString() }),
+  });
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(swarmId ? `@${swarmId}` : ""), `${records.length} bee(s)`, dim(session)]));
+  } else {
+    console.log(`quest-started\t${quest.id}\t${swarmId ?? ""}\t${records.length}`);
+  }
+}
+
+/**
+ * `hive quest start <id> --flow <name>` — run a flow in the FOREGROUND and adopt
+ * every bee it spawns into the quest, reaching the SAME end state as the --frame
+ * path: each bee carries questId + the quest's colony + workspaceId, each live
+ * local window is linked into ws-<id>, the workspace members are persisted, the
+ * flow's swarm cohort is appended to quest.swarmIds, and the quest is flipped to
+ * active (on success only).
+ *
+ * Foreground-only in this increment: the per-spawn stamp/link happens in-process
+ * via the onSpawned hook, which closes over the ensured link session + members
+ * accumulator. A --background child re-execs in a different process where that
+ * closure does not exist (spawnDetachedRun cannot carry a JS callback across the
+ * fork), so --flow --background is an explicit, guarded later-increment throw.
+ */
+async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
+  if (hasFlag(parsed, "background")) {
+    throw new Error("hive quest start --flow --background lands in a later increment");
+  }
+  const flowName = stringFlag(parsed, ["flow"]);
+  if (!flowName) throw new Error("Usage: hive quest start <id> --flow <name> [--arg key=value]...");
+
+  // Resolve + validate the quest BEFORE loading the flow so a bad id fails fast.
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+  if (quest.status === "archived" || quest.status === "done") {
+    throw new Error(`Quest ${quest.id} is ${quest.status}; cannot start work on it`);
+  }
+
+  const flow = await loadFlow(flowName);
+  if (!flow) throw new Error(`Unknown flow: ${flowName}`);
+  const args = parseFlowRunArgs(parsed);
+
+  // Prepare the quest's link session ONCE up front (mirror the --frame path) so
+  // ws-<id> exists before the first bee spawns and has a host for the link.
+  const session = workspaceSessionName(quest.workspace);
+  const ensured = await ensureLinkSession(session);
+  await setWorkspaceOptions(session);
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+
+  // Seed the members accumulator from the existing workspace record. The
+  // onSpawned hook appends to `members` as each bee spawns; we persist it once
+  // after the flow returns (members are records, so they survive kill-on-end).
+  const wsRecord = await loadWorkspace(quest.workspace);
+  const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
+  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+
+  // Per-spawn hook: replicate the --frame loop body for ONE bee. Liveness +
+  // the window inventory MUST be re-read per spawn — bees spawn over time, so a
+  // single up-front snapshot (as in the --frame path) would miss later windows.
+  const onSpawned = async (bee: SessionRecord): Promise<void> => {
+    await stampQuestMembership(bee, quest.id, quest.colony, quest.workspace);
+    // Only local + live windows can be link-window'd (the workspaceAdd discipline).
+    if (bee.node && bee.node !== LOCAL_NODE_NAME) return;
+    if (!(await localSubstrate().hasSession(bee.tmuxTarget))) return;
+    const inventory = await windowInventory();
+    const windowId = inventory.active.get(bee.tmuxTarget);
+    if (!windowId) return; // no live window to link — never record a phantom member
+    await linkTargetsInto(session, [bee.tmuxTarget], ensured);
+    const beeId = bee.id ?? bee.name;
+    if (!memberIds.has(beeId)) {
+      members.push({ kind: "bee", beeId });
+      memberIds.add(beeId);
+    }
+  };
+
+  // The flow's cohort swarmId is the facade default `flow:<name>:run:<runId>`.
+  // Reconstruct it (don't read it off a bee) so a zero-spawn flow still records
+  // the cohort and it never depends on a bee surviving cleanup.
+  const runId = generateRunId();
+  const swarmId = `flow:${flow.name}:run:${runId}`;
+  if (isPretty()) {
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(`flow ${flow.name}`), dim(`run ${runId}`)]));
+  } else {
+    console.log(`quest-flow\t${quest.id}\t${flow.name}\t${runId}`);
+  }
+
+  let outcome: Awaited<ReturnType<typeof executeFlow>>;
+  try {
+    // cleanupOverride:"keep" defeats a flow's kill-on-end — the quest owns its
+    // bees. Foreground (no installSignalHandlers override) so SIGINT aborts the
+    // run exactly like `hive flow run`.
+    outcome = await executeFlow(flow, { args, runId, onSpawned, cleanupOverride: "keep" });
+  } finally {
+    // Persist members REGARDLESS of outcome so the workspace reflects whatever
+    // bees were spawned + linked, even on a failed/cancelled run (the safe
+    // partial state — these bees are real quest members, not orphans).
+    await updateWorkspace(quest.workspace, { members });
+  }
+
+  // Flip the quest active ONLY on success: a crashed/aborted flow must never
+  // leave a phantom-active quest. Append the cohort swarmId either way is wrong
+  // — only record it when we actually activate.
+  if (outcome.status === "ok") {
+    const swarmIds = quest.swarmIds.includes(swarmId) ? quest.swarmIds : [...quest.swarmIds, swarmId];
+    await updateQuest(quest.id, {
+      status: "active",
+      swarmIds,
+      ...(quest.activatedAt ? {} : { activatedAt: new Date().toISOString() }),
+    });
+  }
+
+  if (isPretty()) {
+    const colored = outcome.status === "ok" ? green("ok")
+      : outcome.status === "cancelled" ? yellow("cancelled")
+      : outcome.status === "failed" ? red("failed")
+      : dim(outcome.status);
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(`@${swarmId}`), dim(`${members.length} bee(s)`), colored]));
+    if (outcome.error?.message) console.error(dim(`error: ${outcome.error.message}`));
+  } else {
+    console.log(`quest-started\t${quest.id}\t${swarmId}\t${members.length}\t${outcome.status}`);
+  }
+  if (outcome.status === "failed") process.exitCode = 1;
+  if (outcome.status === "cancelled") process.exitCode = 130;
+}
+
+/**
+ * Stamp a bee's questId (+ colony) so the derived quest:<id> / colony: tags
+ * refresh (the stampWorkspaceMembership pattern). A quest never silently fails to
+ * stamp a bee — that is the heart of acceptance Q1.
+ */
+async function stampQuestMembership(bee: SessionRecord, questId: string, colony: string, workspaceName: string): Promise<void> {
+  const patch: Partial<SessionRecord> = {};
+  if (bee.questId !== questId) patch.questId = questId;
+  if (bee.colony !== colony) patch.colony = colony;
+  if (bee.workspaceId !== workspaceName) patch.workspaceId = workspaceName;
+  if (Object.keys(patch).length === 0) return;
+  await updateSession(bee.name, { ...patch, updatedAt: new Date().toISOString() });
+  await writeHiveTags({ ...bee, ...patch });
+}
+
+async function questList(parsed: Parsed) {
+  const colonyFilter = stringFlag(parsed, ["colony"]);
+  const statusFilter = stringFlag(parsed, ["status"]);
+  let quests = await listQuests();
+  // Archived quests are excluded from default listings (archive handling proper
+  // is increment 9b); a `--status archived` request can still surface them.
+  if (statusFilter !== "archived") quests = quests.filter((q) => q.status !== "archived");
+  if (colonyFilter) quests = quests.filter((q) => q.colony === colonyFilter);
+  if (statusFilter) quests = quests.filter((q) => q.status === statusFilter);
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(quests, null, 2));
+    return;
+  }
+  if (!isPretty()) {
+    for (const q of quests) {
+      console.log(`${q.status}\t${q.id}\t${q.colony}\t${q.workspace}\t${q.swarmIds.length}\t${q.title}`);
+    }
+    return;
+  }
+  if (quests.length === 0) {
+    console.log(dim('No quests. Create one with: hive quest create "<title>" [--colony <c>]'));
+    return;
+  }
+  console.log(formatTable(
+    [
+      { header: "STATUS" },
+      { header: "ID" },
+      { header: "COLONY" },
+      { header: "WORKSPACE" },
+      { header: "SWARMS", align: "right" },
+      { header: "TITLE" },
+      { header: "AGE", align: "right" },
+    ],
+    quests.map((q) => [
+      questStatusColor(q.status),
+      bold(q.id),
+      dim(q.colony),
+      dim(q.workspace),
+      String(q.swarmIds.length),
+      truncate(q.title, 40),
+      dim(formatRelativeTime(q.createdAt)),
+    ]),
+  ));
+}
+
+function questStatusColor(status: QuestStatus): string {
+  switch (status) {
+    case "active":
+      return green("active");
+    case "open":
+      return cyan("open");
+    case "done":
+      return gray("done");
+    case "archived":
+      return gray("archived");
+  }
+}
+
+async function questInspect(parsed: Parsed) {
+  const idArg = parsed.args[1];
+  if (!idArg) throw new Error("Usage: hive quest inspect <id>");
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+
+  // Roll up the quest's bees by filtering the store for questId===id (the same
+  // set the quest:<id> selector resolves, but read directly so inspect stays a
+  // cheap store-only read with no live tmux probe).
+  const bees = (await listSessions()).filter((b) => b.questId === quest.id);
+  const beeSummary = bees.map((b) => ({
+    name: b.name,
+    agent: b.agent,
+    caste: b.caste,
+    status: b.status,
+    state: b.lastObservedState,
+  }));
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify({ ...quest, bees: beeSummary }, null, 2));
+    return;
+  }
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(`"${quest.title}"`), questStatusColor(quest.status)]));
+    console.log(`  ${dim("colony")}    ${quest.colony}`);
+    console.log(`  ${dim("workspace")} ${workspaceSessionName(quest.workspace)}`);
+    console.log(`  ${dim("swarms")}    ${quest.swarmIds.length > 0 ? quest.swarmIds.map((s) => `@${s}`).join(" ") : dim("none")}`);
+    if (quest.linearIssueId) console.log(`  ${dim("linear")}    ${quest.linearIssueId}`);
+    console.log(`  ${dim("bees")}      ${bees.length}`);
+    for (const b of beeSummary) {
+      // A filed bee shows `archived` (it stays in the live store by questId, so
+      // inspect surfaces it even though the default selector path excludes it).
+      const state = b.status === "archived" ? gray("archived") : b.status === "running" ? green(b.state ?? "running") : gray(b.status);
+      console.log(`    ${bold(b.name)} ${dim(b.caste ? `caste:${b.caste}` : b.agent)} ${state}`);
+    }
+  } else {
+    console.log(`quest\t${quest.id}\t${quest.status}\t${quest.colony}\t${quest.workspace}\t${quest.swarmIds.join(",")}\t${quest.linearIssueId ?? ""}`);
+    for (const b of beeSummary) {
+      console.log(`bee\t${b.name}\t${b.caste ?? b.agent}\t${b.status}\t${b.state ?? ""}`);
+    }
+  }
+}
+
+/**
+ * `hive quest done <id> [--keep-bees] [--close-linear]` — file the quest's work
+ * and complete it (PRD §8.4, acceptance Q2). The strict ordering is the safety
+ * spine: FILE (copy seals + the final workspace snapshot) BEFORE any destructive
+ * step, so a crash never loses a seal or the geometry; SNAPSHOT the workspace
+ * BEFORE closing it; KILL transactionally; mark archived ONLY the bees we
+ * confirmed killed (a kill_failed or a kept-alive bee is NEVER marked archived —
+ * the cardinal invariant: never hide a live bee from `list`); then CLOSE the
+ * workspace with the safe close (which never kills a bee, and aborts rather than
+ * orphan one); finally flip the quest to done. The whole flow is restartable.
+ */
+async function questDone(parsed: Parsed) {
+  const idArg = parsed.args[1];
+  if (!idArg) throw new Error("Usage: hive quest done <id> [--keep-bees] [--close-linear]");
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+  // Idempotency guard (mirrors questStart): a quest that is already done/archived
+  // has already been filed; don't re-run the destructive flow.
+  if (quest.status === "done" || quest.status === "archived") {
+    throw new Error(`Quest ${quest.id} is already ${quest.status}`);
+  }
+
+  const keepBees = truthy(flag(parsed, "keep-bees"));
+
+  // 1. Gather members directly from the store by questId (NOT resolveSelector —
+  //    some may already be archived from a prior partial run, and the selector
+  //    path excludes archived).
+  const bees = (await listSessions()).filter((b) => b.questId === quest.id);
+
+  // 3. SNAPSHOT the quest workspace geometry (before close) so the filed
+  //    workspace.json carries live window layouts.
+  const wsSession = workspaceSessionName(quest.workspace);
+  if (await hasSession(wsSession)) {
+    const result = await tmux(["list-windows", "-t", `=${wsSession}:`, "-F", "#{window_name}\t#{window_layout}"], { reject: false });
+    const layout: WorkspaceLayoutEntry[] = [];
+    for (const line of (result.ok ? result.stdout.split("\n") : []).filter(Boolean)) {
+      const tab = line.indexOf("\t");
+      if (tab < 0) continue;
+      const windowName = line.slice(0, tab);
+      const value = line.slice(tab + 1);
+      if (!windowName || !value) continue;
+      layout.push({ windowName, layout: value });
+    }
+    await updateWorkspace(quest.workspace, { layout });
+  }
+  const wsRecord = await loadWorkspace(quest.workspace);
+
+  // 4. FILE ARCHIVE under quests/<id>/ — a COPY, BEFORE any destructive step.
+  const dir = questDir(quest.id);
+  await mkdir(dir, { recursive: true });
+  // 4a. Seals: copy every member's seals (read-only collection — bees seal
+  //     themselves; absence of a seal is not an error). The live sealsRoot is
+  //     never moved, so a crash here leaves seals duplicated (benign), not lost.
+  let filedSealBees = 0;
+  for (const bee of bees) {
+    const copied = await copyBeeSeals(bee.name, join(dir, "seals"));
+    if (copied > 0) filedSealBees += 1;
+  }
+  // 4b. Final workspace snapshot (geometry + members) for reconstruction.
+  if (wsRecord) {
+    await writeFile(join(dir, "workspace.json"), `${JSON.stringify(wsRecord, null, 2)}\n`, { mode: 0o600 });
+  }
+  // 4c. Manifest: each member's final SessionRecord so a filed bee is
+  //     reconstructable even after its live record is later kill-deleted.
+  await writeFile(
+    join(dir, "manifest.json"),
+    `${JSON.stringify({ questId: quest.id, filedAt: new Date().toISOString(), bees }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+
+  // 5./6. KILL (unless --keep-bees) + mark ONLY confirmed-killed bees archived.
+  // A quest bee's window is LINKED into ws-<id> (quest start link-window'd it):
+  // killing the bee's own session leaves that window orphaned in the ws (its only
+  // remaining link), which the safe close would then refuse as a "last link". So
+  // for each CONFIRMED-killed bee we reap its now-dead orphan window from the ws
+  // with `unlink-window -k` — killing a confirmed-dead window is debris cleanup,
+  // never killing a live bee. A kept/kill_failed (live) bee's window is left for
+  // the safe close to safe-unlink (it survives via the bee's own session).
+  const inventory = (await hasSession(wsSession)) ? await windowInventory() : undefined;
+  const outcomes: Array<{ name: string; result: "archived" | "kept" | "kill_failed" }> = [];
+  if (!keepBees) {
+    for (const bee of bees) {
+      if (bee.status === "archived") {
+        // Already filed by a prior partial run — leave it archived.
+        outcomes.push({ name: bee.name, result: "archived" });
+        continue;
+      }
+      // Capture the record + ws window id BEFORE the kill: transactionalKill
+      // deletes the record on confirmed death, and the window id is needed to
+      // reap the orphan afterwards.
+      const snapshot = { ...bee };
+      const wsWindowId = inventory?.active.get(bee.tmuxTarget);
+      const outcome = await transactionalKill(bee);
+      if (outcome.ok) {
+        // Re-create the index record with status:"archived" — the live store
+        // stays the index (PRD §16 #4), the bee is filed not deleted.
+        await saveSession({ ...snapshot, status: "archived", updatedAt: new Date().toISOString() });
+        // Reap the now-dead orphan window from the ws (the bee is confirmed gone).
+        if (wsWindowId) await tmux(["unlink-window", "-k", "-t", wsWindowId], { reject: false });
+        outcomes.push({ name: bee.name, result: "archived" });
+      } else {
+        // A kill_failed bee may still be running — leave it kill_failed, do NOT
+        // archive it (never hide a possibly-live bee), and leave its window for
+        // the safe close to safe-unlink.
+        outcomes.push({ name: bee.name, result: "kill_failed" });
+      }
+    }
+  } else {
+    // --keep-bees: bees stay alive → NEVER mark them archived (that would hide a
+    // live bee from `list`, the cardinal invariant). They keep status:"running".
+    for (const bee of bees) outcomes.push({ name: bee.name, result: "kept" });
+  }
+
+  // 7. CLOSE the quest workspace with the safe close (never kills a bee; aborts
+  //    rather than orphan a still-live --keep-bees window). If it throws, the
+  //    quest is left NOT-done and surfaces the error — no silent bee loss. The
+  //    confirmed-dead orphan windows were already reaped above, so the safe close
+  //    sees only our own windows + any live (kept/kill_failed) bee windows.
+  if (await hasSession(wsSession)) {
+    await closeWorkspaceSession(wsSession);
+  }
+  await archiveWorkspace(quest.workspace).catch(() => undefined);
+
+  // 8. Flip the quest to done (emits the quest.done ledger event).
+  const updated = await updateQuest(quest.id, { status: "done", completedAt: new Date().toISOString() });
+
+  // 9. --close-linear (side-effect-gated WRITE, best-effort): transition the
+  //    quest's Linear issue to Done. The quest is ALREADY done by this point, so
+  //    a Linear failure is a side effect that NEVER fails `quest done`.
+  if (truthy(flag(parsed, "close-linear"))) {
+    if (!updated.linearIssueId) {
+      console.error(note("--close-linear: this quest has no Linear issue — nothing to close"));
+    } else {
+      const adapter = loadLinearAdapter();
+      if (!adapter) {
+        // OFFLINE NO-OP: no LINEAR_API_KEY.
+        console.error(note(`--close-linear: Linear not configured (set LINEAR_API_KEY) — left ${updated.linearIssueId} untouched`));
+      } else {
+        const closed = await adapter.closeIssue(updated.linearIssueId);
+        if (closed) console.error(note(`--close-linear: transitioned ${updated.linearIssueId} to Done`));
+        else console.error(note(`--close-linear: could not close ${updated.linearIssueId} (best-effort; quest is still done)`));
+      }
+    }
+  }
+
+  const killFailed = outcomes.filter((o) => o.result === "kill_failed").map((o) => o.name);
+  if (killFailed.length > 0) {
+    console.error(note(`${killFailed.length} bee(s) failed to die and stay visible (kill_failed): ${killFailed.join(", ")}`));
+  }
+  if (isPretty()) {
+    const beeNote = keepBees ? `${bees.length} bee(s) kept` : `${outcomes.filter((o) => o.result === "archived").length} bee(s) filed`;
+    console.log(actionLine("ok", "quest", [bold(updated.id), dim("done"), dim(beeNote), dim(`${filedSealBees} sealed`)]));
+  } else {
+    console.log(`quest-done\t${updated.id}\t${outcomes.filter((o) => o.result === "archived").length}\t${killFailed.length}`);
+  }
+}
+
+/**
+ * `hive quest archive <id>` — the post-done filing flip (done → archived, PRD
+ * §8.4). A pure quest-record state flip: it does NOT re-touch bees or the
+ * workspace (already handled by `done`). Idempotent: archiving an archived quest
+ * is a no-op. Surfaces in `quest list --status archived`.
+ */
+async function questArchive(parsed: Parsed) {
+  const idArg = parsed.args[1];
+  if (!idArg) throw new Error("Usage: hive quest archive <id>");
+  const quest = await resolveQuestRecord(idArg);
+  if (!quest) throw new Error(`Unknown quest: ${idArg}`);
+  if (quest.status === "archived") {
+    if (isPretty()) console.log(actionLine("ok", "quest", [bold(quest.id), dim("already archived")]));
+    else console.log(`quest-archived\t${quest.id}`);
+    return;
+  }
+  // Archive is the lifecycle flip after done; require done first so the work was
+  // filed (quest done copies seals + snapshot before archiving is meaningful).
+  if (quest.status !== "done") {
+    throw new Error(`Quest ${quest.id} is ${quest.status}; run 'hive quest done ${quest.id}' before archiving`);
+  }
+  const updated = await updateQuest(quest.id, { status: "archived", archivedAt: new Date().toISOString() });
+  if (isPretty()) console.log(actionLine("ok", "quest", [bold(updated.id), dim("archived")]));
+  else console.log(`quest-archived\t${updated.id}`);
+}
+
+async function workspaceClose(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace close <name>");
+  const session = workspaceSessionName(name);
+  if (!(await hasSession(session))) throw new Error(`No such workspace session: ${session}`);
+  const result = await closeWorkspaceSession(session);
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), dim(`closed, ${result.unlinked} bee window(s) unlinked`)]));
+  else console.log(`workspace-closed\t${session}\t${result.unlinked}`);
+}
+
+/**
+ * Tear down a workspace session WITHOUT ever killing a bee (the view invariant,
+ * PRD §13), while still removing the workspace's OWN windows (the throwaway
+ * placeholder and shell/command panes we created).
+ *
+ * The discriminator is PROVENANCE, not link topology: only a window WE created
+ * carries the `@hive_ws_own` marker, so only those are kill-window'd. EVERY other
+ * window is treated as a bee link and is only ever safe-unlinked WITHOUT -k — and
+ * if that refuses (the ws is the window's last link, i.e. an orphaned bee whose
+ * home session is gone) we ABORT the whole close, leaving the workspace intact and
+ * the bee alive. An earlier "linked outside this group ⇒ bee" heuristic was unsound:
+ * an orphaned bee has no outside link either, so it would have been kill-window'd.
+ * view's uniform safe-unlink (a view holds only bees, no own windows) stays simpler;
+ * this preserves the same guarantee — a bee never loses its home to a workspace close.
+ */
+async function closeWorkspaceSession(session: string): Promise<{ sessions: string[]; unlinked: number }> {
+  const groupSet = new Set(await tmuxGroupSessions(session));
+
+  // Classify by PROVENANCE (the @hive_ws_own window marker), never by link
+  // topology. A window the workspace created is marked and may be kill-window'd;
+  // EVERY other window is a bee link and is only ever safe-unlinked WITHOUT -k,
+  // aborting if it is the window's last link (an orphaned bee whose home session
+  // is gone). The old "no link outside the group ⇒ ours" heuristic was unsound:
+  // an orphaned bee also has no outside link, so it would have been killed.
+  const listResult = await tmux(
+    ["list-windows", "-t", `=${session}`, "-F", "#{window_id}\t#{@hive_ws_own}"],
+    { reject: false },
+  );
+  const rows = listResult.ok ? listResult.stdout.split("\n").map((l) => l.trim()).filter(Boolean) : [];
+  const ownWindows: string[] = [];
+  const beeWindows: string[] = [];
+  for (const row of rows) {
+    const tab = row.indexOf("\t");
+    const wid = tab >= 0 ? row.slice(0, tab) : row;
+    const ownFlag = tab >= 0 ? row.slice(tab + 1).trim() : "";
+    (ownFlag === "1" ? ownWindows : beeWindows).push(wid);
+  }
+
+  // First: safe-unlink every (potential) bee window, and ABORT before any
+  // destruction if one refuses — so an aborted close leaves the workspace fully
+  // intact and the orphaned bee alive.
+  let unlinked = 0;
+  for (const wid of beeWindows) {
+    const result = await tmux(["unlink-window", "-t", `=${session}:${wid}`], { reject: false });
+    if (!result.ok) {
+      throw new Error(
+        `Refusing to close ${session}: window ${wid} is a bee whose own session is gone ` +
+          `(${result.stderr.trim() || "last link"}); re-home it first (hive workspace add <ws> <bee>) ` +
+          `or attach to rescue it: tmux attach -t ${session}.`,
+      );
+    }
+    unlinked += 1;
+  }
+  // Then: kill the windows the workspace owns, and the (now empty) group.
+  for (const wid of ownWindows) {
+    await tmux(["kill-window", "-t", `=${session}:${wid}`], { reject: false });
+  }
+  for (const s of groupSet) {
+    await tmux(["kill-session", "-t", `=${s}`], { reject: false });
+  }
+  return { sessions: [...groupSet], unlinked };
+}
+
+/** The session group for `session` (itself + grouped `<session>-<n>` clients). */
+async function tmuxGroupSessions(session: string): Promise<string[]> {
+  const groupResult = await tmux(["list-sessions", "-F", "#{session_name}\t#{session_group}"], { reject: false });
+  const pairs = (groupResult.ok ? groupResult.stdout.split("\n").filter(Boolean) : []).map((line) => {
+    const tab = line.indexOf("\t");
+    return [tab >= 0 ? line.slice(0, tab) : line, tab >= 0 ? line.slice(tab + 1) : ""] as const;
+  });
+  const group = pairs.find(([s]) => s === session)?.[1] ?? "";
+  const sessions = pairs
+    .filter(([s, g]) => s === session || (group.length > 0 && g === group && s.startsWith(`${session}-`)))
+    .map(([s]) => s);
+  if (!sessions.includes(session)) sessions.unshift(session);
+  return sessions;
+}
+
+async function workspaceRename(parsed: Parsed) {
+  const from = parsed.args[1];
+  const to = parsed.args[2];
+  if (!from || !to) throw new Error("Usage: hive workspace rename <old> <new>");
+  const record = await renameWorkspace(from, to);
+  // Rename the live ws- session if present.
+  const oldSession = workspaceSessionName(from);
+  const newSession = workspaceSessionName(to);
+  if (await hasSession(oldSession)) {
+    // rename-session does not accept the `=name` exact prefix; target the bare
+    // session name (it exists and is ws- prefixed, so no collision risk).
+    await tmux(["rename-session", "-t", oldSession, newSession], { reject: false });
+  }
+  // Cascade workspaceId on member bees (cascadeColonyRename pattern).
+  const sessions = await listSessions();
+  for (const bee of sessions) {
+    if (bee.workspaceId !== from) continue;
+    await updateSession(bee.name, { workspaceId: to, updatedAt: new Date().toISOString() });
+    await writeHiveTags({ ...bee, workspaceId: to });
+  }
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(record.name), dim(`renamed from ${from}`)]));
+  else console.log(`workspace-renamed\t${from}\t${to}`);
+}
+
+async function workspaceArchive(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive workspace archive <name>");
+  const record = await archiveWorkspace(name);
+  if (isPretty()) console.log(actionLine("ok", "workspace", [bold(record.name), dim("archived")]));
+  else console.log(`workspace-archived\t${record.name}`);
 }
 
 async function cmdFrame(parsed: Parsed) {
@@ -4909,6 +7159,17 @@ function stringFlag(parsed: Parsed, keys: string[]): string | undefined {
   return undefined;
 }
 
+// A repeatable value flag (e.g. `--tag a --tag b`): the parser arrays repeats,
+// keeps a single value as a string, and a value-less `--tag` as `true`. Coerce
+// all three to a string[] (dropping a value-less use with an error).
+function arrayFlag(parsed: Parsed, key: string): string[] {
+  const raw = flag(parsed, key);
+  if (raw === undefined) return [];
+  if (raw === true) throw new Error(`--${key} requires a value`);
+  if (Array.isArray(raw)) return raw;
+  return [raw];
+}
+
 function ageFlag(parsed: Parsed, keys: string[]): number | undefined {
   for (const key of keys) {
     const value = flag(parsed, key);
@@ -5457,6 +7718,7 @@ function printHelp() {
         ["brief", "<selector> <text>", "send a one-time context brief"],
         ["buz", "<send|inbox|read|…>", "addressed messaging: three-tier delivery + per-bee policy"],
         ["rename", "<selector> <title>", "set a bee's display title (--here for current bee, --auto to derive one, --clear)"],
+        ["tag", "<selector> <tag>...", "add/remove user tags on bees (--remove, --list)"],
         ["seal", "<selector> --from <p>", "record a typed handoff artifact"],
       ],
     },
@@ -5480,7 +7742,11 @@ function printHelp() {
         ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
         ["next", "", "jump to the next bee needing you (waiting/done/failed; --prev, --state)"],
         ["split", "[<bee>] [<agent>]", "spawn a sub-bee into the bee's comb (adjacent pane)"],
+        ["fork", "<bee> [checkpoint]", "branch a bee into a fresh comb, seeded from its state"],
         ["here", "", "resolve the bee owning the current pane (--id, --json)"],
+        ["spawn-picker", "[--frame|--flow]", "print frame/flow names for a display-popup spawn chord"],
+        ["urls", "[<bee>]", "list URLs printed in a bee's pane (--lines, --open, --json)"],
+        ["keys", "<print|path|check>", "print/verify the recommended tmux keybinding set"],
         ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--all, --fresh, --session <id>)"],
         ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],
@@ -5494,6 +7760,8 @@ function printHelp() {
         ["swarm", "<list|inspect|destroy>", "manage live or destroyed bee cohorts"],
         ["frame", "<list|define|…>", "manage reusable swarm blueprints"],
         ["flow", "<list|run|runs|…>", "manage and run flow definitions"],
+        ["own", "<owner> <bee>...", "set the owned-by/reports-to edge (--clear to unset)"],
+        ["move", "<bee> --colony <c>", "reassign a bee's colony (or --owner <o> alias)"],
       ],
     },
     {
