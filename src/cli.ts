@@ -769,6 +769,8 @@ async function cmdLaunch(parsed: Parsed): Promise<void> {
         args: (f.args ?? []).map((a) => ({
           name: a.name,
           ...(a.default !== undefined ? { default: String(a.default) } : {}),
+          ...(a.description ? { description: a.description } : {}),
+          ...(a.name === "bee" ? { picker: "bee" as const } : {}),
         })),
       })),
   ];
@@ -789,6 +791,20 @@ async function cmdLaunch(parsed: Parsed): Promise<void> {
       }
     },
     listSubdirs: (base) => listNewBeeSubdirs(base),
+    loadBeeOptions: async () => {
+      // Account-aware agent shorthands the bee picker offers: <kind>-auto (when
+      // ≥1 account), <kind>-<account-id> per account, or plain <kind> with none.
+      const out: Array<{ value: string; label: string; detail?: string }> = [];
+      for (const kind of agentKinds()) {
+        const accounts = await newBeeAccountRows(kind).catch(() => []);
+        if (accounts.length >= 1) out.push({ value: `${kind}-auto`, label: `${kind} · auto`, detail: "least-loaded account" });
+        for (const acct of accounts) {
+          out.push({ value: `${kind}-${acct.id}`, label: `${kind} · ${acct.label}`, ...(acct.usage ? { detail: acct.usage } : {}) });
+        }
+        if (accounts.length === 0) out.push({ value: kind, label: `${kind} · (no account)` });
+      }
+      return out;
+    },
   });
 
   if (!plan) {

@@ -21,6 +21,20 @@ export type LaunchArg = {
   name: string;
   /** Default value (stringified); absent ⇒ a required field. */
   default?: string;
+  /** One-line help shown under the field while it is focused. */
+  description?: string;
+  /** When "bee", the field is filled from an account-aware agent picker, not free text. */
+  picker?: "bee";
+};
+
+/** An agent×account choice for the bee picker (value is a `hive spawn` shorthand). */
+export type BeeOption = {
+  /** The shorthand written into the field, e.g. "claude-auto" or "codex-thto". */
+  value: string;
+  /** Display label, e.g. "claude · auto" or "codex · thto.no". */
+  label: string;
+  /** Optional right-hand detail (usage, etc.). */
+  detail?: string;
 };
 
 export type LaunchTemplate = {
@@ -50,6 +64,8 @@ export type LaunchTuiHooks = {
   loadProjects: () => Promise<LaunchProject[]>;
   validatePath: (input: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
   listSubdirs: (base: string) => Promise<{ ok: boolean; base: string; dirs: string[]; error?: string }>;
+  /** Account-aware agent options for a `bee`-picker field (claude-auto, codex-thto, …). */
+  loadBeeOptions: () => Promise<BeeOption[]>;
 };
 
 type Stage = "template" | "project" | "args";
@@ -114,6 +130,13 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
   let cursorPath = 0;
   let pathScroll = 0;
   let cursorArg = 0; // 0..args.length; args.length === the "Launch" row
+
+  // ── bee-picker overlay (a `bee` field opens an account-aware agent list) ──
+  let beePicking = false;
+  let beeQuery = "";
+  let cursorBee = 0;
+  let beeScroll = 0;
+  let beeOptions: AsyncState<BeeOption[]> = { state: "idle" };
 
   // ── async-loaded data ───────────────────────────────────────────────────
   let projects: AsyncState<LaunchProject[]> = { state: "idle" };
@@ -316,22 +339,69 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
         launch();
       };
 
+      const focusedArg = (): LaunchArg | undefined => (cursorArg < launchRow() ? argList()[cursorArg] : undefined);
+
+      const openBeePicker = async () => {
+        beePicking = true;
+        beeQuery = "";
+        cursorBee = 0;
+        beeScroll = 0;
+        if (beeOptions.state === "idle" || beeOptions.state === "error") {
+          beeOptions = { state: "loading" };
+          render();
+          try {
+            beeOptions = { state: "loaded", items: await hooks.loadBeeOptions() };
+          } catch (error) {
+            beeOptions = { state: "error", error: error instanceof Error ? error.message : String(error) };
+          }
+        }
+        if (!done) render();
+      };
+
+      const filteredBeeOptions = (): BeeOption[] =>
+        beeOptions.state === "loaded" ? fuzzyFilter(beeQuery, beeOptions.items, (o) => `${o.label} ${o.value}`) : [];
+
+      const chooseBee = () => {
+        const arg = focusedArg();
+        const opt = filteredBeeOptions()[cursorBee];
+        if (arg && opt) argValues[arg.name] = opt.value;
+        beePicking = false;
+        render();
+      };
+
+      const handleBeePickerKey = (value: string, key: readline.Key): boolean => {
+        if (!(stage === "args" && beePicking)) return false;
+        if (key.name === "escape" || key.name === "left") { beePicking = false; render(); return true; }
+        if (key.name === "return" || key.name === "enter") { chooseBee(); return true; }
+        if (key.name === "up") { cursorBee = clamp(cursorBee - 1, filteredBeeOptions().length); render(); return true; }
+        if (key.name === "down") { cursorBee = clamp(cursorBee + 1, filteredBeeOptions().length); render(); return true; }
+        if (key.name === "backspace") { beeQuery = beeQuery.slice(0, -1); cursorBee = 0; render(); return true; }
+        if (key.ctrl && key.name === "u") { beeQuery = ""; cursorBee = 0; render(); return true; }
+        if (isPrintable(value, key)) { beeQuery += value; cursorBee = 0; render(); return true; }
+        return true;
+      };
+
       const handleArgsKey = (value: string, key: readline.Key): boolean => {
-        if (stage !== "args") return false;
+        if (stage !== "args" || beePicking) return false;
         if (key.name === "escape" || key.name === "left") { enterProject(); return true; }
         if (key.name === "up") { cursorArg = clamp(cursorArg - 1, launchRow() + 1); argError = ""; render(); return true; }
         if (key.name === "down") { cursorArg = clamp(cursorArg + 1, launchRow() + 1); argError = ""; render(); return true; }
+        const arg = focusedArg();
+        // A `bee` field is filled from the account-aware picker, not free text.
+        if (arg?.picker === "bee" && (key.name === "return" || key.name === "enter" || key.name === "tab" || isPrintable(value, key))) {
+          void openBeePicker();
+          return true;
+        }
         if (key.name === "return" || key.name === "enter") {
           if (cursorArg < launchRow()) { cursorArg = clamp(cursorArg + 1, launchRow() + 1); render(); return true; }
           submitArgs();
           return true;
         }
-        // editing the focused field
-        if (cursorArg < launchRow()) {
-          const name = argList()[cursorArg]!.name;
-          if (key.name === "backspace") { argValues[name] = (argValues[name] ?? "").slice(0, -1); render(); return true; }
-          if (key.ctrl && key.name === "u") { argValues[name] = ""; render(); return true; }
-          if (isPrintable(value, key)) { argValues[name] = (argValues[name] ?? "") + value; render(); return true; }
+        // editing the focused free-text field
+        if (arg) {
+          if (key.name === "backspace") { argValues[arg.name] = (argValues[arg.name] ?? "").slice(0, -1); render(); return true; }
+          if (key.ctrl && key.name === "u") { argValues[arg.name] = ""; render(); return true; }
+          if (isPrintable(value, key)) { argValues[arg.name] = (argValues[arg.name] ?? "") + value; render(); return true; }
         }
         return true; // consume everything else while in the form
       };
@@ -398,6 +468,7 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
       const onKey = (value: string, key: readline.Key) => {
         if (key.ctrl && key.name === "c") { finish(null); return; }
         if (handleTemplateKey(value, key)) return;
+        if (handleBeePickerKey(value, key)) return;
         if (handleArgsKey(value, key)) return;
         if (handleBrowseKey(value, key)) return;
         if (handlePathKey(value, key)) return;
@@ -454,6 +525,7 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
 
       const footer = (): string => {
         if (stage === "template") return "type to filter · ↑↓ move · enter select · q quit";
+        if (stage === "args" && beePicking) return "type to filter · ↑↓ move · enter pick · esc back";
         if (stage === "args") return "↑↓ field · type to edit · enter next/launch · ← back";
         if (projectView === "browse" || projectView === "path") return "type to filter · ↑↓ move · enter select · esc back";
         return "↑↓ move · enter choose · ← back · q quit";
@@ -539,28 +611,58 @@ export async function chooseLaunch(hooks: LaunchTuiHooks): Promise<LaunchResult 
       };
 
       const renderArgs = (width: number, _bodyRows: number): string[] => {
-        const out: string[] = [dim(`${template?.name} args — fill the boxes, * = required`), ""];
+        if (beePicking) return renderBeePicker(width);
+        const out: string[] = [dim(`${template?.name} — ${red("*")} = required`), ""];
         const labelW = Math.min(22, Math.max(6, ...argList().map((a) => a.name.length + 2)));
+        const fieldW = Math.max(10, width - labelW - 8);
         argList().forEach((arg, i) => {
           const focused = i === cursorArg;
           const req = arg.default === undefined ? red("*") : " ";
           const name = padRight(arg.name, labelW);
           const value = argValues[arg.name] ?? "";
-          const boxW = Math.max(10, width - labelW - 8);
-          const shown = truncate(value, boxW);
-          const field = focused && isPretty() ? `${reverse(` ${padRight(shown, boxW)} `)}` : `[${padRight(shown, boxW)}]`;
-          out.push(`${focused ? green("›") : " "} ${req} ${dim(name)} ${field}`);
+          const shown = truncate(value, fieldW);
+          // No brackets: the focused field is a reverse-video input box; an
+          // unfocused field is plain text (a dim placeholder when empty).
+          let field: string;
+          if (focused && isPretty()) field = reverse(` ${padRight(shown, fieldW)} `);
+          else if (shown.length > 0) field = shown;
+          else field = dim(arg.picker === "bee" ? "↵ pick an agent" : "—");
+          out.push(`${focused ? green("›") : " "} ${req} ${dim(name)}  ${field}`);
         });
+        // Help line for the focused field (what it does).
+        const arg = focusedArg();
         out.push("");
+        out.push(arg?.description ? dim(`  ${truncate(arg.description, width - 4)}`) : "");
         const launchFocused = cursorArg === launchRow();
         const action = `▶ Launch ${template?.kind ?? ""} ${template?.name ?? ""} in ${relTilde(selCwd)}`;
         out.push(`${launchFocused ? green("›") : " "}   ${launchFocused && isPretty() ? reverse(stripAnsi(action)) : bold(action)}`);
         return out;
       };
 
+      const renderBeePicker = (width: number): string[] => {
+        const out: string[] = [dim(`pick the agent for "${focusedArg()?.name ?? "bee"}"`), `${cyan("> ")}${beeQuery}`];
+        if (beeOptions.state === "loading") { out.push(dim("loading accounts…")); return out; }
+        if (beeOptions.state === "error") { out.push(red(beeOptions.error)); return out; }
+        const list = filteredBeeOptions();
+        if (list.length === 0) { out.push(dim("no match")); return out; }
+        const listRows = 12;
+        if (cursorBee < beeScroll) beeScroll = cursorBee;
+        if (cursorBee >= beeScroll + listRows) beeScroll = cursorBee - listRows + 1;
+        for (let i = 0; i < Math.min(listRows, list.length - beeScroll); i += 1) {
+          const idx = beeScroll + i;
+          const o = list[idx]!;
+          const pointer = idx === cursorBee ? green("›") : " ";
+          const detail = o.detail ? `  ${dim(o.detail)}` : "";
+          const line = `${pointer} ${idx === cursorBee ? bold(o.label) : o.label}${detail}`;
+          out.push(idx === cursorBee && isPretty() ? reverse(stripAnsi(line)) : truncate(line, width));
+        }
+        return out;
+      };
+
       const parkCursor = () => {
         // Show a text cursor at the end of the active typing field.
         if (stage === "template") { stdout.write(`\x1b[3;${2 + visibleLength(templateQuery) + 1}H`); return; }
+        if (stage === "args" && beePicking) { stdout.write(`\x1b[4;${2 + visibleLength(beeQuery) + 1}H`); return; } // header, blank, title, "> query"
         if (stage === "project" && projectView === "browse") { stdout.write(`\x1b[3;${2 + visibleLength(browseQuery) + 1}H`); return; }
         if (stage === "project" && projectView === "path") { stdout.write(`\x1b[3;${2 + visibleLength(pathBuffer) + 1}H`); return; }
       };

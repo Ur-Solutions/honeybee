@@ -21,6 +21,8 @@ import { parseJsonFlow } from "./json.js";
 export type FlowArg = {
   name: string;
   default?: unknown;
+  /** One-line help shown next to the field in `hive launch`. */
+  description?: string;
 };
 
 /** Cleanup policy at end-of-flow. Default is 'keep' — bees stay inspectable. */
@@ -160,6 +162,7 @@ function normalizeArgs(value: unknown, flowName: string): FlowArg[] {
     }
     const arg: FlowArg = { name: obj.name };
     if ("default" in obj) arg.default = obj.default;
+    if (typeof obj.description === "string") arg.description = obj.description;
     return arg;
   });
 }
