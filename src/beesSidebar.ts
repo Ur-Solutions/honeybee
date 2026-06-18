@@ -26,7 +26,7 @@ export function clampSidebarWidth(width: number | undefined): number {
   return Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, Math.floor(raw)));
 }
 
-type PaneRow = { paneId: string; nav: boolean };
+type PaneRow = { paneId: string; nav: boolean; active: boolean };
 
 async function currentWindowTarget(): Promise<string> {
   const result = await tmux(["display-message", "-p", "#{session_name}:#{window_index}"]);
@@ -36,15 +36,15 @@ async function currentWindowTarget(): Promise<string> {
 }
 
 async function listWindowPanes(windowTarget: string): Promise<PaneRow[]> {
-  const format = "#{pane_id}\t#{@hive_bees_nav}";
+  const format = "#{pane_id}\t#{@hive_bees_nav}\t#{pane_active}";
   const result = await tmux(["list-panes", "-t", windowTarget, "-F", format], { reject: false });
   if (!result.ok) return [];
   const rows: PaneRow[] = [];
   for (const line of result.stdout.split("\n")) {
     if (!line.trim()) continue;
-    const [paneId, navRaw] = line.split("\t");
+    const [paneId, navRaw, activeRaw] = line.split("\t");
     if (!paneId) continue;
-    rows.push({ paneId, nav: navRaw === "1" });
+    rows.push({ paneId, nav: navRaw === "1", active: activeRaw === "1" });
   }
   return rows;
 }
@@ -242,6 +242,63 @@ async function windowTargetForPane(paneId: string): Promise<string | undefined> 
   const result = await tmux(["display-message", "-p", "-t", paneId, "#{session_name}:#{window_index}"], { reject: false });
   const target = result.ok ? result.stdout.trim() : "";
   return target.includes(":") ? target : undefined;
+}
+
+/**
+ * The window the sidebar strip lives in, resolved from the strip's own pane
+ * ($TMUX_PANE) rather than the client's active pane — the bee pane beside the
+ * strip is usually the active one, so a bare display-message would point there.
+ */
+async function sidebarWindowTarget(): Promise<string | undefined> {
+  const pane = process.env.TMUX_PANE;
+  const args = pane && pane.length > 0
+    ? ["display-message", "-p", "-t", pane, "#{session_name}:#{window_index}"]
+    : ["display-message", "-p", "#{session_name}:#{window_index}"];
+  const result = await tmux(args, { reject: false });
+  const target = result.ok ? result.stdout.trim() : "";
+  return target.includes(":") ? target : undefined;
+}
+
+type SidebarBeeCandidate = Pick<SessionRecord, "name" | "agentPaneId" | "tmuxTarget" | "node">;
+
+/**
+ * Pure pick of the bee (by `record.name`) a sidebar strip sits beside, given the
+ * panes on its window and that window's session:
+ *   1. the active non-nav pane pinned to a record's agentPaneId — picks the
+ *      focused sub-bee when a comb's window holds several
+ *   2. any non-nav pane pinned to a record
+ *   3. the window's session as a local bee's tmuxTarget (solo/legacy combs that
+ *      were never pane-pinned)
+ * Returns undefined when nothing matches (a bare shell window, or a remote bee
+ * whose pane id isn't on this local server).
+ */
+export function pickCurrentSidebarBee(
+  records: SidebarBeeCandidate[],
+  panes: PaneRow[],
+  windowSession: string,
+): string | undefined {
+  const nonNav = panes.filter((pane) => !pane.nav);
+  const ordered = [...nonNav.filter((pane) => pane.active), ...nonNav.filter((pane) => !pane.active)];
+  for (const pane of ordered) {
+    const byPane = records.find((record) => record.agentPaneId === pane.paneId);
+    if (byPane) return byPane.name;
+  }
+  const bySession = records.find((record) => record.tmuxTarget === windowSession && !record.node);
+  return bySession?.name;
+}
+
+/**
+ * Resolve the bee whose window this sidebar strip lives beside, so the TUI can
+ * start with that row selected and mark it. Returns undefined outside tmux or
+ * when the strip's window has no resolvable bee.
+ */
+export async function resolveCurrentSidebarBeeName(records: SessionRecord[]): Promise<string | undefined> {
+  if (!process.env.TMUX) return undefined;
+  const windowTarget = await sidebarWindowTarget();
+  if (!windowTarget) return undefined;
+  const panes = await listWindowPanes(windowTarget);
+  const windowSession = windowTarget.split(":")[0] ?? "";
+  return pickCurrentSidebarBee(records, panes, windowSession);
 }
 
 /** @internal test helper */

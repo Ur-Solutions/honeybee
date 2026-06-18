@@ -25,7 +25,7 @@ import {
 } from "./accounts.js";
 import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
-import { attachBeeWithSidebar, readBeesGroupMode, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
+import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
 import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
 import { listProRepoEntries, listProRepos, resolveProForCwd, type ProRepoEntry } from "./proProjects.js";
@@ -857,11 +857,25 @@ async function cmdBrief(parsed: Parsed) {
 }
 
 async function cmdRename(parsed: Parsed) {
-  const target = parsed.args[0];
   const auto = truthy(flag(parsed, "auto"));
   const clear = truthy(flag(parsed, "clear"));
-  const explicit = parsed.args.slice(1).join(" ").trim();
-  const usage = "Usage: hive rename <selector> <title>  |  hive rename <selector> --auto  |  hive rename <selector> --clear";
+  const here = truthy(flag(parsed, "here"));
+  const usage = "Usage: hive rename <selector> <title>  |  hive rename --here <title>  |  hive rename <selector> --auto  |  hive rename <selector> --clear";
+
+  // `--here` reshapes argv to the selector-then-title contract: resolve the
+  // current pane's bee and treat every positional as the title (no selector to
+  // skip). Without it, args[0] is the selector and args.slice(1) the title.
+  let target: string | undefined;
+  let explicit: string;
+  if (here) {
+    const bee = await resolveBeeInCurrentPane();
+    if (!bee) throw new Error("hive rename --here: no matching bee for the current pane/session");
+    target = bee.name;
+    explicit = parsed.args.join(" ").trim();
+  } else {
+    target = parsed.args[0];
+    explicit = parsed.args.slice(1).join(" ").trim();
+  }
   if (!target || (auto && clear) || ((auto || clear) === Boolean(explicit))) throw new Error(usage);
 
   const resolved = await resolveSelector(target);
@@ -1180,14 +1194,18 @@ async function cmdBees(parsed: Parsed): Promise<void> {
     return;
   }
 
-  const items = await loadBeesTuiItems(parsed);
+  const { items, records } = await loadBeesTuiItems(parsed);
   const sidebar = truthy(flag(parsed, "sidebar"));
   const groupMode = (await readBeesGroupMode()) ?? undefined;
+  // The sidebar lives beside one bee's window: start on that bee and mark it, so
+  // each window's fresh strip lands on its bee instead of resetting to the top.
+  const currentName = sidebar ? await resolveCurrentSidebarBeeName(records) : undefined;
 
   await runBeesTui({
     items,
     sidebar,
     groupMode,
+    ...(currentName ? { currentName } : {}),
     onGroupChange: async (mode) => {
       // Persist globally so every sidebar (and the next launch) shares the facet.
       await writeBeesGroupMode(mode);
@@ -1226,7 +1244,7 @@ async function cmdBees(parsed: Parsed): Promise<void> {
   });
 }
 
-async function loadBeesTuiItems(parsed: Parsed): Promise<BeesTuiItem[]> {
+async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[]; records: SessionRecord[] }> {
   const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
   const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")) : undefined;
   const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
@@ -1260,7 +1278,7 @@ async function loadBeesTuiItems(parsed: Parsed): Promise<BeesTuiItem[]> {
   const proEntries = await listProRepoEntries().catch(() => [] as ProRepoEntry[]);
 
   const now = Date.now();
-  return records.map((record) => {
+  const items = records.map((record) => {
     const derived = deriveState(record, context);
     const live = derived.state !== "dead" && derived.state !== "sealed" && derived.state !== "node_unreachable";
     const liveHive = probe.states.get(liveTargetKey(record.node, record.tmuxTarget));
@@ -1298,6 +1316,7 @@ async function loadBeesTuiItems(parsed: Parsed): Promise<BeesTuiItem[]> {
       }),
     };
   });
+  return { items, records };
 }
 
 function beeTuiDescription(record: SessionRecord, derived: DerivedState): string {

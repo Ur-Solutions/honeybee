@@ -64,6 +64,13 @@ export type RunBeesTuiOptions = {
   syncGroupMode?: () => Promise<BeesGroupMode | undefined>;
   /** Kill a bee (Ctrl-K, after a confirm modal). Removes it from the list on ok. */
   onKill?: (item: BeesTuiItem) => Promise<{ ok: boolean; detail?: string }>;
+  /**
+   * The bee whose tmux window this strip lives beside (sidebar). Its row starts
+   * selected and carries a "you are here" marker so each window's fresh sidebar
+   * lands on the bee it sits next to rather than the top of the list. Matched by
+   * `BeesTuiItem.name`; undefined → first item, no marker.
+   */
+  currentName?: string;
 };
 
 const UNGROUPED_COLONY = "—";
@@ -277,7 +284,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
   let filtered = catalog;
   let groups = groupBeesByMode(filtered, groupMode);
   let flat = flattenBeesTuiGroups(groups);
-  let cursor = firstItemRowIndex(flat);
+  let cursor = initialBeesCursor(flat, options.currentName);
   let scroll = 0;
   let confirmKill: BeesTuiItem | undefined; // bee awaiting kill confirmation
   let killing = false;
@@ -338,10 +345,13 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
       };
 
       const regroup = () => {
+        // Read the highlighted bee from the OLD flat before rebuilding so the
+        // cursor can follow it; resolveRegroupCursor handles the fallbacks.
+        const prevName = currentItem()?.name;
         filtered = query.length > 0 ? filterBeesTuiItems(catalog, query) : catalog;
         groups = groupBeesByMode(filtered, groupMode);
         flat = flattenBeesTuiGroups(groups);
-        cursor = firstItemRowIndex(flat);
+        cursor = resolveRegroupCursor(flat, prevName, options.currentName);
         scroll = 0;
       };
 
@@ -501,7 +511,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
           lines.push(...renderKillModal(confirmKill, bodyRows, width, killing));
         } else {
           const visible = flat.slice(scroll, scroll + bodyRows);
-          for (let i = 0; i < visible.length; i += 1) lines.push(renderFlatRow(visible[i]!, scroll + i, cursor, width));
+          for (let i = 0; i < visible.length; i += 1) lines.push(renderFlatRow(visible[i]!, scroll + i, cursor, width, options.currentName));
           for (let i = visible.length; i < bodyRows; i += 1) lines.push("");
         }
         lines.push(truncate(message, width));
@@ -559,13 +569,41 @@ function firstItemRowIndex(flat: FlatRow[]): number {
   return idx >= 0 ? idx : 0;
 }
 
-function renderFlatRow(row: FlatRow, index: number, cursor: number, width: number): string {
+/** Flat-row index of the item whose name matches, or -1 when absent/unset. */
+export function itemRowIndexForName(flat: FlatRow[], name: string | undefined): number {
+  if (!name) return -1;
+  return flat.findIndex((row) => row.kind === "item" && row.item.name === name);
+}
+
+/** Where the cursor should land: the named bee if present, else the first item. */
+export function initialBeesCursor(flat: FlatRow[], name: string | undefined): number {
+  const named = itemRowIndexForName(flat, name);
+  return named >= 0 ? named : firstItemRowIndex(flat);
+}
+
+/**
+ * Cursor row after a regroup: keep the previously-highlighted bee when it
+ * survived the rebuild (filter refinement, group cycling); otherwise fall back
+ * to the current-window bee, then the first item. After a kill the highlighted
+ * bee is gone from the new list, so this lands on the home bee, not the top.
+ */
+export function resolveRegroupCursor(flat: FlatRow[], prevName: string | undefined, currentName: string | undefined): number {
+  const survived = itemRowIndexForName(flat, prevName);
+  return survived >= 0 ? survived : initialBeesCursor(flat, currentName);
+}
+
+function renderFlatRow(row: FlatRow, index: number, cursor: number, width: number, currentName?: string): string {
   if (row.kind === "header") {
     if (width < 20) return dim(truncate(row.label, width));
     return dim(`── ${truncate(row.label, Math.max(1, width - 4))} ${"─".repeat(Math.max(0, width - visibleLength(row.label) - 4))}`);
   }
-  const isCurrent = index === cursor;
-  const pointer = isCurrent ? cyan("›") : " ";
+  const isCursor = index === cursor;
+  // The leading 1-col gutter is the "you are here" marker: `>` flags the bee whose
+  // window this strip lives beside, else blank. The cursor row has no caret — it's
+  // shown by the reverse-video highlight below — so `>` stays put even when the
+  // active bee is also selected. Reusing one fixed-width slot keeps the ref aligned.
+  const isHere = currentName !== undefined && row.item.name === currentName;
+  const pointer = isHere ? green(">") : " ";
   const title = row.item.displayName.length > 0 ? row.item.displayName : row.item.ref;
   let line: string;
   if (width < 24) {
@@ -589,7 +627,7 @@ function renderFlatRow(row: FlatRow, index: number, cursor: number, width: numbe
     }
   }
   const fitted = truncate(line, width);
-  return isCurrent ? reverse(stripAnsi(fitted)) : fitted;
+  return isCursor ? reverse(stripAnsi(fitted)) : fitted;
 }
 
 function renderKillModal(item: BeesTuiItem, rows: number, width: number, killing: boolean): string[] {

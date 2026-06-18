@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { promisify } from "node:util";
-import { toggleBeesSidebar } from "../src/beesSidebar.js";
+import { pickCurrentSidebarBee, toggleBeesSidebar } from "../src/beesSidebar.js";
 import { setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
 
 const execFileAsync = promisify(execFile);
@@ -26,6 +26,45 @@ after(async () => {
   if (savedTmpdir === undefined) delete process.env.TMUX_TMPDIR;
   else process.env.TMUX_TMPDIR = savedTmpdir;
   rmSync(testTmpdir, { recursive: true, force: true });
+});
+
+test("pickCurrentSidebarBee prefers the active non-nav pane pinned by agentPaneId", () => {
+  const records = [
+    { name: "A", agentPaneId: "%1", tmuxTarget: "A" },
+    { name: "B", agentPaneId: "%2", tmuxTarget: "B" },
+  ];
+  const panes = [
+    { paneId: "%9", nav: true, active: false }, // the strip itself
+    { paneId: "%1", nav: false, active: false },
+    { paneId: "%2", nav: false, active: true }, // focused sub-bee
+  ];
+  assert.equal(pickCurrentSidebarBee(records, panes, "unused"), "B");
+});
+
+test("pickCurrentSidebarBee falls back to any non-nav pane, then the window session", () => {
+  const records = [
+    { name: "A", agentPaneId: "%1", tmuxTarget: "A" },
+    { name: "B", agentPaneId: "%2", tmuxTarget: "B" },
+  ];
+  // No pane is active → first non-nav pane that matches a record wins.
+  assert.equal(pickCurrentSidebarBee(records, [
+    { paneId: "%9", nav: true, active: false },
+    { paneId: "%1", nav: false, active: false },
+  ], "unused"), "A");
+  // Non-nav pane unpinned (legacy bee) → match the window's session name.
+  assert.equal(pickCurrentSidebarBee(records, [
+    { paneId: "%9", nav: true, active: false },
+    { paneId: "%nomatch", nav: false, active: true },
+  ], "B"), "B");
+});
+
+test("pickCurrentSidebarBee skips remote bees in the session fallback and returns undefined when nothing matches", () => {
+  const remote = [{ name: "R", agentPaneId: "%r", tmuxTarget: "R", node: "edge" }];
+  const panes = [
+    { paneId: "%9", nav: true, active: false },
+    { paneId: "%x", nav: false, active: true },
+  ];
+  assert.equal(pickCurrentSidebarBee(remote, panes, "R"), undefined);
 });
 
 test("bees sidebar opens as a root-left split and focuses the sidebar pane", { timeout: 30_000 }, async () => {

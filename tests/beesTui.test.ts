@@ -6,7 +6,9 @@ import {
   flattenBeesTuiGroups,
   groupBeesByMode,
   groupBeesTuiItems,
+  initialBeesCursor,
   nextBeesGroupMode,
+  resolveRegroupCursor,
   type BeesTuiItem,
 } from "../src/beesTui.js";
 import { __testOnlySidebarWidthClamp } from "../src/beesSidebar.js";
@@ -107,6 +109,36 @@ test("groupBeesByMode folder groups by cwd", () => {
   ], "folder");
   assert.equal(groups.length, 2);
   assert.deepEqual(groups.flatMap((g) => g.items).length, 3);
+});
+
+test("initialBeesCursor selects the named bee's row, else the first item", () => {
+  const flat = flattenBeesTuiGroups(groupBeesTuiItems([
+    item({ name: "a", colony: "c" }),
+    item({ name: "b", colony: "c" }),
+  ]));
+  const rowOf = (name: string) => flat.findIndex((row) => row.kind === "item" && row.item.name === name);
+  const firstItem = flat.findIndex((row) => row.kind === "item");
+  assert.equal(initialBeesCursor(flat, "b"), rowOf("b"));
+  assert.equal(initialBeesCursor(flat, "a"), rowOf("a"));
+  assert.equal(initialBeesCursor(flat, "gone"), firstItem); // not in list → first item
+  assert.equal(initialBeesCursor(flat, undefined), firstItem); // no current bee → first item
+});
+
+test("resolveRegroupCursor keeps the survivor, else the current bee, else first", () => {
+  const flat = flattenBeesTuiGroups(groupBeesTuiItems([
+    item({ name: "a", colony: "c" }),
+    item({ name: "b", colony: "c" }),
+    item({ name: "home", colony: "c" }),
+  ]));
+  const rowOf = (name: string) => flat.findIndex((row) => row.kind === "item" && row.item.name === name);
+  const firstItem = flat.findIndex((row) => row.kind === "item");
+  // Highlight survived the regroup → stay on it.
+  assert.equal(resolveRegroupCursor(flat, "b", "home"), rowOf("b"));
+  // Highlighted bee gone (e.g. just killed) → fall back to the current-window bee.
+  assert.equal(resolveRegroupCursor(flat, "killed", "home"), rowOf("home"));
+  // Neither resolves → first item.
+  assert.equal(resolveRegroupCursor(flat, "killed", "also-gone"), firstItem);
+  assert.equal(resolveRegroupCursor(flat, undefined, undefined), firstItem);
 });
 
 test("nextBeesGroupMode cycles forward and wraps, and goes backward", () => {
