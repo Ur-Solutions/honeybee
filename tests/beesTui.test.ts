@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  beesCatalogSignature,
   beesTuiSearchText,
   filterBeesTuiItems,
   flattenBeesTuiGroups,
@@ -70,6 +71,36 @@ test("filterBeesTuiItems fuzzy-matches title and colony", () => {
   const out = filterBeesTuiItems(rows, "auth");
   assert.equal(out.length, 1);
   assert.equal(out[0]!.name, "CL-1");
+});
+
+test("beesCatalogSignature changes when a bee is renamed", () => {
+  const before = [item({ name: "CL-1", displayName: "old title" }), item({ name: "CL-2" })];
+  const after = [item({ name: "CL-1", displayName: "new title" }), item({ name: "CL-2" })];
+  assert.notEqual(beesCatalogSignature(before), beesCatalogSignature(after));
+});
+
+test("beesCatalogSignature is stable when only age drifts", () => {
+  const a = [item({ name: "CL-1", age: "1m" })];
+  const b = [item({ name: "CL-1", age: "9m" })];
+  assert.equal(beesCatalogSignature(a), beesCatalogSignature(b));
+});
+
+test("beesCatalogSignature reflects spawn, kill, and state changes", () => {
+  const base = [item({ name: "CL-1", stateHeadline: "working" })];
+  assert.notEqual(beesCatalogSignature(base), beesCatalogSignature([...base, item({ name: "CL-2" })]), "spawn");
+  assert.notEqual(beesCatalogSignature(base), beesCatalogSignature([]), "kill");
+  assert.notEqual(
+    beesCatalogSignature(base),
+    beesCatalogSignature([item({ name: "CL-1", stateHeadline: "waiting" })]),
+    "state change",
+  );
+});
+
+test("beesCatalogSignature does not collide across field boundaries", () => {
+  // Adjacent fields must not be ambiguous: ("ab","c") vs ("a","bc").
+  const a = [item({ name: "ab", displayName: "c" })];
+  const b = [item({ name: "a", displayName: "bc" })];
+  assert.notEqual(beesCatalogSignature(a), beesCatalogSignature(b));
 });
 
 test("groupBeesByMode type buckets by agent, no-agent last", () => {

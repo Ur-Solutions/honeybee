@@ -40,6 +40,19 @@ export type BeesTuiGroup = {
   items: BeesTuiItem[];
 };
 
+/**
+ * A stable fingerprint of the rendering-relevant fields of a catalog. The
+ * sidebar polls a fresh catalog and only re-groups/re-renders when this changes,
+ * so a rename, spawn, kill, or state change shows up live without churning the
+ * display on every tick. `age` is intentionally excluded — it drifts every
+ * minute and isn't worth a forced redraw mid-interaction.
+ */
+export function beesCatalogSignature(items: BeesTuiItem[]): string {
+  return items
+    .map((i) => [i.name, i.displayName, i.stateHeadline, i.detail, i.colony, i.swarmId, i.live ? "1" : "0"].join(""))
+    .join("");
+}
+
 export type BeesTuiSelectHandler = (item: BeesTuiItem) => void | Promise<void>;
 
 export type RunBeesTuiOptions = {
@@ -62,6 +75,14 @@ export type RunBeesTuiOptions = {
    * them cycles it. Returning a different mode re-groups this instance.
    */
   syncGroupMode?: () => Promise<BeesGroupMode | undefined>;
+  /**
+   * Reload the catalog from the store so renames, spawns, kills, and state
+   * changes surface live. Polled on the same cadence as syncGroupMode (every
+   * other tick); the TUI diffs via {@link beesCatalogSignature} and only
+   * re-groups/re-renders when something actually changed, preserving the cursor
+   * and active filter.
+   */
+  refreshItems?: () => Promise<BeesTuiItem[]>;
   /** Kill a bee (Ctrl-K, after a confirm modal). Removes it from the list on ok. */
   onKill?: (item: BeesTuiItem) => Promise<{ ok: boolean; detail?: string }>;
   /**
@@ -532,14 +553,38 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
       render();
       stdin.on("keypress", onKey);
       stdout.on("resize", onResize);
-      if (options.syncGroupMode) {
+      if (options.syncGroupMode || options.refreshItems) {
+        let refreshing = false;
+        let tick = 0;
+        let lastSignature = beesCatalogSignature(catalog);
         pollTimer = setInterval(() => {
-          void options.syncGroupMode!().then((mode) => {
-            if (done || !mode || mode === groupMode) return;
-            groupMode = mode;
-            regroup();
-            render();
-          });
+          tick += 1;
+          if (options.syncGroupMode) {
+            void options.syncGroupMode().then((mode) => {
+              if (done || !mode || mode === groupMode) return;
+              groupMode = mode;
+              regroup();
+              render();
+            });
+          }
+          // Catalog refresh runs every other tick (~3s) and never overlaps
+          // itself, so a slow store/probe read can't pile up. A confirm modal or
+          // an in-flight kill owns the screen, so defer the redraw until it ends.
+          if (options.refreshItems && tick % 2 === 0 && !refreshing) {
+            refreshing = true;
+            void options.refreshItems()
+              .then((items) => {
+                if (done || confirmKill || killing) return;
+                const signature = beesCatalogSignature(items);
+                if (signature === lastSignature) return;
+                lastSignature = signature;
+                catalog = items;
+                regroup();
+                render();
+              })
+              .catch(() => { /* best-effort; keep the last good catalog */ })
+              .finally(() => { refreshing = false; });
+          }
         }, 1500);
       }
     });

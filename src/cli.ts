@@ -1244,6 +1244,10 @@ async function cmdBees(parsed: Parsed): Promise<void> {
     // Sidebars live-update each other: poll the shared facet so cycling in one
     // strip re-groups the rest. Skipped for the standalone full-screen TUI.
     ...(sidebar ? { syncGroupMode: () => readBeesGroupMode() } : {}),
+    // Live-refresh the catalog so renames/spawns/kills/state changes appear
+    // without reopening. Reuses the same filters this invocation was launched
+    // with; the TUI diffs and only redraws on real change.
+    refreshItems: async () => (await loadBeesTuiItems(parsed)).items,
     onPreview: async (item) => {
       const record = await resolveSession(item.name).catch(() => undefined);
       if (!record) return;
