@@ -3050,6 +3050,11 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
   };
   const decision = pickForkSeed(seedInput);
   if (decision.mode === "refuse") throw new Error(`hive fork: ${decision.reason}`);
+  // Tell the operator when a bare `hive fork` fell back to a cold boot because the
+  // source had nothing to seed from (vs an explicit `--seed none`).
+  if (decision.mode === "none" && seedInput.requestedSeed === undefined) {
+    console.error(note(`${source.name} had no session/seal/transcript to seed from — forking cold`));
+  }
 
   // 7. Build the spawn spec and create the new comb. Resume args are baked into
   //    the spawn command (§7.1); seal/log/none seed via a brief after spawn.

@@ -93,6 +93,12 @@ export function pickForkSeed(input: ForkSeedInput): ForkSeedDecision {
   // 6. Summary is DEFERRED (v1, §11) → fall through to log.
   if (source.transcriptPath) return logDecision(forkName, source.transcriptPath);
 
+  // 7. Nothing to seed from. The IMPLICIT default (`hive fork <bee>` with no
+  //    --seed) forks COLD — a fresh sibling with the same agent/cwd/config — so
+  //    the bare chord always yields a bee even on a never-prompted source. An
+  //    EXPLICIT --seed that couldn't be satisfied (e.g. `--seed resume` with no
+  //    session) still refuses, since the operator asked for a specific seed.
+  if (requestedSeed === undefined) return { mode: "none", checkpoint: "none" };
   return { mode: "refuse", reason: `no resume session, no seal, no transcript to seed from for ${forkName}` };
 }
 

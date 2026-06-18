@@ -113,9 +113,14 @@ test("--read-log with no transcript → refuse", () => {
   assert.match(decision.reason, /transcriptPath/);
 });
 
-test("refuse: no session, no seal, no transcriptPath", () => {
+test("default (no --seed): no session/seal/transcript → cold fork, not refuse", () => {
   const decision = pickForkSeed(input());
-  assert.equal(decision.mode, "refuse");
+  assert.equal(decision.mode, "none", "the bare `hive fork` chord falls back to a cold fork");
+});
+
+test("explicit --seed resume with no session → still refuse", () => {
+  const decision = pickForkSeed(input({ requestedSeed: "resume" }));
+  assert.equal(decision.mode, "refuse", "an explicit seed request that can't be satisfied refuses");
 });
 
 test("none: --seed none → boot cold", () => {
