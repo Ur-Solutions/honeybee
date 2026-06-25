@@ -123,11 +123,12 @@ Bees without a transcript reader yet (Pi, Droid, arbitrary executables) fall bac
 
 ## Bee defaults
 
-**Claude runs permissionless by default** (`claude --dangerously-skip-permissions`)
-so a spawned Claude bee works autonomously instead of stalling on per-action
+**Claude and Kimi run permissionless by default** (`claude --dangerously-skip-permissions`,
+`kimi --yolo`) so those bees work autonomously instead of stalling on per-action
 approval prompts. Opt out per spawn with `--no-yolo`, persistently with
-`hive config set-bee claude --no-yolo`, or by overriding the command entirely
-with `HIVE_CLAUDE_CMD="claude"`.
+`hive config set-bee claude --no-yolo` / `hive config set-bee kimi --no-yolo`,
+or by overriding the command entirely with `HIVE_CLAUDE_CMD="claude"` or
+`HIVE_KIMI_CMD="kimi"`.
 
 Codex, OpenCode, and Grok still default to their safer interactive modes:
 
@@ -137,16 +138,18 @@ opencode run --interactive
 grok --tools= --disable-web-search --no-subagents
 ```
 
-Full-permission/yolo mode is explicit for those (and the default for Claude):
+Full-permission/yolo mode is explicit for those (and the default for Claude and Kimi):
 
 ```sh
 hive spawn claude            # already permissionless
 hive spawn claude --no-yolo  # opt back into approval prompts
+hive spawn kimi              # already permissionless
+hive spawn kimi --no-yolo    # opt back into approval prompts
 hive spawn codex --yolo
 HIVE_CODEX_YOLO=1 hive spawn codex
 ```
 
-When a bee that *does* ask for approval (a `--no-yolo` Claude, or another agent)
+When a bee that *does* ask for approval (a `--no-yolo` Claude/Kimi, or another agent)
 pauses on a permission/approval prompt mid-task, `hive list`/`ps` shows it as
 `blocked` (awaiting permission), and `hive wait`/`run --wait`/`x` flag it rather
 than reading the stall as a finished turn — attach to approve.

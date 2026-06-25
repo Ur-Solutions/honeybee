@@ -123,11 +123,12 @@ Built-in agent defaults:
 | `codex` | `codex` | `codex --dangerously-bypass-approvals-and-sandbox` |
 | `opencode` | `opencode run --interactive` | `opencode run --interactive --dangerously-skip-permissions` |
 | `grok` | `grok --tools= --disable-web-search --no-subagents` | `grok --permission-mode bypassPermissions --always-approve --tools= --disable-web-search --no-subagents` |
+| `kimi` | `kimi` | `kimi --yolo` |
 | `pi` | `pi` | `pi` |
 | `droid` | `droid` | `droid --settings ~/.factory/hive-droid-yolo-settings.json` |
 | `cursor` | `cursor-agent` | `cursor-agent --force` |
 
-Claude defaults to yolo mode unless explicitly opted out. The reserved
+Claude and Kimi default to yolo mode unless explicitly opted out. The reserved
 `codex-auto` account-picking alias also defaults to yolo; plain `codex` and
 other built-in agents use safer defaults unless yolo is requested.
 
@@ -136,12 +137,15 @@ Yolo controls:
 ```sh
 hive spawn claude
 hive spawn claude --no-yolo
+hive spawn kimi
+hive spawn kimi --no-yolo
 hive spawn codex --yolo
 hive spawn codex --dangerous
 HIVE_YOLO=1 hive spawn codex
 HIVE_CODEX_YOLO=1 hive spawn codex
 hive config set-bee codex --yolo
 hive config set-bee claude --no-yolo
+hive config set-bee kimi --no-yolo
 ```
 
 Home/profile aliases:
@@ -274,6 +278,7 @@ hive spawn codex --account codex-work
 hive spawn codex-work        # <tool>-<account-fragment> shorthand
 hive spawn claude-thto --autoswap
 hive spawn claude-auto       # least-loaded account pick (also: --account auto)
+hive spawn codex-rr          # round-robin: next account in registration order (also: --account rr)
 ```
 
 Account-bound spawns activate credentials into a home before launch. Autoswap
@@ -292,6 +297,15 @@ The pick reads limits through the cache with a default ttl of **1h**, so
 back-to-back auto spawns cost no extra provider round-trips. Override per call
 with `--ttl <age>` (`--ttl 0` forces a live read); `hive limits` keeps the
 same cache warm.
+
+`rr` is the second reserved account query (`--account rr`, or `<tool>-rr`):
+hive advances a persistent cursor at `<storeRoot>/round-robin.json` through the
+tool's credentialed accounts, sorted by registration time. Each spawn picks the
+**next** account regardless of remaining quota — use this when you want to
+spread workload evenly (e.g. when running many parallel loops) rather than let
+limits steer the pick. Two concurrent spawns serialize through a file lock so
+the cursor never doubles up or skips. The pick is logged to stderr, e.g.
+`account rr → claude-ursolutions — round-robin: next after claude-thto`.
 
 Homogeneous swarm:
 
@@ -1807,12 +1821,16 @@ and `<tool>-<query>` shorthand.
 seat. When fresh credentials appear, they are captured into the vault and the
 seat is torn down. Use `--no-wait` to leave the seat running and capture later.
 
-Claude-specific notes:
+Credential rotation notes:
 
 - Claude credentials may live in macOS Keychain.
-- Activation rescues and syncs rotated OAuth chains before stamping a home.
-- `hive account sync` pulls rotated Claude OAuth chains from homes back into
-  the vault.
+- Claude refreshes can rotate OAuth chains; Codex, OpenCode, Grok, Kimi, and
+  Cursor can rewrite their file-backed credentials in-place.
+- Activation rescues and syncs rotated/refreshed credentials before stamping a
+  home.
+- `hive account sync` pulls rotated/refreshed credentials from attributed homes
+  back into the vault. Dedicated account homes are trusted automatically; live
+  session homes are trusted when the session record is account-bound.
 
 ### `hive activate`
 
