@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { agentDefaultsToYolo, forcedSessionIdArgs, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
 import { assertExecutableAvailable } from "../src/execCheck.js";
+import { setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
 
 test("forcedSessionIdArgs: claude pins a fresh session id; other providers do not", () => {
   assert.deepEqual(forcedSessionIdArgs("claude", "abc-123"), ["--session-id", "abc-123"]);
@@ -73,10 +74,11 @@ test("agent defaults are safe unless yolo mode is explicit", () => {
   }
 });
 
-test("claude (and its aliases) default to yolo; other bees do not", () => {
+test("claude and kimi default to yolo; other bees do not", () => {
   assert.equal(agentDefaultsToYolo("claude"), true);
   assert.equal(agentDefaultsToYolo("cc3"), true);
   assert.equal(agentDefaultsToYolo("claude2"), true);
+  assert.equal(agentDefaultsToYolo("kimi"), true);
   assert.equal(agentDefaultsToYolo("codex"), false);
   assert.equal(agentDefaultsToYolo("codex2"), false);
   assert.equal(agentDefaultsToYolo("grok"), false);
@@ -149,6 +151,11 @@ test("resolveAgent: no model means no model args (byte-identical to today)", () 
   assert.deepEqual(resolveAgent("codex").args, []);
 });
 
+test("resolveAgent: opencode disables tmux passthrough to avoid palette-reply leaks", () => {
+  assert.deepEqual(resolveAgent("opencode").tmuxOptions, { "allow-passthrough": "off" });
+  assert.equal(resolveAgent("claude").tmuxOptions, undefined);
+});
+
 test("resolveAgent: model args precede user extraArgs so `-- …` still overrides", () => {
   const spec = resolveAgent("claude", ["--foo"], { model: "opus" });
   assert.deepEqual(spec.args, ["--model", "opus", "--foo"]);
@@ -168,10 +175,10 @@ test("resolveAgent: a config/env command override suppresses modelArgs (no doubl
   }
 });
 
-test("resolveAgent: drivers without a modelArgs hook (grok) ignore model — no model args", () => {
+test("resolveAgent: grok embeds a bare --model selector", () => {
   const spec = resolveAgent("grok", [], { model: "grok-4", provider: "xai" });
-  // grok's command is unchanged; no --model is appended (hook is undefined).
-  assert.ok(!spec.args.includes("--model"));
+  assert.equal(spec.command, "grok");
+  assert.deepEqual(spec.args, ["--tools=", "--disable-web-search", "--no-subagents", "--model", "grok-4"]);
 });
 
 test("assertExecutableAvailable accepts a real executable and rejects a missing one", async () => {
@@ -194,5 +201,54 @@ test("spawnBeeForFlow refuses a local spawn when the agent executable is missing
     if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = previous;
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("spawnBeeForFlow stamps tmux hive identity options for spawned bees", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-agents-spawn-stamp-"));
+  const socketDir = await mkdtemp(join(tmpdir(), "hive-agents-spawn-socket-"));
+  const previousStore = process.env.HIVE_STORE_ROOT;
+  const previousTmpdir = process.env.TMUX_TMPDIR;
+  const previousSocket = process.env.HIVE_TMUX_SOCKET;
+  const previousTmux = process.env.TMUX;
+  const socket = join(socketDir, "s.sock");
+  process.env.HIVE_STORE_ROOT = dir;
+  process.env.TMUX_TMPDIR = socketDir;
+  process.env.HIVE_TMUX_SOCKET = socket;
+  delete process.env.TMUX;
+  setTmuxSocket(socket);
+  try {
+    const record = await spawnBeeForFlow({
+      agent: "sh",
+      extraArgs: ["-c", "sleep 30"],
+      cwd: "/tmp",
+      yolo: false,
+      name: `flow-stamp-${process.pid}-${Date.now()}`,
+    });
+    const line = (await tmux([
+      "display-message",
+      "-p",
+      "-t",
+      `=${record.tmuxTarget}:`,
+      "#{@hive_id}\t#{@hive_pane}\t#{@hive_state}\t#{window_name}",
+    ])).stdout.trim();
+    const [id, pane, state, windowName] = line.split("\t");
+    assert.equal(id, record.id);
+    assert.equal(pane, record.agentPaneId);
+    assert.equal(state, "working");
+    assert.equal(windowName, record.id);
+  } finally {
+    await tmux(["kill-server"], { reject: false });
+    setTmuxSocket(undefined);
+    if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousStore;
+    if (previousTmpdir === undefined) delete process.env.TMUX_TMPDIR;
+    else process.env.TMUX_TMPDIR = previousTmpdir;
+    if (previousSocket === undefined) delete process.env.HIVE_TMUX_SOCKET;
+    else process.env.HIVE_TMUX_SOCKET = previousSocket;
+    if (previousTmux === undefined) delete process.env.TMUX;
+    else process.env.TMUX = previousTmux;
+    await rm(dir, { recursive: true, force: true });
+    await rm(socketDir, { recursive: true, force: true });
   }
 });

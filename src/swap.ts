@@ -1,5 +1,5 @@
-import { activateAccountIntoHome, listAccounts, type AccountRecord } from "./accounts.js";
-import { canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
+import { activateAccountIntoHome, listAccounts, syncAccountCredentialsToVault, type AccountRecord } from "./accounts.js";
+import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 
@@ -38,9 +38,9 @@ export async function swapAccount(
   // several providers (opencode → minimax/glm/kimi), a swap must stay within
   // the bee's current provider. Skip the check when EITHER side's provider is
   // undefined (legacy claude/codex accounts have no provider on the record).
+  const accountRegistry = record.accountId ? await (options.listAccounts ?? listAccounts)() : [];
   if (record.accountId && account.provider) {
-    const fromProvider = (await (options.listAccounts ?? listAccounts)())
-      .find((other) => other.id === record.accountId)?.provider;
+    const fromProvider = accountRegistry.find((other) => other.id === record.accountId)?.provider;
     if (fromProvider && fromProvider !== account.provider) {
       throw new Error(
         `Account ${account.id} is a ${account.provider} account; bee ${record.name} runs on ${fromProvider}`,
@@ -88,7 +88,13 @@ export async function swapAccount(
     }
     if (!gone) throw new Error(`Session ${record.tmuxTarget} still alive after kill; aborting swap`);
 
-    // 2. Activate the target account's credentials into the bee's home.
+    // 2. Rescue the current account's freshest credentials from this home
+    //    before activation overwrites it, then activate the target account.
+    const rescueRegistry = current.accountId && accountRegistry.length === 0 ? await (options.listAccounts ?? listAccounts)() : accountRegistry;
+    const currentAccount = current.accountId ? rescueRegistry.find((candidate) => candidate.id === current.accountId) : undefined;
+    if (currentAccount && currentAccount.tool === tool && currentAccount.id !== account.id) {
+      await syncAccountCredentialsToVault(currentAccount, record.homePath!, { trustExtraHome: true }).catch(() => undefined);
+    }
     await activate(account, record.homePath!);
 
     // 3. Resume the same provider session in the same provider home, with the
@@ -103,9 +109,15 @@ export async function swapAccount(
       ...(account.model ? { model: account.model } : {}),
       ...(account.provider ? { provider: account.provider } : {}),
     });
+    if (!record.node) await assertAgentAuthFreshForSpawn(spec, account.id);
     // The swap re-creates the session, so the agent runs in a fresh pane —
     // re-pin to it (the old agentPaneId is now dead).
-    const { paneId } = await substrate.newSession(record.tmuxTarget, record.cwd, { command: spec.command, args: spec.args, env: spec.env });
+    const launch = await substrate.newSession(record.tmuxTarget, record.cwd, {
+      command: spec.command,
+      args: spec.args,
+      env: spec.env,
+      tmuxOptions: spec.tmuxOptions,
+    });
 
     // 4. Persist the new binding and command from the under-lock snapshot so
     //    a concurrent daemon merge (title, transcript metadata, observed
@@ -115,7 +127,8 @@ export async function swapAccount(
       ...current,
       accountId: account.id,
       command: shellCommand(spec),
-      ...(paneId ? { agentPaneId: paneId } : {}),
+      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
       status: "running",
       updatedAt: new Date().toISOString(),
     };

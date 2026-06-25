@@ -165,7 +165,7 @@ export type CompletionState = {
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "workspace" | "quest" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-auto" | "fork-seed";
+type FlagValueKind = "colony" | "workspace" | "quest" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
 
 const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -186,9 +186,10 @@ const FLAG_VALUE_KINDS: Record<string, FlagValueKind> = {
   "--type": "search-type",
   "--status": "seal-status",
   "--flow": "flow",
-  // --account only appears on spawn-side verbs, where the reserved query
-  // `auto` (least-loaded pick) is valid alongside real account ids.
-  "--account": "account-or-auto",
+  // --account only appears on spawn-side verbs, where the reserved queries
+  // `auto` (least-loaded pick) and `rr` (round-robin) are valid alongside
+  // real account ids.
+  "--account": "account-or-meta",
 };
 
 // Per-command overrides + additions. These only apply when args[0] equals
@@ -288,13 +289,18 @@ export function getCompletionsFromState(words: string[], state: CompletionState)
 
   if (positionalIndexOf(args) !== 0) return [];
 
+  // `hive fork launch` opens the interactive launcher; any other first
+  // positional is the source bee to fork.
+  if (command === "fork") return ["launch", ...sessionRefs(state, "all")];
+
   // Bee specs include account shorthands: the full account id is itself a
-  // valid `<tool>-<account>` spawn spec, and `<tool>-auto` picks the
-  // least-loaded account of that tool.
+  // valid `<tool>-<account>` spawn spec; `<tool>-auto` picks the least-loaded
+  // account; `<tool>-rr` advances a per-tool round-robin cursor.
   if (BEE_FIRST_ARG.has(command)) {
     const accounts = state.accounts ?? [];
     const autoAliases = [...new Set(accounts.map((account) => `${account.tool}-auto`))];
-    return [...BEES, ...accounts.map((account) => account.id), ...autoAliases];
+    const rrAliases = [...new Set(accounts.map((account) => `${account.tool}-rr`))];
+    return [...BEES, ...accounts.map((account) => account.id), ...autoAliases, ...rrAliases];
   }
   if (ACCOUNT_FIRST_ARG.has(command)) return resolveFlagValueCandidates("account", state);
   if (SHELL_FIRST_ARG.has(command)) return SHELLS;
@@ -358,8 +364,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return LOOP_SUMMARIZER_VALUES;
     case "account":
       return (state.accounts ?? []).map((account) => account.id);
-    case "account-or-auto":
-      return ["auto", ...(state.accounts ?? []).map((account) => account.id)];
+    case "account-or-meta":
+      return ["auto", "rr", ...(state.accounts ?? []).map((account) => account.id)];
     case "fork-seed":
       return FORK_SEED_VALUES;
   }

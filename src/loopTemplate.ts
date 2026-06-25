@@ -17,7 +17,7 @@ export type LoopTemplate = {
   name: string; // LT_NAME_RE: /^[A-Za-z0-9][A-Za-z0-9_-]*$/
   /** The instruction sent each iteration. */
   prompt: string;
-  /** Agent shorthand (claude, codex-auto, claude-<account>); blank ⇒ ask at launch. */
+  /** Agent shorthand (claude, codex-auto, codex-rr, claude-<account>); blank ⇒ ask at launch. */
   bee?: string;
   /** Context mode: persistent | ralph | rolling. */
   context?: string;

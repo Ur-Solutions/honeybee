@@ -26,12 +26,14 @@ import { loadLatestSeal, recordSeal, type SealArtifact, type SealRecord } from "
 import { resolveSelector } from "../selectors.js";
 import { appendLedger, loadSession, updateSession, type SessionRecord } from "../store.js";
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
-import { spawnBeeForFlow, type SpawnBeeOptions } from "../agents.js";
+import { agentDefaultsToYolo, spawnBeeForFlow, type SpawnBeeOptions } from "../agents.js";
+import { resolveSpawnSpec } from "../spawnResolve.js";
 import { waitForIdle } from "../wait.js";
 import { buildLoopConfig } from "../loop/context.js";
 import { loopFlow } from "../loop/flow.js";
 import {
   ensureLoopDir,
+  generateLoopId,
   type LoopConfig,
   readLoopConfig,
   requestStop,
@@ -40,7 +42,6 @@ import {
 } from "../loop/state.js";
 import type { BeeHandle, FlowSpawnInput } from "./index.js";
 import { cancelRun, spawnDetachedRun } from "./background.js";
-import { generateRunId } from "./runs.js";
 import { runLogPath } from "./runs.js";
 
 /** Identifier for a bee that the facade can resolve to a SessionRecord. */
@@ -157,11 +158,16 @@ export class HiveFacade {
     const node = resolveNode(spec.node);
     const swarmId = spec.swarmId ?? this.defaultSwarmId;
     const cwd = spec.cwd ?? process.cwd();
+    // Resolve the bee token to its kind + optional account here (the flow-spawn
+    // boundary), collapsing `<tool>-auto` to a concrete least-loaded account.
+    // Account binding itself happens in spawnBeeForFlow.
+    const resolved = await resolveSpawnSpec(spec.bee, { onNote: (message) => console.error(message) });
     const spawnOptions: SpawnBeeOptions = {
-      agent: spec.bee,
+      agent: resolved.agent,
+      ...(resolved.account ? { account: resolved.account } : {}),
       extraArgs: [],
       cwd,
-      yolo: false,
+      yolo: agentDefaultsToYolo(resolved.agent),
       ...(spec.name !== undefined ? { name: spec.name } : {}),
       ...(spec.colony !== undefined ? { colony: spec.colony } : {}),
       swarmId,
@@ -229,6 +235,8 @@ export class HiveFacade {
       status: "running",
       brief: text,
       briefedAt: now,
+      lastPrompt: text,
+      lastPromptAt: now,
     });
     await appendLedger({
       type: "flow.brief",
@@ -380,7 +388,10 @@ export class HiveFacade {
    * before a process is forked.
    */
   async loop(spec: LoopSpawnInput): Promise<string> {
-    const loopId = generateRunId();
+    // The bee token (codex-auto / claude-thto / account-id) is kept verbatim and
+    // resolved at each iteration's spawn (spawnLoopBee / facade.spawn) so a
+    // fresh-carrier loop re-picks the least-loaded `auto` account per iteration.
+    const loopId = await generateLoopId();
     // Build/validate the config eagerly; buildLoopConfig throws on bad input.
     const cfg = buildLoopConfig({ ...(spec as Record<string, unknown>), loopId });
     cfg.loopId = loopId;

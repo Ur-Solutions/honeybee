@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { AccountRecord } from "../src/accounts.js";
+import { accountDir, type AccountRecord } from "../src/accounts.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { LaunchSpec, Substrate } from "../src/substrates/types.js";
 import { resumeArgs, swapAccount } from "../src/swap.js";
@@ -57,6 +57,7 @@ function fakeSubstrate(initiallyAlive: boolean) {
     listPanes: async () => new Set<string>(),
     listSessionStates: async () => new Map<string, string>(),
     setUserOptions: async () => undefined,
+    setWindowOptions: async () => undefined,
     renameWindow: async () => undefined,
     attachCommand: () => [],
     attachSession: async () => undefined,
@@ -82,6 +83,16 @@ function record(overrides: Partial<SessionRecord> = {}): SessionRecord {
 }
 
 const account: AccountRecord = { id: "claude-new", tool: "claude", label: "new@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
+
+async function seedOpencodeAuth(account: AccountRecord, token: string, root = accountDir(account), mtimeIso?: string): Promise<void> {
+  const path = join(root, "xdg-data", "opencode", "auth.json");
+  await mkdir(join(path, ".."), { recursive: true });
+  await writeFile(path, JSON.stringify({ [account.provider ?? "zai-coding-plan"]: { type: "api", key: token } }));
+  if (mtimeIso) {
+    const date = new Date(mtimeIso);
+    await utimes(path, date, date);
+  }
+}
 
 test("swapAccount stops, re-credentials, resumes the same session, and rebinds", async () => {
   await withTempStore(async () => {
@@ -218,6 +229,49 @@ test("swapAccount threads the new account's model into the resumed opencode comm
     assert.equal(args[modelIdx + 1], "minimax-coding-plan/MiniMax-M3");
     // ...and still resumes the same provider session.
     assert.deepEqual(args.slice(-2), ["--session", "sess-1"]);
+  });
+});
+
+test("swapAccount rescues generic file-backed credentials before overwriting the home", async () => {
+  await withTempStore(async (dir) => {
+    const { substrate } = fakeSubstrate(false);
+    const currentAccount: AccountRecord = {
+      id: "opencode-current",
+      tool: "opencode",
+      label: "current",
+      provider: "zai-coding-plan",
+      addedAt: "2026-06-01T00:00:00.000Z",
+    };
+    const targetAccount: AccountRecord = {
+      id: "opencode-target",
+      tool: "opencode",
+      label: "target",
+      provider: "zai-coding-plan",
+      addedAt: "2026-06-01T00:00:00.000Z",
+    };
+    const home = join(dir, "homes", "shared-opencode");
+    await seedOpencodeAuth(currentAccount, "old-current", accountDir(currentAccount), "2026-06-01T00:00:00.000Z");
+    await seedOpencodeAuth(currentAccount, "fresh-current", home, "2026-06-02T00:00:00.000Z");
+    await seedOpencodeAuth(targetAccount, "target-key");
+    const existing = record({
+      agent: "opencode",
+      command: `OPENCODE_CONFIG_DIR=${home} opencode run --interactive`,
+      homePath: home,
+      accountId: currentAccount.id,
+      providerSessionId: "sess-1",
+    });
+    await saveSession(existing);
+
+    await swapAccount(existing, targetAccount, {
+      substrate,
+      sleep: async () => undefined,
+      listAccounts: async () => [currentAccount, targetAccount],
+    });
+
+    const rescued = JSON.parse(await readFile(join(accountDir(currentAccount), "xdg-data", "opencode", "auth.json"), "utf8"));
+    assert.equal(rescued["zai-coding-plan"].key, "fresh-current");
+    const stamped = JSON.parse(await readFile(join(home, "xdg-data", "opencode", "auth.json"), "utf8"));
+    assert.equal(stamped["zai-coding-plan"].key, "target-key");
   });
 });
 

@@ -8,6 +8,7 @@
 // logged via ctx.hive.log() and the loop's iter-NNN.log files.
 
 import { spawnBeeForFlow } from "../agents.js";
+import { resolveSpawnSpec } from "../spawnResolve.js";
 import { defineFlow, type BeeHandle, type FlowContext } from "../flow/index.js";
 import type { HiveFacade } from "../flow/hive_facade.js";
 import { AgentReadinessError, isPermissionPromptPane, waitForAgentReady } from "../readiness.js";
@@ -471,7 +472,7 @@ async function captureBoundaryPane(handle: BeeHandle, iter: number): Promise<str
 
 /**
  * Spawn a bee for this loop. Uses spawnBeeForFlow directly when yolo is
- * requested (the facade hardcodes yolo:false); otherwise routes through
+ * requested (the facade applies the per-agent yolo default); otherwise routes through
  * facade.spawn so the bee is tracked for kill-on-end cleanup. The same
  * yolo-aware path serves the iteration bee AND the summarizer/judge helper
  * bees — a non-yolo helper inside a --yolo loop would stall on permission
@@ -485,8 +486,12 @@ async function spawnLoopBee(
   name: string,
 ): Promise<SessionRecord> {
   if (cfg.yolo) {
+    // Resolve the bee token (incl. the `<tool>-auto` least-loaded pick) here —
+    // the yolo path spawns directly, bypassing facade.spawn's own resolution.
+    const resolved = await resolveSpawnSpec(cfg.bee, { onNote: (message) => console.error(message) });
     const record = await spawnBeeForFlow({
-      agent: cfg.bee,
+      agent: resolved.agent,
+      ...(resolved.account ? { account: resolved.account } : {}),
       extraArgs: [],
       cwd: cfg.cwd,
       yolo: true,

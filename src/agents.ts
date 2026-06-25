@@ -2,13 +2,16 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { activateAccountIntoHome, assertGrokHomeAuthFresh, autoAccountTool, defaultHomeForAccount, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord } from "./accounts.js";
 import { beeConfig } from "./config.js";
 import { homeEnvForAgent, identityEnvForAgent, modelArgsForAgent } from "./drivers.js";
 import { assertExecutableAvailable } from "./execCheck.js";
+import { writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity } from "./ids.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
 import { safeName, saveSession, type SessionRecord } from "./store.js";
 import { localSubstrate, substrateForRecord } from "./substrates/index.js";
+import type { TmuxWindowOptions } from "./substrates/index.js";
 
 export type AgentKind = "claude" | "codex" | "opencode" | "grok" | "pi" | "droid" | string;
 
@@ -17,6 +20,7 @@ export type AgentSpec = {
   command: string;
   args: string[];
   env: Record<string, string>;
+  tmuxOptions?: TmuxWindowOptions;
   homePath?: string;
   requestedKind: string;
 };
@@ -54,7 +58,7 @@ const YOLO_COMMANDS: Record<string, string> = {
 // Bees that run in full-permission ("yolo") mode by default. The default is
 // applied by the CLI layer (dangerousMode in cli.ts) so resolveAgent stays
 // policy-free: it only produces the yolo command when explicitly told to.
-const DEFAULT_YOLO_AGENTS = new Set<string>(["claude"]);
+const DEFAULT_YOLO_AGENTS = new Set<string>(["claude", "codex", "kimi"]);
 
 // Map a requested bee kind (including auth-profile aliases like cc3/codex2) to
 // its canonical agent kind. Unknown/arbitrary kinds pass through unchanged.
@@ -65,6 +69,13 @@ export function canonicalAgentKind(kind: string): string {
 // Whether this bee kind should run permissionless unless explicitly opted out.
 export function agentDefaultsToYolo(kind: string): boolean {
   return DEFAULT_YOLO_AGENTS.has(canonicalAgentKind(kind).toLowerCase());
+}
+
+export function tmuxOptionsForAgent(kind: string): TmuxWindowOptions | undefined {
+  // OpenCode's interactive TUI can leak terminal palette-query replies through
+  // tmux passthrough as literal `rgb:...` text on attach. Keep passthrough
+  // disabled for its bee windows even if the user's global tmux config enables it.
+  return canonicalAgentKind(kind).toLowerCase() === "opencode" ? { "allow-passthrough": "off" } : undefined;
 }
 
 export type ResolveAgentOptions = {
@@ -129,11 +140,13 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   // again would double the flag (adversarial review fix #5). When model is
   // undefined the hook returns [] → byte-identical to today.
   const modelArgs = commandOverride === undefined ? modelArgsForAgent(profile.kind, options.model, options.provider) : [];
+  const tmuxOptions = tmuxOptionsForAgent(profile.kind);
   return {
     kind: profile.kind,
     command: parts[0]!,
     args: [...parts.slice(1), ...modelArgs, ...extraArgs],
     env,
+    ...(tmuxOptions ? { tmuxOptions } : {}),
     homePath: profile.homePath,
     requestedKind: kind,
   };
@@ -142,6 +155,12 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
 export function shellCommand(spec: AgentSpec): string {
   const env = Object.entries(spec.env).map(([key, value]) => `${key}=${shellQuoteIfNeeded(value)}`);
   return [...env, ...[spec.command, ...spec.args].map(shellQuoteIfNeeded)].join(" ");
+}
+
+export async function assertAgentAuthFreshForSpawn(spec: AgentSpec, accountId?: string): Promise<void> {
+  if (spec.kind !== "grok") return;
+  const homePath = spec.homePath ?? process.env.GROK_HOME ?? resolve(homedir(), ".grok");
+  await assertGrokHomeAuthFresh(homePath, accountId ? { accountId } : {});
 }
 
 /**
@@ -276,6 +295,15 @@ export type SpawnBeeOptions = {
   cwd: string;
   yolo: boolean;
   home?: string | true | string[];
+  /**
+   * Pre-resolved account to bind (creds activated into a dedicated home, the
+   * account's default model + provider applied). When omitted, `agent` is
+   * resolved via resolveSpawnAgent so an account-id / `<tool>-<account>`
+   * shorthand still binds — but `<tool>-auto` must be collapsed by the caller
+   * first (the auto pick needs live provider limits, resolved at the CLI/flow
+   * boundary, not here).
+   */
+  account?: AccountRecord;
   name?: string;
   colony?: string;
   swarmId?: string;
@@ -299,11 +327,34 @@ function safeTmuxTargetForFlow(value: string): string {
  * flow run.
  */
 export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRecord> {
-  // DEFERRED (adversarial review #1): flow-spawn account-binding is out of
-  // scope for S2. Binding an account here would require importing
-  // activateAccountIntoHome (which lives in cli.ts) and risks an import cycle;
-  // flow-spawned bees stay account-less until a later stage wires it cleanly.
-  const spec = resolveAgent(opts.agent, opts.extraArgs, { home: opts.home, yolo: opts.yolo });
+  // Resolve the bee token to its driver kind + optional bound account, mirroring
+  // the CLI spawn path (spawnBee) so flow/loop-spawned bees are account-bound
+  // too. A pre-resolved opts.account wins; otherwise an account-id /
+  // `<tool>-<account>` shorthand binds via resolveSpawnAgent. `<tool>-auto`
+  // and `<tool>-rr` need a live pick (or cursor advance) and must be collapsed
+  // upstream — guard against either reaching here so a stale alias never
+  // silently spawns the wrong account.
+  if (!opts.account && (autoAccountTool(opts.agent) || roundRobinAccountTool(opts.agent))) {
+    throw new Error(`flow spawn got an unresolved auto/rr alias (${opts.agent}); collapse it to a concrete account before spawning`);
+  }
+  const resolved = opts.account ? { agent: opts.account.tool, account: opts.account } : await resolveSpawnAgent(opts.agent);
+  const account = resolved.account;
+  // An account-bound spawn gets a home (explicit or the account's dedicated
+  // slot), the account's credentials activated into it, the driver's identity
+  // env, and the account's default model — never a blind HOME rewrite.
+  const home = account ? (opts.home ?? defaultHomeForAccount(account)) : opts.home;
+  const spec = resolveAgent(resolved.agent, opts.extraArgs, {
+    home,
+    yolo: opts.yolo,
+    identity: Boolean(account),
+    ...(account?.model ? { model: account.model } : {}),
+    ...(account?.provider ? { provider: account.provider } : {}),
+  });
+  if (account) {
+    if (opts.node && opts.node.kind !== "local-tmux") throw new Error("account-bound flow spawns are local-only (the vault never leaves this machine)");
+    if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
+    await activateAccountIntoHome(account, spec.homePath);
+  }
   // Pin the bee to its own provider session id from birth (see forcedSessionIdArgs):
   // flow runs spawn many siblings in one cwd, the exact case the cwd-blind claude
   // transcript matcher would otherwise cross-match by mtime.
@@ -319,7 +370,10 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
   // Mirror cli.ts spawn: a typo'd agent command would otherwise become a tmux
   // session that dies instantly while leaving a "running" record behind.
-  if (!isRemote) await assertExecutableAvailable(spec.command);
+  if (!isRemote) {
+    await assertExecutableAvailable(spec.command);
+    await assertAgentAuthFreshForSpawn(spec, account?.id);
+  }
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(opts.name ?? identity.id);
   const tmuxTarget = safeTmuxTargetForFlow(name);
@@ -328,7 +382,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   if (await substrate.hasSession(tmuxTarget)) {
     throw new Error(`tmux session already exists${isRemote && opts.node ? ` on ${opts.node.name}` : ""}: ${tmuxTarget}`);
   }
-  const { paneId } = await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env });
+  const launch = await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env, tmuxOptions: spec.tmuxOptions });
   const command = shellCommand(spec);
 
   const now = new Date().toISOString();
@@ -338,7 +392,8 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     cwd: opts.cwd,
     command,
     tmuxTarget,
-    ...(paneId ? { agentPaneId: paneId } : {}),
+    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     // Solo combs: every bee gets combId == tmuxTarget at spawn (§12 Q3).
     combId: tmuxTarget,
     createdAt: now,
@@ -349,6 +404,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     uuid: identity.uuid,
     requestedAgent: spec.requestedKind,
     ...(spec.homePath ? { homePath: spec.homePath } : {}),
+    ...(account ? { accountId: account.id } : {}),
     ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
     ...(opts.colony ? { colony: opts.colony } : {}),
     ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
@@ -359,5 +415,6 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     ...(opts.flowName ? { flowName: opts.flowName } : {}),
   };
   await saveSession(record);
+  await writeSpawnOptions(record);
   return record;
 }

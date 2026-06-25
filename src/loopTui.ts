@@ -23,7 +23,7 @@ import { fuzzyFilter, relativeTo, splitPathQuery } from "./spawnTui.js";
 export type LoopFormValues = {
   /** Context mode (the loop "type"): persistent | ralph | rolling. */
   context: string;
-  /** Agent shorthand (claude, codex-auto, claude-<account>). Required. */
+  /** Agent shorthand (claude, codex-auto, codex-rr, claude-<account>). Required. */
   bee: string;
   /** The instruction sent each iteration. Required. */
   prompt: string;
@@ -40,7 +40,7 @@ export type LoopFormValues = {
 
 /** An agent×account choice for the bee picker (value is a `hive spawn` shorthand). */
 export type BeeOption = {
-  /** The shorthand written into the field, e.g. "claude-auto" or "codex-thto". */
+  /** The shorthand written into the field, e.g. "claude-auto", "codex-rr", or "codex-thto". */
   value: string;
   /** Display label, e.g. "claude · auto" or "codex · thto.no". */
   label: string;
@@ -66,7 +66,7 @@ export type LoopTuiHooks = {
   loadProjects: () => Promise<LoopProject[]>;
   validatePath: (input: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
   listSubdirs: (base: string) => Promise<{ ok: boolean; base: string; dirs: string[]; error?: string }>;
-  /** Account-aware agent options for the bee picker (claude-auto, codex-thto, …). */
+  /** Account-aware agent options for the bee picker (claude-auto, claude-rr, codex-thto, …). */
   loadBeeOptions: () => Promise<BeeOption[]>;
 };
 
