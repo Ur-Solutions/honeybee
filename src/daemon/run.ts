@@ -1,5 +1,5 @@
 import { readFileSync, unlinkSync } from "node:fs";
-import { listAccounts, syncAllClaudeChainsToVault, syncClaudeChainToVault } from "../accounts.js";
+import { listAccounts, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault } from "../accounts.js";
 import { acquireLongLivedLock, type LongLivedLock, LockBusyError } from "../fsx.js";
 import { hiveStateFor, writeHiveState } from "../hiveState.js";
 import { listNodes, type NodeRecord } from "../node.js";
@@ -85,10 +85,9 @@ export type TickDeps = {
    */
   dispatchAutoTitle?: (records: SessionRecord[]) => Promise<AutoTitleOutcome[]>;
   /**
-   * Optional credential-chain sync: pulls rotated claude OAuth chains from
-   * the accounts' homes back into the vault (refresh tokens rotate; the live
-   * link lands wherever the last refresh ran). The default wiring throttles
-   * itself — most ticks are a no-op.
+   * Optional credential sync: pulls rotated/refreshed auth from the accounts'
+   * homes back into the vault. The default wiring throttles itself — most
+   * ticks are a no-op.
    */
   syncChains?: () => Promise<void>;
   now: () => number;
@@ -561,9 +560,9 @@ function sleep(ms: number, shouldStop: () => boolean): Promise<void> {
 /* Default dependency wiring                                           */
 /* ------------------------------------------------------------------ */
 
-// Chain sync reads every claude home's keychain (a `security` subprocess per
-// home) — far too heavy per tick. Every few minutes is plenty: the sweep only
-// has to beat the NEXT activation, not the next tick.
+// Credential sync may read keychain entries and many homes — far too heavy per
+// tick. Every few minutes is plenty: the sweep only has to beat the NEXT
+// activation, not the next tick.
 const CHAIN_SYNC_INTERVAL_MS = 5 * 60_000;
 
 export function buildDefaultDeps(): TickDeps {
@@ -590,17 +589,17 @@ export function buildDefaultDeps(): TickDeps {
       const now = Date.now();
       if (now - lastChainSyncAt < CHAIN_SYNC_INTERVAL_MS) return;
       lastChainSyncAt = now;
-      await syncAllClaudeChainsToVault();
+      await syncAllAccountCredentialsToVault();
       // Account-bound bees may run in homes the sweep cannot find on its own
-      // (arbitrary --home paths outside ~/.claude*); the session records know
-      // them. syncClaudeChainToVault still verifies the home's login email
-      // before trusting its chain.
+      // (arbitrary --home paths outside ~/.claude*/~/.codex*); the session
+      // records know them. Provider sync still verifies the home's identity
+      // before trusting its credentials.
       const accounts = new Map((await listAccounts()).map((account) => [account.id, account]));
       for (const record of await listSessions()) {
         if (!record.accountId || !record.homePath) continue;
         const account = accounts.get(record.accountId);
-        if (account?.tool !== "claude") continue;
-        await syncClaudeChainToVault(account, record.homePath).catch(() => undefined);
+        if (!account) continue;
+        await syncAccountCredentialsToVault(account, record.homePath, { trustExtraHome: true }).catch(() => undefined);
       }
     },
     now: () => Date.now(),

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -11,15 +11,21 @@ import {
   accountsRegistryPath,
   activateAccountIntoHome,
   addAccount,
+  assertGrokHomeAuthFresh,
+  autoAccountTool,
   captureAccountFromHome,
   findAccount,
   listAccounts,
   mergeCredentialsJson,
   normalizeAccountRecord,
+  parseClaudeChain,
   PROVIDER_BY_CLI,
   removeAccount,
   resolveSpawnAgent,
+  roundRobinAccountTool,
+  syncAccountCredentialsToVault,
   syncClaudeChainToVault,
+  syncCodexAuthToVault,
   type AccountRecord,
 } from "../src/accounts.js";
 
@@ -161,6 +167,65 @@ function chainJson(accessToken: string, expiresAt: number, refreshToken?: string
   return JSON.stringify({ claudeAiOauth: { accessToken, expiresAt, ...(refreshToken ? { refreshToken } : {}) } });
 }
 
+function hexPayload(raw: string): string {
+  return Buffer.from(raw, "utf8").toString("hex");
+}
+
+test("parseClaudeChain decodes hex-encoded keychain payloads", () => {
+  const raw = chainJson("tok-hex", 1_797_782_400_000, "refresh-hex");
+  const chain = parseClaudeChain(hexPayload(raw), "keychain");
+  assert.equal(chain?.oauth.accessToken, "tok-hex");
+  assert.equal(chain?.refreshToken, "refresh-hex");
+  assert.equal(chain?.expiresAt, 1_797_782_400_000);
+  assert.equal(chain?.raw, raw);
+});
+
+function fakeJwt(payload: Record<string, unknown>): string {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `eyJhbGciOiJSUzI1NiJ9.${body}.sig`;
+}
+
+function codexAuthJson(email: string, accountId: string, lastRefresh: string, token: string): string {
+  return JSON.stringify({
+    auth_mode: "chatgpt",
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: fakeJwt({ email }),
+      access_token: `access-${token}`,
+      refresh_token: `refresh-${token}`,
+      account_id: accountId,
+    },
+    last_refresh: lastRefresh,
+  });
+}
+
+function opencodeAuthJson(provider: string, token: string): string {
+  return JSON.stringify({ [provider]: { type: "api", key: token } });
+}
+
+function grokAuthJson(email: string, createTime: string, token: string): string {
+  const created = new Date(createTime);
+  const expiresAt = new Date(created.getTime() + 6 * 60 * 60 * 1000).toISOString();
+  return JSON.stringify({
+    "https://auth.x.ai::test-client": {
+      auth_mode: "oidc",
+      email,
+      key: `key-${token}`,
+      refresh_token: `refresh-${token}`,
+      create_time: createTime,
+      expires_at: expiresAt,
+      principal_type: "User",
+    },
+  });
+}
+
+async function writeDatedFile(path: string, data: string, iso: string): Promise<void> {
+  await mkdir(join(path, ".."), { recursive: true });
+  await writeFile(path, data);
+  const date = new Date(iso);
+  await utimes(path, date, date);
+}
+
 test("claude activation seeds skipDangerousModePermissionPrompt without clobbering other settings", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("claude", "bypass@a.b");
@@ -199,6 +264,288 @@ test("claude activation re-asserts the bypass flag every time, surviving a vault
     const settings = JSON.parse(await readFile(join(home, "settings.json"), "utf8"));
     assert.equal(settings.skipDangerousModePermissionPrompt, true);
     assert.equal(settings.theme, "dark");
+  });
+});
+
+test("generic file-backed activation pulls newer dedicated-home credentials into the vault", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("opencode", "minimax", { provider: "minimax-coding-plan" });
+    const rel = join("xdg-data", "opencode", "auth.json");
+    await writeDatedFile(
+      join(accountDir(account), rel),
+      opencodeAuthJson("minimax-coding-plan", "old-key"),
+      "2026-06-01T00:00:00.000Z",
+    );
+    const home = join(dir, "homes", account.id);
+    await writeDatedFile(
+      join(home, rel),
+      opencodeAuthJson("minimax-coding-plan", "fresh-key"),
+      "2026-06-02T00:00:00.000Z",
+    );
+
+    await activateAccountIntoHome(account, home);
+
+    const vault = JSON.parse(await readFile(join(accountDir(account), rel), "utf8"));
+    assert.equal(vault["minimax-coding-plan"].key, "fresh-key");
+    const activated = JSON.parse(await readFile(join(home, rel), "utf8"));
+    assert.equal(activated["minimax-coding-plan"].key, "fresh-key");
+  });
+});
+
+test("generic file-backed sync covers every non-special identity harness", async () => {
+  await withTempStore(async (dir) => {
+    const cases = [
+      {
+        tool: "opencode",
+        label: "zai-table",
+        provider: "zai-coding-plan",
+        rel: join("xdg-data", "opencode", "auth.json"),
+        old: opencodeAuthJson("zai-coding-plan", "old-opencode"),
+        fresh: opencodeAuthJson("zai-coding-plan", "fresh-opencode"),
+        readToken: (value: Record<string, unknown>) => (value["zai-coding-plan"] as { key: string }).key,
+      },
+      {
+        tool: "grok",
+        label: "grok-table",
+        rel: "auth.json",
+        old: grokAuthJson("grok-table", "2026-06-01T00:00:00.000Z", "old-grok"),
+        fresh: grokAuthJson("grok-table", "2026-06-02T00:00:00.000Z", "fresh-grok"),
+        readToken: (value: Record<string, unknown>) => (value["https://auth.x.ai::test-client"] as { key: string }).key,
+      },
+      {
+        tool: "kimi",
+        label: "kimi-table",
+        rel: join("credentials", "kimi-code.json"),
+        old: JSON.stringify({ accessToken: "old-kimi" }),
+        fresh: JSON.stringify({ accessToken: "fresh-kimi" }),
+        readToken: (value: Record<string, unknown>) => value.accessToken,
+      },
+      {
+        tool: "cursor",
+        label: "cursor-table",
+        provider: "cursor",
+        rel: "cli-config.json",
+        old: JSON.stringify({ token: "old-cursor" }),
+        fresh: JSON.stringify({ token: "fresh-cursor" }),
+        readToken: (value: Record<string, unknown>) => value.token,
+      },
+    ];
+
+    for (const item of cases) {
+      const account = await addAccount(item.tool, item.label, item.provider ? { provider: item.provider } : {});
+      await writeDatedFile(join(accountDir(account), item.rel), item.old, "2026-06-01T00:00:00.000Z");
+      const home = join(dir, "homes", account.id);
+      await writeDatedFile(join(home, item.rel), item.fresh, "2026-06-02T00:00:00.000Z");
+
+      const result = await syncAccountCredentialsToVault(account);
+
+      assert.equal(result.vaultUpdated, true, item.tool);
+      const vault = JSON.parse(await readFile(join(accountDir(account), item.rel), "utf8"));
+      assert.equal(item.readToken(vault), item.readToken(JSON.parse(item.fresh)), item.tool);
+    }
+  });
+});
+
+test("generic credential sync ignores arbitrary homes unless a session binding trusts them", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("opencode", "zai", { provider: "zai-coding-plan" });
+    const rel = join("xdg-data", "opencode", "auth.json");
+    await writeDatedFile(
+      join(accountDir(account), rel),
+      opencodeAuthJson("zai-coding-plan", "vault-key"),
+      "2026-06-01T00:00:00.000Z",
+    );
+    const arbitraryHome = join(dir, "some-shared-home");
+    await writeDatedFile(
+      join(arbitraryHome, rel),
+      opencodeAuthJson("zai-coding-plan", "session-key"),
+      "2026-06-03T00:00:00.000Z",
+    );
+
+    const ignored = await syncAccountCredentialsToVault(account, arbitraryHome);
+    assert.equal(ignored.vaultUpdated, false);
+    let vault = JSON.parse(await readFile(join(accountDir(account), rel), "utf8"));
+    assert.equal(vault["zai-coding-plan"].key, "vault-key");
+
+    const trusted = await syncAccountCredentialsToVault(account, arbitraryHome, { trustExtraHome: true });
+    assert.equal(trusted.vaultUpdated, true);
+    vault = JSON.parse(await readFile(join(accountDir(account), rel), "utf8"));
+    assert.equal(vault["zai-coding-plan"].key, "session-key");
+  });
+});
+
+test("grok sync pulls newer shared-home auth when the email matches the account", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("grok", "sync@a.b");
+    await writeDatedFile(
+      join(accountDir(account), "auth.json"),
+      grokAuthJson("sync@a.b", "2026-06-01T00:00:00.000Z", "old"),
+      "2026-06-01T00:00:00.000Z",
+    );
+    const sharedHome = join(dir, "shared-grok");
+    await writeDatedFile(
+      join(sharedHome, "auth.json"),
+      grokAuthJson("sync@a.b", "2026-06-02T00:00:00.000Z", "fresh"),
+      "2026-06-02T00:00:00.000Z",
+    );
+
+    const result = await syncAccountCredentialsToVault(account, sharedHome);
+
+    assert.equal(result.vaultUpdated, true);
+    const vault = JSON.parse(await readFile(join(accountDir(account), "auth.json"), "utf8"));
+    assert.equal(vault["https://auth.x.ai::test-client"].key, "key-fresh");
+  });
+});
+
+test("grok sync refuses a newer shared-home auth that belongs to another email", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("grok", "mine@a.b");
+    await writeDatedFile(
+      join(accountDir(account), "auth.json"),
+      grokAuthJson("mine@a.b", "2026-06-01T00:00:00.000Z", "mine-old"),
+      "2026-06-01T00:00:00.000Z",
+    );
+    const foreignHome = join(dir, "foreign-grok");
+    await writeDatedFile(
+      join(foreignHome, "auth.json"),
+      grokAuthJson("other@a.b", "2026-06-03T00:00:00.000Z", "other-fresh"),
+      "2026-06-03T00:00:00.000Z",
+    );
+
+    const result = await syncAccountCredentialsToVault(account, foreignHome);
+
+    assert.equal(result.vaultUpdated, false);
+    const vault = JSON.parse(await readFile(join(accountDir(account), "auth.json"), "utf8"));
+    assert.equal(vault["https://auth.x.ai::test-client"].key, "key-mine-old");
+  });
+});
+
+test("grok auth freshness check rejects expired or nearly expired OAuth", async () => {
+  await withTempStore(async (dir) => {
+    const home = join(dir, "homes", "grok");
+    await writeDatedFile(
+      join(home, "auth.json"),
+      grokAuthJson("stale@a.b", "2026-06-01T00:00:00.000Z", "stale"),
+      "2026-06-01T00:00:00.000Z",
+    );
+
+    await assert.rejects(
+      () => assertGrokHomeAuthFresh(home, { accountId: "grok-stale", now: () => Date.parse("2026-06-01T06:01:00.000Z") }),
+      /Cannot start Grok .* OAuth token expired .* hive login grok-stale/,
+    );
+
+    await assert.rejects(
+      () => assertGrokHomeAuthFresh(home, { accountId: "grok-stale", now: () => Date.parse("2026-06-01T05:58:00.000Z") }),
+      /Cannot start Grok .* OAuth token expires soon .* hive login grok-stale/,
+    );
+  });
+});
+
+test("grok activation refuses to stamp expired auth into a home", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("grok", "expired@a.b");
+    await writeFile(join(accountDir(account), "auth.json"), grokAuthJson("expired@a.b", "2026-06-01T00:00:00.000Z", "expired"));
+    const home = join(dir, "homes", account.id);
+
+    await assert.rejects(
+      () => activateAccountIntoHome(account, home, { now: () => Date.parse("2026-06-01T06:01:00.000Z") }),
+      /Cannot activate .* Grok OAuth token expired .* hive login grok-expired-a.b/,
+    );
+    await assert.rejects(() => readFile(join(home, "auth.json"), "utf8"), /ENOENT/);
+  });
+});
+
+test("codex activation pulls newer home auth into the vault before stamping", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "sync@a.b");
+    const oldAuth = codexAuthJson("sync@a.b", "acct-sync", "2026-06-01T00:00:00.000Z", "old");
+    const freshAuth = codexAuthJson("sync@a.b", "acct-sync", "2026-06-02T00:00:00.000Z", "fresh");
+    await writeFile(join(accountDir(account), "auth.json"), oldAuth);
+
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, "auth.json"), freshAuth);
+
+    await activateAccountIntoHome(account, home);
+
+    const vault = JSON.parse(await readFile(join(accountDir(account), "auth.json"), "utf8"));
+    assert.equal(vault.tokens.access_token, "access-fresh");
+    const activated = JSON.parse(await readFile(join(home, "auth.json"), "utf8"));
+    assert.equal(activated.tokens.access_token, "access-fresh");
+    const mirror = JSON.parse(await readFile(join(home, ".codex", "auth.json"), "utf8"));
+    assert.equal(mirror.tokens.access_token, "access-fresh");
+  });
+});
+
+test("syncCodexAuthToVault pulls a newer login-home auth by last_refresh", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "login@a.b");
+    await writeFile(
+      join(accountDir(account), "auth.json"),
+      codexAuthJson("login@a.b", "acct-login", "2026-06-01T00:00:00.000Z", "old"),
+    );
+    const loginHome = join(dir, "login-homes", account.id);
+    await mkdir(loginHome, { recursive: true });
+    await writeFile(
+      join(loginHome, "auth.json"),
+      codexAuthJson("login@a.b", "acct-login", "2026-06-03T00:00:00.000Z", "fresh"),
+    );
+
+    const result = await syncCodexAuthToVault(account);
+
+    assert.equal(result.vaultUpdated, true);
+    const vault = JSON.parse(await readFile(join(accountDir(account), "auth.json"), "utf8"));
+    assert.equal(vault.tokens.refresh_token, "refresh-fresh");
+  });
+});
+
+test("codex sync refuses a newer home auth that belongs to another account", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "mine@a.b");
+    await writeFile(
+      join(accountDir(account), "auth.json"),
+      codexAuthJson("mine@a.b", "acct-mine", "2026-06-01T00:00:00.000Z", "mine-old"),
+    );
+    const foreignHome = join(dir, "foreign");
+    await mkdir(foreignHome, { recursive: true });
+    await writeFile(
+      join(foreignHome, "auth.json"),
+      codexAuthJson("other@a.b", "acct-other", "2026-06-04T00:00:00.000Z", "other-fresh"),
+    );
+
+    const result = await syncCodexAuthToVault(account, foreignHome);
+
+    assert.equal(result.vaultUpdated, false);
+    const vault = JSON.parse(await readFile(join(accountDir(account), "auth.json"), "utf8"));
+    assert.equal(vault.tokens.access_token, "access-mine-old");
+  });
+});
+
+test("codex activation rescues a foreign occupant auth before stamping", async () => {
+  await withTempStore(async (dir) => {
+    const tenant = await addAccount("codex", "tenant@a.b");
+    const incoming = await addAccount("codex", "incoming@a.b");
+    await writeFile(
+      join(accountDir(tenant), "auth.json"),
+      codexAuthJson("tenant@a.b", "acct-tenant", "2026-06-01T00:00:00.000Z", "tenant-old"),
+    );
+    await writeFile(
+      join(accountDir(incoming), "auth.json"),
+      codexAuthJson("incoming@a.b", "acct-incoming", "2026-06-01T00:00:00.000Z", "incoming"),
+    );
+    const home = join(dir, "shared-home");
+    await mkdir(home, { recursive: true });
+    await writeFile(
+      join(home, "auth.json"),
+      codexAuthJson("tenant@a.b", "acct-tenant", "2026-06-05T00:00:00.000Z", "tenant-live"),
+    );
+
+    await activateAccountIntoHome(incoming, home);
+
+    const tenantVault = JSON.parse(await readFile(join(accountDir(tenant), "auth.json"), "utf8"));
+    assert.equal(tenantVault.tokens.refresh_token, "refresh-tenant-live");
+    const homeAuth = JSON.parse(await readFile(join(home, "auth.json"), "utf8"));
+    assert.equal(homeAuth.tokens.access_token, "access-incoming");
   });
 });
 
@@ -249,7 +596,7 @@ test("activation refreshes an expired chain and persists the rotation before sta
   });
 });
 
-test("activation warns but proceeds when the expired chain cannot be refreshed", async () => {
+test("activation refuses to stamp an expired chain when refresh fails", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("claude", "dead@a.b");
     const now = Date.now();
@@ -257,16 +604,17 @@ test("activation warns but proceeds when the expired chain cannot be refreshed",
     const home = join(dir, "homes", account.id);
 
     const warnings: string[] = [];
-    await activateAccountIntoHome(account, home, {
-      refreshClaudeToken: async () => null,
-      onWarn: (message) => warnings.push(message),
-    });
+    await assert.rejects(
+      () => activateAccountIntoHome(account, home, {
+        refreshClaudeToken: async () => null,
+        onWarn: (message) => warnings.push(message),
+      }),
+      /Cannot activate .* expired .* could not be refreshed/,
+    );
 
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0]!, /could not be refreshed/);
-    // Still stamped: claude may yet recover (e.g. the refresh failed offline).
-    const homeCreds = JSON.parse(await readFile(join(home, ".credentials.json"), "utf8"));
-    assert.equal(homeCreds.claudeAiOauth.accessToken, "tok-dead");
+    assert.match(warnings[0]!, /provider rejected the refresh token/);
+    await assert.rejects(() => readFile(join(home, ".credentials.json"), "utf8"), /ENOENT/);
   });
 });
 
@@ -314,6 +662,24 @@ test("syncClaudeChainToVault pulls the freshest link from the account's homes", 
   });
 });
 
+test("syncClaudeChainToVault prefers an equal-expiry link with a refresh token", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "same-expiry@a.b");
+    const expiresAt = Date.now() + 3_600_000;
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-vault", expiresAt));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-home", expiresAt, "refresh-home"));
+
+    const result = await syncClaudeChainToVault(account);
+
+    assert.equal(result.vaultUpdated, true);
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-home");
+    assert.equal(vault.claudeAiOauth.refreshToken, "refresh-home");
+  });
+});
+
 test("mergeCredentialsJson overlays the new chain and preserves sibling keys", () => {
   const merged = JSON.parse(mergeCredentialsJson(
     JSON.stringify({ mcpOAuth: { server: "kept" }, claudeAiOauth: { accessToken: "old" } }),
@@ -321,6 +687,21 @@ test("mergeCredentialsJson overlays the new chain and preserves sibling keys", (
   ));
   assert.deepEqual(merged.mcpOAuth, { server: "kept" });
   assert.equal(merged.claudeAiOauth.accessToken, "new");
+
+  const mergedFromHexTarget = JSON.parse(mergeCredentialsJson(
+    hexPayload(JSON.stringify({ mcpOAuth: { server: "kept-from-hex" }, claudeAiOauth: { accessToken: "old" } })),
+    JSON.stringify({ claudeAiOauth: { accessToken: "new-from-hex" } }),
+  ));
+  assert.deepEqual(mergedFromHexTarget.mcpOAuth, { server: "kept-from-hex" });
+  assert.equal(mergedFromHexTarget.claudeAiOauth.accessToken, "new-from-hex");
+
+  const mergedFromHexSource = JSON.parse(mergeCredentialsJson(
+    JSON.stringify({ mcpOAuth: { server: "kept-source" }, claudeAiOauth: { accessToken: "old" } }),
+    hexPayload(JSON.stringify({ claudeAiOauth: { accessToken: "new-source" } })),
+  ));
+  assert.deepEqual(mergedFromHexSource.mcpOAuth, { server: "kept-source" });
+  assert.equal(mergedFromHexSource.claudeAiOauth.accessToken, "new-source");
+
   // Unparseable or missing targets fall back to the source verbatim.
   assert.equal(mergeCredentialsJson("not-json", `{"a":1}`), `{"a":1}`);
   assert.equal(JSON.parse(mergeCredentialsJson(null, `{"a":1}`)).a, 1);
@@ -564,4 +945,30 @@ test("addAccount on a legacy registry lazily upgrades siblings; mixed legacy+v2 
     assert.equal(raw.find((r) => r.id === "claude-legacy")!.provider, "anthropic");
     assert.equal(raw.find((r) => r.id === v2.id)!.provider, "zai-coding-plan");
   });
+});
+
+test("autoAccountTool and roundRobinAccountTool parse only their reserved query", () => {
+  // <tool>-auto picks the auto query; <tool>-rr picks the rr query. Neither
+  // claims the other, and neither matches plain tools, account ids, or empty
+  // suffixes — those fall through to the real account resolver.
+  assert.equal(autoAccountTool("claude-auto"), "claude");
+  assert.equal(autoAccountTool("codex-auto"), "codex");
+  assert.equal(autoAccountTool("claude-rr"), undefined);
+  assert.equal(autoAccountTool("claude-thto"), undefined);
+  assert.equal(autoAccountTool("claude"), undefined);
+  assert.equal(autoAccountTool("claude-"), undefined);
+  assert.equal(autoAccountTool(""), undefined);
+
+  assert.equal(roundRobinAccountTool("claude-rr"), "claude");
+  assert.equal(roundRobinAccountTool("codex-rr"), "codex");
+  assert.equal(roundRobinAccountTool("claude-auto"), undefined);
+  assert.equal(roundRobinAccountTool("claude-thto"), undefined);
+  assert.equal(roundRobinAccountTool("claude"), undefined);
+  assert.equal(roundRobinAccountTool("claude-"), undefined);
+  assert.equal(roundRobinAccountTool(""), undefined);
+
+  // An unknown leading tool isn't shorthand at all — both detectors must
+  // refuse so the resolver treats the whole token as an arbitrary executable.
+  assert.equal(autoAccountTool("nosuchtool-auto"), undefined);
+  assert.equal(roundRobinAccountTool("nosuchtool-rr"), undefined);
 });

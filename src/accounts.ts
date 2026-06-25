@@ -218,10 +218,25 @@ function splitToolShorthand(value: string): { tool: string; query: string } | un
  */
 export const AUTO_ACCOUNT_QUERY = "auto";
 
+/**
+ * Reserved account query: `--account rr` / `<tool>-rr` ask for the next account
+ * in a persistent round-robin order. Unlike `auto`, the pick ignores live
+ * limits and just advances a cursor through the tool's credentialed accounts —
+ * useful when the operator wants to drain workload evenly across accounts
+ * regardless of remaining quota. Cursor lives in `<storeRoot>/round-robin.json`.
+ */
+export const RR_ACCOUNT_QUERY = "rr";
+
 /** `<tool>-auto` spawn alias → the tool whose least-loaded account to pick, else undefined. */
 export function autoAccountTool(value: string): string | undefined {
   const shorthand = splitToolShorthand(value);
   return shorthand?.query === AUTO_ACCOUNT_QUERY ? shorthand.tool : undefined;
+}
+
+/** `<tool>-rr` spawn alias → the tool whose next round-robin account to pick, else undefined. */
+export function roundRobinAccountTool(value: string): string | undefined {
+  const shorthand = splitToolShorthand(value);
+  return shorthand?.query === RR_ACCOUNT_QUERY ? shorthand.tool : undefined;
 }
 
 export type SpawnAgentSpec = {
@@ -372,13 +387,43 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
       await syncClaudeChainToVaultLocked(account, homePath).catch(() => undefined);
       // (3) A stale chain would make claude boot onto an expired access token
       // and replay a possibly-rotated refresh token. Refresh it ourselves and
-      // persist the rotation; on failure, warn and stamp anyway (the chain
-      // may still recover, e.g. when we are merely offline).
+      // persist the rotation; on failure, refuse to stamp a known-dead chain.
       try {
         await refreshVaultClaudeChainIfStaleLocked(account, options);
       } catch (error) {
-        warn(`could not refresh the stale OAuth chain for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+        const detail = error instanceof Error ? error.message : String(error);
+        warn(`could not refresh the stale OAuth chain for ${account.id}: ${detail}`);
+        throw new Error(`Cannot activate ${account.id}: its OAuth chain is expired and could not be refreshed (${detail}). Re-login with: hive login ${account.id}`);
       }
+    }
+    if (account.tool === "codex") {
+      // Codex rewrites auth.json when it refreshes tokens. Rescue the current
+      // occupant before a swap stamp, then pull this account's newest attributed
+      // auth into the vault so activation never revives an older refresh token.
+      await evacuateForeignCodexAuthLocked(account, homePath).catch((error) => {
+        warn(`could not rescue existing Codex auth from ${homePath}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      await syncCodexAuthToVaultLocked(account, homePath).catch((error) => {
+        warn(`could not sync refreshed Codex auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    if (account.tool === "grok") {
+      await syncGrokAuthToVaultLocked(account, homePath).catch((error) => {
+        warn(`could not sync refreshed Grok auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      const vault = await readGrokAuthFile(join(accountDir(account), "auth.json"), "vault");
+      const reason = grokAuthUnavailableReason(vault, options.now?.() ?? Date.now());
+      if (reason) {
+        throw new Error(`Cannot activate ${account.id}: Grok ${reason}. Re-login with: hive login ${account.id}`);
+      }
+    }
+    if (account.tool !== "claude" && account.tool !== "codex" && account.tool !== "grok") {
+      // Other identity recipes are file-based. Pull back changes only from the
+      // account's attributed homes; arbitrary --home paths are not trusted here
+      // because their credential files do not carry a common identity claim.
+      await syncGenericCredentialsToVaultLocked(account, homePath).catch((error) => {
+        warn(`could not sync refreshed credentials for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+      });
     }
     // Refuse to activate without the primary credential: copying only the
     // supporting snapshots would clobber the home's settings without a login.
@@ -440,6 +485,10 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
   });
 }
 
+// Default spawn model for hive-managed claude homes (alias for the latest Opus =
+// Opus 4.8, 1M-context). Seeded into settings.json only when no model is set.
+const CLAUDE_HOME_DEFAULT_MODEL = "opus[1m]";
+
 const CODEX_HOME_DEFAULTS: Record<string, string> = {
   model: `"gpt-5.5"`,
   model_reasoning_effort: `"xhigh"`,
@@ -479,8 +528,20 @@ function withClaudeSettingsDefaults(input: string): string {
       return input;
     }
   }
-  if (parsed.skipDangerousModePermissionPrompt === true) return input;
-  parsed.skipDangerousModePermissionPrompt = true;
+  let changed = false;
+  if (parsed.skipDangerousModePermissionPrompt !== true) {
+    parsed.skipDangerousModePermissionPrompt = true;
+    changed = true;
+  }
+  // Default the spawn model to Opus so a hive-managed claude home never falls
+  // back to the CLI's built-in default (which has pointed at retired models like
+  // Fable, hard-failing every spawn). Seeded only when ABSENT — an explicit
+  // model the operator/vault set is left untouched. Mirrors CODEX_HOME_DEFAULTS.
+  if (typeof parsed.model !== "string" || parsed.model.trim().length === 0) {
+    parsed.model = CLAUDE_HOME_DEFAULT_MODEL;
+    changed = true;
+  }
+  if (!changed) return input;
   return `${JSON.stringify(parsed, null, 2)}\n`;
 }
 
@@ -582,9 +643,25 @@ export async function seedClaudeHomeAcceptance(homePath: string, opts: { yolo?: 
   await atomicWriteFile(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 }
 
-function claudeTokenExpiry(raw: string): number | null {
+function decodeClaudeCredentialsRaw(raw: string | null): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("{")) return raw;
+  if (!/^(?:[0-9a-fA-F]{2})+$/.test(trimmed)) return raw;
   try {
-    const parsed = JSON.parse(raw) as { claudeAiOauth?: { expiresAt?: unknown } };
+    const decoded = Buffer.from(trimmed, "hex").toString("utf8");
+    return decoded.trimStart().startsWith("{") ? decoded : raw;
+  } catch {
+    return raw;
+  }
+}
+
+function claudeTokenExpiry(raw: string): number | null {
+  const decoded = decodeClaudeCredentialsRaw(raw);
+  if (!decoded) return null;
+  try {
+    const parsed = JSON.parse(decoded) as { claudeAiOauth?: { expiresAt?: unknown } };
     return typeof parsed.claudeAiOauth?.expiresAt === "number" ? parsed.claudeAiOauth.expiresAt : null;
   } catch {
     return null;
@@ -604,7 +681,7 @@ function claudeTokenExpiry(raw: string): number | null {
 // ──────────────────────────────────────────────────────────────────────────
 
 export type ClaudeChain = {
-  /** Full credentials JSON as found (preserves sibling keys like mcpOAuth). */
+  /** Full decoded credentials JSON (preserves sibling keys like mcpOAuth). */
   raw: string;
   oauth: Record<string, unknown>;
   expiresAt: number;
@@ -621,13 +698,14 @@ export type RefreshedClaudeToken = {
 };
 
 export function parseClaudeChain(raw: string | null, source: string): ClaudeChain | null {
-  if (!raw) return null;
+  const decoded = decodeClaudeCredentialsRaw(raw);
+  if (!decoded) return null;
   try {
-    const parsed = JSON.parse(raw) as { claudeAiOauth?: Record<string, unknown> };
+    const parsed = JSON.parse(decoded) as { claudeAiOauth?: Record<string, unknown> };
     const oauth = parsed.claudeAiOauth;
     if (!oauth || typeof oauth.accessToken !== "string" || typeof oauth.expiresAt !== "number") return null;
     return {
-      raw,
+      raw: decoded,
       oauth,
       expiresAt: oauth.expiresAt,
       ...(typeof oauth.refreshToken === "string" ? { refreshToken: oauth.refreshToken } : {}),
@@ -638,11 +716,20 @@ export function parseClaudeChain(raw: string | null, source: string): ClaudeChai
   }
 }
 
+function isBetterClaudeChain(candidate: ClaudeChain, current: ClaudeChain | null): boolean {
+  if (!current) return true;
+  if (candidate.raw === current.raw) return false;
+  if (candidate.expiresAt !== current.expiresAt) return candidate.expiresAt > current.expiresAt;
+  if (candidate.refreshToken && !current.refreshToken) return true;
+  if (!candidate.refreshToken && current.refreshToken) return false;
+  return false;
+}
+
 /** The freshest chain link present in a home — its keychain entry or credentials file. */
 export async function readHomeClaudeChain(homePath: string): Promise<ClaudeChain | null> {
   const fromFile = parseClaudeChain(await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null), `${homePath}:file`);
   const fromKeychain = parseClaudeChain(await readClaudeKeychain(homePath), `${homePath}:keychain`);
-  if (fromFile && fromKeychain) return fromKeychain.expiresAt >= fromFile.expiresAt ? fromKeychain : fromFile;
+  if (fromFile && fromKeychain) return isBetterClaudeChain(fromKeychain, fromFile) ? fromKeychain : fromFile;
   return fromKeychain ?? fromFile;
 }
 
@@ -658,6 +745,23 @@ export async function homeClaudeEmail(homePath: string): Promise<string | null> 
 
 export function accountEmail(account: Pick<AccountRecord, "email" | "label">): string | undefined {
   return account.email ?? (account.label.includes("@") ? account.label : undefined);
+}
+
+export function emailFromJwt(jwt: string): string | null {
+  const payload = jwt.split(".")[1];
+  if (!payload) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { email?: unknown };
+    return typeof decoded.email === "string" ? decoded.email : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Email claim from auth.json's id_token JWT — decoded, not verified (local fact). */
+export async function codexAuthEmail(authPath: string): Promise<string | null> {
+  const auth = await readCodexAuthFile(authPath, authPath);
+  return auth?.email ?? null;
 }
 
 /** All `~/.{tool}` / `~/.{tool}-N` style shared homes present on this machine. */
@@ -700,18 +804,492 @@ export async function homeBelongsToAccount(homePath: string, account: AccountRec
   return (await homeClaudeEmail(homePath)) === email;
 }
 
+export type CodexAuthSnapshot = {
+  /** Full auth.json as found. Contains secrets; never log raw. */
+  raw: string;
+  /** Decoded id_token email when present. */
+  email?: string;
+  /** OpenAI account id when present. */
+  accountId?: string;
+  /** Parsed `last_refresh`; preferred freshness signal over file mtime. */
+  lastRefreshMs?: number;
+  /** File mtime fallback for older auth.json shapes. */
+  mtimeMs: number;
+  /** Where this snapshot was found — for ledger/debugging. */
+  source: string;
+};
+
+async function readCodexAuthFile(path: string, source: string): Promise<CodexAuthSnapshot | null> {
+  const info = await stat(path).catch(() => null);
+  if (!info?.isFile()) return null;
+  const raw = await readFile(path, "utf8").catch(() => null);
+  return parseCodexAuth(raw, source, info.mtimeMs);
+}
+
+function parseCodexAuth(raw: string | null, source: string, mtimeMs: number): CodexAuthSnapshot | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const object = parsed as Record<string, unknown>;
+    const tokens = object.tokens && typeof object.tokens === "object" && !Array.isArray(object.tokens)
+      ? object.tokens as Record<string, unknown>
+      : {};
+    const idToken = typeof tokens.id_token === "string" ? tokens.id_token : undefined;
+    const lastRefreshRaw = typeof object.last_refresh === "string" ? Date.parse(object.last_refresh) : NaN;
+    return {
+      raw,
+      ...(idToken ? { email: emailFromJwt(idToken) ?? undefined } : {}),
+      ...(typeof tokens.account_id === "string" ? { accountId: tokens.account_id } : {}),
+      ...(Number.isFinite(lastRefreshRaw) ? { lastRefreshMs: lastRefreshRaw } : {}),
+      mtimeMs,
+      source,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readHomeCodexAuth(homePath: string): Promise<CodexAuthSnapshot | null> {
+  const recipe = identityRecipeForAgent("codex");
+  const relatives = [
+    ...(recipe?.credentialFiles ?? ["auth.json"]),
+    ...Object.values(recipe?.activationMirrors ?? {}),
+  ];
+  let best: CodexAuthSnapshot | null = null;
+  for (const relative of relatives) {
+    const snapshot = await readCodexAuthFile(join(homePath, relative), `${homePath}:${relative}`);
+    if (snapshot && (!best || codexAuthFreshnessMs(snapshot) > codexAuthFreshnessMs(best))) best = snapshot;
+  }
+  return best;
+}
+
+function codexAuthFreshnessMs(snapshot: CodexAuthSnapshot): number {
+  return snapshot.lastRefreshMs ?? snapshot.mtimeMs;
+}
+
+function isFresherCodexAuth(candidate: CodexAuthSnapshot, current: CodexAuthSnapshot | null): boolean {
+  if (!current) return true;
+  if (candidate.raw === current.raw) return false;
+  return codexAuthFreshnessMs(candidate) > codexAuthFreshnessMs(current);
+}
+
+async function codexAccountEmails(account: AccountRecord, vault?: CodexAuthSnapshot | null): Promise<Set<string>> {
+  const emails = new Set<string>();
+  const explicit = accountEmail(account);
+  if (explicit) emails.add(explicit);
+  const snapshot = vault ?? await readCodexAuthFile(join(accountDir(account), "auth.json"), "vault");
+  if (snapshot?.email) emails.add(snapshot.email);
+  return emails;
+}
+
+async function codexAuthBelongsToAccount(snapshot: CodexAuthSnapshot | null, account: AccountRecord, vault?: CodexAuthSnapshot | null): Promise<boolean> {
+  if (!snapshot?.email) return true;
+  const emails = await codexAccountEmails(account, vault);
+  return emails.size === 0 || emails.has(snapshot.email);
+}
+
+async function homeBelongsToCodexAccount(homePath: string, account: AccountRecord, vault?: CodexAuthSnapshot | null): Promise<boolean> {
+  const target = resolve(homePath);
+  const dedicated = dedicatedHomesFor(account).some((dir) => resolve(dir) === target);
+  const snapshot = await readHomeCodexAuth(homePath);
+  if (snapshot?.email) return codexAuthBelongsToAccount(snapshot, account, vault);
+  return dedicated;
+}
+
+/** Homes attributable to the Codex account: dedicated slots + email-matched shared homes. */
+export async function codexHomesForAccount(account: AccountRecord, extraHome?: string): Promise<string[]> {
+  const vault = await readCodexAuthFile(join(accountDir(account), "auth.json"), "vault");
+  const matched = new Map<string, string>();
+  const consider = async (home: string) => {
+    if ((await stat(home).catch(() => null))?.isDirectory() && await homeBelongsToCodexAccount(home, account, vault)) {
+      matched.set(resolve(home), home);
+    }
+  };
+  for (const dir of dedicatedHomesFor(account)) await consider(dir);
+  if (extraHome) await consider(extraHome);
+  if ((await codexAccountEmails(account, vault)).size > 0) {
+    for (const home of await candidateHomes("codex")) await consider(home);
+  }
+  return [...matched.values()];
+}
+
+async function saveCodexAuthToVaultLocked(account: AccountRecord, sourceRaw: string): Promise<void> {
+  const vaultPath = join(accountDir(account), "auth.json");
+  await mkdir(dirname(vaultPath), { recursive: true, mode: 0o700 });
+  await atomicWriteFile(vaultPath, sourceRaw.endsWith("\n") ? sourceRaw : `${sourceRaw}\n`, { mode: 0o600 });
+}
+
+export type CodexAuthSyncResult = { auth: CodexAuthSnapshot | null; vaultUpdated: boolean };
+
+/**
+ * Pull the freshest attributed Codex auth.json into the vault. Codex refreshes
+ * auth.json in-place; if the vault keeps stamping an older refresh token over
+ * account homes, later launches can force sign-in again. Identity checks keep
+ * swapped/shared homes from poisoning a different account's vault entry.
+ */
+export async function syncCodexAuthToVault(account: AccountRecord, extraHome?: string): Promise<CodexAuthSyncResult> {
+  return withAccountsLock(() => syncCodexAuthToVaultLocked(account, extraHome));
+}
+
+async function syncCodexAuthToVaultLocked(account: AccountRecord, extraHome?: string): Promise<CodexAuthSyncResult> {
+  const vault = await readCodexAuthFile(join(accountDir(account), "auth.json"), "vault");
+  let best = vault;
+  for (const home of await codexHomesForAccount(account, extraHome)) {
+    const snapshot = await readHomeCodexAuth(home);
+    if (!snapshot || !(await codexAuthBelongsToAccount(snapshot, account, vault))) continue;
+    if (isFresherCodexAuth(snapshot, best)) best = snapshot;
+  }
+  if (!best || best === vault) return { auth: best, vaultUpdated: false };
+  await saveCodexAuthToVaultLocked(account, best.raw);
+  await appendLedger({
+    type: "account.auth-sync",
+    account: account.id,
+    tool: "codex",
+    from: best.source,
+    ...(best.lastRefreshMs ? { lastRefreshAt: new Date(best.lastRefreshMs).toISOString() } : {}),
+  });
+  return { auth: best, vaultUpdated: true };
+}
+
+async function evacuateForeignCodexAuthLocked(account: AccountRecord, homePath: string): Promise<void> {
+  const occupant = await readHomeCodexAuth(homePath);
+  if (!occupant?.email) return;
+  if (await codexAuthBelongsToAccount(occupant, account)) return;
+  const owner = await findCodexAccountByEmailLocked(occupant.email, account.id);
+  if (!owner) return;
+  const vault = await readCodexAuthFile(join(accountDir(owner), "auth.json"), "vault");
+  if (!isFresherCodexAuth(occupant, vault)) return;
+  await saveCodexAuthToVaultLocked(owner, occupant.raw);
+  await appendLedger({
+    type: "account.auth-evacuate",
+    account: owner.id,
+    tool: "codex",
+    home: homePath,
+    ...(occupant.lastRefreshMs ? { lastRefreshAt: new Date(occupant.lastRefreshMs).toISOString() } : {}),
+  });
+}
+
+async function findCodexAccountByEmailLocked(email: string, excludeId?: string): Promise<AccountRecord | null> {
+  for (const candidate of (await listAccounts()).filter((account) => account.tool === "codex" && account.id !== excludeId)) {
+    if ((await codexAccountEmails(candidate)).has(email)) return candidate;
+  }
+  return null;
+}
+
+export type GrokAuthSnapshot = {
+  raw: string;
+  emails: Set<string>;
+  createTimeMs?: number;
+  expiresAtMs?: number;
+  mtimeMs: number;
+  source: string;
+};
+
+const GROK_AUTH_EXPIRY_SKEW_MS = 5 * 60 * 1000;
+
+async function readGrokAuthFile(path: string, source: string): Promise<GrokAuthSnapshot | null> {
+  const info = await stat(path).catch(() => null);
+  if (!info?.isFile()) return null;
+  const raw = await readFile(path, "utf8").catch(() => null);
+  return parseGrokAuth(raw, source, info.mtimeMs);
+}
+
+function parseGrokAuth(raw: string | null, source: string, mtimeMs: number): GrokAuthSnapshot | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const entries = Object.values(parsed as Record<string, unknown>);
+    const emails = new Set<string>();
+    let createTimeMs: number | undefined;
+    let expiresAtMs: number | undefined;
+    let hasCredentialEntry = false;
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const object = entry as Record<string, unknown>;
+      if (typeof object.key === "string" || typeof object.refresh_token === "string") hasCredentialEntry = true;
+      if (typeof object.email === "string") emails.add(object.email);
+      const create = parseTimeMs(object.create_time);
+      const expires = parseTimeMs(object.expires_at);
+      if (create !== undefined) createTimeMs = Math.max(createTimeMs ?? create, create);
+      if (expires !== undefined) expiresAtMs = Math.max(expiresAtMs ?? expires, expires);
+    }
+    if (!hasCredentialEntry) return null;
+    return { raw, emails, ...(createTimeMs !== undefined ? { createTimeMs } : {}), ...(expiresAtMs !== undefined ? { expiresAtMs } : {}), mtimeMs, source };
+  } catch {
+    return null;
+  }
+}
+
+function parseTimeMs(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+async function readHomeGrokAuth(homePath: string): Promise<GrokAuthSnapshot | null> {
+  return readGrokAuthFile(join(homePath, "auth.json"), `${homePath}:auth.json`);
+}
+
+function grokAuthFreshnessMs(snapshot: GrokAuthSnapshot): number {
+  return snapshot.createTimeMs ?? snapshot.expiresAtMs ?? snapshot.mtimeMs;
+}
+
+function isFresherGrokAuth(candidate: GrokAuthSnapshot, current: GrokAuthSnapshot | null): boolean {
+  if (!current) return true;
+  if (candidate.raw === current.raw) return false;
+  return grokAuthFreshnessMs(candidate) > grokAuthFreshnessMs(current);
+}
+
+function grokAuthUnavailableReason(snapshot: GrokAuthSnapshot | null, now: number, skewMs = GROK_AUTH_EXPIRY_SKEW_MS): string | null {
+  if (!snapshot) return "missing auth.json";
+  if (snapshot.expiresAtMs === undefined) return null;
+  const expiresAt = new Date(snapshot.expiresAtMs).toISOString();
+  if (snapshot.expiresAtMs <= now) return `OAuth token expired at ${expiresAt}`;
+  if (snapshot.expiresAtMs <= now + skewMs) return `OAuth token expires soon at ${expiresAt}`;
+  return null;
+}
+
+export async function assertGrokHomeAuthFresh(
+  homePath: string,
+  options: { accountId?: string; now?: () => number; skewMs?: number } = {},
+): Promise<void> {
+  const reason = grokAuthUnavailableReason(
+    await readHomeGrokAuth(homePath),
+    options.now?.() ?? Date.now(),
+    options.skewMs ?? GROK_AUTH_EXPIRY_SKEW_MS,
+  );
+  if (!reason) return;
+  const relogin = options.accountId ? `hive login ${options.accountId}` : "hive login <grok-account>";
+  throw new Error(`Cannot start Grok from ${homePath}: ${reason}. Re-login with: ${relogin}`);
+}
+
+async function grokAccountEmails(account: AccountRecord, vault?: GrokAuthSnapshot | null): Promise<Set<string>> {
+  const emails = new Set<string>();
+  const explicit = accountEmail(account);
+  if (explicit) emails.add(explicit);
+  const snapshot = vault ?? await readGrokAuthFile(join(accountDir(account), "auth.json"), "vault");
+  for (const email of snapshot?.emails ?? []) emails.add(email);
+  return emails;
+}
+
+async function grokAuthBelongsToAccount(snapshot: GrokAuthSnapshot | null, account: AccountRecord, vault?: GrokAuthSnapshot | null): Promise<boolean> {
+  if (!snapshot || snapshot.emails.size === 0) return true;
+  const emails = await grokAccountEmails(account, vault);
+  return emails.size === 0 || [...snapshot.emails].some((email) => emails.has(email));
+}
+
+async function homeBelongsToGrokAccount(homePath: string, account: AccountRecord, vault?: GrokAuthSnapshot | null): Promise<boolean> {
+  const target = resolve(homePath);
+  const dedicated = dedicatedHomesFor(account).some((dir) => resolve(dir) === target);
+  const snapshot = await readHomeGrokAuth(homePath);
+  if (snapshot?.emails.size) return grokAuthBelongsToAccount(snapshot, account, vault);
+  return dedicated;
+}
+
+/** Homes attributable to the Grok account: dedicated slots + email-matched shared homes. */
+export async function grokHomesForAccount(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<string[]> {
+  const vault = await readGrokAuthFile(join(accountDir(account), "auth.json"), "vault");
+  const matched = new Map<string, string>();
+  const consider = async (home: string, trusted: boolean) => {
+    if ((await stat(home).catch(() => null))?.isDirectory() && (trusted || await homeBelongsToGrokAccount(home, account, vault))) {
+      matched.set(resolve(home), home);
+    }
+  };
+  for (const dir of dedicatedHomesFor(account)) await consider(dir, true);
+  if (extraHome) await consider(extraHome, options.trustExtraHome === true || isDedicatedHomeForAccount(account, extraHome));
+  if ((await grokAccountEmails(account, vault)).size > 0) {
+    for (const home of await candidateHomes("grok")) await consider(home, false);
+  }
+  return [...matched.values()];
+}
+
+async function saveGrokAuthToVaultLocked(account: AccountRecord, sourceRaw: string): Promise<void> {
+  const vaultPath = join(accountDir(account), "auth.json");
+  await mkdir(dirname(vaultPath), { recursive: true, mode: 0o700 });
+  await atomicWriteFile(vaultPath, sourceRaw.endsWith("\n") ? sourceRaw : `${sourceRaw}\n`, { mode: 0o600 });
+}
+
+export type GrokAuthSyncResult = { auth: GrokAuthSnapshot | null; vaultUpdated: boolean };
+
+export async function syncGrokAuthToVault(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<GrokAuthSyncResult> {
+  return withAccountsLock(() => syncGrokAuthToVaultLocked(account, extraHome, options));
+}
+
+async function syncGrokAuthToVaultLocked(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<GrokAuthSyncResult> {
+  const vault = await readGrokAuthFile(join(accountDir(account), "auth.json"), "vault");
+  let best = vault;
+  for (const home of await grokHomesForAccount(account, extraHome, options)) {
+    const snapshot = await readHomeGrokAuth(home);
+    if (!snapshot || !(await grokAuthBelongsToAccount(snapshot, account, vault))) continue;
+    if (isFresherGrokAuth(snapshot, best)) best = snapshot;
+  }
+  if (!best || best === vault) return { auth: best, vaultUpdated: false };
+  await saveGrokAuthToVaultLocked(account, best.raw);
+  await appendLedger({
+    type: "account.auth-sync",
+    account: account.id,
+    tool: "grok",
+    from: best.source,
+    ...(best.createTimeMs ? { refreshedAt: new Date(best.createTimeMs).toISOString() } : {}),
+  });
+  return { auth: best, vaultUpdated: true };
+}
+
+type GenericCredentialFile = {
+  relative: string;
+  raw: string;
+  mtimeMs: number;
+};
+
+type GenericCredentialBundle = {
+  files: GenericCredentialFile[];
+  freshnessMs: number;
+  source: string;
+};
+
+export type GenericCredentialSyncResult = { credentials: GenericCredentialBundle | null; vaultUpdated: boolean };
+
+export type SyncAccountCredentialsOptions = {
+  /**
+   * Trust `extraHome` even when it is not the account's dedicated home. Use
+   * only when a live SessionRecord binds that home to the account.
+   */
+  trustExtraHome?: boolean;
+};
+
+function isDedicatedHomeForAccount(account: AccountRecord, homePath: string): boolean {
+  const target = resolve(homePath);
+  return dedicatedHomesFor(account).some((dir) => resolve(dir) === target);
+}
+
+async function genericCredentialHomesForAccount(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<string[]> {
+  const homes = new Map<string, string>();
+  const consider = async (home: string, trusted: boolean) => {
+    if (!trusted) return;
+    if ((await stat(home).catch(() => null))?.isDirectory()) homes.set(resolve(home), home);
+  };
+  for (const home of dedicatedHomesFor(account)) await consider(home, true);
+  if (extraHome) await consider(extraHome, options.trustExtraHome === true || isDedicatedHomeForAccount(account, extraHome));
+  return [...homes.values()];
+}
+
+async function readGenericCredentialBundle(account: AccountRecord, rootPath: string, source: string): Promise<GenericCredentialBundle | null> {
+  const recipe = recipeFor(account);
+  const primary = recipe.credentialFiles[0]!;
+  const primaryInfo = await stat(join(rootPath, primary)).catch(() => null);
+  if (!primaryInfo?.isFile()) return null;
+  const files: GenericCredentialFile[] = [];
+  let freshnessMs = primaryInfo.mtimeMs;
+  for (const relative of recipe.credentialFiles) {
+    const path = join(rootPath, relative);
+    const info = await stat(path).catch(() => null);
+    if (!info?.isFile()) continue;
+    files.push({ relative, raw: await readFile(path, "utf8"), mtimeMs: info.mtimeMs });
+    freshnessMs = Math.max(freshnessMs, info.mtimeMs);
+  }
+  return { files, freshnessMs, source };
+}
+
+function genericCredentialFingerprint(bundle: GenericCredentialBundle): string {
+  return JSON.stringify(bundle.files.map((file) => [file.relative, file.raw]));
+}
+
+function isFresherGenericCredentialBundle(candidate: GenericCredentialBundle, current: GenericCredentialBundle | null): boolean {
+  if (!current) return true;
+  if (genericCredentialFingerprint(candidate) === genericCredentialFingerprint(current)) return false;
+  return candidate.freshnessMs > current.freshnessMs;
+}
+
+async function saveGenericCredentialBundleToVaultLocked(account: AccountRecord, bundle: GenericCredentialBundle): Promise<void> {
+  for (const file of bundle.files) {
+    const target = join(accountDir(account), file.relative);
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    await atomicWriteFile(target, file.raw.endsWith("\n") ? file.raw : `${file.raw}\n`, { mode: 0o600 });
+  }
+}
+
+export async function syncGenericCredentialsToVault(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<GenericCredentialSyncResult> {
+  return withAccountsLock(() => syncGenericCredentialsToVaultLocked(account, extraHome, options));
+}
+
+async function syncGenericCredentialsToVaultLocked(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<GenericCredentialSyncResult> {
+  const vault = await readGenericCredentialBundle(account, accountDir(account), "vault");
+  let best = vault;
+  for (const home of await genericCredentialHomesForAccount(account, extraHome, options)) {
+    const bundle = await readGenericCredentialBundle(account, home, home);
+    if (bundle && isFresherGenericCredentialBundle(bundle, best)) best = bundle;
+  }
+  if (!best || best === vault) return { credentials: best, vaultUpdated: false };
+  await saveGenericCredentialBundleToVaultLocked(account, best);
+  await appendLedger({
+    type: "account.credential-sync",
+    account: account.id,
+    tool: account.tool,
+    from: best.source,
+    files: best.files.map((file) => file.relative),
+    refreshedAt: new Date(best.freshnessMs).toISOString(),
+  });
+  return { credentials: best, vaultUpdated: true };
+}
+
+export type AccountCredentialSyncResult =
+  | ChainSyncResult
+  | CodexAuthSyncResult
+  | GrokAuthSyncResult
+  | GenericCredentialSyncResult;
+
+export async function syncAccountCredentialsToVault(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<AccountCredentialSyncResult> {
+  if (account.tool === "claude") return syncClaudeChainToVault(account, extraHome);
+  if (account.tool === "codex") return syncCodexAuthToVault(account, extraHome);
+  if (account.tool === "grok") return syncGrokAuthToVault(account, extraHome, options);
+  return syncGenericCredentialsToVault(account, extraHome, options);
+}
+
 /**
  * Overlay the source credentials JSON over the target's, preserving
  * target-only sibling keys (a home's mcpOAuth survives an identity stamp).
  */
 export function mergeCredentialsJson(targetRaw: string | null, sourceRaw: string): string {
+  const sourceText = decodeClaudeCredentialsRaw(sourceRaw) ?? sourceRaw;
   try {
-    const target = targetRaw ? (JSON.parse(targetRaw) as unknown) : {};
-    const source = JSON.parse(sourceRaw) as Record<string, unknown>;
-    if (!target || typeof target !== "object" || Array.isArray(target)) return sourceRaw;
+    const targetText = targetRaw ? decodeClaudeCredentialsRaw(targetRaw) : null;
+    const target = targetText ? (JSON.parse(targetText) as unknown) : {};
+    const source = JSON.parse(sourceText) as Record<string, unknown>;
+    if (!target || typeof target !== "object" || Array.isArray(target)) return sourceText;
     return JSON.stringify({ ...(target as Record<string, unknown>), ...source }, null, 2);
   } catch {
-    return sourceRaw;
+    return sourceText;
   }
 }
 
@@ -754,7 +1332,7 @@ async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: 
   let best = vault;
   for (const home of homes.values()) {
     const chain = await readHomeClaudeChain(home);
-    if (chain && (!best || chain.expiresAt > best.expiresAt)) best = chain;
+    if (chain && isBetterClaudeChain(chain, best)) best = chain;
   }
   if (!best || best === vault) return { chain: best, vaultUpdated: false };
   await saveClaudeChainToVaultLocked(account, best.raw);
@@ -776,6 +1354,51 @@ export async function syncAllClaudeChainsToVault(): Promise<AccountChainSyncOutc
   for (const account of accounts) {
     try {
       const result = await syncClaudeChainToVault(account);
+      outcomes.push({ account: account.id, vaultUpdated: result.vaultUpdated });
+    } catch (error) {
+      outcomes.push({ account: account.id, vaultUpdated: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return outcomes;
+}
+
+/** Sweep every codex account, pulling refreshed auth.json copies from homes into the vault. */
+export async function syncAllCodexAuthToVault(): Promise<AccountChainSyncOutcome[]> {
+  const accounts = (await listAccounts()).filter((account) => account.tool === "codex");
+  const outcomes: AccountChainSyncOutcome[] = [];
+  for (const account of accounts) {
+    try {
+      const result = await syncCodexAuthToVault(account);
+      outcomes.push({ account: account.id, vaultUpdated: result.vaultUpdated });
+    } catch (error) {
+      outcomes.push({ account: account.id, vaultUpdated: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return outcomes;
+}
+
+/** Sweep every generic file-backed account into the vault. */
+export async function syncAllGenericCredentialsToVault(): Promise<AccountChainSyncOutcome[]> {
+  const accounts = (await listAccounts()).filter((account) => account.tool !== "claude" && account.tool !== "codex" && account.tool !== "grok" && identityRecipeForAgent(account.tool));
+  const outcomes: AccountChainSyncOutcome[] = [];
+  for (const account of accounts) {
+    try {
+      const result = await syncGenericCredentialsToVault(account);
+      outcomes.push({ account: account.id, vaultUpdated: result.vaultUpdated });
+    } catch (error) {
+      outcomes.push({ account: account.id, vaultUpdated: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return outcomes;
+}
+
+/** Sweep all account types whose credentials rotate locally after launch. */
+export async function syncAllAccountCredentialsToVault(): Promise<AccountChainSyncOutcome[]> {
+  const outcomes: AccountChainSyncOutcome[] = [];
+  for (const account of await listAccounts()) {
+    if (!identityRecipeForAgent(account.tool)) continue;
+    try {
+      const result = await syncAccountCredentialsToVault(account);
       outcomes.push({ account: account.id, vaultUpdated: result.vaultUpdated });
     } catch (error) {
       outcomes.push({ account: account.id, vaultUpdated: false, error: error instanceof Error ? error.message : String(error) });
@@ -863,14 +1486,12 @@ async function refreshVaultClaudeChainIfStaleLocked(account: AccountRecord, opti
   const chain = parseClaudeChain(await readFile(vaultPath, "utf8").catch(() => null), "vault");
   if (!chain || chain.expiresAt > now + CHAIN_EXPIRY_SKEW_MS) return;
   if (!chain.refreshToken) {
-    options.onWarn?.(`the vaulted OAuth token for ${account.id} is expired and has no refresh token; claude may ask for a fresh login (hive login ${account.id})`);
-    return;
+    throw new Error("expired token has no refresh token");
   }
   const refresh = options.refreshClaudeToken ?? refreshClaudeOauthChain;
   const refreshed = await refresh(chain.refreshToken);
   if (!refreshed) {
-    options.onWarn?.(`the OAuth chain for ${account.id} is expired and could not be refreshed; claude may ask for a fresh login (hive login ${account.id})`);
-    return;
+    throw new Error("provider rejected the refresh token");
   }
   const oauth: Record<string, unknown> = {
     ...chain.oauth,

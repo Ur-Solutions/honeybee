@@ -9,6 +9,7 @@ import {
   accountHasCredentials,
   candidateHomes,
   claudeHomesForAccount,
+  codexHomesForAccount,
   listAccounts,
   persistClaudeChain,
   refreshClaudeOauthChain,
@@ -22,6 +23,7 @@ import { withFileLock } from "./lock.js";
 import { providerAdapter } from "./providers.js";
 
 export type { RefreshedClaudeToken } from "./accounts.js";
+export { codexAuthEmail, emailFromJwt } from "./accounts.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Provider limit windows (Phase 3 follow-up): remaining 5h/weekly usage
@@ -558,45 +560,6 @@ async function fetchCodexLiveRateLimits(homePath: string): Promise<CodexLiveRate
       `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "hive", title: "hive", version: "0.0.1" } } })}\n`,
     );
   });
-}
-
-async function codexHomesForAccount(account: AccountRecord): Promise<string[]> {
-  const vaultEmail = await codexAuthEmail(join(accountDir(account), "auth.json"));
-  const matched: string[] = [];
-  for (const dir of [join(storeRoot(), "homes", account.id), join(storeRoot(), "login-homes", account.id)]) {
-    if ((await stat(dir).catch(() => null))?.isDirectory()) matched.push(dir);
-  }
-  if (!vaultEmail) return matched;
-  for (const home of await candidateHomes("codex")) {
-    const email = await codexAuthEmail(join(home, "auth.json"));
-    if (email && email === vaultEmail) matched.push(home);
-  }
-  return matched;
-}
-
-/** Email claim from auth.json's id_token JWT — decoded, not verified (local fact). */
-export async function codexAuthEmail(authPath: string): Promise<string | null> {
-  const raw = await readFile(authPath, "utf8").catch(() => null);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw) as { tokens?: { id_token?: unknown } };
-    const idToken = parsed.tokens?.id_token;
-    if (typeof idToken !== "string") return null;
-    return emailFromJwt(idToken);
-  } catch {
-    return null;
-  }
-}
-
-export function emailFromJwt(jwt: string): string | null {
-  const payload = jwt.split(".")[1];
-  if (!payload) return null;
-  try {
-    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { email?: unknown };
-    return typeof decoded.email === "string" ? decoded.email : null;
-  } catch {
-    return null;
-  }
 }
 
 /** Newest rate_limits event across the most recent rollout files. */

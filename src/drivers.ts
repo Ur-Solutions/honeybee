@@ -56,8 +56,8 @@ export type AgentDriver = {
    * bare model (`--model <model>`); opencode multiplexes providers, so it needs
    * the qualified `<provider>/<model>` form. Returns [] when no model is given —
    * so a spawn without a model is byte-identical to today. CLIs whose model
-   * flag is unverified (grok/kimi/cursor/pi/droid) leave this undefined (no
-   * model args yet; refined in S4).
+   * flag is unverified (kimi/cursor/pi/droid) leave this undefined (no model
+   * args yet; refined in S4).
    */
   modelArgs?: (model?: string, provider?: string) => string[];
 };
@@ -130,8 +130,10 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     // The OAuth credential lives at $GROK_HOME/auth.json.
     identity: {
       credentialFiles: ["auth.json"],
+      configFiles: ["config.toml"],
     },
     isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
+    modelArgs: (model) => (model ? ["--model", model] : []),
   },
   kimi: {
     kind: "kimi",
@@ -227,8 +229,8 @@ export function exhaustionForAgent(kind: string, pane: string): ExhaustionHit | 
 /**
  * The CLI's model selector args for a spawn, or [] when the driver has no
  * model hook or no model was requested. Drivers without a `modelArgs` hook
- * (grok/kimi/cursor/pi/droid) always yield [] — byte-identical to a spawn
- * with no model.
+ * (kimi/cursor/pi/droid) always yield [] — byte-identical to a spawn with no
+ * model.
  */
 export function modelArgsForAgent(kind: string, model?: string, provider?: string): string[] {
   return agentDriver(kind)?.modelArgs?.(model, provider) ?? [];
