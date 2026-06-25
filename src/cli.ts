@@ -3600,6 +3600,8 @@ async function cmdRevive(parsed: Parsed): Promise<void> {
  * console output — it does only the resolveAgent/newSession/updateSession/
  * appendLedger work and returns the updated record. It does NOT guard liveness
  * (the caller does, so `restore` can decide per-bee whether to skip a live one).
+ * Non-fresh revive requires an exact provider session id; falling back to a
+ * provider's "latest" session can resume a sibling bee in a shared home.
  *
  * ACCOUNT SAFETY: this re-spawns into `record.homePath` with NO account switch
  * (no activateAccountIntoHome) — the same home whose creds are already there, so
@@ -3615,6 +3617,11 @@ async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessi
   // still exists on disk (claude/codex keep sessions keyed by project dir).
   const sessionOverride = opts.sessionOverride;
   const providerSessionId = fresh ? undefined : (sessionOverride ?? record.providerSessionId);
+  if (!fresh && !providerSessionId) {
+    throw new Error(
+      `hive revive: ${record.name} has no recorded provider session id; pass --session <id> to resume an exact session, or --fresh to start anew`,
+    );
+  }
 
   // Mirror the swap relaunch: rebuild the agent command from the configured
   // kind (preserving the original permission mode) and append the resume args.
@@ -3670,17 +3677,14 @@ async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<Session
   const sessionOverride = stringFlag(parsed, ["session"]);
   const providerSessionId = fresh ? undefined : (sessionOverride ?? record.providerSessionId);
   if (!fresh && !providerSessionId) {
-    console.error(
-      note(
-        `${record.name}: no recorded provider session id — resuming the most recent ${tool} session in its home, ` +
-          `which may belong to a sibling bee if the home is shared. Pass --session <id> to target a specific one, or --fresh to start anew.`,
-      ),
+    throw new Error(
+      `hive revive: ${record.name} has no recorded provider session id; pass --session <id> to resume an exact ${tool} session, or --fresh to start anew`,
     );
   }
 
   const updated = await reviveRecord(record, { fresh, sessionOverride });
 
-  const how = providerSessionId ? `resumed ${providerSessionId}` : fresh ? "fresh session" : "resumed latest";
+  const how = providerSessionId ? `resumed ${providerSessionId}` : "fresh session";
   if (isPretty()) console.log(actionLine("ok", "revive", [bold(record.name), record.agent, dim(how)]));
   else console.log(`revived\t${record.name}\t${record.agent}\t${how}`);
   return updated;
