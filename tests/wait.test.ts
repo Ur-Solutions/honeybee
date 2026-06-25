@@ -86,3 +86,27 @@ test("waitForIdle reports a settled pane as idle", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("waitForIdle does not report --last success before a prompted transcript appears", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-wait-last-no-tx-"));
+  try {
+    await withStoreRoot(dir, async () => {
+      const prompted = {
+        ...record(dir),
+        lastPrompt: "Reply OK only.",
+        lastPromptAt: "2026-06-10T00:00:01.000Z",
+      };
+      const substrate = {
+        capture: async () => "Grok Build\n❯ ",
+        hasSession: async () => true,
+      };
+
+      await assert.rejects(
+        waitForIdle({ record: prompted, idleMs: 50, timeoutMs: 220, pollMs: 50, output: "last", rows: 0, json: false, substrate }),
+        /Timed out waiting for idle session/,
+      );
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -183,6 +183,38 @@ test("gatherTitleContext: a brief is a task signal even without a transcript fir
     assert.deepEqual(ctx, { brief: "Wire up the webhook retry" });
     // …but requireExchange still needs an assistant reply, which "shell" can't provide.
     assert.equal(await gatherTitleContext(record, { requireExchange: true }), null);
+  });
+});
+
+test("gatherTitleContext: requireExchange ignores cwd-only transcript matches", async () => {
+  await withTempStore(async () => {
+    const home = await mkdtemp(join(tmpdir(), "hive-naming-codex-"));
+    try {
+      const cwd = join(home, "workspace");
+      const sessionDir = join(home, "sessions", "2026", "06", "18");
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        join(sessionDir, "rollout-2026-06-18T12-10-00-sibling.jsonl"),
+        [
+          JSON.stringify({ type: "session_meta", payload: { id: "sibling", cwd, timestamp: "2026-06-18T12:10:00.000Z" } }),
+          JSON.stringify({ type: "event_msg", timestamp: "2026-06-18T12:10:01.000Z", payload: { type: "user_message", message: "fix the wrong thread" } }),
+          JSON.stringify({ type: "event_msg", timestamp: "2026-06-18T12:10:05.000Z", payload: { type: "agent_message", message: "done" } }),
+        ].join("\n") + "\n",
+      );
+
+      const record = bee({
+        agent: "codex",
+        cwd,
+        command: "codex",
+        homePath: home,
+        createdAt: "2026-06-18T12:00:00.000Z",
+        updatedAt: "2026-06-18T12:00:00.000Z",
+      });
+
+      assert.equal(await gatherTitleContext(record, { requireExchange: true }), null);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });
 

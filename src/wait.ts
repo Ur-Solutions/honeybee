@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { hasTranscriptProvider } from "./drivers.js";
 import { cyan, dim, isPretty, tildify } from "./format.js";
 import { writeHiveState } from "./hiveState.js";
 import { isPermissionPromptPane } from "./readiness.js";
@@ -68,6 +69,10 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
       // "done" — the bee is blocked waiting for a human. Surface that clearly
       // instead of letting the caller read the stall as a completed turn.
       const blocked = isPermissionPromptPane(lastPane);
+      if (!blocked && isWaitingForRequestedTranscript(record, options, tx, assistant)) {
+        await sleep(Math.max(100, pollMs));
+        continue;
+      }
       if (blocked) {
         const hint = `${record.name} is waiting for permission — approve it with: hive attach ${record.name}`;
         console.error(isPretty(process.stderr) ? dim(`⚠ ${hint}`) : `warn\tpermission\t${record.name}`);
@@ -91,6 +96,21 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
   }
 
   throw new Error(`Timed out waiting for idle session after ${timeoutMs}ms: ${record.name}`);
+}
+
+function isWaitingForRequestedTranscript(
+  record: SessionRecord,
+  options: WaitForIdleOptions,
+  tx: Awaited<ReturnType<typeof latestTranscript>>,
+  assistant: string,
+): boolean {
+  if (options.output === "pane" || !hasTranscriptProvider(record.agent)) return false;
+  // Preserve historical pane fallback for unprompted/manual waits that have no
+  // transcript anchor. Prompted runs should not report a stable ready screen as
+  // success while the provider is still writing its transcript.
+  if (!record.lastPrompt && !record.transcriptPath && !record.providerSessionId) return false;
+  if (!tx) return true;
+  return options.output === "last" && assistant.trim().length === 0;
 }
 
 function hashParts(parts: string[]): string {
