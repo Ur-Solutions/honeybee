@@ -123,6 +123,31 @@ test("groupBeesByMode pro-repo groups by project/repo and buckets unmapped", () 
   assert.deepEqual(groups.map((g) => g.label), ["oss/forge · forge", "no pro repo"]);
 });
 
+test("groupBeesByMode pro-repo keeps worktree/checkout bees in the canonical repo's bucket", () => {
+  const groups = groupBeesByMode([
+    item({ name: "canon", proProject: "digitech/digitech", proRepo: "next", proArea: "digitech" }),
+    item({ name: "wt", proProject: "digitech/digitech", proRepo: "next", proArea: "digitech", proSlotKind: "worktree", proSlotName: "unimicro" }),
+    item({ name: "co", proProject: "digitech/digitech", proRepo: "next", proArea: "digitech", proSlotKind: "checkout", proSlotName: "release" }),
+  ], "pro-repo");
+  assert.deepEqual(groups.map((g) => g.label), ["digitech/digitech · next"]);
+  assert.deepEqual(groups[0]!.items.map((i) => i.name).sort(), ["canon", "co", "wt"]);
+});
+
+test("beesTuiSearchText indexes the slot name so a worktree filters by it", () => {
+  const rows = [
+    item({
+      name: "wt-bee",
+      proSlotKind: "worktree",
+      proSlotName: "unimicro-integration",
+      searchText: beesTuiSearchText({ name: "wt-bee", displayName: "wt-bee", agent: "claude", cwd: "~/app", detail: "", ref: "wt-bee", slot: "unimicro-integration" }),
+    }),
+    item({ name: "other" }),
+  ];
+  const out = filterBeesTuiItems(rows, "unimicro");
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.name, "wt-bee");
+});
+
 test("groupBeesByMode pro-area groups by area", () => {
   const groups = groupBeesByMode([
     item({ name: "a", proArea: "oss" }),

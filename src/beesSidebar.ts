@@ -11,6 +11,7 @@ import { substrateFor } from "./substrates/index.js";
 import { formatShellCommand, tmux } from "./tmux.js";
 import type { SessionRecord } from "./store.js";
 import { BEES_GROUP_MODES, type BeesGroupMode } from "./beesTui.js";
+import { tmuxOptionsForAgent } from "./agents.js";
 
 export const BEES_NAV_PANE_OPTION = "@hive_bees_nav";
 export const BEES_SIDEBAR_WIDTH_OPTION = "@hive_bees_sidebar_width";
@@ -35,9 +36,22 @@ async function currentWindowTarget(): Promise<string> {
   return target;
 }
 
+function exactWindowTarget(windowTarget: string): string {
+  const i = windowTarget.indexOf(":");
+  if (i < 0) return windowTarget.startsWith("=") ? windowTarget : `=${windowTarget}`;
+  const session = windowTarget.slice(0, i);
+  const rest = windowTarget.slice(i);
+  return `${session.startsWith("=") ? session : `=${session}`}${rest}`;
+}
+
+function windowSessionName(windowTarget: string): string {
+  const session = windowTarget.split(":")[0] ?? "";
+  return session.startsWith("=") ? session.slice(1) : session;
+}
+
 async function listWindowPanes(windowTarget: string): Promise<PaneRow[]> {
   const format = "#{pane_id}\t#{@hive_bees_nav}\t#{pane_active}";
-  const result = await tmux(["list-panes", "-t", windowTarget, "-F", format], { reject: false });
+  const result = await tmux(["list-panes", "-t", exactWindowTarget(windowTarget), "-F", format], { reject: false });
   if (!result.ok) return [];
   const rows: PaneRow[] = [];
   for (const line of result.stdout.split("\n")) {
@@ -112,7 +126,7 @@ async function openNavPane(windowTarget: string, width: number, command = hiveBe
   const result = await tmux(
     // -f makes this a full-window split, not a split of whichever pane happened
     // to be active. That keeps the sidebar rooted to the left edge.
-    ["split-window", "-h", "-f", "-b", "-d", "-l", String(width), "-P", "-F", "#{pane_id}", "-t", windowTarget, command],
+    ["split-window", "-h", "-f", "-b", "-d", "-l", String(width), "-P", "-F", "#{pane_id}", "-t", exactWindowTarget(windowTarget), command],
     { reject: false },
   );
   const paneId = result.ok ? result.stdout.trim() : "";
@@ -178,6 +192,7 @@ export async function syncBeesSidebarLayout(
 
 /** Switch to a bee and keep the sidebar strip on the new session's window. */
 export async function showBeeBesideSidebar(record: SessionRecord): Promise<void> {
+  await applyBeeWindowOptions(record);
   if (!process.env.TMUX) {
     const { attachSession } = await import("./tmux.js");
     await attachSession(record.tmuxTarget);
@@ -213,6 +228,7 @@ export async function showBeeBesideSidebar(record: SessionRecord): Promise<void>
  * operator lands inside tmux with the strip already up and the bee focused.
  */
 export async function attachBeeWithSidebar(record: SessionRecord): Promise<void> {
+  await applyBeeWindowOptions(record);
   let width = await readGlobalSidebarWidth();
   if (width === undefined) {
     width = DEFAULT_SIDEBAR_WIDTH;
@@ -227,9 +243,15 @@ export async function attachBeeWithSidebar(record: SessionRecord): Promise<void>
   await substrateFor(record).attachSession(record.tmuxTarget);
 }
 
+async function applyBeeWindowOptions(record: SessionRecord): Promise<void> {
+  const options = tmuxOptionsForAgent(record.agent);
+  if (!options) return;
+  await substrateFor(record).setWindowOptions(record.tmuxTarget, options, record.agentPaneId);
+}
+
 async function switchClientToBee(record: SessionRecord): Promise<void> {
   const target = record.agentPaneId ? await windowTargetForPane(record.agentPaneId) : undefined;
-  await tmux(["switch-client", "-t", target ?? `=${record.tmuxTarget}`], { reject: false });
+  await tmux(["switch-client", "-t", target ? exactWindowTarget(target) : `=${record.tmuxTarget}`], { reject: false });
   await selectBeePane(record);
 }
 
@@ -297,7 +319,7 @@ export async function resolveCurrentSidebarBeeName(records: SessionRecord[]): Pr
   const windowTarget = await sidebarWindowTarget();
   if (!windowTarget) return undefined;
   const panes = await listWindowPanes(windowTarget);
-  const windowSession = windowTarget.split(":")[0] ?? "";
+  const windowSession = windowSessionName(windowTarget);
   return pickCurrentSidebarBee(records, panes, windowSession);
 }
 
@@ -310,3 +332,6 @@ export function __testOnlySidebarWidthClamp(width: number): number {
 export async function __testOnlyOpenNavPane(windowTarget: string, width: number, command: string): Promise<string | undefined> {
   return openNavPane(windowTarget, width, command);
 }
+
+/** @internal test helper */
+export const __testOnlyExactWindowTarget = exactWindowTarget;

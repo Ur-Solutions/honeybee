@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { promisify } from "node:util";
-import { pickCurrentSidebarBee, toggleBeesSidebar } from "../src/beesSidebar.js";
+import { __testOnlyExactWindowTarget, pickCurrentSidebarBee, toggleBeesSidebar } from "../src/beesSidebar.js";
 import { setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
 
 const execFileAsync = promisify(execFile);
@@ -65,6 +65,12 @@ test("pickCurrentSidebarBee skips remote bees in the session fallback and return
     { paneId: "%x", nav: false, active: true },
   ];
   assert.equal(pickCurrentSidebarBee(remote, panes, "R"), undefined);
+});
+
+test("sidebar tmux window targets exact-match the session name", () => {
+  assert.equal(__testOnlyExactWindowTarget("CL-abc:0"), "=CL-abc:0");
+  assert.equal(__testOnlyExactWindowTarget("=CL-abc:0"), "=CL-abc:0");
+  assert.equal(__testOnlyExactWindowTarget("CL-abc"), "=CL-abc");
 });
 
 test("bees sidebar opens as a root-left split and focuses the sidebar pane", { timeout: 30_000 }, async () => {

@@ -8,6 +8,7 @@
 import * as readline from "node:readline";
 import { fuzzyFilter } from "./spawnTui.js";
 import { bold, cyan, dim, gray, green, isPretty, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
+import type { ProSlotKind } from "./proProjects.js";
 
 export type BeesTuiItem = {
   name: string;
@@ -29,7 +30,15 @@ export type BeesTuiItem = {
   proArea?: string;
   proProject?: string;
   proRepo?: string;
-  /** Fuzzy index string (name, title, colony, swarm, agent, cwd, detail). */
+  /**
+   * When the cwd lives in a pro worktree/checkout rather than the canonical
+   * repo, the slot kind and name. The bee still groups under its pro
+   * project/repo (proProject/proRepo); this just tags the row so two bees in the
+   * same repo's different slots are distinguishable.
+   */
+  proSlotKind?: ProSlotKind;
+  proSlotName?: string;
+  /** Fuzzy index string (name, title, colony, swarm, agent, cwd, detail, slot). */
   searchText: string;
 };
 
@@ -309,6 +318,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
   let scroll = 0;
   let confirmKill: BeesTuiItem | undefined; // bee awaiting kill confirmation
   let killing = false;
+  let selecting: BeesTuiItem | undefined;
   let message = "type to filter · ↑↓ move · enter selects · q quits";
 
   readline.emitKeypressEvents(stdin);
@@ -393,13 +403,19 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
 
       const onSelect = async () => {
         const item = currentItem();
-        if (!item) return;
+        if (!item || selecting) return;
+        selecting = item;
+        message = `opening ${item.displayName || item.ref}...`;
+        render();
         try {
           await options.onSelect(item);
           message = `→ ${item.displayName}`;
           if (!options.sidebar) finish();
         } catch (error) {
           message = error instanceof Error ? error.message : String(error);
+        } finally {
+          selecting = undefined;
+          if (!done) render();
         }
       };
 
@@ -463,6 +479,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
           finish();
           return;
         }
+        if (selecting) return;
         // Kill confirmation modal owns all input while open.
         if (confirmKill) {
           if (killing) return;
@@ -500,7 +517,6 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
         if (key.name === "tab") { void openPreview(); return; }
         if (key.name === "return" || key.name === "enter") {
           void onSelect();
-          render();
           return;
         }
         if (key.name === "backspace") {
@@ -561,7 +577,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
           tick += 1;
           if (options.syncGroupMode) {
             void options.syncGroupMode().then((mode) => {
-              if (done || !mode || mode === groupMode) return;
+              if (done || selecting || !mode || mode === groupMode) return;
               groupMode = mode;
               regroup();
               render();
@@ -574,7 +590,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
             refreshing = true;
             void options.refreshItems()
               .then((items) => {
-                if (done || confirmKill || killing) return;
+                if (done || confirmKill || killing || selecting) return;
                 const signature = beesCatalogSignature(items);
                 if (signature === lastSignature) return;
                 lastSignature = signature;
@@ -637,6 +653,16 @@ export function resolveRegroupCursor(flat: FlatRow[], prevName: string | undefin
   return survived >= 0 ? survived : initialBeesCursor(flat, currentName);
 }
 
+/**
+ * Leading icon for a bee living in a pro worktree/checkout (⧉ worktree,
+ * ⎇ checkout), prefixed onto the title column so two bees in the same repo read
+ * apart at a glance. "" for canonical-repo bees so their title stays clean.
+ */
+function slotGlyph(item: BeesTuiItem): string {
+  if (!item.proSlotKind) return "";
+  return item.proSlotKind === "worktree" ? "⧉" : "⎇";
+}
+
 function renderFlatRow(row: FlatRow, index: number, cursor: number, width: number, currentName?: string): string {
   if (row.kind === "header") {
     if (width < 20) return dim(truncate(row.label, width));
@@ -649,16 +675,20 @@ function renderFlatRow(row: FlatRow, index: number, cursor: number, width: numbe
   // active bee is also selected. Reusing one fixed-width slot keeps the ref aligned.
   const isHere = currentName !== undefined && row.item.name === currentName;
   const pointer = isHere ? green(">") : " ";
-  const title = row.item.displayName.length > 0 ? row.item.displayName : row.item.ref;
+  // A pro worktree/checkout bee gets a kind icon at the front of the title.
+  const glyph = slotGlyph(row.item);
+  const baseTitle = row.item.displayName.length > 0 ? row.item.displayName : row.item.ref;
+  const title = glyph ? `${glyph} ${baseTitle}` : baseTitle;
   let line: string;
   if (width < 24) {
     line = `${pointer} ${stateGlyph(row.item.stateHeadline, row.item.live)} ${truncate(title, Math.max(1, width - 5))}`;
   } else if (width < 38) {
     line = `${pointer} ${stateGlyph(row.item.stateHeadline, row.item.live)} ${truncate(row.item.ref, 8)} ${truncate(title, Math.max(1, width - 14))}`;
   } else {
-    // ref + state + name. The name gets all remaining width; the noisy detail
-    // tail ("awaiting prompt", "last activity …") is dropped — it duplicates the
-    // state column and crowds out the name. Wide terminals still show the detail.
+    // ref + state + name (with a leading worktree/checkout icon). The name gets
+    // all remaining width; the noisy detail tail ("awaiting prompt", …) is
+    // dropped — it duplicates the state column and crowds out the name. Wide
+    // terminals still show the detail.
     const state = stateCell(row.item.stateHeadline, row.item.live);
     const head = `${pointer} ${pad(truncate(row.item.ref, 10), 10)} ${pad(state, 12)}`;
     const room = Math.max(8, width - visibleLength(stripAnsi(head)) - 1);
@@ -712,6 +742,7 @@ export function beesTuiSearchText(parts: {
   cwd: string;
   detail: string;
   ref: string;
+  slot?: string;
 }): string {
   return [
     parts.name,
@@ -722,6 +753,7 @@ export function beesTuiSearchText(parts: {
     parts.agent,
     parts.cwd,
     parts.detail,
+    parts.slot ?? "",
   ]
     .join(" ")
     .toLowerCase();
