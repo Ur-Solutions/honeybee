@@ -15,6 +15,7 @@
 
 import { appendFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import type { SealRecord, SealStatus } from "../seal.js";
@@ -100,6 +101,65 @@ export function loopStopRequestPath(id: string): string {
 
 function padIter(n: number): string {
   return String(Math.max(0, Math.floor(n))).padStart(3, "0");
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Loop ids — short, bee-id-style (`LP.<hex>`) so a loop reads and targets like
+// a BID (`CL.270`) instead of a raw run id. The suffix is the shortest hex
+// prefix (≥3) that is unambiguous against existing loops; loops are targetable
+// by the full id, the bare suffix, or any unambiguous prefix (see resolveLoopId).
+// ──────────────────────────────────────────────────────────────────────────
+
+export const LOOP_ID_PREFIX = "LP.";
+
+async function existingLoopIds(): Promise<string[]> {
+  const entries = await readdir(loopsRoot(), { withFileTypes: true }).catch(() => []);
+  return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+}
+
+/**
+ * Allocate a fresh short loop id: `LP.` + the shortest hex suffix (≥3 chars)
+ * that neither equals, prefixes, nor is prefixed by any existing loop id — so
+ * every loop stays unambiguously targetable by its suffix. Mirrors the bee
+ * identity scheme. `uuidFactory` is injectable for deterministic tests.
+ */
+export async function generateLoopId(uuidFactory: () => string = randomUUID): Promise<string> {
+  const existing = await existingLoopIds();
+  for (let attempt = 0; attempt < 100_000; attempt += 1) {
+    const hex = uuidFactory().replace(/-/g, "").toLowerCase();
+    if (!/^[0-9a-f]{3,}$/.test(hex)) continue;
+    for (let length = 3; length <= hex.length; length += 1) {
+      const id = `${LOOP_ID_PREFIX}${hex.slice(0, length)}`;
+      // Reject only if the candidate equals or PREFIXES an existing id (which
+      // would make it ambiguously prefix-match). A longer, more-specific id
+      // alongside a shorter existing one is fine — the short one stays
+      // exact-matchable. Grow the suffix until that holds.
+      const clashes = existing.some((other) => other === id || other.startsWith(id));
+      if (!clashes) return id;
+    }
+  }
+  throw new Error("Could not allocate a unique loop id");
+}
+
+/**
+ * Resolve a user-supplied loop reference to a full loop id. Accepts the full id
+ * (`LP.a3f`), the bare suffix (`a3f`), or any unambiguous prefix of either —
+ * and still matches legacy long-form ids exactly. Throws a clear error on an
+ * unknown or ambiguous reference (and never touches the filesystem outside the
+ * loops dir, so a path-traversal query simply fails to match).
+ */
+export async function resolveLoopId(query: string): Promise<string> {
+  const q = query.trim();
+  if (!q) throw new Error("Provide a loop id (LP.xxx or its suffix).");
+  const ids = await existingLoopIds();
+  if (ids.includes(q)) return q; // exact full id (incl. legacy long form)
+  const withPrefix = `${LOOP_ID_PREFIX}${q}`;
+  if (ids.includes(withPrefix)) return withPrefix; // bare suffix → LP.<suffix>
+  const suffixOf = (id: string) => (id.startsWith(LOOP_ID_PREFIX) ? id.slice(LOOP_ID_PREFIX.length) : id);
+  const matches = ids.filter((id) => id.startsWith(q) || suffixOf(id).startsWith(q));
+  if (matches.length === 1) return matches[0]!;
+  if (matches.length > 1) throw new Error(`Ambiguous loop ref "${query}": ${matches.join(", ")}`);
+  throw new Error(`Unknown loop: ${query}`);
 }
 
 // ──────────────────────────────────────────────────────────────────────────

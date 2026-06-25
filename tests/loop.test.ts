@@ -914,7 +914,8 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
       } finally {
         process.argv[1] = original;
       }
-      assert.match(loopId, /^[0-9A-Z]{13}-[0-9a-f]{4}$/);
+      // Short, bee-id-style loop id (LP.<hex>) — targetable by suffix, not a raw run id.
+      assert.match(loopId, /^LP\.[0-9a-f]{3,}$/);
       const cfg = await facade.loopStatus(loopId);
       assert.ok(cfg);
       assert.equal(cfg?.context, "ralph");
