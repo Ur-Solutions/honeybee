@@ -6,6 +6,18 @@ export function storeRoot(): string {
   return process.env.HIVE_STORE_ROOT ?? join(homedir(), ".hive");
 }
 
+/**
+ * Dedicated cwd for title-generator subprocesses. Kept off real bee cwds so the
+ * provider's transcript folders are never polluted with title-gen sessions —
+ * AND so the transcript matcher can hard-exclude these sessions (codex stores
+ * rollouts globally per-home, ignoring cwd, so a dedicated cwd alone does not
+ * keep them out of the scan; see transcripts.ts). Single source of truth shared
+ * by naming.ts (where generators run) and transcripts.ts (where they're skipped).
+ */
+export function namingGeneratorCwd(): string {
+  return join(storeRoot(), "naming");
+}
+
 export type AtomicWriteOptions = {
   mode?: number;
 };

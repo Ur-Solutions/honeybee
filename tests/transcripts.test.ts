@@ -66,6 +66,54 @@ test("latestTranscript: notBeforeIso refuses an older sibling's transcript that 
   }
 });
 
+test("latestTranscript: Codex spawn proximity beats a newer same-cwd sibling", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-proximity-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "06", "18");
+    await mkdir(sessionDir, { recursive: true });
+
+    const ownPath = join(sessionDir, "rollout-2026-06-18T12-00-01-own.jsonl");
+    await writeFile(
+      ownPath,
+      [
+        // Codex can stamp the row later than the real session start. The
+        // payload timestamp is the start anchor that should tie this file to
+        // the bee spawned at 12:00:00.
+        JSON.stringify({ type: "session_meta", timestamp: "2026-06-18T12:10:00.000Z", payload: { id: "own", cwd, timestamp: "2026-06-18T12:00:01.000Z" } }),
+        JSON.stringify({ type: "event_msg", timestamp: "2026-06-18T12:20:00.000Z", payload: { type: "user_message", message: "review the PR" } }),
+        JSON.stringify({ type: "event_msg", timestamp: "2026-06-18T12:20:05.000Z", payload: { type: "agent_message", message: "own review" } }),
+      ].join("\n") + "\n",
+    );
+
+    const siblingPath = join(sessionDir, "rollout-2026-06-18T12-05-00-sibling.jsonl");
+    await writeFile(
+      siblingPath,
+      [
+        JSON.stringify({ type: "session_meta", timestamp: "2026-06-18T12:05:00.000Z", payload: { id: "sibling", cwd, timestamp: "2026-06-18T12:05:00.000Z" } }),
+        JSON.stringify({ type: "event_msg", timestamp: "2026-06-18T12:05:01.000Z", payload: { type: "user_message", message: "review the PR" } }),
+        JSON.stringify({ type: "event_msg", timestamp: "2026-06-18T12:05:05.000Z", payload: { type: "agent_message", message: "sibling review" } }),
+      ].join("\n") + "\n",
+    );
+
+    await utimes(ownPath, new Date("2026-06-18T12:30:00.000Z"), new Date("2026-06-18T12:30:00.000Z"));
+    await utimes(siblingPath, new Date("2026-06-18T13:00:00.000Z"), new Date("2026-06-18T13:00:00.000Z"));
+
+    const tx = await latestTranscript("codex", cwd, {
+      homePath: dir,
+      notBeforeIso: "2026-06-18T12:00:00.000Z",
+      sinceIso: "2026-06-18T12:00:00.000Z",
+      prompt: "review the PR",
+    });
+
+    assert.equal(tx?.sessionId, "own");
+    assert.equal(tx?.matchedBy.includes("spawn-proximity"), true);
+    assert.equal(lastAssistantText(tx?.rows ?? []), "own review");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("latestTranscript inherits Claude ai-title metadata", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-claude-title-"));
   try {
@@ -148,6 +196,37 @@ test("latestTranscript ignores the Codex reasoning-summary mode when titling", a
     assert.ok(tx);
     assert.equal(tx.title, "Implement inherited bee titles");
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("latestTranscript never adopts a Codex title-generator session as a bee transcript", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-titlegen-"));
+  const prevRoot = process.env.HIVE_STORE_ROOT;
+  try {
+    process.env.HIVE_STORE_ROOT = join(dir, "store");
+    // The title generator runs `codex exec` in this dedicated cwd; codex stores
+    // rollouts globally per-home, so the bee shares the sessions dir with it.
+    const generatorCwd = join(dir, "store", "naming");
+    const beeCwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "06", "25");
+    await mkdir(sessionDir, { recursive: true });
+    // A title-gen rollout: its first user message is the title prompt itself.
+    // Without the generator-cwd guard the bee would adopt it and be titled
+    // "You are a session-title generator…".
+    await writeFile(
+      join(sessionDir, "rollout-2026-06-25T05-00-00-titlegen.jsonl"),
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "titlegen", cwd: generatorCwd } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "You are a session-title generator. Output ONLY a 3-8 word title in plain text." } }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("codex", beeCwd, { homePath: dir });
+    assert.equal(tx, null);
+  } finally {
+    if (prevRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = prevRoot;
     await rm(dir, { recursive: true, force: true });
   }
 });

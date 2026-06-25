@@ -3,6 +3,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 export { hasTranscriptProvider } from "./drivers.js";
+import { namingGeneratorCwd } from "./fsx.js";
 
 export type TranscriptProvider = "claude" | "codex" | "opencode" | "grok";
 
@@ -26,6 +27,7 @@ export type TranscriptFile = {
   provider: TranscriptProvider;
   path: string;
   sessionId: string;
+  startedAtMs?: number;
   mtimeMs: number;
   rows: TranscriptRow[];
   score: number;
@@ -53,6 +55,7 @@ const SCORE = {
   path: 2_000,
   sessionId: 1_000,
   prompt: 500,
+  spawnProximity: 300,
   cwd: 200,
   since: 10,
 };
@@ -194,7 +197,7 @@ type ParsedTranscriptCacheEntry = {
   rows: TranscriptRow[];
   promptMatches: Map<string, boolean>;
   claude?: { title?: string };
-  codex?: { rows: TranscriptRow[]; sessionId: string; metaCwd: string; title?: string };
+  codex?: { rows: TranscriptRow[]; sessionId: string; metaCwd: string; startedAtMs?: number; title?: string };
 };
 
 const PARSED_TRANSCRIPT_CACHE_LIMIT = 8;
@@ -306,10 +309,11 @@ async function loadClaudeTranscript(path: string, options: TranscriptLookupOptio
   if (!entry || entry.rows.length === 0) return null;
   const { rows, mtimeMs } = entry;
   const sessionId = basename(path).replace(/\.jsonl$/, "");
-  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, options, promptMatches: entry.promptMatches });
+  const startedAtMs = transcriptStartMs(rows) ?? undefined;
+  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, startedAtMs, mtimeMs, options, promptMatches: entry.promptMatches });
   entry.claude ??= { title: extractClaudeTitle(rows) };
   const title = entry.claude.title;
-  return { provider: "claude", path, sessionId, mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
+  return { provider: "claude", path, sessionId, ...(startedAtMs !== undefined ? { startedAtMs } : {}), mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
 }
 
 async function loadCodexTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownStat?: StatHint): Promise<TranscriptFile | null> {
@@ -319,6 +323,7 @@ async function loadCodexTranscript(path: string, cwd: string, options: Transcrip
   if (!entry.codex) {
     const sessionMeta = rawRows.find((row) => row.type === "session_meta") as { payload?: Record<string, unknown> } | undefined;
     const sessionId = String(sessionMeta?.payload?.id ?? basename(path).replace(/\.jsonl$/, ""));
+    const startedAtMs = codexSessionStartMs(rawRows);
     // Real rollouts carry each message twice: as an event_msg
     // (user_message/agent_message) and as a response_item message. When the
     // event stream is present, it wins and the response_item copies are
@@ -330,12 +335,18 @@ async function loadCodexTranscript(path: string, cwd: string, options: Transcrip
     });
     const rows = rawRows.flatMap((row) => normalizeCodexRow(row, hasEventMessages));
     const metaCwd = String(sessionMeta?.payload?.cwd ?? sessionMeta?.payload?.original_cwd ?? "");
-    entry.codex = { rows, sessionId, metaCwd, title: extractCodexTitle(rawRows, rows) };
+    entry.codex = { rows, sessionId, metaCwd, ...(startedAtMs !== null ? { startedAtMs } : {}), title: extractCodexTitle(rawRows, rows) };
   }
-  const { rows, sessionId, metaCwd, title } = entry.codex;
+  const { rows, sessionId, metaCwd, startedAtMs, title } = entry.codex;
   if (rows.length === 0) return null;
-  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options, promptMatches: entry.promptMatches });
-  return { provider: "codex", path, sessionId, mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
+  // Title-generator subprocesses run `codex exec` in a dedicated cwd
+  // (namingGeneratorCwd). codex stores rollouts globally per-home rather than
+  // per-project, so a bee sharing that home would otherwise adopt the title-gen
+  // session as its own transcript — and its first user message (the title
+  // prompt: "You are a session-title generator…") as the bee's title. Skip them.
+  if (isGeneratorTranscriptCwd(metaCwd)) return null;
+  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, startedAtMs, mtimeMs, cwd, transcriptCwd: metaCwd, options, promptMatches: entry.promptMatches });
+  return { provider: "codex", path, sessionId, ...(startedAtMs !== undefined ? { startedAtMs } : {}), mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
 }
 
 async function loadOpenCodeTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownMtimeMs?: number): Promise<TranscriptFile | null> {
@@ -344,10 +355,14 @@ async function loadOpenCodeTranscript(path: string, cwd: string, options: Transc
   const session = await readJsonObject(path);
   const sessionId = String(session.id ?? basename(path).replace(/\.json$/, ""));
   const directory = String(session.directory ?? "");
+  // See loadCodexTranscript: opencode also scans storage globally, so skip
+  // title-generator sessions rather than adopt them as a bee's transcript.
+  if (isGeneratorTranscriptCwd(directory)) return null;
   const rows = await readOpenCodeRows(sessionId, opencodeStorageRoot(options.homePath));
   if (rows.length === 0) return null;
-  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, mtimeMs, cwd, transcriptCwd: directory, options });
-  return { provider: "opencode", path, sessionId, mtimeMs, rows, score, matchedBy };
+  const startedAtMs = transcriptStartMs(rows) ?? undefined;
+  const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, startedAtMs, mtimeMs, cwd, transcriptCwd: directory, options });
+  return { provider: "opencode", path, sessionId, ...(startedAtMs !== undefined ? { startedAtMs } : {}), mtimeMs, rows, score, matchedBy };
 }
 
 async function loadGrokTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownStat?: StatHint): Promise<TranscriptFile | null> {
@@ -363,8 +378,9 @@ async function loadGrokTranscript(path: string, cwd: string, options: Transcript
   const info = (summary.info && typeof summary.info === "object" ? summary.info : {}) as Record<string, unknown>;
   const sessionId = String(info.id ?? summary.id ?? basename(sessionDir));
   const metaCwd = String(info.cwd ?? summary.cwd ?? "");
-  const { score, matchedBy } = scoreTranscript({ rows, path: chatPath, sessionId, mtimeMs, cwd, transcriptCwd: metaCwd, options, promptMatches: entry.promptMatches });
-  return { provider: "grok", path: chatPath, sessionId, mtimeMs, rows, score, matchedBy };
+  const startedAtMs = transcriptStartMs(rows) ?? undefined;
+  const { score, matchedBy } = scoreTranscript({ rows, path: chatPath, sessionId, startedAtMs, mtimeMs, cwd, transcriptCwd: metaCwd, options, promptMatches: entry.promptMatches });
+  return { provider: "grok", path: chatPath, sessionId, ...(startedAtMs !== undefined ? { startedAtMs } : {}), mtimeMs, rows, score, matchedBy };
 }
 
 function normalizeCodexRow(row: TranscriptRow, skipResponseItemMessages: boolean): TranscriptRow[] {
@@ -449,8 +465,8 @@ async function readOpenCodeRows(sessionId: string, storageRoot: string): Promise
   return rows;
 }
 
-function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId: string; mtimeMs: number; cwd?: string; transcriptCwd?: string; options: TranscriptLookupOptions; promptMatches?: Map<string, boolean> }) {
-  const { rows, path, sessionId, mtimeMs, cwd, transcriptCwd, options, promptMatches } = input;
+function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId: string; startedAtMs?: number; mtimeMs: number; cwd?: string; transcriptCwd?: string; options: TranscriptLookupOptions; promptMatches?: Map<string, boolean> }) {
+  const { rows, path, sessionId, startedAtMs, mtimeMs, cwd, transcriptCwd, options, promptMatches } = input;
   let score = mtimeMs / 1_000_000_000_000;
   const matchedBy: string[] = ["mtime"];
 
@@ -465,6 +481,17 @@ function scoreTranscript(input: { rows: TranscriptRow[]; path: string; sessionId
   if (options.prompt && memoizedPromptMatch(rows, options.prompt, promptMatches)) {
     score += SCORE.prompt;
     matchedBy.push("prompt");
+  }
+  if (options.notBeforeIso && startedAtMs !== undefined) {
+    const spawnedAt = Date.parse(options.notBeforeIso);
+    if (Number.isFinite(spawnedAt) && startedAtMs >= spawnedAt - CREATED_FLOOR_GRACE_MS) {
+      const distanceSeconds = Math.abs(startedAtMs - spawnedAt) / 1_000;
+      const proximity = Math.max(0, SCORE.spawnProximity - distanceSeconds);
+      if (proximity > 0) {
+        score += proximity;
+        matchedBy.push("spawn-proximity");
+      }
+    }
   }
   if (cwd && transcriptCwd && samePath(transcriptCwd, cwd)) {
     score += SCORE.cwd;
@@ -537,7 +564,7 @@ function passesCreatedFloor(tx: TranscriptFile, options: TranscriptLookupOptions
   if (tx.matchedBy.includes("session-id") || tx.matchedBy.includes("path")) return true;
   const floor = Date.parse(options.notBeforeIso) - CREATED_FLOOR_GRACE_MS;
   if (!Number.isFinite(floor)) return true;
-  const start = transcriptStartMs(tx.rows);
+  const start = tx.startedAtMs ?? transcriptStartMs(tx.rows);
   return start === null || start >= floor;
 }
 
@@ -550,6 +577,18 @@ function transcriptStartMs(rows: TranscriptRow[]): number | null {
     if (min === null || ms < min) min = ms;
   }
   return min;
+}
+
+function codexSessionStartMs(rows: TranscriptRow[]): number | null {
+  for (const row of rows) {
+    if (row.type !== "session_meta") continue;
+    const payload = objectPayload(row);
+    const fromPayload = parseTimestampMs(payload?.timestamp);
+    if (fromPayload !== null) return fromPayload;
+    const fromRow = parseTimestampMs(row.timestamp);
+    if (fromRow !== null) return fromRow;
+  }
+  return transcriptStartMs(rows);
 }
 
 function parseTimestampMs(value: unknown): number | null {
@@ -641,6 +680,12 @@ async function readJsonObject(path: string): Promise<Record<string, unknown>> {
 function samePath(a: string, b: string): boolean {
   if (!a || !b) return false;
   return resolve(a) === resolve(b);
+}
+
+/** A transcript recorded in the title-generator's dedicated cwd is a title-gen
+ * artifact, never a real bee session — see loadCodexTranscript. */
+function isGeneratorTranscriptCwd(transcriptCwd: string): boolean {
+  return samePath(transcriptCwd, namingGeneratorCwd());
 }
 
 function isPathInside(path: string, root: string): boolean {

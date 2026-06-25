@@ -45,6 +45,24 @@ export function hiveStateFor(state: BeeState): HiveTmuxState | undefined {
   }
 }
 
+/**
+ * The live @hive_state to trust for display, or undefined to fall back to the
+ * freshly pane-derived state. @hive_state is a cached tmux hint: it's stamped
+ * "working" at spawn and only cleared by agent Stop/Notification hooks or the
+ * daemon's mirror. Hookless CLIs (notably codex) have no way to clear it
+ * themselves, so a lagging or stopped daemon strands "working" on bees whose
+ * live pane plainly shows them idle/ready/blocked. When the pane-derived state
+ * contradicts a stale "working", the pane wins — it's the real-time truth.
+ * Other @hive_state values (waiting/done/failed, set by real hook events) are
+ * trusted as-is.
+ */
+export function effectiveHiveState(liveHive: string | undefined, derived: BeeState | undefined): string | undefined {
+  if (!liveHive || liveHive.length === 0) return undefined;
+  if (liveHive !== "working" || derived === undefined) return liveHive;
+  const derivedHive = hiveStateFor(derived);
+  return derivedHive !== undefined && derivedHive !== "working" ? undefined : liveHive;
+}
+
 type SessionRef = Pick<SessionRecord, "node" | "tmuxTarget">;
 
 export async function writeHiveState(record: SessionRef, state: HiveTmuxState): Promise<void> {

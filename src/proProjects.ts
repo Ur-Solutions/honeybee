@@ -10,6 +10,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { basename, dirname } from "node:path";
 
 export type ProRepo = {
   /** "area/project/repo" — the display label in the picker. */
@@ -57,11 +58,43 @@ export function parseProRepos(stdout: string): ProRepo[] {
   return repos;
 }
 
+// `pro ls repos` is the same shell-out for both the browse list and the
+// per-cwd isolation check, and the spawn/launch TUIs call it repeatedly while
+// the operator navigates. A short-lived promise cache collapses those into one
+// `pro` invocation (and lets the TUI prefetch it up front via prewarmProRepos,
+// so the "checking pro repo…" step resolves instantly instead of blocking the
+// spawn on a cold call). The window is short — a single interactive session —
+// so a repo created mid-session at worst waits out the TTL.
+const PRO_REPOS_CACHE_TTL_MS = 30_000;
+let proReposCache: { at: number; stdout: Promise<string> } | undefined;
+
+function cachedProReposStdout(): Promise<string> {
+  const now = Date.now();
+  if (proReposCache && now - proReposCache.at < PRO_REPOS_CACHE_TTL_MS) return proReposCache.stdout;
+  const stdout = run("pro", ["ls", "repos"]);
+  const entry = { at: now, stdout };
+  proReposCache = entry;
+  // Don't cache a failure: drop it so the next call retries a fresh `pro`.
+  stdout.catch(() => {
+    if (proReposCache === entry) proReposCache = undefined;
+  });
+  return stdout;
+}
+
+/**
+ * Kick off (and cache) the `pro ls repos` shell-out without awaiting it, so the
+ * cost overlaps the operator picking an agent/account/cwd. Best-effort: a failed
+ * prewarm just drops the cache and the real call retries.
+ */
+export function prewarmProRepos(): void {
+  void cachedProReposStdout().catch(() => undefined);
+}
+
 /**
  * List every repo `pro` knows about, in pro's own ordering.
  */
 export async function listProRepos(): Promise<ProRepo[]> {
-  return parseProRepos(await run("pro", ["ls", "repos"]));
+  return parseProRepos(await cachedProReposStdout());
 }
 
 export type ProRepoEntry = {
@@ -90,7 +123,7 @@ export function parseProRepoEntries(stdout: string): ProRepoEntry[] {
 
 /** Structured repo inventory from `pro` (for grouping bees by pro facets). */
 export async function listProRepoEntries(): Promise<ProRepoEntry[]> {
-  return parseProRepoEntries(await run("pro", ["ls", "repos"]));
+  return parseProRepoEntries(await cachedProReposStdout());
 }
 
 /**
@@ -122,6 +155,53 @@ export function resolveProForCwd(
 }
 
 export type ProSlotKind = "worktree" | "checkout";
+
+export type ProSlotResolution = {
+  area: string;
+  project: string;
+  repo: string;
+  /** Where the cwd physically lives. "repo" = the canonical `repos/<repo>`. */
+  kind: "repo" | ProSlotKind;
+  /** Worktree/checkout name (the slug after `<worktrees|checkouts>/<repo>/`); absent for the canonical repo. */
+  slot?: string;
+};
+
+/**
+ * Resolve which pro repo a directory belongs to AND whether it sits in the
+ * canonical checkout, a worktree, or a checkout. `pro` lays slots out as
+ * siblings of `repos/` under the project root:
+ *
+ *   <project>/repos/<repo>            canonical — what `pro ls repos` reports
+ *   <project>/worktrees/<repo>/<name> worktree
+ *   <project>/checkouts/<repo>/<name> checkout
+ *
+ * so a bee whose cwd is in a worktree/checkout shares the canonical repo's
+ * area/project/repo (it groups under the same pro project/repo) but carries a
+ * slot kind+name so the sidebar can tag the row. Longest-prefix match across
+ * every candidate root picks the most specific repo and stops a shorter repo
+ * path from swallowing a sibling. Pure — pass in the entries.
+ */
+export function resolveProSlotForCwd(entries: ProRepoEntry[], cwd: string): ProSlotResolution | undefined {
+  let best: { root: string; res: ProSlotResolution } | undefined;
+  const consider = (root: string, res: ProSlotResolution) => {
+    if (cwd !== root && !cwd.startsWith(`${root}/`)) return;
+    if (!best || root.length > best.root.length) best = { root, res };
+  };
+  for (const entry of entries) {
+    const facets = { area: entry.area, project: entry.project, repo: entry.repo };
+    consider(entry.path, { ...facets, kind: "repo" });
+    // Slots live one directory up from `repos/`, keyed by the repo's own folder.
+    const projectRoot = dirname(dirname(entry.path));
+    const repoDir = basename(entry.path);
+    for (const kind of ["worktree", "checkout"] as const) {
+      const base = `${projectRoot}/${kind}s/${repoDir}`;
+      if (!cwd.startsWith(`${base}/`)) continue;
+      const slot = cwd.slice(base.length + 1).split("/")[0];
+      if (slot) consider(`${base}/${slot}`, { ...facets, kind, slot });
+    }
+  }
+  return best?.res;
+}
 
 /**
  * Lower-case a free-typed name into a pro slug (`[a-z0-9][a-z0-9-]*`, no

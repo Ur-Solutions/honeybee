@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { namingConfig, type ResolvedNamingConfig } from "./config.js";
-import { storeRoot } from "./fsx.js";
+import { namingGeneratorCwd } from "./fsx.js";
 import type { SessionRecord } from "./store.js";
 import { firstUserText, lastAssistantText, latestTranscript } from "./transcripts.js";
 
@@ -62,9 +62,10 @@ export async function gatherTitleContext(
     // cwd-shared cross-match that mis-titles bees). See notBeforeIso.
     notBeforeIso: record.createdAt,
   }).catch(() => null);
+  const reliableTx = tx && isReliableTitleTranscript(tx) ? tx : null;
 
-  const firstUser = clampContext(tx ? firstUserText(tx.rows) : "");
-  const lastAssistant = clampContext(tx ? lastAssistantText(tx.rows) : "");
+  const firstUser = clampContext(reliableTx ? firstUserText(reliableTx.rows) : "");
+  const lastAssistant = clampContext(reliableTx ? lastAssistantText(reliableTx.rows) : "");
   const brief = clampContext(record.brief ?? "");
 
   // A real task signal is a brief or a genuine first user message (firstUserText
@@ -83,6 +84,10 @@ export async function gatherTitleContext(
     ...(firstUser ? { firstUser } : {}),
     ...(lastAssistant ? { lastAssistant } : {}),
   };
+}
+
+function isReliableTitleTranscript(tx: { matchedBy: string[] }): boolean {
+  return tx.matchedBy.some((match) => match === "path" || match === "session-id" || match === "prompt" || match === "spawn-proximity");
 }
 
 function clampContext(value: string): string {
@@ -184,7 +189,7 @@ export async function runTitleGenerator(prompt: string, config: ResolvedNamingCo
  * sessions (the transcript matcher scores by project folder).
  */
 async function generatorCwd(): Promise<string> {
-  const dir = join(storeRoot(), "naming");
+  const dir = namingGeneratorCwd();
   await mkdir(dir, { recursive: true });
   return dir;
 }

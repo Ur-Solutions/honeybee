@@ -3,9 +3,10 @@ import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
-import { agentDefaultsToYolo, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, resolveHome, shellCommand } from "./agents.js";
+import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, resolveHome, shellCommand, tmuxOptionsForAgent } from "./agents.js";
 import {
   AUTO_ACCOUNT_QUERY,
+  RR_ACCOUNT_QUERY,
   type AccountChainSyncOutcome,
   type AccountRecord,
   type SpawnAgentSpec,
@@ -19,9 +20,10 @@ import {
   listAccounts,
   removeAccount,
   resolveSpawnAgent,
+  roundRobinAccountTool,
   seedClaudeHomeAcceptance,
-  syncAllClaudeChainsToVault,
-  syncClaudeChainToVault,
+  syncAccountCredentialsToVault,
+  syncAllAccountCredentialsToVault,
   vaultRoot,
 } from "./accounts.js";
 import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
@@ -31,9 +33,11 @@ import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
 import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
 import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
+import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "./forkTui.js";
 import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
-import { createProSlot, listProRepoEntries, listProRepos, resolveProEntryForCwd, resolveProForCwd, toProSlug, type ProRepoEntry } from "./proProjects.js";
+import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
+import { pickRoundRobinAccount } from "./roundRobin.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { resumeArgs, sniffYolo, swapAccount } from "./swap.js";
 import { modelArgsFor, pickForkSeed, type ForkSeedInput, type SeedMode } from "./fork.js";
@@ -94,6 +98,7 @@ import { loopFlow } from "./loop/flow.js";
 import { buildLoopConfig } from "./loop/context.js";
 import {
   ensureLoopDir,
+  generateLoopId,
   type LoopConfig,
   listLoops,
   loopIterLogPath,
@@ -101,6 +106,7 @@ import {
   readLoopConfig,
   reconcileLoopStatus,
   requestStop,
+  resolveLoopId,
   updateLoopConfig,
   writeLoopConfig,
 } from "./loop/state.js";
@@ -136,7 +142,7 @@ import { resolveSelector } from "./selectors.js";
 import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
-import { hiveStateFor, writeHiveState, writeHiveTags, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
+import { effectiveHiveState, hiveStateFor, writeHiveState, writeHiveTags, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
 import { repoTagFor } from "./repoTag.js";
 import { dedupeTags, effectiveTags, isValidTagValue, normalizeTagArg, rejectReservedNamespaceTag } from "./tags.js";
 import { buildView, closeView, createGroupedView, deriveViewName, linkHere, VIEW_PREFIX, viewSessionName } from "./view.js";
@@ -230,7 +236,8 @@ async function main(argv: string[]) {
       await cmdSplit(parsed);
       break;
     case "fork":
-      await cmdFork(parsed);
+      if (parsed.args[0] === "launch") await cmdForkLaunch(parsed);
+      else await cmdFork(parsed);
       break;
     case "revive":
       await cmdRevive(parsed);
@@ -489,7 +496,10 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   }
   const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
   // Executable validation only applies to local spawns; we cannot reach the remote PATH cheaply.
-  if (!isRemote) await assertExecutableAvailable(spec.command);
+  if (!isRemote) {
+    await assertExecutableAvailable(spec.command);
+    await assertAgentAuthFreshForSpawn(spec, opts.account?.id);
+  }
   timer.mark("exec-check");
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   timer.mark("allocate");
@@ -499,7 +509,12 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const substrate = opts.node ? substrateForRecord(opts.node) : localSubstrate();
   const locationHint = isRemote && opts.node ? ` on ${opts.node.name}` : "";
   if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
-  const { paneId } = await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env });
+  const launch = await substrate.newSession(tmuxTarget, opts.cwd, {
+    command: spec.command,
+    args: spec.args,
+    env: spec.env,
+    tmuxOptions: spec.tmuxOptions,
+  });
   timer.mark("session-create");
   const command = shellCommand(spec);
 
@@ -510,7 +525,8 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     cwd: opts.cwd,
     command,
     tmuxTarget,
-    ...(paneId ? { agentPaneId: paneId } : {}),
+    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     // Solo combs: every bee gets combId == tmuxTarget at spawn (§12 Q3).
     combId: tmuxTarget,
     createdAt: now,
@@ -553,19 +569,39 @@ function ttlFlagMs(parsed: Parsed): number | undefined {
 }
 
 /**
- * resolveSpawnAgent plus the reserved `<tool>-auto` alias: instead of naming
- * an account, pick the tool's account with the least weekly usage (accounts
- * near their 5h limit, then accounts with unreadable limits, sort last).
+ * resolveSpawnAgent plus the reserved `<tool>-auto` and `<tool>-rr` aliases.
+ * `auto` picks the least-loaded account (live limits-aware); `rr` advances a
+ * persistent cursor so spawns walk the credentialed accounts in order, ignoring
+ * remaining quota.
  */
 async function resolveSpawnAgentWithAuto(requested: string, parsed: Parsed): Promise<SpawnAgentSpec> {
+  const rr = roundRobinAccountTool(requested);
+  if (rr) return { agent: rr, account: await pickRoundRobinAccountForCli(rr) };
   const tool = autoAccountTool(requested);
   if (tool) return { agent: tool, account: await pickAutoAccount(tool, ttlFlagMs(parsed)) };
-  return resolveSpawnAgent(requested);
+  const resolved = await resolveSpawnAgent(requested);
+  const defaultAccount = await defaultBareGrokAccount(requested, parsed, resolved);
+  return defaultAccount ? { agent: defaultAccount.tool, account: defaultAccount } : resolved;
 }
 
-/** `--account <query>` resolution; the reserved query `auto` invokes the least-loaded pick. */
+async function defaultBareGrokAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
+  if (resolved.account || resolved.agent !== "grok" || requested.trim().toLowerCase() !== "grok") return undefined;
+  if (hasFlag(parsed, "account") || hasFlag(parsed, "home") || hasFlag(parsed, "profile")) return undefined;
+  const accounts = (await listAccounts()).filter((account) => account.tool === "grok");
+  const credentialed: AccountRecord[] = [];
+  for (const account of accounts) {
+    if (await accountHasCredentials(account)) credentialed.push(account);
+  }
+  if (credentialed.length !== 1) return undefined;
+  const account = credentialed[0]!;
+  console.error(note(`account default → ${account.id} — bare grok uses the only Grok account with credentials`));
+  return account;
+}
+
+/** `--account <query>` resolution; reserved queries: `auto` (least-loaded) and `rr` (round-robin). */
 async function resolveAccountFlag(query: string, tool: string, ttlMs: number | undefined): Promise<AccountRecord> {
   if (query === AUTO_ACCOUNT_QUERY) return pickAutoAccount(tool, ttlMs);
+  if (query === RR_ACCOUNT_QUERY) return pickRoundRobinAccountForCli(tool);
   return findAccount(query, tool);
 }
 
@@ -579,6 +615,12 @@ async function pickAutoAccount(tool: string, ttlMs: number | undefined): Promise
   const usage = autoPickUsage(choice.limits);
   const freshness = choice.limits?.cached && choice.limits.asOf ? `, cached ${formatRelativeTime(choice.limits.asOf)} ago` : "";
   console.error(note(`account auto → ${choice.account.id}${usage ? ` (${usage}${freshness})` : ""} — ${choice.reason}`));
+  return choice.account;
+}
+
+async function pickRoundRobinAccountForCli(tool: string): Promise<AccountRecord> {
+  const choice = await pickRoundRobinAccount(tool);
+  console.error(note(`account rr → ${choice.account.id} — ${choice.reason}`));
   return choice.account;
 }
 
@@ -694,6 +736,11 @@ async function cmdNew(parsed: Parsed): Promise<void> {
   const defaultCwd = here?.cwd ?? (await resolveSpawnCwd(parsed));
   const defaultKind = here ? canonicalAgentKind(here.agent) : undefined;
 
+  // Warm the `pro ls repos` inventory while the operator picks an agent /
+  // account / cwd, so the per-cwd "checking pro repo…" step resolves from cache
+  // instead of blocking the spawn on a cold shell-out.
+  prewarmProRepos();
+
   const plan = await chooseNewBee({
     types: agentKinds().map((kind) => ({ kind })),
     defaultKind,
@@ -773,6 +820,8 @@ async function cmdLaunch(parsed: Parsed): Promise<void> {
   }
   const here = await resolveBeeInCurrentPane();
   const defaultCwd = here?.cwd ?? (await resolveSpawnCwd(parsed));
+  // Warm `pro ls repos` while the operator picks a frame/flow and repo.
+  prewarmProRepos();
 
   const [frames, flows] = await Promise.all([listFrames(), listFlows()]);
   const templates: LaunchTemplate[] = [
@@ -825,12 +874,16 @@ async function cmdLaunch(parsed: Parsed): Promise<void> {
     },
     listSubdirs: (base) => listNewBeeSubdirs(base),
     loadBeeOptions: async () => {
-      // Account-aware agent shorthands the bee picker offers: <kind>-auto (when
-      // ≥1 account), <kind>-<account-id> per account, or plain <kind> with none.
+      // Account-aware agent shorthands the bee picker offers: <kind>-auto and
+      // <kind>-rr (when ≥1 account), <kind>-<account-id> per account, or plain
+      // <kind> with none.
       const out: Array<{ value: string; label: string; detail?: string }> = [];
       for (const kind of agentKinds()) {
         const accounts = await newBeeAccountRows(kind).catch(() => []);
-        if (accounts.length >= 1) out.push({ value: `${kind}-auto`, label: `${kind} · auto`, detail: "least-loaded account" });
+        if (accounts.length >= 1) {
+          out.push({ value: `${kind}-auto`, label: `${kind} · auto`, detail: "least-loaded account" });
+          if (accounts.length >= 2) out.push({ value: `${kind}-rr`, label: `${kind} · rr`, detail: "round-robin next account" });
+        }
         for (const acct of accounts) {
           out.push({ value: `${kind}-${acct.id}`, label: `${kind} · ${acct.label}`, ...(acct.usage ? { detail: acct.usage } : {}) });
         }
@@ -1023,9 +1076,16 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
   const hasComposerMessages = perBeeMessages !== undefined;
   let slot = 0; // running bee index across all castes, aligned with perBeeMessages
   for (const caste of frame.castes) {
-    const yolo = dangerousMode(parsed, caste.bee, caste.bee);
+    const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(caste.bee, parsed);
+    const profile = await resolveProfileOverlay(caste.bee);
+    const agent = profile ? profile.account.tool : resolvedAgent;
+    const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
+    const account = profile?.account ?? aliasAccount;
+    const model = account ? (profile?.model ?? account.model) : undefined;
+    const provider = account?.provider;
+    const yolo = dangerousMode(parsed, agent, caste.bee, profile?.yolo);
     const home = caste.home ?? flagHome;
-    const casteSpec = resolveAgent(caste.bee, parsed.rest, { home, yolo });
+    const casteSpec = resolveAgent(agent, extraArgs, { home, yolo });
     const casteNode = await resolveSpawnNode(parsed, casteSpec.kind);
     for (let i = 0; i < caste.count; i += 1) {
       // A composer message (if non-blank) overrides this bee's caste brief.
@@ -1037,8 +1097,8 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
       // otherwise fall back to the legacy "--briefed delivers caste brief" path.
       const toDeliver = hasComposerMessages ? (hasCustom ? custom : undefined) : briefed && caste.brief ? caste.brief : undefined;
       let record = await spawnBee({
-        agent: caste.bee,
-        extraArgs: parsed.rest,
+        agent,
+        extraArgs,
         cwd,
         yolo,
         ...(home !== undefined ? { home } : {}),
@@ -1046,13 +1106,16 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
         swarmId,
         caste: caste.name,
         node: casteNode,
+        account,
+        model,
+        provider,
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
       if (toDeliver) record = await deliverBrief(parsed, record, toDeliver);
       else unbriefed.push(record);
       records.push(record);
       if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`caste:${caste.name}`), dim(`@${swarmId}`)]));
-      else console.log(`${record.name}\t${caste.bee}\t${cwd}\t${caste.name}\t@${swarmId}`);
+      else console.log(`${record.name}\t${record.agent}\t${cwd}\t${caste.name}\t@${swarmId}`);
     }
   }
 
@@ -1409,14 +1472,29 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
   await substrateFor(record).sendText(record.tmuxTarget, delivered, record.agentPaneId);
   await writeHiveState(record, "working");
   const now = new Date().toISOString();
-  const persisted = await updateSession(record.name, { updatedAt: now, status: "running", brief: briefText, briefedAt: now });
+  const persisted = await updateSession(record.name, {
+    updatedAt: now,
+    status: "running",
+    brief: briefText,
+    briefedAt: now,
+    lastPrompt: delivered,
+    lastPromptAt: now,
+  });
   if (!persisted) {
     // The record vanished mid-brief (concurrent kill/clean). The text was
     // already delivered to the pane, but nothing recorded it — say so instead
     // of silently returning an in-memory merge that looks persisted.
     console.error(note(`warn ${record.name}: session record disappeared while briefing; brief delivered but not recorded`));
   }
-  const updated: SessionRecord = persisted ?? { ...record, updatedAt: now, status: "running", brief: briefText, briefedAt: now };
+  const updated: SessionRecord = persisted ?? {
+    ...record,
+    updatedAt: now,
+    status: "running",
+    brief: briefText,
+    briefedAt: now,
+    lastPrompt: delivered,
+    lastPromptAt: now,
+  };
   await appendLedger({ type: "brief", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, chars: delivered.length, briefChars: briefText.length });
   if (isPretty()) console.log(actionLine("ok", "brief", [bold(record.name), `${briefText.length} chars`]));
   else console.log(`briefed\t${record.name}\t${briefText.length} chars`);
@@ -1601,7 +1679,7 @@ async function cmdList(parsed: Parsed) {
   // store-derived state — the tmux server is the source of truth for live bees.
   const liveHiveState = (record: SessionRecord): string | undefined => {
     const state = probe.states.get(liveTargetKey(record.node, record.tmuxTarget));
-    return state && state.length > 0 ? state : undefined;
+    return effectiveHiveState(state, states.get(record.name)?.state);
   };
 
   // --state matches the live @hive_state, the coarse hive mapping of the derived
@@ -1786,6 +1864,7 @@ async function cmdBees(parsed: Parsed): Promise<void> {
         return;
       }
       const substrate = substrateFor(record);
+      await applyBeeWindowOptions(record);
       await substrate.attachSession(record.tmuxTarget);
       await syncBeesSidebarLayout({ pruneOthers: true });
     },
@@ -1829,13 +1908,13 @@ async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[];
   const items = records.map((record) => {
     const derived = deriveState(record, context);
     const live = derived.state !== "dead" && derived.state !== "sealed" && derived.state !== "node_unreachable";
-    const liveHive = probe.states.get(liveTargetKey(record.node, record.tmuxTarget));
-    const stateHeadline = liveHive && liveHive.length > 0 ? liveHive : stateLabel(derived.state);
+    const liveHive = effectiveHiveState(probe.states.get(liveTargetKey(record.node, record.tmuxTarget)), derived.state);
+    const stateHeadline = liveHive ? liveHive : stateLabel(derived.state);
     const displayName = sessionDisplayName(record);
     const ref = highlightUniqueSessionReference(records, record);
     const ageSource = isTerminalState(derived.state) ? record.updatedAt : record.createdAt;
     const detail = beeTuiDescription(record, derived);
-    const pro = resolveProForCwd(proEntries, record.cwd);
+    const pro = resolveProSlotForCwd(proEntries, record.cwd);
     return {
       name: record.name,
       ref,
@@ -1851,7 +1930,14 @@ async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[];
       tmuxTarget: record.tmuxTarget,
       node: record.node,
       live,
-      ...(pro ? { proArea: pro.area, proProject: pro.project, proRepo: pro.repo } : {}),
+      ...(pro
+        ? {
+            proArea: pro.area,
+            proProject: pro.project,
+            proRepo: pro.repo,
+            ...(pro.slot ? { proSlotKind: pro.kind as ProSlotKind, proSlotName: pro.slot } : {}),
+          }
+        : {}),
       searchText: beesTuiSearchText({
         name: record.name,
         displayName: displayName === "=" ? record.name : displayName,
@@ -1861,6 +1947,7 @@ async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[];
         cwd: record.cwd,
         detail,
         ref,
+        slot: pro?.slot,
       }),
     };
   });
@@ -2597,7 +2684,7 @@ async function cmdKill(parsed: Parsed) {
  */
 async function killSubBeePane(record: SessionRecord): Promise<void> {
   const substrate = substrateFor(record);
-  const result = await substrate.killPane(record.agentPaneId!).catch((error) => ({
+  const result = await substrate.killPane(record.agentPaneId!, { launcherPgid: record.launcherPgid }).catch((error) => ({
     ok: false,
     exitCode: 1,
     stdout: "",
@@ -3012,7 +3099,7 @@ async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
   }
 
   const requestedAgent = agentArg ?? parent.agent;
-  const { agent } = await resolveSpawnAgentWithAuto(requestedAgent, parsed);
+  const { agent, account } = await resolveSpawnAgentWithAuto(requestedAgent, parsed);
 
   const dirRaw = typeof flag(parsed, "dir") === "string" ? String(flag(parsed, "dir")) : "v";
   if (!["h", "v", "window"].includes(dirRaw)) throw new Error(`hive split: invalid --dir ${dirRaw} (use v|h|window)`);
@@ -3021,15 +3108,31 @@ async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
   const cwd = typeof flag(parsed, "cwd") === "string"
     ? await resolveSpawnCwd(parsed)
     : parent.cwd;
-  const home = flag(parsed, "home") ?? flag(parsed, "profile");
+  const homeFlag = flag(parsed, "home") ?? flag(parsed, "profile");
+  const home = account ? (typeof homeFlag === "string" ? homeFlag : defaultHomeForAccount(account)) : homeFlag;
   const yolo = dangerousMode(parsed, agent, requestedAgent);
-  const spec = resolveAgent(agent, parsed.rest, { home, yolo });
-  if (!(parent.node)) await assertExecutableAvailable(spec.command);
+  const spec = resolveAgent(agent, parsed.rest, {
+    home,
+    yolo,
+    identity: Boolean(account),
+    ...(account?.model ? { model: account.model } : {}),
+    ...(account?.provider ? { provider: account.provider } : {}),
+  });
+  if (account) {
+    if (parent.node) throw new Error("--account splits are local-only (the vault never leaves this machine)");
+    if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
+    await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+  }
+  if (!(parent.node)) {
+    await assertExecutableAvailable(spec.command);
+    await assertAgentAuthFreshForSpawn(spec, account?.id);
+  }
 
-  const { paneId } = await substrate.newPane(parent.tmuxTarget, cwd, {
+  const launch = await substrate.newPane(parent.tmuxTarget, cwd, {
     command: spec.command,
     args: spec.args,
     env: spec.env,
+    tmuxOptions: spec.tmuxOptions,
   }, { dir });
 
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
@@ -3042,7 +3145,8 @@ async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
     cwd,
     command: shellCommand(spec),
     tmuxTarget: parent.tmuxTarget, // shared comb
-    agentPaneId: paneId,           // own pane
+    agentPaneId: launch.paneId,    // own pane
+    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     combId,
     parentId: parent.id ?? parent.name,
     createdAt: now,
@@ -3053,12 +3157,13 @@ async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
     uuid: identity.uuid,
     requestedAgent: spec.requestedKind,
     ...(spec.homePath ? { homePath: spec.homePath } : {}),
+    ...(account ? { accountId: account.id } : {}),
     ...(parent.colony ? { colony: parent.colony } : {}),
     ...(parent.node ? { node: parent.node } : {}),
   };
   await saveSession(record);
   await writeSpawnOptions(record);
-  await appendLedger({ type: "bee.split", name: record.name, parentId: record.parentId, combId, agentPaneId: paneId });
+  await appendLedger({ type: "bee.split", name: record.name, parentId: record.parentId, combId, agentPaneId: launch.paneId });
 
   if (isPretty()) console.log(actionLine("ok", "split", [bold(record.name), record.agent, dim(`from ${parent.name}`)]));
   else console.log(`split\t${record.name}\t${record.agent}\t${parent.name}`);
@@ -3227,7 +3332,10 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
     await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
   }
-  if (!isRemote) await assertExecutableAvailable(spec.command);
+  if (!isRemote) {
+    await assertExecutableAvailable(spec.command);
+    await assertAgentAuthFreshForSpawn(spec, account?.id);
+  }
 
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(stringFlag(parsed, ["name"]) ?? identity.id);
@@ -3237,7 +3345,12 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
   const locationHint = isRemote ? ` on ${node.name}` : "";
   if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
 
-  const { paneId } = await substrate.newSession(tmuxTarget, cwd, { command: spec.command, args: spec.args, env: spec.env });
+  const launch = await substrate.newSession(tmuxTarget, cwd, {
+    command: spec.command,
+    args: spec.args,
+    env: spec.env,
+    tmuxOptions: spec.tmuxOptions,
+  });
   const command = shellCommand(spec);
 
   // 8. Build the record with fork lineage + anti-cross-match fields.
@@ -3252,7 +3365,8 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     cwd,
     command,
     tmuxTarget,
-    ...(paneId ? { agentPaneId: paneId } : {}),
+    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     combId: tmuxTarget, // fork is its own comb (new session)
     forkedFromId: source.id ?? source.name,
     forkedAt: now,
@@ -3330,6 +3444,104 @@ async function resolveForkCheckpoint(beeName: string, checkpointArg: string | un
     return match;
   }
   throw new Error(`hive fork: unrecognized checkpoint "${checkpointArg}" (use latest or seal:<ISO>)`);
+}
+
+// ── hive fork launch — the interactive dialog (⌘K) ───────────────────────────
+
+/**
+ * `hive fork launch` — the interactive fork window (the ⌘K target). The SOURCE
+ * is the bee owning the current pane, so the dialog opens straight on a form for
+ * composing the fork (seed, agent, model, worktree isolation, account, name).
+ * The chosen values are turned into a `hive fork` invocation and run through
+ * cmdFork, so account-safety, anti-cross-match, the ledger, and --here linking
+ * are all reused unchanged.
+ */
+async function cmdForkLaunch(parsed: Parsed): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('hive fork launch needs a TTY — bind it to a tmux popup: bind -n M-k display-popup -E "hive fork launch"');
+  }
+  const source = await resolveBeeInCurrentPane();
+  if (!source) {
+    throw new Error("hive fork launch: no bee owns the current pane — run it from inside a bee, or use `hive fork <bee>`.");
+  }
+  const sourceKind = canonicalAgentKind(source.agent);
+
+  // Worktree isolation is offered only when the source lives inside a pro repo.
+  const proRepo = await (async (): Promise<{ label: string; path: string } | null> => {
+    try {
+      const entry = resolveProEntryForCwd(await listProRepoEntries(), source.cwd);
+      if (!entry) return null;
+      const label = [entry.area, entry.project, entry.repo].filter((part) => part.length > 0).join("/") || entry.path;
+      return { label, path: entry.path };
+    } catch {
+      return null;
+    }
+  })();
+
+  // Account options. An account-bound source MUST fork onto a DIFFERENT account
+  // (a shared OAuth chain rotates and logs both bees out), so its own account is
+  // excluded and the "inherit" row withheld; a default-home source may inherit.
+  const accountRequired = Boolean(source.accountId);
+  const accounts = await newBeeAccountRows(sourceKind).catch(() => []);
+  const accountOptions: ForkAccountOption[] = [];
+  if (!accountRequired) accountOptions.push({ value: "", label: "inherit (no account binding)" });
+  accountOptions.push({ value: "auto", label: "auto", detail: "least-loaded account" });
+  for (const acct of accounts) {
+    if (accountRequired && acct.id === source.accountId) continue;
+    accountOptions.push({ value: acct.id, label: acct.label, ...(acct.usage ? { detail: acct.usage } : {}) });
+  }
+
+  const suggestSlot = toProSlug(`fork-${source.name}`) || toProSlug(sourceKind) || "fork";
+  const defaults = defaultForkForm({ sourceAgent: sourceKind, accountRequired, accountOptions, suggestSlot });
+
+  const result = await chooseFork({
+    source: {
+      name: source.name,
+      id: source.id ?? source.name,
+      agent: sourceKind,
+      cwd: source.cwd,
+      ...(source.accountId ? { accountId: source.accountId } : {}),
+    },
+    cwdLabel: tildify(source.cwd),
+    agentKinds: agentKinds(),
+    proRepo,
+    accountRequired,
+    accountOptions,
+    defaults,
+  });
+
+  if (!result) {
+    if (isPretty()) console.error(note("fork launch: cancelled"));
+    return;
+  }
+
+  const intent = forkIntent(result.values, { sourceName: source.name, sourceAgent: sourceKind });
+
+  // Create the worktree/checkout up front — its path becomes the fork's --cwd.
+  let cwd: string | undefined;
+  if (intent.isolation) {
+    if (!proRepo) throw new Error("hive fork launch: not a pro repo — cannot create a worktree");
+    const slug = toProSlug(intent.isolation.name);
+    if (!slug) throw new Error("hive fork launch: worktree name must contain letters, digits, or dashes");
+    if (isPretty()) console.error(note(`creating ${intent.isolation.kind} ${slug}…`));
+    cwd = await createProSlot(intent.isolation.kind, proRepo.path, slug);
+  }
+
+  // Build a `hive fork` invocation and reuse cmdFork wholesale.
+  const flags = new Map<string, string | true | string[]>();
+  if (intent.seed) flags.set("seed", intent.seed);
+  if (intent.agent) flags.set("agent", intent.agent);
+  if (intent.model) flags.set("model", intent.model);
+  if (intent.name) flags.set("name", intent.name);
+  if (intent.account) flags.set("account", intent.account);
+  if (cwd) flags.set("cwd", cwd);
+  flags.set("here", true);
+
+  const record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+
+  if (intent.message) {
+    await cmdSend({ command: "send", args: [record.name, intent.message], flags: new Map(), rest: [] });
+  }
 }
 
 /**
@@ -3411,12 +3623,16 @@ async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessi
     yolo: sniffYolo(record.command),
     identity: true,
   });
-  if (!record.node) await assertExecutableAvailable(spec.command);
+  if (!record.node) {
+    await assertExecutableAvailable(spec.command);
+    await assertAgentAuthFreshForSpawn(spec, record.accountId);
+  }
 
-  const { paneId } = await substrate.newSession(record.tmuxTarget, record.cwd, {
+  const launch = await substrate.newSession(record.tmuxTarget, record.cwd, {
     command: spec.command,
     args: spec.args,
     env: spec.env,
+    tmuxOptions: spec.tmuxOptions,
   });
 
   const updated =
@@ -3424,7 +3640,8 @@ async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessi
       status: "running",
       command: shellCommand(spec),
       combId: record.combId ?? record.tmuxTarget,
-      ...(paneId ? { agentPaneId: paneId } : {}),
+      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
       ...(sessionOverride ? { providerSessionId: sessionOverride } : {}),
       updatedAt: new Date().toISOString(),
     })) ?? record;
@@ -3433,7 +3650,7 @@ async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessi
     type: "bee.revive",
     session: record.name,
     providerSessionId: providerSessionId ?? null,
-    agentPaneId: paneId,
+    agentPaneId: launch.paneId,
     fresh,
   });
   return updated;
@@ -3770,6 +3987,7 @@ async function cmdOpenRaw(parsed: Parsed) {
     console.log(command);
     return;
   }
+  await assertAgentAuthFreshForSpawn(spec, account?.id);
 
   if (wantsWindow) {
     const app = await openInNewTerminal(command, cwd, appFlag);
@@ -3780,11 +3998,11 @@ async function cmdOpenRaw(parsed: Parsed) {
 
   // Default: take over THIS terminal, exactly where the user called from.
   process.exitCode = await runInCurrentTerminal(spec.command, spec.args, spec.env, cwd);
-  // The session may have rotated the OAuth chain (refresh tokens rotate, and
-  // the new link lands in the home, not the vault). Pull it back into the
-  // vault now so the next activation does not stamp a dead link over it.
-  if (account && spec.kind === "claude" && spec.homePath) {
-    await syncClaudeChainToVault(account, spec.homePath).catch(() => undefined);
+  // The session may have refreshed/rotated auth in the home, not the vault.
+  // Pull it back now so the next activation does not stamp an old credential
+  // over the live one.
+  if (account && spec.homePath) {
+    await syncAccountCredentialsToVault(account, spec.homePath, { trustExtraHome: true }).catch(() => undefined);
   }
 }
 
@@ -6245,8 +6463,11 @@ async function loopStartCmd(parsed: Parsed) {
  * loopArgsFromFlags and loopStartArgs produce.
  */
 async function startLoopDetached(rawArgs: Record<string, unknown>) {
+  // The bee token (codex-auto / claude-thto / account-id) is persisted verbatim
+  // and resolved at each iteration's spawn (spawnLoopBee / facade.spawn), so a
+  // fresh-carrier `auto` loop re-picks the least-loaded account per iteration.
   // Validate eagerly so errors surface BEFORE we spawn a detached process.
-  const loopId = generateRunId();
+  const loopId = await generateLoopId();
   const cfg = buildLoopConfig({ ...rawArgs, loopId });
   cfg.loopId = loopId;
 
@@ -6332,7 +6553,10 @@ async function loadLoopBeeOptions(): Promise<Array<{ value: string; label: strin
   const out: Array<{ value: string; label: string; detail?: string }> = [];
   for (const kind of agentKinds()) {
     const accounts = await newBeeAccountRows(kind).catch(() => []);
-    if (accounts.length >= 1) out.push({ value: `${kind}-auto`, label: `${kind} · auto`, detail: "least-loaded account" });
+    if (accounts.length >= 1) {
+      out.push({ value: `${kind}-auto`, label: `${kind} · auto`, detail: "least-loaded account" });
+      if (accounts.length >= 2) out.push({ value: `${kind}-rr`, label: `${kind} · rr`, detail: "round-robin next account" });
+    }
     for (const acct of accounts) {
       out.push({ value: `${kind}-${acct.id}`, label: `${kind} · ${acct.label}`, ...(acct.usage ? { detail: acct.usage } : {}) });
     }
@@ -6446,8 +6670,9 @@ async function loopTemplateRemoveCmd(parsed: Parsed): Promise<void> {
 }
 
 async function loopStatusCmd(parsed: Parsed) {
-  const loopId = parsed.args[1];
-  if (!loopId) return loopListCmd();
+  const loopRef = parsed.args[1];
+  if (!loopRef) return loopListCmd();
+  const loopId = await resolveLoopId(loopRef);
   const cfg = await readLoopConfig(loopId);
   if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
   const status = loopDisplayStatus(cfg);
@@ -6488,8 +6713,9 @@ async function loopStatusCmd(parsed: Parsed) {
 }
 
 async function loopLogsCmd(parsed: Parsed) {
-  const loopId = parsed.args[1];
-  if (!loopId) throw new Error("Usage: hive loop logs <loopId> [--iter <n>] [-n <lines>] [-f|--follow]");
+  const loopRef = parsed.args[1];
+  if (!loopRef) throw new Error("Usage: hive loop logs <loopId> [--iter <n>] [-n <lines>] [-f|--follow]");
+  const loopId = await resolveLoopId(loopRef);
   const cfg = await readLoopConfig(loopId);
   if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
 
@@ -6565,8 +6791,9 @@ function processAlive(pid: number): boolean {
 }
 
 async function loopStopCmd(parsed: Parsed) {
-  const loopId = parsed.args[1];
-  if (!loopId) throw new Error("Usage: hive loop stop <loopId> [--now]");
+  const loopRef = parsed.args[1];
+  if (!loopRef) throw new Error("Usage: hive loop stop <loopId> [--now]");
+  const loopId = await resolveLoopId(loopRef);
   const cfg = await readLoopConfig(loopId);
   if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
   const now = truthy(flag(parsed, "now"));
@@ -7390,8 +7617,15 @@ async function cmdAttach(parsed: Parsed) {
     console.log(command);
     return;
   }
+  await applyBeeWindowOptions(record);
   await substrate.attachSession(record.tmuxTarget);
   await syncBeesSidebarLayout({ pruneOthers: true });
+}
+
+async function applyBeeWindowOptions(record: SessionRecord): Promise<void> {
+  const options = tmuxOptionsForAgent(record.agent);
+  if (!options) return;
+  await substrateFor(record).setWindowOptions(record.tmuxTarget, options, record.agentPaneId);
 }
 
 /**
@@ -7425,6 +7659,8 @@ async function cmdNext(parsed: Parsed) {
     return;
   }
 
+  const record = await loadSession(target).catch(() => null);
+  if (record) await applyBeeWindowOptions(record);
   await substrate.attachSession(target);
   await syncBeesSidebarLayout({ pruneOthers: true });
 
@@ -7546,7 +7782,7 @@ function dangerousMode(parsed: Parsed, agent?: string, requested?: string, profi
   // Thin-profile yolo override (precedence FLAG > config bee yolo > PROFILE >
   // per-agent default).
   if (profileYolo !== undefined) return profileYolo;
-  // Per-agent default: claude runs permissionless unless opted out above.
+  // Per-agent default: selected harnesses run permissionless unless opted out above.
   return agent || requested ? agentDefaultsToYolo(agent ?? requested!) : false;
 }
 
@@ -7650,24 +7886,26 @@ async function cmdAccount(parsed: Parsed) {
       break;
     }
     case "sync": {
-      // Pull rotated OAuth chains from the accounts' homes back into the
-      // vault (refresh tokens rotate; the live link lands wherever the last
-      // refresh ran). One account when named, otherwise every claude account.
+      // Pull rotated/refreshed credentials from account homes back into the
+      // vault. Claude rotates OAuth chains; Codex rewrites auth.json on token
+      // refresh. One account when named, otherwise every supported account.
       const query = parsed.args[1];
       const outcomes: AccountChainSyncOutcome[] = query
         ? await (async () => {
             const account = await findAccount(query);
-            if (account.tool !== "claude") throw new Error(`chain sync only applies to claude accounts; ${account.id} is ${account.tool}`);
-            const result = await syncClaudeChainToVault(account);
+            if (!identityRecipeForAgent(account.tool)) {
+              throw new Error(`credential sync only applies to accounts with identity recipes; ${account.id} is ${account.tool}`);
+            }
+            const result = await syncAccountCredentialsToVault(account);
             return [{ account: account.id, vaultUpdated: result.vaultUpdated }];
           })()
-        : await syncAllClaudeChainsToVault();
+        : await syncAllAccountCredentialsToVault();
       for (const outcome of outcomes) {
         const state = outcome.error ? red(`error: ${outcome.error}`) : outcome.vaultUpdated ? green("vault updated") : dim("already fresh");
         if (isPretty()) console.log(actionLine(outcome.error ? "warn" : "ok", "sync", [bold(outcome.account), state]));
         else console.log(`synced\t${outcome.account}\t${outcome.error ?? (outcome.vaultUpdated ? "updated" : "fresh")}`);
       }
-      if (outcomes.length === 0) console.log(note("no claude accounts registered; chain sync only applies to claude"));
+      if (outcomes.length === 0) console.log(note("no accounts with identity recipes registered; nothing to sync"));
       break;
     }
     default:
@@ -7746,7 +7984,12 @@ async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
     const marker = { account: account.id, keychainDigest: keychainBaseline ? credentialDigest(keychainBaseline) : null };
     await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
     const spec = resolveAgent(account.tool, [], { home: seatHome, identity: true, yolo: false });
-    await substrate.newSession(target, process.cwd(), { command: spec.command, args: spec.args, env: spec.env });
+    await substrate.newSession(target, process.cwd(), {
+      command: spec.command,
+      args: spec.args,
+      env: spec.env,
+      tmuxOptions: spec.tmuxOptions,
+    });
   } else {
     // A seat from a previous attempt is still up — rejoin it.
     console.log(note(`rejoining the running login seat for ${account.id}`));
