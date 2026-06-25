@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
 import type { NodeRecord } from "../node.js";
 import { formatShellCommand, paneArg } from "./local-tmux.js";
-import type { KillResult, LaunchSpec, NewSessionResult, ProbeResult, Substrate } from "./types.js";
+import type { KillResult, LaunchSpec, NewSessionResult, ProbeResult, Substrate, TmuxWindowOptions } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -112,7 +112,9 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     const argv = buildSshTmuxArgv(["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", target, "-c", cwd, ...commandWords]);
     const result = await exec(argv);
     if (result.exitCode !== 0) throw new Error(`Remote tmux new-session failed: ${result.stderr.trim() || result.stdout.trim()}`);
-    return { paneId: result.stdout.trim() };
+    const paneId = result.stdout.trim();
+    await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
+    return { paneId };
   }
 
   async function newPane(target: string, cwd: string, spec: LaunchSpec, opts?: { dir?: "h" | "v" | "window" }): Promise<NewSessionResult> {
@@ -128,21 +130,37 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
       const argv = buildSshTmuxArgv(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${target}:`, "-c", cwd, ...commandWords]);
       const result = await exec(argv);
       if (result.exitCode !== 0) throw new Error(`Remote tmux new-window failed: ${result.stderr.trim() || result.stdout.trim()}`);
-      return { paneId: result.stdout.trim() };
+      const paneId = result.stdout.trim();
+      await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
+      return { paneId };
     }
     const direction = opts?.dir === "h" ? ["-h"] : [];
     const argv = buildSshTmuxArgv(["split-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${target}:`, "-c", cwd, ...direction, ...commandWords]);
     const result = await exec(argv);
     if (result.exitCode !== 0) throw new Error(`Remote tmux split-window failed: ${result.stderr.trim() || result.stdout.trim()}`);
-    return { paneId: result.stdout.trim() };
+    const paneId = result.stdout.trim();
+    await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
+    return { paneId };
   }
 
-  async function kill(target: string): Promise<KillResult> {
+  async function setWindowOptions(target: string, options: TmuxWindowOptions | undefined, paneId?: string): Promise<void> {
+    await applyTmuxWindowOptions(paneArg(target, paneId), options);
+  }
+
+  async function applyTmuxWindowOptions(target: string, options: TmuxWindowOptions | undefined): Promise<void> {
+    if (!options) return;
+    const entries = Object.entries(options).filter((entry): entry is ["allow-passthrough", "on" | "off" | "all"] => entry[1] !== undefined);
+    for (const [key, value] of entries) {
+      await runTmux(["set-option", "-w", "-t", target, key, value]).catch(() => undefined);
+    }
+  }
+
+  async function kill(target: string, _options: { launcherPgid?: number } = {}): Promise<KillResult> {
     const result = await runTmux(["kill-session", "-t", `=${target}`]);
     return { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
   }
 
-  async function killPane(paneId: string): Promise<KillResult> {
+  async function killPane(paneId: string, _options: { launcherPgid?: number } = {}): Promise<KillResult> {
     const result = await runTmux(["kill-pane", "-t", paneId]);
     return { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
   }
@@ -273,6 +291,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     listPanes,
     listSessionStates,
     setUserOptions,
+    setWindowOptions,
     renameWindow,
     attachCommand,
     attachSession,

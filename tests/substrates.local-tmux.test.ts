@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,7 +51,7 @@ test("substrateForNode rejects unknown nodes with a registration hint", () => {
 test("tmux.js shim exposes the same callable names as the substrate's methods", () => {
   const s = createLocalTmuxSubstrate();
   // Spot-check the method/function names that callers depend on.
-  for (const name of ["hasSession", "newSession", "newPane", "sendText", "sendEnter", "sendKey", "capture", "kill", "killPane", "listTmuxSessions", "attachCommand", "attachSession"] as const) {
+  for (const name of ["hasSession", "newSession", "newPane", "sendText", "sendEnter", "sendKey", "capture", "kill", "killPane", "listTmuxSessions", "attachCommand", "attachSession", "setWindowOptions"] as const) {
     if (name === "listTmuxSessions") {
       assert.equal(typeof (legacyTmux as Record<string, unknown>)[name], "function");
       assert.equal(typeof s.listSessions, "function");
@@ -134,6 +135,25 @@ test("local sendText streams a >1MB prompt via load-buffer stdin (no ARG_MAX lim
   }
 });
 
+test("local kill terminates the supplied launcher process group", { timeout: 10_000 }, async () => {
+  const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  assert.ok(child.pid);
+  child.unref();
+  try {
+    await tmuxKillSession(`missing-${process.pid}`, { launcherPgid: child.pid });
+    await sleep(200);
+    assert.equal(processGroupAlive(child.pid), false);
+  } finally {
+    if (processGroupAlive(child.pid)) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // ignore
+      }
+    }
+  }
+});
+
 test("local newSession cleans up its hive-launch tmpdir when tmux refuses the session", { timeout: 30_000 }, async () => {
   const target = `hive-launch-cleanup-${process.pid}`;
   // Isolate os.tmpdir() so only this call's launch dir can appear in it.
@@ -154,6 +174,19 @@ test("local newSession cleans up its hive-launch tmpdir when tmux refuses the se
     await rm(isolatedTmp, { recursive: true, force: true });
   }
 });
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function processGroupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 test("local launcher restores real HOME from a fake parent env unless explicitly overridden", { timeout: 30_000 }, async () => {
   const targetA = `hive-launch-home-a-${process.pid}`;
@@ -185,6 +218,80 @@ test("local launcher restores real HOME from a fake parent env unless explicitly
     await tmuxKillSession(targetA).catch(() => undefined);
     await tmuxKillSession(targetB).catch(() => undefined);
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("local launcher scrubs inherited no-color env for interactive agents", { timeout: 30_000 }, async () => {
+  const target = `hive-launch-color-env-${process.pid}`;
+  const dir = await mkdtemp(join(tmpdir(), "hive-launch-color-"));
+  const out = join(dir, "env.json");
+  const previous = new Map<string, string | undefined>();
+  for (const key of ["NO_COLOR", "FORCE_COLOR", "TERM", "CLICOLOR", "COLORTERM", "HIVE_PRESERVE_NO_COLOR"]) {
+    previous.set(key, process.env[key]);
+  }
+  const writeEnv = [
+    "-e",
+    `require("node:fs").writeFileSync(${JSON.stringify(out)}, JSON.stringify({
+      NO_COLOR: process.env.NO_COLOR ?? null,
+      FORCE_COLOR: process.env.FORCE_COLOR ?? null,
+      TERM: process.env.TERM ?? null,
+      CLICOLOR: process.env.CLICOLOR ?? null,
+      COLORTERM: process.env.COLORTERM ?? null,
+    }))`,
+  ];
+  try {
+    process.env.NO_COLOR = "1";
+    process.env.FORCE_COLOR = "0";
+    process.env.TERM = "dumb";
+    delete process.env.CLICOLOR;
+    delete process.env.COLORTERM;
+    delete process.env.HIVE_PRESERVE_NO_COLOR;
+
+    await newSession(target, "/tmp", { command: process.execPath, args: writeEnv });
+
+    const captured = JSON.parse(await waitForFile(out)) as Record<string, string | null>;
+    assert.equal(captured.NO_COLOR, null);
+    assert.equal(captured.FORCE_COLOR, null);
+    assert.notEqual(captured.TERM, "dumb");
+    assert.equal(captured.CLICOLOR, "1");
+    assert.equal(captured.COLORTERM, "truecolor");
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await tmuxKillSession(target).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("local launcher applies requested tmux window options to the created pane", { timeout: 30_000 }, async () => {
+  const target = `hive-launch-tmux-options-${process.pid}`;
+  try {
+    const { paneId } = await newSession(target, "/tmp", {
+      command: "sleep",
+      args: ["30"],
+      tmuxOptions: { "allow-passthrough": "off" },
+    });
+
+    const shown = await tmux(["show-options", "-w", "-t", paneId, "allow-passthrough"]);
+    assert.equal(shown.stdout.trim(), "allow-passthrough off");
+  } finally {
+    await tmuxKillSession(target).catch(() => undefined);
+  }
+});
+
+test("local substrate applies tmux window options to an existing bee pane", { timeout: 30_000 }, async () => {
+  const target = `hive-existing-tmux-options-${process.pid}`;
+  const substrate = createLocalTmuxSubstrate();
+  try {
+    const { paneId } = await newSession(target, "/tmp", { command: "sleep", args: ["30"] });
+    await substrate.setWindowOptions(target, { "allow-passthrough": "off" }, paneId);
+
+    const shown = await tmux(["show-options", "-w", "-t", paneId, "allow-passthrough"]);
+    assert.equal(shown.stdout.trim(), "allow-passthrough off");
+  } finally {
+    await tmuxKillSession(target).catch(() => undefined);
   }
 });
 

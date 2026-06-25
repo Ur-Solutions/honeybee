@@ -70,10 +70,10 @@ export async function transactionalKill(
     // Probe failures are non-fatal here; proceed to attempt kill.
   }
 
-  if (!alreadyGone) {
+  if (!alreadyGone || record.launcherPgid) {
     attempts += 1;
     try {
-      const killResult = await substrate.kill(record.tmuxTarget);
+      const killResult = await substrate.kill(record.tmuxTarget, { launcherPgid: record.launcherPgid });
       if (!killResult.ok) {
         killReturnedFailure = true;
         killStderr = killResult.stderr?.trim() || killResult.stdout?.trim() || `kill exited with code ${killResult.exitCode}`;

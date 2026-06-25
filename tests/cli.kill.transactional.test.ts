@@ -37,6 +37,7 @@ function seed(record: Partial<SessionRecord> & { name: string; tmuxTarget: strin
     status: record.status ?? "running",
     ...(record.id ? { id: record.id } : {}),
     ...(record.node ? { node: record.node } : {}),
+    ...(record.launcherPgid ? { launcherPgid: record.launcherPgid } : {}),
   };
 }
 
@@ -68,6 +69,7 @@ function makeSubstrate(overrides: SubstrateOverrides): Substrate {
     listPanes: async () => new Set<string>(),
     listSessionStates: async () => new Map<string, string>(),
     setUserOptions: async () => undefined,
+    setWindowOptions: async () => undefined,
     renameWindow: async () => undefined,
     attachCommand: () => ["echo", "noop"],
     attachSession: async () => undefined,
@@ -215,6 +217,28 @@ test("transactionalKill: session already gone (hasSession false from the start) 
     assert.equal(killCalls, 0, "should not call substrate.kill when bee is already gone");
     const gone = await readFile(join(dir, "sessions", "ghost.json"), "utf8").catch(() => null);
     assert.equal(gone, null, "session record should still be deleted");
+  });
+});
+
+test("transactionalKill: session gone still signals a recorded launcher process group", async () => {
+  await withTempStore(async () => {
+    const record = seed({ name: "alpha", tmuxTarget: "alpha", launcherPgid: 1234 });
+    await saveSession(record);
+
+    let killCalls = 0;
+    const substrate = makeSubstrate({
+      hasSession: async () => false,
+      kill: async (_target, options) => {
+        killCalls += 1;
+        assert.equal(options?.launcherPgid, 1234);
+        return killErr("no such session");
+      },
+    });
+
+    const outcome = await transactionalKill(record, { substrate, pollAttempts: 1, pollIntervalMs: 0 });
+
+    assert.deepEqual(outcome, { ok: true, alreadyGone: false, attempts: 1 });
+    assert.equal(killCalls, 1);
   });
 });
 

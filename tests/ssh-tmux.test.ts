@@ -111,6 +111,38 @@ test("newSession shell-quotes cwd when it contains spaces or shell metacharacter
   assert.equal(argv[argv.indexOf("-c") + 1], "'/tmp/path with spaces'");
 });
 
+test("newSession applies requested tmux window options on the remote pane", async () => {
+  const cap = captureExec();
+  cap.respondWith((call) => ({
+    exitCode: 0,
+    stdout: call.argv.includes("new-session") ? "%42\n" : "",
+  }));
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  await s.newSession("alpha", "/remote/path", {
+    command: "opencode",
+    args: ["run", "--interactive"],
+    tmuxOptions: { "allow-passthrough": "off" },
+  });
+
+  assert.equal(cap.calls.length, 2);
+  assert.deepEqual(cap.calls[1]!.argv, [
+    "ssh", ...MUX, "trmd@mini01",
+    "tmux", "set-option", "-w", "-t", "%42", "allow-passthrough", "off",
+  ]);
+});
+
+test("setWindowOptions applies requested tmux window options on an existing remote pane", async () => {
+  const cap = captureExec();
+  cap.respondWith(() => ({ exitCode: 0 }));
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  await s.setWindowOptions("alpha", { "allow-passthrough": "off" }, "%42");
+
+  assert.deepEqual(cap.calls[0]!.argv, [
+    "ssh", ...MUX, "trmd@mini01",
+    "tmux", "set-option", "-w", "-t", "%42", "allow-passthrough", "off",
+  ]);
+});
+
 /** attachCommand branches on $TMUX at call time — pin it so the test suite
  * behaves identically inside and outside a tmux client. */
 function withTmuxEnv<T>(value: string | undefined, fn: () => T): T {

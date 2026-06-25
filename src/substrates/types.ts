@@ -2,16 +2,19 @@ export type SubstrateKind = "local-tmux" | "ssh-tmux";
 
 export const LOCAL_NODE = "local";
 
+export type TmuxWindowOptions = Partial<Record<"allow-passthrough", "on" | "off" | "all">>;
+
 export type LaunchSpec = {
   command: string;
   args: string[];
   env?: Record<string, string>;
+  tmuxOptions?: TmuxWindowOptions;
 };
 
 export type ProbeResult = { ok: true } | { ok: false; reason: string };
 
-/** newSession returns the id of the pane it created, so spawn can pin the bee. */
-export type NewSessionResult = { paneId: string };
+/** newSession returns the pane id so spawn can pin the bee, plus local launcher metadata when available. */
+export type NewSessionResult = { paneId: string; launcherPgid?: number };
 
 export type KillResult = {
   ok: boolean;
@@ -35,12 +38,12 @@ export type Substrate = {
    * (fork-and-pane Phase B — see §6.3)
    */
   newPane(target: string, cwd: string, spec: LaunchSpec, opts?: { dir?: "h" | "v" | "window" }): Promise<NewSessionResult>;
-  kill(target: string): Promise<KillResult>;
+  kill(target: string, options?: { launcherPgid?: number }): Promise<KillResult>;
   /**
    * Kill just one bee's pane without taking down the whole comb/session.
    * `tmux kill-pane -t %id`. (Phase B — see §6.3)
    */
-  killPane(paneId: string): Promise<KillResult>;
+  killPane(paneId: string, options?: { launcherPgid?: number }): Promise<KillResult>;
   // Pane-scoped I/O: when paneId (e.g. "%7") is given, target that exact pane;
   // otherwise fall back to "=name:" (the session's active pane) for legacy
   // bees that were never pinned. This is the fix for I/O following the wrong
@@ -62,6 +65,7 @@ export type Substrate = {
    * session or server must never break the caller — failures are swallowed.
    */
   setUserOptions(target: string, options: Record<string, string>): Promise<void>;
+  setWindowOptions(target: string, options: TmuxWindowOptions | undefined, paneId?: string): Promise<void>;
   /**
    * Best-effort rename of the session's active window (what choose-tree,
    * window strips, and views display). Never throws.

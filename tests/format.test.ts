@@ -1,12 +1,29 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { codePointWidth, displayWidth, formatRelativeTime, formatTable, stripAnsi, truncate, visibleLength } from "../src/format.js";
+import { codePointWidth, displayWidth, formatRelativeTime, formatTable, isPretty, stripAnsi, truncate, visibleLength } from "../src/format.js";
 
 const NOW = Date.parse("2026-06-10T12:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 function ago(ms: number): string {
   return new Date(NOW - ms).toISOString();
+}
+
+function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
+  const previous = new Map<string, string | undefined>();
+  for (const key of Object.keys(vars)) previous.set(key, process.env[key]);
+  try {
+    for (const [key, value] of Object.entries(vars)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }
 
 // Lone surrogates do not survive a UTF-8 round trip; well-formed strings do.
@@ -22,6 +39,19 @@ test("formatRelativeTime walks the unit ladder", () => {
   assert.equal(formatRelativeTime(ago(7 * DAY_MS), NOW), "1w");
   assert.equal(formatRelativeTime(ago(30 * DAY_MS), NOW), "1mo");
   assert.equal(formatRelativeTime(ago(365 * DAY_MS), NOW), "1y");
+});
+
+test("isPretty ignores inherited no-color automation env inside tmux", () => {
+  const tty = { isTTY: true };
+  withEnv({ NO_COLOR: "1", TERM: "dumb", TMUX: "/tmp/tmux/default,1,0", HIVE_NO_COLOR: undefined }, () => {
+    assert.equal(isPretty(tty), true);
+  });
+  withEnv({ NO_COLOR: "1", TERM: "dumb", TMUX: undefined, HIVE_NO_COLOR: undefined }, () => {
+    assert.equal(isPretty(tty), false);
+  });
+  withEnv({ NO_COLOR: "1", TERM: "tmux-256color", TMUX: "/tmp/tmux/default,1,0", HIVE_NO_COLOR: "1" }, () => {
+    assert.equal(isPretty(tty), false);
+  });
 });
 
 test("formatRelativeTime never reports zero months or years at unit boundaries", () => {

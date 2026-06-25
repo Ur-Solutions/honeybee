@@ -4,7 +4,7 @@ import { createLocalTmuxSubstrate } from "./local-tmux.js";
 import { createSshTmuxSubstrate } from "./ssh-tmux.js";
 import { type Substrate } from "./types.js";
 
-export type { KillResult, LaunchSpec, ProbeResult, Substrate, SubstrateKind } from "./types.js";
+export type { KillResult, LaunchSpec, ProbeResult, Substrate, SubstrateKind, TmuxWindowOptions } from "./types.js";
 export { LOCAL_NODE } from "./types.js";
 
 const cache = new Map<string, Substrate>();

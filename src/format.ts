@@ -3,7 +3,19 @@ import { homedir } from "node:os";
 type Stream = NodeJS.WriteStream | { isTTY?: boolean };
 
 export function isPretty(stream: Stream = process.stdout): boolean {
-  return Boolean(stream.isTTY) && process.env.NO_COLOR === undefined && process.env.TERM !== "dumb";
+  return Boolean(stream.isTTY) && !colorDisabledByEnv() && !terminalIsDumbForUi();
+}
+
+function colorDisabledByEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.HIVE_NO_COLOR !== undefined && env.HIVE_NO_COLOR !== "") return true;
+  // Codex/automation parents often export NO_COLOR=1 together with TERM=dumb.
+  // Do not let that leak into interactive tmux TUIs; use HIVE_NO_COLOR for an
+  // intentional Honeybee no-color override inside tmux.
+  return env.TMUX === undefined && env.NO_COLOR !== undefined && env.NO_COLOR !== "";
+}
+
+function terminalIsDumbForUi(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.TMUX === undefined && env.TERM === "dumb";
 }
 
 const ESC = "\x1b[";

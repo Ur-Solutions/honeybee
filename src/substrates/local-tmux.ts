@@ -12,6 +12,7 @@ import {
   type NewSessionResult,
   type ProbeResult,
   type Substrate,
+  type TmuxWindowOptions,
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -98,8 +99,10 @@ export async function newSession(name: string, cwd: string, spec: LaunchSpec): P
   const launcher = await createLauncher(spec);
   try {
     // -P -F prints the new pane's id so spawn can pin the bee to it.
-    const result = await tmux(["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
-    return { paneId: result.stdout.trim() };
+    const result = await tmux(["new-session", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
+    const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
+    await applyTmuxWindowOptions(paneId || `=${name}:`, spec.tmuxOptions);
+    return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
   } catch (error) {
     // The runner only deletes the payload tmpdir once it actually starts; if
     // tmux itself refuses the session, clean up here instead of leaking it.
@@ -114,21 +117,42 @@ export async function newPane(target: string, cwd: string, spec: LaunchSpec, opt
   try {
     if (opts?.dir === "window") {
       // A fresh window in the same session. -P -F prints the new pane id.
-      const result = await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${target}:`, "-c", cwd, command]);
-      return { paneId: result.stdout.trim() };
+      const result = await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", `=${target}:`, "-c", cwd, command]);
+      const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
+      await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
+      return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
     }
     // Split the comb's active window. -h = horizontal (side-by-side); default
     // (no -h) is vertical (stacked). -P -F prints the new pane's id so the
     // sub-bee can be pinned to it.
     const direction = opts?.dir === "h" ? ["-h"] : [];
-    const result = await tmux(["split-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${target}:`, "-c", cwd, ...direction, command]);
-    return { paneId: result.stdout.trim() };
+    const result = await tmux(["split-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", `=${target}:`, "-c", cwd, ...direction, command]);
+    const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
+    await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
+    return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
   } catch (error) {
     // The runner only deletes the payload tmpdir once it actually starts; if
     // tmux itself refuses the split, clean up here instead of leaking it.
     await rm(launcher.dir, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+export async function setWindowOptions(target: string, options: TmuxWindowOptions | undefined, paneId?: string): Promise<void> {
+  await applyTmuxWindowOptions(paneArg(target, paneId), options);
+}
+
+async function applyTmuxWindowOptions(target: string, options: TmuxWindowOptions | undefined): Promise<void> {
+  if (!options) return;
+  const entries = Object.entries(options).filter((entry): entry is ["allow-passthrough", "on" | "off" | "all"] => entry[1] !== undefined);
+  if (entries.length === 0) return;
+
+  const args: string[] = [];
+  entries.forEach(([key, value], index) => {
+    if (index > 0) args.push(";");
+    args.push("set-option", "-w", "-t", target, key, value);
+  });
+  await tmux(args, { reject: false });
 }
 
 export async function sendText(target: string, text: string, paneId?: string): Promise<void> {
@@ -154,15 +178,54 @@ export async function capture(target: string, lines = 80, paneId?: string): Prom
   return result.stdout.trimEnd();
 }
 
-export async function kill(target: string): Promise<KillResult> {
-  return tmux(["kill-session", "-t", `=${target}`], { reject: false });
+export async function kill(target: string, options: { launcherPgid?: number } = {}): Promise<KillResult> {
+  const result = await tmux(["kill-session", "-t", `=${target}`], { reject: false });
+  await terminateProcessGroup(options.launcherPgid);
+  return result;
 }
 
 // A pane id ("%7") is globally unique on the server, so "-t %7" is exact on its
 // own — no "=name:" wrapping needed. Used by comb-aware `hive kill` to drop one
 // sub-bee without taking the whole session.
-export async function killPane(paneId: string): Promise<KillResult> {
-  return tmux(["kill-pane", "-t", paneId], { reject: false });
+export async function killPane(paneId: string, options: { launcherPgid?: number } = {}): Promise<KillResult> {
+  const result = await tmux(["kill-pane", "-t", paneId], { reject: false });
+  await terminateProcessGroup(options.launcherPgid);
+  return result;
+}
+
+function parseLaunchResult(stdout: string): NewSessionResult {
+  const [paneId = "", pidRaw = ""] = stdout.trim().split("\t");
+  const launcherPgid = parsePositiveInt(pidRaw);
+  return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
+}
+
+function parsePositiveInt(value: string): number | undefined {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+async function terminateProcessGroup(pgid: number | undefined): Promise<void> {
+  if (!pgid || process.platform === "win32") return;
+  try {
+    process.kill(-pgid, "SIGTERM");
+  } catch {
+    return;
+  }
+  await sleep(500);
+  try {
+    process.kill(-pgid, 0);
+  } catch {
+    return;
+  }
+  try {
+    process.kill(-pgid, "SIGKILL");
+  } catch {
+    // Already gone or not signalable; tmux teardown result remains authoritative.
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export function attachCommand(target: string): string[] {
@@ -297,6 +360,7 @@ const baseEnv = { ...process.env };
 if (typeof payload.realHome === "string" && payload.realHome.length > 0) {
   baseEnv.HOME = payload.realHome;
 }
+repairInteractiveColorEnv(baseEnv);
 
 const child = spawn(payload.command, Array.isArray(payload.args) ? payload.args : [], {
   env: { ...baseEnv, ...(payload.env && typeof payload.env === "object" ? payload.env : {}) },
@@ -312,6 +376,21 @@ child.on("exit", (code, signal) => {
   if (signal) process.kill(process.pid, signal);
   process.exit(code ?? 1);
 });
+
+function repairInteractiveColorEnv(env) {
+  if (env.HIVE_PRESERVE_NO_COLOR === "1") return;
+  delete env.NO_COLOR;
+  if (env.FORCE_COLOR === "" || env.FORCE_COLOR === "0" || env.FORCE_COLOR === "false") {
+    delete env.FORCE_COLOR;
+  }
+  if (!env.CLICOLOR) env.CLICOLOR = "1";
+  if (!env.COLORTERM || env.COLORTERM === "0" || env.COLORTERM === "false") {
+    env.COLORTERM = "truecolor";
+  }
+  if (!env.TERM || env.TERM === "dumb") {
+    env.TERM = env.TMUX ? "tmux-256color" : "xterm-256color";
+  }
+}
 `,
     { mode: 0o700 },
   );
@@ -351,6 +430,7 @@ export function createLocalTmuxSubstrate(): Substrate {
     listPanes,
     listSessionStates,
     setUserOptions,
+    setWindowOptions,
     renameWindow,
     attachCommand,
     attachSession,

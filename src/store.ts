@@ -18,6 +18,8 @@ export type SessionRecord = {
    * records → they keep the active-pane fallback.
    */
   agentPaneId?: string;
+  /** Local tmux launcher process group; best-effort cleanup for drivers that survive pane teardown. */
+  launcherPgid?: number;
   /**
    * The comb (tmux session) this bee shares. For a solo bee this equals
    * tmuxTarget; sub-bees split into the same comb share the parent's combId.
@@ -297,6 +299,7 @@ const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requeste
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
   ...OPTIONAL_STRING_SESSION_KEYS,
+  "launcherPgid",
   "titleSource",
   "autoTitleAttempts",
   "buzAccept",
@@ -336,6 +339,9 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
 
   if (typeof object.autoTitleAttempts === "number" && Number.isFinite(object.autoTitleAttempts)) {
     record.autoTitleAttempts = object.autoTitleAttempts;
+  }
+  if (typeof object.launcherPgid === "number" && Number.isSafeInteger(object.launcherPgid) && object.launcherPgid > 0) {
+    record.launcherPgid = object.launcherPgid;
   }
 
   // buzAccept is the per-bee acceptance policy for buz messages. The field

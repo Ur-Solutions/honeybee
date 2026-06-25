@@ -22,6 +22,7 @@ export {
   sendText,
   setTmuxSocket,
   setUserOptions,
+  setWindowOptions,
   tmux,
 } from "./substrates/local-tmux.js";
 export type { LaunchSpec } from "./substrates/local-tmux.js";
