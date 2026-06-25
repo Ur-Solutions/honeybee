@@ -23,8 +23,8 @@ export const TMUX_BLOCK_END = "# <<< honeybee keybindings <<<";
  *
  *   M-B  hive launch           → interactive frame/flow launcher (M-b is hive bees)
  *   M-F  hive launch           → same launcher (frames + flows in one wizard)
- *   M-L  hive loop launch      → loop launcher dialog (templates + minimal form)
- *   M-k  fork current bee      (M-f avoided: WezTerm ALT layer)
+ *   M-l  hive loop launch      → loop launcher dialog (templates + minimal form)
+ *   M-k  hive fork launch      → interactive fork window (M-f avoided: WezTerm ALT layer)
  *   M-x  split / decompose
  *   M-u  urls
  *   M-R  workspace rename
@@ -54,9 +54,8 @@ ${TMUX_BLOCK_START}
 # Spawn / decompose / fork (verbs: fork-and-pane Phase B/C/D; pickers: KEYBINDINGS_PRD)
 bind -n M-B display-popup -E -w 80% -h 70% "hive launch"                                                # cmd+shift+b launch a frame/flow (interactive wizard)
 bind -n M-F display-popup -E -w 80% -h 70% "hive launch"                                                # cmd+shift+f launch a frame/flow (same wizard)
-bind -n M-L display-popup -E -w 80% -h 70% "hive loop launch"                                           # cmd+shift+l launch a loop (dialog + templates)
-bind -n M-k display-popup -E \\
-  "hive fork \\"\$(hive here --id)\\" --here"                                                              # cmd+k fork current bee, here (M-f taken by WezTerm ALT layer)
+bind -n M-l display-popup -E -w 80% -h 70% "hive loop launch"                                           # cmd+l launch a loop (dialog + templates)
+bind -n M-k display-popup -E -w 80% -h 70% "hive fork launch"                                           # cmd+k fork launcher (interactive: seed, worktree, agent, account)
 bind -n M-x display-popup -E \\
   "hive split --here"                                                                                   # cmd+x decompose / add sub-bee (split → fork-and-pane B)
 
@@ -79,7 +78,7 @@ export const CANONICAL_WEZTERM_BLOCK = `-- honeybee cmd→Meta additions — app
 { key = 'b', mods = 'SUPER|SHIFT', action = meta('B') },   -- cmd+shift+b spawn-from-frame (cmd+b is hive bees)
 { key = 'k', mods = 'SUPER',       action = meta('k') },   -- cmd+k  fork (M-f avoided: ALT layer)
 { key = 'f', mods = 'SUPER|SHIFT', action = meta('F') },   -- cmd+shift+f frame/flow launcher
-{ key = 'l', mods = 'SUPER|SHIFT', action = meta('L') },   -- cmd+shift+l loop launcher
+{ key = 'l', mods = 'SUPER',       action = meta('l') },   -- cmd+l  loop launcher
 { key = 'x', mods = 'SUPER',       action = meta('x') },   -- cmd+x  split/decompose
 { key = 'u', mods = 'SUPER',       action = meta('u') },   -- cmd+u  urls
 { key = 'r', mods = 'SUPER|SHIFT', action = meta('R') },   -- cmd+shift+r rename workspace
@@ -97,8 +96,8 @@ export type RecommendedBind = { key: string; verb: string; delegated?: boolean; 
 export const RECOMMENDED_BINDS: RecommendedBind[] = [
   { key: "M-B", verb: "launch", note: "interactive frame/flow launcher (M-b is hive bees)" },
   { key: "M-F", verb: "launch", note: "interactive frame/flow launcher" },
-  { key: "M-L", verb: "loop", note: "loop launcher dialog (templates + minimal form)" },
-  { key: "M-k", verb: "fork", note: "fork current bee, here" },
+  { key: "M-l", verb: "loop", note: "loop launcher dialog (templates + minimal form)" },
+  { key: "M-k", verb: "fork", note: "interactive fork launcher (seed, worktree, agent, account)" },
   { key: "M-x", verb: "split", note: "decompose / add sub-bee" },
   { key: "M-u", verb: "urls", note: "list + open URL" },
   { key: "M-R", verb: "workspace", delegated: true, note: "rename workspace (→ WORKSPACES)" },
