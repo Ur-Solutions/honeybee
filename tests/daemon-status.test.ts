@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import {
   daemonLockPath,
+  daemonLoopStale,
   daemonStatePath,
   readDaemonState,
   readDaemonStatus,
@@ -220,3 +221,94 @@ function runCli(cliPath: string, argv: string[]): Promise<{ exitCode: number; st
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+test("daemonLoopStale judges a running loop by lastTickAt age", () => {
+  const state: DaemonState = {
+    startedAt: "2026-06-28T17:00:00.000Z",
+    lastTickAt: "2026-06-29T07:43:14.708Z",
+    tickCount: 23334,
+    version: "1",
+    pid: 51841,
+    recentErrors: [],
+  };
+  const tickMs = Date.parse(state.lastTickAt!);
+  assert.equal(daemonLoopStale(state, tickMs + 60_000, 5 * 60_000).stale, false);
+  const wedged = daemonLoopStale(state, tickMs + 3 * 24 * 3_600_000, 5 * 60_000);
+  assert.equal(wedged.stale, true);
+  assert.ok(wedged.ageMs! >= 3 * 24 * 3_600_000);
+});
+
+test("daemonLoopStale falls back to startedAt when the daemon never ticked", () => {
+  const state: DaemonState = {
+    startedAt: "2026-06-28T17:00:00.000Z",
+    lastTickAt: null,
+    tickCount: 0,
+    version: "1",
+    pid: 1,
+    recentErrors: [],
+  };
+  const startMs = Date.parse(state.startedAt);
+  assert.equal(daemonLoopStale(state, startMs + 1_000, 5 * 60_000).stale, false);
+  assert.equal(daemonLoopStale(state, startMs + 10 * 60_000, 5 * 60_000).stale, true);
+});
+
+test("readDaemonStatus reports STALE for a live process whose lastTickAt is old", async () => {
+  await withTempStore(async () => {
+    const lock = await acquireLongLivedLock(daemonLockPath(), { label: "test daemon" });
+    try {
+      const lastTickAt = new Date(Date.now() - 60 * 60_000).toISOString(); // 1h ago
+      await writeDaemonState({
+        startedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+        lastTickAt,
+        tickCount: 100,
+        version: "1",
+        pid: process.pid,
+        recentErrors: [],
+      });
+      const report = await readDaemonStatus(undefined, { staleAfterMs: 5 * 60_000 });
+      assert.equal(report.running, true);
+      assert.equal(report.stale, true);
+      assert.ok(report.lastTickAgeMs! > 5 * 60_000);
+      assert.equal(report.staleAfterMs, 5 * 60_000);
+    } finally {
+      await lock.release();
+    }
+  });
+});
+
+test("readDaemonStatus reports a fresh running daemon as not stale", async () => {
+  await withTempStore(async () => {
+    const lock = await acquireLongLivedLock(daemonLockPath(), { label: "test daemon" });
+    try {
+      await writeDaemonState({
+        startedAt: new Date(Date.now() - 3_600_000).toISOString(),
+        lastTickAt: new Date().toISOString(),
+        tickCount: 100,
+        version: "1",
+        pid: process.pid,
+        recentErrors: [],
+      });
+      const report = await readDaemonStatus(undefined, { staleAfterMs: 5 * 60_000 });
+      assert.equal(report.running, true);
+      assert.equal(report.stale, false);
+    } finally {
+      await lock.release();
+    }
+  });
+});
+
+test("readDaemonStatus does not mark a down daemon stale", async () => {
+  await withTempStore(async () => {
+    await writeDaemonState({
+      startedAt: "2026-06-28T17:00:00.000Z",
+      lastTickAt: "2026-06-29T07:43:14.708Z",
+      tickCount: 23334,
+      version: "1",
+      pid: 999_999,
+      recentErrors: [],
+    });
+    const report = await readDaemonStatus(undefined, { staleAfterMs: 5 * 60_000 });
+    assert.equal(report.running, false);
+    assert.equal(report.stale, false);
+  });
+});

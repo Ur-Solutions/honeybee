@@ -6,6 +6,12 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+// `security` can block indefinitely on a keychain-unlock or consent dialog —
+// fatal for headless callers (the daemon's credential sync wedges its tick).
+// One minute is enough for a human to answer an interactive prompt; after
+// that the call fails closed (read → null, write → false).
+const SECURITY_EXEC_TIMEOUT_MS = 60_000;
+
 // ──────────────────────────────────────────────────────────────────────────
 // macOS Keychain bridge for Claude Code credentials.
 //
@@ -40,7 +46,7 @@ export async function readClaudeKeychain(homePath: string): Promise<string | nul
   try {
     // macOS may show a one-time "security wants to access ..." consent dialog
     // for items created by Claude Code itself; Always Allow makes it stick.
-    const { stdout } = await execFileAsync("security", ["find-generic-password", "-w", "-s", claudeKeychainService(homePath)]);
+    const { stdout } = await execFileAsync("security", ["find-generic-password", "-w", "-s", claudeKeychainService(homePath)], { timeout: SECURITY_EXEC_TIMEOUT_MS });
     const value = stdout.trim();
     return value.length > 0 ? value : null;
   } catch {
@@ -64,7 +70,7 @@ export async function writeClaudeKeychain(homePath: string, credentials: string)
       claudeKeychainService(homePath),
       "-w",
       credentials,
-    ]);
+    ], { timeout: SECURITY_EXEC_TIMEOUT_MS });
     return true;
   } catch {
     return false;

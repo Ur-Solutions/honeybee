@@ -26,6 +26,44 @@ import {
 
 const DEFAULT_NODE_PROBE_TIMEOUT_MS = 2_500;
 
+/**
+ * Hard per-call budgets for every external await in the tick path. The tick
+ * loop is strictly sequential (one tick fully resolves before the next), so a
+ * single never-settling promise — a wedged tmux client, a keychain prompt, or
+ * even a lost libuv fs completion (observed in production: an fs.promises
+ * readFile of a codex transcript whose threadpool completion was never
+ * delivered) — silently freezes the daemon forever while its process stays
+ * alive. Timeouts convert that class of failure into a recentErrors entry and
+ * a skipped stage instead of a dead observer.
+ */
+export type TickTimeouts = {
+  /** fs-backed deps: listSessions/listNodes/sealedBeeNames/touchSession/appendLedger. */
+  fsMs: number;
+  /** substrate-backed deps: probeNodes (outer bound), capturePanes, livePanes, mirrorHiveState. */
+  substrateMs: number;
+  /** per-record transcript metadata refresh (reads provider transcripts). */
+  transcriptMs: number;
+  /** dispatchers: buz drain, usage sampler, autoswap, auto-title. */
+  dispatchMs: number;
+  /** credential chain sync (keychain + a sweep over many homes). */
+  chainSyncMs: number;
+};
+
+export function defaultTickTimeouts(): TickTimeouts {
+  return {
+    fsMs: envMs("HIVE_DAEMON_FS_TIMEOUT_MS", 15_000),
+    substrateMs: envMs("HIVE_DAEMON_SUBSTRATE_TIMEOUT_MS", 20_000),
+    transcriptMs: envMs("HIVE_DAEMON_TRANSCRIPT_TIMEOUT_MS", 15_000),
+    dispatchMs: envMs("HIVE_DAEMON_DISPATCH_TIMEOUT_MS", 60_000),
+    chainSyncMs: envMs("HIVE_DAEMON_CHAIN_SYNC_TIMEOUT_MS", 120_000),
+  };
+}
+
+function envMs(name: string, fallback: number): number {
+  const raw = Number(process.env[name] ?? fallback);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
 export type ProbeResult = {
   liveTargets: Set<string>;
   unreachableNodes: Set<string>;
@@ -90,6 +128,8 @@ export type TickDeps = {
    * ticks are a no-op.
    */
   syncChains?: () => Promise<void>;
+  /** Per-call hard budgets; unset fields fall back to defaultTickTimeouts(). */
+  timeouts?: Partial<TickTimeouts>;
   now: () => number;
 };
 
@@ -128,17 +168,24 @@ export type TickResult = {
 export async function tick(deps: TickDeps, previousObserved: Map<string, BeeState>): Promise<TickResult> {
   const start = deps.now();
   const errors: Error[] = [];
+  const timeouts: TickTimeouts = { ...defaultTickTimeouts(), ...(deps.timeouts ?? {}) };
 
-  const records: SessionRecord[] = await guard(deps.listSessions(), errors, []);
-  const nodes: NodeRecord[] = await guard(deps.listNodes(), errors, []);
+  const records: SessionRecord[] = await guard(withTimeout(deps.listSessions(), timeouts.fsMs, "listSessions"), errors, []);
+  const nodes: NodeRecord[] = await guard(withTimeout(deps.listNodes(), timeouts.fsMs, "listNodes"), errors, []);
   const probe: ProbeResult = await guard(
-    deps.probeNodes(nodes),
+    withTimeout(deps.probeNodes(nodes), timeouts.substrateMs, "probeNodes"),
     errors,
     { liveTargets: new Set<string>(), unreachableNodes: new Set<string>() },
   );
-  const panes: Map<string, string> = await guard(deps.capturePanes(records, probe.liveTargets), errors, new Map());
-  const seals: Set<string> = await guard(deps.sealedBeeNames(), errors, new Set());
-  const livePanes: Set<string> = deps.livePanes ? await guard(deps.livePanes(), errors, new Set<string>()) : new Set<string>();
+  const panes: Map<string, string> = await guard(
+    withTimeout(deps.capturePanes(records, probe.liveTargets), timeouts.substrateMs, "capturePanes"),
+    errors,
+    new Map(),
+  );
+  const seals: Set<string> = await guard(withTimeout(deps.sealedBeeNames(), timeouts.fsMs, "sealedBeeNames"), errors, new Set());
+  const livePanes: Set<string> = deps.livePanes
+    ? await guard(withTimeout(deps.livePanes(), timeouts.substrateMs, "livePanes"), errors, new Set<string>())
+    : new Set<string>();
 
   const nowMs = deps.now();
   const context: StateContext = {
@@ -169,7 +216,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     if ((transitioned || staleHiveState) && !uncertainBooting) {
       if (deps.mirrorHiveState) {
         try {
-          await deps.mirrorHiveState(record, derived.state);
+          await withTimeout(deps.mirrorHiveState(record, derived.state), timeouts.substrateMs, `mirrorHiveState(${record.name})`);
         } catch (error) {
           errors.push(toError(error));
         }
@@ -178,10 +225,14 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
 
     // Persist the latest observed state. Errors are captured but do not abort the loop.
     try {
-      await deps.touchSession(record.name, {
-        lastObservedState: derived.state,
-        lastObservedStateAt: observedAtIso,
-      });
+      await withTimeout(
+        deps.touchSession(record.name, {
+          lastObservedState: derived.state,
+          lastObservedStateAt: observedAtIso,
+        }),
+        timeouts.fsMs,
+        `touchSession(${record.name})`,
+      );
     } catch (error) {
       errors.push(toError(error));
     }
@@ -191,9 +242,9 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     // before its first refresh (fast finish between ticks) still gets one
     // pass so list/search/tail metadata is not permanently missing.
     const terminal = derived.state === "dead" || derived.state === "sealed";
-    if (!terminal || !record.transcriptPath) {
+    if ((!terminal || !record.transcriptPath) && deps.refreshTranscriptMetadata) {
       try {
-        await deps.refreshTranscriptMetadata?.(record);
+        await withTimeout(deps.refreshTranscriptMetadata(record), timeouts.transcriptMs, `refreshTranscriptMetadata(${record.name})`);
       } catch (error) {
         errors.push(toError(error));
       }
@@ -206,13 +257,17 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     if (transition.to !== "idle_with_output") continue;
     if (transition.from === undefined) continue; // first observation isn't a transition
     try {
-      await deps.appendLedger({
-        type: "state.transition",
-        session: transition.name,
-        from: transition.from,
-        to: transition.to,
-        ts: observedAtIso,
-      });
+      await withTimeout(
+        deps.appendLedger({
+          type: "state.transition",
+          session: transition.name,
+          from: transition.from,
+          to: transition.to,
+          ts: observedAtIso,
+        }),
+        timeouts.fsMs,
+        `appendLedger(state.transition ${transition.name})`,
+      );
     } catch (error) {
       errors.push(toError(error));
     }
@@ -224,7 +279,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   let buzDrains: BuzDispatchOutcome[] = [];
   if (deps.dispatchBuzDrain) {
     try {
-      buzDrains = await deps.dispatchBuzDrain(records, transitions, observed);
+      buzDrains = await withTimeout(deps.dispatchBuzDrain(records, transitions, observed), timeouts.dispatchMs, "dispatchBuzDrain");
     } catch (error) {
       errors.push(toError(error));
     }
@@ -234,7 +289,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   let usage: UsageTickOutcome[] = [];
   if (deps.sampleUsage) {
     try {
-      usage = await deps.sampleUsage(records, panes, nowMs);
+      usage = await withTimeout(deps.sampleUsage(records, panes, nowMs), timeouts.dispatchMs, "sampleUsage");
     } catch (error) {
       errors.push(toError(error));
     }
@@ -244,7 +299,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   let autoswaps: AutoswapOutcome[] = [];
   if (deps.dispatchAutoswap && usage.some((outcome) => outcome.exhausted)) {
     try {
-      autoswaps = await deps.dispatchAutoswap(records, usage);
+      autoswaps = await withTimeout(deps.dispatchAutoswap(records, usage), timeouts.dispatchMs, "dispatchAutoswap");
     } catch (error) {
       errors.push(toError(error));
     }
@@ -255,7 +310,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   let autoTitles: AutoTitleOutcome[] = [];
   if (deps.dispatchAutoTitle) {
     try {
-      autoTitles = await deps.dispatchAutoTitle(records);
+      autoTitles = await withTimeout(deps.dispatchAutoTitle(records), timeouts.dispatchMs, "dispatchAutoTitle");
     } catch (error) {
       errors.push(toError(error));
     }
@@ -265,7 +320,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   // by the default wiring; errors are captured, never fatal to the tick.
   if (deps.syncChains) {
     try {
-      await deps.syncChains();
+      await withTimeout(deps.syncChains(), timeouts.chainSyncMs, "syncChains");
     } catch (error) {
       errors.push(toError(error));
     }
@@ -307,6 +362,13 @@ export type RunDaemonOptions = {
   tickImpl?: typeof tick;
   /** Resolve when the daemon is asked to shut down (testing). */
   shutdownSignal?: AbortSignal;
+  /**
+   * Invoked when the in-process watchdog detects the tick loop stalled past
+   * config.watchdogMs. Defaults to process.exit(1) so supervision (launchd
+   * KeepAlive / systemd Restart) replaces the wedged daemon. Injectable for
+   * tests.
+   */
+  onWatchdogBreach?: (info: { stalledMs: number }) => void;
 };
 
 export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
@@ -342,7 +404,6 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   let stopping = false;
   let stopReason = "loop-exit";
   let exitCode = 0;
-  let activeTick: Promise<void> | null = null;
 
   const tickFn = options.tickImpl ?? tick;
   const deps = buildDefaultDeps();
@@ -403,21 +464,54 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   }
 
+  // In-process watchdog: if the loop stops beating for watchdogMs — the tick
+  // budget machinery itself failed, or a post-tick bookkeeping write wedged —
+  // exit nonzero so supervision restarts the daemon. This is the backstop for
+  // whatever the per-call and per-tick timeouts don't catch; a frozen loop
+  // must never again masquerade as a running daemon.
+  let lastLoopBeatMs = Date.now();
+  let watchdogFired = false;
+  const onWatchdogBreach = options.onWatchdogBreach ?? (() => process.exit(1));
+  const watchdog = setInterval(() => {
+    const stalledMs = Date.now() - lastLoopBeatMs;
+    if (watchdogFired || stopping || stalledMs <= config.watchdogMs) return;
+    watchdogFired = true;
+    pushRecentError(state, new Error(`watchdog: tick loop stalled for ${stalledMs}ms (limit ${config.watchdogMs}ms); exiting for supervised restart`));
+    // The state/log writes are best-effort — they may be wedged on the same
+    // root cause. A hard fallback guarantees the breach action still runs.
+    const hardExit = setTimeout(() => onWatchdogBreach({ stalledMs }), 2_000);
+    hardExit.unref?.();
+    void (async () => {
+      await appendDaemonLog({ level: "error", msg: "daemon.watchdog", stalledMs, limitMs: config.watchdogMs }).catch(() => undefined);
+      await writeDaemonState({ ...state, recentErrors: [...state.recentErrors] }).catch(() => undefined);
+    })().finally(() => {
+      clearTimeout(hardExit);
+      onWatchdogBreach({ stalledMs });
+    });
+  }, Math.max(25, Math.min(config.tickMs, 1_000)));
+
   // Tick loop. We use an async sleep loop (not setInterval) so each tick fully
   // resolves before the next begins; this is the standard reliable-tick pattern.
   try {
     while (!stopping) {
       if (config.maxTicks !== undefined && state.tickCount >= config.maxTicks) break;
-      const tickPromise = (async () => {
-        let result: TickResult | null = null;
-        try {
-          result = await tickFn(deps, observed);
-        } catch (error) {
-          const err = toError(error);
-          await appendDaemonLog({ level: "error", msg: "tick.error", error: err.message });
-          pushRecentError(state, err);
-          return;
-        }
+      lastLoopBeatMs = Date.now();
+      // The whole tick runs under a hard budget. A tick that blows it is
+      // abandoned (its late settlement is swallowed) and recorded; the loop
+      // moves on to the next tick instead of wedging forever. Production
+      // incident 2026-06-29: a lost libuv fs completion froze one tick — and
+      // therefore the daemon — for 3+ days with recentErrors empty.
+      const tickPromise = tickFn(deps, observed);
+      let result: TickResult | null = null;
+      let tickError: Error | null = null;
+      try {
+        result = await withTimeout(tickPromise, config.tickBudgetMs, "tick");
+      } catch (error) {
+        tickError = toError(error);
+        void tickPromise.catch(() => undefined); // an abandoned tick may still reject later
+      }
+      lastLoopBeatMs = Date.now();
+      if (result) {
         observed = result.observed;
         state.tickCount += 1;
         state.lastTickAt = new Date().toISOString();
@@ -479,30 +573,27 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
             ...(outcome.error ? { error: outcome.error } : {}),
           });
         }
-        try {
-          await writeDaemonState({ ...state, recentErrors: [...state.recentErrors] });
-        } catch (error) {
-          const err = toError(error);
-          await appendDaemonLog({ level: "warn", msg: "state.write.failed", error: err.message });
-        }
-      })();
-      activeTick = tickPromise;
-      await tickPromise;
-      activeTick = null;
+      } else if (tickError) {
+        pushRecentError(state, tickError);
+        await appendDaemonLog({ level: "error", msg: "tick.error", error: tickError.message });
+        // A budget-abandoned or thrown tick still proves the loop is alive:
+        // stamp lastTickAt (external staleness checks key on loop-death, not
+        // slow ticks) but do not count it — a frozen tickCount alongside
+        // fresh lastTickAt + recentErrors reads as "loop alive, ticks failing".
+        state.lastTickAt = new Date().toISOString();
+      }
+      try {
+        await writeDaemonState({ ...state, recentErrors: [...state.recentErrors] });
+      } catch (error) {
+        const err = toError(error);
+        await appendDaemonLog({ level: "warn", msg: "state.write.failed", error: err.message });
+      }
       if (stopping) break;
       if (config.maxTicks !== undefined && state.tickCount >= config.maxTicks) break;
       await sleep(config.tickMs, () => stopping);
+      lastLoopBeatMs = Date.now();
     }
 
-    // Clean shutdown path. Any in-flight tick is already complete because
-    // requestShutdown only flips `stopping` — it never interrupts an awaited tick.
-    if (activeTick) {
-      try {
-        await activeTick;
-      } catch {
-        // tick errors already logged
-      }
-    }
     await appendDaemonLog({ level: "info", msg: "daemon.shutdown", reason: stopReason });
     await appendLedger({ type: "daemon.stop", pid: process.pid, reason: stopReason, stoppedAt: new Date().toISOString() }).catch(() => undefined);
     for (const error of uncaughtErrors) {
@@ -510,6 +601,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
       await appendDaemonLog({ level: "error", msg: "daemon.uncaught", error: message });
     }
   } finally {
+    clearInterval(watchdog);
     if (lock) {
       try {
         await lock.release();
@@ -661,13 +753,18 @@ async function defaultCapturePanes(records: SessionRecord[], liveTargets: Set<st
   return new Map(entries);
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+/**
+ * Reject after `ms` if the promise has not settled. The underlying operation
+ * is NOT cancelled — an orphaned call may still complete (or never complete)
+ * in the background; callers treat the rejection as "skip this stage".
+ */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label = "operation"): Promise<T> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      reject(new Error(`Timed out after ${ms}ms`));
+      reject(new Error(`${label} timed out after ${ms}ms`));
     }, ms);
     promise.then(
       (value) => {

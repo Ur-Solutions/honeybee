@@ -49,6 +49,18 @@ function socketArgs(): string[] {
   return socket ? ["-S", socket] : [];
 }
 
+// Hard cap on any single tmux client invocation. tmux commands answer in
+// milliseconds; a client that sits for longer is talking to a wedged server
+// (or one blocked on a stuck client) and would otherwise hang its caller —
+// the daemon tick loop above all — forever. Generous enough for a loaded
+// machine and large paste-buffer round-trips.
+const DEFAULT_TMUX_EXEC_TIMEOUT_MS = 30_000;
+
+function tmuxExecTimeoutMs(): number {
+  const raw = Number(process.env.HIVE_TMUX_TIMEOUT_MS ?? DEFAULT_TMUX_EXEC_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TMUX_EXEC_TIMEOUT_MS;
+}
+
 export async function tmux(args: string[], options: { reject?: boolean } = {}): Promise<TmuxResult> {
   const reject = options.reject ?? true;
   if (args[0] === "kill-server" && !tmuxSocket()) {
@@ -61,10 +73,13 @@ export async function tmux(args: string[], options: { reject?: boolean } = {}): 
     );
   }
   try {
-    const result = await execFileAsync("tmux", [...socketArgs(), ...args], { maxBuffer: 20 * 1024 * 1024 });
+    const result = await execFileAsync("tmux", [...socketArgs(), ...args], { maxBuffer: 20 * 1024 * 1024, timeout: tmuxExecTimeoutMs() });
     return { ok: true, stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
   } catch (error) {
-    const err = error as { stdout?: string; stderr?: string; message?: string; code?: number | string };
+    const err = error as { stdout?: string; stderr?: string; message?: string; code?: number | string; killed?: boolean };
+    // execFile's timeout kill surfaces as killed=true with an empty stderr;
+    // name the condition so recentErrors/logs say what actually happened.
+    if (err.killed && !err.stderr) err.stderr = `tmux ${args[0]} timed out after ${tmuxExecTimeoutMs()}ms`;
     if (reject) throw new Error(err.stderr || err.message || String(error));
     return {
       ok: false,
@@ -259,9 +274,17 @@ async function tmuxWithStdin(args: string[], input: string): Promise<void> {
     const settle = (error?: Error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       if (error) reject(error);
       else resolve();
     };
+    // Same hard cap as tmux(): a client stuck on a wedged server must not
+    // hang the caller. Settling on 'exit' (not 'close') already guards
+    // against inherited-fd stragglers; this guards against the client itself.
+    const deadline = setTimeout(() => {
+      child.kill("SIGKILL");
+      settle(new Error(`tmux ${args[0]} timed out after ${tmuxExecTimeoutMs()}ms`));
+    }, tmuxExecTimeoutMs());
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     child.on("error", (error) => settle(error));
     child.on("exit", (code, signal) => {
@@ -333,7 +356,7 @@ export async function renameWindow(target: string, name: string): Promise<void> 
 
 export async function probe(): Promise<ProbeResult> {
   try {
-    await execFileAsync("tmux", ["-V"], { maxBuffer: 64 * 1024 });
+    await execFileAsync("tmux", ["-V"], { maxBuffer: 64 * 1024, timeout: tmuxExecTimeoutMs() });
     return { ok: true };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

@@ -408,3 +408,67 @@ test("tick: does not mirror uncertain booting over an existing live hive state",
     assert.deepEqual(mirrored, []);
   });
 });
+
+// A promise that never settles — the production wedge shape (a lost libuv fs
+// completion froze one tick, and therefore the daemon, for 3+ days).
+function never<T>(): Promise<T> {
+  return new Promise<T>(() => undefined);
+}
+
+test("tick: a capturePanes that never settles is timed out, recorded, and the tick completes", async () => {
+  await withTempStore(async () => {
+    const record = bee({ lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps: TickDeps = {
+      ...buildDeps({ records: [record], liveTargets: new Set([record.tmuxTarget]), capture }),
+      capturePanes: () => never(),
+      timeouts: { substrateMs: 30 },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.ok(result.errors.some((e) => /capturePanes timed out after 30ms/.test(e.message)));
+    // The tick still observed the record (empty pane fallback) and persisted state.
+    assert.equal(result.observed.has(record.name), true);
+    assert.equal(capture.touches.length, 1);
+  });
+});
+
+test("tick: a hung per-record transcript refresh is timed out and later records still refresh", async () => {
+  await withTempStore(async () => {
+    const first = bee({ name: "alpha", tmuxTarget: "hive:alpha", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const second = bee({ name: "beta", tmuxTarget: "hive:beta", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const refreshed: string[] = [];
+    const deps: TickDeps = {
+      ...buildDeps({ records: [first, second], liveTargets: new Set([first.tmuxTarget, second.tmuxTarget]), capture }),
+      refreshTranscriptMetadata: (rec) => {
+        if (rec.name === "alpha") return never();
+        refreshed.push(rec.name);
+        return Promise.resolve(rec);
+      },
+      timeouts: { transcriptMs: 30 },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.ok(result.errors.some((e) => /refreshTranscriptMetadata\(alpha\) timed out after 30ms/.test(e.message)));
+    assert.deepEqual(refreshed, ["beta"]);
+    assert.equal(result.observed.size, 2);
+  });
+});
+
+test("tick: a hung syncChains is timed out and does not block the tick result", async () => {
+  await withTempStore(async () => {
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps: TickDeps = {
+      ...buildDeps({ records: [], liveTargets: new Set(), capture }),
+      syncChains: () => never(),
+      timeouts: { chainSyncMs: 30 },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.ok(result.errors.some((e) => /syncChains timed out after 30ms/.test(e.message)));
+  });
+});

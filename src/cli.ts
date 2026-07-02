@@ -7059,16 +7059,20 @@ async function daemonRun(parsed: Parsed) {
 
 async function daemonStatus(parsed: Parsed) {
   const label = daemonLabel(parsed);
-  const status = await readDaemonStatus(undefined, { label });
+  const staleAfter = numberFlag(parsed, ["stale-after-ms"], 0);
+  const status = await readDaemonStatus(undefined, { label, ...(staleAfter > 0 ? { staleAfterMs: staleAfter } : {}) });
+  // Exit codes: 0 healthy, 3 down, 4 STALE (process alive, loop wedged).
+  // Anything polling this command must treat nonzero as an outage.
+  const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(status, null, 2));
-    process.exit(status.running ? 0 : 3);
+    process.exit(exitCode);
   }
   const installedTag = status.installed ? "installed" : "not-installed";
   if (!isPretty()) {
-    const dot = status.running ? "running" : "down";
+    const dot = status.running ? (status.stale ? "STALE" : "running") : "down";
     console.log(`${dot}\t${installedTag}\t${status.lock?.pid ?? ""}\t${status.state?.startedAt ?? ""}\t${status.state?.lastTickAt ?? ""}\t${status.state?.tickCount ?? 0}`);
-    process.exit(status.running ? 0 : 3);
+    process.exit(exitCode);
   }
   if (!status.running) {
     console.log(`${red("○")} ${bold("hive daemon")} ${dim("down")} ${dim(`(${installedTag})`)}`);
@@ -7083,6 +7087,20 @@ async function daemonStatus(parsed: Parsed) {
       console.log(dim(`  last tick: ${status.state.lastTickAt ?? "(none)"} ticks=${status.state.tickCount}`));
     }
     process.exit(3);
+  }
+  if (status.stale) {
+    const age = status.state?.lastTickAt ? formatRelativeTime(status.state.lastTickAt) : "never";
+    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("STALE"))} ${dim(`(process alive, loop wedged — last tick ${age} ago, threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
+    if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
+    if (status.state) {
+      console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+      if (status.state.recentErrors.length > 0) {
+        console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
+        for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+      }
+    }
+    console.log(dim(`  hint: hive daemon restart`));
+    process.exit(4);
   }
   console.log(`${green("●")} ${bold("hive daemon")} ${dim("running")} ${dim(`(${installedTag})`)}`);
   if (status.installed && status.plistPath) {
