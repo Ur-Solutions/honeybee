@@ -12,6 +12,7 @@ import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/
 import { createAutoTitleDispatcher, type AutoTitleOutcome } from "./autoTitle.js";
 import { dispatchAutoswaps, type AutoswapOutcome } from "./autoswap.js";
 import { dispatchBuzDrains, type BuzDispatchOutcome } from "./buzDispatcher.js";
+import { createNeedsInputDispatcher, type NeedsInputOutcome } from "./needsInput.js";
 import { createUsageSampler, type UsageSampler, type UsageTickOutcome } from "./usageSampler.js";
 import { appendDaemonLog } from "./log.js";
 import {
@@ -112,6 +113,13 @@ export type TickDeps = {
    */
   dispatchBuzDrain?: (records: SessionRecord[], transitions: TickTransition[], currentStates: Map<string, BeeState>) => Promise<BuzDispatchOutcome[]>;
   /**
+   * Optional HSR needs-input router (APIA-79): for each blocked HSR bee with a
+   * structured needs_input, routes the request as an interrupt-tier buz to the
+   * living parent, or marks it escalated when parentless/dead. Stateful across
+   * ticks (de-dupes each request) — build once per daemon run.
+   */
+  dispatchNeedsInput?: (records: SessionRecord[], currentStates: Map<string, BeeState>) => Promise<NeedsInputOutcome[]>;
+  /**
    * Optional usage sampler (Phase 3): observes panes/transcripts for
    * account-bound bees, appends usage samples and emits account.exhausted
    * events. Stateful across ticks — build once per daemon run.
@@ -158,6 +166,12 @@ export type TickResult = {
    * was not wired.
    */
   buzDrains: BuzDispatchOutcome[];
+  /**
+   * HSR needs-input routing outcomes: each blocked HSR bee's request routed to
+   * its parent (routedTo) or escalated to the user (escalated). Empty when no
+   * blocked HSR bee had a pending request / not wired.
+   */
+  needsInput: NeedsInputOutcome[];
   /** Per-bee usage sampler outcomes (empty when no account-bound bees / not wired). */
   usage: UsageTickOutcome[];
   /** Autoswap dispatcher outcomes (empty when nothing exhausted / not wired). */
@@ -312,6 +326,18 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     }
   }
 
+  // HSR needs-input router: route each blocked HSR bee's structured request to
+  // its living parent (buz) or mark it escalated. Same guard/budget as the
+  // other dispatchers; errors are captured, never fatal to the tick.
+  let needsInput: NeedsInputOutcome[] = [];
+  if (deps.dispatchNeedsInput) {
+    try {
+      needsInput = await withTimeout(deps.dispatchNeedsInput(records, observed), timeouts.dispatchMs, "dispatchNeedsInput");
+    } catch (error) {
+      errors.push(toError(error));
+    }
+  }
+
   // Usage sampler: factual per-account token samples + exhaustion events.
   let usage: UsageTickOutcome[] = [];
   if (deps.sampleUsage) {
@@ -359,6 +385,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     unreachableNodes: probe.unreachableNodes,
     errors,
     buzDrains,
+    needsInput,
     usage,
     autoswaps,
     autoTitles,
@@ -576,6 +603,17 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
             });
           }
         }
+        for (const outcome of result.needsInput) {
+          await appendDaemonLog({
+            level: outcome.error ? "warn" : "info",
+            msg: "needs_input.route",
+            session: outcome.bee,
+            requestId: outcome.requestId,
+            ...(outcome.routedTo ? { routedTo: outcome.routedTo } : {}),
+            ...(outcome.escalated ? { escalated: true } : {}),
+            ...(outcome.error ? { error: outcome.error } : {}),
+          });
+        }
         for (const outcome of result.usage) {
           if (!outcome.exhausted) continue;
           await appendDaemonLog({
@@ -711,6 +749,7 @@ export function buildDefaultDeps(): TickDeps {
     refreshTranscriptMetadata: refreshSessionTranscriptMetadata,
     appendLedger,
     dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),
+    dispatchNeedsInput: createNeedsInputDispatcher(),
     sampleUsage: createUsageSampler(),
     dispatchAutoswap: (records, usageOutcomes) => dispatchAutoswaps(records, usageOutcomes),
     dispatchAutoTitle: createAutoTitleDispatcher(),

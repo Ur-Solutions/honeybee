@@ -195,6 +195,49 @@ export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
 }
 
 /**
+ * The pending needs-input a blocked HSR bee is waiting on, read from the events
+ * tail. Used by the daemon's needs-input → parent-buz router and `hive answer`.
+ * `requestId` falls back to the stable literal "pending" when the emitting event
+ * carried none, so callers always have a de-dupe/answer key.
+ */
+export type PendingNeedsInput = {
+  requestId: string;
+  kind: "permission" | "question";
+  question: string;
+  tool?: string;
+  options?: string[];
+};
+
+/**
+ * The LAST needs_input event in the tail that has no later turn_end — i.e. the
+ * unresolved request the bee is currently blocked on (mirrors the "blocked"
+ * rule in structuredStateFromEvents). Null when the bee is not live or has no
+ * pending request. Never throws.
+ */
+export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
+  const meta = await readHsrMeta(bee);
+  if (!meta || meta.status !== "running" || !isPidAlive(meta.hostPid)) return null;
+  const events = await readEventTail(bee, EVENT_TAIL_LINES);
+  let lastNeeds = -1;
+  let lastEnd = -1;
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i]!;
+    if (event.type === "needs_input") lastNeeds = i;
+    else if (event.type === "turn_end") lastEnd = i;
+  }
+  // Unresolved iff a needs_input is the last turn marker (nothing ended after it).
+  if (lastNeeds < 0 || lastNeeds <= lastEnd) return null;
+  const event = events[lastNeeds] as Extract<RunnerEvent, { type: "needs_input" }>;
+  return {
+    requestId: event.requestId ?? "pending",
+    kind: event.kind,
+    question: event.question,
+    ...(event.tool ? { tool: event.tool } : {}),
+    ...(event.options ? { options: event.options } : {}),
+  };
+}
+
+/**
  * Reconcile stale `running` meta whose host pid is dead: flip status to
  * "exited" (with endedAt) and return the reaped bee names. Crash-adoption v1 —
  * no pipe recovery.

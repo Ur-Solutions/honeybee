@@ -98,9 +98,10 @@ import { executeFlow } from "./flow/run.js";
 import { cancelRun, spawnDetachedRun } from "./flow/background.js";
 import { runHsrHost } from "./hsr/host.js";
 import { adapterFor } from "./hsr/adapters/index.js";
-import { ensureHsrRunDir, hsrRunDir } from "./hsr/runDir.js";
-import { hsrObservations, type HsrObservation } from "./hsr/observe.js";
+import { ensureHsrRunDir, hsrRunDir, readHsrMeta } from "./hsr/runDir.js";
+import { hsrObservations, pendingNeedsInput, type HsrObservation } from "./hsr/observe.js";
 import { hsrSubstrate } from "./hsr/substrate.js";
+import { connectRpcClient } from "./hsr/rpc.js";
 import type { RunnerOpts } from "./hsr/types.js";
 import { loopFlow } from "./loop/flow.js";
 import { buildLoopConfig } from "./loop/context.js";
@@ -206,6 +207,9 @@ async function main(argv: string[]) {
       break;
     case "send":
       await cmdSend(parsed);
+      break;
+    case "answer":
+      await cmdAnswer(parsed);
       break;
     case "tail":
     case "cat":
@@ -1819,6 +1823,38 @@ async function cmdSend(parsed: Parsed) {
     if (isPretty()) console.log(actionLine("ok", "send", [bold(target), `${sent}/${records.length} bees`]));
     else console.log(`sent\t${target}\t${sent}/${records.length}`);
   }
+}
+
+/**
+ * Answer the pending needs_input of a blocked HSR bee over its control socket.
+ * The daemon routes an HSR bee's needs_input to its parent as a buz; the parent
+ * (or a human) replies with `hive answer <bee> <text>`. Defaults to "yes" when
+ * no text is supplied (the common permission-approve case).
+ */
+async function cmdAnswer(parsed: Parsed) {
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: hive answer <bee> [text]");
+  const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ") ?? "";
+  const answer = text.length > 0 ? text : "yes";
+
+  const record = await resolveSession(target);
+  if (record.substrate !== "hsr") {
+    throw new Error(`hive answer applies to HSR bees only; ${record.name} is ${record.substrate ?? "local-tmux"}`);
+  }
+  const pending = await pendingNeedsInput(record.name);
+  if (!pending) throw new Error(`No pending needs-input for ${record.name}`);
+  const meta = await readHsrMeta(record.name);
+  if (!meta?.controlSocket) throw new Error(`No control socket for ${record.name}`);
+
+  const client = await connectRpcClient(meta.controlSocket);
+  try {
+    await client.call("answer", { requestId: pending.requestId, answer });
+  } finally {
+    client.close();
+  }
+
+  if (isPretty()) console.log(actionLine("ok", "answer", [bold(record.name), dim(pending.requestId)]));
+  else console.log(`answered\t${record.name}\t${pending.requestId}`);
 }
 
 async function cmdTail(parsed: Parsed) {
@@ -8611,6 +8647,7 @@ function printHelp() {
       title: "Message",
       rows: [
         ["send", "<selector> <prompt>", "send a prompt to a bee, swarm, or colony"],
+        ["answer", "<bee> [text]", "answer a blocked HSR bee's needs-input (default: yes)"],
         ["brief", "<selector> <text>", "send a one-time context brief"],
         ["buz", "<send|inbox|read|…>", "addressed messaging: three-tier delivery + per-bee policy"],
         ["rename", "<selector> <title>", "set a bee's display title (--here for current bee, --auto to derive one, --clear)"],

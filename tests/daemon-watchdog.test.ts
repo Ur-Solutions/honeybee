@@ -26,6 +26,7 @@ function emptyTickResult(): TickResult {
     unreachableNodes: new Set(),
     errors: [],
     buzDrains: [],
+    needsInput: [],
     usage: [],
     autoswaps: [],
     autoTitles: [],
