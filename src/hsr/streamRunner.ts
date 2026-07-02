@@ -236,6 +236,13 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     ingestEvent({ type: "exit", ts: Date.now(), code: code ?? null, signal: signal ?? undefined });
     flushRing();
     endStream();
+    // Node does NOT auto-close the parent-side stdio pipes on child exit — the
+    // stdin write pipe in particular stays an open handle and would keep the
+    // host's event loop alive forever (a zombie __hsr-run process that never
+    // exits after its session ends). Destroy them so the host exits cleanly.
+    child.stdin?.destroy();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
     resolveExited();
   });
 
@@ -252,6 +259,9 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     if (!stdin || stdin.destroyed || !stdin.writable) {
       throw new Error("hsr stream: child stdin is not writable (session ended?)");
     }
+    // Bracket each turn: emit turn_start before the bytes hit stdin so
+    // turn_start/turn_end frame every turn across all stream harnesses.
+    ingestEvent({ type: "turn_start", ts: Date.now() });
     await new Promise<void>((resolve, reject) => {
       stdin.write(config.encodeUserTurn(text), (err) => (err ? reject(err) : resolve()));
     });

@@ -92,7 +92,16 @@ export async function runHsrHost(params: {
     meta: () => readHsrMeta(bee),
   };
 
-  const server = await startRpcServer({ socketPath: controlSocket, methods });
+  let server: Awaited<ReturnType<typeof startRpcServer>>;
+  try {
+    server = await startRpcServer({ socketPath: controlSocket, methods });
+  } catch (error) {
+    // Setup failed AFTER the harness child spawned (e.g. an AF_UNIX EINVAL on a
+    // too-long socket path). Don't leak the runner: stop it and finalize meta.
+    await session.stop().catch(() => undefined);
+    await writeHsrMeta(bee, { ...meta, status: "exited", exitCode: null, endedAt: new Date().toISOString() }).catch(() => undefined);
+    throw error;
+  }
 
   // Learn the provider session id (captured by the runner from the init line,
   // which carries no RunnerEvent) into meta.json.

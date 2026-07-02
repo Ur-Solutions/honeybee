@@ -346,3 +346,26 @@ JSON-RPC **transport** first, then the runner host/registry/run-dirs reuse it
 for per-bee control, then the adapters, then the daemon aggregate endpoint +
 `deriveState` HSR branch (HSR liveness is registry/run-dir based, since
 `deriveState` otherwise reads every pane-less bee as `dead`).
+
+### 2026-07-02 — Two bugs caught by the first live claude run (tier-B validated)
+
+Running a real `claude -p` stream-json bee end-to-end through the runner
+surfaced two issues unit tests missed:
+
+1. **Control socket must not live under the run dir.** An AF_UNIX path is
+   capped at ~104 bytes (macOS) / ~108 (Linux). `<runDir>/control.sock` under a
+   relocated/temp `HIVE_STORE_ROOT` (or a long bee name) exceeds it →
+   `listen EINVAL`. Fix: the control socket lives at a SHORT hashed path
+   (`/tmp/hive-hsr-<uid>/<bee8>-<hash16>.sock`), recorded in
+   `meta.controlSocket` for observers to read back. Run dir still holds
+   meta/events/ring.
+2. **Host must not leak the child on setup failure.** If `startRpcServer` (or
+   any post-spawn step) throws, `runHsrHost` now stops the already-spawned
+   harness child before rethrowing — otherwise the orphaned child + its open
+   stdio pipes hang the process. Relatedly, the stream runner now destroys the
+   child's stdio pipes on exit so a finished host exits cleanly (no zombie
+   `__hsr-run`).
+
+Confirmed working: `claude -p --input-format stream-json` DOES persist across
+turns (two user messages on one kept-open stdin → two results), so tier-B
+(one persistent process, multi-turn) is correct as designed.

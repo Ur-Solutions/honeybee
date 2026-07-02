@@ -47,8 +47,10 @@ export type RunnerEvent =
 /**
  * Everything an adapter needs to start a session. The caller (SubstrateHsr) has
  * already resolved the AgentSpec: `env` is the fully-resolved spawn env with
- * home isolation applied and any policy env-scrub (e.g. ANTHROPIC_API_KEY on a
- * claude subscription) done. The adapter only appends its tier/auth flags.
+ * home isolation applied. Depending on the caller, the policy env-scrub (e.g.
+ * ANTHROPIC_API_KEY on a claude subscription) may already be done, or the
+ * adapter applies it defensively from `authKind`. `command`/`args` carry the
+ * resolved base argv from resolveAgent; the adapter appends its tier/auth flags.
  */
 export type RunnerOpts = {
   bee: string; // hive bee name
@@ -57,6 +59,11 @@ export type RunnerOpts = {
   sessionId?: string; // provider session id (pinned for claude; learned for others)
   runDir: string; // ~/.hive/hsr/<bee>
   resume?: boolean; // resume an existing provider session (promote/demote, adoption)
+  /** Resolved base argv from resolveAgent (the caller). Adapters build the tier argv from these. */
+  command?: string;
+  args?: string[];
+  /** Auth kind for policy (env scrub etc.). Default "subscription". */
+  authKind?: "subscription" | "api-key";
 };
 
 /**
