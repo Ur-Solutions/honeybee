@@ -91,6 +91,12 @@ export type SessionRecord = {
   brief?: string;
   briefedAt?: string;
   node?: string;
+  /** Substrate hosting this bee. Absent = local-tmux (back-compat). "hsr" = pane-less Hive Substrate Runner. */
+  substrate?: "local-tmux" | "hsr";
+  /** HSR: runner process pid (structured-tier child or server). */
+  runnerPid?: number;
+  /** HSR: resolved runner tier for this bee ("server"|"stream"|"turn"|"pty"). */
+  runnerTier?: string;
   buzAccept?: ("interrupt" | "queue" | "passive")[];
   lastObservedState?: string;
   lastObservedStateAt?: string;
@@ -294,11 +300,13 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "workspaceId", "questId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "workspaceId", "questId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "runnerTier"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
   ...OPTIONAL_STRING_SESSION_KEYS,
+  "substrate",
+  "runnerPid",
   "launcherPgid",
   "titleSource",
   "autoTitleAttempts",
@@ -332,6 +340,16 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
 
   if (object.autoswap === true) record.autoswap = true;
+
+  // HSR fields. `substrate` is a closed union (absent = local-tmux); an
+  // unrecognized value is dropped rather than trusted. runnerPid is validated
+  // like launcherPgid; runnerTier rides the optional-string loop above.
+  if (object.substrate === "local-tmux" || object.substrate === "hsr") {
+    record.substrate = object.substrate;
+  }
+  if (typeof object.runnerPid === "number" && Number.isSafeInteger(object.runnerPid) && object.runnerPid > 0) {
+    record.runnerPid = object.runnerPid;
+  }
 
   if (object.titleSource === "user" || object.titleSource === "auto" || object.titleSource === "provider") {
     record.titleSource = object.titleSource;
