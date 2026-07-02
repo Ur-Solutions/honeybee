@@ -157,7 +157,7 @@ test("command/args prepends stream-json flags then preserves caller args, no dup
 test("adapterFor resolves stub and claude, undefined otherwise", () => {
   assert.equal(adapterFor("stub"), stubAdapter);
   assert.equal(adapterFor("claude"), claudeAdapter);
-  assert.equal(adapterFor("codex"), undefined);
+  assert.equal(adapterFor("nonexistent-harness"), undefined);
   assert.equal(claudeAdapter.harness, "claude");
   assert.equal(claudeAdapter.tier(), "stream");
 });

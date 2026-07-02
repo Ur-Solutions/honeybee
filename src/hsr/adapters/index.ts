@@ -9,6 +9,7 @@
 import type { RunnerAdapter } from "../types.js";
 import { stubAdapter } from "./stub.js";
 import { claudeAdapter } from "./claude.js";
+import { codexAdapter } from "./codex.js";
 
 /** The RunnerAdapter for a harness, or undefined if unmodeled. */
 export function adapterFor(harness: string): RunnerAdapter | undefined {
@@ -17,6 +18,8 @@ export function adapterFor(harness: string): RunnerAdapter | undefined {
       return stubAdapter;
     case "claude":
       return claudeAdapter;
+    case "codex":
+      return codexAdapter;
     default:
       return undefined;
   }
