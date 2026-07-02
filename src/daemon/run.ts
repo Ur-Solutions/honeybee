@@ -15,6 +15,7 @@ import { dispatchBuzDrains, type BuzDispatchOutcome } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher, type NeedsInputOutcome } from "./needsInput.js";
 import { createUsageSampler, type UsageSampler, type UsageTickOutcome } from "./usageSampler.js";
 import { appendDaemonLog } from "./log.js";
+import { startHsrControlServer, type HsrControlServer } from "./hsrControl.js";
 import {
   DAEMON_VERSION,
   daemonLockPath,
@@ -508,6 +509,18 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   await appendDaemonLog({ level: "info", msg: "daemon.start", pid: process.pid, tickMs: config.tickMs });
   await appendLedger({ type: "daemon.start", pid: process.pid, startedAt, version: DAEMON_VERSION }).catch(() => undefined);
 
+  // HSR aggregate control/observe endpoint (APIA-73): one unix socket the
+  // CLI/Apiary ride for spawn/send/interrupt/observe/liveness across all HSR
+  // bees. Started best-effort and event-driven (independent of the tick loop);
+  // a socket failure must NOT prevent the daemon from running.
+  let hsrControl: HsrControlServer | null = null;
+  try {
+    hsrControl = await startHsrControlServer();
+    await appendDaemonLog({ level: "info", msg: "hsr.control.start", path: hsrControl.path });
+  } catch (error) {
+    await appendDaemonLog({ level: "warn", msg: "hsr.control.start.failed", error: error instanceof Error ? error.message : String(error) });
+  }
+
   // Crash adoption v1: a daemon restart reconciles any HSR bee whose meta still
   // says "running" but whose host pid is dead (the host owns the harness pipes,
   // so a dead host is an unrecoverable session). Best-effort — a bad HSR root
@@ -676,6 +689,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   } finally {
     clearInterval(watchdog);
+    if (hsrControl) await hsrControl.close().catch(() => undefined);
     if (lock) {
       try {
         await lock.release();
