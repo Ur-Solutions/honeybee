@@ -1,0 +1,69 @@
+{
+  "swarmId": "honeybee-review-followup-20260619T0835Z",
+  "colony": "honeybee",
+  "spawned": [
+    {
+      "name": "hb-followup-20260619-01-tui-sidebar-navigation-claude-ur",
+      "id": "CL.c34",
+      "shard": "s14-tui-sidebar-navigation",
+      "tool": "claude",
+      "account": "claude-tormod-ursolutions.no"
+    },
+    {
+      "name": "hb-followup-20260619-02-workspaces-quests-pro-claude-ur",
+      "id": "CL.f60",
+      "shard": "s15-workspaces-quests-pro",
+      "tool": "claude",
+      "account": "claude-tormod-ursolutions.no"
+    },
+    {
+      "name": "hb-followup-20260619-03-packaging-config-complet-claude-ur",
+      "id": "CL.b36",
+      "shard": "s16-packaging-config-completion",
+      "tool": "claude",
+      "account": "claude-tormod-ursolutions.no"
+    },
+    {
+      "name": "hb-followup-20260619-04-performance-scalability-claude-ur",
+      "id": "CL.77f",
+      "shard": "s17-performance-scalability",
+      "tool": "claude",
+      "account": "claude-tormod-ursolutions.no"
+    },
+    {
+      "name": "hb-followup-20260619-05-cleanup-revive-reconcile-claude-thto",
+      "id": "CL.92af",
+      "shard": "s18-cleanup-revive-reconcile",
+      "tool": "claude",
+      "account": "claude-tormod-thto.no"
+    },
+    {
+      "name": "hb-followup-20260619-06-cli-god-file-clean-code-claude-thto",
+      "id": "CL.ace",
+      "shard": "s20-cli-god-file-clean-code",
+      "tool": "claude",
+      "account": "claude-tormod-thto.no"
+    },
+    {
+      "name": "hb-followup-20260619-07-path-root-safety-grok",
+      "id": "GR.262",
+      "shard": "s28-path-root-safety",
+      "tool": "grok",
+      "account": "grok-tormod.haugland-gmail.com"
+    },
+    {
+      "name": "hb-followup-20260619-08-live-session-state-machi-grok",
+      "id": "GR.b52",
+      "shard": "s29-live-session-state-machine",
+      "tool": "grok",
+      "account": "grok-tormod.haugland-gmail.com"
+    },
+    {
+      "name": "hb-followup-20260619-09-remote-node-behavior-grok",
+      "id": "GR.7d1",
+      "shard": "s30-remote-node-behavior",
+      "tool": "grok",
+      "account": "grok-tormod.haugland-gmail.com"
+    }
+  ]
+}

@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(codex --version)",
-      "Bash(echo \"\\(exit $?\\)\")"
+      "Bash(echo \"\\(exit $?\\)\")",
+      "Bash(rg -n \"noUnusedLocals|noUnusedParameters\" tsconfig*.json)",
+      "Bash(rg -n \"rotat|truncate|usagePath|usageDir\" src/*.ts src/daemon/*.ts)",
+      "Bash(rg -n \"cwd:.*real|cwd: real|realpath.*cwd|cwd = await realpath\" src/*.ts)",
+      "Bash(echo \"exit=$?\")"
     ]
   },
   "enabledMcpjsonServers": [
