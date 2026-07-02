@@ -36,7 +36,7 @@ import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "./forkTui.js";
 import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
 import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
-import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
+import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { pickRoundRobinAccount } from "./roundRobin.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
 import { resumeArgs, sniffYolo, swapAccount } from "./swap.js";
@@ -673,7 +673,7 @@ async function resolveProfileOverlay(requested: string): Promise<ProfileOverlay 
 
 async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <a|auto>] [-- <bee-args...>]");
+  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
   const timer = startSpawnTimer(requested);
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
@@ -3693,7 +3693,7 @@ async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<Session
 async function cmdRun(parsed: Parsed) {
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
-  if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--wait] [--last] [--rm|--cleanup]");
+  if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--account <name|auto>] [--yolo] [--wait] [--last] [--rm|--cleanup] [-- <bee-args...>]");
   if (truthy(flag(parsed, "keep")) && cleanupAfterRun(parsed)) throw new Error("--keep cannot be combined with --rm/--cleanup");
   if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
     throw new Error("hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
@@ -3796,7 +3796,7 @@ async function cleanupRunSession(record: SessionRecord): Promise<void> {
 async function cmdX(parsed: Parsed) {
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
-  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--home <1|2|3>] [--name <id>] [--yolo]");
+  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--name <id>] [--yolo] [-- <bee-args...>]");
   if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
     throw new Error("hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
   }
@@ -8178,7 +8178,7 @@ function formatTokens(value: number): string {
 // codex is the newest rate_limits snapshot its CLI wrote to disk (stamped).
 async function cmdLimits(parsed: Parsed) {
   const query = parsed.args[0];
-  const accounts = query ? [await findAccount(query)] : await listAccounts();
+  const accounts = query ? [await findAccount(query)] : sortAccountsForLimitsDisplay(await listAccounts());
   if (accounts.length === 0) {
     console.log(note("no accounts registered; add some with: hive account add <tool> <label> && hive login <account>"));
     return;
@@ -8198,10 +8198,11 @@ async function cmdLimits(parsed: Parsed) {
     result.plan ?? "-",
     limitCell(result.fiveHour, result),
     limitCell(result.weekly, result),
+    terseLimitCell(result.fableWeekly, result),
     result.cached ? `cache ${formatRelativeTime(result.asOf)}` : result.asOf ? formatRelativeTime(result.asOf) : result.ok ? "live" : "-",
   ]);
   console.log(formatTable(
-    [{ header: "ACCOUNT" }, { header: "PLAN" }, { header: "5H" }, { header: "WEEKLY" }, { header: "AS-OF" }],
+    [{ header: "ACCOUNT" }, { header: "PLAN" }, { header: "5H" }, { header: "WEEKLY" }, { header: "FABLE" }, { header: "AS-OF" }],
     rows,
   ));
   for (const result of results.filter((candidate) => !candidate.ok)) {
@@ -8223,6 +8224,16 @@ function limitCell(window: WindowUsage | undefined, result: AccountLimits): stri
   const paceSuffix = pace === null ? "" : ` ${formatPace(pace)}`;
   const reset = window.resetsAt ? ` ⟳ ${formatTimeUntil(window.resetsAt)}` : "";
   return `${limitBar(percent)} ${String(Math.round(percent)).padStart(3)}%${reset}${paceSuffix}`;
+}
+
+/** Bar-less cell for narrow columns (Fable included usage): `42% ⟳ 3d`. */
+function terseLimitCell(window: WindowUsage | undefined, result: AccountLimits): string {
+  if (!result.ok || !window) return "-";
+  if (windowRolledOver(window)) return "0%";
+  const percent = Math.max(0, Math.min(100, window.usedPercent));
+  const text = `${Math.round(percent)}%`;
+  const colored = !isPretty() ? text : percent >= 90 ? red(text) : percent >= 70 ? yellow(text) : green(text);
+  return window.resetsAt ? `${colored} ⟳ ${formatTimeUntil(window.resetsAt)}` : colored;
 }
 
 function formatPace(delta: number): string {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { addAccount, accountDir } from "../src/accounts.js";
-import { accountLimits, cachedAccountLimits, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, windowRolledOver } from "../src/limits.js";
+import { accountLimits, cachedAccountLimits, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -110,6 +110,56 @@ test("claude limits use the freshest unexpired token and map the usage windows",
     assert.equal(result!.plan, "max");
     assert.equal(result!.fiveHour?.usedPercent, 87.5);
     assert.equal(result!.weekly?.resetsAt, "2026-06-16T17:00:00Z");
+  });
+});
+
+test("sortAccountsForLimitsDisplay groups claude, then codex, then the rest by tool, keeping in-group order", async () => {
+  await withTempStore(async () => {
+    const grok = await addAccount("grok", "g@a.b");
+    const codex = await addAccount("codex", "c@a.b");
+    const claudeLate = await addAccount("claude", "digitech");
+    const opencode = await addAccount("opencode", "o@a.b", { provider: "zai-coding-plan" });
+    const claudeEarly = await addAccount("claude", "first@a.b");
+
+    const sorted = sortAccountsForLimitsDisplay([grok, codex, claudeLate, opencode, claudeEarly]);
+    assert.deepEqual(
+      sorted.map((account) => account.id),
+      [claudeLate.id, claudeEarly.id, codex.id, grok.id, opencode.id],
+    );
+  });
+});
+
+test("claude limits map the Fable-scoped weekly entry to fableWeekly", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "fab@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-vault", expiresAt: Date.now() + 3_600_000 } }),
+    );
+
+    const [result] = await accountLimits([account], {
+      fetchClaudeUsage: async () => ({
+        five_hour: { utilization: 12, resets_at: "2026-06-10T09:30:00Z" },
+        seven_day: { utilization: 30, resets_at: "2026-06-16T17:00:00Z" },
+        limits: [
+          { kind: "session", percent: 12, resets_at: "2026-06-10T09:30:00Z", scope: null },
+          { kind: "weekly_all", percent: 30, resets_at: "2026-06-16T17:00:00Z", scope: null },
+          // Surface-scoped entries must not be mistaken for the model window.
+          { kind: "weekly_scoped", percent: 99, resets_at: "2026-06-16T17:00:00Z", scope: { model: null } },
+          { kind: "weekly_scoped", percent: 55, resets_at: "2026-06-16T17:00:00Z", scope: { model: { display_name: "Fable" } } },
+        ],
+      }),
+      fetchClaudeProfileEmail: async () => "fab@a.b",
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    assert.equal(result!.fableWeekly?.usedPercent, 55);
+    assert.equal(result!.fableWeekly?.resetsAt, "2026-06-16T17:00:00Z");
+    assert.equal(result!.fableWeekly?.windowMinutes, 10_080);
+    // Unscoped windows stay sourced from five_hour/seven_day.
+    assert.equal(result!.weekly?.usedPercent, 30);
   });
 });
 

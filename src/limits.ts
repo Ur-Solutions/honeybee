@@ -81,6 +81,8 @@ export type AccountLimits = {
   error?: string;
   fiveHour?: WindowUsage;
   weekly?: WindowUsage;
+  /** Weekly window scoped to Fable — the plan's included Fable usage (claude only). */
+  fableWeekly?: WindowUsage;
   plan?: string;
   /** Snapshot time for disk-sourced data; undefined when live. */
   asOf?: string;
@@ -167,6 +169,17 @@ export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps 
 export type ClaudeUsageResponse = {
   five_hour?: { utilization?: number | null; resets_at?: string | null } | null;
   seven_day?: { utilization?: number | null; resets_at?: string | null } | null;
+  /**
+   * Modern limits array. Model-scoped weekly entries carry the plan's
+   * included usage per model (e.g. Fable on Claude 5 plans); the unscoped
+   * session/weekly entries duplicate five_hour/seven_day.
+   */
+  limits?: Array<{
+    kind?: string | null;
+    percent?: number | null;
+    resets_at?: string | null;
+    scope?: { model?: { display_name?: string | null } | null } | null;
+  } | null> | null;
 };
 
 type ClaudeOauthCredentials = {
@@ -318,6 +331,14 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
   }
   if (typeof usage.seven_day?.utilization === "number") {
     result.weekly = { usedPercent: usage.seven_day.utilization, windowMinutes: 10_080, ...(usage.seven_day.resets_at ? { resetsAt: usage.seven_day.resets_at } : {}) };
+  }
+  // Fable included usage rides the limits[] array as a model-scoped weekly
+  // entry (the legacy seven_day_<model> fields stay null on Claude 5 plans).
+  const fable = usage.limits?.find(
+    (entry) => entry?.kind === "weekly_scoped" && entry.scope?.model?.display_name === "Fable",
+  );
+  if (fable && typeof fable.percent === "number") {
+    result.fableWeekly = { usedPercent: fable.percent, windowMinutes: 10_080, ...(fable.resets_at ? { resetsAt: fable.resets_at } : {}) };
   }
   if (!result.fiveHour && !result.weekly) {
     result.ok = false;
@@ -612,6 +633,19 @@ async function walk(dir: string, maxDepth: number, visit: (path: string) => Prom
 
 export async function allAccountLimits(deps: LimitsDeps = {}): Promise<AccountLimits[]> {
   return accountLimits(await listAccounts(), deps);
+}
+
+/**
+ * Display order for the limits table: claude first, codex next, everything
+ * else grouped by tool name; registration order preserved within a group
+ * (sort is stable), so accounts of one tool never interleave with another's.
+ */
+const LIMITS_DISPLAY_RANK: Record<string, number> = { claude: 0, codex: 1 };
+
+export function sortAccountsForLimitsDisplay(accounts: AccountRecord[]): AccountRecord[] {
+  return [...accounts].sort(
+    (a, b) => (LIMITS_DISPLAY_RANK[a.tool] ?? 2) - (LIMITS_DISPLAY_RANK[b.tool] ?? 2) || a.tool.localeCompare(b.tool),
+  );
 }
 
 /* ------------------------------------------------------------------ */
