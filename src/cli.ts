@@ -487,6 +487,9 @@ type HsrRunPayload = {
   sessionId?: string;
   authKind?: "subscription" | "api-key";
   model?: string;
+  /** Lineage for HIVE_COMB/HIVE_PARENT env stamping (APIA-82). */
+  comb?: string;
+  parent?: string;
   spec: { command: string; args: string[]; env: Record<string, string> };
 };
 
@@ -542,6 +545,12 @@ async function runHsrHostFromPayload(payloadPath: string | undefined): Promise<v
     if (typeof value === "string") childEnv[key] = value;
   }
   Object.assign(childEnv, payload.spec.env);
+  // Stamp the bee's identity so in-agent affordances (`hive here`, `hive fork`,
+  // self-seal, buz) resolve the current bee WITHOUT a $TMUX_PANE (APIA-82). HSR
+  // children have no pane, so HIVE_BEE is the pane-less resolution anchor.
+  childEnv.HIVE_BEE = payload.bee;
+  childEnv.HIVE_COMB = payload.comb ?? payload.bee;
+  if (payload.parent) childEnv.HIVE_PARENT = payload.parent;
   const opts: RunnerOpts = {
     bee: payload.bee,
     cwd: payload.cwd,
@@ -669,6 +678,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     const runnerTier = adapter?.tier();
     const hostPid = await spawnHsrHost({
       bee: name,
+      comb: name, // solo comb — a forked sub-bee will carry its parent's comb
       kind: spec.kind,
       cwd: opts.cwd,
       ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
@@ -2976,8 +2986,16 @@ async function killSubBeePane(record: SessionRecord): Promise<void> {
  * Returns undefined when not inside tmux or no record matches.
  */
 async function resolveBeeInCurrentPane(): Promise<SessionRecord | undefined> {
-  if (!process.env.TMUX) return undefined;
   const records = await listSessions();
+  // HIVE_BEE is stamped into every HSR child env (and can be added to tmux
+  // spawns too), so `hive here`/`hive fork`/self-seal resolve the current bee
+  // pane-lessly (APIA-82). It takes precedence — it is the most direct signal.
+  const hiveBee = process.env.HIVE_BEE;
+  if (hiveBee && hiveBee.length > 0) {
+    const byEnv = records.find((record) => record.name === hiveBee);
+    if (byEnv) return byEnv;
+  }
+  if (!process.env.TMUX) return undefined;
   const paneId = process.env.TMUX_PANE;
   if (paneId && paneId.length > 0) {
     const byPane = records.find((record) => record.agentPaneId === paneId);
@@ -3003,7 +3021,9 @@ async function currentTmuxSessionName(): Promise<string | undefined> {
 }
 
 async function cmdHere(parsed: Parsed): Promise<void> {
-  if (!process.env.TMUX) throw new Error("hive here: not inside tmux");
+  // Pane-less HSR bees resolve via HIVE_BEE (APIA-82); only error when neither
+  // a tmux pane nor a HIVE_BEE stamp is available.
+  if (!process.env.TMUX && !process.env.HIVE_BEE) throw new Error("hive here: not inside tmux or an HSR bee");
   const bee = await resolveBeeInCurrentPane();
   if (!bee) throw new Error("hive here: no matching bee for the current pane/session");
 
@@ -3093,7 +3113,7 @@ async function cmdUrls(parsed: Parsed): Promise<void> {
     }
     record = resolved.record;
   } else {
-    if (!process.env.TMUX) throw new Error("hive urls: not inside tmux and no bee selector given");
+    if (!process.env.TMUX && !process.env.HIVE_BEE) throw new Error("hive urls: not inside tmux/an HSR bee and no bee selector given");
     record = await resolveBeeInCurrentPane();
     if (!record) throw new Error("hive urls: no matching bee for the current pane/session");
   }
