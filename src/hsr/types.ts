@@ -64,6 +64,8 @@ export type RunnerOpts = {
   args?: string[];
   /** Auth kind for policy (env scrub etc.). Default "subscription". */
   authKind?: "subscription" | "api-key";
+  /** Model selector for server-tier adapters that pass it out-of-band (codex thread/start). */
+  model?: string;
 };
 
 /**

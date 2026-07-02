@@ -1,3 +1,4 @@
+import { hsrSubstrate } from "../hsr/substrate.js";
 import { loadNodeSync, LOCAL_NODE_NAME, type NodeRecord } from "../node.js";
 import type { SessionRecord } from "../store.js";
 import { createLocalTmuxSubstrate } from "./local-tmux.js";
@@ -13,7 +14,9 @@ export function localSubstrate(): Substrate {
   return getOrCache(`local-tmux::${LOCAL_NODE_NAME}`, createLocalTmuxSubstrate);
 }
 
-export function substrateFor(record: Pick<SessionRecord, "node">): Substrate {
+export function substrateFor(record: Pick<SessionRecord, "node" | "substrate">): Substrate {
+  // HSR is a record-level, local-only substrate — route it before node routing.
+  if (record.substrate === "hsr") return hsrSubstrate();
   const nodeName = record.node && record.node.length > 0 ? record.node : LOCAL_NODE_NAME;
   return substrateForNode(nodeName);
 }

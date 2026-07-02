@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { spawn as spawnChild } from "node:child_process";
+import { tmpdir } from "node:os";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
@@ -94,6 +96,11 @@ import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, load
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
 import { executeFlow } from "./flow/run.js";
 import { cancelRun, spawnDetachedRun } from "./flow/background.js";
+import { runHsrHost } from "./hsr/host.js";
+import { adapterFor } from "./hsr/adapters/index.js";
+import { ensureHsrRunDir, hsrRunDir } from "./hsr/runDir.js";
+import { hsrSubstrate } from "./hsr/substrate.js";
+import type { RunnerOpts } from "./hsr/types.js";
 import { loopFlow } from "./loop/flow.js";
 import { buildLoopConfig } from "./loop/context.js";
 import {
@@ -179,6 +186,10 @@ async function main(argv: string[]) {
   }
   if (argv[0] === "__flow-exec") {
     await runFlowExec(argv.slice(1));
+    return;
+  }
+  if (argv[0] === "__hsr-run") {
+    await runHsrHostFromPayload(argv[1]);
     return;
   }
   const parsed = parse(argv);
@@ -439,6 +450,12 @@ type SpawnOptions = {
   caste?: string;
   brief?: string;
   node?: NodeRecord;
+  /**
+   * Substrate override. HSR ("hsr") runs the bee pane-lessly under a detached
+   * runner host (local-only); absent/"local-tmux" keeps the tmux path. Set only
+   * for HSR spawns — `node` is left undefined in that case.
+   */
+  substrate?: "local-tmux" | "hsr";
   /** Vault account to activate into the home before launch (Phase 3). */
   account?: AccountRecord;
   /** Default model to embed as the CLI model selector (account/profile). */
@@ -455,6 +472,143 @@ type SpawnOptions = {
    */
   timer?: SpawnTimer;
 };
+
+// ──────────────────────────────────────────────────────────────────────────
+// HSR runner host (APIA-76): the detached `hive __hsr-run <payload>` process
+// and the spawn-side fork that launches it. Mirrors flow/background.ts.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** The JSON payload the spawn path hands the detached `hive __hsr-run` host. */
+type HsrRunPayload = {
+  bee: string;
+  kind: string;
+  cwd: string;
+  sessionId?: string;
+  authKind?: "subscription" | "api-key";
+  model?: string;
+  spec: { command: string; args: string[]; env: Record<string, string> };
+};
+
+/** process.execArgv minus flags that would change the child's execution mode. */
+function inheritableExecArgvForHsr(): string[] {
+  return process.execArgv.filter(
+    (arg) => arg !== "--test" && !arg.startsWith("--test=") && arg !== "--watch" && !arg.startsWith("--watch="),
+  );
+}
+
+/** Resolve the CLI entry path (matches spawnDetachedRun's logic). */
+async function resolveHsrEntry(): Promise<string> {
+  const raw = process.argv[1];
+  if (!raw) throw new Error("hsr: could not resolve CLI entry path (process.argv[1] is empty)");
+  try {
+    return await realpath(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * The body of the hidden `hive __hsr-run <payloadPath>` subcommand: read the
+ * payload, run the harness under its RunnerAdapter via runHsrHost, and live
+ * exactly as long as the session (HSR_EXPLORATION.md §7). This process holds the
+ * harness child's pipes; the CLI/daemon observe it purely through the run dir.
+ */
+async function runHsrHostFromPayload(payloadPath: string | undefined): Promise<void> {
+  if (!payloadPath) {
+    process.stderr.write("hive __hsr-run: missing payload path\n");
+    process.exit(1);
+  }
+  let payload: HsrRunPayload;
+  try {
+    payload = JSON.parse(await readFile(payloadPath, "utf8")) as HsrRunPayload;
+  } catch (error) {
+    process.stderr.write(`hive __hsr-run: unreadable payload ${payloadPath}: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+    return;
+  }
+  const adapter = adapterFor(payload.kind);
+  if (!adapter) {
+    process.stderr.write(`hive __hsr-run: no HSR adapter for harness "${payload.kind}"\n`);
+    process.exit(1);
+    return;
+  }
+  // The harness child needs a complete env (PATH etc.), not just the spawn
+  // overrides. The tmux path gets this by merging process.env in its launcher;
+  // here the host inherited the CLI's full env, so overlay spec.env on top of
+  // it. (The claude adapter still scrubs ANTHROPIC_API_KEY for subscriptions.)
+  const childEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === "string") childEnv[key] = value;
+  }
+  Object.assign(childEnv, payload.spec.env);
+  const opts: RunnerOpts = {
+    bee: payload.bee,
+    cwd: payload.cwd,
+    env: childEnv,
+    ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    ...(payload.authKind ? { authKind: payload.authKind } : {}),
+    command: payload.spec.command,
+    args: payload.spec.args,
+    runDir: hsrRunDir(payload.bee),
+  };
+  const handle = await runHsrHost({ bee: payload.bee, adapter, opts });
+  const shutdown = async (): Promise<void> => {
+    try {
+      await handle.stop();
+    } catch {
+      // best-effort; we're exiting regardless
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown());
+  process.on("SIGINT", () => void shutdown());
+  await handle.done;
+  process.exit(0);
+}
+
+/**
+ * Fork the detached `hive __hsr-run` host for a bee and return its pid. Mirrors
+ * spawnDetachedRun/createLauncher: an 0600 payload file under a temp dir, the
+ * host's stdout/stderr to a log file under the run dir, detached + unref'd so it
+ * survives the CLI process.
+ */
+async function spawnHsrHost(payload: HsrRunPayload): Promise<number> {
+  await ensureHsrRunDir(payload.bee);
+  const dir = await mkdtemp(join(tmpdir(), "hive-hsr-payload-"));
+  const payloadPath = join(dir, "payload.json");
+  await writeFile(payloadPath, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
+
+  const logHandle = await open(join(hsrRunDir(payload.bee), "host.log"), "a", 0o600);
+  try {
+    const entry = await resolveHsrEntry();
+    const childArgv = [...inheritableExecArgvForHsr(), entry, "__hsr-run", payloadPath];
+    const child = spawnChild(process.execPath, childArgv, {
+      detached: true,
+      stdio: ["ignore", logHandle.fd, logHandle.fd],
+      env: { ...process.env },
+    });
+    // Async spawn failures surface via 'error' after spawn() returns; the
+    // missing-pid check below converts them into a thrown error.
+    child.once("error", () => undefined);
+    if (!child.pid) throw new Error(`hive __hsr-run: spawn failed (no pid for ${payload.bee})`);
+    const pid = child.pid;
+    child.unref();
+    return pid;
+  } finally {
+    await logHandle.close().catch(() => undefined);
+  }
+}
+
+/** Poll until the runner host records a live session, or the timeout lapses. */
+async function waitForHsrHost(bee: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const substrate = hsrSubstrate();
+  while (Date.now() < deadline) {
+    if (await substrate.hasSession(bee).catch(() => false)) return true;
+    await sleep(100);
+  }
+  return false;
+}
 
 async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // When the caller threads a timer it also owns reporting (it has resolve/ready
@@ -504,6 +658,64 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   timer.mark("allocate");
   const name = safeName(opts.name ?? identity.id);
+
+  // HSR: fork a detached runner host instead of a tmux session. The bee is a
+  // normal SessionRecord with substrate:"hsr", tmuxTarget=name (a logical id, no
+  // tmux target), no pane. resolveAgent / account activation / session-id
+  // pinning / exec-check above are reused verbatim (HSR_EXPLORATION.md §7).
+  if (opts.substrate === "hsr") {
+    const adapter = adapterFor(spec.kind);
+    const runnerTier = adapter?.tier();
+    const hostPid = await spawnHsrHost({
+      bee: name,
+      kind: spec.kind,
+      cwd: opts.cwd,
+      ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
+      authKind: "subscription",
+      ...(opts.model ? { model: opts.model } : {}),
+      spec: { command: spec.command, args: spec.args, env: spec.env },
+    });
+    timer.mark("session-create");
+    const command = shellCommand(spec);
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name,
+      agent: spec.kind,
+      cwd: opts.cwd,
+      command,
+      tmuxTarget: name, // logical id — HSR has no tmux target
+      substrate: "hsr",
+      runnerPid: hostPid,
+      ...(runnerTier ? { runnerTier } : {}),
+      combId: name,
+      createdAt: now,
+      updatedAt: now,
+      status: "running",
+      id: identity.id,
+      prefix: identity.prefix,
+      uuid: identity.uuid,
+      requestedAgent: spec.requestedKind,
+      homePath: spec.homePath,
+      ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
+      ...(opts.colony ? { colony: opts.colony } : {}),
+      ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
+      ...(opts.caste ? { caste: opts.caste } : {}),
+      ...(opts.brief ? { brief: opts.brief } : {}),
+      ...(opts.account ? { accountId: opts.account.id } : {}),
+      ...(opts.autoswap ? { autoswap: true } : {}),
+    };
+    await saveSession(record);
+    await writeSpawnOptions(record);
+    timer.mark("persist");
+    // Wait briefly for the host to come up so the spawn returns a live bee. On
+    // timeout still return the record — observe/deriveState will reconcile.
+    if (!(await waitForHsrHost(name, 5000))) {
+      console.error(note(`hsr host for ${name} did not report live within 5s; the daemon will reconcile`));
+    }
+    if (ownsTimer) timer.report(record.name);
+    return record;
+  }
+
   const tmuxTarget = safeTmuxTarget(name);
   const nodeName = opts.node?.name ?? LOCAL_NODE_NAME;
   const substrate = opts.node ? substrateForRecord(opts.node) : localSubstrate();
@@ -689,7 +901,10 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const colony = await resolveSpawnColony(parsed);
   const spec = resolveAgent(agent, extraArgs, { home, yolo });
-  const node = await resolveSpawnNode(parsed, spec.kind);
+  // HSR is a substrate, not a node: `--substrate hsr` skips node resolution and
+  // runs the bee pane-lessly on the local runner host (HSR_EXPLORATION.md §7).
+  const useHsr = hsrSubstrateRequested(parsed);
+  const node = useHsr ? undefined : await resolveSpawnNode(parsed, spec.kind);
   const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : undefined;
   const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
@@ -705,10 +920,10 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   // "resolve" folds in account/profile/node resolution above (remote node probe
   // lives here); spawnBee marks its own internal phases on the same timer.
   timer.mark("resolve");
-  let record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer });
-  const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
+  let record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(useHsr ? { substrate: "hsr" } : {}) });
+  const nodeSuffix = useHsr ? [dim("substrate:hsr")] : node && node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
-  else console.log(`${record.name}\t${agent}\t${cwd}\t${node.name}`);
+  else console.log(`${record.name}\t${agent}\t${cwd}\t${useHsr ? "hsr" : node?.name ?? LOCAL_NODE_NAME}`);
   if (truthy(flag(parsed, "briefed")) && briefText) {
     record = await deliverBrief(parsed, record, briefText);
     timer.mark("brief");
@@ -1512,6 +1727,12 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
  */
 async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise<void> {
   if (truthy(flag(parsed, "no-wait"))) return;
+  // HSR bees have no interactive TUI to poll — the runner host was already
+  // confirmed live at spawn. Mark it waiting (its "ready" state) and return.
+  if (record.substrate === "hsr") {
+    await writeHiveState(record, "waiting");
+    return;
+  }
   try {
     await waitForAgentReady(record, {
       timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
@@ -3813,16 +4034,21 @@ async function cmdX(parsed: Parsed) {
   };
   const record = await cmdSpawn(spawnParsed);
 
-  try {
-    await waitForAgentReady(record, {
-      timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
-      acceptTrust: acceptsTrust(parsed),
-      raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
-    });
-  } catch (error) {
-    if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
-    console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
-    if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+  // HSR bees have no interactive TUI to poll for readiness — the runner host is
+  // ready as soon as spawn confirmed it live (hasSession). Skip the pane-scrape
+  // readiness wait; steer straight through the control socket.
+  if (record.substrate !== "hsr") {
+    try {
+      await waitForAgentReady(record, {
+        timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+        acceptTrust: acceptsTrust(parsed),
+        raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
+      });
+    } catch (error) {
+      if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
+      console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
+      if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+    }
   }
 
   await substrateFor(record).sendText(record.tmuxTarget, prompt);
@@ -7516,6 +7742,18 @@ function highlightSnippet(snippet: string, start: number, end: number): string {
   const match = snippet.slice(start, end);
   const after = snippet.slice(end);
   return `${before}${bold(yellow(match))}${after}`;
+}
+
+/**
+ * `--substrate hsr` (or bare `hsr` / `hsr:local`) selects the local runner-host
+ * substrate. HSR is NOT a node, so callers short-circuit node resolution when
+ * this is true and set opts.substrate="hsr" instead.
+ */
+function hsrSubstrateRequested(parsed: Parsed): boolean {
+  const raw = flag(parsed, "substrate");
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim().toLowerCase();
+  return trimmed === "hsr" || trimmed === "hsr:local";
 }
 
 export function parseSubstrateAlias(value: string): { kind?: NodeRecord["kind"]; node: string } {
