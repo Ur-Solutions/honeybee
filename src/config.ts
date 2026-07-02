@@ -48,11 +48,41 @@ export type NamingConfig = {
 export const NAMING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"] as const;
 export type NamingEffort = (typeof NAMING_EFFORTS)[number];
 
+export type SubstrateDefault = "hsr" | "local-tmux";
+
+export type SpawnConfig = {
+  /**
+   * Default substrate a bare (no `--substrate`/`--node`) spawn resolves to,
+   * keyed by the spawn's origin (HSR_EXPLORATION.md §5): `agent` when the
+   * spawning process is itself a bee, `user` for human/terminal spawns.
+   */
+  defaultSubstrate?: {
+    agent?: SubstrateDefault;
+    user?: SubstrateDefault;
+  };
+};
+
 export type HiveConfig = {
   bees?: Record<string, BeeConfig>;
   briefFooter?: string;
   naming?: NamingConfig;
+  spawn?: SpawnConfig;
 };
+
+/** Origin defaults when config is absent: agents run pane-less HSR, humans keep local tmux. */
+const DEFAULT_SPAWN_SUBSTRATE: Record<"agent" | "user", SubstrateDefault> = {
+  agent: "hsr",
+  user: "local-tmux",
+};
+
+/**
+ * The substrate a bare spawn (no explicit `--substrate`/`--node`) defaults to
+ * for the given origin, honoring `spawn.defaultSubstrate` overrides.
+ */
+export function spawnDefaultSubstrate(origin: "agent" | "user"): SubstrateDefault {
+  const configured = loadConfig().spawn?.defaultSubstrate?.[origin];
+  return configured ?? DEFAULT_SPAWN_SUBSTRATE[origin];
+}
 
 export const DEFAULT_BRIEF_FOOTER =
   "\n\n(Context only — do not start work yet. Acknowledge briefly, then wait for a follow-up message with the task.)";
@@ -133,6 +163,18 @@ function normalizeConfig(value: unknown): HiveConfig {
     if (typeof r.command === "string" && r.command.length > 0) naming.command = r.command;
     if (typeof r.effort === "string" && (NAMING_EFFORTS as readonly string[]).includes(r.effort)) naming.effort = r.effort as NamingEffort;
     config.naming = naming;
+  }
+  if (object.spawn && typeof object.spawn === "object" && !Array.isArray(object.spawn)) {
+    const r = object.spawn as Record<string, unknown>;
+    const spawn: SpawnConfig = {};
+    if (r.defaultSubstrate && typeof r.defaultSubstrate === "object" && !Array.isArray(r.defaultSubstrate)) {
+      const d = r.defaultSubstrate as Record<string, unknown>;
+      const defaults: NonNullable<SpawnConfig["defaultSubstrate"]> = {};
+      if (d.agent === "hsr" || d.agent === "local-tmux") defaults.agent = d.agent;
+      if (d.user === "hsr" || d.user === "local-tmux") defaults.user = d.user;
+      if (defaults.agent !== undefined || defaults.user !== undefined) spawn.defaultSubstrate = defaults;
+    }
+    if (spawn.defaultSubstrate !== undefined) config.spawn = spawn;
   }
   if (object.bees && typeof object.bees === "object" && !Array.isArray(object.bees)) {
     const bees: Record<string, BeeConfig> = {};

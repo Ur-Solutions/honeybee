@@ -90,7 +90,7 @@ import {
   sendBuzMessage,
   senderDisplay,
 } from "./buz.js";
-import { beeConfig, briefFooter, configPath, loadConfig, NAMING_EFFORTS, resetConfigCache, type NamingEffort } from "./config.js";
+import { beeConfig, briefFooter, configPath, loadConfig, NAMING_EFFORTS, resetConfigCache, spawnDefaultSubstrate, type NamingEffort } from "./config.js";
 import { getCompletions, shellScript } from "./completion.js";
 import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, type Frame } from "./frame.js";
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
@@ -918,8 +918,9 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const spec = resolveAgent(agent, extraArgs, { home, yolo });
   // HSR is a substrate, not a node: `--substrate hsr` skips node resolution and
   // runs the bee pane-lessly on the local runner host (HSR_EXPLORATION.md §7).
-  const useHsr = hsrSubstrateRequested(parsed);
-  const node = useHsr ? undefined : await resolveSpawnNode(parsed, spec.kind);
+  // Origin-based default (agents → HSR, humans → local-tmux) with explicit
+  // `--substrate`/`--node` override — see resolveSpawnSubstrate (§5).
+  const { useHsr, node } = await resolveSpawnSubstrate(parsed, spec.kind);
   const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : undefined;
   const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
@@ -7841,12 +7842,53 @@ function hsrSubstrateRequested(parsed: Parsed): boolean {
   return trimmed === "hsr" || trimmed === "hsr:local";
 }
 
+/**
+ * Resolve which substrate a `hive spawn`/`x`/`new` bee lands on
+ * (HSR_EXPLORATION.md §5). Precedence, highest first:
+ *   1. Explicit `--substrate hsr` (or `hsr:local`)            → HSR.
+ *   2. Explicit `--substrate local|tmux|ssh:...` or `--node`  → tmux (node
+ *      resolution). An explicit choice by an agent overrides the agent default.
+ *   3. Nothing explicit → origin default: agent-initiated spawns (the spawning
+ *      process is itself a bee) follow `spawn.defaultSubstrate.agent` (default
+ *      "hsr"); human/terminal spawns follow `.user` (default "local-tmux").
+ * Only the `spawnSingleBee` path uses this; flows/swarms/fork keep prior
+ * behavior for now (follow-ups: APIA-85 fork, flow/swarm defaults).
+ */
+export async function resolveSpawnSubstrate(parsed: Parsed, agentKind: string): Promise<{ useHsr: boolean; node?: NodeRecord }> {
+  if (hsrSubstrateRequested(parsed)) return { useHsr: true };
+  const substrateFlag = flag(parsed, "substrate");
+  const nodeFlag = flag(parsed, "node");
+  const explicitSubstrate = typeof substrateFlag === "string" && substrateFlag.trim().length > 0;
+  const explicitNode = typeof nodeFlag === "string" && nodeFlag.trim().length > 0;
+  if (explicitSubstrate || explicitNode) {
+    // An explicit non-hsr substrate or node forces tmux — even for agents, so a
+    // bee can opt its child back onto a visible pane with `--substrate tmux`.
+    return { useHsr: false, node: await resolveSpawnNode(parsed, agentKind) };
+  }
+  const origin = (await resolveBeeInCurrentPane()) ? "agent" : "user";
+  const want = spawnDefaultSubstrate(origin);
+  if (want === "hsr") {
+    // Discoverability: the origin default (not an explicit flag) chose HSR.
+    if (origin === "agent" && isPretty()) {
+      console.error(note("agent-context spawn -> HSR (pane-less); use --substrate tmux to override"));
+    }
+    return { useHsr: true };
+  }
+  return { useHsr: false, node: await resolveSpawnNode(parsed, agentKind) };
+}
+
 export function parseSubstrateAlias(value: string): { kind?: NodeRecord["kind"]; node: string } {
   // Accepts both "<kind>:<node>" (e.g. "ssh:mini01", "local:local") and bare "<node>" forms.
   const trimmed = value.trim();
   if (!trimmed) return { node: LOCAL_NODE_NAME };
   const idx = trimmed.indexOf(":");
-  if (idx === -1) return { node: trimmed };
+  if (idx === -1) {
+    // Bare "tmux"/"local"/"local-tmux" are a substrate choice meaning "force the
+    // local tmux node", not a node name to look up.
+    const kind = substrateKindForAlias(trimmed.toLowerCase());
+    if (kind === "local-tmux") return { kind, node: LOCAL_NODE_NAME };
+    return { node: trimmed };
+  }
   const kindRaw = trimmed.slice(0, idx).trim();
   const node = trimmed.slice(idx + 1).trim();
   if (!node) throw new Error(`Invalid --substrate "${value}": missing node name after the kind prefix (e.g. ssh:mini01)`);
@@ -7858,7 +7900,7 @@ export function parseSubstrateAlias(value: string): { kind?: NodeRecord["kind"];
 
 function substrateKindForAlias(alias: string): NodeRecord["kind"] | undefined {
   if (alias === "ssh" || alias === "ssh-tmux") return "ssh-tmux";
-  if (alias === "local" || alias === "local-tmux") return "local-tmux";
+  if (alias === "local" || alias === "local-tmux" || alias === "tmux") return "local-tmux";
   return undefined;
 }
 
