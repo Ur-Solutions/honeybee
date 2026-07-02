@@ -99,6 +99,7 @@ import { cancelRun, spawnDetachedRun } from "./flow/background.js";
 import { runHsrHost } from "./hsr/host.js";
 import { adapterFor } from "./hsr/adapters/index.js";
 import { ensureHsrRunDir, hsrRunDir } from "./hsr/runDir.js";
+import { hsrObservations, type HsrObservation } from "./hsr/observe.js";
 import { hsrSubstrate } from "./hsr/substrate.js";
 import type { RunnerOpts } from "./hsr/types.js";
 import { loopFlow } from "./loop/flow.js";
@@ -1886,12 +1887,26 @@ async function cmdList(parsed: Parsed) {
   const panes = await capturePanesFor(records, probe.liveTargets);
   const seals = await listSealedBeeNames();
   const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
+  // HSR bees are pane-less — observed from run dirs, not tmux. Without this they
+  // have no live pane/target and deriveState reads every one as dead.
+  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+  const hsrLive = new Set<string>();
+  const hsrStates = new Map<string, BeeState>();
+  const hsrSnapshots = new Map<string, string>();
+  for (const [bee, observation] of hsrObs) {
+    if (observation.live) hsrLive.add(bee);
+    if (observation.state) hsrStates.set(bee, observation.state);
+    hsrSnapshots.set(bee, observation.snapshot);
+  }
   const context: StateContext = {
     liveTargets: probe.liveTargets,
     livePanes,
     panes,
     seals,
     unreachableNodes: probe.unreachableNodes,
+    hsrLive,
+    hsrStates,
+    hsrSnapshots,
     now: Date.now(),
   };
   const states = new Map(records.map((record) => [record.name, deriveState(record, context)] as const));
@@ -2111,12 +2126,26 @@ async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[];
   const panes = await capturePanesFor(records, probe.liveTargets);
   const seals = await listSealedBeeNames();
   const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
+  // HSR bees are pane-less — observed from run dirs, not tmux. Best-effort so a
+  // bad/absent HSR root never breaks the tmux path.
+  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+  const hsrLive = new Set<string>();
+  const hsrStates = new Map<string, BeeState>();
+  const hsrSnapshots = new Map<string, string>();
+  for (const [bee, observation] of hsrObs) {
+    if (observation.live) hsrLive.add(bee);
+    if (observation.state) hsrStates.set(bee, observation.state);
+    hsrSnapshots.set(bee, observation.snapshot);
+  }
   const context: StateContext = {
     liveTargets: probe.liveTargets,
     livePanes,
     panes,
     seals,
     unreachableNodes: probe.unreachableNodes,
+    hsrLive,
+    hsrStates,
+    hsrSnapshots,
     now: Date.now(),
   };
 

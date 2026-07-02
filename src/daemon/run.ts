@@ -5,6 +5,7 @@ import { hiveStateFor, writeHiveState } from "../hiveState.js";
 import { listNodes, type NodeRecord } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
+import { hsrObservations, reapDeadHosts, type HsrObservation } from "../hsr/observe.js";
 import { deriveState, liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
@@ -80,6 +81,13 @@ export type TickDeps = {
   capturePanes: (records: SessionRecord[], liveTargets: Set<string>) => Promise<Map<string, string>>;
   /** Live pane ids on the local server, for pane-pinned liveness (problem c). */
   livePanes?: () => Promise<Set<string>>;
+  /**
+   * Cross-process observation of pane-less HSR bees, read from run dirs (host-pid
+   * liveness + structured event state). Threaded into the tick's StateContext so
+   * the daemon derives HSR state and drives transitions/buz-drain for HSR bees
+   * exactly like tmux bees. Absent → no HSR bees observed this tick.
+   */
+  hsrObservations?: () => Promise<Map<string, HsrObservation>>;
   sealedBeeNames: () => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
@@ -187,6 +195,22 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     ? await guard(withTimeout(deps.livePanes(), timeouts.substrateMs, "livePanes"), errors, new Set<string>())
     : new Set<string>();
 
+  // Observe pane-less HSR bees from their run dirs. Same per-call budget +
+  // guard as every other external await in the tick — a wedged fs read is
+  // converted into a skipped stage (empty map) and a recentErrors entry, never
+  // an unbounded await that freezes the loop.
+  const hsrObs: Map<string, HsrObservation> = deps.hsrObservations
+    ? await guard(withTimeout(deps.hsrObservations(), timeouts.substrateMs, "hsrObservations"), errors, new Map())
+    : new Map();
+  const hsrLive = new Set<string>();
+  const hsrStates = new Map<string, BeeState>();
+  const hsrSnapshots = new Map<string, string>();
+  for (const [bee, observation] of hsrObs) {
+    if (observation.live) hsrLive.add(bee);
+    if (observation.state) hsrStates.set(bee, observation.state);
+    hsrSnapshots.set(bee, observation.snapshot);
+  }
+
   const nowMs = deps.now();
   const context: StateContext = {
     liveTargets: probe.liveTargets,
@@ -194,6 +218,9 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     panes,
     seals,
     unreachableNodes: probe.unreachableNodes,
+    hsrLive,
+    hsrStates,
+    hsrSnapshots,
     now: nowMs,
   };
 
@@ -454,6 +481,15 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   await appendDaemonLog({ level: "info", msg: "daemon.start", pid: process.pid, tickMs: config.tickMs });
   await appendLedger({ type: "daemon.start", pid: process.pid, startedAt, version: DAEMON_VERSION }).catch(() => undefined);
 
+  // Crash adoption v1: a daemon restart reconciles any HSR bee whose meta still
+  // says "running" but whose host pid is dead (the host owns the harness pipes,
+  // so a dead host is an unrecoverable session). Best-effort — a bad HSR root
+  // must never block startup.
+  const reaped = await reapDeadHosts().catch(() => [] as string[]);
+  if (reaped.length > 0) {
+    await appendDaemonLog({ level: "info", msg: "hsr.reaped", bees: reaped }).catch(() => undefined);
+  }
+
   if (options.shutdownSignal) {
     if (options.shutdownSignal.aborted) {
       requestShutdown("abort", 0);
@@ -665,6 +701,7 @@ export function buildDefaultDeps(): TickDeps {
     probeNodes: defaultProbeNodes,
     capturePanes: defaultCapturePanes,
     livePanes: () => localSubstrate().listPanes(),
+    hsrObservations: () => hsrObservations(),
     sealedBeeNames,
     touchSession,
     mirrorHiveState: async (record, state) => {

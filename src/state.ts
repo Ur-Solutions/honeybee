@@ -33,6 +33,16 @@ export type StateContext = {
   panes?: Map<string, string>;
   seals?: Set<string>;
   unreachableNodes?: Set<string>;
+  /**
+   * HSR (pane-less runner) observation, keyed by bee name. Sourced from
+   * hsrObservations() (run-dir reads, never tmux): `hsrLive` is host-pid
+   * liveness, `hsrStates` is the structured BeeState from the events tail, and
+   * `hsrSnapshots` is the ring text used as an output fallback. A record with
+   * substrate "hsr" is resolved from these instead of the tmux pane sets.
+   */
+  hsrLive?: Set<string>;
+  hsrStates?: Map<string, BeeState>;
+  hsrSnapshots?: Map<string, string>;
   now?: number;
 };
 
@@ -69,6 +79,14 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   const nodeName = record.node && record.node.length > 0 ? record.node : LOCAL_NODE_NAME;
   if (context.unreachableNodes?.has(nodeName)) {
     return { state: "node_unreachable", detail: `node ${nodeName} offline` };
+  }
+
+  // HSR bees are pane-less: they have neither a live pane nor a live tmux target,
+  // so the tmux liveness block below would read every one as dead. Resolve them
+  // from the run-dir observation (host-pid liveness + structured event state)
+  // that hsrObservations() threaded into the context.
+  if (record.substrate === "hsr") {
+    return deriveHsrState(record, context);
   }
 
   // Pane-pinned local bees: liveness is the PANE, not the session. This is the
@@ -126,6 +144,52 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   }
 
   return { state: "idle_with_output", detail: describeIdle(record, now) };
+}
+
+/**
+ * Resolve an HSR (pane-less) bee purely from run-dir observation. Liveness is
+ * the host pid (context.hsrLive); the live state is the structured BeeState the
+ * observer derived from the events tail (context.hsrStates). We never touch the
+ * tmux pane sets here — an HSR bee has no pane and no live target.
+ */
+function deriveHsrState(record: SessionRecord, context: StateContext): DerivedState {
+  const live = context.hsrLive?.has(record.name) ?? false;
+  if (!live) {
+    if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
+    return { state: "dead", detail: lastActivityHint(record, context) };
+  }
+  if (context.seals?.has(record.name)) {
+    return { state: "sealed", detail: "seal recorded" };
+  }
+
+  const structured = context.hsrStates?.get(record.name);
+  if (structured) {
+    switch (structured) {
+      case "active":
+        return { state: "active", detail: describeActivity(record) };
+      case "idle_with_output":
+        return { state: "idle_with_output", detail: describeIdle(record, context.now ?? Date.now()) };
+      case "blocked":
+        return { state: "blocked", detail: "awaiting input" };
+      case "ready":
+        return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
+      case "booting":
+        return { state: "booting", detail: "starting up" };
+      default:
+        return { state: structured, detail: describeActivity(record) };
+    }
+  }
+
+  // No structured signal yet: a recent prompt means the bee is working; else the
+  // ring snapshot standing in for pane output decides booting vs idle.
+  const now = context.now ?? Date.now();
+  const promptAt = record.lastPromptAt ? Date.parse(record.lastPromptAt) : NaN;
+  if (Number.isFinite(promptAt) && now - promptAt < ACTIVE_WINDOW_MS) {
+    return { state: "active", detail: describeActivity(record) };
+  }
+  const snapshot = context.hsrSnapshots?.get(record.name) ?? "";
+  if (snapshot.length > 0) return { state: "idle_with_output", detail: describeIdle(record, now) };
+  return { state: "booting", detail: "starting up" };
 }
 
 export function stateLabel(state: BeeState): string {
