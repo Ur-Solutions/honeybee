@@ -1060,3 +1060,74 @@ test("autoAccountTool and roundRobinAccountTool parse only their reserved query"
   assert.equal(autoAccountTool("nosuchtool-auto"), undefined);
   assert.equal(roundRobinAccountTool("nosuchtool-rr"), undefined);
 });
+
+test("activations of distinct accounts run in parallel, not serialized on one lock (HIVE-64)", async () => {
+  await withTempStore(async (dir) => {
+    const slowAccount = await addAccount("claude", "slow@a.b");
+    const fastAccount = await addAccount("claude", "fast@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(slowAccount), ".credentials.json"), chainJson("tok-slow-dead", now - 1_000, "r-slow"));
+    await writeFile(join(accountDir(fastAccount), ".credentials.json"), chainJson("tok-fast", now + 8 * 3_600_000, "r-fast"));
+
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => (releaseRefresh = resolve));
+    let refreshStarted!: () => void;
+    const refreshInFlight = new Promise<void>((resolve) => (refreshStarted = resolve));
+
+    // The slow account's activation holds ITS lock through a (gated) network
+    // refresh — the exact shape of the 15s OAuth refresh hold.
+    const slow = activateAccountIntoHome(slowAccount, join(dir, "homes", slowAccount.id), {
+      refreshClaudeToken: async () => {
+        refreshStarted();
+        await refreshGate;
+        return { accessToken: "tok-slow-new", refreshToken: "r-slow2", expiresAt: now + 8 * 3_600_000 };
+      },
+    });
+    await refreshInFlight;
+
+    // A different account must not queue behind that refresh. Under the old
+    // machine-wide lock this deadlocks: fast waits on slow's lock, and slow's
+    // gate is only released after fast completes.
+    let timer: NodeJS.Timeout | undefined;
+    const fast = await Promise.race([
+      activateAccountIntoHome(fastAccount, join(dir, "homes", fastAccount.id)),
+      new Promise<"stuck">((resolve) => (timer = setTimeout(() => resolve("stuck"), 10_000))),
+    ]);
+    clearTimeout(timer);
+    releaseRefresh();
+    assert.notEqual(fast, "stuck", "second account's activation queued behind the first account's network refresh");
+    await slow;
+
+    const fastHome = JSON.parse(await readFile(join(dir, "homes", fastAccount.id, ".credentials.json"), "utf8"));
+    assert.equal(fastHome.claudeAiOauth.accessToken, "tok-fast");
+    const slowHome = JSON.parse(await readFile(join(dir, "homes", slowAccount.id, ".credentials.json"), "utf8"));
+    assert.equal(slowHome.claudeAiOauth.accessToken, "tok-slow-new");
+  });
+});
+
+test("concurrent activations of the SAME account still serialize and refresh once (HIVE-2)", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "serial@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-dead", now - 1_000, "r1"));
+
+    let refreshes = 0;
+    const refreshClaudeToken = async () => {
+      refreshes += 1;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { accessToken: "tok-new", refreshToken: "r2", expiresAt: now + 8 * 3_600_000 };
+    };
+    await Promise.all([
+      activateAccountIntoHome(account, join(dir, "homes", account.id), { refreshClaudeToken }),
+      activateAccountIntoHome(account, join(dir, "slot-2"), { refreshClaudeToken }),
+    ]);
+
+    // The loser of the lock race re-reads the vault, finds the rotated fresh
+    // chain, and must NOT replay the now-dead r1 refresh token.
+    assert.equal(refreshes, 1);
+    for (const home of [join(dir, "homes", account.id), join(dir, "slot-2")]) {
+      const creds = JSON.parse(await readFile(join(home, ".credentials.json"), "utf8"));
+      assert.equal(creds.claudeAiOauth.accessToken, "tok-new");
+    }
+  });
+});
