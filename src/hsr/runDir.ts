@@ -165,8 +165,9 @@ const eventLogSizes = new Map<string, number>();
 // for state + usage, so it must stay small: once it crosses MAX_BYTES the
 // writer compacts it down to a tail of at most COMPACT_KEEP_LINES lines /
 // COMPACT_TARGET_BYTES bytes, folding the dropped prefix into checkpoint
-// events (see compactHsrEvents). KEEP_LINES stays comfortably above the
-// observers' 200-line tail window (observe.ts EVENT_TAIL_LINES).
+// events (see compactHsrEvents). Observers read the whole bounded log
+// (observe.ts EVENT_TAIL_MAX_BYTES covers MAX_BYTES), so the derived
+// structured state survives any turn length (HIVE-55).
 export const HSR_EVENTS_MAX_BYTES = 1024 * 1024;
 export const HSR_EVENTS_COMPACT_KEEP_LINES = 400;
 export const HSR_EVENTS_COMPACT_TARGET_BYTES = 512 * 1024;
@@ -181,10 +182,19 @@ export type HsrEventsCompactLimits = { keepLines: number; targetBytes: number };
  *   - one `usage` event summing every dropped usage event's token counts, so
  *     hsrUsageObservation's cumulative sum is unchanged by compaction;
  *   - the latest dropped `exhausted` event, so the usage sampler's
- *     latest-by-ts exhaustion edge survives even when it fell in the prefix.
+ *     latest-by-ts exhaustion edge survives even when it fell in the prefix;
+ *   - the LAST dropped turn_start / turn_end / needs_input lines, verbatim and
+ *     in their original relative order (HIVE-55). The structured-state
+ *     derivation and pendingNeedsInput only depend on the relative order of
+ *     the last marker of each type, so preserving these makes the derived
+ *     state invariant under compaction — a turn whose start scrolled into the
+ *     dropped prefix still observes as "active", and an unresolved
+ *     needs_input keeps its full payload for `hive answer`;
+ *   - a minimal `text` stub when the prefix held assistant text but no turn
+ *     markers at all, so a marker-less session keeps observing "ready"
+ *     rather than regressing to "booting".
  *
- * Checkpoint types carry no turn markers, so the structured-state derivation
- * over the kept tail is unaffected. Single-writer only (the host / mirror that
+ * Single-writer only (the host / mirror that
  * owns the run dir) — called from the per-bee append chain; the atomic replace
  * means concurrent READERS see either the old or the new file, never a tear.
  */
@@ -210,13 +220,18 @@ export async function compactHsrEvents(
     keepStart -= 1;
   }
   if (keepStart === 0) return; // already within bounds — nothing to drop
-  // Fold the dropped prefix: sum usage tokens, remember the newest exhausted.
+  // Fold the dropped prefix: sum usage tokens, remember the newest exhausted,
+  // and keep the last turn/needs markers so the derived state survives.
   let inputTokens = 0;
   let outputTokens = 0;
   let totalTokens = 0;
   let sawUsage = false;
   let usageTs = 0;
   let latestExhausted: { ts: number; resetHint?: string } | undefined;
+  let lastTurnStart: { index: number; line: string } | undefined;
+  let lastTurnEnd: { index: number; line: string } | undefined;
+  let lastNeedsInput: { index: number; line: string } | undefined;
+  let lastTextTs: number | undefined;
   for (let i = 0; i < keepStart; i++) {
     let event: RunnerEvent;
     try {
@@ -226,7 +241,15 @@ export async function compactHsrEvents(
     } catch {
       continue; // torn / partial line — drop it
     }
-    if (event.type === "usage") {
+    if (event.type === "turn_start") {
+      lastTurnStart = { index: i, line: lines[i]! };
+    } else if (event.type === "turn_end") {
+      lastTurnEnd = { index: i, line: lines[i]! };
+    } else if (event.type === "needs_input") {
+      lastNeedsInput = { index: i, line: lines[i]! };
+    } else if (event.type === "text") {
+      if (event.text.length > 0) lastTextTs = typeof event.ts === "number" && Number.isFinite(event.ts) ? event.ts : 0;
+    } else if (event.type === "usage") {
       sawUsage = true;
       if (typeof event.inputTokens === "number" && Number.isFinite(event.inputTokens)) inputTokens += event.inputTokens;
       if (typeof event.outputTokens === "number" && Number.isFinite(event.outputTokens)) outputTokens += event.outputTokens;
@@ -245,6 +268,19 @@ export async function compactHsrEvents(
   }
   if (latestExhausted) {
     checkpoint.push(JSON.stringify({ type: "exhausted", ...latestExhausted } satisfies RunnerEvent));
+  }
+  // Turn/needs markers in original relative order — observers derive state
+  // from the LAST marker of each type, so this keeps the derivation exact.
+  const markers = [lastTurnStart, lastTurnEnd, lastNeedsInput].filter(
+    (marker): marker is { index: number; line: string } => marker !== undefined,
+  );
+  markers.sort((a, b) => a.index - b.index);
+  if (markers.length > 0) {
+    checkpoint.push(...markers.map((marker) => marker.line));
+  } else if (lastTextTs !== undefined) {
+    // Marker-less prefix with assistant text: keep "ready" observable via a
+    // minimal stub instead of re-carrying a possibly huge text line.
+    checkpoint.push(JSON.stringify({ type: "text", ts: lastTextTs, text: "…" } satisfies RunnerEvent));
   }
   const content = `${[...checkpoint, ...lines.slice(keepStart)].join("\n")}\n`;
   await atomicWriteFile(hsrEventsPath(bee), content, { mode: 0o600 });
