@@ -26,7 +26,7 @@ import { beeMailboxDir, processQueueForBee, type DrainResult } from "../buz.js";
 import type { SessionRecord } from "../store.js";
 import { substrateFor, type Substrate } from "../substrates/index.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
-import type { TickTransition } from "./run.js";
+import type { TickTransition } from "./tick.js";
 
 const DEFAULT_BUZ_MAILBOX_CONCURRENCY = 16;
 const DEFAULT_BUZ_DRAIN_CONCURRENCY = 8;
