@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
-import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, resolveHome, shellCommand, tmuxOptionsForAgent } from "./agents.js";
+import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, hasSessionIdArg, resolveAgent, resolveHome, shellCommand, tmuxOptionsForAgent } from "./agents.js";
 import {
   AUTO_ACCOUNT_QUERY,
   RR_ACCOUNT_QUERY,
@@ -96,7 +96,7 @@ import {
 } from "./buz.js";
 import { beeConfig, briefFooter, configPath, loadConfig, NAMING_EFFORTS, resetConfigCache, spawnDefaultSubstrate, type NamingEffort } from "./config.js";
 import { getCompletions, shellScript } from "./completion.js";
-import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, type Frame } from "./frame.js";
+import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, writeFrameFromValidatedObject, type Frame } from "./frame.js";
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
 import { executeFlow } from "./flow/run.js";
 import { cancelRun, spawnDetachedRun } from "./flow/background.js";
@@ -431,9 +431,14 @@ async function maybeLinkHere(parsed: Parsed, records: SessionRecord[]): Promise<
     console.error(note("--here ignored: not inside tmux (plain spawn done)"));
     return;
   }
-  const local = records.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
-  if (local.length < records.length) {
-    console.error(note(`--here skips ${records.length - local.length} remote bee(s) — link-window cannot cross tmux servers`));
+  const local = records.filter((record) => record.substrate !== "hsr" && (!record.node || record.node === LOCAL_NODE_NAME));
+  const paneLess = records.filter((record) => record.substrate === "hsr").length;
+  const remote = records.filter((record) => record.substrate !== "hsr" && record.node && record.node !== LOCAL_NODE_NAME).length;
+  if (paneLess > 0) {
+    console.error(note(`--here skips ${paneLess} pane-less HSR bee(s) — no tmux window to link`));
+  }
+  if (remote > 0) {
+    console.error(note(`--here skips ${remote} remote bee(s) — link-window cannot cross tmux servers`));
   }
   if (local.length === 0) return;
   try {
@@ -455,7 +460,7 @@ function resolveSpawnCount(parsed: Parsed): number {
   if (raw === undefined) return 1;
   const value = typeof raw === "string" ? Number(raw) : NaN;
   if (Number.isInteger(value) && value >= 1) return value;
-  throw new Error(`--count must be an integer >= 2 (got ${raw === true ? "no value" : String(raw)})`);
+  throw new Error(`--count must be an integer >= 1 (got ${raw === true ? "no value" : String(raw)})`);
 }
 
 type SpawnOptions = {
@@ -717,7 +722,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // mtime — the auto-titler and resume/swap all key off providerSessionId. Skip
   // when the caller already supplied --session-id in extra args.
   let pinnedSessionId: string | undefined;
-  if (!opts.extraArgs?.includes("--session-id")) {
+  if (!hasSessionIdArg(opts.extraArgs)) {
     const sid = randomUUID();
     const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
     if (sessionArgs) {
@@ -1105,8 +1110,9 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${useHsr ? "hsr" : node?.name ?? LOCAL_NODE_NAME}`);
   if (truthy(flag(parsed, "briefed")) && briefText) {
-    record = await deliverBrief(parsed, record, briefText);
-    timer.mark("brief");
+    const delivered = await deliverSpawnBrief(parsed, record, briefText);
+    record = delivered.record;
+    timer.mark(delivered.sent ? "brief" : "ready");
   } else {
     await confirmSpawnReady(parsed, record);
     timer.mark("ready");
@@ -1521,8 +1527,12 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
         provider: beeProvider,
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
-      if (toDeliver) record = await deliverBrief(parsed, record, toDeliver);
-      else unbriefed.push(record);
+      if (toDeliver) {
+        const delivered = await deliverSpawnBrief(parsed, record, toDeliver);
+        record = delivered.record;
+      } else {
+        unbriefed.push(record);
+      }
       records.push(record);
       if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`caste:${caste.name}`), dim(`@${swarmId}`)]));
       else console.log(`${record.name}\t${record.agent}\t${cwd}\t${caste.name}\t@${swarmId}`);
@@ -1911,6 +1921,21 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
   return updated;
 }
 
+async function deliverSpawnBrief(parsed: Parsed, record: SessionRecord, briefText: string): Promise<{ record: SessionRecord; sent: boolean }> {
+  try {
+    return { record: await deliverBrief(parsed, record, briefText), sent: true };
+  } catch (error) {
+    if (!(error instanceof AgentReadinessError)) throw error;
+    warnSpawnReadiness(record, error);
+    return { record, sent: false };
+  }
+}
+
+function warnSpawnReadiness(record: SessionRecord, error: AgentReadinessError): void {
+  if (isPretty()) console.error(actionLine("warn", "spawn", [`${bold(record.name)} not confirmed ready (${error.reason})`]));
+  else console.error(`warn\tspawn\t${record.name}\t${error.reason}`);
+}
+
 /**
  * After a bare spawn, wait for the freshly spawned bee to reach its prompt,
  * auto-accepting any startup trust/safety prompt along the way (e.g. codex's
@@ -1938,8 +1963,7 @@ async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise
     await writeHiveState(record, "waiting");
   } catch (error) {
     if (!(error instanceof AgentReadinessError)) throw error;
-    if (isPretty()) console.error(actionLine("warn", "spawn", [`${bold(record.name)} not confirmed ready (${error.reason})`]));
-    else console.error(`warn\tspawn\t${record.name}\t${error.reason}`);
+    warnSpawnReadiness(record, error);
   }
 }
 
@@ -2014,7 +2038,7 @@ async function cmdSend(parsed: Parsed) {
 async function cmdAnswer(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive answer <bee> [text]");
-  const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ") ?? "";
+  const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ");
   const answer = text.length > 0 ? text : "yes";
 
   const record = await resolveSession(target);
@@ -3921,8 +3945,9 @@ async function liveTmuxRootBinds(): Promise<Map<string, string>> {
   const result = await tmux(["list-keys", "-T", "root"], { reject: false });
   if (!result.ok) return binds;
   for (const line of result.stdout.split("\n")) {
-    // Format: `bind-key -T root M-b <command...>`. Find the table+key, take the rest.
-    const match = line.match(/^bind-key\s+(?:-r\s+)?-T\s+root\s+(\S+)\s+(.*)$/);
+    // Format: `bind-key [-r] [-N note] -T root M-b <command...>`.
+    // tmux may decorate binds before the table flag; keep the command tail intact.
+    const match = line.match(/^bind-key\s+(?:(?:-[nr]\s+)|(?:-N\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S+)\s+))*-T\s+root\s+(\S+)\s+(.*)$/);
     if (!match) continue;
     const key = match[1]!;
     const command = match[2]!.trim();
@@ -4164,7 +4189,7 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     // branch). Pin a fresh provider session id when NOT resuming (resume already
     // carries continuity via its baked-in args).
     let pinnedSessionId: string | undefined;
-    if (decision.mode !== "resume" && !spec.args.includes("--session-id")) {
+    if (decision.mode !== "resume" && !hasSessionIdArg(spec.args)) {
       const sid = randomUUID();
       const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
       if (sessionArgs) {
@@ -4630,6 +4655,10 @@ async function cmdRun(parsed: Parsed) {
   if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
     throw new Error("hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
   }
+  const waited = truthy(flag(parsed, "wait"));
+  if (!waited && hasFlag(parsed, "n")) {
+    throw new Error("hive run: -n is only for --wait output rows; use --lines for the no-wait pane preview");
+  }
 
   // The waitForAgentReady below is authoritative; skip spawn's own readiness
   // confirmation so a slow boot is only waited for once.
@@ -4668,7 +4697,7 @@ async function cmdRun(parsed: Parsed) {
     await writeHiveState(record, "working");
     await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
 
-    if (truthy(flag(parsed, "wait"))) {
+    if (waited) {
       const outcome = await waitForIdle({
         record: { ...record, lastPrompt: prompt, lastPromptAt: now },
         idleMs: numberFlag(parsed, ["idle-ms", "idle"], 3_000),
@@ -4682,7 +4711,7 @@ async function cmdRun(parsed: Parsed) {
     } else {
       const waitMs = Number(flag(parsed, "wait-ms") ?? 1000);
       if (waitMs > 0) await sleep(waitMs);
-      const lines = Number(flag(parsed, "n") ?? flag(parsed, "lines") ?? 80);
+      const lines = Number(flag(parsed, "lines") ?? 80);
       console.log(await substrateFor(record).capture(record.tmuxTarget, Number.isFinite(lines) ? lines : 80, record.agentPaneId));
     }
   } finally {
@@ -4699,7 +4728,6 @@ async function cmdRun(parsed: Parsed) {
     }
   }
 
-  const waited = truthy(flag(parsed, "wait"));
   if (cleanup) {
     return;
   }
@@ -4767,7 +4795,7 @@ async function cmdX(parsed: Parsed) {
     }
   }
 
-  await substrateFor(record).sendText(record.tmuxTarget, prompt);
+  await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
   const now = new Date().toISOString();
   await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
   await writeHiveState(record, "working");
@@ -6647,7 +6675,7 @@ async function frameUpdate(parsed: Parsed) {
   if (!(await frameExists(draft.name))) {
     throw new Error(`Unknown frame: ${draft.name}. Use 'hive frame define' to create a new one.`);
   }
-  const frame = await defineFrameFromFile(sourcePath);
+  const frame = await writeFrameFromValidatedObject(draft, { sourcePath: absolute, ledger: true });
   if (isPretty()) console.log(actionLine("ok", "frame", [bold(frame.name), dim("updated"), dim(sourcePath)]));
   else console.log(`updated\t${frame.name}\t${sourcePath}`);
 }
@@ -7046,7 +7074,7 @@ async function nodeRegister(parsed: Parsed) {
   const name = parsed.args[1];
   if (!name) throw new Error("Usage: hive node register <name> --kind <local-tmux|ssh-tmux|remote-hsr> --endpoint <addr> [--capabilities a,b,c] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"-F /path/to/config\"] [--auth-policy <local-only|ephemeral-token|api-key>]");
   const kindRaw = flag(parsed, "kind");
-  if (typeof kindRaw !== "string") throw new Error("--kind is required (local-tmux or ssh-tmux)");
+  if (typeof kindRaw !== "string") throw new Error("--kind is required (local-tmux, ssh-tmux, or remote-hsr)");
   const endpointRaw = flag(parsed, "endpoint");
   if (typeof endpointRaw !== "string") throw new Error("--endpoint is required");
   const capabilitiesRaw = flag(parsed, "capabilities");
@@ -7982,7 +8010,8 @@ async function loopStopCmd(parsed: Parsed) {
     // cancelRun SIGKILLs the driver's process group, so the driver's own
     // finalize() may never run and loop.json would be stuck at "running".
     // Reconcile it here so `hive loop status/list` reports a terminal state.
-    if (cfg.status === "running") {
+    const latestCfg = await readLoopConfig(loopId).catch(() => null);
+    if (latestCfg?.status === "running") {
       await updateLoopConfig(loopId, { status: "stopped", stopReason: "stopped:now", endedAt: new Date().toISOString() }).catch(
         () => undefined,
       );
@@ -8261,64 +8290,61 @@ async function daemonStatus(parsed: Parsed) {
   const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(status, null, 2));
-    process.exit(exitCode);
-  }
-  const installedTag = status.installed ? "installed" : "not-installed";
-  if (!isPretty()) {
-    const dot = status.running ? (status.stale ? "STALE" : "running") : "down";
-    console.log(`${dot}\t${installedTag}\t${status.lock?.pid ?? ""}\t${status.state?.startedAt ?? ""}\t${status.state?.lastTickAt ?? ""}\t${status.state?.tickCount ?? 0}`);
-    process.exit(exitCode);
-  }
-  if (!status.running) {
-    console.log(`${red("○")} ${bold("hive daemon")} ${dim("down")} ${dim(`(${installedTag})`)}`);
-    if (status.installed && status.plistPath) {
-      console.log(dim(`  plist: ${status.plistPath}`));
-    } else if (!status.installed) {
-      console.log(dim(`  hint: hive daemon install`));
-    }
-    if (status.lock) console.log(dim(`  stale lock: pid ${status.lock.pid} (${status.lock.startedAt})`));
-    if (status.state) {
-      console.log(dim(`  last state.json: pid ${status.state.pid} startedAt ${status.state.startedAt}`));
-      console.log(dim(`  last tick: ${status.state.lastTickAt ?? "(none)"} ticks=${status.state.tickCount}`));
-    }
-    process.exit(3);
-  }
-  if (status.stale) {
-    const reasonLabels: Record<string, string> = {
-      "loop-stale": "loop heartbeat stale",
-      "tick-progress-stale": "tick progress stale",
-      "recent-errors-saturated": "recent errors saturated",
-      "missing-state": "state missing",
-    };
-    const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
-    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
-    if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
-    if (status.state) {
-      console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
-      console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
-      if (status.state.recentErrors.length > 0) {
-        console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
-        for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+  } else {
+    const installedTag = status.installed ? "installed" : "not-installed";
+    if (!isPretty()) {
+      const dot = status.running ? (status.stale ? "STALE" : "running") : "down";
+      console.log(`${dot}\t${installedTag}\t${status.lock?.pid ?? ""}\t${status.state?.startedAt ?? ""}\t${status.state?.lastTickAt ?? ""}\t${status.state?.tickCount ?? 0}`);
+    } else if (!status.running) {
+      console.log(`${red("○")} ${bold("hive daemon")} ${dim("down")} ${dim(`(${installedTag})`)}`);
+      if (status.installed && status.plistPath) {
+        console.log(dim(`  plist: ${status.plistPath}`));
+      } else if (!status.installed) {
+        console.log(dim(`  hint: hive daemon install`));
+      }
+      if (status.lock) console.log(dim(`  stale lock: pid ${status.lock.pid} (${status.lock.startedAt})`));
+      if (status.state) {
+        console.log(dim(`  last state.json: pid ${status.state.pid} startedAt ${status.state.startedAt}`));
+        console.log(dim(`  last tick: ${status.state.lastTickAt ?? "(none)"} ticks=${status.state.tickCount}`));
+      }
+    } else if (status.stale) {
+      const reasonLabels: Record<string, string> = {
+        "loop-stale": "loop heartbeat stale",
+        "tick-progress-stale": "tick progress stale",
+        "recent-errors-saturated": "recent errors saturated",
+        "missing-state": "state missing",
+      };
+      const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
+      console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
+      if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
+      if (status.state) {
+        console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+        console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
+        if (status.state.recentErrors.length > 0) {
+          console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
+          for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+        }
+      }
+      console.log(dim(`  hint: hive daemon restart`));
+    } else {
+      console.log(`${green("●")} ${bold("hive daemon")} ${dim("running")} ${dim(`(${installedTag})`)}`);
+      if (status.installed && status.plistPath) {
+        console.log(`  plist ${status.plistPath}`);
+      }
+      if (status.lock) {
+        console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
+      }
+      if (status.state) {
+        console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+        if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
+        if (status.state.recentErrors.length > 0) {
+          console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
+          for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+        }
       }
     }
-    console.log(dim(`  hint: hive daemon restart`));
-    process.exit(4);
   }
-  console.log(`${green("●")} ${bold("hive daemon")} ${dim("running")} ${dim(`(${installedTag})`)}`);
-  if (status.installed && status.plistPath) {
-    console.log(`  plist ${status.plistPath}`);
-  }
-  if (status.lock) {
-    console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
-  }
-  if (status.state) {
-    console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
-    if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
-    if (status.state.recentErrors.length > 0) {
-      console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
-      for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
-    }
-  }
+  process.exit(exitCode);
 }
 
 async function cmdBuz(parsed: Parsed) {

@@ -1,5 +1,6 @@
 import * as readline from "node:readline";
 import { bold, cyan, dim, gray, graphemeWidth, green, isPretty, magenta, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 import type { BeeState } from "./state.js";
 
 export type CleanTuiItem = {
@@ -258,6 +259,7 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
         }
       };
 
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(1, stdout.columns || 100);
@@ -287,7 +289,7 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
         lines.push("");
         lines.push(truncate(rows.length === 0 ? `${message}. No threads left; q quits.` : message, width));
         lines.push(dim("p/t/l toggles preview · q exits"));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
       };
 
       const onResize = () => render();

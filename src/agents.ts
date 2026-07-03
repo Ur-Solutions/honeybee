@@ -184,6 +184,10 @@ export function forcedSessionIdArgs(kind: string, sessionId: string): string[] |
   return null;
 }
 
+export function hasSessionIdArg(args?: readonly string[]): boolean {
+  return Boolean(args?.some((arg) => arg === "--session-id" || arg.startsWith("--session-id=")));
+}
+
 function resolveProfile(kind: string, explicitHome: string | true | string[] | undefined) {
   const alias = profileAlias(kind);
   const canonicalKind = alias?.kind ?? kind;
@@ -366,7 +370,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   // flow runs spawn many siblings in one cwd, the exact case the cwd-blind claude
   // transcript matcher would otherwise cross-match by mtime.
   let pinnedSessionId: string | undefined;
-  if (!opts.extraArgs?.includes("--session-id")) {
+  if (!hasSessionIdArg(opts.extraArgs)) {
     const sid = randomUUID();
     const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
     if (sessionArgs) {

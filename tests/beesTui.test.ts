@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   beesCatalogSignature,
   beesTuiSearchText,
+  canNarrowBeesFilter,
   filterBeesTuiItems,
   flattenBeesTuiGroups,
   groupBeesByMode,
@@ -234,4 +235,49 @@ test("sidebar width clamp stays in tmux-friendly bounds", () => {
   assert.equal(__testOnlySidebarWidthClamp(5), 12);
   assert.equal(__testOnlySidebarWidthClamp(54), 54);
   assert.equal(__testOnlySidebarWidthClamp(80), 72);
+});
+
+test("canNarrowBeesFilter allows short prefix extensions only", () => {
+  assert.equal(canNarrowBeesFilter("a", "au"), true);
+  assert.equal(canNarrowBeesFilter("au", "aut"), true);
+  assert.equal(canNarrowBeesFilter("aut", "auth"), true);
+  // 5 effective chars: fuzzyScore's sparse-match cap starts growing with the
+  // query, so "matches next ⇒ matches prev" no longer holds.
+  assert.equal(canNarrowBeesFilter("auth", "authx"), false);
+  // Not extensions.
+  assert.equal(canNarrowBeesFilter("ab", "ba"), false);
+  assert.equal(canNarrowBeesFilter("ab", "ab"), false);
+  assert.equal(canNarrowBeesFilter("abc", "ab"), false);
+  // An empty previous pass matched everything — nothing to narrow from.
+  assert.equal(canNarrowBeesFilter("", "a"), false);
+  // Compared on the effective (trimmed, lowercased) query like fuzzyFilter.
+  assert.equal(canNarrowBeesFilter("A", "ab "), true);
+});
+
+test("narrowing from the previous match set equals filtering the catalog", () => {
+  const rows = [
+    item({ name: "auth-api", colony: "backend" }),
+    item({ name: "authz", colony: "backend" }),
+    item({ name: "cart", colony: "shop" }),
+    item({ name: "atlas-utils", colony: "infra" }),
+    item({ name: "worker", colony: "queue" }),
+  ];
+  let prev = "";
+  let pool = rows;
+  for (const query of ["a", "au", "aut", "auth"]) {
+    const full = filterBeesTuiItems(rows, query);
+    if (canNarrowBeesFilter(prev, query)) {
+      assert.deepEqual(filterBeesTuiItems(pool, query).map((r) => r.name), full.map((r) => r.name), `query "${query}"`);
+    }
+    prev = query;
+    pool = full;
+  }
+});
+
+test("fuzzy match is non-monotone past 4 chars — why canNarrowBeesFilter caps there", () => {
+  // Greedy match of "abcd" spans 14 chars (gaps 10 > cap 8) → rejected; the
+  // 5-char "abcde" raises the cap to 10 and the same span passes.
+  const sparse = item({ name: "sparse", searchText: "axxxxxxxxxxbcde" });
+  assert.equal(filterBeesTuiItems([sparse], "abcd").length, 0);
+  assert.equal(filterBeesTuiItems([sparse], "abcde").length, 1);
 });
