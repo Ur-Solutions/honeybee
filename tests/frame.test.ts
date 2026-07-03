@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -181,6 +181,29 @@ test("redefining a frame from the other extension removes the stale sibling", as
     await defineFrameFromFile(jsonSource);
     assert.equal((await frameDefinitionFile("deep-review"))?.ext, ".json");
     assert.equal((await loadFrame("deep-review"))?.description, "JSON wins now");
+  });
+});
+
+test("loadFrame rejects path-traversal names instead of executing files outside the store", async () => {
+  await withTempStore(async (dir) => {
+    // Plant a fully valid .ts frame OUTSIDE the frames dir. "../evil" would
+    // resolve to <dir>/frames/../evil.ts = this file; loading it would mean
+    // arbitrary TS execution.
+    const evil = { ...DEEP_REVIEW, name: "evil" };
+    await writeFile(join(dir, "evil.ts"), `const frame = ${JSON.stringify(evil)}; export default frame;\n`);
+    assert.equal(await loadFrame("../evil"), null);
+    assert.equal(await frameExists("../evil"), false);
+    assert.equal(await frameDefinitionFile("../evil"), null);
+    assert.equal(await loadFrameSource("../evil"), null);
+  });
+});
+
+test("removeFrame rejects path-traversal names instead of deleting files outside the store", async () => {
+  await withTempStore(async (dir) => {
+    await writeFile(join(dir, "victim.json"), "{}");
+    assert.equal(await removeFrame("../victim"), false);
+    // The out-of-store file must survive.
+    assert.equal((await stat(join(dir, "victim.json")).catch(() => null)) !== null, true);
   });
 });
 
