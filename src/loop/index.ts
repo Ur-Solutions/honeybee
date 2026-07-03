@@ -10,6 +10,18 @@ export {
   type ContextKnobs,
 } from "./context.js";
 export {
+  LOOP_STOP_CONDITIONS,
+  appendDefinedLoopStopArgs,
+  buildLoopStopConfig,
+  evaluateLoopStopConditions,
+  loopStopConditionsForPhase,
+  loopStopFlowArgs,
+  type LoopStopDecision,
+  type LoopStopEvaluationContext,
+  type LoopStopInput,
+  type LoopStopPhase,
+} from "./stopConditions.js";
+export {
   appendIterLog,
   ensureLoopDir,
   isStopRequested,

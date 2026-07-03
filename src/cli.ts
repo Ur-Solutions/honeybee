@@ -152,7 +152,7 @@ import { copyBeeSeals, listSeals, loadLatestSeal, recordSeal, sealedBeeNames as 
 import { search, type SearchHit, type SearchOptions, type SearchTypeFilter } from "./search.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
 import { resolveSelector } from "./selectors.js";
-import { type BeeState, type DerivedState, deriveState, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
+import { type BeeState, cleanStatePriority, type DerivedState, deriveState, formatStateCell, isTerminalState, liveTargetKey, stateLabel, type StateContext } from "./state.js";
 import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, saveSwarm, validSwarmId } from "./swarm.js";
 import { actionLine, bold, cyan, dim, errorPrefix, formatRelativeTime, formatTable, formatTimeUntil, gray, green, isPretty, magenta, note, red, statusDot, tildify, truncate, yellow } from "./format.js";
 import { effectiveHiveState, hiveStateFor, writeHiveState, writeHiveTags, writeHiveTitle, writeSpawnOptions } from "./hiveState.js";
@@ -2519,34 +2519,6 @@ function formatHiveStateCell(state: string): string {
   }
 }
 
-function formatStateCell(state: BeeState): string {
-  const label = stateLabel(state);
-  switch (state) {
-    case "active":
-      return `${green("●")} ${green(label)}`;
-    case "ready":
-      return `${green("●")} ${label}`;
-    case "booting":
-      return `${cyan("●")} ${cyan(label)}`;
-    case "blocked":
-      return `${yellow("●")} ${yellow(label)}`;
-    case "idle_with_output":
-      return `${dim("●")} ${label}`;
-    case "sealed":
-      return `${magenta("●")} ${magenta(label)}`;
-    case "archived":
-      return `${gray("○")} ${gray(label)}`;
-    case "error":
-      return `${red("●")} ${red(label)}`;
-    case "kill_failed":
-      return `${red("●")} ${red(label)}`;
-    case "dead":
-      return `${gray("○")} ${gray(label)}`;
-    case "node_unreachable":
-      return `${yellow("?")} ${yellow(label)}`;
-  }
-}
-
 // Each capture forks a subprocess (tmux locally, a full ssh round-trip for
 // remote bees), so an uncapped fan-out over a large hive spawns dozens of
 // simultaneous ssh connections per `hive ls`/clean pass (HIVE-62).
@@ -3039,33 +3011,6 @@ function compareCleanCandidates(a: CleanCandidate, b: CleanCandidate): number {
   const priority = cleanStatePriority(a.state) - cleanStatePriority(b.state);
   if (priority !== 0) return priority;
   return a.record.name.localeCompare(b.record.name);
-}
-
-function cleanStatePriority(state: BeeState): number {
-  switch (state) {
-    case "idle_with_output":
-      return 0;
-    case "dead":
-      return 1;
-    case "archived":
-      return 1;
-    case "sealed":
-      return 2;
-    case "kill_failed":
-      return 3;
-    case "ready":
-      return 4;
-    case "blocked":
-      return 5;
-    case "error":
-      return 6;
-    case "booting":
-      return 7;
-    case "active":
-      return 8;
-    case "node_unreachable":
-      return 9;
-  }
 }
 
 async function cmdTranscript(parsed: Parsed) {
