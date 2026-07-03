@@ -264,10 +264,12 @@ export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
  * The pending needs-input a blocked HSR bee is waiting on, read from the events
  * tail. Used by the daemon's needs-input → parent-buz router and `hive answer`.
  * `requestId` falls back to the stable literal "pending" when the emitting event
- * carried none, so callers always have a de-dupe/answer key.
+ * carried none, so answer paths always have a key. `ts` identifies the specific
+ * needs_input event for routing de-dupe when adapters do not provide requestId.
  */
 export type PendingNeedsInput = {
   requestId: string;
+  ts: number;
   kind: "permission" | "question";
   question: string;
   tool?: string;
@@ -295,6 +297,7 @@ export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput 
   const event = events[lastNeeds] as Extract<RunnerEvent, { type: "needs_input" }>;
   return {
     requestId: event.requestId ?? "pending",
+    ts: event.ts,
     kind: event.kind,
     question: event.question,
     ...(event.tool ? { tool: event.tool } : {}),
