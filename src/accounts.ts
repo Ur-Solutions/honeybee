@@ -1517,6 +1517,17 @@ async function refreshVaultClaudeChainIfStaleLocked(account: AccountRecord, opti
   await persistClaudeChain(account, oauth);
 }
 
+/**
+ * Read the account's CURRENT vault Claude chain. Used as a post-lock re-check:
+ * a caller that took withAccountsLock before rotating a chain re-reads here to
+ * see whether another writer already refreshed it while it waited (HIVE-2),
+ * avoiding a redundant — and reuse-detection-tripping — refresh-token replay.
+ */
+export async function readVaultClaudeChain(account: AccountRecord): Promise<ClaudeChain | null> {
+  const vaultPath = join(accountDir(account), ".credentials.json");
+  return parseClaudeChain(await readFile(vaultPath, "utf8").catch(() => null), "vault");
+}
+
 /** True when the vault holds the account's PRIMARY credential file. */
 export async function accountHasCredentials(account: AccountRecord): Promise<boolean> {
   const recipe = identityRecipeForAgent(account.tool);

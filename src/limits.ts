@@ -12,8 +12,10 @@ import {
   codexHomesForAccount,
   listAccounts,
   persistClaudeChain,
+  readVaultClaudeChain,
   refreshClaudeOauthChain,
   saveClaudeOauthToVault,
+  withAccountsLock,
 } from "./accounts.js";
 import { canonicalAgentKind } from "./agents.js";
 import { launchEnv } from "./env.js";
@@ -101,6 +103,10 @@ export type LimitsDeps = {
   refreshClaudeToken?: (refreshToken: string) => Promise<RefreshedClaudeToken | null>;
   /** Persist a refreshed credential set (vault + the account's homes). */
   persistRefreshedCredentials?: (account: AccountRecord, oauth: Record<string, unknown>) => Promise<void>;
+  /** Re-read the vault chain under the lock (double-checked refresh; tests override). */
+  readVaultChain?: typeof readVaultClaudeChain;
+  /** Serialize the refresh critical section (tests can pass a passthrough). */
+  withAccountsLock?: <T>(fn: () => Promise<T>) => Promise<T>;
   /** Mirror a verified fresher credential into the vault file (no rotation). */
   persistVaultCredentials?: (account: AccountRecord, oauth: Record<string, unknown>) => Promise<void>;
   readKeychain?: typeof readClaudeKeychain;
