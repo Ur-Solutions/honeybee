@@ -17,6 +17,7 @@ import { hsrUsageObservation, type HsrUsageObservation } from "../hsr/observe.js
 import { readHsrMeta } from "../hsr/runDir.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { transcriptLookupForSession } from "../sessionMetadata.js";
+import type { PaneCaptureMap } from "../state.js";
 import { appendLedger, type SessionRecord } from "../store.js";
 import { latestTranscript, readJsonl, type TranscriptRow } from "../transcripts.js";
 import { appendUsageEvent, transcriptTokenTotals, type TokenTotals, type UsageEvent } from "../usage.js";
@@ -49,7 +50,7 @@ export type UsageSamplerDeps = {
   sampleIntervalMs?: number;
 };
 
-export type UsageSampler = (records: SessionRecord[], panes: Map<string, string>, nowMs: number) => Promise<UsageTickOutcome[]>;
+export type UsageSampler = (records: SessionRecord[], panes: PaneCaptureMap, nowMs: number) => Promise<UsageTickOutcome[]>;
 
 const DEFAULT_SAMPLE_INTERVAL_MS = 60_000;
 const EXHAUSTION_PANE_LINES = 30;
@@ -156,12 +157,15 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
         continue;
       }
 
-      const pane = panes.get(record.tmuxTarget);
-      if (pane === undefined) {
+      const paneKey = record.agentPaneId ?? record.tmuxTarget;
+      const paneCaptured = panes.has(paneKey);
+      const pane = panes.get(paneKey);
+      if (!paneCaptured) {
         // Not live this tick; clear the edge detector so a relaunch re-arms it.
         exhaustedNow.delete(record.name);
         continue;
       }
+      if (pane === undefined) continue;
 
       const outcome: UsageTickOutcome = { bee: record.name, account: record.accountId, sampled: false, exhausted: false };
 
