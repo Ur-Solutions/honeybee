@@ -25,7 +25,6 @@ import { effectiveTags, normalizeTagArg } from "../tags.js";
 import { appendedPaneText, parseTailOptions } from "../tail.js";
 import { formatShellCommand } from "../tmux.js";
 import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "../transcripts.js";
-import { buildView, closeView, createGroupedView, deriveViewName, viewSessionName } from "../view.js";
 import { waitForIdle } from "../wait.js";
 import { resolve } from "node:path";
 import { arrayFlag, assertLocalFleetReadable, buildStateContext, currentTmuxSession, ensureLive, formatHiveStateCell, liveTargetsAcrossNodes, resolveBeeInCurrentPane, resolveSession, sleep, stringFlag, transcriptBanner } from "../cli/shared.js";
@@ -79,10 +78,9 @@ export async function cmdList(parsed: Parsed) {
   }
   const probe = await liveTargetsAcrossNodes(nodes, nodeFilter);
   let records = allRecords;
-  // Filed (archived) bees are hidden from the default list — a `quest done`-filed
-  // bee is no longer a working bee (PRD §16 #4). Re-include them with --archived
-  // (mirrors `workspace list --archived`), and auto-include when the user targets
-  // them explicitly with `--state archived` so that query is never empty.
+  // Filed (archived) bees are hidden from the default list — re-include them
+  // with --archived, and auto-include when the user targets them explicitly
+  // with `--state archived` so that query is never empty.
   const showArchived = truthy(flag(parsed, "archived")) || stateFilter === "archived";
   if (!showArchived) records = records.filter((r) => r.status !== "archived");
   if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
@@ -563,59 +561,6 @@ export async function openUrl(url: string): Promise<void> {
   await new Promise<void>((resolveOpen, rejectOpen) => {
     execFile(opener, [url], (error) => (error ? rejectOpen(error) : resolveOpen()));
   });
-}
-
-
-// Colony cockpit: an ephemeral tmux session whose windows are links to live
-// bees' windows. tmux-derived, no store records; closing a view is provably
-// incapable of killing a bee (see src/view.ts).
-export async function cmdView(parsed: Parsed) {
-  const closeName = flag(parsed, "close");
-  if (closeName !== undefined) {
-    if (typeof closeName !== "string" || closeName.length === 0) throw new Error("Usage: hive view --close <name>");
-    const result = await closeView(closeName);
-    if (isPretty()) console.log(actionLine("ok", "view", [bold(viewSessionName(closeName)), dim(`closed, ${result.unlinked} window(s) unlinked`)]));
-    else console.log(`view-closed\t${viewSessionName(closeName)}\t${result.unlinked}`);
-    return;
-  }
-
-  const target = parsed.args[0];
-  if (!target) throw new Error("Usage: hive view <selector> [--name <name>] [--new-client]  |  hive view --close <name>");
-  const nameFlag = flag(parsed, "name");
-  const name = typeof nameFlag === "string" && nameFlag.length > 0 ? nameFlag : deriveViewName(target);
-
-  const resolved = await resolveSelector(target);
-  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
-  if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
-
-  const local = records.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
-  if (local.length < records.length) {
-    console.error(note(`skip ${records.length - local.length} remote bee(s) — link-window cannot cross tmux servers`));
-  }
-  const liveNames = new Set(await localSubstrate().listSessions());
-  const live = local.filter((record) => liveNames.has(record.tmuxTarget));
-  if (live.length < local.length) console.error(note(`skip ${local.length - live.length} dead bee(s)`));
-  if (live.length === 0) throw new Error(`No live local bees match selector: ${target}`);
-
-  const result = await buildView(name, live.map((record) => record.tmuxTarget));
-  const parts = [bold(result.session), `${result.linked.length} bee(s) linked`];
-  if (result.alreadyLinked > 0) parts.push(dim(`${result.alreadyLinked} already linked`));
-  if (isPretty()) console.log(actionLine("ok", "view", parts));
-  else console.log(`view\t${result.session}\t${result.linked.length}\t${result.alreadyLinked}`);
-
-  let enterTarget = result.session;
-  if (truthy(flag(parsed, "new-client"))) {
-    enterTarget = await createGroupedView(name);
-    if (isPretty()) console.error(note(`grouped session ${enterTarget} — independent focus on the same windows`));
-  }
-
-  const substrate = localSubstrate();
-  if (truthy(flag(parsed, "print")) || !process.stdout.isTTY) {
-    if (isPretty()) console.error(note("enter with:"));
-    console.log(formatShellCommand(substrate.attachCommand(enterTarget)));
-    return;
-  }
-  await substrate.attachSession(enterTarget);
 }
 
 

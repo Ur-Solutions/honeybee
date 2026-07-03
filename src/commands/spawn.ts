@@ -26,7 +26,7 @@ import { safeName, saveSession, type SessionRecord } from "../store.js";
 import { localSubstrate, remoteHsrSubstrateForNode, substrateForRecord } from "../substrates/index.js";
 import { createSwarm } from "../swarm.js";
 import { tmux } from "../tmux.js";
-import { linkHere } from "../view.js";
+import { linkHere } from "../spawnLink.js";
 import { randomUUID } from "node:crypto";
 import { readdir, realpath, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";

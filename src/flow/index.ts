@@ -87,11 +87,6 @@ export type FlowSpawnInput = {
   swarmId?: string;
 };
 
-// Quest adoption of flow-spawned bees (`hive quest start --flow`) is threaded as
-// an `onSpawned` callback through ExecuteFlowOptions → HiveFacade, NOT as a flow
-// authoring field: FlowSpawnInput is deliberately NOT widened so a JSON/TS flow
-// author can never claim a questId/workspaceId — the quest owns those, and the
-// membership stamp + window link live in cli.ts (keeping HiveFacade neutral).
 
 /** The compiled flow. `run` receives the runtime-built FlowContext. */
 export type Flow = {

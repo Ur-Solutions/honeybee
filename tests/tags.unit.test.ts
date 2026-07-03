@@ -106,18 +106,6 @@ test("effectiveTags derives reserved tags even with no user tags", () => {
   assert.ok(tags.has("agent:claude"));
 });
 
-test("quest/workspace getters stay dark until their fields are populated", () => {
-  const record = bee();
-  const tags = effectiveTags(record);
-  for (const tag of tags) {
-    assert.ok(!tag.startsWith("quest:"), `unexpected ${tag}`);
-    assert.ok(!tag.startsWith("workspace:"), `unexpected ${tag}`);
-  }
-  // But they light up when the field exists (forward-compat).
-  const withQuest = bee({ ...{ questId: "q-ab" } } as Partial<SessionRecord>);
-  assert.ok(effectiveTags(withQuest).has("quest:q-ab"));
-});
-
 test("parseTag splits bare and namespaced tokens", () => {
   assert.deepEqual(parseTag("migration"), { value: "migration" });
   assert.deepEqual(parseTag("prio:p1"), { namespace: "prio", value: "p1" });
@@ -152,14 +140,14 @@ test("isValidTagValue accepts grammar-valid tags and rejects bad ones", () => {
 });
 
 test("isReservedNamespace recognizes all reserved namespaces", () => {
-  for (const ns of ["colony", "swarm", "caste", "node", "agent", "repo", "quest", "workspace", "comb", "state"]) {
+  for (const ns of ["colony", "swarm", "caste", "node", "agent", "repo", "comb", "state"]) {
     assert.ok(isReservedNamespace(ns), `${ns} should be reserved`);
   }
   assert.ok(!isReservedNamespace("prio"));
   assert.ok(!isReservedNamespace("custom"));
   assert.ok(!isReservedNamespace(undefined));
   // getReservedNamespaces returns the same set.
-  assert.deepEqual(new Set(getReservedNamespaces()), new Set(["colony", "swarm", "caste", "node", "agent", "repo", "quest", "workspace", "comb", "state"]));
+  assert.deepEqual(new Set(getReservedNamespaces()), new Set(["colony", "swarm", "caste", "node", "agent", "repo", "comb", "state"]));
 });
 
 test("isValidSessionTag rejects reserved-namespace tags (defense-in-depth)", () => {

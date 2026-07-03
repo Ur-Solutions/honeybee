@@ -18,7 +18,7 @@ export const TMUX_BLOCK_END = "# <<< honeybee keybindings <<<";
  * copy-pasteable tmux block. These ADD to the shipped bindings already in
  * docs/honeybee.tmux.conf — bees (M-b), hive new (M-n), the attention queue
  * next/prev (M-./M-,), rename (M-r), and the needs-me switcher (M-S) live there;
- * this block adds the spawn/fork/urls/workspace-rename affordances on
+ * this block adds the spawn/fork/urls affordances on
  * collision-free keys (M-b is hive bees, so spawn-from-frame rides M-B):
  *
  *   M-B  hive launch           → interactive frame/flow launcher (M-b is hive bees)
@@ -26,7 +26,6 @@ export const TMUX_BLOCK_END = "# <<< honeybee keybindings <<<";
  *   M-l  hive loop launch      → loop launcher dialog (templates + minimal form)
  *   M-k  hive fork launch      → interactive fork window (M-f avoided: WezTerm ALT layer)
  *   M-u  urls
- *   M-R  workspace rename
  *
  * (M-x / `hive split` decompose was retired with combs — APIA-85; forks now run
  * pane-lessly on HSR via M-k `hive fork launch`.)
@@ -63,8 +62,6 @@ bind -n M-k display-popup -E -w 80% -h 70% "hive fork launch"                   
 # Standalone affordances (owned here)
 bind -n M-u display-popup -E -w 70% -h 60% \\
   "hive urls | fzf --prompt='url> ' --no-sort | xargs -r open"                                          # cmd+u list+open URL (xdg-open on Linux)
-bind -n M-R display-popup -E -w 60% -h 20% \\
-  "read -p 'rename workspace> ' n && [ -n \\"\\$n\\" ] && hive workspace rename \\"\$(hive workspace here)\\" \\"\\$n\\""  # cmd+shift+r rename workspace (both verbs → WORKSPACES)
 
 ${TMUX_BLOCK_END}
 `;
@@ -81,7 +78,6 @@ export const CANONICAL_WEZTERM_BLOCK = `-- honeybee cmd→Meta additions — app
 { key = 'f', mods = 'SUPER|SHIFT', action = meta('F') },   -- cmd+shift+f frame/flow launcher
 { key = 'l', mods = 'SUPER',       action = meta('l') },   -- cmd+l  loop launcher
 { key = 'u', mods = 'SUPER',       action = meta('u') },   -- cmd+u  urls
-{ key = 'r', mods = 'SUPER|SHIFT', action = meta('R') },   -- cmd+shift+r rename workspace
 `;
 
 /**
@@ -99,7 +95,6 @@ export const RECOMMENDED_BINDS: RecommendedBind[] = [
   { key: "M-l", verb: "loop", note: "loop launcher dialog (templates + minimal form)" },
   { key: "M-k", verb: "fork", note: "interactive fork launcher (seed, worktree, agent, account)" },
   { key: "M-u", verb: "urls", note: "list + open URL" },
-  { key: "M-R", verb: "workspace", delegated: true, note: "rename workspace (→ WORKSPACES)" },
 ];
 
 /**

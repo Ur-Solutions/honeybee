@@ -297,14 +297,12 @@ test("listSessions skips malformed session files", async () => {
   }
 });
 
-test("a status:archived record round-trips (not downgraded to dead) and carries questId/workspaceId", async () => {
+test("a status:archived record round-trips (not downgraded to dead)", async () => {
   await withTempStore(async (dir) => {
-    const record = makeRecord(dir, { status: "archived", questId: "q-abc", workspaceId: "q-abc" });
+    const record = makeRecord(dir, { status: "archived" });
     await saveSession(record);
     const loaded = await loadSession(record.name);
     assert.equal(loaded?.status, "archived", "archived survives a round-trip (validation allow-list)");
-    assert.equal(loaded?.questId, "q-abc", "questId is carried through");
-    assert.equal(loaded?.workspaceId, "q-abc", "workspaceId is carried through");
   });
 });
 

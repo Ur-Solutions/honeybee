@@ -88,10 +88,6 @@ export type SessionRecord = {
   autoTitleAttempts?: number;
   colony?: string;
   swarmId?: string;
-  /** The home workspace (ws-<name>) this bee belongs to. (WORKSPACES_AND_QUESTS Phase 1) */
-  workspaceId?: string;
-  /** The quest (QuestRecord id) that spawned this bee. (WORKSPACES_AND_QUESTS Phase 3) */
-  questId?: string;
   caste?: string;
   brief?: string;
   briefedAt?: string;
@@ -371,7 +367,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "workspaceId", "questId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "runnerTier"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "runnerTier"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",

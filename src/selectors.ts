@@ -33,7 +33,6 @@ export type SelectorState = {
 
 const SWARM_PREFIX = "@";
 const COLONY_PREFIX = "colony:";
-const WORKSPACE_PREFIX = "ws:";
 const TAG_PREFIX = "tag:";
 const TAG_HASH = "#";
 const REL_VERBS: RelVerb[] = ["owns", "owned-by", "reports-to", "children-of", "forks-of"];
@@ -47,15 +46,6 @@ export function parseSelector(query: string): Selector {
     const name = trimmed.slice(COLONY_PREFIX.length);
     if (!name) throw new Error(`Empty colony selector: ${query}`);
     return { kind: "colony", name };
-  }
-
-  // ws:x → workspace membership, an alias for tag:workspace:x. The reserved
-  // `workspace:` getter derives the value from record.workspaceId, so this
-  // matches every bee whose home workspace is x. (WORKSPACES_AND_QUESTS §9)
-  if (trimmed.startsWith(WORKSPACE_PREFIX)) {
-    const name = trimmed.slice(WORKSPACE_PREFIX.length);
-    if (!name) throw new Error(`Empty workspace selector: ${query}`);
-    return { kind: "tag", namespace: "workspace", value: name };
   }
 
   // @x → swarm kind (kept for compat; same set as tag:swarm:x).
@@ -99,7 +89,7 @@ export function parseSelector(query: string): Selector {
     }
   }
 
-  // <ns>:<val> → tag kind. Reserved namespaces (e.g. quest:q-ab,
+  // <ns>:<val> → tag kind. Reserved namespaces (e.g. caste:worker,
   // caste:reviewer) match derived facets; non-reserved namespaces (e.g.
   // prio:p1) match user tags stored verbatim.
   const colonIdx = trimmed.indexOf(":");
@@ -166,7 +156,7 @@ export function resolveSelectorFromState(selector: Selector, state: SelectorStat
     // One predicate for every membership/tag selector: effective-tag-set
     // membership. The unknown-value THROW bifurcates per reserved namespace —
     // colony:/swarm: check their existence sets (matching legacy behavior),
-    // while quest:/workspace: have no set yet (match 0..N) and user tags never
+    // and user tags never
     // throw (PRD §8.2).
     const want = selector.namespace ? `${selector.namespace}:${selector.value}` : selector.value;
     const records = state.records.filter((record) => effectiveTags(record).has(want));
@@ -226,10 +216,7 @@ export function formatSelector(selector: Selector): string {
 export async function resolveSelector(query: string): Promise<ResolvedTarget> {
   const selector = parseSelector(query);
   // Filed (archived) bees are excluded from DEFAULT selector resolution
-  // (send/view/kill/list <sel>): a `quest done`-filed bee is no longer a live
-  // send/kill target (PRD §16 #4). `quest inspect` deliberately bypasses this
-  // chokepoint — it reads listSessions() directly by questId — so a done quest's
-  // archived bees stay visible there.
+  // (send/kill/list <sel>): an archived bee is no longer a live send/kill target.
   const records = (await listSessions()).filter((r) => r.status !== "archived");
   const state: SelectorState = { records };
 

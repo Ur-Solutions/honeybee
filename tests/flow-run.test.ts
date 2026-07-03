@@ -273,19 +273,10 @@ test("cleanup=kill-on-end calls killAll() on flow-spawned bees at end", async ()
   });
 });
 
-/* ---------- onSpawned hook (quest adoption) + cleanupOverride ---------- */
+/* ---------- cleanupOverride ---------- */
 
-// A flow that spawns N fake bees through the facade WITHOUT touching tmux: we
-// re-create the spawnBeeForFlow record shape inline, push it onto the facade's
-// internal spawned list (the same tap the cleanup tests use), and emulate the
-// post-push onSpawned call by reading the field off the facade. This exercises
-// the real spawn() → onSpawned ordering since spawn() invokes the hook itself;
-// we instead drive a flow whose run() calls a small helper that mirrors the
-// facade contract. To test the ACTUAL spawn() invocation we stub spawnBeeForFlow
-// via a fake substrate is heavy — instead we assert the hook ordering by having
-// the flow call ctx.hive.spawn with a fake substrate-less path is not possible,
-// so we verify the hook through executeFlow's option forwarding + a flow that
-// pushes records and we invoke the stored hook directly.
+// Fake bees pushed straight onto the facade's internal spawned list (the same
+// tap the cleanup tests use) — no tmux involved.
 
 function fakeRecord(name: string): SessionRecord {
   return {
@@ -300,49 +291,7 @@ function fakeRecord(name: string): SessionRecord {
   };
 }
 
-test("onSpawned hook fires once per spawn, in order, before run() resolves", async () => {
-  await withTempStore(async () => {
-    const seen: string[] = [];
-    const flow = defineFlow({
-      name: "hookorder",
-      run: async (ctx) => {
-        const facade = ctx.hive as HiveFacade;
-        // Read the stored hook off the facade and drive it the way spawn() does:
-        // push to spawned, then await the hook. This proves the field is wired
-        // and that awaiting it blocks run() completion.
-        const hook = (facade as unknown as { onSpawned?: (r: SessionRecord) => Promise<void> }).onSpawned;
-        assert.ok(hook, "facade received the onSpawned hook");
-        for (const name of ["a", "b"]) {
-          const rec = fakeRecord(name);
-          (facade as unknown as { spawned: SessionRecord[] }).spawned.push(rec);
-          await hook!(rec);
-        }
-        return "done";
-      },
-    });
-    const outcome = await executeFlow(flow, {
-      installSignalHandlers: false,
-      onSpawned: async (rec) => { seen.push(rec.name); },
-    });
-    assert.equal(outcome.status, "ok");
-    assert.deepEqual(seen, ["a", "b"], "hook called exactly twice, in spawn order");
-  });
-});
-
-test("onSpawned absent leaves spawn behavior byte-identical (no extra ledger lines)", async () => {
-  await withTempStore(async (dir) => {
-    // Baseline: a no-op flow with no hook. Compare the ledger before/after to a
-    // run WITH an absent (undefined) hook — they must be identical structurally.
-    const flow = defineFlow({ name: "noh", run: async () => "x" });
-    const outcome = await executeFlow(flow, { installSignalHandlers: false });
-    assert.equal(outcome.status, "ok");
-    // The facade's onSpawned is undefined; no quest-adoption ledger artifacts.
-    const ledger = await readFile(join(dir, "ledger.jsonl"), "utf8").catch(() => "");
-    assert.ok(!ledger.includes("quest"), "no quest artifacts leak into a plain run");
-  });
-});
-
-test("cleanupOverride:'keep' defeats a flow's kill-on-end (quest owns its bees)", async () => {
+test("cleanupOverride:'keep' defeats a flow's kill-on-end", async () => {
   await withTempStore(async () => {
     const flow = defineFlow({
       name: "overridekeep",
@@ -382,30 +331,6 @@ test("cleanupOverride absent: kill-on-end still kills (regression guard)", async
     const { loadSession } = await import("../src/store.js");
     const gone = await loadSession("noovr-bee");
     assert.equal(gone, null, "without an override, kill-on-end still deletes the record");
-  });
-});
-
-test("onSpawned rejection propagates: the flow fails (no silent swallow)", async () => {
-  await withTempStore(async () => {
-    const flow = defineFlow({
-      name: "hookthrows",
-      run: async (ctx) => {
-        const facade = ctx.hive as HiveFacade;
-        const hook = (facade as unknown as { onSpawned?: (r: SessionRecord) => Promise<void> }).onSpawned;
-        const rec = fakeRecord("throw-bee");
-        (facade as unknown as { spawned: SessionRecord[] }).spawned.push(rec);
-        // Awaiting the rejecting hook surfaces as a thrown run() — exactly what
-        // spawn() does when onSpawned rejects.
-        await hook!(rec);
-        return "unreached";
-      },
-    });
-    const outcome = await executeFlow(flow, {
-      installSignalHandlers: false,
-      onSpawned: async () => { throw new Error("stamp failed"); },
-    });
-    assert.equal(outcome.status, "failed", "a rejecting hook fails the flow");
-    assert.match(outcome.error?.message ?? "", /stamp failed/);
   });
 });
 

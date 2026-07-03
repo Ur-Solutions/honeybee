@@ -2,15 +2,7 @@ import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
-import {
-  rewriteColonyWorkspaceReferences,
-  rewriteQuestColonyReferences,
-  rewriteQuestWorkspaceReferences,
-  rewriteWorkspaceColonyReferences,
-  withReferenceRenameLocks,
-} from "./referenceCascade.js";
 import { appendLedger } from "./store.js";
-import { createWorkspace, loadWorkspace, saveWorkspace, workspacePath } from "./workspace.js";
 
 export type ColonyRecord = {
   name: string;
@@ -18,10 +10,7 @@ export type ColonyRecord = {
   archived?: boolean;
   archivedAt?: string;
   description?: string;
-  /** The colony's canonical file root, inherited by its auto-workspace (lazy). */
   rootDir?: string;
-  /** The name of the workspace auto-provisioned for this colony (= the colony name). */
-  workspace?: string;
 };
 
 const COLONY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -62,7 +51,6 @@ export async function createColony(name: string, description?: string): Promise<
   return withColoniesLock(async () => {
     const existing = await loadColony(name);
     if (existing) throw new Error(`Colony already exists: ${name}`);
-    if (await loadWorkspace(name)) throw new Error(`Workspace already exists: ${name}`);
     const record: ColonyRecord = {
       name,
       createdAt: new Date().toISOString(),
@@ -70,13 +58,6 @@ export async function createColony(name: string, description?: string): Promise<
     };
     await saveColony(record);
     await appendLedger({ type: "colony.create", name });
-    // Auto-provision the colony's workspace (PRD §7.2). rootDir stays empty and
-    // is resolved lazily on first `hive workspace open <colony>`. Provisioning
-    // failures are surfaced so callers do not get a silently half-provisioned
-    // colony.
-    await createWorkspace({ name, rootDir: "", members: [], colony: name });
-    record.workspace = name;
-    await saveColony(record);
     return record;
   });
 }
@@ -100,37 +81,18 @@ export async function updateColony(name: string, patch: { description?: string }
 export async function renameColony(oldName: string, newName: string): Promise<ColonyRecord> {
   if (!validColonyName(oldName)) throw new Error(`Invalid colony name: ${oldName}. Use alphanumerics, dashes, and underscores.`);
   if (!validColonyName(newName)) throw new Error(`Invalid colony name: ${newName}. Use alphanumerics, dashes, and underscores.`);
-  return withReferenceRenameLocks(async () => {
+  return withColoniesLock(async () => {
     const existing = await loadColony(oldName);
     if (!existing) throw new Error(`Unknown colony: ${oldName}`);
     if (oldName === newName) return existing;
     if (await loadColony(newName)) throw new Error(`Colony already exists: ${newName}`);
 
-    const ownedWorkspace = await loadWorkspace(oldName);
-    const shouldRenameOwnedWorkspace =
-      (existing.workspace === oldName || (existing.workspace === undefined && ownedWorkspace?.colony === oldName));
-    if (shouldRenameOwnedWorkspace && (await loadWorkspace(newName))) {
-      throw new Error(`Workspace already exists: ${newName}`);
-    }
-
     const updated: ColonyRecord = { ...existing, name: newName };
-    if (shouldRenameOwnedWorkspace) updated.workspace = newName;
     // Write the new record before removing the old one: a crash in between
     // leaves the colony alive under both names (an easily deleted duplicate),
     // whereas delete-first would lose the record entirely on a failed write.
     await saveColony(updated);
-    if (shouldRenameOwnedWorkspace && ownedWorkspace) {
-      await saveWorkspace({ ...ownedWorkspace, name: newName, colony: newName, updatedAt: new Date().toISOString() });
-      await rm(workspacePath(oldName), { force: true });
-      await appendLedger({ type: "workspace.rename", from: oldName, to: newName });
-    }
     await rm(colonyPath(oldName), { force: true });
-    await rewriteWorkspaceColonyReferences(oldName, newName);
-    await rewriteQuestColonyReferences(oldName, newName);
-    if (shouldRenameOwnedWorkspace) {
-      await rewriteColonyWorkspaceReferences(oldName, newName);
-      await rewriteQuestWorkspaceReferences(oldName, newName);
-    }
     await appendLedger({ type: "colony.rename", from: oldName, to: newName });
     return updated;
   });
@@ -186,7 +148,6 @@ async function readColony(path: string): Promise<ColonyRecord> {
   // Additive allow-list (the §10 lesson): a new string field is silently dropped
   // on load unless it is explicitly carried through.
   if (typeof object.rootDir === "string") record.rootDir = object.rootDir;
-  if (typeof object.workspace === "string") record.workspace = object.workspace;
   return record;
 }
 

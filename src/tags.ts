@@ -88,7 +88,7 @@ export function dedupeTags(tags: string[]): string[] {
 // (PRD §13, §16 Q6).
 const RESERVED_NAMESPACE_LIST = [
   "colony", "swarm", "caste", "node", "agent", "repo", // live-in-v1 / net-new
-  "quest", "workspace", "comb", // lights-up-later tiers
+  "comb", // lights-up-later tier (legacy comb records)
   "state", // special: tmux-facet only, never store-derived
 ];
 
@@ -108,8 +108,7 @@ export function getReservedNamespaces(): string[] {
  * derives the tag value from a SessionRecord. Split by tier (PRD §6):
  *   - live-in-v1: back an existing field, derive with zero new data;
  *   - net-new derivation this PRD builds: repo;
- *   - lights-up-later: getters present, return undefined until WORKSPACES_AND_
- *     QUESTS / fork-and-pane populate their fields.
+ *   - legacy: comb backs old fork-and-pane records.
  *
  * `state` is intentionally absent — per §13 it must never trigger a per-bee
  * tmux round-trip in the store-only filter path; `--state` (Tier 0) handles
@@ -124,9 +123,7 @@ export const RESERVED_NAMESPACES: Record<string, (record: SessionRecord) => stri
   agent: (r) => r.agent,
   // Net-new derivation this PRD builds:
   repo: (r) => repoTagFor(r.cwd),
-  // Lights up when its owning PRD lands (getter present, value undefined today):
-  quest: (r) => (r as { questId?: string }).questId,
-  workspace: (r) => (r as { workspaceId?: string }).workspaceId,
+  // Legacy comb records (combs retired, APIA-85):
   comb: (r) => r.combId ?? r.tmuxTarget,
 };
 
@@ -195,8 +192,6 @@ const RESERVED_REDIRECTS: Record<string, string> = {
   node: "set it via hive spawn --node at spawn (immutable), not hive tag",
   agent: "set it via hive spawn <agent> at spawn (immutable), not hive tag",
   repo: "repo is read-only; it derives from cwd, not hive tag",
-  quest: "set it via quest start (when WORKSPACES_AND_QUESTS lands), not hive tag",
-  workspace: "set it via workspace add (when WORKSPACES_AND_QUESTS lands), not hive tag",
   comb: "set it via hive split at spawn/split (immutable), not hive tag",
   state: "state is a live tmux facet, not writable via hive tag",
 };

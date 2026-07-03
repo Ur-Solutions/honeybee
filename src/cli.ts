@@ -22,13 +22,11 @@ import { cmdLoop } from "./commands/loop.js";
 import { cmdAnswer, cmdBrief, cmdMove, cmdOwn, cmdRename, cmdSeal, cmdSend, cmdTag } from "./commands/messaging.js";
 import { cmdDemote, cmdPromote, cmdRevive } from "./commands/migrate.js";
 import { cmdNode, cmdSubstrate } from "./commands/node.js";
-import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdTail, cmdTranscript, cmdUrls, cmdView, cmdWait } from "./commands/observe.js";
-import { cmdQuest } from "./commands/quest.js";
+import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdTail, cmdTranscript, cmdUrls, cmdWait } from "./commands/observe.js";
 import { cmdOpen, cmdRun, cmdX, cmdXa } from "./commands/run.js";
 import { cmdSeals, cmdSearch } from "./commands/search.js";
 import { cmdLaunch, cmdNew, cmdSpawn } from "./commands/spawn.js";
 import { cmdSwarm } from "./commands/swarm.js";
-import { cmdRestore, cmdWorkspace } from "./commands/workspace.js";
 
 // Re-exports consumed by the unit tests (tests/*.test.ts import these from
 // "../src/cli.js"). The HIVE-15 decomposition moved the handlers into
@@ -38,7 +36,6 @@ export { emitLog, followFlag, logLinesFlag, resolveSpawnSubstrate } from "./cli/
 export { resolveDefineArgs } from "./commands/frame.js";
 export { assertResumable, tmuxSessionSurvives } from "./commands/migrate.js";
 export { assertSingleBeeInvocation } from "./commands/run.js";
-export { addBeeMember, seedWorkspaceMembers } from "./commands/workspace.js";
 export { resolvePromptArg } from "./commands/loop.js";
 
 async function main(argv: string[]) {
@@ -146,24 +143,11 @@ async function main(argv: string[]) {
     case "next":
       await cmdNext(parsed);
       break;
-    case "view":
-      await cmdView(parsed);
-      break;
     case "completion":
       await cmdCompletion(parsed);
       break;
     case "colony":
       await cmdColony(parsed);
-      break;
-    case "workspace":
-    case "ws":
-      await cmdWorkspace(parsed);
-      break;
-    case "quest":
-      await cmdQuest(parsed);
-      break;
-    case "restore":
-      await cmdRestore(parsed);
       break;
     case "frame":
       await cmdFrame(parsed);
@@ -303,7 +287,6 @@ function printHelp() {
         ["transcript", "<session>", "render structured transcript rows"],
         ["last", "<session>", "print the bee's most recent assistant message or seal"],
         ["wait", "<session>", "block until the bee goes idle or seals"],
-        ["view", "<selector>", "colony cockpit: link live bees' windows into a view session"],
         ["search", "<query>", "search seals, ledger, and session records (seals find: seals only)"],
         ["usage", "[<account>]", "progress against providers' real 5h/weekly limits (--live dashboard; alias: limits)"],
       ],

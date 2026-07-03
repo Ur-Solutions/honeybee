@@ -38,14 +38,7 @@ export type ExecuteFlowOptions = {
   /** Mark this run as backgrounded (meta.background=true). */
   background?: boolean;
   /**
-   * Per-spawn hook forwarded to HiveFacade.onSpawned. Used by
-   * `hive quest start --flow` to stamp + link each spawned bee into the quest.
-   */
-  onSpawned?: (record: SessionRecord) => Promise<void>;
-  /**
-   * Override the flow's own cleanup policy. `hive quest start --flow` passes
-   * "keep" so a flow authored with cleanup=kill-on-end does NOT tear down the
-   * bees the quest just adopted. Absent for all other callers → the flow's
+   * Override the flow's own cleanup policy. Absent → the flow's
    * declared cleanup runs unchanged.
    */
   cleanupOverride?: "keep" | "kill-on-end";
@@ -108,7 +101,6 @@ export async function executeFlow(flow: Flow, options: ExecuteFlowOptions = {}):
     runId,
     cleanup,
     signal: controller.signal,
-    ...(options.onSpawned ? { onSpawned: options.onSpawned } : {}),
   });
 
   let cancelled = false;

@@ -2,19 +2,17 @@ import { BUZ_TIERS as CANONICAL_BUZ_TIERS } from "../buz_tiers.js";
 
 export const COMMANDS = [
   "spawn", "new", "launch", "send", "tail", "cat", "transcript", "tx", "last", "wait",
-  "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "next", "view",
-  "colony", "workspace", "ws", "quest", "frame", "swarm", "node", "substrate", "flow", "loop",
+  "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "next",
+  "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
   "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
-  "split", "fork", "here", "spawn-picker", "urls", "keys", "revive", "restore",
+  "split", "fork", "here", "spawn-picker", "urls", "keys", "revive",
 ];
 
 export const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
-export const WORKSPACE_SUBCOMMANDS = ["open", "list", "ls", "add", "add-pane", "snapshot", "restore", "close", "rename", "here", "archive"];
-export const QUEST_SUBCOMMANDS = ["create", "start", "list", "ls", "inspect", "done", "archive"];
 export const FRAME_SUBCOMMANDS = ["list", "ls", "define", "update", "reload", "edit", "inspect", "remove"];
 export const SWARM_SUBCOMMANDS = ["list", "ls", "inspect", "destroy"];
 export const NODE_SUBCOMMANDS = ["list", "ls", "register", "inspect", "update", "unregister"];
@@ -31,7 +29,6 @@ export const SYNC_SUBCOMMANDS = ["manifest"];
 
 export const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 export const SEAL_STATUS_VALUES = ["done", "blocked", "needs_input", "failed"];
-export const QUEST_STATUS_VALUES = ["open", "active", "done", "archived"];
 export const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
 export const BUZ_TIERS: readonly string[] = CANONICAL_BUZ_TIERS;
 export const BUZ_ACCEPT_VALUES = buzAcceptValues();
@@ -57,7 +54,7 @@ export const SHELLS = ["bash", "zsh", "fish"];
 
 export const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
-export const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach", "view"]);
+export const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach"]);
 export const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "own", "move", "split", "fork", "revive", "urls"]);
 export const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 export const SHELL_FIRST_ARG = new Set(["completion"]);
@@ -70,7 +67,6 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
   revive: ["--all", "--fresh", "--session"],
-  restore: ["--all", "--resume"],
   xa: [
     "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony", "--print",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
@@ -78,9 +74,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ],
   open: ["--raw", "--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust"],
   view: ["--name", "--new-client", "--close", "--print"],
-  workspace: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
   ws: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
-  quest: ["--colony", "--root", "--linear", "--description", "--frame", "--flow", "--status", "--keep-bees", "--close-linear", "--json"],
   usage: ["--samples", "--json", "--ttl"],
   limits: ["--samples", "--json", "--ttl"],
   sessions: ["--home", "--json"],
@@ -145,7 +139,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ],
 };
 
-export type FlagValueKind = "colony" | "workspace" | "quest" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "quest-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
+export type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
 
 export const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 export const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -192,16 +186,10 @@ export const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagVal
   fork: {
     "--seed": "fork-seed",
   },
-  quest: {
-    "--status": "quest-status",
-  },
 };
 
 export const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   colony: COLONY_SUBCOMMANDS,
-  workspace: WORKSPACE_SUBCOMMANDS,
-  ws: WORKSPACE_SUBCOMMANDS,
-  quest: QUEST_SUBCOMMANDS,
   frame: FRAME_SUBCOMMANDS,
   swarm: SWARM_SUBCOMMANDS,
   node: NODE_SUBCOMMANDS,
@@ -217,15 +205,10 @@ export const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   keys: KEYS_SUBCOMMANDS,
 };
 
-export type NounSubArgKind = "colony" | "workspace" | "quest" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run" | "account";
+export type NounSubArgKind = "colony" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run" | "account";
 
 export const NOUN_SUB_ARG: Record<string, Record<string, NounSubArgKind>> = {
   colony: { inspect: "colony", archive: "colony", update: "colony", rename: "colony" },
-  workspace: { open: "workspace", add: "workspace", "add-pane": "workspace", snapshot: "workspace", restore: "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
-  ws: { open: "workspace", add: "workspace", "add-pane": "workspace", snapshot: "workspace", restore: "workspace", close: "workspace", rename: "workspace", archive: "workspace" },
-  // `start`/`inspect`/`done`/`archive` take a quest id; `create` takes a
-  // free-form title (uncompleted).
-  quest: { start: "quest", inspect: "quest", done: "quest", archive: "quest" },
   frame: { inspect: "frame", remove: "frame", edit: "frame", update: "frame", reload: "frame" },
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },

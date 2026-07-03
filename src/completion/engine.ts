@@ -9,11 +9,9 @@ import { listRuns } from "../flow/runs.js";
 import { highlightUniqueSessionReference } from "../ids.js";
 import { listNodes, type NodeRecord } from "../node.js";
 import { BOOLEAN_FLAGS } from "../parse.js";
-import { listQuests, type QuestRecord } from "../quest.js";
 import { listSessions, type SessionRecord } from "../store.js";
 import { listSwarms, type SwarmRecord } from "../swarm.js";
 import { listTmuxSessions } from "../tmux.js";
-import { listWorkspaces, type WorkspaceRecord } from "../workspace.js";
 import {
   ACCOUNT_FIRST_ARG,
   BEE_FIRST_ARG,
@@ -30,7 +28,6 @@ import {
   NOUN_COMMAND_SUBS,
   NOUN_SUB_ARG,
   PER_COMMAND_FLAG_VALUE_KINDS,
-  QUEST_STATUS_VALUES,
   SEARCH_TYPE_VALUES,
   SEAL_STATUS_VALUES,
   SESSION_ANY,
@@ -45,9 +42,7 @@ export type CompletionState = {
   records: SessionRecord[];
   liveTargets: Set<string>;
   colonies?: ColonyRecord[];
-  workspaces?: WorkspaceRecord[];
   swarms?: SwarmRecord[];
-  quests?: QuestRecord[];
   frames?: Frame[];
   flows?: Flow[];
   nodes?: NodeRecord[];
@@ -108,13 +103,11 @@ export function getCompletionsFromState(words: string[], state: CompletionState)
 
 export async function getCompletions(words: string[]): Promise<string[]> {
   try {
-    const [records, live, colonies, workspaces, swarms, quests, frames, nodes, flows, runs, accounts] = await Promise.all([
+    const [records, live, colonies, swarms, frames, nodes, flows, runs, accounts] = await Promise.all([
       listSessions(),
       listTmuxSessions(),
       listColonies().catch(() => []),
-      listWorkspaces().catch(() => []),
       listSwarms().catch(() => []),
-      listQuests().catch(() => []),
       listFrames().catch(() => []),
       listNodes().catch(() => []),
       listFlows().catch(() => []),
@@ -125,9 +118,7 @@ export async function getCompletions(words: string[]): Promise<string[]> {
       records,
       liveTargets: new Set(live),
       colonies,
-      workspaces,
       swarms,
-      quests,
       frames,
       nodes,
       flows,
@@ -155,10 +146,6 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
   switch (kind) {
     case "colony":
       return (state.colonies ?? []).filter((c) => !c.archived).map((c) => c.name);
-    case "workspace":
-      return (state.workspaces ?? []).filter((w) => !w.archived).map((w) => w.name);
-    case "quest":
-      return (state.quests ?? []).filter((q) => q.status !== "archived").map((q) => q.id);
     case "swarm":
       return (state.swarms ?? []).filter((s) => !s.destroyed).map((s) => s.id);
     case "frame":
@@ -179,8 +166,6 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return SEARCH_TYPE_VALUES;
     case "seal-status":
       return SEAL_STATUS_VALUES;
-    case "quest-status":
-      return QUEST_STATUS_VALUES;
     case "hive-state":
       return HIVE_STATE_VALUES;
     case "flow":
@@ -226,10 +211,6 @@ function nounCommandCandidates(command: string, args: string[], state: Completio
   }
   if (positionalIndex === 2 && command === "frame" && sub === "update") {
     return fileCandidates(currentArg, [".json", ".ts"], state.cwd ?? process.cwd());
-  }
-  // `hive workspace add <name> <bee-selector>`: the 2nd positional is any bee.
-  if (positionalIndex === 2 && (command === "workspace" || command === "ws") && sub === "add") {
-    return sessionRefs(state, "all");
   }
   return [];
 }

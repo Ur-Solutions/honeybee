@@ -1,3 +1,8 @@
+> **RETIRED (2026-07-03).** Workspaces, quests, and the view cockpit were removed
+> from the hive CLI: they are Apiary desktop app concepts now. `spawn --here`
+> (window placement) survives in src/spawnLink.ts. Kept as a historical design
+> record; the quest primitive is expected to reappear at the Apiary level.
+
 # honeybee Workspaces & Quests PRD
 
 > Expands the vision in `docs/workspaces-and-quests.md` into an implementable

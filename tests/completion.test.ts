@@ -49,8 +49,6 @@ test("registers the Phase-1 keybinding verbs and their flags/subs", () => {
   assert.deepEqual(getCompletionsFromState(["hive", "urls", "--"], empty), ["--lines", "--open", "--json"]);
   // rename gains --here alongside --auto/--clear.
   assert.deepEqual(getCompletionsFromState(["hive", "rename", "--"], empty), ["--auto", "--clear", "--here"]);
-  // workspace here subcommand.
-  assert.ok(getCompletionsFromState(["hive", "workspace", ""], empty).includes("here"));
 });
 
 test("completes top-level flags when current word starts with dash", () => {
@@ -375,8 +373,3 @@ test("--node and --kind are listed in spawn / node flag completion", () => {
   assert.ok(nodeFlags.includes("--capabilities"), "node flags include --capabilities");
 });
 
-test("completes quest statuses separately from seal statuses", () => {
-  assert.deepEqual(getCompletionsFromState(["hive", "quest", "--status", ""], empty), ["open", "active", "done", "archived"]);
-  assert.deepEqual(getCompletionsFromState(["hive", "search", "--status", ""], empty), ["done", "blocked", "needs_input", "failed"]);
-  assert.deepEqual(getCompletionsFromState(["hive", "seals", "--status", ""], empty), ["done", "blocked", "needs_input", "failed"]);
-});

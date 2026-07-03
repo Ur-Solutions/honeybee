@@ -106,7 +106,7 @@ test("a tag:swarm selector throws on an unknown swarm (existence set)", () => {
   );
 });
 
-test("quest/workspace namespaces match 0..N without an existence-set throw", () => {
+test("non-existence-set namespaces match 0..N without a throw", () => {
   const target = resolveSelectorFromState({ kind: "tag", namespace: "quest", value: "nope" }, { records: [] });
   assert.equal(target.kind, "tag");
   if (target.kind === "tag") assert.deepEqual(target.records, []);

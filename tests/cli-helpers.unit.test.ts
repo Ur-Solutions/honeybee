@@ -4,7 +4,6 @@
  *   - resolveDefineArgs: the (formerly byte-identical) frame/flow define
  *     path/name disambiguation;
  *   - assertSingleBeeInvocation: the run/x/xa cohort-flag guard;
- *   - seedWorkspaceMembers/addBeeMember: the workspace member accumulator
  *     shared by add/quest-start;
  *   - logLinesFlag/followFlag: consistent -n/--lines/-f parsing across the
  *     flow/loop/daemon log commands;
@@ -19,18 +18,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-  addBeeMember,
   assertSingleBeeInvocation,
   emitLog,
   followFlag,
   logLinesFlag,
   resolveDefineArgs,
   resolvePromptArg,
-  seedWorkspaceMembers,
 } from "../src/cli.js";
 import type { Parsed } from "../src/parse.js";
 import type { SessionRecord } from "../src/store.js";
-import type { WorkspaceMember } from "../src/workspace.js";
 
 function parsedWith(flags: Record<string, string | true | string[]> = {}): Parsed {
   return { command: "test", args: [], flags: new Map(Object.entries(flags)), rest: [] };
@@ -67,39 +63,6 @@ test("assertSingleBeeInvocation: passes for a single-bee invocation", () => {
 test("assertSingleBeeInvocation: rejects --count > 1 and --frame with the hint", () => {
   assert.throws(() => assertSingleBeeInvocation(parsedWith({ count: "3" }), "use spawn"), /use spawn/);
   assert.throws(() => assertSingleBeeInvocation(parsedWith({ frame: "review" }), "use spawn"), /use spawn/);
-});
-
-// --- seedWorkspaceMembers/addBeeMember (workspace member accumulator)
-test("seedWorkspaceMembers: seeds from existing members and indexes bee ids", () => {
-  const existing: WorkspaceMember[] = [
-    { kind: "bee", beeId: "id-1" },
-    { kind: "pane", name: "shell" },
-  ];
-  const membership = seedWorkspaceMembers(existing);
-  assert.equal(membership.members.length, 2);
-  assert.deepEqual([...membership.memberIds], ["id-1"]);
-  // The seed is a copy — mutating it must not touch the source record.
-  addBeeMember(membership, beeRecord({ id: "id-2", name: "b2" }));
-  assert.equal(existing.length, 2);
-});
-
-test("seedWorkspaceMembers: undefined seeds an empty accumulator", () => {
-  const membership = seedWorkspaceMembers(undefined);
-  assert.deepEqual(membership.members, []);
-  assert.equal(membership.memberIds.size, 0);
-});
-
-test("addBeeMember: dedups by id ?? name and preserves order", () => {
-  const membership = seedWorkspaceMembers([{ kind: "bee", beeId: "id-1" }]);
-  addBeeMember(membership, beeRecord({ id: "id-1" }));            // already present
-  addBeeMember(membership, beeRecord({ id: "id-2", name: "b2" })); // new by id
-  addBeeMember(membership, beeRecord({ name: "b3" }));             // new by name (no id)
-  addBeeMember(membership, beeRecord({ name: "b3" }));             // dup by name
-  assert.deepEqual(membership.members, [
-    { kind: "bee", beeId: "id-1" },
-    { kind: "bee", beeId: "id-2" },
-    { kind: "bee", beeId: "b3" },
-  ]);
 });
 
 // --- logLinesFlag/followFlag (flow/loop/daemon log flag parsing)
