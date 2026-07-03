@@ -308,7 +308,9 @@ function legacyRecordPath(name: string) {
 }
 
 export function safeName(value: string) {
-  return value.replace(/[^A-Za-z0-9_.:-]/g, "-");
+  const sanitized = value.replace(/[^A-Za-z0-9_.:-]/g, "-");
+  if (/^[.]*$/.test(sanitized)) return sanitized.replace(/[.]/g, "-") || "-";
+  return sanitized;
 }
 
 async function readSessionRecord(path: string): Promise<SessionRecord> {

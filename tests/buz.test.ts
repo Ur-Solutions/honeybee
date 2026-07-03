@@ -128,6 +128,24 @@ test("senderDisplay shows bee id raw and human with human: prefix", () => {
   assert.equal(senderDisplay({ kind: "human", name: "tormod" }), "human:tormod");
 });
 
+test("dot-only bee names stay inside buz root", async () => {
+  await withTempStore(async () => {
+    assert.equal(beeMailboxDir("..", "inbox"), join(buzRoot(), "--", "inbox"));
+    assert.equal(beeMailboxDir(".", "inbox"), join(buzRoot(), "-", "inbox"));
+
+    await sendBuzMessage({
+      recipient: makeRecord(".."),
+      sender: { kind: "bee", id: ".." },
+      tier: "passive",
+      body: "hello",
+    });
+
+    assert.equal((await readdir(join(buzRoot(), "--", "inbox"))).length, 1);
+    assert.equal((await readdir(join(buzRoot(), "--", "outbox"))).length, 1);
+    assert.deepEqual(await readdir(join(process.env.HIVE_STORE_ROOT!, "inbox")).catch(() => []), []);
+  });
+});
+
 test("resolveBuzAccept returns DEFAULT_BUZ_ACCEPT when undefined", () => {
   assert.deepEqual(resolveBuzAccept({ buzAccept: undefined }), DEFAULT_BUZ_ACCEPT);
   assert.deepEqual([...DEFAULT_BUZ_ACCEPT], ["queue", "passive"]);
