@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -18,6 +18,7 @@ import {
   parseBuzMessage,
   processQueueForBee,
   purgeMailbox,
+  readMessageById,
   resolveBuzAccept,
   sanitizeHumanName,
   sendBuzMessage,
@@ -440,6 +441,38 @@ test("consumeMessage no-op when message is not in inbox/", async () => {
     });
     const consumed = await consumeMessage("CO.aaa", result.message.id);
     assert.equal(consumed, null);
+  });
+});
+
+test("readMessageById returns null for a malformed message file", async () => {
+  await withTempStore(async () => {
+    const id = generateMessageId(Date.now());
+    const dir = beeMailboxDir("CO.aaa", "inbox");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `20260101T000000-${id}.md`), "not a valid buz message", "utf8");
+    assert.equal(await readMessageById("CO.aaa", id), null);
+  });
+});
+
+test("readMessageById returns null when the file vanishes between readdir and read", async () => {
+  await withTempStore(async () => {
+    const id = generateMessageId(Date.now());
+    const dir = beeMailboxDir("CO.aaa", "inbox");
+    await mkdir(dir, { recursive: true });
+    // A dangling symlink shows up in readdir but ENOENTs on readFile,
+    // mimicking a concurrent purge/drain removing the file.
+    await symlink(join(dir, "gone.md"), join(dir, `20260101T000000-${id}.md`));
+    assert.equal(await readMessageById("CO.aaa", id), null);
+  });
+});
+
+test("consumeMessage returns null instead of throwing on a malformed inbox file", async () => {
+  await withTempStore(async () => {
+    const id = generateMessageId(Date.now());
+    const dir = beeMailboxDir("CO.aaa", "inbox");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `20260101T000000-${id}.md`), "garbage", "utf8");
+    assert.equal(await consumeMessage("CO.aaa", id), null);
   });
 });
 
