@@ -13,9 +13,11 @@
  * through the hooks so the fork wiring stays in cli.ts.
  */
 
-import * as readline from "node:readline";
+import type * as readline from "node:readline";
 import { bold, cyan, dim, green, isPretty, red, stripAnsi, truncate, visibleLength } from "./format.js";
 import { createTuiPainter } from "./tuiPaint.js";
+import { clamp, isPrintable, padRight, relTilde, reverse } from "./tuiKit.js";
+import { runRawModeTui } from "./tuiRuntime.js";
 
 /** The editable form state — the fork the user is composing. */
 export type ForkFormValues = {
@@ -215,9 +217,7 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
     throw new Error("hive fork launch requires a TTY — run it from a tmux popup binding (⌘K) or an interactive terminal.");
   }
 
-  const stdin = process.stdin;
   const stdout = process.stdout;
-  const previousRaw = stdin.isRaw;
 
   const optionList = (kind: OptKind): string[] => {
     switch (kind) {
@@ -239,213 +239,150 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
   let formError = "";
   let message = "↑↓ field · type to edit · ←/→ or space cycle · enter fork · q cancel";
 
-  readline.emitKeypressEvents(stdin);
-  stdin.setRawMode(true);
-  stdin.resume();
-  stdout.write("\x1b[?1049h\x1b[?25l");
+  return runRawModeTui<ForkLaunchResult | null>((tui) => {
+    const { finish } = tui;
 
-  let restored = false;
-  const restoreTerminal = () => {
-    if (restored) return;
-    restored = true;
-    stdout.write("\x1b[?25h\x1b[?1049l");
-    stdin.setRawMode(previousRaw);
-    stdin.pause();
-  };
-  const onSignal = (signal: NodeJS.Signals) => {
-    restoreTerminal();
-    process.exit(signal === "SIGTERM" ? 143 : 129);
-  };
-  process.once("exit", restoreTerminal);
-  process.once("SIGTERM", onSignal);
-  process.once("SIGHUP", onSignal);
+    const rows = (): FormRow[] => formRows(values, advancedOpen, hooks.accountRequired);
+    const focusedRow = (): FormRow | undefined => rows()[cursorRow];
 
-  try {
-    return await new Promise<ForkLaunchResult | null>((resolve) => {
-      let done = false;
-      const finish = (result: ForkLaunchResult | null) => {
-        if (done) return;
-        done = true;
-        stdin.off("keypress", onKey);
-        stdout.off("resize", onResize);
-        resolve(result);
-      };
+    const cycle = (kind: OptKind, dir: 1 | -1) => {
+      const list = optionList(kind);
+      if (list.length === 0) return;
+      const key = kind === "seed" ? "seed" : kind === "agent" ? "agent" : kind === "where" ? "where" : "account";
+      const i = Math.max(0, list.indexOf(values[key as keyof ForkFormValues] as string));
+      const next = (i + dir + list.length) % list.length;
+      values[key as keyof ForkFormValues] = list[next]! as never;
+      formError = "";
+      render();
+    };
 
-      const rows = (): FormRow[] => formRows(values, advancedOpen, hooks.accountRequired);
-      const focusedRow = (): FormRow | undefined => rows()[cursorRow];
+    const toggleAdvanced = () => {
+      advancedOpen = !advancedOpen;
+      // Keep focus on the toggle row so the reveal doesn't jump the cursor.
+      cursorRow = rows().findIndex((r) => r.kind === "toggle");
+      render();
+    };
 
-      const cycle = (kind: OptKind, dir: 1 | -1) => {
-        const list = optionList(kind);
-        if (list.length === 0) return;
-        const key = kind === "seed" ? "seed" : kind === "agent" ? "agent" : kind === "where" ? "where" : "account";
-        const i = Math.max(0, list.indexOf(values[key as keyof ForkFormValues] as string));
-        const next = (i + dir + list.length) % list.length;
-        values[key as keyof ForkFormValues] = list[next]! as never;
-        formError = "";
+    const submitFork = () => {
+      const missing = missingForFork(values, { accountRequired: hooks.accountRequired });
+      if (missing.length > 0) {
+        formError = `fill required: ${missing.join(", ")}`;
         render();
-      };
+        return;
+      }
+      finish({ action: "fork", values: { ...values } });
+    };
 
-      const toggleAdvanced = () => {
-        advancedOpen = !advancedOpen;
-        // Keep focus on the toggle row so the reveal doesn't jump the cursor.
-        cursorRow = rows().findIndex((r) => r.kind === "toggle");
-        render();
-      };
+    const onKey = (value: string, key: readline.Key) => {
+      if (key.ctrl && key.name === "c") { finish(null); return; }
+      if (key.name === "escape") { finish(null); return; }
+      if (key.name === "up") { cursorRow = clamp(cursorRow - 1, rows().length); formError = ""; render(); return; }
+      if (key.name === "down") { cursorRow = clamp(cursorRow + 1, rows().length); formError = ""; render(); return; }
 
-      const submitFork = () => {
-        const missing = missingForFork(values, { accountRequired: hooks.accountRequired });
-        if (missing.length > 0) {
-          formError = `fill required: ${missing.join(", ")}`;
-          render();
-          return;
-        }
-        finish({ action: "fork", values: { ...values } });
-      };
+      const row = focusedRow();
+      // `q` cancels everywhere except a focused text field, where it is
+      // literal input — a fork named "queen" must be typable. esc/Ctrl-C
+      // (above) cancel regardless of focus.
+      if (key.name === "q" && !(row?.kind === "field" && row.field === "text")) { finish(null); return; }
+      if (!row) return;
 
-      const isPrintable = (value: string, key: readline.Key) =>
-        Boolean(value) && value.length === 1 && value >= " " && !key.ctrl && !key.meta;
+      if (row.kind === "toggle") {
+        if (key.name === "return" || key.name === "enter" || key.name === "space" || key.name === "right" || key.name === "left") toggleAdvanced();
+        return;
+      }
+      if (row.kind === "action") {
+        if (key.name === "return" || key.name === "enter") submitFork();
+        return;
+      }
+      // field row
+      if (row.field === "cycle" && row.opts) {
+        if (key.name === "right" || key.name === "space" || key.name === "return" || key.name === "enter") { cycle(row.opts, 1); return; }
+        if (key.name === "left") { cycle(row.opts, -1); return; }
+        return;
+      }
+      // text field
+      if (key.name === "return" || key.name === "enter") { cursorRow = clamp(cursorRow + 1, rows().length); render(); return; }
+      if (key.name === "left" || key.name === "right") return; // let arrows stay on the row
+      if (key.name === "backspace") { values[row.key] = String(values[row.key]).slice(0, -1) as never; render(); return; }
+      if (key.ctrl && key.name === "u") { values[row.key] = "" as never; render(); return; }
+      if (isPrintable(value, key)) { values[row.key] = (String(values[row.key]) + value) as never; render(); return; }
+    };
 
-      const onKey = (value: string, key: readline.Key) => {
-        if (key.ctrl && key.name === "c") { finish(null); return; }
-        if (key.name === "escape") { finish(null); return; }
-        if (key.name === "up") { cursorRow = clamp(cursorRow - 1, rows().length); formError = ""; render(); return; }
-        if (key.name === "down") { cursorRow = clamp(cursorRow + 1, rows().length); formError = ""; render(); return; }
+    // ── rendering ──────────────────────────────────────────────────────────
+    const painter = createTuiPainter(stdout);
+    const render = () => {
+      if (tui.done) return;
+      const width = Math.max(40, stdout.columns || 100);
+      const height = Math.max(12, stdout.rows || 24);
 
-        const row = focusedRow();
-        // `q` cancels everywhere except a focused text field, where it is
-        // literal input — a fork named "queen" must be typable. esc/Ctrl-C
-        // (above) cancel regardless of focus.
-        if (key.name === "q" && !(row?.kind === "field" && row.field === "text")) { finish(null); return; }
-        if (!row) return;
+      const header = `${bold("hive fork")}  ${dim(breadcrumb())}`;
+      const lines: string[] = [header, "", ...renderForm(width)];
+      while (lines.length < height - 2) lines.push("");
+      lines.push(truncate(formError ? red(formError) : message, width));
+      lines.push(dim("↑↓ field · ←/→ or space cycle · type to edit · enter fork · q/esc cancel"));
+      painter.paint(lines, width, height);
+      parkCursor(width);
+    };
 
+    const breadcrumb = (): string => {
+      const parts = [`${hooks.source.name}`, values.agent, values.seed];
+      if (values.where !== "same") parts.push(`${values.where}:${values.slot || "…"}`);
+      else parts.push(relTilde(hooks.source.cwd));
+      return parts.join("  ›  ");
+    };
+
+    const renderForm = (width: number): string[] => {
+      const list = rows();
+      const fieldRows = list.filter((r): r is FieldRow => r.kind === "field");
+      const labelW = Math.min(16, Math.max(6, ...fieldRows.map((r) => r.label.length + 2)));
+      const fieldW = Math.max(10, width - labelW - 8);
+      const out: string[] = [dim(`fork ${hooks.source.name} — ${red("*")} = required`), ""];
+      list.forEach((row, i) => {
+        const focused = i === cursorRow;
+        const pointer = focused ? green("›") : " ";
         if (row.kind === "toggle") {
-          if (key.name === "return" || key.name === "enter" || key.name === "space" || key.name === "right" || key.name === "left") toggleAdvanced();
+          const label = `[ advanced ${advancedOpen ? "▾" : "▸"} ]`;
+          out.push(`${pointer}   ${focused && isPretty() ? reverse(stripAnsi(label)) : dim(label)}`);
           return;
         }
         if (row.kind === "action") {
-          if (key.name === "return" || key.name === "enter") submitFork();
+          out.push(`${pointer}   ${focused && isPretty() ? reverse(stripAnsi(row.label)) : bold(row.label)}`);
           return;
         }
-        // field row
-        if (row.field === "cycle" && row.opts) {
-          if (key.name === "right" || key.name === "space" || key.name === "return" || key.name === "enter") { cycle(row.opts, 1); return; }
-          if (key.name === "left") { cycle(row.opts, -1); return; }
-          return;
+        const required = (row.key === "slot" && values.where !== "same") || (row.key === "account" && hooks.accountRequired);
+        const req = required ? red("*") : " ";
+        const name = padRight(row.label, labelW);
+        let field: string;
+        if (row.field === "cycle") {
+          const shown = row.opts === "account" ? accountLabel(values.account) : String(values[row.key]);
+          field = focused && isPretty() ? reverse(` ${padRight(stripAnsi(shown), fieldW)} `) : shown;
+        } else {
+          const shown = truncate(String(values[row.key] ?? ""), fieldW);
+          if (focused && isPretty()) field = reverse(` ${padRight(shown, fieldW)} `);
+          else if (shown.length > 0) field = shown;
+          else field = dim("—");
         }
-        // text field
-        if (key.name === "return" || key.name === "enter") { cursorRow = clamp(cursorRow + 1, rows().length); render(); return; }
-        if (key.name === "left" || key.name === "right") return; // let arrows stay on the row
-        if (key.name === "backspace") { values[row.key] = String(values[row.key]).slice(0, -1) as never; render(); return; }
-        if (key.ctrl && key.name === "u") { values[row.key] = "" as never; render(); return; }
-        if (isPrintable(value, key)) { values[row.key] = (String(values[row.key]) + value) as never; render(); return; }
-      };
+        out.push(`${pointer} ${req} ${dim(name)}  ${field}`);
+      });
+      out.push("");
+      const row = focusedRow();
+      const help = row?.kind === "field" && row.key === "seed" ? (SEED_HELP[values.seed] ?? row.description) : row && "description" in row ? row.description : "";
+      out.push(help ? dim(`  ${truncate(help, width - 4)}`) : "");
+      return out;
+    };
 
-      // ── rendering ──────────────────────────────────────────────────────────
-      const painter = createTuiPainter(stdout);
-      const render = () => {
-        if (done) return;
-        const width = Math.max(40, stdout.columns || 100);
-        const height = Math.max(12, stdout.rows || 24);
+    const parkCursor = (width: number) => {
+      // Park the real cursor at the end of a focused TEXT field so typing feels
+      // native; cycle/toggle/action rows hide it.
+      const row = focusedRow();
+      if (!row || row.kind !== "field" || row.field !== "text") return;
+      const list = rows();
+      const labelW = Math.min(16, Math.max(6, ...list.filter((r): r is FieldRow => r.kind === "field").map((r) => r.label.length + 2)));
+      const screenRow = 2 /* header+blank */ + 2 /* form title+blank */ + cursorRow + 1;
+      const col = 1 /* pointer */ + 1 + 1 /* req */ + 1 + labelW + 2 + 1 + visibleLength(String(values[row.key]));
+      stdout.write(`\x1b[${screenRow};${Math.min(col, width)}H`);
+    };
 
-        const header = `${bold("hive fork")}  ${dim(breadcrumb())}`;
-        const lines: string[] = [header, "", ...renderForm(width)];
-        while (lines.length < height - 2) lines.push("");
-        lines.push(truncate(formError ? red(formError) : message, width));
-        lines.push(dim("↑↓ field · ←/→ or space cycle · type to edit · enter fork · q/esc cancel"));
-        painter.paint(lines, width, height);
-        parkCursor(width);
-      };
-
-      const breadcrumb = (): string => {
-        const parts = [`${hooks.source.name}`, values.agent, values.seed];
-        if (values.where !== "same") parts.push(`${values.where}:${values.slot || "…"}`);
-        else parts.push(relTilde(hooks.source.cwd));
-        return parts.join("  ›  ");
-      };
-
-      const renderForm = (width: number): string[] => {
-        const list = rows();
-        const fieldRows = list.filter((r): r is FieldRow => r.kind === "field");
-        const labelW = Math.min(16, Math.max(6, ...fieldRows.map((r) => r.label.length + 2)));
-        const fieldW = Math.max(10, width - labelW - 8);
-        const out: string[] = [dim(`fork ${hooks.source.name} — ${red("*")} = required`), ""];
-        list.forEach((row, i) => {
-          const focused = i === cursorRow;
-          const pointer = focused ? green("›") : " ";
-          if (row.kind === "toggle") {
-            const label = `[ advanced ${advancedOpen ? "▾" : "▸"} ]`;
-            out.push(`${pointer}   ${focused && isPretty() ? reverse(stripAnsi(label)) : dim(label)}`);
-            return;
-          }
-          if (row.kind === "action") {
-            out.push(`${pointer}   ${focused && isPretty() ? reverse(stripAnsi(row.label)) : bold(row.label)}`);
-            return;
-          }
-          const required = (row.key === "slot" && values.where !== "same") || (row.key === "account" && hooks.accountRequired);
-          const req = required ? red("*") : " ";
-          const name = padRight(row.label, labelW);
-          let field: string;
-          if (row.field === "cycle") {
-            const shown = row.opts === "account" ? accountLabel(values.account) : String(values[row.key]);
-            field = focused && isPretty() ? reverse(` ${padRight(stripAnsi(shown), fieldW)} `) : shown;
-          } else {
-            const shown = truncate(String(values[row.key] ?? ""), fieldW);
-            if (focused && isPretty()) field = reverse(` ${padRight(shown, fieldW)} `);
-            else if (shown.length > 0) field = shown;
-            else field = dim("—");
-          }
-          out.push(`${pointer} ${req} ${dim(name)}  ${field}`);
-        });
-        out.push("");
-        const row = focusedRow();
-        const help = row?.kind === "field" && row.key === "seed" ? (SEED_HELP[values.seed] ?? row.description) : row && "description" in row ? row.description : "";
-        out.push(help ? dim(`  ${truncate(help, width - 4)}`) : "");
-        return out;
-      };
-
-      const parkCursor = (width: number) => {
-        // Park the real cursor at the end of a focused TEXT field so typing feels
-        // native; cycle/toggle/action rows hide it.
-        const row = focusedRow();
-        if (!row || row.kind !== "field" || row.field !== "text") return;
-        const list = rows();
-        const labelW = Math.min(16, Math.max(6, ...list.filter((r): r is FieldRow => r.kind === "field").map((r) => r.label.length + 2)));
-        const screenRow = 2 /* header+blank */ + 2 /* form title+blank */ + cursorRow + 1;
-        const col = 1 /* pointer */ + 1 + 1 /* req */ + 1 + labelW + 2 + 1 + visibleLength(String(values[row.key]));
-        stdout.write(`\x1b[${screenRow};${Math.min(col, width)}H`);
-      };
-
-      const relTilde = (abs: string): string => {
-        const home = process.env.HOME;
-        return home && abs.startsWith(home) ? `~${abs.slice(home.length)}` : abs;
-      };
-
-      const onResize = () => render();
-
-      render();
-      stdin.on("keypress", onKey);
-      stdout.on("resize", onResize);
-    });
-  } finally {
-    process.off("exit", restoreTerminal);
-    process.off("SIGTERM", onSignal);
-    process.off("SIGHUP", onSignal);
-    restoreTerminal();
-  }
-}
-
-// ── small helpers ────────────────────────────────────────────────────────────
-
-function clamp(next: number, length: number): number {
-  if (length <= 0) return 0;
-  return Math.max(0, Math.min(length - 1, next));
-}
-
-function padRight(value: string, width: number): string {
-  const visible = visibleLength(value);
-  return visible >= width ? value : value + " ".repeat(width - visible);
-}
-
-function reverse(value: string): string {
-  return isPretty() ? `\x1b[7m${value}\x1b[0m` : value;
+    return { onKey, render };
+  });
 }
