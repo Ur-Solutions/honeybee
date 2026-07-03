@@ -15,6 +15,7 @@
 
 import type { RunnerEvent, RunnerOpts, RunnerSession, RunnerTier } from "./types.js";
 import { attachSessionPlumbing, spawnSessionChild } from "./sessionBase.js";
+import { makeLineReader } from "./lineReader.js";
 
 export type StreamRunnerConfig = {
   harness: string;
@@ -42,22 +43,6 @@ function safeJsonParse(line: string): unknown {
   } catch {
     return undefined;
   }
-}
-
-/** Split a byte stream into complete lines; buffers the partial trailing line. */
-function makeLineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
-  let buffer = "";
-  return (chunk: Buffer): void => {
-    buffer += chunk.toString("utf8");
-    let nl = buffer.indexOf("\n");
-    while (nl !== -1) {
-      const line = buffer.slice(0, nl);
-      buffer = buffer.slice(nl + 1);
-      const trimmed = line.replace(/\r$/, "");
-      if (trimmed.length > 0) onLine(trimmed);
-      nl = buffer.indexOf("\n");
-    }
-  };
 }
 
 export async function startStreamRunner(config: StreamRunnerConfig, opts: RunnerOpts): Promise<RunnerSession> {

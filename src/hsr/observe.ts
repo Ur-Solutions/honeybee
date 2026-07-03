@@ -18,6 +18,7 @@
 
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import type { BeeState } from "../state.js";
+import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
 import {
   HSR_EVENTS_MAX_BYTES,
   hsrEventsPath,
@@ -29,17 +30,6 @@ import {
   type HsrMeta,
 } from "./runDir.js";
 import type { RunnerEvent } from "./types.js";
-
-/** Signal-0 liveness probe; EPERM means the pid exists but isn't ours. */
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
 
 /**
  * Whether a meta record represents a live bee. For a LOCAL host the host pid is

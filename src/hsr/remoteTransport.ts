@@ -32,13 +32,18 @@ import { storeRoot } from "../fsx.js";
 import type { NodeRecord } from "../node.js";
 import { remoteBundlePath } from "./bootstrap.js";
 import { connectRpcClient, type RpcClient } from "./rpc.js";
+import { defaultSshExecHook, DEFAULT_SSH_EXEC_TIMEOUT_MS, type SshExecHook } from "./sshExec.js";
+
+// The ssh exec hook + type live in ./sshExec.js (single source shared with
+// bootstrap.ts); re-exported here so existing `remoteTransport` importers keep working.
+export { defaultSshExecHook };
+export type { SshExecHook };
 
 // --- shared defaults ----------------------------------------------------------
 
 /** Default runner-host control socket path on the remote (tilde-expanded remote-side). */
 export const DEFAULT_REMOTE_SOCKET = "~/.hive/runner-host/control.sock";
 
-const DEFAULT_SSH_EXEC_TIMEOUT_MS = 8_000;
 const DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = Math.ceil(DEFAULT_SSH_EXEC_TIMEOUT_MS / 1000);
 
 // Connection-multiplexing options plus a connect timeout for bounded remote-hsr
@@ -78,11 +83,6 @@ const DEFAULT_RECONNECT_MAX_MS = 5_000;
 const DEFAULT_MAX_QUEUE = 256;
 
 // --- injectable hooks ---------------------------------------------------------
-
-export type SshExecHook = (
-  argv: string[],
-  input?: string,
-) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
 
 /** A spawned long-lived tunnel child. `exited` resolves when the child dies. */
 export type TunnelChild = {
@@ -583,47 +583,6 @@ function pickDeps(opts: RemoteTransportDeps): RemoteTransportDeps {
 }
 
 // --- default hooks ------------------------------------------------------------
-
-/** Default ssh exec hook: spawn ssh, collect stdout/stderr, and bound wall-clock time. */
-export function defaultSshExecHook(
-  argv: string[],
-  input?: string,
-  opts: { timeoutMs?: number } = {},
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const [command, ...args] = argv;
-  if (!command) return Promise.reject(new Error("Empty argv"));
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const timeoutMs = Math.max(1, opts.timeoutMs ?? DEFAULT_SSH_EXEC_TIMEOUT_MS);
-    const settle = (result: { stdout: string; stderr: string; exitCode: number }): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      const timeoutMessage = `timed out after ${timeoutMs}ms`;
-      const timeoutStderr = stderr ? `${stderr}${stderr.endsWith("\n") ? "" : "\n"}${timeoutMessage}` : timeoutMessage;
-      settle({ stdout, stderr: timeoutStderr, exitCode: 1 });
-    }, timeoutMs);
-    timer.unref?.();
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", (error) => settle({ stdout, stderr: stderr || error.message, exitCode: 1 }));
-    child.on("close", (code, signal) => settle({ stdout, stderr, exitCode: code ?? (signal ? 130 : 1) }));
-    child.stdin.on("error", () => undefined);
-    if (input !== undefined) child.stdin.write(input);
-    child.stdin.end();
-  });
-}
 
 /** Default tunnel spawn: a long-lived detached `ssh -N -L ...` child. */
 export function defaultSpawnTunnel(argv: string[]): TunnelChild {

@@ -17,7 +17,7 @@ import { appendFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { atomicWriteFile, storeRoot } from "../fsx.js";
+import { atomicWriteFile, defaultIsPidAlive, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
 import type { SealRecord, SealStatus } from "../seal.js";
 
@@ -254,17 +254,6 @@ export async function listLoops(opts: { isPidAlive?: (pid: number) => boolean; n
   // Newest first — startedAt is ISO so lexical sort matches chronological.
   out.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
   return out;
-}
-
-function defaultIsPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === "EPERM";
-  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
