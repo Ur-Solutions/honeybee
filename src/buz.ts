@@ -30,7 +30,7 @@
 
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseBuzDocument, serializeBuzDocument, type BuzFrontmatter } from "./buz_format.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
@@ -133,15 +133,25 @@ export function buzRoot(): string {
 }
 
 export function beeMailboxDir(beeName: string, mailbox: BuzMailbox): string {
-  return join(buzRoot(), safeName(beeName), mailbox);
+  return anchoredBuzPath(safeName(beeName), mailbox);
 }
 
 export function externalOutboxDir(humanName: string): string {
-  return join(buzRoot(), EXTERNAL_NAMESPACE, sanitizeHumanName(humanName), "outbox");
+  return anchoredBuzPath(EXTERNAL_NAMESPACE, sanitizeHumanName(humanName), "outbox");
 }
 
 function senderLockPath(beeName: string): string {
-  return join(buzRoot(), safeName(beeName), ".write.lock");
+  return anchoredBuzPath(safeName(beeName), ".write.lock");
+}
+
+function anchoredBuzPath(...segments: string[]): string {
+  const root = buzRoot();
+  const path = join(root, ...segments);
+  const rel = relative(resolve(root), resolve(path));
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`buz path escaped root: ${path}`);
+  }
+  return path;
 }
 
 // ──────────────────────────────────────────────────────────────────────────

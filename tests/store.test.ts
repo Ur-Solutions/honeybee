@@ -9,6 +9,7 @@ import {
   ledgerPath,
   listSessions,
   loadSession,
+  safeName,
   saveSession,
   touchSession,
   updateSession,
@@ -41,6 +42,15 @@ async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> 
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+test("safeName neutralizes empty and dot-only path segments", () => {
+  assert.equal(safeName("CO.abc"), "CO.abc");
+  assert.equal(safeName("bad/name"), "bad-name");
+  assert.equal(safeName("."), "-");
+  assert.equal(safeName(".."), "--");
+  assert.equal(safeName("..."), "---");
+  assert.equal(safeName(""), "-");
+});
 
 test("store root is read at call time and session files are private", async () => {
   const oldRoot = process.env.HIVE_STORE_ROOT;

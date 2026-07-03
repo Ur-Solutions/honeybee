@@ -11,7 +11,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { storeRoot } from "./fsx.js";
 import { sealsRoot, type SealRecord } from "./seal.js";
-import { ledgerPath, listSessions, type SessionRecord } from "./store.js";
+import { ledgerPath, listSessions, safeName, type SessionRecord } from "./store.js";
 
 export type SearchHitType = "seal" | "ledger" | "session";
 
@@ -426,14 +426,8 @@ async function* defaultReadSessionRecords(filter: SessionFilter): AsyncIterable<
     if (filter.bee && record.name !== filter.bee) continue;
     if (filter.colony && record.colony !== filter.colony) continue;
     if (filter.swarm && record.swarmId !== filter.swarm) continue;
-    yield { path: join(sessionsDir, `${safeSessionFile(record.name)}.json`), record };
+    yield { path: join(sessionsDir, `${safeName(record.name)}.json`), record };
   }
-}
-
-function safeSessionFile(name: string): string {
-  // Mirror store.ts safeName() locally to avoid a circular dependency in tests
-  // that mock listSessions but still want a path on the hit.
-  return name.replace(/[^A-Za-z0-9_.:-]/g, "-");
 }
 
 async function* defaultReadLedgerLines(filter: LedgerFilter): AsyncIterable<{
