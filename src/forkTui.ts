@@ -15,6 +15,7 @@
 
 import * as readline from "node:readline";
 import { bold, cyan, dim, green, isPretty, red, stripAnsi, truncate, visibleLength } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 
 /** The editable form state — the fork the user is composing. */
 export type ForkFormValues = {
@@ -337,6 +338,7 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
       };
 
       // ── rendering ──────────────────────────────────────────────────────────
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(40, stdout.columns || 100);
@@ -347,7 +349,7 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
         while (lines.length < height - 2) lines.push("");
         lines.push(truncate(formError ? red(formError) : message, width));
         lines.push(dim("↑↓ field · ←/→ or space cycle · type to edit · enter fork · q/esc cancel"));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
         parkCursor(width);
       };
 

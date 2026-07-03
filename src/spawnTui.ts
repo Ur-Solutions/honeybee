@@ -13,6 +13,7 @@
 
 import * as readline from "node:readline";
 import { bold, cyan, dim, green, isPretty, red, stripAnsi, truncate, visibleLength } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 
 export type SpawnTuiType = {
   kind: string;
@@ -677,6 +678,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       };
 
       // ── rendering ──────────────────────────────────────────────────────────
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(40, stdout.columns || 100);
@@ -709,7 +711,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         else if (inIsolation) footer = "j/k move · enter select · ← back · q quit";
         else footer = "j/k move · h/l columns · enter advance · +/- count · q quit";
         lines.push(dim(footer));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
         if (inPath || inBrowse || inIsoName) {
           // Park the real cursor at the end of the "> " filter/name field. Body
           // starts on the 3rd screen line (header, blank, then "> <text>"),
