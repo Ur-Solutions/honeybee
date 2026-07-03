@@ -11,7 +11,7 @@ import {
   claudeHomesForAccount,
   codexHomesForAccount,
   listAccounts,
-  persistClaudeChain,
+  persistClaudeChainLocked,
   readVaultClaudeChain,
   refreshClaudeOauthChain,
   saveClaudeOauthToVault,
@@ -222,10 +222,20 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
   let credential: ClaudeOauthCredentials | undefined;
   const imposters = new Set<string>();
   let unverifiableFresh = 0;
+  let unattributedFresh = 0;
   for (const candidate of candidates.filter((entry) => entry.expiresAt > now)) {
     if (!expectedEmail) {
-      credential = candidate;
-      break;
+      // No email to verify against, so only account-attributed sources
+      // (vault + dedicated homes) can be trusted. An unattributed keychain
+      // entry scraped from a shared ~/.claude* home is most likely another
+      // account's daily-driver login — using it would misattribute that
+      // account's usage here and skew the `auto` least-loaded pick.
+      if (candidate.attributed) {
+        credential = candidate;
+        break;
+      }
+      unattributedFresh += 1;
+      continue;
     }
     const actualEmail = await profileOf(candidate.accessToken).catch(() => null);
     if (actualEmail === expectedEmail) {
@@ -270,44 +280,83 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
       };
     }
     const refresh = deps.refreshClaudeToken ?? refreshClaudeOauthChain;
-    const persist = deps.persistRefreshedCredentials ?? persistClaudeChain;
-    const attempted = new Set<string>();
-    for (const candidate of candidates) {
-      if (candidate.expiresAt > now) continue;
-      if (!candidate.attributed || !candidate.refreshToken || attempted.has(candidate.refreshToken)) continue;
-      attempted.add(candidate.refreshToken);
-      const refreshed = await refresh(candidate.refreshToken).catch(() => null);
-      if (!refreshed) continue;
-      const oauth: Record<string, unknown> = {
-        ...candidate.oauth,
-        accessToken: refreshed.accessToken,
-        refreshToken: refreshed.refreshToken,
-        expiresAt: refreshed.expiresAt,
-        ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
-      };
-      const actualEmail = expectedEmail ? await profileOf(refreshed.accessToken).catch(() => null) : null;
-      if (expectedEmail && actualEmail && actualEmail !== expectedEmail) {
-        // The chain belongs to someone else (mislabeled source). Park the
-        // rotated tokens with their real owner so the chain isn't lost.
-        imposters.add(actualEmail);
-        const owner = (await listAccounts()).find(
-          (other) => other.tool === "claude" && (other.email ?? other.label) === actualEmail,
-        );
-        if (owner) await persist(owner, oauth).catch(() => undefined);
-        continue;
+    const persist = deps.persistRefreshedCredentials ?? persistClaudeChainLocked;
+    const readVault = deps.readVaultChain ?? readVaultClaudeChain;
+    const lock = deps.withAccountsLock ?? withAccountsLock;
+    // HIVE-2: refresh+persist is a read-modify-write of the account's chain,
+    // and refresh tokens rotate — two concurrent refreshes (say, the --live
+    // dashboard and an activation both hitting one expired account) replay
+    // the same refresh token, which trips the provider's reuse detection and
+    // can revoke the whole chain, logging the live session out. Take the same
+    // accounts lock as activation's refresh path, and double-check the vault
+    // inside it: a writer that beat us to the rotation left a fresh chain to
+    // use instead of replaying the now-dead token.
+    credential = await lock<ClaudeOauthCredentials | undefined>(async () => {
+      const attempted = new Set<string>();
+      const vaultNow = await readVault(account).catch(() => null);
+      if (vaultNow && vaultNow.expiresAt > now && typeof vaultNow.oauth.accessToken === "string") {
+        const accessToken = vaultNow.oauth.accessToken;
+        const actualEmail = expectedEmail ? await profileOf(accessToken).catch(() => null) : null;
+        if (!expectedEmail || actualEmail === expectedEmail) {
+          return {
+            accessToken,
+            expiresAt: vaultNow.expiresAt,
+            ...(typeof vaultNow.oauth.subscriptionType === "string" ? { subscriptionType: vaultNow.oauth.subscriptionType } : {}),
+            oauth: vaultNow.oauth,
+            ...(vaultNow.refreshToken ? { refreshToken: vaultNow.refreshToken } : {}),
+            attributed: true,
+            source: "vault",
+          };
+        }
+        if (actualEmail) imposters.add(actualEmail);
       }
-      await persist(account, oauth).catch(() => undefined);
-      credential = {
-        accessToken: refreshed.accessToken,
-        expiresAt: refreshed.expiresAt,
-        ...(typeof candidate.oauth.subscriptionType === "string" ? { subscriptionType: candidate.oauth.subscriptionType } : {}),
-        oauth,
-        refreshToken: refreshed.refreshToken,
-        attributed: true,
-        source: "refresh",
-      };
-      break;
-    }
+      // Even when the rotated-behind-us chain is unusable here (imposter, or
+      // itself expired again), never replay the superseded vault token — that
+      // replay IS the reuse-detection trip this lock exists to prevent.
+      if (vaultNow?.refreshToken) {
+        for (const candidate of candidates) {
+          if (candidate.source === "vault" && candidate.refreshToken && candidate.refreshToken !== vaultNow.refreshToken) {
+            attempted.add(candidate.refreshToken);
+          }
+        }
+      }
+      for (const candidate of candidates) {
+        if (candidate.expiresAt > now) continue;
+        if (!candidate.attributed || !candidate.refreshToken || attempted.has(candidate.refreshToken)) continue;
+        attempted.add(candidate.refreshToken);
+        const refreshed = await refresh(candidate.refreshToken).catch(() => null);
+        if (!refreshed) continue;
+        const oauth: Record<string, unknown> = {
+          ...candidate.oauth,
+          accessToken: refreshed.accessToken,
+          refreshToken: refreshed.refreshToken,
+          expiresAt: refreshed.expiresAt,
+          ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
+        };
+        const actualEmail = expectedEmail ? await profileOf(refreshed.accessToken).catch(() => null) : null;
+        if (expectedEmail && actualEmail && actualEmail !== expectedEmail) {
+          // The chain belongs to someone else (mislabeled source). Park the
+          // rotated tokens with their real owner so the chain isn't lost.
+          imposters.add(actualEmail);
+          const owner = (await listAccounts()).find(
+            (other) => other.tool === "claude" && (other.email ?? other.label) === actualEmail,
+          );
+          if (owner) await persist(owner, oauth).catch(() => undefined);
+          continue;
+        }
+        await persist(account, oauth).catch(() => undefined);
+        return {
+          accessToken: refreshed.accessToken,
+          expiresAt: refreshed.expiresAt,
+          ...(typeof candidate.oauth.subscriptionType === "string" ? { subscriptionType: candidate.oauth.subscriptionType } : {}),
+          oauth,
+          refreshToken: refreshed.refreshToken,
+          attributed: true,
+          source: "refresh",
+        };
+      }
+      return undefined;
+    });
   }
 
   if (!credential) {
@@ -319,7 +368,9 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
       error:
         imposters.size > 0
           ? `no token belongs to ${expectedEmail} (found: ${[...imposters].join(", ")}); re-login with: hive login ${account.id}`
-          : `all ${candidates.length} token(s) expired and refresh failed; re-login with: hive login ${account.id}`,
+          : unattributedFresh > 0
+            ? `found ${unattributedFresh} fresh token(s) only in shared homes, but the account has no email to verify them against; log in with: hive login ${account.id}, or re-add with --email`
+            : `all ${candidates.length} token(s) expired and refresh failed; re-login with: hive login ${account.id}`,
     };
   }
 
@@ -429,7 +480,8 @@ async function claudeCredentialCandidates(
   // The account's true login may live in a home we cannot attribute (the
   // default ~/.claude has no in-home .claude.json). Include every claude
   // home's keychain as a last-resort candidate pool — identity verification
-  // filters out the wrong ones, and these are never refresh-rotated.
+  // filters out the wrong ones, they are never refresh-rotated, and
+  // email-less accounts (nothing to verify against) never use them at all.
   for (const home of await candidateHomes("claude")) {
     push(await readKeychain(home), false, `${home}:keychain`);
   }

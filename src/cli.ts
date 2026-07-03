@@ -109,7 +109,6 @@ import type { RunnerOpts } from "./hsr/types.js";
 import { loopFlow } from "./loop/flow.js";
 import { buildLoopConfig } from "./loop/context.js";
 import {
-  ensureLoopDir,
   generateLoopId,
   type LoopConfig,
   listLoops,
@@ -2091,31 +2090,7 @@ async function cmdList(parsed: Parsed) {
     records = records.filter((r) => names.has(r.name));
   }
 
-  const panes = await capturePanesFor(records, probe.liveTargets);
-  const seals = await listSealedBeeNames();
-  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
-  // HSR bees are pane-less — observed from run dirs, not tmux. Without this they
-  // have no live pane/target and deriveState reads every one as dead.
-  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
-  const hsrLive = new Set<string>();
-  const hsrStates = new Map<string, BeeState>();
-  const hsrSnapshots = new Map<string, string>();
-  for (const [bee, observation] of hsrObs) {
-    if (observation.live) hsrLive.add(bee);
-    if (observation.state) hsrStates.set(bee, observation.state);
-    hsrSnapshots.set(bee, observation.snapshot);
-  }
-  const context: StateContext = {
-    liveTargets: probe.liveTargets,
-    livePanes,
-    panes,
-    seals,
-    unreachableNodes: probe.unreachableNodes,
-    hsrLive,
-    hsrStates,
-    hsrSnapshots,
-    now: Date.now(),
-  };
+  const context = await buildStateContext(records, probe);
   const states = new Map(records.map((record) => [record.name, deriveState(record, context)] as const));
 
   // Live @hive_state (set by hive itself and by agent hooks) wins over the
@@ -2330,31 +2305,7 @@ async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[];
   if (swarmFilter) records = records.filter((record) => record.swarmId === swarmFilter);
   if (nodeFilter) records = records.filter((record) => (record.node ?? LOCAL_NODE_NAME) === nodeFilter);
 
-  const panes = await capturePanesFor(records, probe.liveTargets);
-  const seals = await listSealedBeeNames();
-  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
-  // HSR bees are pane-less — observed from run dirs, not tmux. Best-effort so a
-  // bad/absent HSR root never breaks the tmux path.
-  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
-  const hsrLive = new Set<string>();
-  const hsrStates = new Map<string, BeeState>();
-  const hsrSnapshots = new Map<string, string>();
-  for (const [bee, observation] of hsrObs) {
-    if (observation.live) hsrLive.add(bee);
-    if (observation.state) hsrStates.set(bee, observation.state);
-    hsrSnapshots.set(bee, observation.snapshot);
-  }
-  const context: StateContext = {
-    liveTargets: probe.liveTargets,
-    livePanes,
-    panes,
-    seals,
-    unreachableNodes: probe.unreachableNodes,
-    hsrLive,
-    hsrStates,
-    hsrSnapshots,
-    now: Date.now(),
-  };
+  const context = await buildStateContext(records, probe);
 
   // Resolve each bee's cwd to its pro area/project/repo once, so the TUI can
   // group by pro facets without shelling out. Best-effort: no pro CLI → no
@@ -2561,6 +2512,56 @@ async function listSealedBeeNames(): Promise<Set<string>> {
   return sealedBeeNamesImpl().catch(() => new Set<string>());
 }
 
+/**
+ * Fold the run-dir HSR observations into the StateContext slices. HSR bees are
+ * pane-less — observed from run dirs, not tmux. Best-effort: a bad/absent HSR
+ * root never breaks the tmux path. Also used standalone by `clean --dead`,
+ * which needs HSR liveness without a full StateContext.
+ */
+async function observeHsrLiveness(): Promise<{ hsrLive: Set<string>; hsrStates: Map<string, BeeState>; hsrSnapshots: Map<string, string> }> {
+  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+  const hsrLive = new Set<string>();
+  const hsrStates = new Map<string, BeeState>();
+  const hsrSnapshots = new Map<string, string>();
+  for (const [bee, observation] of hsrObs) {
+    if (observation.live) hsrLive.add(bee);
+    if (observation.state) hsrStates.set(bee, observation.state);
+    hsrSnapshots.set(bee, observation.snapshot);
+  }
+  return { hsrLive, hsrStates, hsrSnapshots };
+}
+
+/**
+ * Assemble the full StateContext for deriveState from one node-probe pass.
+ * Every liveness input — captured panes, seal markers, local pane ids, and the
+ * pane-less HSR run-dir observations — is gathered here and ONLY here, so
+ * list/TUI/clean can never drift on which inputs feed deriveState (the clean
+ * path once omitted the HSR observations and reaped live HSR bees — HIVE-1).
+ * `unreachableNodes` overrides the probe's set for callers that widen it
+ * (clean treats unregistered nodes as unreachable, never dead).
+ */
+async function buildStateContext(
+  records: SessionRecord[],
+  probe: MultiNodeLiveProbe,
+  options: { unreachableNodes?: Set<string> } = {},
+): Promise<StateContext & { hsrLive: Set<string>; now: number }> {
+  const panes = await capturePanesFor(records, probe.liveTargets);
+  const seals = await listSealedBeeNames();
+  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
+  const { hsrLive, hsrStates, hsrSnapshots } = await observeHsrLiveness();
+  return {
+    liveTargets: probe.liveTargets,
+    livePanes,
+    panes,
+    seals,
+    unreachableNodes: options.unreachableNodes ?? probe.unreachableNodes,
+    hsrLive,
+    hsrStates,
+    hsrSnapshots,
+    now: Date.now(),
+  };
+}
+
 async function cmdClean(parsed: Parsed) {
   const interactive = hasFlag(parsed, "interactive") || hasFlag(parsed, "i");
   const wantsDead = hasFlag(parsed, "dead");
@@ -2617,9 +2618,9 @@ async function cmdCleanDead(parsed: Parsed) {
   // reaps its record while the runner host keeps executing — data loss (HIVE-1).
   // Protect any bee the run-dir HSR observer reports live, keyed the same way as
   // the tmux liveTargets set (an HSR record's tmuxTarget is its unique bee name).
-  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+  const { hsrLive } = await observeHsrLiveness();
   for (const record of records) {
-    if (hsrObs.get(record.name)?.live) recordsConsideredAlive.add(liveTargetKey(record.node, record.tmuxTarget));
+    if (hsrLive.has(record.name)) recordsConsideredAlive.add(liveTargetKey(record.node, record.tmuxTarget));
   }
   let dead = deadSessionRecords(records, recordsConsideredAlive);
   // Phase B: a local sub-bee whose pane died (agentPaneId ∉ live panes) is dead
@@ -2836,33 +2837,8 @@ async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; can
     const nodeName = record.node ?? LOCAL_NODE_NAME;
     if (!knownNodes.has(nodeName)) unreachableNodes.add(nodeName);
   }
-  const panes = await capturePanesFor(records, probe.liveTargets);
-  const seals = await listSealedBeeNames();
-  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
-  // HSR bees are pane-less — observed from run dirs, not tmux. Without this,
-  // deriveState reads every live HSR bee as dead and `clean --idle`/interactive
-  // offers a running bee for deletion (HIVE-1). Mirror cmdList's threading.
-  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
-  const hsrLive = new Set<string>();
-  const hsrStates = new Map<string, BeeState>();
-  const hsrSnapshots = new Map<string, string>();
-  for (const [bee, observation] of hsrObs) {
-    if (observation.live) hsrLive.add(bee);
-    if (observation.state) hsrStates.set(bee, observation.state);
-    hsrSnapshots.set(bee, observation.snapshot);
-  }
-  const context: StateContext = {
-    liveTargets: probe.liveTargets,
-    livePanes,
-    panes,
-    seals,
-    unreachableNodes,
-    hsrLive,
-    hsrStates,
-    hsrSnapshots,
-    now: Date.now(),
-  };
-  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || hsrLive.has(record.name), context.now!));
+  const context = await buildStateContext(records, probe, { unreachableNodes });
+  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.hsrLive.has(record.name), context.now));
   candidates.sort(compareCleanCandidates);
   return { records, candidates };
 }
@@ -7522,15 +7498,14 @@ async function startLoopDetached(rawArgs: Record<string, unknown>) {
   // and resolved at each iteration's spawn (spawnLoopBee / facade.spawn), so a
   // fresh-carrier `auto` loop re-picks the least-loaded account per iteration.
   // Validate eagerly so errors surface BEFORE we spawn a detached process.
-  const loopId = await generateLoopId();
-  const cfg = buildLoopConfig({ ...rawArgs, loopId });
-  cfg.loopId = loopId;
+  const cfg = buildLoopConfig(rawArgs);
 
   if (process.platform === "win32") {
     throw new Error("hive loop start is not supported on Windows (POSIX process groups are required to stop).");
   }
 
-  await ensureLoopDir(loopId);
+  const loopId = await generateLoopId();
+  cfg.loopId = loopId;
   await writeLoopConfig(cfg);
   const args = { ...rawArgs, loopId };
   let pid: number;

@@ -15,7 +15,7 @@
  * Node builtins only.
  */
 
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import type { BeeState } from "../state.js";
 import {
   hsrEventsPath,
@@ -99,6 +99,47 @@ export async function hsrSnapshot(bee: string, lines?: number): Promise<string> 
 const EVENT_TAIL_LINES = 200;
 
 /**
+ * Byte cap on the tail read backing the EVENT_TAIL_LINES window (HIVE-13). The
+ * daemon re-reads every bee's events.jsonl each tick, so the read must be
+ * O(tail), not O(file) — even for a huge legacy log written before writer-side
+ * compaction (runDir.ts) bounded the file.
+ */
+const EVENT_TAIL_MAX_BYTES = 256 * 1024;
+
+/**
+ * Read at most the trailing `maxBytes` of a file. When the read starts mid-file
+ * the first (possibly partial) line is dropped, so callers always see whole
+ * lines. Null when the file is missing/unreadable.
+ */
+async function readTailText(path: string, maxBytes: number): Promise<string | null> {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const { size } = await handle.stat();
+    const start = Math.max(0, size - maxBytes);
+    const length = size - start;
+    if (length <= 0) return "";
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
+    if (start > 0) {
+      // We landed mid-line (possibly mid-codepoint) — skip to the next full line.
+      const nl = text.indexOf("\n");
+      text = nl === -1 ? "" : text.slice(nl + 1);
+    }
+    return text;
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/**
  * A single HSR bee's cross-process observation, read purely from its run dir:
  *   live     — host-pid liveness (see file docs).
  *   state    — a STRUCTURED BeeState derived from the events.jsonl tail, or
@@ -165,17 +206,14 @@ function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined 
 }
 
 /**
- * Read the tail of a bee's events.jsonl and parse it into RunnerEvents. Tolerates
- * a missing/partial file and unparseable lines (a truncated crash write) — a bad
- * line is skipped, never thrown.
+ * Read the tail of a bee's events.jsonl and parse it into RunnerEvents. Reads
+ * only the trailing EVENT_TAIL_MAX_BYTES of the file — never the whole log.
+ * Tolerates a missing/partial file and unparseable lines (a truncated crash
+ * write) — a bad line is skipped, never thrown.
  */
 async function readEventTail(bee: string, lines: number): Promise<RunnerEvent[]> {
-  let raw: string;
-  try {
-    raw = await readFile(hsrEventsPath(bee), "utf8");
-  } catch {
-    return [];
-  }
+  const raw = await readTailText(hsrEventsPath(bee), EVENT_TAIL_MAX_BYTES);
+  if (raw === null) return [];
   const all = raw.split("\n").filter((line) => line.trim().length > 0);
   const tail = all.slice(Math.max(0, all.length - lines));
   const events: RunnerEvent[] = [];
@@ -277,8 +315,11 @@ export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput 
  *   latestExhausted — the newest `exhausted` event (by ts) with its resetHint,
  *                     or undefined. The caller edge-detects on `ts`.
  *
- * Reads the whole log (as readEventTail already does under the hood) but is
- * tolerant of a missing/partial/torn file — a bad line is skipped, never thrown.
+ * Reads the whole log — the cumulative sum needs every usage event, including
+ * the checkpoint the writer prepends on compaction — but the log itself is
+ * bounded by writer-side compaction (runDir.ts HSR_EVENTS_MAX_BYTES), so this
+ * stays O(cap) per tick, not O(session lifetime). Tolerant of a
+ * missing/partial/torn file — a bad line is skipped, never thrown.
  */
 export type HsrUsageObservation = {
   totals: { inputTokens: number; outputTokens: number } | null;
