@@ -17,6 +17,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
+import { makeLineReader } from "./lineReader.js";
 
 // --- JSON-RPC 2.0 wire shapes -------------------------------------------------
 
@@ -47,24 +48,6 @@ const DEFAULT_MAX_BROADCAST_QUEUE = 256;
 /** Serialize one JSON-RPC object as a single newline-delimited frame. */
 function frame(value: JsonRpcResponse | JsonRpcNotification | JsonRpcRequest): string {
   return `${JSON.stringify(value)}\n`;
-}
-
-// A newline-delimited-JSON line reader. Buffers partial lines and yields one
-// raw JSON string per complete line; blank lines are ignored. Shared by both
-// server connections and the client.
-function makeLineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
-  let buffer = "";
-  return (chunk: Buffer): void => {
-    buffer += chunk.toString("utf8");
-    let newlineIndex = buffer.indexOf("\n");
-    while (newlineIndex !== -1) {
-      const line = buffer.slice(0, newlineIndex);
-      buffer = buffer.slice(newlineIndex + 1);
-      const trimmed = line.trim();
-      if (trimmed.length > 0) onLine(trimmed);
-      newlineIndex = buffer.indexOf("\n");
-    }
-  };
 }
 
 // --- Server -------------------------------------------------------------------

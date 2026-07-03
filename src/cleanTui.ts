@@ -1,6 +1,8 @@
-import * as readline from "node:readline";
-import { bold, cyan, dim, gray, graphemeWidth, green, isPretty, magenta, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
+import type * as readline from "node:readline";
+import { bold, cyan, dim, gray, graphemeWidth, green, magenta, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
 import { createTuiPainter } from "./tuiPaint.js";
+import { reverse } from "./tuiKit.js";
+import { runRawModeTui } from "./tuiRuntime.js";
 import type { BeeState } from "./state.js";
 
 export type CleanTuiItem = {
@@ -42,9 +44,7 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
   }
   if (items.length === 0) return { cleaned: 0, failed: 0, cancelled: false };
 
-  const stdin = process.stdin;
   const stdout = process.stdout;
-  const previousRaw = stdin.isRaw;
   let rows = [...items];
   let cursor = 0;
   let scroll = 0;
@@ -56,254 +56,212 @@ export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTu
   const selected = new Set<string>();
   const previewCache = new Map<string, PreviewCacheEntry>();
 
-  readline.emitKeypressEvents(stdin);
-  stdin.setRawMode(true);
-  stdin.resume();
-  stdout.write("\x1b[?1049h\x1b[?25l");
+  return runRawModeTui<CleanTuiResult>((tui) => {
+    const finish = () => tui.finish({ cleaned, failed, cancelled: cleaned === 0 && failed === 0 });
 
-  // Restore the terminal exactly once, even if we exit through a signal or a
-  // crash rather than the happy path: leaving the alt screen in raw mode with
-  // a hidden cursor would wedge the user's shell.
-  let restored = false;
-  const restoreTerminal = () => {
-    if (restored) return;
-    restored = true;
-    stdout.write("\x1b[?25h\x1b[?1049l");
-    stdin.setRawMode(previousRaw);
-    stdin.pause();
-  };
-  const onSignal = (signal: NodeJS.Signals) => {
-    restoreTerminal();
-    process.exit(signal === "SIGTERM" ? 143 : 129);
-  };
-  process.once("exit", restoreTerminal);
-  process.once("SIGTERM", onSignal);
-  process.once("SIGHUP", onSignal);
+    const toggleCurrent = () => {
+      const item = rows[cursor];
+      if (!item) return;
+      if (item.disabledReason) {
+        message = `${item.name} is ${item.disabledReason}; use hive kill ${item.name} if you really want it gone`;
+        return;
+      }
+      if (selected.has(item.name)) selected.delete(item.name);
+      else selected.add(item.name);
+      message = selected.size === 1 ? "1 thread marked" : `${selected.size} threads marked`;
+    };
 
-  try {
-    return await new Promise<CleanTuiResult>((resolve) => {
-      let done = false;
-      const finish = () => {
-        if (done) return;
-        done = true;
-        stdin.off("keypress", onKey);
-        stdout.off("resize", onResize);
-        resolve({ cleaned, failed, cancelled: cleaned === 0 && failed === 0 });
-      };
+    const toggleAll = () => {
+      const cleanable = rows.filter((item) => !item.disabledReason);
+      const allSelected = cleanable.length > 0 && cleanable.every((item) => selected.has(item.name));
+      if (allSelected) {
+        selected.clear();
+        message = "selection cleared";
+        return;
+      }
+      for (const item of cleanable) selected.add(item.name);
+      message = cleanable.length === 1 ? "1 thread marked" : `${cleanable.length} threads marked`;
+    };
 
-      const toggleCurrent = () => {
+    const cleanSelection = async () => {
+      if (cleaning) return;
+      if (!options.clean) {
+        message = "No cleaner is configured for this TUI.";
+        render();
+        return;
+      }
+      const targets = selected.size > 0
+        ? rows.filter((item) => selected.has(item.name) && !item.disabledReason)
+        : rows[cursor] && !rows[cursor]!.disabledReason
+          ? [rows[cursor]!]
+          : [];
+      if (targets.length === 0) {
         const item = rows[cursor];
-        if (!item) return;
-        if (item.disabledReason) {
-          message = `${item.name} is ${item.disabledReason}; use hive kill ${item.name} if you really want it gone`;
-          return;
+        message = item?.disabledReason
+          ? `${item.name} is ${item.disabledReason}; move to an idle/dead row or mark cleanable rows`
+          : "No cleanable rows selected.";
+        render();
+        return;
+      }
+      cleaning = true;
+      message = targets.length === 1 ? `cleaning ${targets[0]!.name}...` : `cleaning ${targets.length} threads...`;
+      render();
+      try {
+        const outcomes = await options.clean(targets);
+        if (tui.done) return;
+        const ok = new Set(outcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.name));
+        const bad = outcomes.filter((outcome) => !outcome.ok);
+        cleaned += ok.size;
+        failed += bad.length;
+        rows = rows.filter((item) => !ok.has(item.name));
+        for (const name of ok) {
+          selected.delete(name);
+          previewCache.delete(name);
         }
-        if (selected.has(item.name)) selected.delete(item.name);
-        else selected.add(item.name);
-        message = selected.size === 1 ? "1 thread marked" : `${selected.size} threads marked`;
-      };
-
-      const toggleAll = () => {
-        const cleanable = rows.filter((item) => !item.disabledReason);
-        const allSelected = cleanable.length > 0 && cleanable.every((item) => selected.has(item.name));
-        if (allSelected) {
-          selected.clear();
-          message = "selection cleared";
-          return;
+        if (rows.length === 0) {
+          cursor = 0;
+          scroll = 0;
+        } else {
+          cursor = Math.min(cursor, rows.length - 1);
+          scroll = Math.min(scroll, Math.max(0, rows.length - 1));
         }
-        for (const item of cleanable) selected.add(item.name);
-        message = cleanable.length === 1 ? "1 thread marked" : `${cleanable.length} threads marked`;
-      };
-
-      const cleanSelection = async () => {
-        if (cleaning) return;
-        if (!options.clean) {
-          message = "No cleaner is configured for this TUI.";
+        if (bad.length > 0) {
+          const first = bad[0]!;
+          message = ok.size > 0
+            ? `cleaned ${ok.size}; ${bad.length} failed (${first.name}: ${first.detail})`
+            : `clean failed (${first.name}: ${first.detail})`;
+        } else {
+          message = ok.size === 1 ? "cleaned 1 thread" : `cleaned ${ok.size} threads`;
+        }
+      } catch (error) {
+        failed += targets.length;
+        message = `clean failed: ${error instanceof Error ? error.message : String(error)}`;
+      } finally {
+        cleaning = false;
+        if (!tui.done) {
           render();
-          return;
+          void requestPreview();
         }
-        const targets = selected.size > 0
-          ? rows.filter((item) => selected.has(item.name) && !item.disabledReason)
-          : rows[cursor] && !rows[cursor]!.disabledReason
-            ? [rows[cursor]!]
-            : [];
-        if (targets.length === 0) {
-          const item = rows[cursor];
-          message = item?.disabledReason
-            ? `${item.name} is ${item.disabledReason}; move to an idle/dead row or mark cleanable rows`
-            : "No cleanable rows selected.";
-          render();
-          return;
-        }
-        cleaning = true;
-        message = targets.length === 1 ? `cleaning ${targets[0]!.name}...` : `cleaning ${targets.length} threads...`;
-        render();
-        try {
-          const outcomes = await options.clean(targets);
-          if (done) return;
-          const ok = new Set(outcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.name));
-          const bad = outcomes.filter((outcome) => !outcome.ok);
-          cleaned += ok.size;
-          failed += bad.length;
-          rows = rows.filter((item) => !ok.has(item.name));
-          for (const name of ok) {
-            selected.delete(name);
-            previewCache.delete(name);
-          }
-          if (rows.length === 0) {
-            cursor = 0;
-            scroll = 0;
-          } else {
-            cursor = Math.min(cursor, rows.length - 1);
-            scroll = Math.min(scroll, Math.max(0, rows.length - 1));
-          }
-          if (bad.length > 0) {
-            const first = bad[0]!;
-            message = ok.size > 0
-              ? `cleaned ${ok.size}; ${bad.length} failed (${first.name}: ${first.detail})`
-              : `clean failed (${first.name}: ${first.detail})`;
-          } else {
-            message = ok.size === 1 ? "cleaned 1 thread" : `cleaned ${ok.size} threads`;
-          }
-        } catch (error) {
-          failed += targets.length;
-          message = `clean failed: ${error instanceof Error ? error.message : String(error)}`;
-        } finally {
-          cleaning = false;
-          if (!done) {
-            render();
-            void requestPreview();
-          }
-        }
-      };
+      }
+    };
 
-      const moveCursor = (next: number) => {
-        cursor = rows.length === 0 ? 0 : Math.max(0, Math.min(rows.length - 1, next));
-        render();
-        void requestPreview();
-      };
+    const moveCursor = (next: number) => {
+      cursor = rows.length === 0 ? 0 : Math.max(0, Math.min(rows.length - 1, next));
+      render();
+      void requestPreview();
+    };
 
-      const togglePreview = () => {
-        previewOpen = !previewOpen;
-        message = previewOpen ? "preview open: showing latest transcript or pane tail for the highlighted bee" : "preview closed";
-        render();
-        void requestPreview();
-      };
+    const togglePreview = () => {
+      previewOpen = !previewOpen;
+      message = previewOpen ? "preview open: showing latest transcript or pane tail for the highlighted bee" : "preview closed";
+      render();
+      void requestPreview();
+    };
 
-      const requestPreview = async () => {
-        if (!previewOpen || !options.loadPreview) return;
-        const item = rows[cursor];
-        if (!item || previewCache.has(item.name)) return;
-        previewCache.set(item.name, { state: "loading" });
-        render();
-        try {
-          const text = await options.loadPreview(item);
-          if (done) return;
-          previewCache.set(item.name, { state: "loaded", text });
-        } catch (error) {
-          if (done) return;
-          const text = error instanceof Error ? error.message : String(error);
-          previewCache.set(item.name, { state: "error", text });
-        }
-        render();
-      };
+    const requestPreview = async () => {
+      if (!previewOpen || !options.loadPreview) return;
+      const item = rows[cursor];
+      if (!item || previewCache.has(item.name)) return;
+      previewCache.set(item.name, { state: "loading" });
+      render();
+      try {
+        const text = await options.loadPreview(item);
+        if (tui.done) return;
+        previewCache.set(item.name, { state: "loaded", text });
+      } catch (error) {
+        if (tui.done) return;
+        const text = error instanceof Error ? error.message : String(error);
+        previewCache.set(item.name, { state: "error", text });
+      }
+      render();
+    };
 
-      const onKey = (_value: string, key: readline.Key) => {
-        // Ctrl+C must work even mid-clean: raw mode swallows SIGINT, so this
-        // is the only way out of a hung clean. The finally restores the
-        // terminal; the in-flight clean is guarded by `done`.
-        if (key.ctrl && key.name === "c") {
+    const onKey = (_value: string, key: readline.Key) => {
+      // Ctrl+C must work even mid-clean: raw mode swallows SIGINT, so this
+      // is the only way out of a hung clean. The finally restores the
+      // terminal; the in-flight clean is guarded by `tui.done`.
+      if (key.ctrl && key.name === "c") {
+        finish();
+        return;
+      }
+      if (cleaning) return;
+      switch (key.name) {
+        case "escape":
+        case "q":
           finish();
           return;
-        }
-        if (cleaning) return;
-        switch (key.name) {
-          case "escape":
-          case "q":
-            finish();
-            return;
-          case "up":
-          case "k":
-            moveCursor(cursor - 1);
-            return;
-          case "down":
-          case "j":
-            moveCursor(cursor + 1);
-            return;
-          case "home":
-            moveCursor(0);
-            return;
-          case "end":
-            moveCursor(items.length - 1);
-            return;
-          case "space":
-            toggleCurrent();
-            render();
-            return;
-          case "a":
-            toggleAll();
-            render();
-            return;
-          case "tab":
-          case "p":
-          case "t":
-          case "l":
-            togglePreview();
-            return;
-          case "return":
-          case "enter":
-          case "x":
-          case "d":
-            void cleanSelection();
-            return;
-        }
-      };
+        case "up":
+        case "k":
+          moveCursor(cursor - 1);
+          return;
+        case "down":
+        case "j":
+          moveCursor(cursor + 1);
+          return;
+        case "home":
+          moveCursor(0);
+          return;
+        case "end":
+          moveCursor(items.length - 1);
+          return;
+        case "space":
+          toggleCurrent();
+          render();
+          return;
+        case "a":
+          toggleAll();
+          render();
+          return;
+        case "tab":
+        case "p":
+        case "t":
+        case "l":
+          togglePreview();
+          return;
+        case "return":
+        case "enter":
+        case "x":
+        case "d":
+          void cleanSelection();
+          return;
+      }
+    };
 
-      const painter = createTuiPainter(stdout);
-      const render = () => {
-        if (done) return;
-        const width = Math.max(1, stdout.columns || 100);
-        const height = Math.max(12, stdout.rows || 24);
-        const previewRows = previewOpen ? Math.max(4, Math.min(12, Math.floor(height * 0.35))) : 0;
-        const previewBlockRows = previewOpen ? previewRows + 2 : 0;
-        const bodyRows = Math.max(4, height - 7 - previewBlockRows);
-        scroll = Math.min(scroll, Math.max(0, rows.length - bodyRows));
-        if (cursor < scroll) scroll = cursor;
-        if (cursor >= scroll + bodyRows) scroll = cursor - bodyRows + 1;
-        const visible = rows.slice(scroll, scroll + bodyRows);
-        const selectedLabel = selected.size === 0 ? dim("nothing marked") : green(`${selected.size} marked`);
-        const cleanableCount = rows.filter((item) => !item.disabledReason).length;
-        const lines = [
-          `${bold("hive clean")}  ${dim(`${rows.length} threads`)}  ${selectedLabel}  ${dim(`${cleanableCount} cleanable`)}  ${dim(`cleaned ${cleaned}`)}`,
-          dim("Move with j/k or arrows. Press x/enter to clean marked rows, or the current row if none are marked."),
-          "",
-          tableHeader(width),
-          ...visible.map((item, index) => renderRow(item, scroll + index, cursor, selected, width)),
-        ];
-        const remaining = bodyRows - visible.length;
-        for (let i = 0; i < remaining; i += 1) lines.push("");
-        if (previewOpen) {
-          lines.push(dim("─".repeat(width)));
-          lines.push(...renderPreview(rows[cursor], previewCache, previewRows, width, Boolean(options.loadPreview)));
-        }
-        lines.push("");
-        lines.push(truncate(rows.length === 0 ? `${message}. No threads left; q quits.` : message, width));
-        lines.push(dim("p/t/l toggles preview · q exits"));
-        painter.paint(lines, width, height);
-      };
+    const painter = createTuiPainter(stdout);
+    const render = () => {
+      if (tui.done) return;
+      const width = Math.max(1, stdout.columns || 100);
+      const height = Math.max(12, stdout.rows || 24);
+      const previewRows = previewOpen ? Math.max(4, Math.min(12, Math.floor(height * 0.35))) : 0;
+      const previewBlockRows = previewOpen ? previewRows + 2 : 0;
+      const bodyRows = Math.max(4, height - 7 - previewBlockRows);
+      scroll = Math.min(scroll, Math.max(0, rows.length - bodyRows));
+      if (cursor < scroll) scroll = cursor;
+      if (cursor >= scroll + bodyRows) scroll = cursor - bodyRows + 1;
+      const visible = rows.slice(scroll, scroll + bodyRows);
+      const selectedLabel = selected.size === 0 ? dim("nothing marked") : green(`${selected.size} marked`);
+      const cleanableCount = rows.filter((item) => !item.disabledReason).length;
+      const lines = [
+        `${bold("hive clean")}  ${dim(`${rows.length} threads`)}  ${selectedLabel}  ${dim(`${cleanableCount} cleanable`)}  ${dim(`cleaned ${cleaned}`)}`,
+        dim("Move with j/k or arrows. Press x/enter to clean marked rows, or the current row if none are marked."),
+        "",
+        tableHeader(width),
+        ...visible.map((item, index) => renderRow(item, scroll + index, cursor, selected, width)),
+      ];
+      const remaining = bodyRows - visible.length;
+      for (let i = 0; i < remaining; i += 1) lines.push("");
+      if (previewOpen) {
+        lines.push(dim("─".repeat(width)));
+        lines.push(...renderPreview(rows[cursor], previewCache, previewRows, width, Boolean(options.loadPreview)));
+      }
+      lines.push("");
+      lines.push(truncate(rows.length === 0 ? `${message}. No threads left; q quits.` : message, width));
+      lines.push(dim("p/t/l toggles preview · q exits"));
+      painter.paint(lines, width, height);
+    };
 
-      const onResize = () => render();
-
-      render();
-      stdin.on("keypress", onKey);
-      stdout.on("resize", onResize);
-    });
-  } finally {
-    process.off("exit", restoreTerminal);
-    process.off("SIGTERM", onSignal);
-    process.off("SIGHUP", onSignal);
-    restoreTerminal();
-  }
+    return { onKey, render };
+  });
 }
 
 function tableHeader(width: number): string {
@@ -442,8 +400,4 @@ function pad(value: string, width: number, align: "left" | "right" = "left"): st
   if (visible >= width) return value;
   const spaces = " ".repeat(width - visible);
   return align === "right" ? `${spaces}${value}` : `${value}${spaces}`;
-}
-
-function reverse(value: string): string {
-  return isPretty() ? `\x1b[7m${value}\x1b[0m` : value;
 }
