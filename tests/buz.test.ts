@@ -419,9 +419,10 @@ test("listMessages newest-first, supports --limit and --from filter", async () =
     await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.x" }, tier: "passive", body: "1" });
     await new Promise((r) => setTimeout(r, 5));
     await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.y" }, tier: "passive", body: "2" });
+    await sendBuzMessage({ recipient, sender: { kind: "human", name: "Alice" }, tier: "passive", body: "3" });
 
     const all = await listMessages("CO.aaa", "inbox");
-    assert.equal(all.length, 2);
+    assert.equal(all.length, 3);
 
     const limited = await listMessages("CO.aaa", "inbox", { limit: 1 });
     assert.equal(limited.length, 1);
@@ -429,6 +430,18 @@ test("listMessages newest-first, supports --limit and --from filter", async () =
     const filtered = await listMessages("CO.aaa", "inbox", { fromFilter: "CL.y" });
     assert.equal(filtered.length, 1);
     assert.equal(senderDisplay(filtered[0]!.message.from), "CL.y");
+
+    const humanBare = await listMessages("CO.aaa", "inbox", { fromFilter: "alice" });
+    assert.equal(humanBare.length, 1);
+    assert.equal(senderDisplay(humanBare[0]!.message.from), "human:alice");
+
+    const humanPrefixed = await listMessages("CO.aaa", "inbox", { fromFilter: "human:alice" });
+    assert.equal(humanPrefixed.length, 1);
+    assert.equal(senderDisplay(humanPrefixed[0]!.message.from), "human:alice");
+
+    const humanPrefixedRaw = await listMessages("CO.aaa", "inbox", { fromFilter: "human:Alice" });
+    assert.equal(humanPrefixedRaw.length, 1);
+    assert.equal(senderDisplay(humanPrefixedRaw[0]!.message.from), "human:alice");
   });
 });
 

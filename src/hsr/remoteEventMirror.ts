@@ -69,12 +69,22 @@ export type RemoteEventMirrorDeps = {
   now?: () => number;
 };
 
+export type RemoteEventMirrorDispatcher = {
+  (records: SessionRecord[]): Promise<void>;
+  close(): Promise<void>;
+};
+
 /** One live mirror: its node, unsubscribe fn, and in-memory ring state. */
 type MirrorEntry = {
   node: string;
   off: () => void;
   ring: string;
   ringTimer: NodeJS.Timeout | null;
+};
+
+type SubstrateEntry = {
+  signature: string;
+  substrate: RemoteHsrSubstrate;
 };
 
 /** A record bound to a remote-hsr node (non-local, kind === "remote-hsr"). */
@@ -90,12 +100,16 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
   return !!value && typeof value === "object" && typeof (value as { type?: unknown }).type === "string";
 }
 
+function substrateSignature(node: NodeRecord): string {
+  return JSON.stringify(["remote-hsr", node.name, node.endpoint, node.sshCommand ?? "", node.sshArgs ?? [], node.runnerHostVersion ?? ""]);
+}
+
 /**
  * Build the stateful per-tick mirror dispatcher. Call {@link createRemoteEventMirror}
  * ONCE per daemon run so subscriptions persist across ticks; invoke the returned
  * function every tick with the current SessionRecords.
  */
-export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): (records: SessionRecord[]) => Promise<void> {
+export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): RemoteEventMirrorDispatcher {
   const loadNode = deps.loadNode ?? defaultLoadNode;
   const createSubstrate = deps.createSubstrate ?? remoteHsrSubstrateForNode;
   const now = deps.now ?? (() => Date.now());
@@ -105,15 +119,26 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): (reco
   const mirrors = new Map<string, MirrorEntry>();
   // One resilient substrate per node, reused across ticks (its transport client
   // is lazy + reconnecting internally).
-  const substrates = new Map<string, RemoteHsrSubstrate>();
+  const substrates = new Map<string, SubstrateEntry>();
 
-  function substrateForNode(node: NodeRecord): RemoteHsrSubstrate {
-    let sub = substrates.get(node.name);
-    if (!sub) {
-      sub = createSubstrate(node);
-      substrates.set(node.name, sub);
+  async function closeSubstrate(nodeName: string): Promise<void> {
+    const entry = substrates.get(nodeName);
+    if (!entry) return;
+    substrates.delete(nodeName);
+    await entry.substrate.close().catch(() => undefined);
+  }
+
+  async function substrateForNode(node: NodeRecord): Promise<RemoteHsrSubstrate> {
+    const signature = substrateSignature(node);
+    const existing = substrates.get(node.name);
+    if (existing && existing.signature === signature) return existing.substrate;
+    if (existing) {
+      await teardownNodeMirrors(node.name, false);
+      await closeSubstrate(node.name);
     }
-    return sub;
+    const substrate = createSubstrate(node);
+    substrates.set(node.name, { signature, substrate });
+    return substrate;
   }
 
   function scheduleRingWrite(bee: string, entry: MirrorEntry): void {
@@ -172,7 +197,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): (reco
     }
   }
 
-  async function teardown(bee: string, entry: MirrorEntry): Promise<void> {
+  async function teardown(bee: string, entry: MirrorEntry, options: { markExited: boolean }): Promise<void> {
     try {
       entry.off();
     } catch {
@@ -184,11 +209,26 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): (reco
       await writeHsrRing(bee, entry.ring).catch(() => undefined);
     }
     mirrors.delete(bee);
-    // Flip the mirror meta to exited so deriveState settles it dead/sealed.
-    await writeMirrorMeta(bee, entry.node, "exited").catch(() => undefined);
+    if (options.markExited) {
+      // Flip the mirror meta to exited so deriveState settles it dead/sealed.
+      await writeMirrorMeta(bee, entry.node, "exited").catch(() => undefined);
+    }
   }
 
-  return async (records: SessionRecord[]): Promise<void> => {
+  async function teardownNodeMirrors(nodeName: string, markExited: boolean): Promise<void> {
+    for (const [bee, entry] of [...mirrors]) {
+      if (entry.node === nodeName) await teardown(bee, entry, { markExited });
+    }
+  }
+
+  async function close(): Promise<void> {
+    for (const [bee, entry] of [...mirrors]) {
+      await teardown(bee, entry, { markExited: false });
+    }
+    await Promise.all([...substrates.keys()].map((nodeName) => closeSubstrate(nodeName)));
+  }
+
+  const dispatch: RemoteEventMirrorDispatcher = Object.assign(async (records: SessionRecord[]): Promise<void> => {
     // Group the remote-hsr records by node so we call listSessions once per node.
     const byNode = new Map<string, SessionRecord[]>();
     for (const record of records) {
@@ -210,8 +250,12 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): (reco
       } catch {
         node = null;
       }
-      if (!node || node.kind !== "remote-hsr") continue; // node gone / re-kinded — leave to teardown pass.
-      const substrate = substrateForNode(node);
+      if (!node || node.kind !== "remote-hsr") {
+        await teardownNodeMirrors(nodeName, true);
+        await closeSubstrate(nodeName);
+        continue;
+      }
+      const substrate = await substrateForNode(node);
       let liveBees: Set<string>;
       try {
         liveBees = new Set(await substrate.listSessions());
@@ -233,7 +277,13 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): (reco
     // Teardown pass: any active mirror not wanted this tick (bee left the remote
     // list, or its record/node disappeared) is unsubscribed + marked exited.
     for (const [bee, entry] of [...mirrors]) {
-      if (!wanted.has(bee)) await teardown(bee, entry);
+      if (!wanted.has(bee)) await teardown(bee, entry, { markExited: true });
     }
-  };
+    const activeMirrorNodes = new Set([...mirrors.values()].map((entry) => entry.node));
+    for (const nodeName of [...substrates.keys()]) {
+      if (!byNode.has(nodeName) && !activeMirrorNodes.has(nodeName)) await closeSubstrate(nodeName);
+    }
+  }, { close });
+
+  return dispatch;
 }

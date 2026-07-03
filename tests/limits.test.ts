@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -419,7 +419,7 @@ test("chain refresh and persist run inside the accounts lock (HIVE-2)", async ()
     let depth = 0;
     const events: string[] = [];
     const [result] = await accountLimits([account], {
-      withAccountsLock: async (fn) => {
+      withAccountLock: async (fn) => {
         depth += 1;
         try {
           return await fn();
@@ -460,7 +460,7 @@ test("refresh double-checks the vault under the lock and reuses a chain rotated 
       // Simulate a concurrent writer (activation) winning the lock first and
       // rotating the chain while we waited: by the time our critical section
       // runs, the vault already holds the rotated fresh chain.
-      withAccountsLock: async (fn) => {
+      withAccountLock: async (fn) => {
         await writeFile(
           vaultPath,
           JSON.stringify({
@@ -500,7 +500,7 @@ test("a vault chain rotated behind us to another identity is never replayed (HIV
       // The chain moved on while we waited for the lock — and the rotated
       // link belongs to someone else. The superseded r-old token must not be
       // replayed (that replay is what trips reuse detection).
-      withAccountsLock: async (fn) => {
+      withAccountLock: async (fn) => {
         await writeFile(
           vaultPath,
           JSON.stringify({ claudeAiOauth: { accessToken: "tok-other", expiresAt: Date.now() + 3_600_000, refreshToken: "r-other" } }),
@@ -976,5 +976,61 @@ test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl", as
     // Past the default 1h ttl the pick refetches on its own.
     await pickLeastLoadedAccount("claude", deps(t0 + 90 * 60 * 1000));
     assert.equal(fetchCount, 3);
+  });
+});
+
+test("lastRateLimitsInFile tail-reads huge rollout files instead of slurping them", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-rl-tail-"));
+  try {
+    const row = (ts: string, used: number) =>
+      JSON.stringify({
+        timestamp: ts,
+        type: "event_msg",
+        payload: { type: "token_count", rate_limits: { primary: { used_percent: used, window_minutes: 300, resets_at: 1781037177 }, plan_type: "pro" } },
+      });
+    const filler = `${JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "x".repeat(1024) } })}\n`;
+
+    // The latest rate_limits row sits in the final tail of a multi-MB file.
+    const tailHit = join(dir, "tail-hit.jsonl");
+    await writeFile(tailHit, `${row("2026-07-01T10:00:00Z", 5)}\n${filler.repeat(2048)}${row("2026-07-01T11:00:00Z", 12)}\n`);
+    const snapshot = await lastRateLimitsInFile(tailHit);
+    assert.equal(snapshot?.ts, "2026-07-01T11:00:00Z");
+    assert.equal(snapshot?.limits.primary?.used_percent, 12);
+
+    // A rate_limits row buried before the tail window is deliberately out of
+    // reach — the walk is capped, not exhaustive (HIVE-64).
+    const tailMiss = join(dir, "tail-miss.jsonl");
+    await writeFile(tailMiss, `${row("2026-07-01T10:00:00Z", 5)}\n${filler.repeat(2048)}`);
+    assert.equal(await lastRateLimitsInFile(tailMiss), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("codex snapshot fallback reads the newest date partitions, not the whole sessions tree", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "part@a.b");
+    const sessions = join(dir, "homes", account.id, "sessions");
+    const row = (ts: string, used: number) =>
+      JSON.stringify({
+        timestamp: ts,
+        type: "event_msg",
+        payload: { type: "token_count", rate_limits: { primary: { used_percent: used, window_minutes: 300, resets_at: 1781037177 }, plan_type: "pro" } },
+      });
+    // An old partition holds a stale snapshot; the newest partition holds the
+    // current one. Descending date order must surface the newest partition's
+    // rollout first even though both are on disk.
+    await mkdir(join(sessions, "2026", "06", "20"), { recursive: true });
+    const oldRollout = join(sessions, "2026", "06", "20", "rollout-old.jsonl");
+    await writeFile(oldRollout, `${row("2026-06-20T09:00:00Z", 50)}\n`);
+    await utimes(oldRollout, new Date("2026-06-20T09:00:00Z"), new Date("2026-06-20T09:00:00Z"));
+    await mkdir(join(sessions, "2026", "07", "03"), { recursive: true });
+    await writeFile(join(sessions, "2026", "07", "03", "rollout-new.jsonl"), `${row("2026-07-03T09:00:00Z", 77)}\n`);
+
+    const [result] = await accountLimits([account], { codexLiveRateLimits: async () => null });
+    assert.equal(result!.ok, true);
+    assert.equal(result!.source, "session-snapshot");
+    assert.equal(result!.asOf, "2026-07-03T09:00:00Z");
+    assert.equal(result!.fiveHour?.usedPercent, 77);
   });
 });

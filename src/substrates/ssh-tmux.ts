@@ -200,16 +200,14 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   async function setUserOptions(target: string, options: Record<string, string>): Promise<void> {
     const entries = Object.entries(options);
     if (entries.length === 0) return;
-    // One ssh round-trip: a literal ";" argv element separates tmux commands
-    // (shellQuote keeps it inert through the remote shell). Best-effort by
-    // contract — transport or tmux failures are swallowed. set-option only
-    // honors "=" exact matching in the pane-style "=name:" target form.
-    const args: string[] = [];
-    entries.forEach(([key, value], index) => {
-      if (index > 0) args.push(";");
-      args.push("set-option", "-t", `=${target}:`, key, value);
-    });
-    await runTmux(args).catch(() => undefined);
+    // One remote tmux invocation per option: tmux treats a literal ";" argv
+    // element as a command separator, so batching would corrupt an option whose
+    // value is ";". Best-effort by contract — transport or tmux failures are
+    // swallowed. set-option only honors "=" exact matching in the pane-style
+    // "=name:" target form.
+    for (const [key, value] of entries) {
+      await runTmux(["set-option", "-t", `=${target}:`, key, tmuxOptionValueArg(value)]).catch(() => undefined);
+    }
   }
 
   async function renameWindow(target: string, name: string): Promise<void> {
@@ -316,6 +314,12 @@ async function defaultExecHook(argv: string[], input?: string): Promise<{ stdout
     child.stdin.write(input);
     child.stdin.end();
   });
+}
+
+function tmuxOptionValueArg(value: string): string {
+  // tmux treats a bare ";" argv as a command separator. Send an escaped token
+  // so the remote tmux parser stores it as the literal option value.
+  return value === ";" ? "\\;" : value;
 }
 
 function shellQuote(value: string): string {
