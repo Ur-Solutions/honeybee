@@ -31,6 +31,7 @@ import {
   vaultRoot,
 } from "./accounts.js";
 import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { mapWithConcurrency } from "./concurrency.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
@@ -2516,13 +2517,20 @@ function formatStateCell(state: BeeState): string {
   }
 }
 
+// Each capture forks a subprocess (tmux locally, a full ssh round-trip for
+// remote bees), so an uncapped fan-out over a large hive spawns dozens of
+// simultaneous ssh connections per `hive ls`/clean pass (HIVE-62).
+const PANE_CAPTURE_CONCURRENCY = 8;
+
 async function capturePanesFor(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
   const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
-  const entries = await Promise.all(
+  const entries = await mapWithConcurrency(
+    liveRecords,
+    PANE_CAPTURE_CONCURRENCY,
     // Re-key by the bee's own pane (agentPaneId) so sub-bees sharing one comb's
     // tmuxTarget keep distinct captures; legacy solo bees with no pane fall back
     // to tmuxTarget. deriveState reads with the same `agentPaneId ?? tmuxTarget`.
-    liveRecords.map(async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const),
+    async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const,
   );
   return new Map(entries);
 }

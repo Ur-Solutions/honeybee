@@ -18,6 +18,7 @@ import {
   withAccountsLock,
 } from "./accounts.js";
 import { canonicalAgentKind } from "./agents.js";
+import { mapWithConcurrency } from "./concurrency.js";
 import { launchEnv } from "./env.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { readClaudeKeychain } from "./keychain.js";
@@ -120,28 +121,6 @@ export type LimitsDeps = {
 };
 
 const ACCOUNT_LIMITS_CONCURRENCY = 4;
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  if (items.length === 0) return [];
-  const results = new Array<R>(items.length);
-  let next = 0;
-  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      for (;;) {
-        const index = next;
-        next += 1;
-        if (index >= items.length) return;
-        results[index] = await worker(items[index]!, index);
-      }
-    }),
-  );
-  return results;
-}
 
 function memoizeKeychainReads(readKeychain: typeof readClaudeKeychain): typeof readClaudeKeychain {
   const byHome = new Map<string, Promise<string | null>>();
