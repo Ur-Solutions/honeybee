@@ -1,5 +1,6 @@
 import { activateAccountIntoHome, listAccounts, syncAccountCredentialsToVault, type AccountRecord } from "./accounts.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
+import { resumeArgsForAgent } from "./drivers.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 
@@ -145,12 +146,12 @@ export async function swapAccount(
   });
 }
 
-/** Per-provider resume invocation; falls back to "continue most recent" forms. */
+/**
+ * Per-provider resume invocation; falls back to "continue most recent" forms.
+ * The per-tool args live on the driver registry (AGENT_DRIVERS.resumeArgs).
+ */
 export function resumeArgs(tool: string, providerSessionId: string | undefined): string[] {
-  if (tool === "claude") return providerSessionId ? ["--resume", providerSessionId] : ["--continue"];
-  if (tool === "codex") return providerSessionId ? ["resume", providerSessionId] : ["resume", "--last"];
-  if (tool === "opencode") return providerSessionId ? ["--session", providerSessionId] : ["--continue"];
-  return [];
+  return resumeArgsForAgent(tool, providerSessionId);
 }
 
 // The original spawn's yolo decision is baked into the stored command; sniff it

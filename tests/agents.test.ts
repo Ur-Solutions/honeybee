@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { agentDefaultsToYolo, forcedSessionIdArgs, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
+import { agentDefaultsToYolo, forcedSessionIdArgs, hasSessionIdArg, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
 import { resetConfigCache } from "../src/config.js";
 import { assertExecutableAvailable } from "../src/execCheck.js";
 import { setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
@@ -35,6 +35,12 @@ test("forcedSessionIdArgs: claude pins a fresh session id; other providers do no
   assert.equal(forcedSessionIdArgs("codex", "abc-123"), null);
   assert.equal(forcedSessionIdArgs("opencode", "abc-123"), null);
   assert.equal(forcedSessionIdArgs("grok", "abc-123"), null);
+});
+
+test("hasSessionIdArg accepts both split and equals session-id forms", () => {
+  assert.equal(hasSessionIdArg(["--session-id", "abc-123"]), true);
+  assert.equal(hasSessionIdArg(["--session-id=abc-123"]), true);
+  assert.equal(hasSessionIdArg(["--model", "haiku"]), false);
 });
 
 test("grok supports numbered profile aliases and GROK_HOME isolation", () => {

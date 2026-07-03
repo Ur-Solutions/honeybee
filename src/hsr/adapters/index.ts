@@ -3,27 +3,19 @@
  *
  * Maps a harness name to its RunnerAdapter. The SubstrateHsr and the daemon
  * socket look adapters up here rather than importing each adapter directly.
- *
- * The map is typed `Record<RunnerHarness, RunnerAdapter>`, where RunnerHarness
- * is derived from the harness registry's `runner` flags (harness.ts, HIVE-20).
- * That is the compile-time link: declaring `runner: true` on a descriptor
- * without registering its adapter here — or registering an adapter for a
- * harness the registry doesn't model as a runner — fails tsc.
+ * Real harnesses register their adapter on the agent capability registry
+ * (AGENT_DRIVERS.hsrAdapter in drivers.ts) so a new HSR-capable agent is one
+ * table entry; only the test-only stub stays here.
  */
 
 import type { RunnerAdapter } from "../types.js";
-import type { RunnerHarness } from "../harness.js";
+import { hsrAdapterForAgent } from "../../drivers.js";
 import { stubAdapter } from "./stub.js";
-import { claudeAdapter } from "./claude.js";
-import { codexAdapter } from "./codex.js";
-
-const ADAPTERS: Record<RunnerHarness, RunnerAdapter> = {
-  stub: stubAdapter,
-  claude: claudeAdapter,
-  codex: codexAdapter,
-};
 
 /** The RunnerAdapter for a harness, or undefined if unmodeled. */
 export function adapterFor(harness: string): RunnerAdapter | undefined {
-  return (ADAPTERS as Partial<Record<string, RunnerAdapter>>)[harness];
+  // "stub" is a test-only harness, not a spawnable agent kind — kept out of
+  // AGENT_DRIVERS so it never surfaces in pickers or driver validation.
+  if (harness === "stub") return stubAdapter;
+  return hsrAdapterForAgent(harness);
 }

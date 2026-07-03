@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -35,10 +35,29 @@ test("createColony writes a record and listColonies returns it", async () => {
     assert.equal(record.name, "marketing");
     assert.equal(record.description, "Outbound campaigns");
     assert.ok(record.createdAt);
+    assert.equal(record.workspace, "marketing");
     assert.equal(await colonyExists("marketing"), true);
+    const workspace = await loadWorkspace("marketing");
+    assert.equal(workspace?.colony, "marketing");
 
     const list = await listColonies();
     assert.deepEqual(list.map((r) => r.name), ["marketing"]);
+  });
+});
+
+test("createColony refuses a pre-existing workspace with the same name", async () => {
+  await withTempStore(async () => {
+    await createWorkspace({ name: "claimed", rootDir: "" });
+    await assert.rejects(createColony("claimed"), /Workspace already exists: claimed/);
+    assert.equal(await loadColony("claimed"), null);
+  });
+});
+
+test("createColony surfaces workspace provisioning errors", async () => {
+  await withTempStore(async () => {
+    await writeFile(join(process.env.HIVE_STORE_ROOT!, "workspaces"), "not a directory");
+    await assert.rejects(createColony("broken"), /ENOTDIR|not a directory/);
+    assert.equal(await loadColony("broken"), null);
   });
 });
 

@@ -588,6 +588,34 @@ test("cancelRun re-reads meta and does NOT clobber a concurrently-written termin
   });
 });
 
+test("cancelRun rethrows EPERM from process-group SIGTERM", async () => {
+  await withTempStore(async () => {
+    const runId = generateRunId();
+    await writeMeta("eperm", runId, {
+      runId,
+      flowName: "eperm",
+      args: {},
+      status: "running",
+      startedAt: new Date().toISOString(),
+      pid: 1_000_001,
+      pgid: 1_000_001,
+      background: true,
+    });
+    const error = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    await assert.rejects(
+      () =>
+        cancelRun("eperm", runId, {
+          killImpl: () => {
+            throw error;
+          },
+        }),
+      /operation not permitted/,
+    );
+    const meta = await readMeta("eperm", runId);
+    assert.equal(meta?.status, "running");
+  });
+});
+
 test("spawnDetachedRun persists status=failed when the spawn itself fails", async () => {
   await withTempStore(async () => {
     const flow = defineFlow({ name: "bg-spawnfail", run: async () => "x" });

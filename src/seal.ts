@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
@@ -26,6 +27,14 @@ export type SealArtifact = {
 export type SealRecord = SealArtifact & {
   beeName: string;
   sealedAt: string;
+};
+
+export type LatestSealScan = {
+  seal: SealRecord | null;
+  /** Filename that contained `seal`, when a valid seal was found. */
+  filename: string | null;
+  /** Lexicographically newest seal filename observed during this scan. */
+  highWaterFilename: string | null;
 };
 
 const SEAL_STATUSES = new Set<SealStatus>(["done", "blocked", "needs_input", "failed"]);
@@ -119,32 +128,40 @@ export async function recordSeal(beeName: string, artifact: SealArtifact): Promi
 export async function listSeals(beeName: string): Promise<SealRecord[]> {
   const dir = beeSealDir(beeName);
   const files = await readdir(dir).catch(() => []);
-  const seals: SealRecord[] = [];
+  const seals: Array<{ file: string; seal: SealRecord }> = [];
   for (const file of files.filter((f) => f.endsWith(".json"))) {
     const seal = await readSeal(join(dir, file)).catch(() => null);
-    if (seal) seals.push(seal);
+    if (seal) seals.push({ file, seal });
   }
-  return seals.sort((a, b) => b.sealedAt.localeCompare(a.sealedAt));
+  return seals
+    .sort((a, b) => b.seal.sealedAt.localeCompare(a.seal.sealedAt) || b.file.localeCompare(a.file))
+    .map((entry) => entry.seal);
 }
 
 /**
- * Efficient latest-seal lookup. Seal filenames embed sealedAt (with `:`/`.`
- * mapped to `-`), so lexicographic filename order matches chronological order —
- * pick the lexicographically-last filename and read just that one file instead
- * of parsing every seal (long-running loops accumulate one seal per iteration,
- * which made the read-everything approach O(N²) over a loop's life). Corrupt
- * files are skipped, walking backwards, mirroring listSeals' skip semantics.
+ * Efficient latest-seal lookup. Seal filenames start with sealedAt (with `:`/`.`
+ * mapped to `-`), so lexicographic filename order matches chronological order.
+ * `scanLatestSeal` can start after a previously observed filename, letting
+ * long-running loop boundary polling avoid re-sorting the full seal history.
+ * Corrupt files are skipped, walking backwards, mirroring listSeals' skip
+ * semantics.
  */
 export async function loadLatestSeal(beeName: string): Promise<SealRecord | null> {
+  return (await scanLatestSeal(beeName)).seal;
+}
+
+export async function scanLatestSeal(beeName: string, options: { afterFilename?: string | null } = {}): Promise<LatestSealScan> {
   const dir = beeSealDir(beeName);
+  const afterFilename = options.afterFilename ?? null;
   const files = (await readdir(dir).catch(() => [] as string[]))
-    .filter((f) => f.endsWith(".json"))
+    .filter((f) => f.endsWith(".json") && (afterFilename === null || f > afterFilename))
     .sort();
+  const highWaterFilename = files.length > 0 ? files[files.length - 1]! : afterFilename;
   for (let i = files.length - 1; i >= 0; i -= 1) {
     const seal = await readSeal(join(dir, files[i]!)).catch(() => null);
-    if (seal) return seal;
+    if (seal) return { seal, filename: files[i]!, highWaterFilename };
   }
-  return null;
+  return { seal: null, filename: null, highWaterFilename };
 }
 
 /**
@@ -205,7 +222,21 @@ function beeSealDir(beeName: string): string {
   return join(sealsRoot(), beeName);
 }
 
+let lastSealStamp = "";
+let sameStampCounter = 0;
+
 function sealPath(beeName: string, sealedAt: string): string {
   const safeStamp = sealedAt.replace(/[:.]/g, "-");
-  return join(beeSealDir(beeName), `${safeStamp}.json`);
+  return join(beeSealDir(beeName), `${safeStamp}-${nextSealSuffix(safeStamp)}.json`);
+}
+
+function nextSealSuffix(safeStamp: string): string {
+  if (safeStamp === lastSealStamp) {
+    sameStampCounter += 1;
+  } else {
+    lastSealStamp = safeStamp;
+    sameStampCounter = 0;
+  }
+  const counter = sameStampCounter.toString(36).padStart(4, "0");
+  return `${counter}-${randomBytes(3).toString("hex")}`;
 }
