@@ -41,7 +41,7 @@ import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "./forkTui.js";
 import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
-import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
+import { acquireProSlot, createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { pickRoundRobinAccount } from "./roundRobin.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
@@ -949,13 +949,24 @@ function ttlFlagMs(parsed: Parsed): number | undefined {
  * remaining quota.
  */
 async function resolveSpawnAgentWithAuto(requested: string, parsed: Parsed): Promise<SpawnAgentSpec> {
-  const rr = roundRobinAccountTool(requested);
-  if (rr) return { agent: rr, account: await pickRoundRobinAccountForCli(rr) };
-  const tool = autoAccountTool(requested);
-  if (tool) return { agent: tool, account: await pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  const alias = spawnAccountAliasResolver(requested, parsed);
+  if (alias) return { agent: alias.agent, account: await alias.account() };
   const resolved = await resolveSpawnAgent(requested);
   const defaultAccount = await defaultBareGrokAccount(requested, parsed, resolved);
   return defaultAccount ? { agent: defaultAccount.tool, account: defaultAccount } : resolved;
+}
+
+type SpawnAccountAliasResolver = {
+  agent: string;
+  account: () => Promise<AccountRecord>;
+};
+
+function spawnAccountAliasResolver(requested: string, parsed: Parsed): SpawnAccountAliasResolver | undefined {
+  const rr = roundRobinAccountTool(requested);
+  if (rr) return { agent: rr, account: () => pickRoundRobinAccountForCli(rr) };
+  const tool = autoAccountTool(requested);
+  if (tool) return { agent: tool, account: () => pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  return undefined;
 }
 
 async function defaultBareGrokAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
@@ -1396,15 +1407,16 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
     throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
   }
-  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
+  const perBeeAccountAlias = spawnAccountAliasResolver(requested, parsed);
+  const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
+    ? { agent: perBeeAccountAlias.agent, account: undefined }
+    : await resolveSpawnAgentWithAuto(requested, parsed);
   // Thin profile → account (same overlay as spawnSingleBee).
   const profile = await resolveProfileOverlay(requested);
   const agent = profile ? profile.account.tool : resolvedAgent;
   const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
   const account = profile?.account ?? aliasAccount;
   // Model selector precedence: profile model override > the account default.
-  const model = account ? (profile?.model ?? account.model) : undefined;
-  const provider = account?.provider;
   const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -1421,7 +1433,10 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   // and no new --count restriction.
   const records: SessionRecord[] = [];
   for (let i = 0; i < count; i += 1) {
-    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account, model, provider });
+    const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
+    const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
+    const beeProvider = beeAccount?.provider;
+    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider });
     records.push(record);
     const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
     if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`@${swarmId}`), ...nodeSuffix]));
@@ -1467,13 +1482,14 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
   const hasComposerMessages = perBeeMessages !== undefined;
   let slot = 0; // running bee index across all castes, aligned with perBeeMessages
   for (const caste of frame.castes) {
-    const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(caste.bee, parsed);
+    const perBeeAccountAlias = spawnAccountAliasResolver(caste.bee, parsed);
+    const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
+      ? { agent: perBeeAccountAlias.agent, account: undefined }
+      : await resolveSpawnAgentWithAuto(caste.bee, parsed);
     const profile = await resolveProfileOverlay(caste.bee);
     const agent = profile ? profile.account.tool : resolvedAgent;
     const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
     const account = profile?.account ?? aliasAccount;
-    const model = account ? (profile?.model ?? account.model) : undefined;
-    const provider = account?.provider;
     const yolo = dangerousMode(parsed, agent, caste.bee, profile?.yolo);
     const home = caste.home ?? flagHome;
     const casteSpec = resolveAgent(agent, extraArgs, { home, yolo });
@@ -1487,6 +1503,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
       // With composer messages present, a blank slot explicitly means no brief;
       // otherwise fall back to the legacy "--briefed delivers caste brief" path.
       const toDeliver = hasComposerMessages ? (hasCustom ? custom : undefined) : briefed && caste.brief ? caste.brief : undefined;
+      const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
+      const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
+      const beeProvider = beeAccount?.provider;
       let record = await spawnBee({
         agent,
         extraArgs,
@@ -1497,9 +1516,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
         swarmId,
         caste: caste.name,
         node: casteNode,
-        account,
-        model,
-        provider,
+        account: beeAccount,
+        model: beeModel,
+        provider: beeProvider,
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
       if (toDeliver) record = await deliverBrief(parsed, record, toDeliver);
@@ -4310,6 +4329,12 @@ async function resolveForkCheckpoint(beeName: string, checkpointArg: string | un
 
 // ── hive fork launch — the interactive dialog (⌘K) ───────────────────────────
 
+async function hasRecordedForkUsingCwd(source: SessionRecord, cwd: string): Promise<boolean> {
+  const sourceIds = new Set([source.name, ...(source.id ? [source.id] : [])]);
+  const records = await listSessions();
+  return records.some((record) => record.cwd === cwd && record.forkedFromId !== undefined && sourceIds.has(record.forkedFromId));
+}
+
 /**
  * `hive fork launch` — the interactive fork window (the ⌘K target). The SOURCE
  * is the bee owning the current pane, so the dialog opens straight on a form for
@@ -4381,12 +4406,16 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
 
   // Create the worktree/checkout up front — its path becomes the fork's --cwd.
   let cwd: string | undefined;
+  let createdSlot: { kind: ProSlotKind; repoPath: string; name: string; path: string } | undefined;
   if (intent.isolation) {
     if (!proRepo) throw new Error("hive fork launch: not a pro repo — cannot create a worktree");
     const slug = toProSlug(intent.isolation.name);
     if (!slug) throw new Error("hive fork launch: worktree name must contain letters, digits, or dashes");
     if (isPretty()) console.error(note(`creating ${intent.isolation.kind} ${slug}…`));
-    cwd = await createProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slot = await acquireProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slotPath = await realpath(slot.path).catch(() => slot.path);
+    cwd = slotPath;
+    if (slot.created) createdSlot = { kind: intent.isolation.kind, repoPath: proRepo.path, name: slug, path: slotPath };
   }
 
   // Build a `hive fork` invocation and reuse cmdFork wholesale.
@@ -4399,7 +4428,28 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
   if (cwd) flags.set("cwd", cwd);
   flags.set("here", true);
 
-  const record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  let record: SessionRecord;
+  try {
+    record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  } catch (error) {
+    if (createdSlot) {
+      const launched = await hasRecordedForkUsingCwd(source, createdSlot.path).catch((checkError) => {
+        const message = checkError instanceof Error ? checkError.message : String(checkError);
+        console.error(note(`warn: keeping ${createdSlot.kind} ${createdSlot.name}; could not verify fork records: ${message}`));
+        return true;
+      });
+      if (!launched) {
+        if (isPretty()) console.error(note(`removing ${createdSlot.kind} ${createdSlot.name} after failed fork...`));
+        try {
+          await deleteProSlot(createdSlot.kind, createdSlot.repoPath, createdSlot.name);
+        } catch (cleanupError) {
+          const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          console.error(note(`warn: failed to remove ${createdSlot.kind} ${createdSlot.name} at ${tildify(createdSlot.path)}: ${message}`));
+        }
+      }
+    }
+    throw error;
+  }
 
   if (intent.message) {
     await cmdSend({ command: "send", args: [record.name, intent.message], flags: new Map(), rest: [] });
@@ -8179,7 +8229,7 @@ async function daemonStatus(parsed: Parsed) {
   const label = daemonLabel(parsed);
   const staleAfter = numberFlag(parsed, ["stale-after-ms"], 0);
   const status = await readDaemonStatus(undefined, { label, ...(staleAfter > 0 ? { staleAfterMs: staleAfter } : {}) });
-  // Exit codes: 0 healthy, 3 down, 4 STALE (process alive, loop wedged).
+  // Exit codes: 0 healthy, 3 down, 4 unhealthy/stale (process alive but not progressing).
   // Anything polling this command must treat nonzero as an outage.
   const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
@@ -8207,11 +8257,18 @@ async function daemonStatus(parsed: Parsed) {
     process.exit(3);
   }
   if (status.stale) {
-    const age = status.state?.lastTickAt ? formatRelativeTime(status.state.lastTickAt) : "never";
-    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("STALE"))} ${dim(`(process alive, loop wedged — last tick ${age} ago, threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
+    const reasonLabels: Record<string, string> = {
+      "loop-stale": "loop heartbeat stale",
+      "tick-progress-stale": "tick progress stale",
+      "recent-errors-saturated": "recent errors saturated",
+      "missing-state": "state missing",
+    };
+    const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
+    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
     if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
     if (status.state) {
       console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+      console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
       if (status.state.recentErrors.length > 0) {
         console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
         for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
@@ -8229,6 +8286,7 @@ async function daemonStatus(parsed: Parsed) {
   }
   if (status.state) {
     console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+    if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
     if (status.state.recentErrors.length > 0) {
       console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
       for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));

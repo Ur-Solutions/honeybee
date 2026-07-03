@@ -185,14 +185,15 @@ export function createRemoteHsrSubstrate(
   const observed = new Map<string, number>();
 
   async function reobserve(c: RemoteRunnerClient): Promise<void> {
-    for (const bee of [...observed.keys()]) {
+    for (const [bee, count] of [...observed]) {
       try {
-        // Against a surviving serve this just bumps the relay refcount (there is
-        // no unobserve RPC, so the extra count is inert); against a restarted
-        // serve it re-creates the relay. `ok:false` (bee gone) is left to the
-        // mirror's teardown pass; a thrown call (tunnel flapped again) is
-        // retried by the next reconnect.
-        await c.call("observe", { bee });
+        // `sync` makes the remote SET its relay refcount to our subscriber
+        // count: against a surviving serve a plain observe would inflate the
+        // count past what our unobserve calls return (HIVE-56); against a
+        // restarted serve it re-creates the relay with the right count.
+        // `ok:false` (bee gone) is left to the mirror's teardown pass; a
+        // thrown call (tunnel flapped again) is retried by the next reconnect.
+        await c.call("observe", { bee, sync: count });
       } catch {
         return;
       }
@@ -393,6 +394,12 @@ export function createRemoteHsrSubstrate(
       const count = observed.get(bee) ?? 0;
       if (count <= 1) observed.delete(bee);
       else observed.set(bee, count - 1);
+      // Release the remote side too (HIVE-56): decrement the serve's relay
+      // refcount so the last unsubscribe closes its connection to the bee's
+      // control socket. Best-effort and fire-and-forget — if the tunnel is
+      // down the next reconnect's `sync` reconciles the count anyway. Reuses
+      // the memoized client only; never opens a connection just to release.
+      void clientPromise?.then((c) => c.call("unobserve", { bee })).catch(() => undefined);
     };
   }
 
@@ -444,11 +451,21 @@ export function createRemoteHsrSubstrate(
     listCheckouts,
     observe,
     async close(): Promise<void> {
+      const releasing = [...observed];
       observed.clear();
       if (!clientPromise) return;
       const pending = clientPromise;
       clientPromise = undefined;
-      await pending.then((c) => c.close()).catch(() => undefined);
+      await pending
+        .then(async (c) => {
+          // Best-effort: release every relay we still hold before dropping the
+          // connection, so the serve's per-bee clients don't outlive us (HIVE-56).
+          for (const [bee, count] of releasing) {
+            await c.call("unobserve", { bee, count }).catch(() => undefined);
+          }
+          c.close();
+        })
+        .catch(() => undefined);
     },
   };
 }
