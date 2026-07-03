@@ -8,6 +8,46 @@ export type NodeKind = "local-tmux" | "ssh-tmux" | "remote-hsr";
 
 export type NodeStatus = "online" | "offline" | "unknown";
 
+/**
+ * Per-node credential-delivery policy (APIA-93). SECURITY-SENSITIVE: it decides
+ * whether an `--account`-bound bee may run on a REMOTE node, and if so, how the
+ * account's login reaches it. Default is the strict, historical rule.
+ *
+ * - "local-only"      — the vault NEVER leaves this machine; account-bound bees
+ *                       run only on local-tmux. Any account spawn on this node
+ *                       is refused. (Default when unset.)
+ * - "ephemeral-token" — a SHORT-LIVED credential (a minted claude setup-token,
+ *                       or the account's codex auth.json) is delivered into the
+ *                       remote's per-bee isolated home at spawn and DESTROYED on
+ *                       kill. The vault itself is never copied to the remote.
+ * - "api-key"         — an API key is delivered as env (e.g. ANTHROPIC_API_KEY).
+ *                       A thin variant; see remoteCreds.ts / spawnBee.
+ */
+export type AuthPolicy = "local-only" | "ephemeral-token" | "api-key";
+
+export const AUTH_POLICIES: readonly AuthPolicy[] = ["local-only", "ephemeral-token", "api-key"];
+
+export function isAuthPolicy(value: unknown): value is AuthPolicy {
+  return typeof value === "string" && (AUTH_POLICIES as readonly string[]).includes(value);
+}
+
+/** A node's effective policy: the stored value, or the strict default when unset. */
+export function authPolicyOf(node: Pick<NodeRecord, "authPolicy">): AuthPolicy {
+  return node.authPolicy ?? "local-only";
+}
+
+/** One-line human meaning for `hive node inspect` and error surfaces. */
+export function describeAuthPolicy(policy: AuthPolicy): string {
+  switch (policy) {
+    case "local-only":
+      return "vault never leaves this machine; account-bound bees are local-only";
+    case "ephemeral-token":
+      return "short-lived credential delivered to the remote isolated home at spawn, destroyed on kill";
+    case "api-key":
+      return "API key delivered as env to the remote (thin variant)";
+  }
+}
+
 export type NodeRecord = {
   name: string;
   kind: NodeKind;
@@ -20,6 +60,12 @@ export type NodeRecord = {
   sshArgs?: string[];
   /** For kind "remote-hsr": the handshaked runner-host version deployed on the node. */
   runnerHostVersion?: string;
+  /**
+   * Credential-delivery policy (APIA-93). Absent === "local-only" (the strict
+   * default). Only "ephemeral-token"/"api-key" permit account-bound bees on a
+   * remote node. See {@link authPolicyOf}.
+   */
+  authPolicy?: AuthPolicy;
   createdAt: string;
   updatedAt: string;
 };
@@ -103,12 +149,16 @@ export type RegisterNodeInput = {
   sshCommand?: string;
   sshArgs?: string[];
   runnerHostVersion?: string;
+  authPolicy?: AuthPolicy;
 };
 
 export async function registerNode(input: RegisterNodeInput): Promise<NodeRecord> {
   if (!validNodeName(input.name)) throw new Error(`Invalid node name: ${input.name}. Use alphanumerics, dashes, underscores, and dots.`);
   if (input.kind !== "local-tmux" && input.kind !== "ssh-tmux" && input.kind !== "remote-hsr") throw new Error(`Invalid node kind: ${input.kind}. Use local-tmux, ssh-tmux, or remote-hsr.`);
   if (!input.endpoint || input.endpoint.length === 0) throw new Error("Node endpoint is required");
+  if (input.authPolicy !== undefined && !isAuthPolicy(input.authPolicy)) {
+    throw new Error(`Invalid auth policy: ${input.authPolicy}. Use local-only, ephemeral-token, or api-key.`);
+  }
   if (input.sshCommand && /\s/.test(input.sshCommand)) {
     // The flag parser treats a value starting with "-" as a boolean unless the
     // "=" form is used, so the hint must show --ssh-args="...".
@@ -131,6 +181,8 @@ export async function registerNode(input: RegisterNodeInput): Promise<NodeRecord
     ...(input.sshCommand ? { sshCommand: input.sshCommand } : {}),
     ...(input.sshArgs && input.sshArgs.length > 0 ? { sshArgs: input.sshArgs } : {}),
     ...(input.runnerHostVersion ? { runnerHostVersion: input.runnerHostVersion } : {}),
+    // Store only a non-default policy so plain records stay lean; absent === local-only.
+    ...(input.authPolicy && input.authPolicy !== "local-only" ? { authPolicy: input.authPolicy } : {}),
   };
   await saveNode(record);
   await appendLedger({ type: "node.register", name: record.name, kind: record.kind, endpoint: record.endpoint });
@@ -146,6 +198,8 @@ export type UpdateNodePatch = {
   runnerHostVersion?: string;
   status?: NodeStatus;
   lastSeen?: string;
+  /** "" resets to the default (local-only); a valid policy sets it. */
+  authPolicy?: AuthPolicy | "";
 };
 
 export async function updateNode(name: string, patch: UpdateNodePatch): Promise<NodeRecord> {
@@ -180,6 +234,11 @@ export async function updateNode(name: string, patch: UpdateNodePatch): Promise<
   if (patch.runnerHostVersion !== undefined) {
     if (patch.runnerHostVersion === "") delete updated.runnerHostVersion;
     else updated.runnerHostVersion = patch.runnerHostVersion;
+  }
+  if (patch.authPolicy !== undefined) {
+    if (patch.authPolicy === "" || patch.authPolicy === "local-only") delete updated.authPolicy;
+    else if (!isAuthPolicy(patch.authPolicy)) throw new Error(`Invalid auth policy: ${patch.authPolicy}. Use local-only, ephemeral-token, or api-key.`);
+    else updated.authPolicy = patch.authPolicy;
   }
   if (patch.status !== undefined) updated.status = patch.status;
   if (patch.lastSeen !== undefined) updated.lastSeen = patch.lastSeen;
@@ -242,6 +301,8 @@ function normalizeNode(value: unknown, path: string): NodeRecord {
   if (typeof object.sshCommand === "string") record.sshCommand = object.sshCommand;
   if (Array.isArray(object.sshArgs)) record.sshArgs = object.sshArgs.filter((a): a is string => typeof a === "string");
   if (typeof object.runnerHostVersion === "string") record.runnerHostVersion = object.runnerHostVersion;
+  // Only a valid, non-default policy is carried; garbage/local-only normalizes away.
+  if (isAuthPolicy(object.authPolicy) && object.authPolicy !== "local-only") record.authPolicy = object.authPolicy;
   return record;
 }
 

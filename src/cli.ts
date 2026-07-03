@@ -166,7 +166,8 @@ import { flag, numberFlag, parse, truthy, type Parsed } from "./parse.js";
 import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
 import { startSpawnTimer, type SpawnTimer } from "./spawnTiming.js";
 import { attentionCount, DEFAULT_ATTENTION_STATES, parseStateList, pickNextBee, type BeeStateEntry } from "./next.js";
-import { LOCAL_NODE_NAME, listNodes, loadNode, loadNodeSync, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
+import { authPolicyOf, describeAuthPolicy, LOCAL_NODE_NAME, listNodes, loadNode, loadNodeSync, type AuthPolicy, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
+import { mintEphemeralCredential, type EphemeralCredential } from "./hsr/remoteCreds.js";
 import { bootstrapRunnerHost } from "./hsr/bootstrap.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
@@ -663,10 +664,38 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.provider ? { provider: opts.provider } : {}),
   });
+  // APIA-93: an account-bound spawn on a REMOTE node is gated by the node's
+  // credential-delivery policy. local-only (the default, and every non-remote-hsr
+  // remote kind) keeps the historical "vault never leaves this machine" rule; an
+  // ephemeral-token remote-hsr node instead gets a SHORT-LIVED credential minted
+  // + delivered to its isolated home (below), never the local vault.
+  let remoteCreds: EphemeralCredential | undefined;
   if (opts.account) {
-    if (opts.node && opts.node.kind !== "local-tmux") throw new Error("--account spawns are local-only (the vault never leaves this machine)");
-    if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${opts.account.id}`);
-    await activateAccountIntoHome(opts.account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+    const remoteAccountAllowed =
+      opts.node?.kind === "remote-hsr" &&
+      (authPolicyOf(opts.node) === "ephemeral-token" || authPolicyOf(opts.node) === "api-key");
+    if (opts.node && opts.node.kind !== "local-tmux" && !remoteAccountAllowed) {
+      if (opts.node.kind === "remote-hsr") {
+        throw new Error(`node ${opts.node.name} is auth-policy local-only; set --auth-policy ephemeral-token to run account-bound bees there`);
+      }
+      throw new Error("--account spawns are local-only (the vault never leaves this machine)");
+    }
+    if (remoteAccountAllowed && opts.node) {
+      // Do NOT activateAccountIntoHome here — that is the LOCAL vault path. The
+      // remote gets ONLY the ephemeral material; the vault stays on this machine.
+      if (authPolicyOf(opts.node) === "api-key") {
+        throw new Error(`node ${opts.node.name} auth-policy api-key is not yet wired (APIA-93 delivers ephemeral-token); use --auth-policy ephemeral-token`);
+      }
+      try {
+        remoteCreds = await mintEphemeralCredential(opts.account, spec.kind);
+      } catch (error) {
+        // Scrub: surface only the (secret-free) message, never token/cred bytes.
+        throw new Error(`could not mint an ephemeral credential for ${opts.account.id} on ${opts.node.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${opts.account.id}`);
+      await activateAccountIntoHome(opts.account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+    }
   }
   // "activate" folds in resolveAgent + account activation (the OAuth-refresh
   // network call and accounts-lock wait live here); near-zero without --account.
@@ -714,6 +743,10 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
       authKind: "subscription",
       ...(opts.model ? { model: opts.model } : {}),
+      // APIA-93: ephemeral credential material for an account-bound remote spawn.
+      // Delivered to the remote isolated home at spawn, shredded on kill. Opaque.
+      ...(remoteCreds ? { creds: { ...(remoteCreds.files.length ? { files: remoteCreds.files } : {}), ...(remoteCreds.env ? { env: remoteCreds.env } : {}) } } : {}),
+      ...(remoteCreds && spec.homePath ? { home: spec.homePath } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
     timer.mark("session-create");
@@ -742,6 +775,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
       ...(opts.caste ? { caste: opts.caste } : {}),
       ...(opts.brief ? { brief: opts.brief } : {}),
+      ...(opts.account ? { accountId: opts.account.id } : {}),
     };
     await saveSession(record);
     timer.mark("persist");
@@ -6718,7 +6752,7 @@ function parseSshArgsFlag(parsed: Parsed): string[] | undefined {
 
 async function nodeRegister(parsed: Parsed) {
   const name = parsed.args[1];
-  if (!name) throw new Error("Usage: hive node register <name> --kind <local-tmux|ssh-tmux> --endpoint <addr> [--capabilities a,b,c] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"-F /path/to/config\"]");
+  if (!name) throw new Error("Usage: hive node register <name> --kind <local-tmux|ssh-tmux|remote-hsr> --endpoint <addr> [--capabilities a,b,c] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"-F /path/to/config\"] [--auth-policy <local-only|ephemeral-token|api-key>]");
   const kindRaw = flag(parsed, "kind");
   if (typeof kindRaw !== "string") throw new Error("--kind is required (local-tmux or ssh-tmux)");
   const endpointRaw = flag(parsed, "endpoint");
@@ -6730,6 +6764,7 @@ async function nodeRegister(parsed: Parsed) {
   const description = typeof flag(parsed, "description") === "string" ? String(flag(parsed, "description")) : undefined;
   const sshCommand = typeof flag(parsed, "ssh-command") === "string" ? String(flag(parsed, "ssh-command")) : undefined;
   const sshArgs = parseSshArgsFlag(parsed);
+  const authPolicy = typeof flag(parsed, "auth-policy") === "string" ? (String(flag(parsed, "auth-policy")) as AuthPolicy) : undefined;
   const record = await registerNode({
     name,
     kind: kindRaw as NodeRecord["kind"],
@@ -6738,6 +6773,7 @@ async function nodeRegister(parsed: Parsed) {
     ...(description ? { description } : {}),
     ...(sshCommand ? { sshCommand } : {}),
     ...(sshArgs ? { sshArgs } : {}),
+    ...(authPolicy ? { authPolicy } : {}),
   });
   clearSubstrateCache();
   if (isPretty()) console.log(actionLine("ok", "node", [bold(record.name), record.kind, dim(record.endpoint)]));
@@ -6788,15 +6824,20 @@ async function nodeInspect(parsed: Parsed) {
   const record = await loadNode(name);
   if (!record) throw new Error(`Unknown node: ${name}`);
   console.log(JSON.stringify(record, null, 2));
+  // Surface the credential-delivery policy meaning on stderr so stdout stays
+  // valid JSON for programmatic callers (APIA-93).
+  const policy = authPolicyOf(record);
+  console.error(dim(`auth-policy: ${policy} — ${describeAuthPolicy(policy)}`));
 }
 
 async function nodeUpdate(parsed: Parsed) {
   const name = parsed.args[1];
-  if (!name) throw new Error("Usage: hive node update <name> [--endpoint addr] [--capabilities a,b] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"...\"]");
+  if (!name) throw new Error("Usage: hive node update <name> [--endpoint addr] [--capabilities a,b] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"...\"] [--auth-policy <local-only|ephemeral-token|api-key>]");
   const patch: Parameters<typeof updateNode>[1] = {};
   if (typeof flag(parsed, "endpoint") === "string") patch.endpoint = String(flag(parsed, "endpoint"));
   if (typeof flag(parsed, "description") === "string") patch.description = String(flag(parsed, "description"));
   if (typeof flag(parsed, "ssh-command") === "string") patch.sshCommand = String(flag(parsed, "ssh-command"));
+  if (typeof flag(parsed, "auth-policy") === "string") patch.authPolicy = String(flag(parsed, "auth-policy")) as AuthPolicy | "";
   if (typeof flag(parsed, "capabilities") === "string") {
     patch.capabilities = String(flag(parsed, "capabilities")).split(",").map((c) => c.trim()).filter(Boolean);
   }

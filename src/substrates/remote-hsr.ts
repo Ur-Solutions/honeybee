@@ -25,6 +25,7 @@
 
 import type { NodeRecord } from "../node.js";
 import type { BeeState } from "../state.js";
+import type { DeliveredCredentials } from "../hsr/remoteCreds.js";
 import {
   connectRemoteRunnerHost,
   type ConnectRemoteOptions,
@@ -62,6 +63,18 @@ export type RemoteSpawnParams = {
   model?: string;
   comb?: string;
   parent?: string;
+  /**
+   * APIA-93 ephemeral credential material (opaque, base64 in transit) delivered
+   * into the remote isolated home at spawn and shredded on kill. Only present
+   * for an account-bound spawn on an ephemeral-token node. NEVER logged.
+   */
+  creds?: DeliveredCredentials;
+  /**
+   * The isolated home the credential files are written into (the local side is
+   * authoritative — it resolved the AgentSpec's home). Only used when `creds`
+   * carry files; the remote creates it fresh (0700).
+   */
+  home?: string;
   spec: { command: string; args: string[]; env: Record<string, string> };
 };
 
@@ -237,6 +250,8 @@ export function createRemoteHsrSubstrate(
       ...(params.model ? { model: params.model } : {}),
       ...(params.comb ? { comb: params.comb } : {}),
       ...(params.parent ? { parent: params.parent } : {}),
+      ...(params.creds ? { creds: params.creds } : {}),
+      ...(params.home ? { home: params.home } : {}),
       spec: params.spec,
     })) as { ok?: boolean; bee?: string; tier?: string; error?: string } | null;
     if (!res || !res.ok) {

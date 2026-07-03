@@ -31,6 +31,14 @@ import {
 } from "./rpc.js";
 import { hsrObservations, pendingNeedsInput } from "./observe.js";
 import { readHsrMeta, hsrRunDir } from "./runDir.js";
+import {
+  homeDirForSpec,
+  recordDeliveredCredentials,
+  shredDeliveredCredentials,
+  writeDeliveredCredentials,
+  type DeliveredCredentials,
+  type EphemeralCredentialFile,
+} from "./remoteCreds.js";
 import { runHsrHost, type HsrHostHandle } from "./host.js";
 import { adapterFor } from "./adapters/index.js";
 import type { RunnerOpts } from "./types.js";
@@ -48,6 +56,39 @@ function isPidAlive(pid: number): boolean {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Validate the untyped `creds` RPC param into a DeliveredCredentials, dropping
+ * malformed entries. Never throws and never logs the (opaque) credential bytes.
+ */
+function normalizeCreds(value: unknown): DeliveredCredentials | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const object = value as { files?: unknown; env?: unknown };
+  const files: EphemeralCredentialFile[] = [];
+  if (Array.isArray(object.files)) {
+    for (const entry of object.files) {
+      if (!entry || typeof entry !== "object") continue;
+      const f = entry as Record<string, unknown>;
+      if (typeof f.homeRelPath !== "string" || typeof f.contentB64 !== "string") continue;
+      // Reject path escapes so a delivered file can never land outside the home.
+      if (f.homeRelPath.startsWith("/") || f.homeRelPath.split("/").includes("..")) continue;
+      files.push({
+        homeRelPath: f.homeRelPath,
+        contentB64: f.contentB64,
+        mode: typeof f.mode === "number" ? f.mode : 0o600,
+      });
+    }
+  }
+  const env: Record<string, string> = {};
+  if (object.env && typeof object.env === "object" && !Array.isArray(object.env)) {
+    for (const [key, val] of Object.entries(object.env as Record<string, unknown>)) {
+      if (typeof val === "string") env[key] = val;
+    }
+  }
+  const hasEnv = Object.keys(env).length > 0;
+  if (files.length === 0 && !hasEnv) return undefined;
+  return { ...(files.length ? { files } : {}), ...(hasEnv ? { env } : {}) };
 }
 
 // The package version this host was built from. Bundle-time esbuild `define`
@@ -233,6 +274,8 @@ export function buildController(): RunnerHostController {
         model?: unknown;
         comb?: unknown;
         parent?: unknown;
+        creds?: unknown;
+        home?: unknown;
         spec?: { command?: unknown; args?: unknown; env?: unknown };
       };
       const bee = String(p.bee ?? "");
@@ -255,6 +298,29 @@ export function buildController(): RunnerHostController {
       childEnv.HIVE_BEE = bee;
       childEnv.HIVE_COMB = typeof p.comb === "string" && p.comb ? p.comb : bee;
       if (typeof p.parent === "string" && p.parent) childEnv.HIVE_PARENT = p.parent;
+
+      // APIA-93 credential delivery: the ephemeral-token policy ships a SHORT-LIVED
+      // credential (opaque, base64 in transit) that we write into this bee's
+      // isolated home (0700 dir / 0600 files) BEFORE forking the runner, and
+      // record so `kill` can shred it. The vault itself never reaches the remote.
+      // Secrets are never logged — on failure we surface only a generic message.
+      const creds = normalizeCreds(p.creds);
+      let deliveredCredPaths: string[] = [];
+      if (creds?.env) Object.assign(childEnv, creds.env);
+      if (creds?.files?.length) {
+        // The local side is authoritative about the isolated home; fall back to
+        // the harness home env in the resolved spec if it did not thread one.
+        const homeDir = (typeof p.home === "string" && p.home) ? p.home : homeDirForSpec(kind, childEnv);
+        if (!homeDir) return { ok: false, error: `cannot deliver credentials: no isolated home resolved for harness "${kind}"` };
+        try {
+          deliveredCredPaths = await writeDeliveredCredentials(homeDir, creds);
+          // Record BEFORE forking so a failed runner start still shreds the creds.
+          await recordDeliveredCredentials(bee, deliveredCredPaths);
+        } catch {
+          await shredDeliveredCredentials(bee).catch(() => undefined);
+          return { ok: false, error: "failed to write delivered credentials into the remote home" };
+        }
+      }
       const opts: RunnerOpts = {
         bee,
         cwd: typeof p.cwd === "string" && p.cwd ? p.cwd : process.cwd(),
@@ -267,7 +333,14 @@ export function buildController(): RunnerHostController {
         args,
         runDir: hsrRunDir(bee),
       };
-      const handle = await runHsrHost({ bee, adapter, opts });
+      let handle: HsrHostHandle;
+      try {
+        handle = await runHsrHost({ bee, adapter, opts });
+      } catch (error) {
+        // Runner never started — do not leave the delivered credential on disk.
+        if (deliveredCredPaths.length > 0) await shredDeliveredCredentials(bee).catch(() => undefined);
+        throw error;
+      }
       handles.set(bee, handle);
       // Drop the handle once the session exits so `kill` doesn't retain a dead one.
       void handle.done.then(() => {
@@ -366,6 +439,10 @@ export function buildController(): RunnerHostController {
         relays.delete(bee);
       }
       await stopRunner(bee);
+      // APIA-93: destroy any ephemeral credential delivered into the remote home
+      // BEFORE removing the run dir (which holds the delivered-paths record), so
+      // nothing persists remotely once the bee is gone. Best-effort shred.
+      await shredDeliveredCredentials(bee).catch(() => undefined);
       await rm(hsrRunDir(bee), { recursive: true, force: true }).catch(() => undefined);
       return { ok: true, stdout: "", stderr: "", exitCode: 0 };
     }),
