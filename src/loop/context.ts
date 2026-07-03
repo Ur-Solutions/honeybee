@@ -132,12 +132,12 @@ function coerceMax(value: unknown, forever: boolean): number | null {
 }
 
 function coerceStopOnSeal(value: unknown): SealStatus[] {
-  if (value === undefined || value === null || value === "") return ["done"];
+  if (value === undefined || value === null) return ["done"];
   const parts = String(value)
     .split(",")
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
-  if (parts.length === 0) return ["done"];
+  if (parts.length === 0) return [];
   for (const part of parts) {
     if (!SEAL_STATUSES.has(part as SealStatus)) {
       throw new Error(`Invalid --stop-on-seal "${part}". Use any of: done, blocked, needs_input, failed.`);
