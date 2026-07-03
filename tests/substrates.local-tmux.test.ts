@@ -161,6 +161,26 @@ test("substrateForRecord keys the ssh cache on name + sshCommand + sshArgs, not 
   }
 });
 
+test("substrateForRecord routes every node kind through the registry to the matching substrate, cached per node", () => {
+  clearSubstrateCache();
+  const now = "2026-05-28T00:00:00.000Z";
+  const nodes: Record<string, NodeRecord> = {
+    "local-tmux": { name: "local", kind: "local-tmux", endpoint: "localhost", capabilities: ["*"], createdAt: now, updatedAt: now },
+    "ssh-tmux": { name: "mini01", kind: "ssh-tmux", endpoint: "trmd@mini01", capabilities: ["*"], createdAt: now, updatedAt: now },
+    "remote-hsr": { name: "hsr01", kind: "remote-hsr", endpoint: "trmd@hsr01", capabilities: ["*"], createdAt: now, updatedAt: now },
+  };
+  try {
+    for (const [kind, node] of Object.entries(nodes)) {
+      const substrate = substrateForRecord(node);
+      assert.equal(substrate.kind, kind, `${kind} node routes to a ${kind} substrate`);
+      // getOrCache: an equivalent record resolves to the same cached instance.
+      assert.equal(substrateForRecord({ ...node }), substrate, `${kind} substrate is cached per node`);
+    }
+  } finally {
+    clearSubstrateCache();
+  }
+});
+
 test("local sendText streams a >1MB prompt via load-buffer stdin (no ARG_MAX limit)", { timeout: 60_000 }, async () => {
   const target = `hive-sendtext-argmax-${process.pid}`;
   const buffer = `hive-${target}`;
