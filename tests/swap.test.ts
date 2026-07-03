@@ -36,17 +36,9 @@ function fakeSubstrate(initiallyAlive: boolean) {
       alive = true;
       return { paneId: "%0" };
     },
-    newPane: async (target, _cwd, spec) => {
-      calls.push({ method: "newPane", target, spec });
-      return { paneId: "%0" };
-    },
     kill: async (target) => {
       calls.push({ method: "kill", target });
       alive = false;
-      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
-    },
-    killPane: async (paneId) => {
-      calls.push({ method: "killPane", target: paneId });
       return { ok: true, stdout: "", stderr: "", exitCode: 0 };
     },
     capture: async () => "",

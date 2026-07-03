@@ -1,5 +1,22 @@
 # honeybee Fork & Pane-Identity PRD
 
+> **RETIREMENT NOTE (APIA-85, 2026-07-03).** The **combs / sub-bees** half of this
+> PRD is **retired**. Multiple bees sharing one tmux session via split panes
+> (`hive split`, `newPane`/`killPane`, fork `--pane`/`--window`, comb-aware kill)
+> existed to make subagents *visible* next to each other in tmux; Apiary lineage
+> views over HSR bees now provide that visibility natively. What changed:
+> - `hive split` errors with a deprecation pointer (`hive fork` / `hive x --substrate tmux`).
+> - `hive fork` from inside a bee lands the child **pane-lessly on HSR** by default
+>   (`--substrate tmux`/`--node` forces a separate tmux bee); the `--pane`/`--window`
+>   fork flags are rejected.
+> - `hive kill` always tears down the whole session/runner host (no per-pane sub-bee kill).
+> - `newPane`/`killPane` left the `Substrate` interface (the low-level tmux helpers
+>   stay for direct callers); `combId` is a legacy read-only field.
+>
+> The **`hive fork`** and **pane-identity / `hive here`** halves below are **still
+> live** — pane *pinning* (`agentPaneId`) is retained. Sections describing combs,
+> `hive split`, and sub-bees are historical. See `docs/HSR_EXPLORATION.md` §5.
+
 ## 1. Summary
 
 This PRD covers three intertwined pieces of new functionality on the

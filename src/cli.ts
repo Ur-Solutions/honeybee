@@ -167,7 +167,7 @@ import { attentionCount, DEFAULT_ATTENTION_STATES, parseStateList, pickNextBee, 
 import { LOCAL_NODE_NAME, listNodes, loadNode, loadNodeSync, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
-import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord } from "./substrates/index.js";
+import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord, type Substrate } from "./substrates/index.js";
 import { attachCommand, attachSession, capture, formatShellCommand, hasSession, kill, listTmuxSessions, newSession, sendText, tmux } from "./tmux.js";
 import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
 import { waitForIdle } from "./wait.js";
@@ -2959,29 +2959,12 @@ async function waitForSeal(record: SessionRecord, parsed: Parsed): Promise<void>
 
 async function cmdKill(parsed: Parsed) {
   const target = parsed.args[0];
-  if (!target) throw new Error("Usage: hive kill <session> [--comb]");
+  if (!target) throw new Error("Usage: hive kill <session>");
   const record = await resolveSession(target);
-  const forceComb = truthy(flag(parsed, "comb"));
 
-  // Comb-aware kill: a pane-pinned bee that shares its comb (tmuxTarget) with at
-  // least one live sibling is dropped with killPane — its siblings keep running.
-  // --comb (or a sole/last bee in the comb) takes the whole session via the
-  // existing transactional path. Killing a sub-bee MUST NEVER kill a sibling.
-  if (!forceComb && record.agentPaneId) {
-    const all = await listSessions();
-    const siblings = all.filter(
-      (other) =>
-        other.name !== record.name &&
-        other.tmuxTarget === record.tmuxTarget &&
-        (other.node ?? LOCAL_NODE_NAME) === (record.node ?? LOCAL_NODE_NAME) &&
-        other.agentPaneId, // only pane-pinned siblings would survive a pane kill
-    );
-    if (siblings.length > 0) {
-      await killSubBeePane(record);
-      return;
-    }
-  }
-
+  // Combs are retired (APIA-85): every bee is solo (its own session/runner host),
+  // so a kill always tears down the whole session via the transactional path.
+  // The pane-pinned `agentPaneId` is kept for I/O targeting, not comb membership.
   const outcome = await transactionalKill(record);
   if (!outcome.ok) {
     if (isPretty()) {
@@ -2997,47 +2980,6 @@ async function cmdKill(parsed: Parsed) {
     console.log(actionLine(outcome.alreadyGone ? "warn" : "ok", outcome.alreadyGone ? "gone" : "kill", [bold(record.name)]));
   } else {
     console.log(`${outcome.alreadyGone ? "gone" : "killed"}\t${record.name}`);
-  }
-}
-
-/**
- * Drop one sub-bee by killing only its pane (not the comb). On a clean kill the
- * record is deleted and a `bee.kill_pane` ledger event is emitted; on failure
- * the record is marked kill_failed (mirroring transactionalKill's discipline).
- */
-async function killSubBeePane(record: SessionRecord): Promise<void> {
-  const substrate = substrateFor(record);
-  const result = await substrate.killPane(record.agentPaneId!, { launcherPgid: record.launcherPgid }).catch((error) => ({
-    ok: false,
-    exitCode: 1,
-    stdout: "",
-    stderr: error instanceof Error ? error.message : String(error),
-  }));
-  if (!result.ok) {
-    const lastError = result.stderr.trim() || `kill-pane exited with code ${result.exitCode}`;
-    await updateSession(record.name, { status: "kill_failed", lastError, updatedAt: new Date().toISOString() });
-    if (isPretty()) {
-      console.log(actionLine("warn", "kill_failed", [bold(record.name), dim(lastError)]));
-      console.error(note(`bee may still be running; retry: hive kill ${record.name}`));
-    } else {
-      console.log(`kill_failed\t${record.name}\t${lastError}`);
-    }
-    process.exitCode = 1;
-    return;
-  }
-  await deleteSession(record.name);
-  await appendLedger({
-    type: "bee.kill_pane",
-    session: record.name,
-    node: record.node ?? LOCAL_NODE_NAME,
-    parentId: record.parentId,
-    combId: record.combId ?? record.tmuxTarget,
-    agentPaneId: record.agentPaneId,
-  });
-  if (isPretty()) {
-    console.log(actionLine("ok", "kill", [bold(record.name), dim("pane removed")]));
-  } else {
-    console.log(`killed\t${record.name}\tpane removed`);
   }
 }
 
@@ -3836,120 +3778,19 @@ async function binaryOnPath(name: string): Promise<boolean> {
   });
 }
 
-async function cmdSplit(parsed: Parsed): Promise<SessionRecord> {
-  // hive split [<bee>] [<agent>] [--brief <text>] [--dir v|h|window] [--cwd <dir>] [--home <h>]
-  // No <bee> (or --here) → split the current bee's comb (via hive here resolution).
-  //
-  // The first positional is ambiguous: it can be a parent bee selector OR (when
-  // run from inside a bee, e.g. `hive split codex`) the sub-bee's agent. We
-  // disambiguate by trying to resolve it as an existing session; if that fails
-  // we treat it as the agent and split the current bee's comb.
-  const useHere = truthy(flag(parsed, "here"));
-  const pos0 = parsed.args[0] && !parsed.args[0]!.startsWith("-") ? parsed.args[0]! : undefined;
-  const pos1 = parsed.args[1] && !parsed.args[1]!.startsWith("-") ? parsed.args[1]! : undefined;
-
-  let parent: SessionRecord | undefined;
-  let agentArg: string | undefined;
-  if (useHere || pos0 === undefined) {
-    // Current-pane parent; pos0 (if any) is the agent.
-    parent = await resolveBeeInCurrentPane();
-    agentArg = pos0;
-  } else {
-    // pos0 is a bee selector if it resolves to a session, else it's the agent.
-    parent = await resolveSession(pos0).catch(() => undefined);
-    if (parent) {
-      agentArg = pos1;
-    } else {
-      parent = await resolveBeeInCurrentPane();
-      agentArg = pos0;
-    }
-  }
-  if (!parent) {
-    throw new Error(
-      "hive split: no parent bee specified and not inside a bee pane. " +
-        "Usage: hive split [<bee>] [<agent>] [--brief <text>] [--dir v|h|window] [--cwd <dir>] [--home <h>]",
-    );
-  }
-
-  const substrate = substrateFor(parent);
-  if (!(await substrate.hasSession(parent.tmuxTarget))) {
-    throw new Error(`hive split: parent bee ${parent.name} is not running`);
-  }
-
-  const requestedAgent = agentArg ?? parent.agent;
-  const { agent, account } = await resolveSpawnAgentWithAuto(requestedAgent, parsed);
-
-  const dirRaw = typeof flag(parsed, "dir") === "string" ? String(flag(parsed, "dir")) : "v";
-  if (!["h", "v", "window"].includes(dirRaw)) throw new Error(`hive split: invalid --dir ${dirRaw} (use v|h|window)`);
-  const dir = dirRaw as "h" | "v" | "window";
-
-  const cwd = typeof flag(parsed, "cwd") === "string"
-    ? await resolveSpawnCwd(parsed)
-    : parent.cwd;
-  const homeFlag = flag(parsed, "home") ?? flag(parsed, "profile");
-  const home = account ? (typeof homeFlag === "string" ? homeFlag : defaultHomeForAccount(account)) : homeFlag;
-  const yolo = dangerousMode(parsed, agent, requestedAgent);
-  const spec = resolveAgent(agent, parsed.rest, {
-    home,
-    yolo,
-    identity: Boolean(account),
-    ...(account?.model ? { model: account.model } : {}),
-    ...(account?.provider ? { provider: account.provider } : {}),
-  });
-  if (account) {
-    if (parent.node) throw new Error("--account splits are local-only (the vault never leaves this machine)");
-    if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
-    await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
-  }
-  if (!(parent.node)) {
-    await assertExecutableAvailable(spec.command);
-    await assertAgentAuthFreshForSpawn(spec, account?.id);
-  }
-
-  const launch = await substrate.newPane(parent.tmuxTarget, cwd, {
-    command: spec.command,
-    args: spec.args,
-    env: spec.env,
-    tmuxOptions: spec.tmuxOptions,
-  }, { dir });
-
-  const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
-  const name = safeName(identity.id);
-  const now = new Date().toISOString();
-  const combId = parent.combId ?? parent.tmuxTarget;
-  const record: SessionRecord = {
-    name,
-    agent: spec.kind,
-    cwd,
-    command: shellCommand(spec),
-    tmuxTarget: parent.tmuxTarget, // shared comb
-    agentPaneId: launch.paneId,    // own pane
-    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
-    combId,
-    parentId: parent.id ?? parent.name,
-    createdAt: now,
-    updatedAt: now,
-    status: "running",
-    id: identity.id,
-    prefix: identity.prefix,
-    uuid: identity.uuid,
-    requestedAgent: spec.requestedKind,
-    ...(spec.homePath ? { homePath: spec.homePath } : {}),
-    ...(account ? { accountId: account.id } : {}),
-    ...(parent.colony ? { colony: parent.colony } : {}),
-    ...(parent.node ? { node: parent.node } : {}),
-  };
-  await saveSession(record);
-  await writeSpawnOptions(record);
-  await appendLedger({ type: "bee.split", name: record.name, parentId: record.parentId, combId, agentPaneId: launch.paneId });
-
-  if (isPretty()) console.log(actionLine("ok", "split", [bold(record.name), record.agent, dim(`from ${parent.name}`)]));
-  else console.log(`split\t${record.name}\t${record.agent}\t${parent.name}`);
-
-  const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
-  if (briefText) return deliverBrief(parsed, record, briefText);
-  await confirmSpawnReady(parsed, record);
-  return record;
+/**
+ * RETIRED (APIA-85). `hive split` was the comb splitter: it created an adjacent
+ * pane in the parent bee's tmux session (`substrate.newPane`) so a sub-bee could
+ * share the window. Combs are retired — Apiary lineage views + HSR subagents
+ * replaced the "visible next to me" need — so this now errors and points at the
+ * replacements. The dispatch case is kept so the message is discoverable.
+ */
+async function cmdSplit(_parsed: Parsed): Promise<never> {
+  throw new Error(
+    "hive split is retired: combs (shared tmux panes) are gone. " +
+      "Use `hive fork <bee>` to branch a bee pane-lessly on HSR (see `hive here` / `hive bees` " +
+      "for lineage), or `hive x --substrate tmux` for a separate tmux bee.",
+  );
 }
 
 const FORK_SEED_MODES = new Set<SeedMode>(["resume", "seal", "summary", "log", "none"]);
@@ -4042,6 +3883,17 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     );
   }
 
+  // Combs are retired (APIA-85): `--pane`/`--window` meant "split into the
+  // parent's tmux session so I can see the fork next to me". Forks now run
+  // pane-lessly on HSR; Apiary lineage views + `hive here`/`hive bees` provide
+  // the visibility the split panes used to.
+  if (hasFlag(parsed, "pane") || hasFlag(parsed, "window")) {
+    throw new Error(
+      "--pane/--window are retired; forks now run pane-lessly on HSR " +
+        "(see hive here / hive bees for lineage), or use --substrate tmux for a separate tmux bee",
+    );
+  }
+
   // 1. Resolve source (single bee only — never fork a set).
   const resolved = await resolveSelector(selector);
   if (resolved.kind !== "bee") {
@@ -4097,8 +3949,12 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
   const extraArgs = [...resumeArgsList, ...modelArgs, ...parsed.rest];
 
   const yolo = dangerousMode(parsed, targetTool, requestedAgent);
-  const node = await resolveSpawnNode(parsed, targetTool);
-  const isRemote = node.kind === "ssh-tmux";
+  // Substrate policy (APIA-85): a fork from inside a bee lands on HSR by default,
+  // exactly like spawn (resolveSpawnSubstrate) — combs are retired, so the fork
+  // is a pane-less runner-host bee unless `--substrate tmux`/`--node` forces a
+  // tmux bee. `node` is undefined in the HSR case.
+  const { useHsr, node } = await resolveSpawnSubstrate(parsed, targetTool);
+  const isRemote = node?.kind === "ssh-tmux";
   if (account && isRemote) throw new Error("--account forks are local-only (the vault never leaves this machine)");
 
   // The account brings its own dedicated home; otherwise the fork boots in the
@@ -4117,55 +3973,118 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
 
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(stringFlag(parsed, ["name"]) ?? identity.id);
-  const tmuxTarget = safeTmuxTarget(name);
-  const nodeName = node.name;
-  const substrate = node.name !== LOCAL_NODE_NAME ? substrateForRecord(node) : localSubstrate();
-  const locationHint = isRemote ? ` on ${node.name}` : "";
-  if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
-
-  const launch = await substrate.newSession(tmuxTarget, cwd, {
-    command: spec.command,
-    args: spec.args,
-    env: spec.env,
-    tmuxOptions: spec.tmuxOptions,
-  });
-  const command = shellCommand(spec);
-
-  // 8. Build the record with fork lineage + anti-cross-match fields.
-  //    ANTI-CROSS-MATCH (§7.1): lastPromptAt set at creation, and NO inherited
-  //    providerSessionId / transcriptPath — the fork is a new session with no
-  //    transcript of its own yet, so the daemon's scorer can never assign the
-  //    parent's transcript to the fork.
   const now = new Date().toISOString();
-  const record: SessionRecord = {
-    name,
-    agent: spec.kind,
-    cwd,
-    command,
-    tmuxTarget,
-    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
-    combId: tmuxTarget, // fork is its own comb (new session)
-    forkedFromId: source.id ?? source.name,
-    forkedAt: now,
-    seedMode: decision.mode,
-    forkCheckpoint: decision.checkpoint,
-    ...(model ? { model } : {}),
-    createdAt: now,
-    updatedAt: now,
-    lastPromptAt: now, // anti-cross-match anchor
-    status: "running",
-    id: identity.id,
-    prefix: identity.prefix,
-    uuid: identity.uuid,
-    requestedAgent: spec.requestedKind,
-    homePath: spec.homePath,
-    ...(account ? { accountId: account.id } : {}),
-    ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
-    ...(source.colony ? { colony: source.colony } : {}),
-  };
-  await saveSession(record);
-  await writeSpawnOptions(record);
+
+  // 8. Launch the fork on the chosen substrate and build the record with fork
+  //    lineage + anti-cross-match fields. ANTI-CROSS-MATCH (§7.1): lastPromptAt
+  //    set at creation; the fork gets its OWN provider session (a fresh pinned id
+  //    under HSR, or a new tmux session), never the parent's transcript.
+  let record: SessionRecord;
+  let substrate: Substrate;
+  if (useHsr) {
+    // Pane-less fork: fork a detached runner host (mirrors spawnBee's HSR
+    // branch). Pin a fresh provider session id when NOT resuming (resume already
+    // carries continuity via its baked-in args).
+    let pinnedSessionId: string | undefined;
+    if (decision.mode !== "resume" && !spec.args.includes("--session-id")) {
+      const sid = randomUUID();
+      const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
+      if (sessionArgs) {
+        spec.args = [...spec.args, ...sessionArgs];
+        pinnedSessionId = sid;
+      }
+    }
+    const adapter = adapterFor(spec.kind);
+    const runnerTier = adapter?.tier();
+    const hostPid = await spawnHsrHost({
+      bee: name,
+      comb: name, // fork is its own comb (a fresh lineage root)
+      kind: spec.kind,
+      cwd,
+      ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
+      authKind: "subscription",
+      ...(model ? { model } : {}),
+      spec: { command: spec.command, args: spec.args, env: spec.env },
+    });
+    const command = shellCommand(spec);
+    record = {
+      name,
+      agent: spec.kind,
+      cwd,
+      command,
+      tmuxTarget: name, // logical id — HSR has no tmux target
+      substrate: "hsr",
+      runnerPid: hostPid,
+      ...(runnerTier ? { runnerTier } : {}),
+      combId: name, // fork is its own comb
+      forkedFromId: source.id ?? source.name,
+      forkedAt: now,
+      seedMode: decision.mode,
+      forkCheckpoint: decision.checkpoint,
+      ...(model ? { model } : {}),
+      createdAt: now,
+      updatedAt: now,
+      lastPromptAt: now, // anti-cross-match anchor
+      status: "running",
+      id: identity.id,
+      prefix: identity.prefix,
+      uuid: identity.uuid,
+      requestedAgent: spec.requestedKind,
+      homePath: spec.homePath,
+      ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
+      ...(account ? { accountId: account.id } : {}),
+      ...(source.colony ? { colony: source.colony } : {}),
+    };
+    substrate = hsrSubstrate();
+    await saveSession(record);
+    await writeSpawnOptions(record);
+    if (!(await waitForHsrHost(name, 5000))) {
+      console.error(note(`hsr host for ${name} did not report live within 5s; the daemon will reconcile`));
+    }
+  } else {
+    const tmuxTarget = safeTmuxTarget(name);
+    const nodeName = node?.name ?? LOCAL_NODE_NAME;
+    substrate = node && nodeName !== LOCAL_NODE_NAME ? substrateForRecord(node) : localSubstrate();
+    const locationHint = isRemote && node ? ` on ${node.name}` : "";
+    if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
+
+    const launch = await substrate.newSession(tmuxTarget, cwd, {
+      command: spec.command,
+      args: spec.args,
+      env: spec.env,
+      tmuxOptions: spec.tmuxOptions,
+    });
+    const command = shellCommand(spec);
+    record = {
+      name,
+      agent: spec.kind,
+      cwd,
+      command,
+      tmuxTarget,
+      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+      combId: tmuxTarget, // fork is its own comb (new session)
+      forkedFromId: source.id ?? source.name,
+      forkedAt: now,
+      seedMode: decision.mode,
+      forkCheckpoint: decision.checkpoint,
+      ...(model ? { model } : {}),
+      createdAt: now,
+      updatedAt: now,
+      lastPromptAt: now, // anti-cross-match anchor
+      status: "running",
+      id: identity.id,
+      prefix: identity.prefix,
+      uuid: identity.uuid,
+      requestedAgent: spec.requestedKind,
+      homePath: spec.homePath,
+      ...(account ? { accountId: account.id } : {}),
+      ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+      ...(source.colony ? { colony: source.colony } : {}),
+    };
+    await saveSession(record);
+    await writeSpawnOptions(record);
+  }
 
   // 9. Ledger.
   await appendLedger({
@@ -4175,7 +4094,8 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     seedMode: record.seedMode,
     forkCheckpoint: record.forkCheckpoint,
     ...(model ? { model } : {}),
-    ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+    ...(record.substrate === "hsr" ? { substrate: "hsr" } : {}),
+    ...(record.node ? { node: record.node } : {}),
   });
 
   // Print the success line. The trailing `command` field on the tab form makes
@@ -4195,10 +4115,15 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     await confirmSpawnReady(parsed, record);
   }
 
-  // 11. --print / --here behave like spawn's interactive affordances.
+  // 11. --print / --here behave like spawn's interactive affordances. An HSR bee
+  //     has no tmux target to attach — point at the pane-less read paths instead.
   if (truthy(flag(parsed, "print"))) {
-    if (isPretty()) console.error(note("attach with:"));
-    console.log(formatShellCommand(substrate.attachCommand(record.tmuxTarget)));
+    if (record.substrate === "hsr") {
+      console.error(note(`${record.name} runs pane-lessly on HSR; read it with: hive tail ${record.name} / hive transcript ${record.name}`));
+    } else {
+      if (isPretty()) console.error(note("attach with:"));
+      console.log(formatShellCommand(substrate.attachCommand(record.tmuxTarget)));
+    }
   }
   await maybeLinkHere(parsed, [finalRecord]);
   return finalRecord;
@@ -9061,10 +8986,27 @@ async function cmdLimits(parsed: Parsed) {
   // Live reads refresh the on-disk cache; --ttl serves entries younger than
   // the given age instead of paying the provider round-trips.
   const ttlMs = ttlFlagMs(parsed);
+  const live = wantsUsageLive(parsed);
+  if (live && truthy(flag(parsed, "json"))) throw new Error("--live is interactive; drop --json");
   const results = await cachedAccountLimits(accounts, ttlMs !== undefined ? { ttlMs } : {});
 
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(results, null, 2));
+    return;
+  }
+
+  // --live: an auto-refreshing full-screen dashboard. Needs a real TTY on both
+  // ends; without one we've already printed nothing, so fall back to the static
+  // table (below) plus a note. The dashboard's ttl-less live reads keep the
+  // shared limits cache warm for `hive spawn --account auto`.
+  if (live && process.stdout.isTTY && process.stdin.isTTY) {
+    const intervalMs = usageIntervalFlagMs(parsed);
+    await runUsageTui({
+      // Instant first paint from a generous cache read, then straight to live.
+      seedLimits: () => cachedAccountLimits(accounts, { ttlMs: 24 * 60 * 60 * 1000 }),
+      fetchLimits: () => cachedAccountLimits(accounts, {}),
+      ...(intervalMs !== undefined ? { intervalMs } : {}),
+    });
     return;
   }
 
@@ -9084,6 +9026,24 @@ async function cmdLimits(parsed: Parsed) {
     console.log(note(`${result.account}: ${result.error}`));
   }
   console.log(note("pace = used% − elapsed% of the window: ▲ burning faster than it refills, ▼ headroom, ● on pace"));
+  if (live) console.log(note("--live needs a TTY; printed once"));
+}
+
+/** True when any of the live-dashboard flag spellings is present. */
+function wantsUsageLive(parsed: Parsed): boolean {
+  return truthy(flag(parsed, "live")) || truthy(flag(parsed, "dashboard")) || truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
+}
+
+/**
+ * `--interval <dur>` for `hive usage --live`: same duration grammar as `--ttl`
+ * (30s, 5m). Undefined when absent so the TUI keeps its 60s default; clamped to
+ * a 10s floor by the TUI so it can never hammer provider endpoints.
+ */
+function usageIntervalFlagMs(parsed: Parsed): number | undefined {
+  const raw = flag(parsed, "interval");
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") throw new Error("--interval needs a duration (e.g. 30s, 5m)");
+  return clampUsageInterval(parseAge(raw));
 }
 
 function limitCell(window: WindowUsage | undefined, result: AccountLimits): string {
@@ -9218,7 +9178,7 @@ function printHelp() {
         ["wait", "<session>", "block until the bee goes idle or seals"],
         ["view", "<selector>", "colony cockpit: link live bees' windows into a view session"],
         ["search", "<query>", "search seals, ledger, and session records (seals find: seals only)"],
-        ["usage", "[<account>]", "progress against providers' real 5h/weekly limits (alias: limits)"],
+        ["usage", "[<account>]", "progress against providers' real 5h/weekly limits (--live dashboard; alias: limits)"],
       ],
     },
     {

@@ -18,16 +18,18 @@ export const TMUX_BLOCK_END = "# <<< honeybee keybindings <<<";
  * copy-pasteable tmux block. These ADD to the shipped bindings already in
  * docs/honeybee.tmux.conf — bees (M-b), hive new (M-n), the attention queue
  * next/prev (M-./M-,), rename (M-r), and the needs-me switcher (M-S) live there;
- * this block adds the spawn/fork/split/urls/workspace-rename affordances on
+ * this block adds the spawn/fork/urls/workspace-rename affordances on
  * collision-free keys (M-b is hive bees, so spawn-from-frame rides M-B):
  *
  *   M-B  hive launch           → interactive frame/flow launcher (M-b is hive bees)
  *   M-F  hive launch           → same launcher (frames + flows in one wizard)
  *   M-l  hive loop launch      → loop launcher dialog (templates + minimal form)
  *   M-k  hive fork launch      → interactive fork window (M-f avoided: WezTerm ALT layer)
- *   M-x  split / decompose
  *   M-u  urls
  *   M-R  workspace rename
+ *
+ * (M-x / `hive split` decompose was retired with combs — APIA-85; forks now run
+ * pane-lessly on HSR via M-k `hive fork launch`.)
  *
  * `hive keys print --tmux` emits this block VERBATIM; docs/honeybee.tmux.conf
  * ends with it (a test asserts the doc CONTAINS the block so they never drift).
@@ -51,13 +53,12 @@ export const CANONICAL_TMUX_CONF = `# honeybee keybinding-layer affordances — 
 #
 ${TMUX_BLOCK_START}
 
-# Spawn / decompose / fork (verbs: fork-and-pane Phase B/C/D; pickers: KEYBINDINGS_PRD)
+# Spawn / fork (pickers: KEYBINDINGS_PRD). Combs are retired (APIA-85): the old
+# M-x "hive split" decompose is gone — a fork (M-k) now branches pane-lessly on HSR.
 bind -n M-B display-popup -E -w 80% -h 70% "hive launch"                                                # cmd+shift+b launch a frame/flow (interactive wizard)
 bind -n M-F display-popup -E -w 80% -h 70% "hive launch"                                                # cmd+shift+f launch a frame/flow (same wizard)
 bind -n M-l display-popup -E -w 80% -h 70% "hive loop launch"                                           # cmd+l launch a loop (dialog + templates)
 bind -n M-k display-popup -E -w 80% -h 70% "hive fork launch"                                           # cmd+k fork launcher (interactive: seed, worktree, agent, account)
-bind -n M-x display-popup -E \\
-  "hive split --here"                                                                                   # cmd+x decompose / add sub-bee (split → fork-and-pane B)
 
 # Standalone affordances (owned here)
 bind -n M-u display-popup -E -w 70% -h 60% \\
@@ -79,7 +80,6 @@ export const CANONICAL_WEZTERM_BLOCK = `-- honeybee cmd→Meta additions — app
 { key = 'k', mods = 'SUPER',       action = meta('k') },   -- cmd+k  fork (M-f avoided: ALT layer)
 { key = 'f', mods = 'SUPER|SHIFT', action = meta('F') },   -- cmd+shift+f frame/flow launcher
 { key = 'l', mods = 'SUPER',       action = meta('l') },   -- cmd+l  loop launcher
-{ key = 'x', mods = 'SUPER',       action = meta('x') },   -- cmd+x  split/decompose
 { key = 'u', mods = 'SUPER',       action = meta('u') },   -- cmd+u  urls
 { key = 'r', mods = 'SUPER|SHIFT', action = meta('R') },   -- cmd+shift+r rename workspace
 `;
@@ -98,7 +98,6 @@ export const RECOMMENDED_BINDS: RecommendedBind[] = [
   { key: "M-F", verb: "launch", note: "interactive frame/flow launcher" },
   { key: "M-l", verb: "loop", note: "loop launcher dialog (templates + minimal form)" },
   { key: "M-k", verb: "fork", note: "interactive fork launcher (seed, worktree, agent, account)" },
-  { key: "M-x", verb: "split", note: "decompose / add sub-bee" },
   { key: "M-u", verb: "urls", note: "list + open URL" },
   { key: "M-R", verb: "workspace", delegated: true, note: "rename workspace (→ WORKSPACES)" },
 ];

@@ -30,20 +30,13 @@ export type Substrate = {
   probe(): Promise<ProbeResult>;
   hasSession(target: string): Promise<boolean>;
   newSession(target: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult>;
-  /**
-   * Create an adjacent pane in an existing comb and launch `spec` in it.
-   * Returns the newly created pane id, so the sub-bee can be pinned to it.
-   * - dir:"h"|"v" (default "v") => `split-window` in the comb's active window
-   * - dir:"window" => `new-window` instead
-   * (fork-and-pane Phase B — see §6.3)
-   */
-  newPane(target: string, cwd: string, spec: LaunchSpec, opts?: { dir?: "h" | "v" | "window" }): Promise<NewSessionResult>;
   kill(target: string, options?: { launcherPgid?: number }): Promise<KillResult>;
-  /**
-   * Kill just one bee's pane without taking down the whole comb/session.
-   * `tmux kill-pane -t %id`. (Phase B — see §6.3)
-   */
-  killPane(paneId: string, options?: { launcherPgid?: number }): Promise<KillResult>;
+  // Combs (multiple bees sharing one session via split panes) are retired
+  // (APIA-85), so the pane-spawn/pane-kill verbs (`newPane`/`killPane`) are gone
+  // from this interface. Pane PINNING stays: pane-scoped I/O below still targets
+  // a solo bee's own pane. The low-level tmux `newPane`/`killPane` helpers remain
+  // exported from local-tmux.ts for direct callers (e.g. sidebar layout).
+  //
   // Pane-scoped I/O: when paneId (e.g. "%7") is given, target that exact pane;
   // otherwise fall back to "=name:" (the session's active pane) for legacy
   // bees that were never pinned. This is the fix for I/O following the wrong

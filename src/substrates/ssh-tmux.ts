@@ -117,31 +117,8 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     return { paneId };
   }
 
-  async function newPane(target: string, cwd: string, spec: LaunchSpec, opts?: { dir?: "h" | "v" | "window" }): Promise<NewSessionResult> {
-    // Same env-prefix discipline as newSession: tmux >= 3.0 exec()s the command
-    // directly, so a `K=v cmd` assignment prefix must ride on an `env` word.
-    const envEntries = Object.entries(spec.env ?? {});
-    const commandWords = [
-      ...(envEntries.length > 0 ? ["env", ...envEntries.map(([k, v]) => `${k}=${v}`)] : []),
-      spec.command,
-      ...spec.args,
-    ];
-    if (opts?.dir === "window") {
-      const argv = buildSshTmuxArgv(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${target}:`, "-c", cwd, ...commandWords]);
-      const result = await exec(argv);
-      if (result.exitCode !== 0) throw new Error(`Remote tmux new-window failed: ${result.stderr.trim() || result.stdout.trim()}`);
-      const paneId = result.stdout.trim();
-      await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
-      return { paneId };
-    }
-    const direction = opts?.dir === "h" ? ["-h"] : [];
-    const argv = buildSshTmuxArgv(["split-window", "-d", "-P", "-F", "#{pane_id}", "-t", `=${target}:`, "-c", cwd, ...direction, ...commandWords]);
-    const result = await exec(argv);
-    if (result.exitCode !== 0) throw new Error(`Remote tmux split-window failed: ${result.stderr.trim() || result.stdout.trim()}`);
-    const paneId = result.stdout.trim();
-    await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
-    return { paneId };
-  }
+  // Combs are retired (APIA-85): no remote pane-split (`newPane`) / pane-kill
+  // (`killPane`) — remote bees are their own session, torn down via `kill`.
 
   async function setWindowOptions(target: string, options: TmuxWindowOptions | undefined, paneId?: string): Promise<void> {
     await applyTmuxWindowOptions(paneArg(target, paneId), options);
@@ -157,11 +134,6 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
 
   async function kill(target: string, _options: { launcherPgid?: number } = {}): Promise<KillResult> {
     const result = await runTmux(["kill-session", "-t", `=${target}`]);
-    return { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
-  }
-
-  async function killPane(paneId: string, _options: { launcherPgid?: number } = {}): Promise<KillResult> {
-    const result = await runTmux(["kill-pane", "-t", paneId]);
     return { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
   }
 
@@ -280,9 +252,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     probe,
     hasSession,
     newSession,
-    newPane,
     kill,
-    killPane,
     capture,
     sendText,
     sendEnter,

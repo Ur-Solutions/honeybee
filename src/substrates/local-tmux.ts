@@ -126,6 +126,8 @@ export async function newSession(name: string, cwd: string, spec: LaunchSpec): P
   }
 }
 
+// Low-level tmux pane split. Combs are retired (APIA-85) so this is no longer on
+// the Substrate interface, but it stays exported for direct low-level callers.
 export async function newPane(target: string, cwd: string, spec: LaunchSpec, opts?: { dir?: "h" | "v" | "window" }): Promise<NewSessionResult> {
   const launcher = await createLauncher(spec);
   const command = shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath]);
@@ -200,8 +202,9 @@ export async function kill(target: string, options: { launcherPgid?: number } = 
 }
 
 // A pane id ("%7") is globally unique on the server, so "-t %7" is exact on its
-// own — no "=name:" wrapping needed. Used by comb-aware `hive kill` to drop one
-// sub-bee without taking the whole session.
+// own — no "=name:" wrapping needed. Low-level tmux pane kill: combs are retired
+// (APIA-85) so this is no longer on the Substrate interface, but it stays
+// exported for direct low-level callers (e.g. sidebar-layout teardown).
 export async function killPane(paneId: string, options: { launcherPgid?: number } = {}): Promise<KillResult> {
   const result = await tmux(["kill-pane", "-t", paneId], { reject: false });
   await terminateProcessGroup(options.launcherPgid);
@@ -442,9 +445,7 @@ export function createLocalTmuxSubstrate(): Substrate {
     probe,
     hasSession,
     newSession,
-    newPane,
     kill,
-    killPane,
     capture,
     sendText,
     sendEnter,

@@ -21,9 +21,13 @@ export type SessionRecord = {
   /** Local tmux launcher process group; best-effort cleanup for drivers that survive pane teardown. */
   launcherPgid?: number;
   /**
-   * The comb (tmux session) this bee shares. For a solo bee this equals
-   * tmuxTarget; sub-bees split into the same comb share the parent's combId.
-   * (fork-and-pane Phase B)
+   * LEGACY, read-only (APIA-85). Combs — multiple bees sharing one tmux session
+   * via split panes — are retired: Apiary lineage views + HSR subagents replaced
+   * them, so no new comb grouping is created. Spawn paths still write
+   * `combId == tmuxTarget|name` (a solo bee is its own comb), and old multi-bee
+   * records keep their shared combId, but nothing reads it to group bees anymore.
+   * Retained so aged records deserialize; do not build new features on it.
+   * (was: fork-and-pane Phase B)
    */
   combId?: string;
   /** The bee this one was split from (intra-comb lineage). (Phase B) */

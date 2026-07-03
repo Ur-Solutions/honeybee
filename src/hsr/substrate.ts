@@ -7,7 +7,7 @@
  * ring.txt) and steers/stops them over each bee's per-bee JSON-RPC control
  * socket. Spawn does not go through `newSession` — the spawn path forks the
  * runner host directly (`hive __hsr-run`) and only then records the bee — so the
- * `newSession`/`newPane` verbs throw.
+ * `newSession` verb throws.
  *
  * For an HSR bee the `target` argument passed to every method IS the bee name
  * (spawn sets `record.tmuxTarget = record.name`, a logical id). There are no
@@ -127,16 +127,13 @@ export function hsrSubstrate(): Substrate {
     },
     hasSession,
     // Spawn forks the runner host directly (hive __hsr-run) and records the bee;
-    // it never routes through newSession/newPane.
+    // it never routes through newSession.
     newSession(): Promise<NewSessionResult> {
       throw new Error("HSR bees spawn via the runner host, not newSession");
     },
-    newPane(): Promise<NewSessionResult> {
-      throw new Error("HSR bees spawn via the runner host, not newSession");
-    },
+    // Combs are retired (APIA-85): no newPane/killPane. Killing an HSR bee is
+    // killing its runner host (kill), since there is no pane.
     kill: (target: string) => kill(target),
-    // No panes: killing "the pane" is killing the bee.
-    killPane: (target: string) => kill(target),
     capture: (target: string, lines?: number) => capture(target, lines),
     sendText: (target: string, text: string) => sendText(target, text),
     // HSR turns are committed atomically by sendText (the runner encodes and

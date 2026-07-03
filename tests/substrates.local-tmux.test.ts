@@ -50,8 +50,10 @@ test("substrateForNode rejects unknown nodes with a registration hint", () => {
 
 test("tmux.js shim exposes the same callable names as the substrate's methods", () => {
   const s = createLocalTmuxSubstrate();
-  // Spot-check the method/function names that callers depend on.
-  for (const name of ["hasSession", "newSession", "newPane", "sendText", "sendEnter", "sendKey", "capture", "kill", "killPane", "listTmuxSessions", "attachCommand", "attachSession", "setWindowOptions"] as const) {
+  // Spot-check the method/function names that callers depend on. Combs are
+  // retired (APIA-85): newPane/killPane are no longer Substrate methods, but the
+  // low-level tmux shim keeps exporting them for direct callers.
+  for (const name of ["hasSession", "newSession", "sendText", "sendEnter", "sendKey", "capture", "kill", "listTmuxSessions", "attachCommand", "attachSession", "setWindowOptions"] as const) {
     if (name === "listTmuxSessions") {
       assert.equal(typeof (legacyTmux as Record<string, unknown>)[name], "function");
       assert.equal(typeof s.listSessions, "function");
@@ -60,6 +62,9 @@ test("tmux.js shim exposes the same callable names as the substrate's methods", 
     assert.equal(typeof (legacyTmux as Record<string, unknown>)[name], "function", `legacyTmux.${name} should be a function`);
     assert.equal(typeof (s as unknown as Record<string, unknown>)[name], "function", `substrate.${name} should be a function`);
   }
+  // Low-level pane helpers remain on the tmux shim (not on the substrate object).
+  assert.equal(typeof (legacyTmux as Record<string, unknown>).newPane, "function");
+  assert.equal(typeof (legacyTmux as Record<string, unknown>).killPane, "function");
   assert.equal(typeof legacyTmux.formatShellCommand, "function");
 });
 
