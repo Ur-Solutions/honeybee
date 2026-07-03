@@ -19,6 +19,7 @@
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import type { BeeState } from "../state.js";
 import {
+  HSR_EVENTS_MAX_BYTES,
   hsrEventsPath,
   hsrMetaPath,
   hsrRingPath,
@@ -96,16 +97,16 @@ export async function hsrSnapshot(bee: string, lines?: number): Promise<string> 
   return all.slice(Math.max(0, all.length - lines)).join("\n");
 }
 
-/** How many trailing events.jsonl lines the structured-state reader inspects. */
-const EVENT_TAIL_LINES = 200;
-
 /**
- * Byte cap on the tail read backing the EVENT_TAIL_LINES window (HIVE-13). The
- * daemon re-reads every bee's events.jsonl each tick, so the read must be
- * O(tail), not O(file) — even for a huge legacy log written before writer-side
- * compaction (runDir.ts) bounded the file.
+ * Byte cap on the events.jsonl tail read (HIVE-13). The daemon re-reads every
+ * bee's events.jsonl each tick, so the read must be O(cap), not O(file) — even
+ * for a huge legacy log written before writer-side compaction (runDir.ts)
+ * bounded the file. Sized to cover the writer's whole bound (a compacted log
+ * never exceeds HSR_EVENTS_MAX_BYTES by more than the append that trips
+ * compaction), so on any writer-maintained log the observers see EVERY event:
+ * a single long turn cannot push its turn_start out of the window (HIVE-55).
  */
-const EVENT_TAIL_MAX_BYTES = 256 * 1024;
+export const EVENT_TAIL_MAX_BYTES = HSR_EVENTS_MAX_BYTES + 64 * 1024;
 
 /**
  * Read at most the trailing `maxBytes` of a file. When the read starts mid-file
@@ -161,9 +162,9 @@ export type HsrObservation = {
 };
 
 /**
- * Derive a BeeState from the tail of events.jsonl. Only the last few turn
- * markers matter, so we scan the parsed tail for the last turn_start/turn_end
- * and the last needs_input:
+ * Derive a BeeState from the events.jsonl window. Only the LAST turn markers
+ * matter, so we scan the parsed window for the last turn_start/turn_end and
+ * the last needs_input:
  *   - a needs_input with no later turn_end (unresolved) → "blocked".
  *   - a turn in flight (last marker is turn_start) → "active".
  *   - the last turn finished (turn_end) → "idle_with_output".
@@ -208,17 +209,18 @@ function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined 
 
 /**
  * Read the tail of a bee's events.jsonl and parse it into RunnerEvents. Reads
- * only the trailing EVENT_TAIL_MAX_BYTES of the file — never the whole log.
- * Tolerates a missing/partial file and unparseable lines (a truncated crash
- * write) — a bad line is skipped, never thrown.
+ * at most the trailing EVENT_TAIL_MAX_BYTES of the file — on a writer-bounded
+ * log that is the WHOLE log, so no fixed line count can hide an old turn_start
+ * or unresolved needs_input behind a burst of text chunks (HIVE-55). Tolerates
+ * a missing/partial file and unparseable lines (a truncated crash write) — a
+ * bad line is skipped, never thrown.
  */
-async function readEventTail(bee: string, lines: number): Promise<RunnerEvent[]> {
+async function readEventTail(bee: string): Promise<RunnerEvent[]> {
   const raw = await readTailText(hsrEventsPath(bee), EVENT_TAIL_MAX_BYTES);
   if (raw === null) return [];
-  const all = raw.split("\n").filter((line) => line.trim().length > 0);
-  const tail = all.slice(Math.max(0, all.length - lines));
+  const lines = raw.split("\n").filter((line) => line.trim().length > 0);
   const events: RunnerEvent[] = [];
-  for (const line of tail) {
+  for (const line of lines) {
     try {
       const parsed = JSON.parse(line) as unknown;
       if (parsed && typeof parsed === "object" && typeof (parsed as { type?: unknown }).type === "string") {
@@ -247,7 +249,7 @@ export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
       const mirrorOf = meta?.mirrorOfNode;
       // A dead host's stream is gone — leave state undefined so deriveState
       // settles dead/sealed rather than reporting a stale structured state.
-      const state = live ? structuredStateFromEvents(await readEventTail(bee, EVENT_TAIL_LINES)) : undefined;
+      const state = live ? structuredStateFromEvents(await readEventTail(bee)) : undefined;
       observations.set(bee, {
         live,
         snapshot,
@@ -285,7 +287,7 @@ export type PendingNeedsInput = {
  */
 export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
   if (!isMetaLive(await readHsrMeta(bee))) return null;
-  const events = await readEventTail(bee, EVENT_TAIL_LINES);
+  const events = await readEventTail(bee);
   let lastNeeds = -1;
   let lastEnd = -1;
   for (let i = 0; i < events.length; i++) {

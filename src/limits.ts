@@ -18,6 +18,7 @@ import {
   withAccountsLock,
 } from "./accounts.js";
 import { canonicalAgentKind } from "./agents.js";
+import { mapWithConcurrency } from "./concurrency.js";
 import { launchEnv } from "./env.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { readClaudeKeychain } from "./keychain.js";
@@ -120,28 +121,6 @@ export type LimitsDeps = {
 };
 
 const ACCOUNT_LIMITS_CONCURRENCY = 4;
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  if (items.length === 0) return [];
-  const results = new Array<R>(items.length);
-  let next = 0;
-  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      for (;;) {
-        const index = next;
-        next += 1;
-        if (index >= items.length) return;
-        results[index] = await worker(items[index]!, index);
-      }
-    }),
-  );
-  return results;
-}
 
 function memoizeKeychainReads(readKeychain: typeof readClaudeKeychain): typeof readClaudeKeychain {
   const byHome = new Map<string, Promise<string | null>>();
@@ -457,16 +436,40 @@ async function fetchClaudeUsage(accessToken: string): Promise<ClaudeUsageRespons
  * freshest candidate (the daily driver's keychain chain) is a candidate for
  * EVERY account, so one `hive usage` costs O(accounts × candidates) profile
  * calls and a polling reader (the --live dashboard) rate-limits the OAuth
- * endpoints. Unverifiable lookups (null/error) are not cached — they retry.
+ * endpoints.
+ *
+ * Access tokens rotate regularly and are secret material, so keep only a
+ * bounded recent set. Unverifiable lookups (null/error) are not cached — they
+ * retry.
  */
+export const CLAUDE_PROFILE_EMAIL_CACHE_MAX = 128;
+
 const profileEmailByToken = new Map<string, string>();
 
 async function fetchClaudeProfileEmailCached(accessToken: string): Promise<string | null> {
-  const cached = profileEmailByToken.get(accessToken);
+  const cached = getCachedClaudeProfileEmail(accessToken);
   if (cached !== undefined) return cached;
   const email = await fetchClaudeProfileEmail(accessToken);
-  if (email !== null) profileEmailByToken.set(accessToken, email);
+  if (email !== null) rememberClaudeProfileEmail(accessToken, email);
   return email;
+}
+
+function getCachedClaudeProfileEmail(accessToken: string): string | undefined {
+  const cached = profileEmailByToken.get(accessToken);
+  if (cached === undefined) return undefined;
+  profileEmailByToken.delete(accessToken);
+  profileEmailByToken.set(accessToken, cached);
+  return cached;
+}
+
+function rememberClaudeProfileEmail(accessToken: string, email: string): void {
+  if (profileEmailByToken.has(accessToken)) profileEmailByToken.delete(accessToken);
+  profileEmailByToken.set(accessToken, email);
+  while (profileEmailByToken.size > CLAUDE_PROFILE_EMAIL_CACHE_MAX) {
+    const oldest = profileEmailByToken.keys().next();
+    if (oldest.done) return;
+    profileEmailByToken.delete(oldest.value);
+  }
 }
 
 async function fetchClaudeProfileEmail(accessToken: string): Promise<string | null> {
