@@ -156,6 +156,12 @@ export function resolveProForCwd(
 
 export type ProSlotKind = "worktree" | "checkout";
 
+export type ProSlotAcquisition = {
+  path: string;
+  /** True only when this call created the slot instead of reusing one. */
+  created: boolean;
+};
+
 export type ProSlotResolution = {
   area: string;
   project: string;
@@ -217,6 +223,34 @@ export function toProSlug(input: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
+function proSlotSubcommand(kind: ProSlotKind): "wt" | "co" {
+  return kind === "worktree" ? "wt" : "co";
+}
+
+function proSlotPathFromStdout(stdout: string, command: string): string {
+  const path = stdout.trim().split("\n").pop()?.trim() ?? "";
+  if (!path.startsWith("/")) throw new Error(`\`${command}\` did not return a path`);
+  return path;
+}
+
+async function runProSlotPath(kind: ProSlotKind, repoPath: string, args: string[]): Promise<string> {
+  const sub = proSlotSubcommand(kind);
+  const stdout = await run("pro", [sub, ...args], { cwd: repoPath, timeoutMs: 300_000 });
+  return proSlotPathFromStdout(stdout, `pro ${[sub, ...args].join(" ")}`);
+}
+
+/**
+ * Return the path for an existing pro worktree/checkout. Rejects when the slot
+ * does not exist, matching `pro <wt|co> s <name>`.
+ */
+export async function resolveProSlotPath(kind: ProSlotKind, repoPath: string, name: string): Promise<string> {
+  return runProSlotPath(kind, repoPath, ["s", name]);
+}
+
+async function createNewProSlot(kind: ProSlotKind, repoPath: string, name: string): Promise<string> {
+  return runProSlotPath(kind, repoPath, ["c", name]);
+}
+
 /**
  * Create (or reuse) a pro worktree/checkout beside the repo and return its
  * absolute path. Shells out to `pro <wt|co> s -c <name>` from inside `repoPath`
@@ -226,9 +260,38 @@ export function toProSlug(input: string): string {
  * name rather than erroring. The longer timeout covers a `co` full clone.
  */
 export async function createProSlot(kind: ProSlotKind, repoPath: string, name: string): Promise<string> {
-  const sub = kind === "worktree" ? "wt" : "co";
-  const stdout = await run("pro", [sub, "s", "-c", name], { cwd: repoPath, timeoutMs: 300_000 });
-  const path = stdout.trim().split("\n").pop()?.trim() ?? "";
-  if (!path.startsWith("/")) throw new Error(`\`pro ${sub} s -c ${name}\` did not return a path`);
-  return path;
+  return runProSlotPath(kind, repoPath, ["s", "-c", name]);
+}
+
+/**
+ * Like createProSlot, but reports whether this call created the slot. The fork
+ * launcher uses this to roll back only fresh isolation slots when launch fails,
+ * without deleting a user-owned slot that `pro ... switch -c` would have reused.
+ */
+export async function acquireProSlot(kind: ProSlotKind, repoPath: string, name: string): Promise<ProSlotAcquisition> {
+  const existing = await resolveProSlotPath(kind, repoPath, name).catch(() => undefined);
+  if (existing) return { path: existing, created: false };
+
+  try {
+    return { path: await createNewProSlot(kind, repoPath, name), created: true };
+  } catch (error) {
+    // If another process created the slot between our probe and create call,
+    // reuse it and do not treat it as ours to clean up.
+    const raced = await resolveProSlotPath(kind, repoPath, name).catch(() => undefined);
+    if (raced) return { path: raced, created: false };
+    throw error;
+  }
+}
+
+export function proSlotDeleteArgs(kind: ProSlotKind, name: string): string[] {
+  const args = [proSlotSubcommand(kind), "d", name, "--force", "--hard"];
+  // A same-named branch may have existed before this worktree slot was created.
+  // The rollback is for the directory/checkout, not branch ownership.
+  if (kind === "worktree") args.push("--no-delete-branch");
+  return args;
+}
+
+/** Delete a pro slot from the repo that owns it. */
+export async function deleteProSlot(kind: ProSlotKind, repoPath: string, name: string): Promise<void> {
+  await run("pro", proSlotDeleteArgs(kind, name), { cwd: repoPath, timeoutMs: 300_000 });
 }
