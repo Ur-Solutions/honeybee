@@ -32,6 +32,7 @@ import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityR
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
+import { clampUsageInterval, runUsageTui } from "./usageTui.js";
 import { chooseNewBee, type SpawnTuiAccount } from "./spawnTui.js";
 import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
@@ -237,6 +238,12 @@ async function main(argv: string[]) {
     case "kill":
       await cmdKill(parsed);
       break;
+    case "promote":
+      await cmdPromote(parsed);
+      break;
+    case "demote":
+      await cmdDemote(parsed);
+      break;
     case "here":
       await cmdHere(parsed);
       break;
@@ -361,8 +368,10 @@ async function main(argv: string[]) {
       // One question, one command: where do my accounts stand against the
       // real provider windows. The daemon's local token samples (autoswap's
       // raw material) sit behind --samples.
-      if (truthy(flag(parsed, "samples"))) await cmdUsageSamples(parsed);
-      else await cmdLimits(parsed);
+      if (truthy(flag(parsed, "samples"))) {
+        if (wantsUsageLive(parsed)) throw new Error("--live applies to the limits view, not --samples");
+        await cmdUsageSamples(parsed);
+      } else await cmdLimits(parsed);
       break;
     case "sessions":
       await cmdSessions(parsed);
@@ -492,6 +501,13 @@ type HsrRunPayload = {
   sessionId?: string;
   authKind?: "subscription" | "api-key";
   model?: string;
+  /**
+   * Resume an existing provider session instead of starting fresh (demote:
+   * tmux→HSR). The adapter turns this into `claude --resume <sessionId>` /
+   * codex `thread/resume({threadId})` so the headless run rejoins the SAME
+   * native transcript the tmux session was writing (HSR_EXPLORATION.md §4).
+   */
+  resume?: boolean;
   /** Lineage for HIVE_COMB/HIVE_PARENT env stamping (APIA-82). */
   comb?: string;
   parent?: string;
@@ -562,6 +578,8 @@ async function runHsrHostFromPayload(payloadPath: string | undefined): Promise<v
     env: childEnv,
     ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
     ...(payload.authKind ? { authKind: payload.authKind } : {}),
+    ...(payload.model ? { model: payload.model } : {}),
+    ...(payload.resume ? { resume: true } : {}),
     command: payload.spec.command,
     args: payload.spec.args,
     runDir: hsrRunDir(payload.bee),
@@ -1026,6 +1044,13 @@ async function cmdNew(parsed: Parsed): Promise<void> {
   flags.set(plan.yolo ? "yolo" : "no-yolo", true);
   if (plan.autoswap) flags.set("autoswap", true);
   if (plan.count > 1) flags.set("count", String(plan.count));
+  // Like `hive xa`, `hive new` is an attach workflow — its endgame is
+  // switch-client into the bee's tmux session, which a pane-less HSR bee
+  // doesn't have (and nothing would ever send it a prompt: stuck "booting").
+  // The picker offers no substrate choice, so force local tmux; without this,
+  // running from a popup over a bee's session can classify as an agent-origin
+  // spawn and follow the HSR default.
+  flags.set("substrate", "tmux");
 
   const record = await cmdSpawn({ command: "spawn", args: [plan.kind], flags, rest: [] });
 
@@ -3016,6 +3041,431 @@ async function killSubBeePane(record: SessionRecord): Promise<void> {
   }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// promote / demote (APIA-84): move a bee between HSR (pane-less) and local-tmux
+// by RESUMING the same provider session. The chat/transcript never blinks
+// because it is the same native transcript file (HSR_EXPLORATION.md §4). Gated
+// on verified resume: claude + codex only.
+// ──────────────────────────────────────────────────────────────────────────
+
+// Harnesses whose interactive↔headless resume genuinely carries history — the
+// only ones promote/demote accept. claude is EXCLUDED: its interactive-TUI and
+// headless (`-p`) session stores are disjoint, so `claude --resume <id>` cannot
+// rejoin a headless HSR session (and vice-versa) — a resumed process errors and
+// exits. codex has no such split (`codex resume <threadId>` rejoins an
+// app-server thread). See docs/HSR_EXPLORATION.md §7 (2026-07-03). Re-add
+// "claude" here the day a claude release unifies the two stores.
+const RESUME_GATED_HARNESSES = new Set(["codex"]);
+
+/**
+ * Gate a promote/demote: the harness must have a verified resume path and the
+ * bee must carry a provider session id to resume. Returns the lowercased tool.
+ */
+export function assertResumable(record: SessionRecord, verb: "promote" | "demote"): string {
+  const tool = canonicalAgentKind(record.agent).toLowerCase();
+  if (tool === "claude") {
+    throw new Error(
+      `hive ${verb} does not support claude: its interactive and headless (-p) session stores are disjoint, so a resumed session cannot carry history (docs/HSR_EXPLORATION.md §7). codex is supported.`,
+    );
+  }
+  if (!RESUME_GATED_HARNESSES.has(tool)) {
+    throw new Error(`hive ${verb} needs a resumable provider session; ${record.agent} is not resume-gated (only codex)`);
+  }
+  if (!record.providerSessionId) {
+    throw new Error(`hive ${verb} needs a resumable provider session; ${record.name} has no recorded provider session id`);
+  }
+  return tool;
+}
+
+/**
+ * Quiesce a running HSR bee before we detach its runner. `--now` interrupts the
+ * in-flight turn over the control socket (hsrSubstrate has no interrupt verb, so
+ * we connect the socket directly). Otherwise wait for the current turn to finish
+ * (structured state leaves "active") up to 30s, then tell the user to use --now.
+ */
+async function quiesceHsrBee(record: SessionRecord, now: boolean): Promise<void> {
+  if (now) {
+    const meta = await readHsrMeta(record.name);
+    if (meta?.controlSocket) {
+      const client = await connectRpcClient(meta.controlSocket).catch(() => undefined);
+      if (client) {
+        try {
+          await client.call("interrupt").catch(() => undefined);
+        } finally {
+          client.close();
+        }
+      }
+    }
+    return;
+  }
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const obs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+    const state = obs.get(record.name)?.state;
+    if (state !== "active") return;
+    await sleep(500);
+  }
+  throw new Error(`hive promote: ${record.name} is still mid-turn after 30s; retry with --now to interrupt`);
+}
+
+/**
+ * Stop a bee's HSR runner host WITHOUT deleting its record (the record survives
+ * the substrate switch). Asks the host to stop cleanly over the control socket,
+ * then waits until it is no longer live; SIGTERMs the host pid as a fallback.
+ */
+async function stopHsrRunner(record: SessionRecord): Promise<void> {
+  // hsrSubstrate().kill connects the control socket, calls "stop", waits for the
+  // host to finalize, and falls back to SIGTERM — and it never touches the record.
+  await hsrSubstrate().kill(record.name).catch(() => undefined);
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (!(await hsrSubstrate().hasSession(record.name).catch(() => false))) return;
+    await sleep(100);
+  }
+  if (record.runnerPid) {
+    try {
+      process.kill(record.runnerPid, "SIGTERM");
+    } catch {
+      // already gone / not signalable
+    }
+  }
+}
+
+// How long promote/demote watch the freshly-relaunched agent before trusting it.
+// claude keeps its interactive-TUI and headless-`-p`/SDK session stores DISJOINT:
+// an interactive `--resume` cannot find a `-p`-created session and vice-versa. A
+// harness that rejects the resume prints its error and exits within ~1s (which
+// collapses the tmux window, or flips the HSR meta to "exited"); a healthy agent
+// keeps running indefinitely. 3s cleanly separates the two without stalling the
+// happy path.
+const RESUME_LIVENESS_SETTLE_MS = 3_000;
+
+/**
+ * Watch a just-launched tmux session across the settle window. Returns false the
+ * moment the session vanishes (its agent exited immediately — a bricked
+ * relaunch), true if it survives the whole window.
+ */
+export async function tmuxSessionSurvives(
+  substrate: { hasSession(target: string): Promise<boolean> },
+  target: string,
+  windowMs: number,
+  pollMs = 250,
+): Promise<boolean> {
+  const deadline = Date.now() + windowMs;
+  for (;;) {
+    if (!(await substrate.hasSession(target).catch(() => false))) return false;
+    if (Date.now() >= deadline) return true;
+    await sleep(pollMs);
+  }
+}
+
+/**
+ * Re-fork the HSR runner host for a bee whose record still says substrate:"hsr",
+ * and persist the fresh runnerPid. promote stops the runner BEFORE relaunching
+ * on tmux; if that relaunch fails to stay up (`tmuxSessionSurvives` → false) the
+ * bee would otherwise be stranded — its runner gone, its pane dead. This rejoins
+ * the SAME provider session headlessly (`resume:true` → `claude -p --resume`,
+ * which — unlike the interactive path — DOES resume an HSR session), restoring
+ * the bee exactly where it started.
+ */
+async function reviveHsrRunner(record: SessionRecord, tool: string): Promise<void> {
+  const adapter = adapterFor(tool);
+  const spec = resolveAgent(record.requestedAgent ?? record.agent, [], {
+    home: record.homePath,
+    yolo: agentDefaultsToYolo(tool),
+    identity: Boolean(record.accountId),
+    ...(record.model ? { model: record.model } : {}),
+  });
+  if (record.accountId && spec.homePath) {
+    const account = await findAccount(record.accountId, tool).catch(() => undefined);
+    if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+  }
+  await assertExecutableAvailable(spec.command);
+  const hostPid = await spawnHsrHost({
+    bee: record.name,
+    comb: record.combId ?? record.name,
+    ...(record.parentId ? { parent: record.parentId } : {}),
+    kind: tool,
+    cwd: record.cwd,
+    sessionId: record.providerSessionId,
+    resume: true,
+    authKind: "subscription",
+    ...(record.model ? { model: record.model } : {}),
+    spec: { command: spec.command, args: spec.args, env: spec.env },
+  });
+  await waitForHsrHost(record.name, 5000);
+  const runnerTier = adapter?.tier();
+  const restored: SessionRecord = {
+    ...record,
+    substrate: "hsr",
+    runnerPid: hostPid,
+    ...(runnerTier ? { runnerTier } : {}),
+    updatedAt: new Date().toISOString(),
+    status: "running",
+  };
+  await saveSession(restored);
+  await writeSpawnOptions(restored);
+}
+
+/**
+ * Poll a freshly-forked HSR runner's child across the settle window. Returns
+ * false the moment the child exits (meta status → "exited": the headless resume
+ * was rejected — a bricked demote), true if it stays running the whole window.
+ */
+async function hsrChildSurvives(bee: string, windowMs: number): Promise<boolean> {
+  const deadline = Date.now() + windowMs;
+  for (;;) {
+    const meta = await readHsrMeta(bee).catch(() => null);
+    if (meta?.status === "exited") return false;
+    if (Date.now() >= deadline) return true;
+    await sleep(250);
+  }
+}
+
+/**
+ * Re-launch a bee's interactive tmux pane resuming its provider session, and
+ * persist the fresh pane fields. Mirror of reviveHsrRunner for the demote
+ * rollback: demote kills the tmux pane BEFORE forking the HSR runner; if that
+ * runner's child exits immediately (the headless resume was rejected) this
+ * restores the interactive bee where it started (interactive→interactive resume
+ * works, so the recovery keeps continuity).
+ */
+async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void> {
+  const spec = resolveAgent(record.requestedAgent ?? record.agent, resumeArgs(tool, record.providerSessionId), {
+    home: record.homePath,
+    yolo: agentDefaultsToYolo(tool),
+    identity: Boolean(record.accountId),
+    ...(record.model ? { model: record.model } : {}),
+  });
+  if (record.accountId && spec.homePath) {
+    const account = await findAccount(record.accountId, tool).catch(() => undefined);
+    if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+  }
+  await assertExecutableAvailable(spec.command);
+  const tmuxTarget = safeTmuxTarget(record.name);
+  const substrate = localSubstrate();
+  const launch = await substrate.newSession(tmuxTarget, record.cwd, {
+    command: spec.command,
+    args: spec.args,
+    env: spec.env,
+    tmuxOptions: spec.tmuxOptions,
+  });
+  const restored: SessionRecord = {
+    ...record,
+    command: shellCommand(spec),
+    tmuxTarget,
+    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+    combId: tmuxTarget,
+    updatedAt: new Date().toISOString(),
+    status: "running",
+  };
+  delete restored.substrate;
+  delete restored.runnerPid;
+  delete restored.runnerTier;
+  await saveSession(restored);
+  await writeSpawnOptions(restored);
+}
+
+/**
+ * `hive promote <bee>` — move a pane-less HSR bee onto an interactive tmux pane
+ * by resuming the SAME provider session. Quiesce → stop the runner (keep the
+ * record) → relaunch on local-tmux with resume args → verify it stays up →
+ * flip the record (rolling back to HSR if the relaunch dies immediately).
+ */
+async function cmdPromote(parsed: Parsed): Promise<void> {
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: hive promote <bee> [--now]");
+  const record = await resolveSession(target);
+  if (record.substrate !== "hsr") {
+    throw new Error(`hive promote: ${record.name} is already on tmux (not an HSR bee)`);
+  }
+  // Server-tier harnesses (codex) mint their provider thread id at RUNTIME —
+  // it lands in the HSR meta, never in the spawn record (which had no id to pin).
+  // Backfill it from the meta so the resume gate can see it, and persist the
+  // correction so later resume/swap paths see it too.
+  if (!record.providerSessionId) {
+    const meta = await readHsrMeta(record.name).catch(() => null);
+    if (meta?.sessionId) {
+      record.providerSessionId = meta.sessionId;
+      await saveSession(record);
+    }
+  }
+  const tool = assertResumable(record, "promote");
+  const now = truthy(flag(parsed, "now"));
+
+  // 1. Quiesce the running turn (wait for turn end, or interrupt with --now).
+  await quiesceHsrBee(record, now);
+
+  // 2. Stop the HSR runner host — but keep the record.
+  await stopHsrRunner(record);
+
+  // 3. Build the interactive resume spec: claude `--resume <id>`, codex
+  //    `resume <id>`. Same yolo policy as spawn; re-activate the account for
+  //    token freshness (mirrors spawnBee).
+  const spec = resolveAgent(record.requestedAgent ?? record.agent, resumeArgs(tool, record.providerSessionId), {
+    home: record.homePath,
+    yolo: agentDefaultsToYolo(tool),
+    identity: Boolean(record.accountId),
+    ...(record.model ? { model: record.model } : {}),
+  });
+  if (record.accountId && spec.homePath) {
+    const account = await findAccount(record.accountId, tool).catch(() => undefined);
+    if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+  }
+  await assertExecutableAvailable(spec.command);
+
+  // 4. Launch the interactive tmux session (resuming the same provider session).
+  const tmuxTarget = safeTmuxTarget(record.name);
+  const substrate = localSubstrate();
+  if (await substrate.hasSession(tmuxTarget)) throw new Error(`hive promote: a tmux session already exists: ${tmuxTarget}`);
+  const launch = await substrate.newSession(tmuxTarget, record.cwd, {
+    command: spec.command,
+    args: spec.args,
+    env: spec.env,
+    tmuxOptions: spec.tmuxOptions,
+  });
+
+  // 4b. Verify the interactive agent actually stayed up. If it rejected the
+  //     resume and exited immediately (the tmux window collapsed), we would
+  //     otherwise flip the record and report success on a DEAD bee whose runner
+  //     is already gone. Instead: tear down the dead remnant and re-fork the
+  //     HSR runner so the bee is restored exactly where it was.
+  if (!(await tmuxSessionSurvives(substrate, tmuxTarget, RESUME_LIVENESS_SETTLE_MS))) {
+    await substrate.kill(tmuxTarget, { launcherPgid: launch.launcherPgid }).catch(() => undefined);
+    await reviveHsrRunner(record, tool);
+    throw new Error(
+      `hive promote: ${record.name} exited immediately after the ${record.agent} resume — its provider session is not interactively resumable; left running on HSR`,
+    );
+  }
+
+  // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier,
+  //    set the pane fields; KEEP uuid/providerSessionId/id/lineage/account.
+  const promoted: SessionRecord = {
+    ...record,
+    command: shellCommand(spec),
+    tmuxTarget,
+    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+    combId: tmuxTarget,
+    updatedAt: new Date().toISOString(),
+    status: "running",
+  };
+  delete promoted.substrate;
+  delete promoted.runnerPid;
+  delete promoted.runnerTier;
+  await saveSession(promoted);
+  await writeSpawnOptions(promoted);
+  await appendLedger({ type: "session.promote", session: record.name, from: "hsr", to: "local-tmux", providerSessionId: record.providerSessionId });
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "promote", [bold(record.name), record.agent, dim("→ local-tmux")]));
+    console.error(note(`attach with: ${formatShellCommand(substrate.attachCommand(tmuxTarget))}`));
+  } else {
+    console.log(`promoted\t${record.name}\thsr\tlocal-tmux\t${promoted.command}`);
+  }
+}
+
+/**
+ * `hive demote <bee>` — the mirror: move a tmux bee back to a pane-less HSR
+ * runner by resuming the SAME provider session headlessly. Quiesce → kill the
+ * pane (keep the record) → fork the runner host with resume:true → flip record.
+ */
+async function cmdDemote(parsed: Parsed): Promise<void> {
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: hive demote <bee> [--now]");
+  const record = await resolveSession(target);
+  if (record.substrate === "hsr") {
+    throw new Error(`hive demote: ${record.name} is already on HSR (not a tmux bee)`);
+  }
+  const tool = assertResumable(record, "demote");
+  const adapter = adapterFor(tool);
+  if (!adapter) throw new Error(`hive demote: no HSR adapter for ${record.agent}`);
+  const now = truthy(flag(parsed, "now"));
+
+  // 1. Quiesce. A tmux bee's mid-turn state is heuristic, so absent --now we
+  //    proceed best-effort; --now sends Ctrl-C to the agent pane first.
+  if (now) {
+    await localSubstrate().sendKey(record.tmuxTarget, "C-c", record.agentPaneId).catch(() => undefined);
+    await sleep(300);
+  } else {
+    console.error(note(`${record.name}: a tmux bee's mid-turn state is heuristic — demoting without waiting (use --now to interrupt first)`));
+  }
+
+  // 2. Kill the tmux session/pane — but keep the record.
+  await localSubstrate().kill(record.tmuxTarget, { launcherPgid: record.launcherPgid }).catch(() => undefined);
+
+  // 3. Build the headless spec (the adapter appends the resume + stream flags)
+  //    and fork the runner host with resume:true against the same session id.
+  const spec = resolveAgent(record.requestedAgent ?? record.agent, [], {
+    home: record.homePath,
+    yolo: agentDefaultsToYolo(tool),
+    identity: Boolean(record.accountId),
+    ...(record.model ? { model: record.model } : {}),
+  });
+  if (record.accountId && spec.homePath) {
+    const account = await findAccount(record.accountId, tool).catch(() => undefined);
+    if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+  }
+  await assertExecutableAvailable(spec.command);
+  const runnerTier = adapter.tier();
+  const hostPid = await spawnHsrHost({
+    bee: record.name,
+    comb: record.combId ?? record.name,
+    ...(record.parentId ? { parent: record.parentId } : {}),
+    kind: tool,
+    cwd: record.cwd,
+    sessionId: record.providerSessionId,
+    resume: true,
+    authKind: "subscription",
+    ...(record.model ? { model: record.model } : {}),
+    spec: { command: spec.command, args: spec.args, env: spec.env },
+  });
+
+  // 4. Wait briefly for the host to report live (as spawnBee's HSR path does).
+  if (!(await waitForHsrHost(record.name, 5000))) {
+    console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
+  }
+
+  // 4b. Verify the headless child actually stayed up. If the resume was rejected
+  //     (e.g. claude cannot headlessly resume an interactive TUI session — the
+  //     stores are disjoint) the child exits immediately; flipping now would
+  //     report a dead bee whose tmux pane is already gone. Roll back: stop the
+  //     dead runner and re-launch the interactive pane where the bee started.
+  if (!(await hsrChildSurvives(record.name, RESUME_LIVENESS_SETTLE_MS))) {
+    await stopHsrRunner({ ...record, substrate: "hsr", runnerPid: hostPid });
+    await reviveTmuxPane(record, tool);
+    throw new Error(
+      `hive demote: ${record.name} exited immediately after the ${record.agent} headless resume — its provider session is not headlessly resumable; left running on tmux`,
+    );
+  }
+
+  // 5. Flip the record to HSR: set substrate/runnerPid/runnerTier, make
+  //    tmuxTarget the logical id, delete the pane fields; keep the rest.
+  const demoted: SessionRecord = {
+    ...record,
+    command: shellCommand(spec),
+    substrate: "hsr",
+    runnerPid: hostPid,
+    ...(runnerTier ? { runnerTier } : {}),
+    tmuxTarget: record.name,
+    combId: record.name,
+    updatedAt: new Date().toISOString(),
+    status: "running",
+  };
+  delete demoted.agentPaneId;
+  delete demoted.launcherPgid;
+  await saveSession(demoted);
+  await writeSpawnOptions(demoted);
+  await appendLedger({ type: "session.demote", session: record.name, from: "local-tmux", to: "hsr", providerSessionId: record.providerSessionId });
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "demote", [bold(record.name), record.agent, dim("→ hsr")]));
+  } else {
+    console.log(`demoted\t${record.name}\tlocal-tmux\thsr\t${demoted.command}`);
+  }
+}
+
 /**
  * Resolve the bee owning the current tmux pane:
  *   1. $TMUX_PANE → match a record by agentPaneId (the precise, pane-pinned path)
@@ -3045,6 +3495,26 @@ async function resolveBeeInCurrentPane(): Promise<SessionRecord | undefined> {
     if (bySession) return bySession;
   }
   return undefined;
+}
+
+/**
+ * Whether this process is running INSIDE a bee — the agent-origin signal for
+ * resolveSpawnSubstrate. Unlike resolveBeeInCurrentPane, this requires a
+ * DIRECT anchor: the HIVE_BEE stamp (HSR children) or TMUX_PANE matching a
+ * bee's own agent pane (a tmux bee's subprocesses inherit its pane id). The
+ * session-name fallback is deliberately not consulted: a display-popup
+ * (tmux strips TMUX_PANE from popup commands) or an operator shell pane
+ * inside a comb shares the bee's session without BEING the bee, and treating
+ * those as agent spawns routed human picks onto pane-less HSR where no prompt
+ * ever arrives (stuck "booting").
+ */
+async function spawnOriginIsAgent(): Promise<boolean> {
+  const hiveBee = process.env.HIVE_BEE;
+  const paneId = process.env.TMUX ? process.env.TMUX_PANE : undefined;
+  if (!hiveBee && !paneId) return false;
+  const records = await listSessions();
+  if (hiveBee && records.some((record) => record.name === hiveBee)) return true;
+  return Boolean(paneId && records.some((record) => record.agentPaneId === paneId));
 }
 
 /** The session name of the current pane, via `tmux display-message`. */
@@ -7888,7 +8358,8 @@ function hsrSubstrateRequested(parsed: Parsed): boolean {
  *   2. Explicit `--substrate local|tmux|ssh:...` or `--node`  → tmux (node
  *      resolution). An explicit choice by an agent overrides the agent default.
  *   3. Nothing explicit → origin default: agent-initiated spawns (the spawning
- *      process is itself a bee) follow `spawn.defaultSubstrate.agent` (default
+ *      process is itself a bee — a direct HIVE_BEE/agent-pane anchor, see
+ *      spawnOriginIsAgent) follow `spawn.defaultSubstrate.agent` (default
  *      "hsr"); human/terminal spawns follow `.user` (default "local-tmux").
  * Only the `spawnSingleBee` path uses this; flows/swarms/fork keep prior
  * behavior for now (follow-ups: APIA-85 fork, flow/swarm defaults).
@@ -7904,7 +8375,7 @@ export async function resolveSpawnSubstrate(parsed: Parsed, agentKind: string): 
     // bee can opt its child back onto a visible pane with `--substrate tmux`.
     return { useHsr: false, node: await resolveSpawnNode(parsed, agentKind) };
   }
-  const origin = (await resolveBeeInCurrentPane()) ? "agent" : "user";
+  const origin = (await spawnOriginIsAgent()) ? "agent" : "user";
   const want = spawnDefaultSubstrate(origin);
   if (want === "hsr") {
     // Discoverability: the origin default (not an explicit flag) chose HSR.
@@ -8762,6 +9233,8 @@ function printHelp() {
         ["urls", "[<bee>]", "list URLs printed in a bee's pane (--lines, --open, --json)"],
         ["keys", "<print|path|check>", "print/verify the recommended tmux keybinding set"],
         ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],
+        ["promote", "<bee>", "move an HSR bee onto an interactive tmux pane (resume; claude/codex, --now)"],
+        ["demote", "<bee>", "move a tmux bee back to a pane-less HSR runner (resume; claude/codex, --now)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--all, --fresh, --session <id>)"],
         ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],
         ["loop", "<launch|start|status|stop|…>", "run a bee repeatedly until a stop condition (launch = interactive dialog)"],

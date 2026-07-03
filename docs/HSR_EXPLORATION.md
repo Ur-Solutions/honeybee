@@ -62,7 +62,7 @@ Per harness (verified where noted; ? = verify during build):
 
 | Harness | Best tier | Mechanism | Multi-turn | Resume (for promote) | Native transcript on disk | Confidence |
 |---|---|---|---|---|---|---|
-| **claude** | B | `claude -p --input-format stream-json --output-format stream-json` (process stays alive across turns) or Agent SDK in-proc | ✅ | `claude --resume <uuid>` — deterministic, hive already pins `--session-id` at birth | ✅ JSONL under `$CLAUDE_CONFIG_DIR/projects/…` (also in `-p` mode) | high |
+| **claude** | B | `claude -p --input-format stream-json --output-format stream-json` (process stays alive across turns) or Agent SDK in-proc | ✅ | ⚠️ headless↔headless only — interactive `--resume` CANNOT rejoin a `-p` session (§7 2026-07-03) | ✅ JSONL under `$CLAUDE_CONFIG_DIR/projects/…` (also in `-p` mode) | high |
 | **codex** | **S** | `codex app-server` (JSON-RPC over stdio; the official embedding protocol — `codex proto` is gone). One server per (home/account) hosts many conversations; approvals arrive as RPC callbacks | ✅ | `codex resume <id>` / `codex exec resume` — rollout id learned from server | ✅ rollout JSONL under `$CODEX_HOME/sessions/…` | high |
 | **opencode** | S | `opencode serve` REST (+ official SDK); sessions server-side | ✅ | TUI can attach to a running server / session (`opencode run --attach`-family — pin exact flags) | ✅ SQLite (Apiary already reads it) | med-high |
 | **kimi** | B | `kimi acp` — Agent Client Protocol over stdio (Zed's protocol); subscription explicitly permits third-party embedding | ✅ | ? — check session resume in kimi CLI | ✅ (claude-compatible home layout) | med |
@@ -369,3 +369,34 @@ surfaced two issues unit tests missed:
 Confirmed working: `claude -p --input-format stream-json` DOES persist across
 turns (two user messages on one kept-open stdin → two results), so tier-B
 (one persistent process, multi-turn) is correct as designed.
+
+### 2026-07-03 — claude interactive/headless session stores are DISJOINT (breaks §4 promote for claude; codex is fine)
+
+Building APIA-84 (promote/demote) disproved the §2 claude Resume claim
+("`claude --resume <uuid>` — deterministic … also in `-p` mode"). Verified
+repeatedly against claude 2.1.199:
+
+- **Interactive `claude --resume <id>` cannot rejoin a `-p`/headless session** —
+  it returns `No conversation found` for every HSR (`-p`-created) session, even
+  though the JSONL is on disk under `~/.claude/projects/…`. `--continue` picks
+  up the most recent *interactive* session and ignores a `-p` one.
+- **Headless `claude -p --resume <id>` of an *interactive* session also fails.**
+- **Headless↔headless resume WORKS** with full continuity.
+
+So claude has two disjoint session stores (interactive TUI vs headless `-p`),
+and §4 promote (HSR-headless → interactive tmux) / demote (interactive tmux →
+HSR-headless) **cannot carry claude conversation history** — the resumed
+process errors and exits ~1s. The on-disk JSONL ≠ interactive-resumability.
+
+**codex has NO such separation** — `codex resume <threadId>` rejoins an
+app-server (HSR) thread interactively; codex promote/demote works end-to-end
+with continuity.
+
+Mitigation shipped in APIA-84: promote/demote now **liveness-gate** the relaunch
+(`tmuxSessionSurvives`/`hsrChildSurvives`) and **fail-safe roll back** to the
+original substrate (`reviveHsrRunner`/`reviveTmuxPane`) if the resumed process
+dies, so a rejected resume never bricks a bee. Also: codex mints its thread id
+at runtime, so `cmdPromote` backfills `record.providerSessionId` from the HSR
+`meta.json` before resuming (generalize into the observe/reconcile loop as a
+follow-up). Product decision on whether claude stays promote/demote-gated is
+tracked with APIA-84.

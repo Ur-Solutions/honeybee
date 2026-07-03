@@ -113,6 +113,24 @@ function encodeClaudeUserTurn(text: string): string {
 }
 
 /**
+ * Drop any `--session-id <id>` pair from an arg list. A fresh spawn pins the
+ * provider session with `--session-id`; a RESUME must instead carry `--resume
+ * <id>` and MUST NOT also pass `--session-id` (claude rejects starting a session
+ * whose id already exists on disk). Removes the flag and its following value.
+ */
+function stripSessionIdArgs(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--session-id") {
+      i += 1; // skip the flag's value too
+      continue;
+    }
+    out.push(args[i]!);
+  }
+  return out;
+}
+
+/**
  * Build the claude stream config + scrubbed spawn env WITHOUT spawning. Pure —
  * exported so tests can exercise argv/env policy and the parse/encode hooks in
  * isolation.
@@ -126,7 +144,20 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
   // Prepend the stream-json flags, then preserve the caller's resolved args
   // (--model, --session-id, --dangerously-skip-permissions, …). Defensive: if
   // the caller already carries -p, don't add it a second time.
-  const callerArgs = opts.args ?? [];
+  //
+  // RESUME (demote: tmux→HSR headless resume): when the caller asks to resume an
+  // existing provider session, emit `--resume <sessionId>` INSTEAD of the fresh
+  // spawn's `--session-id` pinning. We strip any `--session-id <id>` pair the
+  // caller left in (a fresh spawn's forcedSessionIdArgs) and ensure `--resume
+  // <sessionId>` is present exactly once, so the headless run rejoins the SAME
+  // native transcript the interactive/tmux session was writing (§4).
+  let callerArgs = opts.args ?? [];
+  if (opts.resume === true && opts.sessionId) {
+    callerArgs = stripSessionIdArgs(callerArgs);
+    if (!callerArgs.includes("--resume")) {
+      callerArgs = ["--resume", opts.sessionId, ...callerArgs];
+    }
+  }
   const streamFlags = callerArgs.includes("-p") ? CLAUDE_STREAM_FLAGS.filter((f) => f !== "-p") : CLAUDE_STREAM_FLAGS;
   const args = [...streamFlags, ...callerArgs];
 
