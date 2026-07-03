@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { addAccount, accountDir } from "../src/accounts.js";
-import { accountLimits, cachedAccountLimits, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
+import { CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountLimits, cachedAccountLimits, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -202,6 +203,170 @@ test("claude limits reject tokens whose profile email belongs to another account
   });
 });
 
+test("claude profile email cache is bounded and evicts least-recently-used tokens", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "cache@a.b");
+    const credentialPath = join(accountDir(account), ".credentials.json");
+    const oldFetch = globalThis.fetch;
+    const profileCallsByToken = new Map<string, number>();
+
+    const writeToken = (accessToken: string) =>
+      writeFile(
+        credentialPath,
+        JSON.stringify({ claudeAiOauth: { accessToken, expiresAt: Date.now() + 3_600_000 } }),
+      );
+    const checkLimits = async () => {
+      const [result] = await accountLimits([account], {
+        fetchClaudeUsage: async () => ({ five_hour: { utilization: 1 } }),
+        readKeychain: async () => null,
+      });
+      assert.equal(result!.ok, true);
+    };
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const authorization =
+        init?.headers && !Array.isArray(init.headers) && !(init.headers instanceof Headers)
+          ? (init.headers as Record<string, string>).Authorization
+          : undefined;
+      const accessToken = authorization?.replace(/^Bearer\s+/, "");
+      assert.ok(accessToken, "profile request must include a bearer token");
+      profileCallsByToken.set(accessToken, (profileCallsByToken.get(accessToken) ?? 0) + 1);
+      return new Response(JSON.stringify({ account: { email: "cache@a.b" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      await writeToken("tok-0");
+      await checkLimits();
+
+      for (let index = 1; index < CLAUDE_PROFILE_EMAIL_CACHE_MAX; index += 1) {
+        await writeToken(`tok-${index}`);
+        await checkLimits();
+      }
+
+      await writeToken("tok-0");
+      await checkLimits();
+      assert.equal(profileCallsByToken.get("tok-0"), 1);
+
+      await writeToken(`tok-${CLAUDE_PROFILE_EMAIL_CACHE_MAX}`);
+      await checkLimits();
+
+      await writeToken("tok-0");
+      await checkLimits();
+      assert.equal(profileCallsByToken.get("tok-0"), 1);
+
+      await writeToken("tok-1");
+      await checkLimits();
+      assert.equal(profileCallsByToken.get("tok-1"), 2);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
+test("an email-less account never trusts unattributed shared-home keychain tokens", async () => {
+  await withTempStore(async (dir) => {
+    // candidateHomes scans os.homedir(); point HOME at the temp dir so the
+    // "shared ~/.claude" below is the only unattributed home on the machine.
+    const oldHome = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      const sharedHome = join(dir, ".claude");
+      await mkdir(sharedHome, { recursive: true });
+      // No email and no @ in the label → nothing to verify identity against.
+      const account = await addAccount("claude", "work");
+      // No vault credentials and no dedicated home: the only candidate is a
+      // FRESH keychain token in the shared home — someone else's daily driver.
+      const [result] = await accountLimits([account], {
+        readKeychain: async (home) =>
+          home === sharedHome
+            ? JSON.stringify({ claudeAiOauth: { accessToken: "tok-daily-driver", expiresAt: Date.now() + 3_600_000 } })
+            : null,
+        fetchClaudeUsage: async () => {
+          throw new Error("must not report another account's usage");
+        },
+        fetchClaudeProfileEmail: async () => {
+          throw new Error("must not be called — there is no email to match");
+        },
+        refreshClaudeToken: async () => null,
+      });
+      assert.equal(result!.ok, false);
+      assert.match(result!.error ?? "", /no email to verify/);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+    }
+  });
+});
+
+test("accountLimits memoizes claude keychain reads per home for one sweep", async () => {
+  await withTempStore(async (dir) => {
+    const oldHome = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      const sharedHome = join(dir, ".claude");
+      await mkdir(sharedHome, { recursive: true });
+      const accounts = [];
+      for (let index = 0; index < 6; index += 1) {
+        accounts.push(await addAccount("claude", `memo-${index}@a.b`));
+      }
+
+      const callsByHome = new Map<string, number>();
+      const results = await accountLimits(accounts, {
+        readKeychain: async (home) => {
+          const key = resolve(home);
+          callsByHome.set(key, (callsByHome.get(key) ?? 0) + 1);
+          await sleep(5);
+          return null;
+        },
+        fetchClaudeUsage: async () => {
+          throw new Error("no keychain token should reach usage");
+        },
+        fetchClaudeProfileEmail: async () => {
+          throw new Error("no keychain token should reach profile verification");
+        },
+      });
+
+      assert.deepEqual(results.map((result) => result.ok), [false, false, false, false, false, false]);
+      assert.equal(callsByHome.get(resolve(sharedHome)), 1);
+      assert.equal([...callsByHome.values()].reduce((sum, count) => sum + count, 0), 1);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+    }
+  });
+});
+
+test("an email-less account uses its attributed vault token without profile verification", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "work");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-vault", expiresAt: Date.now() + 3_600_000, subscriptionType: "max" } }),
+    );
+
+    const asked: string[] = [];
+    const [result] = await accountLimits([account], {
+      fetchClaudeUsage: async (token) => {
+        asked.push(token);
+        return { five_hour: { utilization: 42, resets_at: "2026-06-10T09:30:00Z" } };
+      },
+      fetchClaudeProfileEmail: async () => {
+        throw new Error("no email to verify against — must not be called");
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.deepEqual(asked, ["tok-vault"]);
+    assert.equal(result!.ok, true);
+    assert.equal(result!.plan, "max");
+    assert.equal(result!.fiveHour?.usedPercent, 42);
+  });
+});
+
 test("an expired chain is refreshed, persisted (rotation!), and then used", async () => {
   await withTempStore(async () => {
     const account = await addAccount("claude", "stale@a.b");
@@ -239,6 +404,122 @@ test("an expired chain is refreshed, persisted (rotation!), and then used", asyn
     assert.equal(persisted[0]!.account, account.id);
     assert.equal(persisted[0]!.oauth.refreshToken, "refresh-rotated");
     assert.equal(persisted[0]!.oauth.subscriptionType, "max");
+  });
+});
+
+test("chain refresh and persist run inside the accounts lock (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "lock@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    let depth = 0;
+    const events: string[] = [];
+    const [result] = await accountLimits([account], {
+      withAccountLock: async (fn) => {
+        depth += 1;
+        try {
+          return await fn();
+        } finally {
+          depth -= 1;
+        }
+      },
+      refreshClaudeToken: async () => {
+        events.push(`refresh@${depth}`);
+        return { accessToken: "tok-new", refreshToken: "r-rotated", expiresAt: Date.now() + 3_600_000 };
+      },
+      persistRefreshedCredentials: async () => {
+        events.push(`persist@${depth}`);
+      },
+      fetchClaudeProfileEmail: async () => "lock@a.b",
+      fetchClaudeUsage: async () => ({ five_hour: { utilization: 1, resets_at: "2026-06-10T18:00:00Z" } }),
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    // Both the rotation and its persistence happened while the lock was held.
+    assert.deepEqual(events, ["refresh@1", "persist@1"]);
+  });
+});
+
+test("refresh double-checks the vault under the lock and reuses a chain rotated by a concurrent writer (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "race@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    await writeFile(
+      vaultPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    const usageAskedWith: string[] = [];
+    const [result] = await accountLimits([account], {
+      // Simulate a concurrent writer (activation) winning the lock first and
+      // rotating the chain while we waited: by the time our critical section
+      // runs, the vault already holds the rotated fresh chain.
+      withAccountLock: async (fn) => {
+        await writeFile(
+          vaultPath,
+          JSON.stringify({
+            claudeAiOauth: { accessToken: "tok-rotated", expiresAt: Date.now() + 3_600_000, refreshToken: "r-rotated", subscriptionType: "max" },
+          }),
+        );
+        return fn();
+      },
+      refreshClaudeToken: async () => {
+        throw new Error("must not replay a refresh token another writer already rotated");
+      },
+      fetchClaudeProfileEmail: async () => "race@a.b",
+      fetchClaudeUsage: async (token) => {
+        usageAskedWith.push(token);
+        return { five_hour: { utilization: 1, resets_at: "2026-06-10T18:00:00Z" } };
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    assert.equal(result!.plan, "max");
+    assert.deepEqual(usageAskedWith, ["tok-rotated"]);
+  });
+});
+
+test("a vault chain rotated behind us to another identity is never replayed (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "super@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    await writeFile(
+      vaultPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    const [result] = await accountLimits([account], {
+      // The chain moved on while we waited for the lock — and the rotated
+      // link belongs to someone else. The superseded r-old token must not be
+      // replayed (that replay is what trips reuse detection).
+      withAccountLock: async (fn) => {
+        await writeFile(
+          vaultPath,
+          JSON.stringify({ claudeAiOauth: { accessToken: "tok-other", expiresAt: Date.now() + 3_600_000, refreshToken: "r-other" } }),
+        );
+        return fn();
+      },
+      refreshClaudeToken: async () => {
+        throw new Error("must not replay the superseded refresh token");
+      },
+      fetchClaudeProfileEmail: async (token) => (token === "tok-other" ? "wrong@a.b" : null),
+      fetchClaudeUsage: async () => {
+        throw new Error("must not query usage with another identity's token");
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, false);
+    assert.match(result!.error ?? "", /no token belongs to super@a\.b/);
+    assert.match(result!.error ?? "", /wrong@a\.b/);
   });
 });
 
@@ -384,6 +665,36 @@ test("codex prefers live app-server limits and falls back to disk snapshots", as
     assert.equal(fallback!.ok, false);
     assert.equal(fallback!.source, "session-snapshot");
     assert.match(fallback!.error ?? "", /no rate-limit snapshot/);
+  });
+});
+
+test("accountLimits caps codex live app-server fan-out", async () => {
+  await withTempStore(async (dir) => {
+    const accounts = [];
+    for (let index = 0; index < 8; index += 1) {
+      const account = await addAccount("codex", `fanout-${index}@a.b`);
+      await mkdir(join(dir, "homes", account.id), { recursive: true });
+      accounts.push(account);
+    }
+
+    let active = 0;
+    let maxActive = 0;
+    let calls = 0;
+    const results = await accountLimits(accounts, {
+      codexLiveRateLimits: async () => {
+        calls += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await sleep(20);
+        active -= 1;
+        return { primary: { usedPercent: 1 } };
+      },
+    });
+
+    assert.equal(calls, accounts.length);
+    assert.ok(maxActive <= 4, `expected at most 4 concurrent live Codex reads, saw ${maxActive}`);
+    assert.deepEqual(results.map((result) => result.account), accounts.map((account) => account.id));
+    assert.deepEqual(results.map((result) => result.source), accounts.map(() => "app-server"));
   });
 });
 
@@ -633,6 +944,55 @@ test("cachedAccountLimits serves fresh cache entries and refetches stale or fail
   });
 });
 
+test("cachedAccountLimits serves the last snapshot on a rate-limited live read", async () => {
+  await withTempStore(async () => {
+    const one = await addAccount("claude", "rl@a.b");
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+
+    // Warm the cache with a good live read.
+    await cachedAccountLimits([one], {
+      fetchLimits: async () => [okLimits(one.id, 40, 10)],
+      now: () => t0,
+    });
+
+    // A 429 later serves the stale snapshot, flagged cached + rateLimited so
+    // pollers still see the push-back signal and back off.
+    const rateLimited: import("../src/limits.js").AccountLimits = {
+      account: one.id, tool: "claude", ok: false, source: "oauth-api", error: "/api/oauth/usage: HTTP 429",
+    };
+    const [served] = await cachedAccountLimits([one], {
+      fetchLimits: async () => [rateLimited],
+      now: () => t0 + 10 * 60 * 1000,
+    });
+    assert.equal(served!.ok, true);
+    assert.equal(served!.cached, true);
+    assert.equal(served!.rateLimited, true);
+    assert.equal(served!.asOf, new Date(t0).toISOString());
+    assert.equal(served!.fiveHour?.usedPercent, 10);
+    assert.equal(served!.weekly?.usedPercent, 40);
+
+    // A non-rate-limit failure still surfaces as an error row.
+    const broken: import("../src/limits.js").AccountLimits = {
+      account: one.id, tool: "claude", ok: false, source: "oauth-api", error: "HTTP 401",
+    };
+    const [error] = await cachedAccountLimits([one], {
+      fetchLimits: async () => [broken],
+      now: () => t0 + 11 * 60 * 1000,
+    });
+    assert.equal(error!.ok, false);
+    assert.equal(error!.rateLimited, undefined);
+
+    // A 429 with no cache entry keeps the error row but stamps the signal.
+    const other = await addAccount("claude", "rl2@a.b");
+    const [bare] = await cachedAccountLimits([other], {
+      fetchLimits: async () => [{ ...rateLimited, account: other.id }],
+      now: () => t0 + 12 * 60 * 1000,
+    });
+    assert.equal(bare!.ok, false);
+    assert.equal(bare!.rateLimited, true);
+  });
+});
+
 test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl", async () => {
   await withTempStore(async () => {
     const one = await addAccount("claude", "one@a.b");
@@ -665,5 +1025,61 @@ test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl", as
     // Past the default 1h ttl the pick refetches on its own.
     await pickLeastLoadedAccount("claude", deps(t0 + 90 * 60 * 1000));
     assert.equal(fetchCount, 3);
+  });
+});
+
+test("lastRateLimitsInFile tail-reads huge rollout files instead of slurping them", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-rl-tail-"));
+  try {
+    const row = (ts: string, used: number) =>
+      JSON.stringify({
+        timestamp: ts,
+        type: "event_msg",
+        payload: { type: "token_count", rate_limits: { primary: { used_percent: used, window_minutes: 300, resets_at: 1781037177 }, plan_type: "pro" } },
+      });
+    const filler = `${JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "x".repeat(1024) } })}\n`;
+
+    // The latest rate_limits row sits in the final tail of a multi-MB file.
+    const tailHit = join(dir, "tail-hit.jsonl");
+    await writeFile(tailHit, `${row("2026-07-01T10:00:00Z", 5)}\n${filler.repeat(2048)}${row("2026-07-01T11:00:00Z", 12)}\n`);
+    const snapshot = await lastRateLimitsInFile(tailHit);
+    assert.equal(snapshot?.ts, "2026-07-01T11:00:00Z");
+    assert.equal(snapshot?.limits.primary?.used_percent, 12);
+
+    // A rate_limits row buried before the tail window is deliberately out of
+    // reach — the walk is capped, not exhaustive (HIVE-64).
+    const tailMiss = join(dir, "tail-miss.jsonl");
+    await writeFile(tailMiss, `${row("2026-07-01T10:00:00Z", 5)}\n${filler.repeat(2048)}`);
+    assert.equal(await lastRateLimitsInFile(tailMiss), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("codex snapshot fallback reads the newest date partitions, not the whole sessions tree", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "part@a.b");
+    const sessions = join(dir, "homes", account.id, "sessions");
+    const row = (ts: string, used: number) =>
+      JSON.stringify({
+        timestamp: ts,
+        type: "event_msg",
+        payload: { type: "token_count", rate_limits: { primary: { used_percent: used, window_minutes: 300, resets_at: 1781037177 }, plan_type: "pro" } },
+      });
+    // An old partition holds a stale snapshot; the newest partition holds the
+    // current one. Descending date order must surface the newest partition's
+    // rollout first even though both are on disk.
+    await mkdir(join(sessions, "2026", "06", "20"), { recursive: true });
+    const oldRollout = join(sessions, "2026", "06", "20", "rollout-old.jsonl");
+    await writeFile(oldRollout, `${row("2026-06-20T09:00:00Z", 50)}\n`);
+    await utimes(oldRollout, new Date("2026-06-20T09:00:00Z"), new Date("2026-06-20T09:00:00Z"));
+    await mkdir(join(sessions, "2026", "07", "03"), { recursive: true });
+    await writeFile(join(sessions, "2026", "07", "03", "rollout-new.jsonl"), `${row("2026-07-03T09:00:00Z", 77)}\n`);
+
+    const [result] = await accountLimits([account], { codexLiveRateLimits: async () => null });
+    assert.equal(result!.ok, true);
+    assert.equal(result!.source, "session-snapshot");
+    assert.equal(result!.asOf, "2026-07-03T09:00:00Z");
+    assert.equal(result!.fiveHour?.usedPercent, 77);
   });
 });

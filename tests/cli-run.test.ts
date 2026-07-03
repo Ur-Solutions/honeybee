@@ -80,6 +80,46 @@ test("run --rm cleans up when known driver readiness fails", async () => {
   }
 });
 
+test("run skips pane readiness for HSR bees and sends over the control socket", async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-run-hsr-store-"));
+  const cwd = await mkdtemp(join(tmpdir(), "honeybee-run-hsr-cwd-"));
+  const name = `hive-test-run-hsr-${process.pid}`;
+  try {
+    const result = await runCli(
+      [
+        "run",
+        "stub",
+        "--name",
+        name,
+        "-p",
+        "HIVE_HSR_RUN_OK",
+        "--cwd",
+        cwd,
+        "--substrate",
+        "hsr",
+        "--boot-ms",
+        "1",
+        "--wait",
+        "--idle-ms",
+        "100",
+        "--timeout-ms",
+        "5000",
+        "--last",
+        "--rm",
+      ],
+      { HIVE_STORE_ROOT: storeRoot, HIVE_STUB_CMD: process.execPath },
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /echo:HIVE_HSR_RUN_OK/);
+    assert.doesNotMatch(result.stderr, /Timed out waiting/);
+  } finally {
+    await runCli(["kill", name], { HIVE_STORE_ROOT: storeRoot });
+    await rm(storeRoot, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("x spawns, delivers the prompt, and keeps the session (fire-and-forget)", async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-x-store-"));
   const cwd = await mkdtemp(join(tmpdir(), "honeybee-x-cwd-"));

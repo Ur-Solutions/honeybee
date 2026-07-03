@@ -9,15 +9,18 @@
  * says `status: "running"` AND the host process is still alive — the host owns
  * the harness child's pipes, so a dead host means the live protocol stream is
  * gone regardless of whether the harness child lingers. "Crash adoption v1"
- * (`reapDeadHosts`) reconciles stale `running` meta with dead host pids; it does
- * not recover pipes.
+ * (`reapDeadHosts`) reconciles stale `running` meta with dead host pids and
+ * kills the orphaned harness child group the dead host left behind (HIVE-53);
+ * it does not recover pipes.
  *
  * Node builtins only.
  */
 
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import type { BeeState } from "../state.js";
+import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
 import {
+  HSR_EVENTS_MAX_BYTES,
   hsrEventsPath,
   hsrMetaPath,
   hsrRingPath,
@@ -27,17 +30,6 @@ import {
   type HsrMeta,
 } from "./runDir.js";
 import type { RunnerEvent } from "./types.js";
-
-/** Signal-0 liveness probe; EPERM means the pid exists but isn't ours. */
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
 
 /**
  * Whether a meta record represents a live bee. For a LOCAL host the host pid is
@@ -95,8 +87,49 @@ export async function hsrSnapshot(bee: string, lines?: number): Promise<string> 
   return all.slice(Math.max(0, all.length - lines)).join("\n");
 }
 
-/** How many trailing events.jsonl lines the structured-state reader inspects. */
-const EVENT_TAIL_LINES = 200;
+/**
+ * Byte cap on the events.jsonl tail read (HIVE-13). The daemon re-reads every
+ * bee's events.jsonl each tick, so the read must be O(cap), not O(file) — even
+ * for a huge legacy log written before writer-side compaction (runDir.ts)
+ * bounded the file. Sized to cover the writer's whole bound (a compacted log
+ * never exceeds HSR_EVENTS_MAX_BYTES by more than the append that trips
+ * compaction), so on any writer-maintained log the observers see EVERY event:
+ * a single long turn cannot push its turn_start out of the window (HIVE-55).
+ */
+export const EVENT_TAIL_MAX_BYTES = HSR_EVENTS_MAX_BYTES + 64 * 1024;
+
+/**
+ * Read at most the trailing `maxBytes` of a file. When the read starts mid-file
+ * the first (possibly partial) line is dropped, so callers always see whole
+ * lines. Null when the file is missing/unreadable.
+ */
+async function readTailText(path: string, maxBytes: number): Promise<string | null> {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const { size } = await handle.stat();
+    const start = Math.max(0, size - maxBytes);
+    const length = size - start;
+    if (length <= 0) return "";
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
+    if (start > 0) {
+      // We landed mid-line (possibly mid-codepoint) — skip to the next full line.
+      const nl = text.indexOf("\n");
+      text = nl === -1 ? "" : text.slice(nl + 1);
+    }
+    return text;
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
 
 /**
  * A single HSR bee's cross-process observation, read purely from its run dir:
@@ -116,12 +149,29 @@ export type HsrObservation = {
    * SessionRecord through the HSR state path instead of the coarse node-probe.
    */
   mirrorOf?: string;
+  /**
+   * Optional per-tick daemon cache of events.jsonl-derived facts. Normal callers
+   * do not request this; the daemon does so it can feed state, usage, and
+   * needs-input from the same bounded event read.
+   */
+  eventSnapshot?: HsrEventSnapshot;
+};
+
+export type HsrEventSnapshot = {
+  events: RunnerEvent[];
+  tailEvents: RunnerEvent[];
+  usage: HsrUsageObservation;
+  pendingNeedsInput: PendingNeedsInput | null;
+};
+
+export type HsrObservationOptions = {
+  includeEvents?: boolean;
 };
 
 /**
- * Derive a BeeState from the tail of events.jsonl. Only the last few turn
- * markers matter, so we scan the parsed tail for the last turn_start/turn_end
- * and the last needs_input:
+ * Derive a BeeState from the events.jsonl window. Only the LAST turn markers
+ * matter, so we scan the parsed window for the last turn_start/turn_end and
+ * the last needs_input:
  *   - a needs_input with no later turn_end (unresolved) → "blocked".
  *   - a turn in flight (last marker is turn_start) → "active".
  *   - the last turn finished (turn_end) → "idle_with_output".
@@ -165,21 +215,17 @@ function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined 
 }
 
 /**
- * Read the tail of a bee's events.jsonl and parse it into RunnerEvents. Tolerates
- * a missing/partial file and unparseable lines (a truncated crash write) — a bad
- * line is skipped, never thrown.
+ * Read the tail of a bee's events.jsonl and parse it into RunnerEvents. Reads
+ * at most the trailing EVENT_TAIL_MAX_BYTES of the file — on a writer-bounded
+ * log that is the WHOLE log, so no fixed line count can hide an old turn_start
+ * or unresolved needs_input behind a burst of text chunks (HIVE-55). Tolerates
+ * a missing/partial file and unparseable lines (a truncated crash write) — a
+ * bad line is skipped, never thrown.
  */
-async function readEventTail(bee: string, lines: number): Promise<RunnerEvent[]> {
-  let raw: string;
-  try {
-    raw = await readFile(hsrEventsPath(bee), "utf8");
-  } catch {
-    return [];
-  }
+function parseRunnerEvents(raw: string): RunnerEvent[] {
   const all = raw.split("\n").filter((line) => line.trim().length > 0);
-  const tail = all.slice(Math.max(0, all.length - lines));
   const events: RunnerEvent[] = [];
-  for (const line of tail) {
+  for (const line of all) {
     try {
       const parsed = JSON.parse(line) as unknown;
       if (parsed && typeof parsed === "object" && typeof (parsed as { type?: unknown }).type === "string") {
@@ -192,13 +238,28 @@ async function readEventTail(bee: string, lines: number): Promise<RunnerEvent[]>
   return events;
 }
 
+async function readEventTail(bee: string): Promise<RunnerEvent[]> {
+  const raw = await readTailText(hsrEventsPath(bee), EVENT_TAIL_MAX_BYTES);
+  return raw === null ? [] : parseRunnerEvents(raw);
+}
+
+async function readEventSnapshot(bee: string): Promise<HsrEventSnapshot> {
+  const events = await readEventTail(bee);
+  return {
+    events,
+    tailEvents: events,
+    usage: hsrUsageObservationFromEvents(events),
+    pendingNeedsInput: pendingNeedsInputFromEvents(events),
+  };
+}
+
 /**
  * Batch structured observation of every HSR bee, read purely from run dirs (no
  * tmux). Threaded through StateContext so BOTH `hive bees` and the daemon tick
  * derive HSR state and drive transitions/buz-drain from the same source. Never
  * throws: a bad bee yields `{ live: false, snapshot: "" }`.
  */
-export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
+export async function hsrObservations(options: HsrObservationOptions = {}): Promise<Map<string, HsrObservation>> {
   const observations = new Map<string, HsrObservation>();
   for (const bee of await listHsrBees()) {
     try {
@@ -206,14 +267,18 @@ export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
       const live = isMetaLive(meta);
       const snapshot = await hsrSnapshot(bee);
       const mirrorOf = meta?.mirrorOfNode;
+      const eventSnapshot = options.includeEvents ? await readEventSnapshot(bee) : undefined;
       // A dead host's stream is gone — leave state undefined so deriveState
       // settles dead/sealed rather than reporting a stale structured state.
-      const state = live ? structuredStateFromEvents(await readEventTail(bee, EVENT_TAIL_LINES)) : undefined;
+      const state = live
+        ? structuredStateFromEvents(eventSnapshot ? eventSnapshot.tailEvents : await readEventTail(bee))
+        : undefined;
       observations.set(bee, {
         live,
         snapshot,
         ...(state === undefined ? {} : { state }),
         ...(mirrorOf ? { mirrorOf } : {}),
+        ...(eventSnapshot ? { eventSnapshot } : {}),
       });
     } catch {
       observations.set(bee, { live: false, snapshot: "" });
@@ -226,25 +291,19 @@ export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
  * The pending needs-input a blocked HSR bee is waiting on, read from the events
  * tail. Used by the daemon's needs-input → parent-buz router and `hive answer`.
  * `requestId` falls back to the stable literal "pending" when the emitting event
- * carried none, so callers always have a de-dupe/answer key.
+ * carried none, so answer paths always have a key. `ts` identifies the specific
+ * needs_input event for routing de-dupe when adapters do not provide requestId.
  */
 export type PendingNeedsInput = {
   requestId: string;
+  ts: number;
   kind: "permission" | "question";
   question: string;
   tool?: string;
   options?: string[];
 };
 
-/**
- * The LAST needs_input event in the tail that has no later turn_end — i.e. the
- * unresolved request the bee is currently blocked on (mirrors the "blocked"
- * rule in structuredStateFromEvents). Null when the bee is not live or has no
- * pending request. Never throws.
- */
-export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
-  if (!isMetaLive(await readHsrMeta(bee))) return null;
-  const events = await readEventTail(bee, EVENT_TAIL_LINES);
+function pendingNeedsInputFromEvents(events: RunnerEvent[]): PendingNeedsInput | null {
   let lastNeeds = -1;
   let lastEnd = -1;
   for (let i = 0; i < events.length; i++) {
@@ -257,11 +316,23 @@ export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput 
   const event = events[lastNeeds] as Extract<RunnerEvent, { type: "needs_input" }>;
   return {
     requestId: event.requestId ?? "pending",
+    ts: event.ts,
     kind: event.kind,
     question: event.question,
     ...(event.tool ? { tool: event.tool } : {}),
     ...(event.options ? { options: event.options } : {}),
   };
+}
+
+/**
+ * The LAST needs_input event in the tail that has no later turn_end — i.e. the
+ * unresolved request the bee is currently blocked on (mirrors the "blocked"
+ * rule in structuredStateFromEvents). Null when the bee is not live or has no
+ * pending request. Never throws.
+ */
+export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
+  if (!isMetaLive(await readHsrMeta(bee))) return null;
+  return pendingNeedsInputFromEvents(await readEventTail(bee));
 }
 
 /**
@@ -277,36 +348,23 @@ export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput 
  *   latestExhausted — the newest `exhausted` event (by ts) with its resetHint,
  *                     or undefined. The caller edge-detects on `ts`.
  *
- * Reads the whole log (as readEventTail already does under the hood) but is
- * tolerant of a missing/partial/torn file — a bad line is skipped, never thrown.
+ * Reads the whole log — the cumulative sum needs every usage event, including
+ * the checkpoint the writer prepends on compaction — but the log itself is
+ * bounded by writer-side compaction (runDir.ts HSR_EVENTS_MAX_BYTES), so this
+ * stays O(cap) per tick, not O(session lifetime). Tolerant of a
+ * missing/partial/torn file — a bad line is skipped, never thrown.
  */
 export type HsrUsageObservation = {
   totals: { inputTokens: number; outputTokens: number } | null;
   latestExhausted?: { ts: number; resetHint?: string };
 };
 
-export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservation> {
-  let raw: string;
-  try {
-    raw = await readFile(hsrEventsPath(bee), "utf8");
-  } catch {
-    return { totals: null };
-  }
+export function hsrUsageObservationFromEvents(events: RunnerEvent[]): HsrUsageObservation {
   let input = 0;
   let output = 0;
   let sawUsage = false;
   let latestExhausted: { ts: number; resetHint?: string } | undefined;
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event: RunnerEvent;
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (!parsed || typeof parsed !== "object" || typeof (parsed as { type?: unknown }).type !== "string") continue;
-      event = parsed as RunnerEvent;
-    } catch {
-      continue; // torn / partial line
-    }
+  for (const event of events) {
     if (event.type === "usage") {
       sawUsage = true;
       if (typeof event.inputTokens === "number" && Number.isFinite(event.inputTokens)) input += event.inputTokens;
@@ -324,10 +382,69 @@ export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservat
   };
 }
 
+export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservation> {
+  let raw: string;
+  try {
+    raw = await readFile(hsrEventsPath(bee), "utf8");
+  } catch {
+    return { totals: null };
+  }
+  return hsrUsageObservationFromEvents(parseRunnerEvents(raw));
+}
+
+// Escalation grace for orphaned harness child groups (SIGTERM → SIGKILL),
+// mirrors streamRunner.ts stop().
+const ORPHAN_STOP_GRACE_MS = 2_000;
+const ORPHAN_STOP_POLL_MS = 25;
+
+/** Signal-0 liveness probe of a whole process group. */
+function isPgidAlive(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 0) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 /**
- * Reconcile stale `running` meta whose host pid is dead: flip status to
- * "exited" (with endedAt) and return the reaped bee names. Crash-adoption v1 —
- * no pipe recovery.
+ * Kill the harness child group a dead host left behind (HIVE-53). The runner
+ * spawns the harness detached (own group leader, pgid === childPid), so a host
+ * that dies WITHOUT running finalize (SIGKILL/OOM — locally a crashed
+ * `__hsr-run`, remotely the serve whose in-process runners share its pid)
+ * strands the child: still running, control socket gone, meta stuck "running".
+ * Callers pass a meta whose host pid is already known-dead; we SIGTERM the
+ * recorded child group, grant a short grace, then SIGKILL. Returns true when a
+ * live group was signalled. Never throws.
+ */
+export async function killOrphanedChildGroup(meta: HsrMeta | null): Promise<boolean> {
+  const pgid = meta?.childPgid ?? meta?.childPid ?? 0;
+  if (!isPgidAlive(pgid)) return false;
+  try {
+    process.kill(-pgid, "SIGTERM");
+  } catch {
+    // Died between the probe and the signal.
+  }
+  const deadline = Date.now() + ORPHAN_STOP_GRACE_MS;
+  while (isPgidAlive(pgid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, ORPHAN_STOP_POLL_MS));
+  }
+  if (isPgidAlive(pgid)) {
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {
+      // best-effort
+    }
+  }
+  return true;
+}
+
+/**
+ * Reconcile stale `running` meta whose host pid is dead: kill the orphaned
+ * harness child group it left behind (HIVE-53), flip status to "exited" (with
+ * endedAt) and return the reaped bee names. Crash-adoption v1 — no pipe
+ * recovery.
  */
 export async function reapDeadHosts(): Promise<string[]> {
   const reaped: string[] = [];
@@ -338,6 +455,10 @@ export async function reapDeadHosts(): Promise<string[]> {
     // status (flips to "exited" when the bee leaves the remote list). Skip it.
     if (meta.mirrorOfNode) continue;
     if (isPidAlive(meta.hostPid)) continue;
+    // The dead host never ran finalize, so its detached harness child may still
+    // be running with no control plane — kill the group before flipping meta,
+    // or the leak outlives the reap.
+    await killOrphanedChildGroup(meta);
     await writeHsrMeta(bee, { ...meta, status: "exited", endedAt: new Date().toISOString() });
     reaped.push(bee);
   }

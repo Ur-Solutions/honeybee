@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,6 +8,29 @@ import type { NodeRecord } from "../src/node.js";
 import { clearSubstrateCache, localSubstrate, LOCAL_NODE, substrateFor, substrateForNode, substrateForRecord } from "../src/substrates/index.js";
 import { createLocalTmuxSubstrate, hasSession, kill as tmuxKillSession, newSession, sendText, tmux } from "../src/substrates/local-tmux.js";
 import * as legacyTmux from "../src/tmux.js";
+
+async function withTempStore(fn: () => Promise<void>): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), "hive-substrate-store-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  clearSubstrateCache();
+  try {
+    await fn();
+  } finally {
+    clearSubstrateCache();
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function writeNodeFile(name: string, contents: string): Promise<void> {
+  const root = process.env.HIVE_STORE_ROOT;
+  assert.ok(root, "HIVE_STORE_ROOT must be set by withTempStore");
+  const dir = join(root, "nodes");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, `${name}.json`), contents, { mode: 0o600 });
+}
 
 test("createLocalTmuxSubstrate returns a Substrate tagged 'local-tmux' on the local node", () => {
   const s = createLocalTmuxSubstrate();
@@ -46,6 +69,25 @@ test("substrateForNode rejects unknown nodes with a registration hint", () => {
   assert.throws(() => substrateForNode("mini01"), /Unknown node: mini01.*hive node register/);
   assert.doesNotThrow(() => substrateForNode("local"));
   assert.doesNotThrow(() => substrateForNode(undefined));
+});
+
+test("substrateForNode ignores a corrupt local overlay and falls back to local-tmux", async () => {
+  await withTempStore(async () => {
+    await writeNodeFile(LOCAL_NODE, "{");
+
+    const substrate = substrateForNode(LOCAL_NODE);
+    assert.equal(substrate.kind, "local-tmux");
+    assert.equal(substrate.node, LOCAL_NODE);
+  });
+});
+
+test("substrateForNode treats a corrupt remote node record like an unregistered node", async () => {
+  await withTempStore(async () => {
+    await writeNodeFile("mini01", "{");
+
+    assert.throws(() => substrateForNode("mini01"), /Unknown node: mini01.*hive node register/);
+    assert.throws(() => substrateFor({ node: "mini01" }), /Unknown node: mini01.*hive node register/);
+  });
 });
 
 test("tmux.js shim exposes the same callable names as the substrate's methods", () => {
@@ -114,6 +156,26 @@ test("substrateForRecord keys the ssh cache on name + sshCommand + sshArgs, not 
     // produce a fresh substrate for long-lived processes (daemon).
     assert.notEqual(substrateForRecord({ ...base, sshArgs: ["-F", "/etc/ssh/config"] }), a);
     assert.notEqual(substrateForRecord({ ...base, sshCommand: "/usr/local/bin/ssh" }), a);
+  } finally {
+    clearSubstrateCache();
+  }
+});
+
+test("substrateForRecord routes every node kind through the registry to the matching substrate, cached per node", () => {
+  clearSubstrateCache();
+  const now = "2026-05-28T00:00:00.000Z";
+  const nodes: Record<string, NodeRecord> = {
+    "local-tmux": { name: "local", kind: "local-tmux", endpoint: "localhost", capabilities: ["*"], createdAt: now, updatedAt: now },
+    "ssh-tmux": { name: "mini01", kind: "ssh-tmux", endpoint: "trmd@mini01", capabilities: ["*"], createdAt: now, updatedAt: now },
+    "remote-hsr": { name: "hsr01", kind: "remote-hsr", endpoint: "trmd@hsr01", capabilities: ["*"], createdAt: now, updatedAt: now },
+  };
+  try {
+    for (const [kind, node] of Object.entries(nodes)) {
+      const substrate = substrateForRecord(node);
+      assert.equal(substrate.kind, kind, `${kind} node routes to a ${kind} substrate`);
+      // getOrCache: an equivalent record resolves to the same cached instance.
+      assert.equal(substrateForRecord({ ...node }), substrate, `${kind} substrate is cached per node`);
+    }
   } finally {
     clearSubstrateCache();
   }

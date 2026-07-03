@@ -18,6 +18,7 @@ import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
+import { rewriteColonyWorkspaceReferences, rewriteQuestWorkspaceReferences, withReferenceRenameLocks } from "./referenceCascade.js";
 import { appendLedger } from "./store.js";
 
 export type WorkspaceMember =
@@ -168,7 +169,7 @@ export async function updateWorkspace(name: string, patch: WorkspacePatch): Prom
 export async function renameWorkspace(oldName: string, newName: string): Promise<WorkspaceRecord> {
   if (!validWorkspaceName(oldName)) throw new Error(`Invalid workspace name: ${oldName}. Use alphanumerics, dashes, and underscores.`);
   if (!validWorkspaceName(newName)) throw new Error(`Invalid workspace name: ${newName}. Use alphanumerics, dashes, and underscores.`);
-  return withWorkspacesLock(async () => {
+  return withReferenceRenameLocks(async () => {
     const existing = await loadWorkspace(oldName);
     if (!existing) throw new Error(`Unknown workspace: ${oldName}`);
     if (oldName === newName) return existing;
@@ -179,6 +180,8 @@ export async function renameWorkspace(oldName: string, newName: string): Promise
     // deleted duplicate), not lost entirely on a failed write.
     await saveWorkspace(updated);
     await rm(workspacePath(oldName), { force: true });
+    await rewriteColonyWorkspaceReferences(oldName, newName);
+    await rewriteQuestWorkspaceReferences(oldName, newName);
     await appendLedger({ type: "workspace.rename", from: oldName, to: newName });
     return updated;
   });

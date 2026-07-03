@@ -13,6 +13,7 @@ import {
   loopHistoryLogPath,
   loopHistoryMdPath,
   loopIterLogPath,
+  PIDLESS_RUNNING_GRACE_MS,
   loopProgressPath,
   type LoopConfig,
   readLoopConfig,
@@ -32,12 +33,14 @@ import {
   truncateForInjection,
 } from "../src/loop/summarizer.js";
 import { __setLoopTestHooks, loopFlow } from "../src/loop/flow.js";
-import { listFlows, loadFlow } from "../src/flow/index.js";
+import { loopStatus, loopStop, startLoop, type LoopSpawnInput } from "../src/loop/control.js";
+import { loopStopConditionsForPhase, loopStopFlowArgs } from "../src/loop/stopConditions.js";
+import { listFlows, loadFlow, type FlowContext } from "../src/flow/index.js";
 import { executeFlow } from "../src/flow/run.js";
 import { HiveFacade } from "../src/flow/hive_facade.js";
 import { cancelRun, spawnDetachedRun } from "../src/flow/background.js";
 import { defineFlow } from "../src/flow/index.js";
-import { readMeta, readResult } from "../src/flow/runs.js";
+import { createRunDir, readMeta, readResult } from "../src/flow/runs.js";
 import { recordSeal, type SealRecord, validateSealArtifact } from "../src/seal.js";
 import { saveSession, type SessionRecord } from "../src/store.js";
 
@@ -56,6 +59,26 @@ async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> 
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withFixedDate<T>(iso: string, fn: () => Promise<T>): Promise<T> {
+  const RealDate = globalThis.Date;
+  const fixedMs = RealDate.parse(iso);
+  const FixedDate = class extends RealDate {
+    constructor(...args: unknown[]) {
+      super(args.length === 0 ? fixedMs : (args[0] as string | number | Date));
+    }
+
+    static now(): number {
+      return fixedMs;
+    }
+  } as DateConstructor;
+  globalThis.Date = FixedDate;
+  try {
+    return await fn();
+  } finally {
+    globalThis.Date = RealDate;
+  }
 }
 
 function fakeRecord(name: string): SessionRecord {
@@ -122,7 +145,23 @@ test("buildLoopConfig validates --stop-on-seal CSV against seal statuses", () =>
   // default is ["done"].
   const cfg2 = buildLoopConfig({ ...baseArgs, max: 3 });
   assert.deepEqual(cfg2.stop.stopOnSeal, ["done"]);
+  // Explicit blank means never stop on a seal.
+  const cfg3 = buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: "" });
+  assert.deepEqual(cfg3.stop.stopOnSeal, []);
+  const cfg4 = buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: " , " });
+  assert.deepEqual(cfg4.stop.stopOnSeal, []);
   assert.throws(() => buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: "done,bogus" }), /Invalid --stop-on-seal/);
+});
+
+test("loop stop registry drives flow args and evaluation order", () => {
+  const stopArgNames = loopStopFlowArgs().map((arg) => arg.name);
+  assert.deepEqual(stopArgNames, ["until", "max", "maxDuration", "forever", "stopOnSeal", "stopOnSentinel", "judge"]);
+  assert.deepEqual(loopFlow.args?.slice(4, 4 + stopArgNames.length).map((arg) => arg.name), stopArgNames);
+  assert.deepEqual(loopStopConditionsForPhase("pre").map((condition) => condition.name), ["max", "max-duration", "until"]);
+  assert.deepEqual(
+    loopStopConditionsForPhase("post").map((condition) => condition.name),
+    ["stop-on-seal", "blocked-seal", "boundary-permission-prompt", "stop-on-sentinel", "judge", "max", "max-duration"],
+  );
 });
 
 test("coerceDuration parses 30s/10m/2h", () => {
@@ -185,8 +224,9 @@ test("listLoops returns newest-first by startedAt", async () => {
   });
 });
 
-test("listLoops downgrades running loops with a dead driver pid to orphaned (view only)", async () => {
+test("listLoops downgrades running loops with a dead or missing driver pid to orphaned (view only)", async () => {
   await withTempStore(async () => {
+    const now = Date.parse("2026-06-01T00:01:00.000Z");
     const dead = buildLoopConfig({ ...baseArgs, max: 1, loopId: "DEAD" });
     dead.loopId = "DEAD";
     dead.pid = 999_999_999;
@@ -195,23 +235,29 @@ test("listLoops downgrades running loops with a dead driver pid to orphaned (vie
     alive.loopId = "ALIVE";
     alive.pid = process.pid;
     await writeLoopConfig(alive);
-    const noPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "NOPID" });
-    noPid.loopId = "NOPID";
-    await writeLoopConfig(noPid);
+    const freshNoPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "NOPID_FRESH" });
+    freshNoPid.loopId = "NOPID_FRESH";
+    freshNoPid.startedAt = new Date(now - PIDLESS_RUNNING_GRACE_MS + 1_000).toISOString();
+    await writeLoopConfig(freshNoPid);
+    const staleNoPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "NOPID_STALE" });
+    staleNoPid.loopId = "NOPID_STALE";
+    staleNoPid.startedAt = new Date(now - PIDLESS_RUNNING_GRACE_MS - 1_000).toISOString();
+    await writeLoopConfig(staleNoPid);
 
-    const loops = await listLoops({ isPidAlive: (pid) => pid === process.pid });
+    const loops = await listLoops({ isPidAlive: (pid) => pid === process.pid, now });
     const byId = new Map(loops.map((l) => [l.loopId, l]));
     assert.equal(byId.get("DEAD")?.status, "orphaned");
     assert.equal(byId.get("ALIVE")?.status, "running");
-    // No pid yet (pre-driver write window) — left as-is.
-    assert.equal(byId.get("NOPID")?.status, "running");
+    assert.equal(byId.get("NOPID_FRESH")?.status, "running");
+    assert.equal(byId.get("NOPID_STALE")?.status, "orphaned");
     // The on-disk file is untouched: this is a view-level downgrade.
     const onDisk = await readLoopConfig("DEAD");
     assert.equal(onDisk?.status, "running");
+    assert.equal((await readLoopConfig("NOPID_STALE"))?.status, "running");
   });
 });
 
-test("reconcileLoopStatus only downgrades running+dead-pid", () => {
+test("reconcileLoopStatus only downgrades running loops with dead or stale missing pids", () => {
   const cfg = buildLoopConfig({ ...baseArgs, max: 1, loopId: "R" });
   cfg.loopId = "R";
   cfg.pid = 12345;
@@ -219,6 +265,17 @@ test("reconcileLoopStatus only downgrades running+dead-pid", () => {
   assert.equal(reconcileLoopStatus(cfg, () => true).status, "running");
   const done = { ...cfg, status: "done" as const };
   assert.equal(reconcileLoopStatus(done, () => false).status, "done");
+
+  const now = Date.parse("2026-06-01T00:01:00.000Z");
+  const freshNoPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "FRESH" });
+  freshNoPid.loopId = "FRESH";
+  freshNoPid.startedAt = new Date(now - PIDLESS_RUNNING_GRACE_MS + 1_000).toISOString();
+  assert.equal(reconcileLoopStatus(freshNoPid, () => false, now).status, "running");
+
+  const staleNoPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "STALE" });
+  staleNoPid.loopId = "STALE";
+  staleNoPid.startedAt = new Date(now - PIDLESS_RUNNING_GRACE_MS - 1_000).toISOString();
+  assert.equal(reconcileLoopStatus(staleNoPid, () => false, now).status, "orphaned");
 });
 
 test("stop-request sentinel write + detect", async () => {
@@ -502,6 +559,59 @@ test("driver: stops on max", async () => {
   });
 });
 
+test("driver: maxDuration is checked before starting a pass", async () => {
+  await withTempStore(async () => {
+    let ensureCalled = false;
+    let nowCalls = 0;
+    __setLoopTestHooks({
+      ensureBee: async () => {
+        ensureCalled = true;
+        throw new Error("must not spawn after maxDuration is already due");
+      },
+      now: () => {
+        nowCalls += 1;
+        return nowCalls === 1 ? 1_000 : 2_500;
+      },
+    });
+    try {
+      const outcome = await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "ralph", max: 50, maxDuration: "1s", stopOnSeal: "done", loopId: "DUE1" },
+        runId: "DUE1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("DUE1");
+      assert.equal(ensureCalled, false);
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "max-duration");
+      assert.equal(cfg?.iteration, 0);
+      assert.equal((outcome.value as { stopReason: string }).stopReason, "max-duration");
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
+test("driver: blank --stop-on-seal never stops on seals", async () => {
+  await withTempStore(async () => {
+    installDriverHooks(() => "done");
+    try {
+      await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "ralph", max: 2, stopOnSeal: "", loopId: "NEVERSEAL1" },
+        runId: "NEVERSEAL1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("NEVERSEAL1");
+      assert.deepEqual(cfg?.stop.stopOnSeal, []);
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "max");
+      assert.equal(cfg?.iteration, 2);
+      assert.equal(cfg?.lastSealStatus, "done");
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
 test("driver: persistent re-prompts the SAME bee each iteration", async () => {
   await withTempStore(async () => {
     const beeNames = new Set<string>();
@@ -682,6 +792,45 @@ test("driver: a seal landing BEFORE the boundary wait starts is still detected (
   });
 });
 
+test("driver: same-millisecond seal after baseline is detected by filename cursor", async () => {
+  await withTempStore(async () => {
+    const beeName = "loop-same-ms";
+    await withFixedDate("2026-07-03T12:01:00.123Z", async () => {
+      await recordSeal(beeName, validateSealArtifact({ status: "failed", summary: "old baseline" }));
+    });
+    __setLoopTestHooks({
+      ensureBee: async ({ facade }) => {
+        const record = fakeRecord(beeName);
+        await saveSession(record);
+        (facade as unknown as { spawned: SessionRecord[] }).spawned.push(record);
+        return record;
+      },
+      send: async ({ handle }) => {
+        await withFixedDate("2026-07-03T12:01:00.123Z", async () => {
+          await recordSeal(handle.name, validateSealArtifact({ status: "done", summary: "new same-ms seal" }));
+        });
+      },
+      sealTimeoutMs: 5_000,
+      boundaryPollMs: 10,
+    });
+    try {
+      await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "persistent", max: 5, stopOnSeal: "done", loopId: "SAMEMS1" },
+        runId: "SAMEMS1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("SAMEMS1");
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "seal:done");
+      assert.equal(cfg?.iteration, 1);
+      const iterSeal = JSON.parse(await readFile(join(process.env.HIVE_STORE_ROOT!, "loops", "SAMEMS1", "seals", "iter-001.json"), "utf8")) as SealRecord;
+      assert.equal(iterSeal.summary, "new same-ms seal");
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
 test("driver: stop-on-sentinel fires in ralph (fresh-carrier) mode", async () => {
   await withTempStore(async () => {
     // Regression: in fresh-carrier modes the bee is killed + handle cleared
@@ -783,6 +932,50 @@ test("driver: stop-request sentinel halts before the next iteration", async () =
       const cfg = await readLoopConfig("STOPREQ");
       assert.equal(cfg?.status, "stopped");
       assert.equal(cfg?.stopReason, "stop-requested");
+      assert.equal(cfg?.iteration, 0);
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
+test("driver: abort during send finalizes the loop as stopped", async () => {
+  await withTempStore(async () => {
+    const runId = "ABORTSEND";
+    await createRunDir("loop", runId);
+    const controller = new AbortController();
+    let sendCalled = false;
+    __setLoopTestHooks({
+      ensureBee: async ({ facade }) => {
+        const record = fakeRecord("abort-send-bee");
+        await saveSession(record);
+        (facade as unknown as { spawned: SessionRecord[] }).spawned.push(record);
+        return record;
+      },
+      send: async () => {
+        sendCalled = true;
+        controller.abort();
+        throw new Error("send interrupted by abort");
+      },
+    });
+    try {
+      const facade = new HiveFacade({ flowName: "loop", runId, signal: controller.signal });
+      const ctx: FlowContext = {
+        runId,
+        flowName: "loop",
+        args: { ...baseArgs, context: "ralph", max: 5, stopOnSeal: "done", loopId: runId },
+        bindings: {},
+        signal: controller.signal,
+        hive: facade,
+      };
+      const result = await loopFlow.run(ctx) as { status: string; stopReason: string; iterations: number };
+      const cfg = await readLoopConfig(runId);
+      assert.equal(sendCalled, true);
+      assert.equal(result.status, "stopped");
+      assert.equal(result.stopReason, "aborted");
+      assert.equal(result.iterations, 0);
+      assert.equal(cfg?.status, "stopped");
+      assert.equal(cfg?.stopReason, "aborted");
       assert.equal(cfg?.iteration, 0);
     } finally {
       __setLoopTestHooks(undefined);
@@ -895,10 +1088,10 @@ test("cancelRun('loop', …) signals the NEGATIVE pgid", async () => {
 });
 
 /* ──────────────────────────────────────────────────────────────────────────
- * 8. Facade happy path
+ * 8. Control surface — startLoop / loopStatus / loopStop
  * ────────────────────────────────────────────────────────────────────────── */
 
-test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", async () => {
+test("startLoop writes initial loop.json and loopStop sets the sentinel", async () => {
   await withTempStore(async () => {
     const fixtureDir = await mkdtemp(join(tmpdir(), "honeybee-loop-fix-"));
     try {
@@ -907,22 +1100,51 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
       // Point the detached spawn at the fixture entry so we don't fork the real CLI.
       const original = process.argv[1];
       process.argv[1] = fixture;
-      const facade = new HiveFacade({ flowName: "loop", runId: "facade-run" });
       let loopId: string;
       try {
-        loopId = await facade.loop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x", max: 2 });
+        loopId = await startLoop({
+          bee: "claude",
+          cwd: "/tmp",
+          context: "ralph",
+          prompt: "x",
+          until: "exit 1",
+          max: 2,
+          maxDuration: "30s",
+          stopOnSeal: "done,blocked",
+          stopOnSentinel: "ALL DONE",
+          judge: "claude",
+        });
       } finally {
         process.argv[1] = original;
       }
       // Short, bee-id-style loop id (LP.<hex>) — targetable by suffix, not a raw run id.
       assert.match(loopId, /^LP\.[0-9a-f]{3,}$/);
-      const cfg = await facade.loopStatus(loopId);
+      const cfg = await loopStatus(loopId);
       assert.ok(cfg);
       assert.equal(cfg?.context, "ralph");
       assert.equal(cfg?.stop.max, 2);
+      assert.equal(cfg?.stop.until, "exit 1");
+      assert.equal(cfg?.stop.maxDurationMs, 30_000);
+      assert.deepEqual(cfg?.stop.stopOnSeal, ["done", "blocked"]);
+      assert.equal(cfg?.stop.stopOnSentinel, "ALL DONE");
+      assert.equal(cfg?.stop.judge, "claude");
+      const meta = await readMeta("loop", loopId);
+      assert.deepEqual(meta?.args, {
+        bee: "claude",
+        cwd: "/tmp",
+        context: "ralph",
+        prompt: "x",
+        loopId,
+        until: "exit 1",
+        max: 2,
+        maxDuration: "30s",
+        stopOnSeal: "done,blocked",
+        stopOnSentinel: "ALL DONE",
+        judge: "claude",
+      });
 
       // Graceful stop writes the sentinel.
-      await facade.loopStop(loopId);
+      await loopStop(loopId);
       assert.equal(await isStopRequested(loopId), true);
     } finally {
       await rm(fixtureDir, { recursive: true, force: true });
@@ -930,16 +1152,15 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
   });
 });
 
-test("HiveFacade.loop persists an errored loop.json when the detached spawn fails", async () => {
+test("startLoop persists an errored loop.json when the detached spawn fails", async () => {
   await withTempStore(async () => {
     // Regression: a spawn failure AFTER the loop.json pre-write used to strand
     // the loop as "running" with no pid — nothing could ever reconcile it.
-    const facade = new HiveFacade({ flowName: "loop", runId: "facade-run-spawnfail" });
     const original = process.argv[1];
     process.argv[1] = ""; // resolveEntry() throws → spawnDetachedRun rejects
     try {
       await assert.rejects(
-        () => facade.loop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x", max: 1 }),
+        () => startLoop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x", max: 1 }),
         /could not resolve CLI entry path/,
       );
     } finally {
@@ -953,12 +1174,11 @@ test("HiveFacade.loop persists an errored loop.json when the detached spawn fail
   });
 });
 
-test("HiveFacade.loop validates eagerly (bad config throws before spawning)", async () => {
+test("startLoop validates eagerly (bad config throws before spawning)", async () => {
   await withTempStore(async () => {
-    const facade = new HiveFacade({ flowName: "loop", runId: "facade-run-2" });
     // No max and not forever → buildLoopConfig throws.
     await assert.rejects(
-      () => facade.loop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x" } as Parameters<typeof facade.loop>[0]),
+      () => startLoop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x" } as LoopSpawnInput),
       /--max/,
     );
   });

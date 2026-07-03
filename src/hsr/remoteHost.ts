@@ -19,10 +19,10 @@
  */
 
 import { fileURLToPath } from "node:url";
-import { realpathSync, existsSync, type Dirent } from "node:fs";
-import { mkdir, readdir, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { execFile, execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
 import {
   connectRpcClient,
   startRpcServer,
@@ -30,66 +30,22 @@ import {
   type RpcMethodHandler,
   type RpcServer,
 } from "./rpc.js";
-import { hsrObservations, pendingNeedsInput } from "./observe.js";
-import { readHsrMeta, hsrRunDir, worktreesRoot } from "./runDir.js";
+import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, reapDeadHosts } from "./observe.js";
+import { readHsrMeta, hsrRunDir } from "./runDir.js";
 import {
   homeDirForSpec,
   recordDeliveredCredentials,
   shredDeliveredCredentials,
   writeDeliveredCredentials,
-  type DeliveredCredentials,
-  type EphemeralCredentialFile,
 } from "./remoteCreds.js";
 import { runHsrHost, type HsrHostHandle } from "./host.js";
 import { adapterFor } from "./adapters/index.js";
+import { normalizeCreds } from "./credsParams.js";
+import { provisionCheckout, enumerateCheckouts, type ProvisionParams } from "./provisioning.js";
 import type { RunnerOpts } from "./types.js";
-
-/** Signal-0 liveness probe; EPERM means the pid exists but isn't ours. */
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * Validate the untyped `creds` RPC param into a DeliveredCredentials, dropping
- * malformed entries. Never throws and never logs the (opaque) credential bytes.
- */
-function normalizeCreds(value: unknown): DeliveredCredentials | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const object = value as { files?: unknown; env?: unknown };
-  const files: EphemeralCredentialFile[] = [];
-  if (Array.isArray(object.files)) {
-    for (const entry of object.files) {
-      if (!entry || typeof entry !== "object") continue;
-      const f = entry as Record<string, unknown>;
-      if (typeof f.homeRelPath !== "string" || typeof f.contentB64 !== "string") continue;
-      // Reject path escapes so a delivered file can never land outside the home.
-      if (f.homeRelPath.startsWith("/") || f.homeRelPath.split("/").includes("..")) continue;
-      files.push({
-        homeRelPath: f.homeRelPath,
-        contentB64: f.contentB64,
-        mode: typeof f.mode === "number" ? f.mode : 0o600,
-      });
-    }
-  }
-  const env: Record<string, string> = {};
-  if (object.env && typeof object.env === "object" && !Array.isArray(object.env)) {
-    for (const [key, val] of Object.entries(object.env as Record<string, unknown>)) {
-      if (typeof val === "string") env[key] = val;
-    }
-  }
-  const hasEnv = Object.keys(env).length > 0;
-  if (files.length === 0 && !hasEnv) return undefined;
-  return { ...(files.length ? { files } : {}), ...(hasEnv ? { env } : {}) };
 }
 
 // The package version this host was built from. Bundle-time esbuild `define`
@@ -130,168 +86,6 @@ export function versionCore(): string {
 /** The full handshake string printed by `--version` and returned by `ping`. */
 export function versionString(): string {
   return `runner-host ${versionCore()}`;
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Working-copy provisioning (APIA-95) — clone/enumerate git checkouts ON THE
-// REMOTE under `<storeRoot>/worktrees/<name>`, so a bee can be spawned inside a
-// fresh checkout of a repo/branch on the node. git is driven via child_process
-// (present on any node that runs honeybee); no new deps, bundle stays inlinable.
-//
-// Groundwork for Apiary's "where-it-lives" selector on non-local substrates
-// (substrates-research §5.3 / architecture §7.5): `provision` + `listCheckouts`
-// are the substrate primitives that selector will drive — no Apiary work here.
-// ──────────────────────────────────────────────────────────────────────────
-
-/** Run git without throwing: resolves `{ ok, stdout, stderr, code }`. */
-function runGit(args: string[], cwd?: string): Promise<{ ok: boolean; stdout: string; stderr: string; code: number }> {
-  return new Promise((resolve) => {
-    execFile("git", args, { cwd, maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (!error) {
-        resolve({ ok: true, stdout: stdout ?? "", stderr: stderr ?? "", code: 0 });
-        return;
-      }
-      const code = typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1;
-      resolve({ ok: false, stdout: stdout ?? "", stderr: stderr ?? "", code });
-    });
-  });
-}
-
-function firstLine(text: string): string {
-  return (text.split("\n").find((l) => l.trim().length > 0) ?? "").trim();
-}
-
-/** Normalize a git url for identity comparison (strip trailing `.git` / slashes). */
-function normRepo(url: string): string {
-  return url.trim().replace(/\.git$/i, "").replace(/\/+$/, "");
-}
-
-function sameRepo(a: string, b: string): boolean {
-  return normRepo(a) === normRepo(b);
-}
-
-/** Derive a filesystem-safe checkout name from a repo url (last path segment, no `.git`). */
-function slugForRepo(repo: string): string {
-  const trimmed = repo.trim().replace(/\.git$/i, "").replace(/[/\\]+$/, "");
-  const seg = trimmed.split(/[/:\\]/).filter(Boolean).pop() ?? "repo";
-  const cleaned = seg.replace(/[^A-Za-z0-9._-]/g, "-").replace(/^-+|-+$/g, "");
-  return cleaned || "repo";
-}
-
-/**
- * Validate a checkout name can never escape the worktrees dir: a single path
- * segment, no `..`, no separators, no absolute/NUL. Returns null when invalid.
- */
-function safeCheckoutName(raw: string): string | null {
-  const name = raw.trim();
-  if (!name || name === "." || name === "..") return null;
-  if (name.includes("/") || name.includes("\\") || name.includes("\0")) return null;
-  if (name.startsWith("/")) return null;
-  return name;
-}
-
-/** Current branch of a checkout (`HEAD` when detached → undefined). Best-effort. */
-async function currentBranch(path: string): Promise<string | undefined> {
-  const res = await runGit(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]);
-  if (!res.ok) return undefined;
-  const branch = res.stdout.trim();
-  return branch && branch !== "HEAD" ? branch : undefined;
-}
-
-type ProvisionParams = { repo?: unknown; branch?: unknown; name?: unknown; ref?: unknown };
-
-/**
- * Clone (or idempotently reuse) a git checkout under `<storeRoot>/worktrees/<name>`.
- * Shallow (`--depth 1`) unless a `ref` needs history. Never throws — a git failure
- * (git missing, bad url, auth) surfaces as `{ ok:false, error }`.
- */
-async function provisionCheckout(params: ProvisionParams): Promise<Record<string, unknown>> {
-  const repo = typeof params.repo === "string" ? params.repo.trim() : "";
-  if (!repo) return { ok: false, error: "repo required" };
-  const branch = typeof params.branch === "string" && params.branch ? params.branch : undefined;
-  const ref = typeof params.ref === "string" && params.ref ? params.ref : undefined;
-  const rawName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : slugForRepo(repo);
-  const name = safeCheckoutName(rawName);
-  if (!name) return { ok: false, error: `invalid checkout name: ${rawName}` };
-
-  const root = worktreesRoot();
-  const path = join(root, name);
-
-  if (existsSync(path)) {
-    // Reuse an existing checkout of the SAME repo (fetch + checkout); refuse to
-    // clobber a directory that is not this repo's checkout.
-    const inside = await runGit(["-C", path, "rev-parse", "--is-inside-work-tree"]);
-    if (!inside.ok || inside.stdout.trim() !== "true") {
-      return { ok: false, error: `${path} exists but is not a git checkout` };
-    }
-    const originRes = await runGit(["-C", path, "remote", "get-url", "origin"]);
-    const origin = originRes.stdout.trim();
-    if (originRes.ok && origin && !sameRepo(origin, repo)) {
-      return { ok: false, error: `${path} is a checkout of a different repo (${origin})` };
-    }
-    const fetchArgs = ref
-      ? ["-C", path, "fetch", "origin"]
-      : ["-C", path, "fetch", "--depth", "1", "origin", ...(branch ? [branch] : [])];
-    const fetched = await runGit(fetchArgs);
-    if (!fetched.ok) return { ok: false, error: `fetch failed: ${firstLine(fetched.stderr) || `git exited ${fetched.code}`}` };
-    if (ref) {
-      const co = await runGit(["-C", path, "checkout", ref]);
-      if (!co.ok) return { ok: false, error: `checkout ${ref} failed: ${firstLine(co.stderr) || `git exited ${co.code}`}` };
-    } else if (branch) {
-      const co = await runGit(["-C", path, "checkout", branch]);
-      if (!co.ok) return { ok: false, error: `checkout ${branch} failed: ${firstLine(co.stderr) || `git exited ${co.code}`}` };
-      // Best-effort fast-forward to the freshly fetched tip.
-      await runGit(["-C", path, "reset", "--hard", `origin/${branch}`]);
-    }
-    const resolvedBranch = branch ?? (await currentBranch(path));
-    return { ok: true, path, repo, ...(resolvedBranch ? { branch: resolvedBranch } : {}), reused: true };
-  }
-
-  await mkdir(root, { recursive: true, mode: 0o700 }).catch(() => undefined);
-  const cloneArgs = ["clone"];
-  // Shallow by default; a pinned ref may need history, so clone full then check it out.
-  if (!ref) cloneArgs.push("--depth", "1");
-  if (branch) cloneArgs.push("--branch", branch);
-  cloneArgs.push(repo, path);
-  const cloned = await runGit(cloneArgs);
-  if (!cloned.ok) {
-    return { ok: false, error: `clone failed: ${firstLine(cloned.stderr) || firstLine(cloned.stdout) || `git exited ${cloned.code}`}` };
-  }
-  if (ref) {
-    const co = await runGit(["-C", path, "checkout", ref]);
-    if (!co.ok) return { ok: false, error: `checkout ${ref} failed: ${firstLine(co.stderr) || `git exited ${co.code}`}` };
-  }
-  const resolvedBranch = branch ?? (await currentBranch(path));
-  return { ok: true, path, repo, ...(resolvedBranch ? { branch: resolvedBranch } : {}), reused: false };
-}
-
-/** Enumerate `<storeRoot>/worktrees/*` that are git checkouts. Best-effort; tolerates non-git dirs. */
-async function enumerateCheckouts(): Promise<Array<Record<string, unknown>>> {
-  const root = worktreesRoot();
-  let entries: Dirent[];
-  try {
-    entries = await readdir(root, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const rows: Array<Record<string, unknown>> = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const path = join(root, entry.name);
-    const inside = await runGit(["-C", path, "rev-parse", "--is-inside-work-tree"]);
-    if (!inside.ok || inside.stdout.trim() !== "true") continue; // tolerate a non-git dir
-    const originRes = await runGit(["-C", path, "remote", "get-url", "origin"]);
-    const branch = await currentBranch(path);
-    const dirtyRes = await runGit(["-C", path, "status", "--porcelain"]);
-    rows.push({
-      name: entry.name,
-      path,
-      repo: originRes.ok && originRes.stdout.trim() ? originRes.stdout.trim() : null,
-      branch: branch ?? null,
-      ...(dirtyRes.ok ? { dirty: dirtyRes.stdout.trim().length > 0 } : {}),
-    });
-  }
-  return rows;
 }
 
 /**
@@ -384,11 +178,19 @@ export function buildController(): RunnerHostController {
         }
       }
     }
-    if (!stopped && meta && meta.status === "running" && isPidAlive(meta.hostPid)) {
-      try {
-        process.kill(meta.hostPid, "SIGTERM");
-      } catch {
-        // already gone / not signalable
+    if (!stopped && meta && meta.status === "running") {
+      if (isPidAlive(meta.hostPid)) {
+        try {
+          process.kill(meta.hostPid, "SIGTERM");
+        } catch {
+          // already gone / not signalable
+        }
+      } else {
+        // The host died without finalize (a previous serve was SIGKILLed/OOMed:
+        // its in-process runners carried the serve's pid as hostPid), so the
+        // harness child group is orphaned and unreachable over any control
+        // socket. Signal the recorded child group directly (HIVE-53).
+        await killOrphanedChildGroup(meta);
       }
     }
   }
@@ -551,13 +353,17 @@ export function buildController(): RunnerHostController {
     // Establish (or ref-count into) a relay of the bee's live event stream. Each
     // `event` the bee's control socket pushes is re-broadcast to ALL clients as
     // `hsr.event` { bee, event } — the local transport re-emits it upward.
+    // `sync` (reconnect reconciliation, HIVE-56): instead of incrementing, SET
+    // the refcount to the caller's subscriber count — a re-issued observe after
+    // a tunnel flap must not inflate the count past what unobserve will return.
     observe: guarded(async (params) => {
-      const p = (params ?? {}) as { bee?: unknown };
+      const p = (params ?? {}) as { bee?: unknown; sync?: unknown };
       const bee = String(p.bee ?? "");
       if (!bee) return { ok: false, error: "bee required" };
+      const sync = typeof p.sync === "number" && Number.isFinite(p.sync) ? Math.max(1, Math.floor(p.sync)) : undefined;
       const existing = relays.get(bee);
       if (existing) {
-        existing.refCount += 1;
+        existing.refCount = sync ?? existing.refCount + 1;
         return { ok: true };
       }
       const meta = await readHsrMeta(bee);
@@ -577,11 +383,34 @@ export function buildController(): RunnerHostController {
           // A closing socket must not wedge the relay pump.
         }
       });
-      relays.set(bee, { client, refCount: 1, unsubscribe });
+      relays.set(bee, { client, refCount: sync ?? 1, unsubscribe });
       void client.closed.then(() => {
         const relay = relays.get(bee);
         if (relay && relay.client === client) relays.delete(bee);
       });
+      return { ok: true };
+    }),
+
+    // Release a relay subscription (HIVE-56): decrement the refcount by `count`
+    // (default 1) and close the per-bee control-socket client once it hits zero.
+    // Idempotent — a relay already gone (bee killed, client.closed pruned it)
+    // is a success, so teardown/unsubscribe races never surface errors.
+    unobserve: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; count?: unknown };
+      const bee = String(p.bee ?? "");
+      if (!bee) return { ok: false, error: "bee required" };
+      const count = typeof p.count === "number" && Number.isFinite(p.count) ? Math.max(1, Math.floor(p.count)) : 1;
+      const relay = relays.get(bee);
+      if (!relay) return { ok: true };
+      relay.refCount -= count;
+      if (relay.refCount > 0) return { ok: true };
+      relays.delete(bee);
+      try {
+        relay.unsubscribe();
+        relay.client.close();
+      } catch {
+        // best-effort teardown
+      }
       return { ok: true };
     }),
 
@@ -646,6 +475,12 @@ export function buildController(): RunnerHostController {
 
 /** Start the runner-host control socket. Returns an RpcServer whose close also tears down the controller. */
 export async function serve(socketPath: string): Promise<RpcServer> {
+  // Startup reaper (HIVE-53): a previous serve that died without finalize
+  // (SIGKILL/OOM) left its in-process runners' meta "running" with hostPid =
+  // the dead serve's pid and their detached harness children orphaned. Adopt
+  // them before accepting control traffic: kill the orphaned child groups and
+  // flip their meta so the control plane restarts from a truthful view.
+  await reapDeadHosts().catch(() => undefined);
   const controller = buildController();
   const server = await startRpcServer({ socketPath, methods: controller.methods });
   controller.attachServer(server);
@@ -653,6 +488,7 @@ export async function serve(socketPath: string): Promise<RpcServer> {
     path: server.path,
     broadcast: (method, params) => server.broadcast(method, params),
     connectionCount: () => server.connectionCount(),
+    broadcastDroppedCount: () => server.broadcastDroppedCount(),
     async close(): Promise<void> {
       await controller.close();
       await server.close();

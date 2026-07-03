@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { BUZ_TIERS } from "../src/buz.js";
 import { fileCandidates, getCompletionsFromState, shellScript } from "../src/completion.js";
 import type { SessionRecord } from "../src/store.js";
 
@@ -26,6 +27,8 @@ test("completes commands when no command typed", () => {
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("spawn"));
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("send"));
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("completion"));
+  assert.ok(getCompletionsFromState(["hive", ""], empty).includes("cat"));
+  assert.ok(getCompletionsFromState(["hive", ""], empty).includes("tx"));
 });
 
 test("completes commands with no args at all", () => {
@@ -81,14 +84,14 @@ test("completes shells as first arg of completion", () => {
   assert.deepEqual(getCompletionsFromState(["hive", "completion", ""], empty), ["bash", "zsh", "fish"]);
 });
 
-test("completes only live sessions for send/tail/transcript/last/wait/attach", () => {
+test("completes only live sessions for send/tail/cat/transcript/tx/wait/attach", () => {
   const records = [
     session("brave-otter", "brave-otter-target", "CO.abc"),
     session("dead-bee", "dead-bee-target", "CO.def"),
   ];
   const state = { records, liveTargets: new Set(["brave-otter-target"]) };
 
-  for (const cmd of ["send", "tail", "transcript", "wait", "attach"]) {
+  for (const cmd of ["send", "tail", "cat", "transcript", "tx", "wait", "attach"]) {
     const candidates = getCompletionsFromState(["hive", cmd, ""], state);
     assert.ok(candidates.includes("CO.abc"), `${cmd} should include live ref`);
     assert.ok(!candidates.includes("CO.def"), `${cmd} should exclude dead ref`);
@@ -129,6 +132,9 @@ test("completes flags when current word starts with dash", () => {
   const cleanFlags = getCompletionsFromState(["hive", "clean", "--"], empty);
   assert.ok(cleanFlags.includes("--dead"));
   assert.ok(cleanFlags.includes("--dry-run"));
+
+  assert.deepEqual(getCompletionsFromState(["hive", "cat", "--"], empty), ["-n", "--lines"]);
+  assert.deepEqual(getCompletionsFromState(["hive", "tx", "--"], empty), ["-n", "--limit", "--json"]);
 });
 
 test("returns empty for second positional arg of send (prompt is freeform)", () => {
@@ -224,6 +230,14 @@ test("completes frame names after --frame", () => {
     getCompletionsFromState(["hive", "spawn", "--frame", ""], state).sort(),
     ["deep-review", "frontend-redesign"],
   );
+});
+
+test("completes buz tier and accept values from BUZ_TIERS", () => {
+  assert.deepEqual(getCompletionsFromState(["hive", "buz", "send", "CO.abc", "--tier", ""], empty), [...BUZ_TIERS]);
+
+  const accept = getCompletionsFromState(["hive", "buz", "config", "CO.abc", "--accept", ""], empty);
+  for (const tier of BUZ_TIERS) assert.ok(accept.includes(tier), `accept completion includes ${tier}`);
+  assert.ok(accept.includes(BUZ_TIERS.join(",")), "accept completion includes the full tier chain");
 });
 
 test("completes subcommands for noun commands", () => {
@@ -359,4 +373,10 @@ test("--node and --kind are listed in spawn / node flag completion", () => {
   assert.ok(nodeFlags.includes("--kind"), "node flags include --kind");
   assert.ok(nodeFlags.includes("--endpoint"), "node flags include --endpoint");
   assert.ok(nodeFlags.includes("--capabilities"), "node flags include --capabilities");
+});
+
+test("completes quest statuses separately from seal statuses", () => {
+  assert.deepEqual(getCompletionsFromState(["hive", "quest", "--status", ""], empty), ["open", "active", "done", "archived"]);
+  assert.deepEqual(getCompletionsFromState(["hive", "search", "--status", ""], empty), ["done", "blocked", "needs_input", "failed"]);
+  assert.deepEqual(getCompletionsFromState(["hive", "seals", "--status", ""], empty), ["done", "blocked", "needs_input", "failed"]);
 });

@@ -20,6 +20,8 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { join } from "node:path";
 import { test } from "node:test";
 import { serve } from "../src/hsr/remoteHost.js";
+import { connectRpcClient, startRpcServer } from "../src/hsr/rpc.js";
+import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { createRemoteHsrSubstrate } from "../src/substrates/remote-hsr.js";
 import {
   clearSubstrateCache,
@@ -197,6 +199,217 @@ test("remote HSR substrate: spawnRemote → steer → observe → kill a stub be
     } finally {
       await sub.close();
       await server.close();
+      tunnel.killAll();
+    }
+  });
+});
+
+test("observe survives a remote serve RESTART: the substrate re-issues the observe RPC on reconnect (HIVE-11)", async () => {
+  await withTempStore(async (dir) => {
+    const remoteSock = join(dir, "remote-control.sock");
+    const bee = "restartbee";
+
+    // A fake per-bee runner host: a real RpcServer on the bee's control socket.
+    // The remote serve's observe relay connects here and re-broadcasts every
+    // "event" notification as hsr.event. It OUTLIVES the serve restart below —
+    // exactly like a real runner host (a detached process) does when the serve
+    // crashes and is restarted by ensureRemoteServe.
+    const beeSock = join(dir, "bee-control.sock");
+    const beeHost = await startRpcServer({ socketPath: beeSock, methods: { ping: () => ({ ok: true }) } });
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "stub",
+      tier: "stream",
+      hostPid: process.pid,
+      startedAt: new Date().toISOString(),
+      controlSocket: beeSock,
+      status: "running",
+    });
+
+    let server = await serve(remoteSock);
+    const node = makeNode();
+    const tunnel = makeRelayTunnel();
+    const sub = createRemoteHsrSubstrate(node, {
+      transport: {
+        execHook: serveUpExecHook,
+        spawnTunnel: tunnel.hook,
+        remoteSocket: remoteSock,
+        forward: { waitAttempts: 100, waitIntervalMs: 10 },
+        reconnect: { maxAttempts: 50, baseDelayMs: 10, maxDelayMs: 50 },
+      },
+    });
+
+    try {
+      const events: Array<{ type?: string; text?: string }> = [];
+      const off = await sub.observe(bee, (e) => events.push(e as { type?: string; text?: string }));
+
+      // Sanity: the relay works before the restart.
+      await waitFor(() => {
+        beeHost.broadcast("event", { type: "text", text: "before-restart" });
+        return events.some((e) => e.text === "before-restart");
+      }, "event relayed before restart");
+
+      // RESTART the serve: the new process has an EMPTY relays map, so only a
+      // re-issued observe RPC (not just the transport's local re-bridge) can
+      // bring the event stream back. The bee host itself keeps running.
+      await server.close();
+      server = await serve(remoteSock);
+
+      // The transport reconnects (client socket died with the old serve), the
+      // substrate re-observes, the fresh serve rebuilds its relay — and events
+      // flow again. Without the re-observe this times out: the mirror freezes.
+      await waitFor(() => {
+        beeHost.broadcast("event", { type: "text", text: "after-restart" });
+        return events.some((e) => e.text === "after-restart");
+      }, "event relayed after serve restart", 10_000);
+
+      off();
+    } finally {
+      await sub.close();
+      await server.close();
+      await beeHost.close();
+      tunnel.killAll();
+    }
+  });
+});
+
+test("observe/unobserve refcounting on the serve: last unobserve closes the per-bee relay connection (HIVE-56)", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "refbee";
+
+    // A fake per-bee runner host; its connectionCount() exposes whether the
+    // serve's relay client is still attached.
+    const beeSock = join(dir, "bee-control.sock");
+    const beeHost = await startRpcServer({ socketPath: beeSock, methods: { ping: () => ({ ok: true }) } });
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "stub",
+      tier: "stream",
+      hostPid: process.pid,
+      startedAt: new Date().toISOString(),
+      controlSocket: beeSock,
+      status: "running",
+    });
+
+    const remoteSock = join(dir, "remote-control.sock");
+    const server = await serve(remoteSock);
+    const client = await connectRpcClient(remoteSock);
+
+    try {
+      // Two subscribers share ONE relay connection to the bee's control socket.
+      assert.deepEqual(await client.call("observe", { bee }), { ok: true });
+      assert.deepEqual(await client.call("observe", { bee }), { ok: true });
+      await waitFor(() => beeHost.connectionCount() === 1, "one shared relay connection after two observes");
+
+      // First release: refcount 2 → 1, relay stays up and keeps pumping.
+      assert.deepEqual(await client.call("unobserve", { bee }), { ok: true });
+      const events: unknown[] = [];
+      const off = client.on("hsr.event", (p) => events.push(p));
+      await waitFor(() => {
+        beeHost.broadcast("event", { type: "text", text: "still-alive" });
+        return events.length > 0;
+      }, "relay still pumping after first unobserve");
+      assert.equal(beeHost.connectionCount(), 1, "relay connection survives while refcount > 0");
+
+      // Last release: relay client closes — the per-bee connection is reclaimed.
+      assert.deepEqual(await client.call("unobserve", { bee }), { ok: true });
+      await waitFor(() => beeHost.connectionCount() === 0, "relay connection closed at refcount zero");
+      // Idempotent: releasing an already-gone relay is a success, not an error.
+      assert.deepEqual(await client.call("unobserve", { bee }), { ok: true });
+      off();
+
+      // `sync` SETS the refcount instead of incrementing (reconnect
+      // reconciliation): two observes + a sync:1 re-observe must close after
+      // ONE unobserve, not three.
+      assert.deepEqual(await client.call("observe", { bee }), { ok: true });
+      assert.deepEqual(await client.call("observe", { bee }), { ok: true });
+      assert.deepEqual(await client.call("observe", { bee, sync: 1 }), { ok: true });
+      await waitFor(() => beeHost.connectionCount() === 1, "relay re-established");
+      assert.deepEqual(await client.call("unobserve", { bee }), { ok: true });
+      await waitFor(() => beeHost.connectionCount() === 0, "sync reset the refcount so one release closed the relay");
+
+      // `count` releases several subscriptions at once (substrate close path).
+      assert.deepEqual(await client.call("observe", { bee, sync: 3 }), { ok: true });
+      await waitFor(() => beeHost.connectionCount() === 1, "relay re-established for count release");
+      assert.deepEqual(await client.call("unobserve", { bee, count: 3 }), { ok: true });
+      await waitFor(() => beeHost.connectionCount() === 0, "count:3 released the whole relay");
+    } finally {
+      client.close();
+      await server.close();
+      await beeHost.close();
+    }
+  });
+});
+
+test("substrate unsubscribe releases the remote relay: flapping observe/off cycles do not leak per-bee connections (HIVE-56)", async () => {
+  await withTempStore(async (dir) => {
+    const remoteSock = join(dir, "remote-control.sock");
+    const bee = "flapbee";
+
+    const beeSock = join(dir, "bee-control.sock");
+    const beeHost = await startRpcServer({ socketPath: beeSock, methods: { ping: () => ({ ok: true }) } });
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "stub",
+      tier: "stream",
+      hostPid: process.pid,
+      startedAt: new Date().toISOString(),
+      controlSocket: beeSock,
+      status: "running",
+    });
+
+    const server = await serve(remoteSock);
+    const node = makeNode();
+    const tunnel = makeRelayTunnel();
+    const sub = createRemoteHsrSubstrate(node, {
+      transport: {
+        execHook: serveUpExecHook,
+        spawnTunnel: tunnel.hook,
+        remoteSocket: remoteSock,
+        forward: { waitAttempts: 100, waitIntervalMs: 10 },
+      },
+    });
+
+    try {
+      // Flap: mirror teardown-then-resubscribe. Every off() must reach the
+      // remote — the relay's per-bee connection closes after each cycle
+      // instead of accumulating refcounts until the bee is killed.
+      for (let cycle = 0; cycle < 3; cycle++) {
+        const events: Array<{ text?: string }> = [];
+        const off = await sub.observe(bee, (e) => events.push(e as { text?: string }));
+        await waitFor(() => {
+          beeHost.broadcast("event", { type: "text", text: `cycle-${cycle}` });
+          return events.some((e) => e.text === `cycle-${cycle}`);
+        }, `event relayed on cycle ${cycle}`);
+        assert.equal(beeHost.connectionCount(), 1, `one relay connection during cycle ${cycle}`);
+        off();
+        await waitFor(() => beeHost.connectionCount() === 0, `relay released after cycle ${cycle}`);
+      }
+
+      // Two subscribers: dropping one keeps the shared relay; dropping the
+      // last one releases it.
+      const off1 = await sub.observe(bee, () => undefined);
+      const off2 = await sub.observe(bee, () => undefined);
+      await waitFor(() => beeHost.connectionCount() === 1, "shared relay up for two subscribers");
+      off1();
+      await sleep(100);
+      assert.equal(beeHost.connectionCount(), 1, "relay survives while one subscriber remains");
+      off2();
+      await waitFor(() => beeHost.connectionCount() === 0, "relay released after last unsubscribe");
+
+      // close() releases whatever is still observed before dropping the tunnel.
+      await sub.observe(bee, () => undefined);
+      await sub.observe(bee, () => undefined);
+      await waitFor(() => beeHost.connectionCount() === 1, "relay up again before close");
+      await sub.close();
+      await waitFor(() => beeHost.connectionCount() === 0, "close() released the relay");
+    } finally {
+      await sub.close();
+      await server.close();
+      await beeHost.close();
       tunnel.killAll();
     }
   });

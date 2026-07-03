@@ -3,7 +3,7 @@ import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { firstUserText, hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript, stripCommandNoise, type TranscriptRow } from "../src/transcripts.js";
+import { firstUserText, hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript, stripCommandNoise, transcriptAdapters, type TranscriptProvider, type TranscriptRow } from "../src/transcripts.js";
 
 // Independent re-implementation of Claude Code's project-dir encoding so the
 // fixtures below do not circularly depend on projectKeyForCwd.
@@ -14,6 +14,16 @@ function claudeEncode(cwd: string): string {
 test("projectKeyForCwd matches Claude Code's project-dir encoding for dots and underscores", () => {
   assert.equal(projectKeyForCwd("/tmp/.hidden/my_app"), "-tmp--hidden-my-app");
   assert.equal(projectKeyForCwd("/Users/x/.openclaw/workspace"), "-Users-x--openclaw-workspace");
+});
+
+test("transcriptAdapters registry covers every provider under its own key", () => {
+  const providers: TranscriptProvider[] = ["claude", "codex", "opencode", "grok"];
+  assert.deepEqual(Object.keys(transcriptAdapters).sort(), [...providers].sort());
+  for (const provider of providers) assert.equal(transcriptAdapters[provider].provider, provider);
+});
+
+test("latestTranscript returns null for agents without a transcript adapter", async () => {
+  assert.equal(await latestTranscript("gemini", "/tmp"), null);
 });
 
 test("latestTranscript: notBeforeIso refuses an older sibling's transcript that wins on mtime", async () => {
@@ -259,6 +269,34 @@ test("latestTranscript dedupes Codex dual-format rollouts and filters injected c
     assert.ok(tx);
     assert.equal(renderTranscript(tx.rows), "## user\nFix the flaky test\n\n## assistant\nDone, the test is deflaked.");
     assert.equal(tx.title, "Fix the flaky test");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("latestTranscript keeps Codex response_item messages missing from the event stream", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-mixed-format-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "06", "09");
+    const chatPath = join(sessionDir, "rollout-2026-06-09T12-30-00-session.jsonl");
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Fix the mixed\nrollout" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Fix the mixed rollout" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Response-item assistant survived." }] } }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("codex", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(renderTranscript(tx.rows), "## user\nFix the mixed\nrollout\n\n## assistant\nResponse-item assistant survived.");
+    assert.equal(lastAssistantText(tx.rows), "Response-item assistant survived.");
+    assert.equal(tx.title, "Fix the mixed rollout");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

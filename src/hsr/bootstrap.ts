@@ -6,9 +6,9 @@
  *
  *   1. precheck   — ssh <endpoint> "node --version"  (require >= minNodeMajor)
  *   2. mkdir      — ssh <endpoint> "mkdir -p ~/.hive/runner-host"
- *   3. deploy     — build the bundle locally (ensureRunnerHostBundle) and pipe it
- *                   to the remote (cat > <remotePath>); idempotent — skipped if the
- *                   remote already has that exact version file.
+ *   3. deploy     — build the bundle locally (ensureRunnerHostBundle), verify any
+ *                   remote copy by SHA-256, and pipe it to a temp path before an
+ *                   atomic mv into place when deploy is needed.
  *   4. handshake  — ssh <endpoint> "node <remotePath> --version"; assert it matches
  *                   the deployed version.
  *   5. register   — write/refresh the NodeRecord (kind remote-hsr, endpoint,
@@ -22,7 +22,7 @@
  * control plane rides on (forwarded over ssh in APIA-92).
  */
 
-import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   loadNode,
@@ -32,16 +32,27 @@ import {
   type NodeRecord,
 } from "../node.js";
 import { ensureRunnerHostBundle, type RunnerHostBundle } from "./buildRunnerHostBundle.js";
+import { defaultSshExecHook, type SshExecHook } from "./sshExec.js";
 
-export type SshExecHook = (
-  argv: string[],
-  input?: string,
-) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+// The ssh exec hook + type live in ./sshExec.js (single source shared with
+// remoteTransport.ts); re-exported so existing `bootstrap` importers keep working.
+export type { SshExecHook };
+
+/**
+ * Bootstrap ssh operations (version probe, mkdir, bundle deploy, handshake) are
+ * interactive/long-running — the cat-pipe deploy can stream a multi-hundred-KB
+ * bundle — so they run WITHOUT a wall-clock bound (`timeoutMs: 0`). The daemon
+ * tick path (remoteTransport) uses the same hook WITH the default bound.
+ */
+const unboundedSshExecHook: SshExecHook = (argv, input) => defaultSshExecHook(argv, input, { timeoutMs: 0 });
 
 const DEFAULT_MIN_NODE_MAJOR = 18;
 const REMOTE_DIR = "~/.hive/runner-host";
-const EXISTS_MARKER = "__HIVE_RH_EXISTS__";
 const MISSING_MARKER = "__HIVE_RH_MISSING__";
+const REMOTE_SHA256_SCRIPT =
+  "const { createHash } = require('node:crypto');" +
+  "const { readFileSync } = require('node:fs');" +
+  "process.stdout.write(createHash('sha256').update(readFileSync(process.argv[1])).digest('hex'));";
 
 // Same connection-multiplexing defaults as ssh-tmux (see that file's rationale),
 // plus accept-new so a first-contact bootstrap does not wedge on host-key TOFU.
@@ -91,11 +102,20 @@ function parseNodeMajor(versionOut: string): number | null {
   return Number.isFinite(major) ? major : null;
 }
 
+function sha256Hex(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
 export async function bootstrapRunnerHost(
   params: BootstrapParams,
   deps: BootstrapDeps = {},
 ): Promise<BootstrapResult> {
-  const exec = deps.execHook ?? defaultSshExecHook;
+  const exec = deps.execHook ?? unboundedSshExecHook;
   const ensureBundle = deps.ensureBundle ?? (() => ensureRunnerHostBundle());
   const readBundle = deps.readBundle ?? ((path: string) => readFile(path, "utf8"));
   const minMajor = params.minNodeMajor ?? DEFAULT_MIN_NODE_MAJOR;
@@ -136,14 +156,22 @@ export async function bootstrapRunnerHost(
   // 3. Build the bundle locally and deploy it (idempotent).
   const bundle = await ensureBundle();
   const remotePath = remoteBundlePath(bundle.version);
+  const content = await readBundle(bundle.path);
+  const expectedHash = sha256Hex(content);
 
-  const existsCheck = await runRemote(`[ -f ${remotePath} ] && echo ${EXISTS_MARKER} || echo ${MISSING_MARKER}`);
-  const alreadyThere = existsCheck.exitCode === 0 && existsCheck.stdout.includes(EXISTS_MARKER);
+  const hashCommand = `node -e ${shellQuote(REMOTE_SHA256_SCRIPT)}`;
+  const remoteHash = await runRemote(`[ -f ${remotePath} ] && ${hashCommand} ${remotePath} || echo ${MISSING_MARKER}`);
+  const alreadyThere = remoteHash.exitCode === 0 && remoteHash.stdout.trim() === expectedHash;
 
   let deployed = false;
   if (!alreadyThere) {
-    const content = await readBundle(bundle.path);
-    const copy = await runRemote(`cat > ${remotePath}`, content);
+    const tempPath = `${remotePath}.tmp.$$`;
+    const copyCommand = [
+      `cat > ${tempPath}`,
+      `[ "$(${hashCommand} ${tempPath})" = ${expectedHash} ]`,
+      `mv -f ${tempPath} ${remotePath}`,
+    ].join(" && ");
+    const copy = await runRemote(copyCommand, content);
     if (copy.exitCode !== 0) {
       throw new Error(`runner-host bootstrap: copy to remote failed (exit ${copy.exitCode}): ${copy.stderr.trim()}`);
     }
@@ -194,25 +222,4 @@ export async function bootstrapRunnerHost(
   }
 
   return { node, version: bundle.version, deployed, remotePath };
-}
-
-/**
- * Default exec hook: spawn ssh and collect stdout/stderr, optionally streaming a
- * payload on stdin (the cat-pipe deploy). Mirrors ssh-tmux's defaultExecHook.
- */
-export function defaultSshExecHook(argv: string[], input?: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const [command, ...args] = argv;
-  if (!command) return Promise.reject(new Error("Empty argv"));
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("error", (error) => resolve({ stdout, stderr: stderr || error.message, exitCode: 1 }));
-    child.on("close", (code, signal) => resolve({ stdout, stderr, exitCode: code ?? (signal ? 130 : 1) }));
-    child.stdin.on("error", () => undefined);
-    if (input !== undefined) child.stdin.write(input);
-    child.stdin.end();
-  });
 }

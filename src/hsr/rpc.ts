@@ -17,6 +17,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
+import { makeLineReader } from "./lineReader.js";
 
 // --- JSON-RPC 2.0 wire shapes -------------------------------------------------
 
@@ -38,28 +39,15 @@ const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const SOCKET_DIR_MODE = 0o700;
 const SOCKET_MODE = 0o700;
+// Per-connection outbound broadcast bound (HIVE-70). Mirrors the local
+// transport's inbound DEFAULT_MAX_QUEUE (remoteTransport.ts): once a client
+// stops draining and this many frames are queued, we DROP-OLDEST rather than
+// let Node buffer hsr.event frames without bound in the serve process.
+const DEFAULT_MAX_BROADCAST_QUEUE = 256;
 
 /** Serialize one JSON-RPC object as a single newline-delimited frame. */
 function frame(value: JsonRpcResponse | JsonRpcNotification | JsonRpcRequest): string {
   return `${JSON.stringify(value)}\n`;
-}
-
-// A newline-delimited-JSON line reader. Buffers partial lines and yields one
-// raw JSON string per complete line; blank lines are ignored. Shared by both
-// server connections and the client.
-function makeLineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
-  let buffer = "";
-  return (chunk: Buffer): void => {
-    buffer += chunk.toString("utf8");
-    let newlineIndex = buffer.indexOf("\n");
-    while (newlineIndex !== -1) {
-      const line = buffer.slice(0, newlineIndex);
-      buffer = buffer.slice(newlineIndex + 1);
-      const trimmed = line.trim();
-      if (trimmed.length > 0) onLine(trimmed);
-      newlineIndex = buffer.indexOf("\n");
-    }
-  };
 }
 
 // --- Server -------------------------------------------------------------------
@@ -69,10 +57,17 @@ export type RpcMethodHandler = (params: unknown, ctx: RpcConnectionCtx) => Promi
 
 export type RpcServer = {
   path: string;
-  /** Push a notification to every connected client (used for event streams). */
+  /**
+   * Push a notification to every connected client (used for event streams).
+   * Backpressure-aware (HIVE-70): honors socket.write() return per connection;
+   * a slow client gets a bounded drop-oldest queue instead of unbounded Node
+   * write buffering.
+   */
   broadcast(method: string, params?: unknown): void;
   /** Number of live client connections. */
   connectionCount(): number;
+  /** Total broadcast frames dropped across all connections (backpressure telemetry). */
+  broadcastDroppedCount(): number;
   close(): Promise<void>;
 };
 
@@ -100,23 +95,69 @@ async function clearStaleSocket(socketPath: string): Promise<void> {
   await unlink(socketPath).catch(() => {});
 }
 
+// Per-connection outbound state for broadcast backpressure (HIVE-70). `blocked`
+// is set when socket.write() reports a full stream buffer and cleared on
+// 'drain'; while blocked (or while a backlog exists), broadcast frames queue
+// here — bounded, drop-oldest — instead of piling into Node's write buffer.
+type ServerConnection = {
+  socket: Socket;
+  queue: string[];
+  blocked: boolean;
+  dropped: number;
+};
+
 export async function startRpcServer(opts: {
   socketPath: string;
   methods: Record<string, RpcMethodHandler>;
   /** Optional: called once per new client connection. */
   onConnection?: (ctx: RpcConnectionCtx) => void;
+  /** Max queued broadcast frames per slow connection before drop-oldest (HIVE-70). */
+  maxBroadcastQueue?: number;
 }): Promise<RpcServer> {
   const { socketPath, methods, onConnection } = opts;
+  const maxBroadcastQueue = Math.max(1, opts.maxBroadcastQueue ?? DEFAULT_MAX_BROADCAST_QUEUE);
 
   await mkdir(dirname(socketPath), { recursive: true, mode: SOCKET_DIR_MODE });
   await clearStaleSocket(socketPath);
 
-  const sockets = new Map<number, Socket>();
+  const connections = new Map<number, ServerConnection>();
   let nextConnectionId = 1;
+  let broadcastDropped = 0;
+
+  // Write one broadcast frame to a connection, honoring backpressure. Direct
+  // write while the socket is keeping up; once write() returns false (stream
+  // buffer at highWaterMark) or a backlog exists, frames go through the bounded
+  // per-connection queue and are flushed from the 'drain' handler.
+  const sendBroadcast = (conn: ServerConnection, line: string): void => {
+    if (!conn.socket.writable) return;
+    if (!conn.blocked && conn.queue.length === 0) {
+      if (!conn.socket.write(line, () => {})) conn.blocked = true;
+      return;
+    }
+    if (conn.queue.length >= maxBroadcastQueue) {
+      conn.queue.shift();
+      conn.dropped++;
+      broadcastDropped++;
+    }
+    conn.queue.push(line);
+  };
+
+  const flushBroadcastQueue = (conn: ServerConnection): void => {
+    conn.blocked = false;
+    while (!conn.blocked && conn.queue.length > 0) {
+      if (!conn.socket.writable) {
+        conn.queue.length = 0;
+        return;
+      }
+      const line = conn.queue.shift() as string;
+      if (!conn.socket.write(line, () => {})) conn.blocked = true;
+    }
+  };
 
   const server: Server = createServer((socket) => {
     const connectionId = nextConnectionId++;
-    sockets.set(connectionId, socket);
+    const conn: ServerConnection = { socket, queue: [], blocked: false, dropped: 0 };
+    connections.set(connectionId, conn);
 
     const ctx: RpcConnectionCtx = {
       connectionId,
@@ -163,8 +204,12 @@ export async function startRpcServer(opts: {
     };
 
     socket.on("data", makeLineReader(handleLine));
+    socket.on("drain", () => flushBroadcastQueue(conn));
     socket.on("error", () => socket.destroy());
-    socket.once("close", () => sockets.delete(connectionId));
+    socket.once("close", () => {
+      conn.queue.length = 0;
+      connections.delete(connectionId);
+    });
 
     if (onConnection) {
       try {
@@ -194,19 +239,23 @@ export async function startRpcServer(opts: {
         ? { jsonrpc: "2.0", method }
         : { jsonrpc: "2.0", method, params };
       const line = frame(notification);
-      for (const socket of sockets.values()) {
-        // Best-effort fan-out: a dead/closing socket must not throw here.
-        if (socket.writable) socket.write(line, () => {});
+      for (const conn of connections.values()) {
+        // Best-effort fan-out: a dead/closing socket must not throw here, and
+        // a slow one queues (bounded, drop-oldest) instead of buffering unboundedly.
+        sendBroadcast(conn, line);
       }
     },
     connectionCount(): number {
-      return sockets.size;
+      return connections.size;
+    },
+    broadcastDroppedCount(): number {
+      return broadcastDropped;
     },
     async close(): Promise<void> {
       // Stop accepting, drop every client, then close the listener and unlink
       // the socket file so the path is clean for the next server.
-      for (const socket of sockets.values()) socket.destroy();
-      sockets.clear();
+      for (const conn of connections.values()) conn.socket.destroy();
+      connections.clear();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await unlink(socketPath).catch(() => {});
     },

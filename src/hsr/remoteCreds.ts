@@ -24,7 +24,7 @@
  *    Credentials — pure fs, no accounts.ts import, so the runner-host bundle
  *    stays lean (esbuild DCE drops the mint side + its accounts.ts graph).
  *
- * Node builtins + the lightweight drivers/runDir modules only.
+ * Node builtins + the lightweight drivers/harness/runDir modules only.
  */
 
 import { execFile } from "node:child_process";
@@ -32,6 +32,7 @@ import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { homeEnvForAgent, identityRecipeForAgent } from "../drivers.js";
+import { ephemeralHarnesses, ephemeralPolicyFor } from "./harness.js";
 import { hsrRunDir } from "./runDir.js";
 // accounts.ts is imported ONLY by the mint side; remoteHost.ts imports only the
 // deliver/shred functions, so esbuild's tree-shake keeps accounts.ts out of the
@@ -64,37 +65,10 @@ export type EphemeralCredential = {
   kindNote: string;
 };
 
-// ── Per-kind policy table (allowance-registry style, so it's correctable) ───
-
-type EphemeralKindPolicy = {
-  /**
-   * "mint-token"       — exec the genuine harness to mint a fresh short-lived
-   *                       token, delivered via `tokenEnv` (claude setup-token).
-   * "ship-primary-file"— ship the account's primary credential file into the
-   *                       remote home (codex auth.json — the documented flow).
-   */
-  strategy: "mint-token" | "ship-primary-file";
-  /** For "mint-token": the env var the token is delivered as. */
-  tokenEnv?: string;
-  /** Secret-free human note. */
-  note: string;
-};
-
-const EPHEMERAL_POLICY: Record<string, EphemeralKindPolicy> = {
-  // claude: mint a fresh 1-year OAuth token with the REAL binary. If the binary
-  // is absent / not logged in, fall back to shipping .credentials.json (weaker).
-  claude: {
-    strategy: "mint-token",
-    tokenEnv: "CLAUDE_CODE_OAUTH_TOKEN",
-    note: "claude setup-token → CLAUDE_CODE_OAUTH_TOKEN",
-  },
-  // codex: ship auth.json (the identity recipe's primary credential) into the
-  // remote CODEX_HOME. codex treats auth.json "like a password" (research §2).
-  codex: {
-    strategy: "ship-primary-file",
-    note: "ship auth.json into remote CODEX_HOME",
-  },
-};
+// ── Per-kind policy ─────────────────────────────────────────────────────────
+// The ephemeral-credential policy per harness lives in the harness registry
+// (harness.ts HARNESSES.<name>.ephemeral — the single registration point per
+// HIVE-20); this module consumes it via ephemeralPolicyFor.
 
 export type MintDeps = {
   /**
@@ -114,9 +88,9 @@ export async function mintEphemeralCredential(
   kind: string,
   deps: MintDeps = {},
 ): Promise<EphemeralCredential> {
-  const policy = EPHEMERAL_POLICY[kind];
+  const policy = ephemeralPolicyFor(kind);
   if (!policy) {
-    throw new Error(`ephemeral-token delivery is not wired for harness "${kind}" (supported: ${Object.keys(EPHEMERAL_POLICY).join(", ")})`);
+    throw new Error(`ephemeral-token delivery is not wired for harness "${kind}" (supported: ${ephemeralHarnesses().join(", ")})`);
   }
 
   if (policy.strategy === "mint-token") {

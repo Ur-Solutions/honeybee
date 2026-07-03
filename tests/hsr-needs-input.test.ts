@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { connectRpcClient } from "../src/hsr/rpc.js";
 import { runHsrHost, type HsrHostHandle } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
-import { hsrObservations, pendingNeedsInput } from "../src/hsr/observe.js";
-import { hsrRunDir, readHsrMeta } from "../src/hsr/runDir.js";
+import { hsrObservations, pendingNeedsInput, type HsrObservation } from "../src/hsr/observe.js";
+import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta, writeHsrMeta, type HsrMeta } from "../src/hsr/runDir.js";
 import { listMessages } from "../src/buz.js";
 import { createNeedsInputDispatcher } from "../src/daemon/needsInput.js";
 import { saveSession, type SessionRecord } from "../src/store.js";
 import type { BeeState } from "../src/state.js";
-import type { RunnerOpts } from "../src/hsr/types.js";
+import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -46,6 +46,23 @@ function optsFor(bee: string): RunnerOpts {
     env: process.env as Record<string, string>,
     runDir: hsrRunDir(bee),
   };
+}
+
+function liveMeta(bee: string): HsrMeta {
+  return {
+    bee,
+    harness: "stub",
+    tier: "stream",
+    hostPid: process.pid,
+    startedAt: new Date().toISOString(),
+    controlSocket: "/tmp/unused.sock",
+    status: "running",
+  };
+}
+
+async function writeEvents(bee: string, events: RunnerEvent[]): Promise<void> {
+  await ensureHsrRunDir(bee);
+  await writeFile(hsrEventsPath(bee), `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
 }
 
 function hsrRecord(name: string, extra: Partial<SessionRecord> = {}): SessionRecord {
@@ -156,5 +173,103 @@ test("needs-input dispatcher: routes to living parent, de-dupes, escalates when 
     } finally {
       for (const handle of handles) await handle.stop().catch(() => undefined);
     }
+  });
+});
+
+test("needs-input dispatcher consumes the per-tick event snapshot when provided", async () => {
+  await withTempStore(async () => {
+    const childRecord = hsrRecord("snapshot-child", { id: "snapshot-child-id", parentId: "snapshot-parent-id" });
+    const parentRecord = hsrRecord("snapshot-parent", { id: "snapshot-parent-id" });
+    const dispatch = createNeedsInputDispatcher();
+    const states = new Map<string, BeeState>([
+      ["snapshot-child", "blocked"],
+      ["snapshot-parent", "idle_with_output"],
+    ]);
+    const observation: HsrObservation = {
+      live: true,
+      state: "blocked",
+      snapshot: "",
+      eventSnapshot: {
+        events: [],
+        tailEvents: [],
+        usage: { totals: null },
+        pendingNeedsInput: {
+          requestId: "snap-1",
+          ts: 42,
+          kind: "question",
+          question: "from snapshot?",
+        },
+      },
+    };
+
+    const outcomes = await dispatch(
+      [childRecord, parentRecord],
+      states,
+      new Map([["snapshot-child", observation]]),
+    );
+
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0]!.routedTo, "snapshot-parent");
+    assert.equal(outcomes[0]!.requestId, "snap-1");
+    const queued = await listMessages("snapshot-parent", "queue");
+    assert.equal(queued.length, 1);
+    assert.match(queued[0]!.message.body, /from snapshot\?/);
+  });
+});
+
+test("needs-input dispatcher: routes later id-less requests instead of colliding on pending", async () => {
+  await withTempStore(async () => {
+    const childRecord = hsrRecord("idless-child", { id: "idless-child-id", parentId: "idless-parent-id" });
+    const parentRecord = hsrRecord("idless-parent", { id: "idless-parent-id" });
+    await saveSession(childRecord);
+    await saveSession(parentRecord);
+    await writeHsrMeta("idless-child", liveMeta("idless-child"));
+
+    const dispatch = createNeedsInputDispatcher();
+    const records = [childRecord, parentRecord];
+    const states = new Map<string, BeeState>([
+      ["idless-child", "blocked"],
+      ["idless-parent", "idle_with_output"],
+    ]);
+
+    await writeEvents("idless-child", [
+      { type: "turn_start", ts: 10 },
+      { type: "needs_input", ts: 11, kind: "question", question: "first?" },
+    ]);
+
+    const firstPending = await pendingNeedsInput("idless-child");
+    assert.equal(firstPending?.requestId, "pending");
+    assert.equal(firstPending?.ts, 11);
+
+    const first = await dispatch(records, states);
+    assert.equal(first.length, 1, "first id-less request routes");
+    assert.equal(first[0]!.requestId, "pending");
+    assert.equal(first[0]!.routedTo, "idless-parent");
+
+    const duplicate = await dispatch(records, states);
+    assert.equal(duplicate.length, 0, "same id-less event is still de-duped");
+    assert.equal((await listMessages("idless-parent", "queue")).length, 1, "no duplicate buz for same event");
+
+    await writeEvents("idless-child", [
+      { type: "turn_start", ts: 10 },
+      { type: "needs_input", ts: 11, kind: "question", question: "first?" },
+      { type: "turn_end", ts: 12 },
+      { type: "turn_start", ts: 20 },
+      { type: "needs_input", ts: 21, kind: "question", question: "second?" },
+    ]);
+
+    const secondPending = await pendingNeedsInput("idless-child");
+    assert.equal(secondPending?.requestId, "pending");
+    assert.equal(secondPending?.ts, 21);
+
+    const second = await dispatch(records, states);
+    assert.equal(second.length, 1, "later id-less request with new event ts routes");
+    assert.equal(second[0]!.requestId, "pending");
+    assert.equal(second[0]!.routedTo, "idless-parent");
+
+    const messages = await listMessages("idless-parent", "queue");
+    assert.equal(messages.length, 2, "parent receives both distinct questions");
+    assert.ok(messages.some((entry) => entry.message.body.includes("first?")));
+    assert.ok(messages.some((entry) => entry.message.body.includes("second?")));
   });
 });

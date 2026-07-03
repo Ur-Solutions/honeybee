@@ -39,29 +39,92 @@ function never<T>(): Promise<T> {
   return new Promise<T>(() => undefined);
 }
 
-test("runDaemon: a tick exceeding tickBudgetMs is abandoned, recorded, and the loop keeps ticking", async () => {
+test("runDaemon: a budget-abandoned tick never overlaps the next — the loop skips until it settles, then adopts its observed map", async () => {
   await withTempStore(async () => {
     let calls = 0;
-    const tickImpl = () => {
+    let active = 0;
+    let maxActive = 0;
+    const observedArgs: Array<Map<string, string>> = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The wedged tick eventually resolves with an observed map of its own; the
+    // loop must adopt it so the next tick doesn't re-fire the same transitions.
+    const lateResult: TickResult = { ...emptyTickResult(), observed: new Map([["wedged-bee", "active"]]) };
+
+    const tickImpl: typeof import("../src/daemon/run.js").tick = async (_deps, previousObserved) => {
       calls += 1;
-      // First tick wedges forever (the production failure shape); the rest are healthy.
-      if (calls === 1) return never<TickResult>();
-      return Promise.resolve(emptyTickResult());
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      observedArgs.push(new Map(previousObserved));
+      try {
+        if (calls === 1) {
+          await gate; // wedges well past the budget (the production failure shape), then settles
+          return lateResult;
+        }
+        return emptyTickResult();
+      } finally {
+        active -= 1;
+      }
     };
+    setTimeout(release, 150);
 
     await runDaemon({
-      config: { tickMs: 10, tickBudgetMs: 100, watchdogMs: 60_000, maxTicks: 2 },
+      config: { tickMs: 20, tickBudgetMs: 50, watchdogMs: 60_000, maxConsecutiveFailures: 1_000, maxTicks: 2 },
       tickImpl,
     });
 
     const state = await readDaemonState();
     assert.ok(state, "daemon state was written");
+    assert.equal(maxActive, 1, "no two ticks ever ran concurrently");
     assert.equal(state!.tickCount, 2, "healthy ticks after the abandoned one still count");
     assert.ok(
-      state!.recentErrors.some((e) => /tick timed out after 100ms/.test(e.msg)),
+      state!.recentErrors.some((e) => /tick timed out after 50ms/.test(e.msg)),
       `recentErrors records the abandoned tick (got: ${JSON.stringify(state!.recentErrors)})`,
     );
+    assert.ok(
+      state!.recentErrors.some((e) => /tick skipped: previous tick still running/.test(e.msg)),
+      `recentErrors records the skipped iterations (got: ${JSON.stringify(state!.recentErrors)})`,
+    );
+    assert.equal(
+      observedArgs[1]?.get("wedged-bee"),
+      "active",
+      "the tick after late settlement starts from the abandoned tick's observed map",
+    );
     assert.ok(state!.lastTickAt, "lastTickAt is stamped");
+  });
+});
+
+test("runDaemon: a never-settling abandoned tick escalates via maxConsecutiveFailures instead of spawning overlapping ticks", async () => {
+  await withTempStore(async () => {
+    let calls = 0;
+    const breaches: Array<{ stalledMs: number; reason: string }> = [];
+    const controller = new AbortController();
+
+    const done = runDaemon({
+      config: { tickMs: 5, tickBudgetMs: 30, watchdogMs: 60_000, maxConsecutiveFailures: 3 },
+      tickImpl: () => {
+        calls += 1;
+        return never<TickResult>();
+      },
+      shutdownSignal: controller.signal,
+      onWatchdogBreach: (info) => {
+        breaches.push(info);
+        controller.abort();
+      },
+    });
+
+    await done;
+
+    assert.equal(calls, 1, "the wedged tick was started exactly once — no overlapping tick was launched");
+    assert.equal(breaches.length, 1, "breach fired exactly once");
+    assert.match(breaches[0]!.reason, /consecutive failed loop iterations/);
+    const state = await readDaemonState();
+    assert.ok(
+      state!.recentErrors.some((e) => /tick skipped: previous tick still running/.test(e.msg)),
+      `recentErrors records the skips (got: ${JSON.stringify(state!.recentErrors)})`,
+    );
   });
 });
 

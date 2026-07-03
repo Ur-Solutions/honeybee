@@ -32,18 +32,28 @@ import { storeRoot } from "../fsx.js";
 import type { NodeRecord } from "../node.js";
 import { remoteBundlePath } from "./bootstrap.js";
 import { connectRpcClient, type RpcClient } from "./rpc.js";
+import { defaultSshExecHook, DEFAULT_SSH_EXEC_TIMEOUT_MS, type SshExecHook } from "./sshExec.js";
+
+// The ssh exec hook + type live in ./sshExec.js (single source shared with
+// bootstrap.ts); re-exported here so existing `remoteTransport` importers keep working.
+export { defaultSshExecHook };
+export type { SshExecHook };
 
 // --- shared defaults ----------------------------------------------------------
 
 /** Default runner-host control socket path on the remote (tilde-expanded remote-side). */
 export const DEFAULT_REMOTE_SOCKET = "~/.hive/runner-host/control.sock";
 
-// Connection-multiplexing options, identical to ssh-tmux / bootstrap so all three
+const DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = Math.ceil(DEFAULT_SSH_EXEC_TIMEOUT_MS / 1000);
+
+// Connection-multiplexing options plus a connect timeout for bounded remote-hsr
+// ssh phases. The ControlMaster options match ssh-tmux / bootstrap so all three
 // share one ControlMaster (a single ssh handshake amortized across ops).
 const CONTROL_MASTER_ARGS: string[] = [
   "-o", "ControlMaster=auto",
   "-o", "ControlPath=~/.ssh/hive-%C",
   "-o", "ControlPersist=60",
+  "-o", `ConnectTimeout=${DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS}`,
 ];
 // Forward-specific hardening: fail the tunnel immediately if the LocalForward
 // cannot bind (don't silently hand back a dead socket), and remove any stale
@@ -73,11 +83,6 @@ const DEFAULT_RECONNECT_MAX_MS = 5_000;
 const DEFAULT_MAX_QUEUE = 256;
 
 // --- injectable hooks ---------------------------------------------------------
-
-export type SshExecHook = (
-  argv: string[],
-  input?: string,
-) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
 
 /** A spawned long-lived tunnel child. `exited` resolves when the child dies. */
 export type TunnelChild = {
@@ -290,7 +295,9 @@ export type RemoteRunnerClient = {
   connected(): boolean;
   /**
    * Invoke a remote method. Per-call timeout (default {@link DEFAULT_CALL_TIMEOUT_MS}).
-   * Rejects immediately (does not hang) when the tunnel is down.
+   * Rejects immediately (does not hang) when the tunnel is down — but each such
+   * call also kicks a background reconnect, so the session revives once the
+   * network does.
    */
   call(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
   /**
@@ -454,7 +461,8 @@ export async function connectRemoteRunnerHost(
   // RECONNECT POLICY: capped exponential backoff (base 250ms → cap 5s), a few
   // attempts (default 5). Each attempt re-runs ensureRemoteServe → forward →
   // connect and RE-ADOPTS subscriptions (via establish). On success we emit
-  // 'reconnect'; giving up after N attempts emits 'down' (calls then reject).
+  // 'reconnect'; giving up after N attempts emits 'down' (calls then reject),
+  // but the session is NOT dead for good — see kickReconnect below.
   async function reconnect(): Promise<void> {
     if (reconnecting || closedByUser) return;
     reconnecting = true;
@@ -490,6 +498,17 @@ export async function connectRemoteRunnerHost(
     if (!closedByUser) emitStatus("down", { attempts: reconnectMax });
   }
 
+  // SELF-HEAL (HIVE-9): after reconnect() exhausts its attempts it emits 'down'
+  // and leaves `current` null — nothing else would ever retry, so a blip longer
+  // than the backoff window would kill the transport for the process lifetime.
+  // Any call() or push subscription arriving while down kicks a FRESH reconnect
+  // loop (backoff reset to base); the `reconnecting` flag makes duplicate kicks
+  // no-ops while a loop is already in flight.
+  function kickReconnect(): void {
+    if (current !== null || reconnecting || closedByUser) return;
+    void reconnect();
+  }
+
   // Initial connect: a failure here rejects the caller (no reconnect loop yet).
   await establish();
   emitStatus("up", { attempt: 0 });
@@ -505,6 +524,7 @@ export async function connectRemoteRunnerHost(
     call(method: string, params?: unknown, callOpts?: { timeoutMs?: number }): Promise<unknown> {
       const c = current?.client;
       if (!c) {
+        kickReconnect();
         return Promise.reject(new Error(`remoteTransport: ${node.name} tunnel is down`));
       }
       return c.call(method, params, { timeoutMs: callOpts?.timeoutMs ?? callTimeoutMs });
@@ -529,6 +549,9 @@ export async function connectRemoteRunnerHost(
         subs.set(method, { queue: [], dropped: 0, draining: false });
         if (current) bridge(method, current.client);
       }
+      // A subscription taken while down revives the session; establish()'s
+      // re-adoption then bridges it onto the fresh client.
+      kickReconnect();
       return () => {
         set.delete(handler);
       };
@@ -560,31 +583,6 @@ function pickDeps(opts: RemoteTransportDeps): RemoteTransportDeps {
 }
 
 // --- default hooks ------------------------------------------------------------
-
-/** Default ssh exec hook (mirrors bootstrap's): spawn ssh, collect stdout/stderr. */
-export function defaultSshExecHook(
-  argv: string[],
-  input?: string,
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const [command, ...args] = argv;
-  if (!command) return Promise.reject(new Error("Empty argv"));
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", (error) => resolve({ stdout, stderr: stderr || error.message, exitCode: 1 }));
-    child.on("close", (code, signal) => resolve({ stdout, stderr, exitCode: code ?? (signal ? 130 : 1) }));
-    child.stdin.on("error", () => undefined);
-    if (input !== undefined) child.stdin.write(input);
-    child.stdin.end();
-  });
-}
 
 /** Default tunnel spawn: a long-lived detached `ssh -N -L ...` child. */
 export function defaultSpawnTunnel(argv: string[]): TunnelChild {

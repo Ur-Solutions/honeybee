@@ -222,6 +222,20 @@ test("search reads rotated ledger files newest-first", async () => {
   });
 });
 
+test("search limit on ledger returns newest matching line from the current file", async () => {
+  await withTempStore(async (dir) => {
+    const ledgerFile = join(dir, "ledger.jsonl");
+    const older = JSON.stringify({ ts: "2026-05-01T00:00:00.000Z", type: "note", text: "older widget" });
+    const newer = JSON.stringify({ ts: "2026-06-01T00:00:00.000Z", type: "note", text: "newer widget" });
+    await writeFile(ledgerFile, `${older}\n${newer}\n`);
+
+    const result = await search({ query: "widget", types: new Set(["ledger"]), limit: 1 });
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0]!.matchedAt, "2026-06-01T00:00:00.000Z");
+    assert.equal(result.truncated, true);
+  });
+});
+
 test("search default --limit is 30 and truncated flag is set", async () => {
   await withTempStore(async () => {
     for (let i = 0; i < 35; i += 1) {
@@ -241,6 +255,59 @@ test("search default --limit is 30 and truncated flag is set", async () => {
     assert.equal(all.hits.length, 35);
     assert.equal(all.truncated, false);
   });
+});
+
+test("search stops reading ledger once the requested limit is filled", async () => {
+  let yielded = 0;
+  let closed = false;
+  let sessionsRead = false;
+  const mock: CorpusReader = {
+    listLedgerFiles: async () => [],
+    readSeals: async function* () {},
+    readSessionRecords: async function* () {
+      sessionsRead = true;
+    },
+    readLedgerLines: async function* () {
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          yielded += 1;
+          const row = {
+            ts: `2026-06-${String(10 - i).padStart(2, "0")}T00:00:00.000Z`,
+            type: "note",
+            text: `needle ${i}`,
+          };
+          yield { path: "/fake/ledger.jsonl", line: JSON.stringify(row), parsed: row, ts: row.ts, lineNumber: i + 1 };
+        }
+      } finally {
+        closed = true;
+      }
+    },
+  };
+
+  const result = await search({ query: "needle", types: new Set(["ledger", "sessions"]), limit: 2 }, mock);
+  assert.equal(result.hits.length, 2);
+  assert.equal(yielded, 2);
+  assert.equal(closed, true);
+  assert.equal(sessionsRead, false);
+  assert.equal(result.truncated, true);
+});
+
+test("search applies ledger filters from reader-parsed rows", async () => {
+  const makeMock = (colony: string): CorpusReader => ({
+    listLedgerFiles: async () => [],
+    readSeals: async function* () {},
+    readSessionRecords: async function* () {},
+    readLedgerLines: async function* () {
+      const row = { ts: "2026-06-01T00:00:00.000Z", colony, type: "note" };
+      yield { path: "/fake/ledger.jsonl", line: "needle row that is not JSON", parsed: row, ts: row.ts, lineNumber: 1 };
+    },
+  });
+
+  const hit = await search({ query: "needle", colony: "alpha", types: new Set(["ledger"]) }, makeMock("alpha"));
+  assert.equal(hit.hits.length, 1);
+
+  const miss = await search({ query: "needle", colony: "alpha", types: new Set(["ledger"]) }, makeMock("beta"));
+  assert.equal(miss.hits.length, 0);
 });
 
 test("search with a mock corpus reader bypasses the filesystem", async () => {
@@ -288,4 +355,125 @@ test("highlightSnippet offsets stay correct when snippet is short", async () => 
     const hit: SearchHit = result.hits[0]!;
     assert.equal(hit.snippet.slice(hit.matchStartInSnippet, hit.matchEndInSnippet), "tiny");
   });
+});
+
+test("makeSnippet offsets point at the matched occurrence when text repeats", () => {
+  const text = "needle before some context and then needle again";
+  const matchStart = text.lastIndexOf("needle");
+  const snippet = makeSnippet(text, matchStart, matchStart + "needle".length);
+  assert.equal(snippet.text.slice(snippet.matchStart, snippet.matchEnd), "needle");
+  assert.equal(snippet.matchStart, snippet.text.lastIndexOf("needle"));
+});
+
+test("search --since drops records and lines with unparseable timestamps", async () => {
+  const recentSeal = {
+    ...validateSealArtifact({ status: "done", summary: "widget recent seal" }),
+    beeName: "CO.good",
+    sealedAt: "2026-06-01T00:00:00.000Z",
+  };
+  const badSeal = {
+    ...validateSealArtifact({ status: "done", summary: "widget invalid seal" }),
+    beeName: "CO.bad-seal",
+    sealedAt: "not-a-date",
+  };
+  const goodSession = makeSessionRecord({
+    name: "CO.good-session",
+    brief: "widget recent session",
+    updatedAt: "2026-06-02T00:00:00.000Z",
+  });
+  const badSession = makeSessionRecord({
+    name: "CO.bad-session",
+    brief: "widget invalid session",
+    updatedAt: "not-a-date",
+  });
+  const mock: CorpusReader = {
+    listLedgerFiles: async () => [],
+    readSeals: async function* () {
+      yield { path: "/fake/good-seal.json", record: recentSeal };
+      yield { path: "/fake/bad-seal.json", record: badSeal };
+    },
+    readSessionRecords: async function* () {
+      yield { path: "/fake/good-session.json", record: goodSession };
+      yield { path: "/fake/bad-session.json", record: badSession };
+    },
+    readLedgerLines: async function* () {
+      yield {
+        path: "/fake/ledger.jsonl",
+        line: JSON.stringify({ ts: "not-a-date", type: "note", text: "widget invalid ledger" }),
+        ts: "not-a-date",
+        lineNumber: 1,
+      };
+      yield {
+        path: "/fake/ledger.jsonl",
+        line: JSON.stringify({ ts: "2026-06-03T00:00:00.000Z", type: "note", text: "widget recent ledger" }),
+        ts: "2026-06-03T00:00:00.000Z",
+        lineNumber: 2,
+      };
+    },
+  };
+
+  const result = await search({ query: "widget", sinceMs: Date.parse("2026-01-01T00:00:00.000Z") }, mock);
+  assert.deepEqual(result.hits.map((hit) => hit.beeName ?? hit.path).sort(), [
+    "/fake/ledger.jsonl:2",
+    "CO.good",
+    "CO.good-session",
+  ]);
+});
+
+test("search hits do not retain raw records or ledger lines", async () => {
+  await withTempStore(async () => {
+    await saveSession(makeSessionRecord({ name: "CL.aaa", brief: "tiny" }));
+    const result = await search({ query: "tiny", types: new Set(["sessions"]) });
+    assert.equal(Object.hasOwn(result.hits[0]!, "raw"), false);
+  });
+});
+
+test("search snippets redact secret-shaped prompt and seal content", async () => {
+  await withTempStore(async () => {
+    const secret = "sk-ant-oat01-FAKE-setup-token-never-real-xyz";
+    await saveSession(makeSessionRecord({
+      name: "CL.secret",
+      lastPrompt: `please call the API token endpoint with api_key=${secret}`,
+    }));
+    await recordSeal("CO.secret", validateSealArtifact({
+      status: "done",
+      summary: `verified refresh_token=${secret}`,
+    }));
+
+    const result = await search({ query: "token", types: new Set(["seals", "sessions"]) });
+    assert.ok(result.hits.length >= 2);
+    for (const hit of result.hits) {
+      assert.doesNotMatch(hit.snippet, new RegExp(secret));
+      assert.match(hit.snippet, /\[redacted\]/);
+    }
+  });
+});
+
+test("search recency bonus cannot cross corpus rank boundaries", async () => {
+  const mock: CorpusReader = {
+    listLedgerFiles: async () => [],
+    readSeals: async function* () {},
+    readSessionRecords: async function* () {
+      yield {
+        path: "/fake/session.json",
+        record: makeSessionRecord({
+          name: "CL.fresh",
+          brief: "boundary-keyword in a fresh session",
+          createdAt: "2026-07-03T12:00:00.000Z",
+          updatedAt: "2026-07-03T12:00:00.000Z",
+        }),
+      };
+    },
+    readLedgerLines: async function* () {
+      yield {
+        path: "/fake/ledger.jsonl",
+        line: "old or unparseable boundary-keyword ledger entry",
+        ts: "",
+        lineNumber: 1,
+      };
+    },
+  };
+
+  const result = await search({ query: "boundary-keyword" }, mock);
+  assert.deepEqual(result.hits.map((hit) => hit.type), ["ledger", "session"]);
 });

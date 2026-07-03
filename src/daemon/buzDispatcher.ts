@@ -18,13 +18,18 @@
 // burn through every queued message in a single tick.
 //
 // Per-bee locking is enforced inside processQueueForBee (withFileLock on
-// senderLockPath), so racing drains for the same bee serialize safely.
+// the per-bee delivery lock), so racing drains for the same bee serialize
+// safely without blocking concurrent senders' mailbox writes.
 
 import { readdir } from "node:fs/promises";
 import { beeMailboxDir, processQueueForBee, type DrainResult } from "../buz.js";
 import type { SessionRecord } from "../store.js";
 import { substrateFor, type Substrate } from "../substrates/index.js";
-import type { TickTransition } from "./run.js";
+import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
+import type { TickTransition } from "./tick.js";
+
+const DEFAULT_BUZ_MAILBOX_CONCURRENCY = 16;
+const DEFAULT_BUZ_DRAIN_CONCURRENCY = 8;
 
 export type BuzDispatchTrigger = {
   record: SessionRecord;
@@ -62,6 +67,10 @@ export type BuzDispatchDeps = {
    * failed (those errors are deliberately non-fatal in the tick loop).
    */
   currentStates?: ReadonlyMap<string, string>;
+  /** Maximum concurrent queue readdir probes. */
+  mailboxConcurrency?: number;
+  /** Maximum concurrent per-bee drain attempts. Per-bee locks still serialize same-bee drains. */
+  drainConcurrency?: number;
 };
 
 /**
@@ -82,10 +91,11 @@ export async function selectBuzDispatchTriggers(
   transitions: TickTransition[],
   hasQueuedMessages: (record: SessionRecord) => Promise<boolean> = defaultHasQueuedMessages,
   currentStates?: ReadonlyMap<string, string>,
+  mailboxConcurrency = envConcurrency("HIVE_BUZ_MAILBOX_CONCURRENCY", DEFAULT_BUZ_MAILBOX_CONCURRENCY),
 ): Promise<BuzDispatchTrigger[]> {
   const byName = new Map<string, TickTransition>();
   for (const transition of transitions) byName.set(transition.name, transition);
-  const triggers: BuzDispatchTrigger[] = [];
+  const candidates: BuzDispatchTrigger[] = [];
   for (const record of records) {
     const transition = byName.get(record.name);
     const current = currentStates?.has(record.name)
@@ -94,10 +104,12 @@ export async function selectBuzDispatchTriggers(
         ? transition.to
         : record.lastObservedState;
     if (current !== "idle_with_output") continue;
-    if (!(await hasQueuedMessages(record))) continue;
-    triggers.push({ record, ...(transition ? { transition } : {}) });
+    candidates.push({ record, ...(transition ? { transition } : {}) });
   }
-  return triggers;
+  const checked = await mapWithConcurrency(candidates, mailboxConcurrency, async (trigger) => (
+    await hasQueuedMessages(trigger.record) ? trigger : null
+  ));
+  return checked.filter((trigger): trigger is BuzDispatchTrigger => trigger !== null);
 }
 
 async function defaultHasQueuedMessages(record: SessionRecord): Promise<boolean> {
@@ -122,14 +134,14 @@ export async function dispatchBuzDrains(
   transitions: TickTransition[],
   deps: BuzDispatchDeps = {},
 ): Promise<BuzDispatchOutcome[]> {
-  const triggers = await selectBuzDispatchTriggers(records, transitions, deps.hasQueuedMessages, deps.currentStates);
+  const triggers = await selectBuzDispatchTriggers(records, transitions, deps.hasQueuedMessages, deps.currentStates, deps.mailboxConcurrency);
   if (triggers.length === 0) return [];
 
   const resolveSubstrate = deps.resolveSubstrate ?? substrateFor;
   const drain = deps.drain ?? processQueueForBee;
+  const drainConcurrency = deps.drainConcurrency ?? envConcurrency("HIVE_BUZ_DRAIN_CONCURRENCY", DEFAULT_BUZ_DRAIN_CONCURRENCY);
 
-  const outcomes: BuzDispatchOutcome[] = [];
-  for (const trigger of triggers) {
+  return mapWithConcurrency(triggers, drainConcurrency, async (trigger) => {
     const { record } = trigger;
     try {
       const substrate = resolveSubstrate(record);
@@ -137,17 +149,16 @@ export async function dispatchBuzDrains(
         transport: { substrate, tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId },
         stopOnFirstFailure: true,
       });
-      outcomes.push({ recipient: record.name, result });
+      return { recipient: record.name, result };
     } catch (error) {
-      outcomes.push({
+      return {
         recipient: record.name,
         result: {
           delivered: [],
           quarantined: [],
           errors: [{ id: record.name, message: error instanceof Error ? error.message : String(error) }],
         },
-      });
+      };
     }
-  }
-  return outcomes;
+  });
 }

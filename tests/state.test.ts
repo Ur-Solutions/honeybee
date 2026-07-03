@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { deriveState, isTerminalState, liveTargetKey, stateLabel } from "../src/state.js";
+import { stripAnsi } from "../src/format.js";
+import { type BeeState, cleanStatePriority, deriveState, formatStateCell, isTerminalState, liveTargetKey, STATE_PRESENTATION, stateLabel } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
 function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
@@ -104,6 +105,26 @@ test("active: Codex working marker is recognized after the active window", () =>
   assert.equal(result.state, "active");
 });
 
+test("active: unknown pane capture holds the previous active state", () => {
+  const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
+  const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go", lastObservedState: "active" }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map<string, string | undefined>([["alpha-target", undefined]]),
+    now: NOW,
+  });
+  assert.equal(result.state, "active");
+});
+
+test("active: unknown pane capture without prior state does not default to idle_with_output", () => {
+  const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
+  const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go" }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map(),
+    now: NOW,
+  });
+  assert.equal(result.state, "active");
+});
+
 test("idle_with_output: known agent is ready after a previous prompt", () => {
   const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
   const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go" }), {
@@ -167,6 +188,59 @@ test("stateLabel returns human-readable forms", () => {
   assert.equal(stateLabel("kill_failed"), "kill_failed");
   assert.equal(stateLabel("node_unreachable"), "offline");
   assert.equal(stateLabel("archived"), "archived");
+});
+
+// The full BeeState union, spelled out so the compiler flags any state that is
+// added to the union but forgotten in these coverage assertions.
+const ALL_STATES: BeeState[] = [
+  "dead",
+  "sealed",
+  "archived",
+  "blocked",
+  "ready",
+  "active",
+  "idle_with_output",
+  "booting",
+  "error",
+  "kill_failed",
+  "node_unreachable",
+];
+
+test("STATE_PRESENTATION covers every BeeState with a finite clean priority", () => {
+  // A missing clean-priority case used to fall through to undefined -> NaN and
+  // silently corrupt `hive clean` ordering (HIVE-36).
+  assert.equal(Object.keys(STATE_PRESENTATION).length, ALL_STATES.length);
+  for (const state of ALL_STATES) {
+    const priority = cleanStatePriority(state);
+    assert.ok(Number.isFinite(priority), `${state} has a finite clean priority`);
+    assert.ok(priority >= 0, `${state} clean priority is non-negative`);
+    assert.ok(stateLabel(state).length > 0, `${state} has a non-empty label`);
+    assert.ok(STATE_PRESENTATION[state].glyph.length > 0, `${state} has a glyph`);
+  }
+});
+
+test("cleanStatePriority preserves the original ordering", () => {
+  assert.equal(cleanStatePriority("idle_with_output"), 0);
+  assert.equal(cleanStatePriority("dead"), 1);
+  assert.equal(cleanStatePriority("archived"), 1);
+  assert.equal(cleanStatePriority("sealed"), 2);
+  assert.equal(cleanStatePriority("kill_failed"), 3);
+  assert.equal(cleanStatePriority("ready"), 4);
+  assert.equal(cleanStatePriority("blocked"), 5);
+  assert.equal(cleanStatePriority("error"), 6);
+  assert.equal(cleanStatePriority("booting"), 7);
+  assert.equal(cleanStatePriority("active"), 8);
+  assert.equal(cleanStatePriority("node_unreachable"), 9);
+});
+
+test("formatStateCell renders the table's glyph and label", () => {
+  // Strip color so the assertion holds whether or not stdout is a TTY.
+  assert.equal(stripAnsi(formatStateCell("active")), "● active");
+  assert.equal(stripAnsi(formatStateCell("ready")), "● ready");
+  assert.equal(stripAnsi(formatStateCell("idle_with_output")), "● idle");
+  assert.equal(stripAnsi(formatStateCell("archived")), "○ archived");
+  assert.equal(stripAnsi(formatStateCell("dead")), "○ dead");
+  assert.equal(stripAnsi(formatStateCell("node_unreachable")), "? offline");
 });
 
 test("isTerminalState recognizes end states", () => {
@@ -274,4 +348,26 @@ test("kill_failed still wins over node_unreachable", () => {
     now: NOW,
   });
   assert.equal(result.state, "kill_failed");
+});
+
+test("HSR structured terminal states do not reuse the last prompt as detail", () => {
+  for (const state of ["dead", "error", "kill_failed", "node_unreachable"] as const) {
+    const result = deriveState(
+      bee({
+        substrate: "hsr",
+        node: "mini01",
+        lastPrompt: "deploy prod",
+        lastPromptAt: "2026-05-28T11:30:00.000Z",
+        lastError: "runner failed",
+      }),
+      {
+        liveTargets: new Set(),
+        hsrLive: new Set(["alpha"]),
+        hsrStates: new Map([["alpha", state]]),
+        now: NOW,
+      },
+    );
+    assert.equal(result.state, state);
+    assert.notEqual(result.detail, "deploy prod");
+  }
 });

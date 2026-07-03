@@ -217,6 +217,89 @@ test("hive clean --dead --older-than only removes stale dead sessions", async ()
   }
 });
 
+test("hive clean --dead does not reap a live HSR bee (HIVE-1)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-hsr-"));
+  try {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    // A pane-less HSR bee: no live tmux target, so the dead-sweep would reap it
+    // unless the run-dir HSR observer reports it live.
+    const live: SessionRecord = { ...session("hsr-live", "hsr-live"), substrate: "hsr" };
+    live.updatedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const dead: SessionRecord = { ...session("hsr-dead", "hsr-dead"), substrate: "hsr" };
+    dead.updatedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    await writeFile(join(dir, "sessions", "hsr-live.json"), `${JSON.stringify(live)}\n`);
+    await writeFile(join(dir, "sessions", "hsr-dead.json"), `${JSON.stringify(dead)}\n`);
+
+    // Run-dir meta: the live bee's host pid is this test process (alive); the
+    // dead bee's host pid is a never-allocated pid.
+    await mkdir(join(dir, "hsr", "hsr-live"), { recursive: true });
+    await mkdir(join(dir, "hsr", "hsr-dead"), { recursive: true });
+    const meta = (bee: string, hostPid: number) => JSON.stringify({
+      bee,
+      harness: "claude",
+      tier: "interactive",
+      hostPid,
+      startedAt: new Date().toISOString(),
+      controlSocket: "/tmp/none.sock",
+      status: "running",
+    });
+    await writeFile(join(dir, "hsr", "hsr-live", "meta.json"), meta("hsr-live", process.pid));
+    await writeFile(join(dir, "hsr", "hsr-dead", "meta.json"), meta("hsr-dead", 2 ** 22));
+
+    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead", "--dry-run"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+    assert.doesNotMatch(dryRun.stdout, /hsr-live/, "a live HSR bee must never be listed as dead");
+    assert.match(dryRun.stdout, /hsr-dead/, "an HSR bee with a dead host is dead");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// list and clean share buildStateContext, so both must see the HSR run-dir
+// observations — the clean copy of the context assembly once omitted them and
+// derived every live HSR bee as dead (the HIVE-1 data loss). Pin the shared
+// helper's HSR threading through the list path too (HIVE-16).
+test("hive list derives HSR liveness through the shared state context (HIVE-16)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-list-hsr-"));
+  try {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    const live: SessionRecord = { ...session("hsr-live", "hsr-live"), substrate: "hsr" };
+    const dead: SessionRecord = { ...session("hsr-dead", "hsr-dead"), substrate: "hsr" };
+    await writeFile(join(dir, "sessions", "hsr-live.json"), `${JSON.stringify(live)}\n`);
+    await writeFile(join(dir, "sessions", "hsr-dead.json"), `${JSON.stringify(dead)}\n`);
+
+    await mkdir(join(dir, "hsr", "hsr-live"), { recursive: true });
+    await mkdir(join(dir, "hsr", "hsr-dead"), { recursive: true });
+    const meta = (bee: string, hostPid: number) => JSON.stringify({
+      bee,
+      harness: "claude",
+      tier: "interactive",
+      hostPid,
+      startedAt: new Date().toISOString(),
+      controlSocket: "/tmp/none.sock",
+      status: "running",
+    });
+    await writeFile(join(dir, "hsr", "hsr-live", "meta.json"), meta("hsr-live", process.pid));
+    await writeFile(join(dir, "hsr", "hsr-dead", "meta.json"), meta("hsr-dead", 2 ** 22));
+
+    const listed = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "list", "--json"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+    const rows = JSON.parse(listed.stdout) as Array<{ name: string; beeState: string }>;
+    const liveRow = rows.find((row) => row.name === "hsr-live");
+    const deadRow = rows.find((row) => row.name === "hsr-dead");
+    assert.ok(liveRow, "live HSR bee should be listed");
+    assert.ok(deadRow, "dead HSR bee should be listed");
+    assert.notEqual(liveRow.beeState, "dead", "a live HSR bee must not derive as dead");
+    assert.equal(deadRow.beeState, "dead", "an HSR bee with a dead host derives as dead");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function session(name: string, tmuxTarget: string): SessionRecord {
   return {
     name,

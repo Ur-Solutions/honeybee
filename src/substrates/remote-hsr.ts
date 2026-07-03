@@ -176,16 +176,47 @@ export function createRemoteHsrSubstrate(
   const connect = options.connect ?? connectRemoteRunnerHost;
   const deps = options.transport ?? {};
 
+  // Observed bees (refcounted across subscribers). The remote relay behind the
+  // `observe` RPC lives only in the serve process's memory — if that process
+  // restarts (crash/OOM/redeploy), the transport reconnects and re-adopts the
+  // local `hsr.event` bridge, but the fresh serve has an EMPTY relay map and
+  // would never broadcast again (HIVE-11). So we track what we observe and
+  // re-issue the observe RPC on every transport `reconnect`.
+  const observed = new Map<string, number>();
+
+  async function reobserve(c: RemoteRunnerClient): Promise<void> {
+    for (const [bee, count] of [...observed]) {
+      try {
+        // `sync` makes the remote SET its relay refcount to our subscriber
+        // count: against a surviving serve a plain observe would inflate the
+        // count past what our unobserve calls return (HIVE-56); against a
+        // restarted serve it re-creates the relay with the right count.
+        // `ok:false` (bee gone) is left to the mirror's teardown pass; a
+        // thrown call (tunnel flapped again) is retried by the next reconnect.
+        await c.call("observe", { bee, sync: count });
+      } catch {
+        return;
+      }
+    }
+  }
+
   // Lazily establish ONE resilient client per node (reused by the daemon tick,
   // steer, observe). A failed establish is NOT cached — the next call retries,
-  // so a transient tunnel drop never wedges the substrate.
+  // so a transient tunnel drop never wedges the substrate. Caching a client that
+  // later goes 'down' is safe too: its call()/on() kick a fresh reconnect, so
+  // the memoized client self-heals once the network recovers (HIVE-9).
   let clientPromise: Promise<RemoteRunnerClient> | undefined;
   function client(): Promise<RemoteRunnerClient> {
     if (!clientPromise) {
-      clientPromise = connect(node, deps).catch((error) => {
-        clientPromise = undefined;
-        throw error;
-      });
+      clientPromise = connect(node, deps)
+        .then((c) => {
+          c.on("reconnect", () => void reobserve(c));
+          return c;
+        })
+        .catch((error) => {
+          clientPromise = undefined;
+          throw error;
+        });
     }
     return clientPromise;
   }
@@ -354,7 +385,22 @@ export function createRemoteHsrSubstrate(
       off();
       throw new Error(`remote HSR observe of ${bee} on ${node.name} failed: ${res?.error ?? "unknown"}`);
     }
-    return off;
+    observed.set(bee, (observed.get(bee) ?? 0) + 1);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      off();
+      const count = observed.get(bee) ?? 0;
+      if (count <= 1) observed.delete(bee);
+      else observed.set(bee, count - 1);
+      // Release the remote side too (HIVE-56): decrement the serve's relay
+      // refcount so the last unsubscribe closes its connection to the bee's
+      // control socket. Best-effort and fire-and-forget — if the tunnel is
+      // down the next reconnect's `sync` reconciles the count anyway. Reuses
+      // the memoized client only; never opens a connection just to release.
+      void clientPromise?.then((c) => c.call("unobserve", { bee })).catch(() => undefined);
+    };
   }
 
   return {
@@ -405,10 +451,21 @@ export function createRemoteHsrSubstrate(
     listCheckouts,
     observe,
     async close(): Promise<void> {
+      const releasing = [...observed];
+      observed.clear();
       if (!clientPromise) return;
       const pending = clientPromise;
       clientPromise = undefined;
-      await pending.then((c) => c.close()).catch(() => undefined);
+      await pending
+        .then(async (c) => {
+          // Best-effort: release every relay we still hold before dropping the
+          // connection, so the serve's per-bee clients don't outlive us (HIVE-56).
+          for (const [bee, count] of releasing) {
+            await c.call("unobserve", { bee, count }).catch(() => undefined);
+          }
+          c.close();
+        })
+        .catch(() => undefined);
     },
   };
 }

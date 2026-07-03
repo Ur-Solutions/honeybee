@@ -25,20 +25,10 @@ import type {
   TmuxWindowOptions,
 } from "../substrates/types.js";
 import { LOCAL_NODE } from "../substrates/types.js";
-import { hsrSnapshot, listHsrBees } from "./observe.js";
+import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
+import { hsrSnapshot, killOrphanedChildGroup, listHsrBees } from "./observe.js";
 import { readHsrMeta } from "./runDir.js";
 import { connectRpcClient } from "./rpc.js";
-
-/** Signal-0 liveness probe; EPERM means the pid exists but isn't ours. */
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
 
 /** A runner host is live iff meta says running AND its host pid is alive. */
 async function hasSession(bee: string): Promise<boolean> {
@@ -104,11 +94,18 @@ async function kill(bee: string): Promise<KillResult> {
   // "exited" meta means the bee stopped cleanly (its socket file is gone, so the
   // stop attempt above throws) — signalling meta.hostPid then would target a
   // recycled/unrelated pid.
-  if (!stopped && meta && meta.status === "running" && isPidAlive(meta.hostPid)) {
-    try {
-      process.kill(meta.hostPid, "SIGTERM");
-    } catch {
-      // Already gone or not signalable.
+  if (!stopped && meta && meta.status === "running") {
+    if (isPidAlive(meta.hostPid)) {
+      try {
+        process.kill(meta.hostPid, "SIGTERM");
+      } catch {
+        // Already gone or not signalable.
+      }
+    } else {
+      // The host died without finalize (crashed __hsr-run): its detached
+      // harness child is orphaned with no control socket. Signal the recorded
+      // child group directly so kill actually stops the harness (HIVE-53).
+      await killOrphanedChildGroup(meta);
     }
   }
   return { ok: true, stdout: "", stderr: "", exitCode: 0 };

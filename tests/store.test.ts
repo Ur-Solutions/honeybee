@@ -9,6 +9,7 @@ import {
   ledgerPath,
   listSessions,
   loadSession,
+  safeName,
   saveSession,
   touchSession,
   updateSession,
@@ -41,6 +42,15 @@ async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> 
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+test("safeName neutralizes empty and dot-only path segments", () => {
+  assert.equal(safeName("CO.abc"), "CO.abc");
+  assert.equal(safeName("bad/name"), "bad-name");
+  assert.equal(safeName("."), "-");
+  assert.equal(safeName(".."), "--");
+  assert.equal(safeName("..."), "---");
+  assert.equal(safeName(""), "-");
+});
 
 test("store root is read at call time and session files are private", async () => {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -84,6 +94,61 @@ test("updateSession merges a patch field-level under the session lock", async ()
     assert.equal(reloaded?.notes, "keep me");
 
     assert.equal(await updateSession("missing", { title: "x" }), null);
+  });
+});
+
+test("updateSession deletes fields patched to explicit undefined", async () => {
+  await withTempStore(async (dir) => {
+    // An HSR bee about to be promoted onto tmux.
+    await saveSession(makeRecord(dir, { substrate: "hsr", runnerPid: 4242, runnerTier: "turn" }));
+
+    const merged = await updateSession("CO.abc", {
+      status: "running",
+      agentPaneId: "%7",
+      substrate: undefined,
+      runnerPid: undefined,
+      runnerTier: undefined,
+    });
+    assert.equal(merged?.agentPaneId, "%7");
+    assert.equal("substrate" in (merged ?? {}), false);
+    assert.equal("runnerPid" in (merged ?? {}), false);
+    assert.equal("runnerTier" in (merged ?? {}), false);
+
+    const reloaded = await loadSession("CO.abc");
+    assert.equal(reloaded?.agentPaneId, "%7");
+    assert.equal(reloaded?.substrate, undefined);
+    assert.equal(reloaded?.runnerPid, undefined);
+    assert.equal(reloaded?.runnerTier, undefined);
+  });
+});
+
+test("updateSession flip preserves fields merged concurrently after the caller's load (HIVE-49)", async () => {
+  await withTempStore(async (dir) => {
+    await saveSession(makeRecord(dir, { substrate: "hsr", runnerPid: 4242 }));
+
+    // The caller (hive promote) loads its snapshot...
+    const snapshot = await loadSession("CO.abc");
+    assert.ok(snapshot);
+
+    // ...then the daemon's auto-titler lands title/providerSessionId...
+    await updateSession("CO.abc", { title: "Auto Title", titleSource: "auto", providerSessionId: "sess-123" });
+
+    // ...and the caller persists its single-purpose flip via a field merge
+    // (NOT a full-record save of the stale snapshot).
+    await updateSession(snapshot.name, {
+      status: "running",
+      agentPaneId: "%3",
+      substrate: undefined,
+      runnerPid: undefined,
+    });
+
+    const reloaded = await loadSession("CO.abc");
+    assert.equal(reloaded?.title, "Auto Title");
+    assert.equal(reloaded?.titleSource, "auto");
+    assert.equal(reloaded?.providerSessionId, "sess-123");
+    assert.equal(reloaded?.agentPaneId, "%3");
+    assert.equal(reloaded?.substrate, undefined);
+    assert.equal(reloaded?.runnerPid, undefined);
   });
 });
 

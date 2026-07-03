@@ -3,13 +3,14 @@
  *
  * codex is tier "server": it speaks JSON-RPC 2.0 over a `codex app-server` child's
  * stdio, BIDIRECTIONALLY (the server also sends us requests, for approvals). It
- * does NOT use BaseStreamRunner — the transport is a request/response + inbound
+ * does NOT use the stream runner — the transport is a request/response + inbound
  * server-request peer (codexRpc.ts), not a line→event stream. This file owns:
  *   - the codex protocol flow (initialize → thread/start → turn/start → notifications)
- *   - its OWN event queue + ring buffer + run-dir persistence + child teardown
- *     (mirrors streamRunner.ts scaffolding — a follow-up extracts the shared parts)
  *   - PURE mappers (exported for hermetic tests): notification→events,
  *     user-input encode, server-request→needs_input.
+ *
+ *   - the shared session plumbing (event queue + ring buffer + run-dir
+ *     persistence + child teardown) comes from sessionBase.ts (HIVE-20)
  *
  * v1 scoping: ONE `codex app-server` child per BEE hosting ONE thread. sessionId
  * is the thread id learned from the thread/start response. yolo =
@@ -20,24 +21,13 @@
  * text_elements}, TurnCompletedNotification{threadId,turn}, AgentMessageDelta
  * {delta}, ErrorNotification{error:{message}}, ThreadTokenUsage{last:{...}}.
  *
- * Node builtins only. Process-group teardown mirrors src/flow/background.ts.
+ * Node builtins only.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
 import type { RunnerAdapter, RunnerEvent, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
-import { appendHsrEvent, writeHsrRing } from "../runDir.js";
-import { scrubEnvFor } from "../allowance.js";
+import { harnessAllowance } from "../harness.js";
+import { attachSessionPlumbing, spawnSessionChild } from "../sessionBase.js";
 import { createCodexRpcPeer, CODEX_RPC_METHOD_NOT_FOUND, type CodexRpcPeer } from "./codexRpc.js";
-
-// Ring buffer caps — whichever hits first bounds the rendered tail (as streamRunner).
-const RING_MAX_LINES = 200;
-const RING_MAX_BYTES = 16 * 1024;
-const RING_DEBOUNCE_MS = 50;
-// Process-group teardown grace (SIGTERM → SIGKILL), mirrors flow/background.ts.
-const STOP_GRACE_MS = 2_000;
-const STOP_POLL_MS = 25;
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -160,7 +150,7 @@ function usageFromBreakdown(value: unknown): (RunnerEvent & { type: "usage" }) |
 function usageFromThreadTokenUsage(value: unknown): (RunnerEvent & { type: "usage" }) | undefined {
   const tu = asObject(value);
   if (!tu) return undefined;
-  return usageFromBreakdown(tu.last) ?? usageFromBreakdown(tu.total);
+  return usageFromBreakdown(tu.last);
 }
 
 /** Encode one user turn as a codex UserInput "text" variant (TurnStartParams.input[0]). */
@@ -253,7 +243,7 @@ export function buildCodexSpawn(opts: RunnerOpts): { command: string; args: stri
   const command = opts.command ?? "codex";
   const authKind = opts.authKind ?? "subscription";
   const env: Record<string, string> = { ...opts.env };
-  for (const key of scrubEnvFor("codex", authKind)) delete env[key];
+  for (const key of harnessAllowance("codex", authKind)?.scrubEnv ?? []) delete env[key];
   return { command, args: [...CODEX_APP_SERVER_ARGS], env };
 }
 
@@ -261,102 +251,17 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   const bee = opts.bee;
   const { command, args, env } = buildCodexSpawn(opts);
 
-  const child: ChildProcess = spawn(command, args, {
-    cwd: opts.cwd,
-    env,
-    detached: true, // own process group ⇒ pgid === child.pid, group-killable on stop()
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    const onError = (err: Error): void => reject(err);
-    child.once("error", onError);
-    child.once("spawn", () => {
-      child.removeListener("error", onError);
-      resolve();
-    });
-  });
-  child.on("error", () => undefined); // post-spawn errors (EPIPE) must not crash the host
-
-  const childPid = child.pid as number;
-  const childPgid = childPid;
-
-  // --- structured event queue (backs the AsyncIterable) — mirrors streamRunner --
-  const queue: RunnerEvent[] = [];
-  const waiters: Array<(r: IteratorResult<RunnerEvent>) => void> = [];
-  let ended = false;
-
-  const pushEvent = (event: RunnerEvent): void => {
-    if (ended) return;
-    const waiter = waiters.shift();
-    if (waiter) waiter({ value: event, done: false });
-    else queue.push(event);
-  };
-  const endStream = (): void => {
-    if (ended) return;
-    ended = true;
-    for (const waiter of waiters.splice(0)) waiter({ value: undefined as never, done: true });
-  };
-
-  const events: AsyncIterable<RunnerEvent> = {
-    [Symbol.asyncIterator](): AsyncIterator<RunnerEvent> {
-      return {
-        next(): Promise<IteratorResult<RunnerEvent>> {
-          const buffered = queue.shift();
-          if (buffered !== undefined) return Promise.resolve({ value: buffered, done: false });
-          if (ended) return Promise.resolve({ value: undefined as never, done: true });
-          return new Promise((resolve) => waiters.push(resolve));
-        },
-      };
-    },
-  };
-
-  // --- ring buffer (rendered text tail) — mirrors streamRunner -----------------
-  let ringText = "";
-  let ringTimer: NodeJS.Timeout | null = null;
-  const ringAppend = (text: string): void => {
-    ringText += text.endsWith("\n") ? text : `${text}\n`;
-    const lines = ringText.split("\n");
-    if (lines.length > RING_MAX_LINES + 1) ringText = lines.slice(lines.length - (RING_MAX_LINES + 1)).join("\n");
-    while (Buffer.byteLength(ringText, "utf8") > RING_MAX_BYTES) {
-      const nl = ringText.indexOf("\n");
-      if (nl === -1) {
-        ringText = ringText.slice(ringText.length - RING_MAX_BYTES);
-        break;
-      }
-      ringText = ringText.slice(nl + 1);
-    }
-  };
-  const scheduleRingWrite = (): void => {
-    if (ringTimer) return;
-    ringTimer = setTimeout(() => {
-      ringTimer = null;
-      void writeHsrRing(bee, ringText).catch(() => undefined);
-    }, RING_DEBOUNCE_MS);
-  };
-  const flushRing = (): void => {
-    if (ringTimer) {
-      clearTimeout(ringTimer);
-      ringTimer = null;
-    }
-    void writeHsrRing(bee, ringText).catch(() => undefined);
-  };
-
-  // --- ingest one produced event: stamp, persist, queue, ring — mirrors streamRunner
-  const ingestEvent = (event: RunnerEvent): void => {
-    if (typeof (event as { ts?: unknown }).ts !== "number" || (event as { ts: number }).ts === 0) {
-      (event as { ts: number }).ts = Date.now();
-    }
-    pushEvent(event);
-    void appendHsrEvent(bee, event).catch(() => undefined);
-    if (event.type === "text") {
-      ringAppend(event.text);
-      scheduleRingWrite();
-    }
-  };
+  const child = await spawnSessionChild(command, args, { cwd: opts.cwd, env });
 
   // --- codex rpc peer over the child stdio ------------------------------------
   const peer: CodexRpcPeer = createCodexRpcPeer(child.stdin!, child.stdout!);
+
+  // Shared event queue / ring buffer / ingest / exit teardown / group stop
+  // (sessionBase.ts). The peer is disposed FIRST in the exit handler so
+  // in-flight requests reject before the exit event lands.
+  const { events, ingestEvent, snapshot, hasExited, stop } = attachSessionPlumbing(bee, child, {
+    onChildExit: () => peer.dispose(new Error("codex app-server exited")),
+  });
 
   // Track the live thread + turn ids so interrupt/turn-start carry them.
   let threadId = "";
@@ -390,7 +295,7 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   const session: RunnerSession = {
     sessionId: opts.sessionId ?? "",
     tier: "server",
-    pid: childPid,
+    pid: child.pid as number,
     send,
     interrupt,
     answer,
@@ -398,26 +303,6 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
     snapshot,
     stop,
   };
-
-  // --- child exit — mirrors streamRunner --------------------------------------
-  let exited = false;
-  let resolveExited!: () => void;
-  const exitedPromise = new Promise<void>((resolve) => {
-    resolveExited = resolve;
-  });
-  child.once("exit", (code, signal) => {
-    exited = true;
-    peer.dispose(new Error("codex app-server exited"));
-    ingestEvent({ type: "exit", ts: Date.now(), code: code ?? null, signal: signal ?? undefined });
-    flushRing();
-    endStream();
-    // Node keeps the parent-side stdio pipes open after child exit; destroy them
-    // so the host's event loop can drain and the __hsr-run process exits cleanly.
-    child.stdin?.destroy();
-    child.stdout?.destroy();
-    child.stderr?.destroy();
-    resolveExited();
-  });
 
   // --- protocol handshake: initialize → thread/start (or resume) --------------
   await peer.request("initialize", {
@@ -445,15 +330,8 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   }
   if (threadId.length > 0) session.sessionId = threadId;
 
-  function snapshot(lines?: number): string {
-    if (lines === undefined) return ringText;
-    const all = ringText.split("\n");
-    if (all.length > 0 && all[all.length - 1] === "") all.pop();
-    return all.slice(Math.max(0, all.length - lines)).join("\n");
-  }
-
   async function send(text: string): Promise<void> {
-    if (exited) throw new Error("hsr codex: app-server has exited (session ended?)");
+    if (hasExited()) throw new Error("hsr codex: app-server has exited (session ended?)");
     if (!threadId) throw new Error("hsr codex: no thread id (thread/start did not complete)");
     // Fire the turn; turn_start/turn_end come from turn/started / turn/completed
     // notifications, so we don't block send() on the turn's completion.
@@ -473,39 +351,10 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   }
 
   async function interrupt(): Promise<void> {
-    if (exited || !threadId) return;
+    if (hasExited() || !threadId) return;
     await peer
       .request("turn/interrupt", { threadId, turnId: currentTurnId })
       .catch(() => undefined);
-  }
-
-  async function stop(): Promise<void> {
-    if (exited) return exitedPromise;
-    try {
-      process.kill(-childPgid, "SIGTERM");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-      }
-    }
-    const deadline = Date.now() + STOP_GRACE_MS;
-    while (!exited && Date.now() < deadline) await sleep(STOP_POLL_MS);
-    if (!exited) {
-      try {
-        process.kill(-childPgid, "SIGKILL");
-      } catch {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // ignore
-        }
-      }
-    }
-    await exitedPromise;
   }
 
   return session;

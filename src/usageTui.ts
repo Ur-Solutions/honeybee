@@ -15,7 +15,7 @@
  * exported as pure functions for unit tests.
  */
 
-import * as readline from "node:readline";
+import type * as readline from "node:readline";
 import {
   dim,
   formatRelativeTime,
@@ -28,6 +28,8 @@ import {
   visibleLength,
   yellow,
 } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
+import { runRawModeTui } from "./tuiRuntime.js";
 import { paceDelta, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 
 export type UsageTuiHooks = {
@@ -59,9 +61,15 @@ export const USAGE_TUI_MIN_INTERVAL_MS = 10_000;
 /** Backoff cap: consecutive rate-limited sweeps double the wait up to 8× the interval. */
 export const USAGE_TUI_MAX_BACKOFF_FACTOR = 8;
 
-/** True when any account's live read was rejected for rate limiting. */
+/**
+ * True when any account's live read was rejected for rate limiting — either a
+ * raw 429 error row, or a stale-cache fallback stamped `rateLimited` by
+ * cachedAccountLimits (the row looks healthy but the provider pushed back).
+ */
 export function usageResultsRateLimited(results: AccountLimits[]): boolean {
-  return results.some((result) => !result.ok && /\b429\b|rate.?limit/i.test(result.error ?? ""));
+  return results.some(
+    (result) => result.rateLimited === true || (!result.ok && /\b429\b|rate.?limit/i.test(result.error ?? "")),
+  );
 }
 
 /**
@@ -272,9 +280,7 @@ export async function runUsageTui(hooks: UsageTuiHooks): Promise<void> {
 
   const now = hooks.now ?? Date.now;
   const intervalMs = clampUsageInterval(hooks.intervalMs);
-  const stdin = process.stdin;
   const stdout = process.stdout;
-  const previousRaw = stdin.isRaw;
 
   let results: AccountLimits[] | undefined;
   let lastFetchedAt: number | undefined;
@@ -283,148 +289,121 @@ export async function runUsageTui(hooks: UsageTuiHooks): Promise<void> {
   let refreshError: string | undefined;
   let rateLimitedStreak = 0;
 
-  readline.emitKeypressEvents(stdin);
-  stdin.setRawMode(true);
-  stdin.resume();
-  stdout.write("\x1b[?1049h\x1b[?25l");
+  return runRawModeTui<void>((tui) => {
+    let renderTimer: ReturnType<typeof setInterval> | undefined;
+    let fetchTimer: ReturnType<typeof setTimeout> | undefined;
+    tui.defer(() => {
+      if (renderTimer) clearInterval(renderTimer);
+      if (fetchTimer) clearTimeout(fetchTimer);
+    });
+    const finish = () => tui.finish();
 
-  let restored = false;
-  const restoreTerminal = () => {
-    if (restored) return;
-    restored = true;
-    stdout.write("\x1b[?25h\x1b[?1049l");
-    stdin.setRawMode(previousRaw);
-    stdin.pause();
-  };
-  const onSignal = (signal: NodeJS.Signals) => {
-    restoreTerminal();
-    process.exit(signal === "SIGTERM" ? 143 : 129);
-  };
-  process.once("exit", restoreTerminal);
-  process.once("SIGTERM", onSignal);
-  process.once("SIGHUP", onSignal);
+    const painter = createTuiPainter(stdout);
+    const render = () => {
+      if (tui.done) return;
+      const width = Math.max(20, stdout.columns || 80);
+      const height = Math.max(8, stdout.rows || 24);
+      const status = formatHeaderStatus(lastFetchedAt, nextFetchAt, fetching, now(), rateLimitedStreak > 0);
+      const title = "hive usage — live";
+      const gap = Math.max(1, width - visibleLength(title) - visibleLength(status));
+      const lines: string[] = [truncate(` ${title}${" ".repeat(gap)}${dim(status)}`, width), ""];
 
-  try {
-    await new Promise<void>((resolve) => {
-      let done = false;
-      let renderTimer: ReturnType<typeof setInterval> | undefined;
-      let fetchTimer: ReturnType<typeof setTimeout> | undefined;
-
-      const finish = () => {
-        if (done) return;
-        done = true;
-        if (renderTimer) clearInterval(renderTimer);
-        if (fetchTimer) clearTimeout(fetchTimer);
-        stdin.off("keypress", onKey);
-        stdout.off("resize", render);
-        resolve();
-      };
-
-      const render = () => {
-        if (done) return;
-        const width = Math.max(20, stdout.columns || 80);
-        const height = Math.max(8, stdout.rows || 24);
-        const status = formatHeaderStatus(lastFetchedAt, nextFetchAt, fetching, now(), rateLimitedStreak > 0);
-        const title = "hive usage — live";
-        const gap = Math.max(1, width - visibleLength(title) - visibleLength(status));
-        const lines: string[] = [truncate(` ${title}${" ".repeat(gap)}${dim(status)}`, width), ""];
-
-        if (!results) {
-          lines.push(dim("  loading…"));
+      if (!results) {
+        lines.push(dim("  loading…"));
+      } else {
+        const body = buildUsageRows(results, now(), width);
+        const footer = buildUsageFooter(results, refreshError, hooks.warnings ?? []);
+        // title(1) + blank(1) + blank-before-footer(1) + footer lines.
+        const reserved = 3 + footer.length;
+        const avail = Math.max(1, height - reserved);
+        if (body.length > avail) {
+          const shown = body.slice(0, Math.max(1, avail - 1));
+          lines.push(...shown, dim(`… ${body.length - shown.length} more`));
         } else {
-          const body = buildUsageRows(results, now(), width);
-          const footer = buildUsageFooter(results, refreshError, hooks.warnings ?? []);
-          // title(1) + blank(1) + blank-before-footer(1) + footer lines.
-          const reserved = 3 + footer.length;
-          const avail = Math.max(1, height - reserved);
-          if (body.length > avail) {
-            const shown = body.slice(0, Math.max(1, avail - 1));
-            lines.push(...shown, dim(`… ${body.length - shown.length} more`));
-          } else {
-            lines.push(...body);
-          }
-          lines.push("");
-          lines.push(...footer.map((line) => truncate(line, width)));
+          lines.push(...body);
         }
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
-      };
+        lines.push("");
+        lines.push(...footer.map((line) => truncate(line, width)));
+      }
+      painter.paint(lines, width, height);
+    };
 
-      const scheduleNextFetch = () => {
-        if (fetchTimer) clearTimeout(fetchTimer);
-        // Consecutive rate-limited sweeps double the wait (capped) — polling
-        // through a 429 only prolongs it.
-        const delay = nextUsageFetchDelayMs(intervalMs, rateLimitedStreak);
-        nextFetchAt = now() + delay;
-        fetchTimer = setTimeout(() => {
-          if (!fetching) doFetch(hooks.fetchLimits);
-        }, delay);
-      };
+    const scheduleNextFetch = () => {
+      if (fetchTimer) clearTimeout(fetchTimer);
+      // Consecutive rate-limited sweeps double the wait (capped) — polling
+      // through a 429 only prolongs it.
+      const delay = nextUsageFetchDelayMs(intervalMs, rateLimitedStreak);
+      nextFetchAt = now() + delay;
+      fetchTimer = setTimeout(() => {
+        if (!fetching) doFetch(hooks.fetchLimits);
+      }, delay);
+    };
 
-      const doFetch = (fn: () => Promise<AccountLimits[]>) => {
-        if (fetching) return; // never overlap a fetch
-        fetching = true;
-        render();
-        fn()
-          .then((next) => {
-            if (done) return;
-            results = next;
-            lastFetchedAt = now();
-            refreshError = undefined;
-            rateLimitedStreak = usageResultsRateLimited(next) ? rateLimitedStreak + 1 : 0;
-          })
-          .catch((error) => {
-            if (done) return;
-            refreshError = error instanceof Error ? error.message : String(error);
-          })
-          .finally(() => {
-            fetching = false;
-            if (!done) {
-              scheduleNextFetch();
-              render();
-            }
-          });
-      };
-
-      const onKey = (_value: string, key: readline.Key) => {
-        if (key.ctrl && key.name === "c") {
-          finish();
-          return;
-        }
-        if (key.name === "q" || key.name === "escape") {
-          finish();
-          return;
-        }
-        if (key.name === "r") {
-          rateLimitedStreak = 0; // a human override retries at full cadence
-          doFetch(hooks.fetchLimits);
-        }
-      };
-
+    const doFetch = (fn: () => Promise<AccountLimits[]>) => {
+      if (fetching) return; // never overlap a fetch
+      fetching = true;
       render();
-      stdin.on("keypress", onKey);
-      stdout.on("resize", render);
+      fn()
+        .then((next) => {
+          if (tui.done) return;
+          results = next;
+          lastFetchedAt = now();
+          refreshError = undefined;
+          rateLimitedStreak = usageResultsRateLimited(next) ? rateLimitedStreak + 1 : 0;
+        })
+        .catch((error) => {
+          if (tui.done) return;
+          refreshError = error instanceof Error ? error.message : String(error);
+        })
+        .finally(() => {
+          fetching = false;
+          if (!tui.done) {
+            scheduleNextFetch();
+            render();
+          }
+        });
+    };
+
+    const onKey = (_value: string, key: readline.Key) => {
+      if (key.ctrl && key.name === "c") {
+        finish();
+        return;
+      }
+      if (key.name === "q" || key.name === "escape") {
+        finish();
+        return;
+      }
+      if (key.name === "r") {
+        rateLimitedStreak = 0; // a human override retries at full cadence
+        doFetch(hooks.fetchLimits);
+      }
+    };
+
+    const start = () => {
       renderTimer = setInterval(render, 1000);
 
       // Seed the first frame from the cheap read, then immediately go live.
-      const seed = hooks.seedLimits ?? hooks.fetchLimits;
-      seed()
-        .then((next) => {
-          if (done) return;
-          results = next;
-          lastFetchedAt = now();
-          render();
-        })
-        .catch(() => { /* the live fetch below will surface any error */ })
-        .finally(() => {
-          if (!done) doFetch(hooks.fetchLimits);
-        });
-    });
-  } finally {
-    process.off("exit", restoreTerminal);
-    process.off("SIGTERM", onSignal);
-    process.off("SIGHUP", onSignal);
-    restoreTerminal();
-  }
+      // Without a seed hook there is nothing cheap to show first — go straight
+      // to the live fetch instead of running the same full sweep twice.
+      if (hooks.seedLimits) {
+        hooks.seedLimits()
+          .then((next) => {
+            if (tui.done) return;
+            results = next;
+            lastFetchedAt = now();
+            render();
+          })
+          .catch(() => { /* the live fetch below will surface any error */ })
+          .finally(() => {
+            if (!tui.done) doFetch(hooks.fetchLimits);
+          });
+      } else {
+        doFetch(hooks.fetchLimits);
+      }
+    };
+
+    return { onKey, render, start };
+  });
 }
 
 // Re-exported for callers/tests that want to strip a rendered row.

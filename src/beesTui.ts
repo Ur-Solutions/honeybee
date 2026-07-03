@@ -5,9 +5,12 @@
  * fzf-style filtering, and raw-mode rendering (same discipline as cleanTui).
  */
 
-import * as readline from "node:readline";
+import type * as readline from "node:readline";
 import { fuzzyFilter } from "./spawnTui.js";
 import { bold, cyan, dim, gray, green, isPretty, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
+import { reverse } from "./tuiKit.js";
+import { runRawModeTui } from "./tuiRuntime.js";
 import type { ProSlotKind } from "./proProjects.js";
 
 export type BeesTuiItem = {
@@ -275,6 +278,24 @@ export function filterBeesTuiItems(items: BeesTuiItem[], query: string): BeesTui
   return fuzzyFilter(query, items, beesTuiFuzzyKey);
 }
 
+/** One typing burst costs one fuzzy pass instead of one per keystroke. */
+export const BEES_FILTER_DEBOUNCE_MS = 24;
+
+/**
+ * True when the matches for `next` can be found by re-filtering the matches of
+ * a previous pass for `prev` instead of the whole catalog. That needs "matches
+ * next ⇒ matches prev", which holds for a prefix extension — except that
+ * fuzzyScore's sparse-match cap is max(8, 2·len), so past 4 effective chars the
+ * cap grows with the query and an item rejected for the prefix can legally
+ * match the longer query. Short queries are also exactly where the full scan is
+ * expensive (most matches, biggest sort).
+ */
+export function canNarrowBeesFilter(prev: string, next: string): boolean {
+  const p = prev.trim().toLowerCase();
+  const n = next.trim().toLowerCase();
+  return p.length > 0 && n.length <= 4 && n.length > p.length && n.startsWith(p);
+}
+
 function stateCell(headline: string, live: boolean): string {
   const h = headline.toLowerCase();
   if (h === "working" || h === "active") return `${green("●")} ${truncate(headline, 8)}`;
@@ -293,10 +314,6 @@ function stateGlyph(headline: string, live: boolean): string {
   return dim("●");
 }
 
-function reverse(text: string): string {
-  return isPretty() ? `\x1b[7m${text}\x1b[0m` : text;
-}
-
 export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("hive bees requires a TTY. Bind it to a tmux pane or run interactively.");
@@ -305,9 +322,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
     throw new Error("No bees to show. Spawn one with: hive spawn <bee>");
   }
 
-  const stdin = process.stdin;
   const stdout = process.stdout;
-  const previousRaw = stdin.isRaw;
   let catalog = [...options.items];
   let query = "";
   let groupMode: BeesGroupMode = options.groupMode ?? "colony";
@@ -319,297 +334,274 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
   let confirmKill: BeesTuiItem | undefined; // bee awaiting kill confirmation
   let killing = false;
   let selecting: BeesTuiItem | undefined;
-  let message = "type to filter · ↑↓ move · enter selects · q quits";
+  let message = "type to filter · ↑↓ move · enter selects · esc quits";
 
-  readline.emitKeypressEvents(stdin);
-  stdin.setRawMode(true);
-  stdin.resume();
-  stdout.write("\x1b[?1049h\x1b[?25l");
+  return runRawModeTui<void>((tui) => {
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+    let filterTimer: ReturnType<typeof setTimeout> | undefined;
+    tui.defer(() => {
+      if (pollTimer) clearInterval(pollTimer);
+      if (filterTimer) clearTimeout(filterTimer);
+    });
+    const finish = () => tui.finish();
 
-  let restored = false;
-  const restoreTerminal = () => {
-    if (restored) return;
-    restored = true;
-    stdout.write("\x1b[?25h\x1b[?1049l");
-    stdin.setRawMode(previousRaw);
-    stdin.pause();
-  };
-  const onSignal = (signal: NodeJS.Signals) => {
-    restoreTerminal();
-    process.exit(signal === "SIGTERM" ? 143 : 129);
-  };
-  process.once("exit", restoreTerminal);
-  process.once("SIGTERM", onSignal);
-  process.once("SIGHUP", onSignal);
+    const itemRows = () => flat.filter((row): row is Extract<FlatRow, { kind: "item" }> => row.kind === "item");
 
-  try {
-    await new Promise<void>((resolve) => {
-      let done = false;
-      let pollTimer: ReturnType<typeof setInterval> | undefined;
-      const finish = () => {
-        if (done) return;
-        done = true;
-        if (pollTimer) clearInterval(pollTimer);
-        stdin.off("keypress", onKey);
-        stdout.off("resize", onResize);
-        resolve();
-      };
+    const currentItem = (): BeesTuiItem | undefined => {
+      const row = flat[cursor];
+      return row?.kind === "item" ? row.item : undefined;
+    };
 
-      const itemRows = () => flat.filter((row): row is Extract<FlatRow, { kind: "item" }> => row.kind === "item");
+    // The match set of the last fuzzy pass, so a query that merely extends
+    // the previous one narrows from those matches instead of re-scanning the
+    // catalog. `catalog` is kept by reference: a refresh/kill swaps the array
+    // and silently invalidates the cache.
+    let lastFilter: { query: string; catalog: BeesTuiItem[]; items: BeesTuiItem[] } | undefined;
 
-      const moveCursor = (next: number) => {
-        const items = itemRows();
-        if (items.length === 0) {
-          cursor = 0;
-          return;
-        }
-        const indices = items.map((row) => flat.indexOf(row));
-        let pos = indices.indexOf(cursor);
-        if (pos < 0) pos = 0;
-        pos = Math.max(0, Math.min(indices.length - 1, next));
-        cursor = indices[pos]!;
-      };
+    const regroup = () => {
+      // Read the highlighted bee from the OLD flat before rebuilding so the
+      // cursor can follow it; resolveRegroupCursor handles the fallbacks.
+      const prevName = currentItem()?.name;
+      if (query.length === 0) {
+        filtered = catalog;
+        lastFilter = undefined;
+      } else {
+        const pool = lastFilter && lastFilter.catalog === catalog && canNarrowBeesFilter(lastFilter.query, query)
+          ? lastFilter.items
+          : catalog;
+        filtered = filterBeesTuiItems(pool, query);
+        lastFilter = { query, catalog, items: filtered };
+      }
+      groups = groupBeesByMode(filtered, groupMode);
+      flat = flattenBeesTuiGroups(groups);
+      cursor = resolveRegroupCursor(flat, prevName, options.currentName);
+      scroll = 0;
+    };
 
-      const currentItem = (): BeesTuiItem | undefined => {
-        const row = flat[cursor];
-        return row?.kind === "item" ? row.item : undefined;
-      };
-
-      const regroup = () => {
-        // Read the highlighted bee from the OLD flat before rebuilding so the
-        // cursor can follow it; resolveRegroupCursor handles the fallbacks.
-        const prevName = currentItem()?.name;
-        filtered = query.length > 0 ? filterBeesTuiItems(catalog, query) : catalog;
-        groups = groupBeesByMode(filtered, groupMode);
-        flat = flattenBeesTuiGroups(groups);
-        cursor = resolveRegroupCursor(flat, prevName, options.currentName);
-        scroll = 0;
-      };
-
-      const applyQuery = (next: string) => {
-        query = next;
+    const applyQuery = (next: string) => {
+      query = next;
+      // Debounce the fuzzy pass + regroup: the caller's render() echoes the
+      // typed query immediately (over the previous match list), and the
+      // filter runs once when the burst pauses.
+      if (filterTimer) clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => {
+        filterTimer = undefined;
+        if (tui.done) return;
         regroup();
         const n = itemRows().length;
         message = n === 0 ? "no matches" : n === 1 ? "1 bee" : `${n} bees`;
-      };
-
-      const cycleGroup = (delta: number) => {
-        groupMode = nextBeesGroupMode(groupMode, delta);
-        regroup();
-        message = `group: ${BEES_GROUP_MODE_LABEL[groupMode]}`;
         render();
-        void options.onGroupChange?.(groupMode);
-      };
+      }, BEES_FILTER_DEBOUNCE_MS);
+    };
 
-      const onSelect = async () => {
-        const item = currentItem();
-        if (!item || selecting) return;
-        selecting = item;
-        message = `opening ${item.displayName || item.ref}...`;
-        render();
-        try {
-          await options.onSelect(item);
-          message = `→ ${item.displayName}`;
-          if (!options.sidebar) finish();
-        } catch (error) {
-          message = error instanceof Error ? error.message : String(error);
-        } finally {
-          selecting = undefined;
-          if (!done) render();
-        }
-      };
-
-      const step = (delta: number) => {
-        const indices = itemRows().map((row) => flat.indexOf(row));
-        const pos = indices.indexOf(cursor);
-        moveCursor(pos < 0 ? 0 : Math.max(0, Math.min(indices.length - 1, pos + delta)));
-        render();
-      };
-
-      const openPreview = async () => {
-        if (!options.onPreview) { message = "preview unavailable here"; render(); return; }
-        const item = currentItem();
-        if (!item) return;
-        message = `preview: ${item.displayName || item.ref}`;
-        render();
-        try {
-          await options.onPreview(item); // blocks until the popup closes
-        } catch (error) {
-          if (done) return;
-          message = error instanceof Error ? error.message : String(error);
-        }
-        if (!done) render();
-      };
-
-      const requestKill = () => {
-        if (!options.onKill) { message = "kill unavailable here"; render(); return; }
-        const item = currentItem();
-        if (!item) return;
-        confirmKill = item;
-        render();
-      };
-
-      const performKill = async (item: BeesTuiItem) => {
-        if (!options.onKill || killing) return;
-        killing = true;
-        confirmKill = undefined;
-        message = `killing ${item.displayName || item.ref}…`;
-        render();
-        try {
-          const result = await options.onKill(item);
-          if (done) return;
-          if (result.ok) {
-            catalog = catalog.filter((c) => c.name !== item.name);
-            regroup();
-            message = `killed ${item.displayName || item.ref}`;
-          } else {
-            message = result.detail || "kill failed";
-          }
-        } catch (error) {
-          if (done) return;
-          message = error instanceof Error ? error.message : String(error);
-        } finally {
-          killing = false;
-          if (!done) render();
-        }
-      };
-
-      const onKey = (_value: string, key: readline.Key) => {
-        if (key.ctrl && key.name === "c") {
-          finish();
-          return;
-        }
-        if (selecting) return;
-        // Kill confirmation modal owns all input while open.
-        if (confirmKill) {
-          if (killing) return;
-          if (key.name === "y" || key.name === "return" || key.name === "enter") {
-            void performKill(confirmKill);
-          } else {
-            confirmKill = undefined;
-            message = "kill cancelled";
-            render();
-          }
-          return;
-        }
-        if (key.name === "escape") {
-          if (query.length > 0) {
-            applyQuery("");
-            render();
-            return;
-          }
-          finish();
-          return;
-        }
-        if (key.name === "q" && query.length === 0) {
-          finish();
-          return;
-        }
-        // Navigation is arrow-keys (plus fzf-style Ctrl-N/P) only — j/k are kept
-        // free so they type into the fuzzy filter like any other character.
-        if (key.name === "up" || (key.ctrl && key.name === "p")) { step(-1); return; }
-        if (key.name === "down" || (key.ctrl && key.name === "n")) { step(1); return; }
-        // ⌘g (Meta-g via WezTerm) cycles grouping; Ctrl-G works too where ⌘
-        // isn't mapped; Shift-Tab cycles backward.
-        if ((key.meta || key.ctrl) && key.name === "g") { cycleGroup(1); return; }
-        if (key.ctrl && key.name === "k") { requestKill(); return; }
-        if (key.name === "tab" && key.shift) { cycleGroup(-1); return; }
-        if (key.name === "tab") { void openPreview(); return; }
-        if (key.name === "return" || key.name === "enter") {
-          void onSelect();
-          return;
-        }
-        if (key.name === "backspace") {
-          applyQuery(query.slice(0, -1));
-          render();
-          return;
-        }
-        if (_value && !key.ctrl && !key.meta) {
-          applyQuery(query + _value);
-          render();
-        }
-      };
-
-      const render = () => {
-        if (done) return;
-        const width = Math.max(12, stdout.columns || 80);
-        const height = Math.max(8, stdout.rows || 24);
-        const bodyRows = Math.max(2, height - 5);
-        scroll = Math.min(scroll, Math.max(0, flat.length - bodyRows));
-        if (cursor < scroll) scroll = cursor;
-        if (cursor >= scroll + bodyRows) scroll = cursor - bodyRows + 1;
-        const matchCount = itemRows().length;
-        const lines = [
-          renderTitle(width, catalog.length, query, matchCount),
-          renderHelp(width),
-          "",
-        ];
-        if (confirmKill) {
-          lines.push(...renderKillModal(confirmKill, bodyRows, width, killing));
-        } else {
-          const visible = flat.slice(scroll, scroll + bodyRows);
-          for (let i = 0; i < visible.length; i += 1) lines.push(renderFlatRow(visible[i]!, scroll + i, cursor, width, options.currentName));
-          for (let i = visible.length; i < bodyRows; i += 1) lines.push("");
-        }
-        lines.push(truncate(message, width));
-        lines.push(dim(footerHint()));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
-      };
-
-      const footerHint = (): string => {
-        if (confirmKill) return "y kill · n / esc cancel";
-        const preview = options.onPreview ? " · tab preview" : "";
-        const kill = options.onKill ? " · ^k kill" : "";
-        const group = ` · ⌘g ${BEES_GROUP_MODE_LABEL[groupMode]}`;
-        return (options.sidebar ? "sidebar · q closes" : "q exit") + preview + kill + group;
-      };
-
-      const onResize = () => render();
-
+    const cycleGroup = (delta: number) => {
+      groupMode = nextBeesGroupMode(groupMode, delta);
+      regroup();
+      message = `group: ${BEES_GROUP_MODE_LABEL[groupMode]}`;
       render();
-      stdin.on("keypress", onKey);
-      stdout.on("resize", onResize);
-      if (options.syncGroupMode || options.refreshItems) {
-        let refreshing = false;
-        let tick = 0;
-        let lastSignature = beesCatalogSignature(catalog);
-        pollTimer = setInterval(() => {
-          tick += 1;
-          if (options.syncGroupMode) {
-            void options.syncGroupMode().then((mode) => {
-              if (done || selecting || !mode || mode === groupMode) return;
-              groupMode = mode;
+      void options.onGroupChange?.(groupMode);
+    };
+
+    const onSelect = async () => {
+      const item = currentItem();
+      if (!item || selecting) return;
+      selecting = item;
+      message = `opening ${item.displayName || item.ref}...`;
+      render();
+      try {
+        await options.onSelect(item);
+        message = `→ ${item.displayName}`;
+        if (!options.sidebar) finish();
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      } finally {
+        selecting = undefined;
+        if (!tui.done) render();
+      }
+    };
+
+    const step = (delta: number) => {
+      cursor = stepBeesCursor(flat, cursor, delta);
+      render();
+    };
+
+    const openPreview = async () => {
+      if (!options.onPreview) { message = "preview unavailable here"; render(); return; }
+      const item = currentItem();
+      if (!item) return;
+      message = `preview: ${item.displayName || item.ref}`;
+      render();
+      try {
+        await options.onPreview(item); // blocks until the popup closes
+      } catch (error) {
+        if (tui.done) return;
+        message = error instanceof Error ? error.message : String(error);
+      }
+      if (!tui.done) render();
+    };
+
+    const requestKill = () => {
+      if (!options.onKill) { message = "kill unavailable here"; render(); return; }
+      const item = currentItem();
+      if (!item) return;
+      confirmKill = item;
+      render();
+    };
+
+    const performKill = async (item: BeesTuiItem) => {
+      if (!options.onKill || killing) return;
+      killing = true;
+      confirmKill = undefined;
+      message = `killing ${item.displayName || item.ref}…`;
+      render();
+      try {
+        const result = await options.onKill(item);
+        if (tui.done) return;
+        if (result.ok) {
+          catalog = catalog.filter((c) => c.name !== item.name);
+          regroup();
+          message = `killed ${item.displayName || item.ref}`;
+        } else {
+          message = result.detail || "kill failed";
+        }
+      } catch (error) {
+        if (tui.done) return;
+        message = error instanceof Error ? error.message : String(error);
+      } finally {
+        killing = false;
+        if (!tui.done) render();
+      }
+    };
+
+    const onKey = (_value: string, key: readline.Key) => {
+      if (key.ctrl && key.name === "c") {
+        finish();
+        return;
+      }
+      if (selecting) return;
+      // Kill confirmation modal owns all input while open.
+      if (confirmKill) {
+        if (killing) return;
+        if (key.name === "y" || key.name === "return" || key.name === "enter") {
+          void performKill(confirmKill);
+        } else {
+          confirmKill = undefined;
+          message = "kill cancelled";
+          render();
+        }
+        return;
+      }
+      if (key.name === "escape") {
+        if (query.length > 0) {
+          applyQuery("");
+          render();
+          return;
+        }
+        finish();
+        return;
+      }
+      // Quit is esc/Ctrl-C only — the fuzzy filter is always the live text
+      // buffer here, so every printable (q, j, k, …) must type into it or a
+      // bee named "queen" becomes unfindable by prefix.
+      if (key.name === "up" || (key.ctrl && key.name === "p")) { step(-1); return; }
+      if (key.name === "down" || (key.ctrl && key.name === "n")) { step(1); return; }
+      // ⌘g (Meta-g via WezTerm) cycles grouping; Ctrl-G works too where ⌘
+      // isn't mapped; Shift-Tab cycles backward.
+      if ((key.meta || key.ctrl) && key.name === "g") { cycleGroup(1); return; }
+      if (key.ctrl && key.name === "k") { requestKill(); return; }
+      if (key.name === "tab" && key.shift) { cycleGroup(-1); return; }
+      if (key.name === "tab") { void openPreview(); return; }
+      if (key.name === "return" || key.name === "enter") {
+        void onSelect();
+        return;
+      }
+      if (key.name === "backspace") {
+        applyQuery(query.slice(0, -1));
+        render();
+        return;
+      }
+      if (_value && !key.ctrl && !key.meta) {
+        applyQuery(query + _value);
+        render();
+      }
+    };
+
+    const painter = createTuiPainter(stdout);
+    const render = () => {
+      if (tui.done) return;
+      const width = Math.max(12, stdout.columns || 80);
+      const height = Math.max(8, stdout.rows || 24);
+      const bodyRows = Math.max(2, height - 5);
+      scroll = Math.min(scroll, Math.max(0, flat.length - bodyRows));
+      if (cursor < scroll) scroll = cursor;
+      if (cursor >= scroll + bodyRows) scroll = cursor - bodyRows + 1;
+      const matchCount = itemRows().length;
+      const lines = [
+        renderTitle(width, catalog.length, query, matchCount),
+        renderHelp(width),
+        "",
+      ];
+      if (confirmKill) {
+        lines.push(...renderKillModal(confirmKill, bodyRows, width, killing));
+      } else {
+        const visible = flat.slice(scroll, scroll + bodyRows);
+        for (let i = 0; i < visible.length; i += 1) lines.push(renderFlatRow(visible[i]!, scroll + i, cursor, width, options.currentName));
+        for (let i = visible.length; i < bodyRows; i += 1) lines.push("");
+      }
+      lines.push(truncate(message, width));
+      lines.push(dim(footerHint()));
+      painter.paint(lines, width, height);
+    };
+
+    const footerHint = (): string => {
+      if (confirmKill) return "y kill · n / esc cancel";
+      const preview = options.onPreview ? " · tab preview" : "";
+      const kill = options.onKill ? " · ^k kill" : "";
+      const group = ` · ⌘g ${BEES_GROUP_MODE_LABEL[groupMode]}`;
+      return (options.sidebar ? "sidebar · esc closes" : "esc exit") + preview + kill + group;
+    };
+
+    const start = () => {
+      if (!options.syncGroupMode && !options.refreshItems) return;
+      let refreshing = false;
+      let tick = 0;
+      let lastSignature = beesCatalogSignature(catalog);
+      pollTimer = setInterval(() => {
+        tick += 1;
+        if (options.syncGroupMode) {
+          void options.syncGroupMode().then((mode) => {
+            // Same guard as the catalog refresh below: a confirm modal or an
+            // in-flight kill owns the screen, so don't re-group/repaint under
+            // it — the next poll picks the mode change up once it closes.
+            if (tui.done || selecting || confirmKill || killing || !mode || mode === groupMode) return;
+            groupMode = mode;
+            regroup();
+            render();
+          });
+        }
+        // Catalog refresh runs every other tick (~3s) and never overlaps
+        // itself, so a slow store/probe read can't pile up. A confirm modal or
+        // an in-flight kill owns the screen, so defer the redraw until it ends.
+        if (options.refreshItems && tick % 2 === 0 && !refreshing) {
+          refreshing = true;
+          void options.refreshItems()
+            .then((items) => {
+              if (tui.done || confirmKill || killing || selecting) return;
+              const signature = beesCatalogSignature(items);
+              if (signature === lastSignature) return;
+              lastSignature = signature;
+              catalog = items;
               regroup();
               render();
-            });
-          }
-          // Catalog refresh runs every other tick (~3s) and never overlaps
-          // itself, so a slow store/probe read can't pile up. A confirm modal or
-          // an in-flight kill owns the screen, so defer the redraw until it ends.
-          if (options.refreshItems && tick % 2 === 0 && !refreshing) {
-            refreshing = true;
-            void options.refreshItems()
-              .then((items) => {
-                if (done || confirmKill || killing || selecting) return;
-                const signature = beesCatalogSignature(items);
-                if (signature === lastSignature) return;
-                lastSignature = signature;
-                catalog = items;
-                regroup();
-                render();
-              })
-              .catch(() => { /* best-effort; keep the last good catalog */ })
-              .finally(() => { refreshing = false; });
-          }
-        }, 1500);
-      }
-    });
-  } finally {
-    process.off("exit", restoreTerminal);
-    process.off("SIGTERM", onSignal);
-    process.off("SIGHUP", onSignal);
-    restoreTerminal();
-  }
+            })
+            .catch(() => { /* best-effort; keep the last good catalog */ })
+            .finally(() => { refreshing = false; });
+        }
+      }, 1500);
+    };
+
+    return { onKey, render, start };
+  });
 }
 
 function renderTitle(width: number, total: number, query: string, matchCount: number): string {
@@ -651,6 +643,19 @@ export function initialBeesCursor(flat: FlatRow[], name: string | undefined): nu
 export function resolveRegroupCursor(flat: FlatRow[], prevName: string | undefined, currentName: string | undefined): number {
   const survived = itemRowIndexForName(flat, prevName);
   return survived >= 0 ? survived : initialBeesCursor(flat, currentName);
+}
+
+/**
+ * Cursor row after moving `delta` item rows (headers are skipped, ends clamp).
+ * A cursor that no longer sits on an item (e.g. it drifted onto a header)
+ * snaps to the first item; an item-less list parks at 0.
+ */
+export function stepBeesCursor(flat: FlatRow[], cursor: number, delta: number): number {
+  const indices = flat.flatMap((row, i) => (row.kind === "item" ? [i] : []));
+  if (indices.length === 0) return 0;
+  const pos = indices.indexOf(cursor);
+  const next = pos < 0 ? 0 : Math.max(0, Math.min(indices.length - 1, pos + delta));
+  return indices[next]!;
 }
 
 /**

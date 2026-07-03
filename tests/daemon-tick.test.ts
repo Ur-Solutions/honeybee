@@ -3,8 +3,17 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { tick, type ProbeResult, type TickDeps } from "../src/daemon/run.js";
-import type { BeeState } from "../src/state.js";
+import {
+  createThrottledTranscriptMetadataRefresh,
+  emptyDispatcherOutcomes,
+  tick,
+  tickDispatchers,
+  type DispatcherOutcomes,
+  type ProbeResult,
+  type TickDeps,
+  type TickDispatcher,
+} from "../src/daemon/run.js";
+import type { BeeState, PaneCaptureMap } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -43,7 +52,7 @@ function buildDeps(args: {
   records: SessionRecord[];
   liveTargets: Set<string>;
   sessionStates?: Map<string, string>;
-  panes?: Map<string, string>;
+  panes?: PaneCaptureMap;
   seals?: Set<string>;
   unreachableNodes?: Set<string>;
   now?: number;
@@ -409,11 +418,87 @@ test("tick: does not mirror uncertain booting over an existing live hive state",
   });
 });
 
+test("tick: unknown pane capture preserves active and avoids idle transition side effects", async () => {
+  await withTempStore(async () => {
+    const NOW = Date.parse("2026-06-03T10:00:00.000Z");
+    const record = bee({ lastPromptAt: new Date(NOW - 10 * 60_000).toISOString(), lastPrompt: "keep working" });
+    const capture: Capture = { ledger: [], touches: [] };
+    let dispatchInput: { transitions: Array<{ from: BeeState | undefined; to: BeeState }>; current: BeeState | undefined } | undefined;
+    const deps: TickDeps = {
+      ...buildDeps({
+        records: [record],
+        liveTargets: new Set([record.tmuxTarget]),
+        panes: new Map<string, string | undefined>([[record.tmuxTarget, undefined]]),
+        now: NOW,
+        capture,
+      }),
+      dispatchBuzDrain: async (_records, transitions, currentStates) => {
+        dispatchInput = {
+          transitions: transitions.map(({ from, to }) => ({ from, to })),
+          current: currentStates.get(record.name),
+        };
+        return [];
+      },
+    };
+
+    const result = await tick(deps, new Map([[record.name, "active"]]));
+
+    assert.equal(result.observed.get(record.name), "active");
+    assert.equal(result.transitions.length, 0);
+    assert.equal(capture.ledger.length, 0);
+    assert.equal(capture.touches[0]!.fields.lastObservedState, "active");
+    assert.deepEqual(dispatchInput, { transitions: [], current: "active" });
+  });
+});
+
 // A promise that never settles — the production wedge shape (a lost libuv fs
 // completion froze one tick, and therefore the daemon, for 3+ days).
 function never<T>(): Promise<T> {
   return new Promise<T>(() => undefined);
 }
+
+async function waitForCondition(condition: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`waitForCondition timed out: ${label}`);
+}
+
+test("transcript metadata refresh throttle skips unchanged transcript cursors", async () => {
+  let now = 1_000;
+  let fileStat = { mtimeMs: 10, size: 100 };
+  const refreshed: string[] = [];
+  const refresh = createThrottledTranscriptMetadataRefresh(
+    async (record) => {
+      refreshed.push(`${record.name}:${record.lastPromptAt ?? ""}`);
+      return record;
+    },
+    {
+      intervalMs: 100,
+      now: () => now,
+      statFile: async () => fileStat,
+    },
+  );
+  const record = bee({ transcriptPath: "/tmp/alpha.jsonl", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+
+  await refresh(record);
+  await refresh(record);
+  assert.deepEqual(refreshed, ["alpha:2026-06-03T09:59:00.000Z"], "same cursor inside the interval is skipped");
+
+  now += 101;
+  await refresh(record);
+  assert.equal(refreshed.length, 1, "same transcript mtime/size is skipped after the interval");
+
+  fileStat = { mtimeMs: 11, size: 100 };
+  now += 101;
+  await refresh(record);
+  assert.equal(refreshed.length, 2, "changed transcript mtime refreshes");
+
+  await refresh({ ...record, lastPromptAt: "2026-06-03T10:01:00.000Z" });
+  assert.equal(refreshed.length, 3, "changed prompt cursor refreshes immediately");
+});
 
 test("tick: a capturePanes that never settles is timed out, recorded, and the tick completes", async () => {
   await withTempStore(async () => {
@@ -425,11 +510,14 @@ test("tick: a capturePanes that never settles is timed out, recorded, and the ti
       timeouts: { substrateMs: 30 },
     };
 
-    const result = await tick(deps, new Map());
+    const result = await tick(deps, new Map([[record.name, "active"]]));
 
     assert.ok(result.errors.some((e) => /capturePanes timed out after 30ms/.test(e.message)));
-    // The tick still observed the record (empty pane fallback) and persisted state.
+    // The tick still observed the record, but preserved the previous state
+    // because pane content was unknown rather than factually empty.
     assert.equal(result.observed.has(record.name), true);
+    assert.equal(result.observed.get(record.name), "active");
+    assert.equal(result.transitions.length, 0);
     assert.equal(capture.touches.length, 1);
   });
 });
@@ -456,6 +544,179 @@ test("tick: a hung per-record transcript refresh is timed out and later records 
     assert.deepEqual(refreshed, ["beta"]);
     assert.equal(result.observed.size, 2);
   });
+});
+
+test("tick: per-record refresh work runs with bounded concurrency", async () => {
+  await withTempStore(async () => {
+    const previousConcurrency = process.env.HIVE_DAEMON_RECORD_CONCURRENCY;
+    process.env.HIVE_DAEMON_RECORD_CONCURRENCY = "2";
+    try {
+      const first = bee({ name: "alpha", tmuxTarget: "hive:alpha", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+      const second = bee({ name: "beta", tmuxTarget: "hive:beta", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+      const capture: Capture = { ledger: [], touches: [] };
+      let releaseAlpha: (() => void) | undefined;
+      const started: string[] = [];
+      const deps: TickDeps = {
+        ...buildDeps({ records: [first, second], liveTargets: new Set([first.tmuxTarget, second.tmuxTarget]), capture }),
+        refreshTranscriptMetadata: async (rec) => {
+          started.push(rec.name);
+          if (rec.name === "alpha") {
+            await new Promise<void>((resolve) => {
+              releaseAlpha = resolve;
+            });
+          }
+          return rec;
+        },
+      };
+
+      const pending = tick(deps, new Map());
+      await waitForCondition(() => started.includes("alpha") && started.includes("beta"), "both refreshes started");
+      releaseAlpha?.();
+      const result = await pending;
+
+      assert.equal(result.observed.size, 2);
+      assert.deepEqual(started.sort(), ["alpha", "beta"]);
+    } finally {
+      if (previousConcurrency === undefined) delete process.env.HIVE_DAEMON_RECORD_CONCURRENCY;
+      else process.env.HIVE_DAEMON_RECORD_CONCURRENCY = previousConcurrency;
+    }
+  });
+});
+
+function dispatcherFor<K extends keyof DispatcherOutcomes>(key: K): TickDispatcher<K> {
+  const dispatcher = tickDispatchers.find((candidate) => candidate.key === key);
+  assert.ok(dispatcher, `registry has no dispatcher for ${key}`);
+  return dispatcher as TickDispatcher<K>;
+}
+
+test("dispatcher registry: covers every DispatcherOutcomes key exactly once", () => {
+  const expected = Object.keys(emptyDispatcherOutcomes()).sort();
+  const keys = tickDispatchers.map((dispatcher) => dispatcher.key);
+  assert.deepEqual([...keys].sort(), expected);
+  const names = tickDispatchers.map((dispatcher) => dispatcher.name);
+  assert.equal(new Set(names).size, names.length, "withTimeout labels must be unique");
+});
+
+test("tick: usage exhaustion gates dispatchAutoswap through the registry", async () => {
+  await withTempStore(async () => {
+    const record = bee();
+    const capture: Capture = { ledger: [], touches: [] };
+    const exhausted = { bee: record.name, account: "CL.a", sampled: true, exhausted: true };
+    let swapInput: unknown;
+    const deps: TickDeps = {
+      ...buildDeps({ records: [record], liveTargets: new Set(), capture }),
+      sampleUsage: async () => [exhausted],
+      dispatchAutoswap: async (_records, usageOutcomes) => {
+        swapInput = usageOutcomes;
+        return [{ bee: record.name, from: "CL.a", to: "CL.b", ok: true }];
+      },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.deepEqual(result.usage, [exhausted]);
+    assert.deepEqual(swapInput, [exhausted]);
+    assert.deepEqual(result.autoswaps, [{ bee: record.name, from: "CL.a", to: "CL.b", ok: true }]);
+  });
+});
+
+test("tick: dispatchAutoswap is skipped when no usage outcome is exhausted", async () => {
+  await withTempStore(async () => {
+    const record = bee();
+    const capture: Capture = { ledger: [], touches: [] };
+    let swapped = false;
+    const deps: TickDeps = {
+      ...buildDeps({ records: [record], liveTargets: new Set(), capture }),
+      sampleUsage: async () => [{ bee: record.name, account: "CL.a", sampled: true, exhausted: false }],
+      dispatchAutoswap: async () => {
+        swapped = true;
+        return [];
+      },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.equal(swapped, false);
+    assert.deepEqual(result.autoswaps, []);
+  });
+});
+
+test("tick: a timed-out dispatcher stage is captured and later stages still run", async () => {
+  await withTempStore(async () => {
+    const record = bee();
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps: TickDeps = {
+      ...buildDeps({ records: [record], liveTargets: new Set(), capture }),
+      sampleUsage: () => never(),
+      dispatchAutoTitle: async () => [{ bee: record.name, ok: true, title: "Still titled" }],
+      timeouts: { dispatchMs: 30 },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.ok(result.errors.some((e) => /sampleUsage timed out after 30ms/.test(e.message)));
+    assert.deepEqual(result.usage, []);
+    assert.deepEqual(result.autoTitles, [{ bee: record.name, ok: true, title: "Still titled" }]);
+  });
+});
+
+test("dispatcher registry: log mappings preserve the daemon log formats", () => {
+  const buz = dispatcherFor("buzDrains");
+  assert.equal(buz.log({ recipient: "alpha", result: { delivered: [], quarantined: [], errors: [] } }), null);
+  assert.deepEqual(buz.log({ recipient: "alpha", result: { delivered: ["m-1"], quarantined: [], errors: [] } }), {
+    level: "info",
+    msg: "buz.drain",
+    recipient: "alpha",
+    delivered: 1,
+    quarantined: 0,
+    errors: 0,
+  });
+  assert.equal(buz.log({ recipient: "alpha", result: { delivered: [], quarantined: [], errors: [{ id: "m-2", message: "boom" }] } })?.level, "warn");
+
+  const usage = dispatcherFor("usage");
+  assert.equal(usage.log({ bee: "alpha", account: "CL.a", sampled: true, exhausted: false }), null);
+  assert.deepEqual(usage.log({ bee: "alpha", account: "CL.a", sampled: true, exhausted: true, resetHint: "3pm" }), {
+    level: "warn",
+    msg: "account.exhausted",
+    session: "alpha",
+    account: "CL.a",
+    resetHint: "3pm",
+  });
+
+  const reachability = dispatcherFor("nodeReachability");
+  assert.deepEqual(reachability.log({ node: "mini01", transition: "offline" }), { level: "warn", msg: "node.offline", node: "mini01" });
+  assert.deepEqual(reachability.log({ node: "mini01", transition: "online" }), { level: "info", msg: "node.online", node: "mini01" });
+
+  const needsInput = dispatcherFor("needsInput");
+  assert.deepEqual(needsInput.log({ bee: "alpha", requestId: "r-1", routedTo: "queen" }), {
+    level: "info",
+    msg: "needs_input.route",
+    session: "alpha",
+    requestId: "r-1",
+    routedTo: "queen",
+  });
+  assert.equal(needsInput.log({ bee: "alpha", requestId: "r-1", escalated: true, error: "no parent" })?.level, "warn");
+
+  const autoswaps = dispatcherFor("autoswaps");
+  assert.deepEqual(autoswaps.log({ bee: "alpha", from: "CL.a", to: "CL.b", ok: true }), {
+    level: "info",
+    msg: "account.autoswap",
+    session: "alpha",
+    from: "CL.a",
+    to: "CL.b",
+    ok: true,
+  });
+  assert.equal(autoswaps.log({ bee: "alpha", from: "CL.a", ok: false, skipped: "no candidate" })?.level, "warn");
+
+  const autoTitles = dispatcherFor("autoTitles");
+  assert.deepEqual(autoTitles.log({ bee: "alpha", ok: true, title: "T" }), {
+    level: "info",
+    msg: "title.auto",
+    session: "alpha",
+    ok: true,
+    title: "T",
+  });
+  assert.equal(autoTitles.log({ bee: "alpha", ok: false, error: "boom" })?.level, "warn");
 });
 
 test("tick: a hung syncChains is timed out and does not block the tick result", async () => {

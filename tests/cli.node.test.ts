@@ -5,13 +5,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { stripAnsi } from "../src/format.js";
 
 const execFileAsync = promisify(execFile);
+const FORCE_TTY_IMPORT = "data:text/javascript,Object.defineProperty(process.stdout,%22isTTY%22,{value:true});";
 
 const ENV = (dir: string) => ({ ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" });
+const PRETTY_ENV = (dir: string) => {
+  const env: NodeJS.ProcessEnv = { ...process.env, HIVE_STORE_ROOT: dir, TERM: "xterm-256color" };
+  delete env.NO_COLOR;
+  delete env.HIVE_NO_COLOR;
+  delete env.TMUX;
+  return env;
+};
 
 async function hive(dir: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
   return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], { cwd: process.cwd(), env: ENV(dir) });
+}
+
+async function hivePretty(dir: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
+  const result = await execFileAsync(process.execPath, ["--import", "tsx", "--import", FORCE_TTY_IMPORT, "src/cli.ts", ...args], { cwd: process.cwd(), env: PRETTY_ENV(dir) });
+  return { stdout: stripAnsi(result.stdout), stderr: stripAnsi(result.stderr) };
 }
 
 async function hiveExpectFail(dir: string, ...args: string[]): Promise<string> {
@@ -48,6 +62,16 @@ test("hive node register / inspect / unregister round-trips a real record", asyn
     await hive(dir, "node", "unregister", "mini01");
     const inspectFail = await hiveExpectFail(dir, "node", "inspect", "mini01");
     assert.match(inspectFail, /Unknown node/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive node register missing --kind lists every valid node kind", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-cli-node-"));
+  try {
+    const stderr = await hiveExpectFail(dir, "node", "register", "mini01", "--endpoint", "trmd@mini01");
+    assert.match(stderr, /local-tmux, ssh-tmux, or remote-hsr/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -93,6 +117,23 @@ test("hive substrate list reports per-kind counts", async () => {
     const { stdout } = await hive(dir, "substrate", "list");
     assert.match(stdout, /local-tmux\s+1/);
     assert.match(stdout, /ssh-tmux\s+1/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive node/substrate pretty lists label remote-hsr distinctly", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-cli-node-"));
+  try {
+    await hive(dir, "node", "register", "runner01", "--kind", "remote-hsr", "--endpoint", "trmd@runner01");
+
+    const nodeList = await hivePretty(dir, "node", "list");
+    assert.match(nodeList.stdout, /hsr\s+runner01\s+trmd@runner01/);
+    assert.doesNotMatch(nodeList.stdout, /ssh\s+runner01\s+trmd@runner01/);
+
+    const substrateList = await hivePretty(dir, "substrate", "list");
+    assert.match(substrateList.stdout, /remote-hsr\s+1/);
+    assert.doesNotMatch(substrateList.stdout, /ssh-tmux\s+1/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
