@@ -142,6 +142,28 @@ test("selectBuzDispatchTriggers skips idle bees with an empty queue", async () =
   assert.equal(triggers.length, 0);
 });
 
+test("selectBuzDispatchTriggers bounds concurrent mailbox probes", async () => {
+  const records = ["alpha", "beta", "gamma", "delta"].map((name) => makeRecord(name, { lastObservedState: "idle_with_output" }));
+  let active = 0;
+  let maxActive = 0;
+  const triggers = await selectBuzDispatchTriggers(
+    records,
+    [],
+    async (record) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      active -= 1;
+      return record.name !== "gamma";
+    },
+    undefined,
+    2,
+  );
+
+  assert.equal(maxActive, 2);
+  assert.deepEqual(triggers.map((trigger) => trigger.record.name), ["alpha", "beta", "delta"]);
+});
+
 test("selectBuzDispatchTriggers ignores transitions for unknown records", async () => {
   const transitions: TickTransition[] = [
     { name: "ghost", from: "active", to: "idle_with_output" },

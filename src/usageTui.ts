@@ -28,6 +28,7 @@ import {
   visibleLength,
   yellow,
 } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 import { paceDelta, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 
 export type UsageTuiHooks = {
@@ -320,6 +321,7 @@ export async function runUsageTui(hooks: UsageTuiHooks): Promise<void> {
         resolve();
       };
 
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(20, stdout.columns || 80);
@@ -346,7 +348,7 @@ export async function runUsageTui(hooks: UsageTuiHooks): Promise<void> {
           lines.push("");
           lines.push(...footer.map((line) => truncate(line, width)));
         }
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
       };
 
       const scheduleNextFetch = () => {
@@ -406,18 +408,23 @@ export async function runUsageTui(hooks: UsageTuiHooks): Promise<void> {
       renderTimer = setInterval(render, 1000);
 
       // Seed the first frame from the cheap read, then immediately go live.
-      const seed = hooks.seedLimits ?? hooks.fetchLimits;
-      seed()
-        .then((next) => {
-          if (done) return;
-          results = next;
-          lastFetchedAt = now();
-          render();
-        })
-        .catch(() => { /* the live fetch below will surface any error */ })
-        .finally(() => {
-          if (!done) doFetch(hooks.fetchLimits);
-        });
+      // Without a seed hook there is nothing cheap to show first — go straight
+      // to the live fetch instead of running the same full sweep twice.
+      if (hooks.seedLimits) {
+        hooks.seedLimits()
+          .then((next) => {
+            if (done) return;
+            results = next;
+            lastFetchedAt = now();
+            render();
+          })
+          .catch(() => { /* the live fetch below will surface any error */ })
+          .finally(() => {
+            if (!done) doFetch(hooks.fetchLimits);
+          });
+      } else {
+        doFetch(hooks.fetchLimits);
+      }
     });
   } finally {
     process.off("exit", restoreTerminal);
