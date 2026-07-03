@@ -7398,16 +7398,13 @@ function colorRunStatus(status: FlowRunMeta["status"]): string {
 
 async function flowLogs(parsed: Parsed) {
   const runId = parsed.args[1];
-  if (!runId) throw new Error("Usage: hive flow logs <runId>");
+  if (!runId) throw new Error("Usage: hive flow logs <runId> [-n <lines>]");
   const summary = await findRunById(runId);
   if (!summary) throw new Error(`Unknown run: ${runId}`);
-  const text = await readLogFull(summary.flowName, runId);
-  process.stdout.write(text);
-  if (text.length > 0 && !text.endsWith("\n")) process.stdout.write("\n");
-  // Hint at the path for tail -f users.
-  if (isPretty(process.stderr)) {
-    console.error(dim(`# ${runLogPath(summary.flowName, runId)}`));
-  }
+  const path = runLogPath(summary.flowName, runId);
+  const lines = numberFlag(parsed, ["n", "lines"], 0);
+  const text = tailLogText(await readLogFull(summary.flowName, runId), lines);
+  await emitLogText(text, path);
 }
 
 async function flowStatus(parsed: Parsed) {
@@ -7886,13 +7883,15 @@ async function loopLogsCmd(parsed: Parsed) {
     await followLoopLog(loopId);
     return;
   }
-  let text = await readLogFull("loop", loopId);
-  if (lines > 0) {
-    const parts = text.split("\n");
-    if (parts[parts.length - 1] === "") parts.pop();
-    text = parts.slice(-lines).join("\n");
-  }
+  const text = tailLogText(await readLogFull("loop", loopId), lines);
   await emitLogText(text, path);
+}
+
+function tailLogText(text: string, lines: number): string {
+  if (lines <= 0) return text;
+  const parts = text.split("\n");
+  if (parts[parts.length - 1] === "") parts.pop();
+  return parts.slice(-lines).join("\n");
 }
 
 async function emitLogText(text: string, path: string): Promise<void> {
@@ -7902,18 +7901,15 @@ async function emitLogText(text: string, path: string): Promise<void> {
 }
 
 async function followLoopLog(loopId: string): Promise<void> {
-  let previous = "";
-  const printDelta = (next: string) => {
-    if (next.length > previous.length) {
-      process.stdout.write(next.slice(previous.length));
-    } else if (next !== previous) {
-      // Log was rotated/rewritten — reprint from scratch.
-      process.stdout.write(next);
-    }
-    previous = next;
+  const path = runLogPath("loop", loopId);
+  let offset = 0;
+  const printAppended = async () => {
+    const result = await readLogSince(path, offset);
+    offset = result.offset;
+    if (result.text.length > 0) process.stdout.write(result.text);
   };
   while (true) {
-    printDelta(await readLogFull("loop", loopId));
+    await printAppended();
     const cfg = await readLoopConfig(loopId).catch(() => null);
     if (cfg && cfg.status !== "running") break;
     if (cfg && cfg.status === "running" && typeof cfg.pid === "number" && !processAlive(cfg.pid)) {
@@ -7923,7 +7919,31 @@ async function followLoopLog(loopId: string): Promise<void> {
     await sleep(1_000);
   }
   // One final read: catch lines appended between the last read and the status flip.
-  printDelta(await readLogFull("loop", loopId));
+  await printAppended();
+}
+
+async function readLogSince(path: string, offset: number): Promise<{ text: string; offset: number }> {
+  const info = await stat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!info?.isFile()) return { text: "", offset: 0 };
+  const start = info.size < offset ? 0 : offset;
+  const length = info.size - start;
+  if (length <= 0) return { text: "", offset: info.size };
+
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    handle = await open(path, "r");
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    return { text: buffer.subarray(0, bytesRead).toString("utf8"), offset: start + bytesRead };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { text: "", offset: 0 };
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
 function processAlive(pid: number): boolean {
@@ -8433,14 +8453,7 @@ async function buzRead(parsed: Parsed) {
   const consume = truthy(flag(parsed, "consume"));
   const beeRef = typeof flag(parsed, "bee") === "string" ? String(flag(parsed, "bee")) : undefined;
   const candidates = beeRef ? [await resolveSession(beeRef)] : await listSessions();
-  let found: { message: BuzMessage; bee: string; path: string; mailbox: string } | null = null;
-  for (const record of candidates) {
-    const result = await readMessageById(record.name, id);
-    if (result) {
-      found = { message: result.message, bee: record.name, path: result.path, mailbox: result.mailbox };
-      break;
-    }
-  }
+  const found = await findBuzMessage(candidates, id);
   if (!found) throw new Error(`No buz message found with id: ${id}`);
 
   let consumed = false;
@@ -8467,6 +8480,22 @@ async function buzRead(parsed: Parsed) {
     body: found.message.body,
     consumed,
   }, null, 2));
+}
+
+type BuzReadMatch = { message: BuzMessage; bee: string; path: string; mailbox: string };
+const BUZ_READ_LOOKUP_CONCURRENCY = 16;
+
+async function findBuzMessage(candidates: SessionRecord[], id: string): Promise<BuzReadMatch | null> {
+  for (let i = 0; i < candidates.length; i += BUZ_READ_LOOKUP_CONCURRENCY) {
+    const batch = candidates.slice(i, i + BUZ_READ_LOOKUP_CONCURRENCY);
+    const matches = await Promise.all(batch.map(async (record): Promise<BuzReadMatch | null> => {
+      const result = await readMessageById(record.name, id);
+      return result ? { message: result.message, bee: record.name, path: result.path, mailbox: result.mailbox } : null;
+    }));
+    const found = matches.find((match): match is BuzReadMatch => match !== null);
+    if (found) return found;
+  }
+  return null;
 }
 
 async function buzPurge(parsed: Parsed) {
@@ -9163,31 +9192,38 @@ async function cmdAccount(parsed: Parsed) {
 async function accountList(parsed: Parsed) {
   const accounts = await listAccounts();
   const now = Date.now();
-  const rows: string[][] = [];
-  const jsonRows: Record<string, unknown>[] = [];
-  for (const account of accounts) {
-    const summary = await usageSummary(account.id, now);
-    const hasCreds = await accountHasCredentials(account);
+  const json = truthy(flag(parsed, "json"));
+  const accountRows = await Promise.all(accounts.map(async (account) => {
+    const [summary, hasCreds] = await Promise.all([
+      usageSummary(account.id, now),
+      accountHasCredentials(account),
+    ]);
     const exhausted = isRecentlyExhausted(summary, now);
-    if (truthy(flag(parsed, "json"))) {
-      jsonRows.push({ ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null });
-      continue;
+    if (json) {
+      return {
+        json: { ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null },
+        row: null,
+      };
     }
     const state = !hasCreds ? yellow("no-creds") : exhausted ? red("exhausted") : green("ok");
-    rows.push([
-      account.id,
-      account.tool,
-      account.provider ?? "-",
-      account.label,
-      isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
-      summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
-      summary.lastResetHint ?? "-",
-    ]);
-  }
-  if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify(jsonRows, null, 2));
+    return {
+      json: null,
+      row: [
+        account.id,
+        account.tool,
+        account.provider ?? "-",
+        account.label,
+        isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
+        summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
+        summary.lastResetHint ?? "-",
+      ],
+    };
+  }));
+  if (json) {
+    console.log(JSON.stringify(accountRows.map((entry) => entry.json), null, 2));
     return;
   }
+  const rows = accountRows.map((entry) => entry.row).filter((row): row is string[] => row !== null);
   if (rows.length === 0) {
     console.log(note("no accounts registered; add one with: hive account add <tool> <label>"));
     return;
@@ -9363,8 +9399,7 @@ async function cmdUsageSamples(parsed: Parsed) {
     ? [(await findAccount(query)).id]
     : [...new Set([...accounts.map((account) => account.id), ...(await listUsageAccounts())])];
 
-  const summaries = [];
-  for (const id of ids) summaries.push(await usageSummary(id, now));
+  const summaries = await Promise.all(ids.map((id) => usageSummary(id, now)));
 
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(summaries, null, 2));
