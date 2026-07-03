@@ -1,3 +1,7 @@
+import type { RunnerAdapter } from "./hsr/types.js";
+import { claudeAdapter } from "./hsr/adapters/claude.js";
+import { codexAdapter } from "./hsr/adapters/codex.js";
+
 /**
  * IdentityRecipe describes how a provider's login materializes on disk so the
  * vault can capture credentials out of a home and activate them into another.
@@ -60,7 +64,47 @@ export type AgentDriver = {
    * args yet; refined in S4).
    */
   modelArgs?: (model?: string, provider?: string) => string[];
+  /**
+   * Default boot-ready timeout (ms) for spawn/brief waits (the `--boot-ms`
+   * fallback). Harness startup varies wildly (codex boots MCP servers, droid
+   * is near-instant); undeclared kinds fall back to DEFAULT_BOOT_MS.
+   */
+  bootMs?: number;
+  /**
+   * Whether this harness runs permissionless ("yolo") by default. Policy:
+   * EVERY harness defaults to yolo — hive bees are unattended, so an approval
+   * prompt just strands them at a dialog — so entries leave this unset and a
+   * future harness that must never run permissionless opts out with `false`.
+   */
+  defaultsToYolo?: boolean;
+  /**
+   * The `<tool>-auto` spawn alias forces yolo even over a thin-profile
+   * `yolo: false` (an auto-picked account is a fleet spawn, always unattended).
+   */
+  autoAliasForcesYolo?: boolean;
+  /**
+   * Per-provider resume invocation. The id-less form falls back to "continue
+   * the most recent session". Undefined → the harness has no resume flag and
+   * a resume boots fresh (empty args).
+   */
+  resumeArgs?: (providerSessionId?: string) => string[];
+  /**
+   * Stable CLI flag that pins a FRESH spawn to a caller-chosen provider
+   * session id (claude's `--session-id`). Undefined → no pinning; the
+   * provider keeps cwd disambiguation for transcript matching.
+   */
+  sessionIdFlag?: string;
+  /** HSR runner adapter (and thus runner tier) when the harness is HSR-capable. */
+  hsrAdapter?: RunnerAdapter;
+  /**
+   * A bare `<tool>` spawn (no account/home/profile flags) defaults to the
+   * sole credentialed account for the tool, when exactly one exists.
+   */
+  soleCredentialedAccountDefault?: boolean;
 };
+
+/** Boot-ready timeout for kinds without a declared `bootMs`. */
+export const DEFAULT_BOOT_MS = 10_000;
 
 // Rate-limit / exhaustion phrasing for the multi-provider coding CLIs
 // (opencode/grok/kimi). A resolution verb must sit adjacent to the limit phrase
@@ -82,6 +126,10 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     },
     isExhausted: (pane) => matchExhaustion(pane, /(?:usage|5-hour|weekly) limit reached|You've reached your usage limit/i),
     modelArgs: (model) => (model ? ["--model", model] : []),
+    bootMs: 15_000,
+    resumeArgs: (sid) => (sid ? ["--resume", sid] : ["--continue"]),
+    sessionIdFlag: "--session-id",
+    hsrAdapter: claudeAdapter,
   },
   codex: {
     kind: "codex",
@@ -99,6 +147,10 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     },
     isExhausted: (pane) => matchExhaustion(pane, /You've hit your usage limit|usage limit reached|rate limit reached/i),
     modelArgs: (model) => (model ? ["--model", model] : []),
+    bootMs: 30_000,
+    autoAliasForcesYolo: true,
+    resumeArgs: (sid) => (sid ? ["resume", sid] : ["resume", "--last"]),
+    hsrAdapter: codexAdapter,
   },
   opencode: {
     kind: "opencode",
@@ -119,6 +171,8 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     // opencode surfaces several providers' limit messages; the shared
     // verb-anchored matcher keeps it narrow to avoid false positives.
     isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
+    bootMs: 15_000,
+    resumeArgs: (sid) => (sid ? ["--session", sid] : ["--continue"]),
   },
   grok: {
     kind: "grok",
@@ -134,6 +188,8 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     },
     isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
     modelArgs: (model) => (model ? ["--model", model] : []),
+    bootMs: 10_000,
+    soleCredentialedAccountDefault: true,
   },
   kimi: {
     kind: "kimi",
@@ -158,10 +214,12 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
   pi: {
     kind: "pi",
     isReady: (pane) => /Pi can explain its own features|(?:^|\n)>\s/.test(pane),
+    bootMs: 10_000,
   },
   droid: {
     kind: "droid",
     isReady: (pane) => /TIP: Use \/settings|Welcome to Factory CLI/i.test(pane),
+    bootMs: 5_000,
   },
 };
 
@@ -234,6 +292,63 @@ export function exhaustionForAgent(kind: string, pane: string): ExhaustionHit | 
  */
 export function modelArgsForAgent(kind: string, model?: string, provider?: string): string[] {
   return agentDriver(kind)?.modelArgs?.(model, provider) ?? [];
+}
+
+/** Boot-ready timeout (ms) for spawn/brief waits; undeclared kinds get DEFAULT_BOOT_MS. */
+export function bootMsForAgent(kind: string): number {
+  return agentDriver(kind)?.bootMs ?? DEFAULT_BOOT_MS;
+}
+
+/**
+ * Whether this canonical kind runs permissionless ("yolo") by default. The
+ * policy default is yes for every harness — including unknown kinds — so this
+ * only returns false for a driver that explicitly opts out.
+ */
+export function driverDefaultsToYolo(kind: string): boolean {
+  return agentDriver(kind)?.defaultsToYolo ?? true;
+}
+
+/** Whether the `<tool>-auto` spawn alias forces yolo for this tool. */
+export function autoAliasForcesYolo(kind: string): boolean {
+  return agentDriver(kind)?.autoAliasForcesYolo === true;
+}
+
+/**
+ * Per-provider resume invocation, or [] when the driver has no resume hook
+ * (the resumed spawn just boots fresh). The id-less form continues the most
+ * recent session.
+ */
+export function resumeArgsForAgent(kind: string, providerSessionId?: string): string[] {
+  return agentDriver(kind)?.resumeArgs?.(providerSessionId) ?? [];
+}
+
+/**
+ * Args that pin a FRESH spawn to a caller-chosen provider session id, or null
+ * for drivers with no stable session-id flag (they keep cwd disambiguation).
+ */
+export function forcedSessionIdArgsForAgent(kind: string, sessionId: string): string[] | null {
+  const pin = agentDriver(kind)?.sessionIdFlag;
+  return pin ? [pin, sessionId] : null;
+}
+
+/**
+ * Whether an arg list already carries the driver's session-pin flag (the
+ * caller chose its own provider session id, so auto-pinning must not add a
+ * second one). Always false for drivers without a sessionIdFlag.
+ */
+export function sessionPinnedInArgs(kind: string, args: readonly string[]): boolean {
+  const pin = agentDriver(kind)?.sessionIdFlag;
+  return pin !== undefined && args.includes(pin);
+}
+
+/** The HSR runner adapter for a canonical kind, or undefined when not HSR-capable. */
+export function hsrAdapterForAgent(kind: string): RunnerAdapter | undefined {
+  return agentDriver(kind)?.hsrAdapter;
+}
+
+/** Whether a bare `<tool>` spawn defaults to the tool's sole credentialed account. */
+export function defaultsToSoleCredentialedAccount(kind: string): boolean {
+  return agentDriver(kind)?.soleCredentialedAccountDefault === true;
 }
 
 // Shared matcher: provider limit message + a best-effort verbatim reset hint
