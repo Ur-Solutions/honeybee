@@ -165,6 +165,7 @@ import { AgentReadinessError, waitForAgentReady } from "./readiness.js";
 import { startSpawnTimer, type SpawnTimer } from "./spawnTiming.js";
 import { attentionCount, DEFAULT_ATTENTION_STATES, parseStateList, pickNextBee, type BeeStateEntry } from "./next.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode, loadNodeSync, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
+import { bootstrapRunnerHost } from "./hsr/bootstrap.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
 import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord, type Substrate } from "./substrates/index.js";
@@ -6590,6 +6591,8 @@ async function cmdNode(parsed: Parsed) {
       return nodeList();
     case "register":
       return nodeRegister(parsed);
+    case "bootstrap":
+      return nodeBootstrap(parsed);
     case "inspect":
       return nodeInspect(parsed);
     case "update":
@@ -6597,7 +6600,7 @@ async function cmdNode(parsed: Parsed) {
     case "unregister":
       return nodeUnregister(parsed);
     default:
-      throw new Error(`Unknown node subcommand: ${sub}\nUsage: hive node <list|register|inspect|update|unregister>`);
+      throw new Error(`Unknown node subcommand: ${sub}\nUsage: hive node <list|register|bootstrap|inspect|update|unregister>`);
   }
 }
 
@@ -6683,6 +6686,44 @@ async function nodeRegister(parsed: Parsed) {
   clearSubstrateCache();
   if (isPretty()) console.log(actionLine("ok", "node", [bold(record.name), record.kind, dim(record.endpoint)]));
   else console.log(`registered\t${record.name}\t${record.kind}\t${record.endpoint}`);
+}
+
+async function nodeBootstrap(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive node bootstrap <name> --endpoint <user@host> [--capabilities a,b,c] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"-F /path/to/config\"] [--min-node <major>]");
+  const endpointRaw = flag(parsed, "endpoint");
+  if (typeof endpointRaw !== "string") throw new Error("--endpoint is required (e.g. --endpoint user@host)");
+  const capabilitiesRaw = flag(parsed, "capabilities");
+  const capabilities = typeof capabilitiesRaw === "string"
+    ? capabilitiesRaw.split(",").map((c) => c.trim()).filter(Boolean)
+    : undefined;
+  const description = typeof flag(parsed, "description") === "string" ? String(flag(parsed, "description")) : undefined;
+  const sshCommand = typeof flag(parsed, "ssh-command") === "string" ? String(flag(parsed, "ssh-command")) : undefined;
+  const sshArgs = parseSshArgsFlag(parsed);
+  const minNodeRaw = flag(parsed, "min-node");
+  const minNodeMajor = typeof minNodeRaw === "string" && Number.isFinite(Number(minNodeRaw)) ? Number(minNodeRaw) : undefined;
+
+  const result = await bootstrapRunnerHost({
+    name,
+    endpoint: endpointRaw,
+    ...(capabilities ? { capabilities } : {}),
+    ...(description ? { description } : {}),
+    ...(sshCommand ? { sshCommand } : {}),
+    ...(sshArgs ? { sshArgs } : {}),
+    ...(minNodeMajor !== undefined ? { minNodeMajor } : {}),
+  });
+  clearSubstrateCache();
+  if (isPretty()) {
+    console.log(actionLine("ok", "node", [
+      bold(result.node.name),
+      "remote-hsr",
+      dim(result.node.endpoint),
+      dim(`runner-host ${result.version}`),
+      dim(result.deployed ? "deployed" : "up-to-date"),
+    ]));
+  } else {
+    console.log(`bootstrapped\t${result.node.name}\tremote-hsr\t${result.node.endpoint}\t${result.version}\t${result.deployed ? "deployed" : "cached"}`);
+  }
 }
 
 async function nodeInspect(parsed: Parsed) {

@@ -43,6 +43,12 @@ export function substrateForRecord(node: NodeRecord): Substrate {
   if (node.kind === "local-tmux") {
     return getOrCache(`local-tmux::${node.name}`, createLocalTmuxSubstrate);
   }
+  if (node.kind === "remote-hsr") {
+    // The remote-hsr substrate (forwarding a spawn/observe/steer plane over the
+    // node's ssh-tunnelled runner-host socket) lands in APIA-92. APIA-90 only
+    // bootstraps/handshakes the runner-host bundle onto the node.
+    throw new Error(`remote-hsr substrate lands in APIA-92 (node "${node.name}" is bootstrapped but not yet steerable)`);
+  }
   return getOrCache(sshCacheKey(node), () => createSshTmuxSubstrate({ node }));
 }
 

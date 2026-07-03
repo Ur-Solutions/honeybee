@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { appendLedger } from "./store.js";
 
-export type NodeKind = "local-tmux" | "ssh-tmux";
+export type NodeKind = "local-tmux" | "ssh-tmux" | "remote-hsr";
 
 export type NodeStatus = "online" | "offline" | "unknown";
 
@@ -18,6 +18,8 @@ export type NodeRecord = {
   description?: string;
   sshCommand?: string;
   sshArgs?: string[];
+  /** For kind "remote-hsr": the handshaked runner-host version deployed on the node. */
+  runnerHostVersion?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -100,11 +102,12 @@ export type RegisterNodeInput = {
   description?: string;
   sshCommand?: string;
   sshArgs?: string[];
+  runnerHostVersion?: string;
 };
 
 export async function registerNode(input: RegisterNodeInput): Promise<NodeRecord> {
   if (!validNodeName(input.name)) throw new Error(`Invalid node name: ${input.name}. Use alphanumerics, dashes, underscores, and dots.`);
-  if (input.kind !== "local-tmux" && input.kind !== "ssh-tmux") throw new Error(`Invalid node kind: ${input.kind}. Use local-tmux or ssh-tmux.`);
+  if (input.kind !== "local-tmux" && input.kind !== "ssh-tmux" && input.kind !== "remote-hsr") throw new Error(`Invalid node kind: ${input.kind}. Use local-tmux, ssh-tmux, or remote-hsr.`);
   if (!input.endpoint || input.endpoint.length === 0) throw new Error("Node endpoint is required");
   if (input.sshCommand && /\s/.test(input.sshCommand)) {
     // The flag parser treats a value starting with "-" as a boolean unless the
@@ -127,6 +130,7 @@ export async function registerNode(input: RegisterNodeInput): Promise<NodeRecord
     ...(input.description ? { description: input.description } : {}),
     ...(input.sshCommand ? { sshCommand: input.sshCommand } : {}),
     ...(input.sshArgs && input.sshArgs.length > 0 ? { sshArgs: input.sshArgs } : {}),
+    ...(input.runnerHostVersion ? { runnerHostVersion: input.runnerHostVersion } : {}),
   };
   await saveNode(record);
   await appendLedger({ type: "node.register", name: record.name, kind: record.kind, endpoint: record.endpoint });
@@ -139,6 +143,7 @@ export type UpdateNodePatch = {
   endpoint?: string;
   sshCommand?: string;
   sshArgs?: string[];
+  runnerHostVersion?: string;
   status?: NodeStatus;
   lastSeen?: string;
 };
@@ -171,6 +176,10 @@ export async function updateNode(name: string, patch: UpdateNodePatch): Promise<
   if (patch.sshArgs !== undefined) {
     if (patch.sshArgs.length === 0) delete updated.sshArgs;
     else updated.sshArgs = [...patch.sshArgs];
+  }
+  if (patch.runnerHostVersion !== undefined) {
+    if (patch.runnerHostVersion === "") delete updated.runnerHostVersion;
+    else updated.runnerHostVersion = patch.runnerHostVersion;
   }
   if (patch.status !== undefined) updated.status = patch.status;
   if (patch.lastSeen !== undefined) updated.lastSeen = patch.lastSeen;
@@ -211,7 +220,7 @@ function normalizeNode(value: unknown, path: string): NodeRecord {
   if (typeof name !== "string" || typeof endpoint !== "string") {
     throw new Error(`Invalid node record at ${path}: missing required fields`);
   }
-  if (kind !== "local-tmux" && kind !== "ssh-tmux") {
+  if (kind !== "local-tmux" && kind !== "ssh-tmux" && kind !== "remote-hsr") {
     throw new Error(`Invalid node record at ${path}: unknown kind`);
   }
   const capabilities = Array.isArray(object.capabilities)
@@ -232,6 +241,7 @@ function normalizeNode(value: unknown, path: string): NodeRecord {
   if (typeof object.description === "string") record.description = object.description;
   if (typeof object.sshCommand === "string") record.sshCommand = object.sshCommand;
   if (Array.isArray(object.sshArgs)) record.sshArgs = object.sshArgs.filter((a): a is string => typeof a === "string");
+  if (typeof object.runnerHostVersion === "string") record.runnerHostVersion = object.runnerHostVersion;
   return record;
 }
 
