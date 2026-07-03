@@ -448,3 +448,32 @@ test("search snippets redact secret-shaped prompt and seal content", async () =>
     }
   });
 });
+
+test("search recency bonus cannot cross corpus rank boundaries", async () => {
+  const mock: CorpusReader = {
+    listLedgerFiles: async () => [],
+    readSeals: async function* () {},
+    readSessionRecords: async function* () {
+      yield {
+        path: "/fake/session.json",
+        record: makeSessionRecord({
+          name: "CL.fresh",
+          brief: "boundary-keyword in a fresh session",
+          createdAt: "2026-07-03T12:00:00.000Z",
+          updatedAt: "2026-07-03T12:00:00.000Z",
+        }),
+      };
+    },
+    readLedgerLines: async function* () {
+      yield {
+        path: "/fake/ledger.jsonl",
+        line: "old or unparseable boundary-keyword ledger entry",
+        ts: "",
+        lineNumber: 1,
+      };
+    },
+  };
+
+  const result = await search({ query: "boundary-keyword" }, mock);
+  assert.deepEqual(result.hits.map((hit) => hit.type), ["ledger", "session"]);
+});

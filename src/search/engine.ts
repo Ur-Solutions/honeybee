@@ -196,13 +196,16 @@ function normalizeSnippetWhitespace(text: string): string {
   return text.replace(/\s+/g, " ");
 }
 
+const RECENCY_DIVISOR = 1_000_000_000;
+const MAX_RECENCY_BONUS = 999_999;
+
 export function scoreHit(type: SearchHitType, matchedAt: string): number {
   const corpus = CORPUS_RANK[type];
   const ts = Date.parse(matchedAt);
-  // Use the timestamp itself (ms since epoch) divided by a large constant so it
-  // contributes meaningful but smaller-than-corpus magnitude. This keeps the
-  // ranking corpus-first, recency-second.
-  const recency = Number.isFinite(ts) ? ts / 1_000_000 : 0;
+  // Use the timestamp itself (ms since epoch) divided by a large constant, then
+  // clamp it below the inter-corpus gap. This keeps the ranking corpus-first,
+  // recency-second even for far-future or malformed timestamps (HIVE-52).
+  const recency = Number.isFinite(ts) ? Math.max(0, Math.min(ts / RECENCY_DIVISOR, MAX_RECENCY_BONUS)) : 0;
   return corpus + recency;
 }
 
