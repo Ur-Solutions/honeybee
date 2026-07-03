@@ -26,6 +26,13 @@ export type WindowInventory = {
   active: Map<string, string>;
 };
 
+export type SessionWindowInventory = {
+  /** Window ids linked into one tmux session (in index order). */
+  windows: string[];
+  /** The session's active window id, if tmux reported one. */
+  active: string | undefined;
+};
+
 /** Parse `list-windows -a -F '#{session_name}\t#{window_id}\t#{window_active}'`. */
 export function parseWindowInventory(stdout: string): WindowInventory {
   const windows = new Map<string, string[]>();
@@ -38,6 +45,20 @@ export function parseWindowInventory(stdout: string): WindowInventory {
     list.push(windowId);
     windows.set(session, list);
     if (isActive === "1") active.set(session, windowId);
+  }
+  return { windows, active };
+}
+
+/** Parse `list-windows -t =session -F '#{window_id}\t#{window_active}'`. */
+export function parseSessionWindowInventory(stdout: string): SessionWindowInventory {
+  const windows: string[] = [];
+  let active: string | undefined;
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    const [windowId, isActive] = line.split("\t");
+    if (!windowId) continue;
+    windows.push(windowId);
+    if (isActive === "1") active = windowId;
   }
   return { windows, active };
 }
@@ -57,6 +78,11 @@ export function planLinks(
 export async function windowInventory(): Promise<WindowInventory> {
   const result = await tmux(["list-windows", "-a", "-F", "#{session_name}\t#{window_id}\t#{window_active}"], { reject: false });
   return parseWindowInventory(result.ok ? result.stdout : "");
+}
+
+export async function sessionWindowInventory(session: string): Promise<SessionWindowInventory> {
+  const result = await tmux(["list-windows", "-t", `=${session}`, "-F", "#{window_id}\t#{window_active}"], { reject: false });
+  return parseSessionWindowInventory(result.ok ? result.stdout : "");
 }
 
 export type EnsureLinkSessionResult = {
