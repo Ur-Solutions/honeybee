@@ -1,7 +1,7 @@
 /**
  * HSR claude tier-B (stream) adapter (APIA-74).
  *
- * Configures the shared `BaseStreamRunner` for `claude -p` with the stream-json
+ * Configures the shared stream runner for `claude -p` with the stream-json
  * envelope: one child per bee, NDJSON stdin/stdout, multi-turn. The process
  * plumbing lives in streamRunner.ts; this file is purely the per-harness
  * parse/encode config plus the argv/env policy for claude.
@@ -18,18 +18,7 @@
 
 import type { RunnerAdapter, RunnerEvent, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
 import { startStreamRunner, type StreamRunnerConfig } from "../streamRunner.js";
-import { scrubEnvFor } from "../allowance.js";
-
-// The stream-json flags the adapter prepends for tier "stream". The caller's
-// args (--model, --session-id, --dangerously-skip-permissions, …) follow.
-const CLAUDE_STREAM_FLAGS = [
-  "-p",
-  "--input-format",
-  "stream-json",
-  "--output-format",
-  "stream-json",
-  "--verbose",
-];
+import { harnessAllowance } from "../harness.js";
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -169,6 +158,10 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
   env: Record<string, string>;
 } {
   const command = opts.command ?? "claude";
+  const authKind = opts.authKind ?? "subscription";
+  // The stream-json flags + env scrub come from the harness registry's
+  // allowance policy — the single source shared with allowance.ts (HIVE-20).
+  const policy = harnessAllowance("claude", authKind);
 
   // Prepend the stream-json flags, then preserve the caller's resolved args
   // (--model, --session-id, --dangerously-skip-permissions, …). Defensive: if
@@ -187,14 +180,14 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
       callerArgs = ["--resume", opts.sessionId, ...callerArgs];
     }
   }
-  const streamFlags = callerArgs.includes("-p") ? CLAUDE_STREAM_FLAGS.filter((f) => f !== "-p") : CLAUDE_STREAM_FLAGS;
+  const requiredFlags = policy?.requiredFlags ?? [];
+  const streamFlags = callerArgs.includes("-p") ? requiredFlags.filter((f) => f !== "-p") : [...requiredFlags];
   const args = [...streamFlags, ...callerArgs];
 
   // Env scrub: on a claude subscription, a present ANTHROPIC_API_KEY is silently
   // billed in -p mode. Delete every scrub key for this (harness, authKind).
-  const authKind = opts.authKind ?? "subscription";
   const env: Record<string, string> = { ...opts.env };
-  for (const key of scrubEnvFor("claude", authKind)) delete env[key];
+  for (const key of policy?.scrubEnv ?? []) delete env[key];
 
   const config: StreamRunnerConfig = {
     harness: "claude",
