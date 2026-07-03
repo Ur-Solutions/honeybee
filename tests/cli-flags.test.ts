@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -49,6 +49,24 @@ async function seedSession(dir: string, name: string, overrides: Record<string, 
     ...overrides,
   };
   await writeFile(join(sessionsDir, `${name}.json`), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+}
+
+async function seedArgsFlow(dir: string): Promise<void> {
+  const flowsDir = join(dir, "flows");
+  await mkdir(flowsDir, { recursive: true });
+  const sdk = join(process.cwd(), "src/flow/index.ts");
+  await writeFile(
+    join(flowsDir, "arg-types.ts"),
+    `import { defineFlow } from "${sdk}";\n` +
+    `export default defineFlow({ name: "arg-types", run: async (ctx) => ctx.args });\n`,
+    { mode: 0o600 },
+  );
+}
+
+function parseFlowRunId(stdout: string, flowName: string): string {
+  const match = new RegExp(`^flow\\.run\\t${flowName}\\t([^\\t\\n]+)`, "m").exec(stdout);
+  assert.ok(match, `expected flow.run line in stdout:\n${stdout}`);
+  return match[1]!;
 }
 
 // ─── valueless string flags must not become the literal "true" ───────────
@@ -239,5 +257,50 @@ test("hive flow status --json reports orphaned for a running meta with a dead pi
 
     const { stdout } = await hive(dir, "flow", "status", "run-1", "--json");
     assert.equal(JSON.parse(stdout).meta.status, "orphaned");
+  });
+});
+
+test("hive flow run --arg preserves values that do not round-trip through Number", { timeout: 30_000 }, async () => {
+  await withStore(async (dir) => {
+    await seedArgsFlow(dir);
+
+    const { stdout } = await hive(
+      dir,
+      "flow",
+      "run",
+      "arg-types",
+      "--foreground",
+      "--arg",
+      "zip=01234",
+      "--arg",
+      "version=1.10",
+      "--arg",
+      "id=007",
+      "--arg",
+      "large=9007199254740993",
+      "--arg",
+      "flag=false",
+      "--arg",
+      "truth=true",
+      "--arg",
+      "count=12",
+      "--arg",
+      "ratio=1.25",
+    );
+    const runId = parseFlowRunId(stdout, "arg-types");
+    const result = JSON.parse(await readFile(join(dir, "flows", "arg-types", "runs", runId, "result.json"), "utf8")) as {
+      value: Record<string, unknown>;
+    };
+
+    assert.deepEqual(result.value, {
+      zip: "01234",
+      version: "1.10",
+      id: "007",
+      large: "9007199254740993",
+      flag: "false",
+      truth: "true",
+      count: 12,
+      ratio: 1.25,
+    });
   });
 });

@@ -7144,10 +7144,8 @@ function parseFlowRunArgs(parsed: Parsed): Record<string, unknown> {
     if (eq <= 0) throw new Error(`Invalid --arg: ${entry} (expected key=value)`);
     const key = entry.slice(0, eq);
     const value = entry.slice(eq + 1);
-    // Coerce numeric/boolean literals; everything else stays a string.
-    if (value === "true") out[key] = true;
-    else if (value === "false") out[key] = false;
-    else if (value !== "" && Number.isFinite(Number(value))) out[key] = Number(value);
+    const numberValue = Number(value);
+    if (value !== "" && Number.isFinite(numberValue) && String(numberValue) === value) out[key] = numberValue;
     else out[key] = value;
   }
   return out;
