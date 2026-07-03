@@ -21,8 +21,8 @@ import {
 import { adapterFor } from "../src/hsr/adapters/index.js";
 import { allowanceFor, bestTier, scrubEnvFor } from "../src/hsr/allowance.js";
 
-test("validateHarnessRegistry reports no problems", () => {
-  assert.deepEqual(validateHarnessRegistry(), []);
+test("validateHarnessRegistry reports no problems", async () => {
+  assert.deepEqual(await validateHarnessRegistry(), []);
 });
 
 test("every runner harness has a registered adapter (and only those)", () => {
