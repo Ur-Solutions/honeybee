@@ -4588,16 +4588,21 @@ async function cmdRun(parsed: Parsed) {
   let blocked = false;
 
   try {
-    try {
-      await waitForAgentReady(record, {
-        timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
-        acceptTrust: acceptsTrust(parsed),
-        raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
-      });
-    } catch (error) {
-      if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
-      console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
-      if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+    // HSR bees have no interactive TUI to poll for readiness — the runner host is
+    // ready as soon as spawn confirmed it live (hasSession). Skip the pane-scrape
+    // readiness wait; steer straight through the control socket.
+    if (record.substrate !== "hsr") {
+      try {
+        await waitForAgentReady(record, {
+          timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+          acceptTrust: acceptsTrust(parsed),
+          raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
+        });
+      } catch (error) {
+        if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
+        console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
+        if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+      }
     }
     await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
     const now = new Date().toISOString();
