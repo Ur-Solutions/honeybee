@@ -31,6 +31,7 @@ import {
   vaultRoot,
 } from "./accounts.js";
 import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { mapWithConcurrency } from "./concurrency.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
@@ -77,7 +78,7 @@ import {
   type QuestStatus,
 } from "./quest.js";
 import { isLinearIdentifier, loadLinearAdapter } from "./linear.js";
-import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, windowInventory } from "./tmuxLink.js";
+import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, sessionWindowInventory, windowInventory } from "./tmuxLink.js";
 import {
   BUZ_TIERS,
   type BuzMessage,
@@ -2516,13 +2517,20 @@ function formatStateCell(state: BeeState): string {
   }
 }
 
+// Each capture forks a subprocess (tmux locally, a full ssh round-trip for
+// remote bees), so an uncapped fan-out over a large hive spawns dozens of
+// simultaneous ssh connections per `hive ls`/clean pass (HIVE-62).
+const PANE_CAPTURE_CONCURRENCY = 8;
+
 async function capturePanesFor(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
   const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
-  const entries = await Promise.all(
+  const entries = await mapWithConcurrency(
+    liveRecords,
+    PANE_CAPTURE_CONCURRENCY,
     // Re-key by the bee's own pane (agentPaneId) so sub-bees sharing one comb's
     // tmuxTarget keep distinct captures; legacy solo bees with no pane fall back
     // to tmuxTarget. deriveState reads with the same `agentPaneId ?? tmuxTarget`.
-    liveRecords.map(async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const),
+    async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const,
   );
   return new Map(entries);
 }
@@ -5328,12 +5336,6 @@ async function workspaceList(parsed: Parsed) {
   ));
 }
 
-/** Active window ids per local tmux session, for de-dupe on add/open. */
-async function workspaceWindowsOf(session: string): Promise<string[]> {
-  const inventory = await windowInventory();
-  return inventory.windows.get(session) ?? [];
-}
-
 async function workspaceOpen(parsed: Parsed) {
   const name = parsed.args[1];
   if (!name) throw new Error("Usage: hive workspace open <name|colony> [--root <dir>] [--new-client] [--print]");
@@ -5471,13 +5473,14 @@ async function workspaceAdd(parsed: Parsed) {
   const members: WorkspaceMember[] = [...record.members];
   const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
   const inventory = await windowInventory();
+  const currentWindows = new Set(inventory.windows.get(session) ?? []);
   let linkedCount = 0;
   for (const bee of live) {
     const windowId = inventory.active.get(bee.tmuxTarget);
     if (!windowId) continue;
-    const currentWindows = await workspaceWindowsOf(session);
     const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
     linkedCount += linked;
+    if (linked > 0) currentWindows.add(windowId);
     const beeId = bee.id ?? bee.name;
     if (!memberIds.has(beeId)) {
       members.push({ kind: "bee", beeId });
@@ -6017,19 +6020,31 @@ async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
   const wsRecord = await loadWorkspace(quest.workspace);
   const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
   const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const currentWindows = new Set((await sessionWindowInventory(session)).windows);
+  let placeholderDropped = false;
 
-  // Per-spawn hook: replicate the --frame loop body for ONE bee. Liveness +
-  // the window inventory MUST be re-read per spawn — bees spawn over time, so a
-  // single up-front snapshot (as in the --frame path) would miss later windows.
+  // Per-spawn hook: replicate the --frame loop body for ONE bee. The spawned
+  // bee's windows must be read per spawn because bees appear over time, but a
+  // single-session `list-windows -t =bee` is enough; avoid a global `-a` scan.
   const onSpawned = async (bee: SessionRecord): Promise<void> => {
     await stampQuestMembership(bee, quest.id, quest.colony, quest.workspace);
     // Only local + live windows can be link-window'd (the workspaceAdd discipline).
     if (bee.node && bee.node !== LOCAL_NODE_NAME) return;
-    if (!(await localSubstrate().hasSession(bee.tmuxTarget))) return;
-    const inventory = await windowInventory();
-    const windowId = inventory.active.get(bee.tmuxTarget);
+    const beeWindows = await sessionWindowInventory(bee.tmuxTarget);
+    const windowId = beeWindows.active;
     if (!windowId) return; // no live window to link — never record a phantom member
-    await linkTargetsInto(session, [bee.tmuxTarget], ensured);
+    const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
+    if (linked > 0) {
+      currentWindows.add(windowId);
+      if (ensured.placeholder && !placeholderDropped) {
+        await tmux(["kill-window", "-t", `=${session}:${ensured.placeholder}`], { reject: false });
+        currentWindows.delete(ensured.placeholder);
+        placeholderDropped = true;
+      }
+      if (ensured.created) {
+        await tmux(["select-window", "-t", `=${session}:${windowId}`], { reject: false });
+      }
+    }
     const beeId = bee.id ?? bee.name;
     if (!memberIds.has(beeId)) {
       members.push({ kind: "bee", beeId });
