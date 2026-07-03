@@ -43,6 +43,7 @@ export async function listFrames(): Promise<Frame[]> {
 }
 
 export async function loadFrame(name: string): Promise<Frame | null> {
+  if (!validFrameName(name)) return null;
   const tsPath = frameFilePath(name, ".ts");
   if (await pathExists(tsPath)) return validateFrame(await loadTsModule(tsPath), name);
   const jsonPath = frameFilePath(name, ".json");
@@ -56,6 +57,7 @@ export async function frameExists(name: string): Promise<boolean> {
 
 /** Locate the on-disk definition backing a frame (.ts wins, mirroring loadFrame). */
 export async function frameDefinitionFile(name: string): Promise<{ path: string; ext: ".json" | ".ts" } | null> {
+  if (!validFrameName(name)) return null;
   for (const ext of [".ts", ".json"] as const) {
     const path = frameFilePath(name, ext);
     if (await pathExists(path)) return { path, ext };
@@ -106,6 +108,7 @@ export async function defineFrameFromFile(sourcePath: string, nameOverride?: str
 }
 
 export async function loadFrameSource(name: string): Promise<string | null> {
+  if (!validFrameName(name)) return null;
   try {
     const raw = await readFile(frameSourcePath(name), "utf8");
     const trimmed = raw.trim();
@@ -117,6 +120,7 @@ export async function loadFrameSource(name: string): Promise<string | null> {
 }
 
 export async function removeFrame(name: string): Promise<boolean> {
+  if (!validFrameName(name)) return false;
   let removed = false;
   for (const ext of [".ts", ".json"] as const) {
     const path = frameFilePath(name, ext);
