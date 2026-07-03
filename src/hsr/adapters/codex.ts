@@ -160,7 +160,7 @@ function usageFromBreakdown(value: unknown): (RunnerEvent & { type: "usage" }) |
 function usageFromThreadTokenUsage(value: unknown): (RunnerEvent & { type: "usage" }) | undefined {
   const tu = asObject(value);
   if (!tu) return undefined;
-  return usageFromBreakdown(tu.last) ?? usageFromBreakdown(tu.total);
+  return usageFromBreakdown(tu.last);
 }
 
 /** Encode one user turn as a codex UserInput "text" variant (TurnStartParams.input[0]). */
