@@ -3,8 +3,8 @@
  *
  * codex `app-server` speaks JSON-RPC 2.0 over its child stdio: WE write requests
  * to its stdin and read responses + notifications + SERVER REQUESTS (approvals)
- * off its stdout. Framing is NDJSON (one JSON object per line) with partial-line
- * buffering, mirroring src/hsr/rpc.ts / streamRunner.ts.
+ * off its stdout. Framing is NDJSON (one JSON object per line) via the shared
+ * lineReader.ts, the same reader streamRunner.ts and rpc.ts use.
  *
  * This module is TRANSPORT-ONLY — it knows nothing about codex methods. It:
  *   - request(method, params) → Promise<result>  (numeric id, timeout, rejects on error)
