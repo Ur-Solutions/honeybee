@@ -21,6 +21,7 @@ import {
   buildServeExecArgv,
   buildSshForwardArgv,
   connectRemoteRunnerHost,
+  defaultSshExecHook,
   ensureRemoteServe,
   type SshExecHook,
   type TunnelChild,
@@ -176,6 +177,7 @@ test("buildSshForwardArgv: contains -N, -L <local>:<remote>, ControlMaster=auto,
   assert.ok(li >= 0);
   assert.equal(argv[li + 1], "/local/control.sock:~/.hive/runner-host/control.sock");
   assert.ok(argv.includes("ControlMaster=auto"));
+  assert.ok(argv.includes("ConnectTimeout=8"));
   assert.ok(argv.includes("ExitOnForwardFailure=yes"));
   assert.ok(argv.includes("StreamLocalBindUnlink=yes"));
   assert.equal(argv[0], "ssh");
@@ -190,6 +192,20 @@ test("buildServeExecArgv: `ssh <endpoint> <cmd>` with control-master options", (
   assert.equal(argv[argv.length - 2], "me@remote-host");
   assert.equal(argv[argv.length - 1], "test -S /x");
   assert.ok(argv.includes("ControlMaster=auto"));
+  assert.ok(argv.includes("ConnectTimeout=8"));
+});
+
+test("defaultSshExecHook returns when the child exceeds the wall-clock timeout", async () => {
+  const started = Date.now();
+  const result = await defaultSshExecHook(
+    [process.execPath, "-e", "setTimeout(() => {}, 60000)"],
+    undefined,
+    { timeoutMs: 50 },
+  );
+  const elapsed = Date.now() - started;
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /timed out after 50ms/);
+  assert.ok(elapsed < 1_000, `timeout took ${elapsed}ms`);
 });
 
 // --- connectRemoteRunnerHost: end-to-end over a local socket relay -------------
