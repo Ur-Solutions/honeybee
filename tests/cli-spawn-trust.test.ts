@@ -57,6 +57,15 @@ printf '> \\r\\n'
 sleep 30
 `;
 
+const STUCK_CODEX = `#!/bin/sh
+printf 'still booting\\r\\n'
+sleep 30
+`;
+
+const FAKE_CLAUDE = `#!/bin/sh
+sleep 30
+`;
+
 test("spawn auto-accepts the codex trust prompt and waits for readiness", async () => {
   await withIsolatedTmux(async (socket) => {
     const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-spawn-store-"));
@@ -132,6 +141,66 @@ test("spawn --briefed records the delivered brief as lastPrompt for transcript m
       assert.ok(record.briefedAt, "brief timestamp recorded");
       assert.ok(record.lastPromptAt, "last prompt timestamp recorded");
       assert.match(record.lastPrompt ?? "", /HIVE_BRIEF_ANCHOR/);
+    } finally {
+      await kill(name);
+      await rm(storeRoot, { recursive: true, force: true });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("spawn --briefed warns instead of failing when readiness times out before delivery", async () => {
+  await withIsolatedTmux(async (socket) => {
+    const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-spawn-brief-timeout-store-"));
+    const cwd = await mkdtemp(join(tmpdir(), "honeybee-spawn-brief-timeout-cwd-"));
+    const fakeCodex = join(storeRoot, "stuck-codex.sh");
+    await writeFile(fakeCodex, STUCK_CODEX);
+    await chmod(fakeCodex, 0o755);
+    const name = `hive-test-brief-timeout-${process.pid}-${Date.now()}`;
+    try {
+      const result = await runCli(
+        ["spawn", "codex", "--name", name, "--cwd", cwd, "--briefed", "--brief", "hello", "--boot-ms", "800"],
+        { HIVE_STORE_ROOT: storeRoot, HIVE_CODEX_CMD: fakeCodex, HIVE_TMUX_SOCKET: socket },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stderr, new RegExp(`warn\\tspawn\\t${name}\\ttimeout`));
+      const record = JSON.parse(await readFile(join(storeRoot, "sessions", `${name}.json`), "utf8")) as {
+        brief?: string;
+        lastPromptAt?: string;
+      };
+      assert.equal(record.brief, "hello");
+      assert.equal(record.lastPromptAt, undefined, "timed-out spawn brief was not recorded as delivered");
+    } finally {
+      await kill(name);
+      await rm(storeRoot, { recursive: true, force: true });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("spawn treats --session-id=<id> as caller-supplied and does not add a second session id", async () => {
+  await withIsolatedTmux(async (socket) => {
+    const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-spawn-session-id-store-"));
+    const cwd = await mkdtemp(join(tmpdir(), "honeybee-spawn-session-id-cwd-"));
+    const fakeClaude = join(storeRoot, "fake-claude.sh");
+    await writeFile(fakeClaude, FAKE_CLAUDE);
+    await chmod(fakeClaude, 0o755);
+    const name = `hive-test-session-id-${process.pid}-${Date.now()}`;
+    try {
+      const result = await runCli(
+        ["spawn", "claude", "--name", name, "--cwd", cwd, "--no-wait", "--", "--session-id=custom"],
+        { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: fakeClaude, HIVE_TMUX_SOCKET: socket },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      const record = JSON.parse(await readFile(join(storeRoot, "sessions", `${name}.json`), "utf8")) as {
+        command: string;
+        providerSessionId?: string;
+      };
+      assert.match(record.command, /--session-id=custom/);
+      assert.doesNotMatch(record.command, /--session-id\s+[0-9a-f-]{36}/);
+      assert.equal(record.providerSessionId, undefined);
     } finally {
       await kill(name);
       await rm(storeRoot, { recursive: true, force: true });

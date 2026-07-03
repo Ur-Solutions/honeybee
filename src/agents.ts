@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { activateAccountIntoHome, assertGrokHomeAuthFresh, autoAccountTool, defaultHomeForAccount, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord } from "./accounts.js";
 import { beeConfig } from "./config.js";
-import { homeEnvForAgent, identityEnvForAgent, modelArgsForAgent } from "./drivers.js";
+import { driverDefaultsToYolo, forcedSessionIdArgsForAgent, homeEnvForAgent, identityEnvForAgent, modelArgsForAgent, sessionPinnedInArgs } from "./drivers.js";
 import { assertExecutableAvailable } from "./execCheck.js";
 import { writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity } from "./ids.js";
@@ -65,14 +65,15 @@ export function canonicalAgentKind(kind: string): string {
 }
 
 // Whether this bee kind should run permissionless ("yolo"/bypass) by default.
-// Policy: EVERY harness on EVERY account type defaults to yolo — hive bees are
-// unattended, so a permission/approval prompt just strands them at a dialog.
-// Opt out per spawn with `--no-yolo`, or persistently with
-// `hive config set-bee <bee> --no-yolo`; both are honored by dangerousMode in
-// cli.ts. resolveAgent stays policy-free: it only emits the yolo command when
-// the CLI layer (which applies this default and the opt-outs) tells it to.
-export function agentDefaultsToYolo(_kind: string): boolean {
-  return true;
+// The default lives on the driver registry (AGENT_DRIVERS.defaultsToYolo);
+// current policy is yes for every harness — hive bees are unattended, so a
+// permission/approval prompt just strands them at a dialog. Opt out per spawn
+// with `--no-yolo`, or persistently with `hive config set-bee <bee> --no-yolo`;
+// both are honored by dangerousMode in cli.ts. resolveAgent stays policy-free:
+// it only emits the yolo command when the CLI layer (which applies this
+// default and the opt-outs) tells it to.
+export function agentDefaultsToYolo(kind: string): boolean {
+  return driverDefaultsToYolo(canonicalAgentKind(kind));
 }
 
 export function tmuxOptionsForAgent(kind: string): TmuxWindowOptions | undefined {
@@ -177,11 +178,15 @@ export async function assertAgentAuthFreshForSpawn(spec: AgentSpec, accountId?: 
  * project folder), so sibling bees in one repo would otherwise cross-match on
  * mtime alone — mis-titling and mis-resuming each other. A forced session id
  * scores the bee's own file +1000, which no sibling can beat. Returns null for
- * providers with no stable `--session-id` flag (they keep cwd disambiguation).
+ * providers with no stable session-id flag (they keep cwd disambiguation);
+ * the flag itself lives on the driver registry (AGENT_DRIVERS.sessionIdFlag).
  */
 export function forcedSessionIdArgs(kind: string, sessionId: string): string[] | null {
-  if (kind === "claude") return ["--session-id", sessionId];
-  return null;
+  return forcedSessionIdArgsForAgent(kind, sessionId);
+}
+
+export function hasSessionIdArg(args?: readonly string[]): boolean {
+  return Boolean(args?.some((arg) => arg === "--session-id" || arg.startsWith("--session-id=")));
 }
 
 function resolveProfile(kind: string, explicitHome: string | true | string[] | undefined) {
@@ -366,7 +371,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   // flow runs spawn many siblings in one cwd, the exact case the cwd-blind claude
   // transcript matcher would otherwise cross-match by mtime.
   let pinnedSessionId: string | undefined;
-  if (!opts.extraArgs?.includes("--session-id")) {
+  if (!sessionPinnedInArgs(spec.kind, opts.extraArgs ?? [])) {
     const sid = randomUUID();
     const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
     if (sessionArgs) {

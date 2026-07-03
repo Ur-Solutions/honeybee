@@ -31,6 +31,7 @@ test("parseSelector recognizes #tag and tag: user forms", () => {
 });
 
 test("parseSelector recognizes namespaced tag forms", () => {
+  assert.deepEqual(parseSelector("prio:p1"), { kind: "tag", namespace: "prio", value: "p1" });
   assert.deepEqual(parseSelector("tag:prio:p1"), { kind: "tag", namespace: "prio", value: "p1" });
   assert.deepEqual(parseSelector("tag:colony:fe"), { kind: "tag", namespace: "colony", value: "fe" });
 });
@@ -73,6 +74,13 @@ test("a bare user tag selector matches bees carrying that tag", () => {
 test("a namespaced user tag selector matches verbatim", () => {
   const records = [bee("a", { tags: ["prio:p1"] }), bee("b", { tags: ["prio:p2"] })];
   const target = resolveSelectorFromState({ kind: "tag", namespace: "prio", value: "p1" }, { records });
+  assert.equal(target.kind, "tag");
+  if (target.kind === "tag") assert.deepEqual(target.records.map((r) => r.name), ["a"]);
+});
+
+test("a bare namespaced user tag selector resolves like tag:ns:value", () => {
+  const records = [bee("a", { tags: ["prio:p1"] }), bee("b", { tags: ["prio:p2"] })];
+  const target = resolveSelectorFromState(parseSelector("prio:p1"), { records });
   assert.equal(target.kind, "tag");
   if (target.kind === "tag") assert.deepEqual(target.records.map((r) => r.name), ["a"]);
 });

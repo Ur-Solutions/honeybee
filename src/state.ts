@@ -213,6 +213,18 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
         return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
       case "booting":
         return { state: "booting", detail: "starting up" };
+      case "dead":
+        return { state: "dead", detail: lastActivityHint(record, context) };
+      case "sealed":
+        return { state: "sealed", detail: "seal recorded" };
+      case "archived":
+        return { state: "archived", detail: "filed on quest done" };
+      case "error":
+        return { state: "error", detail: record.lastError ?? "runner error" };
+      case "kill_failed":
+        return { state: "kill_failed", detail: record.lastError ?? "previous kill failed" };
+      case "node_unreachable":
+        return { state: "node_unreachable", detail: `node ${record.node && record.node.length > 0 ? record.node : LOCAL_NODE_NAME} offline` };
       default:
         return { state: structured, detail: describeActivity(record) };
     }
