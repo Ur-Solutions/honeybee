@@ -728,6 +728,7 @@ export async function serve(socketPath: string): Promise<RpcServer> {
     path: server.path,
     broadcast: (method, params) => server.broadcast(method, params),
     connectionCount: () => server.connectionCount(),
+    broadcastDroppedCount: () => server.broadcastDroppedCount(),
     async close(): Promise<void> {
       await controller.close();
       await server.close();

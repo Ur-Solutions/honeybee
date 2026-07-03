@@ -157,6 +157,11 @@ export async function readHsrMeta(bee: string): Promise<HsrMeta | null> {
 // production order — observers tail it for state / needs-input / crash recovery.
 const appendChains = new Map<string, Promise<void>>();
 
+/** @internal test helper */
+export function __testOnlyHasAppendChain(bee: string): boolean {
+  return appendChains.has(bee);
+}
+
 // Per-bee events.jsonl byte size, tracked by the single writer so the growth
 // check is O(1) per append (lazily seeded by one stat, then incremented).
 const eventLogSizes = new Map<string, number>();
@@ -315,6 +320,14 @@ export function appendHsrEvent(bee: string, event: RunnerEvent): Promise<void> {
       }
     });
   appendChains.set(bee, next);
+  void next.then(
+    () => {
+      if (appendChains.get(bee) === next) appendChains.delete(bee);
+    },
+    () => {
+      if (appendChains.get(bee) === next) appendChains.delete(bee);
+    },
+  );
   return next;
 }
 

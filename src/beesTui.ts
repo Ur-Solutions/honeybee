@@ -8,6 +8,7 @@
 import * as readline from "node:readline";
 import { fuzzyFilter } from "./spawnTui.js";
 import { bold, cyan, dim, gray, green, isPretty, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 import type { ProSlotKind } from "./proProjects.js";
 
 export type BeesTuiItem = {
@@ -275,6 +276,24 @@ export function filterBeesTuiItems(items: BeesTuiItem[], query: string): BeesTui
   return fuzzyFilter(query, items, beesTuiFuzzyKey);
 }
 
+/** One typing burst costs one fuzzy pass instead of one per keystroke. */
+export const BEES_FILTER_DEBOUNCE_MS = 24;
+
+/**
+ * True when the matches for `next` can be found by re-filtering the matches of
+ * a previous pass for `prev` instead of the whole catalog. That needs "matches
+ * next ⇒ matches prev", which holds for a prefix extension — except that
+ * fuzzyScore's sparse-match cap is max(8, 2·len), so past 4 effective chars the
+ * cap grows with the query and an item rejected for the prefix can legally
+ * match the longer query. Short queries are also exactly where the full scan is
+ * expensive (most matches, biggest sort).
+ */
+export function canNarrowBeesFilter(prev: string, next: string): boolean {
+  const p = prev.trim().toLowerCase();
+  const n = next.trim().toLowerCase();
+  return p.length > 0 && n.length <= 4 && n.length > p.length && n.startsWith(p);
+}
+
 function stateCell(headline: string, live: boolean): string {
   const h = headline.toLowerCase();
   if (h === "working" || h === "active") return `${green("●")} ${truncate(headline, 8)}`;
@@ -319,7 +338,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
   let confirmKill: BeesTuiItem | undefined; // bee awaiting kill confirmation
   let killing = false;
   let selecting: BeesTuiItem | undefined;
-  let message = "type to filter · ↑↓ move · enter selects · q quits";
+  let message = "type to filter · ↑↓ move · enter selects · esc quits";
 
   readline.emitKeypressEvents(stdin);
   stdin.setRawMode(true);
@@ -346,10 +365,12 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
     await new Promise<void>((resolve) => {
       let done = false;
       let pollTimer: ReturnType<typeof setInterval> | undefined;
+      let filterTimer: ReturnType<typeof setTimeout> | undefined;
       const finish = () => {
         if (done) return;
         done = true;
         if (pollTimer) clearInterval(pollTimer);
+        if (filterTimer) clearTimeout(filterTimer);
         stdin.off("keypress", onKey);
         stdout.off("resize", onResize);
         resolve();
@@ -357,29 +378,31 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
 
       const itemRows = () => flat.filter((row): row is Extract<FlatRow, { kind: "item" }> => row.kind === "item");
 
-      const moveCursor = (next: number) => {
-        const items = itemRows();
-        if (items.length === 0) {
-          cursor = 0;
-          return;
-        }
-        const indices = items.map((row) => flat.indexOf(row));
-        let pos = indices.indexOf(cursor);
-        if (pos < 0) pos = 0;
-        pos = Math.max(0, Math.min(indices.length - 1, next));
-        cursor = indices[pos]!;
-      };
-
       const currentItem = (): BeesTuiItem | undefined => {
         const row = flat[cursor];
         return row?.kind === "item" ? row.item : undefined;
       };
 
+      // The match set of the last fuzzy pass, so a query that merely extends
+      // the previous one narrows from those matches instead of re-scanning the
+      // catalog. `catalog` is kept by reference: a refresh/kill swaps the array
+      // and silently invalidates the cache.
+      let lastFilter: { query: string; catalog: BeesTuiItem[]; items: BeesTuiItem[] } | undefined;
+
       const regroup = () => {
         // Read the highlighted bee from the OLD flat before rebuilding so the
         // cursor can follow it; resolveRegroupCursor handles the fallbacks.
         const prevName = currentItem()?.name;
-        filtered = query.length > 0 ? filterBeesTuiItems(catalog, query) : catalog;
+        if (query.length === 0) {
+          filtered = catalog;
+          lastFilter = undefined;
+        } else {
+          const pool = lastFilter && lastFilter.catalog === catalog && canNarrowBeesFilter(lastFilter.query, query)
+            ? lastFilter.items
+            : catalog;
+          filtered = filterBeesTuiItems(pool, query);
+          lastFilter = { query, catalog, items: filtered };
+        }
         groups = groupBeesByMode(filtered, groupMode);
         flat = flattenBeesTuiGroups(groups);
         cursor = resolveRegroupCursor(flat, prevName, options.currentName);
@@ -388,9 +411,18 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
 
       const applyQuery = (next: string) => {
         query = next;
-        regroup();
-        const n = itemRows().length;
-        message = n === 0 ? "no matches" : n === 1 ? "1 bee" : `${n} bees`;
+        // Debounce the fuzzy pass + regroup: the caller's render() echoes the
+        // typed query immediately (over the previous match list), and the
+        // filter runs once when the burst pauses.
+        if (filterTimer) clearTimeout(filterTimer);
+        filterTimer = setTimeout(() => {
+          filterTimer = undefined;
+          if (done) return;
+          regroup();
+          const n = itemRows().length;
+          message = n === 0 ? "no matches" : n === 1 ? "1 bee" : `${n} bees`;
+          render();
+        }, BEES_FILTER_DEBOUNCE_MS);
       };
 
       const cycleGroup = (delta: number) => {
@@ -420,9 +452,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
       };
 
       const step = (delta: number) => {
-        const indices = itemRows().map((row) => flat.indexOf(row));
-        const pos = indices.indexOf(cursor);
-        moveCursor(pos < 0 ? 0 : Math.max(0, Math.min(indices.length - 1, pos + delta)));
+        cursor = stepBeesCursor(flat, cursor, delta);
         render();
       };
 
@@ -501,12 +531,9 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
           finish();
           return;
         }
-        if (key.name === "q" && query.length === 0) {
-          finish();
-          return;
-        }
-        // Navigation is arrow-keys (plus fzf-style Ctrl-N/P) only — j/k are kept
-        // free so they type into the fuzzy filter like any other character.
+        // Quit is esc/Ctrl-C only — the fuzzy filter is always the live text
+        // buffer here, so every printable (q, j, k, …) must type into it or a
+        // bee named "queen" becomes unfindable by prefix.
         if (key.name === "up" || (key.ctrl && key.name === "p")) { step(-1); return; }
         if (key.name === "down" || (key.ctrl && key.name === "n")) { step(1); return; }
         // ⌘g (Meta-g via WezTerm) cycles grouping; Ctrl-G works too where ⌘
@@ -530,6 +557,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
         }
       };
 
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(12, stdout.columns || 80);
@@ -553,7 +581,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
         }
         lines.push(truncate(message, width));
         lines.push(dim(footerHint()));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
       };
 
       const footerHint = (): string => {
@@ -561,7 +589,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
         const preview = options.onPreview ? " · tab preview" : "";
         const kill = options.onKill ? " · ^k kill" : "";
         const group = ` · ⌘g ${BEES_GROUP_MODE_LABEL[groupMode]}`;
-        return (options.sidebar ? "sidebar · q closes" : "q exit") + preview + kill + group;
+        return (options.sidebar ? "sidebar · esc closes" : "esc exit") + preview + kill + group;
       };
 
       const onResize = () => render();
@@ -577,7 +605,10 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
           tick += 1;
           if (options.syncGroupMode) {
             void options.syncGroupMode().then((mode) => {
-              if (done || selecting || !mode || mode === groupMode) return;
+              // Same guard as the catalog refresh below: a confirm modal or an
+              // in-flight kill owns the screen, so don't re-group/repaint under
+              // it — the next poll picks the mode change up once it closes.
+              if (done || selecting || confirmKill || killing || !mode || mode === groupMode) return;
               groupMode = mode;
               regroup();
               render();
@@ -651,6 +682,19 @@ export function initialBeesCursor(flat: FlatRow[], name: string | undefined): nu
 export function resolveRegroupCursor(flat: FlatRow[], prevName: string | undefined, currentName: string | undefined): number {
   const survived = itemRowIndexForName(flat, prevName);
   return survived >= 0 ? survived : initialBeesCursor(flat, currentName);
+}
+
+/**
+ * Cursor row after moving `delta` item rows (headers are skipped, ends clamp).
+ * A cursor that no longer sits on an item (e.g. it drifted onto a header)
+ * snaps to the first item; an item-less list parks at 0.
+ */
+export function stepBeesCursor(flat: FlatRow[], cursor: number, delta: number): number {
+  const indices = flat.flatMap((row, i) => (row.kind === "item" ? [i] : []));
+  if (indices.length === 0) return 0;
+  const pos = indices.indexOf(cursor);
+  const next = pos < 0 ? 0 : Math.max(0, Math.min(indices.length - 1, pos + delta));
+  return indices[next]!;
 }
 
 /**

@@ -15,6 +15,7 @@
 
 import * as readline from "node:readline";
 import { bold, cyan, dim, green, isPretty, red, stripAnsi, truncate, visibleLength } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 
 /** The editable form state — the fork the user is composing. */
 export type ForkFormValues = {
@@ -311,6 +312,10 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
         if (key.name === "down") { cursorRow = clamp(cursorRow + 1, rows().length); formError = ""; render(); return; }
 
         const row = focusedRow();
+        // `q` cancels everywhere except a focused text field, where it is
+        // literal input — a fork named "queen" must be typable. esc/Ctrl-C
+        // (above) cancel regardless of focus.
+        if (key.name === "q" && !(row?.kind === "field" && row.field === "text")) { finish(null); return; }
         if (!row) return;
 
         if (row.kind === "toggle") {
@@ -332,11 +337,11 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
         if (key.name === "left" || key.name === "right") return; // let arrows stay on the row
         if (key.name === "backspace") { values[row.key] = String(values[row.key]).slice(0, -1) as never; render(); return; }
         if (key.ctrl && key.name === "u") { values[row.key] = "" as never; render(); return; }
-        if (key.name === "q" && String(values[row.key]).length === 0) { finish(null); return; }
         if (isPrintable(value, key)) { values[row.key] = (String(values[row.key]) + value) as never; render(); return; }
       };
 
       // ── rendering ──────────────────────────────────────────────────────────
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(40, stdout.columns || 100);
@@ -347,7 +352,7 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
         while (lines.length < height - 2) lines.push("");
         lines.push(truncate(formError ? red(formError) : message, width));
         lines.push(dim("↑↓ field · ←/→ or space cycle · type to edit · enter fork · q/esc cancel"));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
         parkCursor(width);
       };
 

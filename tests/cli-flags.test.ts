@@ -266,6 +266,29 @@ test("hive flow status --json reports orphaned for a running meta with a dead pi
   });
 });
 
+test("hive flow logs -n prints exactly n lines even without a trailing newline", { timeout: 30_000 }, async () => {
+  await withStore(async (dir) => {
+    const runDir = join(dir, "flows", "myflow", "runs", "run-1");
+    await mkdir(runDir, { recursive: true });
+    const meta = {
+      runId: "run-1",
+      flowName: "myflow",
+      args: {},
+      status: "ok",
+      startedAt: "2026-06-01T00:00:00.000Z",
+      endedAt: "2026-06-01T00:00:01.000Z",
+    };
+    await writeFile(join(runDir, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`);
+    await writeFile(join(runDir, "log.txt"), "one\ntwo\nthree");
+    const noTrailing = await hive(dir, "flow", "logs", "run-1", "-n", "2");
+    assert.equal(noTrailing.stdout, "two\nthree\n");
+
+    await writeFile(join(runDir, "log.txt"), "one\ntwo\nthree\n");
+    const trailing = await hive(dir, "flow", "logs", "run-1", "--lines", "2");
+    assert.equal(trailing.stdout, "two\nthree\n");
+  });
+});
+
 test("hive flow run --arg preserves values that do not round-trip through Number", { timeout: 30_000 }, async () => {
   await withStore(async (dir) => {
     await seedArgsFlow(dir);

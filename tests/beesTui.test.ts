@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   beesCatalogSignature,
   beesTuiSearchText,
+  canNarrowBeesFilter,
   filterBeesTuiItems,
   flattenBeesTuiGroups,
   groupBeesByMode,
@@ -10,6 +11,7 @@ import {
   initialBeesCursor,
   nextBeesGroupMode,
   resolveRegroupCursor,
+  stepBeesCursor,
   type BeesTuiItem,
 } from "../src/beesTui.js";
 import { __testOnlySidebarWidthClamp } from "../src/beesSidebar.js";
@@ -197,6 +199,32 @@ test("resolveRegroupCursor keeps the survivor, else the current bee, else first"
   assert.equal(resolveRegroupCursor(flat, undefined, undefined), firstItem);
 });
 
+test("stepBeesCursor moves by delta across item rows, hopping headers", () => {
+  const flat = flattenBeesTuiGroups(groupBeesTuiItems([
+    item({ name: "a", colony: "c1" }),
+    item({ name: "b", colony: "c1" }),
+    item({ name: "z", colony: "c2" }),
+  ]));
+  // layout: [header c1, a, b, header c2, z]
+  const rowOf = (name: string) => flat.findIndex((row) => row.kind === "item" && row.item.name === name);
+  assert.equal(stepBeesCursor(flat, rowOf("a"), 1), rowOf("b"));
+  assert.equal(stepBeesCursor(flat, rowOf("b"), 1), rowOf("z"), "skips the c2 header");
+  assert.equal(stepBeesCursor(flat, rowOf("z"), -1), rowOf("b"));
+});
+
+test("stepBeesCursor clamps at both ends and recovers a lost cursor", () => {
+  const flat = flattenBeesTuiGroups(groupBeesTuiItems([
+    item({ name: "a", colony: "c" }),
+    item({ name: "b", colony: "c" }),
+  ]));
+  const rowOf = (name: string) => flat.findIndex((row) => row.kind === "item" && row.item.name === name);
+  assert.equal(stepBeesCursor(flat, rowOf("a"), -1), rowOf("a"), "clamps at the top");
+  assert.equal(stepBeesCursor(flat, rowOf("b"), 1), rowOf("b"), "clamps at the bottom");
+  assert.equal(stepBeesCursor(flat, rowOf("a"), 99), rowOf("b"), "large deltas clamp");
+  assert.equal(stepBeesCursor(flat, 0, 1), rowOf("a"), "cursor on a header snaps to the first item");
+  assert.equal(stepBeesCursor([], 5, 1), 0, "item-less list parks at 0");
+});
+
 test("nextBeesGroupMode cycles forward and wraps, and goes backward", () => {
   assert.equal(nextBeesGroupMode("colony", 1), "pro-repo");
   assert.equal(nextBeesGroupMode("type", 1), "colony");
@@ -207,4 +235,49 @@ test("sidebar width clamp stays in tmux-friendly bounds", () => {
   assert.equal(__testOnlySidebarWidthClamp(5), 12);
   assert.equal(__testOnlySidebarWidthClamp(54), 54);
   assert.equal(__testOnlySidebarWidthClamp(80), 72);
+});
+
+test("canNarrowBeesFilter allows short prefix extensions only", () => {
+  assert.equal(canNarrowBeesFilter("a", "au"), true);
+  assert.equal(canNarrowBeesFilter("au", "aut"), true);
+  assert.equal(canNarrowBeesFilter("aut", "auth"), true);
+  // 5 effective chars: fuzzyScore's sparse-match cap starts growing with the
+  // query, so "matches next ⇒ matches prev" no longer holds.
+  assert.equal(canNarrowBeesFilter("auth", "authx"), false);
+  // Not extensions.
+  assert.equal(canNarrowBeesFilter("ab", "ba"), false);
+  assert.equal(canNarrowBeesFilter("ab", "ab"), false);
+  assert.equal(canNarrowBeesFilter("abc", "ab"), false);
+  // An empty previous pass matched everything — nothing to narrow from.
+  assert.equal(canNarrowBeesFilter("", "a"), false);
+  // Compared on the effective (trimmed, lowercased) query like fuzzyFilter.
+  assert.equal(canNarrowBeesFilter("A", "ab "), true);
+});
+
+test("narrowing from the previous match set equals filtering the catalog", () => {
+  const rows = [
+    item({ name: "auth-api", colony: "backend" }),
+    item({ name: "authz", colony: "backend" }),
+    item({ name: "cart", colony: "shop" }),
+    item({ name: "atlas-utils", colony: "infra" }),
+    item({ name: "worker", colony: "queue" }),
+  ];
+  let prev = "";
+  let pool = rows;
+  for (const query of ["a", "au", "aut", "auth"]) {
+    const full = filterBeesTuiItems(rows, query);
+    if (canNarrowBeesFilter(prev, query)) {
+      assert.deepEqual(filterBeesTuiItems(pool, query).map((r) => r.name), full.map((r) => r.name), `query "${query}"`);
+    }
+    prev = query;
+    pool = full;
+  }
+});
+
+test("fuzzy match is non-monotone past 4 chars — why canNarrowBeesFilter caps there", () => {
+  // Greedy match of "abcd" spans 14 chars (gaps 10 > cap 8) → rejected; the
+  // 5-char "abcde" raises the cap to 10 and the same span passes.
+  const sparse = item({ name: "sparse", searchText: "axxxxxxxxxxbcde" });
+  assert.equal(filterBeesTuiItems([sparse], "abcd").length, 0);
+  assert.equal(filterBeesTuiItems([sparse], "abcde").length, 1);
 });

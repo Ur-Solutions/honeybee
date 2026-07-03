@@ -7,7 +7,7 @@
 // data without touching the real filesystem, and so future corpora (artifacts,
 // buz messages) can plug in via additional reader methods.
 
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { storeRoot } from "./fsx.js";
 import { sealsRoot, type SealRecord } from "./seal.js";
@@ -50,14 +50,27 @@ export type SearchOptions = {
 
 export type SearchResult = {
   hits: SearchHit[];
-  truncated: boolean; // true if more hits existed past `limit`
+  // True when the returned hits were capped at `limit`. Once a higher-ranked
+  // corpus fills the top-N, lower-ranked corpora may be skipped without probing
+  // whether they contain additional matches.
+  truncated: boolean;
 };
 
 export type CorpusReader = {
   listLedgerFiles(): Promise<string[]>;
   readSeals(filter: SealFilter): AsyncIterable<{ path: string; record: SealRecord }>;
   readSessionRecords(filter: SessionFilter): AsyncIterable<{ path: string; record: SessionRecord }>;
-  readLedgerLines(filter: LedgerFilter): AsyncIterable<{ path: string; line: string; ts: string; lineNumber: number }>;
+  readLedgerLines(filter: LedgerFilter): AsyncIterable<LedgerLine>;
+};
+
+export type LedgerLine = {
+  path: string;
+  line: string;
+  parsed?: Record<string, unknown>;
+  ts: string;
+  // Present for readers that can provide a source line cheaply. The default
+  // reverse-streaming reader omits it to avoid a full-file pre-scan.
+  lineNumber?: number;
 };
 
 export type SealFilter = {
@@ -82,6 +95,7 @@ const MAX_REGEX_LENGTH = 256;
 const SNIPPET_BEFORE = 40;
 const SNIPPET_AFTER = 80;
 const SNIPPET_CAP = SNIPPET_BEFORE + SNIPPET_AFTER; // 120 total chars
+const LEDGER_READ_CHUNK_BYTES = 64 * 1024;
 
 // Ranking weights. The exact numbers don't matter, only their relative order:
 // seals dominate ledger which dominates sessions. Recency is encoded via a
@@ -101,6 +115,8 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
   const wantSessions = !options.types || options.types.has("sessions");
 
   const hits: SearchHit[] = [];
+  let truncated = false;
+  const limitReached = () => limit > 0 && hits.length >= limit;
 
   if (wantSeals) {
     for await (const { path, record } of reader.readSeals({
@@ -130,56 +146,67 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
   }
 
   if (wantLedger) {
-    for await (const { path, line, ts, lineNumber } of reader.readLedgerLines({
-      ...(options.sinceMs !== undefined ? { sinceMs: options.sinceMs } : {}),
-    })) {
-      if (!passesLedgerFilters(line, options)) continue;
-      const match = matcher.find(line);
-      if (!match) continue;
-      const snippet = makeSnippet(line, match.start, match.end);
-      hits.push({
-        type: "ledger",
-        path: `${path}:${lineNumber}`,
-        snippet: snippet.text,
-        matchStartInSnippet: snippet.matchStart,
-        matchEndInSnippet: snippet.matchEnd,
-        score: scoreHit("ledger", ts),
-        matchedAt: ts,
-        raw: line,
-      });
+    if (limitReached()) {
+      truncated = true;
+    } else {
+      for await (const { path, line, parsed, ts, lineNumber } of reader.readLedgerLines({
+        ...(options.sinceMs !== undefined ? { sinceMs: options.sinceMs } : {}),
+      })) {
+        if (!passesLedgerFilters(parsed, options)) continue;
+        const match = matcher.find(line);
+        if (!match) continue;
+        const snippet = makeSnippet(line, match.start, match.end);
+        hits.push({
+          type: "ledger",
+          path: lineNumber === undefined ? path : `${path}:${lineNumber}`,
+          snippet: snippet.text,
+          matchStartInSnippet: snippet.matchStart,
+          matchEndInSnippet: snippet.matchEnd,
+          score: scoreHit("ledger", ts),
+          matchedAt: ts,
+          raw: parsed ?? line,
+        });
+        if (limitReached()) {
+          truncated = true;
+          break;
+        }
+      }
     }
   }
 
   if (wantSessions) {
-    for await (const { path, record } of reader.readSessionRecords({
-      ...(options.colony ? { colony: options.colony } : {}),
-      ...(options.swarm ? { swarm: options.swarm } : {}),
-      ...(options.bee ? { bee: options.bee } : {}),
-    })) {
-      const matchedAt = record.updatedAt ?? record.createdAt ?? "";
-      const matchedAtMs = Date.parse(matchedAt);
-      if (options.sinceMs !== undefined && Number.isFinite(matchedAtMs) && matchedAtMs < options.sinceMs) continue;
-      const text = sessionHaystack(record);
-      const match = matcher.find(text);
-      if (!match) continue;
-      const snippet = makeSnippet(text, match.start, match.end);
-      hits.push({
-        type: "session",
-        path,
-        beeName: record.name,
-        snippet: snippet.text,
-        matchStartInSnippet: snippet.matchStart,
-        matchEndInSnippet: snippet.matchEnd,
-        score: scoreHit("session", matchedAt),
-        matchedAt,
-        raw: record,
-      });
+    if (limitReached()) {
+      truncated = true;
+    } else {
+      for await (const { path, record } of reader.readSessionRecords({
+        ...(options.colony ? { colony: options.colony } : {}),
+        ...(options.swarm ? { swarm: options.swarm } : {}),
+        ...(options.bee ? { bee: options.bee } : {}),
+      })) {
+        const matchedAt = record.updatedAt ?? record.createdAt ?? "";
+        const matchedAtMs = Date.parse(matchedAt);
+        if (options.sinceMs !== undefined && Number.isFinite(matchedAtMs) && matchedAtMs < options.sinceMs) continue;
+        const text = sessionHaystack(record);
+        const match = matcher.find(text);
+        if (!match) continue;
+        const snippet = makeSnippet(text, match.start, match.end);
+        hits.push({
+          type: "session",
+          path,
+          beeName: record.name,
+          snippet: snippet.text,
+          matchStartInSnippet: snippet.matchStart,
+          matchEndInSnippet: snippet.matchEnd,
+          score: scoreHit("session", matchedAt),
+          matchedAt,
+          raw: record,
+        });
+      }
     }
   }
 
   hits.sort((a, b) => b.score - a.score);
-  const truncated = limit > 0 && hits.length > limit;
-  return { hits: limit > 0 ? hits.slice(0, limit) : hits, truncated };
+  return { hits: limit > 0 ? hits.slice(0, limit) : hits, truncated: truncated || (limit > 0 && hits.length > limit) };
 }
 
 type CompiledMatcher = { find(text: string): { start: number; end: number } | null };
@@ -302,17 +329,12 @@ function sessionHaystack(record: SessionRecord): string {
   return parts.filter((p) => p && p.length > 0).join("\n");
 }
 
-function passesLedgerFilters(line: string, options: SearchOptions): boolean {
-  // The ledger is JSONL; filter by colony/swarm/bee by parsing once. Bad lines
-  // are skipped silently — the ledger is append-only and we never want one
-  // malformed row to abort a long search.
+function passesLedgerFilters(parsed: Record<string, unknown> | undefined, options: SearchOptions): boolean {
+  // The ledger is JSONL; the reader parses each row once and passes the object
+  // through. Bad lines are skipped silently when structured filters are needed
+  // because we never want one malformed row to abort a long search.
   if (!options.colony && !options.swarm && !options.bee) return true;
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(line) as Record<string, unknown>;
-  } catch {
-    return false;
-  }
+  if (!parsed) return false;
   if (options.colony && parsed.colony !== options.colony) return false;
   if (options.swarm && parsed.swarmId !== options.swarm && parsed.swarm !== options.swarm) return false;
   if (options.bee) {
@@ -430,43 +452,74 @@ async function* defaultReadSessionRecords(filter: SessionFilter): AsyncIterable<
   }
 }
 
-async function* defaultReadLedgerLines(filter: LedgerFilter): AsyncIterable<{
-  path: string;
-  line: string;
-  ts: string;
-  lineNumber: number;
-}> {
+async function* defaultReadLedgerLines(filter: LedgerFilter): AsyncIterable<LedgerLine> {
   const files = await listLedgerFiles();
   for (const file of files) {
-    let raw: string;
     try {
-      raw = await readFile(file, "utf8");
+      for await (const line of readFileLinesNewestFirst(file)) {
+        const parsed = parseLedgerLine(line);
+        const ts = typeof parsed?.ts === "string" ? parsed.ts : "";
+        if (filter.sinceMs !== undefined) {
+          const tsMs = Date.parse(ts);
+          if (Number.isFinite(tsMs) && tsMs < filter.sinceMs) continue;
+        }
+        yield { path: file, line, ...(parsed ? { parsed } : {}), ts };
+      }
     } catch {
       continue;
-    }
-    // Lines are newest-last inside any single rotation. Iterate newest-first by
-    // walking the array in reverse so the search-order matches the file-order
-    // (newest-first overall: most recent rotation, newest line, etc.).
-    const lines = raw.split("\n");
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-      const line = lines[i];
-      if (!line) continue;
-      const ts = ledgerLineTimestamp(line);
-      if (filter.sinceMs !== undefined) {
-        const tsMs = Date.parse(ts);
-        if (Number.isFinite(tsMs) && tsMs < filter.sinceMs) continue;
-      }
-      yield { path: file, line, ts, lineNumber: i + 1 };
     }
   }
 }
 
-function ledgerLineTimestamp(line: string): string {
+async function* readFileLinesNewestFirst(file: string): AsyncIterable<string> {
+  const handle = await open(file, "r");
   try {
-    const parsed = JSON.parse(line) as { ts?: string };
-    if (parsed && typeof parsed.ts === "string") return parsed.ts;
+    const info = await handle.stat();
+    let position = info.size;
+    let carry = Buffer.alloc(0);
+
+    while (position > 0) {
+      const chunkSize = Math.min(LEDGER_READ_CHUNK_BYTES, position);
+      position -= chunkSize;
+      const chunk = Buffer.allocUnsafe(chunkSize);
+      const { bytesRead } = await handle.read(chunk, 0, chunkSize, position);
+      if (bytesRead <= 0) continue;
+      const buffer = bytesRead === chunkSize ? chunk : chunk.subarray(0, bytesRead);
+      let end = buffer.length;
+      for (let i = buffer.length - 1; i >= 0; i -= 1) {
+        if (buffer[i] !== 0x0a) continue;
+        const segment = buffer.subarray(i + 1, end);
+        const lineBuffer = carry.length > 0 ? Buffer.concat([segment, carry]) : segment;
+        const line = trimTrailingCarriageReturn(lineBuffer.toString("utf8"));
+        if (line.length > 0) yield line;
+        carry = Buffer.alloc(0);
+        end = i;
+      }
+      const prefix = buffer.subarray(0, end);
+      carry = carry.length > 0 ? Buffer.concat([prefix, carry]) : Buffer.from(prefix);
+    }
+
+    if (carry.length > 0) {
+      const line = trimTrailingCarriageReturn(carry.toString("utf8"));
+      if (line.length > 0) yield line;
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function trimTrailingCarriageReturn(line: string): string {
+  return line.endsWith("\r") ? line.slice(0, -1) : line;
+}
+
+function parseLedgerLine(line: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
   } catch {
     // fall through
   }
-  return "";
+  return undefined;
 }
