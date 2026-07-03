@@ -12,7 +12,7 @@ import { resolveSpawnSpec } from "../spawnResolve.js";
 import { defineFlow, type BeeHandle, type FlowContext } from "../flow/index.js";
 import type { HiveFacade } from "../flow/hive_facade.js";
 import { AgentReadinessError, isPermissionPromptPane, waitForAgentReady } from "../readiness.js";
-import type { SealRecord, SealStatus } from "../seal.js";
+import { scanLatestSeal, type SealRecord, type SealStatus } from "../seal.js";
 import { appendLedger, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
 import { buildLoopConfig } from "./context.js";
@@ -65,6 +65,8 @@ export type LoopTestHooks = {
   boundaryPollMs?: number;
   /** Optional override for the boundary's pane capture (avoids real tmux in tests). */
   capturePane?: (args: { handle: BeeHandle; iter: number }) => Promise<string>;
+  /** Optional clock override for limit tests. */
+  now?: () => number;
 };
 let testHooks: LoopTestHooks | undefined;
 export function __setLoopTestHooks(hooks: LoopTestHooks | undefined): void {
@@ -135,7 +137,8 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
   await ctx.hive.log(`loop ${loopId} started: context=${cfg.context} bee=${cfg.bee} max=${cfg.stop.max ?? "∞"}`);
 
   let handle: BeeHandle | undefined;
-  const started = Date.now();
+  const now = (): number => testHooks?.now?.() ?? Date.now();
+  const started = now();
   let finalStatus: LoopStatus = "running";
   let stopReason = "";
 
@@ -168,6 +171,11 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       }
       if (await isStopRequested(loopId)) {
         await finalize("stopped", "stop-requested");
+        break;
+      }
+      const topLimitDecision = await limitStopDecision(loopId, cfg, cfg.iteration, started, now);
+      if (topLimitDecision) {
+        await finalize(topLimitDecision.status, topLimitDecision.reason);
         break;
       }
 
@@ -233,7 +241,8 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       // Baseline the newest seal BEFORE sending so the idle fallback can reject
       // a stale seal from a prior iteration (matters for carrier=same, whose bee
       // name — and therefore seal stream — is fixed across iterations).
-      const sealBaseline = (await facade.collect(handle))?.sealedAt;
+      const sealBaselineScan = await scanLatestSeal(handle.name).catch(() => null);
+      let sealCursor = sealBaselineScan?.filename ?? null;
 
       if (testHooks?.send) await testHooks.send({ handle, prompt, iter });
       else await facade.send(handle, prompt); // injects AND submits (Enter included)
@@ -246,11 +255,10 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       let boundaryBlocked = false;
       try {
         const boundary = await waitForIterationBoundary({
-          facade,
           handle,
           iter,
-          baselineSealedAt: sealBaseline,
-          timeoutMs: testHooks?.sealTimeoutMs ?? SEAL_TIMEOUT_MS,
+          baselineFilename: sealCursor,
+          timeoutMs: boundaryTimeoutMs(cfg, started, now, testHooks?.sealTimeoutMs ?? SEAL_TIMEOUT_MS),
           idleMs: testHooks?.boundaryIdleMs ?? IDLE_FALLBACK_MS,
           graceMs: testHooks?.boundaryGraceMs ?? BOUNDARY_GRACE_MS,
           pollMs: testHooks?.boundaryPollMs ?? BOUNDARY_POLL_MS,
@@ -258,6 +266,7 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
         });
         seal = boundary.seal;
         boundaryBlocked = boundary.blocked;
+        sealCursor = boundary.highWaterFilename;
       } catch {
         // An aborted signal surfaces as a boundary throw. End cleanly.
         if (ctx.signal?.aborted) {
@@ -269,8 +278,8 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       if (!seal) {
         // A seal may have landed in the final poll gap — one last collect
         // against the pre-send baseline before declaring the turn unsealed.
-        const latest = await facade.collect(handle).catch(() => null);
-        seal = latest && latest.sealedAt !== sealBaseline ? latest : null;
+        const latest = await scanLatestSeal(handle.name, { afterFilename: sealCursor }).catch(() => null);
+        seal = latest?.seal ?? null;
       }
       // Distinguish "the bee actually sealed" from "no seal observed this turn".
       // A non-sealing harness/task must NOT be synthesized into a `done` that
@@ -332,14 +341,7 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
         await recordStopCheck(loopId, "judge", hit);
         if (hit) decision = { status: "done", reason: "judge" };
       }
-      if (!decision && !cfg.stop.forever && cfg.stop.max != null && iter >= cfg.stop.max) {
-        await recordStopCheck(loopId, "max", true);
-        decision = { status: "done", reason: "max" };
-      }
-      if (!decision && cfg.stop.maxDurationMs != null && Date.now() - started >= cfg.stop.maxDurationMs) {
-        await recordStopCheck(loopId, "max-duration", true);
-        decision = { status: "done", reason: "max-duration" };
-      }
+      decision ??= await limitStopDecision(loopId, cfg, iter, started, now);
 
       if (decision?.status === "paused") {
         // PRD: pause-and-notify — the human must be able to attend THIS bee,
@@ -365,6 +367,10 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       // else loop again
     }
   } catch (error) {
+    if (ctx.signal?.aborted) {
+      await finalize("stopped", "aborted");
+      return { loopId, iterations: cfg.iteration, status: finalStatus, stopReason };
+    }
     await finalize("errored", error instanceof Error ? error.message : String(error));
     throw error;
   }
@@ -375,6 +381,30 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
 // ──────────────────────────────────────────────────────────────────────────
 // Helpers.
 // ──────────────────────────────────────────────────────────────────────────
+
+async function limitStopDecision(
+  loopId: string,
+  cfg: LoopConfig,
+  completedIterations: number,
+  started: number,
+  now: () => number,
+): Promise<{ status: LoopStatus; reason: string } | null> {
+  if (!cfg.stop.forever && cfg.stop.max != null && completedIterations >= cfg.stop.max) {
+    await recordStopCheck(loopId, "max", true);
+    return { status: "done", reason: "max" };
+  }
+  if (cfg.stop.maxDurationMs != null && now() - started >= cfg.stop.maxDurationMs) {
+    await recordStopCheck(loopId, "max-duration", true);
+    return { status: "done", reason: "max-duration" };
+  }
+  return null;
+}
+
+function boundaryTimeoutMs(cfg: LoopConfig, started: number, now: () => number, defaultTimeoutMs: number): number {
+  if (cfg.stop.maxDurationMs == null) return defaultTimeoutMs;
+  const remainingMs = cfg.stop.maxDurationMs - (now() - started);
+  return Math.max(0, Math.min(defaultTimeoutMs, remainingMs));
+}
 
 function handleOf(record: SessionRecord): BeeHandle {
   const handle: BeeHandle = {
@@ -390,39 +420,42 @@ function handleOf(record: SessionRecord): BeeHandle {
 /**
  * Iteration boundary detector — RACE seal detection against idle detection
  * (PRD §14: prefer the seal; fall back to ~3s idle detection for
- * harnesses/tasks that don't seal). One poll loop checks for a seal newer
- * than the PRE-SEND baseline each pass while fingerprinting the bee's pane;
- * once the pane has been stable for idleMs + graceMs with no new seal, the
+ * harnesses/tasks that don't seal). One poll loop checks for a seal file beyond
+ * the PRE-SEND filename cursor while fingerprinting the bee's pane; once the
+ * pane has been stable for idleMs + graceMs with no new seal, the
  * boundary is concluded unsealed. timeoutMs remains the overall cap so a
  * never-idle, never-sealing bee cannot wedge an iteration forever.
  */
 async function waitForIterationBoundary(args: {
-  facade: HiveFacade;
   handle: BeeHandle;
   iter: number;
-  baselineSealedAt: string | undefined;
+  baselineFilename: string | null;
   timeoutMs: number;
   idleMs: number;
   graceMs: number;
   pollMs: number;
   signal?: AbortSignal | undefined;
-}): Promise<{ seal: SealRecord | null; blocked: boolean }> {
-  const { facade, handle, baselineSealedAt } = args;
+}): Promise<{ seal: SealRecord | null; blocked: boolean; highWaterFilename: string | null }> {
+  const { handle } = args;
   const started = Date.now();
   let lastPane: string | undefined;
   let stableSince = Date.now();
   let goneSince: number | undefined;
+  let highWaterFilename = args.baselineFilename;
   while (Date.now() - started < args.timeoutMs) {
     if (args.signal?.aborted) throw new Error(`loop boundary aborted: ${handle.name}`);
-    const latest = await facade.collect(handle).catch(() => null);
-    if (latest && latest.sealedAt !== baselineSealedAt) return { seal: latest, blocked: false };
+    const latest = await scanLatestSeal(handle.name, { afterFilename: highWaterFilename }).catch(() => null);
+    if (latest?.seal) {
+      highWaterFilename = latest.filename;
+      return { seal: latest.seal, blocked: false, highWaterFilename };
+    }
     const observed = await captureBoundaryPane(handle, args.iter);
     if (observed === "gone") {
       // The session verifiably ended. A one-shot bee may have written its
-      // seal moments before exiting, so keep polling collect for graceMs
+      // seal moments before exiting, so keep polling the seal stream for graceMs
       // before concluding the boundary unsealed.
       goneSince ??= Date.now();
-      if (Date.now() - goneSince >= args.graceMs) return { seal: null, blocked: false };
+      if (Date.now() - goneSince >= args.graceMs) return { seal: null, blocked: false, highWaterFilename };
     } else if (observed !== null) {
       goneSince = undefined;
       if (observed !== lastPane) {
@@ -432,14 +465,14 @@ async function waitForIterationBoundary(args: {
         // A stable pane sitting on an approval prompt is NOT a finished turn —
         // the bee is blocked on a human decision. Advancing would kill it
         // (fresh carrier) or paste the next prompt into the approval UI.
-        return { seal: null, blocked: isPermissionPromptPane(lastPane ?? "") };
+        return { seal: null, blocked: isPermissionPromptPane(lastPane ?? ""), highWaterFilename };
       }
     }
     // observed === null: transient capture failure (e.g. an ssh hiccup) — skip
     // the stability bookkeeping so it cannot masquerade as a stable idle pane.
     await sleep(args.pollMs);
   }
-  return { seal: null, blocked: false }; // overall cap reached — unsealed boundary.
+  return { seal: null, blocked: false, highWaterFilename }; // overall cap reached — unsealed boundary.
 }
 
 /**
