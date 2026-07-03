@@ -287,11 +287,16 @@ exhausted.
 
 `auto` is a reserved account query (`--account auto`, or the `<tool>-auto` bee
 spec, on `spawn`/`run`/`x`/`xa`/`open`): hive reads the provider limits of every
-credentialed account for that tool and picks the one with the least weekly
-usage. Accounts ≥90% into their 5h window sort behind ones with headroom, and
-accounts whose limits cannot be read are a last resort (oldest registration
-wins). The pick is printed to stderr, e.g.
-`account auto → claude-thto (weekly 34%, 5h 12%) — least weekly usage`.
+credentialed account for that tool and picks the one with the least
+*pace-adjusted* weekly load. Pace is used% minus elapsed% of the window: an
+account behind pace holds unused quota that expires at its reset, so it is
+preferred even over accounts with nominally lower used% — e.g. 70% used but
+resetting tomorrow beats 40% used with five days to go. Pace's weight fades as
+headroom drops below 25%, so a 98%-used account an hour from reset never wins
+on pace alone. Accounts ≥90% into their 5h window sort behind ones with
+headroom, and accounts whose limits cannot be read are a last resort (oldest
+registration wins). The pick is printed to stderr, e.g.
+`account auto → claude-thto (weekly 66%, 5h 12%) — least effective weekly load (18% behind pace — surplus expires at reset)`.
 
 The pick reads limits through the cache with a default ttl of **1h**, so
 back-to-back auto spawns cost no extra provider round-trips. Override per call

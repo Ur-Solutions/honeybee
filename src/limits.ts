@@ -743,6 +743,35 @@ export async function cachedAccountLimits(accounts: AccountRecord[], options: Ca
  */
 export const AUTO_FIVE_HOUR_SATURATION_PERCENT = 90;
 
+/**
+ * Headroom below which pace stops mattering in the auto pick. An account
+ * behind pace but with almost nothing left (98% used, resets in an hour)
+ * would win a pure pace contest yet blow through its remaining 2% long
+ * before the reset — so pace's weight fades linearly to zero as headroom
+ * drops below this threshold, letting raw used% dominate near the wall.
+ */
+export const AUTO_PACE_FULL_WEIGHT_HEADROOM_PERCENT = 25;
+
+/**
+ * Effective load of a window for the auto pick (lower = better). Raw used%
+ * adjusted by pace (used% − elapsed%): an account behind pace holds unused
+ * quota that expires at reset, so it scores lower (burn its surplus first);
+ * an account ahead of pace is on track to exhaust early, so it scores
+ * higher. Pace's influence is weighted by remaining headroom (see
+ * AUTO_PACE_FULL_WEIGHT_HEADROOM_PERCENT) so a nearly-exhausted window
+ * never wins on pace alone. Falls back to raw used% when the window
+ * boundary is unknown; a rolled-over window is fresh (0).
+ */
+export function effectiveWindowLoad(window: WindowUsage, now = Date.now()): number {
+  if (windowRolledOver(window, now)) return 0;
+  const used = window.usedPercent;
+  const pace = paceDelta(window, now);
+  if (pace === null) return used;
+  const headroom = Math.max(0, 100 - used);
+  const paceWeight = Math.min(1, headroom / AUTO_PACE_FULL_WEIGHT_HEADROOM_PERCENT);
+  return paceWeight * pace + (1 - paceWeight) * used;
+}
+
 export type AutoAccountCandidate = { account: AccountRecord; limits?: AccountLimits };
 
 export type AutoAccountChoice = {
@@ -755,17 +784,23 @@ export type AutoAccountChoice = {
 
 /**
  * Order: readable limits before unreadable; 5h headroom before 5h-saturated;
- * then least weekly used% (a rolled-over window counts as 0; a missing weekly
- * window falls back to the 5h one); registration order as the deterministic
- * tie-break. Null only for an empty candidate list.
+ * then least pace-adjusted weekly load (see effectiveWindowLoad — an account
+ * whose unused quota expires at an imminent reset scores below one that is
+ * burning ahead of pace; a rolled-over window counts as 0; a missing weekly
+ * window falls back to the 5h one); raw 5h used% and registration order as
+ * the deterministic tie-breaks. Null only for an empty candidate list.
  */
 export function selectLeastLoadedAccount(candidates: AutoAccountCandidate[], now = Date.now()): AutoAccountChoice | null {
-  const score = (window: WindowUsage | undefined): number | null =>
+  const rawScore = (window: WindowUsage | undefined): number | null =>
     window ? (windowRolledOver(window, now) ? 0 : window.usedPercent) : null;
+  const paceScore = (window: WindowUsage | undefined): number | null =>
+    window ? effectiveWindowLoad(window, now) : null;
   const scored = candidates.map(({ account, limits }) => {
     const ok = limits?.ok === true;
-    const fiveHour = ok ? score(limits?.fiveHour) : null;
-    const weekly = ok ? (score(limits?.weekly) ?? fiveHour) : null;
+    // Saturation and the tie-break stay on RAW 5h used% — a saturated short
+    // window is a wall regardless of how favorable its pace looks.
+    const fiveHour = ok ? rawScore(limits?.fiveHour) : null;
+    const weekly = ok ? (paceScore(limits?.weekly) ?? paceScore(limits?.fiveHour)) : null;
     return {
       account,
       limits,
@@ -789,9 +824,20 @@ export function selectLeastLoadedAccount(candidates: AutoAccountCandidate[], now
   const reason = !best.ok
     ? "limits unreadable for every account; oldest registration"
     : best.saturated
-      ? "every account is close to its 5h limit; least weekly usage"
-      : "least weekly usage";
+      ? "every account is close to its 5h limit; least effective weekly load"
+      : autoPickWeeklyReason(best.limits, now);
   return { account: best.account, ...(best.ok && best.limits ? { limits: best.limits } : {}), reason };
+}
+
+/** Why the winner won, pace-aware: names the expiring surplus / overpace when the window boundary is known. */
+function autoPickWeeklyReason(limits: AccountLimits | undefined, now: number): string {
+  const window = limits?.weekly ?? limits?.fiveHour;
+  const pace = window && !windowRolledOver(window, now) ? paceDelta(window, now) : null;
+  if (pace === null) return "least weekly usage";
+  const rounded = Math.round(Math.abs(pace));
+  if (pace <= -3) return `least effective weekly load (${rounded}% behind pace — surplus expires at reset)`;
+  if (pace >= 3) return `least effective weekly load (${rounded}% ahead of pace)`;
+  return "least effective weekly load (on pace)";
 }
 
 /** Default freshness budget for the auto pick: cached limits younger than this are good enough. */
@@ -803,8 +849,9 @@ export type PickAccountDeps = CachedLimitsOptions & {
 
 /**
  * Resolve the `auto` account query: among the tool's accounts with vaulted
- * credentials, pick the one with the least weekly usage, pushing accounts
- * whose 5h window is nearly exhausted to the back. Limits come through the
+ * credentials, pick the one with the least pace-adjusted weekly load (an
+ * imminent reset with unused quota beats a nominally lower used%), pushing
+ * accounts whose 5h window is nearly exhausted to the back. Limits come through the
  * cache with a 1h default ttl, so back-to-back auto spawns do not re-pay the
  * provider round-trips; pass ttlMs (0 = always live) to override.
  */

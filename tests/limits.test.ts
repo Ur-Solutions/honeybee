@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { addAccount, accountDir } from "../src/accounts.js";
-import { accountLimits, cachedAccountLimits, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
+import { accountLimits, cachedAccountLimits, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -41,6 +41,22 @@ test("paceDelta compares used% against elapsed% of the window", () => {
   assert.equal(paceDelta({ usedPercent: 50, windowMinutes: 300 }, now), null);
   // Boundary already passed → no pace (the snapshot is stale).
   assert.equal(paceDelta({ usedPercent: 50, windowMinutes: 300, resetsAt: "2026-06-10T11:00:00Z" }, now), null);
+});
+
+test("effectiveWindowLoad adjusts used% by pace with diminishing weight near the wall", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  const weekly = (usedPercent: number, resetsAt: string) => ({ usedPercent, windowMinutes: 10_080, resetsAt });
+  // 70% used, resets in a day (85.7% elapsed): behind pace, full weight →
+  // score is the pace delta itself.
+  assert.equal(Math.round(effectiveWindowLoad(weekly(70, "2026-06-11T12:00:00Z"), now)), -16);
+  // Ahead of pace pushes the score above raw used%.
+  assert.ok(effectiveWindowLoad(weekly(40, "2026-06-15T12:00:00Z"), now) > 11);
+  // 98% used with 1h left is behind pace too, but headroom 2 fades the pace
+  // weight to ~0.08 — the score stays close to raw usage.
+  assert.ok(effectiveWindowLoad(weekly(98, "2026-06-10T13:00:00Z"), now) > 85);
+  // No boundary → raw used%; rolled over → fresh.
+  assert.equal(effectiveWindowLoad({ usedPercent: 55 }, now), 55);
+  assert.equal(effectiveWindowLoad(weekly(99, "2026-06-10T11:00:00Z"), now), 0);
 });
 
 test("windowRolledOver flags snapshots whose reset boundary has passed", () => {
@@ -409,7 +425,57 @@ test("selectLeastLoadedAccount picks the least weekly usage", () => {
     now,
   );
   assert.equal(choice?.account.id, "b");
-  assert.equal(choice?.reason, "least weekly usage");
+  assert.match(choice?.reason ?? "", /behind pace/);
+});
+
+test("selectLeastLoadedAccount prefers an imminent reset with expiring surplus over lower raw usage", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  // a: 70% used but its week resets in 1 day (86% elapsed) — 30% expires
+  // unused if nobody burns it. b: only 40% used but 5 days from reset and
+  // already ahead of pace. Pace says a.
+  const withWeekly = (id: string, used: number, resetsAt: string): import("../src/limits.js").AccountLimits => ({
+    ...okLimits(id, used, 10),
+    weekly: { usedPercent: used, windowMinutes: 10_080, resetsAt },
+  });
+  const choice = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: withWeekly("a", 70, "2026-06-11T12:00:00Z") },
+      { account: pickAccount("b", "2026-01-02"), limits: withWeekly("b", 40, "2026-06-15T12:00:00Z") },
+    ],
+    now,
+  );
+  assert.equal(choice?.account.id, "a");
+  assert.match(choice?.reason ?? "", /behind pace — surplus expires at reset/);
+
+  // Diminishing returns near 100%: c is behind pace too (98% used, resets in
+  // 1h) but its remaining 2% is not worth landing a fresh bee on — the
+  // on-pace account with real headroom wins.
+  const nearWall = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("c", "2026-01-01"), limits: withWeekly("c", 98, "2026-06-10T13:00:00Z") },
+      { account: pickAccount("d", "2026-01-02"), limits: withWeekly("d", 50, "2026-06-14T00:00:00Z") },
+    ],
+    now,
+  );
+  assert.equal(nearWall?.account.id, "d");
+
+  // Boundary-less windows keep the old least-used behavior and reason.
+  const noBoundary = (id: string, used: number): import("../src/limits.js").AccountLimits => ({
+    account: id,
+    tool: "claude",
+    ok: true,
+    source: "oauth-api",
+    weekly: { usedPercent: used },
+  });
+  const blind = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("e", "2026-01-01"), limits: noBoundary("e", 60) },
+      { account: pickAccount("f", "2026-01-02"), limits: noBoundary("f", 20) },
+    ],
+    now,
+  );
+  assert.equal(blind?.account.id, "f");
+  assert.equal(blind?.reason, "least weekly usage");
 });
 
 test("selectLeastLoadedAccount pushes 5h-saturated accounts behind ones with headroom", () => {
@@ -439,11 +505,12 @@ test("selectLeastLoadedAccount pushes 5h-saturated accounts behind ones with hea
 test("selectLeastLoadedAccount treats rolled-over windows as fresh and unreadable limits as last resort", () => {
   const now = Date.parse("2026-06-10T12:00:00Z");
   // a's snapshot says 99% but its windows already reset → counts as 0%.
+  // b's week just started (slightly ahead of pace), so fresh-a wins.
   const rolled = okLimits("a", 99, 99, "2026-06-10T11:00:00Z");
   const choice = selectLeastLoadedAccount(
     [
       { account: pickAccount("a", "2026-01-01"), limits: rolled },
-      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 5, 5) },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 5, 5, "2026-06-17T11:00:00Z") },
     ],
     now,
   );
