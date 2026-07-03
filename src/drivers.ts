@@ -338,7 +338,9 @@ export function forcedSessionIdArgsForAgent(kind: string, sessionId: string): st
  */
 export function sessionPinnedInArgs(kind: string, args: readonly string[]): boolean {
   const pin = agentDriver(kind)?.sessionIdFlag;
-  return pin !== undefined && args.includes(pin);
+  // Both arg shapes count as caller-supplied: `--session-id <id>` and
+  // `--session-id=<id>` — missing the latter appended a second pin.
+  return pin !== undefined && args.some((arg) => arg === pin || arg.startsWith(`${pin}=`));
 }
 
 /** The HSR runner adapter for a canonical kind, or undefined when not HSR-capable. */
