@@ -1,4 +1,4 @@
-export type SubstrateKind = "local-tmux" | "ssh-tmux" | "hsr";
+export type SubstrateKind = "local-tmux" | "ssh-tmux" | "hsr" | "remote-hsr";
 
 export const LOCAL_NODE = "local";
 

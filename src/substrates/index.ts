@@ -2,8 +2,11 @@ import { hsrSubstrate } from "../hsr/substrate.js";
 import { loadNodeSync, LOCAL_NODE_NAME, type NodeRecord } from "../node.js";
 import type { SessionRecord } from "../store.js";
 import { createLocalTmuxSubstrate } from "./local-tmux.js";
+import { createRemoteHsrSubstrate, type RemoteHsrSubstrate } from "./remote-hsr.js";
 import { createSshTmuxSubstrate } from "./ssh-tmux.js";
 import { type Substrate } from "./types.js";
+
+export type { RemoteHsrSubstrate } from "./remote-hsr.js";
 
 export type { KillResult, LaunchSpec, ProbeResult, Substrate, SubstrateKind, TmuxWindowOptions } from "./types.js";
 export { LOCAL_NODE } from "./types.js";
@@ -44,12 +47,28 @@ export function substrateForRecord(node: NodeRecord): Substrate {
     return getOrCache(`local-tmux::${node.name}`, createLocalTmuxSubstrate);
   }
   if (node.kind === "remote-hsr") {
-    // The remote-hsr substrate (forwarding a spawn/observe/steer plane over the
-    // node's ssh-tunnelled runner-host socket) lands in APIA-92. APIA-90 only
-    // bootstraps/handshakes the runner-host bundle onto the node.
-    throw new Error(`remote-hsr substrate lands in APIA-92 (node "${node.name}" is bootstrapped but not yet steerable)`);
+    return getOrCache(remoteHsrCacheKey(node), () => createRemoteHsrSubstrate(node));
   }
   return getOrCache(sshCacheKey(node), () => createSshTmuxSubstrate({ node }));
+}
+
+/**
+ * The typed remote-HSR substrate for a node (the spawn path needs `spawnRemote`,
+ * which is not on the base Substrate interface). Shares the per-node cache with
+ * substrateForRecord so one resilient transport client is reused everywhere.
+ */
+export function remoteHsrSubstrateForNode(node: NodeRecord): RemoteHsrSubstrate {
+  if (node.kind !== "remote-hsr") {
+    throw new Error(`remoteHsrSubstrateForNode requires kind=remote-hsr, got ${node.kind}`);
+  }
+  return getOrCache(remoteHsrCacheKey(node), () => createRemoteHsrSubstrate(node)) as RemoteHsrSubstrate;
+}
+
+// Key on the fields that shape the ssh transport (endpoint + ssh command/args)
+// plus the runner-host version, so a re-bootstrap or ssh-arg change doesn't leave
+// the daemon reusing a stale forwarded socket.
+function remoteHsrCacheKey(node: NodeRecord): string {
+  return JSON.stringify(["remote-hsr", node.name, node.endpoint, node.sshCommand ?? "", node.sshArgs ?? [], node.runnerHostVersion ?? ""]);
 }
 
 // Key on every field that shapes the ssh transport, not just the endpoint:

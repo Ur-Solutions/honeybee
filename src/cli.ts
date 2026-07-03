@@ -12,7 +12,9 @@ import {
   type AccountChainSyncOutcome,
   type AccountRecord,
   type SpawnAgentSpec,
+  accountEmail,
   accountHasCredentials,
+  accountsRegistryPath,
   activateAccountIntoHome,
   addAccount,
   autoAccountTool,
@@ -168,7 +170,7 @@ import { LOCAL_NODE_NAME, listNodes, loadNode, loadNodeSync, type NodeRecord, re
 import { bootstrapRunnerHost } from "./hsr/bootstrap.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
-import { clearSubstrateCache, localSubstrate, substrateFor, substrateForRecord, type Substrate } from "./substrates/index.js";
+import { clearSubstrateCache, localSubstrate, remoteHsrSubstrateForNode, substrateFor, substrateForRecord, type Substrate } from "./substrates/index.js";
 import { attachCommand, attachSession, capture, formatShellCommand, hasSession, kill, listTmuxSessions, newSession, sendText, tmux } from "./tmux.js";
 import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
 import { waitForIdle } from "./wait.js";
@@ -682,8 +684,10 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       pinnedSessionId = sid;
     }
   }
-  const isRemote = Boolean(opts.node && opts.node.kind === "ssh-tmux");
-  // Executable validation only applies to local spawns; we cannot reach the remote PATH cheaply.
+  const isRemoteHsr = Boolean(opts.node && opts.node.kind === "remote-hsr");
+  const isRemote = Boolean(opts.node && (opts.node.kind === "ssh-tmux" || opts.node.kind === "remote-hsr"));
+  // Executable validation only applies to local spawns; we cannot reach the remote
+  // PATH cheaply and the remote runner host resolves the executable itself.
   if (!isRemote) {
     await assertExecutableAvailable(spec.command);
     await assertAgentAuthFreshForSpawn(spec, opts.account?.id);
@@ -692,6 +696,58 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   timer.mark("allocate");
   const name = safeName(opts.name ?? identity.id);
+
+  // Remote HSR (APIA-92): the runner host lives ON the remote node. Resolve the
+  // AgentSpec LOCALLY (above), then hand the resolved spec to the remote `spawn`
+  // RPC — no resolveAgent on the remote. The record carries `node` (routed by
+  // node.kind to the remote substrate) and NO local `substrate:"hsr"`, so it is
+  // observed via the node-probe path like an ssh-tmux bee. Credential delivery
+  // to the remote home is APIA-93; for now the remote uses its own home's auth.
+  if (isRemoteHsr && opts.node) {
+    const substrate = remoteHsrSubstrateForNode(opts.node);
+    const adapter = adapterFor(spec.kind);
+    const spawnResult = await substrate.spawnRemote({
+      bee: name,
+      kind: spec.kind,
+      cwd: opts.cwd,
+      comb: name, // solo comb
+      ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
+      authKind: "subscription",
+      ...(opts.model ? { model: opts.model } : {}),
+      spec: { command: spec.command, args: spec.args, env: spec.env },
+    });
+    timer.mark("session-create");
+    const runnerTier = adapter?.tier() ?? spawnResult.tier;
+    const command = shellCommand(spec);
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name,
+      agent: spec.kind,
+      cwd: opts.cwd,
+      command,
+      tmuxTarget: name, // logical id — remote HSR has no tmux target
+      node: opts.node.name,
+      ...(runnerTier ? { runnerTier } : {}),
+      combId: name,
+      createdAt: now,
+      updatedAt: now,
+      status: "running",
+      id: identity.id,
+      prefix: identity.prefix,
+      uuid: identity.uuid,
+      requestedAgent: spec.requestedKind,
+      homePath: spec.homePath,
+      ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
+      ...(opts.colony ? { colony: opts.colony } : {}),
+      ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
+      ...(opts.caste ? { caste: opts.caste } : {}),
+      ...(opts.brief ? { brief: opts.brief } : {}),
+    };
+    await saveSession(record);
+    timer.mark("persist");
+    if (ownsTimer) timer.report(record.name);
+    return record;
+  }
 
   // HSR: fork a detached runner host instead of a tmux session. The bee is a
   // normal SessionRecord with substrate:"hsr", tmuxTarget=name (a logical id, no
@@ -8708,6 +8764,7 @@ async function cmdAccount(parsed: Parsed) {
       if (isPretty()) console.log(actionLine("ok", "account", [bold(account.id), account.tool, account.provider ?? "?", account.label]));
       else console.log(`${account.id}\t${account.tool}\t${account.provider ?? ""}\t${account.label}`);
       console.log(note(`vault dir ready; capture credentials with: hive account login ${account.tool} ${account.label}`));
+      for (const warning of claudeIdentityWarnings([account])) console.log(warning);
       break;
     }
     case "login": {
@@ -8724,6 +8781,8 @@ async function cmdAccount(parsed: Parsed) {
       const provider = typeof flag(parsed, "provider") === "string" ? String(flag(parsed, "provider")) : undefined;
       const model = typeof flag(parsed, "model") === "string" ? String(flag(parsed, "model")) : undefined;
       const account = existing ?? (await addAccount(tool, label, { provider, model }));
+      // Before the interactive seat so it isn't buried under login output.
+      for (const warning of claudeIdentityWarnings([account])) console.log(warning);
       await runLoginSeat(parsed, account);
       break;
     }
@@ -9029,25 +9088,29 @@ async function cmdLimits(parsed: Parsed) {
   const ttlMs = ttlFlagMs(parsed);
   const live = wantsUsageLive(parsed);
   if (live && truthy(flag(parsed, "json"))) throw new Error("--live is interactive; drop --json");
-  const results = await cachedAccountLimits(accounts, ttlMs !== undefined ? { ttlMs } : {});
-
-  if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify(results, null, 2));
-    return;
-  }
 
   // --live: an auto-refreshing full-screen dashboard. Needs a real TTY on both
-  // ends; without one we've already printed nothing, so fall back to the static
-  // table (below) plus a note. The dashboard's ttl-less live reads keep the
-  // shared limits cache warm for `hive spawn --account auto`.
+  // ends; without one we fall through to the static table plus a note. Enter
+  // BEFORE the eager sweep below — the dashboard does its own seed-then-live
+  // reads, and paying an extra full live sweep per launch is how pollers get
+  // rate-limited. The dashboard's ttl-less live reads keep the shared limits
+  // cache warm for `hive spawn --account auto`.
   if (live && process.stdout.isTTY && process.stdin.isTTY) {
     const intervalMs = usageIntervalFlagMs(parsed);
     await runUsageTui({
       // Instant first paint from a generous cache read, then straight to live.
       seedLimits: () => cachedAccountLimits(accounts, { ttlMs: 24 * 60 * 60 * 1000 }),
       fetchLimits: () => cachedAccountLimits(accounts, {}),
+      warnings: claudeIdentityWarnings(accounts),
       ...(intervalMs !== undefined ? { intervalMs } : {}),
     });
+    return;
+  }
+
+  const results = await cachedAccountLimits(accounts, ttlMs !== undefined ? { ttlMs } : {});
+
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(results, null, 2));
     return;
   }
 
@@ -9066,6 +9129,7 @@ async function cmdLimits(parsed: Parsed) {
   for (const result of results.filter((candidate) => !candidate.ok)) {
     console.log(note(`${result.account}: ${result.error}`));
   }
+  for (const warning of claudeIdentityWarnings(accounts)) console.log(warning);
   console.log(note("pace = used% − elapsed% of the window: ▲ burning faster than it refills, ▼ headroom, ● on pace"));
   if (live) console.log(note("--live needs a TTY; printed once"));
 }
@@ -9073,6 +9137,23 @@ async function cmdLimits(parsed: Parsed) {
 /** True when any of the live-dashboard flag spellings is present. */
 function wantsUsageLive(parsed: Parsed): boolean {
   return truthy(flag(parsed, "live")) || truthy(flag(parsed, "dashboard")) || truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
+}
+
+/**
+ * Loud warnings for claude accounts with no resolvable email. Every identity
+ * guard — profile verification of candidate tokens, imposter parking, vault
+ * mirroring, foreign-chain evacuation — keys off the account email, so an
+ * email-less account silently reads (and can be overwritten by) ANOTHER
+ * account's credentials. That state looks healthy right up until two accounts
+ * swap identities, hence loud.
+ */
+function claudeIdentityWarnings(accounts: AccountRecord[]): string[] {
+  return accounts
+    .filter((account) => account.tool === "claude" && !accountEmail(account))
+    .map((account) => {
+      const text = `⚠ ${account.id}: no email on record — identity checks DISABLED; usage may show another account's data and its vault can be overwritten. Fix: add "email": "<addr>" to this account in ${tildify(accountsRegistryPath())}`;
+      return isPretty() ? bold(red(text)) : text;
+    });
 }
 
 /**
