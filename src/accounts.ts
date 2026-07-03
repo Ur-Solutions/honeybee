@@ -1468,8 +1468,13 @@ export async function refreshClaudeOauthChain(refreshToken: string): Promise<Ref
  * plus the keychain entry and credentials file of each attributable home —
  * merged, so sibling keys (mcpOAuth, ...) survive. Skipping any copy would
  * orphan that copy on a dead link.
+ *
+ * Caller MUST hold withAccountsLock (which is not reentrant, so it cannot be
+ * taken here): an unlocked refresh+persist races activation's refresh of the
+ * same chain, and replaying a rotated refresh token trips the provider's
+ * reuse detection — revoking the chain and logging live sessions out (HIVE-2).
  */
-export async function persistClaudeChain(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
+export async function persistClaudeChainLocked(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
   const sourceRaw = JSON.stringify({ claudeAiOauth: oauth });
   await saveClaudeChainToVaultLocked(account, sourceRaw);
   for (const home of await claudeHomesForAccount(account)) {
@@ -1514,7 +1519,7 @@ async function refreshVaultClaudeChainIfStaleLocked(account: AccountRecord, opti
     expiresAt: refreshed.expiresAt,
     ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
   };
-  await persistClaudeChain(account, oauth);
+  await persistClaudeChainLocked(account, oauth);
 }
 
 /**
