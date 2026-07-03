@@ -7458,7 +7458,7 @@ async function cmdLoop(parsed: Parsed) {
 }
 
 function loopArgsFromFlags(parsed: Parsed, prompt: string): Record<string, unknown> {
-  return {
+  const args: Record<string, unknown> = {
     bee: typeof flag(parsed, "bee") === "string" ? String(flag(parsed, "bee")) : "",
     cwd: typeof flag(parsed, "cwd") === "string" ? String(flag(parsed, "cwd")) : "",
     context: typeof flag(parsed, "context") === "string" ? String(flag(parsed, "context")) : "",
@@ -7467,12 +7467,14 @@ function loopArgsFromFlags(parsed: Parsed, prompt: string): Record<string, unkno
     max: typeof flag(parsed, "max") === "string" ? String(flag(parsed, "max")) : undefined,
     maxDuration: typeof flag(parsed, "max-duration") === "string" ? String(flag(parsed, "max-duration")) : "",
     forever: truthy(flag(parsed, "forever")),
-    stopOnSeal: typeof flag(parsed, "stop-on-seal") === "string" ? String(flag(parsed, "stop-on-seal")) : "",
     stopOnSentinel: typeof flag(parsed, "stop-on-sentinel") === "string" ? String(flag(parsed, "stop-on-sentinel")) : "",
     judge: typeof flag(parsed, "judge") === "string" ? String(flag(parsed, "judge")) : "",
     summarizer: typeof flag(parsed, "summarizer") === "string" ? String(flag(parsed, "summarizer")) : "",
     yolo: truthy(flag(parsed, "yolo")),
   };
+  const stopOnSeal = flag(parsed, "stop-on-seal");
+  if (stopOnSeal !== undefined) args.stopOnSeal = Array.isArray(stopOnSeal) ? stopOnSeal.join(",") : stopOnSeal === true ? "" : String(stopOnSeal);
+  return args;
 }
 
 async function loopStartCmd(parsed: Parsed) {
