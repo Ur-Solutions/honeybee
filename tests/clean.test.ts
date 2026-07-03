@@ -217,6 +217,46 @@ test("hive clean --dead --older-than only removes stale dead sessions", async ()
   }
 });
 
+test("hive clean --dead does not reap a live HSR bee (HIVE-1)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-hsr-"));
+  try {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    // A pane-less HSR bee: no live tmux target, so the dead-sweep would reap it
+    // unless the run-dir HSR observer reports it live.
+    const live: SessionRecord = { ...session("hsr-live", "hsr-live"), substrate: "hsr" };
+    live.updatedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const dead: SessionRecord = { ...session("hsr-dead", "hsr-dead"), substrate: "hsr" };
+    dead.updatedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    await writeFile(join(dir, "sessions", "hsr-live.json"), `${JSON.stringify(live)}\n`);
+    await writeFile(join(dir, "sessions", "hsr-dead.json"), `${JSON.stringify(dead)}\n`);
+
+    // Run-dir meta: the live bee's host pid is this test process (alive); the
+    // dead bee's host pid is a never-allocated pid.
+    await mkdir(join(dir, "hsr", "hsr-live"), { recursive: true });
+    await mkdir(join(dir, "hsr", "hsr-dead"), { recursive: true });
+    const meta = (bee: string, hostPid: number) => JSON.stringify({
+      bee,
+      harness: "claude",
+      tier: "interactive",
+      hostPid,
+      startedAt: new Date().toISOString(),
+      controlSocket: "/tmp/none.sock",
+      status: "running",
+    });
+    await writeFile(join(dir, "hsr", "hsr-live", "meta.json"), meta("hsr-live", process.pid));
+    await writeFile(join(dir, "hsr", "hsr-dead", "meta.json"), meta("hsr-dead", 2 ** 22));
+
+    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead", "--dry-run"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+    assert.doesNotMatch(dryRun.stdout, /hsr-live/, "a live HSR bee must never be listed as dead");
+    assert.match(dryRun.stdout, /hsr-dead/, "an HSR bee with a dead host is dead");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function session(name: string, tmuxTarget: string): SessionRecord {
   return {
     name,

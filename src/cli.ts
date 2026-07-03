@@ -2611,6 +2611,16 @@ async function cmdCleanDead(parsed: Parsed) {
     if (isPretty()) console.error(note(`skipping bees on unregistered node(s): ${skipped} (re-register or kill them explicitly)`));
     else console.error(`# skipping bees on unregistered node(s): ${skipped}`);
   }
+  // HSR bees are pane-less: they have no live tmux target, and listNodes() always
+  // includes the local node so they get no unreachable-node protection either.
+  // Without this, deadSessionRecords reports every running HSR bee as dead and
+  // reaps its record while the runner host keeps executing — data loss (HIVE-1).
+  // Protect any bee the run-dir HSR observer reports live, keyed the same way as
+  // the tmux liveTargets set (an HSR record's tmuxTarget is its unique bee name).
+  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+  for (const record of records) {
+    if (hsrObs.get(record.name)?.live) recordsConsideredAlive.add(liveTargetKey(record.node, record.tmuxTarget));
+  }
   let dead = deadSessionRecords(records, recordsConsideredAlive);
   // Phase B: a local sub-bee whose pane died (agentPaneId ∉ live panes) is dead
   // even though its comb/session survives via a sibling pane. Mirror
@@ -2829,15 +2839,30 @@ async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; can
   const panes = await capturePanesFor(records, probe.liveTargets);
   const seals = await listSealedBeeNames();
   const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
+  // HSR bees are pane-less — observed from run dirs, not tmux. Without this,
+  // deriveState reads every live HSR bee as dead and `clean --idle`/interactive
+  // offers a running bee for deletion (HIVE-1). Mirror cmdList's threading.
+  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+  const hsrLive = new Set<string>();
+  const hsrStates = new Map<string, BeeState>();
+  const hsrSnapshots = new Map<string, string>();
+  for (const [bee, observation] of hsrObs) {
+    if (observation.live) hsrLive.add(bee);
+    if (observation.state) hsrStates.set(bee, observation.state);
+    hsrSnapshots.set(bee, observation.snapshot);
+  }
   const context: StateContext = {
     liveTargets: probe.liveTargets,
     livePanes,
     panes,
     seals,
     unreachableNodes,
+    hsrLive,
+    hsrStates,
+    hsrSnapshots,
     now: Date.now(),
   };
-  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)), context.now!));
+  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || hsrLive.has(record.name), context.now!));
   candidates.sort(compareCleanCandidates);
   return { records, candidates };
 }
