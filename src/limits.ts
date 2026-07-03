@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { readFile, readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   type AccountRecord,
   type RefreshedClaudeToken,
@@ -119,6 +119,45 @@ export type LimitsDeps = {
   now?: () => number;
 };
 
+const ACCOUNT_LIMITS_CONCURRENCY = 4;
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const index = next;
+        next += 1;
+        if (index >= items.length) return;
+        results[index] = await worker(items[index]!, index);
+      }
+    }),
+  );
+  return results;
+}
+
+function memoizeKeychainReads(readKeychain: typeof readClaudeKeychain): typeof readClaudeKeychain {
+  const byHome = new Map<string, Promise<string | null>>();
+  return (homePath: string) => {
+    const key = resolve(homePath);
+    const cached = byHome.get(key);
+    if (cached) return cached;
+    const read = readKeychain(homePath).catch((error: unknown) => {
+      byHome.delete(key);
+      throw error;
+    });
+    byHome.set(key, read);
+    return read;
+  };
+}
+
 /**
  * Provider-keyed limits dispatch. A CYCLE-FREE hybrid: self-contained provider
  * fetchers (zai/minimax) live on the registry adapter in providers.ts (which
@@ -129,8 +168,11 @@ export type LimitsDeps = {
  * which is stamped uniformly below.
  */
 export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps = {}): Promise<AccountLimits[]> {
-  return Promise.all(
-    accounts.map(async (account) => {
+  const sweepDeps: LimitsDeps = { ...deps, readKeychain: memoizeKeychainReads(deps.readKeychain ?? readClaudeKeychain) };
+  return mapWithConcurrency(
+    accounts,
+    ACCOUNT_LIMITS_CONCURRENCY,
+    async (account) => {
       // Dispatch on the effective provider: the record's own provider when
       // present, else inferred from its cli. Belt-and-suspenders so the dispatch
       // is robust even for a raw AccountRecord that never flowed through
@@ -143,9 +185,9 @@ export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps 
         account.provider ? { ...limits, provider: account.provider } : limits;
       try {
         const adapter = providerAdapter(provider);
-        if (adapter?.fetchLimits) return stampProvider(await adapter.fetchLimits(account, deps));
-        if (provider === "anthropic") return stampProvider(await claudeLimits(account, deps));
-        if (provider === "openai") return stampProvider(await codexLimits(account, deps));
+        if (adapter?.fetchLimits) return stampProvider(await adapter.fetchLimits(account, sweepDeps));
+        if (provider === "anthropic") return stampProvider(await claudeLimits(account, sweepDeps));
+        if (provider === "openai") return stampProvider(await codexLimits(account, sweepDeps));
         return stampProvider({
           account: account.id,
           tool: account.tool,
@@ -164,7 +206,7 @@ export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps 
           error: error instanceof Error ? error.message : String(error),
         });
       }
-    }),
+    },
   );
 }
 
