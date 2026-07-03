@@ -141,12 +141,6 @@ export type SpawnOptions = {
   timer?: SpawnTimer;
 };
 
-// ──────────────────────────────────────────────────────────────────────────
-// HSR runner host (APIA-76): the detached `hive __hsr-run <payload>` process
-// and the spawn-side fork that launches it. Mirrors flow/background.ts.
-// ──────────────────────────────────────────────────────────────────────────
-
-
 export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // When the caller threads a timer it also owns reporting (it has resolve/ready
   // phases to fold in); a bare spawnBee gets its own self-reporting timer so

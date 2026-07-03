@@ -749,7 +749,3 @@ export function safeTmuxTarget(value: string): string {
   return value.replace(/[^A-Za-z0-9_-]/g, "-");
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Phase 3: identity & accounts
-// ──────────────────────────────────────────────────────────────────────────
-

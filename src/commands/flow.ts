@@ -370,9 +370,3 @@ export async function flowRemove(parsed: Parsed) {
   if (isPretty()) console.log(actionLine("ok", "flow", [bold(name), dim("removed")]));
   else console.log(`removed\t${name}`);
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// Loops — `hive loop <start|status|logs|stop|list>`. A loop is the built-in
-// `loop` flow run detached (runId === loopId); state lives under
-// ~/.hive/loops/<loopId>/.
-// ──────────────────────────────────────────────────────────────────────────

@@ -515,14 +515,6 @@ export async function cmdKill(parsed: Parsed) {
   }
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// promote / demote (APIA-84): move a bee between HSR (pane-less) and local-tmux
-// by RESUMING the same provider session. The chat/transcript never blinks
-// because it is the same native transcript file (HSR_EXPLORATION.md §4). Gated
-// on verified resume: claude + codex only.
-// ──────────────────────────────────────────────────────────────────────────
-
-
 // hive urls [<bee>] [--lines <n>] [--open] [--json]
 // Lists website URLs printed in a bee's pane. Side-effect-free unless --open.
 export async function cmdUrls(parsed: Parsed): Promise<void> {
