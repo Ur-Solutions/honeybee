@@ -13,7 +13,7 @@
 // when the events log carries no usage yet). tmux behavior is unchanged.
 
 import { exhaustionForAgent } from "../drivers.js";
-import { hsrUsageObservation, type HsrUsageObservation } from "../hsr/observe.js";
+import { hsrUsageObservation, type HsrObservation, type HsrUsageObservation } from "../hsr/observe.js";
 import { readHsrMeta } from "../hsr/runDir.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { transcriptLookupForSession } from "../sessionMetadata.js";
@@ -50,7 +50,12 @@ export type UsageSamplerDeps = {
   sampleIntervalMs?: number;
 };
 
-export type UsageSampler = (records: SessionRecord[], panes: PaneCaptureMap, nowMs: number) => Promise<UsageTickOutcome[]>;
+export type UsageSampler = (
+  records: SessionRecord[],
+  panes: PaneCaptureMap,
+  nowMs: number,
+  hsrObservations?: ReadonlyMap<string, HsrObservation>,
+) => Promise<UsageTickOutcome[]>;
 
 const DEFAULT_SAMPLE_INTERVAL_MS = 60_000;
 const EXHAUSTION_PANE_LINES = 30;
@@ -114,9 +119,13 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
   }
 
   // HSR bees have NO pane: sample exhaustion + tokens purely from events.jsonl.
-  async function sampleHsr(record: SessionRecord, nowMs: number): Promise<UsageTickOutcome> {
+  async function sampleHsr(
+    record: SessionRecord,
+    nowMs: number,
+    hsrObservation?: HsrObservation,
+  ): Promise<UsageTickOutcome> {
     const outcome: UsageTickOutcome = { bee: record.name, account: record.accountId!, sampled: false, exhausted: false };
-    const observation = await readHsrUsage(record.name).catch(() => null);
+    const observation = hsrObservation?.eventSnapshot?.usage ?? await readHsrUsage(record.name).catch(() => null);
 
     // Exhaustion: rising edge on a strictly-newer `exhausted` event ts.
     if (observation?.latestExhausted) {
@@ -143,17 +152,18 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
     return outcome;
   }
 
-  return async (records, panes, nowMs) => {
+  return async (records, panes, nowMs, hsrObservations) => {
     const outcomes: UsageTickOutcome[] = [];
 
     for (const record of records) {
       if (!record.accountId) continue;
+      const hsrObservation = hsrObservations?.get(record.name);
 
       // HSR bees are pane-less — feed the sampler from their events.jsonl. A
       // remote-hsr bee with a LOCAL mirror (APIA-94) has the same event log
       // locally, so it takes the same path.
-      if (record.substrate === "hsr" || (await isMirroredRemoteBee(record))) {
-        outcomes.push(await sampleHsr(record, nowMs));
+      if (record.substrate === "hsr" || hsrObservation?.mirrorOf || (await isMirroredRemoteBee(record))) {
+        outcomes.push(await sampleHsr(record, nowMs, hsrObservation));
         continue;
       }
 
