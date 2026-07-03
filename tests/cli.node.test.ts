@@ -67,6 +67,16 @@ test("hive node register / inspect / unregister round-trips a real record", asyn
   }
 });
 
+test("hive node register missing --kind lists every valid node kind", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-cli-node-"));
+  try {
+    const stderr = await hiveExpectFail(dir, "node", "register", "mini01", "--endpoint", "trmd@mini01");
+    assert.match(stderr, /local-tmux, ssh-tmux, or remote-hsr/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hive spawn --node fails early with an actionable error when the node is unknown", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hive-cli-node-"));
   try {

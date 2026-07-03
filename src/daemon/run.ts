@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { listAccounts, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault } from "../accounts.js";
 import { acquireLongLivedLock, type LongLivedLock, LockBusyError } from "../fsx.js";
 import { hiveStateFor, writeHiveState } from "../hiveState.js";
@@ -17,6 +18,7 @@ import { dispatchBuzDrains, type BuzDispatchOutcome } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher, type NeedsInputOutcome } from "./needsInput.js";
 import { createNodeReachabilityTracker, type NodeReachabilityDispatcher, type NodeReachabilityOutcome } from "./nodeReachability.js";
 import { createUsageSampler, type UsageSampler, type UsageTickOutcome } from "./usageSampler.js";
+import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import { appendDaemonLog, daemonLogPath } from "./log.js";
 import { startHsrControlServer, type HsrControlServer } from "./hsrControl.js";
 import {
@@ -32,6 +34,9 @@ import {
 } from "./index.js";
 
 const DEFAULT_NODE_PROBE_TIMEOUT_MS = 2_500;
+const DEFAULT_NODE_PROBE_CONCURRENCY = 8;
+const DEFAULT_RECORD_CONCURRENCY = 8;
+const DEFAULT_TRANSCRIPT_REFRESH_INTERVAL_MS = 15_000;
 
 /**
  * Hard per-call budgets for every external await in the tick path. The tick
@@ -104,7 +109,7 @@ export type TickDeps = {
    * — build once per daemon run. Runs BEFORE hsrObservations() so this tick can
    * already read a freshly-created mirror meta.
    */
-  mirrorRemoteEvents?: (records: SessionRecord[]) => Promise<void>;
+  mirrorRemoteEvents?: ((records: SessionRecord[]) => Promise<void>) & { close?: () => Promise<void> };
   sealedBeeNames: () => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
@@ -134,7 +139,11 @@ export type TickDeps = {
    * living parent, or marks it escalated when parentless/dead. Stateful across
    * ticks (de-dupes each request) — build once per daemon run.
    */
-  dispatchNeedsInput?: (records: SessionRecord[], currentStates: Map<string, BeeState>) => Promise<NeedsInputOutcome[]>;
+  dispatchNeedsInput?: (
+    records: SessionRecord[],
+    currentStates: Map<string, BeeState>,
+    hsrObservations?: ReadonlyMap<string, HsrObservation>,
+  ) => Promise<NeedsInputOutcome[]>;
   /**
    * Optional node online/offline edge tracker (APIA-96): given this tick's nodes
    * and the node-probe's unreachableNodes, emits a `node.offline`/`node.online`
@@ -284,8 +293,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   const observed = new Map<string, BeeState>();
   const transitions: TickTransition[] = [];
   const observedAtIso = new Date(nowMs).toISOString();
-
-  for (const record of records) {
+  const recordPlans = records.map((record) => {
     const derived = deriveState(record, context);
     observed.set(record.name, derived.state);
     const prev = previousObserved.get(record.name);
@@ -297,43 +305,56 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     if (transitioned) {
       transitions.push({ name: record.name, from: prev, to: derived.state });
     }
-    if ((transitioned || staleHiveState) && !uncertainBooting) {
-      if (deps.mirrorHiveState) {
+    const terminal = derived.state === "dead" || derived.state === "sealed";
+    return {
+      record,
+      state: derived.state,
+      mirrorHiveState: (transitioned || staleHiveState) && !uncertainBooting,
+      refreshTranscriptMetadata: (!terminal || !record.transcriptPath) && deps.refreshTranscriptMetadata !== undefined,
+    };
+  });
+
+  await mapWithConcurrency(
+    recordPlans,
+    envConcurrency("HIVE_DAEMON_RECORD_CONCURRENCY", DEFAULT_RECORD_CONCURRENCY),
+    async (plan) => {
+      const { record } = plan;
+
+      if (plan.mirrorHiveState && deps.mirrorHiveState) {
         try {
-          await withTimeout(deps.mirrorHiveState(record, derived.state), timeouts.substrateMs, `mirrorHiveState(${record.name})`);
+          await withTimeout(deps.mirrorHiveState(record, plan.state), timeouts.substrateMs, `mirrorHiveState(${record.name})`);
         } catch (error) {
           errors.push(toError(error));
         }
       }
-    }
 
-    // Persist the latest observed state. Errors are captured but do not abort the loop.
-    try {
-      await withTimeout(
-        deps.touchSession(record.name, {
-          lastObservedState: derived.state,
-          lastObservedStateAt: observedAtIso,
-        }),
-        timeouts.fsMs,
-        `touchSession(${record.name})`,
-      );
-    } catch (error) {
-      errors.push(toError(error));
-    }
-
-    // Dead/sealed bees no longer produce transcript updates — skip the
-    // refresh once transcript metadata has been captured. A bee that exited
-    // before its first refresh (fast finish between ticks) still gets one
-    // pass so list/search/tail metadata is not permanently missing.
-    const terminal = derived.state === "dead" || derived.state === "sealed";
-    if ((!terminal || !record.transcriptPath) && deps.refreshTranscriptMetadata) {
+      // Persist the latest observed state. Errors are captured but do not abort the loop.
       try {
-        await withTimeout(deps.refreshTranscriptMetadata(record), timeouts.transcriptMs, `refreshTranscriptMetadata(${record.name})`);
+        await withTimeout(
+          deps.touchSession(record.name, {
+            lastObservedState: plan.state,
+            lastObservedStateAt: observedAtIso,
+          }),
+          timeouts.fsMs,
+          `touchSession(${record.name})`,
+        );
       } catch (error) {
         errors.push(toError(error));
       }
-    }
-  }
+
+      // Dead/sealed bees no longer produce transcript updates — skip the
+      // refresh once transcript metadata has been captured. A bee that exited
+      // before its first refresh (fast finish between ticks) still gets one
+      // pass so list/search/tail metadata is not permanently missing.
+      if (plan.refreshTranscriptMetadata && deps.refreshTranscriptMetadata) {
+        try {
+          await withTimeout(deps.refreshTranscriptMetadata(record), timeouts.transcriptMs, `refreshTranscriptMetadata(${record.name})`);
+        } catch (error) {
+          errors.push(toError(error));
+        }
+      }
+    },
+  );
 
   // Emit a ledger event for each transition into idle_with_output (the daemon's
   // headline signal — the buz dispatcher subscribes to this).
@@ -375,7 +396,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   let needsInput: NeedsInputOutcome[] = [];
   if (deps.dispatchNeedsInput) {
     try {
-      needsInput = await withTimeout(deps.dispatchNeedsInput(records, observed), timeouts.dispatchMs, "dispatchNeedsInput");
+      needsInput = await withTimeout(deps.dispatchNeedsInput(records, observed, hsrObs), timeouts.dispatchMs, "dispatchNeedsInput");
     } catch (error) {
       errors.push(toError(error));
     }
@@ -401,7 +422,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   let usage: UsageTickOutcome[] = [];
   if (deps.sampleUsage) {
     try {
-      usage = await withTimeout(deps.sampleUsage(records, panes, nowMs), timeouts.dispatchMs, "sampleUsage");
+      usage = await withTimeout(deps.sampleUsage(records, panes, nowMs, hsrObs), timeouts.dispatchMs, "sampleUsage");
     } catch (error) {
       errors.push(toError(error));
     }
@@ -902,6 +923,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
       }
     }
     if (hsrControl) await hsrControl.close().catch(() => undefined);
+    await deps.mirrorRemoteEvents?.close?.().catch(() => undefined);
     if (lock) {
       try {
         await lock.release();
@@ -957,15 +979,90 @@ function sleep(ms: number, shouldStop: () => boolean): Promise<void> {
 // activation, not the next tick.
 const CHAIN_SYNC_INTERVAL_MS = 5 * 60_000;
 
+type TranscriptFileStat = { mtimeMs: number; size: number };
+
+export type ThrottledTranscriptRefreshOptions = {
+  intervalMs?: number;
+  now?: () => number;
+  statFile?: (path: string) => Promise<TranscriptFileStat | null>;
+};
+
+export function createThrottledTranscriptMetadataRefresh(
+  refresh: (record: SessionRecord) => Promise<SessionRecord | null> = refreshSessionTranscriptMetadata,
+  options: ThrottledTranscriptRefreshOptions = {},
+): (record: SessionRecord) => Promise<SessionRecord | null> {
+  const intervalMs = options.intervalMs ?? envMs("HIVE_DAEMON_TRANSCRIPT_REFRESH_INTERVAL_MS", DEFAULT_TRANSCRIPT_REFRESH_INTERVAL_MS);
+  const now = options.now ?? (() => Date.now());
+  const statFile = options.statFile ?? defaultTranscriptFileStat;
+  const cache = new Map<string, { checkedAt: number; cursor: string; statKey?: string }>();
+
+  return async (record) => {
+    const nowMs = now();
+    const cursor = transcriptRefreshCursor(record);
+    const cached = cache.get(record.name);
+
+    if (cached?.cursor === cursor) {
+      if (nowMs - cached.checkedAt < intervalMs) return record;
+      if (record.transcriptPath) {
+        const currentStatKey = await transcriptStatKey(record.transcriptPath, statFile);
+        if (currentStatKey && currentStatKey === cached.statKey) {
+          cached.checkedAt = nowMs;
+          return record;
+        }
+      }
+    }
+
+    const updated = await refresh(record);
+    const effective = updated ?? record;
+    const statKey = effective.transcriptPath ? await transcriptStatKey(effective.transcriptPath, statFile) : undefined;
+    cache.set(effective.name, {
+      checkedAt: nowMs,
+      cursor: transcriptRefreshCursor(effective),
+      ...(statKey ? { statKey } : {}),
+    });
+    return updated;
+  };
+}
+
+function transcriptRefreshCursor(record: SessionRecord): string {
+  return [
+    record.agent,
+    record.cwd,
+    record.homePath ?? "",
+    record.lastPromptAt ?? "",
+    record.lastPrompt ?? "",
+    record.transcriptPath ?? "",
+    record.providerSessionId ?? "",
+  ].join("\0");
+}
+
+async function transcriptStatKey(
+  path: string,
+  statFile: (path: string) => Promise<TranscriptFileStat | null>,
+): Promise<string | undefined> {
+  const info = await statFile(path).catch(() => null);
+  return info ? `${info.mtimeMs}:${info.size}` : undefined;
+}
+
+async function defaultTranscriptFileStat(path: string): Promise<TranscriptFileStat | null> {
+  try {
+    const info = await stat(path);
+    return { mtimeMs: info.mtimeMs, size: info.size };
+  } catch {
+    return null;
+  }
+}
+
 export function buildDefaultDeps(): TickDeps {
   let lastChainSyncAt = 0;
+  const refreshTranscriptMetadata = createThrottledTranscriptMetadataRefresh();
   return {
     listSessions,
     listNodes,
     probeNodes: defaultProbeNodes,
     capturePanes: defaultCapturePanes,
     livePanes: () => localSubstrate().listPanes(),
-    hsrObservations: () => hsrObservations(),
+    hsrObservations: () => hsrObservations({ includeEvents: true }),
     mirrorRemoteEvents: createRemoteEventMirror(),
     sealedBeeNames,
     touchSession,
@@ -973,7 +1070,7 @@ export function buildDefaultDeps(): TickDeps {
       const mapped = hiveStateFor(state);
       if (mapped) await writeHiveState(record, mapped);
     },
-    refreshTranscriptMetadata: refreshSessionTranscriptMetadata,
+    refreshTranscriptMetadata,
     appendLedger,
     dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),
     dispatchNeedsInput: createNeedsInputDispatcher(),
@@ -1008,7 +1105,7 @@ async function defaultProbeNodes(nodes: NodeRecord[]): Promise<ProbeResult> {
   const liveTargets = new Set<string>();
   const unreachableNodes = new Set<string>();
   const sessionStates = new Map<string, string>();
-  const queries = nodes.map(async (node) => {
+  await mapWithConcurrency(nodes, envConcurrency("HIVE_NODE_PROBE_CONCURRENCY", DEFAULT_NODE_PROBE_CONCURRENCY), async (node) => {
     try {
       const substrate = substrateForRecord(node);
       const probeResult = await withTimeout(substrate.probe(), timeoutMs);
@@ -1026,7 +1123,6 @@ async function defaultProbeNodes(nodes: NodeRecord[]): Promise<ProbeResult> {
       unreachableNodes.add(node.name);
     }
   });
-  await Promise.allSettled(queries);
   return { liveTargets, unreachableNodes, sessionStates };
 }
 

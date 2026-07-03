@@ -222,6 +222,20 @@ test("search reads rotated ledger files newest-first", async () => {
   });
 });
 
+test("search limit on ledger returns newest matching line from the current file", async () => {
+  await withTempStore(async (dir) => {
+    const ledgerFile = join(dir, "ledger.jsonl");
+    const older = JSON.stringify({ ts: "2026-05-01T00:00:00.000Z", type: "note", text: "older widget" });
+    const newer = JSON.stringify({ ts: "2026-06-01T00:00:00.000Z", type: "note", text: "newer widget" });
+    await writeFile(ledgerFile, `${older}\n${newer}\n`);
+
+    const result = await search({ query: "widget", types: new Set(["ledger"]), limit: 1 });
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0]!.matchedAt, "2026-06-01T00:00:00.000Z");
+    assert.equal(result.truncated, true);
+  });
+});
+
 test("search default --limit is 30 and truncated flag is set", async () => {
   await withTempStore(async () => {
     for (let i = 0; i < 35; i += 1) {
@@ -241,6 +255,59 @@ test("search default --limit is 30 and truncated flag is set", async () => {
     assert.equal(all.hits.length, 35);
     assert.equal(all.truncated, false);
   });
+});
+
+test("search stops reading ledger once the requested limit is filled", async () => {
+  let yielded = 0;
+  let closed = false;
+  let sessionsRead = false;
+  const mock: CorpusReader = {
+    listLedgerFiles: async () => [],
+    readSeals: async function* () {},
+    readSessionRecords: async function* () {
+      sessionsRead = true;
+    },
+    readLedgerLines: async function* () {
+      try {
+        for (let i = 0; i < 10; i += 1) {
+          yielded += 1;
+          const row = {
+            ts: `2026-06-${String(10 - i).padStart(2, "0")}T00:00:00.000Z`,
+            type: "note",
+            text: `needle ${i}`,
+          };
+          yield { path: "/fake/ledger.jsonl", line: JSON.stringify(row), parsed: row, ts: row.ts, lineNumber: i + 1 };
+        }
+      } finally {
+        closed = true;
+      }
+    },
+  };
+
+  const result = await search({ query: "needle", types: new Set(["ledger", "sessions"]), limit: 2 }, mock);
+  assert.equal(result.hits.length, 2);
+  assert.equal(yielded, 2);
+  assert.equal(closed, true);
+  assert.equal(sessionsRead, false);
+  assert.equal(result.truncated, true);
+});
+
+test("search applies ledger filters from reader-parsed rows", async () => {
+  const makeMock = (colony: string): CorpusReader => ({
+    listLedgerFiles: async () => [],
+    readSeals: async function* () {},
+    readSessionRecords: async function* () {},
+    readLedgerLines: async function* () {
+      const row = { ts: "2026-06-01T00:00:00.000Z", colony, type: "note" };
+      yield { path: "/fake/ledger.jsonl", line: "needle row that is not JSON", parsed: row, ts: row.ts, lineNumber: 1 };
+    },
+  });
+
+  const hit = await search({ query: "needle", colony: "alpha", types: new Set(["ledger"]) }, makeMock("alpha"));
+  assert.equal(hit.hits.length, 1);
+
+  const miss = await search({ query: "needle", colony: "alpha", types: new Set(["ledger"]) }, makeMock("beta"));
+  assert.equal(miss.hits.length, 0);
 });
 
 test("search with a mock corpus reader bypasses the filesystem", async () => {

@@ -81,6 +81,20 @@ test("codexNotificationToEvents maps thread/tokenUsage/updated → [usage] from 
   ]);
 });
 
+test("codexNotificationToEvents never maps cumulative tokenUsage.total as a usage delta", () => {
+  const params = {
+    threadId: "t-1",
+    turnId: "turn-1",
+    tokenUsage: {
+      total: { totalTokens: 999, inputTokens: 900, cachedInputTokens: 0, outputTokens: 99, reasoningOutputTokens: 0 },
+      modelContextWindow: 200000,
+    },
+  };
+
+  assert.deepEqual(codexNotificationToEvents("thread/tokenUsage/updated", params), []);
+  assert.deepEqual(stripTs(codexNotificationToEvents("turn/completed", params)), [{ type: "turn_end" }]);
+});
+
 test("codexNotificationToEvents maps error → [error] from error.message", () => {
   // ErrorNotification = { error: TurnError{ message, ... }, willRetry, threadId, turnId }
   const params = {

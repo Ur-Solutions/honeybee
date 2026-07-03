@@ -652,12 +652,13 @@ test("syncClaudeChainToVault pulls the freshest link from the account's homes", 
     await mkdir(home, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-live", now + 8 * 3_600_000));
 
-    const first = await syncClaudeChainToVault(account);
+    const deps = { fetchProfileEmail: async () => "sync@a.b" };
+    const first = await syncClaudeChainToVault(account, undefined, deps);
     assert.equal(first.vaultUpdated, true);
     const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
     assert.equal(vault.claudeAiOauth.accessToken, "tok-live");
 
-    const second = await syncClaudeChainToVault(account);
+    const second = await syncClaudeChainToVault(account, undefined, deps);
     assert.equal(second.vaultUpdated, false);
   });
 });
@@ -671,7 +672,7 @@ test("syncClaudeChainToVault prefers an equal-expiry link with a refresh token",
     await mkdir(home, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-home", expiresAt, "refresh-home"));
 
-    const result = await syncClaudeChainToVault(account);
+    const result = await syncClaudeChainToVault(account, undefined, { fetchProfileEmail: async () => "same-expiry@a.b" });
 
     assert.equal(result.vaultUpdated, true);
     const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
@@ -710,12 +711,60 @@ test("syncClaudeChainToVault prefers an earlier-expiry refreshable home link ove
     await mkdir(home, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-home", now + 3_600_000, "refresh-home"));
 
-    const result = await syncClaudeChainToVault(account);
+    const result = await syncClaudeChainToVault(account, undefined, { fetchProfileEmail: async () => "gain-refresh@a.b" });
 
     assert.equal(result.vaultUpdated, true);
     const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
     assert.equal(vault.claudeAiOauth.accessToken, "tok-home");
     assert.equal(vault.claudeAiOauth.refreshToken, "refresh-home");
+  });
+});
+
+test("syncClaudeChainToVault parks a verified foreign chain with its owner instead of adopting it", async () => {
+  await withTempStore(async (dir) => {
+    const victim = await addAccount("claude", "victim@a.b");
+    const owner = await addAccount("claude", "owner@c.d");
+    const now = Date.now();
+    await writeFile(join(accountDir(victim), ".credentials.json"), chainJson("tok-victim", now + 3_600_000));
+    await writeFile(join(accountDir(owner), ".credentials.json"), chainJson("tok-owner-old", now - 1_000));
+    // A racing swap stamped the OWNER's live chain into the victim's
+    // dedicated home; adopting it would hijack the victim's vault.
+    const home = join(dir, "homes", victim.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-owner-live", now + 8 * 3_600_000));
+
+    const result = await syncClaudeChainToVault(victim, undefined, {
+      fetchProfileEmail: async (token) => (token === "tok-owner-live" ? "owner@c.d" : "victim@a.b"),
+    });
+
+    // The victim's vault is untouched...
+    assert.equal(result.vaultUpdated, false);
+    const victimVault = JSON.parse(await readFile(join(accountDir(victim), ".credentials.json"), "utf8"));
+    assert.equal(victimVault.claudeAiOauth.accessToken, "tok-victim");
+    // ...and the stranded chain was rescued into its real owner's vault.
+    const ownerVault = JSON.parse(await readFile(join(accountDir(owner), ".credentials.json"), "utf8"));
+    assert.equal(ownerVault.claudeAiOauth.accessToken, "tok-owner-live");
+  });
+});
+
+test("syncClaudeChainToVault adopts an unverifiable fresh chain (endpoint unreachable keeps rescue semantics)", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "offline@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-old", now + 1_000));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-rotated", now + 8 * 3_600_000));
+
+    const result = await syncClaudeChainToVault(account, undefined, {
+      fetchProfileEmail: async () => {
+        throw new Error("offline");
+      },
+    });
+
+    assert.equal(result.vaultUpdated, true);
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-rotated");
   });
 });
 
@@ -1010,4 +1059,75 @@ test("autoAccountTool and roundRobinAccountTool parse only their reserved query"
   // refuse so the resolver treats the whole token as an arbitrary executable.
   assert.equal(autoAccountTool("nosuchtool-auto"), undefined);
   assert.equal(roundRobinAccountTool("nosuchtool-rr"), undefined);
+});
+
+test("activations of distinct accounts run in parallel, not serialized on one lock (HIVE-64)", async () => {
+  await withTempStore(async (dir) => {
+    const slowAccount = await addAccount("claude", "slow@a.b");
+    const fastAccount = await addAccount("claude", "fast@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(slowAccount), ".credentials.json"), chainJson("tok-slow-dead", now - 1_000, "r-slow"));
+    await writeFile(join(accountDir(fastAccount), ".credentials.json"), chainJson("tok-fast", now + 8 * 3_600_000, "r-fast"));
+
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => (releaseRefresh = resolve));
+    let refreshStarted!: () => void;
+    const refreshInFlight = new Promise<void>((resolve) => (refreshStarted = resolve));
+
+    // The slow account's activation holds ITS lock through a (gated) network
+    // refresh — the exact shape of the 15s OAuth refresh hold.
+    const slow = activateAccountIntoHome(slowAccount, join(dir, "homes", slowAccount.id), {
+      refreshClaudeToken: async () => {
+        refreshStarted();
+        await refreshGate;
+        return { accessToken: "tok-slow-new", refreshToken: "r-slow2", expiresAt: now + 8 * 3_600_000 };
+      },
+    });
+    await refreshInFlight;
+
+    // A different account must not queue behind that refresh. Under the old
+    // machine-wide lock this deadlocks: fast waits on slow's lock, and slow's
+    // gate is only released after fast completes.
+    let timer: NodeJS.Timeout | undefined;
+    const fast = await Promise.race([
+      activateAccountIntoHome(fastAccount, join(dir, "homes", fastAccount.id)),
+      new Promise<"stuck">((resolve) => (timer = setTimeout(() => resolve("stuck"), 10_000))),
+    ]);
+    clearTimeout(timer);
+    releaseRefresh();
+    assert.notEqual(fast, "stuck", "second account's activation queued behind the first account's network refresh");
+    await slow;
+
+    const fastHome = JSON.parse(await readFile(join(dir, "homes", fastAccount.id, ".credentials.json"), "utf8"));
+    assert.equal(fastHome.claudeAiOauth.accessToken, "tok-fast");
+    const slowHome = JSON.parse(await readFile(join(dir, "homes", slowAccount.id, ".credentials.json"), "utf8"));
+    assert.equal(slowHome.claudeAiOauth.accessToken, "tok-slow-new");
+  });
+});
+
+test("concurrent activations of the SAME account still serialize and refresh once (HIVE-2)", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "serial@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-dead", now - 1_000, "r1"));
+
+    let refreshes = 0;
+    const refreshClaudeToken = async () => {
+      refreshes += 1;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { accessToken: "tok-new", refreshToken: "r2", expiresAt: now + 8 * 3_600_000 };
+    };
+    await Promise.all([
+      activateAccountIntoHome(account, join(dir, "homes", account.id), { refreshClaudeToken }),
+      activateAccountIntoHome(account, join(dir, "slot-2"), { refreshClaudeToken }),
+    ]);
+
+    // The loser of the lock race re-reads the vault, finds the rotated fresh
+    // chain, and must NOT replay the now-dead r1 refresh token.
+    assert.equal(refreshes, 1);
+    for (const home of [join(dir, "homes", account.id), join(dir, "slot-2")]) {
+      const creds = JSON.parse(await readFile(join(home, ".credentials.json"), "utf8"));
+      assert.equal(creds.claudeAiOauth.accessToken, "tok-new");
+    }
+  });
 });
