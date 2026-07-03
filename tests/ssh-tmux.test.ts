@@ -143,6 +143,23 @@ test("setWindowOptions applies requested tmux window options on an existing remo
   ]);
 });
 
+test("setUserOptions sends one remote tmux command per option so semicolon values survive", async () => {
+  const cap = captureExec();
+  cap.respondWith(() => ({ exitCode: 0 }));
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  await s.setUserOptions("alpha", { "@hive_state": "working", "@hive_separator": ";" });
+
+  assert.equal(cap.calls.length, 2);
+  assert.deepEqual(cap.calls[0]!.argv, [
+    "ssh", ...MUX, "trmd@mini01",
+    "tmux", "set-option", "-t", "=alpha:", "@hive_state", "working",
+  ]);
+  assert.deepEqual(cap.calls[1]!.argv, [
+    "ssh", ...MUX, "trmd@mini01",
+    "tmux", "set-option", "-t", "=alpha:", "@hive_separator", "'\\;'",
+  ]);
+});
+
 /** attachCommand branches on $TMUX at call time — pin it so the test suite
  * behaves identically inside and outside a tmux client. */
 function withTmuxEnv<T>(value: string | undefined, fn: () => T): T {
