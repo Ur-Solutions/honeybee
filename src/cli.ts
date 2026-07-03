@@ -3665,7 +3665,7 @@ async function cmdHere(parsed: Parsed): Promise<void> {
  * detectable from inside hive and is the operator's collision call.
  */
 function defaultSubstrateIsSshTmux(): boolean {
-  const overlay = loadNodeSync(LOCAL_NODE_NAME);
+  const overlay = loadNodeSync(LOCAL_NODE_NAME, { tolerateInvalid: true });
   return overlay?.kind === "ssh-tmux";
 }
 

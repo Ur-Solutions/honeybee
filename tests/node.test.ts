@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  InvalidNodeRecordError,
   isLocalNode,
   listNodes,
   loadNode,
@@ -28,6 +29,16 @@ async function withTempStore(fn: () => Promise<void>): Promise<void> {
     else process.env.HIVE_STORE_ROOT = previous;
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+async function writeNodeFile(name: string, contents: string): Promise<string> {
+  const root = process.env.HIVE_STORE_ROOT;
+  assert.ok(root, "HIVE_STORE_ROOT must be set by withTempStore");
+  const dir = join(root, "nodes");
+  const path = join(dir, `${name}.json`);
+  await mkdir(dir, { recursive: true });
+  await writeFile(path, contents, { mode: 0o600 });
+  return path;
 }
 
 test("validNodeName accepts identifiers and rejects unsafe characters", () => {
@@ -66,6 +77,37 @@ test("loadNodeSync mirrors loadNode for both implicit and explicit nodes", async
     const explicit = loadNodeSync("mini01");
     assert.equal(explicit?.endpoint, "trmd@mini01");
     assert.equal(loadNodeSync("nope"), null);
+  });
+});
+
+test("loadNode reports invalid node JSON with a descriptive error", async () => {
+  await withTempStore(async () => {
+    const path = await writeNodeFile("bad", "{");
+
+    await assert.rejects(
+      loadNode("bad"),
+      (error) =>
+        error instanceof InvalidNodeRecordError &&
+        error.path === path &&
+        new RegExp(`Invalid JSON in node record ${escapeRegExp(path)}:`).test(error.message),
+    );
+    assert.throws(
+      () => loadNodeSync("bad"),
+      (error) =>
+        error instanceof InvalidNodeRecordError &&
+        error.path === path &&
+        new RegExp(`Invalid JSON in node record ${escapeRegExp(path)}:`).test(error.message),
+    );
+  });
+});
+
+test("listNodes skips corrupt node records while keeping valid nodes", async () => {
+  await withTempStore(async () => {
+    await registerNode({ name: "mini01", kind: "ssh-tmux", endpoint: "trmd@mini01" });
+    await writeNodeFile("bad", "{");
+
+    const nodes = await listNodes();
+    assert.deepEqual(nodes.map((node) => node.name).sort(), [LOCAL_NODE_NAME, "mini01"]);
   });
 });
 
@@ -182,3 +224,7 @@ test("updateNode rejects an ssh-command containing whitespace and hints the --ss
     );
   });
 });
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

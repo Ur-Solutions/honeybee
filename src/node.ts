@@ -70,6 +70,24 @@ export type NodeRecord = {
   updatedAt: string;
 };
 
+export class InvalidNodeRecordError extends Error {
+  constructor(
+    readonly path: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "InvalidNodeRecordError";
+  }
+}
+
+export type LoadNodeOptions = {
+  /**
+   * Treat an unreadable node record like a missing node. Substrate routing uses
+   * this so a corrupt node overlay does not poison unrelated local operations.
+   */
+  tolerateInvalid?: boolean;
+};
+
 const NODE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
 export const LOCAL_NODE_NAME = "local";
@@ -110,7 +128,7 @@ export async function listNodes(): Promise<NodeRecord[]> {
   return all.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export async function loadNode(name: string): Promise<NodeRecord | null> {
+export async function loadNode(name: string, options: LoadNodeOptions = {}): Promise<NodeRecord | null> {
   try {
     return await readNode(nodePath(name));
   } catch (error) {
@@ -118,17 +136,26 @@ export async function loadNode(name: string): Promise<NodeRecord | null> {
       if (name === LOCAL_NODE_NAME) return IMPLICIT_LOCAL;
       return null;
     }
+    if (options.tolerateInvalid && error instanceof InvalidNodeRecordError) {
+      if (name === LOCAL_NODE_NAME) return IMPLICIT_LOCAL;
+      return null;
+    }
     throw error;
   }
 }
 
-export function loadNodeSync(name: string): NodeRecord | null {
+export function loadNodeSync(name: string, options: LoadNodeOptions = {}): NodeRecord | null {
   try {
-    const raw = readFileSync(nodePath(name), "utf8");
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed ? normalizeNode(parsed, nodePath(name)) : null;
+    const path = nodePath(name);
+    const raw = readFileSync(path, "utf8");
+    const parsed = parseNodeJson(raw, path);
+    return normalizeNode(parsed, path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (name === LOCAL_NODE_NAME) return IMPLICIT_LOCAL;
+      return null;
+    }
+    if (options.tolerateInvalid && error instanceof InvalidNodeRecordError) {
       if (name === LOCAL_NODE_NAME) return IMPLICIT_LOCAL;
       return null;
     }
@@ -264,23 +291,31 @@ export async function saveNode(record: NodeRecord): Promise<void> {
 
 async function readNode(path: string): Promise<NodeRecord> {
   const raw = await readFile(path, "utf8");
-  const parsed = JSON.parse(raw) as unknown;
+  const parsed = parseNodeJson(raw, path);
   return normalizeNode(parsed, path);
+}
+
+function parseNodeJson(raw: string, path: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch (error) {
+    throw new InvalidNodeRecordError(path, `Invalid JSON in node record ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function normalizeNode(value: unknown, path: string): NodeRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Invalid node record at ${path}`);
+    throw new InvalidNodeRecordError(path, `Invalid node record at ${path}`);
   }
   const object = value as Record<string, unknown>;
   const name = object.name;
   const kind = object.kind;
   const endpoint = object.endpoint;
   if (typeof name !== "string" || typeof endpoint !== "string") {
-    throw new Error(`Invalid node record at ${path}: missing required fields`);
+    throw new InvalidNodeRecordError(path, `Invalid node record at ${path}: missing required fields`);
   }
   if (kind !== "local-tmux" && kind !== "ssh-tmux" && kind !== "remote-hsr") {
-    throw new Error(`Invalid node record at ${path}: unknown kind`);
+    throw new InvalidNodeRecordError(path, `Invalid node record at ${path}: unknown kind`);
   }
   const capabilities = Array.isArray(object.capabilities)
     ? object.capabilities.filter((c): c is string => typeof c === "string")
