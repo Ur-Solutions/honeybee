@@ -303,7 +303,8 @@ export async function readLockMeta(path: string): Promise<LockMeta | null> {
   }
 }
 
-function defaultIsPidAlive(pid: number): boolean {
+/** Signal-0 liveness probe; EPERM means the pid exists but isn't ours. */
+export function defaultIsPidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
