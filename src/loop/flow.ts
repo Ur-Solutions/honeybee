@@ -16,6 +16,7 @@ import { scanLatestSeal, type SealRecord, type SealStatus } from "../seal.js";
 import { appendLedger, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
 import { buildLoopConfig } from "./context.js";
+import { evaluateLoopStopConditions, loopStopFlowArgs } from "./stopConditions.js";
 import {
   appendIterLog,
   ensureLoopDir,
@@ -102,13 +103,7 @@ export const loopFlow = defineFlow({
     { name: "cwd", description: "working directory the bee runs in" },
     { name: "context", description: "how each iteration sees the last: persistent (same session), ralph (fresh each time), rolling (fresh + a rolling summary)" },
     { name: "prompt", description: "the instruction sent every iteration" },
-    { name: "until", default: "", description: "stop once this command/condition succeeds (a shell test; blank = ignore)" },
-    { name: "max", default: 100, description: "stop after this many iterations" },
-    { name: "maxDuration", default: "", description: "stop after this much wall-clock (e.g. 2h, 90m; blank = no limit)" },
-    { name: "forever", default: false, description: "ignore max/maxDuration — run until a stop condition or `hive loop stop`" },
-    { name: "stopOnSeal", default: "done", description: "stop when the bee emits a seal of this status (e.g. done; blank = never)" },
-    { name: "stopOnSentinel", default: "", description: "stop when this text appears in the bee's pane (blank = off)" },
-    { name: "judge", default: "", description: "optional judge bee/command that decides whether to continue" },
+    ...loopStopFlowArgs(),
     { name: "summarizer", default: "self", description: "who summarizes between iterations: self (the bee) or bee (a dedicated summarizer)" },
     { name: "loopId", default: "", description: "internal run id — leave blank to auto-generate" },
     { name: "yolo", default: false, description: "run the bee in dangerous/bypass-permissions mode" },
@@ -173,24 +168,21 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
         await finalize("stopped", "stop-requested");
         break;
       }
-      const topLimitDecision = await limitStopDecision(loopId, cfg, cfg.iteration, started, now);
-      if (topLimitDecision) {
-        await finalize(topLimitDecision.status, topLimitDecision.reason);
+      const topStopDecision = await evaluateLoopStopConditions({
+        phase: "pre",
+        cfg,
+        completedIterations: cfg.iteration,
+        started,
+        now,
+        signal: ctx.signal,
+        recordStopCheck: (condition, result) => recordStopCheck(loopId, condition, result),
+        runStopPredicate,
+        scanSentinel: async () => false,
+        judgeSaysStop: async () => false,
+      });
+      if (topStopDecision) {
+        await finalize(topStopDecision.status, topStopDecision.reason);
         break;
-      }
-
-      // --until check at the top of every pass. Evaluating here (rather than
-      // after the iteration) gives one spawn per boundary AND lets an
-      // already-satisfied predicate exit before the first iteration does any
-      // work. The bee is idle between the previous pass and this check, so no
-      // loop-driven change is missed by not re-checking post-iteration.
-      if (cfg.stop.until) {
-        const hit = await runStopPredicate(cfg.stop.until, cfg.cwd, { signal: ctx.signal });
-        await recordStopCheck(loopId, "until", hit);
-        if (hit) {
-          await finalize("done", "until");
-          break;
-        }
       }
 
       // ── Ensure a ready bee. ──
@@ -303,15 +295,6 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       await appendLedger({ type: "loop.iteration", loopId, iteration: iter, status: statusLabel });
       await ctx.hive.log(`iteration ${iter} status=${statusLabel}`);
 
-      // Scan the sentinel BEFORE the fresh-carrier kill: once the bee is killed
-      // its tmux session is gone and the handle is cleared, so a post-kill scan
-      // would always miss. Capture the decision while the bee is still live.
-      const sentinelMatched = cfg.stop.stopOnSentinel
-        ? testHooks?.scanSentinel
-          ? await testHooks.scanSentinel({ handle, pattern: cfg.stop.stopOnSentinel, iter })
-          : await paneMatches(handle, cfg.stop.stopOnSentinel)
-        : false;
-
       // ── Stop menu (first hit wins). pause is distinct from stop. ──
       // Evaluated BEFORE the fresh-carrier kill so a pause decision can leave
       // the bee alive for the operator. Seal-derived stops only apply when the
@@ -319,29 +302,21 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       // stop the loop on its own. An explicit --stop-on-seal membership wins
       // over the implicit blocked/needs_input pause: an operator who opted
       // into stopping on those statuses gets a stop, not a pause.
-      let decision: { status: LoopStatus; reason: string } | null = null;
-      if (seal && cfg.stop.stopOnSeal.length > 0 && cfg.stop.stopOnSeal.includes(seal.status)) {
-        await recordStopCheck(loopId, "stop-on-seal", true);
-        decision = { status: "done", reason: `seal:${seal.status}` };
-      } else if (seal && (seal.status === "blocked" || seal.status === "needs_input")) {
-        decision = { status: "paused", reason: `seal:${seal.status}` };
-      } else if (!seal && boundaryBlocked) {
-        // The idle boundary settled on a permission prompt — pause so the
-        // operator can approve/deny instead of advancing past a blocked bee.
-        decision = { status: "paused", reason: "boundary:permission_prompt" };
-      }
-      if (!decision && cfg.stop.stopOnSentinel) {
-        await recordStopCheck(loopId, "stop-on-sentinel", sentinelMatched);
-        if (sentinelMatched) decision = { status: "done", reason: "sentinel" };
-      }
-      // (--until is evaluated at the top of the loop, not here, to avoid a
-      // redundant second spawn of the same predicate across the boundary.)
-      if (!decision && cfg.stop.judge) {
-        const hit = await judgeSaysStop(facade, cfg, loopId, iter);
-        await recordStopCheck(loopId, "judge", hit);
-        if (hit) decision = { status: "done", reason: "judge" };
-      }
-      decision ??= await limitStopDecision(loopId, cfg, iter, started, now);
+      const decision = await evaluateLoopStopConditions({
+        phase: "post",
+        cfg,
+        completedIterations: iter,
+        started,
+        now,
+        signal: ctx.signal,
+        seal,
+        boundaryBlocked,
+        recordStopCheck: (condition, result) => recordStopCheck(loopId, condition, result),
+        runStopPredicate,
+        scanSentinel: (pattern) =>
+          testHooks?.scanSentinel ? testHooks.scanSentinel({ handle, pattern, iter }) : paneMatches(handle, pattern),
+        judgeSaysStop: () => judgeSaysStop(facade, cfg, loopId, iter),
+      });
 
       if (decision?.status === "paused") {
         // PRD: pause-and-notify — the human must be able to attend THIS bee,
@@ -381,24 +356,6 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
 // ──────────────────────────────────────────────────────────────────────────
 // Helpers.
 // ──────────────────────────────────────────────────────────────────────────
-
-async function limitStopDecision(
-  loopId: string,
-  cfg: LoopConfig,
-  completedIterations: number,
-  started: number,
-  now: () => number,
-): Promise<{ status: LoopStatus; reason: string } | null> {
-  if (!cfg.stop.forever && cfg.stop.max != null && completedIterations >= cfg.stop.max) {
-    await recordStopCheck(loopId, "max", true);
-    return { status: "done", reason: "max" };
-  }
-  if (cfg.stop.maxDurationMs != null && now() - started >= cfg.stop.maxDurationMs) {
-    await recordStopCheck(loopId, "max-duration", true);
-    return { status: "done", reason: "max-duration" };
-  }
-  return null;
-}
 
 function boundaryTimeoutMs(cfg: LoopConfig, started: number, now: () => number, defaultTimeoutMs: number): number {
   if (cfg.stop.maxDurationMs == null) return defaultTimeoutMs;
