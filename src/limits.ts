@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   type AccountRecord,
@@ -15,7 +15,8 @@ import {
   readVaultClaudeChain,
   refreshClaudeOauthChain,
   saveClaudeOauthToVault,
-  withAccountsLock,
+  CROSS_ACCOUNT_LOCK_TIMEOUT_MS,
+  withAccountLock,
 } from "./accounts.js";
 import { canonicalAgentKind } from "./agents.js";
 import { launchEnv } from "./env.js";
@@ -106,7 +107,7 @@ export type LimitsDeps = {
   /** Re-read the vault chain under the lock (double-checked refresh; tests override). */
   readVaultChain?: typeof readVaultClaudeChain;
   /** Serialize the refresh critical section (tests can pass a passthrough). */
-  withAccountsLock?: <T>(fn: () => Promise<T>) => Promise<T>;
+  withAccountLock?: <T>(fn: () => Promise<T>) => Promise<T>;
   /** Mirror a verified fresher credential into the vault file (no rotation). */
   persistVaultCredentials?: (account: AccountRecord, oauth: Record<string, unknown>) => Promise<void>;
   readKeychain?: typeof readClaudeKeychain;
@@ -324,15 +325,15 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
     const refresh = deps.refreshClaudeToken ?? refreshClaudeOauthChain;
     const persist = deps.persistRefreshedCredentials ?? persistClaudeChainLocked;
     const readVault = deps.readVaultChain ?? readVaultClaudeChain;
-    const lock = deps.withAccountsLock ?? withAccountsLock;
+    const lock = deps.withAccountLock ?? (<T>(fn: () => Promise<T>) => withAccountLock(account.id, fn));
     // HIVE-2: refresh+persist is a read-modify-write of the account's chain,
     // and refresh tokens rotate — two concurrent refreshes (say, the --live
     // dashboard and an activation both hitting one expired account) replay
     // the same refresh token, which trips the provider's reuse detection and
     // can revoke the whole chain, logging the live session out. Take the same
-    // accounts lock as activation's refresh path, and double-check the vault
-    // inside it: a writer that beat us to the rotation left a fresh chain to
-    // use instead of replaying the now-dead token.
+    // per-account lock as activation's refresh path, and double-check the
+    // vault inside it: a writer that beat us to the rotation left a fresh
+    // chain to use instead of replaying the now-dead token.
     credential = await lock<ClaudeOauthCredentials | undefined>(async () => {
       const attempted = new Set<string>();
       const vaultNow = await readVault(account).catch(() => null);
@@ -378,12 +379,16 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
         const actualEmail = expectedEmail ? await profileOf(refreshed.accessToken).catch(() => null) : null;
         if (expectedEmail && actualEmail && actualEmail !== expectedEmail) {
           // The chain belongs to someone else (mislabeled source). Park the
-          // rotated tokens with their real owner so the chain isn't lost.
+          // rotated tokens with their real owner so the chain isn't lost —
+          // under the OWNER's per-account lock (we hold only this account's),
+          // best-effort with the short cross-account timeout.
           imposters.add(actualEmail);
           const owner = (await listAccounts()).find(
             (other) => other.tool === "claude" && (other.email ?? other.label) === actualEmail,
           );
-          if (owner) await persist(owner, oauth).catch(() => undefined);
+          if (owner) {
+            await withAccountLock(owner.id, () => persist(owner, oauth), { timeoutMs: CROSS_ACCOUNT_LOCK_TIMEOUT_MS }).catch(() => undefined);
+          }
           continue;
         }
         await persist(account, oauth).catch(() => undefined);
@@ -702,26 +707,70 @@ async function fetchCodexLiveRateLimits(homePath: string): Promise<CodexLiveRate
   });
 }
 
+// How many recent rollout files to inspect — a fresh session may not have
+// emitted token_count yet, so look back a few files.
+const MAX_ROLLOUT_CANDIDATES = 5;
+// Codex partitions sessions/ by date (YYYY/MM/DD). Walk partitions
+// newest-first and stop once enough recent file-bearing partitions have been
+// scanned: a full depth-5 sweep stats every rollout ever written, which is
+// thousands of files on a busy machine (HIVE-64). Two partitions cover "today
+// plus the previous active day", so a still-running session that started
+// yesterday is not missed.
+const MIN_ROLLOUT_LEAF_DIRS = 2;
+// Directory-visit budget: bounds the walk even when the newest partitions are
+// sparse or empty (or the tree is not date-shaped).
+const MAX_ROLLOUT_DIR_VISITS = 64;
+
 /** Newest rate_limits event across the most recent rollout files. */
 async function newestRateLimitSnapshot(sessionsDir: string): Promise<{ limits: CodexRateLimits; ts: string } | null> {
-  const files: { path: string; mtimeMs: number }[] = [];
-  await walk(sessionsDir, 5, async (path) => {
-    if (!path.endsWith(".jsonl")) return;
-    const info = await stat(path).catch(() => null);
-    if (info?.isFile()) files.push({ path, mtimeMs: info.mtimeMs });
-  });
-  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  // A fresh session may not have emitted token_count yet; look back a few files.
-  for (const file of files.slice(0, 5)) {
-    const snapshot = await lastRateLimitsInFile(file.path);
+  for (const file of await newestRolloutFiles(sessionsDir)) {
+    const snapshot = await lastRateLimitsInFile(file);
     if (snapshot) return snapshot;
   }
   return null;
 }
 
+/**
+ * The newest rollout files, walking date partitions newest-first (descending
+ * directory-name order = descending date) and stopping once enough recent
+ * partitions have been scanned instead of statting the whole tree.
+ */
+async function newestRolloutFiles(sessionsDir: string): Promise<string[]> {
+  const files: { path: string; mtimeMs: number }[] = [];
+  let leafDirs = 0;
+  let dirVisits = 0;
+  const done = () => leafDirs >= MIN_ROLLOUT_LEAF_DIRS && files.length >= MAX_ROLLOUT_CANDIDATES;
+  const visit = async (dir: string, depth: number): Promise<void> => {
+    if (depth > 5 || dirVisits >= MAX_ROLLOUT_DIR_VISITS || done()) return;
+    dirVisits += 1;
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    let sawFile = false;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+      const path = join(dir, entry.name);
+      const info = await stat(path).catch(() => null);
+      if (!info?.isFile()) continue;
+      files.push({ path, mtimeMs: info.mtimeMs });
+      sawFile = true;
+    }
+    if (sawFile) leafDirs += 1;
+    const subdirs = entries
+      .filter((entry) => entry.isDirectory())
+      .sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }));
+    for (const sub of subdirs) await visit(join(dir, sub.name), depth + 1);
+  };
+  await visit(sessionsDir, 0);
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return files.slice(0, MAX_ROLLOUT_CANDIDATES).map((file) => file.path);
+}
+
+// Rollout files grow to many MB over a long session; rate_limits rides the
+// per-turn token_count events, so the latest one sits near the end. Read only
+// the tail instead of slurping the whole file (HIVE-64).
+const ROLLOUT_TAIL_BYTES = 256 * 1024;
+
 export async function lastRateLimitsInFile(path: string): Promise<{ limits: CodexRateLimits; ts: string } | null> {
-  const raw = await readFile(path, "utf8").catch(() => null);
+  const raw = await readFileTail(path, ROLLOUT_TAIL_BYTES);
   if (!raw) return null;
   const lines = raw.split("\n");
   for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -740,13 +789,23 @@ export async function lastRateLimitsInFile(path: string): Promise<{ limits: Code
   return null;
 }
 
-async function walk(dir: string, maxDepth: number, visit: (path: string) => Promise<void>): Promise<void> {
-  if (maxDepth < 0) return;
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  for (const entry of entries) {
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) await walk(path, maxDepth - 1, visit);
-    else if (entry.isFile()) await visit(path);
+/** The file's last maxBytes as utf8, minus the leading torn line; null on any error. */
+async function readFileTail(path: string, maxBytes: number): Promise<string | null> {
+  try {
+    const info = await stat(path);
+    if (info.size <= maxBytes) return await readFile(path, "utf8");
+    const handle = await open(path, "r");
+    try {
+      const buffer = Buffer.alloc(maxBytes);
+      const { bytesRead } = await handle.read(buffer, 0, maxBytes, info.size - maxBytes);
+      const text = buffer.subarray(0, bytesRead).toString("utf8");
+      const newline = text.indexOf("\n");
+      return newline >= 0 ? text.slice(newline + 1) : text;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
   }
 }
 
