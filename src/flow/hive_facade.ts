@@ -32,7 +32,6 @@ import { waitForIdle } from "../wait.js";
 import { buildLoopConfig } from "../loop/context.js";
 import { loopFlow } from "../loop/flow.js";
 import {
-  ensureLoopDir,
   generateLoopId,
   type LoopConfig,
   readLoopConfig,
@@ -391,11 +390,10 @@ export class HiveFacade {
     // The bee token (codex-auto / claude-thto / account-id) is kept verbatim and
     // resolved at each iteration's spawn (spawnLoopBee / facade.spawn) so a
     // fresh-carrier loop re-picks the least-loaded `auto` account per iteration.
-    const loopId = await generateLoopId();
     // Build/validate the config eagerly; buildLoopConfig throws on bad input.
-    const cfg = buildLoopConfig({ ...(spec as Record<string, unknown>), loopId });
+    const cfg = buildLoopConfig(spec as Record<string, unknown>);
+    const loopId = await generateLoopId();
     cfg.loopId = loopId;
-    await ensureLoopDir(loopId);
     await writeLoopConfig(cfg);
     const args = loopArgsFromSpec(spec, loopId);
     try {
