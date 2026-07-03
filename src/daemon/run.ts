@@ -705,28 +705,63 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   };
 
-  // Tick loop. We use an async sleep loop (not setInterval) so each tick fully
-  // resolves before the next begins; this is the standard reliable-tick pattern.
+  // Tick loop: an async sleep loop (not setInterval), with ticks strictly
+  // serialized — at most one tick is ever in flight. A budget-abandoned tick
+  // keeps running in the background, and the tick path is NOT reentrant: the
+  // dispatchers (usage sampler, needs-input, node reachability, auto-title)
+  // are stateful closures built once per daemon run, and the per-record loop
+  // writes session files. Overlapping ticks would mutate that shared state
+  // concurrently (double-fired events, corrupted sampler maps, torn record
+  // writes), so while an abandoned tick is still pending the loop SKIPS its
+  // tick instead of starting another.
   let consecutiveFailures = 0;
   let lastHealthyIterationMs = Date.now();
+  // The most recent budget-abandoned tick, until it settles. `result` carries
+  // its late resolution so the next tick can adopt the observed map.
+  let abandonedTick: { settled: boolean; result: TickResult | null } | null = null;
   try {
     while (!stopping) {
       if (config.maxTicks !== undefined && state.tickCount >= config.maxTicks) break;
       lastLoopBeatMs = Date.now();
       iterationIoFailed = false;
       // The whole tick runs under a hard budget. A tick that blows it is
-      // abandoned (its late settlement is swallowed) and recorded; the loop
-      // moves on to the next tick instead of wedging forever. Production
-      // incident 2026-06-29: a lost libuv fs completion froze one tick — and
-      // therefore the daemon — for 3+ days with recentErrors empty.
-      const tickPromise = tickFn(deps, observed);
+      // abandoned and recorded; the loop keeps iterating (skipping ticks)
+      // until the abandoned tick settles, so the loop itself never wedges —
+      // production incident 2026-06-29: a lost libuv fs completion froze one
+      // tick, and therefore the daemon, for 3+ days with recentErrors empty.
+      // Skipped iterations count as failures, so a tick that NEVER settles
+      // escalates through maxConsecutiveFailures to a supervised restart.
       let result: TickResult | null = null;
       let tickError: Error | null = null;
-      try {
-        result = await withTimeout(tickPromise, config.tickBudgetMs, "tick");
-      } catch (error) {
-        tickError = toError(error);
-        void tickPromise.catch(() => undefined); // an abandoned tick may still reject later
+      if (abandonedTick && !abandonedTick.settled) {
+        tickError = new Error(`tick skipped: previous tick still running past its ${config.tickBudgetMs}ms budget`);
+      } else {
+        if (abandonedTick) {
+          // The abandoned tick's side effects (dispatches, ledger events,
+          // record writes) really happened: adopt its observed map so the
+          // next tick doesn't re-detect — and re-dispatch — the same
+          // transitions. It still doesn't count toward tickCount.
+          if (abandonedTick.result) observed = abandonedTick.result.observed;
+          await safeLog({ level: "info", msg: "tick.abandoned.settled", adoptedObserved: abandonedTick.result !== null });
+          abandonedTick = null;
+        }
+        const tickPromise = tickFn(deps, observed);
+        try {
+          result = await withTimeout(tickPromise, config.tickBudgetMs, "tick");
+        } catch (error) {
+          tickError = toError(error);
+          const entry: { settled: boolean; result: TickResult | null } = { settled: false, result: null };
+          tickPromise.then(
+            (late) => {
+              entry.settled = true;
+              entry.result = late;
+            },
+            () => {
+              entry.settled = true; // an abandoned tick may still reject later
+            },
+          );
+          abandonedTick = entry;
+        }
       }
       lastLoopBeatMs = Date.now();
       if (result) {
