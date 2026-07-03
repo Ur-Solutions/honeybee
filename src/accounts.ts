@@ -1327,6 +1327,34 @@ export async function saveClaudeOauthToVault(account: AccountRecord, oauth: Reco
 
 export type ChainSyncResult = { chain: ClaudeChain | null; vaultUpdated: boolean };
 
+export type ChainSyncDeps = {
+  /** Resolve a fresh token's identity (tests inject; default is the memoized OAuth profile lookup). */
+  fetchProfileEmail?: (accessToken: string) => Promise<string | null>;
+  now?: () => number;
+};
+
+/**
+ * Token → verified email via the OAuth profile endpoint, memoized per process:
+ * a given access token's identity never changes, so one round-trip per token
+ * is enough. Unverifiable lookups (no email, HTTP error) are not cached.
+ */
+const claudeTokenEmailCache = new Map<string, string>();
+
+export async function claudeProfileEmailCached(accessToken: string): Promise<string | null> {
+  const cached = claudeTokenEmailCache.get(accessToken);
+  if (cached !== undefined) return cached;
+  const response = await fetch("https://api.anthropic.com/api/oauth/profile", {
+    headers: { Authorization: `Bearer ${accessToken}`, "anthropic-beta": "oauth-2025-04-20", "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error(`/api/oauth/profile: HTTP ${response.status}`);
+  const profile = (await response.json()) as { account?: { email?: unknown; email_address?: unknown } };
+  const email = profile.account?.email ?? profile.account?.email_address;
+  if (typeof email !== "string") return null;
+  claudeTokenEmailCache.set(accessToken, email);
+  return email;
+}
+
 /**
  * Pull the freshest attributed chain link into the vault. Reads the vault
  * snapshot plus every home attributable to the account (and extraHome when
@@ -1334,11 +1362,11 @@ export type ChainSyncResult = { chain: ClaudeChain | null; vaultUpdated: boolean
  * running or past claude rotated the chain there — the vault catches up, so
  * a later activation does not stamp a dead link over a live one.
  */
-export async function syncClaudeChainToVault(account: AccountRecord, extraHome?: string): Promise<ChainSyncResult> {
-  return withAccountsLock(() => syncClaudeChainToVaultLocked(account, extraHome));
+export async function syncClaudeChainToVault(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<ChainSyncResult> {
+  return withAccountsLock(() => syncClaudeChainToVaultLocked(account, extraHome, deps));
 }
 
-async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: string): Promise<ChainSyncResult> {
+async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<ChainSyncResult> {
   const vaultPath = join(accountDir(account), ".credentials.json");
   const vault = parseClaudeChain(await readFile(vaultPath, "utf8").catch(() => null), "vault");
   const homes = new Map<string, string>();
@@ -1346,10 +1374,34 @@ async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: 
   if (extraHome && !homes.has(resolve(extraHome)) && (await homeBelongsToAccount(extraHome, account))) {
     homes.set(resolve(extraHome), extraHome);
   }
+  const expected = accountEmail(account);
+  const profileOf = deps.fetchProfileEmail ?? claudeProfileEmailCached;
+  const nowMs = (deps.now ?? Date.now)();
   let best = vault;
   for (const home of homes.values()) {
     const chain = await readHomeClaudeChain(home);
-    if (chain && isBetterClaudeChain(chain, best)) best = chain;
+    if (!chain || !isBetterClaudeChain(chain, best)) continue;
+    // Adopting a home chain rewrites the vault — the one moment a foreign
+    // chain can hijack the account. A dedicated home is the account's by
+    // construction, but its CONTENTS may not be: racing account swaps stamp
+    // another account's chain into it, and the home's .claude.json marker
+    // cannot be trusted mid-stamp (seen live: a swap race parked a digitech
+    // chain in gmail's vault and orphaned a third account's chain entirely).
+    // So verify fresh adoption candidates against the profile endpoint: a
+    // VERIFIED imposter is parked with its real owner and skipped. An
+    // unverifiable chain (expired, endpoint unreachable) is adopted as
+    // before — sync exists to rescue rotated links, and orphaning one on a
+    // network blip is worse than the residual risk. Verification only fires
+    // when the chain differs from the vault's, so steady-state activations
+    // pay no extra round-trips (and lookups are memoized per token).
+    if (expected && chain.expiresAt > nowMs) {
+      const actual = await profileOf(String(chain.oauth.accessToken)).catch(() => null);
+      if (actual && actual !== expected) {
+        await parkClaudeChainWithOwnerLocked(chain, actual, account).catch(() => undefined);
+        continue;
+      }
+    }
+    best = chain;
   }
   if (!best || best === vault) return { chain: best, vaultUpdated: false };
   await saveClaudeChainToVaultLocked(account, best.raw);
@@ -1360,6 +1412,23 @@ async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: 
     expiresAt: new Date(best.expiresAt).toISOString(),
   });
   return { chain: best, vaultUpdated: true };
+}
+
+/**
+ * Freshness-guarded write of a verified foreign chain into its owner's vault —
+ * the sync-side twin of evacuateForeignClaudeChainLocked. Turning a would-be
+ * hijack into a rescue makes the sweep self-healing: an account whose live
+ * link is stranded in another account's home gets it back on the next sync.
+ */
+async function parkClaudeChainWithOwnerLocked(chain: ClaudeChain, email: string, notAccount: AccountRecord): Promise<void> {
+  const owner = (await listAccounts()).find(
+    (candidate) => candidate.tool === "claude" && candidate.id !== notAccount.id && accountEmail(candidate) === email,
+  );
+  if (!owner) return;
+  const vault = parseClaudeChain(await readFile(join(accountDir(owner), ".credentials.json"), "utf8").catch(() => null), "vault");
+  if (vault && vault.expiresAt >= chain.expiresAt) return;
+  await saveClaudeChainToVaultLocked(owner, chain.raw);
+  await appendLedger({ type: "account.chain-evacuate", account: owner.id, home: chain.source });
 }
 
 export type AccountChainSyncOutcome = { account: string; vaultUpdated: boolean; error?: string };

@@ -652,12 +652,13 @@ test("syncClaudeChainToVault pulls the freshest link from the account's homes", 
     await mkdir(home, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-live", now + 8 * 3_600_000));
 
-    const first = await syncClaudeChainToVault(account);
+    const deps = { fetchProfileEmail: async () => "sync@a.b" };
+    const first = await syncClaudeChainToVault(account, undefined, deps);
     assert.equal(first.vaultUpdated, true);
     const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
     assert.equal(vault.claudeAiOauth.accessToken, "tok-live");
 
-    const second = await syncClaudeChainToVault(account);
+    const second = await syncClaudeChainToVault(account, undefined, deps);
     assert.equal(second.vaultUpdated, false);
   });
 });
@@ -671,7 +672,7 @@ test("syncClaudeChainToVault prefers an equal-expiry link with a refresh token",
     await mkdir(home, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-home", expiresAt, "refresh-home"));
 
-    const result = await syncClaudeChainToVault(account);
+    const result = await syncClaudeChainToVault(account, undefined, { fetchProfileEmail: async () => "same-expiry@a.b" });
 
     assert.equal(result.vaultUpdated, true);
     const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
@@ -710,12 +711,60 @@ test("syncClaudeChainToVault prefers an earlier-expiry refreshable home link ove
     await mkdir(home, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-home", now + 3_600_000, "refresh-home"));
 
-    const result = await syncClaudeChainToVault(account);
+    const result = await syncClaudeChainToVault(account, undefined, { fetchProfileEmail: async () => "gain-refresh@a.b" });
 
     assert.equal(result.vaultUpdated, true);
     const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
     assert.equal(vault.claudeAiOauth.accessToken, "tok-home");
     assert.equal(vault.claudeAiOauth.refreshToken, "refresh-home");
+  });
+});
+
+test("syncClaudeChainToVault parks a verified foreign chain with its owner instead of adopting it", async () => {
+  await withTempStore(async (dir) => {
+    const victim = await addAccount("claude", "victim@a.b");
+    const owner = await addAccount("claude", "owner@c.d");
+    const now = Date.now();
+    await writeFile(join(accountDir(victim), ".credentials.json"), chainJson("tok-victim", now + 3_600_000));
+    await writeFile(join(accountDir(owner), ".credentials.json"), chainJson("tok-owner-old", now - 1_000));
+    // A racing swap stamped the OWNER's live chain into the victim's
+    // dedicated home; adopting it would hijack the victim's vault.
+    const home = join(dir, "homes", victim.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-owner-live", now + 8 * 3_600_000));
+
+    const result = await syncClaudeChainToVault(victim, undefined, {
+      fetchProfileEmail: async (token) => (token === "tok-owner-live" ? "owner@c.d" : "victim@a.b"),
+    });
+
+    // The victim's vault is untouched...
+    assert.equal(result.vaultUpdated, false);
+    const victimVault = JSON.parse(await readFile(join(accountDir(victim), ".credentials.json"), "utf8"));
+    assert.equal(victimVault.claudeAiOauth.accessToken, "tok-victim");
+    // ...and the stranded chain was rescued into its real owner's vault.
+    const ownerVault = JSON.parse(await readFile(join(accountDir(owner), ".credentials.json"), "utf8"));
+    assert.equal(ownerVault.claudeAiOauth.accessToken, "tok-owner-live");
+  });
+});
+
+test("syncClaudeChainToVault adopts an unverifiable fresh chain (endpoint unreachable keeps rescue semantics)", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "offline@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-old", now + 1_000));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-rotated", now + 8 * 3_600_000));
+
+    const result = await syncClaudeChainToVault(account, undefined, {
+      fetchProfileEmail: async () => {
+        throw new Error("offline");
+      },
+    });
+
+    assert.equal(result.vaultUpdated, true);
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-rotated");
   });
 });
 
