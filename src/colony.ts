@@ -62,6 +62,7 @@ export async function createColony(name: string, description?: string): Promise<
   return withColoniesLock(async () => {
     const existing = await loadColony(name);
     if (existing) throw new Error(`Colony already exists: ${name}`);
+    if (await loadWorkspace(name)) throw new Error(`Workspace already exists: ${name}`);
     const record: ColonyRecord = {
       name,
       createdAt: new Date().toISOString(),
@@ -69,18 +70,13 @@ export async function createColony(name: string, description?: string): Promise<
     };
     await saveColony(record);
     await appendLedger({ type: "colony.create", name });
-    // Auto-provision the colony's workspace (PRD §7.2). rootDir stays empty —
-    // it is resolved lazily on first `hive workspace open <colony>`. Best-effort:
-    // a workspace failure must never abort colony creation.
-    try {
-      await createWorkspace({ name, rootDir: "", members: [], colony: name });
-      record.workspace = name;
-      await saveColony(record);
-    } catch {
-      // log-and-continue: the colony still exists; the workspace can be
-      // (re)created on first open. We deliberately swallow a pre-existing
-      // workspace or any provisioning hiccup here.
-    }
+    // Auto-provision the colony's workspace (PRD §7.2). rootDir stays empty and
+    // is resolved lazily on first `hive workspace open <colony>`. Provisioning
+    // failures are surfaced so callers do not get a silently half-provisioned
+    // colony.
+    await createWorkspace({ name, rootDir: "", members: [], colony: name });
+    record.workspace = name;
+    await saveColony(record);
     return record;
   });
 }

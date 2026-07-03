@@ -11,7 +11,7 @@ import { appendLedger, safeName } from "./store.js";
 // ──────────────────────────────────────────────────────────────────────────
 // The credential vault. LOCAL ONLY — never synced. An account is a provider
 // identity (the "who"); a home is a slot (the "where"). Activating an account
-// copies its credential files into a home under the accounts lock.
+// copies its credential files into a home under that account's lock.
 // ──────────────────────────────────────────────────────────────────────────
 
 export type AccountRecord = {
@@ -70,15 +70,44 @@ export function accountsLockPath(): string {
   return join(storeRoot(), "accounts.lock");
 }
 
+export function accountLockPath(accountId: string): string {
+  return join(storeRoot(), "locks", "accounts", `${safeName(accountId)}.lock`);
+}
+
 export function accountDir(account: Pick<AccountRecord, "tool" | "id">): string {
   return join(vaultRoot(), account.tool, account.id);
 }
 
+/**
+ * Machine-wide registry lock: serializes accounts.json read-modify-writes
+ * (add/remove). Per-account vault work takes withAccountLock instead, so
+ * distinct accounts never queue behind each other (HIVE-64). When both locks
+ * are needed the registry lock is acquired FIRST (removeAccount), never the
+ * other way around.
+ */
 export function withAccountsLock<T>(fn: () => Promise<T>): Promise<T> {
-  // Activation may refresh an OAuth chain over the network (15s cap) while
-  // holding the lock; give waiters enough patience to outlive that.
   return withFileLock(accountsLockPath(), fn, { timeoutMs: 30_000 });
 }
+
+/**
+ * Per-account lock: guards one account's vault entry and OAuth chain. Sharded
+ * by account id so a swarm of N account-bound bees activates in parallel —
+ * one account's network refresh no longer stalls every other account's
+ * activation past the lock timeout (HIVE-64). Same-account work still
+ * serializes, which rotating refresh tokens require (HIVE-2). Not reentrant.
+ */
+export function withAccountLock<T>(accountId: string, fn: () => Promise<T>, options: { timeoutMs?: number } = {}): Promise<T> {
+  // Activation may refresh an OAuth chain over the network (15s cap) while
+  // holding the lock; give waiters enough patience to outlive that.
+  return withFileLock(accountLockPath(accountId), fn, { timeoutMs: options.timeoutMs ?? 30_000 });
+}
+
+// Cross-account writes (chain evacuation, imposter parking) take the OTHER
+// account's lock while already holding one. Give up sooner than the normal
+// patience: these writes are best-effort at every call site, and the shorter
+// timeout breaks the rare A→B/B→A acquisition cycle instead of stalling both
+// activations for the full 30s.
+export const CROSS_ACCOUNT_LOCK_TIMEOUT_MS = 10_000;
 
 export function accountIdFor(tool: string, label: string): string {
   return safeName(`${tool}-${label}`).toLowerCase();
@@ -171,10 +200,14 @@ export async function removeAccount(idOrLabel: string): Promise<AccountRecord> {
   return withAccountsLock(async () => {
     const accounts = await listAccounts();
     const account = matchAccount(accounts, idOrLabel);
-    await writeRegistry(accounts.filter((candidate) => candidate.id !== account.id));
-    await rm(accountDir(account), { recursive: true, force: true });
-    await appendLedger({ type: "account.remove", account: account.id, tool: account.tool, ...(account.provider ? { provider: account.provider } : {}) });
-    return account;
+    // Nested per-account lock (registry → account, never the reverse): the
+    // vault dir must not be deleted under an in-flight activation or sync.
+    return withAccountLock(account.id, async () => {
+      await writeRegistry(accounts.filter((candidate) => candidate.id !== account.id));
+      await rm(accountDir(account), { recursive: true, force: true });
+      await appendLedger({ type: "account.remove", account: account.id, tool: account.tool, ...(account.provider ? { provider: account.provider } : {}) });
+      return account;
+    });
   });
 }
 
@@ -302,7 +335,7 @@ function recipeFor(account: AccountRecord): IdentityRecipe {
  */
 export async function captureAccountFromHome(account: AccountRecord, homePath: string): Promise<string[]> {
   const recipe = recipeFor(account);
-  return withAccountsLock(async () => {
+  return withAccountLock(account.id, async () => {
     const captured: string[] = [];
     const capturedCredentials: string[] = [];
     for (const relative of recipe.credentialFiles) {
@@ -375,13 +408,13 @@ export type ActivateAccountOptions = {
 export async function activateAccountIntoHome(account: AccountRecord, homePath: string, options: ActivateAccountOptions = {}): Promise<string[]> {
   const recipe = recipeFor(account);
   const warn = options.onWarn ?? (() => undefined);
-  return withAccountsLock(async () => {
+  return withAccountLock(account.id, async () => {
     if (account.tool === "claude") {
       // (1) The home may currently hold ANOTHER account's chain (swap). The
       // rotated live link exists only there — rescue it into its own vault
       // before stamping over it, or that account's next activation revives a
       // dead link and logs it out.
-      await evacuateForeignClaudeChainLocked(account, homePath).catch(() => undefined);
+      await evacuateForeignClaudeChain(account, homePath).catch(() => undefined);
       // (2) Pull the account's own freshest link into the vault so we never
       // stamp a dead link over a live one.
       await syncClaudeChainToVaultLocked(account, homePath).catch(() => undefined);
@@ -400,7 +433,7 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
       // Codex rewrites auth.json when it refreshes tokens. Rescue the current
       // occupant before a swap stamp, then pull this account's newest attributed
       // auth into the vault so activation never revives an older refresh token.
-      await evacuateForeignCodexAuthLocked(account, homePath).catch((error) => {
+      await evacuateForeignCodexAuth(account, homePath).catch((error) => {
         warn(`could not rescue existing Codex auth from ${homePath}: ${error instanceof Error ? error.message : String(error)}`);
       });
       await syncCodexAuthToVaultLocked(account, homePath).catch((error) => {
@@ -946,7 +979,7 @@ export type CodexAuthSyncResult = { auth: CodexAuthSnapshot | null; vaultUpdated
  * swapped/shared homes from poisoning a different account's vault entry.
  */
 export async function syncCodexAuthToVault(account: AccountRecord, extraHome?: string): Promise<CodexAuthSyncResult> {
-  return withAccountsLock(() => syncCodexAuthToVaultLocked(account, extraHome));
+  return withAccountLock(account.id, () => syncCodexAuthToVaultLocked(account, extraHome));
 }
 
 async function syncCodexAuthToVaultLocked(account: AccountRecord, extraHome?: string): Promise<CodexAuthSyncResult> {
@@ -969,25 +1002,31 @@ async function syncCodexAuthToVaultLocked(account: AccountRecord, extraHome?: st
   return { auth: best, vaultUpdated: true };
 }
 
-async function evacuateForeignCodexAuthLocked(account: AccountRecord, homePath: string): Promise<void> {
+// Called while holding the ACTIVATING account's lock; the rescue itself is a
+// read-check-merge of the OWNER's vault, so it takes the owner's lock too —
+// otherwise it could interleave with the owner's own sync and lose a rotated
+// refresh token.
+async function evacuateForeignCodexAuth(account: AccountRecord, homePath: string): Promise<void> {
   const occupant = await readHomeCodexAuth(homePath);
   if (!occupant?.email) return;
   if (await codexAuthBelongsToAccount(occupant, account)) return;
-  const owner = await findCodexAccountByEmailLocked(occupant.email, account.id);
+  const owner = await findCodexAccountByEmail(occupant.email, account.id);
   if (!owner) return;
-  const vault = await readCodexAuthFile(join(accountDir(owner), "auth.json"), "vault");
-  if (!isFresherCodexAuth(occupant, vault)) return;
-  await saveCodexAuthToVaultLocked(owner, occupant.raw);
-  await appendLedger({
-    type: "account.auth-evacuate",
-    account: owner.id,
-    tool: "codex",
-    home: homePath,
-    ...(occupant.lastRefreshMs ? { lastRefreshAt: new Date(occupant.lastRefreshMs).toISOString() } : {}),
-  });
+  await withAccountLock(owner.id, async () => {
+    const vault = await readCodexAuthFile(join(accountDir(owner), "auth.json"), "vault");
+    if (!isFresherCodexAuth(occupant, vault)) return;
+    await saveCodexAuthToVaultLocked(owner, occupant.raw);
+    await appendLedger({
+      type: "account.auth-evacuate",
+      account: owner.id,
+      tool: "codex",
+      home: homePath,
+      ...(occupant.lastRefreshMs ? { lastRefreshAt: new Date(occupant.lastRefreshMs).toISOString() } : {}),
+    });
+  }, { timeoutMs: CROSS_ACCOUNT_LOCK_TIMEOUT_MS });
 }
 
-async function findCodexAccountByEmailLocked(email: string, excludeId?: string): Promise<AccountRecord | null> {
+async function findCodexAccountByEmail(email: string, excludeId?: string): Promise<AccountRecord | null> {
   for (const candidate of (await listAccounts()).filter((account) => account.tool === "codex" && account.id !== excludeId)) {
     if ((await codexAccountEmails(candidate)).has(email)) return candidate;
   }
@@ -1140,7 +1179,7 @@ export async function syncGrokAuthToVault(
   extraHome?: string,
   options: SyncAccountCredentialsOptions = {},
 ): Promise<GrokAuthSyncResult> {
-  return withAccountsLock(() => syncGrokAuthToVaultLocked(account, extraHome, options));
+  return withAccountLock(account.id, () => syncGrokAuthToVaultLocked(account, extraHome, options));
 }
 
 async function syncGrokAuthToVaultLocked(
@@ -1249,7 +1288,7 @@ export async function syncGenericCredentialsToVault(
   extraHome?: string,
   options: SyncAccountCredentialsOptions = {},
 ): Promise<GenericCredentialSyncResult> {
-  return withAccountsLock(() => syncGenericCredentialsToVaultLocked(account, extraHome, options));
+  return withAccountLock(account.id, () => syncGenericCredentialsToVaultLocked(account, extraHome, options));
 }
 
 async function syncGenericCredentialsToVaultLocked(
@@ -1319,13 +1358,41 @@ async function saveClaudeChainToVaultLocked(account: AccountRecord, sourceRaw: s
 
 /** Write a chain's claudeAiOauth into the vault file, preserving sibling keys. */
 export async function saveClaudeOauthToVault(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
-  await withAccountsLock(async () => {
+  await withAccountLock(account.id, async () => {
     await saveClaudeChainToVaultLocked(account, JSON.stringify({ claudeAiOauth: oauth }));
     await appendLedger({ type: "account.chain-sync", account: account.id, from: "verified-credential" });
   });
 }
 
 export type ChainSyncResult = { chain: ClaudeChain | null; vaultUpdated: boolean };
+
+export type ChainSyncDeps = {
+  /** Resolve a fresh token's identity (tests inject; default is the memoized OAuth profile lookup). */
+  fetchProfileEmail?: (accessToken: string) => Promise<string | null>;
+  now?: () => number;
+};
+
+/**
+ * Token → verified email via the OAuth profile endpoint, memoized per process:
+ * a given access token's identity never changes, so one round-trip per token
+ * is enough. Unverifiable lookups (no email, HTTP error) are not cached.
+ */
+const claudeTokenEmailCache = new Map<string, string>();
+
+export async function claudeProfileEmailCached(accessToken: string): Promise<string | null> {
+  const cached = claudeTokenEmailCache.get(accessToken);
+  if (cached !== undefined) return cached;
+  const response = await fetch("https://api.anthropic.com/api/oauth/profile", {
+    headers: { Authorization: `Bearer ${accessToken}`, "anthropic-beta": "oauth-2025-04-20", "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error(`/api/oauth/profile: HTTP ${response.status}`);
+  const profile = (await response.json()) as { account?: { email?: unknown; email_address?: unknown } };
+  const email = profile.account?.email ?? profile.account?.email_address;
+  if (typeof email !== "string") return null;
+  claudeTokenEmailCache.set(accessToken, email);
+  return email;
+}
 
 /**
  * Pull the freshest attributed chain link into the vault. Reads the vault
@@ -1334,11 +1401,11 @@ export type ChainSyncResult = { chain: ClaudeChain | null; vaultUpdated: boolean
  * running or past claude rotated the chain there — the vault catches up, so
  * a later activation does not stamp a dead link over a live one.
  */
-export async function syncClaudeChainToVault(account: AccountRecord, extraHome?: string): Promise<ChainSyncResult> {
-  return withAccountsLock(() => syncClaudeChainToVaultLocked(account, extraHome));
+export async function syncClaudeChainToVault(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<ChainSyncResult> {
+  return withAccountLock(account.id, () => syncClaudeChainToVaultLocked(account, extraHome, deps));
 }
 
-async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: string): Promise<ChainSyncResult> {
+async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<ChainSyncResult> {
   const vaultPath = join(accountDir(account), ".credentials.json");
   const vault = parseClaudeChain(await readFile(vaultPath, "utf8").catch(() => null), "vault");
   const homes = new Map<string, string>();
@@ -1346,10 +1413,34 @@ async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: 
   if (extraHome && !homes.has(resolve(extraHome)) && (await homeBelongsToAccount(extraHome, account))) {
     homes.set(resolve(extraHome), extraHome);
   }
+  const expected = accountEmail(account);
+  const profileOf = deps.fetchProfileEmail ?? claudeProfileEmailCached;
+  const nowMs = (deps.now ?? Date.now)();
   let best = vault;
   for (const home of homes.values()) {
     const chain = await readHomeClaudeChain(home);
-    if (chain && isBetterClaudeChain(chain, best)) best = chain;
+    if (!chain || !isBetterClaudeChain(chain, best)) continue;
+    // Adopting a home chain rewrites the vault — the one moment a foreign
+    // chain can hijack the account. A dedicated home is the account's by
+    // construction, but its CONTENTS may not be: racing account swaps stamp
+    // another account's chain into it, and the home's .claude.json marker
+    // cannot be trusted mid-stamp (seen live: a swap race parked a digitech
+    // chain in gmail's vault and orphaned a third account's chain entirely).
+    // So verify fresh adoption candidates against the profile endpoint: a
+    // VERIFIED imposter is parked with its real owner and skipped. An
+    // unverifiable chain (expired, endpoint unreachable) is adopted as
+    // before — sync exists to rescue rotated links, and orphaning one on a
+    // network blip is worse than the residual risk. Verification only fires
+    // when the chain differs from the vault's, so steady-state activations
+    // pay no extra round-trips (and lookups are memoized per token).
+    if (expected && chain.expiresAt > nowMs) {
+      const actual = await profileOf(String(chain.oauth.accessToken)).catch(() => null);
+      if (actual && actual !== expected) {
+        await parkClaudeChainWithOwnerLocked(chain, actual, account).catch(() => undefined);
+        continue;
+      }
+    }
+    best = chain;
   }
   if (!best || best === vault) return { chain: best, vaultUpdated: false };
   await saveClaudeChainToVaultLocked(account, best.raw);
@@ -1360,6 +1451,23 @@ async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: 
     expiresAt: new Date(best.expiresAt).toISOString(),
   });
   return { chain: best, vaultUpdated: true };
+}
+
+/**
+ * Freshness-guarded write of a verified foreign chain into its owner's vault —
+ * the sync-side twin of evacuateForeignClaudeChainLocked. Turning a would-be
+ * hijack into a rescue makes the sweep self-healing: an account whose live
+ * link is stranded in another account's home gets it back on the next sync.
+ */
+async function parkClaudeChainWithOwnerLocked(chain: ClaudeChain, email: string, notAccount: AccountRecord): Promise<void> {
+  const owner = (await listAccounts()).find(
+    (candidate) => candidate.tool === "claude" && candidate.id !== notAccount.id && accountEmail(candidate) === email,
+  );
+  if (!owner) return;
+  const vault = parseClaudeChain(await readFile(join(accountDir(owner), ".credentials.json"), "utf8").catch(() => null), "vault");
+  if (vault && vault.expiresAt >= chain.expiresAt) return;
+  await saveClaudeChainToVaultLocked(owner, chain.raw);
+  await appendLedger({ type: "account.chain-evacuate", account: owner.id, home: chain.source });
 }
 
 export type AccountChainSyncOutcome = { account: string; vaultUpdated: boolean; error?: string };
@@ -1427,9 +1535,11 @@ export async function syncAllAccountCredentialsToVault(): Promise<AccountChainSy
 /**
  * The home being activated may hold ANOTHER account's chain whose live link
  * exists nowhere else. Rescue it into its owner's vault (freshness-guarded)
- * before the stamp destroys it.
+ * before the stamp destroys it. Called while holding the ACTIVATING account's
+ * lock; the rescue itself takes the OWNER's lock so it cannot interleave with
+ * the owner's own refresh/persist of the same vault file.
  */
-async function evacuateForeignClaudeChainLocked(account: AccountRecord, homePath: string): Promise<void> {
+async function evacuateForeignClaudeChain(account: AccountRecord, homePath: string): Promise<void> {
   const occupant = await readHomeClaudeChain(homePath);
   if (!occupant) return;
   const email = await homeClaudeEmail(homePath);
@@ -1438,10 +1548,12 @@ async function evacuateForeignClaudeChainLocked(account: AccountRecord, homePath
     (candidate) => candidate.tool === "claude" && candidate.id !== account.id && accountEmail(candidate) === email,
   );
   if (!owner) return;
-  const vault = parseClaudeChain(await readFile(join(accountDir(owner), ".credentials.json"), "utf8").catch(() => null), "vault");
-  if (vault && vault.expiresAt >= occupant.expiresAt) return;
-  await saveClaudeChainToVaultLocked(owner, occupant.raw);
-  await appendLedger({ type: "account.chain-evacuate", account: owner.id, home: homePath });
+  await withAccountLock(owner.id, async () => {
+    const vault = parseClaudeChain(await readFile(join(accountDir(owner), ".credentials.json"), "utf8").catch(() => null), "vault");
+    if (vault && vault.expiresAt >= occupant.expiresAt) return;
+    await saveClaudeChainToVaultLocked(owner, occupant.raw);
+    await appendLedger({ type: "account.chain-evacuate", account: owner.id, home: homePath });
+  }, { timeoutMs: CROSS_ACCOUNT_LOCK_TIMEOUT_MS });
 }
 
 // Claude Code's public OAuth client id (the same one the CLI itself uses).
@@ -1472,10 +1584,11 @@ export async function refreshClaudeOauthChain(refreshToken: string): Promise<Ref
  * merged, so sibling keys (mcpOAuth, ...) survive. Skipping any copy would
  * orphan that copy on a dead link.
  *
- * Caller MUST hold withAccountsLock (which is not reentrant, so it cannot be
- * taken here): an unlocked refresh+persist races activation's refresh of the
- * same chain, and replaying a rotated refresh token trips the provider's
- * reuse detection — revoking the chain and logging live sessions out (HIVE-2).
+ * Caller MUST hold the account's withAccountLock (which is not reentrant, so
+ * it cannot be taken here): an unlocked refresh+persist races activation's
+ * refresh of the same chain, and replaying a rotated refresh token trips the
+ * provider's reuse detection — revoking the chain and logging live sessions
+ * out (HIVE-2).
  */
 export async function persistClaudeChainLocked(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
   const sourceRaw = JSON.stringify({ claudeAiOauth: oauth });
@@ -1527,7 +1640,7 @@ async function refreshVaultClaudeChainIfStaleLocked(account: AccountRecord, opti
 
 /**
  * Read the account's CURRENT vault Claude chain. Used as a post-lock re-check:
- * a caller that took withAccountsLock before rotating a chain re-reads here to
+ * a caller that took withAccountLock before rotating a chain re-reads here to
  * see whether another writer already refreshed it while it waited (HIVE-2),
  * avoiding a redundant — and reuse-detection-tripping — refresh-token replay.
  */

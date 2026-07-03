@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { connectRpcClient } from "../src/hsr/rpc.js";
 import { runHsrHost, type HsrHostHandle } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
-import { hsrObservations, pendingNeedsInput } from "../src/hsr/observe.js";
+import { hsrObservations, pendingNeedsInput, type HsrObservation } from "../src/hsr/observe.js";
 import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta, writeHsrMeta, type HsrMeta } from "../src/hsr/runDir.js";
 import { listMessages } from "../src/buz.js";
 import { createNeedsInputDispatcher } from "../src/daemon/needsInput.js";
@@ -173,6 +173,47 @@ test("needs-input dispatcher: routes to living parent, de-dupes, escalates when 
     } finally {
       for (const handle of handles) await handle.stop().catch(() => undefined);
     }
+  });
+});
+
+test("needs-input dispatcher consumes the per-tick event snapshot when provided", async () => {
+  await withTempStore(async () => {
+    const childRecord = hsrRecord("snapshot-child", { id: "snapshot-child-id", parentId: "snapshot-parent-id" });
+    const parentRecord = hsrRecord("snapshot-parent", { id: "snapshot-parent-id" });
+    const dispatch = createNeedsInputDispatcher();
+    const states = new Map<string, BeeState>([
+      ["snapshot-child", "blocked"],
+      ["snapshot-parent", "idle_with_output"],
+    ]);
+    const observation: HsrObservation = {
+      live: true,
+      state: "blocked",
+      snapshot: "",
+      eventSnapshot: {
+        events: [],
+        tailEvents: [],
+        usage: { totals: null },
+        pendingNeedsInput: {
+          requestId: "snap-1",
+          ts: 42,
+          kind: "question",
+          question: "from snapshot?",
+        },
+      },
+    };
+
+    const outcomes = await dispatch(
+      [childRecord, parentRecord],
+      states,
+      new Map([["snapshot-child", observation]]),
+    );
+
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0]!.routedTo, "snapshot-parent");
+    assert.equal(outcomes[0]!.requestId, "snap-1");
+    const queued = await listMessages("snapshot-parent", "queue");
+    assert.equal(queued.length, 1);
+    assert.match(queued[0]!.message.body, /from snapshot\?/);
   });
 });
 

@@ -295,3 +295,25 @@ test("kill_failed still wins over node_unreachable", () => {
   });
   assert.equal(result.state, "kill_failed");
 });
+
+test("HSR structured terminal states do not reuse the last prompt as detail", () => {
+  for (const state of ["dead", "error", "kill_failed", "node_unreachable"] as const) {
+    const result = deriveState(
+      bee({
+        substrate: "hsr",
+        node: "mini01",
+        lastPrompt: "deploy prod",
+        lastPromptAt: "2026-05-28T11:30:00.000Z",
+        lastError: "runner failed",
+      }),
+      {
+        liveTargets: new Set(),
+        hsrLive: new Set(["alpha"]),
+        hsrStates: new Map([["alpha", state]]),
+        now: NOW,
+      },
+    );
+    assert.equal(result.state, state);
+    assert.notEqual(result.detail, "deploy prod");
+  }
+});

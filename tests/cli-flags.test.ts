@@ -91,9 +91,9 @@ test("hive run / x / brief reject a bare prompt flag; spawn rejects bare --cwd",
 
 test("hive spawn validates --count from the raw flag value", { timeout: 30_000 }, async () => {
   await withStore(async (dir) => {
-    assert.match(await hiveExpectFail(dir, "spawn", "codex", "--count", "0"), /--count must be an integer >= 2/);
-    assert.match(await hiveExpectFail(dir, "spawn", "codex", "--count", "nope"), /--count must be an integer >= 2/);
-    assert.match(await hiveExpectFail(dir, "spawn", "codex", "--count"), /--count must be an integer >= 2/);
+    assert.match(await hiveExpectFail(dir, "spawn", "codex", "--count", "0"), /--count must be an integer >= 1/);
+    assert.match(await hiveExpectFail(dir, "spawn", "codex", "--count", "nope"), /--count must be an integer >= 1/);
+    assert.match(await hiveExpectFail(dir, "spawn", "codex", "--count"), /--count must be an integer >= 1/);
   });
 });
 
@@ -111,6 +111,12 @@ test("hive run refuses swarm spawns (--count / --frame)", { timeout: 30_000 }, a
   await withStore(async (dir) => {
     assert.match(await hiveExpectFail(dir, "run", "codex", "-p", "hi", "--count", "2"), /hive run spawns a single bee/);
     assert.match(await hiveExpectFail(dir, "run", "codex", "-p", "hi", "--frame", "review"), /hive run spawns a single bee/);
+  });
+});
+
+test("hive run reserves -n for --wait output rows and tells no-wait callers to use --lines", { timeout: 30_000 }, async () => {
+  await withStore(async (dir) => {
+    assert.match(await hiveExpectFail(dir, "run", "codex", "-p", "hi", "-n", "5"), /-n is only for --wait output rows; use --lines/);
   });
 });
 
@@ -257,6 +263,29 @@ test("hive flow status --json reports orphaned for a running meta with a dead pi
 
     const { stdout } = await hive(dir, "flow", "status", "run-1", "--json");
     assert.equal(JSON.parse(stdout).meta.status, "orphaned");
+  });
+});
+
+test("hive flow logs -n prints exactly n lines even without a trailing newline", { timeout: 30_000 }, async () => {
+  await withStore(async (dir) => {
+    const runDir = join(dir, "flows", "myflow", "runs", "run-1");
+    await mkdir(runDir, { recursive: true });
+    const meta = {
+      runId: "run-1",
+      flowName: "myflow",
+      args: {},
+      status: "ok",
+      startedAt: "2026-06-01T00:00:00.000Z",
+      endedAt: "2026-06-01T00:00:01.000Z",
+    };
+    await writeFile(join(runDir, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`);
+    await writeFile(join(runDir, "log.txt"), "one\ntwo\nthree");
+    const noTrailing = await hive(dir, "flow", "logs", "run-1", "-n", "2");
+    assert.equal(noTrailing.stdout, "two\nthree\n");
+
+    await writeFile(join(runDir, "log.txt"), "one\ntwo\nthree\n");
+    const trailing = await hive(dir, "flow", "logs", "run-1", "--lines", "2");
+    assert.equal(trailing.stdout, "two\nthree\n");
   });
 });
 

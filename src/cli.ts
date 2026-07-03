@@ -30,7 +30,7 @@ import {
   syncAllAccountCredentialsToVault,
   vaultRoot,
 } from "./accounts.js";
-import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { agentKinds, autoAliasForcesYolo, bootMsForAgent, defaultsToSoleCredentialedAccount, identityEnvForAgent, identityRecipeForAgent, sessionPinnedInArgs, type IdentityRecipe } from "./drivers.js";
 import { mapWithConcurrency } from "./concurrency.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
@@ -96,7 +96,7 @@ import {
 } from "./buz.js";
 import { beeConfig, briefFooter, configPath, loadConfig, NAMING_EFFORTS, resetConfigCache, spawnDefaultSubstrate, type NamingEffort } from "./config.js";
 import { getCompletions, shellScript } from "./completion.js";
-import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, type Frame } from "./frame.js";
+import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, writeFrameFromValidatedObject, type Frame } from "./frame.js";
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
 import { executeFlow } from "./flow/run.js";
 import { cancelRun, spawnDetachedRun } from "./flow/background.js";
@@ -431,9 +431,14 @@ async function maybeLinkHere(parsed: Parsed, records: SessionRecord[]): Promise<
     console.error(note("--here ignored: not inside tmux (plain spawn done)"));
     return;
   }
-  const local = records.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
-  if (local.length < records.length) {
-    console.error(note(`--here skips ${records.length - local.length} remote bee(s) — link-window cannot cross tmux servers`));
+  const local = records.filter((record) => record.substrate !== "hsr" && (!record.node || record.node === LOCAL_NODE_NAME));
+  const paneLess = records.filter((record) => record.substrate === "hsr").length;
+  const remote = records.filter((record) => record.substrate !== "hsr" && record.node && record.node !== LOCAL_NODE_NAME).length;
+  if (paneLess > 0) {
+    console.error(note(`--here skips ${paneLess} pane-less HSR bee(s) — no tmux window to link`));
+  }
+  if (remote > 0) {
+    console.error(note(`--here skips ${remote} remote bee(s) — link-window cannot cross tmux servers`));
   }
   if (local.length === 0) return;
   try {
@@ -455,7 +460,7 @@ function resolveSpawnCount(parsed: Parsed): number {
   if (raw === undefined) return 1;
   const value = typeof raw === "string" ? Number(raw) : NaN;
   if (Number.isInteger(value) && value >= 1) return value;
-  throw new Error(`--count must be an integer >= 2 (got ${raw === true ? "no value" : String(raw)})`);
+  throw new Error(`--count must be an integer >= 1 (got ${raw === true ? "no value" : String(raw)})`);
 }
 
 type SpawnOptions = {
@@ -715,9 +720,9 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // Pin the bee to its own provider session id from birth so the transcript
   // matcher anchors on it (+1000) instead of cross-matching a sibling's file by
   // mtime — the auto-titler and resume/swap all key off providerSessionId. Skip
-  // when the caller already supplied --session-id in extra args.
+  // when the caller already supplied the driver's session-pin flag in extra args.
   let pinnedSessionId: string | undefined;
-  if (!opts.extraArgs?.includes("--session-id")) {
+  if (!sessionPinnedInArgs(spec.kind, opts.extraArgs ?? [])) {
     const sid = randomUUID();
     const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
     if (sessionArgs) {
@@ -952,7 +957,7 @@ async function resolveSpawnAgentWithAuto(requested: string, parsed: Parsed): Pro
   const alias = spawnAccountAliasResolver(requested, parsed);
   if (alias) return { agent: alias.agent, account: await alias.account() };
   const resolved = await resolveSpawnAgent(requested);
-  const defaultAccount = await defaultBareGrokAccount(requested, parsed, resolved);
+  const defaultAccount = await defaultSoleCredentialedAccount(requested, parsed, resolved);
   return defaultAccount ? { agent: defaultAccount.tool, account: defaultAccount } : resolved;
 }
 
@@ -969,17 +974,23 @@ function spawnAccountAliasResolver(requested: string, parsed: Parsed): SpawnAcco
   return undefined;
 }
 
-async function defaultBareGrokAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
-  if (resolved.account || resolved.agent !== "grok" || requested.trim().toLowerCase() !== "grok") return undefined;
+/**
+ * For tools with the registry's soleCredentialedAccountDefault capability
+ * (grok today): a bare `<tool>` spawn with no account/home/profile flags
+ * defaults to the only credentialed account for that tool.
+ */
+async function defaultSoleCredentialedAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
+  const tool = resolved.agent;
+  if (resolved.account || !defaultsToSoleCredentialedAccount(tool) || requested.trim().toLowerCase() !== tool) return undefined;
   if (hasFlag(parsed, "account") || hasFlag(parsed, "home") || hasFlag(parsed, "profile")) return undefined;
-  const accounts = (await listAccounts()).filter((account) => account.tool === "grok");
+  const accounts = (await listAccounts()).filter((account) => account.tool === tool);
   const credentialed: AccountRecord[] = [];
   for (const account of accounts) {
     if (await accountHasCredentials(account)) credentialed.push(account);
   }
   if (credentialed.length !== 1) return undefined;
   const account = credentialed[0]!;
-  console.error(note(`account default → ${account.id} — bare grok uses the only Grok account with credentials`));
+  console.error(note(`account default → ${account.id} — bare ${tool} uses the only ${tool} account with credentials`));
   return account;
 }
 
@@ -1105,8 +1116,9 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${useHsr ? "hsr" : node?.name ?? LOCAL_NODE_NAME}`);
   if (truthy(flag(parsed, "briefed")) && briefText) {
-    record = await deliverBrief(parsed, record, briefText);
-    timer.mark("brief");
+    const delivered = await deliverSpawnBrief(parsed, record, briefText);
+    record = delivered.record;
+    timer.mark(delivered.sent ? "brief" : "ready");
   } else {
     await confirmSpawnReady(parsed, record);
     timer.mark("ready");
@@ -1521,8 +1533,12 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
         provider: beeProvider,
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
-      if (toDeliver) record = await deliverBrief(parsed, record, toDeliver);
-      else unbriefed.push(record);
+      if (toDeliver) {
+        const delivered = await deliverSpawnBrief(parsed, record, toDeliver);
+        record = delivered.record;
+      } else {
+        unbriefed.push(record);
+      }
       records.push(record);
       if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`caste:${caste.name}`), dim(`@${swarmId}`)]));
       else console.log(`${record.name}\t${record.agent}\t${cwd}\t${caste.name}\t@${swarmId}`);
@@ -1870,7 +1886,7 @@ async function cmdMove(parsed: Parsed) {
 async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: string): Promise<SessionRecord> {
   try {
     await waitForAgentReady(record, {
-      timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+      timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
       acceptTrust: acceptsTrust(parsed),
       raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
     });
@@ -1911,6 +1927,21 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
   return updated;
 }
 
+async function deliverSpawnBrief(parsed: Parsed, record: SessionRecord, briefText: string): Promise<{ record: SessionRecord; sent: boolean }> {
+  try {
+    return { record: await deliverBrief(parsed, record, briefText), sent: true };
+  } catch (error) {
+    if (!(error instanceof AgentReadinessError)) throw error;
+    warnSpawnReadiness(record, error);
+    return { record, sent: false };
+  }
+}
+
+function warnSpawnReadiness(record: SessionRecord, error: AgentReadinessError): void {
+  if (isPretty()) console.error(actionLine("warn", "spawn", [`${bold(record.name)} not confirmed ready (${error.reason})`]));
+  else console.error(`warn\tspawn\t${record.name}\t${error.reason}`);
+}
+
 /**
  * After a bare spawn, wait for the freshly spawned bee to reach its prompt,
  * auto-accepting any startup trust/safety prompt along the way (e.g. codex's
@@ -1930,7 +1961,7 @@ async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise
   }
   try {
     await waitForAgentReady(record, {
-      timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+      timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
       acceptTrust: acceptsTrust(parsed),
       raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
     });
@@ -1938,8 +1969,7 @@ async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise
     await writeHiveState(record, "waiting");
   } catch (error) {
     if (!(error instanceof AgentReadinessError)) throw error;
-    if (isPretty()) console.error(actionLine("warn", "spawn", [`${bold(record.name)} not confirmed ready (${error.reason})`]));
-    else console.error(`warn\tspawn\t${record.name}\t${error.reason}`);
+    warnSpawnReadiness(record, error);
   }
 }
 
@@ -2014,7 +2044,7 @@ async function cmdSend(parsed: Parsed) {
 async function cmdAnswer(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive answer <bee> [text]");
-  const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ") ?? "";
+  const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ");
   const answer = text.length > 0 ? text : "yes";
 
   const record = await resolveSession(target);
@@ -3903,8 +3933,9 @@ async function liveTmuxRootBinds(): Promise<Map<string, string>> {
   const result = await tmux(["list-keys", "-T", "root"], { reject: false });
   if (!result.ok) return binds;
   for (const line of result.stdout.split("\n")) {
-    // Format: `bind-key -T root M-b <command...>`. Find the table+key, take the rest.
-    const match = line.match(/^bind-key\s+(?:-r\s+)?-T\s+root\s+(\S+)\s+(.*)$/);
+    // Format: `bind-key [-r] [-N note] -T root M-b <command...>`.
+    // tmux may decorate binds before the table flag; keep the command tail intact.
+    const match = line.match(/^bind-key\s+(?:(?:-[nr]\s+)|(?:-N\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S+)\s+))*-T\s+root\s+(\S+)\s+(.*)$/);
     if (!match) continue;
     const key = match[1]!;
     const command = match[2]!.trim();
@@ -4146,7 +4177,7 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     // branch). Pin a fresh provider session id when NOT resuming (resume already
     // carries continuity via its baked-in args).
     let pinnedSessionId: string | undefined;
-    if (decision.mode !== "resume" && !spec.args.includes("--session-id")) {
+    if (decision.mode !== "resume" && !sessionPinnedInArgs(spec.kind, spec.args)) {
       const sid = randomUUID();
       const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
       if (sessionArgs) {
@@ -4644,7 +4675,7 @@ async function waitForPromptReady(record: SessionRecord, parsed: Parsed): Promis
   if (record.substrate === "hsr") return;
   try {
     await waitForAgentReady(record, {
-      timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+      timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
       acceptTrust: acceptsTrust(parsed),
       raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
     });
@@ -4675,6 +4706,10 @@ async function cmdRun(parsed: Parsed) {
   if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--account <name|auto>] [--yolo] [--wait] [--last] [--rm|--cleanup] [-- <bee-args...>]");
   if (truthy(flag(parsed, "keep")) && cleanupAfterRun(parsed)) throw new Error("--keep cannot be combined with --rm/--cleanup");
   assertSingleBeeInvocation(parsed, "hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
+  const waited = truthy(flag(parsed, "wait"));
+  if (!waited && hasFlag(parsed, "n")) {
+    throw new Error("hive run: -n is only for --wait output rows; use --lines for the no-wait pane preview");
+  }
 
   // The waitForPromptReady below is authoritative; skip spawn's own readiness
   // confirmation so a slow boot is only waited for once.
@@ -4686,7 +4721,7 @@ async function cmdRun(parsed: Parsed) {
     await waitForPromptReady(record, parsed);
     const now = await deliverPromptToBee(record, prompt);
 
-    if (truthy(flag(parsed, "wait"))) {
+    if (waited) {
       const outcome = await waitForIdle({
         record: { ...record, lastPrompt: prompt, lastPromptAt: now },
         idleMs: numberFlag(parsed, ["idle-ms", "idle"], 3_000),
@@ -4700,7 +4735,7 @@ async function cmdRun(parsed: Parsed) {
     } else {
       const waitMs = Number(flag(parsed, "wait-ms") ?? 1000);
       if (waitMs > 0) await sleep(waitMs);
-      const lines = Number(flag(parsed, "n") ?? flag(parsed, "lines") ?? 80);
+      const lines = Number(flag(parsed, "lines") ?? 80);
       console.log(await substrateFor(record).capture(record.tmuxTarget, Number.isFinite(lines) ? lines : 80, record.agentPaneId));
     }
   } finally {
@@ -4717,7 +4752,6 @@ async function cmdRun(parsed: Parsed) {
     }
   }
 
-  const waited = truthy(flag(parsed, "wait"));
   if (cleanup) {
     return;
   }
@@ -6647,7 +6681,7 @@ async function frameUpdate(parsed: Parsed) {
   if (!(await frameExists(draft.name))) {
     throw new Error(`Unknown frame: ${draft.name}. Use 'hive frame define' to create a new one.`);
   }
-  const frame = await defineFrameFromFile(sourcePath);
+  const frame = await writeFrameFromValidatedObject(draft, { sourcePath: absolute, ledger: true });
   if (isPretty()) console.log(actionLine("ok", "frame", [bold(frame.name), dim("updated"), dim(sourcePath)]));
   else console.log(`updated\t${frame.name}\t${sourcePath}`);
 }
@@ -7046,7 +7080,7 @@ async function nodeRegister(parsed: Parsed) {
   const name = parsed.args[1];
   if (!name) throw new Error("Usage: hive node register <name> --kind <local-tmux|ssh-tmux|remote-hsr> --endpoint <addr> [--capabilities a,b,c] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"-F /path/to/config\"] [--auth-policy <local-only|ephemeral-token|api-key>]");
   const kindRaw = flag(parsed, "kind");
-  if (typeof kindRaw !== "string") throw new Error("--kind is required (local-tmux or ssh-tmux)");
+  if (typeof kindRaw !== "string") throw new Error("--kind is required (local-tmux, ssh-tmux, or remote-hsr)");
   const endpointRaw = flag(parsed, "endpoint");
   if (typeof endpointRaw !== "string") throw new Error("--endpoint is required");
   const capabilitiesRaw = flag(parsed, "capabilities");
@@ -7922,18 +7956,15 @@ async function loopLogsCmd(parsed: Parsed) {
 }
 
 async function followLoopLog(loopId: string): Promise<void> {
-  let previous = "";
-  const printDelta = (next: string) => {
-    if (next.length > previous.length) {
-      process.stdout.write(next.slice(previous.length));
-    } else if (next !== previous) {
-      // Log was rotated/rewritten — reprint from scratch.
-      process.stdout.write(next);
-    }
-    previous = next;
+  const path = runLogPath("loop", loopId);
+  let offset = 0;
+  const printAppended = async () => {
+    const result = await readLogSince(path, offset);
+    offset = result.offset;
+    if (result.text.length > 0) process.stdout.write(result.text);
   };
   while (true) {
-    printDelta(await readLogFull("loop", loopId));
+    await printAppended();
     const cfg = await readLoopConfig(loopId).catch(() => null);
     if (cfg && cfg.status !== "running") break;
     if (cfg && cfg.status === "running" && typeof cfg.pid === "number" && !processAlive(cfg.pid)) {
@@ -7943,7 +7974,31 @@ async function followLoopLog(loopId: string): Promise<void> {
     await sleep(1_000);
   }
   // One final read: catch lines appended between the last read and the status flip.
-  printDelta(await readLogFull("loop", loopId));
+  await printAppended();
+}
+
+async function readLogSince(path: string, offset: number): Promise<{ text: string; offset: number }> {
+  const info = await stat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!info?.isFile()) return { text: "", offset: 0 };
+  const start = info.size < offset ? 0 : offset;
+  const length = info.size - start;
+  if (length <= 0) return { text: "", offset: info.size };
+
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    handle = await open(path, "r");
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    return { text: buffer.subarray(0, bytesRead).toString("utf8"), offset: start + bytesRead };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { text: "", offset: 0 };
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
 function processAlive(pid: number): boolean {
@@ -7967,7 +8022,8 @@ async function loopStopCmd(parsed: Parsed) {
     // cancelRun SIGKILLs the driver's process group, so the driver's own
     // finalize() may never run and loop.json would be stuck at "running".
     // Reconcile it here so `hive loop status/list` reports a terminal state.
-    if (cfg.status === "running") {
+    const latestCfg = await readLoopConfig(loopId).catch(() => null);
+    if (latestCfg?.status === "running") {
       await updateLoopConfig(loopId, { status: "stopped", stopReason: "stopped:now", endedAt: new Date().toISOString() }).catch(
         () => undefined,
       );
@@ -8239,64 +8295,61 @@ async function daemonStatus(parsed: Parsed) {
   const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(status, null, 2));
-    process.exit(exitCode);
-  }
-  const installedTag = status.installed ? "installed" : "not-installed";
-  if (!isPretty()) {
-    const dot = status.running ? (status.stale ? "STALE" : "running") : "down";
-    console.log(`${dot}\t${installedTag}\t${status.lock?.pid ?? ""}\t${status.state?.startedAt ?? ""}\t${status.state?.lastTickAt ?? ""}\t${status.state?.tickCount ?? 0}`);
-    process.exit(exitCode);
-  }
-  if (!status.running) {
-    console.log(`${red("○")} ${bold("hive daemon")} ${dim("down")} ${dim(`(${installedTag})`)}`);
-    if (status.installed && status.plistPath) {
-      console.log(dim(`  plist: ${status.plistPath}`));
-    } else if (!status.installed) {
-      console.log(dim(`  hint: hive daemon install`));
-    }
-    if (status.lock) console.log(dim(`  stale lock: pid ${status.lock.pid} (${status.lock.startedAt})`));
-    if (status.state) {
-      console.log(dim(`  last state.json: pid ${status.state.pid} startedAt ${status.state.startedAt}`));
-      console.log(dim(`  last tick: ${status.state.lastTickAt ?? "(none)"} ticks=${status.state.tickCount}`));
-    }
-    process.exit(3);
-  }
-  if (status.stale) {
-    const reasonLabels: Record<string, string> = {
-      "loop-stale": "loop heartbeat stale",
-      "tick-progress-stale": "tick progress stale",
-      "recent-errors-saturated": "recent errors saturated",
-      "missing-state": "state missing",
-    };
-    const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
-    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
-    if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
-    if (status.state) {
-      console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
-      console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
-      if (status.state.recentErrors.length > 0) {
-        console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
-        for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+  } else {
+    const installedTag = status.installed ? "installed" : "not-installed";
+    if (!isPretty()) {
+      const dot = status.running ? (status.stale ? "STALE" : "running") : "down";
+      console.log(`${dot}\t${installedTag}\t${status.lock?.pid ?? ""}\t${status.state?.startedAt ?? ""}\t${status.state?.lastTickAt ?? ""}\t${status.state?.tickCount ?? 0}`);
+    } else if (!status.running) {
+      console.log(`${red("○")} ${bold("hive daemon")} ${dim("down")} ${dim(`(${installedTag})`)}`);
+      if (status.installed && status.plistPath) {
+        console.log(dim(`  plist: ${status.plistPath}`));
+      } else if (!status.installed) {
+        console.log(dim(`  hint: hive daemon install`));
+      }
+      if (status.lock) console.log(dim(`  stale lock: pid ${status.lock.pid} (${status.lock.startedAt})`));
+      if (status.state) {
+        console.log(dim(`  last state.json: pid ${status.state.pid} startedAt ${status.state.startedAt}`));
+        console.log(dim(`  last tick: ${status.state.lastTickAt ?? "(none)"} ticks=${status.state.tickCount}`));
+      }
+    } else if (status.stale) {
+      const reasonLabels: Record<string, string> = {
+        "loop-stale": "loop heartbeat stale",
+        "tick-progress-stale": "tick progress stale",
+        "recent-errors-saturated": "recent errors saturated",
+        "missing-state": "state missing",
+      };
+      const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
+      console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
+      if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
+      if (status.state) {
+        console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+        console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
+        if (status.state.recentErrors.length > 0) {
+          console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
+          for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+        }
+      }
+      console.log(dim(`  hint: hive daemon restart`));
+    } else {
+      console.log(`${green("●")} ${bold("hive daemon")} ${dim("running")} ${dim(`(${installedTag})`)}`);
+      if (status.installed && status.plistPath) {
+        console.log(`  plist ${status.plistPath}`);
+      }
+      if (status.lock) {
+        console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
+      }
+      if (status.state) {
+        console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+        if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
+        if (status.state.recentErrors.length > 0) {
+          console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
+          for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+        }
       }
     }
-    console.log(dim(`  hint: hive daemon restart`));
-    process.exit(4);
   }
-  console.log(`${green("●")} ${bold("hive daemon")} ${dim("running")} ${dim(`(${installedTag})`)}`);
-  if (status.installed && status.plistPath) {
-    console.log(`  plist ${status.plistPath}`);
-  }
-  if (status.lock) {
-    console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
-  }
-  if (status.state) {
-    console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
-    if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
-    if (status.state.recentErrors.length > 0) {
-      console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
-      for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
-    }
-  }
+  process.exit(exitCode);
 }
 
 async function cmdBuz(parsed: Parsed) {
@@ -8446,14 +8499,7 @@ async function buzRead(parsed: Parsed) {
   const consume = truthy(flag(parsed, "consume"));
   const beeRef = typeof flag(parsed, "bee") === "string" ? String(flag(parsed, "bee")) : undefined;
   const candidates = beeRef ? [await resolveSession(beeRef)] : await listSessions();
-  let found: { message: BuzMessage; bee: string; path: string; mailbox: string } | null = null;
-  for (const record of candidates) {
-    const result = await readMessageById(record.name, id);
-    if (result) {
-      found = { message: result.message, bee: record.name, path: result.path, mailbox: result.mailbox };
-      break;
-    }
-  }
+  const found = await findBuzMessage(candidates, id);
   if (!found) throw new Error(`No buz message found with id: ${id}`);
 
   let consumed = false;
@@ -8480,6 +8526,22 @@ async function buzRead(parsed: Parsed) {
     body: found.message.body,
     consumed,
   }, null, 2));
+}
+
+type BuzReadMatch = { message: BuzMessage; bee: string; path: string; mailbox: string };
+const BUZ_READ_LOOKUP_CONCURRENCY = 16;
+
+async function findBuzMessage(candidates: SessionRecord[], id: string): Promise<BuzReadMatch | null> {
+  for (let i = 0; i < candidates.length; i += BUZ_READ_LOOKUP_CONCURRENCY) {
+    const batch = candidates.slice(i, i + BUZ_READ_LOOKUP_CONCURRENCY);
+    const matches = await Promise.all(batch.map(async (record): Promise<BuzReadMatch | null> => {
+      const result = await readMessageById(record.name, id);
+      return result ? { message: result.message, bee: record.name, path: result.path, mailbox: result.mailbox } : null;
+    }));
+    const found = matches.find((match): match is BuzReadMatch => match !== null);
+    if (found) return found;
+  }
+  return null;
 }
 
 async function buzPurge(parsed: Parsed) {
@@ -9010,18 +9072,6 @@ function acceptsTrust(parsed: Parsed): boolean {
   return true;
 }
 
-function defaultBootMs(agent: string): number {
-  switch (agent) {
-    case "claude": return 15_000;
-    case "codex": return 30_000;
-    case "opencode": return 15_000;
-    case "grok": return 10_000;
-    case "droid": return 5_000;
-    case "pi": return 10_000;
-    default: return 10_000;
-  }
-}
-
 function dangerousMode(parsed: Parsed, agent?: string, requested?: string, profileYolo?: boolean): boolean {
   // Explicit per-spawn opt-out always wins.
   if (truthy(flag(parsed, "no-yolo"))) return false;
@@ -9035,7 +9085,10 @@ function dangerousMode(parsed: Parsed, agent?: string, requested?: string, profi
     names.some((name) => truthyEnv(process.env[`HIVE_${envSuffix(name)}_YOLO`]))
   ) return true;
   if (names.some((name) => beeConfig(name).yolo === true)) return true;
-  if (requested && autoAccountTool(requested) === "codex") return true;
+  // `<tool>-auto` alias for a harness whose registry entry forces yolo on
+  // auto-picked accounts (codex today) — wins over the thin-profile override.
+  const autoTool = requested ? autoAccountTool(requested) : undefined;
+  if (autoTool && autoAliasForcesYolo(autoTool)) return true;
   // Thin-profile yolo override (precedence FLAG > config bee yolo > PROFILE >
   // per-agent default).
   if (profileYolo !== undefined) return profileYolo;
@@ -9176,31 +9229,38 @@ async function cmdAccount(parsed: Parsed) {
 async function accountList(parsed: Parsed) {
   const accounts = await listAccounts();
   const now = Date.now();
-  const rows: string[][] = [];
-  const jsonRows: Record<string, unknown>[] = [];
-  for (const account of accounts) {
-    const summary = await usageSummary(account.id, now);
-    const hasCreds = await accountHasCredentials(account);
+  const json = truthy(flag(parsed, "json"));
+  const accountRows = await Promise.all(accounts.map(async (account) => {
+    const [summary, hasCreds] = await Promise.all([
+      usageSummary(account.id, now),
+      accountHasCredentials(account),
+    ]);
     const exhausted = isRecentlyExhausted(summary, now);
-    if (truthy(flag(parsed, "json"))) {
-      jsonRows.push({ ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null });
-      continue;
+    if (json) {
+      return {
+        json: { ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null },
+        row: null,
+      };
     }
     const state = !hasCreds ? yellow("no-creds") : exhausted ? red("exhausted") : green("ok");
-    rows.push([
-      account.id,
-      account.tool,
-      account.provider ?? "-",
-      account.label,
-      isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
-      summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
-      summary.lastResetHint ?? "-",
-    ]);
-  }
-  if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify(jsonRows, null, 2));
+    return {
+      json: null,
+      row: [
+        account.id,
+        account.tool,
+        account.provider ?? "-",
+        account.label,
+        isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
+        summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
+        summary.lastResetHint ?? "-",
+      ],
+    };
+  }));
+  if (json) {
+    console.log(JSON.stringify(accountRows.map((entry) => entry.json), null, 2));
     return;
   }
+  const rows = accountRows.map((entry) => entry.row).filter((row): row is string[] => row !== null);
   if (rows.length === 0) {
     console.log(note("no accounts registered; add one with: hive account add <tool> <label>"));
     return;
@@ -9376,8 +9436,7 @@ async function cmdUsageSamples(parsed: Parsed) {
     ? [(await findAccount(query)).id]
     : [...new Set([...accounts.map((account) => account.id), ...(await listUsageAccounts())])];
 
-  const summaries = [];
-  for (const id of ids) summaries.push(await usageSummary(id, now));
+  const summaries = await Promise.all(ids.map((id) => usageSummary(id, now)));
 
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(summaries, null, 2));

@@ -20,7 +20,7 @@
 // Never throws — per-bee errors are captured into the outcome.
 
 import { sendBuzMessage, type BuzSender } from "../buz.js";
-import { pendingNeedsInput, type PendingNeedsInput } from "../hsr/observe.js";
+import { pendingNeedsInput, type HsrObservation, type PendingNeedsInput } from "../hsr/observe.js";
 import { isTerminalState, type BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
 
@@ -68,18 +68,22 @@ function dedupeKey(bee: string, pending: PendingNeedsInput): string {
 export function createNeedsInputDispatcher(): (
   records: SessionRecord[],
   currentStates: Map<string, BeeState>,
+  hsrObservations?: ReadonlyMap<string, HsrObservation>,
 ) => Promise<NeedsInputOutcome[]> {
   // Persists across ticks for the life of the daemon run so each needs_input is
   // routed exactly once.
   const handled = new Set<string>();
 
-  return async (records, currentStates) => {
+  return async (records, currentStates, hsrObservations) => {
     const outcomes: NeedsInputOutcome[] = [];
     for (const record of records) {
       if (record.substrate !== "hsr") continue;
       if (currentStates.get(record.name) !== "blocked") continue;
       try {
-        const pending = await pendingNeedsInput(record.name);
+        const observed = hsrObservations?.get(record.name);
+        const pending = observed?.live && observed.eventSnapshot
+          ? observed.eventSnapshot.pendingNeedsInput
+          : await pendingNeedsInput(record.name);
         if (!pending) continue;
         const key = dedupeKey(record.name, pending);
         if (handled.has(key)) continue;

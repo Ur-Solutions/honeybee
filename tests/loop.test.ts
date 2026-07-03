@@ -33,12 +33,12 @@ import {
   truncateForInjection,
 } from "../src/loop/summarizer.js";
 import { __setLoopTestHooks, loopFlow } from "../src/loop/flow.js";
-import { listFlows, loadFlow } from "../src/flow/index.js";
+import { listFlows, loadFlow, type FlowContext } from "../src/flow/index.js";
 import { executeFlow } from "../src/flow/run.js";
 import { HiveFacade } from "../src/flow/hive_facade.js";
 import { cancelRun, spawnDetachedRun } from "../src/flow/background.js";
 import { defineFlow } from "../src/flow/index.js";
-import { readMeta, readResult } from "../src/flow/runs.js";
+import { createRunDir, readMeta, readResult } from "../src/flow/runs.js";
 import { recordSeal, type SealRecord, validateSealArtifact } from "../src/seal.js";
 import { saveSession, type SessionRecord } from "../src/store.js";
 
@@ -57,6 +57,26 @@ async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> 
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withFixedDate<T>(iso: string, fn: () => Promise<T>): Promise<T> {
+  const RealDate = globalThis.Date;
+  const fixedMs = RealDate.parse(iso);
+  const FixedDate = class extends RealDate {
+    constructor(...args: unknown[]) {
+      super(args.length === 0 ? fixedMs : (args[0] as string | number | Date));
+    }
+
+    static now(): number {
+      return fixedMs;
+    }
+  } as DateConstructor;
+  globalThis.Date = FixedDate;
+  try {
+    return await fn();
+  } finally {
+    globalThis.Date = RealDate;
+  }
 }
 
 function fakeRecord(name: string): SessionRecord {
@@ -526,6 +546,38 @@ test("driver: stops on max", async () => {
   });
 });
 
+test("driver: maxDuration is checked before starting a pass", async () => {
+  await withTempStore(async () => {
+    let ensureCalled = false;
+    let nowCalls = 0;
+    __setLoopTestHooks({
+      ensureBee: async () => {
+        ensureCalled = true;
+        throw new Error("must not spawn after maxDuration is already due");
+      },
+      now: () => {
+        nowCalls += 1;
+        return nowCalls === 1 ? 1_000 : 2_500;
+      },
+    });
+    try {
+      const outcome = await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "ralph", max: 50, maxDuration: "1s", stopOnSeal: "done", loopId: "DUE1" },
+        runId: "DUE1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("DUE1");
+      assert.equal(ensureCalled, false);
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "max-duration");
+      assert.equal(cfg?.iteration, 0);
+      assert.equal((outcome.value as { stopReason: string }).stopReason, "max-duration");
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
 test("driver: blank --stop-on-seal never stops on seals", async () => {
   await withTempStore(async () => {
     installDriverHooks(() => "done");
@@ -727,6 +779,45 @@ test("driver: a seal landing BEFORE the boundary wait starts is still detected (
   });
 });
 
+test("driver: same-millisecond seal after baseline is detected by filename cursor", async () => {
+  await withTempStore(async () => {
+    const beeName = "loop-same-ms";
+    await withFixedDate("2026-07-03T12:01:00.123Z", async () => {
+      await recordSeal(beeName, validateSealArtifact({ status: "failed", summary: "old baseline" }));
+    });
+    __setLoopTestHooks({
+      ensureBee: async ({ facade }) => {
+        const record = fakeRecord(beeName);
+        await saveSession(record);
+        (facade as unknown as { spawned: SessionRecord[] }).spawned.push(record);
+        return record;
+      },
+      send: async ({ handle }) => {
+        await withFixedDate("2026-07-03T12:01:00.123Z", async () => {
+          await recordSeal(handle.name, validateSealArtifact({ status: "done", summary: "new same-ms seal" }));
+        });
+      },
+      sealTimeoutMs: 5_000,
+      boundaryPollMs: 10,
+    });
+    try {
+      await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "persistent", max: 5, stopOnSeal: "done", loopId: "SAMEMS1" },
+        runId: "SAMEMS1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("SAMEMS1");
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "seal:done");
+      assert.equal(cfg?.iteration, 1);
+      const iterSeal = JSON.parse(await readFile(join(process.env.HIVE_STORE_ROOT!, "loops", "SAMEMS1", "seals", "iter-001.json"), "utf8")) as SealRecord;
+      assert.equal(iterSeal.summary, "new same-ms seal");
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
 test("driver: stop-on-sentinel fires in ralph (fresh-carrier) mode", async () => {
   await withTempStore(async () => {
     // Regression: in fresh-carrier modes the bee is killed + handle cleared
@@ -828,6 +919,50 @@ test("driver: stop-request sentinel halts before the next iteration", async () =
       const cfg = await readLoopConfig("STOPREQ");
       assert.equal(cfg?.status, "stopped");
       assert.equal(cfg?.stopReason, "stop-requested");
+      assert.equal(cfg?.iteration, 0);
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
+test("driver: abort during send finalizes the loop as stopped", async () => {
+  await withTempStore(async () => {
+    const runId = "ABORTSEND";
+    await createRunDir("loop", runId);
+    const controller = new AbortController();
+    let sendCalled = false;
+    __setLoopTestHooks({
+      ensureBee: async ({ facade }) => {
+        const record = fakeRecord("abort-send-bee");
+        await saveSession(record);
+        (facade as unknown as { spawned: SessionRecord[] }).spawned.push(record);
+        return record;
+      },
+      send: async () => {
+        sendCalled = true;
+        controller.abort();
+        throw new Error("send interrupted by abort");
+      },
+    });
+    try {
+      const facade = new HiveFacade({ flowName: "loop", runId, signal: controller.signal });
+      const ctx: FlowContext = {
+        runId,
+        flowName: "loop",
+        args: { ...baseArgs, context: "ralph", max: 5, stopOnSeal: "done", loopId: runId },
+        bindings: {},
+        signal: controller.signal,
+        hive: facade,
+      };
+      const result = await loopFlow.run(ctx) as { status: string; stopReason: string; iterations: number };
+      const cfg = await readLoopConfig(runId);
+      assert.equal(sendCalled, true);
+      assert.equal(result.status, "stopped");
+      assert.equal(result.stopReason, "aborted");
+      assert.equal(result.iterations, 0);
+      assert.equal(cfg?.status, "stopped");
+      assert.equal(cfg?.stopReason, "aborted");
       assert.equal(cfg?.iteration, 0);
     } finally {
       __setLoopTestHooks(undefined);

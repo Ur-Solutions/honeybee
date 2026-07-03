@@ -16,6 +16,7 @@
 
 import * as readline from "node:readline";
 import { bold, cyan, dim, green, isPretty, red, stripAnsi, truncate, visibleLength } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 import type { LoopTemplate } from "./loopTemplate.js";
 import { fuzzyFilter, relativeTo, splitPathQuery } from "./spawnTui.js";
 
@@ -662,6 +663,7 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
       };
 
       // ── rendering ──────────────────────────────────────────────────────────
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(40, stdout.columns || 100);
@@ -679,7 +681,7 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
         const err = stage === "form" ? (naming ? nameError : formError) : pathError;
         lines.push(truncate(err ? red(err) : message, width));
         lines.push(dim(footer()));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
         parkCursor();
       };
 
