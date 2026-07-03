@@ -2,8 +2,15 @@ import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
+import {
+  rewriteColonyWorkspaceReferences,
+  rewriteQuestColonyReferences,
+  rewriteQuestWorkspaceReferences,
+  rewriteWorkspaceColonyReferences,
+  withReferenceRenameLocks,
+} from "./referenceCascade.js";
 import { appendLedger } from "./store.js";
-import { createWorkspace } from "./workspace.js";
+import { createWorkspace, loadWorkspace, saveWorkspace, workspacePath } from "./workspace.js";
 
 export type ColonyRecord = {
   name: string;
@@ -97,17 +104,37 @@ export async function updateColony(name: string, patch: { description?: string }
 export async function renameColony(oldName: string, newName: string): Promise<ColonyRecord> {
   if (!validColonyName(oldName)) throw new Error(`Invalid colony name: ${oldName}. Use alphanumerics, dashes, and underscores.`);
   if (!validColonyName(newName)) throw new Error(`Invalid colony name: ${newName}. Use alphanumerics, dashes, and underscores.`);
-  return withColoniesLock(async () => {
+  return withReferenceRenameLocks(async () => {
     const existing = await loadColony(oldName);
     if (!existing) throw new Error(`Unknown colony: ${oldName}`);
     if (oldName === newName) return existing;
     if (await loadColony(newName)) throw new Error(`Colony already exists: ${newName}`);
+
+    const ownedWorkspace = await loadWorkspace(oldName);
+    const shouldRenameOwnedWorkspace =
+      (existing.workspace === oldName || (existing.workspace === undefined && ownedWorkspace?.colony === oldName));
+    if (shouldRenameOwnedWorkspace && (await loadWorkspace(newName))) {
+      throw new Error(`Workspace already exists: ${newName}`);
+    }
+
     const updated: ColonyRecord = { ...existing, name: newName };
+    if (shouldRenameOwnedWorkspace) updated.workspace = newName;
     // Write the new record before removing the old one: a crash in between
     // leaves the colony alive under both names (an easily deleted duplicate),
     // whereas delete-first would lose the record entirely on a failed write.
     await saveColony(updated);
+    if (shouldRenameOwnedWorkspace && ownedWorkspace) {
+      await saveWorkspace({ ...ownedWorkspace, name: newName, colony: newName, updatedAt: new Date().toISOString() });
+      await rm(workspacePath(oldName), { force: true });
+      await appendLedger({ type: "workspace.rename", from: oldName, to: newName });
+    }
     await rm(colonyPath(oldName), { force: true });
+    await rewriteWorkspaceColonyReferences(oldName, newName);
+    await rewriteQuestColonyReferences(oldName, newName);
+    if (shouldRenameOwnedWorkspace) {
+      await rewriteColonyWorkspaceReferences(oldName, newName);
+      await rewriteQuestWorkspaceReferences(oldName, newName);
+    }
     await appendLedger({ type: "colony.rename", from: oldName, to: newName });
     return updated;
   });

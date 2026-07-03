@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { archiveColony, colonyExists, createColony, listColonies, loadColony, renameColony, updateColony, validColonyName } from "../src/colony.js";
+import { createQuest, loadQuest } from "../src/quest.js";
+import { createWorkspace, loadWorkspace } from "../src/workspace.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-colony-"));
@@ -102,6 +104,47 @@ test("renameColony moves the record and refuses collisions", async () => {
     await assert.rejects(renameColony("new", "blocker"), /already exists/);
     await assert.rejects(renameColony("new", "../bad"), /Invalid colony name/);
     await assert.rejects(renameColony("ghost", "x"), /Unknown colony/);
+  });
+});
+
+test("renameColony renames its auto-workspace and rewrites workspace and quest colony references", async () => {
+  await withTempStore(async () => {
+    await createColony("old", "desc");
+    await createWorkspace({ name: "quest-ws", rootDir: "", colony: "old" });
+    await createQuest({ id: "q-dedicated", title: "dedicated", colony: "old", workspace: "quest-ws" });
+    await createQuest({ id: "q-shared", title: "shared", colony: "old", workspace: "old" });
+
+    const renamed = await renameColony("old", "new");
+    assert.equal(renamed.name, "new");
+    assert.equal(renamed.workspace, "new");
+    assert.equal(await loadColony("old"), null);
+
+    const colony = await loadColony("new");
+    assert.equal(colony?.workspace, "new");
+    assert.equal(await loadWorkspace("old"), null);
+    const autoWorkspace = await loadWorkspace("new");
+    assert.equal(autoWorkspace?.colony, "new");
+
+    const questWorkspace = await loadWorkspace("quest-ws");
+    assert.equal(questWorkspace?.colony, "new");
+    const dedicatedQuest = await loadQuest("q-dedicated");
+    assert.equal(dedicatedQuest?.colony, "new");
+    assert.equal(dedicatedQuest?.workspace, "quest-ws");
+    const sharedQuest = await loadQuest("q-shared");
+    assert.equal(sharedQuest?.colony, "new");
+    assert.equal(sharedQuest?.workspace, "new");
+  });
+});
+
+test("renameColony refuses to orphan its auto-workspace on workspace name collision", async () => {
+  await withTempStore(async () => {
+    await createColony("old");
+    await createWorkspace({ name: "new", rootDir: "" });
+
+    await assert.rejects(renameColony("old", "new"), /Workspace already exists/);
+    assert.ok(await loadColony("old"));
+    assert.ok(await loadWorkspace("old"));
+    assert.ok(await loadWorkspace("new"));
   });
 });
 
