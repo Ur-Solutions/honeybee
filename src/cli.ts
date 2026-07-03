@@ -40,7 +40,7 @@ import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "./forkTui.js";
 import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
-import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
+import { acquireProSlot, createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { pickRoundRobinAccount } from "./roundRobin.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
@@ -4302,6 +4302,12 @@ async function resolveForkCheckpoint(beeName: string, checkpointArg: string | un
 
 // ── hive fork launch — the interactive dialog (⌘K) ───────────────────────────
 
+async function hasRecordedForkUsingCwd(source: SessionRecord, cwd: string): Promise<boolean> {
+  const sourceIds = new Set([source.name, ...(source.id ? [source.id] : [])]);
+  const records = await listSessions();
+  return records.some((record) => record.cwd === cwd && record.forkedFromId !== undefined && sourceIds.has(record.forkedFromId));
+}
+
 /**
  * `hive fork launch` — the interactive fork window (the ⌘K target). The SOURCE
  * is the bee owning the current pane, so the dialog opens straight on a form for
@@ -4373,12 +4379,16 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
 
   // Create the worktree/checkout up front — its path becomes the fork's --cwd.
   let cwd: string | undefined;
+  let createdSlot: { kind: ProSlotKind; repoPath: string; name: string; path: string } | undefined;
   if (intent.isolation) {
     if (!proRepo) throw new Error("hive fork launch: not a pro repo — cannot create a worktree");
     const slug = toProSlug(intent.isolation.name);
     if (!slug) throw new Error("hive fork launch: worktree name must contain letters, digits, or dashes");
     if (isPretty()) console.error(note(`creating ${intent.isolation.kind} ${slug}…`));
-    cwd = await createProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slot = await acquireProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slotPath = await realpath(slot.path).catch(() => slot.path);
+    cwd = slotPath;
+    if (slot.created) createdSlot = { kind: intent.isolation.kind, repoPath: proRepo.path, name: slug, path: slotPath };
   }
 
   // Build a `hive fork` invocation and reuse cmdFork wholesale.
@@ -4391,7 +4401,28 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
   if (cwd) flags.set("cwd", cwd);
   flags.set("here", true);
 
-  const record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  let record: SessionRecord;
+  try {
+    record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  } catch (error) {
+    if (createdSlot) {
+      const launched = await hasRecordedForkUsingCwd(source, createdSlot.path).catch((checkError) => {
+        const message = checkError instanceof Error ? checkError.message : String(checkError);
+        console.error(note(`warn: keeping ${createdSlot.kind} ${createdSlot.name}; could not verify fork records: ${message}`));
+        return true;
+      });
+      if (!launched) {
+        if (isPretty()) console.error(note(`removing ${createdSlot.kind} ${createdSlot.name} after failed fork...`));
+        try {
+          await deleteProSlot(createdSlot.kind, createdSlot.repoPath, createdSlot.name);
+        } catch (cleanupError) {
+          const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          console.error(note(`warn: failed to remove ${createdSlot.kind} ${createdSlot.name} at ${tildify(createdSlot.path)}: ${message}`));
+        }
+      }
+    }
+    throw error;
+  }
 
   if (intent.message) {
     await cmdSend({ command: "send", args: [record.name, intent.message], flags: new Map(), rest: [] });
