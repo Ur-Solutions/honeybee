@@ -295,7 +295,9 @@ export type RemoteRunnerClient = {
   connected(): boolean;
   /**
    * Invoke a remote method. Per-call timeout (default {@link DEFAULT_CALL_TIMEOUT_MS}).
-   * Rejects immediately (does not hang) when the tunnel is down.
+   * Rejects immediately (does not hang) when the tunnel is down — but each such
+   * call also kicks a background reconnect, so the session revives once the
+   * network does.
    */
   call(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
   /**
@@ -459,7 +461,8 @@ export async function connectRemoteRunnerHost(
   // RECONNECT POLICY: capped exponential backoff (base 250ms → cap 5s), a few
   // attempts (default 5). Each attempt re-runs ensureRemoteServe → forward →
   // connect and RE-ADOPTS subscriptions (via establish). On success we emit
-  // 'reconnect'; giving up after N attempts emits 'down' (calls then reject).
+  // 'reconnect'; giving up after N attempts emits 'down' (calls then reject),
+  // but the session is NOT dead for good — see kickReconnect below.
   async function reconnect(): Promise<void> {
     if (reconnecting || closedByUser) return;
     reconnecting = true;
@@ -495,6 +498,17 @@ export async function connectRemoteRunnerHost(
     if (!closedByUser) emitStatus("down", { attempts: reconnectMax });
   }
 
+  // SELF-HEAL (HIVE-9): after reconnect() exhausts its attempts it emits 'down'
+  // and leaves `current` null — nothing else would ever retry, so a blip longer
+  // than the backoff window would kill the transport for the process lifetime.
+  // Any call() or push subscription arriving while down kicks a FRESH reconnect
+  // loop (backoff reset to base); the `reconnecting` flag makes duplicate kicks
+  // no-ops while a loop is already in flight.
+  function kickReconnect(): void {
+    if (current !== null || reconnecting || closedByUser) return;
+    void reconnect();
+  }
+
   // Initial connect: a failure here rejects the caller (no reconnect loop yet).
   await establish();
   emitStatus("up", { attempt: 0 });
@@ -510,6 +524,7 @@ export async function connectRemoteRunnerHost(
     call(method: string, params?: unknown, callOpts?: { timeoutMs?: number }): Promise<unknown> {
       const c = current?.client;
       if (!c) {
+        kickReconnect();
         return Promise.reject(new Error(`remoteTransport: ${node.name} tunnel is down`));
       }
       return c.call(method, params, { timeoutMs: callOpts?.timeoutMs ?? callTimeoutMs });
@@ -534,6 +549,9 @@ export async function connectRemoteRunnerHost(
         subs.set(method, { queue: [], dropped: 0, draining: false });
         if (current) bridge(method, current.client);
       }
+      // A subscription taken while down revives the session; establish()'s
+      // re-adoption then bridges it onto the fresh client.
+      kickReconnect();
       return () => {
         set.delete(handler);
       };

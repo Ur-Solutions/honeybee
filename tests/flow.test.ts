@@ -446,6 +446,30 @@ test("loadFlow returns null when no source exists", async () => {
   });
 });
 
+test("loadFlow rejects path-traversal names instead of executing files outside the store", async () => {
+  await withTempStore(async (dir) => {
+    // Plant a fully valid .ts flow OUTSIDE the flows dir. "../evil" would
+    // resolve to <dir>/flows/../evil.ts = this file; loading it would mean
+    // arbitrary TS execution.
+    await writeFile(
+      join(dir, "evil.ts"),
+      `export default { name: "evil", run: async () => "pwned" };\n`,
+    );
+    assert.equal(await loadFlow("../evil"), null);
+    assert.equal(await flowExists("../evil"), false);
+    assert.equal(await loadFlowSource("../evil"), null);
+  });
+});
+
+test("removeFlow rejects path-traversal names instead of deleting files outside the store", async () => {
+  await withTempStore(async (dir) => {
+    await writeFile(join(dir, "victim.json"), "{}");
+    assert.equal(await removeFlow("../victim"), false);
+    // The out-of-store file must survive.
+    assert.equal(await readFile(join(dir, "victim.json"), "utf8"), "{}");
+  });
+});
+
 test("validateFlow auto-compiles a JSON shape arriving via TS default export", () => {
   // Simulates the case where a TS file ends up exporting a JSON-shaped object
   // (rare but legal) — validateFlow should route it through parseJsonFlow.

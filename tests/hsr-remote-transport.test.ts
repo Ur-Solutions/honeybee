@@ -351,6 +351,135 @@ test("reconnect + re-adoption: drop the relay, bring it back, subscription still
   });
 });
 
+/**
+ * An exec hook with a toggleable outage: while `state.down` every ssh exec fails
+ * (exit 255, as unreachable ssh does), so ensureRemoteServe — and therefore each
+ * reconnect attempt — genuinely fails until the "network" comes back.
+ */
+function outageExecHook(state: { down: boolean }): SshExecHook {
+  return async () => {
+    if (state.down) return { stdout: "", stderr: "ssh: connect refused", exitCode: 255 };
+    return { stdout: "", stderr: "", exitCode: 0 };
+  };
+}
+
+/** Drop the live session: kill the remote serve and every relay conn/server. */
+async function dropSession(ctx: { server: RpcServer }, tunnel: ReturnType<typeof makeRelayTunnel>): Promise<void> {
+  await ctx.server.close();
+  tunnel.killAll();
+}
+
+test("self-heal (HIVE-9): call() after reconnect gave up ('down') kicks a fresh reconnect and revives", async () => {
+  await withRemoteServe({ ping: () => ({ ok: true }) }, async (ctx) => {
+    const tunnel = makeRelayTunnel();
+    const outage = { down: false };
+    const client = await connectRemoteRunnerHost(makeNode(), {
+      execHook: outageExecHook(outage),
+      spawnTunnel: tunnel.hook,
+      remoteSocket: ctx.remoteSock,
+      forward: { waitAttempts: 100, waitIntervalMs: 10 },
+      reconnect: { maxAttempts: 2, baseDelayMs: 10, maxDelayMs: 20 },
+    });
+    try {
+      assert.equal(client.connected(), true);
+
+      // OUTAGE: exceed the backoff window so reconnect() exhausts its attempts.
+      const wentDown = new Promise<void>((resolve) => client.on("down", () => resolve()));
+      outage.down = true;
+      await dropSession(ctx, tunnel);
+      await wentDown;
+      assert.equal(client.connected(), false);
+
+      // Still down: call() rejects fast and the kicked reconnect fails again.
+      const wentDownAgain = new Promise<void>((resolve) => client.on("down", () => resolve()));
+      await assert.rejects(client.call("ping"), /tunnel is down/);
+      await wentDownAgain;
+      assert.equal(client.connected(), false, "reconnect kicked while still offline must fail again");
+
+      // RECOVERY: network + remote serve come back...
+      outage.down = false;
+      await ctx.restart();
+
+      // ...the next call() still rejects (no live session yet) but kicks a fresh
+      // reconnect that now succeeds.
+      const revived = new Promise<void>((resolve) => client.on("up", () => resolve()));
+      await assert.rejects(client.call("ping"), /tunnel is down/);
+      await revived;
+      assert.equal(client.connected(), true);
+      assert.deepEqual(await client.call("ping"), { ok: true });
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+test("self-heal (HIVE-9): a push subscription taken while down revives the session and is re-adopted", async () => {
+  await withRemoteServe({ ping: () => ({ ok: true }) }, async (ctx) => {
+    const tunnel = makeRelayTunnel();
+    const outage = { down: false };
+    const client = await connectRemoteRunnerHost(makeNode(), {
+      execHook: outageExecHook(outage),
+      spawnTunnel: tunnel.hook,
+      remoteSocket: ctx.remoteSock,
+      forward: { waitAttempts: 100, waitIntervalMs: 10 },
+      reconnect: { maxAttempts: 2, baseDelayMs: 10, maxDelayMs: 20 },
+    });
+    try {
+      const wentDown = new Promise<void>((resolve) => client.on("down", () => resolve()));
+      outage.down = true;
+      await dropSession(ctx, tunnel);
+      await wentDown;
+      assert.equal(client.connected(), false);
+
+      // Recovery happens before anyone subscribes.
+      outage.down = false;
+      await ctx.restart();
+
+      // Subscribing while down must kick the reconnect; the fresh session then
+      // bridges (re-adopts) the subscription so pushed events flow.
+      const revived = new Promise<void>((resolve) => client.on("up", () => resolve()));
+      const received: number[] = [];
+      client.on("hsr.event", (p) => received.push((p as { n: number }).n));
+      await revived;
+      assert.equal(client.connected(), true);
+
+      await sleep(20);
+      ctx.server.broadcast("hsr.event", { n: 7 });
+      const got = new Promise<void>((resolve) => {
+        const iv = setInterval(() => {
+          if (received.includes(7)) {
+            clearInterval(iv);
+            resolve();
+          }
+        }, 10);
+      });
+      await got;
+      assert.deepEqual(received, [7]);
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+test("self-heal (HIVE-9): call() after close() does NOT kick a reconnect", async () => {
+  await withRemoteServe({ ping: () => ({ ok: true }) }, async (ctx) => {
+    const tunnel = makeRelayTunnel();
+    const client = await connectRemoteRunnerHost(makeNode(), {
+      execHook: serveUpExecHook([]),
+      spawnTunnel: tunnel.hook,
+      remoteSocket: ctx.remoteSock,
+      forward: { waitAttempts: 100, waitIntervalMs: 10 },
+      reconnect: { maxAttempts: 2, baseDelayMs: 10, maxDelayMs: 20 },
+    });
+    await client.close();
+    const spawnsAtClose = tunnel.argvs.length;
+    await assert.rejects(client.call("ping"), /tunnel is down/);
+    await sleep(100);
+    assert.equal(client.connected(), false);
+    assert.equal(tunnel.argvs.length, spawnsAtClose, "no new tunnel may be spawned after close()");
+  });
+});
+
 test("per-call timeoutMs rejects a hung call", async () => {
   await withRemoteServe({ hang: () => new Promise(() => {}) }, async ({ remoteSock }) => {
     const tunnel = makeRelayTunnel();

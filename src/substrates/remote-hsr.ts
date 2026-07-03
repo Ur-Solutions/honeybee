@@ -176,16 +176,46 @@ export function createRemoteHsrSubstrate(
   const connect = options.connect ?? connectRemoteRunnerHost;
   const deps = options.transport ?? {};
 
+  // Observed bees (refcounted across subscribers). The remote relay behind the
+  // `observe` RPC lives only in the serve process's memory — if that process
+  // restarts (crash/OOM/redeploy), the transport reconnects and re-adopts the
+  // local `hsr.event` bridge, but the fresh serve has an EMPTY relay map and
+  // would never broadcast again (HIVE-11). So we track what we observe and
+  // re-issue the observe RPC on every transport `reconnect`.
+  const observed = new Map<string, number>();
+
+  async function reobserve(c: RemoteRunnerClient): Promise<void> {
+    for (const bee of [...observed.keys()]) {
+      try {
+        // Against a surviving serve this just bumps the relay refcount (there is
+        // no unobserve RPC, so the extra count is inert); against a restarted
+        // serve it re-creates the relay. `ok:false` (bee gone) is left to the
+        // mirror's teardown pass; a thrown call (tunnel flapped again) is
+        // retried by the next reconnect.
+        await c.call("observe", { bee });
+      } catch {
+        return;
+      }
+    }
+  }
+
   // Lazily establish ONE resilient client per node (reused by the daemon tick,
   // steer, observe). A failed establish is NOT cached — the next call retries,
-  // so a transient tunnel drop never wedges the substrate.
+  // so a transient tunnel drop never wedges the substrate. Caching a client that
+  // later goes 'down' is safe too: its call()/on() kick a fresh reconnect, so
+  // the memoized client self-heals once the network recovers (HIVE-9).
   let clientPromise: Promise<RemoteRunnerClient> | undefined;
   function client(): Promise<RemoteRunnerClient> {
     if (!clientPromise) {
-      clientPromise = connect(node, deps).catch((error) => {
-        clientPromise = undefined;
-        throw error;
-      });
+      clientPromise = connect(node, deps)
+        .then((c) => {
+          c.on("reconnect", () => void reobserve(c));
+          return c;
+        })
+        .catch((error) => {
+          clientPromise = undefined;
+          throw error;
+        });
     }
     return clientPromise;
   }
@@ -354,7 +384,16 @@ export function createRemoteHsrSubstrate(
       off();
       throw new Error(`remote HSR observe of ${bee} on ${node.name} failed: ${res?.error ?? "unknown"}`);
     }
-    return off;
+    observed.set(bee, (observed.get(bee) ?? 0) + 1);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      off();
+      const count = observed.get(bee) ?? 0;
+      if (count <= 1) observed.delete(bee);
+      else observed.set(bee, count - 1);
+    };
   }
 
   return {
@@ -405,6 +444,7 @@ export function createRemoteHsrSubstrate(
     listCheckouts,
     observe,
     async close(): Promise<void> {
+      observed.clear();
       if (!clientPromise) return;
       const pending = clientPromise;
       clientPromise = undefined;
