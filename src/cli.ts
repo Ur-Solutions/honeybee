@@ -3238,15 +3238,14 @@ export async function tmuxSessionSurvives(
 
 /**
  * Re-fork the HSR runner host for a bee whose record still says substrate:"hsr",
- * and persist the fresh runnerPid. promote stops the runner BEFORE relaunching
- * on tmux; if that relaunch fails to stay up (`tmuxSessionSurvives` → false) the
- * bee would otherwise be stranded — its runner gone, its pane dead. This rejoins
- * the SAME provider session headlessly (`resume:true` → `claude -p --resume`,
- * which — unlike the interactive path — DOES resume an HSR session), restoring
- * the bee exactly where it started.
+ * and persist the fresh runnerPid. promote rollbacks use the default resume path
+ * to rejoin the SAME provider session headlessly; revive can pass `fresh` to
+ * start a new HSR session while preserving the record identity.
  */
-async function reviveHsrRunner(record: SessionRecord, tool: string): Promise<void> {
+async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fresh?: boolean; sessionOverride?: string } = {}): Promise<SessionRecord> {
   const adapter = adapterFor(tool);
+  const fresh = opts.fresh === true;
+  const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
   const spec = resolveAgent(record.requestedAgent ?? record.agent, [], {
     home: record.homePath,
     yolo: agentDefaultsToYolo(tool),
@@ -3264,24 +3263,31 @@ async function reviveHsrRunner(record: SessionRecord, tool: string): Promise<voi
     ...(record.parentId ? { parent: record.parentId } : {}),
     kind: tool,
     cwd: record.cwd,
-    sessionId: record.providerSessionId,
-    resume: true,
+    ...(providerSessionId ? { sessionId: providerSessionId } : {}),
+    ...(fresh ? {} : { resume: true }),
     authKind: "subscription",
     ...(record.model ? { model: record.model } : {}),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
-  await waitForHsrHost(record.name, 5000);
+  if (!(await waitForHsrHost(record.name, 5000))) {
+    console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
+  }
   const runnerTier = adapter?.tier();
-  const restored: SessionRecord = {
-    ...record,
+  // Field-merge, not a full-record save, so daemon writes since `record`
+  // loaded survive; null = record deleted concurrently, nothing to persist
+  // (HIVE-49).
+  const patch: Partial<SessionRecord> = {
+    command: shellCommand(spec),
     substrate: "hsr",
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
+    ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
     updatedAt: new Date().toISOString(),
     status: "running",
   };
-  await saveSession(restored);
+  const restored = (await updateSession(record.name, patch)) ?? { ...record, ...patch };
   await writeSpawnOptions(restored);
+  return restored;
 }
 
 /**
@@ -3327,8 +3333,10 @@ async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void
     env: spec.env,
     tmuxOptions: spec.tmuxOptions,
   });
-  const restored: SessionRecord = {
-    ...record,
+  // Field-merge, not a full-record save, so daemon writes since `record`
+  // loaded survive; explicit undefined deletes the HSR fields; null = record
+  // deleted concurrently, nothing to persist (HIVE-49).
+  const restored = await updateSession(record.name, {
     command: shellCommand(spec),
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
@@ -3336,12 +3344,11 @@ async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void
     combId: tmuxTarget,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete restored.substrate;
-  delete restored.runnerPid;
-  delete restored.runnerTier;
-  await saveSession(restored);
-  await writeSpawnOptions(restored);
+    substrate: undefined,
+    runnerPid: undefined,
+    runnerTier: undefined,
+  });
+  if (restored) await writeSpawnOptions(restored);
 }
 
 /**
@@ -3365,7 +3372,9 @@ async function cmdPromote(parsed: Parsed): Promise<void> {
     const meta = await readHsrMeta(record.name).catch(() => null);
     if (meta?.sessionId) {
       record.providerSessionId = meta.sessionId;
-      await saveSession(record);
+      // Field-merge, not a full-record save: a full save would revert daemon
+      // writes (auto-title, observed state) since `record` loaded (HIVE-49).
+      await updateSession(record.name, { providerSessionId: meta.sessionId });
     }
   }
   const tool = assertResumable(record, "promote");
@@ -3416,30 +3425,34 @@ async function cmdPromote(parsed: Parsed): Promise<void> {
     );
   }
 
-  // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier,
-  //    set the pane fields; KEEP uuid/providerSessionId/id/lineage/account.
-  const promoted: SessionRecord = {
-    ...record,
-    command: shellCommand(spec),
+  // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier
+  //    (explicit undefined = delete), set the pane fields; KEEP
+  //    uuid/providerSessionId/id/lineage/account. Field-merge under the lock
+  //    (updateSession) instead of a full-record save so daemon writes that
+  //    landed since `record` was loaded (auto-title, observed state) survive
+  //    the flip (HIVE-49). null = record deleted mid-promote (concurrent
+  //    kill) — don't resurrect it.
+  const command = shellCommand(spec);
+  const promoted = await updateSession(record.name, {
+    command,
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
     ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     combId: tmuxTarget,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete promoted.substrate;
-  delete promoted.runnerPid;
-  delete promoted.runnerTier;
-  await saveSession(promoted);
-  await writeSpawnOptions(promoted);
+    substrate: undefined,
+    runnerPid: undefined,
+    runnerTier: undefined,
+  });
+  if (promoted) await writeSpawnOptions(promoted);
   await appendLedger({ type: "session.promote", session: record.name, from: "hsr", to: "local-tmux", providerSessionId: record.providerSessionId });
 
   if (isPretty()) {
     console.log(actionLine("ok", "promote", [bold(record.name), record.agent, dim("→ local-tmux")]));
     console.error(note(`attach with: ${formatShellCommand(substrate.attachCommand(tmuxTarget))}`));
   } else {
-    console.log(`promoted\t${record.name}\thsr\tlocal-tmux\t${promoted.command}`);
+    console.log(`promoted\t${record.name}\thsr\tlocal-tmux\t${command}`);
   }
 }
 
@@ -3518,10 +3531,14 @@ async function cmdDemote(parsed: Parsed): Promise<void> {
   }
 
   // 5. Flip the record to HSR: set substrate/runnerPid/runnerTier, make
-  //    tmuxTarget the logical id, delete the pane fields; keep the rest.
-  const demoted: SessionRecord = {
-    ...record,
-    command: shellCommand(spec),
+  //    tmuxTarget the logical id, delete the pane fields (explicit undefined
+  //    = delete); keep the rest. Field-merge under the lock (updateSession)
+  //    instead of a full-record save so daemon writes that landed since
+  //    `record` was loaded survive the flip (HIVE-49). null = record deleted
+  //    mid-demote (concurrent kill) — don't resurrect it.
+  const command = shellCommand(spec);
+  const demoted = await updateSession(record.name, {
+    command,
     substrate: "hsr",
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
@@ -3529,17 +3546,16 @@ async function cmdDemote(parsed: Parsed): Promise<void> {
     combId: record.name,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete demoted.agentPaneId;
-  delete demoted.launcherPgid;
-  await saveSession(demoted);
-  await writeSpawnOptions(demoted);
+    agentPaneId: undefined,
+    launcherPgid: undefined,
+  });
+  if (demoted) await writeSpawnOptions(demoted);
   await appendLedger({ type: "session.demote", session: record.name, from: "local-tmux", to: "hsr", providerSessionId: record.providerSessionId });
 
   if (isPretty()) {
     console.log(actionLine("ok", "demote", [bold(record.name), record.agent, dim("→ hsr")]));
   } else {
-    console.log(`demoted\t${record.name}\tlocal-tmux\thsr\t${demoted.command}`);
+    console.log(`demoted\t${record.name}\tlocal-tmux\thsr\t${command}`);
   }
 }
 
@@ -3649,7 +3665,7 @@ async function cmdHere(parsed: Parsed): Promise<void> {
  * detectable from inside hive and is the operator's collision call.
  */
 function defaultSubstrateIsSshTmux(): boolean {
-  const overlay = loadNodeSync(LOCAL_NODE_NAME);
+  const overlay = loadNodeSync(LOCAL_NODE_NAME, { tolerateInvalid: true });
   return overlay?.kind === "ssh-tmux";
 }
 
@@ -4402,27 +4418,37 @@ async function cmdRevive(parsed: Parsed): Promise<void> {
     let revived = 0;
     let alive = 0;
     const skipped: string[] = [];
+    const failed: Array<{ name: string; error: string }> = [];
     for (const record of local) {
-      if (await substrateFor(record).hasSession(record.tmuxTarget)) {
-        alive += 1;
-        continue;
+      try {
+        if (await substrateFor(record).hasSession(record.tmuxTarget)) {
+          alive += 1;
+          continue;
+        }
+        // --all only auto-revives bees we can resume precisely; resuming "the
+        // latest session in the home" would grab a sibling's when homes are shared.
+        if (!record.providerSessionId && !truthy(flag(parsed, "fresh"))) {
+          skipped.push(record.name);
+          continue;
+        }
+        await reviveOne(record, parsed);
+        revived += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failed.push({ name: record.name, error: message });
+        if (isPretty()) console.log(actionLine("warn", "revive", [bold(record.name), dim(message)]));
+        else console.log(`revive_failed\t${record.name}\t${message}`);
       }
-      // --all only auto-revives bees we can resume precisely; resuming "the
-      // latest session in the home" would grab a sibling's when homes are shared.
-      if (!record.providerSessionId && !truthy(flag(parsed, "fresh"))) {
-        skipped.push(record.name);
-        continue;
-      }
-      await reviveOne(record, parsed);
-      revived += 1;
     }
     if (isPretty()) {
       const parts = [`revived ${revived}`, `${alive} already alive`];
       if (skipped.length > 0) parts.push(`${skipped.length} skipped (no resumable session id: ${skipped.join(", ")})`);
+      if (failed.length > 0) parts.push(`${failed.length} failed (${failed.map((failure) => failure.name).join(", ")})`);
       console.log(note(parts.join(" · ")));
     } else {
       console.log(`revive\tall\t${revived}\t${alive}\t${skipped.length}`);
     }
+    if (failed.length > 0) process.exitCode = 1;
     return;
   }
 
@@ -4433,21 +4459,20 @@ async function cmdRevive(parsed: Parsed): Promise<void> {
 }
 
 /**
- * Pure relaunch core: re-create a bee's tmux session in its OWN cwd/home and
- * resume (or, with `fresh`, start anew) its provider session. No `parsed`, no
- * console output — it does only the resolveAgent/newSession/updateSession/
+ * Pure relaunch core: re-create a bee's runtime in its OWN cwd/home and resume
+ * (or, with `fresh`, start anew) its provider session. No `parsed`, no console
+ * output — it does only the resolveAgent/newSession-or-HSR/updateSession/
  * appendLedger work and returns the updated record. It does NOT guard liveness
  * (the caller does, so `restore` can decide per-bee whether to skip a live one).
  * Non-fresh revive requires an exact provider session id; falling back to a
  * provider's "latest" session can resume a sibling bee in a shared home.
  *
- * ACCOUNT SAFETY: this re-spawns into `record.homePath` with NO account switch
- * (no activateAccountIntoHome) — the same home whose creds are already there, so
- * there is no cross-account OAuth-logout hazard. `reviveOne`/`restore` both rely
- * on this invariant.
+ * ACCOUNT SAFETY: this re-spawns into `record.homePath` with NO account switch.
+ * The tmux path does not activate credentials; the HSR path may refresh the same
+ * bound account into the same home. In both cases there is no cross-account
+ * OAuth-logout hazard. `reviveOne`/`restore` both rely on this invariant.
  */
 async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessionOverride?: string }): Promise<SessionRecord> {
-  const substrate = substrateFor(record);
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   const fresh = opts.fresh;
   // sessionOverride resumes (and persists) a specific provider session — used to
@@ -4460,6 +4485,17 @@ async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessi
       `hive revive: ${record.name} has no recorded provider session id; pass --session <id> to resume an exact session, or --fresh to start anew`,
     );
   }
+  if (record.substrate === "hsr") {
+    const updated = await reviveHsrRunner(record, tool, { fresh, sessionOverride });
+    await appendLedger({
+      type: "bee.revive",
+      session: record.name,
+      providerSessionId: providerSessionId ?? null,
+      fresh,
+    });
+    return updated;
+  }
+  const substrate = substrateFor(record);
 
   // Mirror the swap relaunch: rebuild the agent command from the configured
   // kind (preserving the original permission mode) and append the resume args.
@@ -4552,16 +4588,21 @@ async function cmdRun(parsed: Parsed) {
   let blocked = false;
 
   try {
-    try {
-      await waitForAgentReady(record, {
-        timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
-        acceptTrust: acceptsTrust(parsed),
-        raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
-      });
-    } catch (error) {
-      if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
-      console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
-      if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+    // HSR bees have no interactive TUI to poll for readiness — the runner host is
+    // ready as soon as spawn confirmed it live (hasSession). Skip the pane-scrape
+    // readiness wait; steer straight through the control socket.
+    if (record.substrate !== "hsr") {
+      try {
+        await waitForAgentReady(record, {
+          timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+          acceptTrust: acceptsTrust(parsed),
+          raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
+        });
+      } catch (error) {
+        if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
+        console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
+        if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+      }
     }
     await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
     const now = new Date().toISOString();
@@ -6203,8 +6244,10 @@ async function questDone(parsed: Parsed) {
       }
       // Capture the record + ws window id BEFORE the kill: transactionalKill
       // deletes the record on confirmed death, and the window id is needed to
-      // reap the orphan afterwards.
-      const snapshot = { ...bee };
+      // reap the orphan afterwards. Re-read from disk (not the quest listing's
+      // possibly-stale `bee`) so daemon merges since then — auto-title,
+      // providerSessionId — survive into the archived record (HIVE-49).
+      const snapshot = (await loadSession(bee.name)) ?? { ...bee };
       const wsWindowId = inventory?.active.get(bee.tmuxTarget);
       const outcome = await transactionalKill(bee);
       if (outcome.ok) {
