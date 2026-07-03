@@ -252,6 +252,63 @@ test("parseJsonFlow passes timeoutMs through waitForSeal opts", async () => {
   assert.deepEqual(mock.calls[1]?.args[1], { timeoutMs: 1234 });
 });
 
+test("parseJsonFlow dispatches every JSON op through the op table", async () => {
+  const flow = parseJsonFlow({
+    name: "all-ops",
+    steps: [
+      {
+        op: "spawn",
+        as: "a",
+        bee: "claude",
+        name: "worker-{{target}}",
+        cwd: "{{target}}",
+        home: "/tmp/home",
+        node: "node-1",
+        colony: "colony-a",
+        swarmId: "swarm-a",
+      },
+      { op: "send", to: "{{a.id}}", text: "ping {{target}}" },
+      { op: "brief", to: "{{a.id}}", text: "brief {{target}}" },
+      { op: "waitForSeal", of: "{{a.id}}", timeoutMs: 50 },
+      { op: "wait", of: "{{a.id}}", idleMs: 10, timeoutMs: 20 },
+      { op: "seal", of: "{{a.id}}", from: "{{target}}/seal.json" },
+      { op: "kill", of: "{{a.id}}" },
+      { op: "log", message: "done {{target}}" },
+      { op: "return", value: "finished" },
+    ],
+  });
+  const mock = makeMockHive();
+  const result = await flow.run(makeCtx({ hive: mock.hive, args: { target: "src" } }));
+
+  assert.equal(result, "finished");
+  assert.deepEqual(mock.calls.map((call) => call.op), [
+    "spawn",
+    "send",
+    "brief",
+    "waitForSeal",
+    "wait",
+    "seal",
+    "kill",
+    "log",
+  ]);
+  assert.deepEqual(mock.calls[0]?.args[0], {
+    bee: "claude",
+    name: "worker-src",
+    cwd: "src",
+    home: "/tmp/home",
+    node: "node-1",
+    colony: "colony-a",
+    swarmId: "swarm-a",
+  });
+  assert.deepEqual(mock.calls[1]?.args, ["bee-1", "ping src"]);
+  assert.deepEqual(mock.calls[2]?.args, ["bee-1", "brief src"]);
+  assert.deepEqual(mock.calls[3]?.args, ["bee-1", { timeoutMs: 50 }]);
+  assert.deepEqual(mock.calls[4]?.args, ["bee-1", { idleMs: 10, timeoutMs: 20 }]);
+  assert.deepEqual(mock.calls[5]?.args, ["bee-1", "src/seal.json"]);
+  assert.deepEqual(mock.calls[6]?.args, ["bee-1"]);
+  assert.deepEqual(mock.calls[7]?.args, ["done src"]);
+});
+
 test("parseJsonFlow honors abort signal between steps", async () => {
   const flow = parseJsonFlow({
     name: "abrt",

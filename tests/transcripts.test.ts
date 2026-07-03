@@ -3,7 +3,7 @@ import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { firstUserText, hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript, stripCommandNoise, type TranscriptRow } from "../src/transcripts.js";
+import { firstUserText, hasTranscriptProvider, lastAssistantText, latestTranscript, projectKeyForCwd, renderTranscript, stripCommandNoise, transcriptAdapters, type TranscriptProvider, type TranscriptRow } from "../src/transcripts.js";
 
 // Independent re-implementation of Claude Code's project-dir encoding so the
 // fixtures below do not circularly depend on projectKeyForCwd.
@@ -14,6 +14,16 @@ function claudeEncode(cwd: string): string {
 test("projectKeyForCwd matches Claude Code's project-dir encoding for dots and underscores", () => {
   assert.equal(projectKeyForCwd("/tmp/.hidden/my_app"), "-tmp--hidden-my-app");
   assert.equal(projectKeyForCwd("/Users/x/.openclaw/workspace"), "-Users-x--openclaw-workspace");
+});
+
+test("transcriptAdapters registry covers every provider under its own key", () => {
+  const providers: TranscriptProvider[] = ["claude", "codex", "opencode", "grok"];
+  assert.deepEqual(Object.keys(transcriptAdapters).sort(), [...providers].sort());
+  for (const provider of providers) assert.equal(transcriptAdapters[provider].provider, provider);
+});
+
+test("latestTranscript returns null for agents without a transcript adapter", async () => {
+  assert.equal(await latestTranscript("gemini", "/tmp"), null);
 });
 
 test("latestTranscript: notBeforeIso refuses an older sibling's transcript that wins on mtime", async () => {

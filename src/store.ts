@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { isBuzTier, type BuzTier } from "./buz_tiers.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
 import { dedupeTags, isValidSessionTag, MAX_TAGS_PER_BEE } from "./tags.js";
@@ -101,7 +102,7 @@ export type SessionRecord = {
   runnerPid?: number;
   /** HSR: resolved runner tier for this bee ("server"|"stream"|"turn"|"pty"). */
   runnerTier?: string;
-  buzAccept?: ("interrupt" | "queue" | "passive")[];
+  buzAccept?: BuzTier[];
   lastObservedState?: string;
   lastObservedStateAt?: string;
   runId?: string;
@@ -437,8 +438,7 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   // older binary reading a record written by a newer one does not throw.
   if (Array.isArray(object.buzAccept)) {
     const tiers = object.buzAccept.filter(
-      (value): value is "interrupt" | "queue" | "passive" =>
-        value === "interrupt" || value === "queue" || value === "passive",
+      (value): value is BuzTier => isBuzTier(value),
     );
     if (tiers.length > 0) record.buzAccept = tiers;
   }
