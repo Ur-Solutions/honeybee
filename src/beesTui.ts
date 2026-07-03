@@ -338,7 +338,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
   let confirmKill: BeesTuiItem | undefined; // bee awaiting kill confirmation
   let killing = false;
   let selecting: BeesTuiItem | undefined;
-  let message = "type to filter · ↑↓ move · enter selects · q quits";
+  let message = "type to filter · ↑↓ move · enter selects · esc quits";
 
   readline.emitKeypressEvents(stdin);
   stdin.setRawMode(true);
@@ -377,19 +377,6 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
       };
 
       const itemRows = () => flat.filter((row): row is Extract<FlatRow, { kind: "item" }> => row.kind === "item");
-
-      const moveCursor = (next: number) => {
-        const items = itemRows();
-        if (items.length === 0) {
-          cursor = 0;
-          return;
-        }
-        const indices = items.map((row) => flat.indexOf(row));
-        let pos = indices.indexOf(cursor);
-        if (pos < 0) pos = 0;
-        pos = Math.max(0, Math.min(indices.length - 1, next));
-        cursor = indices[pos]!;
-      };
 
       const currentItem = (): BeesTuiItem | undefined => {
         const row = flat[cursor];
@@ -465,9 +452,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
       };
 
       const step = (delta: number) => {
-        const indices = itemRows().map((row) => flat.indexOf(row));
-        const pos = indices.indexOf(cursor);
-        moveCursor(pos < 0 ? 0 : Math.max(0, Math.min(indices.length - 1, pos + delta)));
+        cursor = stepBeesCursor(flat, cursor, delta);
         render();
       };
 
@@ -546,12 +531,9 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
           finish();
           return;
         }
-        if (key.name === "q" && query.length === 0) {
-          finish();
-          return;
-        }
-        // Navigation is arrow-keys (plus fzf-style Ctrl-N/P) only — j/k are kept
-        // free so they type into the fuzzy filter like any other character.
+        // Quit is esc/Ctrl-C only — the fuzzy filter is always the live text
+        // buffer here, so every printable (q, j, k, …) must type into it or a
+        // bee named "queen" becomes unfindable by prefix.
         if (key.name === "up" || (key.ctrl && key.name === "p")) { step(-1); return; }
         if (key.name === "down" || (key.ctrl && key.name === "n")) { step(1); return; }
         // ⌘g (Meta-g via WezTerm) cycles grouping; Ctrl-G works too where ⌘
@@ -607,7 +589,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
         const preview = options.onPreview ? " · tab preview" : "";
         const kill = options.onKill ? " · ^k kill" : "";
         const group = ` · ⌘g ${BEES_GROUP_MODE_LABEL[groupMode]}`;
-        return (options.sidebar ? "sidebar · q closes" : "q exit") + preview + kill + group;
+        return (options.sidebar ? "sidebar · esc closes" : "esc exit") + preview + kill + group;
       };
 
       const onResize = () => render();
@@ -623,7 +605,10 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
           tick += 1;
           if (options.syncGroupMode) {
             void options.syncGroupMode().then((mode) => {
-              if (done || selecting || !mode || mode === groupMode) return;
+              // Same guard as the catalog refresh below: a confirm modal or an
+              // in-flight kill owns the screen, so don't re-group/repaint under
+              // it — the next poll picks the mode change up once it closes.
+              if (done || selecting || confirmKill || killing || !mode || mode === groupMode) return;
               groupMode = mode;
               regroup();
               render();
@@ -697,6 +682,19 @@ export function initialBeesCursor(flat: FlatRow[], name: string | undefined): nu
 export function resolveRegroupCursor(flat: FlatRow[], prevName: string | undefined, currentName: string | undefined): number {
   const survived = itemRowIndexForName(flat, prevName);
   return survived >= 0 ? survived : initialBeesCursor(flat, currentName);
+}
+
+/**
+ * Cursor row after moving `delta` item rows (headers are skipped, ends clamp).
+ * A cursor that no longer sits on an item (e.g. it drifted onto a header)
+ * snaps to the first item; an item-less list parks at 0.
+ */
+export function stepBeesCursor(flat: FlatRow[], cursor: number, delta: number): number {
+  const indices = flat.flatMap((row, i) => (row.kind === "item" ? [i] : []));
+  if (indices.length === 0) return 0;
+  const pos = indices.indexOf(cursor);
+  const next = pos < 0 ? 0 : Math.max(0, Math.min(indices.length - 1, pos + delta));
+  return indices[next]!;
 }
 
 /**

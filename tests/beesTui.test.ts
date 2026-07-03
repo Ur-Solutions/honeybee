@@ -11,6 +11,7 @@ import {
   initialBeesCursor,
   nextBeesGroupMode,
   resolveRegroupCursor,
+  stepBeesCursor,
   type BeesTuiItem,
 } from "../src/beesTui.js";
 import { __testOnlySidebarWidthClamp } from "../src/beesSidebar.js";
@@ -196,6 +197,32 @@ test("resolveRegroupCursor keeps the survivor, else the current bee, else first"
   // Neither resolves → first item.
   assert.equal(resolveRegroupCursor(flat, "killed", "also-gone"), firstItem);
   assert.equal(resolveRegroupCursor(flat, undefined, undefined), firstItem);
+});
+
+test("stepBeesCursor moves by delta across item rows, hopping headers", () => {
+  const flat = flattenBeesTuiGroups(groupBeesTuiItems([
+    item({ name: "a", colony: "c1" }),
+    item({ name: "b", colony: "c1" }),
+    item({ name: "z", colony: "c2" }),
+  ]));
+  // layout: [header c1, a, b, header c2, z]
+  const rowOf = (name: string) => flat.findIndex((row) => row.kind === "item" && row.item.name === name);
+  assert.equal(stepBeesCursor(flat, rowOf("a"), 1), rowOf("b"));
+  assert.equal(stepBeesCursor(flat, rowOf("b"), 1), rowOf("z"), "skips the c2 header");
+  assert.equal(stepBeesCursor(flat, rowOf("z"), -1), rowOf("b"));
+});
+
+test("stepBeesCursor clamps at both ends and recovers a lost cursor", () => {
+  const flat = flattenBeesTuiGroups(groupBeesTuiItems([
+    item({ name: "a", colony: "c" }),
+    item({ name: "b", colony: "c" }),
+  ]));
+  const rowOf = (name: string) => flat.findIndex((row) => row.kind === "item" && row.item.name === name);
+  assert.equal(stepBeesCursor(flat, rowOf("a"), -1), rowOf("a"), "clamps at the top");
+  assert.equal(stepBeesCursor(flat, rowOf("b"), 1), rowOf("b"), "clamps at the bottom");
+  assert.equal(stepBeesCursor(flat, rowOf("a"), 99), rowOf("b"), "large deltas clamp");
+  assert.equal(stepBeesCursor(flat, 0, 1), rowOf("a"), "cursor on a header snaps to the first item");
+  assert.equal(stepBeesCursor([], 5, 1), 0, "item-less list parks at 0");
 });
 
 test("nextBeesGroupMode cycles forward and wraps, and goes backward", () => {

@@ -312,6 +312,10 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
         if (key.name === "down") { cursorRow = clamp(cursorRow + 1, rows().length); formError = ""; render(); return; }
 
         const row = focusedRow();
+        // `q` cancels everywhere except a focused text field, where it is
+        // literal input — a fork named "queen" must be typable. esc/Ctrl-C
+        // (above) cancel regardless of focus.
+        if (key.name === "q" && !(row?.kind === "field" && row.field === "text")) { finish(null); return; }
         if (!row) return;
 
         if (row.kind === "toggle") {
@@ -333,7 +337,6 @@ export async function chooseFork(hooks: ForkTuiHooks): Promise<ForkLaunchResult 
         if (key.name === "left" || key.name === "right") return; // let arrows stay on the row
         if (key.name === "backspace") { values[row.key] = String(values[row.key]).slice(0, -1) as never; render(); return; }
         if (key.ctrl && key.name === "u") { values[row.key] = "" as never; render(); return; }
-        if (key.name === "q" && String(values[row.key]).length === 0) { finish(null); return; }
         if (isPrintable(value, key)) { values[row.key] = (String(values[row.key]) + value) as never; render(); return; }
       };
 

@@ -8,6 +8,7 @@ import { codexNotificationToEvents } from "../src/hsr/adapters/codex.js";
 import { ensureHsrRunDir, hsrEventsPath } from "../src/hsr/runDir.js";
 import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
 import { createUsageSampler } from "../src/daemon/usageSampler.js";
+import type { HsrObservation } from "../src/hsr/observe.js";
 import type { SessionRecord } from "../src/store.js";
 import { readUsageEvents, type UsageEvent } from "../src/usage.js";
 
@@ -111,6 +112,42 @@ test("HSR sampler fires exhaustion on the rising edge of an exhausted event", as
     assert.equal(third[0]!.exhausted, true);
     assert.equal(third[0]!.resetHint, "2026-07-03T19:00:00.000Z");
     assert.equal(ledger.filter((e) => e.type === "account.exhausted").length, 2);
+  });
+});
+
+test("HSR sampler uses the per-tick event snapshot when provided", async () => {
+  await withTempStore(async () => {
+    const ledger: Record<string, unknown>[] = [];
+    const sampler = createUsageSampler({
+      appendLedger: async (e) => void ledger.push(e),
+      readHsrUsage: async () => {
+        throw new Error("snapshot should avoid a second HSR event read");
+      },
+      sampleIntervalMs: 0,
+    });
+    const observation: HsrObservation = {
+      live: true,
+      state: "idle_with_output",
+      snapshot: "",
+      eventSnapshot: {
+        events: [],
+        tailEvents: [],
+        usage: {
+          totals: { inputTokens: 33, outputTokens: 7 },
+          latestExhausted: { ts: 10, resetHint: "soon" },
+        },
+        pendingNeedsInput: null,
+      },
+    };
+
+    const out = await sampler([record()], new Map(), 1_000, new Map([["CL.hsr", observation]]));
+
+    assert.equal(out[0]!.sampled, true);
+    assert.equal(out[0]!.exhausted, true);
+    assert.equal(out[0]!.resetHint, "soon");
+    assert.equal(ledger.filter((e) => e.type === "account.exhausted").length, 1);
+    const samples = (await readUsageEvents("acct-hsr")).filter((e): e is Extract<UsageEvent, { kind: "sample" }> => e.kind === "sample");
+    assert.deepEqual(samples.map((sample) => [sample.inputTokens, sample.outputTokens]), [[33, 7]]);
   });
 });
 
