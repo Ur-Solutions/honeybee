@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +35,7 @@ type Recorded = { command: string; input?: string };
 function makeExecHook(opts: {
   nodeVersion?: string;
   remoteHasBundle?: boolean;
+  remoteBundleHash?: string;
   handshakeVersion: string; // what `node <bundle> --version` prints
   trace: Recorded[];
 }): SshExecHook {
@@ -47,8 +49,8 @@ function makeExecHook(opts: {
       return { stdout: "", stderr: "", exitCode: 0 };
     }
     if (command.startsWith("[ -f")) {
-      const marker = opts.remoteHasBundle ? "__HIVE_RH_EXISTS__" : "__HIVE_RH_MISSING__";
-      return { stdout: `${marker}\n`, stderr: "", exitCode: 0 };
+      const output = opts.remoteHasBundle ? (opts.remoteBundleHash ?? "") : "__HIVE_RH_MISSING__";
+      return { stdout: `${output}\n`, stderr: "", exitCode: 0 };
     }
     if (command.startsWith("cat >")) {
       return { stdout: "", stderr: "", exitCode: 0 };
@@ -60,16 +62,31 @@ function makeExecHook(opts: {
   };
 }
 
+function sha256Hex(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function assertAtomicCopyCommand(command: string, version: string, expectedHash: string): void {
+  const remotePath = remoteBundlePath(version);
+  const tempPath = `${remotePath}.tmp.$$`;
+  assert.ok(command.startsWith(`cat > ${tempPath} && [ "$(node -e `), "copy should write to a temp path and hash it");
+  assert.ok(
+    command.includes(` ${tempPath})" = ${expectedHash} ] && mv -f ${tempPath} ${remotePath}`),
+    "copy should move the temp path into place only after the remote hash matches",
+  );
+}
+
 const fakeBundle = (version: string) => ({
   ensureBundle: async () => ({ path: `/local/hive-runner-host-${version}.mjs`, version }),
   readBundle: async () => `// fake bundle ${version}\n`,
+  content: `// fake bundle ${version}\n`,
 });
 
 test("bootstrap: registers remote-hsr node and runs node-check → mkdir → copy → handshake in order", async () => {
   await withTempStore(async () => {
     const version = "0.0.1+deadbeef1234";
     const trace: Recorded[] = [];
-    const { ensureBundle, readBundle } = fakeBundle(version);
+    const { ensureBundle, readBundle, content } = fakeBundle(version);
     const result = await bootstrapRunnerHost(
       { name: "loopunit", endpoint: "me@localhost", capabilities: ["claude"] },
       { execHook: makeExecHook({ handshakeVersion: `runner-host ${version}`, trace }), ensureBundle, readBundle },
@@ -89,18 +106,19 @@ test("bootstrap: registers remote-hsr node and runs node-check → mkdir → cop
     assert.equal(loaded.runnerHostVersion, version);
     assert.deepEqual(loaded.capabilities, ["claude"]);
 
-    // Command sequence: node --version → mkdir → exists-check → copy → handshake.
+    // Command sequence: node --version → mkdir → hash-check → copy → handshake.
     const kinds = trace.map((t) => {
       if (t.command === "node --version") return "node-check";
       if (t.command.startsWith("mkdir")) return "mkdir";
-      if (t.command.startsWith("[ -f")) return "exists";
+      if (t.command.startsWith("[ -f")) return "hash";
       if (t.command.startsWith("cat >")) return "copy";
       if (t.command.endsWith("--version")) return "handshake";
       return "other";
     });
-    assert.deepEqual(kinds, ["node-check", "mkdir", "exists", "copy", "handshake"]);
+    assert.deepEqual(kinds, ["node-check", "mkdir", "hash", "copy", "handshake"]);
     // The copy carried the bundle bytes on stdin.
     const copy = trace.find((t) => t.command.startsWith("cat >"))!;
+    assertAtomicCopyCommand(copy.command, version, sha256Hex(content));
     assert.match(copy.input ?? "", /fake bundle/);
   });
 });
@@ -109,11 +127,11 @@ test("bootstrap: idempotent re-run skips re-copy when the remote already has the
   await withTempStore(async () => {
     const version = "0.0.1+cafebabe5678";
     const trace: Recorded[] = [];
-    const { ensureBundle, readBundle } = fakeBundle(version);
+    const { ensureBundle, readBundle, content } = fakeBundle(version);
     const result = await bootstrapRunnerHost(
       { name: "loopunit2", endpoint: "me@localhost" },
       {
-        execHook: makeExecHook({ handshakeVersion: `runner-host ${version}`, remoteHasBundle: true, trace }),
+        execHook: makeExecHook({ handshakeVersion: `runner-host ${version}`, remoteHasBundle: true, remoteBundleHash: sha256Hex(content), trace }),
         ensureBundle,
         readBundle,
       },
@@ -122,6 +140,32 @@ test("bootstrap: idempotent re-run skips re-copy when the remote already has the
     assert.ok(!trace.some((t) => t.command.startsWith("cat >")), "no copy command should be issued");
     // Still handshakes.
     assert.ok(trace.some((t) => t.command.endsWith("--version") && t.command.includes(".mjs")));
+  });
+});
+
+test("bootstrap: re-deploys atomically when an existing remote bundle hash differs", async () => {
+  await withTempStore(async () => {
+    const version = "0.0.1+badc0ffee123";
+    const trace: Recorded[] = [];
+    const { ensureBundle, readBundle, content } = fakeBundle(version);
+    const result = await bootstrapRunnerHost(
+      { name: "loopunit-corrupt", endpoint: "me@localhost" },
+      {
+        execHook: makeExecHook({
+          handshakeVersion: `runner-host ${version}`,
+          remoteHasBundle: true,
+          remoteBundleHash: sha256Hex("// truncated\n"),
+          trace,
+        }),
+        ensureBundle,
+        readBundle,
+      },
+    );
+
+    assert.equal(result.deployed, true, "hash mismatch should force a fresh deploy");
+    const copy = trace.find((t) => t.command.startsWith("cat >"));
+    assert.ok(copy, "copy command should be issued for a corrupt existing file");
+    assertAtomicCopyCommand(copy.command, version, sha256Hex(content));
   });
 });
 
