@@ -54,23 +54,68 @@ export async function readClaudeKeychain(homePath: string): Promise<string | nul
   }
 }
 
+// `security -i` reads one command per line from stdin. Its tokenizer
+// (verified empirically) splits on whitespace, groups "double-quoted"
+// tokens, and treats \X as literal X — so \ and " are the only characters
+// that need a backslash escape inside a quoted token.
+function quoteSecurityToken(value: string): string {
+  return `"${value.replace(/[\\"]/g, "\\$&")}"`;
+}
+
+// `security -i` reads each command with a ~4096-byte line buffer (measured:
+// ~4095 bytes of line + newline; longer lines are split and the tail runs as
+// garbage commands). Kept conservative to absorb OS-version drift.
+const SECURITY_LINE_MAX = 4000;
+
+/**
+ * Build the `security -i` command line that stores a secret. The secret is
+ * hex-encoded (-X) so it needs no quoting and survives arbitrary content —
+ * including the multi-line pretty-printed JSON that mergeCredentialsJson
+ * produces. When the hex of the exact bytes would overflow the interpreter's
+ * line buffer, the secret is re-serialized as compact JSON (semantically
+ * identical for every consumer; the login-seat digest baseline is computed
+ * from a post-write read-back, never from this input). Returns null when it
+ * still cannot fit, or when account/service/keychain contain bytes that
+ * would break the one-command-per-line protocol — callers fail closed
+ * rather than fall back to argv. The optional trailing keychain path targets
+ * a specific keychain file; tests use it to stay out of the login keychain.
+ * Exported for tests.
+ */
+export function buildAddGenericPasswordCommand(account: string, service: string, secret: string, keychainPath?: string): string | null {
+  const assemble = (data: string): string | null => {
+    const parts = ["add-generic-password", "-U", "-a", quoteSecurityToken(account), "-s", quoteSecurityToken(service), "-X", Buffer.from(data, "utf8").toString("hex")];
+    if (keychainPath !== undefined) parts.push(quoteSecurityToken(keychainPath));
+    const command = parts.join(" ");
+    return command.length > SECURITY_LINE_MAX || /[\r\n\0]/.test(command) ? null : command;
+  };
+  const exact = assemble(secret);
+  if (exact !== null) return exact;
+  try {
+    return assemble(JSON.stringify(JSON.parse(secret)));
+  } catch {
+    return null;
+  }
+}
+
 /** Create/update the keychain entry for a home. Returns false when unavailable or rejected. */
 export async function writeClaudeKeychain(homePath: string, credentials: string): Promise<boolean> {
   if (!keychainAvailable()) return false;
+  // -U updates in place. The secret must not travel via argv — argv is
+  // visible to any local process while `security` runs — so the whole
+  // command is fed to `security -i` on stdin instead. A failing command
+  // sets the exit status, which rejects the promise below.
+  const command = buildAddGenericPasswordCommand(userInfo().username, claudeKeychainService(homePath), credentials);
+  if (command === null) return false; // unrepresentable secret: fail closed, never argv
   try {
-    // -U updates in place. The secret travels via argv, which is briefly
-    // visible in the local process list; the alternative interactive stdin
-    // mode of `security` is not scriptable.
-    await execFileAsync("security", [
-      "add-generic-password",
-      "-U",
-      "-a",
-      userInfo().username,
-      "-s",
-      claudeKeychainService(homePath),
-      "-w",
-      credentials,
-    ], { timeout: SECURITY_EXEC_TIMEOUT_MS });
+    const pending = execFileAsync("security", ["-i"], { timeout: SECURITY_EXEC_TIMEOUT_MS });
+    const stdin = pending.child.stdin;
+    if (stdin) {
+      // Swallow EPIPE from an early security exit; the exit status carries
+      // the real failure.
+      stdin.on("error", () => {});
+      stdin.end(`${command}\n`);
+    }
+    await pending;
     return true;
   } catch {
     return false;
