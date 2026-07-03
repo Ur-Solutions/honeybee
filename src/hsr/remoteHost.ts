@@ -30,7 +30,7 @@ import {
   type RpcMethodHandler,
   type RpcServer,
 } from "./rpc.js";
-import { hsrObservations, pendingNeedsInput } from "./observe.js";
+import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, reapDeadHosts } from "./observe.js";
 import { readHsrMeta, hsrRunDir, worktreesRoot } from "./runDir.js";
 import {
   homeDirForSpec,
@@ -384,11 +384,19 @@ export function buildController(): RunnerHostController {
         }
       }
     }
-    if (!stopped && meta && meta.status === "running" && isPidAlive(meta.hostPid)) {
-      try {
-        process.kill(meta.hostPid, "SIGTERM");
-      } catch {
-        // already gone / not signalable
+    if (!stopped && meta && meta.status === "running") {
+      if (isPidAlive(meta.hostPid)) {
+        try {
+          process.kill(meta.hostPid, "SIGTERM");
+        } catch {
+          // already gone / not signalable
+        }
+      } else {
+        // The host died without finalize (a previous serve was SIGKILLed/OOMed:
+        // its in-process runners carried the serve's pid as hostPid), so the
+        // harness child group is orphaned and unreachable over any control
+        // socket. Signal the recorded child group directly (HIVE-53).
+        await killOrphanedChildGroup(meta);
       }
     }
   }
@@ -646,6 +654,12 @@ export function buildController(): RunnerHostController {
 
 /** Start the runner-host control socket. Returns an RpcServer whose close also tears down the controller. */
 export async function serve(socketPath: string): Promise<RpcServer> {
+  // Startup reaper (HIVE-53): a previous serve that died without finalize
+  // (SIGKILL/OOM) left its in-process runners' meta "running" with hostPid =
+  // the dead serve's pid and their detached harness children orphaned. Adopt
+  // them before accepting control traffic: kill the orphaned child groups and
+  // flip their meta so the control plane restarts from a truthful view.
+  await reapDeadHosts().catch(() => undefined);
   const controller = buildController();
   const server = await startRpcServer({ socketPath, methods: controller.methods });
   controller.attachServer(server);
