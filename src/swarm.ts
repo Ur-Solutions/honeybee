@@ -3,6 +3,7 @@ import { readFile, readdir, rm } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
+import { withFileLock } from "./lock.js";
 import { appendLedger } from "./store.js";
 
 export type SwarmRecord = {
@@ -56,12 +57,14 @@ export async function swarmIds(): Promise<Set<string>> {
 
 export async function createSwarm(input: Omit<SwarmRecord, "createdAt">): Promise<SwarmRecord> {
   if (!validSwarmId(input.id)) throw new Error(`Invalid swarm id: ${input.id}`);
-  const existing = await loadSwarm(input.id);
-  if (existing) throw new Error(`Swarm already exists: ${input.id}`);
-  const record: SwarmRecord = { ...input, createdAt: new Date().toISOString() };
-  await saveSwarm(record);
-  await appendLedger({ type: "swarm.create", id: record.id, frame: record.frame, colony: record.colony, beeCount: record.beeIds.length });
-  return record;
+  return withSwarmsLock(async () => {
+    const existing = await loadSwarm(input.id);
+    if (existing) throw new Error(`Swarm already exists: ${input.id}`);
+    const record: SwarmRecord = { ...input, createdAt: new Date().toISOString() };
+    await saveSwarm(record);
+    await appendLedger({ type: "swarm.create", id: record.id, frame: record.frame, colony: record.colony, beeCount: record.beeIds.length });
+    return record;
+  });
 }
 
 export async function saveSwarm(record: SwarmRecord): Promise<void> {
@@ -110,6 +113,10 @@ async function readSwarm(path: string): Promise<SwarmRecord> {
 
 async function ensureDir(): Promise<void> {
   await mkdir(swarmsDir(), { recursive: true });
+}
+
+async function withSwarmsLock<T>(fn: () => Promise<T>): Promise<T> {
+  return withFileLock(join(swarmsDir(), ".swarms.lock"), fn);
 }
 
 function swarmsDir(): string {

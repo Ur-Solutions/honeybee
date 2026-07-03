@@ -19,15 +19,26 @@ export type AllocateBeeIdentityOptions = {
   requestedAgent: string;
   storeRoot?: string;
   uuid?: () => string;
+  maxRetainedIds?: number;
 };
 
 const MIN_UUID_CHARS = 3;
 
+// The index exists so a new short id never collides with an id that can still
+// be referenced (live bees, recent scrollback). Retaining every uuid ever
+// allocated made each spawn O(lifetime spawns) under the global lock, so
+// retention is capped: entries are kept in allocation order and the oldest
+// fall off once newer allocations exceed the cap. A short id only becomes
+// reusable after this many newer allocations — far beyond any plausible
+// number of concurrently live bees.
+const MAX_RETAINED_IDS = 10_000;
+
 export async function allocateBeeIdentity(options: AllocateBeeIdentityOptions): Promise<BeeIdentity> {
   const storeRoot = options.storeRoot ?? defaultStoreRoot();
+  const maxRetained = options.maxRetainedIds ?? MAX_RETAINED_IDS;
   return withFileLock(join(storeRoot, "id-index.lock"), async () => {
     const index = await readIndex(storeRoot);
-    const used = new Set(index.used.map(normalizeUuid));
+    const used = new Set(index.used);
     const prefix = beePrefix(options.agent, options.requestedAgent);
     const uuidFactory = options.uuid ?? randomUUID;
 
@@ -36,9 +47,9 @@ export async function allocateBeeIdentity(options: AllocateBeeIdentityOptions): 
       if (used.has(uuid)) continue;
 
       const length = shortestUnusedUuidPrefixLength(uuid, used);
-      const next = { id: `${prefix}${uuid.slice(0, length)}`, prefix, uuid };
-      await writeIndex(storeRoot, { used: [...used, uuid].sort() });
-      return next;
+      const retained = [...used, uuid];
+      await writeIndex(storeRoot, { used: retained.length > maxRetained ? retained.slice(retained.length - maxRetained) : retained });
+      return { id: `${prefix}${uuid.slice(0, length)}`, prefix, uuid };
     }
 
     throw new Error("Could not allocate a unique bee id after 100000 UUID attempts");
@@ -107,13 +118,18 @@ function suffixReference(record: { id?: string; uuid?: string }): { display: str
   return { display, full: record.uuid ?? display };
 }
 
+// The shortest prefix no retained uuid starts with is one character past the
+// longest prefix the candidate shares with any of them.
 function shortestUnusedUuidPrefixLength(uuid: string, used: Set<string>): number {
-  const existingIds = [...used];
-  for (let length = MIN_UUID_CHARS; length <= uuid.length; length += 1) {
-    const candidate = uuid.slice(0, length);
-    if (!existingIds.some((existing) => existing.startsWith(candidate))) return length;
+  let longestShared = 0;
+  for (const existing of used) {
+    const limit = Math.min(existing.length, uuid.length);
+    let shared = 0;
+    while (shared < limit && existing[shared] === uuid[shared]) shared += 1;
+    if (shared > longestShared) longestShared = shared;
+    if (longestShared >= uuid.length) break;
   }
-  return uuid.length;
+  return Math.min(uuid.length, Math.max(MIN_UUID_CHARS, longestShared + 1));
 }
 
 function initials(value: string): string {

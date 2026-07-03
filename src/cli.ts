@@ -109,7 +109,6 @@ import type { RunnerOpts } from "./hsr/types.js";
 import { loopFlow } from "./loop/flow.js";
 import { buildLoopConfig } from "./loop/context.js";
 import {
-  ensureLoopDir,
   generateLoopId,
   type LoopConfig,
   listLoops,
@@ -2091,31 +2090,7 @@ async function cmdList(parsed: Parsed) {
     records = records.filter((r) => names.has(r.name));
   }
 
-  const panes = await capturePanesFor(records, probe.liveTargets);
-  const seals = await listSealedBeeNames();
-  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
-  // HSR bees are pane-less — observed from run dirs, not tmux. Without this they
-  // have no live pane/target and deriveState reads every one as dead.
-  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
-  const hsrLive = new Set<string>();
-  const hsrStates = new Map<string, BeeState>();
-  const hsrSnapshots = new Map<string, string>();
-  for (const [bee, observation] of hsrObs) {
-    if (observation.live) hsrLive.add(bee);
-    if (observation.state) hsrStates.set(bee, observation.state);
-    hsrSnapshots.set(bee, observation.snapshot);
-  }
-  const context: StateContext = {
-    liveTargets: probe.liveTargets,
-    livePanes,
-    panes,
-    seals,
-    unreachableNodes: probe.unreachableNodes,
-    hsrLive,
-    hsrStates,
-    hsrSnapshots,
-    now: Date.now(),
-  };
+  const context = await buildStateContext(records, probe);
   const states = new Map(records.map((record) => [record.name, deriveState(record, context)] as const));
 
   // Live @hive_state (set by hive itself and by agent hooks) wins over the
@@ -2330,31 +2305,7 @@ async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[];
   if (swarmFilter) records = records.filter((record) => record.swarmId === swarmFilter);
   if (nodeFilter) records = records.filter((record) => (record.node ?? LOCAL_NODE_NAME) === nodeFilter);
 
-  const panes = await capturePanesFor(records, probe.liveTargets);
-  const seals = await listSealedBeeNames();
-  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
-  // HSR bees are pane-less — observed from run dirs, not tmux. Best-effort so a
-  // bad/absent HSR root never breaks the tmux path.
-  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
-  const hsrLive = new Set<string>();
-  const hsrStates = new Map<string, BeeState>();
-  const hsrSnapshots = new Map<string, string>();
-  for (const [bee, observation] of hsrObs) {
-    if (observation.live) hsrLive.add(bee);
-    if (observation.state) hsrStates.set(bee, observation.state);
-    hsrSnapshots.set(bee, observation.snapshot);
-  }
-  const context: StateContext = {
-    liveTargets: probe.liveTargets,
-    livePanes,
-    panes,
-    seals,
-    unreachableNodes: probe.unreachableNodes,
-    hsrLive,
-    hsrStates,
-    hsrSnapshots,
-    now: Date.now(),
-  };
+  const context = await buildStateContext(records, probe);
 
   // Resolve each bee's cwd to its pro area/project/repo once, so the TUI can
   // group by pro facets without shelling out. Best-effort: no pro CLI → no
@@ -2561,6 +2512,56 @@ async function listSealedBeeNames(): Promise<Set<string>> {
   return sealedBeeNamesImpl().catch(() => new Set<string>());
 }
 
+/**
+ * Fold the run-dir HSR observations into the StateContext slices. HSR bees are
+ * pane-less — observed from run dirs, not tmux. Best-effort: a bad/absent HSR
+ * root never breaks the tmux path. Also used standalone by `clean --dead`,
+ * which needs HSR liveness without a full StateContext.
+ */
+async function observeHsrLiveness(): Promise<{ hsrLive: Set<string>; hsrStates: Map<string, BeeState>; hsrSnapshots: Map<string, string> }> {
+  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+  const hsrLive = new Set<string>();
+  const hsrStates = new Map<string, BeeState>();
+  const hsrSnapshots = new Map<string, string>();
+  for (const [bee, observation] of hsrObs) {
+    if (observation.live) hsrLive.add(bee);
+    if (observation.state) hsrStates.set(bee, observation.state);
+    hsrSnapshots.set(bee, observation.snapshot);
+  }
+  return { hsrLive, hsrStates, hsrSnapshots };
+}
+
+/**
+ * Assemble the full StateContext for deriveState from one node-probe pass.
+ * Every liveness input — captured panes, seal markers, local pane ids, and the
+ * pane-less HSR run-dir observations — is gathered here and ONLY here, so
+ * list/TUI/clean can never drift on which inputs feed deriveState (the clean
+ * path once omitted the HSR observations and reaped live HSR bees — HIVE-1).
+ * `unreachableNodes` overrides the probe's set for callers that widen it
+ * (clean treats unregistered nodes as unreachable, never dead).
+ */
+async function buildStateContext(
+  records: SessionRecord[],
+  probe: MultiNodeLiveProbe,
+  options: { unreachableNodes?: Set<string> } = {},
+): Promise<StateContext & { hsrLive: Set<string>; now: number }> {
+  const panes = await capturePanesFor(records, probe.liveTargets);
+  const seals = await listSealedBeeNames();
+  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
+  const { hsrLive, hsrStates, hsrSnapshots } = await observeHsrLiveness();
+  return {
+    liveTargets: probe.liveTargets,
+    livePanes,
+    panes,
+    seals,
+    unreachableNodes: options.unreachableNodes ?? probe.unreachableNodes,
+    hsrLive,
+    hsrStates,
+    hsrSnapshots,
+    now: Date.now(),
+  };
+}
+
 async function cmdClean(parsed: Parsed) {
   const interactive = hasFlag(parsed, "interactive") || hasFlag(parsed, "i");
   const wantsDead = hasFlag(parsed, "dead");
@@ -2617,9 +2618,9 @@ async function cmdCleanDead(parsed: Parsed) {
   // reaps its record while the runner host keeps executing — data loss (HIVE-1).
   // Protect any bee the run-dir HSR observer reports live, keyed the same way as
   // the tmux liveTargets set (an HSR record's tmuxTarget is its unique bee name).
-  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
+  const { hsrLive } = await observeHsrLiveness();
   for (const record of records) {
-    if (hsrObs.get(record.name)?.live) recordsConsideredAlive.add(liveTargetKey(record.node, record.tmuxTarget));
+    if (hsrLive.has(record.name)) recordsConsideredAlive.add(liveTargetKey(record.node, record.tmuxTarget));
   }
   let dead = deadSessionRecords(records, recordsConsideredAlive);
   // Phase B: a local sub-bee whose pane died (agentPaneId ∉ live panes) is dead
@@ -2836,33 +2837,8 @@ async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; can
     const nodeName = record.node ?? LOCAL_NODE_NAME;
     if (!knownNodes.has(nodeName)) unreachableNodes.add(nodeName);
   }
-  const panes = await capturePanesFor(records, probe.liveTargets);
-  const seals = await listSealedBeeNames();
-  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
-  // HSR bees are pane-less — observed from run dirs, not tmux. Without this,
-  // deriveState reads every live HSR bee as dead and `clean --idle`/interactive
-  // offers a running bee for deletion (HIVE-1). Mirror cmdList's threading.
-  const hsrObs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
-  const hsrLive = new Set<string>();
-  const hsrStates = new Map<string, BeeState>();
-  const hsrSnapshots = new Map<string, string>();
-  for (const [bee, observation] of hsrObs) {
-    if (observation.live) hsrLive.add(bee);
-    if (observation.state) hsrStates.set(bee, observation.state);
-    hsrSnapshots.set(bee, observation.snapshot);
-  }
-  const context: StateContext = {
-    liveTargets: probe.liveTargets,
-    livePanes,
-    panes,
-    seals,
-    unreachableNodes,
-    hsrLive,
-    hsrStates,
-    hsrSnapshots,
-    now: Date.now(),
-  };
-  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || hsrLive.has(record.name), context.now!));
+  const context = await buildStateContext(records, probe, { unreachableNodes });
+  const candidates = records.map((record) => cleanCandidateFor(record, records, deriveState(record, context), probe.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.hsrLive.has(record.name), context.now));
   candidates.sort(compareCleanCandidates);
   return { records, candidates };
 }
@@ -3262,15 +3238,14 @@ export async function tmuxSessionSurvives(
 
 /**
  * Re-fork the HSR runner host for a bee whose record still says substrate:"hsr",
- * and persist the fresh runnerPid. promote stops the runner BEFORE relaunching
- * on tmux; if that relaunch fails to stay up (`tmuxSessionSurvives` → false) the
- * bee would otherwise be stranded — its runner gone, its pane dead. This rejoins
- * the SAME provider session headlessly (`resume:true` → `claude -p --resume`,
- * which — unlike the interactive path — DOES resume an HSR session), restoring
- * the bee exactly where it started.
+ * and persist the fresh runnerPid. promote rollbacks use the default resume path
+ * to rejoin the SAME provider session headlessly; revive can pass `fresh` to
+ * start a new HSR session while preserving the record identity.
  */
-async function reviveHsrRunner(record: SessionRecord, tool: string): Promise<void> {
+async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fresh?: boolean; sessionOverride?: string } = {}): Promise<SessionRecord> {
   const adapter = adapterFor(tool);
+  const fresh = opts.fresh === true;
+  const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
   const spec = resolveAgent(record.requestedAgent ?? record.agent, [], {
     home: record.homePath,
     yolo: agentDefaultsToYolo(tool),
@@ -3288,24 +3263,31 @@ async function reviveHsrRunner(record: SessionRecord, tool: string): Promise<voi
     ...(record.parentId ? { parent: record.parentId } : {}),
     kind: tool,
     cwd: record.cwd,
-    sessionId: record.providerSessionId,
-    resume: true,
+    ...(providerSessionId ? { sessionId: providerSessionId } : {}),
+    ...(fresh ? {} : { resume: true }),
     authKind: "subscription",
     ...(record.model ? { model: record.model } : {}),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
-  await waitForHsrHost(record.name, 5000);
+  if (!(await waitForHsrHost(record.name, 5000))) {
+    console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
+  }
   const runnerTier = adapter?.tier();
-  const restored: SessionRecord = {
-    ...record,
+  // Field-merge, not a full-record save, so daemon writes since `record`
+  // loaded survive; null = record deleted concurrently, nothing to persist
+  // (HIVE-49).
+  const patch: Partial<SessionRecord> = {
+    command: shellCommand(spec),
     substrate: "hsr",
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
+    ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
     updatedAt: new Date().toISOString(),
     status: "running",
   };
-  await saveSession(restored);
+  const restored = (await updateSession(record.name, patch)) ?? { ...record, ...patch };
   await writeSpawnOptions(restored);
+  return restored;
 }
 
 /**
@@ -3351,8 +3333,10 @@ async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void
     env: spec.env,
     tmuxOptions: spec.tmuxOptions,
   });
-  const restored: SessionRecord = {
-    ...record,
+  // Field-merge, not a full-record save, so daemon writes since `record`
+  // loaded survive; explicit undefined deletes the HSR fields; null = record
+  // deleted concurrently, nothing to persist (HIVE-49).
+  const restored = await updateSession(record.name, {
     command: shellCommand(spec),
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
@@ -3360,12 +3344,11 @@ async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void
     combId: tmuxTarget,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete restored.substrate;
-  delete restored.runnerPid;
-  delete restored.runnerTier;
-  await saveSession(restored);
-  await writeSpawnOptions(restored);
+    substrate: undefined,
+    runnerPid: undefined,
+    runnerTier: undefined,
+  });
+  if (restored) await writeSpawnOptions(restored);
 }
 
 /**
@@ -3389,7 +3372,9 @@ async function cmdPromote(parsed: Parsed): Promise<void> {
     const meta = await readHsrMeta(record.name).catch(() => null);
     if (meta?.sessionId) {
       record.providerSessionId = meta.sessionId;
-      await saveSession(record);
+      // Field-merge, not a full-record save: a full save would revert daemon
+      // writes (auto-title, observed state) since `record` loaded (HIVE-49).
+      await updateSession(record.name, { providerSessionId: meta.sessionId });
     }
   }
   const tool = assertResumable(record, "promote");
@@ -3440,30 +3425,34 @@ async function cmdPromote(parsed: Parsed): Promise<void> {
     );
   }
 
-  // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier,
-  //    set the pane fields; KEEP uuid/providerSessionId/id/lineage/account.
-  const promoted: SessionRecord = {
-    ...record,
-    command: shellCommand(spec),
+  // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier
+  //    (explicit undefined = delete), set the pane fields; KEEP
+  //    uuid/providerSessionId/id/lineage/account. Field-merge under the lock
+  //    (updateSession) instead of a full-record save so daemon writes that
+  //    landed since `record` was loaded (auto-title, observed state) survive
+  //    the flip (HIVE-49). null = record deleted mid-promote (concurrent
+  //    kill) — don't resurrect it.
+  const command = shellCommand(spec);
+  const promoted = await updateSession(record.name, {
+    command,
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
     ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     combId: tmuxTarget,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete promoted.substrate;
-  delete promoted.runnerPid;
-  delete promoted.runnerTier;
-  await saveSession(promoted);
-  await writeSpawnOptions(promoted);
+    substrate: undefined,
+    runnerPid: undefined,
+    runnerTier: undefined,
+  });
+  if (promoted) await writeSpawnOptions(promoted);
   await appendLedger({ type: "session.promote", session: record.name, from: "hsr", to: "local-tmux", providerSessionId: record.providerSessionId });
 
   if (isPretty()) {
     console.log(actionLine("ok", "promote", [bold(record.name), record.agent, dim("→ local-tmux")]));
     console.error(note(`attach with: ${formatShellCommand(substrate.attachCommand(tmuxTarget))}`));
   } else {
-    console.log(`promoted\t${record.name}\thsr\tlocal-tmux\t${promoted.command}`);
+    console.log(`promoted\t${record.name}\thsr\tlocal-tmux\t${command}`);
   }
 }
 
@@ -3542,10 +3531,14 @@ async function cmdDemote(parsed: Parsed): Promise<void> {
   }
 
   // 5. Flip the record to HSR: set substrate/runnerPid/runnerTier, make
-  //    tmuxTarget the logical id, delete the pane fields; keep the rest.
-  const demoted: SessionRecord = {
-    ...record,
-    command: shellCommand(spec),
+  //    tmuxTarget the logical id, delete the pane fields (explicit undefined
+  //    = delete); keep the rest. Field-merge under the lock (updateSession)
+  //    instead of a full-record save so daemon writes that landed since
+  //    `record` was loaded survive the flip (HIVE-49). null = record deleted
+  //    mid-demote (concurrent kill) — don't resurrect it.
+  const command = shellCommand(spec);
+  const demoted = await updateSession(record.name, {
+    command,
     substrate: "hsr",
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
@@ -3553,17 +3546,16 @@ async function cmdDemote(parsed: Parsed): Promise<void> {
     combId: record.name,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete demoted.agentPaneId;
-  delete demoted.launcherPgid;
-  await saveSession(demoted);
-  await writeSpawnOptions(demoted);
+    agentPaneId: undefined,
+    launcherPgid: undefined,
+  });
+  if (demoted) await writeSpawnOptions(demoted);
   await appendLedger({ type: "session.demote", session: record.name, from: "local-tmux", to: "hsr", providerSessionId: record.providerSessionId });
 
   if (isPretty()) {
     console.log(actionLine("ok", "demote", [bold(record.name), record.agent, dim("→ hsr")]));
   } else {
-    console.log(`demoted\t${record.name}\tlocal-tmux\thsr\t${demoted.command}`);
+    console.log(`demoted\t${record.name}\tlocal-tmux\thsr\t${command}`);
   }
 }
 
@@ -3673,7 +3665,7 @@ async function cmdHere(parsed: Parsed): Promise<void> {
  * detectable from inside hive and is the operator's collision call.
  */
 function defaultSubstrateIsSshTmux(): boolean {
-  const overlay = loadNodeSync(LOCAL_NODE_NAME);
+  const overlay = loadNodeSync(LOCAL_NODE_NAME, { tolerateInvalid: true });
   return overlay?.kind === "ssh-tmux";
 }
 
@@ -4426,27 +4418,37 @@ async function cmdRevive(parsed: Parsed): Promise<void> {
     let revived = 0;
     let alive = 0;
     const skipped: string[] = [];
+    const failed: Array<{ name: string; error: string }> = [];
     for (const record of local) {
-      if (await substrateFor(record).hasSession(record.tmuxTarget)) {
-        alive += 1;
-        continue;
+      try {
+        if (await substrateFor(record).hasSession(record.tmuxTarget)) {
+          alive += 1;
+          continue;
+        }
+        // --all only auto-revives bees we can resume precisely; resuming "the
+        // latest session in the home" would grab a sibling's when homes are shared.
+        if (!record.providerSessionId && !truthy(flag(parsed, "fresh"))) {
+          skipped.push(record.name);
+          continue;
+        }
+        await reviveOne(record, parsed);
+        revived += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failed.push({ name: record.name, error: message });
+        if (isPretty()) console.log(actionLine("warn", "revive", [bold(record.name), dim(message)]));
+        else console.log(`revive_failed\t${record.name}\t${message}`);
       }
-      // --all only auto-revives bees we can resume precisely; resuming "the
-      // latest session in the home" would grab a sibling's when homes are shared.
-      if (!record.providerSessionId && !truthy(flag(parsed, "fresh"))) {
-        skipped.push(record.name);
-        continue;
-      }
-      await reviveOne(record, parsed);
-      revived += 1;
     }
     if (isPretty()) {
       const parts = [`revived ${revived}`, `${alive} already alive`];
       if (skipped.length > 0) parts.push(`${skipped.length} skipped (no resumable session id: ${skipped.join(", ")})`);
+      if (failed.length > 0) parts.push(`${failed.length} failed (${failed.map((failure) => failure.name).join(", ")})`);
       console.log(note(parts.join(" · ")));
     } else {
       console.log(`revive\tall\t${revived}\t${alive}\t${skipped.length}`);
     }
+    if (failed.length > 0) process.exitCode = 1;
     return;
   }
 
@@ -4457,21 +4459,20 @@ async function cmdRevive(parsed: Parsed): Promise<void> {
 }
 
 /**
- * Pure relaunch core: re-create a bee's tmux session in its OWN cwd/home and
- * resume (or, with `fresh`, start anew) its provider session. No `parsed`, no
- * console output — it does only the resolveAgent/newSession/updateSession/
+ * Pure relaunch core: re-create a bee's runtime in its OWN cwd/home and resume
+ * (or, with `fresh`, start anew) its provider session. No `parsed`, no console
+ * output — it does only the resolveAgent/newSession-or-HSR/updateSession/
  * appendLedger work and returns the updated record. It does NOT guard liveness
  * (the caller does, so `restore` can decide per-bee whether to skip a live one).
  * Non-fresh revive requires an exact provider session id; falling back to a
  * provider's "latest" session can resume a sibling bee in a shared home.
  *
- * ACCOUNT SAFETY: this re-spawns into `record.homePath` with NO account switch
- * (no activateAccountIntoHome) — the same home whose creds are already there, so
- * there is no cross-account OAuth-logout hazard. `reviveOne`/`restore` both rely
- * on this invariant.
+ * ACCOUNT SAFETY: this re-spawns into `record.homePath` with NO account switch.
+ * The tmux path does not activate credentials; the HSR path may refresh the same
+ * bound account into the same home. In both cases there is no cross-account
+ * OAuth-logout hazard. `reviveOne`/`restore` both rely on this invariant.
  */
 async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessionOverride?: string }): Promise<SessionRecord> {
-  const substrate = substrateFor(record);
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   const fresh = opts.fresh;
   // sessionOverride resumes (and persists) a specific provider session — used to
@@ -4484,6 +4485,17 @@ async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessi
       `hive revive: ${record.name} has no recorded provider session id; pass --session <id> to resume an exact session, or --fresh to start anew`,
     );
   }
+  if (record.substrate === "hsr") {
+    const updated = await reviveHsrRunner(record, tool, { fresh, sessionOverride });
+    await appendLedger({
+      type: "bee.revive",
+      session: record.name,
+      providerSessionId: providerSessionId ?? null,
+      fresh,
+    });
+    return updated;
+  }
+  const substrate = substrateFor(record);
 
   // Mirror the swap relaunch: rebuild the agent command from the configured
   // kind (preserving the original permission mode) and append the resume args.
@@ -4576,16 +4588,21 @@ async function cmdRun(parsed: Parsed) {
   let blocked = false;
 
   try {
-    try {
-      await waitForAgentReady(record, {
-        timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
-        acceptTrust: acceptsTrust(parsed),
-        raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
-      });
-    } catch (error) {
-      if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
-      console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
-      if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+    // HSR bees have no interactive TUI to poll for readiness — the runner host is
+    // ready as soon as spawn confirmed it live (hasSession). Skip the pane-scrape
+    // readiness wait; steer straight through the control socket.
+    if (record.substrate !== "hsr") {
+      try {
+        await waitForAgentReady(record, {
+          timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+          acceptTrust: acceptsTrust(parsed),
+          raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
+        });
+      } catch (error) {
+        if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
+        console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
+        if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+      }
     }
     await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
     const now = new Date().toISOString();
@@ -6227,8 +6244,10 @@ async function questDone(parsed: Parsed) {
       }
       // Capture the record + ws window id BEFORE the kill: transactionalKill
       // deletes the record on confirmed death, and the window id is needed to
-      // reap the orphan afterwards.
-      const snapshot = { ...bee };
+      // reap the orphan afterwards. Re-read from disk (not the quest listing's
+      // possibly-stale `bee`) so daemon merges since then — auto-title,
+      // providerSessionId — survive into the archived record (HIVE-49).
+      const snapshot = (await loadSession(bee.name)) ?? { ...bee };
       const wsWindowId = inventory?.active.get(bee.tmuxTarget);
       const outcome = await transactionalKill(bee);
       if (outcome.ok) {
@@ -7522,15 +7541,14 @@ async function startLoopDetached(rawArgs: Record<string, unknown>) {
   // and resolved at each iteration's spawn (spawnLoopBee / facade.spawn), so a
   // fresh-carrier `auto` loop re-picks the least-loaded account per iteration.
   // Validate eagerly so errors surface BEFORE we spawn a detached process.
-  const loopId = await generateLoopId();
-  const cfg = buildLoopConfig({ ...rawArgs, loopId });
-  cfg.loopId = loopId;
+  const cfg = buildLoopConfig(rawArgs);
 
   if (process.platform === "win32") {
     throw new Error("hive loop start is not supported on Windows (POSIX process groups are required to stop).");
   }
 
-  await ensureLoopDir(loopId);
+  const loopId = await generateLoopId();
+  cfg.loopId = loopId;
   await writeLoopConfig(cfg);
   const args = { ...rawArgs, loopId };
   let pid: number;

@@ -324,16 +324,12 @@ async function loadCodexTranscript(path: string, cwd: string, options: Transcrip
     const sessionMeta = rawRows.find((row) => row.type === "session_meta") as { payload?: Record<string, unknown> } | undefined;
     const sessionId = String(sessionMeta?.payload?.id ?? basename(path).replace(/\.jsonl$/, ""));
     const startedAtMs = codexSessionStartMs(rawRows);
-    // Real rollouts carry each message twice: as an event_msg
-    // (user_message/agent_message) and as a response_item message. When the
-    // event stream is present, it wins and the response_item copies are
-    // dropped so transcripts do not render every message duplicated.
-    const hasEventMessages = rawRows.some((row) => {
-      if (row.type !== "event_msg") return false;
-      const payloadType = (row.payload as Record<string, unknown> | undefined)?.type;
-      return payloadType === "user_message" || payloadType === "agent_message";
-    });
-    const rows = rawRows.flatMap((row) => normalizeCodexRow(row, hasEventMessages));
+    // Real rollouts usually carry each message twice: as an event_msg
+    // (user_message/agent_message) and as a response_item message. Dedup only
+    // the response_item copies whose role/text identity is actually present in
+    // the event stream so mixed provider formats do not lose messages.
+    const eventMessages = codexEventMessages(rawRows);
+    const rows = rawRows.flatMap((row) => normalizeCodexRow(row, eventMessages));
     const metaCwd = String(sessionMeta?.payload?.cwd ?? sessionMeta?.payload?.original_cwd ?? "");
     entry.codex = { rows, sessionId, metaCwd, ...(startedAtMs !== null ? { startedAtMs } : {}), title: extractCodexTitle(rawRows, rows) };
   }
@@ -383,7 +379,37 @@ async function loadGrokTranscript(path: string, cwd: string, options: Transcript
   return { provider: "grok", path: chatPath, sessionId, ...(startedAtMs !== undefined ? { startedAtMs } : {}), mtimeMs, rows, score, matchedBy };
 }
 
-function normalizeCodexRow(row: TranscriptRow, skipResponseItemMessages: boolean): TranscriptRow[] {
+type CodexConversationRole = "user" | "assistant";
+
+type CodexEventMessages = Record<CodexConversationRole, Set<string>>;
+
+function codexEventMessages(rows: TranscriptRow[]): CodexEventMessages {
+  const seen: CodexEventMessages = { user: new Set(), assistant: new Set() };
+  for (const row of rows) {
+    if (row.type !== "event_msg") continue;
+    const payload = row.payload as Record<string, unknown> | undefined;
+    if (!payload || typeof payload.message !== "string") continue;
+    const role = codexEventRole(payload.type);
+    if (!role) continue;
+    if (role === "user" && isInjectedCodexContext(payload.message)) continue;
+    const text = normalizeForMatch(payload.message);
+    if (text) seen[role].add(text);
+  }
+  return seen;
+}
+
+function codexEventRole(type: unknown): CodexConversationRole | null {
+  if (type === "user_message") return "user";
+  if (type === "agent_message") return "assistant";
+  return null;
+}
+
+function hasCodexEventMessage(eventMessages: CodexEventMessages, role: CodexConversationRole, content: string): boolean {
+  const text = normalizeForMatch(content);
+  return Boolean(text) && eventMessages[role].has(text);
+}
+
+function normalizeCodexRow(row: TranscriptRow, eventMessages: CodexEventMessages): TranscriptRow[] {
   const payload = row.payload as Record<string, unknown> | undefined;
   if (!payload) return [];
   if (row.type === "event_msg") {
@@ -400,12 +426,12 @@ function normalizeCodexRow(row: TranscriptRow, skipResponseItemMessages: boolean
     const role = typeof payload.role === "string" ? payload.role : "event";
     // developer/system rows carry harness instructions, not conversation.
     if (role !== "user" && role !== "assistant") return [];
-    // The event_msg stream already carries these messages; keeping the
-    // response_item copies would duplicate every message in the render.
-    if (skipResponseItemMessages) return [];
     const content = textFromContent(payload.content);
     if (!content) return [];
     if (role === "user" && isInjectedCodexContext(content)) return [];
+    // The event_msg stream already carries this exact conversation message;
+    // keeping the response_item copy would duplicate it in the render.
+    if (hasCodexEventMessage(eventMessages, role, content)) return [];
     return [{ type: role, timestamp: row.timestamp, message: { role, content } }];
   }
   return [];
