@@ -28,7 +28,6 @@ export type SearchHit = {
   // then break ties by recency, so callers can sort([]).reverse() if needed.
   score: number;
   matchedAt: string; // ISO timestamp used for recency ranking
-  raw?: unknown;
 };
 
 export type SearchTypeFilter = "seals" | "ledger" | "sessions";
@@ -110,7 +109,7 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
       ...(options.status ? { status: options.status } : {}),
     })) {
       const matchedAtMs = Date.parse(record.sealedAt);
-      if (options.sinceMs !== undefined && Number.isFinite(matchedAtMs) && matchedAtMs < options.sinceMs) continue;
+      if (options.sinceMs !== undefined && (!Number.isFinite(matchedAtMs) || matchedAtMs < options.sinceMs)) continue;
       const text = sealHaystack(record);
       const match = matcher.find(text);
       if (!match) continue;
@@ -124,7 +123,6 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
         matchEndInSnippet: snippet.matchEnd,
         score: scoreHit("seal", record.sealedAt),
         matchedAt: record.sealedAt,
-        raw: record,
       });
     }
   }
@@ -133,10 +131,12 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
     for await (const { path, line, ts, lineNumber } of reader.readLedgerLines({
       ...(options.sinceMs !== undefined ? { sinceMs: options.sinceMs } : {}),
     })) {
+      if (isOutsideSinceWindow(ts, options.sinceMs)) continue;
       if (!passesLedgerFilters(line, options)) continue;
-      const match = matcher.find(line);
+      const text = redactSearchText(line);
+      const match = matcher.find(text);
       if (!match) continue;
-      const snippet = makeSnippet(line, match.start, match.end);
+      const snippet = makeSnippet(text, match.start, match.end);
       hits.push({
         type: "ledger",
         path: `${path}:${lineNumber}`,
@@ -145,7 +145,6 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
         matchEndInSnippet: snippet.matchEnd,
         score: scoreHit("ledger", ts),
         matchedAt: ts,
-        raw: line,
       });
     }
   }
@@ -158,7 +157,7 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
     })) {
       const matchedAt = record.updatedAt ?? record.createdAt ?? "";
       const matchedAtMs = Date.parse(matchedAt);
-      if (options.sinceMs !== undefined && Number.isFinite(matchedAtMs) && matchedAtMs < options.sinceMs) continue;
+      if (options.sinceMs !== undefined && (!Number.isFinite(matchedAtMs) || matchedAtMs < options.sinceMs)) continue;
       const text = sessionHaystack(record);
       const match = matcher.find(text);
       if (!match) continue;
@@ -172,7 +171,6 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
         matchEndInSnippet: snippet.matchEnd,
         score: scoreHit("session", matchedAt),
         matchedAt,
-        raw: record,
       });
     }
   }
@@ -239,27 +237,25 @@ export function makeSnippet(text: string, matchStart: number, matchEnd: number):
 
   const ellipsisLeft = start > 0;
   const ellipsisRight = end < text.length;
-  const body = text.slice(start, end).replace(/\s+/g, " ");
+  const body = normalizeSnippetWhitespace(text.slice(start, end));
 
   // Snippet output keeps the ellipsis prefix/suffix so users can see truncation,
   // but match offsets refer to the visible match characters inside the snippet.
   const prefix = ellipsisLeft ? "…" : "";
   const suffix = ellipsisRight ? "…" : "";
-  // Match start in slice -> add prefix length. We collapsed whitespace so the
-  // raw count from `text` is an upper bound; we recompute by finding the match
-  // text inside the formatted snippet for robustness.
-  const matchText = text.slice(matchStart, matchEnd).replace(/\s+/g, " ");
-  const rawSliceMatchOffset = matchStart - start;
-  // Best-effort: find the first occurrence of `matchText` in `body`. If the
-  // whitespace collapse changed the layout we still recover a sensible offset.
-  let visibleStart = body.indexOf(matchText);
-  if (visibleStart === -1) visibleStart = Math.max(0, Math.min(rawSliceMatchOffset, body.length));
+  const matchText = normalizeSnippetWhitespace(text.slice(matchStart, matchEnd));
+  const rawSliceBeforeMatch = text.slice(start, matchStart);
+  const visibleStart = Math.max(0, Math.min(normalizeSnippetWhitespace(rawSliceBeforeMatch).length, body.length));
   const visibleEnd = Math.min(body.length, visibleStart + matchText.length);
   return {
     text: `${prefix}${body}${suffix}`,
     matchStart: prefix.length + visibleStart,
     matchEnd: prefix.length + visibleEnd,
   };
+}
+
+function normalizeSnippetWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ");
 }
 
 function scoreHit(type: SearchHitType, matchedAt: string): number {
@@ -285,7 +281,7 @@ function sealHaystack(record: SealRecord): string {
     (record.nextActions ?? []).join(" "),
     ...(record.testsRun ?? []).map((t) => `${t.command} ${t.result} ${t.notes ?? ""}`),
   ];
-  return parts.filter((p) => p && p.length > 0).join("\n");
+  return redactSearchText(parts.filter((p) => p && p.length > 0).join("\n"));
 }
 
 function sessionHaystack(record: SessionRecord): string {
@@ -299,7 +295,21 @@ function sessionHaystack(record: SessionRecord): string {
     record.brief ?? "",
     record.notes ?? "",
   ];
-  return parts.filter((p) => p && p.length > 0).join("\n");
+  return redactSearchText(parts.filter((p) => p && p.length > 0).join("\n"));
+}
+
+const REDACTED = "[redacted]";
+const SECRET_ASSIGNMENT_RE = /\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|authorization)\s*[:=]\s*["']?(?:Bearer\s+)?)[^\s"',;)}\]]+/gi;
+const BEARER_SECRET_RE = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}\b/gi;
+const KNOWN_SECRET_VALUE_RE = /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9][A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35})\b/g;
+const JWT_RE = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
+
+function redactSearchText(text: string): string {
+  return text
+    .replace(SECRET_ASSIGNMENT_RE, `$1${REDACTED}`)
+    .replace(BEARER_SECRET_RE, `$1${REDACTED}`)
+    .replace(KNOWN_SECRET_VALUE_RE, REDACTED)
+    .replace(JWT_RE, REDACTED);
 }
 
 function passesLedgerFilters(line: string, options: SearchOptions): boolean {
@@ -454,11 +464,17 @@ async function* defaultReadLedgerLines(filter: LedgerFilter): AsyncIterable<{
       const ts = ledgerLineTimestamp(line);
       if (filter.sinceMs !== undefined) {
         const tsMs = Date.parse(ts);
-        if (Number.isFinite(tsMs) && tsMs < filter.sinceMs) continue;
+        if (!Number.isFinite(tsMs) || tsMs < filter.sinceMs) continue;
       }
       yield { path: file, line, ts, lineNumber: i + 1 };
     }
   }
+}
+
+function isOutsideSinceWindow(timestamp: string, sinceMs: number | undefined): boolean {
+  if (sinceMs === undefined) return false;
+  const ms = Date.parse(timestamp);
+  return !Number.isFinite(ms) || ms < sinceMs;
 }
 
 function ledgerLineTimestamp(line: string): string {

@@ -289,3 +289,95 @@ test("highlightSnippet offsets stay correct when snippet is short", async () => 
     assert.equal(hit.snippet.slice(hit.matchStartInSnippet, hit.matchEndInSnippet), "tiny");
   });
 });
+
+test("makeSnippet offsets point at the matched occurrence when text repeats", () => {
+  const text = "needle before some context and then needle again";
+  const matchStart = text.lastIndexOf("needle");
+  const snippet = makeSnippet(text, matchStart, matchStart + "needle".length);
+  assert.equal(snippet.text.slice(snippet.matchStart, snippet.matchEnd), "needle");
+  assert.equal(snippet.matchStart, snippet.text.lastIndexOf("needle"));
+});
+
+test("search --since drops records and lines with unparseable timestamps", async () => {
+  const recentSeal = {
+    ...validateSealArtifact({ status: "done", summary: "widget recent seal" }),
+    beeName: "CO.good",
+    sealedAt: "2026-06-01T00:00:00.000Z",
+  };
+  const badSeal = {
+    ...validateSealArtifact({ status: "done", summary: "widget invalid seal" }),
+    beeName: "CO.bad-seal",
+    sealedAt: "not-a-date",
+  };
+  const goodSession = makeSessionRecord({
+    name: "CO.good-session",
+    brief: "widget recent session",
+    updatedAt: "2026-06-02T00:00:00.000Z",
+  });
+  const badSession = makeSessionRecord({
+    name: "CO.bad-session",
+    brief: "widget invalid session",
+    updatedAt: "not-a-date",
+  });
+  const mock: CorpusReader = {
+    listLedgerFiles: async () => [],
+    readSeals: async function* () {
+      yield { path: "/fake/good-seal.json", record: recentSeal };
+      yield { path: "/fake/bad-seal.json", record: badSeal };
+    },
+    readSessionRecords: async function* () {
+      yield { path: "/fake/good-session.json", record: goodSession };
+      yield { path: "/fake/bad-session.json", record: badSession };
+    },
+    readLedgerLines: async function* () {
+      yield {
+        path: "/fake/ledger.jsonl",
+        line: JSON.stringify({ ts: "not-a-date", type: "note", text: "widget invalid ledger" }),
+        ts: "not-a-date",
+        lineNumber: 1,
+      };
+      yield {
+        path: "/fake/ledger.jsonl",
+        line: JSON.stringify({ ts: "2026-06-03T00:00:00.000Z", type: "note", text: "widget recent ledger" }),
+        ts: "2026-06-03T00:00:00.000Z",
+        lineNumber: 2,
+      };
+    },
+  };
+
+  const result = await search({ query: "widget", sinceMs: Date.parse("2026-01-01T00:00:00.000Z") }, mock);
+  assert.deepEqual(result.hits.map((hit) => hit.beeName ?? hit.path).sort(), [
+    "/fake/ledger.jsonl:2",
+    "CO.good",
+    "CO.good-session",
+  ]);
+});
+
+test("search hits do not retain raw records or ledger lines", async () => {
+  await withTempStore(async () => {
+    await saveSession(makeSessionRecord({ name: "CL.aaa", brief: "tiny" }));
+    const result = await search({ query: "tiny", types: new Set(["sessions"]) });
+    assert.equal(Object.hasOwn(result.hits[0]!, "raw"), false);
+  });
+});
+
+test("search snippets redact secret-shaped prompt and seal content", async () => {
+  await withTempStore(async () => {
+    const secret = "sk-ant-oat01-FAKE-setup-token-never-real-xyz";
+    await saveSession(makeSessionRecord({
+      name: "CL.secret",
+      lastPrompt: `please call the API token endpoint with api_key=${secret}`,
+    }));
+    await recordSeal("CO.secret", validateSealArtifact({
+      status: "done",
+      summary: `verified refresh_token=${secret}`,
+    }));
+
+    const result = await search({ query: "token", types: new Set(["seals", "sessions"]) });
+    assert.ok(result.hits.length >= 2);
+    for (const hit of result.hits) {
+      assert.doesNotMatch(hit.snippet, new RegExp(secret));
+      assert.match(hit.snippet, /\[redacted\]/);
+    }
+  });
+});

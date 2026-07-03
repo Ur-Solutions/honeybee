@@ -94,6 +94,12 @@ export function briefFooter(): string {
 
 let cached: HiveConfig | undefined;
 
+const TOP_LEVEL_CONFIG_KEYS = new Set(["bees", "briefFooter", "naming", "spawn"]);
+const NAMING_CONFIG_KEYS = new Set(["auto", "tool", "model", "command", "effort"]);
+const SPAWN_CONFIG_KEYS = new Set(["defaultSubstrate"]);
+const SPAWN_DEFAULT_SUBSTRATE_KEYS = new Set(["agent", "user"]);
+const BEE_CONFIG_KEYS = new Set(["yolo", "home", "command", "kind", "account", "model", "args", "cwd"]);
+
 export function configPath(): string {
   return join(storeRoot(), "config.json");
 }
@@ -107,7 +113,11 @@ export function loadConfig(): HiveConfig {
   }
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-    cached = normalizeConfig(parsed);
+    const normalized = normalizeConfig(parsed);
+    if (normalized.unknownKeys.length > 0) {
+      console.error(`hive: ignoring unknown config keys at ${path}: ${normalized.unknownKeys.join(", ")}`);
+    }
+    cached = normalized.config;
   } catch (error) {
     // Warn (once per process — the result is cached) instead of silently
     // dropping the user's yolo flags / home / command overrides on the floor.
@@ -149,13 +159,16 @@ export function namingConfig(): ResolvedNamingConfig {
   };
 }
 
-function normalizeConfig(value: unknown): HiveConfig {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+function normalizeConfig(value: unknown): { config: HiveConfig; unknownKeys: string[] } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { config: {}, unknownKeys: [] };
   const object = value as Record<string, unknown>;
   const config: HiveConfig = {};
+  const unknownKeys: string[] = [];
+  collectUnknownKeys(object, TOP_LEVEL_CONFIG_KEYS, "", unknownKeys);
   if (typeof object.briefFooter === "string") config.briefFooter = object.briefFooter;
   if (object.naming && typeof object.naming === "object" && !Array.isArray(object.naming)) {
     const r = object.naming as Record<string, unknown>;
+    collectUnknownKeys(r, NAMING_CONFIG_KEYS, "naming", unknownKeys);
     const naming: NamingConfig = {};
     if (typeof r.auto === "boolean") naming.auto = r.auto;
     if (r.tool === "claude" || r.tool === "codex") naming.tool = r.tool;
@@ -166,9 +179,11 @@ function normalizeConfig(value: unknown): HiveConfig {
   }
   if (object.spawn && typeof object.spawn === "object" && !Array.isArray(object.spawn)) {
     const r = object.spawn as Record<string, unknown>;
+    collectUnknownKeys(r, SPAWN_CONFIG_KEYS, "spawn", unknownKeys);
     const spawn: SpawnConfig = {};
     if (r.defaultSubstrate && typeof r.defaultSubstrate === "object" && !Array.isArray(r.defaultSubstrate)) {
       const d = r.defaultSubstrate as Record<string, unknown>;
+      collectUnknownKeys(d, SPAWN_DEFAULT_SUBSTRATE_KEYS, "spawn.defaultSubstrate", unknownKeys);
       const defaults: NonNullable<SpawnConfig["defaultSubstrate"]> = {};
       if (d.agent === "hsr" || d.agent === "local-tmux") defaults.agent = d.agent;
       if (d.user === "hsr" || d.user === "local-tmux") defaults.user = d.user;
@@ -182,6 +197,7 @@ function normalizeConfig(value: unknown): HiveConfig {
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
       const bee: BeeConfig = {};
       const r = raw as Record<string, unknown>;
+      collectUnknownKeys(r, BEE_CONFIG_KEYS, `bees.${key}`, unknownKeys);
       if (typeof r.yolo === "boolean") bee.yolo = r.yolo;
       if (typeof r.home === "string" && r.home.length > 0) bee.home = r.home;
       if (typeof r.command === "string" && r.command.length > 0) bee.command = r.command;
@@ -198,6 +214,11 @@ function normalizeConfig(value: unknown): HiveConfig {
     }
     config.bees = bees;
   }
-  return config;
+  return { config, unknownKeys };
 }
 
+function collectUnknownKeys(object: Record<string, unknown>, allowed: Set<string>, prefix: string, out: string[]): void {
+  for (const key of Object.keys(object)) {
+    if (!allowed.has(key)) out.push(prefix ? `${prefix}.${key}` : key);
+  }
+}

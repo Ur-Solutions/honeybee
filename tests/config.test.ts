@@ -213,3 +213,40 @@ test("corrupt config.json warns once and falls back to empty config", async () =
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("unknown config keys warn once while known keys still load", async () => {
+  const warnings: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => warnings.push(args.join(" "));
+  try {
+    await withTempConfig(
+      {
+        typoTop: true,
+        naming: { tool: "codex", modle: "gpt-5" },
+        spawn: {
+          typoSpawn: true,
+          defaultSubstrate: { agent: "hsr", usr: "local-tmux" },
+        },
+        bees: {
+          codex: { yol: true, yolo: true, home: "2" },
+        },
+      },
+      () => {
+        assert.deepEqual(beeConfig("codex"), { yolo: true, home: "2" });
+        assert.equal(namingConfig().tool, "codex");
+        assert.equal(loadConfig().spawn?.defaultSubstrate?.agent, "hsr");
+        // Cached: repeated reads should not warn again.
+        assert.equal(loadConfig().spawn?.defaultSubstrate?.agent, "hsr");
+      },
+    );
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /unknown config keys/);
+    assert.match(warnings[0]!, /typoTop/);
+    assert.match(warnings[0]!, /naming\.modle/);
+    assert.match(warnings[0]!, /spawn\.typoSpawn/);
+    assert.match(warnings[0]!, /spawn\.defaultSubstrate\.usr/);
+    assert.match(warnings[0]!, /bees\.codex\.yol/);
+  } finally {
+    console.error = original;
+  }
+});
