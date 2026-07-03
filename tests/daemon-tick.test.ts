@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { tick, type ProbeResult, type TickDeps } from "../src/daemon/run.js";
-import type { BeeState } from "../src/state.js";
+import type { BeeState, PaneCaptureMap } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -43,7 +43,7 @@ function buildDeps(args: {
   records: SessionRecord[];
   liveTargets: Set<string>;
   sessionStates?: Map<string, string>;
-  panes?: Map<string, string>;
+  panes?: PaneCaptureMap;
   seals?: Set<string>;
   unreachableNodes?: Set<string>;
   now?: number;
@@ -409,6 +409,39 @@ test("tick: does not mirror uncertain booting over an existing live hive state",
   });
 });
 
+test("tick: unknown pane capture preserves active and avoids idle transition side effects", async () => {
+  await withTempStore(async () => {
+    const NOW = Date.parse("2026-06-03T10:00:00.000Z");
+    const record = bee({ lastPromptAt: new Date(NOW - 10 * 60_000).toISOString(), lastPrompt: "keep working" });
+    const capture: Capture = { ledger: [], touches: [] };
+    let dispatchInput: { transitions: Array<{ from: BeeState | undefined; to: BeeState }>; current: BeeState | undefined } | undefined;
+    const deps: TickDeps = {
+      ...buildDeps({
+        records: [record],
+        liveTargets: new Set([record.tmuxTarget]),
+        panes: new Map<string, string | undefined>([[record.tmuxTarget, undefined]]),
+        now: NOW,
+        capture,
+      }),
+      dispatchBuzDrain: async (_records, transitions, currentStates) => {
+        dispatchInput = {
+          transitions: transitions.map(({ from, to }) => ({ from, to })),
+          current: currentStates.get(record.name),
+        };
+        return [];
+      },
+    };
+
+    const result = await tick(deps, new Map([[record.name, "active"]]));
+
+    assert.equal(result.observed.get(record.name), "active");
+    assert.equal(result.transitions.length, 0);
+    assert.equal(capture.ledger.length, 0);
+    assert.equal(capture.touches[0]!.fields.lastObservedState, "active");
+    assert.deepEqual(dispatchInput, { transitions: [], current: "active" });
+  });
+});
+
 // A promise that never settles — the production wedge shape (a lost libuv fs
 // completion froze one tick, and therefore the daemon, for 3+ days).
 function never<T>(): Promise<T> {
@@ -425,11 +458,14 @@ test("tick: a capturePanes that never settles is timed out, recorded, and the ti
       timeouts: { substrateMs: 30 },
     };
 
-    const result = await tick(deps, new Map());
+    const result = await tick(deps, new Map([[record.name, "active"]]));
 
     assert.ok(result.errors.some((e) => /capturePanes timed out after 30ms/.test(e.message)));
-    // The tick still observed the record (empty pane fallback) and persisted state.
+    // The tick still observed the record, but preserved the previous state
+    // because pane content was unknown rather than factually empty.
     assert.equal(result.observed.has(record.name), true);
+    assert.equal(result.observed.get(record.name), "active");
+    assert.equal(result.transitions.length, 0);
     assert.equal(capture.touches.length, 1);
   });
 });
