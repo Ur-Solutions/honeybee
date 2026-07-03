@@ -7,7 +7,10 @@ import { test } from "node:test";
 import {
   daemonLockPath,
   daemonLoopStale,
+  daemonRecentErrorsSaturated,
   daemonStatePath,
+  daemonTickProgressStale,
+  maxRecentErrors,
   readDaemonState,
   readDaemonStatus,
   writeDaemonState,
@@ -33,6 +36,7 @@ test("writeDaemonState/readDaemonState round-trip preserves shape", async () => 
     const state: DaemonState = {
       startedAt: "2026-06-03T10:00:00.000Z",
       lastTickAt: "2026-06-03T10:00:02.000Z",
+      lastSuccessfulTickAt: "2026-06-03T10:00:02.000Z",
       tickCount: 1,
       version: "1",
       pid: 12345,
@@ -252,6 +256,60 @@ test("daemonLoopStale falls back to startedAt when the daemon never ticked", () 
   assert.equal(daemonLoopStale(state, startMs + 10 * 60_000, 5 * 60_000).stale, true);
 });
 
+test("daemonTickProgressStale keys on lastSuccessfulTickAt, not the loop heartbeat", () => {
+  const now = Date.parse("2026-06-29T08:00:00.000Z");
+  const state: DaemonState = {
+    startedAt: "2026-06-29T07:00:00.000Z",
+    lastTickAt: "2026-06-29T07:59:59.000Z",
+    lastSuccessfulTickAt: "2026-06-29T07:43:14.708Z",
+    tickCount: 23334,
+    version: "1",
+    pid: 51841,
+    recentErrors: [{ ts: "2026-06-29T07:59:59.000Z", msg: "tick failed" }],
+  };
+  assert.equal(daemonLoopStale(state, now, 5 * 60_000).stale, false);
+  const progress = daemonTickProgressStale(state, now, 5 * 60_000);
+  assert.equal(progress.stale, true);
+  assert.ok(progress.ageMs! > 5 * 60_000);
+});
+
+test("daemonTickProgressStale uses startedAt until the first successful tick", () => {
+  const now = Date.parse("2026-06-29T08:00:00.000Z");
+  const state: DaemonState = {
+    startedAt: "2026-06-29T07:43:00.000Z",
+    lastTickAt: "2026-06-29T07:59:59.000Z",
+    lastSuccessfulTickAt: null,
+    tickCount: 0,
+    version: "1",
+    pid: 51841,
+    recentErrors: [{ ts: "2026-06-29T07:59:59.000Z", msg: "tick failed" }],
+  };
+  assert.equal(daemonLoopStale(state, now, 5 * 60_000).stale, false);
+  assert.equal(daemonTickProgressStale(state, now, 5 * 60_000).stale, true);
+});
+
+test("daemonRecentErrorsSaturated requires a full buffer with a fresh latest error", () => {
+  const now = Date.parse("2026-06-29T08:00:00.000Z");
+  const recentErrors = Array.from({ length: maxRecentErrors() }, (_, i) => ({
+    ts: new Date(now - (maxRecentErrors() - i) * 1_000).toISOString(),
+    msg: `boom ${i}`,
+  }));
+  const state: DaemonState = {
+    startedAt: "2026-06-29T07:00:00.000Z",
+    lastTickAt: "2026-06-29T08:00:00.000Z",
+    lastSuccessfulTickAt: "2026-06-29T08:00:00.000Z",
+    tickCount: 10,
+    version: "1",
+    pid: 51841,
+    recentErrors,
+  };
+  assert.equal(daemonRecentErrorsSaturated(state, now, 5 * 60_000), true);
+  state.recentErrors = recentErrors.map((error) => ({ ...error, ts: "2026-06-29T07:00:00.000Z" }));
+  assert.equal(daemonRecentErrorsSaturated(state, now, 5 * 60_000), false);
+  state.recentErrors = recentErrors.slice(1);
+  assert.equal(daemonRecentErrorsSaturated(state, now, 5 * 60_000), false);
+});
+
 test("readDaemonStatus reports STALE for a live process whose lastTickAt is old", async () => {
   await withTempStore(async () => {
     const lock = await acquireLongLivedLock(daemonLockPath(), { label: "test daemon" });
@@ -280,9 +338,11 @@ test("readDaemonStatus reports a fresh running daemon as not stale", async () =>
   await withTempStore(async () => {
     const lock = await acquireLongLivedLock(daemonLockPath(), { label: "test daemon" });
     try {
+      const now = new Date().toISOString();
       await writeDaemonState({
         startedAt: new Date(Date.now() - 3_600_000).toISOString(),
-        lastTickAt: new Date().toISOString(),
+        lastTickAt: now,
+        lastSuccessfulTickAt: now,
         tickCount: 100,
         version: "1",
         pid: process.pid,
@@ -291,6 +351,86 @@ test("readDaemonStatus reports a fresh running daemon as not stale", async () =>
       const report = await readDaemonStatus(undefined, { staleAfterMs: 5 * 60_000 });
       assert.equal(report.running, true);
       assert.equal(report.stale, false);
+      assert.deepEqual(report.staleReasons, []);
+    } finally {
+      await lock.release();
+    }
+  });
+});
+
+test("readDaemonStatus reports STALE when tick progress is old but lastTickAt is fresh", async () => {
+  await withTempStore(async () => {
+    const lock = await acquireLongLivedLock(daemonLockPath(), { label: "test daemon" });
+    try {
+      const now = Date.now();
+      await writeDaemonState({
+        startedAt: new Date(now - 2 * 3_600_000).toISOString(),
+        lastTickAt: new Date(now).toISOString(),
+        lastSuccessfulTickAt: new Date(now - 60 * 60_000).toISOString(),
+        tickCount: 100,
+        version: "1",
+        pid: process.pid,
+        recentErrors: [{ ts: new Date(now).toISOString(), msg: "tick timed out" }],
+      });
+      const report = await readDaemonStatus(() => now, { staleAfterMs: 5 * 60_000 });
+      assert.equal(report.running, true);
+      assert.equal(report.stale, true);
+      assert.ok(report.lastTickAgeMs! < 5 * 60_000);
+      assert.ok(report.lastSuccessfulTickAgeMs! > 5 * 60_000);
+      assert.deepEqual(report.staleReasons, ["tick-progress-stale"]);
+    } finally {
+      await lock.release();
+    }
+  });
+});
+
+test("readDaemonStatus reports STALE when recentErrors is saturated with fresh failures", async () => {
+  await withTempStore(async () => {
+    const lock = await acquireLongLivedLock(daemonLockPath(), { label: "test daemon" });
+    try {
+      const now = Date.now();
+      const fresh = new Date(now).toISOString();
+      await writeDaemonState({
+        startedAt: new Date(now - 3_600_000).toISOString(),
+        lastTickAt: fresh,
+        lastSuccessfulTickAt: fresh,
+        tickCount: 100,
+        version: "1",
+        pid: process.pid,
+        recentErrors: Array.from({ length: maxRecentErrors() }, (_, i) => ({ ts: fresh, msg: `boom ${i}` })),
+      });
+      const report = await readDaemonStatus(() => now, { staleAfterMs: 5 * 60_000 });
+      assert.equal(report.running, true);
+      assert.equal(report.stale, true);
+      assert.equal(report.recentErrorsSaturated, true);
+      assert.deepEqual(report.staleReasons, ["recent-errors-saturated"]);
+    } finally {
+      await lock.release();
+    }
+  });
+});
+
+test("readDaemonStatus does not keep a recovered daemon stale for old saturated errors", async () => {
+  await withTempStore(async () => {
+    const lock = await acquireLongLivedLock(daemonLockPath(), { label: "test daemon" });
+    try {
+      const now = Date.now();
+      const fresh = new Date(now).toISOString();
+      const old = new Date(now - 60 * 60_000).toISOString();
+      await writeDaemonState({
+        startedAt: new Date(now - 3_600_000).toISOString(),
+        lastTickAt: fresh,
+        lastSuccessfulTickAt: fresh,
+        tickCount: 100,
+        version: "1",
+        pid: process.pid,
+        recentErrors: Array.from({ length: maxRecentErrors() }, (_, i) => ({ ts: old, msg: `old boom ${i}` })),
+      });
+      const report = await readDaemonStatus(() => now, { staleAfterMs: 5 * 60_000 });
+      assert.equal(report.running, true);
+      assert.equal(report.stale, false);
+      assert.equal(report.recentErrorsSaturated, false);
+      assert.deepEqual(report.staleReasons, []);
     } finally {
       await lock.release();
     }

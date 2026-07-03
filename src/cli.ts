@@ -40,7 +40,7 @@ import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "./forkTui.js";
 import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
-import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
+import { acquireProSlot, createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { pickRoundRobinAccount } from "./roundRobin.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
@@ -4321,6 +4321,12 @@ async function resolveForkCheckpoint(beeName: string, checkpointArg: string | un
 
 // ── hive fork launch — the interactive dialog (⌘K) ───────────────────────────
 
+async function hasRecordedForkUsingCwd(source: SessionRecord, cwd: string): Promise<boolean> {
+  const sourceIds = new Set([source.name, ...(source.id ? [source.id] : [])]);
+  const records = await listSessions();
+  return records.some((record) => record.cwd === cwd && record.forkedFromId !== undefined && sourceIds.has(record.forkedFromId));
+}
+
 /**
  * `hive fork launch` — the interactive fork window (the ⌘K target). The SOURCE
  * is the bee owning the current pane, so the dialog opens straight on a form for
@@ -4392,12 +4398,16 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
 
   // Create the worktree/checkout up front — its path becomes the fork's --cwd.
   let cwd: string | undefined;
+  let createdSlot: { kind: ProSlotKind; repoPath: string; name: string; path: string } | undefined;
   if (intent.isolation) {
     if (!proRepo) throw new Error("hive fork launch: not a pro repo — cannot create a worktree");
     const slug = toProSlug(intent.isolation.name);
     if (!slug) throw new Error("hive fork launch: worktree name must contain letters, digits, or dashes");
     if (isPretty()) console.error(note(`creating ${intent.isolation.kind} ${slug}…`));
-    cwd = await createProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slot = await acquireProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slotPath = await realpath(slot.path).catch(() => slot.path);
+    cwd = slotPath;
+    if (slot.created) createdSlot = { kind: intent.isolation.kind, repoPath: proRepo.path, name: slug, path: slotPath };
   }
 
   // Build a `hive fork` invocation and reuse cmdFork wholesale.
@@ -4410,7 +4420,28 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
   if (cwd) flags.set("cwd", cwd);
   flags.set("here", true);
 
-  const record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  let record: SessionRecord;
+  try {
+    record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  } catch (error) {
+    if (createdSlot) {
+      const launched = await hasRecordedForkUsingCwd(source, createdSlot.path).catch((checkError) => {
+        const message = checkError instanceof Error ? checkError.message : String(checkError);
+        console.error(note(`warn: keeping ${createdSlot.kind} ${createdSlot.name}; could not verify fork records: ${message}`));
+        return true;
+      });
+      if (!launched) {
+        if (isPretty()) console.error(note(`removing ${createdSlot.kind} ${createdSlot.name} after failed fork...`));
+        try {
+          await deleteProSlot(createdSlot.kind, createdSlot.repoPath, createdSlot.name);
+        } catch (cleanupError) {
+          const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          console.error(note(`warn: failed to remove ${createdSlot.kind} ${createdSlot.name} at ${tildify(createdSlot.path)}: ${message}`));
+        }
+      }
+    }
+    throw error;
+  }
 
   if (intent.message) {
     await cmdSend({ command: "send", args: [record.name, intent.message], flags: new Map(), rest: [] });
@@ -6859,7 +6890,7 @@ async function nodeStatus(parsed: Parsed) {
     ],
     healths.map((h) => [
       bold(h.name),
-      h.kind === "local-tmux" ? gray("local") : h.kind === "remote-hsr" ? magenta("hsr") : cyan("ssh"),
+      nodeKindLabel(h.kind),
       h.reachable ? green("● online") : red("○ offline"),
       h.latencyMs === null ? dim("-") : dim(`${h.latencyMs}ms`),
       formatNodeVersion(h),
@@ -6875,6 +6906,28 @@ function formatNodeVersion(h: NodeHealth): string {
   return h.versionDrift
     ? `${h.runnerHostVersion} ${yellow("(drift)")}`
     : dim(h.runnerHostVersion);
+}
+
+function nodeKindLabel(kind: NodeRecord["kind"] | string, display: "short" | "full" = "short"): string {
+  const label = display === "full"
+    ? kind
+    : kind === "local-tmux"
+      ? "local"
+      : kind === "ssh-tmux"
+        ? "ssh"
+        : kind === "remote-hsr"
+          ? "hsr"
+          : kind;
+  switch (kind) {
+    case "local-tmux":
+      return gray(label);
+    case "ssh-tmux":
+      return cyan(label);
+    case "remote-hsr":
+      return magenta(label);
+    default:
+      return yellow(label || "unknown");
+  }
 }
 
 /**
@@ -6938,7 +6991,7 @@ async function nodeList() {
       { header: "DESCRIPTION" },
     ],
     nodes.map((n) => [
-      n.kind === "local-tmux" ? gray("local") : cyan("ssh"),
+      nodeKindLabel(n.kind),
       bold(n.name),
       dim(n.endpoint),
       formatNodeStatus(n.status),
@@ -7104,7 +7157,7 @@ async function cmdSubstrate(parsed: Parsed) {
 
 async function substrateList() {
   const nodes = await listNodes();
-  const kinds = new Map<string, number>();
+  const kinds = new Map<NodeRecord["kind"], number>();
   for (const node of nodes) kinds.set(node.kind, (kinds.get(node.kind) ?? 0) + 1);
   if (!isPretty()) {
     for (const [kind, count] of kinds) console.log(`${kind}\t${count}`);
@@ -7116,7 +7169,7 @@ async function substrateList() {
       { header: "NODES", align: "right" },
     ],
     [...kinds.entries()].sort().map(([kind, count]) => [
-      kind === "local-tmux" ? gray("local-tmux") : cyan("ssh-tmux"),
+      nodeKindLabel(kind, "full"),
       String(count),
     ]),
   ));
@@ -7163,10 +7216,8 @@ function parseFlowRunArgs(parsed: Parsed): Record<string, unknown> {
     if (eq <= 0) throw new Error(`Invalid --arg: ${entry} (expected key=value)`);
     const key = entry.slice(0, eq);
     const value = entry.slice(eq + 1);
-    // Coerce numeric/boolean literals; everything else stays a string.
-    if (value === "true") out[key] = true;
-    else if (value === "false") out[key] = false;
-    else if (value !== "" && Number.isFinite(Number(value))) out[key] = Number(value);
+    const numberValue = Number(value);
+    if (value !== "" && Number.isFinite(numberValue) && String(numberValue) === value) out[key] = numberValue;
     else out[key] = value;
   }
   return out;
@@ -8170,7 +8221,7 @@ async function daemonStatus(parsed: Parsed) {
   const label = daemonLabel(parsed);
   const staleAfter = numberFlag(parsed, ["stale-after-ms"], 0);
   const status = await readDaemonStatus(undefined, { label, ...(staleAfter > 0 ? { staleAfterMs: staleAfter } : {}) });
-  // Exit codes: 0 healthy, 3 down, 4 STALE (process alive, loop wedged).
+  // Exit codes: 0 healthy, 3 down, 4 unhealthy/stale (process alive but not progressing).
   // Anything polling this command must treat nonzero as an outage.
   const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
@@ -8198,11 +8249,18 @@ async function daemonStatus(parsed: Parsed) {
     process.exit(3);
   }
   if (status.stale) {
-    const age = status.state?.lastTickAt ? formatRelativeTime(status.state.lastTickAt) : "never";
-    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("STALE"))} ${dim(`(process alive, loop wedged — last tick ${age} ago, threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
+    const reasonLabels: Record<string, string> = {
+      "loop-stale": "loop heartbeat stale",
+      "tick-progress-stale": "tick progress stale",
+      "recent-errors-saturated": "recent errors saturated",
+      "missing-state": "state missing",
+    };
+    const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
+    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
     if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
     if (status.state) {
       console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+      console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
       if (status.state.recentErrors.length > 0) {
         console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
         for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
@@ -8220,6 +8278,7 @@ async function daemonStatus(parsed: Parsed) {
   }
   if (status.state) {
     console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+    if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
     if (status.state.recentErrors.length > 0) {
       console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
       for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));

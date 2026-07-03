@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { parseProRepoEntries, parseProRepos, resolveProEntryForCwd, resolveProForCwd, resolveProSlotForCwd, toProSlug } from "../src/proProjects.js";
+import { acquireProSlot, deleteProSlot, parseProRepoEntries, parseProRepos, proSlotDeleteArgs, resolveProEntryForCwd, resolveProForCwd, resolveProSlotForCwd, toProSlug } from "../src/proProjects.js";
 
 test("parseProRepos turns tab-separated rows into labelled repos", () => {
   const out = [
@@ -93,4 +96,86 @@ test("toProSlug lowercases and dashes free text into a pro-valid slug", () => {
   assert.equal(toProSlug("--Edge--"), "edge");
   assert.equal(toProSlug("claude"), "claude");
   assert.equal(toProSlug("!!!"), ""); // nothing usable → caller surfaces a hint
+});
+
+test("proSlotDeleteArgs removes the slot without taking ownership of worktree branches", () => {
+  assert.deepEqual(proSlotDeleteArgs("worktree", "fork-api"), ["wt", "d", "fork-api", "--force", "--hard", "--no-delete-branch"]);
+  assert.deepEqual(proSlotDeleteArgs("checkout", "fork-api"), ["co", "d", "fork-api", "--force", "--hard"]);
+});
+
+async function withStubPro(exists: boolean, fn: (ctx: { repo: string; log: string; slotPath: string }) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "hive-pro-stub-"));
+  const bin = join(root, "bin");
+  const repo = join(root, "repo");
+  const log = join(root, "pro.log");
+  const slotPath = join(root, "slot");
+  await mkdir(bin, { recursive: true });
+  await mkdir(repo, { recursive: true });
+  await writeFile(log, "");
+  await writeFile(join(bin, "pro"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$PRO_STUB_LOG"
+case "$1:$2" in
+  wt:s|co:s)
+    if [ "\${3:-}" = "-c" ]; then
+      printf '%s\\n' "$PRO_STUB_PATH"
+    elif [ "\${PRO_STUB_EXISTS:-0}" = "1" ]; then
+      printf '%s\\n' "$PRO_STUB_PATH"
+    else
+      printf 'slot missing\\n' >&2
+      exit 2
+    fi
+    ;;
+  wt:c|co:c)
+    printf '%s\\n' "$PRO_STUB_PATH"
+    ;;
+  wt:d|co:d)
+    ;;
+  *)
+    printf 'unexpected pro args: %s\\n' "$*" >&2
+    exit 64
+    ;;
+esac
+`, { mode: 0o755 });
+
+  const oldPath = process.env.PATH;
+  const oldLog = process.env.PRO_STUB_LOG;
+  const oldPathOut = process.env.PRO_STUB_PATH;
+  const oldExists = process.env.PRO_STUB_EXISTS;
+  process.env.PATH = `${bin}:${oldPath ?? ""}`;
+  process.env.PRO_STUB_LOG = log;
+  process.env.PRO_STUB_PATH = slotPath;
+  process.env.PRO_STUB_EXISTS = exists ? "1" : "0";
+  try {
+    await fn({ repo, log, slotPath });
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH;
+    else process.env.PATH = oldPath;
+    if (oldLog === undefined) delete process.env.PRO_STUB_LOG;
+    else process.env.PRO_STUB_LOG = oldLog;
+    if (oldPathOut === undefined) delete process.env.PRO_STUB_PATH;
+    else process.env.PRO_STUB_PATH = oldPathOut;
+    if (oldExists === undefined) delete process.env.PRO_STUB_EXISTS;
+    else process.env.PRO_STUB_EXISTS = oldExists;
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("acquireProSlot reports an existing slot without creating it", async () => {
+  await withStubPro(true, async ({ repo, log, slotPath }) => {
+    assert.deepEqual(await acquireProSlot("worktree", repo, "fork-api"), { path: slotPath, created: false });
+    assert.equal(await readFile(log, "utf8"), "wt s fork-api\n");
+  });
+});
+
+test("acquireProSlot creates a missing slot and deleteProSlot removes it", async () => {
+  await withStubPro(false, async ({ repo, log, slotPath }) => {
+    assert.deepEqual(await acquireProSlot("worktree", repo, "fork-api"), { path: slotPath, created: true });
+    await deleteProSlot("worktree", repo, "fork-api");
+    assert.deepEqual((await readFile(log, "utf8")).trim().split("\n"), [
+      "wt s fork-api",
+      "wt c fork-api",
+      "wt d fork-api --force --hard --no-delete-branch",
+    ]);
+  });
 });
