@@ -6871,7 +6871,7 @@ async function nodeStatus(parsed: Parsed) {
     ],
     healths.map((h) => [
       bold(h.name),
-      h.kind === "local-tmux" ? gray("local") : h.kind === "remote-hsr" ? magenta("hsr") : cyan("ssh"),
+      nodeKindLabel(h.kind),
       h.reachable ? green("● online") : red("○ offline"),
       h.latencyMs === null ? dim("-") : dim(`${h.latencyMs}ms`),
       formatNodeVersion(h),
@@ -6887,6 +6887,28 @@ function formatNodeVersion(h: NodeHealth): string {
   return h.versionDrift
     ? `${h.runnerHostVersion} ${yellow("(drift)")}`
     : dim(h.runnerHostVersion);
+}
+
+function nodeKindLabel(kind: NodeRecord["kind"] | string, display: "short" | "full" = "short"): string {
+  const label = display === "full"
+    ? kind
+    : kind === "local-tmux"
+      ? "local"
+      : kind === "ssh-tmux"
+        ? "ssh"
+        : kind === "remote-hsr"
+          ? "hsr"
+          : kind;
+  switch (kind) {
+    case "local-tmux":
+      return gray(label);
+    case "ssh-tmux":
+      return cyan(label);
+    case "remote-hsr":
+      return magenta(label);
+    default:
+      return yellow(label || "unknown");
+  }
 }
 
 /**
@@ -6950,7 +6972,7 @@ async function nodeList() {
       { header: "DESCRIPTION" },
     ],
     nodes.map((n) => [
-      n.kind === "local-tmux" ? gray("local") : cyan("ssh"),
+      nodeKindLabel(n.kind),
       bold(n.name),
       dim(n.endpoint),
       formatNodeStatus(n.status),
@@ -7116,7 +7138,7 @@ async function cmdSubstrate(parsed: Parsed) {
 
 async function substrateList() {
   const nodes = await listNodes();
-  const kinds = new Map<string, number>();
+  const kinds = new Map<NodeRecord["kind"], number>();
   for (const node of nodes) kinds.set(node.kind, (kinds.get(node.kind) ?? 0) + 1);
   if (!isPretty()) {
     for (const [kind, count] of kinds) console.log(`${kind}\t${count}`);
@@ -7128,7 +7150,7 @@ async function substrateList() {
       { header: "NODES", align: "right" },
     ],
     [...kinds.entries()].sort().map(([kind, count]) => [
-      kind === "local-tmux" ? gray("local-tmux") : cyan("ssh-tmux"),
+      nodeKindLabel(kind, "full"),
       String(count),
     ]),
   ));
@@ -7175,10 +7197,8 @@ function parseFlowRunArgs(parsed: Parsed): Record<string, unknown> {
     if (eq <= 0) throw new Error(`Invalid --arg: ${entry} (expected key=value)`);
     const key = entry.slice(0, eq);
     const value = entry.slice(eq + 1);
-    // Coerce numeric/boolean literals; everything else stays a string.
-    if (value === "true") out[key] = true;
-    else if (value === "false") out[key] = false;
-    else if (value !== "" && Number.isFinite(Number(value))) out[key] = Number(value);
+    const numberValue = Number(value);
+    if (value !== "" && Number.isFinite(numberValue) && String(numberValue) === value) out[key] = numberValue;
     else out[key] = value;
   }
   return out;
@@ -8182,7 +8202,7 @@ async function daemonStatus(parsed: Parsed) {
   const label = daemonLabel(parsed);
   const staleAfter = numberFlag(parsed, ["stale-after-ms"], 0);
   const status = await readDaemonStatus(undefined, { label, ...(staleAfter > 0 ? { staleAfterMs: staleAfter } : {}) });
-  // Exit codes: 0 healthy, 3 down, 4 STALE (process alive, loop wedged).
+  // Exit codes: 0 healthy, 3 down, 4 unhealthy/stale (process alive but not progressing).
   // Anything polling this command must treat nonzero as an outage.
   const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
@@ -8210,11 +8230,18 @@ async function daemonStatus(parsed: Parsed) {
     process.exit(3);
   }
   if (status.stale) {
-    const age = status.state?.lastTickAt ? formatRelativeTime(status.state.lastTickAt) : "never";
-    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("STALE"))} ${dim(`(process alive, loop wedged — last tick ${age} ago, threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
+    const reasonLabels: Record<string, string> = {
+      "loop-stale": "loop heartbeat stale",
+      "tick-progress-stale": "tick progress stale",
+      "recent-errors-saturated": "recent errors saturated",
+      "missing-state": "state missing",
+    };
+    const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
+    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
     if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
     if (status.state) {
       console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+      console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
       if (status.state.recentErrors.length > 0) {
         console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
         for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
@@ -8232,6 +8259,7 @@ async function daemonStatus(parsed: Parsed) {
   }
   if (status.state) {
     console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+    if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
     if (status.state.recentErrors.length > 0) {
       console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
       for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
