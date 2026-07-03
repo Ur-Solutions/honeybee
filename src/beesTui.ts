@@ -8,6 +8,7 @@
 import * as readline from "node:readline";
 import { fuzzyFilter } from "./spawnTui.js";
 import { bold, cyan, dim, gray, green, isPretty, red, stripAnsi, tildify, truncate, visibleLength, yellow } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 import type { ProSlotKind } from "./proProjects.js";
 
 export type BeesTuiItem = {
@@ -275,6 +276,24 @@ export function filterBeesTuiItems(items: BeesTuiItem[], query: string): BeesTui
   return fuzzyFilter(query, items, beesTuiFuzzyKey);
 }
 
+/** One typing burst costs one fuzzy pass instead of one per keystroke. */
+export const BEES_FILTER_DEBOUNCE_MS = 24;
+
+/**
+ * True when the matches for `next` can be found by re-filtering the matches of
+ * a previous pass for `prev` instead of the whole catalog. That needs "matches
+ * next ⇒ matches prev", which holds for a prefix extension — except that
+ * fuzzyScore's sparse-match cap is max(8, 2·len), so past 4 effective chars the
+ * cap grows with the query and an item rejected for the prefix can legally
+ * match the longer query. Short queries are also exactly where the full scan is
+ * expensive (most matches, biggest sort).
+ */
+export function canNarrowBeesFilter(prev: string, next: string): boolean {
+  const p = prev.trim().toLowerCase();
+  const n = next.trim().toLowerCase();
+  return p.length > 0 && n.length <= 4 && n.length > p.length && n.startsWith(p);
+}
+
 function stateCell(headline: string, live: boolean): string {
   const h = headline.toLowerCase();
   if (h === "working" || h === "active") return `${green("●")} ${truncate(headline, 8)}`;
@@ -346,10 +365,12 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
     await new Promise<void>((resolve) => {
       let done = false;
       let pollTimer: ReturnType<typeof setInterval> | undefined;
+      let filterTimer: ReturnType<typeof setTimeout> | undefined;
       const finish = () => {
         if (done) return;
         done = true;
         if (pollTimer) clearInterval(pollTimer);
+        if (filterTimer) clearTimeout(filterTimer);
         stdin.off("keypress", onKey);
         stdout.off("resize", onResize);
         resolve();
@@ -375,11 +396,26 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
         return row?.kind === "item" ? row.item : undefined;
       };
 
+      // The match set of the last fuzzy pass, so a query that merely extends
+      // the previous one narrows from those matches instead of re-scanning the
+      // catalog. `catalog` is kept by reference: a refresh/kill swaps the array
+      // and silently invalidates the cache.
+      let lastFilter: { query: string; catalog: BeesTuiItem[]; items: BeesTuiItem[] } | undefined;
+
       const regroup = () => {
         // Read the highlighted bee from the OLD flat before rebuilding so the
         // cursor can follow it; resolveRegroupCursor handles the fallbacks.
         const prevName = currentItem()?.name;
-        filtered = query.length > 0 ? filterBeesTuiItems(catalog, query) : catalog;
+        if (query.length === 0) {
+          filtered = catalog;
+          lastFilter = undefined;
+        } else {
+          const pool = lastFilter && lastFilter.catalog === catalog && canNarrowBeesFilter(lastFilter.query, query)
+            ? lastFilter.items
+            : catalog;
+          filtered = filterBeesTuiItems(pool, query);
+          lastFilter = { query, catalog, items: filtered };
+        }
         groups = groupBeesByMode(filtered, groupMode);
         flat = flattenBeesTuiGroups(groups);
         cursor = resolveRegroupCursor(flat, prevName, options.currentName);
@@ -388,9 +424,18 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
 
       const applyQuery = (next: string) => {
         query = next;
-        regroup();
-        const n = itemRows().length;
-        message = n === 0 ? "no matches" : n === 1 ? "1 bee" : `${n} bees`;
+        // Debounce the fuzzy pass + regroup: the caller's render() echoes the
+        // typed query immediately (over the previous match list), and the
+        // filter runs once when the burst pauses.
+        if (filterTimer) clearTimeout(filterTimer);
+        filterTimer = setTimeout(() => {
+          filterTimer = undefined;
+          if (done) return;
+          regroup();
+          const n = itemRows().length;
+          message = n === 0 ? "no matches" : n === 1 ? "1 bee" : `${n} bees`;
+          render();
+        }, BEES_FILTER_DEBOUNCE_MS);
       };
 
       const cycleGroup = (delta: number) => {
@@ -530,6 +575,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
         }
       };
 
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(12, stdout.columns || 80);
@@ -553,7 +599,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
         }
         lines.push(truncate(message, width));
         lines.push(dim(footerHint()));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
       };
 
       const footerHint = (): string => {
