@@ -733,10 +733,13 @@ export function parseClaudeChain(raw: string | null, source: string): ClaudeChai
 function isBetterClaudeChain(candidate: ClaudeChain, current: ClaudeChain | null): boolean {
   if (!current) return true;
   if (candidate.raw === current.raw) return false;
-  if (candidate.expiresAt !== current.expiresAt) return candidate.expiresAt > current.expiresAt;
+  // Refreshability outranks expiry: a refreshable link can always be renewed,
+  // while a link without a refresh token becomes an unrecoverable activation
+  // the moment it expires. Trading a refresh token away for a later expiry
+  // would strand the whole chain.
   if (candidate.refreshToken && !current.refreshToken) return true;
   if (!candidate.refreshToken && current.refreshToken) return false;
-  return false;
+  return candidate.expiresAt > current.expiresAt;
 }
 
 /** The freshest chain link present in a home — its keychain entry or credentials file. */
