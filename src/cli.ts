@@ -109,7 +109,6 @@ import type { RunnerOpts } from "./hsr/types.js";
 import { loopFlow } from "./loop/flow.js";
 import { buildLoopConfig } from "./loop/context.js";
 import {
-  ensureLoopDir,
   generateLoopId,
   type LoopConfig,
   listLoops,
@@ -7499,15 +7498,14 @@ async function startLoopDetached(rawArgs: Record<string, unknown>) {
   // and resolved at each iteration's spawn (spawnLoopBee / facade.spawn), so a
   // fresh-carrier `auto` loop re-picks the least-loaded account per iteration.
   // Validate eagerly so errors surface BEFORE we spawn a detached process.
-  const loopId = await generateLoopId();
-  const cfg = buildLoopConfig({ ...rawArgs, loopId });
-  cfg.loopId = loopId;
+  const cfg = buildLoopConfig(rawArgs);
 
   if (process.platform === "win32") {
     throw new Error("hive loop start is not supported on Windows (POSIX process groups are required to stop).");
   }
 
-  await ensureLoopDir(loopId);
+  const loopId = await generateLoopId();
+  cfg.loopId = loopId;
   await writeLoopConfig(cfg);
   const args = { ...rawArgs, loopId };
   let pid: number;

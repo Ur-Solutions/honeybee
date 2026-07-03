@@ -18,6 +18,7 @@ import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
+import { withFileLock } from "../lock.js";
 import type { SealRecord, SealStatus } from "../seal.js";
 
 export type LoopStatus = "running" | "paused" | "stopped" | "done" | "errored" | "orphaned";
@@ -65,6 +66,10 @@ export type LoopConfig = {
 
 export function loopsRoot(): string {
   return join(storeRoot(), "loops");
+}
+
+function loopsLockPath(): string {
+  return join(loopsRoot(), ".loops.lock");
 }
 
 export function loopDir(id: string): string {
@@ -118,27 +123,37 @@ async function existingLoopIds(): Promise<string[]> {
 }
 
 /**
- * Allocate a fresh short loop id: `LP.` + the shortest hex suffix (≥3 chars)
- * that neither equals, prefixes, nor is prefixed by any existing loop id — so
- * every loop stays unambiguously targetable by its suffix. Mirrors the bee
- * identity scheme. `uuidFactory` is injectable for deterministic tests.
+ * Allocate and reserve a fresh short loop id: `LP.` + the shortest hex suffix
+ * (≥3 chars) that neither equals nor prefixes any existing loop id. The
+ * reservation is the loop directory itself, created while holding the loops
+ * lock, so concurrent starters cannot receive the same id before loop.json is
+ * written. `uuidFactory` is injectable for deterministic tests.
  */
 export async function generateLoopId(uuidFactory: () => string = randomUUID): Promise<string> {
-  const existing = await existingLoopIds();
-  for (let attempt = 0; attempt < 100_000; attempt += 1) {
-    const hex = uuidFactory().replace(/-/g, "").toLowerCase();
-    if (!/^[0-9a-f]{3,}$/.test(hex)) continue;
-    for (let length = 3; length <= hex.length; length += 1) {
-      const id = `${LOOP_ID_PREFIX}${hex.slice(0, length)}`;
-      // Reject only if the candidate equals or PREFIXES an existing id (which
-      // would make it ambiguously prefix-match). A longer, more-specific id
-      // alongside a shorter existing one is fine — the short one stays
-      // exact-matchable. Grow the suffix until that holds.
-      const clashes = existing.some((other) => other === id || other.startsWith(id));
-      if (!clashes) return id;
+  return withFileLock(loopsLockPath(), async () => {
+    const existing = await existingLoopIds();
+    for (let attempt = 0; attempt < 100_000; attempt += 1) {
+      const hex = uuidFactory().replace(/-/g, "").toLowerCase();
+      if (!/^[0-9a-f]{3,}$/.test(hex)) continue;
+      for (let length = 3; length <= hex.length; length += 1) {
+        const id = `${LOOP_ID_PREFIX}${hex.slice(0, length)}`;
+        // Reject only if the candidate equals or PREFIXES an existing id (which
+        // would make it ambiguously prefix-match). A longer, more-specific id
+        // alongside a shorter existing one is fine — the short one stays
+        // exact-matchable. Grow the suffix until that holds.
+        const clashes = existing.some((other) => other === id || other.startsWith(id));
+        if (clashes) continue;
+        try {
+          await mkdir(loopDir(id));
+          return id;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          existing.push(id);
+        }
+      }
     }
-  }
-  throw new Error("Could not allocate a unique loop id");
+    throw new Error("Could not allocate a unique loop id");
+  });
 }
 
 /**
