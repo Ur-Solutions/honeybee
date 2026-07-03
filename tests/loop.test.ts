@@ -33,6 +33,7 @@ import {
   truncateForInjection,
 } from "../src/loop/summarizer.js";
 import { __setLoopTestHooks, loopFlow } from "../src/loop/flow.js";
+import { loopStatus, loopStop, startLoop, type LoopSpawnInput } from "../src/loop/control.js";
 import { loopStopConditionsForPhase, loopStopFlowArgs } from "../src/loop/stopConditions.js";
 import { listFlows, loadFlow, type FlowContext } from "../src/flow/index.js";
 import { executeFlow } from "../src/flow/run.js";
@@ -1087,10 +1088,10 @@ test("cancelRun('loop', …) signals the NEGATIVE pgid", async () => {
 });
 
 /* ──────────────────────────────────────────────────────────────────────────
- * 8. Facade happy path
+ * 8. Control surface — startLoop / loopStatus / loopStop
  * ────────────────────────────────────────────────────────────────────────── */
 
-test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", async () => {
+test("startLoop writes initial loop.json and loopStop sets the sentinel", async () => {
   await withTempStore(async () => {
     const fixtureDir = await mkdtemp(join(tmpdir(), "honeybee-loop-fix-"));
     try {
@@ -1099,10 +1100,9 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
       // Point the detached spawn at the fixture entry so we don't fork the real CLI.
       const original = process.argv[1];
       process.argv[1] = fixture;
-      const facade = new HiveFacade({ flowName: "loop", runId: "facade-run" });
       let loopId: string;
       try {
-        loopId = await facade.loop({
+        loopId = await startLoop({
           bee: "claude",
           cwd: "/tmp",
           context: "ralph",
@@ -1119,7 +1119,7 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
       }
       // Short, bee-id-style loop id (LP.<hex>) — targetable by suffix, not a raw run id.
       assert.match(loopId, /^LP\.[0-9a-f]{3,}$/);
-      const cfg = await facade.loopStatus(loopId);
+      const cfg = await loopStatus(loopId);
       assert.ok(cfg);
       assert.equal(cfg?.context, "ralph");
       assert.equal(cfg?.stop.max, 2);
@@ -1144,7 +1144,7 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
       });
 
       // Graceful stop writes the sentinel.
-      await facade.loopStop(loopId);
+      await loopStop(loopId);
       assert.equal(await isStopRequested(loopId), true);
     } finally {
       await rm(fixtureDir, { recursive: true, force: true });
@@ -1152,16 +1152,15 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
   });
 });
 
-test("HiveFacade.loop persists an errored loop.json when the detached spawn fails", async () => {
+test("startLoop persists an errored loop.json when the detached spawn fails", async () => {
   await withTempStore(async () => {
     // Regression: a spawn failure AFTER the loop.json pre-write used to strand
     // the loop as "running" with no pid — nothing could ever reconcile it.
-    const facade = new HiveFacade({ flowName: "loop", runId: "facade-run-spawnfail" });
     const original = process.argv[1];
     process.argv[1] = ""; // resolveEntry() throws → spawnDetachedRun rejects
     try {
       await assert.rejects(
-        () => facade.loop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x", max: 1 }),
+        () => startLoop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x", max: 1 }),
         /could not resolve CLI entry path/,
       );
     } finally {
@@ -1175,12 +1174,11 @@ test("HiveFacade.loop persists an errored loop.json when the detached spawn fail
   });
 });
 
-test("HiveFacade.loop validates eagerly (bad config throws before spawning)", async () => {
+test("startLoop validates eagerly (bad config throws before spawning)", async () => {
   await withTempStore(async () => {
-    const facade = new HiveFacade({ flowName: "loop", runId: "facade-run-2" });
     // No max and not forever → buildLoopConfig throws.
     await assert.rejects(
-      () => facade.loop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x" } as Parameters<typeof facade.loop>[0]),
+      () => startLoop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x" } as LoopSpawnInput),
       /--max/,
     );
   });

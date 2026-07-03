@@ -4,6 +4,13 @@
 
 export { loopFlow } from "./flow.js";
 export {
+  loopArgsFromSpec,
+  loopStatus,
+  loopStop,
+  startLoop,
+  type LoopSpawnInput,
+} from "./control.js";
+export {
   buildLoopConfig,
   coerceDuration,
   parseContextMode,
