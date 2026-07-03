@@ -60,6 +60,7 @@ function toNumber(value: unknown): number | undefined {
  *   item/agentMessage/delta     → [text]                       (params.delta)
  *   turn/completed              → [turn_end] (+ [usage] if params carries tokens)
  *   thread/tokenUsage/updated   → [usage]                      (params.tokenUsage.last)
+ *   account/rateLimits/updated  → [exhausted] when a limit is REACHED (else [])
  *   error                       → [error]                      (params.error.message)
  */
 export function codexNotificationToEvents(method: string, params: unknown): RunnerEvent[] {
@@ -86,6 +87,8 @@ export function codexNotificationToEvents(method: string, params: unknown): Runn
       const usage = usageFromThreadTokenUsage(p.tokenUsage);
       return usage ? [usage] : [];
     }
+    case "account/rateLimits/updated":
+      return rateLimitsToEvents(p.rateLimits);
     case "error": {
       const err = asObject(p.error);
       const message = String(err?.message ?? p.message ?? "codex error");
@@ -96,6 +99,49 @@ export function codexNotificationToEvents(method: string, params: unknown): Runn
       // intentionally dropped from the v1 event/ring stream.
       return [];
   }
+}
+
+/**
+ * Map a codex `AccountRateLimitsUpdatedNotification.rateLimits` (a
+ * `RateLimitSnapshot`) to zero or one `exhausted` event. Exact bindings
+ * (codex app-server v2):
+ *   RateLimitSnapshot { limitId, limitName, primary: RateLimitWindow|null,
+ *     secondary: RateLimitWindow|null, credits, individualLimit, planType,
+ *     rateLimitReachedType: RateLimitReachedType|null }
+ *   RateLimitWindow  { usedPercent, windowDurationMins, resetsAt: number|null }
+ *   RateLimitReachedType = "rate_limit_reached" | "workspace_owner_credits_depleted"
+ *     | "workspace_member_credits_depleted" | "workspace_owner_usage_limit_reached"
+ *     | "workspace_member_usage_limit_reached"
+ *
+ * `rateLimitReachedType` is the authoritative gate: a NON-null value means a
+ * limit has actually been reached / credits depleted ⇒ exhausted. A rolling
+ * update with `rateLimitReachedType: null` (the common case) is benign ⇒ [].
+ * The reset hint comes from the primary window's `resetsAt` (UNIX seconds),
+ * falling back to the secondary window.
+ *
+ * NOTE (unverified): codex may also surface a per-turn rate-limit as an `error`
+ * notification, but the generated bindings give `ErrorNotification` only a
+ * `{error:{message}}` shape with no typed rate-limit discriminator, so we cannot
+ * reliably distinguish a rate-limit error from any other error here. Those keep
+ * mapping to `error` (unchanged); the snapshot notification is the safe subset.
+ */
+function rateLimitsToEvents(rateLimits: unknown): RunnerEvent[] {
+  const snapshot = asObject(rateLimits);
+  if (!snapshot) return [];
+  const reached = snapshot.rateLimitReachedType;
+  // null / absent ⇒ benign rolling update. Only a non-null reached-type exhausts.
+  if (reached === null || reached === undefined) return [];
+  const resetHint =
+    resetHintFromWindow(snapshot.primary) ?? resetHintFromWindow(snapshot.secondary);
+  return [{ type: "exhausted", ts: 0, ...(resetHint ? { resetHint } : {}) }];
+}
+
+/** ISO reset hint from a RateLimitWindow.resetsAt (UNIX seconds), or undefined. */
+function resetHintFromWindow(value: unknown): string | undefined {
+  const window = asObject(value);
+  const seconds = toNumber(window?.resetsAt);
+  if (seconds === undefined || seconds <= 0) return undefined;
+  return new Date(seconds * 1000).toISOString();
 }
 
 /** Build a usage event from a TokenUsageBreakdown-shaped object, or undefined. */

@@ -31,6 +31,10 @@ export type RunnerEvent =
   | { type: "text"; ts: number; text: string } // assistant output chunk (feeds ring buffer)
   | { type: "tool_use"; ts: number; tool: string; input?: unknown }
   | { type: "usage"; ts: number; inputTokens?: number; outputTokens?: number; totalTokens?: number }
+  // Provider rate-limit / exhaustion signal (claude rate_limit_event, codex
+  // account/rateLimits/updated). Feeds the usage sampler's account.exhausted
+  // edge for pane-less HSR bees. resetHint is a verbatim/derived reset marker.
+  | { type: "exhausted"; ts: number; resetHint?: string }
   | {
       type: "needs_input";
       ts: number;

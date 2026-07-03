@@ -238,6 +238,66 @@ export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput 
 }
 
 /**
+ * Cumulative token totals + the latest provider-exhaustion signal for an HSR
+ * bee, derived from its events.jsonl. Feeds the usage sampler (a pane-less HSR
+ * bee has no live pane to scrape, but its events carry EXACT usage + typed
+ * rate-limit signals).
+ *
+ *   totals          — session cumulative tokens. `usage` events carry PER-TURN
+ *                     counts (claude result usage; codex thread token deltas),
+ *                     so the cumulative is their sum, which stays monotonic
+ *                     across a session. null when the log holds no usage yet.
+ *   latestExhausted — the newest `exhausted` event (by ts) with its resetHint,
+ *                     or undefined. The caller edge-detects on `ts`.
+ *
+ * Reads the whole log (as readEventTail already does under the hood) but is
+ * tolerant of a missing/partial/torn file — a bad line is skipped, never thrown.
+ */
+export type HsrUsageObservation = {
+  totals: { inputTokens: number; outputTokens: number } | null;
+  latestExhausted?: { ts: number; resetHint?: string };
+};
+
+export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservation> {
+  let raw: string;
+  try {
+    raw = await readFile(hsrEventsPath(bee), "utf8");
+  } catch {
+    return { totals: null };
+  }
+  let input = 0;
+  let output = 0;
+  let sawUsage = false;
+  let latestExhausted: { ts: number; resetHint?: string } | undefined;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event: RunnerEvent;
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (!parsed || typeof parsed !== "object" || typeof (parsed as { type?: unknown }).type !== "string") continue;
+      event = parsed as RunnerEvent;
+    } catch {
+      continue; // torn / partial line
+    }
+    if (event.type === "usage") {
+      sawUsage = true;
+      if (typeof event.inputTokens === "number" && Number.isFinite(event.inputTokens)) input += event.inputTokens;
+      if (typeof event.outputTokens === "number" && Number.isFinite(event.outputTokens)) output += event.outputTokens;
+    } else if (event.type === "exhausted") {
+      const ts = typeof event.ts === "number" && Number.isFinite(event.ts) ? event.ts : 0;
+      if (!latestExhausted || ts >= latestExhausted.ts) {
+        latestExhausted = { ts, ...(event.resetHint ? { resetHint: event.resetHint } : {}) };
+      }
+    }
+  }
+  return {
+    totals: sawUsage ? { inputTokens: input, outputTokens: output } : null,
+    ...(latestExhausted ? { latestExhausted } : {}),
+  };
+}
+
+/**
  * Reconcile stale `running` meta whose host pid is dead: flip status to
  * "exited" (with endedAt) and return the reaped bee names. Crash-adoption v1 —
  * no pipe recovery.

@@ -8,7 +8,7 @@
  *
  * Envelope (claude 2.1.x, verified from a live capture):
  *   {type:"system",subtype:"init",session_id,...}     — FIRST line, carries session_id.
- *   {type:"rate_limit_event",rate_limit_info,...}      — future exhaustion signal, ignored v1.
+ *   {type:"rate_limit_event",rate_limit_info,...}      — exhaustion signal → {type:"exhausted"} when rejected.
  *   {type:"system",subtype:"thinking_tokens",...}      — progress ping, ignored.
  *   {type:"assistant",message:{content:[thinking|text|tool_use]},...}
  *   {type:"result",subtype,is_error,result,usage,...}  — marks TURN END.
@@ -56,8 +56,7 @@ function parseClaudeLine(line: string): RunnerEvent[] {
       // init → sessionId learned via sessionIdFromEvent; thinking_tokens → progress ping.
       return [];
     case "rate_limit_event":
-      // v1: rate_limit_info is a future exhaustion signal, not acted on yet.
-      return [];
+      return parseClaudeRateLimit(msg.rate_limit_info);
     case "assistant": {
       const message = asObject(msg.message);
       const content = message?.content;
@@ -96,6 +95,36 @@ function parseClaudeLine(line: string): RunnerEvent[] {
     default:
       return [];
   }
+}
+
+/**
+ * Map a claude `rate_limit_event`'s `rate_limit_info` to zero or one `exhausted`
+ * event. Real envelope (verified capture):
+ *   {status:"allowed", resetsAt:1783034400, rateLimitType:"five_hour",
+ *    overageStatus:"rejected", overageDisabledReason:..., isUsingOverage:false}
+ *
+ * `status` is the gate. Claude Code's rolling-limit statuses are "allowed" and
+ * "allowed_warning" (benign — allowed now / approaching the cap) plus rejected
+ * states ("rejected", "blocked", …) that mean the account is out of quota. We
+ * treat any status that does NOT start with "allowed" as exhausted, so a benign
+ * update (or a future "allowed_*" variant) keeps returning []. `resetsAt` is a
+ * UNIX-SECONDS epoch; we surface it as an ISO resetHint when present.
+ */
+function parseClaudeRateLimit(rateLimitInfo: unknown): RunnerEvent[] {
+  const info = asObject(rateLimitInfo);
+  if (!info) return [];
+  const status = typeof info.status === "string" ? info.status : undefined;
+  // No status, or a benign "allowed"/"allowed_warning": not an exhaustion edge.
+  if (!status || status.startsWith("allowed")) return [];
+  const resetHint = resetHintFromEpochSeconds(info.resetsAt);
+  return [{ type: "exhausted", ts: Date.now(), ...(resetHint ? { resetHint } : {}) }];
+}
+
+/** Convert a UNIX-seconds epoch to an ISO reset hint, or undefined if unusable. */
+function resetHintFromEpochSeconds(value: unknown): string | undefined {
+  const seconds = toNumber(value);
+  if (seconds === undefined || seconds <= 0) return undefined;
+  return new Date(seconds * 1000).toISOString();
 }
 
 /** Pull the provider session id out of a system/init line (event-less). */
