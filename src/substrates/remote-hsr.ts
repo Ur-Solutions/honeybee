@@ -42,6 +42,11 @@ import type {
 /** Short per-call budget for the tick-facing calls (probe/liveness/list). */
 const PROBE_TIMEOUT_MS = 2_500;
 
+/** A clone can be slow (network + checkout), so provision gets a long budget. */
+const PROVISION_TIMEOUT_MS = 120_000;
+/** listCheckouts shells git across several dirs — a moderate budget over probe. */
+const LIST_CHECKOUTS_TIMEOUT_MS = 15_000;
+
 /** A row of the remote `list` RPC (see remoteHost.ts buildController.list). */
 type RemoteListRow = {
   bee: string;
@@ -81,6 +86,24 @@ export type RemoteSpawnParams = {
 export type RemoteSpawnResult = { bee: string; tier?: string; sessionId?: string };
 
 /**
+ * APIA-95 working-copy provisioning params/result. Clone (or idempotently reuse)
+ * a git checkout ON THE REMOTE under its `<storeRoot>/worktrees/<name>`, then run
+ * the bee inside it. Groundwork for Apiary's "where-it-lives" selector on
+ * non-local substrates (substrates-research §5.3 / architecture §7.5).
+ */
+export type RemoteProvisionParams = { repo: string; branch?: string; name?: string; ref?: string };
+export type RemoteProvisionResult = { path: string; repo: string; branch?: string; reused: boolean };
+
+/** A row of the remote `listCheckouts` RPC (a provisioned git checkout on the node). */
+export type RemoteCheckoutRow = {
+  name: string;
+  path: string;
+  repo: string | null;
+  branch: string | null;
+  dirty?: boolean;
+};
+
+/**
  * The Substrate returned for a `remote-hsr` node, plus the two verbs the tmux
  * Substrate interface has no slot for: {@link spawnRemote} (the spawn path calls
  * it after resolving the AgentSpec locally) and {@link observe} (relayed event
@@ -88,6 +111,13 @@ export type RemoteSpawnResult = { bee: string; tier?: string; sessionId?: string
  */
 export type RemoteHsrSubstrate = Substrate & {
   spawnRemote(params: RemoteSpawnParams): Promise<RemoteSpawnResult>;
+  /**
+   * APIA-95: clone (or idempotently reuse) a working copy on the remote and
+   * return its path — the spawn path uses it as the bee's cwd.
+   */
+  provisionRemote(params: RemoteProvisionParams): Promise<RemoteProvisionResult>;
+  /** APIA-95: enumerate existing checkouts on the remote node. */
+  listCheckouts(): Promise<RemoteCheckoutRow[]>;
   /** Subscribe to a bee's relayed event stream. Returns an unsubscribe fn. */
   observe(bee: string, onEvent: (event: unknown) => void): Promise<() => void>;
   /** Tear down the cached transport client (tests / shutdown). */
@@ -264,6 +294,35 @@ export function createRemoteHsrSubstrate(
     };
   }
 
+  async function provisionRemote(params: RemoteProvisionParams): Promise<RemoteProvisionResult> {
+    const c = await client();
+    const res = (await c.call(
+      "provision",
+      {
+        repo: params.repo,
+        ...(params.branch ? { branch: params.branch } : {}),
+        ...(params.name ? { name: params.name } : {}),
+        ...(params.ref ? { ref: params.ref } : {}),
+      },
+      { timeoutMs: PROVISION_TIMEOUT_MS },
+    )) as { ok?: boolean; path?: string; repo?: string; branch?: string; reused?: boolean; error?: string } | null;
+    if (!res || !res.ok || typeof res.path !== "string") {
+      throw new Error(`remote HSR provision on ${node.name} failed: ${res?.error ?? "unknown"}`);
+    }
+    return {
+      path: res.path,
+      repo: res.repo ?? params.repo,
+      ...(res.branch ? { branch: res.branch } : {}),
+      reused: Boolean(res.reused),
+    };
+  }
+
+  async function listCheckouts(): Promise<RemoteCheckoutRow[]> {
+    const c = await client();
+    const rows = await c.call("listCheckouts", undefined, { timeoutMs: LIST_CHECKOUTS_TIMEOUT_MS });
+    return Array.isArray(rows) ? (rows as RemoteCheckoutRow[]) : [];
+  }
+
   async function observe(bee: string, onEvent: (event: unknown) => void): Promise<() => void> {
     const c = await client();
     const off = c.on("hsr.event", (params) => {
@@ -321,6 +380,8 @@ export function createRemoteHsrSubstrate(
       throw new Error("remote HSR bees have no tmux target; use hive tail/transcript");
     },
     spawnRemote,
+    provisionRemote,
+    listCheckouts,
     observe,
     async close(): Promise<void> {
       if (!clientPromise) return;

@@ -484,6 +484,17 @@ type SpawnOptions = {
   /** Opt this bee into the daemon's autoswap flow. Requires account. */
   autoswap?: boolean;
   /**
+   * APIA-95 working-copy provisioning (remote-hsr only). When `repo` is set, the
+   * bee's cwd is a git checkout cloned/reused on the remote node (`branch`/`ref`
+   * pin it, `checkout` names/reuses it). When only `checkout` is set, an existing
+   * checkout of that name is resolved and used as cwd. Ignored/rejected off a
+   * remote-hsr node.
+   */
+  repo?: string;
+  branch?: string;
+  ref?: string;
+  checkout?: string;
+  /**
    * Opt-in phase timer (HIVE_DEBUG_SPAWN). When passed, spawnBee marks its
    * internal phases on it and leaves reporting to the caller (so resolve/ready
    * phases measured outside spawnBee join the same line). When absent, spawnBee
@@ -715,6 +726,12 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   }
   const isRemoteHsr = Boolean(opts.node && opts.node.kind === "remote-hsr");
   const isRemote = Boolean(opts.node && (opts.node.kind === "ssh-tmux" || opts.node.kind === "remote-hsr"));
+  // APIA-95: working-copy provisioning is a remote-hsr affordance (the checkout
+  // lives on the node). Reject the flags off a remote-hsr node rather than
+  // silently ignoring them.
+  if ((opts.repo || opts.checkout) && !isRemoteHsr) {
+    throw new Error("--repo/--checkout provisioning requires a remote-hsr node (spawn with --node <remote-hsr>)");
+  }
   // Executable validation only applies to local spawns; we cannot reach the remote
   // PATH cheaply and the remote runner host resolves the executable itself.
   if (!isRemote) {
@@ -735,10 +752,29 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   if (isRemoteHsr && opts.node) {
     const substrate = remoteHsrSubstrateForNode(opts.node);
     const adapter = adapterFor(spec.kind);
+    // APIA-95: if a working copy was requested, provision (or resolve) it on the
+    // remote FIRST and run the bee inside that checkout — overriding opts.cwd.
+    let spawnCwd = opts.cwd;
+    if (opts.repo) {
+      const prov = await substrate.provisionRemote({
+        repo: opts.repo,
+        ...(opts.branch ? { branch: opts.branch } : {}),
+        ...(opts.ref ? { ref: opts.ref } : {}),
+        ...(opts.checkout ? { name: opts.checkout } : {}),
+      });
+      spawnCwd = prov.path;
+    } else if (opts.checkout) {
+      const rows = await substrate.listCheckouts();
+      const match = rows.find((r) => r.name === opts.checkout);
+      if (!match) {
+        throw new Error(`no checkout named "${opts.checkout}" on ${opts.node.name}; provision one with --repo <url>`);
+      }
+      spawnCwd = match.path;
+    }
     const spawnResult = await substrate.spawnRemote({
       bee: name,
       kind: spec.kind,
-      cwd: opts.cwd,
+      cwd: spawnCwd,
       comb: name, // solo comb
       ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
       authKind: "subscription",
@@ -756,7 +792,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     const record: SessionRecord = {
       name,
       agent: spec.kind,
-      cwd: opts.cwd,
+      cwd: spawnCwd,
       command,
       tmuxTarget: name, // logical id — remote HSR has no tmux target
       node: opts.node.name,
@@ -1043,10 +1079,16 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const provider = account?.provider;
   const autoswap = truthy(flag(parsed, "autoswap"));
   if (autoswap && !account) throw new Error("--autoswap requires an account (--account or a <tool>-<account> bee spec)");
+  // APIA-95 working-copy provisioning (remote-hsr only): clone/reuse a checkout on
+  // the node and run the bee inside it. spawnBee rejects these off a remote-hsr node.
+  const repo = typeof flag(parsed, "repo") === "string" ? String(flag(parsed, "repo")) : undefined;
+  const branch = typeof flag(parsed, "branch") === "string" ? String(flag(parsed, "branch")) : undefined;
+  const ref = typeof flag(parsed, "ref") === "string" ? String(flag(parsed, "ref")) : undefined;
+  const checkout = typeof flag(parsed, "checkout") === "string" ? String(flag(parsed, "checkout")) : undefined;
   // "resolve" folds in account/profile/node resolution above (remote node probe
   // lives here); spawnBee marks its own internal phases on the same timer.
   timer.mark("resolve");
-  let record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(useHsr ? { substrate: "hsr" } : {}) });
+  let record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(useHsr ? { substrate: "hsr" } : {}) });
   const nodeSuffix = useHsr ? [dim("substrate:hsr")] : node && node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${useHsr ? "hsr" : node?.name ?? LOCAL_NODE_NAME}`);
@@ -6689,8 +6731,51 @@ async function cmdNode(parsed: Parsed) {
       return nodeUpdate(parsed);
     case "unregister":
       return nodeUnregister(parsed);
+    case "checkouts":
+      return nodeCheckouts(parsed);
     default:
-      throw new Error(`Unknown node subcommand: ${sub}\nUsage: hive node <list|register|bootstrap|inspect|update|unregister>`);
+      throw new Error(`Unknown node subcommand: ${sub}\nUsage: hive node <list|register|bootstrap|inspect|update|unregister|checkouts>`);
+  }
+}
+
+/**
+ * `hive node checkouts <node>` (APIA-95): list the working-copy checkouts
+ * provisioned on a remote-hsr node (name/branch/repo/path). Groundwork for
+ * Apiary's "where-it-lives" selector (substrates-research §5.3 / arch §7.5).
+ */
+async function nodeCheckouts(parsed: Parsed) {
+  const name = parsed.args[1];
+  if (!name) throw new Error("Usage: hive node checkouts <node>");
+  const record = await loadNode(name);
+  if (!record) throw new Error(`Unknown node: ${name}`);
+  if (record.kind !== "remote-hsr") {
+    throw new Error(`node ${name} is kind ${record.kind}; checkouts are only available on remote-hsr nodes`);
+  }
+  const substrate = remoteHsrSubstrateForNode(record);
+  try {
+    const rows = await substrate.listCheckouts();
+    if (!isPretty()) {
+      for (const r of rows) {
+        console.log(`${r.name}\t${r.branch ?? ""}\t${r.repo ?? ""}\t${r.path}${r.dirty ? "\tdirty" : ""}`);
+      }
+      return;
+    }
+    if (rows.length === 0) {
+      console.log(dim(`No checkouts on ${name}.`));
+      return;
+    }
+    console.log(formatTable(
+      [{ header: "NAME" }, { header: "BRANCH" }, { header: "REPO" }, { header: "PATH" }],
+      rows.map((r) => [
+        bold(r.name),
+        r.branch ?? "",
+        dim(r.repo ?? ""),
+        dim(r.path) + (r.dirty ? ` ${red("dirty")}` : ""),
+      ]),
+    ));
+  } finally {
+    // A one-shot query: tear down the forwarded tunnel so the CLI exits cleanly.
+    await substrate.close().catch(() => undefined);
   }
 }
 

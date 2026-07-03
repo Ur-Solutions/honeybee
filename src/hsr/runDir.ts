@@ -31,6 +31,18 @@ export function hsrRunDir(bee: string): string {
   return join(hsrRoot(), bee);
 }
 
+/**
+ * Root of working-copy checkouts provisioned on this node: `~/.hive/worktrees`.
+ * A `remote-hsr` node clones repos here (one dir per named checkout) so a bee can
+ * be run inside a fresh checkout on the remote (APIA-95). Groundwork for Apiary's
+ * "where-it-lives" selector on non-local substrates (substrates-research §5.3 /
+ * architecture §7.5) — the enumeration + provisioning verbs live here; no Apiary
+ * work in this repo.
+ */
+export function worktreesRoot(): string {
+  return join(storeRoot(), "worktrees");
+}
+
 export function hsrMetaPath(bee: string): string {
   return join(hsrRunDir(bee), "meta.json");
 }
