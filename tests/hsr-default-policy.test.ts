@@ -41,7 +41,7 @@ async function withTempStore(fn: () => Promise<void>): Promise<void> {
   }
 }
 
-function stubRecord(name: string): SessionRecord {
+function stubRecord(name: string, extra?: Partial<SessionRecord>): SessionRecord {
   const now = new Date().toISOString();
   return {
     name,
@@ -52,6 +52,7 @@ function stubRecord(name: string): SessionRecord {
     createdAt: now,
     updatedAt: now,
     status: "running",
+    ...extra,
   };
 }
 
@@ -77,6 +78,45 @@ test("user origin (no HIVE_BEE/TMUX) defaults to local-tmux node", async () => {
     assert.ok(node, "local-tmux resolves a node");
     assert.equal(node?.name, "local");
     assert.equal(node?.kind, "local-tmux");
+  });
+});
+
+test("TMUX_PANE matching a bee's agent pane is agent origin (defaults to HSR)", async () => {
+  await withTempStore(async () => {
+    await saveSession(stubRecord("parentbee", { agentPaneId: "%7" }));
+    process.env.TMUX = "/tmp/fake-tmux-socket,1,0";
+    process.env.TMUX_PANE = "%7";
+    const { useHsr } = await resolveSpawnSubstrate(spawnArgs(), "claude");
+    assert.equal(useHsr, true, "a subprocess inside the bee's own pane is an agent spawn");
+  });
+});
+
+test("TMUX without a bee-pane anchor is user origin (popup / operator pane in a comb)", async () => {
+  await withTempStore(async () => {
+    // A bee session exists (its tmuxTarget could match the client's session
+    // name), but the spawning process carries no direct anchor: no HIVE_BEE
+    // and — like a display-popup command — no TMUX_PANE. This is `hive new`
+    // from cmd+shift+n over a bee's session; it must stay a user spawn.
+    await saveSession(stubRecord("parentbee", { agentPaneId: "%7" }));
+    process.env.TMUX = "/tmp/fake-tmux-socket,1,0";
+    delete process.env.TMUX_PANE;
+    const { useHsr, node } = await resolveSpawnSubstrate(spawnArgs(), "claude");
+    assert.equal(useHsr, false, "session-name proximity alone must not classify as agent");
+    assert.equal(node?.kind, "local-tmux");
+
+    // Same story for a pane that exists but is not any bee's agent pane (an
+    // operator shell split inside the comb).
+    process.env.TMUX_PANE = "%9";
+    const shellPane = await resolveSpawnSubstrate(spawnArgs(), "claude");
+    assert.equal(shellPane.useHsr, false, "a non-agent pane in the comb is a user spawn");
+  });
+});
+
+test("HIVE_BEE naming no live record is user origin", async () => {
+  await withTempStore(async () => {
+    process.env.HIVE_BEE = "ghostbee";
+    const { useHsr } = await resolveSpawnSubstrate(spawnArgs(), "claude");
+    assert.equal(useHsr, false, "a stale HIVE_BEE stamp must not route to HSR");
   });
 });
 
