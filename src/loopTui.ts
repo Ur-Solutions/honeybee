@@ -10,17 +10,22 @@
  * Presentation-only and dependency-free, mirroring src/launchTui.ts: raw mode +
  * alt screen + signal-safe restore, one keypress handler, a full redraw per
  * event. All data (templates, repos, path validation, bee options) arrives
- * through callbacks so the launch wiring stays in cli.ts. The repo picker reuses
- * spawnTui's pure helpers (fuzzyFilter / splitPathQuery / relativeTo).
+ * through callbacks so the launch wiring stays in cli.ts. The repo picker and
+ * the bee picker are the shared Screens from src/projectPicker.ts and
+ * src/beePicker.ts; this module wires them into the template/form stages.
  */
 
 import type * as readline from "node:readline";
 import { bold, cyan, dim, green, isPretty, red, stripAnsi, truncate, visibleLength } from "./format.js";
 import { createTuiPainter } from "./tuiPaint.js";
 import type { LoopTemplate } from "./loopTemplate.js";
-import { fuzzyFilter, relativeTo, splitPathQuery } from "./spawnTui.js";
-import { type AsyncState, clamp, expandTilde, isPrintable, padRight, relTilde, reverse } from "./tuiKit.js";
+import { createBeePicker, type BeeOption } from "./beePicker.js";
+import { createProjectPicker } from "./projectPicker.js";
+import { clamp, fuzzyFilter, isPrintable, padRight, relTilde, reverse } from "./tuiKit.js";
 import { runRawModeTui } from "./tuiRuntime.js";
+
+/** Re-exported from beePicker: the account-aware agent choice for the bee field. */
+export type { BeeOption };
 
 /** The editable form state — the loop config the user is composing. */
 export type LoopFormValues = {
@@ -39,16 +44,6 @@ export type LoopFormValues = {
   judge: string;
   summarizer: string;
   yolo: boolean;
-};
-
-/** An agent×account choice for the bee picker (value is a `hive spawn` shorthand). */
-export type BeeOption = {
-  /** The shorthand written into the field, e.g. "claude-auto", "codex-rr", or "codex-thto". */
-  value: string;
-  /** Display label, e.g. "claude · auto" or "codex · thto.no". */
-  label: string;
-  /** Optional right-hand detail (usage, etc.). */
-  detail?: string;
 };
 
 export type LoopProject = { label: string; path: string; project?: string };
@@ -74,9 +69,6 @@ export type LoopTuiHooks = {
 };
 
 type Stage = "template" | "project" | "form";
-type ProjectView = "menu" | "browse" | "path";
-
-const PROJECT_MENU = ["here", "project", "path"] as const;
 
 /** The context-mode choices the "type" picker cycles through. */
 export const CONTEXT_MODES = ["persistent", "ralph", "rolling"] as const;
@@ -224,36 +216,17 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
   let formError = "";
 
   // ── per-stage cursors ───────────────────────────────────────────────────
+  // The repo picker and the bee picker own their own cursors/scroll/query.
   let templateQuery = "";
   let cursorTemplate = 0;
   let templateScroll = 0;
-  let cursorProjectMenu = 0;
-  let cursorBrowse = 0;
-  let browseScroll = 0;
-  let cursorPath = 0;
-  let pathScroll = 0;
   let cursorRow = 0; // index into formRows(advancedOpen)
-
-  // ── bee-picker overlay (the bee field opens an account-aware agent list) ──
-  let beePicking = false;
-  let beeQuery = "";
-  let cursorBee = 0;
-  let beeScroll = 0;
-  let beeOptions: AsyncState<BeeOption[]> = { state: "idle" };
 
   // ── save-as-template inline name field ───────────────────────────────────
   let naming = false;
   let nameBuffer = "";
   let nameError = "";
 
-  // ── async-loaded data ───────────────────────────────────────────────────
-  let projects: AsyncState<LoopProject[]> = { state: "idle" };
-  let projectView: ProjectView = "menu";
-  let browseQuery = "";
-  let pathBuffer = "";
-  let pathError = "";
-  let subdirs: AsyncState<{ base: string; dirs: string[] }> = { state: "idle" };
-  let subdirsBase = "";
   let message = "type to filter · ↑↓ pick · enter select · q cancel";
 
   return runRawModeTui<LoopLaunchResult | null>((tui) => {
@@ -268,15 +241,37 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
     const filteredTemplates = (): TemplateRow[] =>
       fuzzyFilter(templateQuery, templateRows(), (r) => `${r.name} ${r.preview}`);
 
-    const filteredProjects = (): LoopProject[] =>
-      projects.state === "loaded" ? fuzzyFilter(browseQuery, projects.items, (repo) => repo.label) : [];
+    // ── the repo/cwd picker (here · browse repos · type a path) ────────────
+    const projectPicker = createProjectPicker({
+      hooks,
+      text: {
+        browseMenuLabel: "browse repos…",
+        pathMenuLabel: "type a path…",
+        menuMessage: "↑↓ pick · enter: here / browse repos / type a path · ← back",
+        browseMessage: "type to filter · ↑↓ pick · enter select · esc back",
+        pathMessage: "type to filter · ↑↓ pick · tab drills in · enter select · esc back",
+        browseLoading: "loading repos…",
+        browseEmptyNone: "no repos found",
+        pathFallback: "enter uses the typed path",
+      },
+      ownsMenu: true,
+      onChosen: (path) => repoChosen(path),
+      onBack: () => backToTemplate(),
+      onQuit: () => finish(null),
+      setMessage: (m) => { message = m; },
+      render: () => render(),
+      isDone: () => tui.done,
+      stdout,
+    });
 
-    const filteredSubdirs = (): Array<{ abs: string; rel: string }> => {
-      if (subdirs.state !== "loaded") return [];
-      const { base, dirs } = subdirs.items;
-      const { query } = splitPathQuery(expandTilde(pathBuffer));
-      return fuzzyFilter(query, dirs.map((abs) => ({ abs, rel: relativeTo(base, abs) })), (row) => row.rel);
-    };
+    // ── the bee picker overlay (the bee field opens an agent list) ─────────
+    const beePicker = createBeePicker({
+      title: () => "pick the agent for the loop",
+      load: () => hooks.loadBeeOptions(),
+      onChosen: (value) => { values.bee = value; },
+      render: () => render(),
+      isDone: () => tui.done,
+    });
 
     // ── stage transitions ─────────────────────────────────────────────────
     const chooseTemplate = () => {
@@ -288,23 +283,14 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
 
     const enterProject = () => {
       stage = "project";
-      projectView = "menu";
-      cursorProjectMenu = 0;
-      stdout.write("\x1b[?25l");
-      message = "↑↓ pick · enter: here / browse repos / type a path · ← back";
-      render();
+      projectPicker.enterMenu(true);
     };
 
-    const loadProjectsIfNeeded = async () => {
-      if (projects.state === "loaded" || projects.state === "loading") return;
-      projects = { state: "loading" };
+    const backToTemplate = () => {
+      stage = "template";
+      stdout.write("\x1b[?25h");
+      message = "type to filter · ↑↓ pick · enter select · q cancel";
       render();
-      try {
-        projects = { state: "loaded", items: await hooks.loadProjects() };
-      } catch (error) {
-        projects = { state: "error", error: error instanceof Error ? error.message : String(error) };
-      }
-      if (!tui.done) render();
     };
 
     const repoChosen = (cwd: string) => {
@@ -315,80 +301,6 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
       stdout.write("\x1b[?25h");
       message = "↑↓ field · type to edit · enter next/launch · ← back";
       render();
-    };
-
-    const activateProjectMenu = () => {
-      const choice = PROJECT_MENU[cursorProjectMenu];
-      if (choice === "here") {
-        repoChosen(hooks.defaultCwd);
-      } else if (choice === "project") {
-        projectView = "browse";
-        browseQuery = "";
-        cursorBrowse = 0;
-        browseScroll = 0;
-        message = "type to filter · ↑↓ pick · enter select · esc back";
-        stdout.write("\x1b[?25h");
-        void loadProjectsIfNeeded();
-        render();
-      } else {
-        projectView = "path";
-        pathBuffer = hooks.defaultCwd.endsWith("/") ? hooks.defaultCwd : `${hooks.defaultCwd}/`;
-        pathError = "";
-        subdirs = { state: "idle" };
-        subdirsBase = "";
-        cursorPath = 0;
-        pathScroll = 0;
-        message = "type to filter · ↑↓ pick · tab drills in · enter select · esc back";
-        stdout.write("\x1b[?25h");
-        refreshPathCompletion();
-      }
-    };
-
-    const chooseBrowse = () => {
-      const repo = filteredProjects()[cursorBrowse];
-      if (repo) repoChosen(repo.path);
-    };
-
-    const refreshPathCompletion = () => {
-      const { base } = splitPathQuery(expandTilde(pathBuffer));
-      if (base === subdirsBase && subdirs.state !== "idle") { render(); return; }
-      subdirsBase = base;
-      subdirs = { state: "loading" };
-      cursorPath = 0;
-      pathScroll = 0;
-      render();
-      void hooks
-        .listSubdirs(base)
-        .then((res) => {
-          if (tui.done || splitPathQuery(expandTilde(pathBuffer)).base !== base) return;
-          subdirs = res.ok ? { state: "loaded", items: { base: res.base, dirs: res.dirs } } : { state: "error", error: res.error ?? "cannot read directory" };
-          render();
-        })
-        .catch((error) => {
-          if (tui.done) return;
-          subdirs = { state: "error", error: error instanceof Error ? error.message : String(error) };
-          render();
-        });
-    };
-
-    const drillPath = () => {
-      const pick = filteredSubdirs()[cursorPath];
-      if (!pick) return;
-      pathBuffer = pick.abs.endsWith("/") ? pick.abs : `${pick.abs}/`;
-      pathError = "";
-      cursorPath = 0;
-      refreshPathCompletion();
-    };
-
-    const submitPath = async () => {
-      const pick = filteredSubdirs()[cursorPath];
-      if (pick) { repoChosen(pick.abs); return; }
-      const input = pathBuffer.trim();
-      if (!input) { pathError = "enter a path"; render(); return; }
-      const result = await hooks.validatePath(input);
-      if (tui.done) return;
-      if (!result.ok || !result.path) { pathError = result.error ?? "invalid path"; render(); return; }
-      repoChosen(result.path);
     };
 
     // ── form ──────────────────────────────────────────────────────────────
@@ -439,46 +351,7 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
       finish({ action: "save-template", cwd: selCwd, values: { ...values }, templateName: name });
     };
 
-    const openBeePicker = async () => {
-      beePicking = true;
-      beeQuery = "";
-      cursorBee = 0;
-      beeScroll = 0;
-      if (beeOptions.state === "idle" || beeOptions.state === "error") {
-        beeOptions = { state: "loading" };
-        render();
-        try {
-          beeOptions = { state: "loaded", items: await hooks.loadBeeOptions() };
-        } catch (error) {
-          beeOptions = { state: "error", error: error instanceof Error ? error.message : String(error) };
-        }
-      }
-      if (!tui.done) render();
-    };
-
-    const filteredBeeOptions = (): BeeOption[] =>
-      beeOptions.state === "loaded" ? fuzzyFilter(beeQuery, beeOptions.items, (o) => `${o.label} ${o.value}`) : [];
-
-    const chooseBee = () => {
-      const opt = filteredBeeOptions()[cursorBee];
-      if (opt) values.bee = opt.value;
-      beePicking = false;
-      render();
-    };
-
     // ── key handlers (each returns true when it consumes the key) ──────────
-    const handleBeePickerKey = (value: string, key: readline.Key): boolean => {
-      if (!(stage === "form" && beePicking)) return false;
-      if (key.name === "escape" || key.name === "left") { beePicking = false; render(); return true; }
-      if (key.name === "return" || key.name === "enter") { chooseBee(); return true; }
-      if (key.name === "up") { cursorBee = clamp(cursorBee - 1, filteredBeeOptions().length); render(); return true; }
-      if (key.name === "down") { cursorBee = clamp(cursorBee + 1, filteredBeeOptions().length); render(); return true; }
-      if (key.name === "backspace") { beeQuery = beeQuery.slice(0, -1); cursorBee = 0; render(); return true; }
-      if (key.ctrl && key.name === "u") { beeQuery = ""; cursorBee = 0; render(); return true; }
-      if (isPrintable(value, key)) { beeQuery += value; cursorBee = 0; render(); return true; }
-      return true;
-    };
-
     const handleNamingKey = (value: string, key: readline.Key): boolean => {
       if (!(stage === "form" && naming)) return false;
       if (key.name === "escape") { naming = false; nameError = ""; message = "↑↓ field · type to edit · enter next/launch · ← back"; render(); return true; }
@@ -490,7 +363,7 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
     };
 
     const handleFormKey = (value: string, key: readline.Key): boolean => {
-      if (stage !== "form" || beePicking || naming) return false;
+      if (stage !== "form" || beePicker.active || naming) return false;
       if (key.name === "escape" || key.name === "left") { enterProject(); return true; }
       if (key.name === "up") { cursorRow = clamp(cursorRow - 1, rows().length); formError = ""; render(); return true; }
       if (key.name === "down") { cursorRow = clamp(cursorRow + 1, rows().length); formError = ""; render(); return true; }
@@ -515,7 +388,7 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
         return true;
       }
       if (row.field === "bee") {
-        if (key.name === "return" || key.name === "enter" || key.name === "tab" || isPrintable(value, key)) { void openBeePicker(); return true; }
+        if (key.name === "return" || key.name === "enter" || key.name === "tab" || isPrintable(value, key)) { void beePicker.open(); return true; }
         return true;
       }
       if (row.field === "bool") {
@@ -534,23 +407,6 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
       return true;
     };
 
-    const goBack = () => {
-      if (stage === "template") { finish(null); return; }
-      if (stage === "form") { enterProject(); return; }
-      // project
-      if (projectView === "browse" || projectView === "path") {
-        projectView = "menu";
-        stdout.write("\x1b[?25l");
-        message = "↑↓ pick · enter: here / browse repos / type a path · ← back";
-        render();
-        return;
-      }
-      stage = "template";
-      stdout.write("\x1b[?25h");
-      message = "type to filter · ↑↓ pick · enter select · q cancel";
-      render();
-    };
-
     const handleTemplateKey = (value: string, key: readline.Key): boolean => {
       if (stage !== "template") return false;
       if (key.name === "return" || key.name === "enter") { chooseTemplate(); return true; }
@@ -563,66 +419,13 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
       return true;
     };
 
-    const handleBrowseKey = (value: string, key: readline.Key): boolean => {
-      if (!(stage === "project" && projectView === "browse")) return false;
-      if (key.name === "return" || key.name === "enter") { chooseBrowse(); return true; }
-      if (key.name === "escape" || key.name === "left") { goBack(); return true; }
-      if (key.name === "up") { cursorBrowse = clamp(cursorBrowse - 1, filteredProjects().length); render(); return true; }
-      if (key.name === "down") { cursorBrowse = clamp(cursorBrowse + 1, filteredProjects().length); render(); return true; }
-      if (key.name === "backspace") { browseQuery = browseQuery.slice(0, -1); cursorBrowse = 0; render(); return true; }
-      if (key.ctrl && key.name === "u") { browseQuery = ""; cursorBrowse = 0; render(); return true; }
-      if (isPrintable(value, key)) { browseQuery += value; cursorBrowse = 0; render(); return true; }
-      return true;
-    };
-
-    const handlePathKey = (value: string, key: readline.Key): boolean => {
-      if (!(stage === "project" && projectView === "path")) return false;
-      if (key.name === "return" || key.name === "enter") { void submitPath(); return true; }
-      if (key.name === "escape" || key.name === "left") { goBack(); return true; }
-      if (key.name === "tab") { drillPath(); return true; }
-      if (key.name === "up") { cursorPath = clamp(cursorPath - 1, filteredSubdirs().length); render(); return true; }
-      if (key.name === "down") { cursorPath = clamp(cursorPath + 1, filteredSubdirs().length); render(); return true; }
-      if (key.name === "backspace") { pathBuffer = pathBuffer.slice(0, -1); pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
-      if (key.ctrl && key.name === "u") { pathBuffer = ""; pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
-      if (isPrintable(value, key)) { pathBuffer += value; pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
-      return true;
-    };
-
     const onKey = (value: string, key: readline.Key) => {
       if (key.ctrl && key.name === "c") { finish(null); return; }
       if (handleTemplateKey(value, key)) return;
-      if (handleBeePickerKey(value, key)) return;
+      if (beePicker.onKey(value, key)) return;
       if (handleNamingKey(value, key)) return;
       if (handleFormKey(value, key)) return;
-      if (handleBrowseKey(value, key)) return;
-      if (handlePathKey(value, key)) return;
-      // project menu
-      switch (key.name) {
-        case "q":
-        case "escape":
-          finish(null);
-          return;
-        case "up":
-        case "k":
-          cursorProjectMenu = clamp(cursorProjectMenu - 1, PROJECT_MENU.length);
-          render();
-          return;
-        case "down":
-        case "j":
-          cursorProjectMenu = clamp(cursorProjectMenu + 1, PROJECT_MENU.length);
-          render();
-          return;
-        case "left":
-        case "h":
-          goBack();
-          return;
-        case "right":
-        case "l":
-        case "return":
-        case "enter":
-          activateProjectMenu();
-          return;
-      }
+      if (stage === "project" && projectPicker.onKey(value, key)) return;
     };
 
     // ── rendering ──────────────────────────────────────────────────────────
@@ -637,11 +440,11 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
       const lines: string[] = [header, ""];
 
       if (stage === "template") lines.push(...renderTemplates(width, bodyRows));
-      else if (stage === "form") lines.push(...renderForm(width));
-      else lines.push(...renderProject(width, bodyRows));
+      else if (stage === "form") lines.push(...renderForm(width, bodyRows));
+      else lines.push(...projectPicker.render(width, bodyRows));
 
       while (lines.length < height - 2) lines.push("");
-      const err = stage === "form" ? (naming ? nameError : formError) : pathError;
+      const err = stage === "form" ? (naming ? nameError : formError) : projectPicker.errorLine();
       lines.push(truncate(err ? red(err) : message, width));
       lines.push(dim(footer()));
       painter.paint(lines, width, height);
@@ -650,10 +453,10 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
 
     const footer = (): string => {
       if (stage === "template") return "type to filter · ↑↓ move · enter select · q quit";
-      if (stage === "form" && beePicking) return "type to filter · ↑↓ move · enter pick · esc back";
+      if (stage === "form" && beePicker.active) return "type to filter · ↑↓ move · enter pick · esc back";
       if (stage === "form" && naming) return "type a name · enter save · esc cancel";
       if (stage === "form") return "↑↓ field · type to edit · enter next/launch · ← back";
-      if (projectView === "browse" || projectView === "path") return "type to filter · ↑↓ move · enter select · esc back";
+      if (projectPicker.active()) return "type to filter · ↑↓ move · enter select · esc back";
       return "↑↓ move · enter choose · ← back · q quit";
     };
 
@@ -684,57 +487,8 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
       return out;
     };
 
-    const renderProject = (width: number, bodyRows: number): string[] => {
-      if (projectView === "menu") {
-        const rows2 = [`here  ${dim(truncate(hooks.defaultCwdLabel, Math.max(6, width - 8)))}`, "browse repos…", "type a path…"];
-        return rows2.map((text, i) => {
-          const pointer = i === cursorProjectMenu ? green("›") : " ";
-          const line = `${pointer} ${text}`;
-          return i === cursorProjectMenu && isPretty() ? reverse(stripAnsi(line)) : truncate(line, width);
-        });
-      }
-      const listRows = Math.max(1, bodyRows - 2);
-      if (projectView === "browse") {
-        const total = projects.state === "loaded" ? projects.items.length : 0;
-        const list = filteredProjects();
-        const out: string[] = [`${cyan("> ")}${browseQuery}`];
-        if (projects.state === "loading") { out.push(dim("loading repos…")); return out; }
-        if (projects.state === "error") { out.push(red(projects.error)); return out; }
-        out.push(dim(`${list.length}/${total} repos`));
-        if (list.length === 0) { out.push(dim(total === 0 ? "no repos found" : "no match")); return out; }
-        if (cursorBrowse < browseScroll) browseScroll = cursorBrowse;
-        if (cursorBrowse >= browseScroll + listRows) browseScroll = cursorBrowse - listRows + 1;
-        for (let i = 0; i < Math.min(listRows, list.length - browseScroll); i += 1) {
-          const idx = browseScroll + i;
-          const repo = list[idx]!;
-          const pointer = idx === cursorBrowse ? green("›") : " ";
-          const label = truncate(repo.label, Math.max(10, Math.floor(width * 0.5)));
-          const path = dim(truncate(repo.path, Math.max(10, width - visibleLength(label) - 6)));
-          const line = `${pointer} ${idx === cursorBrowse ? bold(label) : label}  ${path}`;
-          out.push(idx === cursorBrowse && isPretty() ? reverse(stripAnsi(line)) : line);
-        }
-        return out;
-      }
-      // path
-      const list = filteredSubdirs();
-      const out: string[] = [`${cyan("> ")}${pathBuffer}`];
-      if (subdirs.state === "loading") { out.push(dim("scanning…")); return out; }
-      if (subdirs.state === "error") { out.push(dim(`${subdirs.error} — enter uses the typed path`)); return out; }
-      out.push(dim(list.length === 0 ? "no subfolders match — enter uses the typed path" : `${list.length} folder${list.length === 1 ? "" : "s"} · tab drills in`));
-      if (cursorPath < pathScroll) pathScroll = cursorPath;
-      if (cursorPath >= pathScroll + listRows) pathScroll = cursorPath - listRows + 1;
-      for (let i = 0; i < Math.min(listRows, list.length - pathScroll); i += 1) {
-        const idx = pathScroll + i;
-        const row = list[idx]!;
-        const pointer = idx === cursorPath ? green("›") : " ";
-        const line = `${pointer} ${row.rel}`;
-        out.push(idx === cursorPath && isPretty() ? reverse(stripAnsi(line)) : truncate(line, width));
-      }
-      return out;
-    };
-
-    const renderForm = (width: number): string[] => {
-      if (beePicking) return renderBeePicker(width);
+    const renderForm = (width: number, bodyRows: number): string[] => {
+      if (beePicker.active) return beePicker.render(width, bodyRows);
       if (naming) return renderNaming(width);
       const list = rows();
       const fieldRows = list.filter((r): r is FieldRow => r.kind === "field");
@@ -781,26 +535,6 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
       return out;
     };
 
-    const renderBeePicker = (width: number): string[] => {
-      const out: string[] = [dim(`pick the agent for the loop`), `${cyan("> ")}${beeQuery}`];
-      if (beeOptions.state === "loading") { out.push(dim("loading accounts…")); return out; }
-      if (beeOptions.state === "error") { out.push(red(beeOptions.error)); return out; }
-      const list = filteredBeeOptions();
-      if (list.length === 0) { out.push(dim("no match")); return out; }
-      const listRows = 12;
-      if (cursorBee < beeScroll) beeScroll = cursorBee;
-      if (cursorBee >= beeScroll + listRows) beeScroll = cursorBee - listRows + 1;
-      for (let i = 0; i < Math.min(listRows, list.length - beeScroll); i += 1) {
-        const idx = beeScroll + i;
-        const o = list[idx]!;
-        const pointer = idx === cursorBee ? green("›") : " ";
-        const detail = o.detail ? `  ${dim(o.detail)}` : "";
-        const line = `${pointer} ${idx === cursorBee ? bold(o.label) : o.label}${detail}`;
-        out.push(idx === cursorBee && isPretty() ? reverse(stripAnsi(line)) : truncate(line, width));
-      }
-      return out;
-    };
-
     const renderNaming = (width: number): string[] => {
       const fieldW = Math.max(10, width - 16);
       const shown = truncate(nameBuffer, fieldW);
@@ -816,10 +550,15 @@ export async function chooseLoop(hooks: LoopTuiHooks): Promise<LoopLaunchResult 
 
     const parkCursor = () => {
       if (stage === "template") { stdout.write(`\x1b[3;${2 + visibleLength(templateQuery) + 1}H`); return; }
-      if (stage === "form" && beePicking) { stdout.write(`\x1b[4;${2 + visibleLength(beeQuery) + 1}H`); return; }
+      if (stage === "form" && beePicker.active) { writeCursor(beePicker.cursor()); return; }
       if (stage === "form" && naming) { stdout.write(`\x1b[5;${8 + visibleLength(nameBuffer) + 1}H`); return; }
-      if (stage === "project" && projectView === "browse") { stdout.write(`\x1b[3;${2 + visibleLength(browseQuery) + 1}H`); return; }
-      if (stage === "project" && projectView === "path") { stdout.write(`\x1b[3;${2 + visibleLength(pathBuffer) + 1}H`); return; }
+      if (stage === "project") { writeCursor(projectPicker.cursor()); return; }
+    };
+
+    // Park the terminal cursor from a Screen's body-relative coordinate. Body
+    // starts on screen line 3 (header, blank, then the first body row).
+    const writeCursor = (at: { line: number; col: number } | null) => {
+      if (at) stdout.write(`\x1b[${3 + at.line};${at.col}H`);
     };
 
     return { onKey, render };
