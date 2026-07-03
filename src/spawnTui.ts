@@ -5,17 +5,24 @@
  * inside an attached session: choose the agent type, then the account (with live
  * usage), then config toggles, then the working directory. Enter spawns.
  *
- * This module is presentation-only and dependency-free, mirroring src/cleanTui.ts:
- * raw mode + alt screen + signal-safe restore, a single keypress handler, and a
- * full redraw per event. All data (accounts, usage, projects, path validation)
- * arrives through callbacks so the spawn wiring stays in cli.ts.
+ * This module is presentation-only, mirroring src/cleanTui.ts: raw mode + alt
+ * screen + signal-safe restore, a single keypress handler, and a full redraw per
+ * event. All data (accounts, usage, projects, path validation) arrives through
+ * callbacks so the spawn wiring stays in cli.ts. The PROJECT column's browse +
+ * path modes are the shared Screen from src/projectPicker.ts (menu-external, so
+ * `hive new` keeps rendering the menu as one Miller column).
  */
 
 import type * as readline from "node:readline";
 import { bold, cyan, dim, green, isPretty, red, stripAnsi, truncate, visibleLength } from "./format.js";
 import { createTuiPainter } from "./tuiPaint.js";
-import { type AsyncState, clamp, expandTilde, isPrintable, padRight, reverse } from "./tuiKit.js";
+import { createProjectPicker } from "./projectPicker.js";
+import { type AsyncState, clamp, isPrintable, padRight, reverse } from "./tuiKit.js";
 import { runRawModeTui } from "./tuiRuntime.js";
+
+// Re-exported from tuiKit for backward compatibility: these fuzzy/path helpers
+// used to live here and are imported by loopTui/launchTui/beesTui and tests.
+export { fuzzyFilter, relativeTo, splitPathQuery } from "./tuiKit.js";
 
 export type SpawnTuiType = {
   kind: string;
@@ -87,7 +94,6 @@ export type SpawnTuiHooks = {
 };
 
 type Stage = "type" | "account" | "config" | "project" | "isolation";
-type ProjectView = "menu" | "browse" | "path";
 type IsolationView = "menu" | "name";
 
 const MAX_COUNT = 24;
@@ -114,64 +120,6 @@ export function resolveAccountStep(real: SpawnTuiAccount[]): {
   return { showColumn: false, account: undefined, label: "no account", rows: [] };
 }
 
-/**
- * fzf-style incremental filter (kept pure for testing). Empty query keeps the
- * original order; otherwise items are ranked: exact substring beats a scattered
- * subsequence, earlier and more contiguous matches score higher, ties break on
- * the shorter candidate. Non-matches are dropped.
- */
-export function fuzzyFilter<T>(query: string, items: T[], key: (item: T) => string): T[] {
-  const q = query.trim().toLowerCase();
-  if (!q) return items;
-  const scored: Array<{ item: T; score: number; len: number }> = [];
-  for (const item of items) {
-    const text = key(item);
-    const score = fuzzyScore(q, text.toLowerCase());
-    if (score >= 0) scored.push({ item, score, len: text.length });
-  }
-  scored.sort((a, b) => b.score - a.score || a.len - b.len);
-  return scored.map((entry) => entry.item);
-}
-
-function fuzzyScore(query: string, text: string): number {
-  const idx = text.indexOf(query);
-  if (idx >= 0) return 2000 - Math.min(idx, 1000); // contiguous substring wins decisively
-  let from = 0;
-  let score = 0;
-  let streak = 0;
-  let first = -1;
-  let last = -1;
-  for (const ch of query) {
-    const found = text.indexOf(ch, from);
-    if (found < 0) return -1;
-    if (first < 0) first = found;
-    last = found;
-    streak = found === from ? streak + 1 : 0;
-    score += 1 + streak;
-    from = found + 1;
-  }
-  // Reject sparse matches: a real fuzzy hit is reasonably localized, but a
-  // garbage query (e.g. "ebabaebaerba") only "matches" a long corpus by
-  // scattering its characters across the whole thing. Cap the gap between the
-  // first and last matched character relative to the query length.
-  const gaps = last - first + 1 - query.length;
-  if (gaps > Math.max(8, query.length * 2)) return -1;
-  return score;
-}
-
-/** Split a typed path into the directory to list and the trailing fuzzy query. */
-export function splitPathQuery(buffer: string): { base: string; query: string } {
-  const slash = buffer.lastIndexOf("/");
-  if (slash < 0) return { base: ".", query: buffer };
-  return { base: buffer.slice(0, slash) || "/", query: buffer.slice(slash + 1) };
-}
-
-/** Display an absolute dir relative to `base` (falls back to the abs path). */
-export function relativeTo(base: string, abs: string): string {
-  const prefix = base.endsWith("/") ? base : `${base}/`;
-  return abs.startsWith(prefix) ? abs.slice(prefix.length) : abs;
-}
-
 export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult | null> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("hive new requires a TTY — run it from a tmux popup binding (e.g. M-n) or an interactive terminal.");
@@ -195,23 +143,11 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
   let cursorType = initialType;
   let cursorAccount = 0;
   let cursorConfig = 0;
-  let cursorProjectMenu = 0;
-  let cursorBrowse = 0;
-  let browseScroll = 0;
-  let cursorPath = 0;
-  let pathScroll = 0;
+  let cursorProjectMenu = 0; // the PROJECT column menu (browse/path own their own)
 
   // ── async-loaded data ───────────────────────────────────────────────────
   let accounts: AsyncState<SpawnTuiAccount[]> = { state: "idle" };
   let accountRows: SpawnTuiAccount[] = []; // [auto, ...real] once loaded
-  let projects: AsyncState<SpawnTuiProject[]> = { state: "idle" };
-  let projectView: ProjectView = "menu";
-  let browseQuery = "";                     // fzf filter for the pro repo list
-  let pathBuffer = "";                      // typed path (path mode)
-  let pathError = "";
-  // Live subdir completion for path mode, keyed by the base dir being listed.
-  let subdirs: AsyncState<{ base: string; dirs: string[] }> = { state: "idle" };
-  let subdirsBase = "";                     // raw base string we last requested
   // ── isolation state (only when the chosen cwd is inside a pro repo) ───────
   let proTarget: { label: string; path: string } | null = null;
   let isolationView: IsolationView = "menu";
@@ -231,6 +167,40 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
 
   return runRawModeTui<SpawnTuiResult | null>((tui) => {
     const { finish } = tui;
+
+    // ── the repo/cwd browse+path picker ───────────────────────────────────
+    // `hive new` renders + drives its own PROJECT column menu (ownsMenu: false),
+    // so the picker only owns the fuzzy repo browser and the path completer,
+    // entered via enterBrowse()/enterPath() from activateProjectMenu below.
+    const projectPicker = createProjectPicker({
+      hooks,
+      text: {
+        browseMenuLabel: "project…",
+        pathMenuLabel: "path…",
+        menuMessage: "↑↓ pick · enter: spawn / browse / type a path · ← back",
+        browseMessage: "type to filter · ↑↓ pick · enter spawn · esc back",
+        pathMessage: "type to filter · ↑↓ pick · tab drills in · enter spawn · esc back",
+        browseLoading: "loading repos from `pro`…",
+        browseEmptyNone: "no pro repos found",
+        pathFallback: "enter spawns the typed path",
+      },
+      ownsMenu: false,
+      onChosen: (path, source) => {
+        // Choosing from the path completer hides the typing cursor before the
+        // pro-repo probe (matches the pre-refactor submitPath); a browsed repo
+        // leaves it as-is.
+        if (source === "path") stdout.write("\x1b[?25l");
+        void finalizeCwd(path);
+      },
+      onBack: () => {}, // menu is spawnTui's column — the picker never owns it
+      onQuit: () => {},
+      setMessage: (m) => { message = m; },
+      render: () => render(),
+      isDone: () => tui.done,
+      guardValidate: true, // wrap path validation in stageBusy (see stageBusy)
+      setBusy: (b) => { stageBusy = b; },
+      stdout,
+    });
 
     // ── config rows are dynamic (autoswap depends on an account) ──────────
     const configRows = (): Array<"yolo" | "autoswap" | "count"> => ["yolo", "autoswap", "count"];
@@ -292,22 +262,9 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       enterConfig();
     };
 
-    const loadProjectsIfNeeded = async () => {
-      if (projects.state === "loaded" || projects.state === "loading") return;
-      projects = { state: "loading" };
-      render();
-      try {
-        const items = await hooks.loadProjects();
-        projects = { state: "loaded", items };
-      } catch (error) {
-        projects = { state: "error", error: error instanceof Error ? error.message : String(error) };
-      }
-      if (!tui.done) render();
-    };
-
     const enterProject = () => {
       stage = "project";
-      projectView = "menu";
+      projectPicker.toMenu();
       cursorProjectMenu = 0;
       message = "↑↓ pick · enter: spawn / browse / type a path · ← back";
       render();
@@ -385,112 +342,13 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
     };
 
     // ── project column actions ────────────────────────────────────────────
-    const filteredProjects = (): SpawnTuiProject[] =>
-      projects.state === "loaded" ? fuzzyFilter(browseQuery, projects.items, (repo) => repo.label) : [];
-
-    const filteredSubdirs = (): Array<{ abs: string; rel: string }> => {
-      if (subdirs.state !== "loaded") return [];
-      const { base, dirs } = subdirs.items;
-      const { query } = splitPathQuery(expandTilde(pathBuffer));
-      const rows = dirs.map((abs) => ({ abs, rel: relativeTo(base, abs) }));
-      return fuzzyFilter(query, rows, (row) => row.rel);
-    };
-
+    // The PROJECT column is a menu; "project"/"path" hand off to the shared
+    // browse/path picker, "here" finalizes the current cwd directly.
     const activateProjectMenu = () => {
       const choice = PROJECT_MENU[cursorProjectMenu];
-      if (choice === "here") {
-        void finalizeCwd(hooks.defaultCwd);
-      } else if (choice === "project") {
-        projectView = "browse";
-        browseQuery = "";
-        cursorBrowse = 0;
-        browseScroll = 0;
-        message = "type to filter · ↑↓ pick · enter spawn · esc back";
-        stdout.write("\x1b[?25h"); // show cursor for the filter field
-        void loadProjectsIfNeeded();
-        render();
-      } else {
-        projectView = "path";
-        pathBuffer = hooks.defaultCwd.endsWith("/") ? hooks.defaultCwd : `${hooks.defaultCwd}/`;
-        pathError = "";
-        subdirs = { state: "idle" };
-        subdirsBase = "";
-        cursorPath = 0;
-        pathScroll = 0;
-        message = "type to filter · ↑↓ pick · tab drills in · enter spawn · esc back";
-        stdout.write("\x1b[?25h");
-        refreshPathCompletion();
-      }
-    };
-
-    const chooseBrowse = () => {
-      const repo = filteredProjects()[cursorBrowse];
-      if (!repo) return;
-      void finalizeCwd(repo.path);
-    };
-
-    // Reload the subdir list whenever the directory portion of the buffer
-    // changes; editing only the trailing query reuses the loaded list.
-    const refreshPathCompletion = () => {
-      const { base } = splitPathQuery(expandTilde(pathBuffer));
-      if (base === subdirsBase && subdirs.state !== "idle") { render(); return; }
-      subdirsBase = base;
-      subdirs = { state: "loading" };
-      cursorPath = 0;
-      pathScroll = 0;
-      render();
-      void hooks
-        .listSubdirs(base)
-        .then((res) => {
-          if (tui.done) return;
-          if (splitPathQuery(expandTilde(pathBuffer)).base !== base) return; // stale
-          subdirs = res.ok
-            ? { state: "loaded", items: { base: res.base, dirs: res.dirs } }
-            : { state: "error", error: res.error ?? "cannot read directory" };
-          render();
-        })
-        .catch((error) => {
-          if (tui.done) return;
-          subdirs = { state: "error", error: error instanceof Error ? error.message : String(error) };
-          render();
-        });
-    };
-
-    const drillPath = () => {
-      const pick = filteredSubdirs()[cursorPath];
-      if (!pick) return;
-      pathBuffer = pick.abs.endsWith("/") ? pick.abs : `${pick.abs}/`;
-      pathError = "";
-      cursorPath = 0;
-      refreshPathCompletion();
-    };
-
-    const submitPath = async () => {
-      const pick = filteredSubdirs()[cursorPath];
-      if (pick) {
-        stdout.write("\x1b[?25l");
-        void finalizeCwd(pick.abs);
-        return;
-      }
-      // Nothing matched the completion — fall back to validating the literal text.
-      const input = pathBuffer.trim();
-      if (!input) { pathError = "enter a path"; render(); return; }
-      if (stageBusy) return;
-      stageBusy = true;
-      let result: { ok: boolean; path?: string; error?: string };
-      try {
-        result = await hooks.validatePath(input);
-      } finally {
-        stageBusy = false;
-      }
-      if (tui.done) return;
-      if (!result.ok || !result.path) {
-        pathError = result.error ?? "invalid path";
-        render();
-        return;
-      }
-      stdout.write("\x1b[?25l");
-      void finalizeCwd(result.path);
+      if (choice === "here") void finalizeCwd(hooks.defaultCwd);
+      else if (choice === "project") projectPicker.enterBrowse();
+      else projectPicker.enterPath();
     };
 
     // ── navigation ────────────────────────────────────────────────────────
@@ -506,7 +364,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         }
         // back from the isolation menu to the project menu
         stage = "project";
-        projectView = "menu";
+        projectPicker.toMenu();
         message = "↑↓ pick · enter: spawn / browse / type a path · ← back";
         render();
         return;
@@ -519,42 +377,30 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         render();
         return;
       }
-      // project
-      if (projectView === "browse" || projectView === "path") {
-        projectView = "menu";
-        stdout.write("\x1b[?25l");
-        message = "↑↓ pick · enter: spawn / browse / type a path · ← back";
-        render();
-        return;
-      }
+      // project menu → config (browse/path esc is handled by the picker itself)
       stage = "config";
       message = "space toggles · +/- count · → enter advance · ← back";
       render();
     };
 
     const moveCursor = (delta: number) => {
-      // Browse/path modes capture their own up/down in the typing handler
-      // (j/k are literal text there), so this only covers menu-style stages.
+      // Browse/path modes capture their own up/down in the picker (j/k are
+      // literal text there), so this only covers menu-style stages.
       if (stage === "type") cursorType = clamp(cursorType + delta, hooks.types.length);
       else if (stage === "account") cursorAccount = clamp(cursorAccount + delta, accountRows.length);
       else if (stage === "config") cursorConfig = clamp(cursorConfig + delta, configRows().length);
-      else if (stage === "project" && projectView === "menu") cursorProjectMenu = clamp(cursorProjectMenu + delta, PROJECT_MENU.length);
+      else if (stage === "project" && !projectPicker.active()) cursorProjectMenu = clamp(cursorProjectMenu + delta, PROJECT_MENU.length);
       else if (stage === "isolation" && isolationView === "menu") cursorIsolation = clamp(cursorIsolation + delta, ISOLATION_MENU.length);
       render();
     };
-
-    const moveBrowse = (delta: number) => { cursorBrowse = clamp(cursorBrowse + delta, filteredProjects().length); render(); };
-    const movePath = (delta: number) => { cursorPath = clamp(cursorPath + delta, filteredSubdirs().length); render(); };
 
     const advance = () => {
       if (stage === "type") { void chooseType(); return; }
       if (stage === "account") { chooseAccount(); return; }
       if (stage === "config") { enterProject(); return; }
       if (stage === "isolation") { if (isolationView === "menu") activateIsolationMenu(); return; }
-      // project
-      if (projectView === "menu") { activateProjectMenu(); return; }
-      if (projectView === "browse") { chooseBrowse(); return; }
-      if (projectView === "path") { void submitPath(); return; }
+      // project menu (browse/path keys are consumed by the picker)
+      activateProjectMenu();
     };
 
     const toggleConfig = () => {
@@ -579,34 +425,6 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       }
     };
 
-    // ── type-to-filter modes ──────────────────────────────────────────────
-    // Both the pro-repo browser and the path completer are fzf-style: letters
-    // edit a query, arrows move the highlight (j/k would be literal text).
-    const handleBrowseKey = (value: string, key: readline.Key): boolean => {
-      if (!(stage === "project" && projectView === "browse")) return false;
-      if (key.name === "return" || key.name === "enter") { chooseBrowse(); return true; }
-      if (key.name === "escape" || key.name === "left") { goBack(); return true; }
-      if (key.name === "up") { moveBrowse(-1); return true; }
-      if (key.name === "down") { moveBrowse(1); return true; }
-      if (key.name === "backspace") { browseQuery = browseQuery.slice(0, -1); cursorBrowse = 0; render(); return true; }
-      if (key.ctrl && key.name === "u") { browseQuery = ""; cursorBrowse = 0; render(); return true; }
-      if (isPrintable(value, key)) { browseQuery += value; cursorBrowse = 0; render(); return true; }
-      return true; // consume everything else while filtering
-    };
-
-    const handlePathKey = (value: string, key: readline.Key): boolean => {
-      if (!(stage === "project" && projectView === "path")) return false;
-      if (key.name === "return" || key.name === "enter") { void submitPath(); return true; }
-      if (key.name === "escape" || key.name === "left") { goBack(); return true; }
-      if (key.name === "tab") { drillPath(); return true; }
-      if (key.name === "up") { movePath(-1); return true; }
-      if (key.name === "down") { movePath(1); return true; }
-      if (key.name === "backspace") { pathBuffer = pathBuffer.slice(0, -1); pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
-      if (key.ctrl && key.name === "u") { pathBuffer = ""; pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
-      if (isPrintable(value, key)) { pathBuffer += value; pathError = ""; cursorPath = 0; refreshPathCompletion(); return true; }
-      return true;
-    };
-
     // Name entry for a worktree/checkout — a single text field (no completion
     // list). The isolation MENU is steered by the global nav handler below.
     const handleIsolationNameKey = (value: string, key: readline.Key): boolean => {
@@ -623,8 +441,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
     const onKey = (value: string, key: readline.Key) => {
       if (key.ctrl && key.name === "c") { finish(null); return; }
       if (stageBusy) return; // async stage transition resolving — see stageBusy
-      if (handleBrowseKey(value, key)) return;
-      if (handlePathKey(value, key)) return;
+      if (stage === "project" && projectPicker.onKey(value, key)) return;
       if (handleIsolationNameKey(value, key)) return;
       switch (key.name) {
         case "q":
@@ -665,8 +482,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       const height = Math.max(12, stdout.rows || 24);
       const bodyRows = Math.max(6, height - 6);
 
-      const inBrowse = stage === "project" && projectView === "browse";
-      const inPath = stage === "project" && projectView === "path";
+      const inPicker = stage === "project" && projectPicker.active();
       const inIsolation = stage === "isolation";
       const inIsoName = inIsolation && isolationView === "name";
 
@@ -675,29 +491,30 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
 
       if (inIsolation) {
         lines.push(...renderIsolation(width));
-      } else if (inBrowse || inPath) {
-        lines.push(...renderFull(width, bodyRows, inBrowse));
+      } else if (inPicker) {
+        lines.push(...projectPicker.render(width, bodyRows));
       } else {
         lines.push(...renderColumns(width, bodyRows));
       }
 
       // pad body
       while (lines.length < height - 2) lines.push("");
-      const errLine = pathError || nameError;
+      const errLine = projectPicker.errorLine() || nameError;
       lines.push(truncate(errLine ? red(errLine) : message, width));
       let footer: string;
-      if (inBrowse || inPath) footer = "type to filter · ↑↓ move · enter select · esc back";
+      if (inPicker) footer = "type to filter · ↑↓ move · enter select · esc back";
       else if (inIsoName) footer = "type a name · enter create & spawn · esc back";
       else if (inIsolation) footer = "j/k move · enter select · ← back · q quit";
       else footer = "j/k move · h/l columns · enter advance · +/- count · q quit";
       lines.push(dim(footer));
       painter.paint(lines, width, height);
-      if (inPath || inBrowse || inIsoName) {
-        // Park the real cursor at the end of the "> " filter/name field. Body
-        // starts on the 3rd screen line (header, blank, then "> <text>"),
-        // and the "> " prompt is two columns wide.
-        const text = inIsoName ? nameBuffer : inPath ? pathBuffer : browseQuery;
-        stdout.write(`\x1b[3;${2 + visibleLength(text) + 1}H`);
+      // Park the real cursor at the end of the "> " filter/name field. Body
+      // starts on the 3rd screen line (header, blank, then the first body row).
+      if (inPicker) {
+        const at = projectPicker.cursor();
+        if (at) stdout.write(`\x1b[${3 + at.line};${at.col}H`);
+      } else if (inIsoName) {
+        stdout.write(`\x1b[3;${2 + visibleLength(nameBuffer) + 1}H`);
       }
     };
 
@@ -772,48 +589,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         "project…",
         "path…",
       ];
-      return rows.map((text, i) => ({ text: truncate(text, w), active: projectView === "menu" && i === cursorProjectMenu }));
-    };
-
-    const renderFull = (width: number, bodyRows: number, inBrowse: boolean): string[] => {
-      const listRows = Math.max(1, bodyRows - 2);
-      if (inBrowse) {
-        const total = projects.state === "loaded" ? projects.items.length : 0;
-        const list = filteredProjects();
-        const out: string[] = [`${cyan("> ")}${browseQuery}`];
-        if (projects.state === "loading") { out.push(dim("loading repos from `pro`…")); return out; }
-        if (projects.state === "error") { out.push(red(projects.error)); return out; }
-        out.push(dim(`${list.length}/${total} repos`));
-        if (list.length === 0) { out.push(dim(total === 0 ? "no pro repos found" : "no match")); return out; }
-        if (cursorBrowse < browseScroll) browseScroll = cursorBrowse;
-        if (cursorBrowse >= browseScroll + listRows) browseScroll = cursorBrowse - listRows + 1;
-        for (let i = 0; i < Math.min(listRows, list.length - browseScroll); i += 1) {
-          const idx = browseScroll + i;
-          const repo = list[idx]!;
-          const pointer = idx === cursorBrowse ? green("›") : " ";
-          const label = truncate(repo.label, Math.max(10, Math.floor(width * 0.5)));
-          const path = dim(truncate(repo.path, Math.max(10, width - visibleLength(label) - 6)));
-          const line = `${pointer} ${idx === cursorBrowse ? bold(label) : label}  ${path}`;
-          out.push(idx === cursorBrowse && isPretty() ? reverse(stripAnsi(line)) : line);
-        }
-        return out;
-      }
-      // path completion
-      const list = filteredSubdirs();
-      const out: string[] = [`${cyan("> ")}${pathBuffer}`];
-      if (subdirs.state === "loading") { out.push(dim("scanning…")); return out; }
-      if (subdirs.state === "error") { out.push(dim(`${subdirs.error} — enter spawns the typed path`)); return out; }
-      out.push(dim(list.length === 0 ? "no subfolders match — enter spawns the typed path" : `${list.length} folder${list.length === 1 ? "" : "s"} · tab drills in`));
-      if (cursorPath < pathScroll) pathScroll = cursorPath;
-      if (cursorPath >= pathScroll + listRows) pathScroll = cursorPath - listRows + 1;
-      for (let i = 0; i < Math.min(listRows, list.length - pathScroll); i += 1) {
-        const idx = pathScroll + i;
-        const row = list[idx]!;
-        const pointer = idx === cursorPath ? green("›") : " ";
-        const line = `${pointer} ${row.rel}`;
-        out.push(idx === cursorPath && isPretty() ? reverse(stripAnsi(line)) : truncate(line, width));
-      }
-      return out;
+      return rows.map((text, i) => ({ text: truncate(text, w), active: !projectPicker.active() && i === cursorProjectMenu }));
     };
 
     // Isolation step: a small menu (here / worktree / checkout), then a single
