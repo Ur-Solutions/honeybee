@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { readHsrMeta } from "../src/hsr/runDir.js";
+import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
 
 const execFileAsync = promisify(execFile);
@@ -52,6 +54,7 @@ function hive(store: string, socket: string, args: string[]): Promise<{ stdout: 
       HIVE_STORE_ROOT: store,
       HIVE_TMUX_SOCKET: socket,
       HIVE_CODEX_CMD: "sh -c 'sleep 120' --",
+      HIVE_STUB_CMD: process.execPath,
       HIVE_NO_KEYCHAIN: "1",
       NO_COLOR: "1",
       TERM: "dumb",
@@ -71,6 +74,37 @@ async function withRig(fn: (ctx: { store: string; socket: string }) => Promise<v
     setTmuxSocket(undefined);
     await rm(socketDir, { recursive: true, force: true });
     await rm(store, { recursive: true, force: true });
+  }
+}
+
+async function withStoreEnv<T>(store: string, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = store;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = prev;
+  }
+}
+
+async function killHsrBee(store: string, bee: string): Promise<void> {
+  await withStoreEnv(store, async () => {
+    await hsrSubstrate().kill(bee).catch(() => undefined);
+  });
+}
+
+async function hiveResult(store: string, socket: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const result = await hive(store, socket, args);
+    return { code: 0, ...result };
+  } catch (error) {
+    const failed = error as { code?: number; stdout?: string; stderr?: string };
+    return {
+      code: typeof failed.code === "number" ? failed.code : 1,
+      stdout: failed.stdout ?? "",
+      stderr: failed.stderr ?? "",
+    };
   }
 }
 
@@ -100,5 +134,85 @@ test("revive --session resumes and persists the exact provider session id", { sk
     assert.equal(record.providerSessionId, "sess-exact");
     assert.match(String(record.command), /resume sess-exact/);
     assert.doesNotMatch(String(record.command), /resume --last/);
+  });
+});
+
+test("revive routes local HSR records through the runner host", async () => {
+  await withRig(async ({ store, socket }) => {
+    const bee = "HSR.revive";
+    await seedBee(store, bee, {
+      agent: "stub",
+      requestedAgent: "stub",
+      command: "stub",
+      tmuxTarget: bee,
+      substrate: "hsr",
+      runnerPid: 2 ** 31 - 1,
+      providerSessionId: "sess-hsr",
+    });
+
+    try {
+      const result = await hive(store, socket, ["revive", bee]);
+      assert.match(result.stdout, /revived\tHSR\.revive\tstub\tresumed sess-hsr/);
+
+      const record = await readBee(store, bee);
+      assert.equal(record.status, "running");
+      assert.equal(record.substrate, "hsr");
+      assert.equal(record.providerSessionId, "sess-hsr");
+      assert.equal(typeof record.runnerPid, "number");
+
+      await withStoreEnv(store, async () => {
+        const meta = await readHsrMeta(bee);
+        assert.equal(meta?.status, "running");
+        assert.equal(meta?.harness, "stub");
+        assert.equal(meta?.sessionId, "sess-hsr");
+      });
+    } finally {
+      await killHsrBee(store, bee);
+    }
+  });
+});
+
+test("revive --all continues after a per-bee failure", async () => {
+  await withRig(async ({ store, socket }) => {
+    const bad = "HSR.bad";
+    const good = "HSR.good";
+    await seedBee(store, bad, {
+      agent: "definitely-missing-hsr-harness",
+      requestedAgent: "definitely-missing-hsr-harness",
+      command: "definitely-missing-hsr-harness",
+      tmuxTarget: bad,
+      substrate: "hsr",
+      providerSessionId: "sess-bad",
+      updatedAt: "2026-06-25T00:00:02.000Z",
+    });
+    await seedBee(store, good, {
+      agent: "stub",
+      requestedAgent: "stub",
+      command: "stub",
+      tmuxTarget: good,
+      substrate: "hsr",
+      providerSessionId: "sess-good",
+      updatedAt: "2026-06-25T00:00:01.000Z",
+    });
+
+    try {
+      const result = await hiveResult(store, socket, ["revive", "--all"]);
+      assert.equal(result.code, 1, "bulk revive reports partial failure");
+      assert.match(result.stdout, /revive_failed\tHSR\.bad\tExecutable not found on PATH: definitely-missing-hsr-harness/);
+      assert.match(result.stdout, /revived\tHSR\.good\tstub\tresumed sess-good/);
+      assert.match(result.stdout, /revive\tall\t1\t0\t0/);
+
+      const goodRecord = await readBee(store, good);
+      assert.equal(goodRecord.status, "running");
+      assert.equal(goodRecord.substrate, "hsr");
+
+      await withStoreEnv(store, async () => {
+        const meta = await readHsrMeta(good);
+        assert.equal(meta?.status, "running");
+        assert.equal(meta?.sessionId, "sess-good");
+      });
+    } finally {
+      await killHsrBee(store, good);
+    }
   });
 });
