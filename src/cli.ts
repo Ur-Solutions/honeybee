@@ -30,7 +30,7 @@ import {
   syncAllAccountCredentialsToVault,
   vaultRoot,
 } from "./accounts.js";
-import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { agentKinds, autoAliasForcesYolo, bootMsForAgent, defaultsToSoleCredentialedAccount, identityEnvForAgent, identityRecipeForAgent, sessionPinnedInArgs, type IdentityRecipe } from "./drivers.js";
 import { mapWithConcurrency } from "./concurrency.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
@@ -715,9 +715,9 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // Pin the bee to its own provider session id from birth so the transcript
   // matcher anchors on it (+1000) instead of cross-matching a sibling's file by
   // mtime — the auto-titler and resume/swap all key off providerSessionId. Skip
-  // when the caller already supplied --session-id in extra args.
+  // when the caller already supplied the driver's session-pin flag in extra args.
   let pinnedSessionId: string | undefined;
-  if (!opts.extraArgs?.includes("--session-id")) {
+  if (!sessionPinnedInArgs(spec.kind, opts.extraArgs ?? [])) {
     const sid = randomUUID();
     const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
     if (sessionArgs) {
@@ -952,7 +952,7 @@ async function resolveSpawnAgentWithAuto(requested: string, parsed: Parsed): Pro
   const alias = spawnAccountAliasResolver(requested, parsed);
   if (alias) return { agent: alias.agent, account: await alias.account() };
   const resolved = await resolveSpawnAgent(requested);
-  const defaultAccount = await defaultBareGrokAccount(requested, parsed, resolved);
+  const defaultAccount = await defaultSoleCredentialedAccount(requested, parsed, resolved);
   return defaultAccount ? { agent: defaultAccount.tool, account: defaultAccount } : resolved;
 }
 
@@ -969,17 +969,23 @@ function spawnAccountAliasResolver(requested: string, parsed: Parsed): SpawnAcco
   return undefined;
 }
 
-async function defaultBareGrokAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
-  if (resolved.account || resolved.agent !== "grok" || requested.trim().toLowerCase() !== "grok") return undefined;
+/**
+ * For tools with the registry's soleCredentialedAccountDefault capability
+ * (grok today): a bare `<tool>` spawn with no account/home/profile flags
+ * defaults to the only credentialed account for that tool.
+ */
+async function defaultSoleCredentialedAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
+  const tool = resolved.agent;
+  if (resolved.account || !defaultsToSoleCredentialedAccount(tool) || requested.trim().toLowerCase() !== tool) return undefined;
   if (hasFlag(parsed, "account") || hasFlag(parsed, "home") || hasFlag(parsed, "profile")) return undefined;
-  const accounts = (await listAccounts()).filter((account) => account.tool === "grok");
+  const accounts = (await listAccounts()).filter((account) => account.tool === tool);
   const credentialed: AccountRecord[] = [];
   for (const account of accounts) {
     if (await accountHasCredentials(account)) credentialed.push(account);
   }
   if (credentialed.length !== 1) return undefined;
   const account = credentialed[0]!;
-  console.error(note(`account default → ${account.id} — bare grok uses the only Grok account with credentials`));
+  console.error(note(`account default → ${account.id} — bare ${tool} uses the only ${tool} account with credentials`));
   return account;
 }
 
@@ -1870,7 +1876,7 @@ async function cmdMove(parsed: Parsed) {
 async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: string): Promise<SessionRecord> {
   try {
     await waitForAgentReady(record, {
-      timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+      timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
       acceptTrust: acceptsTrust(parsed),
       raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
     });
@@ -1930,7 +1936,7 @@ async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise
   }
   try {
     await waitForAgentReady(record, {
-      timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+      timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
       acceptTrust: acceptsTrust(parsed),
       raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
     });
@@ -4164,7 +4170,7 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     // branch). Pin a fresh provider session id when NOT resuming (resume already
     // carries continuity via its baked-in args).
     let pinnedSessionId: string | undefined;
-    if (decision.mode !== "resume" && !spec.args.includes("--session-id")) {
+    if (decision.mode !== "resume" && !sessionPinnedInArgs(spec.kind, spec.args)) {
       const sid = randomUUID();
       const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
       if (sessionArgs) {
@@ -4652,7 +4658,7 @@ async function cmdRun(parsed: Parsed) {
     if (record.substrate !== "hsr") {
       try {
         await waitForAgentReady(record, {
-          timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+          timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
           acceptTrust: acceptsTrust(parsed),
           raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
         });
@@ -4756,7 +4762,7 @@ async function cmdX(parsed: Parsed) {
   if (record.substrate !== "hsr") {
     try {
       await waitForAgentReady(record, {
-        timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+        timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
         acceptTrust: acceptsTrust(parsed),
         raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
       });
@@ -9041,18 +9047,6 @@ function acceptsTrust(parsed: Parsed): boolean {
   return true;
 }
 
-function defaultBootMs(agent: string): number {
-  switch (agent) {
-    case "claude": return 15_000;
-    case "codex": return 30_000;
-    case "opencode": return 15_000;
-    case "grok": return 10_000;
-    case "droid": return 5_000;
-    case "pi": return 10_000;
-    default: return 10_000;
-  }
-}
-
 function dangerousMode(parsed: Parsed, agent?: string, requested?: string, profileYolo?: boolean): boolean {
   // Explicit per-spawn opt-out always wins.
   if (truthy(flag(parsed, "no-yolo"))) return false;
@@ -9066,7 +9060,10 @@ function dangerousMode(parsed: Parsed, agent?: string, requested?: string, profi
     names.some((name) => truthyEnv(process.env[`HIVE_${envSuffix(name)}_YOLO`]))
   ) return true;
   if (names.some((name) => beeConfig(name).yolo === true)) return true;
-  if (requested && autoAccountTool(requested) === "codex") return true;
+  // `<tool>-auto` alias for a harness whose registry entry forces yolo on
+  // auto-picked accounts (codex today) — wins over the thin-profile override.
+  const autoTool = requested ? autoAccountTool(requested) : undefined;
+  if (autoTool && autoAliasForcesYolo(autoTool)) return true;
   // Thin-profile yolo override (precedence FLAG > config bee yolo > PROFILE >
   // per-agent default).
   if (profileYolo !== undefined) return profileYolo;
