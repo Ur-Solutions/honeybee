@@ -104,6 +104,26 @@ test("active: Codex working marker is recognized after the active window", () =>
   assert.equal(result.state, "active");
 });
 
+test("active: unknown pane capture holds the previous active state", () => {
+  const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
+  const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go", lastObservedState: "active" }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map<string, string | undefined>([["alpha-target", undefined]]),
+    now: NOW,
+  });
+  assert.equal(result.state, "active");
+});
+
+test("active: unknown pane capture without prior state does not default to idle_with_output", () => {
+  const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
+  const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go" }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map(),
+    now: NOW,
+  });
+  assert.equal(result.state, "active");
+});
+
 test("idle_with_output: known agent is ready after a previous prompt", () => {
   const oldPrompt = new Date(NOW - 10 * 60_000).toISOString();
   const result = deriveState(bee({ lastPromptAt: oldPrompt, lastPrompt: "go" }), {

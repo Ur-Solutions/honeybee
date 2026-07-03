@@ -8,7 +8,7 @@ import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { hsrObservations, reapDeadHosts, type HsrObservation } from "../hsr/observe.js";
 import { createRemoteEventMirror } from "../hsr/remoteEventMirror.js";
-import { deriveState, liveTargetKey, type BeeState, type StateContext } from "../state.js";
+import { deriveState, liveTargetKey, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
 import { createAutoTitleDispatcher, type AutoTitleOutcome } from "./autoTitle.js";
@@ -84,7 +84,7 @@ export type TickDeps = {
   /** Live target enumeration + node reachability — substrate-routable. */
   probeNodes: (nodes: NodeRecord[]) => Promise<ProbeResult>;
   /** Captures panes for the subset of live records. */
-  capturePanes: (records: SessionRecord[], liveTargets: Set<string>) => Promise<Map<string, string>>;
+  capturePanes: (records: SessionRecord[], liveTargets: Set<string>) => Promise<PaneCaptureMap>;
   /** Live pane ids on the local server, for pane-pinned liveness (problem c). */
   livePanes?: () => Promise<Set<string>>;
   /**
@@ -227,7 +227,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     errors,
     { liveTargets: new Set<string>(), unreachableNodes: new Set<string>() },
   );
-  const panes: Map<string, string> = await guard(
+  const panes: PaneCaptureMap = await guard(
     withTimeout(deps.capturePanes(records, probe.liveTargets), timeouts.substrateMs, "capturePanes"),
     errors,
     new Map(),
@@ -271,6 +271,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     liveTargets: probe.liveTargets,
     livePanes,
     panes,
+    previousStates: previousObserved,
     seals,
     unreachableNodes: probe.unreachableNodes,
     hsrLive,
@@ -1035,7 +1036,7 @@ function liveHiveStateFor(record: SessionRecord, probe: ProbeResult): string | u
   return undefined;
 }
 
-async function defaultCapturePanes(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
+async function defaultCapturePanes(records: SessionRecord[], liveTargets: Set<string>): Promise<PaneCaptureMap> {
   const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
   const entries = await Promise.all(
     liveRecords.map(async (record) => {
@@ -1047,7 +1048,7 @@ async function defaultCapturePanes(records: SessionRecord[], liveTargets: Set<st
         const text = await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId);
         return [key, text] as const;
       } catch {
-        return [key, ""] as const;
+        return [key, undefined] as const;
       }
     }),
   );
