@@ -34,7 +34,6 @@
  * adapters/index.ts owns the harness→RunnerAdapter map.
  */
 
-import { hasAgentDriver, homeEnvForAgent, identityRecipeForAgent } from "../drivers.js";
 import type { RunnerTier } from "./types.js";
 
 export const AUTH_KINDS = ["subscription", "api-key"] as const;
@@ -282,7 +281,10 @@ export function ephemeralHarnesses(): string[] {
  * coherent. Enforced by tests/hsr-harness-registry.test.ts so a new harness
  * that misses a recipe fails CI instead of silently misbehaving at spawn.
  */
-export function validateHarnessRegistry(): string[] {
+export async function validateHarnessRegistry(): Promise<string[]> {
+  // Lazy import: drivers.ts registers adapters that import this module's
+  // lookups, so a static drivers import here is a cycle (TDZ at load).
+  const { hasAgentDriver, homeEnvForAgent, identityRecipeForAgent } = await import("../drivers.js");
   const problems: string[] = [];
   for (const name of harnessNames()) {
     const desc = REGISTRY[name]!;
