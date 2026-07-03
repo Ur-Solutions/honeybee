@@ -206,6 +206,21 @@ test("hive loop status/list downgrade a running loop with a dead driver pid to o
   });
 });
 
+test("hive loop status/list downgrade a stale pid-less running loop to orphaned", { timeout: 30_000 }, async () => {
+  await withStore(async (dir) => {
+    await seedLoop(dir, "lp1", { status: "running", startedAt: "2000-01-01T00:00:00.000Z" });
+
+    const status = await hive(dir, "loop", "status", "lp1");
+    assert.match(status.stdout, /\torphaned\t/);
+
+    const json = await hive(dir, "loop", "status", "lp1", "--json");
+    assert.equal(JSON.parse(json.stdout).status, "orphaned");
+
+    const list = await hive(dir, "loop", "list");
+    assert.match(list.stdout, /loop\.run\tlp1\tralph\torphaned\t/);
+  });
+});
+
 // ─── flow status --json emits the reconciled status ───────────────────────
 
 test("hive flow status --json reports orphaned for a running meta with a dead pid", { timeout: 30_000 }, async () => {

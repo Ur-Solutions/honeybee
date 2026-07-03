@@ -209,27 +209,47 @@ export async function updateLoopConfig(id: string, patch: Partial<LoopConfig>): 
 }
 
 /**
+ * Age past which a pid-less "running" loop is presumed dead. The pre-write →
+ * pid-patch window in HiveFacade.loop/loopFlow is milliseconds long; a record
+ * still pid-less after this long means the driver died before the patch landed.
+ */
+export const PIDLESS_RUNNING_GRACE_MS = 30_000;
+
+/**
  * Reconcile a loop's persisted status against driver-process liveness: a loop
  * stuck on status "running" whose driver pid is dead (SIGKILLed, crashed,
  * machine rebooted) is shown as "orphaned". The on-disk loop.json is left
  * untouched — this is a view-level downgrade mirroring flow runs (runs.ts).
- * Records with no pid yet (the pre-driver write window) are left as-is.
+ * A pid-less "running" loop older than PIDLESS_RUNNING_GRACE_MS is downgraded
+ * the same way; it can only mean the driver died before writing its pid.
  */
-export function reconcileLoopStatus(cfg: LoopConfig, isPidAlive: (pid: number) => boolean = defaultIsPidAlive): LoopConfig {
+export function reconcileLoopStatus(
+  cfg: LoopConfig,
+  isPidAlive: (pid: number) => boolean = defaultIsPidAlive,
+  now: number = Date.now(),
+): LoopConfig {
   if (cfg.status !== "running") return cfg;
-  if (typeof cfg.pid !== "number" || cfg.pid <= 0) return cfg;
-  if (isPidAlive(cfg.pid)) return cfg;
-  return { ...cfg, status: "orphaned" };
+  if (typeof cfg.pid === "number" && cfg.pid > 0) {
+    if (isPidAlive(cfg.pid)) return cfg;
+    return { ...cfg, status: "orphaned" };
+  }
+
+  const age = now - Date.parse(cfg.startedAt);
+  if (Number.isFinite(age) && age > PIDLESS_RUNNING_GRACE_MS) {
+    return { ...cfg, status: "orphaned" };
+  }
+  return cfg;
 }
 
-export async function listLoops(opts: { isPidAlive?: (pid: number) => boolean } = {}): Promise<LoopConfig[]> {
+export async function listLoops(opts: { isPidAlive?: (pid: number) => boolean; now?: number } = {}): Promise<LoopConfig[]> {
   const isAlive = opts.isPidAlive ?? defaultIsPidAlive;
+  const now = opts.now ?? Date.now();
   const entries = await readdir(loopsRoot(), { withFileTypes: true }).catch(() => []);
   const out: LoopConfig[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const cfg = await readLoopConfig(entry.name).catch(() => null);
-    if (cfg) out.push(reconcileLoopStatus(cfg, isAlive));
+    if (cfg) out.push(reconcileLoopStatus(cfg, isAlive, now));
   }
   // Newest first — startedAt is ISO so lexical sort matches chronological.
   out.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
