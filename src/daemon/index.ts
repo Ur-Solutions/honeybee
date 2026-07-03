@@ -11,7 +11,10 @@ export type DaemonConfig = {
   tickMs: number;
   /**
    * Hard budget for a single tick. A tick that exceeds it is abandoned and
-   * recorded in recentErrors; the loop continues with the next tick.
+   * recorded in recentErrors; the loop keeps iterating but skips further
+   * ticks (each skip counting as a failed iteration) until the abandoned
+   * tick settles — the tick path is stateful and must never run twice
+   * concurrently.
    */
   tickBudgetMs: number;
   /**
