@@ -159,6 +159,23 @@ export type HsrObservation = {
    * SessionRecord through the HSR state path instead of the coarse node-probe.
    */
   mirrorOf?: string;
+  /**
+   * Optional per-tick daemon cache of events.jsonl-derived facts. Normal callers
+   * do not request this; the daemon does so it can feed state, usage, and
+   * needs-input from the same bounded event read.
+   */
+  eventSnapshot?: HsrEventSnapshot;
+};
+
+export type HsrEventSnapshot = {
+  events: RunnerEvent[];
+  tailEvents: RunnerEvent[];
+  usage: HsrUsageObservation;
+  pendingNeedsInput: PendingNeedsInput | null;
+};
+
+export type HsrObservationOptions = {
+  includeEvents?: boolean;
 };
 
 /**
@@ -215,12 +232,10 @@ function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined 
  * a missing/partial file and unparseable lines (a truncated crash write) — a
  * bad line is skipped, never thrown.
  */
-async function readEventTail(bee: string): Promise<RunnerEvent[]> {
-  const raw = await readTailText(hsrEventsPath(bee), EVENT_TAIL_MAX_BYTES);
-  if (raw === null) return [];
-  const lines = raw.split("\n").filter((line) => line.trim().length > 0);
+function parseRunnerEvents(raw: string): RunnerEvent[] {
+  const all = raw.split("\n").filter((line) => line.trim().length > 0);
   const events: RunnerEvent[] = [];
-  for (const line of lines) {
+  for (const line of all) {
     try {
       const parsed = JSON.parse(line) as unknown;
       if (parsed && typeof parsed === "object" && typeof (parsed as { type?: unknown }).type === "string") {
@@ -233,13 +248,28 @@ async function readEventTail(bee: string): Promise<RunnerEvent[]> {
   return events;
 }
 
+async function readEventTail(bee: string): Promise<RunnerEvent[]> {
+  const raw = await readTailText(hsrEventsPath(bee), EVENT_TAIL_MAX_BYTES);
+  return raw === null ? [] : parseRunnerEvents(raw);
+}
+
+async function readEventSnapshot(bee: string): Promise<HsrEventSnapshot> {
+  const events = await readEventTail(bee);
+  return {
+    events,
+    tailEvents: events,
+    usage: hsrUsageObservationFromEvents(events),
+    pendingNeedsInput: pendingNeedsInputFromEvents(events),
+  };
+}
+
 /**
  * Batch structured observation of every HSR bee, read purely from run dirs (no
  * tmux). Threaded through StateContext so BOTH `hive bees` and the daemon tick
  * derive HSR state and drive transitions/buz-drain from the same source. Never
  * throws: a bad bee yields `{ live: false, snapshot: "" }`.
  */
-export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
+export async function hsrObservations(options: HsrObservationOptions = {}): Promise<Map<string, HsrObservation>> {
   const observations = new Map<string, HsrObservation>();
   for (const bee of await listHsrBees()) {
     try {
@@ -247,14 +277,18 @@ export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
       const live = isMetaLive(meta);
       const snapshot = await hsrSnapshot(bee);
       const mirrorOf = meta?.mirrorOfNode;
+      const eventSnapshot = options.includeEvents ? await readEventSnapshot(bee) : undefined;
       // A dead host's stream is gone — leave state undefined so deriveState
       // settles dead/sealed rather than reporting a stale structured state.
-      const state = live ? structuredStateFromEvents(await readEventTail(bee)) : undefined;
+      const state = live
+        ? structuredStateFromEvents(eventSnapshot ? eventSnapshot.tailEvents : await readEventTail(bee))
+        : undefined;
       observations.set(bee, {
         live,
         snapshot,
         ...(state === undefined ? {} : { state }),
         ...(mirrorOf ? { mirrorOf } : {}),
+        ...(eventSnapshot ? { eventSnapshot } : {}),
       });
     } catch {
       observations.set(bee, { live: false, snapshot: "" });
@@ -279,15 +313,7 @@ export type PendingNeedsInput = {
   options?: string[];
 };
 
-/**
- * The LAST needs_input event in the tail that has no later turn_end — i.e. the
- * unresolved request the bee is currently blocked on (mirrors the "blocked"
- * rule in structuredStateFromEvents). Null when the bee is not live or has no
- * pending request. Never throws.
- */
-export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
-  if (!isMetaLive(await readHsrMeta(bee))) return null;
-  const events = await readEventTail(bee);
+function pendingNeedsInputFromEvents(events: RunnerEvent[]): PendingNeedsInput | null {
   let lastNeeds = -1;
   let lastEnd = -1;
   for (let i = 0; i < events.length; i++) {
@@ -306,6 +332,17 @@ export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput 
     ...(event.tool ? { tool: event.tool } : {}),
     ...(event.options ? { options: event.options } : {}),
   };
+}
+
+/**
+ * The LAST needs_input event in the tail that has no later turn_end — i.e. the
+ * unresolved request the bee is currently blocked on (mirrors the "blocked"
+ * rule in structuredStateFromEvents). Null when the bee is not live or has no
+ * pending request. Never throws.
+ */
+export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
+  if (!isMetaLive(await readHsrMeta(bee))) return null;
+  return pendingNeedsInputFromEvents(await readEventTail(bee));
 }
 
 /**
@@ -332,28 +369,12 @@ export type HsrUsageObservation = {
   latestExhausted?: { ts: number; resetHint?: string };
 };
 
-export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservation> {
-  let raw: string;
-  try {
-    raw = await readFile(hsrEventsPath(bee), "utf8");
-  } catch {
-    return { totals: null };
-  }
+export function hsrUsageObservationFromEvents(events: RunnerEvent[]): HsrUsageObservation {
   let input = 0;
   let output = 0;
   let sawUsage = false;
   let latestExhausted: { ts: number; resetHint?: string } | undefined;
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event: RunnerEvent;
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (!parsed || typeof parsed !== "object" || typeof (parsed as { type?: unknown }).type !== "string") continue;
-      event = parsed as RunnerEvent;
-    } catch {
-      continue; // torn / partial line
-    }
+  for (const event of events) {
     if (event.type === "usage") {
       sawUsage = true;
       if (typeof event.inputTokens === "number" && Number.isFinite(event.inputTokens)) input += event.inputTokens;
@@ -369,6 +390,16 @@ export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservat
     totals: sawUsage ? { inputTokens: input, outputTokens: output } : null,
     ...(latestExhausted ? { latestExhausted } : {}),
   };
+}
+
+export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservation> {
+  let raw: string;
+  try {
+    raw = await readFile(hsrEventsPath(bee), "utf8");
+  } catch {
+    return { totals: null };
+  }
+  return hsrUsageObservationFromEvents(parseRunnerEvents(raw));
 }
 
 // Escalation grace for orphaned harness child groups (SIGTERM → SIGKILL),

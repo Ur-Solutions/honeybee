@@ -13,6 +13,7 @@
 
 import * as readline from "node:readline";
 import { bold, cyan, dim, green, isPretty, red, stripAnsi, truncate, visibleLength } from "./format.js";
+import { createTuiPainter } from "./tuiPaint.js";
 
 export type SpawnTuiType = {
   kind: string;
@@ -224,7 +225,13 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
   let nameBuffer = "";                       // typed worktree/checkout name
   let nameError = "";
   let isoBusy = false;                       // creating the slot (ignore input)
-  let resolvingCwd = false;                  // detecting pro repo (guards re-entry)
+  /**
+   * An async stage transition (account load, path validation, pro-repo probe)
+   * is in flight. onKey swallows everything but Ctrl-C while set — otherwise a
+   * keypress during the await would be clobbered when the resolving callback
+   * rewrites the stage. Also guards re-entry (double Enter).
+   */
+  let stageBusy = false;
   let message = "↑↓ pick · → enter advance · ← back · q cancel";
 
   readline.emitKeypressEvents(stdin);
@@ -275,8 +282,10 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       // Resolve the account list after a type is chosen; skip the column when
       // there are 0 or 1 real accounts (nothing to choose).
       const chooseType = async () => {
+        if (stageBusy) return;
         const type = hooks.types[cursorType];
         if (!type) return;
+        stageBusy = true;
         selKind = type.kind;
         yolo = hooks.defaultYolo(selKind);
         autoswap = false;
@@ -292,6 +301,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         } catch (error) {
           accounts = { state: "error", error: error instanceof Error ? error.message : String(error) };
         }
+        stageBusy = false;
         if (done) return;
         const step = resolveAccountStep(real);
         if (!step.showColumn) {
@@ -345,8 +355,8 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       // repo, offer the worktree/checkout step before spawning; otherwise spawn
       // straight in the cwd (unchanged behavior for non-pro dirs).
       const finalizeCwd = async (cwd: string) => {
-        if (resolvingCwd) return;
-        resolvingCwd = true;
+        if (stageBusy) return;
+        stageBusy = true;
         selCwd = cwd;
         message = "checking pro repo…";
         render();
@@ -356,7 +366,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         } catch {
           target = null;
         }
-        resolvingCwd = false;
+        stageBusy = false;
         if (done) return;
         if (!target) { spawn(); return; }
         proTarget = target;
@@ -499,7 +509,14 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         // Nothing matched the completion — fall back to validating the literal text.
         const input = pathBuffer.trim();
         if (!input) { pathError = "enter a path"; render(); return; }
-        const result = await hooks.validatePath(input);
+        if (stageBusy) return;
+        stageBusy = true;
+        let result: { ok: boolean; path?: string; error?: string };
+        try {
+          result = await hooks.validatePath(input);
+        } finally {
+          stageBusy = false;
+        }
         if (done) return;
         if (!result.ok || !result.path) {
           pathError = result.error ?? "invalid path";
@@ -642,6 +659,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
 
       const onKey = (value: string, key: readline.Key) => {
         if (key.ctrl && key.name === "c") { finish(null); return; }
+        if (stageBusy) return; // async stage transition resolving — see stageBusy
         if (handleBrowseKey(value, key)) return;
         if (handlePathKey(value, key)) return;
         if (handleIsolationNameKey(value, key)) return;
@@ -677,6 +695,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
       };
 
       // ── rendering ──────────────────────────────────────────────────────────
+      const painter = createTuiPainter(stdout);
       const render = () => {
         if (done) return;
         const width = Math.max(40, stdout.columns || 100);
@@ -709,7 +728,7 @@ export async function chooseNewBee(hooks: SpawnTuiHooks): Promise<SpawnTuiResult
         else if (inIsolation) footer = "j/k move · enter select · ← back · q quit";
         else footer = "j/k move · h/l columns · enter advance · +/- count · q quit";
         lines.push(dim(footer));
-        stdout.write(`\x1b[2J\x1b[H${lines.map((line) => truncate(line, width)).join("\n")}`);
+        painter.paint(lines, width, height);
         if (inPath || inBrowse || inIsoName) {
           // Park the real cursor at the end of the "> " filter/name field. Body
           // starts on the 3rd screen line (header, blank, then "> <text>"),
