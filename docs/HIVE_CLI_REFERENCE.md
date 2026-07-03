@@ -121,31 +121,25 @@ Built-in agent defaults:
 | --- | --- | --- |
 | `claude` | `claude` | `claude --dangerously-skip-permissions` |
 | `codex` | `codex` | `codex --dangerously-bypass-approvals-and-sandbox` |
-| `opencode` | `opencode run --interactive` | `opencode run --interactive --dangerously-skip-permissions` |
+| `opencode` | `opencode --mini` | `opencode --mini --auto` |
 | `grok` | `grok --tools= --disable-web-search --no-subagents` | `grok --permission-mode bypassPermissions --always-approve --tools= --disable-web-search --no-subagents` |
 | `kimi` | `kimi` | `kimi --yolo` |
 | `pi` | `pi` | `pi` |
 | `droid` | `droid` | `droid --settings ~/.factory/hive-droid-yolo-settings.json` |
 | `cursor` | `cursor-agent` | `cursor-agent --force` |
 
-Claude and Kimi default to yolo mode unless explicitly opted out. The reserved
-`codex-auto` account-picking alias also defaults to yolo; plain `codex` and
-other built-in agents use safer defaults unless yolo is requested.
+Every built-in agent — and any arbitrary harness kind — defaults to yolo mode
+unless explicitly opted out. Kinds with no curated yolo command (e.g. `pi`) run
+their normal command; the rest use the bypass command above.
 
 Yolo controls:
 
 ```sh
-hive spawn claude
-hive spawn claude --no-yolo
-hive spawn kimi
-hive spawn kimi --no-yolo
-hive spawn codex --yolo
-hive spawn codex --dangerous
-HIVE_YOLO=1 hive spawn codex
-HIVE_CODEX_YOLO=1 hive spawn codex
-hive config set-bee codex --yolo
-hive config set-bee claude --no-yolo
-hive config set-bee kimi --no-yolo
+hive spawn claude               # permissionless (default)
+hive spawn claude --no-yolo     # opt back into approval prompts
+hive spawn grok --no-yolo
+HIVE_YOLO=1 hive spawn codex     # env force (redundant with the default)
+hive config set-bee grok --no-yolo   # persistent opt-out
 ```
 
 Home/profile aliases:
@@ -1896,6 +1890,7 @@ Show provider window usage or local usage samples.
 ```sh
 hive usage [account] [--ttl <age>] [--json]
 hive limits [account] [--ttl <age>] [--json]
+hive usage [account] --live [--interval <dur>]
 hive usage [account] --samples [--json]
 ```
 
@@ -1905,6 +1900,8 @@ Examples:
 hive limits
 hive limits --ttl 30m
 hive limits claude-work --json
+hive usage --live
+hive usage tormod --live --interval 30s
 hive usage --samples
 ```
 
@@ -1917,6 +1914,38 @@ entries younger than that instead of paying the provider round-trips; anything
 older — and any account whose last read failed — is fetched live and
 re-cached. Cached rows show `cache <age>` in the AS-OF column. `--ttl 0`
 forces a live read.
+
+#### Live dashboard (`--live`)
+
+`hive usage --live` (aliases `--dashboard`, `--follow`, `-f`) opens a
+full-screen, auto-refreshing dashboard in the current terminal showing the same
+per-account 5h / weekly / Fable windows as the static table, with wider bars and
+live countdowns. The screen repaints every second so reset countdowns and
+as-of ages move without network I/O; the underlying limits are re-fetched on a
+slower cadence (default 2m, set with `--interval <dur>` such as `30s` or `5m`,
+floored at 10s so it can't hammer provider endpoints). A fetch never overlaps a
+previous one; a failed refresh keeps the last good data on screen and retries on
+the next tick. When the provider rate-limits a sweep (HTTP 429), consecutive
+rate-limited sweeps double the wait up to 8× the interval — the header shows
+`rate-limited, backing off` — and one clean sweep restores the normal cadence.
+
+Keys: `r` forces an immediate refresh (and resets the cadence and any backoff);
+`q` / `Esc` / `Ctrl-C` exit cleanly, restoring the terminal. There is no cursor
+or selection — it is a wall dashboard.
+
+A claude account registered without a resolvable email (no `--email` and a
+label that is not an address) is flagged loudly — in `account add`/`account
+login` output, under the static table, and pinned into the dashboard footer:
+every identity guard (token verification, imposter parking, vault mirroring)
+keys off the email, so an email-less account can silently show — and be
+overwritten by — another account's credentials. Fix it by adding `"email"` to
+the record in the accounts registry.
+
+Each live read is ttl-less, so it refreshes the shared on-disk limits cache and
+keeps `hive spawn --account auto` warm while the dashboard runs. `--live`
+requires an interactive TTY on both stdin and stdout; when either is missing (a
+pipe or redirect), it prints the static table once plus a note instead of
+opening the dashboard. `--live` cannot be combined with `--json` or `--samples`.
 
 ## Seals and Search
 

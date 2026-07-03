@@ -34,7 +34,10 @@ const DROID_YOLO_SETTINGS = {
 const DEFAULT_COMMANDS: Record<string, string> = {
   claude: "claude",
   codex: "codex",
-  opencode: "opencode run --interactive",
+  // opencode >=1.17 requires a message for `run` (even with -i), so a bare
+  // `run --interactive` spawn dies instantly. `--mini` is the root-command
+  // equivalent of the split-footer interactive mode and starts empty.
+  opencode: "opencode --mini",
   grok: "grok --tools= --disable-web-search --no-subagents",
   kimi: "kimi",
   // Pi's interactive CLI has no approval/yolo flag in --help; full tools are enabled by default.
@@ -46,7 +49,7 @@ const DEFAULT_COMMANDS: Record<string, string> = {
 const YOLO_COMMANDS: Record<string, string> = {
   claude: "claude --dangerously-skip-permissions",
   codex: "codex --dangerously-bypass-approvals-and-sandbox",
-  opencode: "opencode run --interactive --dangerously-skip-permissions",
+  opencode: "opencode --mini --auto",
   grok: "grok --permission-mode bypassPermissions --always-approve --tools= --disable-web-search --no-subagents",
   kimi: "kimi --yolo",
   pi: "pi",
@@ -55,20 +58,21 @@ const YOLO_COMMANDS: Record<string, string> = {
   cursor: "cursor-agent --force",
 };
 
-// Bees that run in full-permission ("yolo") mode by default. The default is
-// applied by the CLI layer (dangerousMode in cli.ts) so resolveAgent stays
-// policy-free: it only produces the yolo command when explicitly told to.
-const DEFAULT_YOLO_AGENTS = new Set<string>(["claude", "codex", "kimi"]);
-
 // Map a requested bee kind (including auth-profile aliases like cc3/codex2) to
 // its canonical agent kind. Unknown/arbitrary kinds pass through unchanged.
 export function canonicalAgentKind(kind: string): string {
   return profileAlias(kind)?.kind ?? kind;
 }
 
-// Whether this bee kind should run permissionless unless explicitly opted out.
-export function agentDefaultsToYolo(kind: string): boolean {
-  return DEFAULT_YOLO_AGENTS.has(canonicalAgentKind(kind).toLowerCase());
+// Whether this bee kind should run permissionless ("yolo"/bypass) by default.
+// Policy: EVERY harness on EVERY account type defaults to yolo — hive bees are
+// unattended, so a permission/approval prompt just strands them at a dialog.
+// Opt out per spawn with `--no-yolo`, or persistently with
+// `hive config set-bee <bee> --no-yolo`; both are honored by dangerousMode in
+// cli.ts. resolveAgent stays policy-free: it only emits the yolo command when
+// the CLI layer (which applies this default and the opt-outs) tells it to.
+export function agentDefaultsToYolo(_kind: string): boolean {
+  return true;
 }
 
 export function tmuxOptionsForAgent(kind: string): TmuxWindowOptions | undefined {
@@ -126,7 +130,10 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   // applies per-agent defaults and opt-outs) is authoritative; only fall back
   // to env/config when the caller has no opinion.
   const yolo = options.yolo ?? yoloFallback;
-  const configured = commandOverride ?? (yolo ? YOLO_COMMANDS[profile.kind] : DEFAULT_COMMANDS[profile.kind]) ?? profile.kind;
+  // With yolo now the default for every kind, a harness that has a base command
+  // but no curated YOLO_COMMANDS entry must fall back to its DEFAULT_COMMANDS
+  // (its normal args) rather than collapsing to the bare binary.
+  const configured = commandOverride ?? (yolo ? (YOLO_COMMANDS[profile.kind] ?? DEFAULT_COMMANDS[profile.kind]) : DEFAULT_COMMANDS[profile.kind]) ?? profile.kind;
   if (profile.kind === "droid" && yolo && commandOverride === undefined) ensureDroidYoloSettings();
   const parts = splitShellWords(configured).map(expandTildeWord);
   if (parts.length === 0) throw new Error(`Empty command for agent ${profile.kind}`);

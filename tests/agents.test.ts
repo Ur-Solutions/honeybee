@@ -2,10 +2,33 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import { agentDefaultsToYolo, forcedSessionIdArgs, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
+import { resetConfigCache } from "../src/config.js";
 import { assertExecutableAvailable } from "../src/execCheck.js";
 import { setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
+
+// resolveAgent() consults beeConfig(), which reads ~/.hive/config.json via
+// storeRoot(). Left un-isolated, these tests would inherit the operator's real
+// per-bee command/yolo overrides (e.g. a codex `command`), so byte-identical
+// arg snapshots break on whoever's machine runs them. Point the whole file at
+// an empty store so every resolveAgent assertion sees only the built-in defaults.
+let cleanStoreDir: string;
+let prevStoreRoot: string | undefined;
+
+before(async () => {
+  prevStoreRoot = process.env.HIVE_STORE_ROOT;
+  cleanStoreDir = await mkdtemp(join(tmpdir(), "honeybee-agents-store-"));
+  process.env.HIVE_STORE_ROOT = cleanStoreDir;
+  resetConfigCache();
+});
+
+after(async () => {
+  if (prevStoreRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+  else process.env.HIVE_STORE_ROOT = prevStoreRoot;
+  resetConfigCache();
+  await rm(cleanStoreDir, { recursive: true, force: true });
+});
 
 test("forcedSessionIdArgs: claude pins a fresh session id; other providers do not", () => {
   assert.deepEqual(forcedSessionIdArgs("claude", "abc-123"), ["--session-id", "abc-123"]);
@@ -74,14 +97,12 @@ test("agent defaults are safe unless yolo mode is explicit", () => {
   }
 });
 
-test("claude and kimi default to yolo; other bees do not", () => {
-  assert.equal(agentDefaultsToYolo("claude"), true);
-  assert.equal(agentDefaultsToYolo("cc3"), true);
-  assert.equal(agentDefaultsToYolo("claude2"), true);
-  assert.equal(agentDefaultsToYolo("kimi"), true);
-  assert.equal(agentDefaultsToYolo("codex"), false);
-  assert.equal(agentDefaultsToYolo("codex2"), false);
-  assert.equal(agentDefaultsToYolo("grok"), false);
+test("every harness on every account type defaults to yolo", () => {
+  // Policy: hive bees are unattended, so all kinds run permissionless unless
+  // explicitly opted out (--no-yolo / config). Aliases and arbitrary kinds too.
+  for (const kind of ["claude", "cc3", "claude2", "kimi", "codex", "codex2", "grok", "opencode", "pi", "droid", "cursor", "some-arbitrary-harness"]) {
+    assert.equal(agentDefaultsToYolo(kind), true, `${kind} should default to yolo`);
+  }
 });
 
 test("an explicit yolo decision is authoritative over env signals", () => {
@@ -127,14 +148,14 @@ test("splitShellWords does not treat shell metacharacters as syntax", () => {
 test("resolveAgent: opencode embeds the qualified --model <provider>/<model> selector", () => {
   const spec = resolveAgent("opencode", [], { model: "MiniMax-M3", provider: "minimax-coding-plan" });
   assert.equal(spec.command, "opencode");
-  assert.deepEqual(spec.args, ["run", "--interactive", "--model", "minimax-coding-plan/MiniMax-M3"]);
+  assert.deepEqual(spec.args, ["--mini", "--model", "minimax-coding-plan/MiniMax-M3"]);
 });
 
 test("resolveAgent: opencode with a model but no provider emits no selector (no `--model undefined/...`)", () => {
   // A provider-less opencode account (e.g. un-migrated) must not produce a
   // malformed `--model undefined/<model>`; it falls back to opencode's default.
   const spec = resolveAgent("opencode", [], { model: "MiniMax-M3" });
-  assert.deepEqual(spec.args, ["run", "--interactive"]);
+  assert.deepEqual(spec.args, ["--mini"]);
   assert.ok(!spec.args.includes("--model"));
 });
 
@@ -146,7 +167,7 @@ test("resolveAgent: claude embeds a bare --model selector", () => {
 
 test("resolveAgent: no model means no model args (byte-identical to today)", () => {
   // Snapshot equality: omitting model/provider must reproduce the pre-S2 args.
-  assert.deepEqual(resolveAgent("opencode").args, ["run", "--interactive"]);
+  assert.deepEqual(resolveAgent("opencode").args, ["--mini"]);
   assert.deepEqual(resolveAgent("claude").args, []);
   assert.deepEqual(resolveAgent("codex").args, []);
 });

@@ -464,6 +464,20 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     if (account.tool === "claude" && await seedClaudeHomeDefaults(homePath)) {
       if (!written.includes("settings.json")) written.push("settings.json");
     }
+    // Self-heal claude's startup acceptances on EVERY activation. The vault's
+    // .claude.json is a copied credential file, so the loop above just stamped
+    // its snapshot — which typically carries stale onboarding/trust state — over
+    // the home, resurfacing the bypass-permissions consent and folder-trust
+    // dialogs (an unattended bee then sits at them until the boot timeout).
+    // Re-merge the acceptances here so every activation path (swarm, flow, login
+    // seat, resume) self-heals, not just the primary spawn — which additionally
+    // re-seeds the exact spawn cwd afterward. yolo:true is safe regardless of the
+    // bee's mode: it only pre-accepts the bypass dialog; bypass mode still only
+    // engages when the CLI is launched with the flag.
+    if (account.tool === "claude") {
+      await seedClaudeHomeAcceptance(homePath, { yolo: true, trustCwd: process.cwd() });
+      if (!written.includes(".claude.json")) written.push(".claude.json");
+    }
     // On macOS, claude prefers the per-config-dir Keychain entry over the
     // credentials file — seed it so an activated home doesn't resolve a stale
     // identity from an old entry. Merged, not replaced: home-local sibling
