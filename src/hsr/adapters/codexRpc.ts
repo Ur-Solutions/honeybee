@@ -3,8 +3,8 @@
  *
  * codex `app-server` speaks JSON-RPC 2.0 over its child stdio: WE write requests
  * to its stdin and read responses + notifications + SERVER REQUESTS (approvals)
- * off its stdout. Framing is NDJSON (one JSON object per line) with partial-line
- * buffering, mirroring src/hsr/rpc.ts / streamRunner.ts.
+ * off its stdout. Framing is NDJSON (one JSON object per line) via the shared
+ * lineReader.ts, the same reader streamRunner.ts and rpc.ts use.
  *
  * This module is TRANSPORT-ONLY — it knows nothing about codex methods. It:
  *   - request(method, params) → Promise<result>  (numeric id, timeout, rejects on error)
@@ -21,6 +21,7 @@
  */
 
 import type { Readable, Writable } from "node:stream";
+import { makeLineReader } from "../lineReader.js";
 
 type JsonRpcId = string | number;
 
@@ -28,21 +29,6 @@ type JsonRpcId = string | number;
 export const CODEX_RPC_METHOD_NOT_FOUND = -32601;
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-
-/** Split a byte stream into complete lines; buffers the partial trailing line. */
-function makeLineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
-  let buffer = "";
-  return (chunk: Buffer): void => {
-    buffer += chunk.toString("utf8");
-    let nl = buffer.indexOf("\n");
-    while (nl !== -1) {
-      const line = buffer.slice(0, nl).replace(/\r$/, "");
-      buffer = buffer.slice(nl + 1);
-      if (line.trim().length > 0) onLine(line);
-      nl = buffer.indexOf("\n");
-    }
-  };
-}
 
 export type CodexRpcPeer = {
   /** Send a JSON-RPC request; resolves with `result` or rejects on error/timeout. */
