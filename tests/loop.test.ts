@@ -33,6 +33,7 @@ import {
   truncateForInjection,
 } from "../src/loop/summarizer.js";
 import { __setLoopTestHooks, loopFlow } from "../src/loop/flow.js";
+import { loopStopConditionsForPhase, loopStopFlowArgs } from "../src/loop/stopConditions.js";
 import { listFlows, loadFlow, type FlowContext } from "../src/flow/index.js";
 import { executeFlow } from "../src/flow/run.js";
 import { HiveFacade } from "../src/flow/hive_facade.js";
@@ -149,6 +150,17 @@ test("buildLoopConfig validates --stop-on-seal CSV against seal statuses", () =>
   const cfg4 = buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: " , " });
   assert.deepEqual(cfg4.stop.stopOnSeal, []);
   assert.throws(() => buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: "done,bogus" }), /Invalid --stop-on-seal/);
+});
+
+test("loop stop registry drives flow args and evaluation order", () => {
+  const stopArgNames = loopStopFlowArgs().map((arg) => arg.name);
+  assert.deepEqual(stopArgNames, ["until", "max", "maxDuration", "forever", "stopOnSeal", "stopOnSentinel", "judge"]);
+  assert.deepEqual(loopFlow.args?.slice(4, 4 + stopArgNames.length).map((arg) => arg.name), stopArgNames);
+  assert.deepEqual(loopStopConditionsForPhase("pre").map((condition) => condition.name), ["max", "max-duration", "until"]);
+  assert.deepEqual(
+    loopStopConditionsForPhase("post").map((condition) => condition.name),
+    ["stop-on-seal", "blocked-seal", "boundary-permission-prompt", "stop-on-sentinel", "judge", "max", "max-duration"],
+  );
 });
 
 test("coerceDuration parses 30s/10m/2h", () => {
@@ -1090,7 +1102,18 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
       const facade = new HiveFacade({ flowName: "loop", runId: "facade-run" });
       let loopId: string;
       try {
-        loopId = await facade.loop({ bee: "claude", cwd: "/tmp", context: "ralph", prompt: "x", max: 2 });
+        loopId = await facade.loop({
+          bee: "claude",
+          cwd: "/tmp",
+          context: "ralph",
+          prompt: "x",
+          until: "exit 1",
+          max: 2,
+          maxDuration: "30s",
+          stopOnSeal: "done,blocked",
+          stopOnSentinel: "ALL DONE",
+          judge: "claude",
+        });
       } finally {
         process.argv[1] = original;
       }
@@ -1100,6 +1123,25 @@ test("HiveFacade.loop writes initial loop.json and loopStop sets the sentinel", 
       assert.ok(cfg);
       assert.equal(cfg?.context, "ralph");
       assert.equal(cfg?.stop.max, 2);
+      assert.equal(cfg?.stop.until, "exit 1");
+      assert.equal(cfg?.stop.maxDurationMs, 30_000);
+      assert.deepEqual(cfg?.stop.stopOnSeal, ["done", "blocked"]);
+      assert.equal(cfg?.stop.stopOnSentinel, "ALL DONE");
+      assert.equal(cfg?.stop.judge, "claude");
+      const meta = await readMeta("loop", loopId);
+      assert.deepEqual(meta?.args, {
+        bee: "claude",
+        cwd: "/tmp",
+        context: "ralph",
+        prompt: "x",
+        loopId,
+        until: "exit 1",
+        max: 2,
+        maxDuration: "30s",
+        stopOnSeal: "done,blocked",
+        stopOnSentinel: "ALL DONE",
+        judge: "claude",
+      });
 
       // Graceful stop writes the sentinel.
       await facade.loopStop(loopId);

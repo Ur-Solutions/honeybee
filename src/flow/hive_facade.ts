@@ -30,6 +30,7 @@ import { agentDefaultsToYolo, spawnBeeForFlow, type SpawnBeeOptions } from "../a
 import { resolveSpawnSpec } from "../spawnResolve.js";
 import { waitForIdle } from "../wait.js";
 import { buildLoopConfig } from "../loop/context.js";
+import { appendDefinedLoopStopArgs, type LoopStopInput } from "../loop/stopConditions.js";
 import { loopFlow } from "../loop/flow.js";
 import {
   generateLoopId,
@@ -88,18 +89,11 @@ export type FacadeSealOptions = {
 };
 
 /** Input to HiveFacade.loop() — the programmatic surface for starting a loop. */
-export type LoopSpawnInput = {
+export type LoopSpawnInput = LoopStopInput & {
   bee: string;
   cwd: string;
   context: "persistent" | "ralph" | "rolling";
   prompt: string;
-  until?: string;
-  max?: number;
-  maxDuration?: string;
-  forever?: boolean;
-  stopOnSeal?: string;
-  stopOnSentinel?: string;
-  judge?: string;
   summarizer?: "self" | "bee";
   yolo?: boolean;
 };
@@ -517,13 +511,7 @@ function loopArgsFromSpec(spec: LoopSpawnInput, loopId: string): Record<string, 
     prompt: spec.prompt,
     loopId,
   };
-  if (spec.until !== undefined) args.until = spec.until;
-  if (spec.max !== undefined) args.max = spec.max;
-  if (spec.maxDuration !== undefined) args.maxDuration = spec.maxDuration;
-  if (spec.forever !== undefined) args.forever = spec.forever;
-  if (spec.stopOnSeal !== undefined) args.stopOnSeal = spec.stopOnSeal;
-  if (spec.stopOnSentinel !== undefined) args.stopOnSentinel = spec.stopOnSentinel;
-  if (spec.judge !== undefined) args.judge = spec.judge;
+  appendDefinedLoopStopArgs(spec, args);
   if (spec.summarizer !== undefined) args.summarizer = spec.summarizer;
   if (spec.yolo !== undefined) args.yolo = spec.yolo;
   return args;
