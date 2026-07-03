@@ -53,8 +53,10 @@ export function keysPrint(parsed: Parsed): void {
  * silently. `hive keys check` audits presence either way.
  */
 export function keybindingsConfPath(): string {
+  // keys.ts lives in src/commands (dist/commands), one level below cli.ts, so
+  // walk up two dirs to reach the package root where docs/ lives.
   const moduleDir = fileURLToPath(new URL(".", import.meta.url));
-  return resolve(moduleDir, "..", "docs", "honeybee.tmux.conf");
+  return resolve(moduleDir, "..", "..", "docs", "honeybee.tmux.conf");
 }
 
 
