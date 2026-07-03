@@ -4,19 +4,30 @@
 // fold rolling memory, then evaluate the stop menu. Repeat until a condition
 // fires, a graceful stop is requested, or the run is cancelled.
 //
+// runLoop stays thin: each phase is a named helper — ensureReadyBee (spawn +
+// readiness), resolveBoundarySeal (boundary race → seal), decideStop (the stop
+// menu). Bee spawning lives in loop/spawn.ts, boundary detection in
+// loop/boundary.ts, and the start/status/stop surface in loop/control.ts.
+//
 // No console.* here — the CLI layer owns stdout/stderr. Per-iteration state is
 // logged via ctx.hive.log() and the loop's iter-NNN.log files.
 
-import { spawnBeeForFlow } from "../agents.js";
-import { resolveSpawnSpec } from "../spawnResolve.js";
 import { defineFlow, type BeeHandle, type FlowContext } from "../flow/index.js";
 import type { HiveFacade } from "../flow/hive_facade.js";
-import { AgentReadinessError, isPermissionPromptPane, waitForAgentReady } from "../readiness.js";
+import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
 import { scanLatestSeal, type SealRecord, type SealStatus } from "../seal.js";
 import { appendLedger, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
+import {
+  BOUNDARY_GRACE_MS,
+  BOUNDARY_POLL_MS,
+  IDLE_FALLBACK_MS,
+  waitForIterationBoundary,
+} from "./boundary.js";
 import { buildLoopConfig } from "./context.js";
-import { evaluateLoopStopConditions, loopStopFlowArgs } from "./stopConditions.js";
+import { bootMs, handleOf, readFileSafe } from "./internal.js";
+import { judgeSaysStop, runSummarizerBee, spawnIterationBee } from "./spawn.js";
+import { evaluateLoopStopConditions, loopStopFlowArgs, type LoopStopDecision } from "./stopConditions.js";
 import {
   appendIterLog,
   ensureLoopDir,
@@ -30,14 +41,10 @@ import {
   writeIterSeal,
   writeLoopConfig,
 } from "./state.js";
-import { buildIterationPrompt, foldForward, truncateForInjection } from "./summarizer.js";
+import { buildIterationPrompt, foldForward } from "./summarizer.js";
 import { runStopPredicate } from "./until.js";
 
 const SEAL_TIMEOUT_MS = 30 * 60_000; // overall per-iteration boundary cap
-const HELPER_SEAL_TIMEOUT_MS = 5 * 60_000; // summarizer/judge bees get a much shorter leash
-const IDLE_FALLBACK_MS = 3_000; // pane stability window (PRD §14: idle detection ~3s)
-const BOUNDARY_GRACE_MS = 2_000; // extra slack after idle for a late-landing seal
-const BOUNDARY_POLL_MS = 500;
 
 /**
  * Test seam. When set, the driver uses this to obtain (and ready) the iteration
@@ -72,26 +79,6 @@ export type LoopTestHooks = {
 let testHooks: LoopTestHooks | undefined;
 export function __setLoopTestHooks(hooks: LoopTestHooks | undefined): void {
   testHooks = hooks;
-}
-
-/** Per-harness boot timeouts (mirror cli.ts defaultBootMs). */
-function bootMs(agent: string): number {
-  switch (agent) {
-    case "claude":
-      return 15_000;
-    case "codex":
-      return 30_000;
-    case "opencode":
-      return 15_000;
-    case "grok":
-      return 10_000;
-    case "pi":
-      return 10_000;
-    case "droid":
-      return 5_000;
-    default:
-      return 10_000;
-  }
 }
 
 export const loopFlow = defineFlow({
@@ -186,37 +173,17 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       }
 
       // ── Ensure a ready bee. ──
-      if (cfg.carrier === "fresh" || !handle) {
-        if (testHooks) {
-          const record = await testHooks.ensureBee({ facade, cfg, loopId, iter: cfg.iteration + 1 });
-          handle = handleOf(record);
-        } else {
-          let record: SessionRecord;
-          try {
-            record = await spawnIterationBee(facade, cfg, loopId, cfg.iteration + 1);
-          } catch (error) {
-            await finalize("errored", `spawn:${error instanceof Error ? error.message : String(error)}`);
-            break;
-          }
-          handle = handleOf(record);
-          try {
-            await waitForAgentReady(record, {
-              timeoutMs: bootMs(cfg.bee),
-              acceptTrust: true,
-              raiseDroidAutonomy: cfg.yolo,
-            });
-          } catch (error) {
-            if (error instanceof AgentReadinessError && (error.reason === "trust" || error.reason === "blocked")) {
-              await appendIterLog(loopId, cfg.iteration + 1, `paused: readiness:${error.reason}`);
-              await pause(`readiness:${error.reason}`);
-              break;
-            }
-            // timeout (or anything else) — surface as errored.
-            await finalize("errored", `readiness:${error instanceof Error ? error.message : String(error)}`);
-            break;
-          }
+      const ready = await ensureReadyBee({ facade, cfg, loopId, iter: cfg.iteration + 1, existing: handle });
+      if (ready.kind !== "ready") {
+        if (ready.handle) handle = ready.handle; // adopt the spawned bee so pause/cleanup can find it
+        if (ready.kind === "pause") {
+          await pause(ready.reason);
+          break;
         }
+        await finalize("errored", ready.reason);
+        break;
       }
+      handle = ready.handle;
 
       const iter = cfg.iteration + 1;
       const progress = await readFileSafe(loopProgressPath(loopId));
@@ -234,7 +201,7 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       // a stale seal from a prior iteration (matters for carrier=same, whose bee
       // name — and therefore seal stream — is fixed across iterations).
       const sealBaselineScan = await scanLatestSeal(handle.name).catch(() => null);
-      let sealCursor = sealBaselineScan?.filename ?? null;
+      const sealCursor = sealBaselineScan?.filename ?? null;
 
       if (testHooks?.send) await testHooks.send({ handle, prompt, iter });
       else await facade.send(handle, prompt); // injects AND submits (Enter included)
@@ -243,47 +210,28 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       // ── Boundary: RACE seal detection against idle detection (PRD §14). ──
       // A harness that never seals must conclude the boundary via ~3s idle
       // detection, not after the 30-minute seal cap.
-      let seal: SealRecord | null = null;
-      let boundaryBlocked = false;
-      try {
-        const boundary = await waitForIterationBoundary({
-          handle,
-          iter,
-          baselineFilename: sealCursor,
-          timeoutMs: boundaryTimeoutMs(cfg, started, now, testHooks?.sealTimeoutMs ?? SEAL_TIMEOUT_MS),
-          idleMs: testHooks?.boundaryIdleMs ?? IDLE_FALLBACK_MS,
-          graceMs: testHooks?.boundaryGraceMs ?? BOUNDARY_GRACE_MS,
-          pollMs: testHooks?.boundaryPollMs ?? BOUNDARY_POLL_MS,
-          signal: ctx.signal,
-        });
-        seal = boundary.seal;
-        boundaryBlocked = boundary.blocked;
-        sealCursor = boundary.highWaterFilename;
-      } catch {
+      const boundary = await resolveBoundarySeal({
+        handle,
+        iter,
+        baselineFilename: sealCursor,
+        cfg,
+        started,
+        now,
+        signal: ctx.signal,
+      });
+      if (boundary.aborted) {
         // An aborted signal surfaces as a boundary throw. End cleanly.
-        if (ctx.signal?.aborted) {
-          await finalize("stopped", "aborted");
-          break;
-        }
-        seal = null;
+        await finalize("stopped", "aborted");
+        break;
       }
-      if (!seal) {
-        // A seal may have landed in the final poll gap — one last collect
-        // against the pre-send baseline before declaring the turn unsealed.
-        const latest = await scanLatestSeal(handle.name, { afterFilename: sealCursor }).catch(() => null);
-        seal = latest?.seal ?? null;
-      }
-      // Distinguish "the bee actually sealed" from "no seal observed this turn".
-      // A non-sealing harness/task must NOT be synthesized into a `done` that
-      // trips stop-on-seal; instead it falls through to the mechanical stops
-      // (sentinel / until / judge / max), which are the documented fallbacks
-      // for harnesses without reliable seals. Observability records the
-      // distinct value "none" — never a fabricated seal status.
-      const statusLabel: SealStatus | "none" = seal?.status ?? "none";
+      const { seal, boundaryBlocked, statusLabel } = boundary;
 
       // ── Fold rolling memory forward. ──
       if (cfg.memory === "rolling" && seal) {
-        const summarizerSeal = cfg.summarizer === "bee" ? await runSummarizerBee(facade, cfg, loopId, iter, seal) : seal;
+        const summarizerSeal =
+          cfg.summarizer === "bee"
+            ? await runSummarizerBee(facade, cfg, loopId, iter, seal, { sealTimeoutMs: testHooks?.sealTimeoutMs })
+            : seal;
         await foldForward(loopId, iter, summarizerSeal);
       }
 
@@ -302,20 +250,17 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       // stop the loop on its own. An explicit --stop-on-seal membership wins
       // over the implicit blocked/needs_input pause: an operator who opted
       // into stopping on those statuses gets a stop, not a pause.
-      const decision = await evaluateLoopStopConditions({
-        phase: "post",
+      const decision = await decideStop({
+        facade,
         cfg,
-        completedIterations: iter,
+        loopId,
+        iter,
         started,
         now,
         signal: ctx.signal,
         seal,
         boundaryBlocked,
-        recordStopCheck: (condition, result) => recordStopCheck(loopId, condition, result),
-        runStopPredicate,
-        scanSentinel: (pattern) =>
-          testHooks?.scanSentinel ? testHooks.scanSentinel({ handle, pattern, iter }) : paneMatches(handle, pattern),
-        judgeSaysStop: () => judgeSaysStop(facade, cfg, loopId, iter),
+        handle,
       });
 
       if (decision?.status === "paused") {
@@ -354,6 +299,158 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Iteration phases (each a slice of the driver loop above).
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Outcome of ensureReadyBee: a ready bee, or a terminal decision. `handle`
+ * carries the bee to adopt even on failure so the driver can pause on (and
+ * exempt from cleanup) the very bee that blocked.
+ */
+type EnsureReadyResult =
+  | { kind: "ready"; handle: BeeHandle }
+  | { kind: "pause"; reason: string; handle: BeeHandle }
+  | { kind: "errored"; reason: string; handle: BeeHandle | undefined };
+
+/**
+ * Ensure the iteration has a ready bee. Persistent carriers reuse the live bee;
+ * fresh carriers (or a first iteration) spawn one and wait for readiness. A
+ * trust/blocked readiness failure becomes a pause (the operator must attend the
+ * bee); anything else — including a spawn failure — becomes an error.
+ */
+async function ensureReadyBee(args: {
+  facade: HiveFacade;
+  cfg: LoopConfig;
+  loopId: string;
+  iter: number;
+  existing: BeeHandle | undefined;
+}): Promise<EnsureReadyResult> {
+  const { facade, cfg, loopId, iter, existing } = args;
+  // Persistent carrier reuses the live bee across iterations.
+  if (cfg.carrier !== "fresh" && existing) return { kind: "ready", handle: existing };
+
+  if (testHooks) {
+    const record = await testHooks.ensureBee({ facade, cfg, loopId, iter });
+    return { kind: "ready", handle: handleOf(record) };
+  }
+
+  let record: SessionRecord;
+  try {
+    record = await spawnIterationBee(facade, cfg, loopId, iter);
+  } catch (error) {
+    return { kind: "errored", reason: `spawn:${error instanceof Error ? error.message : String(error)}`, handle: undefined };
+  }
+  const handle = handleOf(record);
+  try {
+    await waitForAgentReady(record, {
+      timeoutMs: bootMs(cfg.bee),
+      acceptTrust: true,
+      raiseDroidAutonomy: cfg.yolo,
+    });
+  } catch (error) {
+    if (error instanceof AgentReadinessError && (error.reason === "trust" || error.reason === "blocked")) {
+      await appendIterLog(loopId, iter, `paused: readiness:${error.reason}`);
+      return { kind: "pause", reason: `readiness:${error.reason}`, handle };
+    }
+    // timeout (or anything else) — surface as errored.
+    return { kind: "errored", reason: `readiness:${error instanceof Error ? error.message : String(error)}`, handle };
+  }
+  return { kind: "ready", handle };
+}
+
+/** Boundary outcome for the driver: aborted, or the resolved seal + label. */
+type BoundaryResolution =
+  | { aborted: true }
+  | { aborted: false; seal: SealRecord | null; boundaryBlocked: boolean; statusLabel: SealStatus | "none" };
+
+/**
+ * Run the boundary race for one iteration and resolve the turn's seal. Prefers
+ * the seal the boundary observed; if none, one last collect against the
+ * pre-send baseline catches a seal that landed in the final poll gap. A
+ * non-sealing harness/task yields statusLabel "none" (never a fabricated seal
+ * status) so it falls through to the mechanical stops rather than tripping
+ * stop-on-seal. An aborted signal is reported so the driver can end cleanly.
+ */
+async function resolveBoundarySeal(args: {
+  handle: BeeHandle;
+  iter: number;
+  baselineFilename: string | null;
+  cfg: LoopConfig;
+  started: number;
+  now: () => number;
+  signal?: AbortSignal | undefined;
+}): Promise<BoundaryResolution> {
+  const { handle, iter, cfg, started, now, signal } = args;
+  let seal: SealRecord | null = null;
+  let boundaryBlocked = false;
+  let sealCursor = args.baselineFilename;
+  try {
+    const boundary = await waitForIterationBoundary({
+      handle,
+      iter,
+      baselineFilename: sealCursor,
+      timeoutMs: boundaryTimeoutMs(cfg, started, now, testHooks?.sealTimeoutMs ?? SEAL_TIMEOUT_MS),
+      idleMs: testHooks?.boundaryIdleMs ?? IDLE_FALLBACK_MS,
+      graceMs: testHooks?.boundaryGraceMs ?? BOUNDARY_GRACE_MS,
+      pollMs: testHooks?.boundaryPollMs ?? BOUNDARY_POLL_MS,
+      signal,
+      capturePane: testHooks?.capturePane,
+    });
+    seal = boundary.seal;
+    boundaryBlocked = boundary.blocked;
+    sealCursor = boundary.highWaterFilename;
+  } catch {
+    if (signal?.aborted) return { aborted: true };
+    seal = null;
+  }
+  if (!seal) {
+    // A seal may have landed in the final poll gap — one last collect against
+    // the pre-send baseline before declaring the turn unsealed.
+    const latest = await scanLatestSeal(handle.name, { afterFilename: sealCursor }).catch(() => null);
+    seal = latest?.seal ?? null;
+  }
+  // Distinguish "the bee actually sealed" from "no seal observed this turn".
+  // Observability records the distinct value "none" — never a fabricated seal.
+  const statusLabel: SealStatus | "none" = seal?.status ?? "none";
+  return { aborted: false, seal, boundaryBlocked, statusLabel };
+}
+
+/**
+ * Evaluate the post-iteration stop menu (first hit wins). Wires the sentinel
+ * scan and judge to the live bee. Returns the stop/pause decision, or null to
+ * continue looping.
+ */
+async function decideStop(args: {
+  facade: HiveFacade;
+  cfg: LoopConfig;
+  loopId: string;
+  iter: number;
+  started: number;
+  now: () => number;
+  signal?: AbortSignal | undefined;
+  seal: SealRecord | null;
+  boundaryBlocked: boolean;
+  handle: BeeHandle;
+}): Promise<LoopStopDecision | null> {
+  const { facade, cfg, loopId, iter, started, now, signal, seal, boundaryBlocked, handle } = args;
+  return evaluateLoopStopConditions({
+    phase: "post",
+    cfg,
+    completedIterations: iter,
+    started,
+    now,
+    signal,
+    seal,
+    boundaryBlocked,
+    recordStopCheck: (condition, result) => recordStopCheck(loopId, condition, result),
+    runStopPredicate,
+    scanSentinel: (pattern) =>
+      testHooks?.scanSentinel ? testHooks.scanSentinel({ handle, pattern, iter }) : paneMatches(handle, pattern),
+    judgeSaysStop: () => judgeSaysStop(facade, cfg, loopId, iter, { sealTimeoutMs: testHooks?.sealTimeoutMs }),
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Helpers.
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -361,250 +458,6 @@ function boundaryTimeoutMs(cfg: LoopConfig, started: number, now: () => number, 
   if (cfg.stop.maxDurationMs == null) return defaultTimeoutMs;
   const remainingMs = cfg.stop.maxDurationMs - (now() - started);
   return Math.max(0, Math.min(defaultTimeoutMs, remainingMs));
-}
-
-function handleOf(record: SessionRecord): BeeHandle {
-  const handle: BeeHandle = {
-    id: record.id ?? record.name,
-    name: record.name,
-    agent: record.agent,
-    cwd: record.cwd,
-  };
-  if (record.node) handle.node = record.node;
-  return handle;
-}
-
-/**
- * Iteration boundary detector — RACE seal detection against idle detection
- * (PRD §14: prefer the seal; fall back to ~3s idle detection for
- * harnesses/tasks that don't seal). One poll loop checks for a seal file beyond
- * the PRE-SEND filename cursor while fingerprinting the bee's pane; once the
- * pane has been stable for idleMs + graceMs with no new seal, the
- * boundary is concluded unsealed. timeoutMs remains the overall cap so a
- * never-idle, never-sealing bee cannot wedge an iteration forever.
- */
-async function waitForIterationBoundary(args: {
-  handle: BeeHandle;
-  iter: number;
-  baselineFilename: string | null;
-  timeoutMs: number;
-  idleMs: number;
-  graceMs: number;
-  pollMs: number;
-  signal?: AbortSignal | undefined;
-}): Promise<{ seal: SealRecord | null; blocked: boolean; highWaterFilename: string | null }> {
-  const { handle } = args;
-  const started = Date.now();
-  let lastPane: string | undefined;
-  let stableSince = Date.now();
-  let goneSince: number | undefined;
-  let highWaterFilename = args.baselineFilename;
-  while (Date.now() - started < args.timeoutMs) {
-    if (args.signal?.aborted) throw new Error(`loop boundary aborted: ${handle.name}`);
-    const latest = await scanLatestSeal(handle.name, { afterFilename: highWaterFilename }).catch(() => null);
-    if (latest?.seal) {
-      highWaterFilename = latest.filename;
-      return { seal: latest.seal, blocked: false, highWaterFilename };
-    }
-    const observed = await captureBoundaryPane(handle, args.iter);
-    if (observed === "gone") {
-      // The session verifiably ended. A one-shot bee may have written its
-      // seal moments before exiting, so keep polling the seal stream for graceMs
-      // before concluding the boundary unsealed.
-      goneSince ??= Date.now();
-      if (Date.now() - goneSince >= args.graceMs) return { seal: null, blocked: false, highWaterFilename };
-    } else if (observed !== null) {
-      goneSince = undefined;
-      if (observed !== lastPane) {
-        lastPane = observed;
-        stableSince = Date.now();
-      } else if (Date.now() - stableSince >= args.idleMs + args.graceMs) {
-        // A stable pane sitting on an approval prompt is NOT a finished turn —
-        // the bee is blocked on a human decision. Advancing would kill it
-        // (fresh carrier) or paste the next prompt into the approval UI.
-        return { seal: null, blocked: isPermissionPromptPane(lastPane ?? ""), highWaterFilename };
-      }
-    }
-    // observed === null: transient capture failure (e.g. an ssh hiccup) — skip
-    // the stability bookkeeping so it cannot masquerade as a stable idle pane.
-    await sleep(args.pollMs);
-  }
-  return { seal: null, blocked: false, highWaterFilename }; // overall cap reached — unsealed boundary.
-}
-
-/**
- * Pane snapshot for the boundary's idleness fingerprint. Returns the pane
- * text, "gone" when the session verifiably no longer exists, or null when the
- * capture failed transiently (transport trouble) and nothing can be inferred.
- */
-async function captureBoundaryPane(handle: BeeHandle, iter: number): Promise<string | "gone" | null> {
-  if (testHooks?.capturePane) return testHooks.capturePane({ handle, iter }).catch(() => null);
-  try {
-    const { loadSession } = await import("../store.js");
-    const record = await loadSession(handle.name);
-    // No record: nothing to capture — an empty observable pane. The idle
-    // window still applies, so a seal that is about to land gets its chance
-    // before the boundary concludes.
-    if (!record) return "";
-    const substrate = substrateFor(record);
-    try {
-      return await substrate.capture(record.tmuxTarget, 200, record.agentPaneId);
-    } catch {
-      // Clean "no such session" means the bee died; a transport throw means
-      // we simply don't know this pass.
-      const alive = await substrate.hasSession(record.tmuxTarget).catch(() => null);
-      return alive === false ? "gone" : null;
-    }
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Spawn a bee for this loop. Uses spawnBeeForFlow directly when yolo is
- * requested (the facade applies the per-agent yolo default); otherwise routes through
- * facade.spawn so the bee is tracked for kill-on-end cleanup. The same
- * yolo-aware path serves the iteration bee AND the summarizer/judge helper
- * bees — a non-yolo helper inside a --yolo loop would stall on permission
- * prompts and silently burn its whole seal timeout. For the yolo path we push
- * the record onto the facade's spawned list so killAll/kill still find it.
- */
-async function spawnLoopBee(
-  facade: HiveFacade,
-  cfg: LoopConfig,
-  loopId: string,
-  name: string,
-): Promise<SessionRecord> {
-  if (cfg.yolo) {
-    // Resolve the bee token (incl. the `<tool>-auto` least-loaded pick) here —
-    // the yolo path spawns directly, bypassing facade.spawn's own resolution.
-    const resolved = await resolveSpawnSpec(cfg.bee, { onNote: (message) => console.error(message) });
-    const record = await spawnBeeForFlow({
-      agent: resolved.agent,
-      ...(resolved.account ? { account: resolved.account } : {}),
-      extraArgs: [],
-      cwd: cfg.cwd,
-      yolo: true,
-      name,
-      swarmId: `flow:loop:run:${loopId}`,
-      runId: loopId,
-      flowName: "loop",
-    });
-    trackSpawned(facade, record);
-    await appendLedger({ type: "flow.spawn", flowName: "loop", runId: loopId, session: record.name, agent: record.agent });
-    return record;
-  }
-  const handle = await facade.spawn({ bee: cfg.bee, cwd: cfg.cwd, name });
-  // facade.spawn tracks internally; resolve the freshly-saved record.
-  const { loadSession } = await import("../store.js");
-  const record = await loadSession(handle.name);
-  if (!record) throw new Error(`spawn produced no session record for ${handle.name}`);
-  return record;
-}
-
-/**
- * Spawn the iteration bee. Fresh-carrier names are unique per iteration to
- * avoid the "tmux session already exists" collision.
- */
-async function spawnIterationBee(
-  facade: HiveFacade,
-  cfg: LoopConfig,
-  loopId: string,
-  iter: number,
-): Promise<SessionRecord> {
-  const uniqueName = cfg.carrier === "fresh" ? `loop-${loopId}-i${iter}` : `loop-${loopId}`;
-  return spawnLoopBee(facade, cfg, loopId, uniqueName);
-}
-
-/** Push a record onto the facade's private spawned list (yolo bypass path). */
-function trackSpawned(facade: HiveFacade, record: SessionRecord): void {
-  (facade as unknown as { spawned: SessionRecord[] }).spawned.push(record);
-}
-
-/**
- * `bee` summarizer mode: spawn a cheap bee, brief it with the prior progress +
- * the loop bee's seal, wait for ITS seal, and return that. On any failure fall
- * back to the loop bee's own seal so the loop never stalls.
- */
-async function runSummarizerBee(
-  facade: HiveFacade,
-  cfg: LoopConfig,
-  loopId: string,
-  iter: number,
-  loopSeal: SealRecord,
-): Promise<SealRecord> {
-  let handle: BeeHandle | undefined;
-  try {
-    const record = await spawnLoopBee(facade, cfg, loopId, `loop-${loopId}-sum${iter}`);
-    handle = handleOf(record);
-    await waitForAgentReady(record, { timeoutMs: bootMs(cfg.bee), acceptTrust: true, raiseDroidAutonomy: cfg.yolo }).catch(
-      () => undefined,
-    );
-    const progress = truncateForInjection(await readFileSafe(loopProgressPath(loopId)));
-    const brief = [
-      `# Summarizer for loop ${loopId} iteration ${iter}`,
-      "Integrate the iteration result below into the carried-forward progress, producing the new complete fold-forward progress, then seal with that as your summary. Keep it concise — do not let the summary grow without bound.",
-      `## Carried-forward progress\n${progress.trim() || "(none yet)"}`,
-      `## This iteration's result (status=${loopSeal.status})\n${loopSeal.summary}`,
-    ].join("\n\n");
-    const baseline = (await facade.collect(handle).catch(() => null))?.sealedAt ?? null;
-    await facade.brief(handle, brief);
-    const seal = await facade.waitForSeal(handle, {
-      timeoutMs: testHooks?.sealTimeoutMs ?? HELPER_SEAL_TIMEOUT_MS,
-      baselineSealedAt: baseline,
-    });
-    return seal;
-  } catch {
-    return loopSeal;
-  } finally {
-    if (handle) {
-      try {
-        await facade.kill(handle);
-      } catch {
-        // ignore
-      }
-    }
-  }
-}
-
-/**
- * Judge stop condition (opt-in). Spawn a cheap bee, ask the judge question, and
- * read a yes/stop out of its seal. Conservatively returns false on any failure
- * so a flaky judge never falsely stops the loop.
- */
-async function judgeSaysStop(facade: HiveFacade, cfg: LoopConfig, loopId: string, iter: number): Promise<boolean> {
-  let handle: BeeHandle | undefined;
-  try {
-    const record = await spawnLoopBee(facade, cfg, loopId, `loop-${loopId}-judge${iter}`);
-    handle = handleOf(record);
-    await waitForAgentReady(record, { timeoutMs: bootMs(cfg.bee), acceptTrust: true, raiseDroidAutonomy: cfg.yolo }).catch(
-      () => undefined,
-    );
-    const progress = truncateForInjection(await readFileSafe(loopProgressPath(loopId)));
-    const brief = [
-      `# Loop ${loopId} judge`,
-      cfg.stop.judge ?? "",
-      `## Loop progress so far\n${progress.trim() || "(none yet)"}`,
-      'Answer by sealing: status "done" with a summary that begins with "STOP" if the loop should stop, otherwise status "done" with a summary beginning "CONTINUE".',
-    ].join("\n\n");
-    const baseline = (await facade.collect(handle).catch(() => null))?.sealedAt ?? null;
-    await facade.brief(handle, brief);
-    const seal = await facade.waitForSeal(handle, {
-      timeoutMs: testHooks?.sealTimeoutMs ?? HELPER_SEAL_TIMEOUT_MS,
-      baselineSealedAt: baseline,
-    });
-    return /^\s*stop\b/i.test(seal.summary);
-  } catch {
-    return false;
-  } finally {
-    if (handle) {
-      try {
-        await facade.kill(handle);
-      } catch {
-        // ignore
-      }
-    }
-  }
 }
 
 /** Scan the bee's pane for a regex sentinel marker. */
@@ -631,13 +484,4 @@ async function recordStopCheck(loopId: string, condition: string, result: boolea
   await updateLoopConfig(loopId, { lastStopCheck: { condition, result, at: new Date().toISOString() } }).catch(
     () => undefined,
   );
-}
-
-async function readFileSafe(path: string): Promise<string> {
-  const { readFile } = await import("node:fs/promises");
-  return readFile(path, "utf8").catch(() => "");
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
