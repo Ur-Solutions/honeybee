@@ -222,10 +222,20 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
   let credential: ClaudeOauthCredentials | undefined;
   const imposters = new Set<string>();
   let unverifiableFresh = 0;
+  let unattributedFresh = 0;
   for (const candidate of candidates.filter((entry) => entry.expiresAt > now)) {
     if (!expectedEmail) {
-      credential = candidate;
-      break;
+      // No email to verify against, so only account-attributed sources
+      // (vault + dedicated homes) can be trusted. An unattributed keychain
+      // entry scraped from a shared ~/.claude* home is most likely another
+      // account's daily-driver login — using it would misattribute that
+      // account's usage here and skew the `auto` least-loaded pick.
+      if (candidate.attributed) {
+        credential = candidate;
+        break;
+      }
+      unattributedFresh += 1;
+      continue;
     }
     const actualEmail = await profileOf(candidate.accessToken).catch(() => null);
     if (actualEmail === expectedEmail) {
@@ -319,7 +329,9 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
       error:
         imposters.size > 0
           ? `no token belongs to ${expectedEmail} (found: ${[...imposters].join(", ")}); re-login with: hive login ${account.id}`
-          : `all ${candidates.length} token(s) expired and refresh failed; re-login with: hive login ${account.id}`,
+          : unattributedFresh > 0
+            ? `found ${unattributedFresh} fresh token(s) only in shared homes, but the account has no email to verify them against; log in with: hive login ${account.id}, or re-add with --email`
+            : `all ${candidates.length} token(s) expired and refresh failed; re-login with: hive login ${account.id}`,
     };
   }
 
@@ -429,7 +441,8 @@ async function claudeCredentialCandidates(
   // The account's true login may live in a home we cannot attribute (the
   // default ~/.claude has no in-home .claude.json). Include every claude
   // home's keychain as a last-resort candidate pool — identity verification
-  // filters out the wrong ones, and these are never refresh-rotated.
+  // filters out the wrong ones, they are never refresh-rotated, and
+  // email-less accounts (nothing to verify against) never use them at all.
   for (const home of await candidateHomes("claude")) {
     push(await readKeychain(home), false, `${home}:keychain`);
   }

@@ -202,6 +202,69 @@ test("claude limits reject tokens whose profile email belongs to another account
   });
 });
 
+test("an email-less account never trusts unattributed shared-home keychain tokens", async () => {
+  await withTempStore(async (dir) => {
+    // candidateHomes scans os.homedir(); point HOME at the temp dir so the
+    // "shared ~/.claude" below is the only unattributed home on the machine.
+    const oldHome = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      const sharedHome = join(dir, ".claude");
+      await mkdir(sharedHome, { recursive: true });
+      // No email and no @ in the label → nothing to verify identity against.
+      const account = await addAccount("claude", "work");
+      // No vault credentials and no dedicated home: the only candidate is a
+      // FRESH keychain token in the shared home — someone else's daily driver.
+      const [result] = await accountLimits([account], {
+        readKeychain: async (home) =>
+          home === sharedHome
+            ? JSON.stringify({ claudeAiOauth: { accessToken: "tok-daily-driver", expiresAt: Date.now() + 3_600_000 } })
+            : null,
+        fetchClaudeUsage: async () => {
+          throw new Error("must not report another account's usage");
+        },
+        fetchClaudeProfileEmail: async () => {
+          throw new Error("must not be called — there is no email to match");
+        },
+        refreshClaudeToken: async () => null,
+      });
+      assert.equal(result!.ok, false);
+      assert.match(result!.error ?? "", /no email to verify/);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+    }
+  });
+});
+
+test("an email-less account uses its attributed vault token without profile verification", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "work");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-vault", expiresAt: Date.now() + 3_600_000, subscriptionType: "max" } }),
+    );
+
+    const asked: string[] = [];
+    const [result] = await accountLimits([account], {
+      fetchClaudeUsage: async (token) => {
+        asked.push(token);
+        return { five_hour: { utilization: 42, resets_at: "2026-06-10T09:30:00Z" } };
+      },
+      fetchClaudeProfileEmail: async () => {
+        throw new Error("no email to verify against — must not be called");
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.deepEqual(asked, ["tok-vault"]);
+    assert.equal(result!.ok, true);
+    assert.equal(result!.plan, "max");
+    assert.equal(result!.fiveHour?.usedPercent, 42);
+  });
+});
+
 test("an expired chain is refreshed, persisted (rotation!), and then used", async () => {
   await withTempStore(async () => {
     const account = await addAccount("claude", "stale@a.b");
