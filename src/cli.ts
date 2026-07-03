@@ -948,13 +948,24 @@ function ttlFlagMs(parsed: Parsed): number | undefined {
  * remaining quota.
  */
 async function resolveSpawnAgentWithAuto(requested: string, parsed: Parsed): Promise<SpawnAgentSpec> {
-  const rr = roundRobinAccountTool(requested);
-  if (rr) return { agent: rr, account: await pickRoundRobinAccountForCli(rr) };
-  const tool = autoAccountTool(requested);
-  if (tool) return { agent: tool, account: await pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  const alias = spawnAccountAliasResolver(requested, parsed);
+  if (alias) return { agent: alias.agent, account: await alias.account() };
   const resolved = await resolveSpawnAgent(requested);
   const defaultAccount = await defaultBareGrokAccount(requested, parsed, resolved);
   return defaultAccount ? { agent: defaultAccount.tool, account: defaultAccount } : resolved;
+}
+
+type SpawnAccountAliasResolver = {
+  agent: string;
+  account: () => Promise<AccountRecord>;
+};
+
+function spawnAccountAliasResolver(requested: string, parsed: Parsed): SpawnAccountAliasResolver | undefined {
+  const rr = roundRobinAccountTool(requested);
+  if (rr) return { agent: rr, account: () => pickRoundRobinAccountForCli(rr) };
+  const tool = autoAccountTool(requested);
+  if (tool) return { agent: tool, account: () => pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  return undefined;
 }
 
 async function defaultBareGrokAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
@@ -1395,15 +1406,16 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
     throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
   }
-  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
+  const perBeeAccountAlias = spawnAccountAliasResolver(requested, parsed);
+  const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
+    ? { agent: perBeeAccountAlias.agent, account: undefined }
+    : await resolveSpawnAgentWithAuto(requested, parsed);
   // Thin profile → account (same overlay as spawnSingleBee).
   const profile = await resolveProfileOverlay(requested);
   const agent = profile ? profile.account.tool : resolvedAgent;
   const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
   const account = profile?.account ?? aliasAccount;
   // Model selector precedence: profile model override > the account default.
-  const model = account ? (profile?.model ?? account.model) : undefined;
-  const provider = account?.provider;
   const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -1420,7 +1432,10 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   // and no new --count restriction.
   const records: SessionRecord[] = [];
   for (let i = 0; i < count; i += 1) {
-    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account, model, provider });
+    const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
+    const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
+    const beeProvider = beeAccount?.provider;
+    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider });
     records.push(record);
     const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
     if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`@${swarmId}`), ...nodeSuffix]));
@@ -1466,13 +1481,14 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
   const hasComposerMessages = perBeeMessages !== undefined;
   let slot = 0; // running bee index across all castes, aligned with perBeeMessages
   for (const caste of frame.castes) {
-    const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(caste.bee, parsed);
+    const perBeeAccountAlias = spawnAccountAliasResolver(caste.bee, parsed);
+    const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
+      ? { agent: perBeeAccountAlias.agent, account: undefined }
+      : await resolveSpawnAgentWithAuto(caste.bee, parsed);
     const profile = await resolveProfileOverlay(caste.bee);
     const agent = profile ? profile.account.tool : resolvedAgent;
     const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
     const account = profile?.account ?? aliasAccount;
-    const model = account ? (profile?.model ?? account.model) : undefined;
-    const provider = account?.provider;
     const yolo = dangerousMode(parsed, agent, caste.bee, profile?.yolo);
     const home = caste.home ?? flagHome;
     const casteSpec = resolveAgent(agent, extraArgs, { home, yolo });
@@ -1486,6 +1502,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
       // With composer messages present, a blank slot explicitly means no brief;
       // otherwise fall back to the legacy "--briefed delivers caste brief" path.
       const toDeliver = hasComposerMessages ? (hasCustom ? custom : undefined) : briefed && caste.brief ? caste.brief : undefined;
+      const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
+      const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
+      const beeProvider = beeAccount?.provider;
       let record = await spawnBee({
         agent,
         extraArgs,
@@ -1496,9 +1515,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
         swarmId,
         caste: caste.name,
         node: casteNode,
-        account,
-        model,
-        provider,
+        account: beeAccount,
+        model: beeModel,
+        provider: beeProvider,
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
       if (toDeliver) record = await deliverBrief(parsed, record, toDeliver);
