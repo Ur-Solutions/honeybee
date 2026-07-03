@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { listSessionStates, setTmuxSocket, setUserOptions, tmux } from "../src/substrates/local-tmux.js";
+import { listSessionStates, setTmuxSocket, setUserOptions, setWindowOptions, tmux } from "../src/substrates/local-tmux.js";
 
 process.env.TMUX_TMPDIR = mkdtempSync(join(tmpdir(), "hive-state-itest-"));
 delete process.env.TMUX;
@@ -27,6 +27,14 @@ test("setUserOptions writes exactly and listSessionStates reads back", { timeout
     await setUserOptions("CL-abcd", { "@hive_state": "working", "@hive_id": "CL.abcd" });
     const states = await listSessionStates();
     assert.equal(states.get("CL-abcd"), "working");
+
+    await setUserOptions("CL-abcd", { "@hive_separator": ";" });
+    const separator = (await tmux(["show-options", "-qv", "-t", "=CL-abcd:", "@hive_separator"])).stdout.trimEnd();
+    assert.equal(separator, ";");
+
+    await setWindowOptions("CL-abcd", { "@hive_window_separator": ";" } as unknown as Parameters<typeof setWindowOptions>[1]);
+    const windowSeparator = (await tmux(["show-options", "-wqv", "-t", "=CL-abcd:", "@hive_window_separator"])).stdout.trimEnd();
+    assert.equal(windowSeparator, ";");
 
     // Exact match: a write aimed at a vanished shorter name must not
     // prefix-match onto CL-abcd (set-option without "=" would).

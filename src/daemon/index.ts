@@ -49,12 +49,23 @@ export type RecentError = {
 
 export type DaemonState = {
   startedAt: string;
+  /**
+   * Loop heartbeat: refreshed by both completed ticks and failed/abandoned
+   * iterations to prove the daemon loop itself is still alive.
+   */
   lastTickAt: string | null;
+  /**
+   * Progress heartbeat: refreshed only when tickCount advances. Older state
+   * files may not carry it; status falls back conservatively for those.
+   */
+  lastSuccessfulTickAt?: string | null;
   tickCount: number;
   version: string;
   pid: number;
   recentErrors: RecentError[];
 };
+
+export type DaemonStaleReason = "loop-stale" | "tick-progress-stale" | "recent-errors-saturated" | "missing-state";
 
 export type DaemonStatusReport = {
   running: boolean;
@@ -67,13 +78,20 @@ export type DaemonStatusReport = {
   lockHeldByOtherHost: boolean;
   state: DaemonState | null;
   /**
-   * True when the daemon process is alive but its loop is not: running &&
-   * lastTickAt (or startedAt, if it never ticked) older than staleAfterMs.
-   * A wedged loop inside a live process must read as an outage, not health.
+   * True when the daemon process is alive but unhealthy: its loop heartbeat is
+   * stale, successful tick progress is stale, or recentErrors is saturated
+   * with fresh failures. A live but non-progressing process must read as an
+   * outage, not health.
    */
   stale: boolean;
+  /** Machine-readable causes behind stale=true. */
+  staleReasons: DaemonStaleReason[];
   /** Age of the last tick in ms (running daemons only, null otherwise). */
   lastTickAgeMs: number | null;
+  /** Age of the last tick that advanced tickCount (running daemons only). */
+  lastSuccessfulTickAgeMs: number | null;
+  /** True when recentErrors is full and the newest entry is still fresh. */
+  recentErrorsSaturated: boolean;
   /** The threshold staleness was judged against. */
   staleAfterMs: number;
   installed: boolean;
@@ -142,6 +160,8 @@ export async function readDaemonState(): Promise<DaemonState | null> {
     if (typeof obj.pid !== "number") return null;
     const tickCount = typeof obj.tickCount === "number" ? obj.tickCount : 0;
     const lastTickAt = typeof obj.lastTickAt === "string" ? obj.lastTickAt : null;
+    const lastSuccessfulTickAt =
+      typeof obj.lastSuccessfulTickAt === "string" || obj.lastSuccessfulTickAt === null ? obj.lastSuccessfulTickAt : undefined;
     const recentErrors = Array.isArray(obj.recentErrors)
       ? obj.recentErrors
           .filter((e): e is { ts: string; msg: string } => !!e && typeof e === "object" && typeof (e as RecentError).ts === "string" && typeof (e as RecentError).msg === "string")
@@ -154,6 +174,7 @@ export async function readDaemonState(): Promise<DaemonState | null> {
       version: obj.version,
       pid: obj.pid,
       recentErrors,
+      ...(lastSuccessfulTickAt !== undefined ? { lastSuccessfulTickAt } : {}),
     };
   } catch {
     return null;
@@ -179,6 +200,33 @@ export function daemonLoopStale(state: DaemonState, nowMs: number, staleAfterMs:
   if (!Number.isFinite(parsed)) return { stale: true, ageMs: null };
   const ageMs = Math.max(0, nowMs - parsed);
   return { stale: ageMs > staleAfterMs, ageMs };
+}
+
+/**
+ * Progress staleness judgment: has tickCount advanced recently? New daemon
+ * state carries lastSuccessfulTickAt; legacy state falls back to lastTickAt
+ * only after at least one successful tickCount was recorded.
+ */
+export function daemonTickProgressStale(state: DaemonState, nowMs: number, staleAfterMs: number): { stale: boolean; ageMs: number | null } {
+  const hasProgressField = Object.prototype.hasOwnProperty.call(state, "lastSuccessfulTickAt");
+  const basis = hasProgressField
+    ? state.lastSuccessfulTickAt ?? state.startedAt
+    : state.tickCount > 0
+      ? state.lastTickAt ?? state.startedAt
+      : state.startedAt;
+  const parsed = Date.parse(basis);
+  if (!Number.isFinite(parsed)) return { stale: true, ageMs: null };
+  const ageMs = Math.max(0, nowMs - parsed);
+  return { stale: ageMs > staleAfterMs, ageMs };
+}
+
+export function daemonRecentErrorsSaturated(state: DaemonState, nowMs: number, staleAfterMs: number): boolean {
+  if (state.recentErrors.length < maxRecentErrors()) return false;
+  const newest = state.recentErrors.at(-1);
+  if (!newest) return false;
+  const parsed = Date.parse(newest.ts);
+  if (!Number.isFinite(parsed)) return true;
+  return Math.max(0, nowMs - parsed) <= staleAfterMs;
 }
 
 /**
@@ -208,16 +256,27 @@ export async function readDaemonStatus(
   const lockHeldByOtherHost = !!lock && !lockOwnedByThisMachine(lock);
   const running = !!lock && !lockHeldByOtherHost && isPidLikelyAlive(lock.pid);
   const staleAfterMs = options.staleAfterMs ?? defaultStaleAfterMs();
-  // Staleness only applies to a running daemon: a live process whose loop
-  // stopped ticking. A down daemon is already reported as down.
-  const loop = running && state ? daemonLoopStale(state, now(), staleAfterMs) : { stale: running && !state, ageMs: null };
+  // Staleness only applies to a running daemon. A down daemon is already
+  // reported as down; a live daemon with no readable state is unhealthy.
+  const nowMs = now();
+  const loop = running && state ? daemonLoopStale(state, nowMs, staleAfterMs) : { stale: running && !state, ageMs: null };
+  const progress = running && state ? daemonTickProgressStale(state, nowMs, staleAfterMs) : { stale: false, ageMs: null };
+  const recentErrorsSaturated = running && state ? daemonRecentErrorsSaturated(state, nowMs, staleAfterMs) : false;
+  const staleReasons: DaemonStaleReason[] = [];
+  if (running && !state) staleReasons.push("missing-state");
+  if (loop.stale && state) staleReasons.push("loop-stale");
+  if (progress.stale && state) staleReasons.push("tick-progress-stale");
+  if (recentErrorsSaturated) staleReasons.push("recent-errors-saturated");
   return {
     running,
     lock,
     lockHeldByOtherHost,
     state,
-    stale: loop.stale,
+    stale: staleReasons.length > 0,
+    staleReasons,
     lastTickAgeMs: loop.ageMs,
+    lastSuccessfulTickAgeMs: progress.ageMs,
+    recentErrorsSaturated,
     staleAfterMs,
     installed: install.plistExists,
     plistPath: install.plistExists ? install.plistPath : null,

@@ -7,7 +7,7 @@
 // data without touching the real filesystem, and so future corpora (artifacts,
 // buz messages) can plug in via additional reader methods.
 
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readFile, readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { storeRoot } from "./fsx.js";
 import { sealsRoot, type SealRecord } from "./seal.js";
@@ -28,7 +28,6 @@ export type SearchHit = {
   // then break ties by recency, so callers can sort([]).reverse() if needed.
   score: number;
   matchedAt: string; // ISO timestamp used for recency ranking
-  raw?: unknown;
 };
 
 export type SearchTypeFilter = "seals" | "ledger" | "sessions";
@@ -50,14 +49,27 @@ export type SearchOptions = {
 
 export type SearchResult = {
   hits: SearchHit[];
-  truncated: boolean; // true if more hits existed past `limit`
+  // True when the returned hits were capped at `limit`. Once a higher-ranked
+  // corpus fills the top-N, lower-ranked corpora may be skipped without probing
+  // whether they contain additional matches.
+  truncated: boolean;
 };
 
 export type CorpusReader = {
   listLedgerFiles(): Promise<string[]>;
   readSeals(filter: SealFilter): AsyncIterable<{ path: string; record: SealRecord }>;
   readSessionRecords(filter: SessionFilter): AsyncIterable<{ path: string; record: SessionRecord }>;
-  readLedgerLines(filter: LedgerFilter): AsyncIterable<{ path: string; line: string; ts: string; lineNumber: number }>;
+  readLedgerLines(filter: LedgerFilter): AsyncIterable<LedgerLine>;
+};
+
+export type LedgerLine = {
+  path: string;
+  line: string;
+  parsed?: Record<string, unknown>;
+  ts: string;
+  // Present for readers that can provide a source line cheaply. The default
+  // reverse-streaming reader omits it to avoid a full-file pre-scan.
+  lineNumber?: number;
 };
 
 export type SealFilter = {
@@ -82,6 +94,7 @@ const MAX_REGEX_LENGTH = 256;
 const SNIPPET_BEFORE = 40;
 const SNIPPET_AFTER = 80;
 const SNIPPET_CAP = SNIPPET_BEFORE + SNIPPET_AFTER; // 120 total chars
+const LEDGER_READ_CHUNK_BYTES = 64 * 1024;
 
 // Ranking weights. The exact numbers don't matter, only their relative order:
 // seals dominate ledger which dominates sessions. Recency is encoded via a
@@ -101,6 +114,8 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
   const wantSessions = !options.types || options.types.has("sessions");
 
   const hits: SearchHit[] = [];
+  let truncated = false;
+  const limitReached = () => limit > 0 && hits.length >= limit;
 
   if (wantSeals) {
     for await (const { path, record } of reader.readSeals({
@@ -110,7 +125,7 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
       ...(options.status ? { status: options.status } : {}),
     })) {
       const matchedAtMs = Date.parse(record.sealedAt);
-      if (options.sinceMs !== undefined && Number.isFinite(matchedAtMs) && matchedAtMs < options.sinceMs) continue;
+      if (options.sinceMs !== undefined && (!Number.isFinite(matchedAtMs) || matchedAtMs < options.sinceMs)) continue;
       const text = sealHaystack(record);
       const match = matcher.find(text);
       if (!match) continue;
@@ -124,62 +139,72 @@ export async function search(options: SearchOptions, reader: CorpusReader = defa
         matchEndInSnippet: snippet.matchEnd,
         score: scoreHit("seal", record.sealedAt),
         matchedAt: record.sealedAt,
-        raw: record,
       });
     }
   }
 
   if (wantLedger) {
-    for await (const { path, line, ts, lineNumber } of reader.readLedgerLines({
-      ...(options.sinceMs !== undefined ? { sinceMs: options.sinceMs } : {}),
-    })) {
-      if (!passesLedgerFilters(line, options)) continue;
-      const match = matcher.find(line);
-      if (!match) continue;
-      const snippet = makeSnippet(line, match.start, match.end);
-      hits.push({
-        type: "ledger",
-        path: `${path}:${lineNumber}`,
-        snippet: snippet.text,
-        matchStartInSnippet: snippet.matchStart,
-        matchEndInSnippet: snippet.matchEnd,
-        score: scoreHit("ledger", ts),
-        matchedAt: ts,
-        raw: line,
-      });
+    if (limitReached()) {
+      truncated = true;
+    } else {
+      for await (const { path, line, parsed, ts, lineNumber } of reader.readLedgerLines({
+        ...(options.sinceMs !== undefined ? { sinceMs: options.sinceMs } : {}),
+      })) {
+        if (isOutsideSinceWindow(ts, options.sinceMs)) continue;
+        if (!passesLedgerFilters(parsed, options)) continue;
+        const text = redactSearchText(line);
+        const match = matcher.find(text);
+        if (!match) continue;
+        const snippet = makeSnippet(text, match.start, match.end);
+        hits.push({
+          type: "ledger",
+          path: lineNumber === undefined ? path : `${path}:${lineNumber}`,
+          snippet: snippet.text,
+          matchStartInSnippet: snippet.matchStart,
+          matchEndInSnippet: snippet.matchEnd,
+          score: scoreHit("ledger", ts),
+          matchedAt: ts,
+        });
+        if (limitReached()) {
+          truncated = true;
+          break;
+        }
+      }
     }
   }
 
   if (wantSessions) {
-    for await (const { path, record } of reader.readSessionRecords({
-      ...(options.colony ? { colony: options.colony } : {}),
-      ...(options.swarm ? { swarm: options.swarm } : {}),
-      ...(options.bee ? { bee: options.bee } : {}),
-    })) {
-      const matchedAt = record.updatedAt ?? record.createdAt ?? "";
-      const matchedAtMs = Date.parse(matchedAt);
-      if (options.sinceMs !== undefined && Number.isFinite(matchedAtMs) && matchedAtMs < options.sinceMs) continue;
-      const text = sessionHaystack(record);
-      const match = matcher.find(text);
-      if (!match) continue;
-      const snippet = makeSnippet(text, match.start, match.end);
-      hits.push({
-        type: "session",
-        path,
-        beeName: record.name,
-        snippet: snippet.text,
-        matchStartInSnippet: snippet.matchStart,
-        matchEndInSnippet: snippet.matchEnd,
-        score: scoreHit("session", matchedAt),
-        matchedAt,
-        raw: record,
-      });
+    if (limitReached()) {
+      truncated = true;
+    } else {
+      for await (const { path, record } of reader.readSessionRecords({
+        ...(options.colony ? { colony: options.colony } : {}),
+        ...(options.swarm ? { swarm: options.swarm } : {}),
+        ...(options.bee ? { bee: options.bee } : {}),
+      })) {
+        const matchedAt = record.updatedAt ?? record.createdAt ?? "";
+        const matchedAtMs = Date.parse(matchedAt);
+        if (options.sinceMs !== undefined && (!Number.isFinite(matchedAtMs) || matchedAtMs < options.sinceMs)) continue;
+        const text = sessionHaystack(record);
+        const match = matcher.find(text);
+        if (!match) continue;
+        const snippet = makeSnippet(text, match.start, match.end);
+        hits.push({
+          type: "session",
+          path,
+          beeName: record.name,
+          snippet: snippet.text,
+          matchStartInSnippet: snippet.matchStart,
+          matchEndInSnippet: snippet.matchEnd,
+          score: scoreHit("session", matchedAt),
+          matchedAt,
+        });
+      }
     }
   }
 
   hits.sort((a, b) => b.score - a.score);
-  const truncated = limit > 0 && hits.length > limit;
-  return { hits: limit > 0 ? hits.slice(0, limit) : hits, truncated };
+  return { hits: limit > 0 ? hits.slice(0, limit) : hits, truncated: truncated || (limit > 0 && hits.length > limit) };
 }
 
 type CompiledMatcher = { find(text: string): { start: number; end: number } | null };
@@ -239,27 +264,25 @@ export function makeSnippet(text: string, matchStart: number, matchEnd: number):
 
   const ellipsisLeft = start > 0;
   const ellipsisRight = end < text.length;
-  const body = text.slice(start, end).replace(/\s+/g, " ");
+  const body = normalizeSnippetWhitespace(text.slice(start, end));
 
   // Snippet output keeps the ellipsis prefix/suffix so users can see truncation,
   // but match offsets refer to the visible match characters inside the snippet.
   const prefix = ellipsisLeft ? "…" : "";
   const suffix = ellipsisRight ? "…" : "";
-  // Match start in slice -> add prefix length. We collapsed whitespace so the
-  // raw count from `text` is an upper bound; we recompute by finding the match
-  // text inside the formatted snippet for robustness.
-  const matchText = text.slice(matchStart, matchEnd).replace(/\s+/g, " ");
-  const rawSliceMatchOffset = matchStart - start;
-  // Best-effort: find the first occurrence of `matchText` in `body`. If the
-  // whitespace collapse changed the layout we still recover a sensible offset.
-  let visibleStart = body.indexOf(matchText);
-  if (visibleStart === -1) visibleStart = Math.max(0, Math.min(rawSliceMatchOffset, body.length));
+  const matchText = normalizeSnippetWhitespace(text.slice(matchStart, matchEnd));
+  const rawSliceBeforeMatch = text.slice(start, matchStart);
+  const visibleStart = Math.max(0, Math.min(normalizeSnippetWhitespace(rawSliceBeforeMatch).length, body.length));
   const visibleEnd = Math.min(body.length, visibleStart + matchText.length);
   return {
     text: `${prefix}${body}${suffix}`,
     matchStart: prefix.length + visibleStart,
     matchEnd: prefix.length + visibleEnd,
   };
+}
+
+function normalizeSnippetWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ");
 }
 
 function scoreHit(type: SearchHitType, matchedAt: string): number {
@@ -285,7 +308,7 @@ function sealHaystack(record: SealRecord): string {
     (record.nextActions ?? []).join(" "),
     ...(record.testsRun ?? []).map((t) => `${t.command} ${t.result} ${t.notes ?? ""}`),
   ];
-  return parts.filter((p) => p && p.length > 0).join("\n");
+  return redactSearchText(parts.filter((p) => p && p.length > 0).join("\n"));
 }
 
 function sessionHaystack(record: SessionRecord): string {
@@ -299,20 +322,29 @@ function sessionHaystack(record: SessionRecord): string {
     record.brief ?? "",
     record.notes ?? "",
   ];
-  return parts.filter((p) => p && p.length > 0).join("\n");
+  return redactSearchText(parts.filter((p) => p && p.length > 0).join("\n"));
 }
 
-function passesLedgerFilters(line: string, options: SearchOptions): boolean {
-  // The ledger is JSONL; filter by colony/swarm/bee by parsing once. Bad lines
-  // are skipped silently — the ledger is append-only and we never want one
-  // malformed row to abort a long search.
+const REDACTED = "[redacted]";
+const SECRET_ASSIGNMENT_RE = /\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|authorization)\s*[:=]\s*["']?(?:Bearer\s+)?)[^\s"',;)}\]]+/gi;
+const BEARER_SECRET_RE = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}\b/gi;
+const KNOWN_SECRET_VALUE_RE = /\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9][A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35})\b/g;
+const JWT_RE = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
+
+function redactSearchText(text: string): string {
+  return text
+    .replace(SECRET_ASSIGNMENT_RE, `$1${REDACTED}`)
+    .replace(BEARER_SECRET_RE, `$1${REDACTED}`)
+    .replace(KNOWN_SECRET_VALUE_RE, REDACTED)
+    .replace(JWT_RE, REDACTED);
+}
+
+function passesLedgerFilters(parsed: Record<string, unknown> | undefined, options: SearchOptions): boolean {
+  // The ledger is JSONL; the reader parses each row once and passes the object
+  // through. Bad lines are skipped silently when structured filters are needed
+  // because we never want one malformed row to abort a long search.
   if (!options.colony && !options.swarm && !options.bee) return true;
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(line) as Record<string, unknown>;
-  } catch {
-    return false;
-  }
+  if (!parsed) return false;
   if (options.colony && parsed.colony !== options.colony) return false;
   if (options.swarm && parsed.swarmId !== options.swarm && parsed.swarm !== options.swarm) return false;
   if (options.bee) {
@@ -430,43 +462,80 @@ async function* defaultReadSessionRecords(filter: SessionFilter): AsyncIterable<
   }
 }
 
-async function* defaultReadLedgerLines(filter: LedgerFilter): AsyncIterable<{
-  path: string;
-  line: string;
-  ts: string;
-  lineNumber: number;
-}> {
+async function* defaultReadLedgerLines(filter: LedgerFilter): AsyncIterable<LedgerLine> {
   const files = await listLedgerFiles();
   for (const file of files) {
-    let raw: string;
     try {
-      raw = await readFile(file, "utf8");
+      for await (const line of readFileLinesNewestFirst(file)) {
+        const parsed = parseLedgerLine(line);
+        const ts = typeof parsed?.ts === "string" ? parsed.ts : "";
+        if (filter.sinceMs !== undefined) {
+          const tsMs = Date.parse(ts);
+          if (Number.isFinite(tsMs) && tsMs < filter.sinceMs) continue;
+        }
+        yield { path: file, line, ...(parsed ? { parsed } : {}), ts };
+      }
     } catch {
       continue;
-    }
-    // Lines are newest-last inside any single rotation. Iterate newest-first by
-    // walking the array in reverse so the search-order matches the file-order
-    // (newest-first overall: most recent rotation, newest line, etc.).
-    const lines = raw.split("\n");
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-      const line = lines[i];
-      if (!line) continue;
-      const ts = ledgerLineTimestamp(line);
-      if (filter.sinceMs !== undefined) {
-        const tsMs = Date.parse(ts);
-        if (Number.isFinite(tsMs) && tsMs < filter.sinceMs) continue;
-      }
-      yield { path: file, line, ts, lineNumber: i + 1 };
     }
   }
 }
 
-function ledgerLineTimestamp(line: string): string {
+function isOutsideSinceWindow(timestamp: string, sinceMs: number | undefined): boolean {
+  if (sinceMs === undefined) return false;
+  const ms = Date.parse(timestamp);
+  return !Number.isFinite(ms) || ms < sinceMs;
+}
+
+async function* readFileLinesNewestFirst(file: string): AsyncIterable<string> {
+  const handle = await open(file, "r");
   try {
-    const parsed = JSON.parse(line) as { ts?: string };
-    if (parsed && typeof parsed.ts === "string") return parsed.ts;
+    const info = await handle.stat();
+    let position = info.size;
+    let carry = Buffer.alloc(0);
+
+    while (position > 0) {
+      const chunkSize = Math.min(LEDGER_READ_CHUNK_BYTES, position);
+      position -= chunkSize;
+      const chunk = Buffer.allocUnsafe(chunkSize);
+      const { bytesRead } = await handle.read(chunk, 0, chunkSize, position);
+      if (bytesRead <= 0) continue;
+      const buffer = bytesRead === chunkSize ? chunk : chunk.subarray(0, bytesRead);
+      let end = buffer.length;
+      for (let i = buffer.length - 1; i >= 0; i -= 1) {
+        if (buffer[i] !== 0x0a) continue;
+        const segment = buffer.subarray(i + 1, end);
+        const lineBuffer = carry.length > 0 ? Buffer.concat([segment, carry]) : segment;
+        const line = trimTrailingCarriageReturn(lineBuffer.toString("utf8"));
+        if (line.length > 0) yield line;
+        carry = Buffer.alloc(0);
+        end = i;
+      }
+      const prefix = buffer.subarray(0, end);
+      carry = carry.length > 0 ? Buffer.concat([prefix, carry]) : Buffer.from(prefix);
+    }
+
+    if (carry.length > 0) {
+      const line = trimTrailingCarriageReturn(carry.toString("utf8"));
+      if (line.length > 0) yield line;
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function trimTrailingCarriageReturn(line: string): string {
+  return line.endsWith("\r") ? line.slice(0, -1) : line;
+}
+
+function parseLedgerLine(line: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
   } catch {
     // fall through
   }
-  return "";
+  return undefined;
 }

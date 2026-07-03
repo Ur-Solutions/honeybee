@@ -162,14 +162,15 @@ export async function setWindowOptions(target: string, options: TmuxWindowOption
 async function applyTmuxWindowOptions(target: string, options: TmuxWindowOptions | undefined): Promise<void> {
   if (!options) return;
   const entries = Object.entries(options).filter((entry): entry is ["allow-passthrough", "on" | "off" | "all"] => entry[1] !== undefined);
-  if (entries.length === 0) return;
+  for (const [key, value] of entries) {
+    await tmux(["set-option", "-w", "-t", target, key, tmuxOptionValueArg(value)], { reject: false });
+  }
+}
 
-  const args: string[] = [];
-  entries.forEach(([key, value], index) => {
-    if (index > 0) args.push(";");
-    args.push("set-option", "-w", "-t", target, key, value);
-  });
-  await tmux(args, { reject: false });
+function tmuxOptionValueArg(value: string): string {
+  // tmux treats a bare ";" argv as a command separator even when there is only
+  // one command in the client invocation. Escaping preserves it as data.
+  return value === ";" ? "\\;" : value;
 }
 
 export async function sendText(target: string, text: string, paneId?: string): Promise<void> {
@@ -331,19 +332,17 @@ export async function listSessionStates(): Promise<Map<string, string>> {
 export async function setUserOptions(target: string, options: Record<string, string>): Promise<void> {
   const entries = Object.entries(options);
   if (entries.length === 0) return;
-  // One invocation: tmux parses a literal ";" argv element as a command
-  // separator. Best-effort by contract — reject:false swallows a missing
-  // session/server, and the catch guards everything else (e.g. ENOENT).
+  // One invocation per option: tmux parses a literal ";" argv element as a
+  // command separator, so batching would corrupt an option whose value is ";".
+  // Best-effort by contract — reject:false swallows a missing session/server,
+  // and the catch guards everything else (e.g. ENOENT).
   // set-option rejects a bare "=name" target (and silently prefix-matches
   // without "="!); only the pane-style "=name:" form is both accepted and
   // exact.
-  const args: string[] = [];
-  entries.forEach(([key, value], index) => {
-    if (index > 0) args.push(";");
-    args.push("set-option", "-t", `=${target}:`, key, value);
-  });
   try {
-    await tmux(args, { reject: false });
+    for (const [key, value] of entries) {
+      await tmux(["set-option", "-t", `=${target}:`, key, tmuxOptionValueArg(value)], { reject: false });
+    }
   } catch {
     // best-effort
   }

@@ -30,7 +30,7 @@
 
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseBuzDocument, serializeBuzDocument, type BuzFrontmatter } from "./buz_format.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
@@ -140,7 +140,7 @@ export function externalOutboxDir(humanName: string): string {
   return anchoredBuzPath(EXTERNAL_NAMESPACE, sanitizeHumanName(humanName), "outbox");
 }
 
-function senderLockPath(beeName: string): string {
+function recipientWriteLockPath(beeName: string): string {
   return anchoredBuzPath(safeName(beeName), ".write.lock");
 }
 
@@ -236,10 +236,12 @@ export function downgradeTier(requested: BuzTier, accepted: readonly BuzTier[]):
 // Filename construction.
 // ──────────────────────────────────────────────────────────────────────────
 
-export function inboxFilename(message: BuzMessage): string {
+export function recipientMailboxFilename(message: BuzMessage): string {
   const stamp = safeStamp(message.sentAt);
   return `${stamp}-from-${senderToken(message.from)}-${message.id}.md`;
 }
+
+export const inboxFilename = recipientMailboxFilename;
 
 export function outboxFilename(message: BuzMessage): string {
   const stamp = safeStamp(message.sentAt);
@@ -366,7 +368,7 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
   // never across substrate I/O. A write-lock timeout after a successful paste
   // loses the inbox copy but not the paste; delivery is at-least-once and the
   // pre-delivery outbox record above keeps the audit trail.
-  await withFileLock(senderLockPath(input.recipient.name), async () => {
+  await withFileLock(recipientWriteLockPath(input.recipient.name), async () => {
     if (message.deliveredAs === "queue") {
       result.queuePath = await writeMailbox(input.recipient.name, "queue", message);
     } else {
@@ -418,7 +420,7 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
 async function writeMailbox(beeName: string, mailbox: BuzMailbox, message: BuzMessage): Promise<string> {
   const dir = beeMailboxDir(beeName, mailbox);
   await mkdir(dir, { recursive: true });
-  const path = join(dir, inboxFilename(message));
+  const path = join(dir, recipientMailboxFilename(message));
   await atomicWriteFile(path, serializeBuzMessage(message), { mode: 0o600 });
   return path;
 }
@@ -468,8 +470,7 @@ export async function listMessages(
     } catch {
       continue;
     }
-    if (options.fromFilter && senderDisplay(message.from) !== options.fromFilter
-        && (message.from.kind !== "bee" || message.from.id !== options.fromFilter)) {
+    if (options.fromFilter && !senderMatchesFilter(message.from, options.fromFilter)) {
       continue;
     }
     results.push({ message, path });
@@ -478,6 +479,19 @@ export async function listMessages(
     return results.slice(0, options.limit);
   }
   return results;
+}
+
+function senderMatchesFilter(sender: BuzSender, rawFilter: string): boolean {
+  const filter = rawFilter.trim();
+  if (filter.length === 0) return true;
+  if (senderDisplay(sender) === filter) return true;
+  if (sender.kind === "bee") return sender.id === filter;
+  const humanFilter = filter.startsWith("human:") ? filter.slice("human:".length) : filter;
+  try {
+    return sanitizeHumanName(humanFilter) === sanitizeHumanName(sender.name);
+  } catch {
+    return false;
+  }
 }
 
 export async function readMessageById(beeName: string, id: string): Promise<{ message: BuzMessage; path: string; mailbox: BuzMailbox } | null> {
@@ -510,7 +524,7 @@ export async function consumeMessage(beeName: string, id: string): Promise<{ mes
   if (!found || found.mailbox !== "inbox") return null;
   const readDir = beeMailboxDir(beeName, "read");
   await mkdir(readDir, { recursive: true });
-  const filename = found.path.split("/").pop()!;
+  const filename = basename(found.path);
   const dest = join(readDir, filename);
   await rename(found.path, dest);
   await appendLedger({ type: "buz.read", bee: beeName, messageId: id, consumed: true, mailbox: "inbox" });
@@ -663,7 +677,7 @@ export async function processQueueForBee(
         message = parseBuzMessage(text);
       } catch (error) {
         // Malformed file: quarantine.
-        await withFileLock(senderLockPath(record.name), async () => {
+        await withFileLock(recipientWriteLockPath(record.name), async () => {
           await mkdir(quarantineDir, { recursive: true });
           await rename(entry.path, join(quarantineDir, entry.file));
         });
@@ -678,7 +692,7 @@ export async function processQueueForBee(
         const retriesPath = `${entry.path}.retries`;
         const prev = Number((await readFile(retriesPath, "utf8").catch(() => "0")).trim()) || 0;
         const next = prev + 1;
-        await withFileLock(senderLockPath(record.name), async () => {
+        await withFileLock(recipientWriteLockPath(record.name), async () => {
           if (next >= maxFailures) {
             await mkdir(quarantineDir, { recursive: true });
             await rename(entry.path, join(quarantineDir, entry.file));
@@ -710,7 +724,7 @@ export async function processQueueForBee(
       message.deliveredAt = (context.now ? new Date(context.now()) : new Date()).toISOString();
       message.deliveredAs = "queue";
       const updated = serializeBuzMessage(message);
-      await withFileLock(senderLockPath(record.name), async () => {
+      await withFileLock(recipientWriteLockPath(record.name), async () => {
         await atomicWriteFile(entry.path, updated, { mode: 0o600 });
         const target = join(inboxDir, entry.file);
         await rename(entry.path, target);

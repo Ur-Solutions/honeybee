@@ -360,3 +360,9 @@ test("--node and --kind are listed in spawn / node flag completion", () => {
   assert.ok(nodeFlags.includes("--endpoint"), "node flags include --endpoint");
   assert.ok(nodeFlags.includes("--capabilities"), "node flags include --capabilities");
 });
+
+test("completes quest statuses separately from seal statuses", () => {
+  assert.deepEqual(getCompletionsFromState(["hive", "quest", "--status", ""], empty), ["open", "active", "done", "archived"]);
+  assert.deepEqual(getCompletionsFromState(["hive", "search", "--status", ""], empty), ["done", "blocked", "needs_input", "failed"]);
+  assert.deepEqual(getCompletionsFromState(["hive", "seals", "--status", ""], empty), ["done", "blocked", "needs_input", "failed"]);
+});

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
-import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, resolveHome, shellCommand, tmuxOptionsForAgent } from "./agents.js";
+import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, hasSessionIdArg, resolveAgent, resolveHome, shellCommand, tmuxOptionsForAgent } from "./agents.js";
 import {
   AUTO_ACCOUNT_QUERY,
   RR_ACCOUNT_QUERY,
@@ -31,6 +31,7 @@ import {
   vaultRoot,
 } from "./accounts.js";
 import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { mapWithConcurrency } from "./concurrency.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
@@ -40,7 +41,7 @@ import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "./forkTui.js";
 import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
-import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
+import { acquireProSlot, createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { pickRoundRobinAccount } from "./roundRobin.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
@@ -77,7 +78,7 @@ import {
   type QuestStatus,
 } from "./quest.js";
 import { isLinearIdentifier, loadLinearAdapter } from "./linear.js";
-import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, windowInventory } from "./tmuxLink.js";
+import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, sessionWindowInventory, windowInventory } from "./tmuxLink.js";
 import {
   BUZ_TIERS,
   type BuzMessage,
@@ -95,7 +96,7 @@ import {
 } from "./buz.js";
 import { beeConfig, briefFooter, configPath, loadConfig, NAMING_EFFORTS, resetConfigCache, spawnDefaultSubstrate, type NamingEffort } from "./config.js";
 import { getCompletions, shellScript } from "./completion.js";
-import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, type Frame } from "./frame.js";
+import { defineFrameFromFile, frameDefinitionFile, frameExists, listFrames, loadFrame, loadFrameSource, removeFrame, validateFrame, writeFrameFromObject, writeFrameFromValidatedObject, type Frame } from "./frame.js";
 import { defineFlowFromFile, listFlows, loadFlow, loadFlowSource, removeFlow, type Flow } from "./flow/index.js";
 import { executeFlow } from "./flow/run.js";
 import { cancelRun, spawnDetachedRun } from "./flow/background.js";
@@ -430,9 +431,14 @@ async function maybeLinkHere(parsed: Parsed, records: SessionRecord[]): Promise<
     console.error(note("--here ignored: not inside tmux (plain spawn done)"));
     return;
   }
-  const local = records.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
-  if (local.length < records.length) {
-    console.error(note(`--here skips ${records.length - local.length} remote bee(s) — link-window cannot cross tmux servers`));
+  const local = records.filter((record) => record.substrate !== "hsr" && (!record.node || record.node === LOCAL_NODE_NAME));
+  const paneLess = records.filter((record) => record.substrate === "hsr").length;
+  const remote = records.filter((record) => record.substrate !== "hsr" && record.node && record.node !== LOCAL_NODE_NAME).length;
+  if (paneLess > 0) {
+    console.error(note(`--here skips ${paneLess} pane-less HSR bee(s) — no tmux window to link`));
+  }
+  if (remote > 0) {
+    console.error(note(`--here skips ${remote} remote bee(s) — link-window cannot cross tmux servers`));
   }
   if (local.length === 0) return;
   try {
@@ -454,7 +460,7 @@ function resolveSpawnCount(parsed: Parsed): number {
   if (raw === undefined) return 1;
   const value = typeof raw === "string" ? Number(raw) : NaN;
   if (Number.isInteger(value) && value >= 1) return value;
-  throw new Error(`--count must be an integer >= 2 (got ${raw === true ? "no value" : String(raw)})`);
+  throw new Error(`--count must be an integer >= 1 (got ${raw === true ? "no value" : String(raw)})`);
 }
 
 type SpawnOptions = {
@@ -716,7 +722,7 @@ async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // mtime — the auto-titler and resume/swap all key off providerSessionId. Skip
   // when the caller already supplied --session-id in extra args.
   let pinnedSessionId: string | undefined;
-  if (!opts.extraArgs?.includes("--session-id")) {
+  if (!hasSessionIdArg(opts.extraArgs)) {
     const sid = randomUUID();
     const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
     if (sessionArgs) {
@@ -948,13 +954,24 @@ function ttlFlagMs(parsed: Parsed): number | undefined {
  * remaining quota.
  */
 async function resolveSpawnAgentWithAuto(requested: string, parsed: Parsed): Promise<SpawnAgentSpec> {
-  const rr = roundRobinAccountTool(requested);
-  if (rr) return { agent: rr, account: await pickRoundRobinAccountForCli(rr) };
-  const tool = autoAccountTool(requested);
-  if (tool) return { agent: tool, account: await pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  const alias = spawnAccountAliasResolver(requested, parsed);
+  if (alias) return { agent: alias.agent, account: await alias.account() };
   const resolved = await resolveSpawnAgent(requested);
   const defaultAccount = await defaultBareGrokAccount(requested, parsed, resolved);
   return defaultAccount ? { agent: defaultAccount.tool, account: defaultAccount } : resolved;
+}
+
+type SpawnAccountAliasResolver = {
+  agent: string;
+  account: () => Promise<AccountRecord>;
+};
+
+function spawnAccountAliasResolver(requested: string, parsed: Parsed): SpawnAccountAliasResolver | undefined {
+  const rr = roundRobinAccountTool(requested);
+  if (rr) return { agent: rr, account: () => pickRoundRobinAccountForCli(rr) };
+  const tool = autoAccountTool(requested);
+  if (tool) return { agent: tool, account: () => pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  return undefined;
 }
 
 async function defaultBareGrokAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
@@ -1093,8 +1110,9 @@ async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${useHsr ? "hsr" : node?.name ?? LOCAL_NODE_NAME}`);
   if (truthy(flag(parsed, "briefed")) && briefText) {
-    record = await deliverBrief(parsed, record, briefText);
-    timer.mark("brief");
+    const delivered = await deliverSpawnBrief(parsed, record, briefText);
+    record = delivered.record;
+    timer.mark(delivered.sent ? "brief" : "ready");
   } else {
     await confirmSpawnReady(parsed, record);
     timer.mark("ready");
@@ -1395,15 +1413,16 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
     throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
   }
-  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
+  const perBeeAccountAlias = spawnAccountAliasResolver(requested, parsed);
+  const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
+    ? { agent: perBeeAccountAlias.agent, account: undefined }
+    : await resolveSpawnAgentWithAuto(requested, parsed);
   // Thin profile → account (same overlay as spawnSingleBee).
   const profile = await resolveProfileOverlay(requested);
   const agent = profile ? profile.account.tool : resolvedAgent;
   const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
   const account = profile?.account ?? aliasAccount;
   // Model selector precedence: profile model override > the account default.
-  const model = account ? (profile?.model ?? account.model) : undefined;
-  const provider = account?.provider;
   const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -1420,7 +1439,10 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   // and no new --count restriction.
   const records: SessionRecord[] = [];
   for (let i = 0; i < count; i += 1) {
-    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account, model, provider });
+    const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
+    const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
+    const beeProvider = beeAccount?.provider;
+    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider });
     records.push(record);
     const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
     if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`@${swarmId}`), ...nodeSuffix]));
@@ -1466,13 +1488,14 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
   const hasComposerMessages = perBeeMessages !== undefined;
   let slot = 0; // running bee index across all castes, aligned with perBeeMessages
   for (const caste of frame.castes) {
-    const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(caste.bee, parsed);
+    const perBeeAccountAlias = spawnAccountAliasResolver(caste.bee, parsed);
+    const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
+      ? { agent: perBeeAccountAlias.agent, account: undefined }
+      : await resolveSpawnAgentWithAuto(caste.bee, parsed);
     const profile = await resolveProfileOverlay(caste.bee);
     const agent = profile ? profile.account.tool : resolvedAgent;
     const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
     const account = profile?.account ?? aliasAccount;
-    const model = account ? (profile?.model ?? account.model) : undefined;
-    const provider = account?.provider;
     const yolo = dangerousMode(parsed, agent, caste.bee, profile?.yolo);
     const home = caste.home ?? flagHome;
     const casteSpec = resolveAgent(agent, extraArgs, { home, yolo });
@@ -1486,6 +1509,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
       // With composer messages present, a blank slot explicitly means no brief;
       // otherwise fall back to the legacy "--briefed delivers caste brief" path.
       const toDeliver = hasComposerMessages ? (hasCustom ? custom : undefined) : briefed && caste.brief ? caste.brief : undefined;
+      const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
+      const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
+      const beeProvider = beeAccount?.provider;
       let record = await spawnBee({
         agent,
         extraArgs,
@@ -1496,13 +1522,17 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
         swarmId,
         caste: caste.name,
         node: casteNode,
-        account,
-        model,
-        provider,
+        account: beeAccount,
+        model: beeModel,
+        provider: beeProvider,
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
-      if (toDeliver) record = await deliverBrief(parsed, record, toDeliver);
-      else unbriefed.push(record);
+      if (toDeliver) {
+        const delivered = await deliverSpawnBrief(parsed, record, toDeliver);
+        record = delivered.record;
+      } else {
+        unbriefed.push(record);
+      }
       records.push(record);
       if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`caste:${caste.name}`), dim(`@${swarmId}`)]));
       else console.log(`${record.name}\t${record.agent}\t${cwd}\t${caste.name}\t@${swarmId}`);
@@ -1891,6 +1921,21 @@ async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: st
   return updated;
 }
 
+async function deliverSpawnBrief(parsed: Parsed, record: SessionRecord, briefText: string): Promise<{ record: SessionRecord; sent: boolean }> {
+  try {
+    return { record: await deliverBrief(parsed, record, briefText), sent: true };
+  } catch (error) {
+    if (!(error instanceof AgentReadinessError)) throw error;
+    warnSpawnReadiness(record, error);
+    return { record, sent: false };
+  }
+}
+
+function warnSpawnReadiness(record: SessionRecord, error: AgentReadinessError): void {
+  if (isPretty()) console.error(actionLine("warn", "spawn", [`${bold(record.name)} not confirmed ready (${error.reason})`]));
+  else console.error(`warn\tspawn\t${record.name}\t${error.reason}`);
+}
+
 /**
  * After a bare spawn, wait for the freshly spawned bee to reach its prompt,
  * auto-accepting any startup trust/safety prompt along the way (e.g. codex's
@@ -1918,8 +1963,7 @@ async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): Promise
     await writeHiveState(record, "waiting");
   } catch (error) {
     if (!(error instanceof AgentReadinessError)) throw error;
-    if (isPretty()) console.error(actionLine("warn", "spawn", [`${bold(record.name)} not confirmed ready (${error.reason})`]));
-    else console.error(`warn\tspawn\t${record.name}\t${error.reason}`);
+    warnSpawnReadiness(record, error);
   }
 }
 
@@ -1994,7 +2038,7 @@ async function cmdSend(parsed: Parsed) {
 async function cmdAnswer(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive answer <bee> [text]");
-  const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ") ?? "";
+  const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ");
   const answer = text.length > 0 ? text : "yes";
 
   const record = await resolveSession(target);
@@ -2497,13 +2541,20 @@ function formatStateCell(state: BeeState): string {
   }
 }
 
+// Each capture forks a subprocess (tmux locally, a full ssh round-trip for
+// remote bees), so an uncapped fan-out over a large hive spawns dozens of
+// simultaneous ssh connections per `hive ls`/clean pass (HIVE-62).
+const PANE_CAPTURE_CONCURRENCY = 8;
+
 async function capturePanesFor(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
   const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
-  const entries = await Promise.all(
+  const entries = await mapWithConcurrency(
+    liveRecords,
+    PANE_CAPTURE_CONCURRENCY,
     // Re-key by the bee's own pane (agentPaneId) so sub-bees sharing one comb's
     // tmuxTarget keep distinct captures; legacy solo bees with no pane fall back
     // to tmuxTarget. deriveState reads with the same `agentPaneId ?? tmuxTarget`.
-    liveRecords.map(async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const),
+    async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const,
   );
   return new Map(entries);
 }
@@ -3894,8 +3945,9 @@ async function liveTmuxRootBinds(): Promise<Map<string, string>> {
   const result = await tmux(["list-keys", "-T", "root"], { reject: false });
   if (!result.ok) return binds;
   for (const line of result.stdout.split("\n")) {
-    // Format: `bind-key -T root M-b <command...>`. Find the table+key, take the rest.
-    const match = line.match(/^bind-key\s+(?:-r\s+)?-T\s+root\s+(\S+)\s+(.*)$/);
+    // Format: `bind-key [-r] [-N note] -T root M-b <command...>`.
+    // tmux may decorate binds before the table flag; keep the command tail intact.
+    const match = line.match(/^bind-key\s+(?:(?:-[nr]\s+)|(?:-N\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\S+)\s+))*-T\s+root\s+(\S+)\s+(.*)$/);
     if (!match) continue;
     const key = match[1]!;
     const command = match[2]!.trim();
@@ -4137,7 +4189,7 @@ async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     // branch). Pin a fresh provider session id when NOT resuming (resume already
     // carries continuity via its baked-in args).
     let pinnedSessionId: string | undefined;
-    if (decision.mode !== "resume" && !spec.args.includes("--session-id")) {
+    if (decision.mode !== "resume" && !hasSessionIdArg(spec.args)) {
       const sid = randomUUID();
       const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
       if (sessionArgs) {
@@ -4302,6 +4354,12 @@ async function resolveForkCheckpoint(beeName: string, checkpointArg: string | un
 
 // ── hive fork launch — the interactive dialog (⌘K) ───────────────────────────
 
+async function hasRecordedForkUsingCwd(source: SessionRecord, cwd: string): Promise<boolean> {
+  const sourceIds = new Set([source.name, ...(source.id ? [source.id] : [])]);
+  const records = await listSessions();
+  return records.some((record) => record.cwd === cwd && record.forkedFromId !== undefined && sourceIds.has(record.forkedFromId));
+}
+
 /**
  * `hive fork launch` — the interactive fork window (the ⌘K target). The SOURCE
  * is the bee owning the current pane, so the dialog opens straight on a form for
@@ -4373,12 +4431,16 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
 
   // Create the worktree/checkout up front — its path becomes the fork's --cwd.
   let cwd: string | undefined;
+  let createdSlot: { kind: ProSlotKind; repoPath: string; name: string; path: string } | undefined;
   if (intent.isolation) {
     if (!proRepo) throw new Error("hive fork launch: not a pro repo — cannot create a worktree");
     const slug = toProSlug(intent.isolation.name);
     if (!slug) throw new Error("hive fork launch: worktree name must contain letters, digits, or dashes");
     if (isPretty()) console.error(note(`creating ${intent.isolation.kind} ${slug}…`));
-    cwd = await createProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slot = await acquireProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slotPath = await realpath(slot.path).catch(() => slot.path);
+    cwd = slotPath;
+    if (slot.created) createdSlot = { kind: intent.isolation.kind, repoPath: proRepo.path, name: slug, path: slotPath };
   }
 
   // Build a `hive fork` invocation and reuse cmdFork wholesale.
@@ -4391,7 +4453,28 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
   if (cwd) flags.set("cwd", cwd);
   flags.set("here", true);
 
-  const record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  let record: SessionRecord;
+  try {
+    record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  } catch (error) {
+    if (createdSlot) {
+      const launched = await hasRecordedForkUsingCwd(source, createdSlot.path).catch((checkError) => {
+        const message = checkError instanceof Error ? checkError.message : String(checkError);
+        console.error(note(`warn: keeping ${createdSlot.kind} ${createdSlot.name}; could not verify fork records: ${message}`));
+        return true;
+      });
+      if (!launched) {
+        if (isPretty()) console.error(note(`removing ${createdSlot.kind} ${createdSlot.name} after failed fork...`));
+        try {
+          await deleteProSlot(createdSlot.kind, createdSlot.repoPath, createdSlot.name);
+        } catch (cleanupError) {
+          const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          console.error(note(`warn: failed to remove ${createdSlot.kind} ${createdSlot.name} at ${tildify(createdSlot.path)}: ${message}`));
+        }
+      }
+    }
+    throw error;
+  }
 
   if (intent.message) {
     await cmdSend({ command: "send", args: [record.name, intent.message], flags: new Map(), rest: [] });
@@ -4572,6 +4655,10 @@ async function cmdRun(parsed: Parsed) {
   if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
     throw new Error("hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
   }
+  const waited = truthy(flag(parsed, "wait"));
+  if (!waited && hasFlag(parsed, "n")) {
+    throw new Error("hive run: -n is only for --wait output rows; use --lines for the no-wait pane preview");
+  }
 
   // The waitForAgentReady below is authoritative; skip spawn's own readiness
   // confirmation so a slow boot is only waited for once.
@@ -4610,7 +4697,7 @@ async function cmdRun(parsed: Parsed) {
     await writeHiveState(record, "working");
     await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
 
-    if (truthy(flag(parsed, "wait"))) {
+    if (waited) {
       const outcome = await waitForIdle({
         record: { ...record, lastPrompt: prompt, lastPromptAt: now },
         idleMs: numberFlag(parsed, ["idle-ms", "idle"], 3_000),
@@ -4624,7 +4711,7 @@ async function cmdRun(parsed: Parsed) {
     } else {
       const waitMs = Number(flag(parsed, "wait-ms") ?? 1000);
       if (waitMs > 0) await sleep(waitMs);
-      const lines = Number(flag(parsed, "n") ?? flag(parsed, "lines") ?? 80);
+      const lines = Number(flag(parsed, "lines") ?? 80);
       console.log(await substrateFor(record).capture(record.tmuxTarget, Number.isFinite(lines) ? lines : 80, record.agentPaneId));
     }
   } finally {
@@ -4641,7 +4728,6 @@ async function cmdRun(parsed: Parsed) {
     }
   }
 
-  const waited = truthy(flag(parsed, "wait"));
   if (cleanup) {
     return;
   }
@@ -4709,7 +4795,7 @@ async function cmdX(parsed: Parsed) {
     }
   }
 
-  await substrateFor(record).sendText(record.tmuxTarget, prompt);
+  await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
   const now = new Date().toISOString();
   await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
   await writeHiveState(record, "working");
@@ -5278,12 +5364,6 @@ async function workspaceList(parsed: Parsed) {
   ));
 }
 
-/** Active window ids per local tmux session, for de-dupe on add/open. */
-async function workspaceWindowsOf(session: string): Promise<string[]> {
-  const inventory = await windowInventory();
-  return inventory.windows.get(session) ?? [];
-}
-
 async function workspaceOpen(parsed: Parsed) {
   const name = parsed.args[1];
   if (!name) throw new Error("Usage: hive workspace open <name|colony> [--root <dir>] [--new-client] [--print]");
@@ -5421,13 +5501,14 @@ async function workspaceAdd(parsed: Parsed) {
   const members: WorkspaceMember[] = [...record.members];
   const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
   const inventory = await windowInventory();
+  const currentWindows = new Set(inventory.windows.get(session) ?? []);
   let linkedCount = 0;
   for (const bee of live) {
     const windowId = inventory.active.get(bee.tmuxTarget);
     if (!windowId) continue;
-    const currentWindows = await workspaceWindowsOf(session);
     const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
     linkedCount += linked;
+    if (linked > 0) currentWindows.add(windowId);
     const beeId = bee.id ?? bee.name;
     if (!memberIds.has(beeId)) {
       members.push({ kind: "bee", beeId });
@@ -5967,19 +6048,31 @@ async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
   const wsRecord = await loadWorkspace(quest.workspace);
   const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
   const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const currentWindows = new Set((await sessionWindowInventory(session)).windows);
+  let placeholderDropped = false;
 
-  // Per-spawn hook: replicate the --frame loop body for ONE bee. Liveness +
-  // the window inventory MUST be re-read per spawn — bees spawn over time, so a
-  // single up-front snapshot (as in the --frame path) would miss later windows.
+  // Per-spawn hook: replicate the --frame loop body for ONE bee. The spawned
+  // bee's windows must be read per spawn because bees appear over time, but a
+  // single-session `list-windows -t =bee` is enough; avoid a global `-a` scan.
   const onSpawned = async (bee: SessionRecord): Promise<void> => {
     await stampQuestMembership(bee, quest.id, quest.colony, quest.workspace);
     // Only local + live windows can be link-window'd (the workspaceAdd discipline).
     if (bee.node && bee.node !== LOCAL_NODE_NAME) return;
-    if (!(await localSubstrate().hasSession(bee.tmuxTarget))) return;
-    const inventory = await windowInventory();
-    const windowId = inventory.active.get(bee.tmuxTarget);
+    const beeWindows = await sessionWindowInventory(bee.tmuxTarget);
+    const windowId = beeWindows.active;
     if (!windowId) return; // no live window to link — never record a phantom member
-    await linkTargetsInto(session, [bee.tmuxTarget], ensured);
+    const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
+    if (linked > 0) {
+      currentWindows.add(windowId);
+      if (ensured.placeholder && !placeholderDropped) {
+        await tmux(["kill-window", "-t", `=${session}:${ensured.placeholder}`], { reject: false });
+        currentWindows.delete(ensured.placeholder);
+        placeholderDropped = true;
+      }
+      if (ensured.created) {
+        await tmux(["select-window", "-t", `=${session}:${windowId}`], { reject: false });
+      }
+    }
     const beeId = bee.id ?? bee.name;
     if (!memberIds.has(beeId)) {
       members.push({ kind: "bee", beeId });
@@ -6582,7 +6675,7 @@ async function frameUpdate(parsed: Parsed) {
   if (!(await frameExists(draft.name))) {
     throw new Error(`Unknown frame: ${draft.name}. Use 'hive frame define' to create a new one.`);
   }
-  const frame = await defineFrameFromFile(sourcePath);
+  const frame = await writeFrameFromValidatedObject(draft, { sourcePath: absolute, ledger: true });
   if (isPretty()) console.log(actionLine("ok", "frame", [bold(frame.name), dim("updated"), dim(sourcePath)]));
   else console.log(`updated\t${frame.name}\t${sourcePath}`);
 }
@@ -6981,7 +7074,7 @@ async function nodeRegister(parsed: Parsed) {
   const name = parsed.args[1];
   if (!name) throw new Error("Usage: hive node register <name> --kind <local-tmux|ssh-tmux|remote-hsr> --endpoint <addr> [--capabilities a,b,c] [--description \"...\"] [--ssh-command ssh] [--ssh-args=\"-F /path/to/config\"] [--auth-policy <local-only|ephemeral-token|api-key>]");
   const kindRaw = flag(parsed, "kind");
-  if (typeof kindRaw !== "string") throw new Error("--kind is required (local-tmux or ssh-tmux)");
+  if (typeof kindRaw !== "string") throw new Error("--kind is required (local-tmux, ssh-tmux, or remote-hsr)");
   const endpointRaw = flag(parsed, "endpoint");
   if (typeof endpointRaw !== "string") throw new Error("--endpoint is required");
   const capabilitiesRaw = flag(parsed, "capabilities");
@@ -7348,16 +7441,13 @@ function colorRunStatus(status: FlowRunMeta["status"]): string {
 
 async function flowLogs(parsed: Parsed) {
   const runId = parsed.args[1];
-  if (!runId) throw new Error("Usage: hive flow logs <runId>");
+  if (!runId) throw new Error("Usage: hive flow logs <runId> [-n <lines>]");
   const summary = await findRunById(runId);
   if (!summary) throw new Error(`Unknown run: ${runId}`);
-  const text = await readLogFull(summary.flowName, runId);
-  process.stdout.write(text);
-  if (text.length > 0 && !text.endsWith("\n")) process.stdout.write("\n");
-  // Hint at the path for tail -f users.
-  if (isPretty(process.stderr)) {
-    console.error(dim(`# ${runLogPath(summary.flowName, runId)}`));
-  }
+  const path = runLogPath(summary.flowName, runId);
+  const lines = numberFlag(parsed, ["n", "lines"], 0);
+  const text = tailLogText(await readLogFull(summary.flowName, runId), lines);
+  await emitLogText(text, path);
 }
 
 async function flowStatus(parsed: Parsed) {
@@ -7836,13 +7926,15 @@ async function loopLogsCmd(parsed: Parsed) {
     await followLoopLog(loopId);
     return;
   }
-  let text = await readLogFull("loop", loopId);
-  if (lines > 0) {
-    const parts = text.split("\n");
-    if (parts[parts.length - 1] === "") parts.pop();
-    text = parts.slice(-lines).join("\n");
-  }
+  const text = tailLogText(await readLogFull("loop", loopId), lines);
   await emitLogText(text, path);
+}
+
+function tailLogText(text: string, lines: number): string {
+  if (lines <= 0) return text;
+  const parts = text.split("\n");
+  if (parts[parts.length - 1] === "") parts.pop();
+  return parts.slice(-lines).join("\n");
 }
 
 async function emitLogText(text: string, path: string): Promise<void> {
@@ -7852,18 +7944,15 @@ async function emitLogText(text: string, path: string): Promise<void> {
 }
 
 async function followLoopLog(loopId: string): Promise<void> {
-  let previous = "";
-  const printDelta = (next: string) => {
-    if (next.length > previous.length) {
-      process.stdout.write(next.slice(previous.length));
-    } else if (next !== previous) {
-      // Log was rotated/rewritten — reprint from scratch.
-      process.stdout.write(next);
-    }
-    previous = next;
+  const path = runLogPath("loop", loopId);
+  let offset = 0;
+  const printAppended = async () => {
+    const result = await readLogSince(path, offset);
+    offset = result.offset;
+    if (result.text.length > 0) process.stdout.write(result.text);
   };
   while (true) {
-    printDelta(await readLogFull("loop", loopId));
+    await printAppended();
     const cfg = await readLoopConfig(loopId).catch(() => null);
     if (cfg && cfg.status !== "running") break;
     if (cfg && cfg.status === "running" && typeof cfg.pid === "number" && !processAlive(cfg.pid)) {
@@ -7873,7 +7962,31 @@ async function followLoopLog(loopId: string): Promise<void> {
     await sleep(1_000);
   }
   // One final read: catch lines appended between the last read and the status flip.
-  printDelta(await readLogFull("loop", loopId));
+  await printAppended();
+}
+
+async function readLogSince(path: string, offset: number): Promise<{ text: string; offset: number }> {
+  const info = await stat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!info?.isFile()) return { text: "", offset: 0 };
+  const start = info.size < offset ? 0 : offset;
+  const length = info.size - start;
+  if (length <= 0) return { text: "", offset: info.size };
+
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    handle = await open(path, "r");
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    return { text: buffer.subarray(0, bytesRead).toString("utf8"), offset: start + bytesRead };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { text: "", offset: 0 };
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
 function processAlive(pid: number): boolean {
@@ -7897,7 +8010,8 @@ async function loopStopCmd(parsed: Parsed) {
     // cancelRun SIGKILLs the driver's process group, so the driver's own
     // finalize() may never run and loop.json would be stuck at "running".
     // Reconcile it here so `hive loop status/list` reports a terminal state.
-    if (cfg.status === "running") {
+    const latestCfg = await readLoopConfig(loopId).catch(() => null);
+    if (latestCfg?.status === "running") {
       await updateLoopConfig(loopId, { status: "stopped", stopReason: "stopped:now", endedAt: new Date().toISOString() }).catch(
         () => undefined,
       );
@@ -8171,61 +8285,66 @@ async function daemonStatus(parsed: Parsed) {
   const label = daemonLabel(parsed);
   const staleAfter = numberFlag(parsed, ["stale-after-ms"], 0);
   const status = await readDaemonStatus(undefined, { label, ...(staleAfter > 0 ? { staleAfterMs: staleAfter } : {}) });
-  // Exit codes: 0 healthy, 3 down, 4 STALE (process alive, loop wedged).
+  // Exit codes: 0 healthy, 3 down, 4 unhealthy/stale (process alive but not progressing).
   // Anything polling this command must treat nonzero as an outage.
   const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(status, null, 2));
-    process.exit(exitCode);
-  }
-  const installedTag = status.installed ? "installed" : "not-installed";
-  if (!isPretty()) {
-    const dot = status.running ? (status.stale ? "STALE" : "running") : "down";
-    console.log(`${dot}\t${installedTag}\t${status.lock?.pid ?? ""}\t${status.state?.startedAt ?? ""}\t${status.state?.lastTickAt ?? ""}\t${status.state?.tickCount ?? 0}`);
-    process.exit(exitCode);
-  }
-  if (!status.running) {
-    console.log(`${red("○")} ${bold("hive daemon")} ${dim("down")} ${dim(`(${installedTag})`)}`);
-    if (status.installed && status.plistPath) {
-      console.log(dim(`  plist: ${status.plistPath}`));
-    } else if (!status.installed) {
-      console.log(dim(`  hint: hive daemon install`));
-    }
-    if (status.lock) console.log(dim(`  stale lock: pid ${status.lock.pid} (${status.lock.startedAt})`));
-    if (status.state) {
-      console.log(dim(`  last state.json: pid ${status.state.pid} startedAt ${status.state.startedAt}`));
-      console.log(dim(`  last tick: ${status.state.lastTickAt ?? "(none)"} ticks=${status.state.tickCount}`));
-    }
-    process.exit(3);
-  }
-  if (status.stale) {
-    const age = status.state?.lastTickAt ? formatRelativeTime(status.state.lastTickAt) : "never";
-    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("STALE"))} ${dim(`(process alive, loop wedged — last tick ${age} ago, threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
-    if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
-    if (status.state) {
-      console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
-      if (status.state.recentErrors.length > 0) {
-        console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
-        for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+  } else {
+    const installedTag = status.installed ? "installed" : "not-installed";
+    if (!isPretty()) {
+      const dot = status.running ? (status.stale ? "STALE" : "running") : "down";
+      console.log(`${dot}\t${installedTag}\t${status.lock?.pid ?? ""}\t${status.state?.startedAt ?? ""}\t${status.state?.lastTickAt ?? ""}\t${status.state?.tickCount ?? 0}`);
+    } else if (!status.running) {
+      console.log(`${red("○")} ${bold("hive daemon")} ${dim("down")} ${dim(`(${installedTag})`)}`);
+      if (status.installed && status.plistPath) {
+        console.log(dim(`  plist: ${status.plistPath}`));
+      } else if (!status.installed) {
+        console.log(dim(`  hint: hive daemon install`));
+      }
+      if (status.lock) console.log(dim(`  stale lock: pid ${status.lock.pid} (${status.lock.startedAt})`));
+      if (status.state) {
+        console.log(dim(`  last state.json: pid ${status.state.pid} startedAt ${status.state.startedAt}`));
+        console.log(dim(`  last tick: ${status.state.lastTickAt ?? "(none)"} ticks=${status.state.tickCount}`));
+      }
+    } else if (status.stale) {
+      const reasonLabels: Record<string, string> = {
+        "loop-stale": "loop heartbeat stale",
+        "tick-progress-stale": "tick progress stale",
+        "recent-errors-saturated": "recent errors saturated",
+        "missing-state": "state missing",
+      };
+      const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
+      console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
+      if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
+      if (status.state) {
+        console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+        console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
+        if (status.state.recentErrors.length > 0) {
+          console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
+          for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+        }
+      }
+      console.log(dim(`  hint: hive daemon restart`));
+    } else {
+      console.log(`${green("●")} ${bold("hive daemon")} ${dim("running")} ${dim(`(${installedTag})`)}`);
+      if (status.installed && status.plistPath) {
+        console.log(`  plist ${status.plistPath}`);
+      }
+      if (status.lock) {
+        console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
+      }
+      if (status.state) {
+        console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+        if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
+        if (status.state.recentErrors.length > 0) {
+          console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
+          for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
+        }
       }
     }
-    console.log(dim(`  hint: hive daemon restart`));
-    process.exit(4);
   }
-  console.log(`${green("●")} ${bold("hive daemon")} ${dim("running")} ${dim(`(${installedTag})`)}`);
-  if (status.installed && status.plistPath) {
-    console.log(`  plist ${status.plistPath}`);
-  }
-  if (status.lock) {
-    console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
-  }
-  if (status.state) {
-    console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
-    if (status.state.recentErrors.length > 0) {
-      console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
-      for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
-    }
-  }
+  process.exit(exitCode);
 }
 
 async function cmdBuz(parsed: Parsed) {
@@ -8375,14 +8494,7 @@ async function buzRead(parsed: Parsed) {
   const consume = truthy(flag(parsed, "consume"));
   const beeRef = typeof flag(parsed, "bee") === "string" ? String(flag(parsed, "bee")) : undefined;
   const candidates = beeRef ? [await resolveSession(beeRef)] : await listSessions();
-  let found: { message: BuzMessage; bee: string; path: string; mailbox: string } | null = null;
-  for (const record of candidates) {
-    const result = await readMessageById(record.name, id);
-    if (result) {
-      found = { message: result.message, bee: record.name, path: result.path, mailbox: result.mailbox };
-      break;
-    }
-  }
+  const found = await findBuzMessage(candidates, id);
   if (!found) throw new Error(`No buz message found with id: ${id}`);
 
   let consumed = false;
@@ -8409,6 +8521,22 @@ async function buzRead(parsed: Parsed) {
     body: found.message.body,
     consumed,
   }, null, 2));
+}
+
+type BuzReadMatch = { message: BuzMessage; bee: string; path: string; mailbox: string };
+const BUZ_READ_LOOKUP_CONCURRENCY = 16;
+
+async function findBuzMessage(candidates: SessionRecord[], id: string): Promise<BuzReadMatch | null> {
+  for (let i = 0; i < candidates.length; i += BUZ_READ_LOOKUP_CONCURRENCY) {
+    const batch = candidates.slice(i, i + BUZ_READ_LOOKUP_CONCURRENCY);
+    const matches = await Promise.all(batch.map(async (record): Promise<BuzReadMatch | null> => {
+      const result = await readMessageById(record.name, id);
+      return result ? { message: result.message, bee: record.name, path: result.path, mailbox: result.mailbox } : null;
+    }));
+    const found = matches.find((match): match is BuzReadMatch => match !== null);
+    if (found) return found;
+  }
+  return null;
 }
 
 async function buzPurge(parsed: Parsed) {
@@ -9105,31 +9233,38 @@ async function cmdAccount(parsed: Parsed) {
 async function accountList(parsed: Parsed) {
   const accounts = await listAccounts();
   const now = Date.now();
-  const rows: string[][] = [];
-  const jsonRows: Record<string, unknown>[] = [];
-  for (const account of accounts) {
-    const summary = await usageSummary(account.id, now);
-    const hasCreds = await accountHasCredentials(account);
+  const json = truthy(flag(parsed, "json"));
+  const accountRows = await Promise.all(accounts.map(async (account) => {
+    const [summary, hasCreds] = await Promise.all([
+      usageSummary(account.id, now),
+      accountHasCredentials(account),
+    ]);
     const exhausted = isRecentlyExhausted(summary, now);
-    if (truthy(flag(parsed, "json"))) {
-      jsonRows.push({ ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null });
-      continue;
+    if (json) {
+      return {
+        json: { ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null },
+        row: null,
+      };
     }
     const state = !hasCreds ? yellow("no-creds") : exhausted ? red("exhausted") : green("ok");
-    rows.push([
-      account.id,
-      account.tool,
-      account.provider ?? "-",
-      account.label,
-      isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
-      summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
-      summary.lastResetHint ?? "-",
-    ]);
-  }
-  if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify(jsonRows, null, 2));
+    return {
+      json: null,
+      row: [
+        account.id,
+        account.tool,
+        account.provider ?? "-",
+        account.label,
+        isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
+        summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
+        summary.lastResetHint ?? "-",
+      ],
+    };
+  }));
+  if (json) {
+    console.log(JSON.stringify(accountRows.map((entry) => entry.json), null, 2));
     return;
   }
+  const rows = accountRows.map((entry) => entry.row).filter((row): row is string[] => row !== null);
   if (rows.length === 0) {
     console.log(note("no accounts registered; add one with: hive account add <tool> <label>"));
     return;
@@ -9305,8 +9440,7 @@ async function cmdUsageSamples(parsed: Parsed) {
     ? [(await findAccount(query)).id]
     : [...new Set([...accounts.map((account) => account.id), ...(await listUsageAccounts())])];
 
-  const summaries = [];
-  for (const id of ids) summaries.push(await usageSummary(id, now));
+  const summaries = await Promise.all(ids.map((id) => usageSummary(id, now)));
 
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(summaries, null, 2));

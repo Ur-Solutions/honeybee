@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
@@ -293,10 +293,56 @@ export async function listSessions(): Promise<SessionRecord[]> {
 
 export async function appendLedger(event: Record<string, unknown>) {
   await ensureStore();
-  await withFileLock(`${ledgerPath()}.lock`, async () => {
-    await rotateLedgerIfNeeded();
-    await writeFile(ledgerPath(), `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`, { flag: "a", mode: 0o600 });
-  });
+  const path = ledgerPath();
+  const line = `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`;
+  const bytes = Buffer.byteLength(line);
+  const maxBytes = ledgerMaxBytes();
+
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
+    ledgerSizeCache = undefined;
+    await writeLedgerLine(path, line);
+    return;
+  }
+
+  if (shouldCheckLedgerRotation(path, maxBytes, bytes)) {
+    await withFileLock(`${path}.lock`, async () => {
+      const currentSize = await rotateLedgerIfNeeded(path, maxBytes);
+      await writeLedgerLine(path, line);
+      rememberLedgerSize(path, maxBytes, currentSize + bytes, 0);
+    });
+    return;
+  }
+
+  await writeLedgerLine(path, line);
+  if (ledgerSizeCache && ledgerSizeCache.path === path && ledgerSizeCache.maxBytes === maxBytes) {
+    rememberLedgerSize(path, maxBytes, ledgerSizeCache.estimatedSize + bytes, ledgerSizeCache.appendsSinceCheck + 1);
+  }
+}
+
+const LEDGER_ROTATION_CHECK_APPENDS = 64;
+
+type LedgerSizeCache = {
+  path: string;
+  maxBytes: number;
+  estimatedSize: number;
+  appendsSinceCheck: number;
+};
+
+let ledgerSizeCache: LedgerSizeCache | undefined;
+
+function shouldCheckLedgerRotation(path: string, maxBytes: number, nextBytes: number): boolean {
+  const cache = ledgerSizeCache;
+  if (!cache || cache.path !== path || cache.maxBytes !== maxBytes) return true;
+  if (cache.appendsSinceCheck >= LEDGER_ROTATION_CHECK_APPENDS) return true;
+  return cache.estimatedSize + nextBytes >= maxBytes;
+}
+
+function rememberLedgerSize(path: string, maxBytes: number, estimatedSize: number, appendsSinceCheck: number): void {
+  ledgerSizeCache = { path, maxBytes, estimatedSize, appendsSinceCheck };
+}
+
+async function writeLedgerLine(path: string, line: string): Promise<void> {
+  await appendFile(path, line, { mode: 0o600 });
 }
 
 function recordPath(name: string) {
@@ -438,15 +484,19 @@ export function ledgerPath(): string {
   return join(storeRoot(), "ledger.jsonl");
 }
 
-async function rotateLedgerIfNeeded(): Promise<void> {
-  const maxBytes = Number(process.env.HIVE_LEDGER_MAX_BYTES ?? 10 * 1024 * 1024);
-  if (!Number.isFinite(maxBytes) || maxBytes <= 0) return;
-  const path = ledgerPath();
+function ledgerMaxBytes(): number {
+  return Number(process.env.HIVE_LEDGER_MAX_BYTES ?? 10 * 1024 * 1024);
+}
+
+async function rotateLedgerIfNeeded(path: string, maxBytes: number): Promise<number> {
   const info = await stat(path).catch(() => null);
-  if (!info || info.size < maxBytes) return;
+  if (!info) return 0;
+  if (info.size < maxBytes) return info.size;
   const suffix = new Date().toISOString().replace(/[:.]/g, "-");
-  await rename(path, `${path}.${suffix}`).catch(() => undefined);
-  await pruneLedgerRotations();
+  const rotated = await rename(path, `${path}.${suffix}`).then(() => true, () => false);
+  if (!rotated) return (await stat(path).catch(() => null))?.size ?? 0;
+  await pruneLedgerRotations(path);
+  return 0;
 }
 
 // Rotation suffixes are ISO timestamps with `:`/`.` replaced by `-`, e.g.
@@ -456,10 +506,9 @@ const LEDGER_ROTATION_SUFFIX_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/
 
 const DEFAULT_LEDGER_KEEP_ROTATIONS = 5;
 
-async function pruneLedgerRotations(): Promise<void> {
+async function pruneLedgerRotations(path: string = ledgerPath()): Promise<void> {
   const keep = Number(process.env.HIVE_LEDGER_KEEP_ROTATIONS ?? DEFAULT_LEDGER_KEEP_ROTATIONS);
   if (!Number.isFinite(keep) || keep < 0) return;
-  const path = ledgerPath();
   const dir = dirname(path);
   const prefix = `${basename(path)}.`;
   const entries = await readdir(dir).catch(() => [] as string[]);

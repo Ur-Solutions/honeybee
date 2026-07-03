@@ -95,7 +95,8 @@ test("bare grok defaults to the single Grok account with credentials", async () 
     const { stdout, stderr } = await hive(dir, "open", "grok", "--raw", "--print");
 
     assert.match(stderr, /account default → grok-solo-example\.com/);
-    assert.match(stdout, /GROK_HOME=.*\/homes\/grok-solo-example\.com grok --tools=/);
+    assert.match(stdout, /GROK_HOME=.*\/homes\/grok-solo-example\.com grok\b/);
+    assert.match(stdout, /--tools=/);
   });
 });
 
@@ -107,7 +108,8 @@ test("bare grok does not default an account when an explicit home is requested",
     const { stdout, stderr } = await hive(dir, "open", "grok", "--raw", "--print", "--home", "1");
 
     assert.doesNotMatch(stderr, /account default/);
-    assert.match(stdout, /GROK_HOME=.*\.grok-1 grok --tools=/);
+    assert.match(stdout, /GROK_HOME=.*\.grok-1 grok\b/);
+    assert.match(stdout, /--tools=/);
   });
 });
 

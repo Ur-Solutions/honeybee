@@ -212,6 +212,18 @@ test("keys check reports a recommended bind as present when wired to its verb", 
   });
 });
 
+test("keys check parses decorated root binds such as bind-key -N", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    await tmux(["new-session", "-d", "-s", "probe", "sleep 120"], { reject: false });
+    const bind = await tmux(["bind-key", "-N", "Hive launch", "-T", "root", "M-B", "display-popup", "-E", "hive launch"], { reject: false });
+    if (!bind.ok) return;
+
+    const out = await hive(store, ["keys", "check"], {}, socket);
+    assert.equal(out.code, 0);
+    assert.match(out.stdout, /bind\tpresent\tM-B\tlaunch/, "M-B decorated bind reported present");
+  });
+});
+
 test("workspace here prints <name> inside a ws-<name> session", { skip: !tmuxAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     await tmux(["new-session", "-d", "-s", "ws-frontend", "sleep 120"], { reject: false });

@@ -46,6 +46,7 @@ const SYNC_SUBCOMMANDS = ["manifest"];
 
 const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 const SEAL_STATUS_VALUES = ["done", "blocked", "needs_input", "failed"];
+const QUEST_STATUS_VALUES = ["open", "active", "done", "archived"];
 const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
 const BUZ_TIERS = ["interrupt", "queue", "passive"];
 const BUZ_ACCEPT_VALUES = [
@@ -140,7 +141,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--accept",
   ],
   daemon: ["--tick-ms", "--json", "--label", "--force", "--follow", "--lines", "-n"],
-  flow: ["--arg", "--foreground", "--background", "--flow", "--json"],
+  flow: ["--arg", "--foreground", "--background", "--flow", "--json", "-n", "--lines"],
   loop: [
     "--bee", "--cwd", "--context", "--prompt", "--prompt-file",
     "--until", "--max", "--max-duration", "--forever",
@@ -165,7 +166,7 @@ export type CompletionState = {
   cwd?: string;
 };
 
-type FlagValueKind = "colony" | "workspace" | "quest" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
+type FlagValueKind = "colony" | "workspace" | "quest" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "quest-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
 
 const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -211,6 +212,9 @@ const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagValueKind>
   },
   fork: {
     "--seed": "fork-seed",
+  },
+  quest: {
+    "--status": "quest-status",
   },
 };
 
@@ -348,6 +352,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return SEARCH_TYPE_VALUES;
     case "seal-status":
       return SEAL_STATUS_VALUES;
+    case "quest-status":
+      return QUEST_STATUS_VALUES;
     case "hive-state":
       return HIVE_STATE_VALUES;
     case "flow":
