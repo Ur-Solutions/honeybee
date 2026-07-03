@@ -6840,7 +6840,7 @@ async function nodeStatus(parsed: Parsed) {
     ],
     healths.map((h) => [
       bold(h.name),
-      h.kind === "local-tmux" ? gray("local") : h.kind === "remote-hsr" ? magenta("hsr") : cyan("ssh"),
+      nodeKindLabel(h.kind),
       h.reachable ? green("● online") : red("○ offline"),
       h.latencyMs === null ? dim("-") : dim(`${h.latencyMs}ms`),
       formatNodeVersion(h),
@@ -6856,6 +6856,28 @@ function formatNodeVersion(h: NodeHealth): string {
   return h.versionDrift
     ? `${h.runnerHostVersion} ${yellow("(drift)")}`
     : dim(h.runnerHostVersion);
+}
+
+function nodeKindLabel(kind: NodeRecord["kind"] | string, display: "short" | "full" = "short"): string {
+  const label = display === "full"
+    ? kind
+    : kind === "local-tmux"
+      ? "local"
+      : kind === "ssh-tmux"
+        ? "ssh"
+        : kind === "remote-hsr"
+          ? "hsr"
+          : kind;
+  switch (kind) {
+    case "local-tmux":
+      return gray(label);
+    case "ssh-tmux":
+      return cyan(label);
+    case "remote-hsr":
+      return magenta(label);
+    default:
+      return yellow(label || "unknown");
+  }
 }
 
 /**
@@ -6919,7 +6941,7 @@ async function nodeList() {
       { header: "DESCRIPTION" },
     ],
     nodes.map((n) => [
-      n.kind === "local-tmux" ? gray("local") : cyan("ssh"),
+      nodeKindLabel(n.kind),
       bold(n.name),
       dim(n.endpoint),
       formatNodeStatus(n.status),
@@ -7085,7 +7107,7 @@ async function cmdSubstrate(parsed: Parsed) {
 
 async function substrateList() {
   const nodes = await listNodes();
-  const kinds = new Map<string, number>();
+  const kinds = new Map<NodeRecord["kind"], number>();
   for (const node of nodes) kinds.set(node.kind, (kinds.get(node.kind) ?? 0) + 1);
   if (!isPretty()) {
     for (const [kind, count] of kinds) console.log(`${kind}\t${count}`);
@@ -7097,7 +7119,7 @@ async function substrateList() {
       { header: "NODES", align: "right" },
     ],
     [...kinds.entries()].sort().map(([kind, count]) => [
-      kind === "local-tmux" ? gray("local-tmux") : cyan("ssh-tmux"),
+      nodeKindLabel(kind, "full"),
       String(count),
     ]),
   ));
