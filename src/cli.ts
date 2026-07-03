@@ -8171,7 +8171,7 @@ async function daemonStatus(parsed: Parsed) {
   const label = daemonLabel(parsed);
   const staleAfter = numberFlag(parsed, ["stale-after-ms"], 0);
   const status = await readDaemonStatus(undefined, { label, ...(staleAfter > 0 ? { staleAfterMs: staleAfter } : {}) });
-  // Exit codes: 0 healthy, 3 down, 4 STALE (process alive, loop wedged).
+  // Exit codes: 0 healthy, 3 down, 4 unhealthy/stale (process alive but not progressing).
   // Anything polling this command must treat nonzero as an outage.
   const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
@@ -8199,11 +8199,18 @@ async function daemonStatus(parsed: Parsed) {
     process.exit(3);
   }
   if (status.stale) {
-    const age = status.state?.lastTickAt ? formatRelativeTime(status.state.lastTickAt) : "never";
-    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("STALE"))} ${dim(`(process alive, loop wedged — last tick ${age} ago, threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
+    const reasonLabels: Record<string, string> = {
+      "loop-stale": "loop heartbeat stale",
+      "tick-progress-stale": "tick progress stale",
+      "recent-errors-saturated": "recent errors saturated",
+      "missing-state": "state missing",
+    };
+    const reasons = status.staleReasons.map((reason) => reasonLabels[reason] ?? reason).join(", ") || "unhealthy";
+    console.log(`${red("●")} ${bold("hive daemon")} ${red(bold("UNHEALTHY"))} ${dim(`(${reasons}; threshold ${Math.round(status.staleAfterMs / 60_000)}m)`)}`);
     if (status.lock) console.log(`  pid ${status.lock.pid}  host ${status.lock.hostname || "<unknown>"}  startedAt ${status.lock.startedAt}`);
     if (status.state) {
       console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+      console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
       if (status.state.recentErrors.length > 0) {
         console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
         for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
@@ -8221,6 +8228,7 @@ async function daemonStatus(parsed: Parsed) {
   }
   if (status.state) {
     console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
+    if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
     if (status.state.recentErrors.length > 0) {
       console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
       for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
