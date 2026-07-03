@@ -73,6 +73,54 @@ test("matchesSessionReference targets the suffix even without a recorded uuid", 
   assert.equal(matchesSessionReference(bee, "ab"), false);
 });
 
+test("allocateBeeIdentity caps the retained index at maxRetainedIds, evicting the oldest entries", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-ids-"));
+  try {
+    const uuids = [
+      "aaa00000-0000-4000-8000-000000000000",
+      "bbb00000-0000-4000-8000-000000000000",
+      "ccc00000-0000-4000-8000-000000000000",
+      "ddd00000-0000-4000-8000-000000000000",
+      "eee00000-0000-4000-8000-000000000000",
+    ];
+    for (const uuid of uuids) {
+      await allocateBeeIdentity({ storeRoot: dir, agent: "codex", requestedAgent: "codex", uuid: () => uuid, maxRetainedIds: 3 });
+    }
+
+    const index = JSON.parse(await readFile(join(dir, "id-index.json"), "utf8")) as { used: string[] };
+    // Only the three most recent allocations are retained, in allocation order.
+    assert.deepEqual(index.used, [
+      "ccc00000000040008000000000000000",
+      "ddd00000000040008000000000000000",
+      "eee00000000040008000000000000000",
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("allocateBeeIdentity can reissue a short id once its entry ages out of the cap", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-ids-"));
+  try {
+    const first = await allocateBeeIdentity({ storeRoot: dir, agent: "codex", requestedAgent: "codex", uuid: () => "abc00000-0000-4000-8000-000000000000", maxRetainedIds: 2 });
+    assert.equal(first.id, "CO.abc");
+
+    // While the first allocation is retained, a shared prefix must grow longer.
+    const second = await allocateBeeIdentity({ storeRoot: dir, agent: "codex", requestedAgent: "codex", uuid: () => "abc11111-1111-4111-8111-111111111111", maxRetainedIds: 2 });
+    assert.equal(second.id, "CO.abc1");
+
+    // Push both abc entries out of the cap...
+    await allocateBeeIdentity({ storeRoot: dir, agent: "codex", requestedAgent: "codex", uuid: () => "eee00000-0000-4000-8000-000000000000", maxRetainedIds: 2 });
+    await allocateBeeIdentity({ storeRoot: dir, agent: "codex", requestedAgent: "codex", uuid: () => "fff00000-0000-4000-8000-000000000000", maxRetainedIds: 2 });
+
+    // ...after which the short id is free to be allocated again.
+    const reused = await allocateBeeIdentity({ storeRoot: dir, agent: "codex", requestedAgent: "codex", uuid: () => "abc22222-2222-4222-8222-222222222222", maxRetainedIds: 2 });
+    assert.equal(reused.id, "CO.abc");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("allocateBeeIdentity skips invalid id-index entries instead of failing", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-ids-"));
   try {

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, removeSwarmRecord, swarmIds, validSwarmId } from "../src/swarm.js";
+import { createSwarm, destroySwarm, generateSwarmId, listSwarms, loadSwarm, removeSwarmRecord, saveSwarm, swarmIds, validSwarmId } from "../src/swarm.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-swarm-"));
@@ -85,5 +85,33 @@ test("removeSwarmRecord deletes the file", async () => {
     await createSwarm({ id: "tmp", beeIds: [] });
     await removeSwarmRecord("tmp");
     assert.equal(await loadSwarm("tmp"), null);
+  });
+});
+
+test("loadSwarm rejects path-traversal ids instead of reading files outside the store", async () => {
+  await withTempStore(async () => {
+    const dir = process.env.HIVE_STORE_ROOT!;
+    // Plant a valid-shaped swarm record OUTSIDE the swarms dir. "../secret"
+    // would resolve to <dir>/swarms/../secret.json = this file; loading it
+    // would mean arbitrary .json disclosure via `hive swarm inspect`.
+    await writeFile(
+      join(dir, "secret.json"),
+      JSON.stringify({ id: "secret", createdAt: new Date().toISOString(), beeIds: [] }),
+    );
+    assert.equal(await loadSwarm("../secret"), null);
+  });
+});
+
+test("removeSwarmRecord and saveSwarm reject path-traversal ids", async () => {
+  await withTempStore(async () => {
+    const dir = process.env.HIVE_STORE_ROOT!;
+    await writeFile(join(dir, "victim.json"), "{}");
+    await removeSwarmRecord("../victim");
+    // The out-of-store file must survive.
+    assert.equal(await readFile(join(dir, "victim.json"), "utf8"), "{}");
+    await assert.rejects(
+      saveSwarm({ id: "../victim", beeIds: [], createdAt: new Date().toISOString() }),
+      /Invalid swarm id/,
+    );
   });
 });
