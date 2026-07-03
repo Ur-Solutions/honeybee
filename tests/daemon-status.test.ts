@@ -312,3 +312,93 @@ test("readDaemonStatus does not mark a down daemon stale", async () => {
     assert.equal(report.stale, false);
   });
 });
+
+test("machineId is minted once and stable across calls", async () => {
+  await withTempStore(async () => {
+    const { machineId, storeRoot } = await import("../src/fsx.js");
+    const first = machineId();
+    assert.ok(/^[0-9a-f-]{36}$/.test(first), `uuid shape (got ${first})`);
+    assert.equal(machineId(), first, "stable within a process");
+    const onDisk = (await readFile(join(storeRoot(), "machine-id"), "utf8")).trim();
+    assert.equal(onDisk, first, "persisted at <storeRoot>/machine-id");
+  });
+});
+
+test("lockOwnedByThisMachine: machineId is authoritative — a hostname flap never makes our own lock foreign", async () => {
+  const { lockOwnedByThisMachine } = await import("../src/fsx.js");
+  const current = { machineId: "id-A", hostname: "Tormods-Mac-Studio.local" };
+  // The live 2026-07-03 regression: same machine, DHCP-renamed hostname.
+  assert.equal(lockOwnedByThisMachine({ machineId: "id-A", hostname: "Mac.home" }, current), true);
+  // A different machine id is foreign even when hostnames collide (NFS/synced store roots).
+  assert.equal(lockOwnedByThisMachine({ machineId: "id-B", hostname: "Tormods-Mac-Studio.local" }, current), false);
+});
+
+test("lockOwnedByThisMachine: legacy locks without machineId fall back to hostname equality", async () => {
+  const { lockOwnedByThisMachine } = await import("../src/fsx.js");
+  const current = { machineId: "id-A", hostname: "host-1" };
+  assert.equal(lockOwnedByThisMachine({ hostname: "host-1" }, current), true, "legacy match");
+  assert.equal(lockOwnedByThisMachine({ hostname: "host-2" }, current), false, "legacy mismatch");
+  assert.equal(lockOwnedByThisMachine({ hostname: "" }, current), false, "empty hostname stays foreign");
+});
+
+test("acquireLongLivedLock stamps the persisted machineId into the lock meta", async () => {
+  await withTempStore(async () => {
+    const { machineId } = await import("../src/fsx.js");
+    const lock = await acquireLongLivedLock(daemonLockPath(), { label: "test daemon" });
+    try {
+      const meta = await (await import("../src/fsx.js")).readLockMeta(daemonLockPath());
+      assert.equal(meta!.machineId, machineId());
+    } finally {
+      await lock.release();
+    }
+  });
+});
+
+test("readDaemonStatus reports running despite a hostname flap when the lock's machineId matches", async () => {
+  await withTempStore(async () => {
+    const { machineId } = await import("../src/fsx.js");
+    const lockPath = daemonLockPath();
+    await mkdir(dirname(lockPath), { recursive: true });
+    // The exact live regression shape: our machine id, a live local pid, but
+    // a hostname written before the DHCP/mDNS rename.
+    const meta = {
+      pid: process.pid,
+      hostname: "some-old-dhcp-name.home",
+      machineId: machineId(),
+      startedAt: new Date().toISOString(),
+      token: "x",
+    };
+    await writeFile(lockPath, JSON.stringify(meta));
+    await writeDaemonState({
+      startedAt: new Date().toISOString(),
+      lastTickAt: new Date().toISOString(),
+      tickCount: 10,
+      version: "1",
+      pid: process.pid,
+      recentErrors: [],
+    });
+    const report = await readDaemonStatus(undefined, { staleAfterMs: 5 * 60_000 });
+    assert.equal(report.lockHeldByOtherHost, false, "machineId match overrides hostname mismatch");
+    assert.equal(report.running, true);
+    assert.equal(report.stale, false);
+  });
+});
+
+test("readDaemonStatus still treats a different machineId as foreign even when hostnames match", async () => {
+  await withTempStore(async () => {
+    const { hostname } = await import("node:os");
+    const lockPath = daemonLockPath();
+    await mkdir(dirname(lockPath), { recursive: true });
+    const meta = {
+      pid: process.pid,
+      hostname: hostname(),
+      machineId: "00000000-0000-4000-8000-000000000000",
+      startedAt: new Date().toISOString(),
+      token: "x",
+    };
+    await writeFile(lockPath, JSON.stringify(meta));
+    const report = await readDaemonStatus();
+    assert.equal(report.lockHeldByOtherHost, true);
+    assert.equal(report.running, false);
+  });
+});

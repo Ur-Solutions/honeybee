@@ -1,7 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
-import { hostname } from "node:os";
 import { join } from "node:path";
-import { atomicWriteFile } from "../fsx.js";
+import { atomicWriteFile, lockOwnedByThisMachine } from "../fsx.js";
 import type { LockMeta } from "../fsx.js";
 import { readLockMeta } from "../fsx.js";
 import { daemonRoot } from "./log.js";
@@ -197,10 +196,13 @@ export async function readDaemonStatus(
     readInstallStatus(options.label),
   ]);
   // A shared/synced store root can carry a lock from another machine; a
-  // foreign PID must not be validated against the local PID table. Missing
-  // or empty hostname counts as foreign (matches the lock-steal refusal in
-  // fsx.acquireLongLivedLock).
-  const lockHeldByOtherHost = !!lock && (!lock.hostname || lock.hostname !== hostname());
+  // foreign PID must not be validated against the local PID table. Identity
+  // is the persisted machine id when the lock carries one (os.hostname()
+  // flaps between DHCP and mDNS names on macOS — a rename must never make
+  // the daemon's own lock look foreign); legacy locks fall back to hostname
+  // equality, where a missing/empty hostname counts as foreign (matches the
+  // lock-steal refusal in fsx.acquireLongLivedLock).
+  const lockHeldByOtherHost = !!lock && !lockOwnedByThisMachine(lock);
   const running = !!lock && !lockHeldByOtherHost && isPidLikelyAlive(lock.pid);
   const staleAfterMs = options.staleAfterMs ?? defaultStaleAfterMs();
   // Staleness only applies to a running daemon: a live process whose loop

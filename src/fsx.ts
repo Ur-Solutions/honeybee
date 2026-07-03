@@ -1,9 +1,74 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 export function storeRoot(): string {
   return process.env.HIVE_STORE_ROOT ?? join(homedir(), ".hive");
+}
+
+// Cache keyed by resolved path so tests that swap HIVE_STORE_ROOT per test
+// never leak an id across temp stores.
+const machineIdCache = new Map<string, string>();
+
+/**
+ * Stable hive-generated machine identity: a UUID minted once and persisted at
+ * <storeRoot>/machine-id. os.hostname() is NOT identity on macOS — it flaps
+ * between the DHCP-provided name and the mDNS LocalHostName on network
+ * changes (observed live 2026-07-02/03: Mac.home <-> Tormods-Mac-Studio.local),
+ * which made the daemon's own lock look foreign and wedged both status and
+ * recovery. The persisted id survives renames while still distinguishing real
+ * machines that share a synced/NFS store root (each mints its own file only
+ * if the path is truly shared storage written by one of them first — in that
+ * case the two machines see the same id and the pid check governs, which is
+ * the pre-machine-id behavior for same-hostname collisions; no worse).
+ */
+export function machineId(): string {
+  const path = join(storeRoot(), "machine-id");
+  const cached = machineIdCache.get(path);
+  if (cached) return cached;
+  try {
+    const existing = readFileSync(path, "utf8").trim();
+    if (existing) {
+      machineIdCache.set(path, existing);
+      return existing;
+    }
+  } catch {
+    // missing — mint below
+  }
+  const minted = randomUUID();
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${minted}\n`, { mode: 0o600, flag: "wx" });
+  } catch {
+    // Lost the mint race to another process: adopt the winner's id.
+    try {
+      const winner = readFileSync(path, "utf8").trim();
+      if (winner) {
+        machineIdCache.set(path, winner);
+        return winner;
+      }
+    } catch {
+      // Unreadable/unwritable store: fall through to an ephemeral id.
+    }
+  }
+  machineIdCache.set(path, minted);
+  return minted;
+}
+
+/**
+ * Does this lock belong to the current machine? machineId is authoritative
+ * when the lock carries one; legacy locks (written before machine ids) fall
+ * back to hostname equality, where a missing/empty hostname stays foreign —
+ * refuse rather than risk a wrong-machine steal.
+ */
+export function lockOwnedByThisMachine(
+  meta: Pick<LockMeta, "machineId" | "hostname">,
+  current: { machineId: string; hostname: string } = { machineId: machineId(), hostname: hostname() },
+): boolean {
+  if (meta.machineId) return meta.machineId === current.machineId;
+  return !!meta.hostname && meta.hostname === current.hostname;
 }
 
 /**
@@ -36,7 +101,10 @@ export async function atomicWriteFile(path: string, data: string, options: Atomi
 
 export type LockMeta = {
   pid: number;
+  /** Display metadata only — never compared for identity (hostnames flap). */
   hostname: string;
+  /** Persisted machine identity (see machineId()); absent on legacy locks. */
+  machineId?: string;
   startedAt: string;
   token?: string;
   label?: string;
@@ -76,7 +144,7 @@ const UNREADABLE_LOCK_STALE_MS = 30_000;
 export async function acquireLongLivedLock(path: string, options: AcquireLockOptions = {}): Promise<LongLivedLock> {
   await mkdir(dirname(path), { recursive: true });
   const aliveCheck = options.isPidAlive ?? defaultIsPidAlive;
-  const currentHost = hostname();
+  const current = { machineId: machineId(), hostname: hostname() };
   await cleanupOrphanedStagedFiles(path);
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -84,7 +152,8 @@ export async function acquireLongLivedLock(path: string, options: AcquireLockOpt
       const token = generateLockToken();
       const meta: LockMeta = {
         pid: process.pid,
-        hostname: currentHost,
+        hostname: current.hostname,
+        machineId: current.machineId,
         startedAt: new Date().toISOString(),
         token,
         ...(options.label ? { label: options.label } : {}),
@@ -128,8 +197,10 @@ export async function acquireLongLivedLock(path: string, options: AcquireLockOpt
         }
         throw new LockBusyError(`Lock busy: ${path}`, null);
       }
-      // Treat missing or empty hostname as unknown — refuse rather than risk a wrong-host steal.
-      if (!existing.hostname || existing.hostname !== currentHost) {
+      // Identity check: machineId when the lock carries one, legacy hostname
+      // comparison otherwise (empty hostname stays foreign — refuse rather
+      // than risk a wrong-machine steal).
+      if (!lockOwnedByThisMachine(existing, current)) {
         throw new LockBusyError(
           `Lock held by pid ${existing.pid} on host ${existing.hostname || "<unknown>"} since ${existing.startedAt}`,
           existing,
@@ -138,7 +209,7 @@ export async function acquireLongLivedLock(path: string, options: AcquireLockOpt
       if (!aliveCheck(existing.pid)) {
         await stealLongLivedLock(path, async () => {
           const meta = await readLockMeta(path);
-          return !!meta && meta.hostname === currentHost && !aliveCheck(meta.pid);
+          return !!meta && lockOwnedByThisMachine(meta, current) && !aliveCheck(meta.pid);
         });
         continue;
       }
@@ -222,6 +293,7 @@ export async function readLockMeta(path: string): Promise<LockMeta | null> {
     return {
       pid: object.pid,
       hostname: typeof object.hostname === "string" ? object.hostname : "",
+      ...(typeof object.machineId === "string" && object.machineId ? { machineId: object.machineId } : {}),
       startedAt: object.startedAt,
       ...(typeof object.token === "string" ? { token: object.token } : {}),
       ...(typeof object.label === "string" ? { label: object.label } : {}),
