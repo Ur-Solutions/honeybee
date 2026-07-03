@@ -211,7 +211,7 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
   // homes get re-logged-in, refresh keeps a wrong token fresh forever. Ask
   // the profile endpoint who each candidate actually is and use the first
   // (freshest) one that matches the account.
-  const profileOf = deps.fetchClaudeProfileEmail ?? fetchClaudeProfileEmail;
+  const profileOf = deps.fetchClaudeProfileEmail ?? fetchClaudeProfileEmailCached;
   const expectedEmail = account.email ?? (account.label.includes("@") ? account.label : undefined);
   let credential: ClaudeOauthCredentials | undefined;
   const imposters = new Set<string>();
@@ -349,6 +349,25 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
 
 async function fetchClaudeUsage(accessToken: string): Promise<ClaudeUsageResponse> {
   return claudeOauthGet(accessToken, "https://api.anthropic.com/api/oauth/usage") as Promise<ClaudeUsageResponse>;
+}
+
+/**
+ * Token → verified email, memoized per process. A given access token's
+ * identity never changes, so one profile round-trip per token is enough.
+ * Without this, every limits sweep re-verifies every candidate — and the
+ * freshest candidate (the daily driver's keychain chain) is a candidate for
+ * EVERY account, so one `hive usage` costs O(accounts × candidates) profile
+ * calls and a polling reader (the --live dashboard) rate-limits the OAuth
+ * endpoints. Unverifiable lookups (null/error) are not cached — they retry.
+ */
+const profileEmailByToken = new Map<string, string>();
+
+async function fetchClaudeProfileEmailCached(accessToken: string): Promise<string | null> {
+  const cached = profileEmailByToken.get(accessToken);
+  if (cached !== undefined) return cached;
+  const email = await fetchClaudeProfileEmail(accessToken);
+  if (email !== null) profileEmailByToken.set(accessToken, email);
+  return email;
 }
 
 async function fetchClaudeProfileEmail(accessToken: string): Promise<string | null> {
