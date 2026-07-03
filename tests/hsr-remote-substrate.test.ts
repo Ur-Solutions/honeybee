@@ -20,6 +20,8 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { join } from "node:path";
 import { test } from "node:test";
 import { serve } from "../src/hsr/remoteHost.js";
+import { startRpcServer } from "../src/hsr/rpc.js";
+import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { createRemoteHsrSubstrate } from "../src/substrates/remote-hsr.js";
 import {
   clearSubstrateCache,
@@ -197,6 +199,76 @@ test("remote HSR substrate: spawnRemote → steer → observe → kill a stub be
     } finally {
       await sub.close();
       await server.close();
+      tunnel.killAll();
+    }
+  });
+});
+
+test("observe survives a remote serve RESTART: the substrate re-issues the observe RPC on reconnect (HIVE-11)", async () => {
+  await withTempStore(async (dir) => {
+    const remoteSock = join(dir, "remote-control.sock");
+    const bee = "restartbee";
+
+    // A fake per-bee runner host: a real RpcServer on the bee's control socket.
+    // The remote serve's observe relay connects here and re-broadcasts every
+    // "event" notification as hsr.event. It OUTLIVES the serve restart below —
+    // exactly like a real runner host (a detached process) does when the serve
+    // crashes and is restarted by ensureRemoteServe.
+    const beeSock = join(dir, "bee-control.sock");
+    const beeHost = await startRpcServer({ socketPath: beeSock, methods: { ping: () => ({ ok: true }) } });
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "stub",
+      tier: "stream",
+      hostPid: process.pid,
+      startedAt: new Date().toISOString(),
+      controlSocket: beeSock,
+      status: "running",
+    });
+
+    let server = await serve(remoteSock);
+    const node = makeNode();
+    const tunnel = makeRelayTunnel();
+    const sub = createRemoteHsrSubstrate(node, {
+      transport: {
+        execHook: serveUpExecHook,
+        spawnTunnel: tunnel.hook,
+        remoteSocket: remoteSock,
+        forward: { waitAttempts: 100, waitIntervalMs: 10 },
+        reconnect: { maxAttempts: 50, baseDelayMs: 10, maxDelayMs: 50 },
+      },
+    });
+
+    try {
+      const events: Array<{ type?: string; text?: string }> = [];
+      const off = await sub.observe(bee, (e) => events.push(e as { type?: string; text?: string }));
+
+      // Sanity: the relay works before the restart.
+      await waitFor(() => {
+        beeHost.broadcast("event", { type: "text", text: "before-restart" });
+        return events.some((e) => e.text === "before-restart");
+      }, "event relayed before restart");
+
+      // RESTART the serve: the new process has an EMPTY relays map, so only a
+      // re-issued observe RPC (not just the transport's local re-bridge) can
+      // bring the event stream back. The bee host itself keeps running.
+      await server.close();
+      server = await serve(remoteSock);
+
+      // The transport reconnects (client socket died with the old serve), the
+      // substrate re-observes, the fresh serve rebuilds its relay — and events
+      // flow again. Without the re-observe this times out: the mirror freezes.
+      await waitFor(() => {
+        beeHost.broadcast("event", { type: "text", text: "after-restart" });
+        return events.some((e) => e.text === "after-restart");
+      }, "event relayed after serve restart", 10_000);
+
+      off();
+    } finally {
+      await sub.close();
+      await server.close();
+      await beeHost.close();
       tunnel.killAll();
     }
   });
