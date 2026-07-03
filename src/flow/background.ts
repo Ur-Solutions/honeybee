@@ -279,9 +279,6 @@ export async function cancelRun(
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ESRCH") {
       signalled = "already-dead";
-    } else if (code === "EPERM") {
-      // We don't own it — treat as a hard failure.
-      throw error;
     } else {
       throw error;
     }

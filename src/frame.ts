@@ -65,14 +65,25 @@ export async function frameDefinitionFile(name: string): Promise<{ path: string;
   return null;
 }
 
-export async function writeFrameFromObject(frame: Frame): Promise<Frame> {
-  const validated = validateFrame(frame);
+export async function writeFrameFromValidatedObject(
+  validated: Frame,
+  options: { sourcePath?: string; ledger?: boolean } = {},
+): Promise<Frame> {
   await ensureDir();
   const target = frameFilePath(validated.name, ".json");
   await atomicWriteFile(target, `${JSON.stringify(validated, null, 2)}\n`, { mode: 0o600 });
   // loadFrame prefers .ts — remove a stale sibling so the write takes effect.
   await rm(frameFilePath(validated.name, ".ts"), { force: true });
+  if (options.sourcePath !== undefined) {
+    const absolute = resolve(options.sourcePath);
+    await atomicWriteFile(frameSourcePath(validated.name), `${absolute}\n`, { mode: 0o600 });
+    if (options.ledger) await appendLedger({ type: "frame.define", name: validated.name, source: absolute });
+  }
   return validated;
+}
+
+export async function writeFrameFromObject(frame: Frame): Promise<Frame> {
+  return writeFrameFromValidatedObject(validateFrame(frame));
 }
 
 export async function defineFrameFromFile(sourcePath: string, nameOverride?: string): Promise<Frame> {

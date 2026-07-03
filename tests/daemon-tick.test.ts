@@ -3,7 +3,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createThrottledTranscriptMetadataRefresh, tick, type ProbeResult, type TickDeps } from "../src/daemon/run.js";
+import {
+  createThrottledTranscriptMetadataRefresh,
+  emptyDispatcherOutcomes,
+  tick,
+  tickDispatchers,
+  type DispatcherOutcomes,
+  type ProbeResult,
+  type TickDeps,
+  type TickDispatcher,
+} from "../src/daemon/run.js";
 import type { BeeState, PaneCaptureMap } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
@@ -572,6 +581,142 @@ test("tick: per-record refresh work runs with bounded concurrency", async () => 
       else process.env.HIVE_DAEMON_RECORD_CONCURRENCY = previousConcurrency;
     }
   });
+});
+
+function dispatcherFor<K extends keyof DispatcherOutcomes>(key: K): TickDispatcher<K> {
+  const dispatcher = tickDispatchers.find((candidate) => candidate.key === key);
+  assert.ok(dispatcher, `registry has no dispatcher for ${key}`);
+  return dispatcher as TickDispatcher<K>;
+}
+
+test("dispatcher registry: covers every DispatcherOutcomes key exactly once", () => {
+  const expected = Object.keys(emptyDispatcherOutcomes()).sort();
+  const keys = tickDispatchers.map((dispatcher) => dispatcher.key);
+  assert.deepEqual([...keys].sort(), expected);
+  const names = tickDispatchers.map((dispatcher) => dispatcher.name);
+  assert.equal(new Set(names).size, names.length, "withTimeout labels must be unique");
+});
+
+test("tick: usage exhaustion gates dispatchAutoswap through the registry", async () => {
+  await withTempStore(async () => {
+    const record = bee();
+    const capture: Capture = { ledger: [], touches: [] };
+    const exhausted = { bee: record.name, account: "CL.a", sampled: true, exhausted: true };
+    let swapInput: unknown;
+    const deps: TickDeps = {
+      ...buildDeps({ records: [record], liveTargets: new Set(), capture }),
+      sampleUsage: async () => [exhausted],
+      dispatchAutoswap: async (_records, usageOutcomes) => {
+        swapInput = usageOutcomes;
+        return [{ bee: record.name, from: "CL.a", to: "CL.b", ok: true }];
+      },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.deepEqual(result.usage, [exhausted]);
+    assert.deepEqual(swapInput, [exhausted]);
+    assert.deepEqual(result.autoswaps, [{ bee: record.name, from: "CL.a", to: "CL.b", ok: true }]);
+  });
+});
+
+test("tick: dispatchAutoswap is skipped when no usage outcome is exhausted", async () => {
+  await withTempStore(async () => {
+    const record = bee();
+    const capture: Capture = { ledger: [], touches: [] };
+    let swapped = false;
+    const deps: TickDeps = {
+      ...buildDeps({ records: [record], liveTargets: new Set(), capture }),
+      sampleUsage: async () => [{ bee: record.name, account: "CL.a", sampled: true, exhausted: false }],
+      dispatchAutoswap: async () => {
+        swapped = true;
+        return [];
+      },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.equal(swapped, false);
+    assert.deepEqual(result.autoswaps, []);
+  });
+});
+
+test("tick: a timed-out dispatcher stage is captured and later stages still run", async () => {
+  await withTempStore(async () => {
+    const record = bee();
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps: TickDeps = {
+      ...buildDeps({ records: [record], liveTargets: new Set(), capture }),
+      sampleUsage: () => never(),
+      dispatchAutoTitle: async () => [{ bee: record.name, ok: true, title: "Still titled" }],
+      timeouts: { dispatchMs: 30 },
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.ok(result.errors.some((e) => /sampleUsage timed out after 30ms/.test(e.message)));
+    assert.deepEqual(result.usage, []);
+    assert.deepEqual(result.autoTitles, [{ bee: record.name, ok: true, title: "Still titled" }]);
+  });
+});
+
+test("dispatcher registry: log mappings preserve the daemon log formats", () => {
+  const buz = dispatcherFor("buzDrains");
+  assert.equal(buz.log({ recipient: "alpha", result: { delivered: [], quarantined: [], errors: [] } }), null);
+  assert.deepEqual(buz.log({ recipient: "alpha", result: { delivered: ["m-1"], quarantined: [], errors: [] } }), {
+    level: "info",
+    msg: "buz.drain",
+    recipient: "alpha",
+    delivered: 1,
+    quarantined: 0,
+    errors: 0,
+  });
+  assert.equal(buz.log({ recipient: "alpha", result: { delivered: [], quarantined: [], errors: [{ id: "m-2", message: "boom" }] } })?.level, "warn");
+
+  const usage = dispatcherFor("usage");
+  assert.equal(usage.log({ bee: "alpha", account: "CL.a", sampled: true, exhausted: false }), null);
+  assert.deepEqual(usage.log({ bee: "alpha", account: "CL.a", sampled: true, exhausted: true, resetHint: "3pm" }), {
+    level: "warn",
+    msg: "account.exhausted",
+    session: "alpha",
+    account: "CL.a",
+    resetHint: "3pm",
+  });
+
+  const reachability = dispatcherFor("nodeReachability");
+  assert.deepEqual(reachability.log({ node: "mini01", transition: "offline" }), { level: "warn", msg: "node.offline", node: "mini01" });
+  assert.deepEqual(reachability.log({ node: "mini01", transition: "online" }), { level: "info", msg: "node.online", node: "mini01" });
+
+  const needsInput = dispatcherFor("needsInput");
+  assert.deepEqual(needsInput.log({ bee: "alpha", requestId: "r-1", routedTo: "queen" }), {
+    level: "info",
+    msg: "needs_input.route",
+    session: "alpha",
+    requestId: "r-1",
+    routedTo: "queen",
+  });
+  assert.equal(needsInput.log({ bee: "alpha", requestId: "r-1", escalated: true, error: "no parent" })?.level, "warn");
+
+  const autoswaps = dispatcherFor("autoswaps");
+  assert.deepEqual(autoswaps.log({ bee: "alpha", from: "CL.a", to: "CL.b", ok: true }), {
+    level: "info",
+    msg: "account.autoswap",
+    session: "alpha",
+    from: "CL.a",
+    to: "CL.b",
+    ok: true,
+  });
+  assert.equal(autoswaps.log({ bee: "alpha", from: "CL.a", ok: false, skipped: "no candidate" })?.level, "warn");
+
+  const autoTitles = dispatcherFor("autoTitles");
+  assert.deepEqual(autoTitles.log({ bee: "alpha", ok: true, title: "T" }), {
+    level: "info",
+    msg: "title.auto",
+    session: "alpha",
+    ok: true,
+    title: "T",
+  });
+  assert.equal(autoTitles.log({ bee: "alpha", ok: false, error: "boom" })?.level, "warn");
 });
 
 test("tick: a hung syncChains is timed out and does not block the tick result", async () => {

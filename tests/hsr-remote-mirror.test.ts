@@ -30,7 +30,7 @@ import { test } from "node:test";
 import { createRemoteEventMirror } from "../src/hsr/remoteEventMirror.js";
 import { hsrObservations, hsrUsageObservation } from "../src/hsr/observe.js";
 import { hsrEventsPath, hsrRingPath, readHsrMeta } from "../src/hsr/runDir.js";
-import { createRemoteHsrSubstrate } from "../src/substrates/remote-hsr.js";
+import { createRemoteHsrSubstrate, type RemoteHsrSubstrate } from "../src/substrates/remote-hsr.js";
 import { clearSubstrateCache } from "../src/substrates/index.js";
 import { createUsageSampler } from "../src/daemon/usageSampler.js";
 import { deriveState, type BeeState, type StateContext } from "../src/state.js";
@@ -149,6 +149,92 @@ function beeRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
     ...overrides,
   };
 }
+
+type FakeSubstrateLifecycle = {
+  observeCalls: number;
+  offCalls: number;
+  closeCalls: number;
+};
+
+function fakeRemoteSubstrate(node: NodeRecord, liveSessions: Set<string>, lifecycle: FakeSubstrateLifecycle): RemoteHsrSubstrate {
+  return {
+    kind: "remote-hsr",
+    node: node.name,
+    endpoint: node.endpoint,
+    probe: async () => ({ ok: true }),
+    hasSession: async (target) => liveSessions.has(target),
+    newSession: async () => ({ paneId: "%1" }),
+    kill: async () => ({ ok: true, stdout: "", stderr: "", exitCode: 0 }),
+    capture: async () => "",
+    sendText: async () => undefined,
+    sendEnter: async () => undefined,
+    sendKey: async () => undefined,
+    listSessions: async () => [...liveSessions],
+    listPanes: async () => new Set(),
+    listSessionStates: async () => new Map(),
+    setUserOptions: async () => undefined,
+    setWindowOptions: async () => undefined,
+    renameWindow: async () => undefined,
+    attachCommand: () => [],
+    attachSession: async () => undefined,
+    ping: async () => ({ ok: true }),
+    spawnRemote: async (params) => ({ bee: params.bee }),
+    provisionRemote: async (params) => ({ path: "/tmp/remote-checkout", repo: params.repo, branch: params.branch, reused: false }),
+    listCheckouts: async () => [],
+    observe: async () => {
+      lifecycle.observeCalls += 1;
+      return () => {
+        lifecycle.offCalls += 1;
+      };
+    },
+    close: async () => {
+      lifecycle.closeCalls += 1;
+    },
+  };
+}
+
+test("remote event mirror closes a node substrate when the node is re-kinded", async () => {
+  await withTempStore(async () => {
+    let node = makeNode();
+    const lifecycle: FakeSubstrateLifecycle = { observeCalls: 0, offCalls: 0, closeCalls: 0 };
+    const liveSessions = new Set([beeRecord().name]);
+    const mirror = createRemoteEventMirror({
+      loadNode: async () => node,
+      createSubstrate: (n) => fakeRemoteSubstrate(n, liveSessions, lifecycle),
+    });
+
+    await mirror([beeRecord()]);
+    assert.equal(lifecycle.observeCalls, 1, "mirror subscribed on first tick");
+
+    node = makeNode({ kind: "ssh-tmux" });
+    await mirror([beeRecord()]);
+
+    assert.equal(lifecycle.offCalls, 1, "re-kind unsubscribed the old mirror");
+    assert.equal(lifecycle.closeCalls, 1, "re-kind closed the old substrate");
+    assert.equal((await readHsrMeta(beeRecord().name))?.status, "exited", "re-kind marks the local mirror exited");
+  });
+});
+
+test("remote event mirror close releases subscriptions and substrates without marking mirrors exited", async () => {
+  await withTempStore(async () => {
+    const lifecycle: FakeSubstrateLifecycle = { observeCalls: 0, offCalls: 0, closeCalls: 0 };
+    const liveSessions = new Set([beeRecord().name]);
+    const mirror = createRemoteEventMirror({
+      loadNode: async () => makeNode(),
+      createSubstrate: (n) => fakeRemoteSubstrate(n, liveSessions, lifecycle),
+    });
+
+    await mirror([beeRecord()]);
+    assert.equal((await readHsrMeta(beeRecord().name))?.status, "running");
+
+    await mirror.close();
+    await mirror.close();
+
+    assert.equal(lifecycle.offCalls, 1, "dispatcher close unsubscribes once");
+    assert.equal(lifecycle.closeCalls, 1, "dispatcher close closes the substrate once");
+    assert.equal((await readHsrMeta(beeRecord().name))?.status, "running", "shutdown close must not fake a remote exit");
+  });
+});
 
 test("remote event mirror: subscribe → replay events/ring locally → deriveState + usage → teardown on disappear", async () => {
   await withTempStore(async (localDir) => {

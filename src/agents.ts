@@ -185,6 +185,10 @@ export function forcedSessionIdArgs(kind: string, sessionId: string): string[] |
   return forcedSessionIdArgsForAgent(kind, sessionId);
 }
 
+export function hasSessionIdArg(args?: readonly string[]): boolean {
+  return Boolean(args?.some((arg) => arg === "--session-id" || arg.startsWith("--session-id=")));
+}
+
 function resolveProfile(kind: string, explicitHome: string | true | string[] | undefined) {
   const alias = profileAlias(kind);
   const canonicalKind = alias?.kind ?? kind;

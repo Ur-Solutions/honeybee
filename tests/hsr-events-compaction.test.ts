@@ -22,6 +22,7 @@ import { test } from "node:test";
 import { EVENT_TAIL_MAX_BYTES, hsrObservations, hsrUsageObservation, pendingNeedsInput } from "../src/hsr/observe.js";
 import {
   HSR_EVENTS_MAX_BYTES,
+  __testOnlyHasAppendChain,
   appendHsrEvent,
   compactHsrEvents,
   ensureHsrRunDir,
@@ -149,6 +150,21 @@ test("appendHsrEvent auto-compacts past the byte cap without losing usage totals
     const usage = await hsrUsageObservation(bee);
     assert.deepEqual(usage.totals, { inputTokens: expectedInput, outputTokens: expectedOutput });
     assert.equal(usage.latestExhausted?.resetHint, "early-reset");
+  });
+});
+
+test("appendHsrEvent drops settled append-chain entries", async () => {
+  await withTempStore(async () => {
+    const bee = "chain-cleanup";
+    await ensureHsrRunDir(bee);
+
+    await appendHsrEvent(bee, { type: "text", ts: 1, text: "one" });
+    assert.equal(__testOnlyHasAppendChain(bee), false, "settled append chain must not remain cached");
+
+    const first = appendHsrEvent(bee, { type: "text", ts: 2, text: "two" });
+    const second = appendHsrEvent(bee, { type: "text", ts: 3, text: "three" });
+    await Promise.all([first, second]);
+    assert.equal(__testOnlyHasAppendChain(bee), false, "concurrent append chain must also clean itself up");
   });
 });
 

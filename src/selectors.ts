@@ -2,7 +2,7 @@ import { colonyExists, listColonies } from "./colony.js";
 import { matchesSessionReference } from "./ids.js";
 import { listSessions, type SessionRecord } from "./store.js";
 import { swarmIds } from "./swarm.js";
-import { effectiveTags, isReservedNamespace } from "./tags.js";
+import { effectiveTags } from "./tags.js";
 
 /**
  * Reverse-relationship verbs. owns/owned-by/reports-to are aliases reading the
@@ -99,16 +99,14 @@ export function parseSelector(query: string): Selector {
     }
   }
 
-  // <ns>:<val> where <ns> is a known reserved namespace (e.g. quest:q-ab,
-  // caste:reviewer) → tag kind. A non-reserved namespace (e.g. prio:p1) is a
-  // bare-token user tag stored verbatim, so it falls through to the bee branch
-  // only if it doesn't look like ns:val — but a user tag with a namespace is a
-  // legitimate selector too, so route any `ns:val` we recognize as a tag.
+  // <ns>:<val> → tag kind. Reserved namespaces (e.g. quest:q-ab,
+  // caste:reviewer) match derived facets; non-reserved namespaces (e.g.
+  // prio:p1) match user tags stored verbatim.
   const colonIdx = trimmed.indexOf(":");
   if (colonIdx > 0) {
     const namespace = trimmed.slice(0, colonIdx);
     const value = trimmed.slice(colonIdx + 1);
-    if (value && isReservedNamespace(namespace)) {
+    if (value) {
       return { kind: "tag", namespace, value };
     }
   }

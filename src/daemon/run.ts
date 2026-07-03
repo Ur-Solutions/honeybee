@@ -19,7 +19,7 @@ import { createNeedsInputDispatcher, type NeedsInputOutcome } from "./needsInput
 import { createNodeReachabilityTracker, type NodeReachabilityDispatcher, type NodeReachabilityOutcome } from "./nodeReachability.js";
 import { createUsageSampler, type UsageSampler, type UsageTickOutcome } from "./usageSampler.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
-import { appendDaemonLog, daemonLogPath } from "./log.js";
+import { appendDaemonLog, daemonLogPath, type LogInput } from "./log.js";
 import { startHsrControlServer, type HsrControlServer } from "./hsrControl.js";
 import {
   DAEMON_VERSION,
@@ -109,7 +109,7 @@ export type TickDeps = {
    * — build once per daemon run. Runs BEFORE hsrObservations() so this tick can
    * already read a freshly-created mirror meta.
    */
-  mirrorRemoteEvents?: (records: SessionRecord[]) => Promise<void>;
+  mirrorRemoteEvents?: ((records: SessionRecord[]) => Promise<void>) & { close?: () => Promise<void> };
   sealedBeeNames: () => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
@@ -187,11 +187,12 @@ export type TickTransition = {
   to: BeeState;
 };
 
-export type TickResult = {
-  transitions: TickTransition[];
-  observed: Map<string, BeeState>;
-  unreachableNodes: Set<string>;
-  errors: Error[];
+/**
+ * Per-stage outcome arrays produced by the dispatcher registry below. Each key
+ * is one registry stage; a stage that was not wired (or whose trigger condition
+ * did not fire) keeps its empty array.
+ */
+export type DispatcherOutcomes = {
   /**
    * Per-bee outcomes from the buz queue dispatcher. Empty when no bee
    * transitioned into idle_with_output this tick or when dispatchBuzDrain
@@ -215,8 +216,211 @@ export type TickResult = {
   autoswaps: AutoswapOutcome[];
   /** Auto-title dispatcher outcomes (empty when nothing finished / not wired). */
   autoTitles: AutoTitleOutcome[];
+};
+
+export type TickResult = DispatcherOutcomes & {
+  transitions: TickTransition[];
+  observed: Map<string, BeeState>;
+  unreachableNodes: Set<string>;
+  errors: Error[];
   durationMs: number;
 };
+
+/** Everything a tick has observed by the time the dispatcher stages run. */
+export type DispatchContext = {
+  deps: TickDeps;
+  records: SessionRecord[];
+  nodes: NodeRecord[];
+  probe: ProbeResult;
+  panes: PaneCaptureMap;
+  hsrObs: Map<string, HsrObservation>;
+  transitions: TickTransition[];
+  /** This tick's freshly derived state per bee (authoritative current state). */
+  observed: Map<string, BeeState>;
+  nowMs: number;
+  /**
+   * Outcomes of the stages that already ran this tick, in registry order —
+   * later stages may consume earlier stages' outcomes (autoswap reads usage).
+   */
+  outcomes: DispatcherOutcomes;
+};
+
+/**
+ * One outcome-producing dispatcher stage. tick() iterates the registry to run
+ * the stages (each under its own budget, errors captured, never fatal) and
+ * runDaemon() iterates the SAME registry to log the outcomes — adding a
+ * periodic task is one TickDeps hook plus one registry entry.
+ *
+ * `run`/`log` use method syntax deliberately: its bivariant parameter check is
+ * what lets the per-key entries form the AnyTickDispatcher union.
+ */
+export type TickDispatcher<K extends keyof DispatcherOutcomes> = {
+  /** DispatcherOutcomes/TickResult field the stage's outcomes land in. */
+  key: K;
+  /** withTimeout label, surfaced in timeout errors. */
+  name: string;
+  /** Which TickTimeouts budget bounds the stage. */
+  timeoutKey: keyof TickTimeouts;
+  /**
+   * Start the stage. Return undefined to skip it — dep not wired, or the
+   * stage's trigger condition not met — leaving its outcomes empty.
+   */
+  run(ctx: DispatchContext): Promise<DispatcherOutcomes[K]> | undefined;
+  /** Map one outcome to a daemon-log entry; null = this outcome is not logged. */
+  log(outcome: DispatcherOutcomes[K][number]): LogInput | null;
+};
+
+type AnyTickDispatcher = { [K in keyof DispatcherOutcomes]: TickDispatcher<K> }[keyof DispatcherOutcomes];
+
+/**
+ * The dispatcher registry: state-derived work that runs at the end of every
+ * tick, strictly in this order (autoswap consumes the usage stage's outcomes).
+ * Void periodic tasks with positional constraints (mirrorRemoteEvents,
+ * syncChains) stay inline in tick() — they produce no outcomes to log.
+ */
+export const tickDispatchers: readonly AnyTickDispatcher[] = [
+  // The buz queue dispatcher drains tier-B messages for any bee that
+  // transitioned into idle_with_output.
+  {
+    key: "buzDrains",
+    name: "dispatchBuzDrain",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, transitions, observed }) => deps.dispatchBuzDrain?.(records, transitions, observed),
+    log: (outcome) =>
+      outcome.result.delivered.length > 0 || outcome.result.quarantined.length > 0 || outcome.result.errors.length > 0
+        ? {
+            level: outcome.result.errors.length > 0 ? "warn" : "info",
+            msg: "buz.drain",
+            recipient: outcome.recipient,
+            delivered: outcome.result.delivered.length,
+            quarantined: outcome.result.quarantined.length,
+            errors: outcome.result.errors.length,
+          }
+        : null,
+  },
+  // HSR needs-input router: route each blocked HSR bee's structured request to
+  // its living parent (buz) or mark it escalated.
+  {
+    key: "needsInput",
+    name: "dispatchNeedsInput",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed, hsrObs }) => deps.dispatchNeedsInput?.(records, observed, hsrObs),
+    log: (outcome) => ({
+      level: outcome.error ? "warn" : "info",
+      msg: "needs_input.route",
+      session: outcome.bee,
+      requestId: outcome.requestId,
+      ...(outcome.routedTo ? { routedTo: outcome.routedTo } : {}),
+      ...(outcome.escalated ? { escalated: true } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
+  // Node reachability edge tracker (APIA-96): emit node.online/node.offline on
+  // the reachability edge only, keyed off the node-probe's unreachableNodes.
+  {
+    key: "nodeReachability",
+    name: "dispatchNodeReachability",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, nodes, probe, nowMs }) => deps.dispatchNodeReachability?.(nodes, probe.unreachableNodes, nowMs),
+    log: (outcome) => ({
+      level: outcome.transition === "offline" ? "warn" : "info",
+      msg: `node.${outcome.transition}`,
+      node: outcome.node,
+    }),
+  },
+  // Usage sampler: factual per-account token samples + exhaustion events.
+  {
+    key: "usage",
+    name: "sampleUsage",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, panes, nowMs, hsrObs }) => deps.sampleUsage?.(records, panes, nowMs, hsrObs),
+    log: (outcome) =>
+      outcome.exhausted
+        ? {
+            level: "warn",
+            msg: "account.exhausted",
+            session: outcome.bee,
+            account: outcome.account,
+            resetHint: outcome.resetHint ?? null,
+          }
+        : null,
+  },
+  // Autoswap: opt-in deterministic reaction to this tick's exhaustion edges.
+  {
+    key: "autoswaps",
+    name: "dispatchAutoswap",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, outcomes }) =>
+      deps.dispatchAutoswap && outcomes.usage.some((outcome) => outcome.exhausted)
+        ? deps.dispatchAutoswap(records, outcomes.usage)
+        : undefined,
+    log: (outcome) => ({
+      level: outcome.ok ? "info" : "warn",
+      msg: "account.autoswap",
+      session: outcome.bee,
+      from: outcome.from,
+      to: outcome.to ?? null,
+      ok: outcome.ok,
+      ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
+  // Auto-titler: kick off (or collect) background title generation for
+  // untitled bees whose initial exchange is now visible.
+  {
+    key: "autoTitles",
+    name: "dispatchAutoTitle",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records }) => deps.dispatchAutoTitle?.(records),
+    log: (outcome) => ({
+      level: outcome.ok ? "info" : "warn",
+      msg: "title.auto",
+      session: outcome.bee,
+      ok: outcome.ok,
+      ...(outcome.title ? { title: outcome.title } : {}),
+      ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
+];
+
+export function emptyDispatcherOutcomes(): DispatcherOutcomes {
+  return { buzDrains: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [] };
+}
+
+/**
+ * Run one registry stage under its budget, landing its outcomes in
+ * ctx.outcomes[key]. Errors (including timeouts) are captured into errors[]
+ * and the stage's outcomes stay empty — never fatal to the tick. Generic so
+ * the key/outcome-array pairing stays correlated per stage.
+ */
+async function runTickDispatcher<K extends keyof DispatcherOutcomes>(
+  dispatcher: TickDispatcher<K>,
+  ctx: DispatchContext,
+  timeouts: TickTimeouts,
+  errors: Error[],
+): Promise<void> {
+  const pending = dispatcher.run(ctx);
+  if (!pending) return;
+  try {
+    ctx.outcomes[dispatcher.key] = await withTimeout(pending, timeouts[dispatcher.timeoutKey], dispatcher.name);
+  } catch (error) {
+    errors.push(toError(error));
+  }
+}
+
+/** Log entries for one stage's outcomes (registry order), skipping nulls. */
+function dispatcherLogEntries<K extends keyof DispatcherOutcomes>(
+  dispatcher: TickDispatcher<K>,
+  outcomes: DispatcherOutcomes,
+): LogInput[] {
+  const entries: LogInput[] = [];
+  for (const outcome of outcomes[dispatcher.key]) {
+    const entry = dispatcher.log(outcome);
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
 
 /**
  * Pure tick. Performs the per-tick observation cycle using only the injected
@@ -378,75 +582,23 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     }
   }
 
-  // Run dispatchers for state-derived work. The buz queue dispatcher drains
-  // tier-B messages for any bee that transitioned into idle_with_output.
-  // Dispatcher errors are captured into errors[] but do not abort the tick.
-  let buzDrains: BuzDispatchOutcome[] = [];
-  if (deps.dispatchBuzDrain) {
-    try {
-      buzDrains = await withTimeout(deps.dispatchBuzDrain(records, transitions, observed), timeouts.dispatchMs, "dispatchBuzDrain");
-    } catch (error) {
-      errors.push(toError(error));
-    }
-  }
-
-  // HSR needs-input router: route each blocked HSR bee's structured request to
-  // its living parent (buz) or mark it escalated. Same guard/budget as the
-  // other dispatchers; errors are captured, never fatal to the tick.
-  let needsInput: NeedsInputOutcome[] = [];
-  if (deps.dispatchNeedsInput) {
-    try {
-      needsInput = await withTimeout(deps.dispatchNeedsInput(records, observed, hsrObs), timeouts.dispatchMs, "dispatchNeedsInput");
-    } catch (error) {
-      errors.push(toError(error));
-    }
-  }
-
-  // Node reachability edge tracker (APIA-96): emit node.online/node.offline on
-  // the reachability edge only, keyed off the node-probe's unreachableNodes.
-  // Same guard/budget as the other dispatchers; errors are captured, never fatal.
-  let nodeReachability: NodeReachabilityOutcome[] = [];
-  if (deps.dispatchNodeReachability) {
-    try {
-      nodeReachability = await withTimeout(
-        deps.dispatchNodeReachability(nodes, probe.unreachableNodes, nowMs),
-        timeouts.dispatchMs,
-        "dispatchNodeReachability",
-      );
-    } catch (error) {
-      errors.push(toError(error));
-    }
-  }
-
-  // Usage sampler: factual per-account token samples + exhaustion events.
-  let usage: UsageTickOutcome[] = [];
-  if (deps.sampleUsage) {
-    try {
-      usage = await withTimeout(deps.sampleUsage(records, panes, nowMs, hsrObs), timeouts.dispatchMs, "sampleUsage");
-    } catch (error) {
-      errors.push(toError(error));
-    }
-  }
-
-  // Autoswap: opt-in deterministic reaction to this tick's exhaustion edges.
-  let autoswaps: AutoswapOutcome[] = [];
-  if (deps.dispatchAutoswap && usage.some((outcome) => outcome.exhausted)) {
-    try {
-      autoswaps = await withTimeout(deps.dispatchAutoswap(records, usage), timeouts.dispatchMs, "dispatchAutoswap");
-    } catch (error) {
-      errors.push(toError(error));
-    }
-  }
-
-  // Auto-titler: kick off (or collect) background title generation for
-  // untitled bees whose initial exchange is now visible.
-  let autoTitles: AutoTitleOutcome[] = [];
-  if (deps.dispatchAutoTitle) {
-    try {
-      autoTitles = await withTimeout(deps.dispatchAutoTitle(records), timeouts.dispatchMs, "dispatchAutoTitle");
-    } catch (error) {
-      errors.push(toError(error));
-    }
+  // Run the dispatcher registry for state-derived work, strictly in registry
+  // order (autoswap consumes the usage stage's outcomes). Each stage runs
+  // under its own budget; errors are captured into errors[], never fatal.
+  const dispatchContext: DispatchContext = {
+    deps,
+    records,
+    nodes,
+    probe,
+    panes,
+    hsrObs,
+    transitions,
+    observed,
+    nowMs,
+    outcomes: emptyDispatcherOutcomes(),
+  };
+  for (const dispatcher of tickDispatchers) {
+    await runTickDispatcher(dispatcher, dispatchContext, timeouts, errors);
   }
 
   // Chain sync: keep the vault tracking rotated OAuth chains. Self-throttled
@@ -464,12 +616,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     observed,
     unreachableNodes: probe.unreachableNodes,
     errors,
-    buzDrains,
-    needsInput,
-    nodeReachability,
-    usage,
-    autoswaps,
-    autoTitles,
+    ...dispatchContext.outcomes,
     durationMs: Math.max(0, deps.now() - start),
   };
 }
@@ -805,68 +952,10 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
             to: transition.to,
           });
         }
-        for (const outcome of result.buzDrains) {
-          if (outcome.result.delivered.length > 0 || outcome.result.quarantined.length > 0 || outcome.result.errors.length > 0) {
-            await safeLog({
-              level: outcome.result.errors.length > 0 ? "warn" : "info",
-              msg: "buz.drain",
-              recipient: outcome.recipient,
-              delivered: outcome.result.delivered.length,
-              quarantined: outcome.result.quarantined.length,
-              errors: outcome.result.errors.length,
-            });
+        for (const dispatcher of tickDispatchers) {
+          for (const entry of dispatcherLogEntries(dispatcher, result)) {
+            await safeLog(entry);
           }
-        }
-        for (const outcome of result.needsInput) {
-          await safeLog({
-            level: outcome.error ? "warn" : "info",
-            msg: "needs_input.route",
-            session: outcome.bee,
-            requestId: outcome.requestId,
-            ...(outcome.routedTo ? { routedTo: outcome.routedTo } : {}),
-            ...(outcome.escalated ? { escalated: true } : {}),
-            ...(outcome.error ? { error: outcome.error } : {}),
-          });
-        }
-        for (const outcome of result.nodeReachability) {
-          await safeLog({
-            level: outcome.transition === "offline" ? "warn" : "info",
-            msg: `node.${outcome.transition}`,
-            node: outcome.node,
-          });
-        }
-        for (const outcome of result.usage) {
-          if (!outcome.exhausted) continue;
-          await safeLog({
-            level: "warn",
-            msg: "account.exhausted",
-            session: outcome.bee,
-            account: outcome.account,
-            resetHint: outcome.resetHint ?? null,
-          });
-        }
-        for (const outcome of result.autoswaps) {
-          await safeLog({
-            level: outcome.ok ? "info" : "warn",
-            msg: "account.autoswap",
-            session: outcome.bee,
-            from: outcome.from,
-            to: outcome.to ?? null,
-            ok: outcome.ok,
-            ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
-            ...(outcome.error ? { error: outcome.error } : {}),
-          });
-        }
-        for (const outcome of result.autoTitles) {
-          await safeLog({
-            level: outcome.ok ? "info" : "warn",
-            msg: "title.auto",
-            session: outcome.bee,
-            ok: outcome.ok,
-            ...(outcome.title ? { title: outcome.title } : {}),
-            ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
-            ...(outcome.error ? { error: outcome.error } : {}),
-          });
         }
       } else if (tickError) {
         pushRecentError(state, tickError);
@@ -923,6 +1012,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
       }
     }
     if (hsrControl) await hsrControl.close().catch(() => undefined);
+    await deps.mirrorRemoteEvents?.close?.().catch(() => undefined);
     if (lock) {
       try {
         await lock.release();
