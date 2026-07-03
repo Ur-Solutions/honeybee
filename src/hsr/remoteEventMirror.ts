@@ -30,8 +30,10 @@
  *               gone) the subscription is torn down and the mirror meta flips to
  *               "exited" so deriveState settles it dead/sealed.
  *   dedupe    — one subscription per bee; a repeated tick never double-subscribes.
- *   reconnect — the transport re-adopts subscriptions across tunnel drops
- *               (remoteTransport.ts), so a transient drop needs no re-arm here.
+ *   reconnect — the transport re-adopts the local hsr.event bridge across tunnel
+ *               drops (remoteTransport.ts) and the substrate re-issues the
+ *               remote `observe` RPC on reconnect so a RESTARTED serve rebuilds
+ *               its relays (remote-hsr.ts, HIVE-11) — no re-arm needed here.
  *
  * NATIVE-TRANSCRIPT SHIPPING — DEFERRED (follow-up). Full provider-JSONL
  * shipping (so Apiary's capture host resolves a remote bee's native transcript

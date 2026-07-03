@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createColony, loadColony } from "../src/colony.js";
+import { createQuest, loadQuest } from "../src/quest.js";
 import {
   archiveWorkspace,
   createWorkspace,
@@ -204,6 +205,24 @@ test("renameWorkspace moves the record and refuses collisions", async () => {
     await assert.rejects(renameWorkspace("new", "blocker"), /already exists/);
     await assert.rejects(renameWorkspace("new", "../bad"), /Invalid workspace name/);
     await assert.rejects(renameWorkspace("ghost", "x"), /Unknown workspace/);
+  });
+});
+
+test("renameWorkspace rewrites colony and quest workspace references", async () => {
+  await withTempStore(async () => {
+    await createColony("old");
+    await createQuest({ id: "q-old", title: "uses old workspace", colony: "old", workspace: "old" });
+
+    const renamed = await renameWorkspace("old", "new");
+    assert.equal(renamed.name, "new");
+    assert.equal(renamed.colony, "old");
+    assert.equal(await loadWorkspace("old"), null);
+
+    const colony = await loadColony("old");
+    assert.equal(colony?.workspace, "new");
+    const quest = await loadQuest("q-old");
+    assert.equal(quest?.colony, "old");
+    assert.equal(quest?.workspace, "new");
   });
 });
 

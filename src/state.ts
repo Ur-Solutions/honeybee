@@ -16,6 +16,8 @@ export type BeeState =
   | "kill_failed"
   | "node_unreachable";
 
+export type PaneCaptureMap = ReadonlyMap<string, string | undefined>;
+
 export type StateContext = {
   /**
    * Live tmux sessions keyed by liveTargetKey(node, target) so that targets
@@ -30,7 +32,13 @@ export type StateContext = {
    * session survives. Absent → fall back to session liveness for everyone.
    */
   livePanes?: Set<string>;
-  panes?: Map<string, string>;
+  panes?: PaneCaptureMap;
+  /**
+   * Previous in-memory daemon observations, keyed by bee name. Used when pane
+   * content is unknown for a live tmux bee so a transient capture failure does
+   * not fabricate an active -> idle_with_output transition.
+   */
+  previousStates?: ReadonlyMap<string, BeeState>;
   seals?: Set<string>;
   unreachableNodes?: Set<string>;
   /**
@@ -127,21 +135,28 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
 
   // Content is keyed by the bee's own pane (agentPaneId) so sub-bees sharing a
   // comb's tmuxTarget don't collide; legacy solo bees fall back to tmuxTarget.
-  const pane = context.panes?.get(record.agentPaneId ?? record.tmuxTarget) ?? "";
-  if (pane) {
-    if (isMcpWarningPane(pane)) return { state: "blocked", detail: "MCP warning" };
-    if (isTrustPromptPane(pane)) return { state: "blocked", detail: "trust prompt" };
-    if (isPermissionPromptPane(pane)) return { state: "blocked", detail: "awaiting permission" };
+  const paneKey = record.agentPaneId ?? record.tmuxTarget;
+  const paneCaptured = context.panes?.has(paneKey) ?? false;
+  const pane = paneCaptured ? context.panes?.get(paneKey) : undefined;
+  if (pane === undefined) {
+    const held = heldStateForUnknownPane(record, context);
+    if (held) return held;
+  }
+  const paneText = pane ?? "";
+  if (paneText) {
+    if (isMcpWarningPane(paneText)) return { state: "blocked", detail: "MCP warning" };
+    if (isTrustPromptPane(paneText)) return { state: "blocked", detail: "trust prompt" };
+    if (isPermissionPromptPane(paneText)) return { state: "blocked", detail: "awaiting permission" };
   }
 
   const now = context.now ?? Date.now();
   const promptAt = record.lastPromptAt ? Date.parse(record.lastPromptAt) : NaN;
   const briefedAt = record.briefedAt ? Date.parse(record.briefedAt) : NaN;
   const lastActivityAt = pickMax(promptAt, briefedAt);
-  const hasOutput = pane.length >= READY_PANE_MIN_BYTES;
+  const hasOutput = paneText.length >= READY_PANE_MIN_BYTES;
   const knownAgent = hasAgentDriver(record.agent);
-  const paneReady = pane ? isAgentReadyPane(record.agent, pane) : false;
-  const paneActive = pane ? isAgentActivePane(record.agent, pane) : false;
+  const paneReady = paneText ? isAgentReadyPane(record.agent, paneText) : false;
+  const paneActive = paneText ? isAgentActivePane(record.agent, paneText) : false;
 
   if (Number.isFinite(lastActivityAt) && now - lastActivityAt < ACTIVE_WINDOW_MS) {
     return { state: "active", detail: describeActivity(record) };
@@ -150,7 +165,7 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   if (!Number.isFinite(promptAt)) {
     if (paneReady) return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
     if (!record.brief && !hasOutput) return { state: "booting", detail: "starting up" };
-    if (pane && knownAgent && !paneReady) return { state: "booting", detail: "starting up" };
+    if (paneText && knownAgent && !paneReady) return { state: "booting", detail: "starting up" };
     return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
   }
 
@@ -158,7 +173,11 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
     return { state: "active", detail: describeActivity(record) };
   }
 
-  if (pane && knownAgent && !paneReady) {
+  if (paneText && knownAgent && !paneReady) {
+    return { state: "active", detail: describeActivity(record) };
+  }
+
+  if (pane === undefined && Number.isFinite(promptAt)) {
     return { state: "active", detail: describeActivity(record) };
   }
 
@@ -241,6 +260,51 @@ export function stateLabel(state: BeeState): string {
 export function isTerminalState(state: BeeState): boolean {
   // node_unreachable is transient — the node may come back online — and not terminal.
   return state === "dead" || state === "sealed" || state === "archived" || state === "error" || state === "kill_failed";
+}
+
+function heldStateForUnknownPane(record: SessionRecord, context: StateContext): DerivedState | null {
+  const previous = context.previousStates?.get(record.name) ?? parseBeeState(record.lastObservedState);
+  if (!previous || !isHoldableUnknownPaneState(previous)) return null;
+  return { state: previous, detail: detailForHeldState(previous, record, context.now ?? Date.now()) };
+}
+
+function parseBeeState(value: string | undefined): BeeState | undefined {
+  switch (value) {
+    case "blocked":
+    case "ready":
+    case "active":
+    case "idle_with_output":
+    case "booting":
+    case "error":
+    case "dead":
+    case "sealed":
+    case "archived":
+    case "kill_failed":
+    case "node_unreachable":
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+function isHoldableUnknownPaneState(state: BeeState): boolean {
+  return state === "active" || state === "blocked" || state === "ready" || state === "idle_with_output" || state === "booting";
+}
+
+function detailForHeldState(state: BeeState, record: SessionRecord, now: number): string {
+  switch (state) {
+    case "active":
+    case "blocked":
+      return describeActivity(record);
+    case "ready":
+      return record.brief ? "briefed, awaiting prompt" : "awaiting prompt";
+    case "idle_with_output":
+      return describeIdle(record, now);
+    case "booting":
+      return "starting up";
+    default:
+      return describeActivity(record);
+  }
 }
 
 function lastActivityHint(record: SessionRecord, _context: StateContext): string {

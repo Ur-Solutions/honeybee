@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { addAccount, accountDir } from "../src/accounts.js";
 import { accountLimits, cachedAccountLimits, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
@@ -237,6 +238,44 @@ test("an email-less account never trusts unattributed shared-home keychain token
   });
 });
 
+test("accountLimits memoizes claude keychain reads per home for one sweep", async () => {
+  await withTempStore(async (dir) => {
+    const oldHome = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      const sharedHome = join(dir, ".claude");
+      await mkdir(sharedHome, { recursive: true });
+      const accounts = [];
+      for (let index = 0; index < 6; index += 1) {
+        accounts.push(await addAccount("claude", `memo-${index}@a.b`));
+      }
+
+      const callsByHome = new Map<string, number>();
+      const results = await accountLimits(accounts, {
+        readKeychain: async (home) => {
+          const key = resolve(home);
+          callsByHome.set(key, (callsByHome.get(key) ?? 0) + 1);
+          await sleep(5);
+          return null;
+        },
+        fetchClaudeUsage: async () => {
+          throw new Error("no keychain token should reach usage");
+        },
+        fetchClaudeProfileEmail: async () => {
+          throw new Error("no keychain token should reach profile verification");
+        },
+      });
+
+      assert.deepEqual(results.map((result) => result.ok), [false, false, false, false, false, false]);
+      assert.equal(callsByHome.get(resolve(sharedHome)), 1);
+      assert.equal([...callsByHome.values()].reduce((sum, count) => sum + count, 0), 1);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+    }
+  });
+});
+
 test("an email-less account uses its attributed vault token without profile verification", async () => {
   await withTempStore(async () => {
     const account = await addAccount("claude", "work");
@@ -302,6 +341,122 @@ test("an expired chain is refreshed, persisted (rotation!), and then used", asyn
     assert.equal(persisted[0]!.account, account.id);
     assert.equal(persisted[0]!.oauth.refreshToken, "refresh-rotated");
     assert.equal(persisted[0]!.oauth.subscriptionType, "max");
+  });
+});
+
+test("chain refresh and persist run inside the accounts lock (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "lock@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    let depth = 0;
+    const events: string[] = [];
+    const [result] = await accountLimits([account], {
+      withAccountsLock: async (fn) => {
+        depth += 1;
+        try {
+          return await fn();
+        } finally {
+          depth -= 1;
+        }
+      },
+      refreshClaudeToken: async () => {
+        events.push(`refresh@${depth}`);
+        return { accessToken: "tok-new", refreshToken: "r-rotated", expiresAt: Date.now() + 3_600_000 };
+      },
+      persistRefreshedCredentials: async () => {
+        events.push(`persist@${depth}`);
+      },
+      fetchClaudeProfileEmail: async () => "lock@a.b",
+      fetchClaudeUsage: async () => ({ five_hour: { utilization: 1, resets_at: "2026-06-10T18:00:00Z" } }),
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    // Both the rotation and its persistence happened while the lock was held.
+    assert.deepEqual(events, ["refresh@1", "persist@1"]);
+  });
+});
+
+test("refresh double-checks the vault under the lock and reuses a chain rotated by a concurrent writer (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "race@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    await writeFile(
+      vaultPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    const usageAskedWith: string[] = [];
+    const [result] = await accountLimits([account], {
+      // Simulate a concurrent writer (activation) winning the lock first and
+      // rotating the chain while we waited: by the time our critical section
+      // runs, the vault already holds the rotated fresh chain.
+      withAccountsLock: async (fn) => {
+        await writeFile(
+          vaultPath,
+          JSON.stringify({
+            claudeAiOauth: { accessToken: "tok-rotated", expiresAt: Date.now() + 3_600_000, refreshToken: "r-rotated", subscriptionType: "max" },
+          }),
+        );
+        return fn();
+      },
+      refreshClaudeToken: async () => {
+        throw new Error("must not replay a refresh token another writer already rotated");
+      },
+      fetchClaudeProfileEmail: async () => "race@a.b",
+      fetchClaudeUsage: async (token) => {
+        usageAskedWith.push(token);
+        return { five_hour: { utilization: 1, resets_at: "2026-06-10T18:00:00Z" } };
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    assert.equal(result!.plan, "max");
+    assert.deepEqual(usageAskedWith, ["tok-rotated"]);
+  });
+});
+
+test("a vault chain rotated behind us to another identity is never replayed (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "super@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    await writeFile(
+      vaultPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    const [result] = await accountLimits([account], {
+      // The chain moved on while we waited for the lock — and the rotated
+      // link belongs to someone else. The superseded r-old token must not be
+      // replayed (that replay is what trips reuse detection).
+      withAccountsLock: async (fn) => {
+        await writeFile(
+          vaultPath,
+          JSON.stringify({ claudeAiOauth: { accessToken: "tok-other", expiresAt: Date.now() + 3_600_000, refreshToken: "r-other" } }),
+        );
+        return fn();
+      },
+      refreshClaudeToken: async () => {
+        throw new Error("must not replay the superseded refresh token");
+      },
+      fetchClaudeProfileEmail: async (token) => (token === "tok-other" ? "wrong@a.b" : null),
+      fetchClaudeUsage: async () => {
+        throw new Error("must not query usage with another identity's token");
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, false);
+    assert.match(result!.error ?? "", /no token belongs to super@a\.b/);
+    assert.match(result!.error ?? "", /wrong@a\.b/);
   });
 });
 
@@ -447,6 +602,36 @@ test("codex prefers live app-server limits and falls back to disk snapshots", as
     assert.equal(fallback!.ok, false);
     assert.equal(fallback!.source, "session-snapshot");
     assert.match(fallback!.error ?? "", /no rate-limit snapshot/);
+  });
+});
+
+test("accountLimits caps codex live app-server fan-out", async () => {
+  await withTempStore(async (dir) => {
+    const accounts = [];
+    for (let index = 0; index < 8; index += 1) {
+      const account = await addAccount("codex", `fanout-${index}@a.b`);
+      await mkdir(join(dir, "homes", account.id), { recursive: true });
+      accounts.push(account);
+    }
+
+    let active = 0;
+    let maxActive = 0;
+    let calls = 0;
+    const results = await accountLimits(accounts, {
+      codexLiveRateLimits: async () => {
+        calls += 1;
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await sleep(20);
+        active -= 1;
+        return { primary: { usedPercent: 1 } };
+      },
+    });
+
+    assert.equal(calls, accounts.length);
+    assert.ok(maxActive <= 4, `expected at most 4 concurrent live Codex reads, saw ${maxActive}`);
+    assert.deepEqual(results.map((result) => result.account), accounts.map((account) => account.id));
+    assert.deepEqual(results.map((result) => result.source), accounts.map(() => "app-server"));
   });
 });
 

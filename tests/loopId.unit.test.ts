@@ -2,10 +2,10 @@
 // generateLoopId mints `LP.<hex>` ids that stay unambiguously targetable, and
 // resolveLoopId matches a loop by full id, bare suffix, or unambiguous prefix
 // (and still matches legacy long-form run ids exactly). generateLoopId/
-// resolveLoopId only read the loops dir's entry NAMES, so the tests just mkdir
-// empty loop dirs to simulate existing loops.
+// resolveLoopId use the loops dir's entry NAMES; generateLoopId also reserves
+// the selected id by creating its loop dir.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -48,6 +48,20 @@ test("generateLoopId: grows when the short form would PREFIX an existing longer 
     // len-3 "LP.a3f" prefixes existing "LP.a3f9" (ambiguous) → grow to "LP.a3f0".
     const id = await generateLoopId(uuid("a3f0112233445566778899aabbccddee"));
     assert.equal(id, "LP.a3f0");
+  });
+});
+
+test("generateLoopId: concurrent calls reserve distinct ids under the loops lock", async () => {
+  await withStore([], async (dir) => {
+    const ids = await Promise.all([
+      generateLoopId(uuid("a3f9c2b1d4e5000000000000000000ab")),
+      generateLoopId(uuid("a3f9c2b1d4e5000000000000000000ab")),
+      generateLoopId(uuid("a3f9c2b1d4e5000000000000000000ab")),
+    ]);
+    assert.deepEqual([...ids].sort(), ["LP.a3f", "LP.a3f9", "LP.a3f9c"].sort());
+    for (const id of ids) {
+      assert.equal((await stat(join(dir, "loops", id))).isDirectory(), true);
+    }
   });
 });
 

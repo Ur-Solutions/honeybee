@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -18,6 +18,7 @@ import {
   parseBuzMessage,
   processQueueForBee,
   purgeMailbox,
+  readMessageById,
   resolveBuzAccept,
   sanitizeHumanName,
   sendBuzMessage,
@@ -461,6 +462,38 @@ test("consumeMessage no-op when message is not in inbox/", async () => {
   });
 });
 
+test("readMessageById returns null for a malformed message file", async () => {
+  await withTempStore(async () => {
+    const id = generateMessageId(Date.now());
+    const dir = beeMailboxDir("CO.aaa", "inbox");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `20260101T000000-${id}.md`), "not a valid buz message", "utf8");
+    assert.equal(await readMessageById("CO.aaa", id), null);
+  });
+});
+
+test("readMessageById returns null when the file vanishes between readdir and read", async () => {
+  await withTempStore(async () => {
+    const id = generateMessageId(Date.now());
+    const dir = beeMailboxDir("CO.aaa", "inbox");
+    await mkdir(dir, { recursive: true });
+    // A dangling symlink shows up in readdir but ENOENTs on readFile,
+    // mimicking a concurrent purge/drain removing the file.
+    await symlink(join(dir, "gone.md"), join(dir, `20260101T000000-${id}.md`));
+    assert.equal(await readMessageById("CO.aaa", id), null);
+  });
+});
+
+test("consumeMessage returns null instead of throwing on a malformed inbox file", async () => {
+  await withTempStore(async () => {
+    const id = generateMessageId(Date.now());
+    const dir = beeMailboxDir("CO.aaa", "inbox");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `20260101T000000-${id}.md`), "garbage", "utf8");
+    assert.equal(await consumeMessage("CO.aaa", id), null);
+  });
+});
+
 test("purge --read removes only read/ messages", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa");
@@ -532,6 +565,100 @@ test("processQueueForBee quarantines after 3 substrate failures and keeps draini
 
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 0);
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "quarantine"))).length, 1);
+  });
+});
+
+// ─── HIVE-47: substrate I/O must not hold the recipient write lock ─────────
+
+test("interrupt paste in flight does not block a concurrent send to the same recipient (HIVE-47)", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa", { buzAccept: ["interrupt", "queue"] });
+    let releasePaste!: () => void;
+    const pasteGate = new Promise<void>((r) => { releasePaste = r; });
+    let pasteStarted!: () => void;
+    const started = new Promise<void>((r) => { pasteStarted = r; });
+    const sub = fakeSubstrate({ sendText: async () => { pasteStarted(); await pasteGate; } });
+
+    const interrupt = sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.x" },
+      tier: "interrupt",
+      body: "slow paste",
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    await started;
+
+    // With the paste mid-flight, a queue-tier send must complete immediately:
+    // before HIVE-47 it blocked on the recipient write lock (held across
+    // sendText) and threw "Timed out waiting for lock" after 10s.
+    const queued = await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.y" }, tier: "queue", body: "quick" });
+    assert.equal(queued.message.deliveredAs, "queue");
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
+
+    releasePaste();
+    const delivered = await interrupt;
+    assert.equal(delivered.message.deliveredAs, "interrupt");
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "inbox"))).length, 1);
+  });
+});
+
+test("drain paste in flight does not block a concurrent send to the same recipient (HIVE-47)", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.x" }, tier: "queue", body: "draining" });
+
+    let releasePaste!: () => void;
+    const pasteGate = new Promise<void>((r) => { releasePaste = r; });
+    let pasteStarted!: () => void;
+    const started = new Promise<void>((r) => { pasteStarted = r; });
+    const sub = fakeSubstrate({ sendText: async () => { pasteStarted(); await pasteGate; } });
+
+    const drain = processQueueForBee(recipient, { transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget } });
+    await started;
+
+    // The drain's paste is mid-flight; a sender writing to this bee's mailbox
+    // must not wait behind it.
+    const queued = await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.y" }, tier: "queue", body: "quick" });
+    assert.equal(queued.message.deliveredAs, "queue");
+
+    releasePaste();
+    const result = await drain;
+    assert.equal(result.delivered.length, 1);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "inbox"))).length, 1);
+    // The message sent mid-drain stays queued for the next tick.
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
+  });
+});
+
+test("concurrent interrupt pastes to the same recipient never overlap (delivery lock)", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa", { buzAccept: ["interrupt"] });
+    let active = 0;
+    let maxConcurrent = 0;
+    const sub = fakeSubstrate({
+      sendText: async () => {
+        active += 1;
+        maxConcurrent = Math.max(maxConcurrent, active);
+        await new Promise((r) => setTimeout(r, 40));
+        active -= 1;
+      },
+    });
+
+    const send = (body: string) =>
+      sendBuzMessage({
+        recipient,
+        sender: { kind: "bee", id: "CL.x" },
+        tier: "interrupt",
+        body,
+        transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+      });
+    const results = await Promise.all([send("a"), send("b"), send("c")]);
+
+    // sendText loads a per-target tmux buffer, so overlapping pastes to the
+    // same bee would clobber each other; the delivery lock serializes them.
+    assert.equal(maxConcurrent, 1);
+    for (const result of results) assert.equal(result.message.deliveredAs, "interrupt");
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "inbox"))).length, 3);
   });
 });
 

@@ -126,6 +126,14 @@ export async function withSessionLock<T>(name: string, fn: () => Promise<T>): Pr
   return withFileLock(sessionLockPath(name), fn);
 }
 
+/**
+ * Write a FULL record, overwriting whatever is on disk. Only for creating a
+ * record (spawn/fork) or deliberately re-creating one that was just deleted
+ * (quest archiving). To mutate an existing record use updateSession instead:
+ * this overwrite reverts any field a concurrent writer (the daemon's
+ * auto-titler, touchSession heartbeats) persisted after the caller loaded its
+ * snapshot (HIVE-49).
+ */
 export async function saveSession(record: SessionRecord) {
   // Serialize against touchSession/updateSession so a concurrent merge can't
   // interleave with this full-record overwrite.
@@ -190,6 +198,10 @@ export async function touchSession(name: string, fields: Partial<SessionRecord>)
  * writers (e.g. the daemon's touchSession) can't be clobbered by a stale
  * load→modify→save cycle. Appends a compact ledger row like saveSession.
  *
+ * A patch key set to an EXPLICIT undefined deletes that field from the record
+ * (e.g. promote clears substrate/runnerPid); an absent key leaves the stored
+ * value untouched.
+ *
  * Returns the merged record, or null when the record no longer exists on disk.
  */
 export async function updateSession(name: string, patch: Partial<SessionRecord>): Promise<SessionRecord | null> {
@@ -207,6 +219,12 @@ async function mergeSessionFields(
     const existing = await loadSession(name);
     if (!existing) return null;
     const merged: SessionRecord = { ...existing, ...fields, name: existing.name };
+    // An explicitly-undefined patch value means "delete this field". Strip the
+    // keys so the returned record matches what JSON.stringify persists.
+    const bag = merged as Record<string, unknown>;
+    for (const key of Object.keys(bag)) {
+      if (bag[key] === undefined) delete bag[key];
+    }
     if (options.skipNoopWrites && sessionFingerprint(existing) === sessionFingerprint(merged)) {
       if (existing.lastObservedStateAt === merged.lastObservedStateAt) return merged;
       const previousAt = Date.parse(existing.lastObservedStateAt ?? "");

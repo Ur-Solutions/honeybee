@@ -18,7 +18,8 @@
 // burn through every queued message in a single tick.
 //
 // Per-bee locking is enforced inside processQueueForBee (withFileLock on
-// senderLockPath), so racing drains for the same bee serialize safely.
+// the per-bee delivery lock), so racing drains for the same bee serialize
+// safely without blocking concurrent senders' mailbox writes.
 
 import { readdir } from "node:fs/promises";
 import { beeMailboxDir, processQueueForBee, type DrainResult } from "../buz.js";

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { readFile, readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   type AccountRecord,
   type RefreshedClaudeToken,
@@ -11,7 +11,7 @@ import {
   claudeHomesForAccount,
   codexHomesForAccount,
   listAccounts,
-  persistClaudeChain,
+  persistClaudeChainLocked,
   readVaultClaudeChain,
   refreshClaudeOauthChain,
   saveClaudeOauthToVault,
@@ -119,6 +119,45 @@ export type LimitsDeps = {
   now?: () => number;
 };
 
+const ACCOUNT_LIMITS_CONCURRENCY = 4;
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const index = next;
+        next += 1;
+        if (index >= items.length) return;
+        results[index] = await worker(items[index]!, index);
+      }
+    }),
+  );
+  return results;
+}
+
+function memoizeKeychainReads(readKeychain: typeof readClaudeKeychain): typeof readClaudeKeychain {
+  const byHome = new Map<string, Promise<string | null>>();
+  return (homePath: string) => {
+    const key = resolve(homePath);
+    const cached = byHome.get(key);
+    if (cached) return cached;
+    const read = readKeychain(homePath).catch((error: unknown) => {
+      byHome.delete(key);
+      throw error;
+    });
+    byHome.set(key, read);
+    return read;
+  };
+}
+
 /**
  * Provider-keyed limits dispatch. A CYCLE-FREE hybrid: self-contained provider
  * fetchers (zai/minimax) live on the registry adapter in providers.ts (which
@@ -129,8 +168,11 @@ export type LimitsDeps = {
  * which is stamped uniformly below.
  */
 export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps = {}): Promise<AccountLimits[]> {
-  return Promise.all(
-    accounts.map(async (account) => {
+  const sweepDeps: LimitsDeps = { ...deps, readKeychain: memoizeKeychainReads(deps.readKeychain ?? readClaudeKeychain) };
+  return mapWithConcurrency(
+    accounts,
+    ACCOUNT_LIMITS_CONCURRENCY,
+    async (account) => {
       // Dispatch on the effective provider: the record's own provider when
       // present, else inferred from its cli. Belt-and-suspenders so the dispatch
       // is robust even for a raw AccountRecord that never flowed through
@@ -143,9 +185,9 @@ export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps 
         account.provider ? { ...limits, provider: account.provider } : limits;
       try {
         const adapter = providerAdapter(provider);
-        if (adapter?.fetchLimits) return stampProvider(await adapter.fetchLimits(account, deps));
-        if (provider === "anthropic") return stampProvider(await claudeLimits(account, deps));
-        if (provider === "openai") return stampProvider(await codexLimits(account, deps));
+        if (adapter?.fetchLimits) return stampProvider(await adapter.fetchLimits(account, sweepDeps));
+        if (provider === "anthropic") return stampProvider(await claudeLimits(account, sweepDeps));
+        if (provider === "openai") return stampProvider(await codexLimits(account, sweepDeps));
         return stampProvider({
           account: account.id,
           tool: account.tool,
@@ -164,7 +206,7 @@ export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps 
           error: error instanceof Error ? error.message : String(error),
         });
       }
-    }),
+    },
   );
 }
 
@@ -280,44 +322,83 @@ async function claudeLimits(account: AccountRecord, deps: LimitsDeps): Promise<A
       };
     }
     const refresh = deps.refreshClaudeToken ?? refreshClaudeOauthChain;
-    const persist = deps.persistRefreshedCredentials ?? persistClaudeChain;
-    const attempted = new Set<string>();
-    for (const candidate of candidates) {
-      if (candidate.expiresAt > now) continue;
-      if (!candidate.attributed || !candidate.refreshToken || attempted.has(candidate.refreshToken)) continue;
-      attempted.add(candidate.refreshToken);
-      const refreshed = await refresh(candidate.refreshToken).catch(() => null);
-      if (!refreshed) continue;
-      const oauth: Record<string, unknown> = {
-        ...candidate.oauth,
-        accessToken: refreshed.accessToken,
-        refreshToken: refreshed.refreshToken,
-        expiresAt: refreshed.expiresAt,
-        ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
-      };
-      const actualEmail = expectedEmail ? await profileOf(refreshed.accessToken).catch(() => null) : null;
-      if (expectedEmail && actualEmail && actualEmail !== expectedEmail) {
-        // The chain belongs to someone else (mislabeled source). Park the
-        // rotated tokens with their real owner so the chain isn't lost.
-        imposters.add(actualEmail);
-        const owner = (await listAccounts()).find(
-          (other) => other.tool === "claude" && (other.email ?? other.label) === actualEmail,
-        );
-        if (owner) await persist(owner, oauth).catch(() => undefined);
-        continue;
+    const persist = deps.persistRefreshedCredentials ?? persistClaudeChainLocked;
+    const readVault = deps.readVaultChain ?? readVaultClaudeChain;
+    const lock = deps.withAccountsLock ?? withAccountsLock;
+    // HIVE-2: refresh+persist is a read-modify-write of the account's chain,
+    // and refresh tokens rotate — two concurrent refreshes (say, the --live
+    // dashboard and an activation both hitting one expired account) replay
+    // the same refresh token, which trips the provider's reuse detection and
+    // can revoke the whole chain, logging the live session out. Take the same
+    // accounts lock as activation's refresh path, and double-check the vault
+    // inside it: a writer that beat us to the rotation left a fresh chain to
+    // use instead of replaying the now-dead token.
+    credential = await lock<ClaudeOauthCredentials | undefined>(async () => {
+      const attempted = new Set<string>();
+      const vaultNow = await readVault(account).catch(() => null);
+      if (vaultNow && vaultNow.expiresAt > now && typeof vaultNow.oauth.accessToken === "string") {
+        const accessToken = vaultNow.oauth.accessToken;
+        const actualEmail = expectedEmail ? await profileOf(accessToken).catch(() => null) : null;
+        if (!expectedEmail || actualEmail === expectedEmail) {
+          return {
+            accessToken,
+            expiresAt: vaultNow.expiresAt,
+            ...(typeof vaultNow.oauth.subscriptionType === "string" ? { subscriptionType: vaultNow.oauth.subscriptionType } : {}),
+            oauth: vaultNow.oauth,
+            ...(vaultNow.refreshToken ? { refreshToken: vaultNow.refreshToken } : {}),
+            attributed: true,
+            source: "vault",
+          };
+        }
+        if (actualEmail) imposters.add(actualEmail);
       }
-      await persist(account, oauth).catch(() => undefined);
-      credential = {
-        accessToken: refreshed.accessToken,
-        expiresAt: refreshed.expiresAt,
-        ...(typeof candidate.oauth.subscriptionType === "string" ? { subscriptionType: candidate.oauth.subscriptionType } : {}),
-        oauth,
-        refreshToken: refreshed.refreshToken,
-        attributed: true,
-        source: "refresh",
-      };
-      break;
-    }
+      // Even when the rotated-behind-us chain is unusable here (imposter, or
+      // itself expired again), never replay the superseded vault token — that
+      // replay IS the reuse-detection trip this lock exists to prevent.
+      if (vaultNow?.refreshToken) {
+        for (const candidate of candidates) {
+          if (candidate.source === "vault" && candidate.refreshToken && candidate.refreshToken !== vaultNow.refreshToken) {
+            attempted.add(candidate.refreshToken);
+          }
+        }
+      }
+      for (const candidate of candidates) {
+        if (candidate.expiresAt > now) continue;
+        if (!candidate.attributed || !candidate.refreshToken || attempted.has(candidate.refreshToken)) continue;
+        attempted.add(candidate.refreshToken);
+        const refreshed = await refresh(candidate.refreshToken).catch(() => null);
+        if (!refreshed) continue;
+        const oauth: Record<string, unknown> = {
+          ...candidate.oauth,
+          accessToken: refreshed.accessToken,
+          refreshToken: refreshed.refreshToken,
+          expiresAt: refreshed.expiresAt,
+          ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
+        };
+        const actualEmail = expectedEmail ? await profileOf(refreshed.accessToken).catch(() => null) : null;
+        if (expectedEmail && actualEmail && actualEmail !== expectedEmail) {
+          // The chain belongs to someone else (mislabeled source). Park the
+          // rotated tokens with their real owner so the chain isn't lost.
+          imposters.add(actualEmail);
+          const owner = (await listAccounts()).find(
+            (other) => other.tool === "claude" && (other.email ?? other.label) === actualEmail,
+          );
+          if (owner) await persist(owner, oauth).catch(() => undefined);
+          continue;
+        }
+        await persist(account, oauth).catch(() => undefined);
+        return {
+          accessToken: refreshed.accessToken,
+          expiresAt: refreshed.expiresAt,
+          ...(typeof candidate.oauth.subscriptionType === "string" ? { subscriptionType: candidate.oauth.subscriptionType } : {}),
+          oauth,
+          refreshToken: refreshed.refreshToken,
+          attributed: true,
+          source: "refresh",
+        };
+      }
+      return undefined;
+    });
   }
 
   if (!credential) {

@@ -138,6 +138,13 @@ test("usage sampler emits exhaustion on the rising edge only and samples token d
     assert.equal(second[0]!.exhausted, false);
     assert.equal(second[0]!.sampled, false);
 
+    // Unknown capture is not a factual recovery; it must not re-arm exhaustion.
+    const unknown = await sampler(records, new Map<string, string | undefined>([["CL-a", undefined]]), 2_500);
+    assert.equal(unknown.length, 0);
+
+    const stillExhausted = await sampler(records, new Map([["CL-a", exhaustedPane]]), 2_750);
+    assert.equal(stillExhausted[0]!.exhausted, false);
+
     // Recovered pane re-arms the edge detector; new totals append a sample.
     totals = { input_tokens: 250, output_tokens: 25 };
     const third = await sampler(records, new Map([["CL-a", "❯ ready"]]), 3_000);

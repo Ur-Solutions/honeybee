@@ -680,6 +680,45 @@ test("syncClaudeChainToVault prefers an equal-expiry link with a refresh token",
   });
 });
 
+test("syncClaudeChainToVault never drops a refreshable vault link for a later-expiry link without one", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "keep-refresh@a.b");
+    const now = Date.now();
+    // Vault link is expired but refreshable — activation can still recover it.
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-vault", now - 3_600_000, "refresh-vault"));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    // Home link expires later but has no refresh token — once it expires the
+    // chain would be unrecoverable ("expired token has no refresh token").
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-home", now - 1_000));
+
+    const result = await syncClaudeChainToVault(account);
+
+    assert.equal(result.vaultUpdated, false);
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-vault");
+    assert.equal(vault.claudeAiOauth.refreshToken, "refresh-vault");
+  });
+});
+
+test("syncClaudeChainToVault prefers an earlier-expiry refreshable home link over a non-refreshable vault link", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "gain-refresh@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-vault", now + 8 * 3_600_000));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-home", now + 3_600_000, "refresh-home"));
+
+    const result = await syncClaudeChainToVault(account);
+
+    assert.equal(result.vaultUpdated, true);
+    const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-home");
+    assert.equal(vault.claudeAiOauth.refreshToken, "refresh-home");
+  });
+});
+
 test("mergeCredentialsJson overlays the new chain and preserves sibling keys", () => {
   const merged = JSON.parse(mergeCredentialsJson(
     JSON.stringify({ mcpOAuth: { server: "kept" }, claudeAiOauth: { accessToken: "old" } }),
