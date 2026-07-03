@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
-import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, hasSessionIdArg, resolveAgent, resolveHome, shellCommand, tmuxOptionsForAgent } from "./agents.js";
+import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, resolveHome, shellCommand, tmuxOptionsForAgent, type AgentSpec } from "./agents.js";
 import {
   AUTO_ACCOUNT_QUERY,
   RR_ACCOUNT_QUERY,
@@ -78,7 +78,7 @@ import {
   type QuestStatus,
 } from "./quest.js";
 import { isLinearIdentifier, loadLinearAdapter } from "./linear.js";
-import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, sessionWindowInventory, windowInventory } from "./tmuxLink.js";
+import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, sessionWindowInventory, windowInventory, type EnsureLinkSessionResult } from "./tmuxLink.js";
 import {
   BUZ_TIERS,
   type BuzMessage,
@@ -3294,16 +3294,15 @@ export async function tmuxSessionSurvives(
 }
 
 /**
- * Re-fork the HSR runner host for a bee whose record still says substrate:"hsr",
- * and persist the fresh runnerPid. promote rollbacks use the default resume path
- * to rejoin the SAME provider session headlessly; revive can pass `fresh` to
- * start a new HSR session while preserving the record identity.
+ * Build the spec for re-launching a bee's recorded agent in place: same
+ * yolo policy as spawn, re-activate the bound account for token freshness
+ * (mirrors spawnBee), and assert the executable exists. The promote/demote/
+ * revive paths all relaunch this way — headless callers pass [] (the HSR
+ * adapter appends its own resume flags), interactive callers pass
+ * resumeArgs(tool, id).
  */
-async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fresh?: boolean; sessionOverride?: string } = {}): Promise<SessionRecord> {
-  const adapter = adapterFor(tool);
-  const fresh = opts.fresh === true;
-  const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
-  const spec = resolveAgent(record.requestedAgent ?? record.agent, [], {
+async function buildResumeSpec(record: SessionRecord, tool: string, extraArgs: string[]): Promise<AgentSpec> {
+  const spec = resolveAgent(record.requestedAgent ?? record.agent, extraArgs, {
     home: record.homePath,
     yolo: agentDefaultsToYolo(tool),
     identity: Boolean(record.accountId),
@@ -3314,6 +3313,20 @@ async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fres
     if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
   }
   await assertExecutableAvailable(spec.command);
+  return spec;
+}
+
+/**
+ * Re-fork the HSR runner host for a bee whose record still says substrate:"hsr",
+ * and persist the fresh runnerPid. promote rollbacks use the default resume path
+ * to rejoin the SAME provider session headlessly; revive can pass `fresh` to
+ * start a new HSR session while preserving the record identity.
+ */
+async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fresh?: boolean; sessionOverride?: string } = {}): Promise<SessionRecord> {
+  const adapter = adapterFor(tool);
+  const fresh = opts.fresh === true;
+  const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
+  const spec = await buildResumeSpec(record, tool, []);
   const hostPid = await spawnHsrHost({
     bee: record.name,
     comb: record.combId ?? record.name,
@@ -3371,17 +3384,7 @@ async function hsrChildSurvives(bee: string, windowMs: number): Promise<boolean>
  * works, so the recovery keeps continuity).
  */
 async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void> {
-  const spec = resolveAgent(record.requestedAgent ?? record.agent, resumeArgs(tool, record.providerSessionId), {
-    home: record.homePath,
-    yolo: agentDefaultsToYolo(tool),
-    identity: Boolean(record.accountId),
-    ...(record.model ? { model: record.model } : {}),
-  });
-  if (record.accountId && spec.homePath) {
-    const account = await findAccount(record.accountId, tool).catch(() => undefined);
-    if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
-  }
-  await assertExecutableAvailable(spec.command);
+  const spec = await buildResumeSpec(record, tool, resumeArgs(tool, record.providerSessionId));
   const tmuxTarget = safeTmuxTarget(record.name);
   const substrate = localSubstrate();
   const launch = await substrate.newSession(tmuxTarget, record.cwd, {
@@ -3444,19 +3447,8 @@ async function cmdPromote(parsed: Parsed): Promise<void> {
   await stopHsrRunner(record);
 
   // 3. Build the interactive resume spec: claude `--resume <id>`, codex
-  //    `resume <id>`. Same yolo policy as spawn; re-activate the account for
-  //    token freshness (mirrors spawnBee).
-  const spec = resolveAgent(record.requestedAgent ?? record.agent, resumeArgs(tool, record.providerSessionId), {
-    home: record.homePath,
-    yolo: agentDefaultsToYolo(tool),
-    identity: Boolean(record.accountId),
-    ...(record.model ? { model: record.model } : {}),
-  });
-  if (record.accountId && spec.homePath) {
-    const account = await findAccount(record.accountId, tool).catch(() => undefined);
-    if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
-  }
-  await assertExecutableAvailable(spec.command);
+  //    `resume <id>`.
+  const spec = await buildResumeSpec(record, tool, resumeArgs(tool, record.providerSessionId));
 
   // 4. Launch the interactive tmux session (resuming the same provider session).
   const tmuxTarget = safeTmuxTarget(record.name);
@@ -3544,17 +3536,7 @@ async function cmdDemote(parsed: Parsed): Promise<void> {
 
   // 3. Build the headless spec (the adapter appends the resume + stream flags)
   //    and fork the runner host with resume:true against the same session id.
-  const spec = resolveAgent(record.requestedAgent ?? record.agent, [], {
-    home: record.homePath,
-    yolo: agentDefaultsToYolo(tool),
-    identity: Boolean(record.accountId),
-    ...(record.model ? { model: record.model } : {}),
-  });
-  if (record.accountId && spec.homePath) {
-    const account = await findAccount(record.accountId, tool).catch(() => undefined);
-    if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
-  }
-  await assertExecutableAvailable(spec.command);
+  const spec = await buildResumeSpec(record, tool, []);
   const runnerTier = adapter.tier();
   const hostPid = await spawnHsrHost({
     bee: record.name,
@@ -4653,55 +4635,91 @@ async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<Session
   return updated;
 }
 
+/**
+ * run/x/xa spawn exactly one bee — reject cohort flags with a command-specific
+ * hint (the guard used to be copy-pasted per command and drifted).
+ */
+export function assertSingleBeeInvocation(parsed: Parsed, hint: string): void {
+  if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) throw new Error(hint);
+}
+
+/**
+ * The shared run/x/xa/open delegation to cmdSpawn: clone the caller's flags,
+ * let `mutateFlags` adjust the clone (no-wait, forced substrate, delegated-flag
+ * pruning), and spawn with the caller's rest unless overridden.
+ */
+async function spawnDelegated(
+  parsed: Parsed,
+  agent: string,
+  opts: { mutateFlags?: (flags: Map<string, string | true | string[]>) => void; rest?: string[] } = {},
+): Promise<SessionRecord> {
+  const spawnFlags = new Map(parsed.flags);
+  opts.mutateFlags?.(spawnFlags);
+  const spawnParsed: Parsed = {
+    command: "spawn",
+    args: [agent],
+    flags: spawnFlags,
+    rest: opts.rest ?? parsed.rest,
+  };
+  return cmdSpawn(spawnParsed);
+}
+
+/**
+ * run/x readiness gate. HSR bees have no interactive TUI to poll for readiness
+ * — the runner host is ready as soon as spawn confirmed it live (hasSession),
+ * so only tmux bees wait on the pane scrape; --force-send downgrades a
+ * readiness timeout to a warning. Shared so the HSR split cannot diverge
+ * between run and x again.
+ */
+async function waitForPromptReady(record: SessionRecord, parsed: Parsed): Promise<void> {
+  if (record.substrate === "hsr") return;
+  try {
+    await waitForAgentReady(record, {
+      timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
+      acceptTrust: acceptsTrust(parsed),
+      raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
+    });
+  } catch (error) {
+    if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
+    console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
+    if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+  }
+}
+
+/**
+ * Deliver a run/x prompt: send it to the agent pane, stamp the record's
+ * lastPrompt fields, flip hive-state to working, and ledger the prompt.
+ * Returns the stamp timestamp (cmdRun's waitForIdle needs it).
+ */
+async function deliverPromptToBee(record: SessionRecord, prompt: string): Promise<string> {
+  await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
+  const now = new Date().toISOString();
+  await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+  await writeHiveState(record, "working");
+  await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
+  return now;
+}
+
 async function cmdRun(parsed: Parsed) {
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
   if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--account <name|auto>] [--yolo] [--wait] [--last] [--rm|--cleanup] [-- <bee-args...>]");
   if (truthy(flag(parsed, "keep")) && cleanupAfterRun(parsed)) throw new Error("--keep cannot be combined with --rm/--cleanup");
-  if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
-    throw new Error("hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
-  }
+  assertSingleBeeInvocation(parsed, "hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
   const waited = truthy(flag(parsed, "wait"));
   if (!waited && hasFlag(parsed, "n")) {
     throw new Error("hive run: -n is only for --wait output rows; use --lines for the no-wait pane preview");
   }
 
-  // The waitForAgentReady below is authoritative; skip spawn's own readiness
+  // The waitForPromptReady below is authoritative; skip spawn's own readiness
   // confirmation so a slow boot is only waited for once.
-  const spawnFlags = new Map(parsed.flags);
-  spawnFlags.set("no-wait", true);
-  const spawnParsed: Parsed = {
-    command: "spawn",
-    args: [agent],
-    flags: spawnFlags,
-    rest: parsed.rest,
-  };
-  const record = await cmdSpawn(spawnParsed);
+  const record = await spawnDelegated(parsed, agent, { mutateFlags: (flags) => flags.set("no-wait", true) });
   const cleanup = cleanupAfterRun(parsed);
   let blocked = false;
 
   try {
-    // HSR bees have no interactive TUI to poll for readiness — the runner host is
-    // ready as soon as spawn confirmed it live (hasSession). Skip the pane-scrape
-    // readiness wait; steer straight through the control socket.
-    if (record.substrate !== "hsr") {
-      try {
-        await waitForAgentReady(record, {
-          timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
-          acceptTrust: acceptsTrust(parsed),
-          raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
-        });
-      } catch (error) {
-        if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
-        console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
-        if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
-      }
-    }
-    await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
-    const now = new Date().toISOString();
-    await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
-    await writeHiveState(record, "working");
-    await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
+    await waitForPromptReady(record, parsed);
+    const now = await deliverPromptToBee(record, prompt);
 
     if (waited) {
       const outcome = await waitForIdle({
@@ -4768,44 +4786,14 @@ async function cmdX(parsed: Parsed) {
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
   if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--name <id>] [--yolo] [-- <bee-args...>]");
-  if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
-    throw new Error("hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
-  }
+  assertSingleBeeInvocation(parsed, "hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
 
-  // The waitForAgentReady below is authoritative; skip spawn's own readiness
+  // The waitForPromptReady below is authoritative; skip spawn's own readiness
   // confirmation so a slow boot is only waited for once.
-  const spawnFlags = new Map(parsed.flags);
-  spawnFlags.set("no-wait", true);
-  const spawnParsed: Parsed = {
-    command: "spawn",
-    args: [agent],
-    flags: spawnFlags,
-    rest: parsed.rest,
-  };
-  const record = await cmdSpawn(spawnParsed);
+  const record = await spawnDelegated(parsed, agent, { mutateFlags: (flags) => flags.set("no-wait", true) });
 
-  // HSR bees have no interactive TUI to poll for readiness — the runner host is
-  // ready as soon as spawn confirmed it live (hasSession). Skip the pane-scrape
-  // readiness wait; steer straight through the control socket.
-  if (record.substrate !== "hsr") {
-    try {
-      await waitForAgentReady(record, {
-        timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
-        acceptTrust: acceptsTrust(parsed),
-        raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
-      });
-    } catch (error) {
-      if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
-      console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
-      if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
-    }
-  }
-
-  await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
-  const now = new Date().toISOString();
-  await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
-  await writeHiveState(record, "working");
-  await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
+  await waitForPromptReady(record, parsed);
+  await deliverPromptToBee(record, prompt);
   if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
   else console.log(`sent\t${record.name}\t${prompt.length} chars`);
 }
@@ -4817,9 +4805,7 @@ async function cmdX(parsed: Parsed) {
 async function cmdXa(parsed: Parsed) {
   const agent = parsed.args[0];
   if (!agent) throw new Error("Usage: hive xa <bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--name <id>] [--print]");
-  if (numberFlag(parsed, ["count"], 1) > 1 || flag(parsed, "frame")) {
-    throw new Error("hive xa attaches to a single bee; spawn cohorts with hive spawn --count/--frame");
-  }
+  assertSingleBeeInvocation(parsed, "hive xa attaches to a single bee; spawn cohorts with hive spawn --count/--frame");
 
   // `xa` = spawn + attach to a terminal. HSR bees are pane-less and have no
   // tmux target to attach, so xa must never produce one: reject an explicit
@@ -4837,16 +4823,11 @@ async function cmdXa(parsed: Parsed) {
   const xaHasExplicitTarget =
     (typeof xaSubstrateFlag === "string" && xaSubstrateFlag.trim().length > 0) ||
     (typeof xaNodeFlag === "string" && xaNodeFlag.trim().length > 0);
-  const xaFlags = new Map(parsed.flags);
-  if (!xaHasExplicitTarget) xaFlags.set("substrate", "tmux");
-
-  const spawnParsed: Parsed = {
-    command: "spawn",
-    args: [agent],
-    flags: xaFlags,
-    rest: parsed.rest,
-  };
-  const record = await cmdSpawn(spawnParsed);
+  const record = await spawnDelegated(parsed, agent, {
+    mutateFlags: (flags) => {
+      if (!xaHasExplicitTarget) flags.set("substrate", "tmux");
+    },
+  });
 
   const substrate = substrateFor(record);
   if (truthy(flag(parsed, "print")) || !process.stdout.isTTY) {
@@ -4907,21 +4888,18 @@ async function cmdOpen(parsed: Parsed) {
   const rawAppFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
   const raw = truthy(flag(parsed, "raw")) || truthy(flag(parsed, "window")) || rawAppFlag !== undefined;
   if (!raw) {
-    const spawnFlags = new Map(parsed.flags);
-    for (const key of [...spawnFlags.keys()]) {
-      // Unknown flags reach the agent via the spawn rest, not as spawn flags.
-      if (!OPEN_DELEGATED_FLAGS.has(key)) spawnFlags.delete(key);
-    }
-    spawnFlags.delete("raw");
-    spawnFlags.delete("print");
-    if (process.env.TMUX) spawnFlags.set("here", true);
-    const spawnParsed: Parsed = {
-      command: "spawn",
-      args: [requested],
-      flags: spawnFlags,
+    const record = await spawnDelegated(parsed, requested, {
+      mutateFlags: (flags) => {
+        for (const key of [...flags.keys()]) {
+          // Unknown flags reach the agent via the spawn rest, not as spawn flags.
+          if (!OPEN_DELEGATED_FLAGS.has(key)) flags.delete(key);
+        }
+        flags.delete("raw");
+        flags.delete("print");
+        if (process.env.TMUX) flags.set("here", true);
+      },
       rest: [...openPassthroughArgs(parsed, OPEN_DELEGATED_FLAGS), ...parsed.rest],
-    };
-    const record = await cmdSpawn(spawnParsed);
+    });
     const substrate = substrateFor(record);
     if (truthy(flag(parsed, "print")) || !process.stdout.isTTY) {
       if (isPretty()) console.error(note("attach with:"));
@@ -5384,31 +5362,21 @@ async function workspaceOpen(parsed: Parsed) {
   }
 
   const session = workspaceSessionName(record.name);
-  const ensured = await ensureLinkSession(session);
-  // Workspaces persist across terminal close — unlike views, never auto-destroyed.
-  await setWorkspaceOptions(session);
-  // The placeholder shell is the workspace's own window — mark it so `close`
-  // may kill-window it (it survives as the anchor of an empty/pane-only ws).
-  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+  const ensured = await ensureWorkspaceSession(session);
 
   // Materialize bee members: resolve each bee's live session, link its window in.
-  const records = await listSessions();
-  const byId = new Map(records.map((r) => [r.id ?? r.name, r] as const));
-  const liveNames = new Set(await localSubstrate().listSessions());
+  const index = await beeSessionIndex();
   const beeTargets: string[] = [];
   for (const member of record.members) {
     if (member.kind !== "bee") continue;
-    const bee = byId.get(member.beeId) ?? records.find((r) => r.name === member.beeId);
+    const bee = resolveBeeMember(index, member.beeId);
     if (!bee) continue;
     if (bee.node && bee.node !== LOCAL_NODE_NAME) continue;
-    if (!liveNames.has(bee.tmuxTarget)) continue;
+    if (!index.liveNames.has(bee.tmuxTarget)) continue;
     beeTargets.push(bee.tmuxTarget);
     // Converge with `add`: a member bee must carry workspaceId so ws:<name>
     // (derived from bee.workspaceId) and record.members never disagree.
-    if (bee.workspaceId !== record.name) {
-      await updateSession(bee.name, { workspaceId: record.name });
-      await writeHiveTags({ ...bee, workspaceId: record.name });
-    }
+    await stampWorkspaceMembership(bee, record.name);
   }
   const linkResult = await linkTargetsInto(session, beeTargets, ensured);
 
@@ -5458,6 +5426,57 @@ async function setWorkspaceOptions(session: string): Promise<void> {
   await tmux(["set-option", "-t", session, "detach-on-destroy", "off"], { reject: false });
 }
 
+/**
+ * Shared workspace/quest session bootstrap (open/restore/quest-start): ensure
+ * the link session, make it persist across terminal close, and mark the
+ * placeholder shell as the workspace's own window so `close` may reap it (it
+ * survives as the anchor of an empty/pane-only workspace).
+ */
+async function ensureWorkspaceSession(session: string): Promise<EnsureLinkSessionResult> {
+  const ensured = await ensureLinkSession(session);
+  await setWorkspaceOptions(session);
+  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+  return ensured;
+}
+
+/**
+ * Session records keyed by id ?? name plus the live local tmux session set —
+ * the resolution workspaceOpen and restore share for materializing bee members.
+ */
+type BeeSessionIndex = { records: SessionRecord[]; byId: Map<string, SessionRecord>; liveNames: Set<string> };
+
+async function beeSessionIndex(): Promise<BeeSessionIndex> {
+  const records = await listSessions();
+  const byId = new Map(records.map((r) => [r.id ?? r.name, r] as const));
+  const liveNames = new Set(await localSubstrate().listSessions());
+  return { records, byId, liveNames };
+}
+
+/** Resolve a workspace bee member to its record — member ids may be record ids or bare names. */
+function resolveBeeMember(index: BeeSessionIndex, beeId: string): SessionRecord | undefined {
+  return index.byId.get(beeId) ?? index.records.find((r) => r.name === beeId);
+}
+
+/**
+ * The members accumulator add/quest-start share: existing members (order
+ * preserved) plus the bee-member id set for dedup.
+ */
+export type WorkspaceMembership = { members: WorkspaceMember[]; memberIds: Set<string> };
+
+export function seedWorkspaceMembers(existing: WorkspaceMember[] | undefined): WorkspaceMembership {
+  const members: WorkspaceMember[] = existing ? [...existing] : [];
+  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  return { members, memberIds };
+}
+
+/** Record a bee as a workspace member once (keyed by id ?? name). */
+export function addBeeMember(membership: WorkspaceMembership, bee: SessionRecord): void {
+  const beeId = bee.id ?? bee.name;
+  if (membership.memberIds.has(beeId)) return;
+  membership.members.push({ kind: "bee", beeId });
+  membership.memberIds.add(beeId);
+}
+
 /** Open a window at `rootDir` running `command` (or the user's shell). */
 const WS_OWN_OPTION = "@hive_ws_own";
 
@@ -5504,8 +5523,7 @@ async function workspaceAdd(parsed: Parsed) {
   if (live.length < local.length) console.error(note(`skip ${local.length - live.length} dead bee(s)`));
   if (live.length === 0) throw new Error(`No live local bees match selector: ${sel}`);
 
-  const members: WorkspaceMember[] = [...record.members];
-  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const membership = seedWorkspaceMembers(record.members);
   const inventory = await windowInventory();
   const currentWindows = new Set(inventory.windows.get(session) ?? []);
   let linkedCount = 0;
@@ -5515,18 +5533,14 @@ async function workspaceAdd(parsed: Parsed) {
     const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
     linkedCount += linked;
     if (linked > 0) currentWindows.add(windowId);
-    const beeId = bee.id ?? bee.name;
-    if (!memberIds.has(beeId)) {
-      members.push({ kind: "bee", beeId });
-      memberIds.add(beeId);
-    }
+    addBeeMember(membership, bee);
     // Stamp workspaceId on the live bee so the derived ws: tag refreshes
     // (cmdMove colony pattern).
     const now = new Date().toISOString();
     await updateSession(bee.name, { workspaceId: record.name, updatedAt: now });
     await writeHiveTags({ ...bee, workspaceId: record.name });
   }
-  await updateWorkspace(record.name, { members });
+  await updateWorkspace(record.name, { members: membership.members });
 
   if (isPretty()) console.log(actionLine("ok", "workspace", [bold(session), `${linkedCount} bee(s) linked`]));
   else console.log(`workspace-add\t${session}\t${linkedCount}`);
@@ -5624,11 +5638,8 @@ async function restoreWorkspaceRecord(record: WorkspaceRecord, opts: { resume: b
   }
   const session = workspaceSessionName(record.name);
 
-  // Same session bootstrap as workspaceOpen: ensure it, make it persist, and
-  // mark the placeholder shell own so `close` can later reap it.
-  const ensured = await ensureLinkSession(session);
-  await setWorkspaceOptions(session);
-  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+  // Same session bootstrap as workspaceOpen.
+  const ensured = await ensureWorkspaceSession(session);
 
   // Pane members: recreate a window at rootDir per pane — only when the session
   // was freshly created this call. A re-restore of a LIVE ws keeps its existing
@@ -5645,9 +5656,7 @@ async function restoreWorkspaceRecord(record: WorkspaceRecord, opts: { resume: b
   }
 
   // Bee members: same resolution as workspaceOpen (records keyed by id ?? name).
-  const records = await listSessions();
-  const byId = new Map(records.map((r) => [r.id ?? r.name, r] as const));
-  const liveNames = new Set(await localSubstrate().listSessions());
+  const index = await beeSessionIndex();
   const beeTargets: string[] = [];
   const seenBees = new Set<string>();
   let beeCount = 0;
@@ -5657,13 +5666,13 @@ async function restoreWorkspaceRecord(record: WorkspaceRecord, opts: { resume: b
     // each beeId once so we never revive (or double-count) the same bee twice.
     if (seenBees.has(member.beeId)) continue;
     seenBees.add(member.beeId);
-    const bee = byId.get(member.beeId) ?? records.find((r) => r.name === member.beeId);
+    const bee = resolveBeeMember(index, member.beeId);
     if (bee && bee.node && bee.node !== LOCAL_NODE_NAME) {
       // link-window cannot cross tmux servers; leave a remote bee for its node.
       console.error(note(`skip remote bee ${member.beeId} — restore links local windows only`));
       continue;
     }
-    if (bee && liveNames.has(bee.tmuxTarget)) {
+    if (bee && index.liveNames.has(bee.tmuxTarget)) {
       // ALREADY live — never double-spawn (PRD §13). Just link it in + stamp.
       beeTargets.push(bee.tmuxTarget);
       beeCount += 1;
@@ -5962,15 +5971,12 @@ async function questStart(parsed: Parsed) {
   // so the derived quest:<id> tag lights up, and link each bee's window into the
   // quest's workspace — reusing the workspace link path, never reinventing it.
   const session = workspaceSessionName(quest.workspace);
-  const ensured = await ensureLinkSession(session);
-  await setWorkspaceOptions(session);
-  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+  const ensured = await ensureWorkspaceSession(session);
 
   const inventory = await windowInventory();
   const liveNames = new Set(await localSubstrate().listSessions());
   const wsRecord = await loadWorkspace(quest.workspace);
-  const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
-  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const membership = seedWorkspaceMembers(wsRecord?.members);
   const beeTargets: string[] = [];
   for (const bee of records) {
     await stampQuestMembership(bee, quest.id, quest.colony, quest.workspace);
@@ -5980,16 +5986,12 @@ async function questStart(parsed: Parsed) {
     const windowId = inventory.active.get(bee.tmuxTarget);
     if (!windowId) continue; // no live window to link — never record a phantom member
     beeTargets.push(bee.tmuxTarget);
-    const beeId = bee.id ?? bee.name;
-    if (!memberIds.has(beeId)) {
-      members.push({ kind: "bee", beeId });
-      memberIds.add(beeId);
-    }
+    addBeeMember(membership, bee);
   }
   await linkTargetsInto(session, beeTargets, ensured);
   // Persist the bee membership on the workspace so a later restore brings them
   // back (converges with the workspace add/open invariant).
-  await updateWorkspace(quest.workspace, { members });
+  await updateWorkspace(quest.workspace, { members: membership.members });
 
   // Flip the quest to active: stamp activatedAt (first activation only) and
   // append the swarm id. The swarm id is the frame's swarm hint (spawnFromFrame
@@ -6044,16 +6046,13 @@ async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
   // Prepare the quest's link session ONCE up front (mirror the --frame path) so
   // ws-<id> exists before the first bee spawns and has a host for the link.
   const session = workspaceSessionName(quest.workspace);
-  const ensured = await ensureLinkSession(session);
-  await setWorkspaceOptions(session);
-  if (ensured.placeholder) await markWorkspaceOwnWindow(session, ensured.placeholder);
+  const ensured = await ensureWorkspaceSession(session);
 
   // Seed the members accumulator from the existing workspace record. The
-  // onSpawned hook appends to `members` as each bee spawns; we persist it once
+  // onSpawned hook appends to it as each bee spawns; we persist it once
   // after the flow returns (members are records, so they survive kill-on-end).
   const wsRecord = await loadWorkspace(quest.workspace);
-  const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
-  const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const membership = seedWorkspaceMembers(wsRecord?.members);
   const currentWindows = new Set((await sessionWindowInventory(session)).windows);
   let placeholderDropped = false;
 
@@ -6079,11 +6078,7 @@ async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
         await tmux(["select-window", "-t", `=${session}:${windowId}`], { reject: false });
       }
     }
-    const beeId = bee.id ?? bee.name;
-    if (!memberIds.has(beeId)) {
-      members.push({ kind: "bee", beeId });
-      memberIds.add(beeId);
-    }
+    addBeeMember(membership, bee);
   };
 
   // The flow's cohort swarmId is the facade default `flow:<name>:run:<runId>`.
@@ -6107,7 +6102,7 @@ async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
     // Persist members REGARDLESS of outcome so the workspace reflects whatever
     // bees were spawned + linked, even on a failed/cancelled run (the safe
     // partial state — these bees are real quest members, not orphans).
-    await updateWorkspace(quest.workspace, { members });
+    await updateWorkspace(quest.workspace, { members: membership.members });
   }
 
   // Flip the quest active ONLY on success: a crashed/aborted flow must never
@@ -6127,10 +6122,10 @@ async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
       : outcome.status === "cancelled" ? yellow("cancelled")
       : outcome.status === "failed" ? red("failed")
       : dim(outcome.status);
-    console.log(actionLine("ok", "quest", [bold(quest.id), dim(`@${swarmId}`), dim(`${members.length} bee(s)`), colored]));
+    console.log(actionLine("ok", "quest", [bold(quest.id), dim(`@${swarmId}`), dim(`${membership.members.length} bee(s)`), colored]));
     if (outcome.error?.message) console.error(dim(`error: ${outcome.error.message}`));
   } else {
-    console.log(`quest-started\t${quest.id}\t${swarmId}\t${members.length}\t${outcome.status}`);
+    console.log(`quest-started\t${quest.id}\t${swarmId}\t${membership.members.length}\t${outcome.status}`);
   }
   if (outcome.status === "failed") process.exitCode = 1;
   if (outcome.status === "cancelled") process.exitCode = 130;
@@ -6616,23 +6611,28 @@ async function frameDefine(parsed: Parsed) {
   const first = parsed.args[1];
   const second = parsed.args[2];
   if (!first) throw new Error("Usage: hive frame define <path-to-frame.json|.ts> [<name>]");
-  const { sourcePath, nameOverride } = resolveFrameDefineArgs(first, second);
+  const { sourcePath, nameOverride } = resolveDefineArgs(first, second);
   const frame = await defineFrameFromFile(sourcePath, nameOverride);
   if (isPretty()) console.log(actionLine("ok", "frame", [bold(frame.name), `${frame.castes.length} castes`, dim(sourcePath)]));
   else console.log(`defined\t${frame.name}\t${frame.castes.length}\t${sourcePath}`);
 }
 
-function resolveFrameDefineArgs(first: string, second?: string): { sourcePath: string; nameOverride?: string } {
+/** A frame/flow define source: a path when it has a slash or a .json/.ts suffix. */
+function looksLikeDefinePath(value: string): boolean {
+  return value.includes("/") || value.endsWith(".json") || value.endsWith(".ts");
+}
+
+/**
+ * `hive frame|flow define <a> [<b>]` accepts <path> [<name>] in either order;
+ * on an ambiguous pair the first arg is taken as the path.
+ */
+export function resolveDefineArgs(first: string, second?: string): { sourcePath: string; nameOverride?: string } {
   if (!second) return { sourcePath: first };
-  const firstIsPath = looksLikeFramePath(first);
-  const secondIsPath = looksLikeFramePath(second);
+  const firstIsPath = looksLikeDefinePath(first);
+  const secondIsPath = looksLikeDefinePath(second);
   if (firstIsPath && !secondIsPath) return { sourcePath: first, nameOverride: second };
   if (!firstIsPath && secondIsPath) return { sourcePath: second, nameOverride: first };
   return { sourcePath: first, nameOverride: second };
-}
-
-function looksLikeFramePath(value: string): boolean {
-  return value.includes("/") || value.endsWith(".json") || value.endsWith(".ts");
 }
 
 async function frameUpdate(parsed: Parsed) {
@@ -6641,14 +6641,14 @@ async function frameUpdate(parsed: Parsed) {
   if (!first) throw new Error("Usage: hive frame update <name> [path] OR hive frame update <path>");
 
   // hive frame update <name>  → reload from remembered source
-  if (!second && !looksLikeFramePath(first)) {
+  if (!second && !looksLikeDefinePath(first)) {
     return reloadFrame(first);
   }
 
   let sourcePath: string;
   let targetName: string | undefined;
   if (second) {
-    const { sourcePath: s, nameOverride } = resolveFrameDefineArgs(first, second);
+    const { sourcePath: s, nameOverride } = resolveDefineArgs(first, second);
     sourcePath = s;
     targetName = nameOverride;
   } else {
@@ -7445,15 +7445,48 @@ function colorRunStatus(status: FlowRunMeta["status"]): string {
   return dim(status);
 }
 
+/**
+ * Consistent `-n/--lines` parsing for the flow/loop/daemon log commands (they
+ * had each grown their own variant): first of -n/--lines wins, non-negative
+ * integers only, anything else falls back.
+ */
+export function logLinesFlag(parsed: Parsed, fallback: number): number {
+  const n = numberFlag(parsed, ["n", "lines"], fallback);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+/** Consistent `-f/--follow` parsing for the loop/daemon log commands. */
+export function followFlag(parsed: Parsed): boolean {
+  return truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
+}
+
+/**
+ * Shared flow/loop log emitter: trim to the last `lines` lines (0/omitted =
+ * the full log), newline-terminate, and hint the on-disk path for tail -f
+ * users on pretty stderr.
+ */
+export async function emitLog(opts: { text: string; path: string; lines?: number }): Promise<void> {
+  let text = opts.text;
+  if (opts.lines !== undefined && opts.lines > 0) {
+    const parts = text.split("\n");
+    if (parts[parts.length - 1] === "") parts.pop();
+    text = parts.slice(-opts.lines).join("\n");
+  }
+  process.stdout.write(text);
+  if (text.length > 0 && !text.endsWith("\n")) process.stdout.write("\n");
+  if (isPretty(process.stderr)) console.error(dim(`# ${opts.path}`));
+}
+
 async function flowLogs(parsed: Parsed) {
   const runId = parsed.args[1];
   if (!runId) throw new Error("Usage: hive flow logs <runId> [-n <lines>]");
   const summary = await findRunById(runId);
   if (!summary) throw new Error(`Unknown run: ${runId}`);
-  const path = runLogPath(summary.flowName, runId);
-  const lines = numberFlag(parsed, ["n", "lines"], 0);
-  const text = tailLogText(await readLogFull(summary.flowName, runId), lines);
-  await emitLogText(text, path);
+  await emitLog({
+    text: await readLogFull(summary.flowName, runId),
+    path: runLogPath(summary.flowName, runId),
+    lines: logLinesFlag(parsed, 0),
+  });
 }
 
 async function flowStatus(parsed: Parsed) {
@@ -7524,26 +7557,13 @@ async function flowDefine(parsed: Parsed) {
   const first = parsed.args[1];
   const second = parsed.args[2];
   if (!first) throw new Error("Usage: hive flow define <path-to-flow.json|.ts> [<name>]");
-  const { sourcePath, nameOverride } = resolveFlowDefineArgs(first, second);
+  const { sourcePath, nameOverride } = resolveDefineArgs(first, second);
   const flow = await defineFlowFromFile(sourcePath, nameOverride);
   if (isPretty()) {
     console.log(actionLine("ok", "flow", [bold(flow.name), `${flow.args?.length ?? 0} args`, dim(sourcePath)]));
   } else {
     console.log(`defined\t${flow.name}\t${flow.args?.length ?? 0}\t${sourcePath}`);
   }
-}
-
-function resolveFlowDefineArgs(first: string, second?: string): { sourcePath: string; nameOverride?: string } {
-  if (!second) return { sourcePath: first };
-  const firstIsPath = looksLikeFlowPath(first);
-  const secondIsPath = looksLikeFlowPath(second);
-  if (firstIsPath && !secondIsPath) return { sourcePath: first, nameOverride: second };
-  if (!firstIsPath && secondIsPath) return { sourcePath: second, nameOverride: first };
-  return { sourcePath: first, nameOverride: second };
-}
-
-function looksLikeFlowPath(value: string): boolean {
-  return value.includes("/") || value.endsWith(".json") || value.endsWith(".ts");
 }
 
 async function flowInspect(parsed: Parsed) {
@@ -7636,16 +7656,19 @@ function loopArgsFromFlags(parsed: Parsed, prompt: string): Record<string, unkno
   return args;
 }
 
-async function loopStartCmd(parsed: Parsed) {
-  // Resolve the prompt from --prompt or --prompt-file.
-  let prompt = typeof flag(parsed, "prompt") === "string" ? String(flag(parsed, "prompt")) : "";
+/** Resolve a loop prompt from --prompt or --prompt-file (mutually exclusive; may be empty). */
+export async function resolvePromptArg(parsed: Parsed): Promise<string> {
+  const prompt = typeof flag(parsed, "prompt") === "string" ? String(flag(parsed, "prompt")) : "";
   const promptFile = typeof flag(parsed, "prompt-file") === "string" ? String(flag(parsed, "prompt-file")) : undefined;
   if (promptFile) {
     if (prompt) throw new Error("Provide either --prompt or --prompt-file, not both.");
-    prompt = (await readFile(resolve(promptFile), "utf8")).trim();
+    return (await readFile(resolve(promptFile), "utf8")).trim();
   }
+  return prompt;
+}
 
-  await startLoopDetached(loopArgsFromFlags(parsed, prompt));
+async function loopStartCmd(parsed: Parsed) {
+  await startLoopDetached(loopArgsFromFlags(parsed, await resolvePromptArg(parsed)));
 }
 
 /**
@@ -7819,12 +7842,7 @@ async function loopTemplateListCmd(parsed: Parsed): Promise<void> {
 async function loopTemplateSaveCmd(parsed: Parsed): Promise<void> {
   const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : "";
   if (!name) throw new Error("Usage: hive loop template save --name <name> --prompt \"...\" [--context …]");
-  let prompt = typeof flag(parsed, "prompt") === "string" ? String(flag(parsed, "prompt")) : "";
-  const promptFile = typeof flag(parsed, "prompt-file") === "string" ? String(flag(parsed, "prompt-file")) : undefined;
-  if (promptFile) {
-    if (prompt) throw new Error("Provide either --prompt or --prompt-file, not both.");
-    prompt = (await readFile(resolve(promptFile), "utf8")).trim();
-  }
+  const prompt = await resolvePromptArg(parsed);
   if (!prompt) throw new Error("hive loop template save needs --prompt or --prompt-file.");
 
   const input: LoopTemplateInput = { name, prompt };
@@ -7910,7 +7928,7 @@ async function loopLogsCmd(parsed: Parsed) {
   const cfg = await readLoopConfig(loopId);
   if (!cfg) throw new Error(`Unknown loop: ${loopId}`);
 
-  const follow = truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
+  const follow = followFlag(parsed);
   const iterRaw = flag(parsed, "iter");
   if (iterRaw !== undefined) {
     if (typeof iterRaw !== "string") throw new Error("--iter requires an iteration number (e.g. --iter 3)");
@@ -7922,31 +7940,19 @@ async function loopLogsCmd(parsed: Parsed) {
       if (error.code === "ENOENT") throw new Error(`No log for iteration ${n} of loop ${loopId}`);
       throw error;
     });
-    await emitLogText(text, path);
+    await emitLog({ text, path });
     return;
   }
 
-  const path = runLogPath("loop", loopId);
-  const lines = numberFlag(parsed, ["n", "lines"], 0);
   if (follow) {
     await followLoopLog(loopId);
     return;
   }
-  const text = tailLogText(await readLogFull("loop", loopId), lines);
-  await emitLogText(text, path);
-}
-
-function tailLogText(text: string, lines: number): string {
-  if (lines <= 0) return text;
-  const parts = text.split("\n");
-  if (parts[parts.length - 1] === "") parts.pop();
-  return parts.slice(-lines).join("\n");
-}
-
-async function emitLogText(text: string, path: string): Promise<void> {
-  process.stdout.write(text);
-  if (text.length > 0 && !text.endsWith("\n")) process.stdout.write("\n");
-  if (isPretty(process.stderr)) console.error(dim(`# ${path}`));
+  await emitLog({
+    text: await readLogFull("loop", loopId),
+    path: runLogPath("loop", loopId),
+    lines: logLinesFlag(parsed, 0),
+  });
 }
 
 async function followLoopLog(loopId: string): Promise<void> {
@@ -8238,15 +8244,8 @@ async function daemonRestart(parsed: Parsed) {
 }
 
 async function daemonLogs(parsed: Parsed) {
-  const follow = truthy(flag(parsed, "follow")) || truthy(flag(parsed, "f"));
-  const linesRaw = flag(parsed, "lines");
-  const linesN = (() => {
-    if (typeof linesRaw !== "string") return undefined;
-    const n = Number(linesRaw);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
-  })();
-  const nFlag = numberFlag(parsed, ["n"], NaN);
-  const lines = Number.isFinite(nFlag) ? nFlag : (linesN ?? 50);
+  const follow = followFlag(parsed);
+  const lines = logLinesFlag(parsed, 50);
 
   const controller = new AbortController();
   const onSignal = () => controller.abort();
