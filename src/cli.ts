@@ -31,6 +31,7 @@ import {
   vaultRoot,
 } from "./accounts.js";
 import { agentKinds, identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "./drivers.js";
+import { mapWithConcurrency } from "./concurrency.js";
 import { credentialDigest, readClaudeKeychain } from "./keychain.js";
 import { attachBeeWithSidebar, readBeesGroupMode, resolveCurrentSidebarBeeName, showBeeBesideSidebar, syncBeesSidebarLayout, toggleBeesSidebar, writeBeesGroupMode } from "./beesSidebar.js";
 import { beesTuiSearchText, runBeesTui, type BeesTuiItem } from "./beesTui.js";
@@ -40,7 +41,7 @@ import { chooseLaunch, type LaunchTemplate } from "./launchTui.js";
 import { chooseLoop, loopStartArgs, type LoopLaunchResult } from "./loopTui.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "./forkTui.js";
 import { listLoopTemplates, loadLoopTemplate, removeLoopTemplate, saveLoopTemplate, type LoopTemplate, type LoopTemplateInput } from "./loopTemplate.js";
-import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
+import { acquireProSlot, createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, resolveProSlotForCwd, toProSlug, type ProRepoEntry, type ProSlotKind } from "./proProjects.js";
 import { cachedAccountLimits, paceDelta, pickLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver, type AccountLimits, type WindowUsage } from "./limits.js";
 import { pickRoundRobinAccount } from "./roundRobin.js";
 import { reconcileSessions, sessionIndexPath, syncManifestPath, writeSyncManifest } from "./reconcile.js";
@@ -77,7 +78,7 @@ import {
   type QuestStatus,
 } from "./quest.js";
 import { isLinearIdentifier, loadLinearAdapter } from "./linear.js";
-import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, windowInventory } from "./tmuxLink.js";
+import { createGroupedSession, ensureLinkSession, linkTargetsInto, linkWindowsInto, sessionWindowInventory, windowInventory } from "./tmuxLink.js";
 import {
   BUZ_TIERS,
   type BuzMessage,
@@ -948,13 +949,24 @@ function ttlFlagMs(parsed: Parsed): number | undefined {
  * remaining quota.
  */
 async function resolveSpawnAgentWithAuto(requested: string, parsed: Parsed): Promise<SpawnAgentSpec> {
-  const rr = roundRobinAccountTool(requested);
-  if (rr) return { agent: rr, account: await pickRoundRobinAccountForCli(rr) };
-  const tool = autoAccountTool(requested);
-  if (tool) return { agent: tool, account: await pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  const alias = spawnAccountAliasResolver(requested, parsed);
+  if (alias) return { agent: alias.agent, account: await alias.account() };
   const resolved = await resolveSpawnAgent(requested);
   const defaultAccount = await defaultBareGrokAccount(requested, parsed, resolved);
   return defaultAccount ? { agent: defaultAccount.tool, account: defaultAccount } : resolved;
+}
+
+type SpawnAccountAliasResolver = {
+  agent: string;
+  account: () => Promise<AccountRecord>;
+};
+
+function spawnAccountAliasResolver(requested: string, parsed: Parsed): SpawnAccountAliasResolver | undefined {
+  const rr = roundRobinAccountTool(requested);
+  if (rr) return { agent: rr, account: () => pickRoundRobinAccountForCli(rr) };
+  const tool = autoAccountTool(requested);
+  if (tool) return { agent: tool, account: () => pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  return undefined;
 }
 
 async function defaultBareGrokAccount(requested: string, parsed: Parsed, resolved: SpawnAgentSpec): Promise<AccountRecord | undefined> {
@@ -1395,15 +1407,16 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
     throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
   }
-  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
+  const perBeeAccountAlias = spawnAccountAliasResolver(requested, parsed);
+  const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
+    ? { agent: perBeeAccountAlias.agent, account: undefined }
+    : await resolveSpawnAgentWithAuto(requested, parsed);
   // Thin profile → account (same overlay as spawnSingleBee).
   const profile = await resolveProfileOverlay(requested);
   const agent = profile ? profile.account.tool : resolvedAgent;
   const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
   const account = profile?.account ?? aliasAccount;
   // Model selector precedence: profile model override > the account default.
-  const model = account ? (profile?.model ?? account.model) : undefined;
-  const provider = account?.provider;
   const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
@@ -1420,7 +1433,10 @@ async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Promise<Ses
   // and no new --count restriction.
   const records: SessionRecord[] = [];
   for (let i = 0; i < count; i += 1) {
-    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account, model, provider });
+    const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
+    const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
+    const beeProvider = beeAccount?.provider;
+    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider });
     records.push(record);
     const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
     if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`@${swarmId}`), ...nodeSuffix]));
@@ -1466,13 +1482,14 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
   const hasComposerMessages = perBeeMessages !== undefined;
   let slot = 0; // running bee index across all castes, aligned with perBeeMessages
   for (const caste of frame.castes) {
-    const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(caste.bee, parsed);
+    const perBeeAccountAlias = spawnAccountAliasResolver(caste.bee, parsed);
+    const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
+      ? { agent: perBeeAccountAlias.agent, account: undefined }
+      : await resolveSpawnAgentWithAuto(caste.bee, parsed);
     const profile = await resolveProfileOverlay(caste.bee);
     const agent = profile ? profile.account.tool : resolvedAgent;
     const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
     const account = profile?.account ?? aliasAccount;
-    const model = account ? (profile?.model ?? account.model) : undefined;
-    const provider = account?.provider;
     const yolo = dangerousMode(parsed, agent, caste.bee, profile?.yolo);
     const home = caste.home ?? flagHome;
     const casteSpec = resolveAgent(agent, extraArgs, { home, yolo });
@@ -1486,6 +1503,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
       // With composer messages present, a blank slot explicitly means no brief;
       // otherwise fall back to the legacy "--briefed delivers caste brief" path.
       const toDeliver = hasComposerMessages ? (hasCustom ? custom : undefined) : briefed && caste.brief ? caste.brief : undefined;
+      const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
+      const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
+      const beeProvider = beeAccount?.provider;
       let record = await spawnBee({
         agent,
         extraArgs,
@@ -1496,9 +1516,9 @@ async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?
         swarmId,
         caste: caste.name,
         node: casteNode,
-        account,
-        model,
-        provider,
+        account: beeAccount,
+        model: beeModel,
+        provider: beeProvider,
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
       if (toDeliver) record = await deliverBrief(parsed, record, toDeliver);
@@ -2497,13 +2517,20 @@ function formatStateCell(state: BeeState): string {
   }
 }
 
+// Each capture forks a subprocess (tmux locally, a full ssh round-trip for
+// remote bees), so an uncapped fan-out over a large hive spawns dozens of
+// simultaneous ssh connections per `hive ls`/clean pass (HIVE-62).
+const PANE_CAPTURE_CONCURRENCY = 8;
+
 async function capturePanesFor(records: SessionRecord[], liveTargets: Set<string>): Promise<Map<string, string>> {
   const liveRecords = records.filter((record) => liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
-  const entries = await Promise.all(
+  const entries = await mapWithConcurrency(
+    liveRecords,
+    PANE_CAPTURE_CONCURRENCY,
     // Re-key by the bee's own pane (agentPaneId) so sub-bees sharing one comb's
     // tmuxTarget keep distinct captures; legacy solo bees with no pane fall back
     // to tmuxTarget. deriveState reads with the same `agentPaneId ?? tmuxTarget`.
-    liveRecords.map(async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const),
+    async (record) => [record.agentPaneId ?? record.tmuxTarget, await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId).catch(() => "")] as const,
   );
   return new Map(entries);
 }
@@ -4302,6 +4329,12 @@ async function resolveForkCheckpoint(beeName: string, checkpointArg: string | un
 
 // ── hive fork launch — the interactive dialog (⌘K) ───────────────────────────
 
+async function hasRecordedForkUsingCwd(source: SessionRecord, cwd: string): Promise<boolean> {
+  const sourceIds = new Set([source.name, ...(source.id ? [source.id] : [])]);
+  const records = await listSessions();
+  return records.some((record) => record.cwd === cwd && record.forkedFromId !== undefined && sourceIds.has(record.forkedFromId));
+}
+
 /**
  * `hive fork launch` — the interactive fork window (the ⌘K target). The SOURCE
  * is the bee owning the current pane, so the dialog opens straight on a form for
@@ -4373,12 +4406,16 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
 
   // Create the worktree/checkout up front — its path becomes the fork's --cwd.
   let cwd: string | undefined;
+  let createdSlot: { kind: ProSlotKind; repoPath: string; name: string; path: string } | undefined;
   if (intent.isolation) {
     if (!proRepo) throw new Error("hive fork launch: not a pro repo — cannot create a worktree");
     const slug = toProSlug(intent.isolation.name);
     if (!slug) throw new Error("hive fork launch: worktree name must contain letters, digits, or dashes");
     if (isPretty()) console.error(note(`creating ${intent.isolation.kind} ${slug}…`));
-    cwd = await createProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slot = await acquireProSlot(intent.isolation.kind, proRepo.path, slug);
+    const slotPath = await realpath(slot.path).catch(() => slot.path);
+    cwd = slotPath;
+    if (slot.created) createdSlot = { kind: intent.isolation.kind, repoPath: proRepo.path, name: slug, path: slotPath };
   }
 
   // Build a `hive fork` invocation and reuse cmdFork wholesale.
@@ -4391,7 +4428,28 @@ async function cmdForkLaunch(parsed: Parsed): Promise<void> {
   if (cwd) flags.set("cwd", cwd);
   flags.set("here", true);
 
-  const record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  let record: SessionRecord;
+  try {
+    record = await cmdFork({ command: "fork", args: [source.name], flags, rest: [] });
+  } catch (error) {
+    if (createdSlot) {
+      const launched = await hasRecordedForkUsingCwd(source, createdSlot.path).catch((checkError) => {
+        const message = checkError instanceof Error ? checkError.message : String(checkError);
+        console.error(note(`warn: keeping ${createdSlot.kind} ${createdSlot.name}; could not verify fork records: ${message}`));
+        return true;
+      });
+      if (!launched) {
+        if (isPretty()) console.error(note(`removing ${createdSlot.kind} ${createdSlot.name} after failed fork...`));
+        try {
+          await deleteProSlot(createdSlot.kind, createdSlot.repoPath, createdSlot.name);
+        } catch (cleanupError) {
+          const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          console.error(note(`warn: failed to remove ${createdSlot.kind} ${createdSlot.name} at ${tildify(createdSlot.path)}: ${message}`));
+        }
+      }
+    }
+    throw error;
+  }
 
   if (intent.message) {
     await cmdSend({ command: "send", args: [record.name, intent.message], flags: new Map(), rest: [] });
@@ -5278,12 +5336,6 @@ async function workspaceList(parsed: Parsed) {
   ));
 }
 
-/** Active window ids per local tmux session, for de-dupe on add/open. */
-async function workspaceWindowsOf(session: string): Promise<string[]> {
-  const inventory = await windowInventory();
-  return inventory.windows.get(session) ?? [];
-}
-
 async function workspaceOpen(parsed: Parsed) {
   const name = parsed.args[1];
   if (!name) throw new Error("Usage: hive workspace open <name|colony> [--root <dir>] [--new-client] [--print]");
@@ -5421,13 +5473,14 @@ async function workspaceAdd(parsed: Parsed) {
   const members: WorkspaceMember[] = [...record.members];
   const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
   const inventory = await windowInventory();
+  const currentWindows = new Set(inventory.windows.get(session) ?? []);
   let linkedCount = 0;
   for (const bee of live) {
     const windowId = inventory.active.get(bee.tmuxTarget);
     if (!windowId) continue;
-    const currentWindows = await workspaceWindowsOf(session);
     const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
     linkedCount += linked;
+    if (linked > 0) currentWindows.add(windowId);
     const beeId = bee.id ?? bee.name;
     if (!memberIds.has(beeId)) {
       members.push({ kind: "bee", beeId });
@@ -5967,19 +6020,31 @@ async function questStartFlow(parsed: Parsed, idArg: string): Promise<void> {
   const wsRecord = await loadWorkspace(quest.workspace);
   const members: WorkspaceMember[] = wsRecord ? [...wsRecord.members] : [];
   const memberIds = new Set(members.filter((m) => m.kind === "bee").map((m) => (m as { beeId: string }).beeId));
+  const currentWindows = new Set((await sessionWindowInventory(session)).windows);
+  let placeholderDropped = false;
 
-  // Per-spawn hook: replicate the --frame loop body for ONE bee. Liveness +
-  // the window inventory MUST be re-read per spawn — bees spawn over time, so a
-  // single up-front snapshot (as in the --frame path) would miss later windows.
+  // Per-spawn hook: replicate the --frame loop body for ONE bee. The spawned
+  // bee's windows must be read per spawn because bees appear over time, but a
+  // single-session `list-windows -t =bee` is enough; avoid a global `-a` scan.
   const onSpawned = async (bee: SessionRecord): Promise<void> => {
     await stampQuestMembership(bee, quest.id, quest.colony, quest.workspace);
     // Only local + live windows can be link-window'd (the workspaceAdd discipline).
     if (bee.node && bee.node !== LOCAL_NODE_NAME) return;
-    if (!(await localSubstrate().hasSession(bee.tmuxTarget))) return;
-    const inventory = await windowInventory();
-    const windowId = inventory.active.get(bee.tmuxTarget);
+    const beeWindows = await sessionWindowInventory(bee.tmuxTarget);
+    const windowId = beeWindows.active;
     if (!windowId) return; // no live window to link — never record a phantom member
-    await linkTargetsInto(session, [bee.tmuxTarget], ensured);
+    const linked = await linkWindowsInto(session, currentWindows, [{ session: bee.tmuxTarget, windowId }], { select: false });
+    if (linked > 0) {
+      currentWindows.add(windowId);
+      if (ensured.placeholder && !placeholderDropped) {
+        await tmux(["kill-window", "-t", `=${session}:${ensured.placeholder}`], { reject: false });
+        currentWindows.delete(ensured.placeholder);
+        placeholderDropped = true;
+      }
+      if (ensured.created) {
+        await tmux(["select-window", "-t", `=${session}:${windowId}`], { reject: false });
+      }
+    }
     const beeId = bee.id ?? bee.name;
     if (!memberIds.has(beeId)) {
       members.push({ kind: "bee", beeId });
@@ -7348,16 +7413,13 @@ function colorRunStatus(status: FlowRunMeta["status"]): string {
 
 async function flowLogs(parsed: Parsed) {
   const runId = parsed.args[1];
-  if (!runId) throw new Error("Usage: hive flow logs <runId>");
+  if (!runId) throw new Error("Usage: hive flow logs <runId> [-n <lines>]");
   const summary = await findRunById(runId);
   if (!summary) throw new Error(`Unknown run: ${runId}`);
-  const text = await readLogFull(summary.flowName, runId);
-  process.stdout.write(text);
-  if (text.length > 0 && !text.endsWith("\n")) process.stdout.write("\n");
-  // Hint at the path for tail -f users.
-  if (isPretty(process.stderr)) {
-    console.error(dim(`# ${runLogPath(summary.flowName, runId)}`));
-  }
+  const path = runLogPath(summary.flowName, runId);
+  const lines = numberFlag(parsed, ["n", "lines"], 0);
+  const text = tailLogText(await readLogFull(summary.flowName, runId), lines);
+  await emitLogText(text, path);
 }
 
 async function flowStatus(parsed: Parsed) {
@@ -7836,13 +7898,15 @@ async function loopLogsCmd(parsed: Parsed) {
     await followLoopLog(loopId);
     return;
   }
-  let text = await readLogFull("loop", loopId);
-  if (lines > 0) {
-    const parts = text.split("\n");
-    if (parts[parts.length - 1] === "") parts.pop();
-    text = parts.slice(-lines).join("\n");
-  }
+  const text = tailLogText(await readLogFull("loop", loopId), lines);
   await emitLogText(text, path);
+}
+
+function tailLogText(text: string, lines: number): string {
+  if (lines <= 0) return text;
+  const parts = text.split("\n");
+  if (parts[parts.length - 1] === "") parts.pop();
+  return parts.slice(-lines).join("\n");
 }
 
 async function emitLogText(text: string, path: string): Promise<void> {
@@ -7852,18 +7916,15 @@ async function emitLogText(text: string, path: string): Promise<void> {
 }
 
 async function followLoopLog(loopId: string): Promise<void> {
-  let previous = "";
-  const printDelta = (next: string) => {
-    if (next.length > previous.length) {
-      process.stdout.write(next.slice(previous.length));
-    } else if (next !== previous) {
-      // Log was rotated/rewritten — reprint from scratch.
-      process.stdout.write(next);
-    }
-    previous = next;
+  const path = runLogPath("loop", loopId);
+  let offset = 0;
+  const printAppended = async () => {
+    const result = await readLogSince(path, offset);
+    offset = result.offset;
+    if (result.text.length > 0) process.stdout.write(result.text);
   };
   while (true) {
-    printDelta(await readLogFull("loop", loopId));
+    await printAppended();
     const cfg = await readLoopConfig(loopId).catch(() => null);
     if (cfg && cfg.status !== "running") break;
     if (cfg && cfg.status === "running" && typeof cfg.pid === "number" && !processAlive(cfg.pid)) {
@@ -7873,7 +7934,31 @@ async function followLoopLog(loopId: string): Promise<void> {
     await sleep(1_000);
   }
   // One final read: catch lines appended between the last read and the status flip.
-  printDelta(await readLogFull("loop", loopId));
+  await printAppended();
+}
+
+async function readLogSince(path: string, offset: number): Promise<{ text: string; offset: number }> {
+  const info = await stat(path).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!info?.isFile()) return { text: "", offset: 0 };
+  const start = info.size < offset ? 0 : offset;
+  const length = info.size - start;
+  if (length <= 0) return { text: "", offset: info.size };
+
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    handle = await open(path, "r");
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    return { text: buffer.subarray(0, bytesRead).toString("utf8"), offset: start + bytesRead };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { text: "", offset: 0 };
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
 function processAlive(pid: number): boolean {
@@ -8383,14 +8468,7 @@ async function buzRead(parsed: Parsed) {
   const consume = truthy(flag(parsed, "consume"));
   const beeRef = typeof flag(parsed, "bee") === "string" ? String(flag(parsed, "bee")) : undefined;
   const candidates = beeRef ? [await resolveSession(beeRef)] : await listSessions();
-  let found: { message: BuzMessage; bee: string; path: string; mailbox: string } | null = null;
-  for (const record of candidates) {
-    const result = await readMessageById(record.name, id);
-    if (result) {
-      found = { message: result.message, bee: record.name, path: result.path, mailbox: result.mailbox };
-      break;
-    }
-  }
+  const found = await findBuzMessage(candidates, id);
   if (!found) throw new Error(`No buz message found with id: ${id}`);
 
   let consumed = false;
@@ -8417,6 +8495,22 @@ async function buzRead(parsed: Parsed) {
     body: found.message.body,
     consumed,
   }, null, 2));
+}
+
+type BuzReadMatch = { message: BuzMessage; bee: string; path: string; mailbox: string };
+const BUZ_READ_LOOKUP_CONCURRENCY = 16;
+
+async function findBuzMessage(candidates: SessionRecord[], id: string): Promise<BuzReadMatch | null> {
+  for (let i = 0; i < candidates.length; i += BUZ_READ_LOOKUP_CONCURRENCY) {
+    const batch = candidates.slice(i, i + BUZ_READ_LOOKUP_CONCURRENCY);
+    const matches = await Promise.all(batch.map(async (record): Promise<BuzReadMatch | null> => {
+      const result = await readMessageById(record.name, id);
+      return result ? { message: result.message, bee: record.name, path: result.path, mailbox: result.mailbox } : null;
+    }));
+    const found = matches.find((match): match is BuzReadMatch => match !== null);
+    if (found) return found;
+  }
+  return null;
 }
 
 async function buzPurge(parsed: Parsed) {
@@ -9113,31 +9207,38 @@ async function cmdAccount(parsed: Parsed) {
 async function accountList(parsed: Parsed) {
   const accounts = await listAccounts();
   const now = Date.now();
-  const rows: string[][] = [];
-  const jsonRows: Record<string, unknown>[] = [];
-  for (const account of accounts) {
-    const summary = await usageSummary(account.id, now);
-    const hasCreds = await accountHasCredentials(account);
+  const json = truthy(flag(parsed, "json"));
+  const accountRows = await Promise.all(accounts.map(async (account) => {
+    const [summary, hasCreds] = await Promise.all([
+      usageSummary(account.id, now),
+      accountHasCredentials(account),
+    ]);
     const exhausted = isRecentlyExhausted(summary, now);
-    if (truthy(flag(parsed, "json"))) {
-      jsonRows.push({ ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null });
-      continue;
+    if (json) {
+      return {
+        json: { ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null },
+        row: null,
+      };
     }
     const state = !hasCreds ? yellow("no-creds") : exhausted ? red("exhausted") : green("ok");
-    rows.push([
-      account.id,
-      account.tool,
-      account.provider ?? "-",
-      account.label,
-      isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
-      summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
-      summary.lastResetHint ?? "-",
-    ]);
-  }
-  if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify(jsonRows, null, 2));
+    return {
+      json: null,
+      row: [
+        account.id,
+        account.tool,
+        account.provider ?? "-",
+        account.label,
+        isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
+        summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
+        summary.lastResetHint ?? "-",
+      ],
+    };
+  }));
+  if (json) {
+    console.log(JSON.stringify(accountRows.map((entry) => entry.json), null, 2));
     return;
   }
+  const rows = accountRows.map((entry) => entry.row).filter((row): row is string[] => row !== null);
   if (rows.length === 0) {
     console.log(note("no accounts registered; add one with: hive account add <tool> <label>"));
     return;
@@ -9313,8 +9414,7 @@ async function cmdUsageSamples(parsed: Parsed) {
     ? [(await findAccount(query)).id]
     : [...new Set([...accounts.map((account) => account.id), ...(await listUsageAccounts())])];
 
-  const summaries = [];
-  for (const id of ids) summaries.push(await usageSummary(id, now));
+  const summaries = await Promise.all(ids.map((id) => usageSummary(id, now)));
 
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(summaries, null, 2));

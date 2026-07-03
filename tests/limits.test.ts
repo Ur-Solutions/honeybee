@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { addAccount, accountDir } from "../src/accounts.js";
-import { accountLimits, cachedAccountLimits, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
+import { CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountLimits, cachedAccountLimits, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -200,6 +200,69 @@ test("claude limits reject tokens whose profile email belongs to another account
     assert.equal(result!.ok, false);
     assert.match(result!.error ?? "", /no token belongs to right@a\.b/);
     assert.match(result!.error ?? "", /wrong@a\.b/);
+  });
+});
+
+test("claude profile email cache is bounded and evicts least-recently-used tokens", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "cache@a.b");
+    const credentialPath = join(accountDir(account), ".credentials.json");
+    const oldFetch = globalThis.fetch;
+    const profileCallsByToken = new Map<string, number>();
+
+    const writeToken = (accessToken: string) =>
+      writeFile(
+        credentialPath,
+        JSON.stringify({ claudeAiOauth: { accessToken, expiresAt: Date.now() + 3_600_000 } }),
+      );
+    const checkLimits = async () => {
+      const [result] = await accountLimits([account], {
+        fetchClaudeUsage: async () => ({ five_hour: { utilization: 1 } }),
+        readKeychain: async () => null,
+      });
+      assert.equal(result!.ok, true);
+    };
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const authorization =
+        init?.headers && !Array.isArray(init.headers) && !(init.headers instanceof Headers)
+          ? (init.headers as Record<string, string>).Authorization
+          : undefined;
+      const accessToken = authorization?.replace(/^Bearer\s+/, "");
+      assert.ok(accessToken, "profile request must include a bearer token");
+      profileCallsByToken.set(accessToken, (profileCallsByToken.get(accessToken) ?? 0) + 1);
+      return new Response(JSON.stringify({ account: { email: "cache@a.b" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      await writeToken("tok-0");
+      await checkLimits();
+
+      for (let index = 1; index < CLAUDE_PROFILE_EMAIL_CACHE_MAX; index += 1) {
+        await writeToken(`tok-${index}`);
+        await checkLimits();
+      }
+
+      await writeToken("tok-0");
+      await checkLimits();
+      assert.equal(profileCallsByToken.get("tok-0"), 1);
+
+      await writeToken(`tok-${CLAUDE_PROFILE_EMAIL_CACHE_MAX}`);
+      await checkLimits();
+
+      await writeToken("tok-0");
+      await checkLimits();
+      assert.equal(profileCallsByToken.get("tok-0"), 1);
+
+      await writeToken("tok-1");
+      await checkLimits();
+      assert.equal(profileCallsByToken.get("tok-1"), 2);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
   });
 });
 

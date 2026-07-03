@@ -30,7 +30,7 @@ import {
   type RpcMethodHandler,
   type RpcServer,
 } from "./rpc.js";
-import { hsrObservations, pendingNeedsInput } from "./observe.js";
+import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, reapDeadHosts } from "./observe.js";
 import { readHsrMeta, hsrRunDir, worktreesRoot } from "./runDir.js";
 import {
   homeDirForSpec,
@@ -418,11 +418,19 @@ export function buildController(): RunnerHostController {
         }
       }
     }
-    if (!stopped && meta && meta.status === "running" && isPidAlive(meta.hostPid)) {
-      try {
-        process.kill(meta.hostPid, "SIGTERM");
-      } catch {
-        // already gone / not signalable
+    if (!stopped && meta && meta.status === "running") {
+      if (isPidAlive(meta.hostPid)) {
+        try {
+          process.kill(meta.hostPid, "SIGTERM");
+        } catch {
+          // already gone / not signalable
+        }
+      } else {
+        // The host died without finalize (a previous serve was SIGKILLed/OOMed:
+        // its in-process runners carried the serve's pid as hostPid), so the
+        // harness child group is orphaned and unreachable over any control
+        // socket. Signal the recorded child group directly (HIVE-53).
+        await killOrphanedChildGroup(meta);
       }
     }
   }
@@ -585,13 +593,17 @@ export function buildController(): RunnerHostController {
     // Establish (or ref-count into) a relay of the bee's live event stream. Each
     // `event` the bee's control socket pushes is re-broadcast to ALL clients as
     // `hsr.event` { bee, event } — the local transport re-emits it upward.
+    // `sync` (reconnect reconciliation, HIVE-56): instead of incrementing, SET
+    // the refcount to the caller's subscriber count — a re-issued observe after
+    // a tunnel flap must not inflate the count past what unobserve will return.
     observe: guarded(async (params) => {
-      const p = (params ?? {}) as { bee?: unknown };
+      const p = (params ?? {}) as { bee?: unknown; sync?: unknown };
       const bee = String(p.bee ?? "");
       if (!bee) return { ok: false, error: "bee required" };
+      const sync = typeof p.sync === "number" && Number.isFinite(p.sync) ? Math.max(1, Math.floor(p.sync)) : undefined;
       const existing = relays.get(bee);
       if (existing) {
-        existing.refCount += 1;
+        existing.refCount = sync ?? existing.refCount + 1;
         return { ok: true };
       }
       const meta = await readHsrMeta(bee);
@@ -611,11 +623,34 @@ export function buildController(): RunnerHostController {
           // A closing socket must not wedge the relay pump.
         }
       });
-      relays.set(bee, { client, refCount: 1, unsubscribe });
+      relays.set(bee, { client, refCount: sync ?? 1, unsubscribe });
       void client.closed.then(() => {
         const relay = relays.get(bee);
         if (relay && relay.client === client) relays.delete(bee);
       });
+      return { ok: true };
+    }),
+
+    // Release a relay subscription (HIVE-56): decrement the refcount by `count`
+    // (default 1) and close the per-bee control-socket client once it hits zero.
+    // Idempotent — a relay already gone (bee killed, client.closed pruned it)
+    // is a success, so teardown/unsubscribe races never surface errors.
+    unobserve: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; count?: unknown };
+      const bee = String(p.bee ?? "");
+      if (!bee) return { ok: false, error: "bee required" };
+      const count = typeof p.count === "number" && Number.isFinite(p.count) ? Math.max(1, Math.floor(p.count)) : 1;
+      const relay = relays.get(bee);
+      if (!relay) return { ok: true };
+      relay.refCount -= count;
+      if (relay.refCount > 0) return { ok: true };
+      relays.delete(bee);
+      try {
+        relay.unsubscribe();
+        relay.client.close();
+      } catch {
+        // best-effort teardown
+      }
       return { ok: true };
     }),
 
@@ -680,6 +715,12 @@ export function buildController(): RunnerHostController {
 
 /** Start the runner-host control socket. Returns an RpcServer whose close also tears down the controller. */
 export async function serve(socketPath: string): Promise<RpcServer> {
+  // Startup reaper (HIVE-53): a previous serve that died without finalize
+  // (SIGKILL/OOM) left its in-process runners' meta "running" with hostPid =
+  // the dead serve's pid and their detached harness children orphaned. Adopt
+  // them before accepting control traffic: kill the orphaned child groups and
+  // flip their meta so the control plane restarts from a truthful view.
+  await reapDeadHosts().catch(() => undefined);
   const controller = buildController();
   const server = await startRpcServer({ socketPath, methods: controller.methods });
   controller.attachServer(server);
@@ -687,6 +728,7 @@ export async function serve(socketPath: string): Promise<RpcServer> {
     path: server.path,
     broadcast: (method, params) => server.broadcast(method, params),
     connectionCount: () => server.connectionCount(),
+    broadcastDroppedCount: () => server.broadcastDroppedCount(),
     async close(): Promise<void> {
       await controller.close();
       await server.close();
