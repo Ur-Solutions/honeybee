@@ -26,6 +26,8 @@ test("completes commands when no command typed", () => {
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("spawn"));
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("send"));
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("completion"));
+  assert.ok(getCompletionsFromState(["hive", ""], empty).includes("cat"));
+  assert.ok(getCompletionsFromState(["hive", ""], empty).includes("tx"));
 });
 
 test("completes commands with no args at all", () => {
@@ -81,14 +83,14 @@ test("completes shells as first arg of completion", () => {
   assert.deepEqual(getCompletionsFromState(["hive", "completion", ""], empty), ["bash", "zsh", "fish"]);
 });
 
-test("completes only live sessions for send/tail/transcript/last/wait/attach", () => {
+test("completes only live sessions for send/tail/cat/transcript/tx/wait/attach", () => {
   const records = [
     session("brave-otter", "brave-otter-target", "CO.abc"),
     session("dead-bee", "dead-bee-target", "CO.def"),
   ];
   const state = { records, liveTargets: new Set(["brave-otter-target"]) };
 
-  for (const cmd of ["send", "tail", "transcript", "wait", "attach"]) {
+  for (const cmd of ["send", "tail", "cat", "transcript", "tx", "wait", "attach"]) {
     const candidates = getCompletionsFromState(["hive", cmd, ""], state);
     assert.ok(candidates.includes("CO.abc"), `${cmd} should include live ref`);
     assert.ok(!candidates.includes("CO.def"), `${cmd} should exclude dead ref`);
@@ -129,6 +131,9 @@ test("completes flags when current word starts with dash", () => {
   const cleanFlags = getCompletionsFromState(["hive", "clean", "--"], empty);
   assert.ok(cleanFlags.includes("--dead"));
   assert.ok(cleanFlags.includes("--dry-run"));
+
+  assert.deepEqual(getCompletionsFromState(["hive", "cat", "--"], empty), ["-n", "--lines"]);
+  assert.deepEqual(getCompletionsFromState(["hive", "tx", "--"], empty), ["-n", "--limit", "--json"]);
 });
 
 test("returns empty for second positional arg of send (prompt is freeform)", () => {
