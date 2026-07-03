@@ -19,22 +19,14 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
-import type { SealRecord, SealStatus } from "../seal.js";
+import type { SealRecord } from "../seal.js";
+import type { LoopStopConfig } from "./stopConditions.js";
+export type { LoopStopConfig } from "./stopConditions.js";
 
 export type LoopStatus = "running" | "paused" | "stopped" | "done" | "errored" | "orphaned";
 export type LoopContextMode = "persistent" | "ralph" | "rolling";
 export type LoopCarrier = "same" | "fresh";
 export type LoopMemory = "harness" | "none" | "rolling";
-
-export type LoopStopConfig = {
-  max: number | null;
-  maxDurationMs: number | null;
-  forever: boolean;
-  until: string | null;
-  stopOnSeal: SealStatus[];
-  stopOnSentinel: string | null;
-  judge: string | null;
-};
 
 export type LoopConfig = {
   loopId: string;
