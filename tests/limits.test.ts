@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { addAccount, accountDir } from "../src/accounts.js";
-import { CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountLimits, cachedAccountLimits, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pickLeastLoadedAccount, selectLeastLoadedAccount, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
+import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -993,16 +993,16 @@ test("cachedAccountLimits serves the last snapshot on a rate-limited live read",
   });
 });
 
-test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl", async () => {
+test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl, re-reading a picked account after its grace", async () => {
   await withTempStore(async () => {
     const one = await addAccount("claude", "one@a.b");
     const two = await addAccount("claude", "two@a.b");
     const t0 = Date.parse("2026-06-10T12:00:00Z");
-    let fetchCount = 0;
+    const fetched: string[][] = [];
     const deps = (now: number) => ({
       hasCredentials: async () => true,
       fetchLimits: async (accounts: import("../src/accounts.js").AccountRecord[]) => {
-        fetchCount += 1;
+        fetched.push(accounts.map((account) => account.id));
         return accounts.map((account) => okLimits(account.id, account.id === two.id ? 10 : 50, 5));
       },
       now: () => now,
@@ -1010,21 +1010,30 @@ test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl", as
 
     const first = await pickLeastLoadedAccount("claude", deps(t0));
     assert.equal(first.account.id, two.id);
-    assert.equal(fetchCount, 1);
+    assert.equal(fetched.length, 1);
 
-    // Second pick 10 minutes later rides the cache.
-    const second = await pickLeastLoadedAccount("claude", deps(t0 + 10 * 60 * 1000));
+    // A pick 2 minutes later rides the cache entirely: the picked account
+    // keeps PICKED_ENTRY_GRACE_MS of freshness, so spawn bursts stay cheap.
+    const second = await pickLeastLoadedAccount("claude", deps(t0 + 2 * 60 * 1000));
     assert.equal(second.account.id, two.id);
     assert.equal(second.limits?.cached, true);
-    assert.equal(fetchCount, 1);
+    assert.equal(fetched.length, 1);
 
-    // ttlMs 0 forces a live read.
+    // Past the grace, ONLY the picked (aged) account re-reads live; the
+    // untouched account still rides the cache (HIVE-80 pick bookkeeping).
+    const third = await pickLeastLoadedAccount("claude", deps(t0 + 10 * 60 * 1000));
+    assert.equal(third.account.id, two.id);
+    assert.equal(fetched.length, 2);
+    assert.deepEqual(fetched[1], [two.id]);
+
+    // ttlMs 0 forces a live read of everything.
     await pickLeastLoadedAccount("claude", { ...deps(t0 + 20 * 60 * 1000), ttlMs: 0 });
-    assert.equal(fetchCount, 2);
+    assert.equal(fetched.length, 3);
+    assert.deepEqual(fetched[2], [one.id, two.id]);
 
     // Past the default 1h ttl the pick refetches on its own.
     await pickLeastLoadedAccount("claude", deps(t0 + 90 * 60 * 1000));
-    assert.equal(fetchCount, 3);
+    assert.equal(fetched.length, 4);
   });
 });
 
@@ -1081,5 +1090,150 @@ test("codex snapshot fallback reads the newest date partitions, not the whole se
     assert.equal(result!.source, "session-snapshot");
     assert.equal(result!.asOf, "2026-07-03T09:00:00Z");
     assert.equal(result!.fiveHour?.usedPercent, 77);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* HIVE-80 — commitments, pick debits, near-tie rotation               */
+/* ------------------------------------------------------------------ */
+
+function liveSession(name: string, accountId: string, state: string, agent = "claude"): import("../src/store.js").SessionRecord {
+  return {
+    name,
+    agent,
+    cwd: "/tmp",
+    command: agent,
+    tmuxTarget: name,
+    createdAt: "2026-06-10T10:00:00Z",
+    updatedAt: "2026-06-10T10:00:00Z",
+    status: "running",
+    accountId,
+    lastObservedState: state,
+  };
+}
+
+test("sessionCommitmentPercent weighs busy over parked and ignores dead/unbound sessions", () => {
+  assert.equal(sessionCommitmentPercent(liveSession("s1", "a", "active")), AUTO_COMMITMENT_BUSY_PERCENT);
+  assert.equal(sessionCommitmentPercent(liveSession("s2", "a", "working")), AUTO_COMMITMENT_BUSY_PERCENT);
+  assert.equal(sessionCommitmentPercent(liveSession("s3", "a", "ready")), AUTO_COMMITMENT_PARKED_PERCENT);
+  assert.equal(sessionCommitmentPercent({ ...liveSession("s4", "a", "active"), status: "dead" }), 0);
+  assert.equal(sessionCommitmentPercent({ ...liveSession("s5", "a", "active"), accountId: undefined }), 0);
+});
+
+test("accountCommitments sums per account and filters by tool", async () => {
+  const sessions = [
+    liveSession("s1", "a", "active"),
+    liveSession("s2", "a", "working"),
+    liveSession("s3", "a", "ready"),
+    liveSession("s4", "b", "active"),
+    liveSession("s5", "b", "active", "codex"),
+    { ...liveSession("s6", "b", "active"), status: "dead" as const },
+  ];
+  const claude = await accountCommitments("claude", sessions);
+  assert.equal(claude.get("a"), 2 * AUTO_COMMITMENT_BUSY_PERCENT + AUTO_COMMITMENT_PARKED_PERCENT);
+  assert.equal(claude.get("b"), AUTO_COMMITMENT_BUSY_PERCENT);
+  const codex = await accountCommitments("codex", sessions);
+  assert.equal(codex.get("b"), AUTO_COMMITMENT_BUSY_PERCENT);
+  assert.equal(codex.get("a"), undefined);
+});
+
+test("decayedPickDebit decays linearly and treats clock skew as fresh", () => {
+  const t0 = Date.parse("2026-06-10T12:00:00Z");
+  const pick = { at: "2026-06-10T12:00:00Z", percent: AUTO_PICK_DEBIT_PERCENT };
+  assert.equal(decayedPickDebit(pick, t0), AUTO_PICK_DEBIT_PERCENT);
+  assert.equal(decayedPickDebit(pick, t0 + AUTO_PICK_DEBIT_TTL_MS / 2), AUTO_PICK_DEBIT_PERCENT / 2);
+  assert.equal(decayedPickDebit(pick, t0 + AUTO_PICK_DEBIT_TTL_MS), 0);
+  assert.equal(decayedPickDebit({ ...pick, at: "garbage" }, t0), AUTO_PICK_DEBIT_PERCENT);
+  assert.equal(decayedPickDebit({ ...pick, at: "2026-06-10T13:00:00Z" }, t0), AUTO_PICK_DEBIT_PERCENT);
+});
+
+test("recordAutoPick accumulates decaying debits and prunes expired ones", async () => {
+  await withTempStore(async () => {
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+    await recordAutoPick("a", t0);
+    await recordAutoPick("a", t0);
+    await recordAutoPick("b", t0);
+    const fresh = await pendingPickDebits(t0);
+    assert.equal(fresh.get("a"), 2 * AUTO_PICK_DEBIT_PERCENT);
+    assert.equal(fresh.get("b"), AUTO_PICK_DEBIT_PERCENT);
+    // Fully decayed debits read as absent...
+    const later = await pendingPickDebits(t0 + AUTO_PICK_DEBIT_TTL_MS);
+    assert.equal(later.size, 0);
+    // ...and are pruned from the file by the next write.
+    await recordAutoPick("c", t0 + AUTO_PICK_DEBIT_TTL_MS);
+    const raw = JSON.parse(await readFile(pendingPicksPath(), "utf8")) as Record<string, unknown[]>;
+    assert.deepEqual(Object.keys(raw), ["c"]);
+  });
+});
+
+test("selectLeastLoadedAccount applies commitments to the score and reports near-ties", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  // b is emptier on provider numbers, but carries two busy bees.
+  const steered = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: okLimits("a", 20, 10) },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 10, 10), commitment: 2 * AUTO_COMMITMENT_BUSY_PERCENT },
+    ],
+    now,
+  );
+  assert.equal(steered?.account.id, "a");
+  // The winner's own commitment is named in the reason.
+  const committed = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: okLimits("a", 50, 10) },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 10, 10), commitment: 5 },
+    ],
+    now,
+  );
+  assert.equal(committed?.account.id, "b");
+  assert.match(committed?.reason ?? "", /\+5 in-flight/);
+  // Equal effective loads are a near-tie group, winner first.
+  const tied = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: okLimits("a", 10, 10) },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits("b", 10, 10) },
+      { account: pickAccount("c", "2026-01-03"), limits: okLimits("c", 40, 10) },
+    ],
+    now,
+  );
+  assert.deepEqual(tied?.nearTieIds, ["a", "b"]);
+});
+
+test("pickLeastLoadedAccount spreads a same-instant burst instead of stacking one account (HIVE-80)", async () => {
+  await withTempStore(async () => {
+    const a = await addAccount("claude", "a@a.b");
+    const b = await addAccount("claude", "b@a.b");
+    const c = await addAccount("claude", "c@a.b");
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+    const deps = {
+      hasCredentials: async () => true,
+      fetchLimits: async (accounts: import("../src/accounts.js").AccountRecord[]) =>
+        accounts.map((account) => okLimits(account.id, 10, 10)),
+      now: () => t0,
+    };
+    // Four sequential picks with identical provider numbers and an identical
+    // clock — exactly the burst that used to stack all four on one account.
+    const picks: string[] = [];
+    for (let i = 0; i < 4; i += 1) picks.push((await pickLeastLoadedAccount("claude", deps)).account.id);
+    assert.equal(new Set(picks.slice(0, 3)).size, 3, `first three picks should spread, got ${picks.join(",")}`);
+    assert.equal(new Set(picks).size, 3, `four picks over three accounts should reuse only one, got ${picks.join(",")}`);
+    assert.ok([a.id, b.id, c.id].every((id) => picks.includes(id)));
+  });
+});
+
+test("pickLeastLoadedAccount steers around an account with live bees", async () => {
+  await withTempStore(async () => {
+    const busy = await addAccount("claude", "busy@a.b");
+    const quiet = await addAccount("claude", "quiet@a.b");
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+    const choice = await pickLeastLoadedAccount("claude", {
+      hasCredentials: async () => true,
+      // busy is emptier on provider numbers (10 vs 20) but hosts two workers.
+      fetchLimits: async (accounts: import("../src/accounts.js").AccountRecord[]) =>
+        accounts.map((account) => okLimits(account.id, account.id === busy.id ? 10 : 20, 10)),
+      now: () => t0,
+      sessions: [liveSession("w1", busy.id, "active"), liveSession("w2", busy.id, "working")],
+    });
+    assert.equal(choice.account.id, quiet.id);
   });
 });
