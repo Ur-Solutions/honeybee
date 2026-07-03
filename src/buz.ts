@@ -144,6 +144,20 @@ function senderLockPath(beeName: string): string {
   return join(buzRoot(), safeName(beeName), ".write.lock");
 }
 
+// Serializes substrate pastes to a recipient's pane: sendText loads a tmux
+// buffer whose name is derived from the target, so two concurrent pastes to
+// the same bee would clobber each other's buffer (and interleave the
+// paste+Enter pair). Kept separate from the write lock so filesystem mailbox
+// mutations never wait behind live tmux/ssh I/O (HIVE-47).
+function deliveryLockPath(beeName: string): string {
+  return join(buzRoot(), safeName(beeName), ".deliver.lock");
+}
+
+// Must exceed the worst-case sendText: three substrate execs (load-buffer,
+// paste-buffer, send-keys) at up to the 30s per-exec tmux timeout each. The
+// write lock keeps its 10s default — it now only guards fast fs mutations.
+const DELIVERY_LOCK_TIMEOUT_MS = 120_000;
+
 // ──────────────────────────────────────────────────────────────────────────
 // Sender sanitization.
 // ──────────────────────────────────────────────────────────────────────────
@@ -304,58 +318,65 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
   // the effective tier is final.
   result.outboxPath = await writeOutbox(message);
 
-  // Serialize per-bee writes so two concurrent senders cannot collide on
-  // the same filename / mailbox. We have a single lock per recipient bee.
-  await withFileLock(senderLockPath(input.recipient.name), async () => {
-    if (downgrade.effective === "interrupt") {
-      // Strict: interrupt requires a transport context. If transport is
-      // missing, downgrade to queue rather than silently failing.
-      if (!input.transport) {
-        message.deliveredAs = "queue";
-        const queued = await writeMailbox(input.recipient.name, "queue", message);
-        result.queuePath = queued;
-        result.downgraded = true;
-        result.reason = result.reason ?? "tier=interrupt without transport context; downgraded to queue";
-        return;
-      }
+  // The interrupt paste runs OUTSIDE the recipient write lock: sendText can
+  // block for up to the substrate exec timeout (30s per tmux call), far past
+  // the write lock's 10s default, so holding the write lock across it starved
+  // concurrent senders and the daemon drain (HIVE-47). Pastes serialize on
+  // the dedicated delivery lock instead.
+  let interruptAttempted = false;
+  if (downgrade.effective === "interrupt") {
+    // Strict: interrupt requires a transport context. If transport is
+    // missing, downgrade to queue rather than silently failing.
+    if (!input.transport) {
+      message.deliveredAs = "queue";
+      result.downgraded = true;
+      result.reason = result.reason ?? "tier=interrupt without transport context; downgraded to queue";
+    } else {
+      interruptAttempted = true;
+      const transport = input.transport;
       try {
-        await input.transport.substrate.sendText(input.transport.tmuxTarget, input.body, input.transport.agentPaneId);
+        await withFileLock(
+          deliveryLockPath(input.recipient.name),
+          () => transport.substrate.sendText(transport.tmuxTarget, input.body, transport.agentPaneId),
+          { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS },
+        );
         message.deliveredAt = new Date().toISOString();
       } catch (error) {
         // Transport failure on interrupt: downgrade to queue and let the
         // daemon retry. Do not lose the message.
         message.deliveredAs = "queue";
-        const queued = await writeMailbox(input.recipient.name, "queue", message);
-        result.queuePath = queued;
         result.downgraded = true;
         result.reason = `interrupt transport failed: ${error instanceof Error ? error.message : String(error)}`;
-        await appendLedger({
-          type: "buz.deliver",
-          messageId: message.id,
-          recipient: message.to,
-          tier: "interrupt",
-          ok: false,
-          error: result.reason,
-          ...(input.node ? { node: input.node } : {}),
-        });
-        return;
       }
-      result.inboxPath = await writeMailbox(input.recipient.name, "inbox", message);
-      await appendLedger({
-        type: "buz.deliver",
-        messageId: message.id,
-        recipient: message.to,
-        tier: "interrupt",
-        ok: true,
-        ...(input.node ? { node: input.node } : {}),
-      });
-    } else if (downgrade.effective === "queue") {
+    }
+  }
+
+  // Serialize per-bee mailbox writes so two concurrent senders cannot collide
+  // on the same filename / mailbox. Held only for the filesystem mutation —
+  // never across substrate I/O. A write-lock timeout after a successful paste
+  // loses the inbox copy but not the paste; delivery is at-least-once and the
+  // pre-delivery outbox record above keeps the audit trail.
+  await withFileLock(senderLockPath(input.recipient.name), async () => {
+    if (message.deliveredAs === "queue") {
       result.queuePath = await writeMailbox(input.recipient.name, "queue", message);
     } else {
-      // passive
+      // interrupt (already pasted) and passive both land in inbox/.
       result.inboxPath = await writeMailbox(input.recipient.name, "inbox", message);
     }
   });
+
+  if (interruptAttempted) {
+    const failed = message.deliveredAs !== "interrupt";
+    await appendLedger({
+      type: "buz.deliver",
+      messageId: message.id,
+      recipient: message.to,
+      tier: "interrupt",
+      ok: !failed,
+      ...(failed ? { error: result.reason } : {}),
+      ...(input.node ? { node: input.node } : {}),
+    });
+  }
 
   // Rewrite the outbox copy now that delivery settled: an interrupt can
   // downgrade to queue mid-delivery (missing transport, transport failure),
@@ -606,7 +627,14 @@ export async function processQueueForBee(
 
   const result: DrainResult = { delivered: [], quarantined: [], errors: [] };
 
-  await withFileLock(senderLockPath(record.name), async () => {
+  // The delivery lock — not the write lock — is held for the whole drain: it
+  // serializes pastes against interrupt sends and excludes concurrent drains
+  // for the same bee (which would double-paste every queue file both listed).
+  // Filesystem mutations take the write lock briefly per message, so
+  // concurrent senders' mailbox writes never wait behind substrate I/O
+  // (HIVE-47). Lock order is always delivery -> write; sendBuzMessage never
+  // holds one while acquiring the other, so the pair cannot deadlock.
+  await withFileLock(deliveryLockPath(record.name), async () => {
     await mkdir(inboxDir, { recursive: true });
 
     for (const entry of stamped) {
@@ -617,8 +645,10 @@ export async function processQueueForBee(
         message = parseBuzMessage(text);
       } catch (error) {
         // Malformed file: quarantine.
-        await mkdir(quarantineDir, { recursive: true });
-        await rename(entry.path, join(quarantineDir, entry.file));
+        await withFileLock(senderLockPath(record.name), async () => {
+          await mkdir(quarantineDir, { recursive: true });
+          await rename(entry.path, join(quarantineDir, entry.file));
+        });
         result.quarantined.push(entry.file);
         result.errors.push({ id: entry.file, message: error instanceof Error ? error.message : String(error) });
         continue;
@@ -630,14 +660,16 @@ export async function processQueueForBee(
         const retriesPath = `${entry.path}.retries`;
         const prev = Number((await readFile(retriesPath, "utf8").catch(() => "0")).trim()) || 0;
         const next = prev + 1;
-        if (next >= maxFailures) {
-          await mkdir(quarantineDir, { recursive: true });
-          await rename(entry.path, join(quarantineDir, entry.file));
-          await rm(retriesPath, { force: true });
-          result.quarantined.push(entry.file);
-        } else {
-          await atomicWriteFile(retriesPath, String(next), { mode: 0o600 });
-        }
+        await withFileLock(senderLockPath(record.name), async () => {
+          if (next >= maxFailures) {
+            await mkdir(quarantineDir, { recursive: true });
+            await rename(entry.path, join(quarantineDir, entry.file));
+            await rm(retriesPath, { force: true });
+            result.quarantined.push(entry.file);
+          } else {
+            await atomicWriteFile(retriesPath, String(next), { mode: 0o600 });
+          }
+        });
         result.errors.push({ id: message.id, message: error instanceof Error ? error.message : String(error) });
         await appendLedger({
           type: "buz.deliver",
@@ -660,10 +692,12 @@ export async function processQueueForBee(
       message.deliveredAt = (context.now ? new Date(context.now()) : new Date()).toISOString();
       message.deliveredAs = "queue";
       const updated = serializeBuzMessage(message);
-      await atomicWriteFile(entry.path, updated, { mode: 0o600 });
-      const target = join(inboxDir, entry.file);
-      await rename(entry.path, target);
-      await rm(`${entry.path}.retries`, { force: true }).catch(() => undefined);
+      await withFileLock(senderLockPath(record.name), async () => {
+        await atomicWriteFile(entry.path, updated, { mode: 0o600 });
+        const target = join(inboxDir, entry.file);
+        await rename(entry.path, target);
+        await rm(`${entry.path}.retries`, { force: true }).catch(() => undefined);
+      });
 
       result.delivered.push(message.id);
       await appendLedger({
@@ -674,7 +708,7 @@ export async function processQueueForBee(
         ok: true,
       });
     }
-  });
+  }, { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS });
 
   if (result.delivered.length > 0 || result.quarantined.length > 0) {
     await appendLedger({
