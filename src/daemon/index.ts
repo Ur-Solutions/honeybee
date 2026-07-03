@@ -17,10 +17,25 @@ export type DaemonConfig = {
   tickBudgetMs: number;
   /**
    * In-process watchdog threshold: if the tick loop stops beating for this
-   * long the daemon exits nonzero so supervision restarts it. Must exceed
-   * tickBudgetMs (the budget is the first line of defense).
+   * long the daemon hard-kills itself so supervision restarts it. Must
+   * exceed tickBudgetMs (the budget is the first line of defense).
    */
   watchdogMs: number;
+  /**
+   * Consecutive failed loop iterations (tick error/timeout or wedged
+   * bookkeeping IO) before the daemon judges its runtime poisoned — a lost
+   * libuv completion kills ALL subsequent async fs — and hard-kills itself
+   * for a supervised restart.
+   */
+  maxConsecutiveFailures: number;
+  /**
+   * Out-of-process sentinel: heartbeat (state.json mtime) age at which the
+   * sentinel SIGKILLs the daemon. Sits above watchdogMs so the in-process
+   * defenses get the first shot.
+   */
+  sentinelStaleMs: number;
+  /** Sentinel poll interval. */
+  sentinelCheckMs: number;
   /** Optional cap on how many ticks before voluntary exit (testing only). */
   maxTicks?: number;
 };
@@ -81,7 +96,12 @@ export function defaultDaemonConfig(): DaemonConfig {
   // The watchdog only backstops what the tick budget missed, so it sits well
   // above the budget: a stall can only mean the budget machinery itself died.
   const watchdogMs = positiveEnvMs("HIVE_DAEMON_WATCHDOG_MS", Math.max(3 * tickMs, 2 * tickBudgetMs));
-  return { tickMs, tickBudgetMs, watchdogMs };
+  const maxConsecutiveFailures = positiveEnvMs("HIVE_DAEMON_MAX_FAILURES", 5);
+  // The sentinel is the outermost net; give the in-process watchdog a full
+  // extra minute to act before the SIGKILL from outside.
+  const sentinelStaleMs = positiveEnvMs("HIVE_DAEMON_SENTINEL_STALE_MS", watchdogMs + 60_000);
+  const sentinelCheckMs = positiveEnvMs("HIVE_DAEMON_SENTINEL_CHECK_MS", 15_000);
+  return { tickMs, tickBudgetMs, watchdogMs, maxConsecutiveFailures, sentinelStaleMs, sentinelCheckMs };
 }
 
 export function defaultStaleAfterMs(): number {

@@ -132,6 +132,7 @@ import {
 import { transactionalKill } from "./kill.js";
 import { readDaemonStatus } from "./daemon/index.js";
 import { runDaemon } from "./daemon/run.js";
+import { runSentinel } from "./daemon/sentinel.js";
 import {
   DEFAULT_LAUNCH_LABEL,
   installAgent,
@@ -7218,11 +7219,27 @@ async function cmdDaemon(parsed: Parsed) {
       return daemonRestart(parsed);
     case "logs":
       return daemonLogs(parsed);
+    // Internal: the out-of-process heartbeat watcher spawned by `daemon run`.
+    // Deliberately absent from the usage string.
+    case "sentinel":
+      return daemonSentinel(parsed);
     default:
       throw new Error(
         `Unknown daemon subcommand: ${sub}\nUsage: hive daemon <install|uninstall|start|stop|restart|status|logs|run>`,
       );
   }
+}
+
+async function daemonSentinel(parsed: Parsed) {
+  const parentPid = numberFlag(parsed, ["parent-pid"], 0);
+  const statePath = stringFlag(parsed, ["state-path"]);
+  const staleMs = numberFlag(parsed, ["stale-ms"], 0);
+  const checkMs = numberFlag(parsed, ["check-ms"], 15_000);
+  const logPath = stringFlag(parsed, ["log-path"]);
+  if (!parentPid || !statePath || !staleMs) {
+    throw new Error("Usage (internal): hive daemon sentinel --parent-pid <pid> --state-path <file> --stale-ms <ms> [--check-ms <ms>] [--log-path <file>]");
+  }
+  await runSentinel({ parentPid, statePath, staleMs, checkMs, ...(logPath ? { logPath } : {}) });
 }
 
 function daemonLabel(parsed: Parsed): string {
@@ -7358,7 +7375,10 @@ async function daemonRun(parsed: Parsed) {
   }
   if (isPretty()) console.error(note(`hive daemon starting (pid ${process.pid})...`));
   try {
-    await runDaemon({ config });
+    // The production entrypoint runs with the out-of-process sentinel: the
+    // only defense that still works when this process can no longer run JS
+    // (sync-blocked loop, exit path deadlocked on a poisoned threadpool).
+    await runDaemon({ config, sentinel: !process.env.HIVE_DAEMON_NO_SENTINEL });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "EBUSY") {

@@ -1,4 +1,5 @@
-import { readFileSync, unlinkSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { appendFileSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { listAccounts, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault } from "../accounts.js";
 import { acquireLongLivedLock, type LongLivedLock, LockBusyError } from "../fsx.js";
 import { hiveStateFor, writeHiveState } from "../hiveState.js";
@@ -14,11 +15,12 @@ import { dispatchAutoswaps, type AutoswapOutcome } from "./autoswap.js";
 import { dispatchBuzDrains, type BuzDispatchOutcome } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher, type NeedsInputOutcome } from "./needsInput.js";
 import { createUsageSampler, type UsageSampler, type UsageTickOutcome } from "./usageSampler.js";
-import { appendDaemonLog } from "./log.js";
+import { appendDaemonLog, daemonLogPath } from "./log.js";
 import { startHsrControlServer, type HsrControlServer } from "./hsrControl.js";
 import {
   DAEMON_VERSION,
   daemonLockPath,
+  daemonStatePath,
   defaultDaemonConfig,
   maxRecentErrors,
   writeDaemonState,
@@ -418,12 +420,22 @@ export type RunDaemonOptions = {
   /** Resolve when the daemon is asked to shut down (testing). */
   shutdownSignal?: AbortSignal;
   /**
-   * Invoked when the in-process watchdog detects the tick loop stalled past
-   * config.watchdogMs. Defaults to process.exit(1) so supervision (launchd
-   * KeepAlive / systemd Restart) replaces the wedged daemon. Injectable for
-   * tests.
+   * Invoked when an in-process defense judges the daemon unrecoverable: the
+   * loop stopped beating past config.watchdogMs, or maxConsecutiveFailures
+   * loop iterations failed in a row (a poisoned threadpool fails every fs op
+   * forever). The default hard-kills the process: best-effort SYNC state/log
+   * writes (sync fs syscalls bypass the threadpool) then SIGKILL — NOT
+   * process.exit(), whose exit path joins the threadpool and deadlocked for
+   * ~9h in the 2026-07-02 incident. Supervision (launchd KeepAlive) restarts
+   * the daemon. Injectable for tests.
    */
-  onWatchdogBreach?: (info: { stalledMs: number }) => void;
+  onWatchdogBreach?: (info: { stalledMs: number; reason: string }) => void;
+  /**
+   * Spawn the out-of-process sentinel (SIGKILLs this daemon when the
+   * state.json heartbeat stalls; see sentinel.ts). Off by default so tests
+   * and embedders opt in; the `hive daemon run` CLI path enables it.
+   */
+  sentinel?: boolean;
 };
 
 export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
@@ -540,38 +552,112 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   }
 
+  // Hard self-destruct for a poisoned runtime. Everything here is
+  // SYNCHRONOUS on purpose: once a libuv completion is lost, every async fs
+  // op hangs forever, and process.exit() deadlocks joining the threadpool
+  // (2026-07-02 incident: ~9h stuck inside process.exit called by the
+  // previous watchdog). Sync fs is a direct syscall on this thread and
+  // SIGKILL needs no cooperation from the wedged runtime; launchd KeepAlive
+  // (SuccessfulExit=false) restarts us.
+  const hardKill = (info: { stalledMs: number; reason: string }) => {
+    try {
+      appendFileSync(
+        daemonLogPath(),
+        `${JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: "daemon.breach", reason: info.reason, stalledMs: info.stalledMs })}\n`,
+      );
+    } catch {
+      // best effort
+    }
+    safetyNetRelease();
+    process.kill(process.pid, "SIGKILL");
+  };
+  const onBreach = options.onWatchdogBreach ?? hardKill;
+  let breachFired = false;
+  const breach = (info: { stalledMs: number; reason: string }) => {
+    if (breachFired) return;
+    breachFired = true;
+    pushRecentError(state, new Error(`${info.reason}; hard-killing for supervised restart (stalled ${info.stalledMs}ms)`));
+    // Persist the breach record synchronously BEFORE the breach action: the
+    // action is normally SIGKILL, after which nothing runs, and async writes
+    // are exactly what a poisoned threadpool can no longer deliver.
+    try {
+      writeFileSync(daemonStatePath(), `${JSON.stringify({ ...state, recentErrors: [...state.recentErrors] }, null, 2)}\n`, { mode: 0o600 });
+    } catch {
+      // best effort
+    }
+    onBreach(info);
+  };
+
   // In-process watchdog: if the loop stops beating for watchdogMs — the tick
-  // budget machinery itself failed, or a post-tick bookkeeping write wedged —
-  // exit nonzero so supervision restarts the daemon. This is the backstop for
-  // whatever the per-call and per-tick timeouts don't catch; a frozen loop
-  // must never again masquerade as a running daemon.
+  // budget machinery itself failed, or a bookkeeping write wedged past its
+  // own timeout — hard-kill so supervision restarts the daemon. A frozen
+  // loop must never masquerade as a running daemon. (A synchronously-blocked
+  // event loop defeats any timer, including this one — that mode is covered
+  // by the out-of-process sentinel.)
   let lastLoopBeatMs = Date.now();
-  let watchdogFired = false;
-  const onWatchdogBreach = options.onWatchdogBreach ?? (() => process.exit(1));
   const watchdog = setInterval(() => {
     const stalledMs = Date.now() - lastLoopBeatMs;
-    if (watchdogFired || stopping || stalledMs <= config.watchdogMs) return;
-    watchdogFired = true;
-    pushRecentError(state, new Error(`watchdog: tick loop stalled for ${stalledMs}ms (limit ${config.watchdogMs}ms); exiting for supervised restart`));
-    // The state/log writes are best-effort — they may be wedged on the same
-    // root cause. A hard fallback guarantees the breach action still runs.
-    const hardExit = setTimeout(() => onWatchdogBreach({ stalledMs }), 2_000);
-    hardExit.unref?.();
-    void (async () => {
-      await appendDaemonLog({ level: "error", msg: "daemon.watchdog", stalledMs, limitMs: config.watchdogMs }).catch(() => undefined);
-      await writeDaemonState({ ...state, recentErrors: [...state.recentErrors] }).catch(() => undefined);
-    })().finally(() => {
-      clearTimeout(hardExit);
-      onWatchdogBreach({ stalledMs });
-    });
+    if (stopping || stalledMs <= config.watchdogMs) return;
+    breach({ stalledMs, reason: `watchdog: tick loop stalled past ${config.watchdogMs}ms` });
   }, Math.max(25, Math.min(config.tickMs, 1_000)));
+
+  // Out-of-process sentinel: a separate process that SIGKILLs us when the
+  // state.json heartbeat stalls. It is the only defense that works when this
+  // process can no longer run ANY JS (sync-blocked loop, wedged exit path).
+  let sentinel: ChildProcess | null = null;
+  if (options.sentinel === true) {
+    try {
+      const cliPath = process.argv[1];
+      if (!cliPath) throw new Error("cannot resolve CLI entrypoint for sentinel");
+      sentinel = spawn(
+        process.execPath,
+        [
+          cliPath,
+          "daemon",
+          "sentinel",
+          "--parent-pid",
+          String(process.pid),
+          "--state-path",
+          daemonStatePath(),
+          "--stale-ms",
+          String(config.sentinelStaleMs),
+          "--check-ms",
+          String(config.sentinelCheckMs),
+          "--log-path",
+          daemonLogPath(),
+        ],
+        { stdio: "ignore" },
+      );
+      sentinel.unref();
+      await appendDaemonLog({ level: "info", msg: "daemon.sentinel.start", pid: sentinel.pid ?? null, staleMs: config.sentinelStaleMs });
+    } catch (error) {
+      await appendDaemonLog({ level: "warn", msg: "daemon.sentinel.start.failed", error: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
+    }
+  }
+
+  // Bookkeeping IO (daemon log + state writes) runs under the same hard
+  // budget as tick-path fs. Incident 2026-07-02: the tick was contained by
+  // its per-call timeouts, but an UNTIMED post-tick appendDaemonLog hung on
+  // the poisoned threadpool and froze the loop with recentErrors empty.
+  const bookkeepingMs = defaultTickTimeouts().fsMs;
+  let iterationIoFailed = false;
+  const safeLog = async (entry: Parameters<typeof appendDaemonLog>[0]) => {
+    try {
+      await withTimeout(appendDaemonLog(entry), bookkeepingMs, "appendDaemonLog");
+    } catch {
+      iterationIoFailed = true;
+    }
+  };
 
   // Tick loop. We use an async sleep loop (not setInterval) so each tick fully
   // resolves before the next begins; this is the standard reliable-tick pattern.
+  let consecutiveFailures = 0;
+  let lastHealthyIterationMs = Date.now();
   try {
     while (!stopping) {
       if (config.maxTicks !== undefined && state.tickCount >= config.maxTicks) break;
       lastLoopBeatMs = Date.now();
+      iterationIoFailed = false;
       // The whole tick runs under a hard budget. A tick that blows it is
       // abandoned (its late settlement is swallowed) and recorded; the loop
       // moves on to the next tick instead of wedging forever. Production
@@ -593,10 +679,10 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         state.lastTickAt = new Date().toISOString();
         for (const err of result.errors) {
           pushRecentError(state, err);
-          await appendDaemonLog({ level: "warn", msg: "tick.partial", error: err.message });
+          await safeLog({ level: "warn", msg: "tick.partial", error: err.message });
         }
         for (const transition of result.transitions) {
-          await appendDaemonLog({
+          await safeLog({
             level: "info",
             msg: "state.transition",
             session: transition.name,
@@ -606,7 +692,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         }
         for (const outcome of result.buzDrains) {
           if (outcome.result.delivered.length > 0 || outcome.result.quarantined.length > 0 || outcome.result.errors.length > 0) {
-            await appendDaemonLog({
+            await safeLog({
               level: outcome.result.errors.length > 0 ? "warn" : "info",
               msg: "buz.drain",
               recipient: outcome.recipient,
@@ -617,7 +703,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
           }
         }
         for (const outcome of result.needsInput) {
-          await appendDaemonLog({
+          await safeLog({
             level: outcome.error ? "warn" : "info",
             msg: "needs_input.route",
             session: outcome.bee,
@@ -629,7 +715,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         }
         for (const outcome of result.usage) {
           if (!outcome.exhausted) continue;
-          await appendDaemonLog({
+          await safeLog({
             level: "warn",
             msg: "account.exhausted",
             session: outcome.bee,
@@ -638,7 +724,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
           });
         }
         for (const outcome of result.autoswaps) {
-          await appendDaemonLog({
+          await safeLog({
             level: outcome.ok ? "info" : "warn",
             msg: "account.autoswap",
             session: outcome.bee,
@@ -650,7 +736,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
           });
         }
         for (const outcome of result.autoTitles) {
-          await appendDaemonLog({
+          await safeLog({
             level: outcome.ok ? "info" : "warn",
             msg: "title.auto",
             session: outcome.bee,
@@ -662,7 +748,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         }
       } else if (tickError) {
         pushRecentError(state, tickError);
-        await appendDaemonLog({ level: "error", msg: "tick.error", error: tickError.message });
+        await safeLog({ level: "error", msg: "tick.error", error: tickError.message });
         // A budget-abandoned or thrown tick still proves the loop is alive:
         // stamp lastTickAt (external staleness checks key on loop-death, not
         // slow ticks) but do not count it — a frozen tickCount alongside
@@ -670,10 +756,28 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         state.lastTickAt = new Date().toISOString();
       }
       try {
-        await writeDaemonState({ ...state, recentErrors: [...state.recentErrors] });
+        await withTimeout(writeDaemonState({ ...state, recentErrors: [...state.recentErrors] }), bookkeepingMs, "writeDaemonState");
       } catch (error) {
+        iterationIoFailed = true;
         const err = toError(error);
-        await appendDaemonLog({ level: "warn", msg: "state.write.failed", error: err.message });
+        await safeLog({ level: "warn", msg: "state.write.failed", error: err.message });
+      }
+      // A poisoned threadpool (lost libuv completion) fails EVERY fs op from
+      // then on: each iteration times out its tick and its bookkeeping, but
+      // the loop itself stays alive — so the beat watchdog never fires and
+      // the daemon would run uselessly forever. Escalate to a hard kill once
+      // failures are clearly systemic rather than a transient blip.
+      if (tickError !== null || iterationIoFailed) {
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= config.maxConsecutiveFailures && !stopping) {
+          breach({
+            stalledMs: Date.now() - lastHealthyIterationMs,
+            reason: `${consecutiveFailures} consecutive failed loop iterations (poisoned runtime)`,
+          });
+        }
+      } else {
+        consecutiveFailures = 0;
+        lastHealthyIterationMs = Date.now();
       }
       if (stopping) break;
       if (config.maxTicks !== undefined && state.tickCount >= config.maxTicks) break;
@@ -689,6 +793,13 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   } finally {
     clearInterval(watchdog);
+    if (sentinel) {
+      try {
+        sentinel.kill("SIGTERM");
+      } catch {
+        // already gone
+      }
+    }
     if (hsrControl) await hsrControl.close().catch(() => undefined);
     if (lock) {
       try {
