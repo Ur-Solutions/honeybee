@@ -10,7 +10,7 @@
 
 import { mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { atomicWriteFile, storeRoot } from "../fsx.js";
+import { atomicWriteFile, defaultIsPidAlive, storeRoot } from "../fsx.js";
 
 export type RunStatus = "running" | "ok" | "failed" | "cancelled" | "orphaned";
 
@@ -278,16 +278,5 @@ async function statQuiet(path: string) {
     return await stat(path);
   } catch {
     return null;
-  }
-}
-
-function defaultIsPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === "EPERM";
   }
 }
