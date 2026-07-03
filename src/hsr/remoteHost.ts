@@ -30,7 +30,7 @@ import {
   type RpcMethodHandler,
   type RpcServer,
 } from "./rpc.js";
-import { hsrObservations, pendingNeedsInput } from "./observe.js";
+import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, reapDeadHosts } from "./observe.js";
 import { readHsrMeta, hsrRunDir, worktreesRoot } from "./runDir.js";
 import {
   homeDirForSpec,
@@ -179,6 +179,31 @@ function slugForRepo(repo: string): string {
 }
 
 /**
+ * Validate a branch/ref for use as a git positional: conservative charset
+ * (`^[A-Za-z0-9._/-]+$`), never `-`-leading (a `-refname` would be parsed as a
+ * git flag, e.g. `--force`), no `..` (range/rev syntax). Returns null when invalid.
+ */
+function safeGitRef(raw: string): string | null {
+  const ref = raw.trim();
+  if (!ref || ref.startsWith("-") || ref.includes("..")) return null;
+  if (!/^[A-Za-z0-9._/-]+$/.test(ref)) return null;
+  return ref;
+}
+
+/**
+ * Reject repo urls git would misinterpret: `-`-leading (parsed as an option,
+ * e.g. `--upload-pack=…`) or remote-helper transport syntax (`ext::sh -c …`,
+ * `fd::`, …) which executes arbitrary commands. Ordinary https/ssh/git/file
+ * urls, scp-like specs and local paths pass through. Returns null when invalid.
+ */
+function safeRepoUrl(raw: string): string | null {
+  const repo = raw.trim();
+  if (!repo || repo.startsWith("-")) return null;
+  if (/^[A-Za-z0-9][A-Za-z0-9+.-]*::/.test(repo)) return null;
+  return repo;
+}
+
+/**
  * Validate a checkout name can never escape the worktrees dir: a single path
  * segment, no `..`, no separators, no absolute/NUL. Returns null when invalid.
  */
@@ -206,10 +231,18 @@ type ProvisionParams = { repo?: unknown; branch?: unknown; name?: unknown; ref?:
  * (git missing, bad url, auth) surfaces as `{ ok:false, error }`.
  */
 async function provisionCheckout(params: ProvisionParams): Promise<Record<string, unknown>> {
-  const repo = typeof params.repo === "string" ? params.repo.trim() : "";
-  if (!repo) return { ok: false, error: "repo required" };
-  const branch = typeof params.branch === "string" && params.branch ? params.branch : undefined;
-  const ref = typeof params.ref === "string" && params.ref ? params.ref : undefined;
+  const rawRepo = typeof params.repo === "string" ? params.repo.trim() : "";
+  if (!rawRepo) return { ok: false, error: "repo required" };
+  // Never let repo/branch/ref reach git argv unvalidated: a `-`-leading value
+  // becomes a git flag and an `ext::`-style url executes commands (HIVE-57).
+  const repo = safeRepoUrl(rawRepo);
+  if (!repo) return { ok: false, error: `invalid repo url: ${rawRepo}` };
+  const rawBranch = typeof params.branch === "string" && params.branch ? params.branch : undefined;
+  const branch = rawBranch === undefined ? undefined : safeGitRef(rawBranch);
+  if (rawBranch !== undefined && !branch) return { ok: false, error: `invalid branch: ${rawBranch}` };
+  const rawRef = typeof params.ref === "string" && params.ref ? params.ref : undefined;
+  const ref = rawRef === undefined ? undefined : safeGitRef(rawRef);
+  if (rawRef !== undefined && !ref) return { ok: false, error: `invalid ref: ${rawRef}` };
   const rawName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : slugForRepo(repo);
   const name = safeCheckoutName(rawName);
   if (!name) return { ok: false, error: `invalid checkout name: ${rawName}` };
@@ -231,14 +264,15 @@ async function provisionCheckout(params: ProvisionParams): Promise<Record<string
     }
     const fetchArgs = ref
       ? ["-C", path, "fetch", "origin"]
-      : ["-C", path, "fetch", "--depth", "1", "origin", ...(branch ? [branch] : [])];
+      : ["-C", path, "fetch", "--depth", "1", "origin", ...(branch ? ["--", branch] : [])];
     const fetched = await runGit(fetchArgs);
     if (!fetched.ok) return { ok: false, error: `fetch failed: ${firstLine(fetched.stderr) || `git exited ${fetched.code}`}` };
     if (ref) {
-      const co = await runGit(["-C", path, "checkout", ref]);
+      // Trailing `--` pins the positional as a revision, never an option/pathspec.
+      const co = await runGit(["-C", path, "checkout", ref, "--"]);
       if (!co.ok) return { ok: false, error: `checkout ${ref} failed: ${firstLine(co.stderr) || `git exited ${co.code}`}` };
     } else if (branch) {
-      const co = await runGit(["-C", path, "checkout", branch]);
+      const co = await runGit(["-C", path, "checkout", branch, "--"]);
       if (!co.ok) return { ok: false, error: `checkout ${branch} failed: ${firstLine(co.stderr) || `git exited ${co.code}`}` };
       // Best-effort fast-forward to the freshly fetched tip.
       await runGit(["-C", path, "reset", "--hard", `origin/${branch}`]);
@@ -252,13 +286,13 @@ async function provisionCheckout(params: ProvisionParams): Promise<Record<string
   // Shallow by default; a pinned ref may need history, so clone full then check it out.
   if (!ref) cloneArgs.push("--depth", "1");
   if (branch) cloneArgs.push("--branch", branch);
-  cloneArgs.push(repo, path);
+  cloneArgs.push("--", repo, path);
   const cloned = await runGit(cloneArgs);
   if (!cloned.ok) {
     return { ok: false, error: `clone failed: ${firstLine(cloned.stderr) || firstLine(cloned.stdout) || `git exited ${cloned.code}`}` };
   }
   if (ref) {
-    const co = await runGit(["-C", path, "checkout", ref]);
+    const co = await runGit(["-C", path, "checkout", ref, "--"]);
     if (!co.ok) return { ok: false, error: `checkout ${ref} failed: ${firstLine(co.stderr) || `git exited ${co.code}`}` };
   }
   const resolvedBranch = branch ?? (await currentBranch(path));
@@ -384,11 +418,19 @@ export function buildController(): RunnerHostController {
         }
       }
     }
-    if (!stopped && meta && meta.status === "running" && isPidAlive(meta.hostPid)) {
-      try {
-        process.kill(meta.hostPid, "SIGTERM");
-      } catch {
-        // already gone / not signalable
+    if (!stopped && meta && meta.status === "running") {
+      if (isPidAlive(meta.hostPid)) {
+        try {
+          process.kill(meta.hostPid, "SIGTERM");
+        } catch {
+          // already gone / not signalable
+        }
+      } else {
+        // The host died without finalize (a previous serve was SIGKILLed/OOMed:
+        // its in-process runners carried the serve's pid as hostPid), so the
+        // harness child group is orphaned and unreachable over any control
+        // socket. Signal the recorded child group directly (HIVE-53).
+        await killOrphanedChildGroup(meta);
       }
     }
   }
@@ -673,6 +715,12 @@ export function buildController(): RunnerHostController {
 
 /** Start the runner-host control socket. Returns an RpcServer whose close also tears down the controller. */
 export async function serve(socketPath: string): Promise<RpcServer> {
+  // Startup reaper (HIVE-53): a previous serve that died without finalize
+  // (SIGKILL/OOM) left its in-process runners' meta "running" with hostPid =
+  // the dead serve's pid and their detached harness children orphaned. Adopt
+  // them before accepting control traffic: kill the orphaned child groups and
+  // flip their meta so the control plane restarts from a truthful view.
+  await reapDeadHosts().catch(() => undefined);
   const controller = buildController();
   const server = await startRpcServer({ socketPath, methods: controller.methods });
   controller.attachServer(server);

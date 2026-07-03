@@ -518,6 +518,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   const state: DaemonState = {
     startedAt,
     lastTickAt: null,
+    lastSuccessfulTickAt: null,
     tickCount: 0,
     version: DAEMON_VERSION,
     pid: process.pid,
@@ -769,6 +770,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         observed = result.observed;
         state.tickCount += 1;
         state.lastTickAt = new Date().toISOString();
+        state.lastSuccessfulTickAt = state.lastTickAt;
         for (const err of result.errors) {
           pushRecentError(state, err);
           await safeLog({ level: "warn", msg: "tick.partial", error: err.message });
