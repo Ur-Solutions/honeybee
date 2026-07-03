@@ -24,6 +24,7 @@ import {
   hsrRoot,
   readHsrMeta,
   writeHsrMeta,
+  type HsrMeta,
 } from "./runDir.js";
 import type { RunnerEvent } from "./types.js";
 
@@ -36,6 +37,19 @@ function isPidAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+/**
+ * Whether a meta record represents a live bee. For a LOCAL host the host pid is
+ * authoritative (see file docs). For a MIRROR (APIA-94: `mirrorOfNode` set)
+ * there is NO local host — liveness is remote-list driven, and the mirror owns
+ * `status`, flipping it to "exited" when the bee leaves the remote node's live
+ * list. So a mirror is live iff `status === "running"`; never pid-probed.
+ */
+function isMetaLive(meta: HsrMeta | null): boolean {
+  if (!meta || meta.status !== "running") return false;
+  if (meta.mirrorOfNode) return true;
+  return isPidAlive(meta.hostPid);
 }
 
 /** All bees with a run dir containing a meta.json, sorted. */
@@ -62,9 +76,7 @@ export async function listHsrBees(): Promise<string[]> {
 export async function hsrLiveness(): Promise<Map<string, boolean>> {
   const liveness = new Map<string, boolean>();
   for (const bee of await listHsrBees()) {
-    const meta = await readHsrMeta(bee);
-    const alive = !!meta && meta.status === "running" && isPidAlive(meta.hostPid);
-    liveness.set(bee, alive);
+    liveness.set(bee, isMetaLive(await readHsrMeta(bee)));
   }
   return liveness;
 }
@@ -94,7 +106,17 @@ const EVENT_TAIL_LINES = 200;
  *              dead/sealed) or no structured signal exists yet.
  *   snapshot — the rendered ring text tail (used as an output fallback).
  */
-export type HsrObservation = { live: boolean; state?: BeeState; snapshot: string };
+export type HsrObservation = {
+  live: boolean;
+  state?: BeeState;
+  snapshot: string;
+  /**
+   * Set to the remote node name when this bee is a LOCAL MIRROR of a remote-hsr
+   * bee (APIA-94). The daemon uses it to route the (node-carrying, non-`hsr`)
+   * SessionRecord through the HSR state path instead of the coarse node-probe.
+   */
+  mirrorOf?: string;
+};
 
 /**
  * Derive a BeeState from the tail of events.jsonl. Only the last few turn
@@ -181,12 +203,18 @@ export async function hsrObservations(): Promise<Map<string, HsrObservation>> {
   for (const bee of await listHsrBees()) {
     try {
       const meta = await readHsrMeta(bee);
-      const live = !!meta && meta.status === "running" && isPidAlive(meta.hostPid);
+      const live = isMetaLive(meta);
       const snapshot = await hsrSnapshot(bee);
+      const mirrorOf = meta?.mirrorOfNode;
       // A dead host's stream is gone — leave state undefined so deriveState
       // settles dead/sealed rather than reporting a stale structured state.
       const state = live ? structuredStateFromEvents(await readEventTail(bee, EVENT_TAIL_LINES)) : undefined;
-      observations.set(bee, state === undefined ? { live, snapshot } : { live, state, snapshot });
+      observations.set(bee, {
+        live,
+        snapshot,
+        ...(state === undefined ? {} : { state }),
+        ...(mirrorOf ? { mirrorOf } : {}),
+      });
     } catch {
       observations.set(bee, { live: false, snapshot: "" });
     }
@@ -215,8 +243,7 @@ export type PendingNeedsInput = {
  * pending request. Never throws.
  */
 export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
-  const meta = await readHsrMeta(bee);
-  if (!meta || meta.status !== "running" || !isPidAlive(meta.hostPid)) return null;
+  if (!isMetaLive(await readHsrMeta(bee))) return null;
   const events = await readEventTail(bee, EVENT_TAIL_LINES);
   let lastNeeds = -1;
   let lastEnd = -1;
@@ -307,6 +334,9 @@ export async function reapDeadHosts(): Promise<string[]> {
   for (const bee of await listHsrBees()) {
     const meta = await readHsrMeta(bee);
     if (!meta || meta.status !== "running") continue;
+    // A mirror has no local host pid to reap: the remoteEventMirror owns its
+    // status (flips to "exited" when the bee leaves the remote list). Skip it.
+    if (meta.mirrorOfNode) continue;
     if (isPidAlive(meta.hostPid)) continue;
     await writeHsrMeta(bee, { ...meta, status: "exited", endedAt: new Date().toISOString() });
     reaped.push(bee);

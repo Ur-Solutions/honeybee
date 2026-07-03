@@ -43,6 +43,16 @@ export type StateContext = {
   hsrLive?: Set<string>;
   hsrStates?: Map<string, BeeState>;
   hsrSnapshots?: Map<string, string>;
+  /**
+   * Bees that are LOCAL MIRRORS of remote-hsr bees (APIA-94): their structured
+   * events are replayed into a local run dir by the daemon's remoteEventMirror.
+   * A record in this set — even though it carries a `node` and NOT
+   * `substrate:"hsr"` — is resolved from the same run-dir HSR observation
+   * (hsrLive/hsrStates/hsrSnapshots) as a local HSR bee, giving finer state than
+   * the coarse node-probe. Sourced from hsrObservations() rows whose meta is a
+   * mirror.
+   */
+  hsrMirrors?: Set<string>;
   now?: number;
 };
 
@@ -86,6 +96,15 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   // from the run-dir observation (host-pid liveness + structured event state)
   // that hsrObservations() threaded into the context.
   if (record.substrate === "hsr") {
+    return deriveHsrState(record, context);
+  }
+
+  // A remote-hsr bee with a LOCAL MIRROR (APIA-94): the daemon replays its
+  // events into a local run dir, so we resolve it from the same run-dir HSR
+  // observation as a local HSR bee — finer than the coarse node-probe state.
+  // The node is already known-reachable here (node_unreachable short-circuits
+  // above), so the mirror reflects the current remote state.
+  if (context.hsrMirrors?.has(record.name)) {
     return deriveHsrState(record, context);
   }
 

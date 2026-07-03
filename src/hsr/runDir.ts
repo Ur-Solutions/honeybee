@@ -86,6 +86,18 @@ export type HsrMeta = {
   status: "running" | "exited";
   exitCode?: number | null;
   endedAt?: string; // ISO
+  /**
+   * Remote-event-mirror marker (APIA-94): when set, this run dir is a LOCAL
+   * MIRROR of a bee hosted on the named remote-hsr node — the daemon's
+   * remoteEventMirror subscribes to that node's serve and replays every event
+   * here so deriveState/usage/capture work for remote bees like local ones.
+   *
+   * A mirror has NO local host: `hostPid` is a sentinel (0), so its liveness is
+   * NOT the local-pid probe. Instead the mirror owns `status` — it flips to
+   * "exited" when the bee leaves the remote node's live list. Observers treat a
+   * mirror meta as live iff `status === "running"` (see observe.ts isMetaLive).
+   */
+  mirrorOfNode?: string;
 };
 
 /** mkdir -p the run dir (owner-only). */
@@ -144,4 +156,31 @@ export function appendHsrEvent(bee: string, event: RunnerEvent): Promise<void> {
 /** Atomically replace the ring buffer text tail. */
 export async function writeHsrRing(bee: string, text: string): Promise<void> {
   await atomicWriteFile(hsrRingPath(bee), text, { mode: 0o600 });
+}
+
+// Ring buffer caps — whichever hits first bounds the rendered text tail. Shared
+// by the local stream runner (streamRunner.ts) and the remote event mirror
+// (remoteEventMirror.ts) so both bound ring.txt identically.
+export const HSR_RING_MAX_LINES = 200;
+export const HSR_RING_MAX_BYTES = 16 * 1024;
+
+/**
+ * Append `text` to a ring buffer and bound it: cap by line count first, then by
+ * byte size (dropping whole leading lines). Pure — returns the new ring text.
+ */
+export function appendRingText(ring: string, text: string): string {
+  let out = ring + (text.endsWith("\n") ? text : `${text}\n`);
+  const lines = out.split("\n");
+  if (lines.length > HSR_RING_MAX_LINES + 1) {
+    out = lines.slice(lines.length - (HSR_RING_MAX_LINES + 1)).join("\n");
+  }
+  while (Buffer.byteLength(out, "utf8") > HSR_RING_MAX_BYTES) {
+    const nl = out.indexOf("\n");
+    if (nl === -1) {
+      out = out.slice(out.length - HSR_RING_MAX_BYTES);
+      break;
+    }
+    out = out.slice(nl + 1);
+  }
+  return out;
 }

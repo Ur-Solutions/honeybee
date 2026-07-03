@@ -14,6 +14,8 @@
 
 import { exhaustionForAgent } from "../drivers.js";
 import { hsrUsageObservation, type HsrUsageObservation } from "../hsr/observe.js";
+import { readHsrMeta } from "../hsr/runDir.js";
+import { LOCAL_NODE_NAME } from "../node.js";
 import { transcriptLookupForSession } from "../sessionMetadata.js";
 import { appendLedger, type SessionRecord } from "../store.js";
 import { latestTranscript, readJsonl, type TranscriptRow } from "../transcripts.js";
@@ -36,6 +38,13 @@ export type UsageSamplerDeps = {
   readTranscriptRows?: (record: SessionRecord) => Promise<{ provider: string; rows: TranscriptRow[] } | null>;
   /** Structured usage/exhaustion from an HSR bee's events.jsonl. Injectable for tests. */
   readHsrUsage?: (bee: string) => Promise<HsrUsageObservation>;
+  /**
+   * Whether a (node-carrying, non-`hsr`) remote bee has a LOCAL mirror run dir
+   * (APIA-94) — if so it is fed from the mirrored events.jsonl via the HSR path,
+   * just like a local HSR bee. Injectable for tests; defaults to reading the
+   * mirror meta.json.
+   */
+  isMirroredRemoteBee?: (record: SessionRecord) => Promise<boolean>;
   /** Minimum interval between transcript reads per bee (default 60s). */
   sampleIntervalMs?: number;
 };
@@ -50,6 +59,7 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
   const ledger = deps.appendLedger ?? appendLedger;
   const readRows = deps.readTranscriptRows ?? defaultReadTranscriptRows;
   const readHsrUsage = deps.readHsrUsage ?? hsrUsageObservation;
+  const isMirroredRemoteBee = deps.isMirroredRemoteBee ?? defaultIsMirroredRemoteBee;
   const sampleIntervalMs = deps.sampleIntervalMs ?? DEFAULT_SAMPLE_INTERVAL_MS;
 
   // Sampler state survives across ticks: rising-edge debounce for exhaustion
@@ -138,8 +148,10 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
     for (const record of records) {
       if (!record.accountId) continue;
 
-      // HSR bees are pane-less — feed the sampler from their events.jsonl.
-      if (record.substrate === "hsr") {
+      // HSR bees are pane-less — feed the sampler from their events.jsonl. A
+      // remote-hsr bee with a LOCAL mirror (APIA-94) has the same event log
+      // locally, so it takes the same path.
+      if (record.substrate === "hsr" || (await isMirroredRemoteBee(record))) {
         outcomes.push(await sampleHsr(record, nowMs));
         continue;
       }
@@ -176,6 +188,17 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
 
     return outcomes;
   };
+}
+
+// A remote bee is fed from the HSR path iff it carries a non-local node, is not
+// already the local-hsr substrate, and has a local mirror meta marked
+// `mirrorOfNode`. The negative case is cheap: a non-mirrored remote bee has no
+// local run dir, so readHsrMeta resolves null without touching the events log.
+async function defaultIsMirroredRemoteBee(record: SessionRecord): Promise<boolean> {
+  if (record.substrate === "hsr") return false;
+  if (!record.node || record.node === LOCAL_NODE_NAME) return false;
+  const meta = await readHsrMeta(record.name).catch(() => null);
+  return !!meta?.mirrorOfNode;
 }
 
 // Claude transcripts keep usage on the raw rows latestTranscript already

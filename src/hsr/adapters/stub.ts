@@ -50,6 +50,9 @@ rl.on("line", (raw) => {
     return;
   }
   emit({ t: "assistant", text: "echo:" + text });
+  // A turn mentioning "usage" also reports token usage — lets tests exercise the
+  // usage-event path (per-turn counts) end to end.
+  if (text.includes("usage")) emit({ t: "usage", inputTokens: 100, outputTokens: 10 });
   emit({ t: "result" });
 });
 `;
@@ -83,6 +86,15 @@ const stubConfig: StreamRunnerConfig = {
             kind: "question",
             question: String(msg.question ?? ""),
             requestId: typeof msg.requestId === "string" ? msg.requestId : undefined,
+          },
+        ];
+      case "usage":
+        return [
+          {
+            type: "usage",
+            ts: 0,
+            inputTokens: Number(msg.inputTokens ?? 0),
+            outputTokens: Number(msg.outputTokens ?? 0),
           },
         ];
       case "result":

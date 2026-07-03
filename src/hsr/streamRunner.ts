@@ -18,7 +18,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import type { RunnerEvent, RunnerOpts, RunnerSession, RunnerTier } from "./types.js";
-import { appendHsrEvent, writeHsrRing } from "./runDir.js";
+import { appendHsrEvent, appendRingText, writeHsrRing } from "./runDir.js";
 
 export type StreamRunnerConfig = {
   harness: string;
@@ -35,9 +35,6 @@ export type StreamRunnerConfig = {
   sessionIdFromEvent?(event: RunnerEvent, raw: unknown): string | undefined;
 };
 
-// Ring buffer caps — whichever hits first bounds the rendered tail.
-const RING_MAX_LINES = 200;
-const RING_MAX_BYTES = 16 * 1024;
 // Debounce ring.txt writes so a chatty turn does not thrash the disk.
 const RING_DEBOUNCE_MS = 50;
 // Process-group teardown grace (SIGTERM → SIGKILL), mirrors flow/background.ts.
@@ -136,21 +133,7 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
   let ringTimer: NodeJS.Timeout | null = null;
 
   const ringAppend = (text: string): void => {
-    ringText += text.endsWith("\n") ? text : `${text}\n`;
-    // Cap by line count.
-    const lines = ringText.split("\n");
-    if (lines.length > RING_MAX_LINES + 1) {
-      ringText = lines.slice(lines.length - (RING_MAX_LINES + 1)).join("\n");
-    }
-    // Then cap by byte size, dropping whole leading lines.
-    while (Buffer.byteLength(ringText, "utf8") > RING_MAX_BYTES) {
-      const nl = ringText.indexOf("\n");
-      if (nl === -1) {
-        ringText = ringText.slice(ringText.length - RING_MAX_BYTES);
-        break;
-      }
-      ringText = ringText.slice(nl + 1);
-    }
+    ringText = appendRingText(ringText, text);
   };
   const scheduleRingWrite = (): void => {
     if (ringTimer) return;

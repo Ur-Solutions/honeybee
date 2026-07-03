@@ -7,6 +7,7 @@ import { listNodes, type NodeRecord } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { hsrObservations, reapDeadHosts, type HsrObservation } from "../hsr/observe.js";
+import { createRemoteEventMirror } from "../hsr/remoteEventMirror.js";
 import { deriveState, liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
@@ -92,6 +93,17 @@ export type TickDeps = {
    * exactly like tmux bees. Absent → no HSR bees observed this tick.
    */
   hsrObservations?: () => Promise<Map<string, HsrObservation>>;
+  /**
+   * Optional remote-event mirror (APIA-94): for each live remote-hsr bee,
+   * maintains an `observe` subscription to its node's serve and replays every
+   * event into the LOCAL run dir (events.jsonl/ring.txt + a mirror meta.json).
+   * That makes the mirrored bee observable by the SAME run-dir machinery as a
+   * local HSR bee — deriveState (finer than the node-probe) and the usage
+   * sampler both read the mirror. Stateful across ticks (subscriptions persist)
+   * — build once per daemon run. Runs BEFORE hsrObservations() so this tick can
+   * already read a freshly-created mirror meta.
+   */
+  mirrorRemoteEvents?: (records: SessionRecord[]) => Promise<void>;
   sealedBeeNames: () => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
@@ -212,6 +224,17 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     ? await guard(withTimeout(deps.livePanes(), timeouts.substrateMs, "livePanes"), errors, new Set<string>())
     : new Set<string>();
 
+  // Remote-event mirror (APIA-94): refresh subscriptions + replay remote-hsr
+  // events into local run dirs BEFORE we read them below. Same per-call budget +
+  // guard as the other dispatchers; errors are captured, never fatal.
+  if (deps.mirrorRemoteEvents) {
+    try {
+      await withTimeout(deps.mirrorRemoteEvents(records), timeouts.dispatchMs, "mirrorRemoteEvents");
+    } catch (error) {
+      errors.push(toError(error));
+    }
+  }
+
   // Observe pane-less HSR bees from their run dirs. Same per-call budget +
   // guard as every other external await in the tick — a wedged fs read is
   // converted into a skipped stage (empty map) and a recentErrors entry, never
@@ -222,10 +245,12 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   const hsrLive = new Set<string>();
   const hsrStates = new Map<string, BeeState>();
   const hsrSnapshots = new Map<string, string>();
+  const hsrMirrors = new Set<string>();
   for (const [bee, observation] of hsrObs) {
     if (observation.live) hsrLive.add(bee);
     if (observation.state) hsrStates.set(bee, observation.state);
     hsrSnapshots.set(bee, observation.snapshot);
+    if (observation.mirrorOf) hsrMirrors.add(bee);
   }
 
   const nowMs = deps.now();
@@ -238,6 +263,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     hsrLive,
     hsrStates,
     hsrSnapshots,
+    hsrMirrors,
     now: nowMs,
   };
 
@@ -865,6 +891,7 @@ export function buildDefaultDeps(): TickDeps {
     capturePanes: defaultCapturePanes,
     livePanes: () => localSubstrate().listPanes(),
     hsrObservations: () => hsrObservations(),
+    mirrorRemoteEvents: createRemoteEventMirror(),
     sealedBeeNames,
     touchSession,
     mirrorHiveState: async (record, state) => {
