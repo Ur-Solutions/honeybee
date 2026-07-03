@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { copyBeeSeals, listSeals, loadLatestSeal, recordSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
+import { copyBeeSeals, listSeals, loadLatestSeal, recordSeal, scanLatestSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-seal-"));
@@ -31,6 +31,26 @@ const VALID = {
   nextActions: ["Add migration helper for legacy session IDs."],
   confidence: 0.78,
 };
+
+async function withFixedDate<T>(iso: string, fn: () => Promise<T>): Promise<T> {
+  const RealDate = globalThis.Date;
+  const fixedMs = RealDate.parse(iso);
+  const FixedDate = class extends RealDate {
+    constructor(...args: unknown[]) {
+      super(args.length === 0 ? fixedMs : (args[0] as string | number | Date));
+    }
+
+    static now(): number {
+      return fixedMs;
+    }
+  } as DateConstructor;
+  globalThis.Date = FixedDate;
+  try {
+    return await fn();
+  } finally {
+    globalThis.Date = RealDate;
+  }
+}
 
 test("validateSealArtifact accepts a complete payload", () => {
   const artifact = validateSealArtifact(VALID);
@@ -72,6 +92,25 @@ test("recordSeal stores a seal and listSeals returns it", async () => {
     const list = await listSeals("CL.cc9");
     assert.equal(list.length, 1);
     assert.equal(list[0]!.summary, VALID.summary);
+  });
+});
+
+test("recordSeal keeps same-millisecond seals as distinct files", async () => {
+  await withTempStore(async () => {
+    await withFixedDate("2026-07-03T12:00:00.123Z", async () => {
+      const first = await recordSeal("CL.collision", validateSealArtifact({ status: "done", summary: "first" }));
+      const second = await recordSeal("CL.collision", validateSealArtifact({ status: "done", summary: "second" }));
+      assert.equal(first.sealedAt, second.sealedAt, "test setup must force equal millisecond stamps");
+    });
+
+    const files = (await readdir(join(sealsRoot(), "CL.collision"))).filter((f) => f.endsWith(".json")).sort();
+    assert.equal(files.length, 2, "same-ms seals must not overwrite each other");
+    assert.equal(new Set(files).size, 2, "same-ms seal filenames must be unique");
+
+    const latest = await loadLatestSeal("CL.collision");
+    assert.equal(latest?.summary, "second");
+    const listed = await listSeals("CL.collision");
+    assert.deepEqual(listed.map((seal) => seal.summary), ["second", "first"]);
   });
 });
 
@@ -118,6 +157,22 @@ test("loadLatestSeal returns the newest of multiple seals", async () => {
     await recordSeal("CL.cc9", validateSealArtifact({ status: "done", summary: "second" }));
     const latest = await loadLatestSeal("CL.cc9");
     assert.equal(latest?.summary, "second");
+  });
+});
+
+test("scanLatestSeal can start after a cached filename", async () => {
+  await withTempStore(async () => {
+    await recordSeal("CL.cursor", validateSealArtifact({ status: "done", summary: "first" }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await recordSeal("CL.cursor", validateSealArtifact({ status: "done", summary: "second" }));
+    const files = (await readdir(join(sealsRoot(), "CL.cursor"))).filter((f) => f.endsWith(".json")).sort();
+
+    const afterFirst = await scanLatestSeal("CL.cursor", { afterFilename: files[0] });
+    assert.equal(afterFirst.seal?.summary, "second");
+    assert.equal(afterFirst.filename, files[1]);
+
+    const afterNewest = await scanLatestSeal("CL.cursor", { afterFilename: files[1] });
+    assert.equal(afterNewest.seal, null);
   });
 });
 
