@@ -242,6 +242,122 @@ test("an expired chain is refreshed, persisted (rotation!), and then used", asyn
   });
 });
 
+test("chain refresh and persist run inside the accounts lock (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "lock@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    let depth = 0;
+    const events: string[] = [];
+    const [result] = await accountLimits([account], {
+      withAccountsLock: async (fn) => {
+        depth += 1;
+        try {
+          return await fn();
+        } finally {
+          depth -= 1;
+        }
+      },
+      refreshClaudeToken: async () => {
+        events.push(`refresh@${depth}`);
+        return { accessToken: "tok-new", refreshToken: "r-rotated", expiresAt: Date.now() + 3_600_000 };
+      },
+      persistRefreshedCredentials: async () => {
+        events.push(`persist@${depth}`);
+      },
+      fetchClaudeProfileEmail: async () => "lock@a.b",
+      fetchClaudeUsage: async () => ({ five_hour: { utilization: 1, resets_at: "2026-06-10T18:00:00Z" } }),
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    // Both the rotation and its persistence happened while the lock was held.
+    assert.deepEqual(events, ["refresh@1", "persist@1"]);
+  });
+});
+
+test("refresh double-checks the vault under the lock and reuses a chain rotated by a concurrent writer (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "race@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    await writeFile(
+      vaultPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    const usageAskedWith: string[] = [];
+    const [result] = await accountLimits([account], {
+      // Simulate a concurrent writer (activation) winning the lock first and
+      // rotating the chain while we waited: by the time our critical section
+      // runs, the vault already holds the rotated fresh chain.
+      withAccountsLock: async (fn) => {
+        await writeFile(
+          vaultPath,
+          JSON.stringify({
+            claudeAiOauth: { accessToken: "tok-rotated", expiresAt: Date.now() + 3_600_000, refreshToken: "r-rotated", subscriptionType: "max" },
+          }),
+        );
+        return fn();
+      },
+      refreshClaudeToken: async () => {
+        throw new Error("must not replay a refresh token another writer already rotated");
+      },
+      fetchClaudeProfileEmail: async () => "race@a.b",
+      fetchClaudeUsage: async (token) => {
+        usageAskedWith.push(token);
+        return { five_hour: { utilization: 1, resets_at: "2026-06-10T18:00:00Z" } };
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, true);
+    assert.equal(result!.plan, "max");
+    assert.deepEqual(usageAskedWith, ["tok-rotated"]);
+  });
+});
+
+test("a vault chain rotated behind us to another identity is never replayed (HIVE-2)", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "super@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    await writeFile(
+      vaultPath,
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-dead", expiresAt: Date.now() - 1000, refreshToken: "r-old" } }),
+    );
+
+    const [result] = await accountLimits([account], {
+      // The chain moved on while we waited for the lock — and the rotated
+      // link belongs to someone else. The superseded r-old token must not be
+      // replayed (that replay is what trips reuse detection).
+      withAccountsLock: async (fn) => {
+        await writeFile(
+          vaultPath,
+          JSON.stringify({ claudeAiOauth: { accessToken: "tok-other", expiresAt: Date.now() + 3_600_000, refreshToken: "r-other" } }),
+        );
+        return fn();
+      },
+      refreshClaudeToken: async () => {
+        throw new Error("must not replay the superseded refresh token");
+      },
+      fetchClaudeProfileEmail: async (token) => (token === "tok-other" ? "wrong@a.b" : null),
+      fetchClaudeUsage: async () => {
+        throw new Error("must not query usage with another identity's token");
+      },
+      readKeychain: async () => null,
+    });
+
+    assert.equal(result!.ok, false);
+    assert.match(result!.error ?? "", /no token belongs to super@a\.b/);
+    assert.match(result!.error ?? "", /wrong@a\.b/);
+  });
+});
+
 test("refreshing a mislabeled chain parks the rotated tokens with their real owner", async () => {
   await withTempStore(async () => {
     const account = await addAccount("claude", "mine@a.b");
