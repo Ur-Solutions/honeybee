@@ -140,7 +140,7 @@ const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--accept",
   ],
   daemon: ["--tick-ms", "--json", "--label", "--force", "--follow", "--lines", "-n"],
-  flow: ["--arg", "--foreground", "--background", "--flow", "--json"],
+  flow: ["--arg", "--foreground", "--background", "--flow", "--json", "-n", "--lines"],
   loop: [
     "--bee", "--cwd", "--context", "--prompt", "--prompt-file",
     "--until", "--max", "--max-duration", "--forever",
