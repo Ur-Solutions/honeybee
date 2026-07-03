@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { BUZ_TIERS } from "../src/buz.js";
 import { fileCandidates, getCompletionsFromState, shellScript } from "../src/completion.js";
 import type { SessionRecord } from "../src/store.js";
 
@@ -229,6 +230,14 @@ test("completes frame names after --frame", () => {
     getCompletionsFromState(["hive", "spawn", "--frame", ""], state).sort(),
     ["deep-review", "frontend-redesign"],
   );
+});
+
+test("completes buz tier and accept values from BUZ_TIERS", () => {
+  assert.deepEqual(getCompletionsFromState(["hive", "buz", "send", "CO.abc", "--tier", ""], empty), [...BUZ_TIERS]);
+
+  const accept = getCompletionsFromState(["hive", "buz", "config", "CO.abc", "--accept", ""], empty);
+  for (const tier of BUZ_TIERS) assert.ok(accept.includes(tier), `accept completion includes ${tier}`);
+  assert.ok(accept.includes(BUZ_TIERS.join(",")), "accept completion includes the full tier chain");
 });
 
 test("completes subcommands for noun commands", () => {

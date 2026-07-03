@@ -1,3 +1,5 @@
+import { BUZ_TIERS as CANONICAL_BUZ_TIERS } from "../buz_tiers.js";
+
 export const COMMANDS = [
   "spawn", "new", "launch", "send", "tail", "cat", "transcript", "tx", "last", "wait",
   "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "next", "view",
@@ -31,11 +33,20 @@ export const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 export const SEAL_STATUS_VALUES = ["done", "blocked", "needs_input", "failed"];
 export const QUEST_STATUS_VALUES = ["open", "active", "done", "archived"];
 export const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
-export const BUZ_TIERS = ["interrupt", "queue", "passive"];
-export const BUZ_ACCEPT_VALUES = [
-  "interrupt", "queue", "passive",
-  "queue,passive", "interrupt,queue", "interrupt,queue,passive",
-];
+export const BUZ_TIERS: readonly string[] = CANONICAL_BUZ_TIERS;
+export const BUZ_ACCEPT_VALUES = buzAcceptValues();
+
+// Every contiguous tier run, shortest-suffix first — derived from the shared
+// tier table so completion can never drift from delivery (HIVE-33).
+function buzAcceptValues(): string[] {
+  const values: string[] = [...CANONICAL_BUZ_TIERS];
+  for (let length = 2; length <= CANONICAL_BUZ_TIERS.length; length += 1) {
+    for (let start = CANONICAL_BUZ_TIERS.length - length; start >= 0; start -= 1) {
+      values.push(CANONICAL_BUZ_TIERS.slice(start, start + length).join(","));
+    }
+  }
+  return values;
+}
 
 export const BEES = [
   "claude", "codex", "opencode", "grok", "pi", "droid", "cursor",

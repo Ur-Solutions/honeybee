@@ -186,7 +186,7 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
     case "flow":
       return (state.flows ?? []).map((f) => f.name);
     case "buz-tier":
-      return BUZ_TIERS;
+      return [...BUZ_TIERS];
     case "buz-accept":
       return BUZ_ACCEPT_VALUES;
     case "run":
