@@ -169,6 +169,7 @@ import { attentionCount, DEFAULT_ATTENTION_STATES, parseStateList, pickNextBee, 
 import { authPolicyOf, describeAuthPolicy, LOCAL_NODE_NAME, listNodes, loadNode, loadNodeSync, type AuthPolicy, type NodeRecord, registerNode, supportsCapability, unregisterNode, updateNode, validNodeName } from "./node.js";
 import { mintEphemeralCredential, type EphemeralCredential } from "./hsr/remoteCreds.js";
 import { bootstrapRunnerHost } from "./hsr/bootstrap.js";
+import { nodeHealth, type NodeHealth } from "./nodeHealth.js";
 import { appendLedger, deleteSession, listSessions, loadSession, safeName, saveSession, storeRoot, updateSession, type SessionRecord } from "./store.js";
 import { appendedPaneText, parseTailOptions } from "./tail.js";
 import { clearSubstrateCache, localSubstrate, remoteHsrSubstrateForNode, substrateFor, substrateForRecord, type Substrate } from "./substrates/index.js";
@@ -6721,6 +6722,8 @@ async function cmdNode(parsed: Parsed) {
     case "list":
     case "ls":
       return nodeList();
+    case "status":
+      return nodeStatus(parsed);
     case "register":
       return nodeRegister(parsed);
     case "bootstrap":
@@ -6734,8 +6737,81 @@ async function cmdNode(parsed: Parsed) {
     case "checkouts":
       return nodeCheckouts(parsed);
     default:
-      throw new Error(`Unknown node subcommand: ${sub}\nUsage: hive node <list|register|bootstrap|inspect|update|unregister|checkouts>`);
+      throw new Error(`Unknown node subcommand: ${sub}\nUsage: hive node <list|status|register|bootstrap|inspect|update|unregister|checkouts>`);
   }
+}
+
+/**
+ * `hive node status [<node>]` (APIA-96): probe each node (or the named one) and
+ * print a health row — reachable + probe latency, and for remote-hsr nodes the
+ * runner-host version (live ping, else recorded), a drift flag vs the local
+ * bundle, and the live bee count. A per-node timeout keeps one dead node from
+ * hanging the command; unreachable nodes render as `offline` with a reason.
+ *
+ * TODO(apiary): the Apiary runner-submenu node visibility is a separate change
+ * in the apiary repo (a parallel effort owns it) — not wired here.
+ */
+async function nodeStatus(parsed: Parsed) {
+  const name = parsed.args[1];
+  let nodes: NodeRecord[];
+  if (name) {
+    const record = await loadNode(name);
+    if (!record) throw new Error(`Unknown node: ${name}`);
+    nodes = [record];
+  } else {
+    nodes = await listNodes();
+  }
+
+  // Probe all nodes concurrently — each is independently time-bounded, so a dead
+  // node only slows its own row, never the whole command.
+  const healths = await Promise.all(nodes.map((node) => nodeHealth(node)));
+
+  if (!isPretty()) {
+    for (const h of healths) {
+      console.log(
+        [
+          h.name,
+          h.kind,
+          h.reachable ? "online" : "offline",
+          h.latencyMs ?? "",
+          h.runnerHostVersion ?? "",
+          h.versionDrift ? "drift" : "",
+          h.liveBees ?? "",
+          h.reason ?? "",
+        ].join("\t"),
+      );
+    }
+    return;
+  }
+
+  console.log(formatTable(
+    [
+      { header: "NODE" },
+      { header: "KIND" },
+      { header: "HEALTH" },
+      { header: "LATENCY", align: "right" },
+      { header: "VERSION" },
+      { header: "BEES", align: "right" },
+      { header: "DETAIL" },
+    ],
+    healths.map((h) => [
+      bold(h.name),
+      h.kind === "local-tmux" ? gray("local") : h.kind === "remote-hsr" ? magenta("hsr") : cyan("ssh"),
+      h.reachable ? green("● online") : red("○ offline"),
+      h.latencyMs === null ? dim("-") : dim(`${h.latencyMs}ms`),
+      formatNodeVersion(h),
+      h.liveBees === undefined ? dim("-") : String(h.liveBees),
+      h.reason ? red(h.reason) : dim(""),
+    ]),
+  ));
+}
+
+/** Version cell: `<core>` for remote-hsr, plus a drift marker; `-` otherwise. */
+function formatNodeVersion(h: NodeHealth): string {
+  if (h.kind !== "remote-hsr" || !h.runnerHostVersion) return dim("-");
+  return h.versionDrift
+    ? `${h.runnerHostVersion} ${yellow("(drift)")}`
+    : dim(h.runnerHostVersion);
 }
 
 /**

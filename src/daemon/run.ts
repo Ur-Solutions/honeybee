@@ -15,6 +15,7 @@ import { createAutoTitleDispatcher, type AutoTitleOutcome } from "./autoTitle.js
 import { dispatchAutoswaps, type AutoswapOutcome } from "./autoswap.js";
 import { dispatchBuzDrains, type BuzDispatchOutcome } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher, type NeedsInputOutcome } from "./needsInput.js";
+import { createNodeReachabilityTracker, type NodeReachabilityDispatcher, type NodeReachabilityOutcome } from "./nodeReachability.js";
 import { createUsageSampler, type UsageSampler, type UsageTickOutcome } from "./usageSampler.js";
 import { appendDaemonLog, daemonLogPath } from "./log.js";
 import { startHsrControlServer, type HsrControlServer } from "./hsrControl.js";
@@ -135,6 +136,13 @@ export type TickDeps = {
    */
   dispatchNeedsInput?: (records: SessionRecord[], currentStates: Map<string, BeeState>) => Promise<NeedsInputOutcome[]>;
   /**
+   * Optional node online/offline edge tracker (APIA-96): given this tick's nodes
+   * and the node-probe's unreachableNodes, emits a `node.offline`/`node.online`
+   * ledger event ONLY on a reachability edge. Stateful across ticks (edge
+   * detection) — build once per daemon run.
+   */
+  dispatchNodeReachability?: NodeReachabilityDispatcher;
+  /**
    * Optional usage sampler (Phase 3): observes panes/transcripts for
    * account-bound bees, appends usage samples and emits account.exhausted
    * events. Stateful across ticks — build once per daemon run.
@@ -187,6 +195,11 @@ export type TickResult = {
    * blocked HSR bee had a pending request / not wired.
    */
   needsInput: NeedsInputOutcome[];
+  /**
+   * Node online/offline edges detected this tick (APIA-96). Empty when no node
+   * changed reachability / not wired.
+   */
+  nodeReachability: NodeReachabilityOutcome[];
   /** Per-bee usage sampler outcomes (empty when no account-bound bees / not wired). */
   usage: UsageTickOutcome[];
   /** Autoswap dispatcher outcomes (empty when nothing exhausted / not wired). */
@@ -367,6 +380,22 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     }
   }
 
+  // Node reachability edge tracker (APIA-96): emit node.online/node.offline on
+  // the reachability edge only, keyed off the node-probe's unreachableNodes.
+  // Same guard/budget as the other dispatchers; errors are captured, never fatal.
+  let nodeReachability: NodeReachabilityOutcome[] = [];
+  if (deps.dispatchNodeReachability) {
+    try {
+      nodeReachability = await withTimeout(
+        deps.dispatchNodeReachability(nodes, probe.unreachableNodes, nowMs),
+        timeouts.dispatchMs,
+        "dispatchNodeReachability",
+      );
+    } catch (error) {
+      errors.push(toError(error));
+    }
+  }
+
   // Usage sampler: factual per-account token samples + exhaustion events.
   let usage: UsageTickOutcome[] = [];
   if (deps.sampleUsage) {
@@ -415,6 +444,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     errors,
     buzDrains,
     needsInput,
+    nodeReachability,
     usage,
     autoswaps,
     autoTitles,
@@ -739,6 +769,13 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
             ...(outcome.error ? { error: outcome.error } : {}),
           });
         }
+        for (const outcome of result.nodeReachability) {
+          await safeLog({
+            level: outcome.transition === "offline" ? "warn" : "info",
+            msg: `node.${outcome.transition}`,
+            node: outcome.node,
+          });
+        }
         for (const outcome of result.usage) {
           if (!outcome.exhausted) continue;
           await safeLog({
@@ -902,6 +939,7 @@ export function buildDefaultDeps(): TickDeps {
     appendLedger,
     dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),
     dispatchNeedsInput: createNeedsInputDispatcher(),
+    dispatchNodeReachability: createNodeReachabilityTracker(),
     sampleUsage: createUsageSampler(),
     dispatchAutoswap: (records, usageOutcomes) => dispatchAutoswaps(records, usageOutcomes),
     dispatchAutoTitle: createAutoTitleDispatcher(),

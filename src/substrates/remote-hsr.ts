@@ -110,6 +110,13 @@ export type RemoteCheckoutRow = {
  * stream), and {@link close} for teardown.
  */
 export type RemoteHsrSubstrate = Substrate & {
+  /**
+   * Live handshake against the remote runner-host `ping` (APIA-96): `{ ok }` plus
+   * the runner-host `version` string (`runner-host <core>`) when the serve is
+   * reachable. `hive node status` times this and reads the version/drift from it;
+   * a down tunnel resolves `{ ok:false, reason }` (never throws).
+   */
+  ping(): Promise<{ ok: boolean; version?: string; reason?: string }>;
   spawnRemote(params: RemoteSpawnParams): Promise<RemoteSpawnResult>;
   /**
    * APIA-95: clone (or idempotently reuse) a working copy on the remote and
@@ -195,6 +202,19 @@ export function createRemoteHsrSubstrate(
       const res = (await c.call("ping", undefined, { timeoutMs: PROBE_TIMEOUT_MS })) as { ok?: boolean } | null;
       if (res && res.ok === false) return { ok: false, reason: "remote serve reported not-ok" };
       return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: messageOf(error) };
+    }
+  }
+
+  async function ping(): Promise<{ ok: boolean; version?: string; reason?: string }> {
+    try {
+      const c = await client();
+      const res = (await c.call("ping", undefined, { timeoutMs: PROBE_TIMEOUT_MS })) as
+        | { ok?: boolean; version?: string }
+        | null;
+      if (res && res.ok === false) return { ok: false, reason: "remote serve reported not-ok" };
+      return { ok: true, ...(res && typeof res.version === "string" ? { version: res.version } : {}) };
     } catch (error) {
       return { ok: false, reason: messageOf(error) };
     }
@@ -379,6 +399,7 @@ export function createRemoteHsrSubstrate(
     async attachSession(): Promise<void> {
       throw new Error("remote HSR bees have no tmux target; use hive tail/transcript");
     },
+    ping,
     spawnRemote,
     provisionRemote,
     listCheckouts,
