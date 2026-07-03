@@ -97,16 +97,53 @@ export function buildAddGenericPasswordCommand(account: string, service: string,
   }
 }
 
-/** Create/update the keychain entry for a home. Returns false when unavailable or rejected. */
-export async function writeClaudeKeychain(homePath: string, credentials: string): Promise<boolean> {
-  if (!keychainAvailable()) return false;
-  // -U updates in place. The secret must not travel via argv — argv is
-  // visible to any local process while `security` runs — so the whole
-  // command is fed to `security -i` on stdin instead. A failing command
-  // sets the exit status, which rejects the promise below.
-  const command = buildAddGenericPasswordCommand(userInfo().username, claudeKeychainService(homePath), credentials);
-  if (command === null) return false; // unrepresentable secret: fail closed, never argv
+export type KeychainWriteReport =
+  | { ok: true; mode: "full" | "identity-only" }
+  | { ok: false; reason: "unavailable" | "unrepresentable" | "rejected" };
+
+/**
+ * Extract a `{claudeAiOauth}`-only payload from a credentials JSON string.
+ * Fallback for entries whose full merge (mcpOAuth and other sibling keys can
+ * add multiple KB) overflows the `security -i` line buffer: the identity must
+ * always land — a stale claudeAiOauth silently bills every bee on the home to
+ * the wrong account — while dropped siblings cost at most an MCP re-auth
+ * (claude still finds them in the home's .credentials.json where present).
+ * Exported for tests.
+ */
+export function identityOnlyCredentials(credentials: string): string | null {
   try {
+    const parsed = JSON.parse(credentials) as Record<string, unknown> | null;
+    const oauth = parsed?.claudeAiOauth;
+    if (oauth === undefined || oauth === null || typeof oauth !== "object") return null;
+    return JSON.stringify({ claudeAiOauth: oauth });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Create/update the keychain entry for a home. When the full payload cannot
+ * be represented (line-buffer overflow), retries with the identity-only
+ * subset before giving up — callers can ledger the degradation but never
+ * lose the identity stamp itself.
+ */
+export async function writeClaudeKeychainEntry(homePath: string, credentials: string): Promise<KeychainWriteReport> {
+  if (!keychainAvailable()) return { ok: false, reason: "unavailable" };
+  const username = userInfo().username;
+  const service = claudeKeychainService(homePath);
+  let mode: "full" | "identity-only" = "full";
+  let command = buildAddGenericPasswordCommand(username, service, credentials);
+  if (command === null) {
+    const minimal = identityOnlyCredentials(credentials);
+    command = minimal === null ? null : buildAddGenericPasswordCommand(username, service, minimal);
+    mode = "identity-only";
+  }
+  if (command === null) return { ok: false, reason: "unrepresentable" }; // fail closed, never argv
+  try {
+    // -U updates in place. The secret must not travel via argv — argv is
+    // visible to any local process while `security` runs — so the whole
+    // command is fed to `security -i` on stdin instead. A failing command
+    // sets the exit status, which rejects the promise below.
     const pending = execFileAsync("security", ["-i"], { timeout: SECURITY_EXEC_TIMEOUT_MS });
     const stdin = pending.child.stdin;
     if (stdin) {
@@ -116,9 +153,9 @@ export async function writeClaudeKeychain(homePath: string, credentials: string)
       stdin.end(`${command}\n`);
     }
     await pending;
-    return true;
+    return { ok: true, mode };
   } catch {
-    return false;
+    return { ok: false, reason: "rejected" };
   }
 }
 

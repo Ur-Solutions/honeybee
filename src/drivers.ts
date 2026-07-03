@@ -94,6 +94,22 @@ export type AgentDriver = {
    * provider keeps cwd disambiguation for transcript matching.
    */
   sessionIdFlag?: string;
+  /**
+   * Caller-arg flags that mark the spawn as resuming an existing provider
+   * session (claude's `--resume`/`--continue`). Only meaningful alongside
+   * sessionIdFlag: see sessionPinWithResumeArgs.
+   */
+  resumeDetectFlags?: string[];
+  /**
+   * Extra flag(s) that make sessionIdFlag legal on a resume. Claude REFUSES
+   * `--resume <id> --session-id <new>` outright ("--session-id can only be
+   * used with --continue or --resume if --fork-session is also specified"),
+   * so a `hive spawn ... -- --resume <id>` with the auto-injected pin exits
+   * within a second and the bee reads dead at boot. `--fork-session` forks
+   * the resumed transcript onto the pinned id: full context, valid invocation,
+   * and the pin keeps anchoring the bee's own transcript.
+   */
+  sessionPinWithResumeArgs?: string[];
   /** HSR runner adapter (and thus runner tier) when the harness is HSR-capable. */
   hsrAdapter?: RunnerAdapter;
   /**
@@ -129,6 +145,8 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     bootMs: 15_000,
     resumeArgs: (sid) => (sid ? ["--resume", sid] : ["--continue"]),
     sessionIdFlag: "--session-id",
+    resumeDetectFlags: ["--resume", "--continue"],
+    sessionPinWithResumeArgs: ["--fork-session"],
     hsrAdapter: claudeAdapter,
   },
   codex: {
@@ -329,6 +347,23 @@ export function resumeArgsForAgent(kind: string, providerSessionId?: string): st
 export function forcedSessionIdArgsForAgent(kind: string, sessionId: string): string[] | null {
   const pin = agentDriver(kind)?.sessionIdFlag;
   return pin ? [pin, sessionId] : null;
+}
+
+/**
+ * Extra args the auto-injected session pin needs when the caller's args
+ * already resume an existing provider session (claude: `--fork-session`,
+ * without which `--resume <id> --session-id <new>` is refused and the bee
+ * dies at boot). Empty when the driver declares no resume/pin interplay,
+ * when the args carry no resume flag, or when the extras are already there.
+ */
+export function sessionPinResumeExtrasForAgent(kind: string, args: readonly string[]): string[] {
+  const driver = agentDriver(kind);
+  const extras = driver?.sessionPinWithResumeArgs;
+  const resumeFlags = driver?.resumeDetectFlags;
+  if (!extras?.length || !resumeFlags?.length) return [];
+  const resuming = args.some((arg) => resumeFlags.includes(arg) || resumeFlags.some((flag) => arg.startsWith(`${flag}=`)));
+  if (!resuming) return [];
+  return extras.filter((extra) => !args.includes(extra));
 }
 
 /**

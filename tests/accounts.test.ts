@@ -28,6 +28,8 @@ import {
   syncCodexAuthToVault,
   type AccountRecord,
 } from "../src/accounts.js";
+import { verifyActivatedClaudeIdentity, type ActivationContext } from "../src/accounts/activation.js";
+import { identityRecipeForAgent } from "../src/drivers.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -166,6 +168,93 @@ test("activate fails when the vault is empty for the account", async () => {
 function chainJson(accessToken: string, expiresAt: number, refreshToken?: string): string {
   return JSON.stringify({ claudeAiOauth: { accessToken, expiresAt, ...(refreshToken ? { refreshToken } : {}) } });
 }
+
+function activationContext(account: AccountRecord, homePath: string, overrides: { fetchProfileEmail?: (token: string) => Promise<string | null>; warn?: (message: string) => void } = {}): ActivationContext {
+  return {
+    account,
+    homePath,
+    recipe: identityRecipeForAgent("claude")!,
+    options: overrides.fetchProfileEmail ? { fetchProfileEmail: overrides.fetchProfileEmail } : {},
+    warn: overrides.warn ?? (() => {}),
+    written: [],
+  };
+}
+
+test("post-activation identity check refuses a home whose effective credential belongs to another account", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "real@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-own", now + 3_600_000, "r"));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-own", now + 3_600_000, "r"));
+    // The incident shape (2026-07-03): the home's keychain entry kept ANOTHER
+    // account's token — claude prefers it over the (correct) file, so every
+    // bee on the home bills the other account.
+    const lookups: string[] = [];
+    await assert.rejects(
+      () =>
+        verifyActivatedClaudeIdentity(
+          activationContext(account, home, {
+            fetchProfileEmail: async (token) => {
+              lookups.push(token);
+              return "other@x.y";
+            },
+          }),
+          { readKeychain: async () => chainJson("tok-foreign", now + 3_600_000, "r") },
+        ),
+      /identity mismatch.*other@x\.y.*real@a\.b/i,
+    );
+    assert.deepEqual(lookups, ["tok-foreign"]);
+  });
+});
+
+test("post-activation identity check is network-free when the effective token is the vault's own", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "own@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-own", now + 3_600_000, "r"));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-own", now + 3_600_000, "r"));
+    let lookups = 0;
+    await verifyActivatedClaudeIdentity(
+      activationContext(account, home, {
+        fetchProfileEmail: async () => {
+          lookups += 1;
+          return "own@a.b";
+        },
+      }),
+      { readKeychain: async () => chainJson("tok-own", now + 3_600_000, "r") },
+    );
+    assert.equal(lookups, 0, "identity proven by vault-token equality; the profile endpoint must not be hit");
+  });
+});
+
+test("post-activation identity check fails open when the profile lookup is unavailable", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "offline@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-own", now + 3_600_000, "r"));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-own", now + 3_600_000, "r"));
+    const warnings: string[] = [];
+    // Divergent token, but the lookup errors (offline/rate-limited): only a
+    // VERIFIED foreign identity may refuse an activation.
+    await verifyActivatedClaudeIdentity(
+      activationContext(account, home, {
+        fetchProfileEmail: async () => {
+          throw new Error("HTTP 429");
+        },
+        warn: (message) => warnings.push(message),
+      }),
+      { readKeychain: async () => chainJson("tok-divergent", now + 3_600_000, "r") },
+    );
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /could not verify/i);
+  });
+});
 
 function hexPayload(raw: string): string {
   return Buffer.from(raw, "utf8").toString("hex");
