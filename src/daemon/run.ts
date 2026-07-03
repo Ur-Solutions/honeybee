@@ -109,7 +109,7 @@ export type TickDeps = {
    * — build once per daemon run. Runs BEFORE hsrObservations() so this tick can
    * already read a freshly-created mirror meta.
    */
-  mirrorRemoteEvents?: (records: SessionRecord[]) => Promise<void>;
+  mirrorRemoteEvents?: ((records: SessionRecord[]) => Promise<void>) & { close?: () => Promise<void> };
   sealedBeeNames: () => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
@@ -923,6 +923,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
       }
     }
     if (hsrControl) await hsrControl.close().catch(() => undefined);
+    await deps.mirrorRemoteEvents?.close?.().catch(() => undefined);
     if (lock) {
       try {
         await lock.release();
