@@ -4158,10 +4158,29 @@ async function cmdXa(parsed: Parsed) {
     throw new Error("hive xa attaches to a single bee; spawn cohorts with hive spawn --count/--frame");
   }
 
+  // `xa` = spawn + attach to a terminal. HSR bees are pane-less and have no
+  // tmux target to attach, so xa must never produce one: reject an explicit
+  // --substrate hsr, and — when nothing is explicit — force local tmux so the
+  // agent-context HSR default (spawnSingleBee policy) never applies to an
+  // attach workflow. An explicit tmux-family target (--substrate ssh:host /
+  // --node host, an attachable remote pane) is honored as-is.
+  if (hsrSubstrateRequested(parsed)) {
+    throw new Error(
+      "hive xa attaches to a terminal, which HSR bees don't have. Use `hive x <bee> --substrate hsr` then `hive send`/`hive tail`, or drop --substrate hsr to attach a tmux bee.",
+    );
+  }
+  const xaSubstrateFlag = flag(parsed, "substrate");
+  const xaNodeFlag = flag(parsed, "node");
+  const xaHasExplicitTarget =
+    (typeof xaSubstrateFlag === "string" && xaSubstrateFlag.trim().length > 0) ||
+    (typeof xaNodeFlag === "string" && xaNodeFlag.trim().length > 0);
+  const xaFlags = new Map(parsed.flags);
+  if (!xaHasExplicitTarget) xaFlags.set("substrate", "tmux");
+
   const spawnParsed: Parsed = {
     command: "spawn",
     args: [agent],
-    flags: new Map(parsed.flags),
+    flags: xaFlags,
     rest: parsed.rest,
   };
   const record = await cmdSpawn(spawnParsed);
@@ -8808,7 +8827,7 @@ function printHelp() {
     "  claude, codex, opencode, grok, pi, droid, cursor — or any executable on PATH",
     `  ${dim("home aliases: codex1, codex2, codex3, cc1, cc2, cc3")}`,
     `  ${dim("account shorthands: <tool>-<account fragment> (codex-ur, claude-thto) — see hive account list")}`,
-    `  ${dim("<tool>-auto / --account auto: pick the account with the least weekly usage")}`,
+    `  ${dim("<tool>-auto / --account auto: pick the least-loaded account (pace-aware: prefers unused quota expiring at the next reset)")}`,
   ].join("\n");
 
   const envs = [
