@@ -65,16 +65,23 @@ export type CachedLimitsOptions = LimitsDeps & {
  * read refreshes the cache — including ttl-less calls, so a plain
  * `hive limits` keeps the cache warm for later cached readers.
  */
+/** True when a failed live read was the provider pushing back (HTTP 429), not a broken account. */
+function isRateLimitedFailure(result: AccountLimits): boolean {
+  return !result.ok && /\b429\b|rate.?limit/i.test(result.error ?? "");
+}
+
 export async function cachedAccountLimits(accounts: AccountRecord[], options: CachedLimitsOptions = {}): Promise<AccountLimits[]> {
   const now = (options.now ?? Date.now)();
   const ttlMs = options.ttlMs ?? 0;
-  const cache = ttlMs > 0 ? await readLimitsCache() : {};
+  // The cache is read even for ttl-less calls: a rate-limited live read falls
+  // back to the last good snapshot below.
+  const cache = await readLimitsCache();
   const hits = new Map<string, AccountLimits>();
   const misses: AccountRecord[] = [];
   for (const account of accounts) {
     const entry = cache[account.id];
     const age = entry ? now - Date.parse(entry.fetchedAt) : Number.NaN;
-    if (entry && Number.isFinite(age) && age >= 0 && age <= ttlMs) {
+    if (ttlMs > 0 && entry && Number.isFinite(age) && age >= 0 && age <= ttlMs) {
       hits.set(account.id, { ...entry.limits, cached: true, asOf: entry.limits.asOf ?? entry.fetchedAt });
     } else {
       misses.push(account);
@@ -86,5 +93,16 @@ export async function cachedAccountLimits(accounts: AccountRecord[], options: Ca
   const fetchedById = new Map(fetched.map((result) => [result.account, result]));
   return accounts
     .map((account) => hits.get(account.id) ?? fetchedById.get(account.id))
-    .filter((result): result is AccountLimits => result !== undefined);
+    .filter((result): result is AccountLimits => result !== undefined)
+    .map((result) => {
+      // A 429 is transient provider push-back, not truth about the account —
+      // and the endpoint is contended (every running claude session polls it
+      // too). Serve the last good snapshot instead of an error row, with the
+      // age visible via asOf and `rateLimited` kept so pollers (the --live
+      // dashboard) still see the signal and back off.
+      if (!isRateLimitedFailure(result)) return result;
+      const entry = cache[result.account];
+      if (!entry) return { ...result, rateLimited: true };
+      return { ...entry.limits, cached: true, rateLimited: true, asOf: entry.limits.asOf ?? entry.fetchedAt };
+    });
 }

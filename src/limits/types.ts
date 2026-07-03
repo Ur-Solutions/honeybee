@@ -39,6 +39,8 @@ export type AccountLimits = {
   source: "oauth-api" | "app-server" | "session-snapshot" | "unsupported";
   /** True when served from the on-disk limits cache rather than fetched now. */
   cached?: boolean;
+  /** True when the live read was rate-limited (this row may be a stale cache fallback). */
+  rateLimited?: boolean;
 };
 
 export type ClaudeUsageResponse = {

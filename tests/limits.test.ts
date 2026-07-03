@@ -944,6 +944,55 @@ test("cachedAccountLimits serves fresh cache entries and refetches stale or fail
   });
 });
 
+test("cachedAccountLimits serves the last snapshot on a rate-limited live read", async () => {
+  await withTempStore(async () => {
+    const one = await addAccount("claude", "rl@a.b");
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+
+    // Warm the cache with a good live read.
+    await cachedAccountLimits([one], {
+      fetchLimits: async () => [okLimits(one.id, 40, 10)],
+      now: () => t0,
+    });
+
+    // A 429 later serves the stale snapshot, flagged cached + rateLimited so
+    // pollers still see the push-back signal and back off.
+    const rateLimited: import("../src/limits.js").AccountLimits = {
+      account: one.id, tool: "claude", ok: false, source: "oauth-api", error: "/api/oauth/usage: HTTP 429",
+    };
+    const [served] = await cachedAccountLimits([one], {
+      fetchLimits: async () => [rateLimited],
+      now: () => t0 + 10 * 60 * 1000,
+    });
+    assert.equal(served!.ok, true);
+    assert.equal(served!.cached, true);
+    assert.equal(served!.rateLimited, true);
+    assert.equal(served!.asOf, new Date(t0).toISOString());
+    assert.equal(served!.fiveHour?.usedPercent, 10);
+    assert.equal(served!.weekly?.usedPercent, 40);
+
+    // A non-rate-limit failure still surfaces as an error row.
+    const broken: import("../src/limits.js").AccountLimits = {
+      account: one.id, tool: "claude", ok: false, source: "oauth-api", error: "HTTP 401",
+    };
+    const [error] = await cachedAccountLimits([one], {
+      fetchLimits: async () => [broken],
+      now: () => t0 + 11 * 60 * 1000,
+    });
+    assert.equal(error!.ok, false);
+    assert.equal(error!.rateLimited, undefined);
+
+    // A 429 with no cache entry keeps the error row but stamps the signal.
+    const other = await addAccount("claude", "rl2@a.b");
+    const [bare] = await cachedAccountLimits([other], {
+      fetchLimits: async () => [{ ...rateLimited, account: other.id }],
+      now: () => t0 + 12 * 60 * 1000,
+    });
+    assert.equal(bare!.ok, false);
+    assert.equal(bare!.rateLimited, true);
+  });
+});
+
 test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl", async () => {
   await withTempStore(async () => {
     const one = await addAccount("claude", "one@a.b");

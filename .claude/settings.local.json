@@ -7,7 +7,8 @@
       "Bash(rg -n \"rotat|truncate|usagePath|usageDir\" src/*.ts src/daemon/*.ts)",
       "Bash(rg -n \"cwd:.*real|cwd: real|realpath.*cwd|cwd = await realpath\" src/*.ts)",
       "Bash(echo \"exit=$?\")",
-      "Read(//Users/trmd/.hive/login-homes/**)"
+      "Read(//Users/trmd/.hive/login-homes/**)",
+      "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\('deps:',Object.keys\\(p.dependencies||{}\\).join\\(', '\\)||'\\(none\\)'\\); console.log\\('bin:',JSON.stringify\\(p.bin\\)\\); console.log\\('devDeps:',Object.keys\\(p.devDependencies||{}\\).join\\(', '\\)||'\\(none\\)'\\)\")"
     ]
   },
   "enabledMcpjsonServers": [

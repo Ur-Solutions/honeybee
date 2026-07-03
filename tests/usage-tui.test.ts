@@ -194,3 +194,8 @@ test("buildUsageFooter: standing warnings are pinned between refresh error and a
   assert.equal(lines[1], "⚠ claude-x: no email on record");
   assert.match(lines[2]!, /HTTP 401/);
 });
+
+test("usageResultsRateLimited: a stale-cache fallback row stamped rateLimited triggers backoff", () => {
+  assert.equal(usageResultsRateLimited([okAccount({ cached: true, rateLimited: true })]), true);
+  assert.equal(usageResultsRateLimited([okAccount({ cached: true })]), false);
+});

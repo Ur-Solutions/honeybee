@@ -61,9 +61,15 @@ export const USAGE_TUI_MIN_INTERVAL_MS = 10_000;
 /** Backoff cap: consecutive rate-limited sweeps double the wait up to 8× the interval. */
 export const USAGE_TUI_MAX_BACKOFF_FACTOR = 8;
 
-/** True when any account's live read was rejected for rate limiting. */
+/**
+ * True when any account's live read was rejected for rate limiting — either a
+ * raw 429 error row, or a stale-cache fallback stamped `rateLimited` by
+ * cachedAccountLimits (the row looks healthy but the provider pushed back).
+ */
 export function usageResultsRateLimited(results: AccountLimits[]): boolean {
-  return results.some((result) => !result.ok && /\b429\b|rate.?limit/i.test(result.error ?? ""));
+  return results.some(
+    (result) => result.rateLimited === true || (!result.ok && /\b429\b|rate.?limit/i.test(result.error ?? "")),
+  );
 }
 
 /**
