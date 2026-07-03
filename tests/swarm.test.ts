@@ -54,6 +54,20 @@ test("createSwarm refuses duplicate ids", async () => {
   });
 });
 
+test("concurrent createSwarm calls produce exactly one swarm", async () => {
+  await withTempStore(async () => {
+    const results = await Promise.allSettled([
+      createSwarm({ id: "contested", beeIds: ["CO.aaa"] }),
+      createSwarm({ id: "contested", beeIds: ["CO.bbb"] }),
+      createSwarm({ id: "contested", beeIds: ["CO.ccc"] }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    assert.equal(fulfilled.length, 1, `expected exactly one create to win, got ${fulfilled.length}`);
+    const list = await listSwarms();
+    assert.deepEqual(list.map((record) => record.id), ["contested"]);
+  });
+});
+
 test("destroySwarm marks the record and is idempotent", async () => {
   await withTempStore(async () => {
     await createSwarm({ id: "gone", beeIds: ["x"] });
