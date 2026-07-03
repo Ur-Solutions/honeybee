@@ -264,6 +264,34 @@ test("latestTranscript dedupes Codex dual-format rollouts and filters injected c
   }
 });
 
+test("latestTranscript keeps Codex response_item messages missing from the event stream", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-mixed-format-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "06", "09");
+    const chatPath = join(sessionDir, "rollout-2026-06-09T12-30-00-session.jsonl");
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Fix the mixed\nrollout" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Fix the mixed rollout" }] } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Response-item assistant survived." }] } }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("codex", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(renderTranscript(tx.rows), "## user\nFix the mixed\nrollout\n\n## assistant\nResponse-item assistant survived.");
+    assert.equal(lastAssistantText(tx.rows), "Response-item assistant survived.");
+    assert.equal(tx.title, "Fix the mixed rollout");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("latestTranscript still renders Codex rollouts that only carry response_item messages", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-response-items-"));
   try {

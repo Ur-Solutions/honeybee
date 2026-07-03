@@ -311,7 +311,7 @@ async function runLoop(ctx: FlowContext): Promise<Record<string, unknown>> {
       // over the implicit blocked/needs_input pause: an operator who opted
       // into stopping on those statuses gets a stop, not a pause.
       let decision: { status: LoopStatus; reason: string } | null = null;
-      if (seal && cfg.stop.stopOnSeal.includes(seal.status)) {
+      if (seal && cfg.stop.stopOnSeal.length > 0 && cfg.stop.stopOnSeal.includes(seal.status)) {
         await recordStopCheck(loopId, "stop-on-seal", true);
         decision = { status: "done", reason: `seal:${seal.status}` };
       } else if (seal && (seal.status === "blocked" || seal.status === "needs_input")) {

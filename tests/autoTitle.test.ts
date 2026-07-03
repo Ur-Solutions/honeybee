@@ -276,6 +276,49 @@ test("auto-title: a never-settling generation is freed by the watchdog, not wedg
   assert.equal(capture.claims.length, 2, "the slot is freed so another bee can be claimed");
 });
 
+test("auto-title: a watchdog-reclaimed completion cannot clear a newer in-flight generation", async () => {
+  const a = bee({ name: "a", tmuxTarget: "hive:a", brief: "task a" });
+  const b = bee({ name: "b", tmuxTarget: "hive:b", brief: "task b" });
+  const c = bee({ name: "c", tmuxTarget: "hive:c", brief: "task c" });
+  const store = new Map([[a.name, a], [b.name, b], [c.name, c]]);
+  const capture: Capture = { claims: [], updates: [] };
+  let clock = NOW;
+  const releases: Array<(value: string) => void> = [];
+  const dispatch = createAutoTitleDispatcher({
+    ...buildDeps({ store, capture }),
+    now: () => clock,
+    contextFor: async (record) => ({ brief: record.name }),
+    generate: () => new Promise<string>((resolve) => { releases.push(resolve); }),
+  });
+  const args = () => [store.get(a.name)!, store.get(b.name)!, store.get(c.name)!];
+
+  await dispatch(args());
+  assert.equal(capture.claims.length, 1, "a is claimed first");
+
+  clock += AUTO_TITLE_WATCHDOG_MS + 1;
+  const watchdogOutcomes = await dispatch(args());
+  assert.ok(watchdogOutcomes.some((o) => o.bee === "a" && /watchdog/.test(o.error ?? "")), "a is watchdog-reclaimed");
+  assert.equal(capture.claims.length, 2, "b starts after the watchdog frees a");
+  assert.equal(releases.length, 2, "a and b have generation promises");
+
+  releases[0]!("Title A");
+  await settle();
+  const afterStaleA = await dispatch(args());
+  assert.deepEqual(afterStaleA, [{ bee: "a", ok: true, title: "Title A" }]);
+  assert.equal(capture.claims.length, 2, "c is not claimed while b is still in flight");
+  assert.equal(releases.length, 2, "no third generation starts after stale a settles");
+
+  releases[1]!("Title B");
+  await settle();
+  const afterB = await dispatch(args());
+  assert.deepEqual(afterB, [{ bee: "b", ok: true, title: "Title B" }]);
+  assert.equal(capture.claims.length, 3, "c can start after b actually finishes");
+
+  releases[2]!("Title C");
+  await settle();
+  assert.deepEqual(await dispatch(args()), [{ bee: "c", ok: true, title: "Title C" }]);
+});
+
 test("auto-title: mirrorTitle receives the fresh record + title, and a throwing mirror still yields ok", async () => {
   const record = bee({ brief: "fix things" });
   const store = new Map([[record.name, record]]);

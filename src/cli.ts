@@ -3273,8 +3273,10 @@ async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fres
     console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
   }
   const runnerTier = adapter?.tier();
-  const restored: SessionRecord = {
-    ...record,
+  // Field-merge, not a full-record save, so daemon writes since `record`
+  // loaded survive; null = record deleted concurrently, nothing to persist
+  // (HIVE-49).
+  const patch: Partial<SessionRecord> = {
     command: shellCommand(spec),
     substrate: "hsr",
     runnerPid: hostPid,
@@ -3283,7 +3285,7 @@ async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fres
     updatedAt: new Date().toISOString(),
     status: "running",
   };
-  await saveSession(restored);
+  const restored = (await updateSession(record.name, patch)) ?? { ...record, ...patch };
   await writeSpawnOptions(restored);
   return restored;
 }
@@ -3331,8 +3333,10 @@ async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void
     env: spec.env,
     tmuxOptions: spec.tmuxOptions,
   });
-  const restored: SessionRecord = {
-    ...record,
+  // Field-merge, not a full-record save, so daemon writes since `record`
+  // loaded survive; explicit undefined deletes the HSR fields; null = record
+  // deleted concurrently, nothing to persist (HIVE-49).
+  const restored = await updateSession(record.name, {
     command: shellCommand(spec),
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
@@ -3340,12 +3344,11 @@ async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void
     combId: tmuxTarget,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete restored.substrate;
-  delete restored.runnerPid;
-  delete restored.runnerTier;
-  await saveSession(restored);
-  await writeSpawnOptions(restored);
+    substrate: undefined,
+    runnerPid: undefined,
+    runnerTier: undefined,
+  });
+  if (restored) await writeSpawnOptions(restored);
 }
 
 /**
@@ -3369,7 +3372,9 @@ async function cmdPromote(parsed: Parsed): Promise<void> {
     const meta = await readHsrMeta(record.name).catch(() => null);
     if (meta?.sessionId) {
       record.providerSessionId = meta.sessionId;
-      await saveSession(record);
+      // Field-merge, not a full-record save: a full save would revert daemon
+      // writes (auto-title, observed state) since `record` loaded (HIVE-49).
+      await updateSession(record.name, { providerSessionId: meta.sessionId });
     }
   }
   const tool = assertResumable(record, "promote");
@@ -3420,30 +3425,34 @@ async function cmdPromote(parsed: Parsed): Promise<void> {
     );
   }
 
-  // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier,
-  //    set the pane fields; KEEP uuid/providerSessionId/id/lineage/account.
-  const promoted: SessionRecord = {
-    ...record,
-    command: shellCommand(spec),
+  // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier
+  //    (explicit undefined = delete), set the pane fields; KEEP
+  //    uuid/providerSessionId/id/lineage/account. Field-merge under the lock
+  //    (updateSession) instead of a full-record save so daemon writes that
+  //    landed since `record` was loaded (auto-title, observed state) survive
+  //    the flip (HIVE-49). null = record deleted mid-promote (concurrent
+  //    kill) — don't resurrect it.
+  const command = shellCommand(spec);
+  const promoted = await updateSession(record.name, {
+    command,
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
     ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     combId: tmuxTarget,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete promoted.substrate;
-  delete promoted.runnerPid;
-  delete promoted.runnerTier;
-  await saveSession(promoted);
-  await writeSpawnOptions(promoted);
+    substrate: undefined,
+    runnerPid: undefined,
+    runnerTier: undefined,
+  });
+  if (promoted) await writeSpawnOptions(promoted);
   await appendLedger({ type: "session.promote", session: record.name, from: "hsr", to: "local-tmux", providerSessionId: record.providerSessionId });
 
   if (isPretty()) {
     console.log(actionLine("ok", "promote", [bold(record.name), record.agent, dim("→ local-tmux")]));
     console.error(note(`attach with: ${formatShellCommand(substrate.attachCommand(tmuxTarget))}`));
   } else {
-    console.log(`promoted\t${record.name}\thsr\tlocal-tmux\t${promoted.command}`);
+    console.log(`promoted\t${record.name}\thsr\tlocal-tmux\t${command}`);
   }
 }
 
@@ -3522,10 +3531,14 @@ async function cmdDemote(parsed: Parsed): Promise<void> {
   }
 
   // 5. Flip the record to HSR: set substrate/runnerPid/runnerTier, make
-  //    tmuxTarget the logical id, delete the pane fields; keep the rest.
-  const demoted: SessionRecord = {
-    ...record,
-    command: shellCommand(spec),
+  //    tmuxTarget the logical id, delete the pane fields (explicit undefined
+  //    = delete); keep the rest. Field-merge under the lock (updateSession)
+  //    instead of a full-record save so daemon writes that landed since
+  //    `record` was loaded survive the flip (HIVE-49). null = record deleted
+  //    mid-demote (concurrent kill) — don't resurrect it.
+  const command = shellCommand(spec);
+  const demoted = await updateSession(record.name, {
+    command,
     substrate: "hsr",
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
@@ -3533,17 +3546,16 @@ async function cmdDemote(parsed: Parsed): Promise<void> {
     combId: record.name,
     updatedAt: new Date().toISOString(),
     status: "running",
-  };
-  delete demoted.agentPaneId;
-  delete demoted.launcherPgid;
-  await saveSession(demoted);
-  await writeSpawnOptions(demoted);
+    agentPaneId: undefined,
+    launcherPgid: undefined,
+  });
+  if (demoted) await writeSpawnOptions(demoted);
   await appendLedger({ type: "session.demote", session: record.name, from: "local-tmux", to: "hsr", providerSessionId: record.providerSessionId });
 
   if (isPretty()) {
     console.log(actionLine("ok", "demote", [bold(record.name), record.agent, dim("→ hsr")]));
   } else {
-    console.log(`demoted\t${record.name}\tlocal-tmux\thsr\t${demoted.command}`);
+    console.log(`demoted\t${record.name}\tlocal-tmux\thsr\t${command}`);
   }
 }
 
@@ -3653,7 +3665,7 @@ async function cmdHere(parsed: Parsed): Promise<void> {
  * detectable from inside hive and is the operator's collision call.
  */
 function defaultSubstrateIsSshTmux(): boolean {
-  const overlay = loadNodeSync(LOCAL_NODE_NAME);
+  const overlay = loadNodeSync(LOCAL_NODE_NAME, { tolerateInvalid: true });
   return overlay?.kind === "ssh-tmux";
 }
 
@@ -4576,16 +4588,21 @@ async function cmdRun(parsed: Parsed) {
   let blocked = false;
 
   try {
-    try {
-      await waitForAgentReady(record, {
-        timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
-        acceptTrust: acceptsTrust(parsed),
-        raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
-      });
-    } catch (error) {
-      if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
-      console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
-      if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+    // HSR bees have no interactive TUI to poll for readiness — the runner host is
+    // ready as soon as spawn confirmed it live (hasSession). Skip the pane-scrape
+    // readiness wait; steer straight through the control socket.
+    if (record.substrate !== "hsr") {
+      try {
+        await waitForAgentReady(record, {
+          timeoutMs: numberFlag(parsed, ["boot-ms"], defaultBootMs(record.agent)),
+          acceptTrust: acceptsTrust(parsed),
+          raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
+        });
+      } catch (error) {
+        if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
+        console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, sending anyway`]));
+        if (error.pane.trim()) console.error(formatPaneExcerpt(error.pane));
+      }
     }
     await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
     const now = new Date().toISOString();
@@ -6227,8 +6244,10 @@ async function questDone(parsed: Parsed) {
       }
       // Capture the record + ws window id BEFORE the kill: transactionalKill
       // deletes the record on confirmed death, and the window id is needed to
-      // reap the orphan afterwards.
-      const snapshot = { ...bee };
+      // reap the orphan afterwards. Re-read from disk (not the quest listing's
+      // possibly-stale `bee`) so daemon merges since then — auto-title,
+      // providerSessionId — survive into the archived record (HIVE-49).
+      const snapshot = (await loadSession(bee.name)) ?? { ...bee };
       const wsWindowId = inventory?.active.get(bee.tmuxTarget);
       const outcome = await transactionalKill(bee);
       if (outcome.ok) {
@@ -7482,7 +7501,7 @@ async function cmdLoop(parsed: Parsed) {
 }
 
 function loopArgsFromFlags(parsed: Parsed, prompt: string): Record<string, unknown> {
-  return {
+  const args: Record<string, unknown> = {
     bee: typeof flag(parsed, "bee") === "string" ? String(flag(parsed, "bee")) : "",
     cwd: typeof flag(parsed, "cwd") === "string" ? String(flag(parsed, "cwd")) : "",
     context: typeof flag(parsed, "context") === "string" ? String(flag(parsed, "context")) : "",
@@ -7491,12 +7510,14 @@ function loopArgsFromFlags(parsed: Parsed, prompt: string): Record<string, unkno
     max: typeof flag(parsed, "max") === "string" ? String(flag(parsed, "max")) : undefined,
     maxDuration: typeof flag(parsed, "max-duration") === "string" ? String(flag(parsed, "max-duration")) : "",
     forever: truthy(flag(parsed, "forever")),
-    stopOnSeal: typeof flag(parsed, "stop-on-seal") === "string" ? String(flag(parsed, "stop-on-seal")) : "",
     stopOnSentinel: typeof flag(parsed, "stop-on-sentinel") === "string" ? String(flag(parsed, "stop-on-sentinel")) : "",
     judge: typeof flag(parsed, "judge") === "string" ? String(flag(parsed, "judge")) : "",
     summarizer: typeof flag(parsed, "summarizer") === "string" ? String(flag(parsed, "summarizer")) : "",
     yolo: truthy(flag(parsed, "yolo")),
   };
+  const stopOnSeal = flag(parsed, "stop-on-seal");
+  if (stopOnSeal !== undefined) args.stopOnSeal = Array.isArray(stopOnSeal) ? stopOnSeal.join(",") : stopOnSeal === true ? "" : String(stopOnSeal);
+  return args;
 }
 
 async function loopStartCmd(parsed: Parsed) {

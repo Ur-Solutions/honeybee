@@ -123,6 +123,11 @@ test("buildLoopConfig validates --stop-on-seal CSV against seal statuses", () =>
   // default is ["done"].
   const cfg2 = buildLoopConfig({ ...baseArgs, max: 3 });
   assert.deepEqual(cfg2.stop.stopOnSeal, ["done"]);
+  // Explicit blank means never stop on a seal.
+  const cfg3 = buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: "" });
+  assert.deepEqual(cfg3.stop.stopOnSeal, []);
+  const cfg4 = buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: " , " });
+  assert.deepEqual(cfg4.stop.stopOnSeal, []);
   assert.throws(() => buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: "done,bogus" }), /Invalid --stop-on-seal/);
 });
 
@@ -515,6 +520,27 @@ test("driver: stops on max", async () => {
       assert.equal(cfg?.status, "done");
       assert.equal(cfg?.stopReason, "max");
       assert.equal(cfg?.iteration, 3);
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
+test("driver: blank --stop-on-seal never stops on seals", async () => {
+  await withTempStore(async () => {
+    installDriverHooks(() => "done");
+    try {
+      await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "ralph", max: 2, stopOnSeal: "", loopId: "NEVERSEAL1" },
+        runId: "NEVERSEAL1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("NEVERSEAL1");
+      assert.deepEqual(cfg?.stop.stopOnSeal, []);
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "max");
+      assert.equal(cfg?.iteration, 2);
+      assert.equal(cfg?.lastSealStatus, "done");
     } finally {
       __setLoopTestHooks(undefined);
     }

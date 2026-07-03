@@ -14,9 +14,10 @@
 //     Desktop notifications / Apiary "Needs-me" are a later UI concern.
 //
 // Stateful across ticks within a daemon run: an internal Set de-dupes on
-// "<bee>:<requestId>" so each needs_input is routed ONCE, not re-buzzed every
-// tick while the bee stays blocked. Never throws — per-bee errors are captured
-// into the outcome.
+// "<bee>:<requestId>:<event-ts>" so each needs_input is routed ONCE, not
+// re-buzzed every tick while the bee stays blocked. The event timestamp keeps
+// id-less adapter requests distinct after the bee unblocks and blocks again.
+// Never throws — per-bee errors are captured into the outcome.
 
 import { sendBuzMessage, type BuzSender } from "../buz.js";
 import { pendingNeedsInput, type PendingNeedsInput } from "../hsr/observe.js";
@@ -56,6 +57,10 @@ function formatBody(bee: string, pending: PendingNeedsInput): string {
   return lines.join("\n");
 }
 
+function dedupeKey(bee: string, pending: PendingNeedsInput): string {
+  return `${bee}:${pending.requestId}:${pending.ts}`;
+}
+
 /**
  * Build the stateful per-tick needs-input dispatcher. Call the returned function
  * once per tick with the tick's records and its freshly-derived state map.
@@ -76,7 +81,7 @@ export function createNeedsInputDispatcher(): (
       try {
         const pending = await pendingNeedsInput(record.name);
         if (!pending) continue;
-        const key = `${record.name}:${pending.requestId}`;
+        const key = dedupeKey(record.name, pending);
         if (handled.has(key)) continue;
 
         // parentId is a bee id; tolerate a name for older/loose records.
