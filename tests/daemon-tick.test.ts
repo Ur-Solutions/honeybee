@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { tick, type ProbeResult, type TickDeps } from "../src/daemon/run.js";
+import { createThrottledTranscriptMetadataRefresh, tick, type ProbeResult, type TickDeps } from "../src/daemon/run.js";
 import type { BeeState, PaneCaptureMap } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
@@ -448,6 +448,49 @@ function never<T>(): Promise<T> {
   return new Promise<T>(() => undefined);
 }
 
+async function waitForCondition(condition: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`waitForCondition timed out: ${label}`);
+}
+
+test("transcript metadata refresh throttle skips unchanged transcript cursors", async () => {
+  let now = 1_000;
+  let fileStat = { mtimeMs: 10, size: 100 };
+  const refreshed: string[] = [];
+  const refresh = createThrottledTranscriptMetadataRefresh(
+    async (record) => {
+      refreshed.push(`${record.name}:${record.lastPromptAt ?? ""}`);
+      return record;
+    },
+    {
+      intervalMs: 100,
+      now: () => now,
+      statFile: async () => fileStat,
+    },
+  );
+  const record = bee({ transcriptPath: "/tmp/alpha.jsonl", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+
+  await refresh(record);
+  await refresh(record);
+  assert.deepEqual(refreshed, ["alpha:2026-06-03T09:59:00.000Z"], "same cursor inside the interval is skipped");
+
+  now += 101;
+  await refresh(record);
+  assert.equal(refreshed.length, 1, "same transcript mtime/size is skipped after the interval");
+
+  fileStat = { mtimeMs: 11, size: 100 };
+  now += 101;
+  await refresh(record);
+  assert.equal(refreshed.length, 2, "changed transcript mtime refreshes");
+
+  await refresh({ ...record, lastPromptAt: "2026-06-03T10:01:00.000Z" });
+  assert.equal(refreshed.length, 3, "changed prompt cursor refreshes immediately");
+});
+
 test("tick: a capturePanes that never settles is timed out, recorded, and the tick completes", async () => {
   await withTempStore(async () => {
     const record = bee({ lastPromptAt: "2026-06-03T09:59:00.000Z" });
@@ -491,6 +534,43 @@ test("tick: a hung per-record transcript refresh is timed out and later records 
     assert.ok(result.errors.some((e) => /refreshTranscriptMetadata\(alpha\) timed out after 30ms/.test(e.message)));
     assert.deepEqual(refreshed, ["beta"]);
     assert.equal(result.observed.size, 2);
+  });
+});
+
+test("tick: per-record refresh work runs with bounded concurrency", async () => {
+  await withTempStore(async () => {
+    const previousConcurrency = process.env.HIVE_DAEMON_RECORD_CONCURRENCY;
+    process.env.HIVE_DAEMON_RECORD_CONCURRENCY = "2";
+    try {
+      const first = bee({ name: "alpha", tmuxTarget: "hive:alpha", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+      const second = bee({ name: "beta", tmuxTarget: "hive:beta", lastPromptAt: "2026-06-03T09:59:00.000Z" });
+      const capture: Capture = { ledger: [], touches: [] };
+      let releaseAlpha: (() => void) | undefined;
+      const started: string[] = [];
+      const deps: TickDeps = {
+        ...buildDeps({ records: [first, second], liveTargets: new Set([first.tmuxTarget, second.tmuxTarget]), capture }),
+        refreshTranscriptMetadata: async (rec) => {
+          started.push(rec.name);
+          if (rec.name === "alpha") {
+            await new Promise<void>((resolve) => {
+              releaseAlpha = resolve;
+            });
+          }
+          return rec;
+        },
+      };
+
+      const pending = tick(deps, new Map());
+      await waitForCondition(() => started.includes("alpha") && started.includes("beta"), "both refreshes started");
+      releaseAlpha?.();
+      const result = await pending;
+
+      assert.equal(result.observed.size, 2);
+      assert.deepEqual(started.sort(), ["alpha", "beta"]);
+    } finally {
+      if (previousConcurrency === undefined) delete process.env.HIVE_DAEMON_RECORD_CONCURRENCY;
+      else process.env.HIVE_DAEMON_RECORD_CONCURRENCY = previousConcurrency;
+    }
   });
 });
 

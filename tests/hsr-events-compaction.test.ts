@@ -99,6 +99,10 @@ test("compactHsrEvents folds dropped usage/exhausted into checkpoints, keeps the
     const observation = (await hsrObservations()).get(bee);
     assert.equal(observation?.live, true);
     assert.equal(observation?.state, "blocked");
+    const observedWithEvents = (await hsrObservations({ includeEvents: true })).get(bee);
+    assert.deepEqual(observedWithEvents?.eventSnapshot?.usage.totals, { inputTokens: 150, outputTokens: 15 });
+    assert.deepEqual(observedWithEvents?.eventSnapshot?.usage.latestExhausted, { ts: 3, resetHint: "R1" });
+    assert.equal(observedWithEvents?.eventSnapshot?.pendingNeedsInput?.requestId, "req-1");
     const pending = await pendingNeedsInput(bee);
     assert.equal(pending?.requestId, "req-1");
     assert.equal(pending?.question, "pick?");
