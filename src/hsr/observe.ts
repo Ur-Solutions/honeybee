@@ -9,8 +9,9 @@
  * says `status: "running"` AND the host process is still alive — the host owns
  * the harness child's pipes, so a dead host means the live protocol stream is
  * gone regardless of whether the harness child lingers. "Crash adoption v1"
- * (`reapDeadHosts`) reconciles stale `running` meta with dead host pids; it does
- * not recover pipes.
+ * (`reapDeadHosts`) reconciles stale `running` meta with dead host pids and
+ * kills the orphaned harness child group the dead host left behind (HIVE-53);
+ * it does not recover pipes.
  *
  * Node builtins only.
  */
@@ -368,10 +369,59 @@ export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservat
   };
 }
 
+// Escalation grace for orphaned harness child groups (SIGTERM → SIGKILL),
+// mirrors streamRunner.ts stop().
+const ORPHAN_STOP_GRACE_MS = 2_000;
+const ORPHAN_STOP_POLL_MS = 25;
+
+/** Signal-0 liveness probe of a whole process group. */
+function isPgidAlive(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 0) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 /**
- * Reconcile stale `running` meta whose host pid is dead: flip status to
- * "exited" (with endedAt) and return the reaped bee names. Crash-adoption v1 —
- * no pipe recovery.
+ * Kill the harness child group a dead host left behind (HIVE-53). The runner
+ * spawns the harness detached (own group leader, pgid === childPid), so a host
+ * that dies WITHOUT running finalize (SIGKILL/OOM — locally a crashed
+ * `__hsr-run`, remotely the serve whose in-process runners share its pid)
+ * strands the child: still running, control socket gone, meta stuck "running".
+ * Callers pass a meta whose host pid is already known-dead; we SIGTERM the
+ * recorded child group, grant a short grace, then SIGKILL. Returns true when a
+ * live group was signalled. Never throws.
+ */
+export async function killOrphanedChildGroup(meta: HsrMeta | null): Promise<boolean> {
+  const pgid = meta?.childPgid ?? meta?.childPid ?? 0;
+  if (!isPgidAlive(pgid)) return false;
+  try {
+    process.kill(-pgid, "SIGTERM");
+  } catch {
+    // Died between the probe and the signal.
+  }
+  const deadline = Date.now() + ORPHAN_STOP_GRACE_MS;
+  while (isPgidAlive(pgid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, ORPHAN_STOP_POLL_MS));
+  }
+  if (isPgidAlive(pgid)) {
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {
+      // best-effort
+    }
+  }
+  return true;
+}
+
+/**
+ * Reconcile stale `running` meta whose host pid is dead: kill the orphaned
+ * harness child group it left behind (HIVE-53), flip status to "exited" (with
+ * endedAt) and return the reaped bee names. Crash-adoption v1 — no pipe
+ * recovery.
  */
 export async function reapDeadHosts(): Promise<string[]> {
   const reaped: string[] = [];
@@ -382,6 +432,10 @@ export async function reapDeadHosts(): Promise<string[]> {
     // status (flips to "exited" when the bee leaves the remote list). Skip it.
     if (meta.mirrorOfNode) continue;
     if (isPidAlive(meta.hostPid)) continue;
+    // The dead host never ran finalize, so its detached harness child may still
+    // be running with no control plane — kill the group before flipping meta,
+    // or the leak outlives the reap.
+    await killOrphanedChildGroup(meta);
     await writeHsrMeta(bee, { ...meta, status: "exited", endedAt: new Date().toISOString() });
     reaped.push(bee);
   }
