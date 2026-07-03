@@ -178,7 +178,9 @@ export function createRemoteHsrSubstrate(
 
   // Lazily establish ONE resilient client per node (reused by the daemon tick,
   // steer, observe). A failed establish is NOT cached — the next call retries,
-  // so a transient tunnel drop never wedges the substrate.
+  // so a transient tunnel drop never wedges the substrate. Caching a client that
+  // later goes 'down' is safe too: its call()/on() kick a fresh reconnect, so
+  // the memoized client self-heals once the network recovers (HIVE-9).
   let clientPromise: Promise<RemoteRunnerClient> | undefined;
   function client(): Promise<RemoteRunnerClient> {
     if (!clientPromise) {

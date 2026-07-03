@@ -237,6 +237,7 @@ function unloadableFlow(name: string, error: unknown): Flow {
 }
 
 export async function loadFlow(name: string): Promise<Flow | null> {
+  if (!validFlowName(name)) return null;
   const builtin = BUILTIN_FLOW_LOADERS[name];
   if (builtin) return builtin();
   const tsPath = flowFilePath(name, ".ts");
@@ -321,6 +322,7 @@ export async function defineFlowFromFile(sourcePath: string, nameOverride?: stri
 }
 
 export async function loadFlowSource(name: string): Promise<string | null> {
+  if (!validFlowName(name)) return null;
   try {
     const raw = await readFile(flowSourcePath(name), "utf8");
     const trimmed = raw.trim();
@@ -332,6 +334,7 @@ export async function loadFlowSource(name: string): Promise<string | null> {
 }
 
 export async function removeFlow(name: string): Promise<boolean> {
+  if (!validFlowName(name)) return false;
   if (isBuiltinFlow(name)) {
     throw new Error(`Cannot remove flow "${name}": it is a built-in flow.`);
   }

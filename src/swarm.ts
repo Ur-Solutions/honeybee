@@ -40,6 +40,7 @@ export async function listSwarms(): Promise<SwarmRecord[]> {
 }
 
 export async function loadSwarm(id: string): Promise<SwarmRecord | null> {
+  if (!validSwarmId(id)) return null;
   try {
     return await readSwarm(swarmPath(id));
   } catch (error) {
@@ -64,6 +65,7 @@ export async function createSwarm(input: Omit<SwarmRecord, "createdAt">): Promis
 }
 
 export async function saveSwarm(record: SwarmRecord): Promise<void> {
+  if (!validSwarmId(record.id)) throw new Error(`Invalid swarm id: ${record.id}`);
   await ensureDir();
   await atomicWriteFile(swarmPath(record.id), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
 }
@@ -79,6 +81,7 @@ export async function destroySwarm(id: string): Promise<SwarmRecord> {
 }
 
 export async function removeSwarmRecord(id: string): Promise<void> {
+  if (!validSwarmId(id)) return;
   await rm(swarmPath(id), { force: true });
 }
 
