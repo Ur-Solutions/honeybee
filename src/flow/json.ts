@@ -21,16 +21,50 @@ import type { BeeHandle, Flow, FlowArg, FlowContext, FlowSpawnInput } from "./in
  */
 
 /** Supported declarative ops in JSON. Parallel/loops/sub-flows are TS-only. */
-export type JsonFlowOp =
-  | { op: "spawn"; as: string; bee: string; name?: string; cwd?: string; home?: string; node?: string; colony?: string; swarmId?: string }
-  | { op: "send"; to: string; text: string }
-  | { op: "brief"; to: string; text: string }
-  | { op: "waitForSeal"; of: string; timeoutMs?: number }
-  | { op: "wait"; of: string; idleMs?: number; timeoutMs?: number }
-  | { op: "kill"; of: string }
-  | { op: "seal"; of: string; from: string }
-  | { op: "log"; message: string }
-  | { op: "return"; value?: unknown };
+type SpawnJsonFlowOp = {
+  op: "spawn";
+  as: string;
+  bee: string;
+  name?: string;
+  cwd?: string;
+  home?: string;
+  node?: string;
+  colony?: string;
+  swarmId?: string;
+};
+type SendJsonFlowOp = { op: "send"; to: string; text: string };
+type BriefJsonFlowOp = { op: "brief"; to: string; text: string };
+type WaitForSealJsonFlowOp = { op: "waitForSeal"; of: string; timeoutMs?: number };
+type WaitJsonFlowOp = { op: "wait"; of: string; idleMs?: number; timeoutMs?: number };
+type KillJsonFlowOp = { op: "kill"; of: string };
+type SealJsonFlowOp = { op: "seal"; of: string; from: string };
+type LogJsonFlowOp = { op: "log"; message: string };
+type ReturnJsonFlowOp = { op: "return"; value?: unknown };
+
+type StepCompileResult = { kind: "return"; value: unknown } | void;
+
+type JsonFlowOpDefinition<Step extends { op: string }> = {
+  op: Step["op"];
+  validate: (step: Record<string, unknown>, index: number, flowName: string) => Step;
+  compile: (step: Step, ctx: FlowContext) => Promise<StepCompileResult> | StepCompileResult;
+};
+
+const JSON_FLOW_OPS = {
+  spawn: { op: "spawn", validate: validateSpawn, compile: compileSpawn },
+  send: { op: "send", validate: validateSend, compile: compileSend },
+  brief: { op: "brief", validate: validateBrief, compile: compileBrief },
+  waitForSeal: { op: "waitForSeal", validate: validateWaitForSeal, compile: compileWaitForSeal },
+  wait: { op: "wait", validate: validateWait, compile: compileWait },
+  kill: { op: "kill", validate: validateKill, compile: compileKill },
+  seal: { op: "seal", validate: validateSeal, compile: compileSeal },
+  log: { op: "log", validate: validateLog, compile: compileLog },
+  return: { op: "return", validate: validateReturn, compile: compileReturn },
+} as const;
+
+type JsonFlowOpTable = typeof JSON_FLOW_OPS;
+type JsonFlowOpName = keyof JsonFlowOpTable;
+
+export type JsonFlowOp = ReturnType<JsonFlowOpTable[JsonFlowOpName]["validate"]>;
 
 export type JsonFlow = {
   name: string;
@@ -49,17 +83,7 @@ export type ParseOptions = {
 // hydrate the JSON via the source file).
 export type CompiledStep = JsonFlowOp;
 
-const SUPPORTED_OPS = new Set<string>([
-  "spawn",
-  "send",
-  "brief",
-  "waitForSeal",
-  "wait",
-  "kill",
-  "seal",
-  "log",
-  "return",
-]);
+const SUPPORTED_OPS = new Set<string>(Object.keys(JSON_FLOW_OPS));
 
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
@@ -122,36 +146,19 @@ function validateStep(value: unknown, index: number, flowName: string): JsonFlow
   if (typeof op !== "string") {
     throw new Error(`Invalid step #${index} in flow ${flowName}: missing op`);
   }
-  if (!SUPPORTED_OPS.has(op)) {
+  if (!isJsonFlowOpName(op)) {
     throw new Error(
       `Invalid step #${index} in flow ${flowName}: unknown op "${op}". Supported: ${[...SUPPORTED_OPS].sort().join(", ")}`,
     );
   }
-  switch (op) {
-    case "spawn":
-      return validateSpawn(step, index, flowName);
-    case "send":
-    case "brief":
-      return validateSendLike(step, op, index, flowName);
-    case "waitForSeal":
-      return validateWaitForSeal(step, index, flowName);
-    case "wait":
-      return validateWait(step, index, flowName);
-    case "kill":
-      return validateKill(step, index, flowName);
-    case "seal":
-      return validateSeal(step, index, flowName);
-    case "log":
-      return validateLog(step, index, flowName);
-    case "return":
-      return { op: "return", ...("value" in step ? { value: step.value } : {}) };
-    default:
-      // Unreachable — SUPPORTED_OPS guards the switch — but TS narrows nicely.
-      throw new Error(`Invalid step #${index} in flow ${flowName}: unhandled op "${op}"`);
-  }
+  return JSON_FLOW_OPS[op].validate(step, index, flowName);
 }
 
-function validateSpawn(step: Record<string, unknown>, index: number, flowName: string): JsonFlowOp {
+function isJsonFlowOpName(op: string): op is JsonFlowOpName {
+  return SUPPORTED_OPS.has(op);
+}
+
+function validateSpawn(step: Record<string, unknown>, index: number, flowName: string): SpawnJsonFlowOp {
   const as = step.as;
   if (typeof as !== "string" || !NAME_RE.test(as)) {
     throw new Error(`Invalid step #${index} (spawn) in flow ${flowName}: 'as' must be a valid binding name`);
@@ -160,7 +167,7 @@ function validateSpawn(step: Record<string, unknown>, index: number, flowName: s
   if (typeof bee !== "string" || bee.length === 0) {
     throw new Error(`Invalid step #${index} (spawn) in flow ${flowName}: 'bee' must be a non-empty string`);
   }
-  const out: JsonFlowOp = { op: "spawn", as, bee };
+  const out: SpawnJsonFlowOp = { op: "spawn", as, bee };
   for (const k of ["name", "cwd", "home", "node", "colony", "swarmId"] as const) {
     const v = step[k];
     if (v !== undefined) {
@@ -173,12 +180,32 @@ function validateSpawn(step: Record<string, unknown>, index: number, flowName: s
   return out;
 }
 
+function validateSend(step: Record<string, unknown>, index: number, flowName: string): SendJsonFlowOp {
+  return validateSendLike(step, "send", index, flowName);
+}
+
+function validateBrief(step: Record<string, unknown>, index: number, flowName: string): BriefJsonFlowOp {
+  return validateSendLike(step, "brief", index, flowName);
+}
+
+function validateSendLike(
+  step: Record<string, unknown>,
+  op: "send",
+  index: number,
+  flowName: string,
+): SendJsonFlowOp;
+function validateSendLike(
+  step: Record<string, unknown>,
+  op: "brief",
+  index: number,
+  flowName: string,
+): BriefJsonFlowOp;
 function validateSendLike(
   step: Record<string, unknown>,
   op: "send" | "brief",
   index: number,
   flowName: string,
-): JsonFlowOp {
+): SendJsonFlowOp | BriefJsonFlowOp {
   const to = step.to;
   if (typeof to !== "string" || to.length === 0) {
     throw new Error(`Invalid step #${index} (${op}) in flow ${flowName}: 'to' must be a non-empty string`);
@@ -190,12 +217,12 @@ function validateSendLike(
   return { op, to, text };
 }
 
-function validateWaitForSeal(step: Record<string, unknown>, index: number, flowName: string): JsonFlowOp {
+function validateWaitForSeal(step: Record<string, unknown>, index: number, flowName: string): WaitForSealJsonFlowOp {
   const of = step.of;
   if (typeof of !== "string" || of.length === 0) {
     throw new Error(`Invalid step #${index} (waitForSeal) in flow ${flowName}: 'of' must be a non-empty string`);
   }
-  const out: JsonFlowOp = { op: "waitForSeal", of };
+  const out: WaitForSealJsonFlowOp = { op: "waitForSeal", of };
   if (step.timeoutMs !== undefined) {
     if (typeof step.timeoutMs !== "number" || !Number.isFinite(step.timeoutMs) || step.timeoutMs < 0) {
       throw new Error(`Invalid step #${index} (waitForSeal) in flow ${flowName}: 'timeoutMs' must be a non-negative number`);
@@ -205,12 +232,12 @@ function validateWaitForSeal(step: Record<string, unknown>, index: number, flowN
   return out;
 }
 
-function validateWait(step: Record<string, unknown>, index: number, flowName: string): JsonFlowOp {
+function validateWait(step: Record<string, unknown>, index: number, flowName: string): WaitJsonFlowOp {
   const of = step.of;
   if (typeof of !== "string" || of.length === 0) {
     throw new Error(`Invalid step #${index} (wait) in flow ${flowName}: 'of' must be a non-empty string`);
   }
-  const out: JsonFlowOp = { op: "wait", of };
+  const out: WaitJsonFlowOp = { op: "wait", of };
   for (const k of ["idleMs", "timeoutMs"] as const) {
     const v = step[k];
     if (v !== undefined) {
@@ -223,7 +250,7 @@ function validateWait(step: Record<string, unknown>, index: number, flowName: st
   return out;
 }
 
-function validateKill(step: Record<string, unknown>, index: number, flowName: string): JsonFlowOp {
+function validateKill(step: Record<string, unknown>, index: number, flowName: string): KillJsonFlowOp {
   const of = step.of;
   if (typeof of !== "string" || of.length === 0) {
     throw new Error(`Invalid step #${index} (kill) in flow ${flowName}: 'of' must be a non-empty string`);
@@ -231,7 +258,7 @@ function validateKill(step: Record<string, unknown>, index: number, flowName: st
   return { op: "kill", of };
 }
 
-function validateSeal(step: Record<string, unknown>, index: number, flowName: string): JsonFlowOp {
+function validateSeal(step: Record<string, unknown>, index: number, flowName: string): SealJsonFlowOp {
   const of = step.of;
   if (typeof of !== "string" || of.length === 0) {
     throw new Error(`Invalid step #${index} (seal) in flow ${flowName}: 'of' must be a non-empty string`);
@@ -243,12 +270,16 @@ function validateSeal(step: Record<string, unknown>, index: number, flowName: st
   return { op: "seal", of, from };
 }
 
-function validateLog(step: Record<string, unknown>, index: number, flowName: string): JsonFlowOp {
+function validateLog(step: Record<string, unknown>, index: number, flowName: string): LogJsonFlowOp {
   const message = step.message;
   if (typeof message !== "string") {
     throw new Error(`Invalid step #${index} (log) in flow ${flowName}: 'message' must be a string`);
   }
   return { op: "log", message };
+}
+
+function validateReturn(step: Record<string, unknown>): ReturnJsonFlowOp {
+  return { op: "return", ...("value" in step ? { value: step.value } : {}) };
 }
 
 /* ------------------------------------------------------------------ */
@@ -263,53 +294,69 @@ function compileSteps(steps: JsonFlowOp[], flowName: string): Flow["run"] {
         throw new Error(`Flow ${flowName} aborted at step #${i}`);
       }
       const step = steps[i]!;
-      switch (step.op) {
-        case "spawn": {
-          const spec: FlowSpawnInput = { bee: substituteString(step.bee, ctx) };
-          if (step.name !== undefined) spec.name = substituteString(step.name, ctx);
-          if (step.cwd !== undefined) spec.cwd = substituteString(step.cwd, ctx);
-          if (step.home !== undefined) spec.home = substituteString(step.home, ctx);
-          if (step.node !== undefined) spec.node = substituteString(step.node, ctx);
-          if (step.colony !== undefined) spec.colony = substituteString(step.colony, ctx);
-          if (step.swarmId !== undefined) spec.swarmId = substituteString(step.swarmId, ctx);
-          const handle: BeeHandle = await ctx.hive.spawn(spec);
-          ctx.bindings[step.as] = handle;
-          break;
-        }
-        case "send":
-          await ctx.hive.send(substituteString(step.to, ctx), substituteString(step.text, ctx));
-          break;
-        case "brief":
-          await ctx.hive.brief(substituteString(step.to, ctx), substituteString(step.text, ctx));
-          break;
-        case "waitForSeal": {
-          const opts = step.timeoutMs !== undefined ? { timeoutMs: step.timeoutMs } : undefined;
-          await ctx.hive.waitForSeal(substituteString(step.of, ctx), opts);
-          break;
-        }
-        case "wait": {
-          const opts: { idleMs?: number; timeoutMs?: number } = {};
-          if (step.idleMs !== undefined) opts.idleMs = step.idleMs;
-          if (step.timeoutMs !== undefined) opts.timeoutMs = step.timeoutMs;
-          await ctx.hive.wait(substituteString(step.of, ctx), Object.keys(opts).length > 0 ? opts : undefined);
-          break;
-        }
-        case "kill":
-          await ctx.hive.kill(substituteString(step.of, ctx));
-          break;
-        case "seal":
-          await ctx.hive.seal(substituteString(step.of, ctx), substituteString(step.from, ctx));
-          break;
-        case "log":
-          await ctx.hive.log(substituteString(step.message, ctx));
-          break;
-        case "return":
-          returnValue = step.value;
-          return returnValue;
+      const result = await compileStep(step, ctx);
+      if (result?.kind === "return") {
+        returnValue = result.value;
+        return returnValue;
       }
     }
     return returnValue;
   };
+}
+
+function compileStep(step: JsonFlowOp, ctx: FlowContext): Promise<StepCompileResult> | StepCompileResult {
+  // The step discriminant selects the matching table entry at runtime; TS cannot
+  // preserve that correlation through an indexed lookup on the heterogeneous map.
+  const definition = JSON_FLOW_OPS[step.op] as JsonFlowOpDefinition<JsonFlowOp>;
+  return definition.compile(step, ctx);
+}
+
+async function compileSpawn(step: SpawnJsonFlowOp, ctx: FlowContext): Promise<void> {
+  const spec: FlowSpawnInput = { bee: substituteString(step.bee, ctx) };
+  if (step.name !== undefined) spec.name = substituteString(step.name, ctx);
+  if (step.cwd !== undefined) spec.cwd = substituteString(step.cwd, ctx);
+  if (step.home !== undefined) spec.home = substituteString(step.home, ctx);
+  if (step.node !== undefined) spec.node = substituteString(step.node, ctx);
+  if (step.colony !== undefined) spec.colony = substituteString(step.colony, ctx);
+  if (step.swarmId !== undefined) spec.swarmId = substituteString(step.swarmId, ctx);
+  const handle: BeeHandle = await ctx.hive.spawn(spec);
+  ctx.bindings[step.as] = handle;
+}
+
+async function compileSend(step: SendJsonFlowOp, ctx: FlowContext): Promise<void> {
+  await ctx.hive.send(substituteString(step.to, ctx), substituteString(step.text, ctx));
+}
+
+async function compileBrief(step: BriefJsonFlowOp, ctx: FlowContext): Promise<void> {
+  await ctx.hive.brief(substituteString(step.to, ctx), substituteString(step.text, ctx));
+}
+
+async function compileWaitForSeal(step: WaitForSealJsonFlowOp, ctx: FlowContext): Promise<void> {
+  const opts = step.timeoutMs !== undefined ? { timeoutMs: step.timeoutMs } : undefined;
+  await ctx.hive.waitForSeal(substituteString(step.of, ctx), opts);
+}
+
+async function compileWait(step: WaitJsonFlowOp, ctx: FlowContext): Promise<void> {
+  const opts: { idleMs?: number; timeoutMs?: number } = {};
+  if (step.idleMs !== undefined) opts.idleMs = step.idleMs;
+  if (step.timeoutMs !== undefined) opts.timeoutMs = step.timeoutMs;
+  await ctx.hive.wait(substituteString(step.of, ctx), Object.keys(opts).length > 0 ? opts : undefined);
+}
+
+async function compileKill(step: KillJsonFlowOp, ctx: FlowContext): Promise<void> {
+  await ctx.hive.kill(substituteString(step.of, ctx));
+}
+
+async function compileSeal(step: SealJsonFlowOp, ctx: FlowContext): Promise<void> {
+  await ctx.hive.seal(substituteString(step.of, ctx), substituteString(step.from, ctx));
+}
+
+async function compileLog(step: LogJsonFlowOp, ctx: FlowContext): Promise<void> {
+  await ctx.hive.log(substituteString(step.message, ctx));
+}
+
+function compileReturn(step: ReturnJsonFlowOp): StepCompileResult {
+  return { kind: "return", value: step.value };
 }
 
 /* ------------------------------------------------------------------ */
@@ -357,4 +404,3 @@ export function substituteString(template: string, ctx: FlowContext): string {
     }
   });
 }
-
