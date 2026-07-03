@@ -6,7 +6,10 @@
  * bees`, SubstrateHsr) reads back (HSR_EXPLORATION.md §3 crash recovery, §7):
  *
  *   meta.json     — the host/child identity + status record (this file's HsrMeta)
- *   events.jsonl  — append-only structured RunnerEvent log (one JSON per line)
+ *   events.jsonl  — append-mostly structured RunnerEvent log (one JSON per line),
+ *                   compacted past a byte cap (HIVE-13): the dropped prefix is
+ *                   folded into synthetic checkpoint events so cumulative usage
+ *                   totals and the latest exhaustion signal survive exactly
  *   ring.txt      — rendered text tail (the assistant-output ring buffer)
  *   control.sock  — the per-bee JSON-RPC control socket (owned by the host)
  *
@@ -14,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendFile } from "node:fs/promises";
@@ -154,13 +157,127 @@ export async function readHsrMeta(bee: string): Promise<HsrMeta | null> {
 // production order — observers tail it for state / needs-input / crash recovery.
 const appendChains = new Map<string, Promise<void>>();
 
-/** Append one structured event to events.jsonl (owner-only, one JSON per line). */
+// Per-bee events.jsonl byte size, tracked by the single writer so the growth
+// check is O(1) per append (lazily seeded by one stat, then incremented).
+const eventLogSizes = new Map<string, number>();
+
+// events.jsonl growth bounds (HIVE-13). The log is the daemon's per-tick read
+// for state + usage, so it must stay small: once it crosses MAX_BYTES the
+// writer compacts it down to a tail of at most COMPACT_KEEP_LINES lines /
+// COMPACT_TARGET_BYTES bytes, folding the dropped prefix into checkpoint
+// events (see compactHsrEvents). KEEP_LINES stays comfortably above the
+// observers' 200-line tail window (observe.ts EVENT_TAIL_LINES).
+export const HSR_EVENTS_MAX_BYTES = 1024 * 1024;
+export const HSR_EVENTS_COMPACT_KEEP_LINES = 400;
+export const HSR_EVENTS_COMPACT_TARGET_BYTES = 512 * 1024;
+
+export type HsrEventsCompactLimits = { keepLines: number; targetBytes: number };
+
+/**
+ * Compact a bee's events.jsonl: keep the trailing `keepLines` lines (fewer if
+ * they exceed `targetBytes`; always at least the last line) and fold the
+ * dropped prefix into synthetic checkpoint events prepended to the new file:
+ *
+ *   - one `usage` event summing every dropped usage event's token counts, so
+ *     hsrUsageObservation's cumulative sum is unchanged by compaction;
+ *   - the latest dropped `exhausted` event, so the usage sampler's
+ *     latest-by-ts exhaustion edge survives even when it fell in the prefix.
+ *
+ * Checkpoint types carry no turn markers, so the structured-state derivation
+ * over the kept tail is unaffected. Single-writer only (the host / mirror that
+ * owns the run dir) — called from the per-bee append chain; the atomic replace
+ * means concurrent READERS see either the old or the new file, never a tear.
+ */
+export async function compactHsrEvents(
+  bee: string,
+  limits: HsrEventsCompactLimits = { keepLines: HSR_EVENTS_COMPACT_KEEP_LINES, targetBytes: HSR_EVENTS_COMPACT_TARGET_BYTES },
+): Promise<void> {
+  let raw: string;
+  try {
+    raw = await readFile(hsrEventsPath(bee), "utf8");
+  } catch {
+    return; // nothing to compact
+  }
+  const lines = raw.split("\n").filter((line) => line.trim().length > 0);
+  // Walk back from the end, keeping lines until either bound trips (always
+  // keep at least the final line so the newest event is never dropped).
+  let keepStart = lines.length;
+  let keptBytes = 0;
+  while (keepStart > 0 && lines.length - keepStart < limits.keepLines) {
+    const lineBytes = Buffer.byteLength(lines[keepStart - 1]!, "utf8") + 1;
+    if (keptBytes + lineBytes > limits.targetBytes && keepStart < lines.length) break;
+    keptBytes += lineBytes;
+    keepStart -= 1;
+  }
+  if (keepStart === 0) return; // already within bounds — nothing to drop
+  // Fold the dropped prefix: sum usage tokens, remember the newest exhausted.
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let totalTokens = 0;
+  let sawUsage = false;
+  let usageTs = 0;
+  let latestExhausted: { ts: number; resetHint?: string } | undefined;
+  for (let i = 0; i < keepStart; i++) {
+    let event: RunnerEvent;
+    try {
+      const parsed = JSON.parse(lines[i]!) as unknown;
+      if (!parsed || typeof parsed !== "object" || typeof (parsed as { type?: unknown }).type !== "string") continue;
+      event = parsed as RunnerEvent;
+    } catch {
+      continue; // torn / partial line — drop it
+    }
+    if (event.type === "usage") {
+      sawUsage = true;
+      if (typeof event.inputTokens === "number" && Number.isFinite(event.inputTokens)) inputTokens += event.inputTokens;
+      if (typeof event.outputTokens === "number" && Number.isFinite(event.outputTokens)) outputTokens += event.outputTokens;
+      if (typeof event.totalTokens === "number" && Number.isFinite(event.totalTokens)) totalTokens += event.totalTokens;
+      if (typeof event.ts === "number" && Number.isFinite(event.ts) && event.ts > usageTs) usageTs = event.ts;
+    } else if (event.type === "exhausted") {
+      const ts = typeof event.ts === "number" && Number.isFinite(event.ts) ? event.ts : 0;
+      if (!latestExhausted || ts >= latestExhausted.ts) {
+        latestExhausted = { ts, ...(event.resetHint ? { resetHint: event.resetHint } : {}) };
+      }
+    }
+  }
+  const checkpoint: string[] = [];
+  if (sawUsage) {
+    checkpoint.push(JSON.stringify({ type: "usage", ts: usageTs, inputTokens, outputTokens, totalTokens } satisfies RunnerEvent));
+  }
+  if (latestExhausted) {
+    checkpoint.push(JSON.stringify({ type: "exhausted", ...latestExhausted } satisfies RunnerEvent));
+  }
+  const content = `${[...checkpoint, ...lines.slice(keepStart)].join("\n")}\n`;
+  await atomicWriteFile(hsrEventsPath(bee), content, { mode: 0o600 });
+  eventLogSizes.set(bee, Buffer.byteLength(content, "utf8"));
+}
+
+/**
+ * Append one structured event to events.jsonl (owner-only, one JSON per line).
+ * Once the log crosses HSR_EVENTS_MAX_BYTES it is compacted in-chain (see
+ * compactHsrEvents), so the file every observer re-reads per tick stays bounded.
+ */
 export function appendHsrEvent(bee: string, event: RunnerEvent): Promise<void> {
   const line = `${JSON.stringify(event)}\n`;
   const prev = appendChains.get(bee) ?? Promise.resolve();
   const next = prev
     .catch(() => undefined)
-    .then(() => appendFile(hsrEventsPath(bee), line, { mode: 0o600 }));
+    .then(async () => {
+      await appendFile(hsrEventsPath(bee), line, { mode: 0o600 });
+      let size = eventLogSizes.get(bee);
+      if (size === undefined) {
+        try {
+          size = (await stat(hsrEventsPath(bee))).size;
+        } catch {
+          size = Buffer.byteLength(line, "utf8");
+        }
+      } else {
+        size += Buffer.byteLength(line, "utf8");
+      }
+      eventLogSizes.set(bee, size);
+      if (size > HSR_EVENTS_MAX_BYTES) {
+        await compactHsrEvents(bee).catch(() => undefined);
+      }
+    });
   appendChains.set(bee, next);
   return next;
 }
