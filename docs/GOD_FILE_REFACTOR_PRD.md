@@ -43,7 +43,7 @@ Ranked by severity (lines, fan-out, fan-in):
 | `src/accounts.ts` | ~793 | Registry CRUD + home activation + Claude OAuth chain lifecycle |
 | `src/limits.ts` | ~793 | Provider usage APIs + cache + auto-pick heuristics |
 | `src/buz.ts` | ~712 | Messaging policy + transport + storage + daemon queue drain |
-| `src/daemon/run.ts` | ~666 | `tick()` business logic + `runDaemon()` lifecycle + default wiring |
+| `src/daemon/run.ts` | ~394 (was 1,050+; decomposed, see §6.5) | `runDaemon()` lifecycle + re-export barrel |
 | `src/loop/flow.ts` | ~648 | Loop driver + boundary detection + summarizer + stop-menu |
 | `src/transcripts.ts` | ~639 | Provider-specific transcript adapters aggregated |
 | `src/completion.ts` | ~518 | Huge static tables mixed with completion logic |
@@ -125,17 +125,24 @@ Shrink `LimitsDeps` by injecting per-provider fetchers from the new provider mod
 | `src/buz/daemonDrain.ts` | `processQueueForBee`, `DrainResult`, retry/quarantine logic |
 | `src/buz/index.ts` | Public barrel |
 
-### 6.5 `src/daemon/run.ts` → `src/daemon/`
+### 6.5 `src/daemon/run.ts` → `src/daemon/` — DONE (HIVE-18)
+
+`run.ts` had grown to 1,050+ lines by the time this landed (the ~666 above was the
+count when the PRD was written). Decomposed as follows; `run.ts` re-exports the
+tick/probe/wiring/timeout surface so existing `./daemon/run.js` imports keep resolving.
 
 | Module | Responsibility |
 |--------|---------------|
-| `src/daemon/tick.ts` | Pure `tick()` and `TickDeps` |
-| `src/daemon/probe.ts` | `defaultProbeNodes`, `defaultCapturePanes`, `ProbeResult` |
-| `src/daemon/wiring.ts` | `buildDefaultDeps` |
-| `src/daemon/run.ts` | Keep `runDaemon()` lifecycle only |
-| `src/daemon/utils.ts` | `guard`, `toError`, `sleep`, `withTimeout` |
+| `src/daemon/tick.ts` | Pure `tick()`, `TickDeps`/`TickResult` and the tick types, the dispatcher registry (`tickDispatchers`, `emptyDispatcherOutcomes`), and `logTickResult()` |
+| `src/daemon/probe.ts` | `defaultProbeNodes`, `defaultCapturePanes` (`ProbeResult` lives with the tick contract in `tick.ts`) |
+| `src/daemon/wiring.ts` | `buildDefaultDeps` + throttled transcript-metadata refresh |
+| `src/daemon/supervision.ts` | In-process watchdog + `breach`/hard-kill self-destruct + out-of-process sentinel spawn + `pushRecentError` (`createSupervisor()`) |
+| `src/daemon/timeouts.ts` | `withTimeout`, `guard`, `toError`, `TickTimeouts`/`defaultTickTimeouts` |
+| `src/daemon/run.ts` | `runDaemon()` lifecycle (lock, signals, loop) + backward-compat re-export barrel |
 
-Inside `tick.ts`, split the long function into phase helpers: observe, transition, dispatch.
+`sleep` stays inline in `run.ts` (a loop concern). The supervision defenses moved
+into a `Supervisor` factory so the watchdog/breach state is no longer entangled
+in `runDaemon()`, and the ~75-line result-logging fan-out is now `logTickResult()`.
 
 ### 6.6 `src/loop/flow.ts` → `src/loop/`
 
@@ -255,7 +262,7 @@ Migration order:
 ### Phase 5 — Provider adapters and supporting files
 - `src/transcripts.ts` → `src/transcripts/providers/`.
 - `src/completion.ts` → `src/completion/`.
-- `src/daemon/run.ts` → `src/daemon/{tick,probe,wiring,utils}.ts`.
+- `src/daemon/run.ts` → `src/daemon/{tick,probe,wiring,supervision,timeouts}.ts` (DONE, HIVE-18).
 - `src/loop/flow.ts` → `src/loop/{driver,boundary,helpers,stopMenu,spawn}.ts`.
 
 ### Phase 6 — Facade and search
