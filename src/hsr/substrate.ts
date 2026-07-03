@@ -25,20 +25,10 @@ import type {
   TmuxWindowOptions,
 } from "../substrates/types.js";
 import { LOCAL_NODE } from "../substrates/types.js";
+import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
 import { hsrSnapshot, killOrphanedChildGroup, listHsrBees } from "./observe.js";
 import { readHsrMeta } from "./runDir.js";
 import { connectRpcClient } from "./rpc.js";
-
-/** Signal-0 liveness probe; EPERM means the pid exists but isn't ours. */
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
 
 /** A runner host is live iff meta says running AND its host pid is alive. */
 async function hasSession(bee: string): Promise<boolean> {

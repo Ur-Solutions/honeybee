@@ -22,7 +22,6 @@
  * control plane rides on (forwarded over ssh in APIA-92).
  */
 
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
@@ -33,11 +32,19 @@ import {
   type NodeRecord,
 } from "../node.js";
 import { ensureRunnerHostBundle, type RunnerHostBundle } from "./buildRunnerHostBundle.js";
+import { defaultSshExecHook, type SshExecHook } from "./sshExec.js";
 
-export type SshExecHook = (
-  argv: string[],
-  input?: string,
-) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+// The ssh exec hook + type live in ./sshExec.js (single source shared with
+// remoteTransport.ts); re-exported so existing `bootstrap` importers keep working.
+export type { SshExecHook };
+
+/**
+ * Bootstrap ssh operations (version probe, mkdir, bundle deploy, handshake) are
+ * interactive/long-running — the cat-pipe deploy can stream a multi-hundred-KB
+ * bundle — so they run WITHOUT a wall-clock bound (`timeoutMs: 0`). The daemon
+ * tick path (remoteTransport) uses the same hook WITH the default bound.
+ */
+const unboundedSshExecHook: SshExecHook = (argv, input) => defaultSshExecHook(argv, input, { timeoutMs: 0 });
 
 const DEFAULT_MIN_NODE_MAJOR = 18;
 const REMOTE_DIR = "~/.hive/runner-host";
@@ -108,7 +115,7 @@ export async function bootstrapRunnerHost(
   params: BootstrapParams,
   deps: BootstrapDeps = {},
 ): Promise<BootstrapResult> {
-  const exec = deps.execHook ?? defaultSshExecHook;
+  const exec = deps.execHook ?? unboundedSshExecHook;
   const ensureBundle = deps.ensureBundle ?? (() => ensureRunnerHostBundle());
   const readBundle = deps.readBundle ?? ((path: string) => readFile(path, "utf8"));
   const minMajor = params.minNodeMajor ?? DEFAULT_MIN_NODE_MAJOR;
@@ -215,25 +222,4 @@ export async function bootstrapRunnerHost(
   }
 
   return { node, version: bundle.version, deployed, remotePath };
-}
-
-/**
- * Default exec hook: spawn ssh and collect stdout/stderr, optionally streaming a
- * payload on stdin (the cat-pipe deploy). Mirrors ssh-tmux's defaultExecHook.
- */
-export function defaultSshExecHook(argv: string[], input?: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const [command, ...args] = argv;
-  if (!command) return Promise.reject(new Error("Empty argv"));
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("error", (error) => resolve({ stdout, stderr: stderr || error.message, exitCode: 1 }));
-    child.on("close", (code, signal) => resolve({ stdout, stderr, exitCode: code ?? (signal ? 130 : 1) }));
-    child.stdin.on("error", () => undefined);
-    if (input !== undefined) child.stdin.write(input);
-    child.stdin.end();
-  });
 }
