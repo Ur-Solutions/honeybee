@@ -13,6 +13,7 @@ import {
   loopHistoryLogPath,
   loopHistoryMdPath,
   loopIterLogPath,
+  PIDLESS_RUNNING_GRACE_MS,
   loopProgressPath,
   type LoopConfig,
   readLoopConfig,
@@ -122,6 +123,11 @@ test("buildLoopConfig validates --stop-on-seal CSV against seal statuses", () =>
   // default is ["done"].
   const cfg2 = buildLoopConfig({ ...baseArgs, max: 3 });
   assert.deepEqual(cfg2.stop.stopOnSeal, ["done"]);
+  // Explicit blank means never stop on a seal.
+  const cfg3 = buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: "" });
+  assert.deepEqual(cfg3.stop.stopOnSeal, []);
+  const cfg4 = buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: " , " });
+  assert.deepEqual(cfg4.stop.stopOnSeal, []);
   assert.throws(() => buildLoopConfig({ ...baseArgs, max: 3, stopOnSeal: "done,bogus" }), /Invalid --stop-on-seal/);
 });
 
@@ -185,8 +191,9 @@ test("listLoops returns newest-first by startedAt", async () => {
   });
 });
 
-test("listLoops downgrades running loops with a dead driver pid to orphaned (view only)", async () => {
+test("listLoops downgrades running loops with a dead or missing driver pid to orphaned (view only)", async () => {
   await withTempStore(async () => {
+    const now = Date.parse("2026-06-01T00:01:00.000Z");
     const dead = buildLoopConfig({ ...baseArgs, max: 1, loopId: "DEAD" });
     dead.loopId = "DEAD";
     dead.pid = 999_999_999;
@@ -195,23 +202,29 @@ test("listLoops downgrades running loops with a dead driver pid to orphaned (vie
     alive.loopId = "ALIVE";
     alive.pid = process.pid;
     await writeLoopConfig(alive);
-    const noPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "NOPID" });
-    noPid.loopId = "NOPID";
-    await writeLoopConfig(noPid);
+    const freshNoPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "NOPID_FRESH" });
+    freshNoPid.loopId = "NOPID_FRESH";
+    freshNoPid.startedAt = new Date(now - PIDLESS_RUNNING_GRACE_MS + 1_000).toISOString();
+    await writeLoopConfig(freshNoPid);
+    const staleNoPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "NOPID_STALE" });
+    staleNoPid.loopId = "NOPID_STALE";
+    staleNoPid.startedAt = new Date(now - PIDLESS_RUNNING_GRACE_MS - 1_000).toISOString();
+    await writeLoopConfig(staleNoPid);
 
-    const loops = await listLoops({ isPidAlive: (pid) => pid === process.pid });
+    const loops = await listLoops({ isPidAlive: (pid) => pid === process.pid, now });
     const byId = new Map(loops.map((l) => [l.loopId, l]));
     assert.equal(byId.get("DEAD")?.status, "orphaned");
     assert.equal(byId.get("ALIVE")?.status, "running");
-    // No pid yet (pre-driver write window) — left as-is.
-    assert.equal(byId.get("NOPID")?.status, "running");
+    assert.equal(byId.get("NOPID_FRESH")?.status, "running");
+    assert.equal(byId.get("NOPID_STALE")?.status, "orphaned");
     // The on-disk file is untouched: this is a view-level downgrade.
     const onDisk = await readLoopConfig("DEAD");
     assert.equal(onDisk?.status, "running");
+    assert.equal((await readLoopConfig("NOPID_STALE"))?.status, "running");
   });
 });
 
-test("reconcileLoopStatus only downgrades running+dead-pid", () => {
+test("reconcileLoopStatus only downgrades running loops with dead or stale missing pids", () => {
   const cfg = buildLoopConfig({ ...baseArgs, max: 1, loopId: "R" });
   cfg.loopId = "R";
   cfg.pid = 12345;
@@ -219,6 +232,17 @@ test("reconcileLoopStatus only downgrades running+dead-pid", () => {
   assert.equal(reconcileLoopStatus(cfg, () => true).status, "running");
   const done = { ...cfg, status: "done" as const };
   assert.equal(reconcileLoopStatus(done, () => false).status, "done");
+
+  const now = Date.parse("2026-06-01T00:01:00.000Z");
+  const freshNoPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "FRESH" });
+  freshNoPid.loopId = "FRESH";
+  freshNoPid.startedAt = new Date(now - PIDLESS_RUNNING_GRACE_MS + 1_000).toISOString();
+  assert.equal(reconcileLoopStatus(freshNoPid, () => false, now).status, "running");
+
+  const staleNoPid = buildLoopConfig({ ...baseArgs, max: 1, loopId: "STALE" });
+  staleNoPid.loopId = "STALE";
+  staleNoPid.startedAt = new Date(now - PIDLESS_RUNNING_GRACE_MS - 1_000).toISOString();
+  assert.equal(reconcileLoopStatus(staleNoPid, () => false, now).status, "orphaned");
 });
 
 test("stop-request sentinel write + detect", async () => {
@@ -496,6 +520,27 @@ test("driver: stops on max", async () => {
       assert.equal(cfg?.status, "done");
       assert.equal(cfg?.stopReason, "max");
       assert.equal(cfg?.iteration, 3);
+    } finally {
+      __setLoopTestHooks(undefined);
+    }
+  });
+});
+
+test("driver: blank --stop-on-seal never stops on seals", async () => {
+  await withTempStore(async () => {
+    installDriverHooks(() => "done");
+    try {
+      await executeFlow(loopFlow, {
+        args: { ...baseArgs, context: "ralph", max: 2, stopOnSeal: "", loopId: "NEVERSEAL1" },
+        runId: "NEVERSEAL1",
+        installSignalHandlers: false,
+      });
+      const cfg = await readLoopConfig("NEVERSEAL1");
+      assert.deepEqual(cfg?.stop.stopOnSeal, []);
+      assert.equal(cfg?.status, "done");
+      assert.equal(cfg?.stopReason, "max");
+      assert.equal(cfg?.iteration, 2);
+      assert.equal(cfg?.lastSealStatus, "done");
     } finally {
       __setLoopTestHooks(undefined);
     }

@@ -18,6 +18,7 @@ import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
+import { withFileLock } from "../lock.js";
 import type { SealRecord, SealStatus } from "../seal.js";
 
 export type LoopStatus = "running" | "paused" | "stopped" | "done" | "errored" | "orphaned";
@@ -65,6 +66,10 @@ export type LoopConfig = {
 
 export function loopsRoot(): string {
   return join(storeRoot(), "loops");
+}
+
+function loopsLockPath(): string {
+  return join(loopsRoot(), ".loops.lock");
 }
 
 export function loopDir(id: string): string {
@@ -118,27 +123,37 @@ async function existingLoopIds(): Promise<string[]> {
 }
 
 /**
- * Allocate a fresh short loop id: `LP.` + the shortest hex suffix (≥3 chars)
- * that neither equals, prefixes, nor is prefixed by any existing loop id — so
- * every loop stays unambiguously targetable by its suffix. Mirrors the bee
- * identity scheme. `uuidFactory` is injectable for deterministic tests.
+ * Allocate and reserve a fresh short loop id: `LP.` + the shortest hex suffix
+ * (≥3 chars) that neither equals nor prefixes any existing loop id. The
+ * reservation is the loop directory itself, created while holding the loops
+ * lock, so concurrent starters cannot receive the same id before loop.json is
+ * written. `uuidFactory` is injectable for deterministic tests.
  */
 export async function generateLoopId(uuidFactory: () => string = randomUUID): Promise<string> {
-  const existing = await existingLoopIds();
-  for (let attempt = 0; attempt < 100_000; attempt += 1) {
-    const hex = uuidFactory().replace(/-/g, "").toLowerCase();
-    if (!/^[0-9a-f]{3,}$/.test(hex)) continue;
-    for (let length = 3; length <= hex.length; length += 1) {
-      const id = `${LOOP_ID_PREFIX}${hex.slice(0, length)}`;
-      // Reject only if the candidate equals or PREFIXES an existing id (which
-      // would make it ambiguously prefix-match). A longer, more-specific id
-      // alongside a shorter existing one is fine — the short one stays
-      // exact-matchable. Grow the suffix until that holds.
-      const clashes = existing.some((other) => other === id || other.startsWith(id));
-      if (!clashes) return id;
+  return withFileLock(loopsLockPath(), async () => {
+    const existing = await existingLoopIds();
+    for (let attempt = 0; attempt < 100_000; attempt += 1) {
+      const hex = uuidFactory().replace(/-/g, "").toLowerCase();
+      if (!/^[0-9a-f]{3,}$/.test(hex)) continue;
+      for (let length = 3; length <= hex.length; length += 1) {
+        const id = `${LOOP_ID_PREFIX}${hex.slice(0, length)}`;
+        // Reject only if the candidate equals or PREFIXES an existing id (which
+        // would make it ambiguously prefix-match). A longer, more-specific id
+        // alongside a shorter existing one is fine — the short one stays
+        // exact-matchable. Grow the suffix until that holds.
+        const clashes = existing.some((other) => other === id || other.startsWith(id));
+        if (clashes) continue;
+        try {
+          await mkdir(loopDir(id));
+          return id;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          existing.push(id);
+        }
+      }
     }
-  }
-  throw new Error("Could not allocate a unique loop id");
+    throw new Error("Could not allocate a unique loop id");
+  });
 }
 
 /**
@@ -194,27 +209,47 @@ export async function updateLoopConfig(id: string, patch: Partial<LoopConfig>): 
 }
 
 /**
+ * Age past which a pid-less "running" loop is presumed dead. The pre-write →
+ * pid-patch window in HiveFacade.loop/loopFlow is milliseconds long; a record
+ * still pid-less after this long means the driver died before the patch landed.
+ */
+export const PIDLESS_RUNNING_GRACE_MS = 30_000;
+
+/**
  * Reconcile a loop's persisted status against driver-process liveness: a loop
  * stuck on status "running" whose driver pid is dead (SIGKILLed, crashed,
  * machine rebooted) is shown as "orphaned". The on-disk loop.json is left
  * untouched — this is a view-level downgrade mirroring flow runs (runs.ts).
- * Records with no pid yet (the pre-driver write window) are left as-is.
+ * A pid-less "running" loop older than PIDLESS_RUNNING_GRACE_MS is downgraded
+ * the same way; it can only mean the driver died before writing its pid.
  */
-export function reconcileLoopStatus(cfg: LoopConfig, isPidAlive: (pid: number) => boolean = defaultIsPidAlive): LoopConfig {
+export function reconcileLoopStatus(
+  cfg: LoopConfig,
+  isPidAlive: (pid: number) => boolean = defaultIsPidAlive,
+  now: number = Date.now(),
+): LoopConfig {
   if (cfg.status !== "running") return cfg;
-  if (typeof cfg.pid !== "number" || cfg.pid <= 0) return cfg;
-  if (isPidAlive(cfg.pid)) return cfg;
-  return { ...cfg, status: "orphaned" };
+  if (typeof cfg.pid === "number" && cfg.pid > 0) {
+    if (isPidAlive(cfg.pid)) return cfg;
+    return { ...cfg, status: "orphaned" };
+  }
+
+  const age = now - Date.parse(cfg.startedAt);
+  if (Number.isFinite(age) && age > PIDLESS_RUNNING_GRACE_MS) {
+    return { ...cfg, status: "orphaned" };
+  }
+  return cfg;
 }
 
-export async function listLoops(opts: { isPidAlive?: (pid: number) => boolean } = {}): Promise<LoopConfig[]> {
+export async function listLoops(opts: { isPidAlive?: (pid: number) => boolean; now?: number } = {}): Promise<LoopConfig[]> {
   const isAlive = opts.isPidAlive ?? defaultIsPidAlive;
+  const now = opts.now ?? Date.now();
   const entries = await readdir(loopsRoot(), { withFileTypes: true }).catch(() => []);
   const out: LoopConfig[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const cfg = await readLoopConfig(entry.name).catch(() => null);
-    if (cfg) out.push(reconcileLoopStatus(cfg, isAlive));
+    if (cfg) out.push(reconcileLoopStatus(cfg, isAlive, now));
   }
   // Newest first — startedAt is ISO so lexical sort matches chronological.
   out.sort((a, b) => b.startedAt.localeCompare(a.startedAt));

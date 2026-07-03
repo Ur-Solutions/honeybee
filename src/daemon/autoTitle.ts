@@ -77,6 +77,8 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
   let inFlight = false;
   let inFlightSince = 0;
   let inFlightBee = "";
+  let inFlightToken = 0;
+  let nextInFlightToken = 0;
   const finished: AutoTitleOutcome[] = [];
 
   return async (records) => {
@@ -88,8 +90,12 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
       // A generation that never settled (wedged subprocess) must not disable
       // titling forever — free the slot once it's clearly stale.
       if (now - inFlightSince < AUTO_TITLE_WATCHDOG_MS) return outcomes;
+      const staleBee = inFlightBee;
       inFlight = false;
-      outcomes.push({ bee: inFlightBee, ok: false, error: `generation watchdog fired after ${AUTO_TITLE_WATCHDOG_MS}ms; freeing the slot` });
+      inFlightSince = 0;
+      inFlightBee = "";
+      inFlightToken = 0;
+      outcomes.push({ bee: staleBee, ok: false, error: `generation watchdog fired after ${AUTO_TITLE_WATCHDOG_MS}ms; freeing the slot` });
     }
 
     for (const candidate of records) {
@@ -113,9 +119,12 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
       inFlight = true;
       inFlightSince = now;
       inFlightBee = record.name;
+      const generationToken = ++nextInFlightToken;
+      inFlightToken = generationToken;
       // Promise.resolve().then(...) so even a synchronously-throwing generate
       // dep becomes a rejection routed through .catch/.finally — inFlight is
-      // always reset, never stranded.
+      // always reset, never stranded. The token keeps a watchdog-reclaimed
+      // stale completion from clearing a newer in-flight generation.
       void Promise.resolve()
         .then(() => deps.generate(context))
         .then(async (title) => {
@@ -138,7 +147,11 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
           finished.push({ bee: record.name, ok: false, error: error instanceof Error ? error.message : String(error) });
         })
         .finally(() => {
+          if (inFlightToken !== generationToken) return;
           inFlight = false;
+          inFlightSince = 0;
+          inFlightBee = "";
+          inFlightToken = 0;
         });
       break;
     }

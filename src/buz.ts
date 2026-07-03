@@ -477,8 +477,16 @@ export async function readMessageById(beeName: string, id: string): Promise<{ me
     for (const file of entries) {
       if (!file.endsWith(`-${id}.md`)) continue;
       const path = join(dir, file);
-      const text = await readFile(path, "utf8");
-      return { message: parseBuzMessage(text), path, mailbox };
+      // Like listMessages: a concurrent purge/drain may remove the file
+      // between readdir and readFile, and files may be malformed — treat
+      // both as "not found" rather than throwing.
+      const text = await readFile(path, "utf8").catch(() => null);
+      if (text === null) continue;
+      try {
+        return { message: parseBuzMessage(text), path, mailbox };
+      } catch {
+        continue;
+      }
     }
   }
   return null;
