@@ -400,3 +400,28 @@ at runtime, so `cmdPromote` backfills `record.providerSessionId` from the HSR
 `meta.json` before resuming (generalize into the observe/reconcile loop as a
 follow-up). Product decision on whether claude stays promote/demote-gated is
 tracked with APIA-84.
+
+### 2026-07-03 — remote-hsr vs ssh-tmux: when to choose which (APIA-97 parity)
+
+Phase B (APIA-90–96) landed `remote-hsr` as the proper structured remote
+substrate. `ssh-tmux` stays — the two are complementary, not redundant:
+
+| | **remote-hsr** (structured) | **ssh-tmux** (attach-first) |
+|---|---|---|
+| On the node | detached runner-host, no tmux | a tmux session/pane |
+| Observation | structured events streamed home (§APIA-94) → exact state/usage, in-chat needs-input | screen-scrape over `tmux capture-pane` |
+| Steering | `hive send` → runner-host RPC over the ssh-forwarded socket | tmux `send-keys` |
+| Attach | read-only console (ring + live stream) / `promote` to local tmux | `hive attach` → a real remote TUI |
+| Economics | tier-S shares one server per (harness,home); no ptmx/pane churn | one pane per bee |
+| Best for | fan-out subagents, background work, structured chat/usage, cheap swarms | raw TUI interaction, visual diffs, an explicit terminal-attach workflow on the remote |
+
+Default remote work → **remote-hsr**. Reach for **ssh-tmux** when a human needs
+to sit in a real terminal on the remote (slash-commands, TUI, eyeball a quirk).
+`remote-hsr` can `promote` a bee to local tmux for the raw-TUI moments (§4).
+
+**Parity confirmed (2026-07-03):** APIA-85's Substrate-interface shrink (removed
+`newPane`/`killPane`) did NOT regress ssh-tmux — `tests/ssh-tmux.test.ts` 24/24,
+`cli.multinode` 8/8, `cli.attach.remote` 2/2, `substrates.local-tmux` 17/17 all
+green. The **live** ssh-tmux suite (`ssh-tmux.live.test.ts`) + the remote-hsr
+real-host e2e both need a reachable ssh host and are exercised in APIA-98
+(loopback ssh key-auth is not provisioned in the dev sandbox — flagged).
