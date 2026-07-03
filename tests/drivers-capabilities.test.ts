@@ -10,6 +10,7 @@ import {
   hsrAdapterForAgent,
   resumeArgsForAgent,
   sessionPinnedInArgs,
+  sessionPinResumeExtrasForAgent,
 } from "../src/drivers.js";
 import { adapterFor } from "../src/hsr/adapters/index.js";
 
@@ -63,6 +64,20 @@ test("sessionPinnedInArgs: detects the driver's pin flag, never for pin-less dri
   // codex has no session-id flag, so even a literal --session-id is not a pin.
   assert.equal(sessionPinnedInArgs("codex", ["--session-id", "abc"]), false);
   assert.equal(sessionPinnedInArgs("no-such-agent", ["--session-id", "abc"]), false);
+});
+
+test("sessionPinResumeExtrasForAgent: claude resumes need --fork-session next to the auto-pin", () => {
+  // claude REFUSES `--resume <id> --session-id <new>` without --fork-session
+  // (the CLI exits before boot and the bee reads dead), so the auto-injected
+  // pin must bring the bridge flag whenever the caller's args resume.
+  assert.deepEqual(sessionPinResumeExtrasForAgent("claude", ["--resume", "abc"]), ["--fork-session"]);
+  assert.deepEqual(sessionPinResumeExtrasForAgent("claude", ["--continue"]), ["--fork-session"]);
+  assert.deepEqual(sessionPinResumeExtrasForAgent("claude", ["--model", "opus", "--resume", "abc"]), ["--fork-session"]);
+  // Already bridged, not resuming, or a driver without the interplay → nothing.
+  assert.deepEqual(sessionPinResumeExtrasForAgent("claude", ["--resume", "abc", "--fork-session"]), []);
+  assert.deepEqual(sessionPinResumeExtrasForAgent("claude", ["--model", "opus"]), []);
+  assert.deepEqual(sessionPinResumeExtrasForAgent("codex", ["resume", "abc"]), []);
+  assert.deepEqual(sessionPinResumeExtrasForAgent("no-such-agent", ["--resume", "abc"]), []);
 });
 
 test("hsrAdapterForAgent + adapterFor: registry-backed adapters and their tiers", () => {

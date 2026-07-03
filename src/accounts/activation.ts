@@ -1,18 +1,21 @@
 import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { identityRecipeForAgent, type IdentityRecipe } from "../drivers.js";
-import { keychainAvailable, readClaudeKeychain, writeClaudeKeychain } from "../keychain.js";
+import { keychainAvailable, readClaudeKeychain, writeClaudeKeychainEntry } from "../keychain.js";
 import { atomicWriteFile } from "../fsx.js";
 import { appendLedger } from "../store.js";
 import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./registry.js";
 import {
+  claudeProfileEmailCached,
   claudeTokenExpiry,
   evacuateForeignClaudeChain,
   mergeCredentialsJson,
+  parseClaudeChain,
   refreshVaultClaudeChainIfStaleLocked,
   syncClaudeChainToVaultLocked,
   type RefreshedClaudeToken,
 } from "./claudeChain.js";
+import { accountEmail } from "./utils.js";
 import { evacuateForeignCodexAuth, syncCodexAuthToVaultLocked } from "./codexAuth.js";
 import { grokAuthUnavailableReason, readGrokAuthFile, syncGrokAuthToVaultLocked } from "./grokAuth.js";
 import { syncGenericCredentialsToVaultLocked } from "./genericSync.js";
@@ -80,6 +83,8 @@ export type ActivateAccountOptions = {
   onWarn?: (message: string) => void;
   /** OAuth refresh override (tests). Defaults to refreshClaudeOauthChain. */
   refreshClaudeToken?: (refreshToken: string) => Promise<RefreshedClaudeToken | null>;
+  /** Profile lookup override (tests). Defaults to claudeProfileEmailCached. */
+  fetchProfileEmail?: (accessToken: string) => Promise<string | null>;
   now?: () => number;
 };
 
@@ -93,7 +98,7 @@ export type ActivateAccountOptions = {
 // hook entry — not editing an if-chain in the middle of the copy loop.
 // ──────────────────────────────────────────────────────────────────────────
 
-type ActivationContext = {
+export type ActivationContext = {
   account: AccountRecord;
   homePath: string;
   recipe: IdentityRecipe;
@@ -169,7 +174,8 @@ async function codexSeedHomeDefaults({ homePath, written }: ActivationContext): 
   }
 }
 
-async function claudeSeedHomeDefaults({ account, homePath, recipe, written }: ActivationContext): Promise<void> {
+async function claudeSeedHomeDefaults(ctx: ActivationContext): Promise<void> {
+  const { account, homePath, recipe, warn, written } = ctx;
   if (await seedClaudeHomeDefaults(homePath)) {
     if (!written.includes("settings.json")) written.push("settings.json");
   }
@@ -188,18 +194,70 @@ async function claudeSeedHomeDefaults({ account, homePath, recipe, written }: Ac
   // On macOS, claude prefers the per-config-dir Keychain entry over the
   // credentials file — seed it so an activated home doesn't resolve a stale
   // identity from an old entry. Merged, not replaced: home-local sibling
-  // keys (mcpOAuth, ...) survive the identity stamp.
+  // keys (mcpOAuth, ...) survive the identity stamp — except when the merged
+  // payload overflows the `security -i` line buffer, where the writer falls
+  // back to stamping the identity alone rather than leaving the old one.
   if (keychainAvailable()) {
     const credentials = (await readFile(join(accountDir(account), recipe.credentialFiles[0]!), "utf8")).trim();
     const existing = await readClaudeKeychain(homePath);
-    const ok = await writeClaudeKeychain(homePath, mergeCredentialsJson(existing, credentials));
-    if (ok) {
-      written.push("keychain");
+    const write = await writeClaudeKeychainEntry(homePath, mergeCredentialsJson(existing, credentials));
+    if (write.ok) {
+      written.push(write.mode === "identity-only" ? "keychain (identity-only)" : "keychain");
+      if (write.mode === "identity-only") {
+        warn(`keychain entry for ${homePath} was too large to store whole; stamped the identity alone (MCP connectors on this home may need re-auth)`);
+      }
     } else if (existing) {
       // A stale entry exists and we could not replace it: claude would keep
       // using the OLD account. Refuse rather than activate a lie.
       throw new Error(`Could not update the macOS Keychain entry for ${homePath}; claude would keep its previous identity`);
     }
+  }
+  await verifyActivatedClaudeIdentity(ctx);
+}
+
+/**
+ * Post-stamp identity check — the last line of defense for the whole class
+ * of crossed-credential bugs. Resolve the credential claude will actually
+ * boot with (keychain entry first, since claude prefers it; else the home
+ * file) and refuse the activation when it verifiably belongs to another
+ * account. Whatever went wrong upstream — a failed keychain stamp, a running
+ * bee re-stamping its in-memory identity, a swap race — a home that would
+ * bill another account must never be handed to a bee (observed live
+ * 2026-07-03: a home whose keychain kept another account's token billed that
+ * account past its limit and into paid usage credits).
+ *
+ * Network-frugal: when the effective token IS the account's vault link — the
+ * normal post-activation state — identity is proven by equality and no
+ * lookup runs. Only divergent tokens hit the profile endpoint, and an
+ * unverifiable lookup (offline, rate-limited) warns and passes: only a
+ * VERIFIED foreign identity refuses.
+ */
+export async function verifyActivatedClaudeIdentity(
+  { account, homePath, options, warn }: ActivationContext,
+  deps: { readKeychain?: typeof readClaudeKeychain } = {},
+): Promise<void> {
+  const expected = accountEmail(account);
+  if (!expected) return;
+  const readKeychain = deps.readKeychain ?? readClaudeKeychain;
+  const effective =
+    parseClaudeChain(await readKeychain(homePath), `${homePath}:keychain`) ??
+    parseClaudeChain(await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null), `${homePath}:file`);
+  if (!effective) return;
+  const vault = parseClaudeChain(await readFile(join(accountDir(account), ".credentials.json"), "utf8").catch(() => null), "vault");
+  if (vault && vault.oauth.accessToken === effective.oauth.accessToken) return;
+  const profileOf = options.fetchProfileEmail ?? claudeProfileEmailCached;
+  let actual: string | null = null;
+  try {
+    actual = await profileOf(String(effective.oauth.accessToken));
+  } catch (error) {
+    warn(`could not verify the activated identity of ${homePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (actual !== null && actual !== expected) {
+    await appendLedger({ type: "account.activation-identity-mismatch", account: account.id, home: homePath, expected, actual, source: effective.source }).catch(() => {});
+    throw new Error(
+      `Activation identity mismatch for ${homePath}: the credential claude would boot with (${effective.source}) belongs to ${actual}, not ${expected} — a bee on this home would bill ${actual}. Repair with: hive login ${account.id}`,
+    );
   }
 }
 

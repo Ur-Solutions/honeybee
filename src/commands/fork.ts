@@ -3,7 +3,7 @@
 // Extracted from cli.ts (HIVE-15).
 import { activateAccountIntoHome, defaultHomeForAccount, type AccountRecord } from "../accounts.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, shellCommand } from "../agents.js";
-import { agentKinds, sessionPinnedInArgs } from "../drivers.js";
+import { agentKinds, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { modelArgsFor, pickForkSeed, type ForkSeedInput, type SeedMode } from "../fork.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "../forkTui.js";
@@ -242,7 +242,9 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       const sid = randomUUID();
       const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
       if (sessionArgs) {
-        spec.args = [...spec.args, ...sessionArgs];
+        // Caller args may still carry --resume even outside hive's own resume
+        // mode; the pin then needs the driver's bridge flags (--fork-session).
+        spec.args = [...spec.args, ...sessionArgs, ...sessionPinResumeExtrasForAgent(spec.kind, spec.args)];
         pinnedSessionId = sid;
       }
     }

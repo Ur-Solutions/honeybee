@@ -5,7 +5,7 @@ import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAc
 import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, shellCommand } from "../agents.js";
 import { syncBeesSidebarLayout } from "../beesSidebar.js";
 import { beeConfig } from "../config.js";
-import { agentKinds, defaultsToSoleCredentialedAccount, sessionPinnedInArgs } from "../drivers.js";
+import { agentKinds, defaultsToSoleCredentialedAccount, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { listFlows } from "../flow/index.js";
 import { actionLine, bold, dim, formatRelativeTime, isPretty, note, tildify } from "../format.js";
@@ -203,7 +203,10 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     const sid = randomUUID();
     const sessionArgs = forcedSessionIdArgs(spec.kind, sid);
     if (sessionArgs) {
-      spec.args = [...spec.args, ...sessionArgs];
+      // A caller resuming a session (`-- --resume <id>`) needs the driver's
+      // pin/resume bridge flags (claude: --fork-session) or the pin makes the
+      // invocation invalid and the bee dies at boot.
+      spec.args = [...spec.args, ...sessionArgs, ...sessionPinResumeExtrasForAgent(spec.kind, spec.args)];
       pinnedSessionId = sid;
     }
   }

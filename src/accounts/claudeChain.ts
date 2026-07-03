@@ -1,6 +1,6 @@
 import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { readClaudeKeychain, writeClaudeKeychain } from "../keychain.js";
+import { readClaudeKeychain, writeClaudeKeychainEntry } from "../keychain.js";
 import { atomicWriteFile } from "../fsx.js";
 import { appendLedger } from "../store.js";
 import { accountDir, withAccountLock, listAccounts, CROSS_ACCOUNT_LOCK_TIMEOUT_MS, type AccountRecord } from "./registry.js";
@@ -343,7 +343,17 @@ export async function persistClaudeChainLocked(account: AccountRecord, oauth: Re
   for (const home of await claudeHomesForAccount(account)) {
     try {
       const existingEntry = await readClaudeKeychain(home);
-      await writeClaudeKeychain(home, mergeCredentialsJson(existingEntry, sourceRaw));
+      const keychainWrite = await writeClaudeKeychainEntry(home, mergeCredentialsJson(existingEntry, sourceRaw));
+      // A failed or degraded keychain write MUST be visible: claude prefers
+      // the keychain over .credentials.json, so a home whose file is fresh
+      // but whose keychain kept a previous identity silently bills every bee
+      // on it to the wrong account until someone reads the invoice (HIVE-2
+      // territory, observed live 2026-07-03).
+      if (!keychainWrite.ok && keychainWrite.reason !== "unavailable") {
+        await appendLedger({ type: "account.keychain-write-failed", account: account.id, home, reason: keychainWrite.reason }).catch(() => {});
+      } else if (keychainWrite.ok && keychainWrite.mode === "identity-only") {
+        await appendLedger({ type: "account.keychain-write-degraded", account: account.id, home, dropped: "sibling-keys" }).catch(() => {});
+      }
       // Only update home files that already exist — refresh propagation must
       // not seed credentials into homes that never held them.
       const filePath = join(home, ".credentials.json");
@@ -351,8 +361,11 @@ export async function persistClaudeChainLocked(account: AccountRecord, oauth: Re
       if (existingFile !== null) {
         await atomicWriteFile(filePath, `${mergeCredentialsJson(existingFile, sourceRaw)}\n`, { mode: 0o600 });
       }
-    } catch {
-      // best effort per home
+    } catch (error) {
+      // Best effort per home, but never silently: a swallowed propagation
+      // failure leaves this home on a dead link with no trace to debug from.
+      const message = error instanceof Error ? error.message : String(error);
+      await appendLedger({ type: "account.chain-propagation-failed", account: account.id, home, error: message }).catch(() => {});
     }
   }
   await appendLedger({ type: "account.token-refresh", account: account.id });

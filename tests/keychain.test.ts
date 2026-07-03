@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { buildAddGenericPasswordCommand, claudeKeychainService, credentialDigest, keychainAvailable, readClaudeKeychain, writeClaudeKeychain } from "../src/keychain.js";
+import { buildAddGenericPasswordCommand, claudeKeychainService, credentialDigest, identityOnlyCredentials, keychainAvailable, readClaudeKeychain, writeClaudeKeychainEntry } from "../src/keychain.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,7 +24,7 @@ test("HIVE_NO_KEYCHAIN disables the bridge entirely", async () => {
   try {
     assert.equal(keychainAvailable(), false);
     assert.equal(await readClaudeKeychain("/tmp/x"), null);
-    assert.equal(await writeClaudeKeychain("/tmp/x", "{}"), false);
+    assert.deepEqual(await writeClaudeKeychainEntry("/tmp/x", "{}"), { ok: false, reason: "unavailable" });
   } finally {
     if (old === undefined) delete process.env.HIVE_NO_KEYCHAIN;
     else process.env.HIVE_NO_KEYCHAIN = old;
@@ -102,6 +102,31 @@ test("security -i round-trips a hostile secret byte-for-byte (macOS only)", { sk
     await execFileAsync("security", ["delete-keychain", keychain]).catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("identityOnlyCredentials extracts the claudeAiOauth identity and drops siblings", () => {
+  // The oversize driver in the wild: mcpOAuth alone (~2KB of connector
+  // tokens) pushes a merged entry past the `security -i` line budget, so the
+  // full write fails while the identity subset fits with room to spare. The
+  // fallback must always be able to stamp the identity — a keychain kept on
+  // a previous account's token silently bills every bee on the home to the
+  // wrong account (observed live 2026-07-03).
+  const merged = JSON.stringify(
+    {
+      claudeAiOauth: { accessToken: "sk-ant-oat01-abc", refreshToken: "sk-ant-ort01-def", expiresAt: 1783112557760 },
+      mcpOAuth: { server: { accessToken: "m".repeat(2000) } },
+    },
+    null,
+    2,
+  );
+  assert.equal(buildAddGenericPasswordCommand("me", "svc", merged), null, "precondition: the full merge must overflow the line budget");
+  const minimal = identityOnlyCredentials(merged);
+  assert.notEqual(minimal, null);
+  assert.deepEqual(JSON.parse(minimal!), { claudeAiOauth: { accessToken: "sk-ant-oat01-abc", refreshToken: "sk-ant-ort01-def", expiresAt: 1783112557760 } });
+  assert.notEqual(buildAddGenericPasswordCommand("me", "svc", minimal!), null, "the identity subset must fit the line budget");
+  // No claudeAiOauth key, or not JSON → nothing to extract.
+  assert.equal(identityOnlyCredentials(JSON.stringify({ mcpOAuth: {} })), null);
+  assert.equal(identityOnlyCredentials("not json"), null);
 });
 
 test("credentialDigest is a stable content hash", () => {
