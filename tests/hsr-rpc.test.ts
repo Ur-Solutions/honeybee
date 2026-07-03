@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -104,6 +105,89 @@ test("notification stream: client receives all broadcasts in order", async () =>
       assert.deepEqual(received, [1, 2, 3]);
     } finally {
       client.close();
+      await server.close();
+    }
+  });
+});
+
+/** Poll until `cond` is true or the deadline passes (test never hangs). */
+async function waitFor(cond: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error("waitFor: condition not met in time");
+    await sleep(5);
+  }
+}
+
+test("broadcast backpressure: slow client gets bounded drop-oldest queue; fast client and telemetry unaffected (HIVE-70)", async () => {
+  await withSocketDir(async (socketPath) => {
+    const server = await startRpcServer({ socketPath, methods: {}, maxBroadcastQueue: 4 });
+
+    // Fast client: a normal rpc client that reads promptly.
+    const fast = await connectRpcClient(socketPath);
+    const fastMarkers: string[] = [];
+    fast.on("marker", (params) => {
+      fastMarkers.push((params as { t: string }).t);
+    });
+
+    // Slow client: a raw socket that never reads (paused) — simulates a lagging
+    // forwarded tunnel consumer. Without backpressure the server would buffer
+    // every broadcast frame for it unboundedly.
+    const slow = await new Promise<Socket>((resolve, reject) => {
+      const s = createConnection(socketPath);
+      s.once("connect", () => resolve(s));
+      s.once("error", reject);
+    });
+    slow.pause();
+
+    try {
+      await waitFor(() => server.connectionCount() === 2);
+      assert.equal(server.broadcastDroppedCount(), 0);
+
+      // Saturate the slow connection with big frames until drop-oldest engages.
+      // The sleep between broadcasts lets the fast client's socket flush, so it
+      // never blocks and every drop is attributable to the slow connection.
+      const pad = "x".repeat(512 * 1024);
+      for (let i = 0; i < 20 && server.broadcastDroppedCount() === 0; i++) {
+        server.broadcast("filler", { pad });
+        await sleep(5);
+      }
+      assert.ok(server.broadcastDroppedCount() > 0, "expected drop-oldest to engage on the slow connection");
+      const droppedAfterFill = server.broadcastDroppedCount();
+
+      // With the slow connection blocked and its queue full, each further
+      // broadcast displaces the oldest queued frame. Synchronous loop: no
+      // 'drain' can fire mid-way, so the queue ends as the LAST 4 markers.
+      for (let n = 1; n <= 6; n++) server.broadcast("marker", { t: `t${n}` });
+      assert.equal(server.broadcastDroppedCount(), droppedAfterFill + 6);
+
+      // The fast client is isolated from the slow one: it receives all 6.
+      await waitFor(() => fastMarkers.length === 6);
+      assert.deepEqual(fastMarkers, ["t1", "t2", "t3", "t4", "t5", "t6"]);
+
+      // Once the slow client drains, it gets the bounded tail (drop-oldest):
+      // exactly the last maxBroadcastQueue=4 markers, in order.
+      const slowMarkers: string[] = [];
+      let buffer = "";
+      slow.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8");
+        let idx = buffer.indexOf("\n");
+        while (idx !== -1) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (line) {
+            const msg = JSON.parse(line) as { method?: string; params?: { t?: string } };
+            if (msg.method === "marker" && msg.params?.t) slowMarkers.push(msg.params.t);
+          }
+          idx = buffer.indexOf("\n");
+        }
+      });
+      slow.resume();
+      await waitFor(() => slowMarkers.includes("t6"));
+      assert.deepEqual(slowMarkers, ["t3", "t4", "t5", "t6"]);
+    } finally {
+      slow.destroy();
+      fast.close();
       await server.close();
     }
   });
