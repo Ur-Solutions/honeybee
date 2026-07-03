@@ -180,6 +180,16 @@ test("downgradeTier with empty policy falls back to passive (documented floor)",
   assert.equal(r.downgraded, true);
 });
 
+test("downgradeTier walks the exported BUZ_TIERS order from the requested tier", () => {
+  for (let index = 0; index < BUZ_TIERS.length; index += 1) {
+    const requested = BUZ_TIERS[index]!;
+    assert.equal(downgradeTier(requested, BUZ_TIERS.slice(index)).effective, requested);
+
+    const nextTier = BUZ_TIERS[index + 1];
+    if (nextTier) assert.equal(downgradeTier(requested, [nextTier]).effective, nextTier);
+  }
+});
+
 test("validateAcceptList rejects unknown tiers and dedupes", () => {
   assert.deepEqual(validateAcceptList(["queue", "queue", "passive"]), ["queue", "passive"]);
   assert.throws(() => validateAcceptList(["bogus"]), /Unknown tier/);

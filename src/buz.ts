@@ -32,13 +32,13 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseBuzDocument, serializeBuzDocument, type BuzFrontmatter } from "./buz_format.js";
+import { BUZ_TIERS, isBuzTier, type BuzTier } from "./buz_tiers.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
 import { appendLedger, safeName, type SessionRecord } from "./store.js";
 import type { Substrate } from "./substrates/index.js";
 
-export const BUZ_TIERS = ["interrupt", "queue", "passive"] as const;
-export type BuzTier = (typeof BUZ_TIERS)[number];
+export { BUZ_TIERS, isBuzTier, type BuzTier } from "./buz_tiers.js";
 
 export const BUZ_MAILBOXES = ["inbox", "queue", "outbox", "read", "quarantine"] as const;
 export type BuzMailbox = (typeof BUZ_MAILBOXES)[number];
@@ -206,16 +206,18 @@ export type DowngradeResult = {
   reason?: string;
 };
 
+const BUZ_DOWNGRADE_CHAIN: readonly BuzTier[] = BUZ_TIERS;
+const BUZ_DOWNGRADE_FLOOR: BuzTier = BUZ_TIERS.at(-1)!;
+
 // Auto-downgrade chain interrupt -> queue -> passive. If even passive is
 // disallowed by an explicit policy that excludes all three, returns
 // passive as a hard floor (we never silently drop a message); callers can
 // inspect `downgraded` + `reason` to decide whether to error.
 export function downgradeTier(requested: BuzTier, accepted: readonly BuzTier[]): DowngradeResult {
-  const chain: BuzTier[] = ["interrupt", "queue", "passive"];
-  const startIdx = chain.indexOf(requested);
+  const startIdx = BUZ_DOWNGRADE_CHAIN.indexOf(requested);
   if (startIdx === -1) throw new Error(`Unknown tier: ${String(requested)}`);
-  for (let i = startIdx; i < chain.length; i += 1) {
-    const candidate = chain[i]!;
+  for (let i = startIdx; i < BUZ_DOWNGRADE_CHAIN.length; i += 1) {
+    const candidate = BUZ_DOWNGRADE_CHAIN[i]!;
     if (accepted.includes(candidate)) {
       return {
         effective: candidate,
@@ -226,9 +228,9 @@ export function downgradeTier(requested: BuzTier, accepted: readonly BuzTier[]):
   }
   // Policy excludes every tier — fall back to passive as a documented floor.
   return {
-    effective: "passive",
-    downgraded: requested !== "passive",
-    reason: `policy disallows ${requested}; no accepted tier; fell back to passive`,
+    effective: BUZ_DOWNGRADE_FLOOR,
+    downgraded: requested !== BUZ_DOWNGRADE_FLOOR,
+    reason: `policy disallows ${requested}; no accepted tier; fell back to ${BUZ_DOWNGRADE_FLOOR}`,
   };
 }
 
@@ -276,10 +278,10 @@ export function parseBuzMessage(text: string): BuzMessage {
   for (const key of required) {
     if (typeof frontmatter[key] !== "string") throw new Error(`Buz message missing field: ${key}`);
   }
-  const tier = frontmatter.tier as BuzTier;
-  const deliveredAs = frontmatter.deliveredAs as BuzTier;
-  if (!BUZ_TIERS.includes(tier)) throw new Error(`Invalid tier: ${tier}`);
-  if (!BUZ_TIERS.includes(deliveredAs)) throw new Error(`Invalid deliveredAs: ${deliveredAs}`);
+  const tier = frontmatter.tier!;
+  const deliveredAs = frontmatter.deliveredAs!;
+  if (!isBuzTier(tier)) throw new Error(`Invalid tier: ${tier}`);
+  if (!isBuzTier(deliveredAs)) throw new Error(`Invalid deliveredAs: ${deliveredAs}`);
   const fromRaw = frontmatter.from!;
   const from: BuzSender = fromRaw.startsWith("human:")
     ? { kind: "human", name: fromRaw.slice("human:".length) }
@@ -297,6 +299,31 @@ export function parseBuzMessage(text: string): BuzMessage {
   if (frontmatter.subject) message.subject = frontmatter.subject;
   return message;
 }
+
+type BuzDeliveryContext = {
+  input: BuzSendInput;
+  message: BuzMessage;
+  result: BuzSendResult;
+};
+
+type BuzDeliveryOutcome = {
+  interruptAttempted: boolean;
+};
+
+type BuzDeliveryHandler = (context: BuzDeliveryContext) => Promise<BuzDeliveryOutcome>;
+
+const BUZ_DELIVERY_HANDLERS = {
+  interrupt: deliverInterruptTier,
+  queue: deliverQueueTier,
+  passive: deliverPassiveTier,
+} satisfies Record<BuzTier, BuzDeliveryHandler>;
+
+type RecipientDeliveryMailbox = Extract<BuzMailbox, "inbox" | "queue">;
+
+const RESULT_PATH_FIELD_BY_MAILBOX = {
+  inbox: "inboxPath",
+  queue: "queuePath",
+} satisfies Record<RecipientDeliveryMailbox, "inboxPath" | "queuePath">;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Send.
@@ -330,54 +357,9 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
   // the effective tier is final.
   result.outboxPath = await writeOutbox(message);
 
-  // The interrupt paste runs OUTSIDE the recipient write lock: sendText can
-  // block for up to the substrate exec timeout (30s per tmux call), far past
-  // the write lock's 10s default, so holding the write lock across it starved
-  // concurrent senders and the daemon drain (HIVE-47). Pastes serialize on
-  // the dedicated delivery lock instead.
-  let interruptAttempted = false;
-  if (downgrade.effective === "interrupt") {
-    // Strict: interrupt requires a transport context. If transport is
-    // missing, downgrade to queue rather than silently failing.
-    if (!input.transport) {
-      message.deliveredAs = "queue";
-      result.downgraded = true;
-      result.reason = result.reason ?? "tier=interrupt without transport context; downgraded to queue";
-    } else {
-      interruptAttempted = true;
-      const transport = input.transport;
-      try {
-        await withFileLock(
-          deliveryLockPath(input.recipient.name),
-          () => transport.substrate.sendText(transport.tmuxTarget, input.body, transport.agentPaneId),
-          { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS },
-        );
-        message.deliveredAt = new Date().toISOString();
-      } catch (error) {
-        // Transport failure on interrupt: downgrade to queue and let the
-        // daemon retry. Do not lose the message.
-        message.deliveredAs = "queue";
-        result.downgraded = true;
-        result.reason = `interrupt transport failed: ${error instanceof Error ? error.message : String(error)}`;
-      }
-    }
-  }
+  const delivery = await BUZ_DELIVERY_HANDLERS[message.deliveredAs]({ input, message, result });
 
-  // Serialize per-bee mailbox writes so two concurrent senders cannot collide
-  // on the same filename / mailbox. Held only for the filesystem mutation —
-  // never across substrate I/O. A write-lock timeout after a successful paste
-  // loses the inbox copy but not the paste; delivery is at-least-once and the
-  // pre-delivery outbox record above keeps the audit trail.
-  await withFileLock(recipientWriteLockPath(input.recipient.name), async () => {
-    if (message.deliveredAs === "queue") {
-      result.queuePath = await writeMailbox(input.recipient.name, "queue", message);
-    } else {
-      // interrupt (already pasted) and passive both land in inbox/.
-      result.inboxPath = await writeMailbox(input.recipient.name, "inbox", message);
-    }
-  });
-
-  if (interruptAttempted) {
+  if (delivery.interruptAttempted) {
     const failed = message.deliveredAs !== "interrupt";
     await appendLedger({
       type: "buz.deliver",
@@ -415,6 +397,68 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
   });
 
   return result;
+}
+
+async function deliverInterruptTier(context: BuzDeliveryContext): Promise<BuzDeliveryOutcome> {
+  const { input, message, result } = context;
+
+  // The interrupt paste runs OUTSIDE the recipient write lock: sendText can
+  // block for up to the substrate exec timeout (30s per tmux call), far past
+  // the write lock's 10s default, so holding the write lock across it starved
+  // concurrent senders and the daemon drain (HIVE-47). Pastes serialize on
+  // the dedicated delivery lock instead.
+  if (!input.transport) {
+    // Strict: interrupt requires a transport context. If transport is
+    // missing, downgrade to queue rather than silently failing.
+    message.deliveredAs = "queue";
+    result.downgraded = true;
+    result.reason = result.reason ?? "tier=interrupt without transport context; downgraded to queue";
+    await BUZ_DELIVERY_HANDLERS.queue(context);
+    return { interruptAttempted: false };
+  }
+
+  const transport = input.transport;
+  try {
+    await withFileLock(
+      deliveryLockPath(input.recipient.name),
+      () => transport.substrate.sendText(transport.tmuxTarget, input.body, transport.agentPaneId),
+      { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS },
+    );
+    message.deliveredAt = new Date().toISOString();
+  } catch (error) {
+    // Transport failure on interrupt: downgrade to queue and let the daemon
+    // retry. Do not lose the message.
+    message.deliveredAs = "queue";
+    result.downgraded = true;
+    result.reason = `interrupt transport failed: ${error instanceof Error ? error.message : String(error)}`;
+    await BUZ_DELIVERY_HANDLERS.queue(context);
+    return { interruptAttempted: true };
+  }
+
+  await writeRecipientMailbox(context, "inbox");
+  return { interruptAttempted: true };
+}
+
+async function deliverQueueTier(context: BuzDeliveryContext): Promise<BuzDeliveryOutcome> {
+  await writeRecipientMailbox(context, "queue");
+  return { interruptAttempted: false };
+}
+
+async function deliverPassiveTier(context: BuzDeliveryContext): Promise<BuzDeliveryOutcome> {
+  await writeRecipientMailbox(context, "inbox");
+  return { interruptAttempted: false };
+}
+
+async function writeRecipientMailbox(context: BuzDeliveryContext, mailbox: RecipientDeliveryMailbox): Promise<void> {
+  const { input, message, result } = context;
+  // Serialize per-bee mailbox writes so two concurrent senders cannot collide
+  // on the same filename / mailbox. Held only for the filesystem mutation —
+  // never across substrate I/O. A write-lock timeout after a successful paste
+  // loses the inbox copy but not the paste; delivery is at-least-once and the
+  // pre-delivery outbox record above keeps the audit trail.
+  await withFileLock(recipientWriteLockPath(input.recipient.name), async () => {
+    result[RESULT_PATH_FIELD_BY_MAILBOX[mailbox]] = await writeMailbox(input.recipient.name, mailbox, message);
+  });
 }
 
 async function writeMailbox(beeName: string, mailbox: BuzMailbox, message: BuzMessage): Promise<string> {
@@ -763,12 +807,12 @@ export function validateAcceptList(values: string[]): BuzTier[] {
   for (const raw of values) {
     const value = raw.trim();
     if (value.length === 0) continue;
-    if (!BUZ_TIERS.includes(value as BuzTier)) {
+    if (!isBuzTier(value)) {
       throw new Error(`Unknown tier: ${value}. Use one of: ${BUZ_TIERS.join(", ")}`);
     }
     if (seen.has(value)) continue;
     seen.add(value);
-    out.push(value as BuzTier);
+    out.push(value);
   }
   return out;
 }

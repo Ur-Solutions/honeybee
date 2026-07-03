@@ -2,6 +2,7 @@ import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { listAccounts, type AccountRecord } from "./accounts.js";
+import { BUZ_TIERS } from "./buz_tiers.js";
 import { listColonies, type ColonyRecord } from "./colony.js";
 import { type Frame, listFrames } from "./frame.js";
 import { type Flow, listFlows } from "./flow/index.js";
@@ -48,11 +49,7 @@ const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 const SEAL_STATUS_VALUES = ["done", "blocked", "needs_input", "failed"];
 const QUEST_STATUS_VALUES = ["open", "active", "done", "archived"];
 const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
-const BUZ_TIERS = ["interrupt", "queue", "passive"];
-const BUZ_ACCEPT_VALUES = [
-  "interrupt", "queue", "passive",
-  "queue,passive", "interrupt,queue", "interrupt,queue,passive",
-];
+const BUZ_ACCEPT_VALUES = buzAcceptValues();
 
 const BEES = [
   "claude", "codex", "opencode", "grok", "pi", "droid", "cursor",
@@ -62,6 +59,16 @@ const BEES = [
 const SHELLS = ["bash", "zsh", "fish"];
 
 const TOP_LEVEL_FLAGS = ["--version", "--help"];
+
+function buzAcceptValues(): string[] {
+  const values: string[] = [...BUZ_TIERS];
+  for (let length = 2; length <= BUZ_TIERS.length; length += 1) {
+    for (let start = BUZ_TIERS.length - length; start >= 0; start -= 1) {
+      values.push(BUZ_TIERS.slice(start, start + length).join(","));
+    }
+  }
+  return values;
+}
 
 const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach", "view"]);
 const SESSION_ANY = new Set(["kill", "last", "seal", "rename", "tag", "own", "move", "split", "fork", "revive", "urls"]);
@@ -359,7 +366,7 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
     case "flow":
       return (state.flows ?? []).map((f) => f.name);
     case "buz-tier":
-      return BUZ_TIERS;
+      return [...BUZ_TIERS];
     case "buz-accept":
       return BUZ_ACCEPT_VALUES;
     case "run":
