@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { accountDir, addAccount } from "../src/accounts.js";
 import { identityRecipeForAgent } from "../src/drivers.js";
-import { pickRoundRobinAccount } from "../src/roundRobin.js";
+import { pickRoundRobinAccount } from "../src/limits/autoPick.js";
 import { storeRoot } from "../src/fsx.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {

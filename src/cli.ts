@@ -296,7 +296,6 @@ function printHelp() {
       rows: [
         ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
         ["next", "", "jump to the next bee needing you (waiting/done/failed; --prev, --state)"],
-        ["split", "[<bee>] [<agent>]", "spawn a sub-bee into the bee's comb (adjacent pane)"],
         ["fork", "<bee> [checkpoint]", "branch a bee into a fresh comb, seeded from its state"],
         ["here", "", "resolve the bee owning the current pane (--id, --json)"],
         ["spawn-picker", "[--frame|--flow]", "print frame/flow names for a display-popup spawn chord"],

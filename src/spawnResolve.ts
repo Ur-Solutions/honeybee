@@ -14,7 +14,7 @@
 // loop spawns once, so it naturally picks once).
 import { autoAccountTool, resolveSpawnAgent, roundRobinAccountTool, type SpawnAgentSpec } from "./accounts.js";
 import { pickLeastLoadedAccount } from "./limits.js";
-import { pickRoundRobinAccount } from "./roundRobin.js";
+import { pickRoundRobinAccount } from "./limits/autoPick.js";
 
 export type ResolveSpawnSpecOptions = {
   /** Max acceptable age (ms) for cached provider limits when auto-picking; 0 = always live. */

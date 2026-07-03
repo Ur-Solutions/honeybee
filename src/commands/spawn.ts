@@ -19,7 +19,7 @@ import { cachedAccountLimits, pickLeastLoadedAccount, windowRolledOver, type Acc
 import { LOCAL_NODE_NAME, authPolicyOf, type NodeRecord } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, toProSlug } from "../proProjects.js";
-import { pickRoundRobinAccount } from "../roundRobin.js";
+import { pickRoundRobinAccount } from "../limits/autoPick.js";
 import { startSpawnTimer, type SpawnTimer } from "../spawnTiming.js";
 import { chooseNewBee, type SpawnTuiAccount } from "../spawnTui.js";
 import { safeName, saveSession, type SessionRecord } from "../store.js";

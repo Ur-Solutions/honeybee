@@ -9,7 +9,7 @@ export const COMMANDS = [
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
   "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
-  "split", "fork", "here", "spawn-picker", "urls", "keys", "revive",
+  "fork", "here", "spawn-picker", "urls", "keys", "revive",
 ];
 
 export const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
