@@ -27,7 +27,7 @@ export function substrateFor(record: Pick<SessionRecord, "node" | "substrate">):
 export function substrateForNode(nodeName: string | undefined): Substrate {
   const resolved = nodeName && nodeName.length > 0 ? nodeName : LOCAL_NODE_NAME;
   if (resolved === LOCAL_NODE_NAME) {
-    const overlay = loadNodeSync(LOCAL_NODE_NAME);
+    const overlay = loadNodeSync(LOCAL_NODE_NAME, { tolerateInvalid: true });
     if (overlay && overlay.kind === "ssh-tmux") {
       // User explicitly aliased "local" to a remote endpoint. Honor it.
       return getOrCache(sshCacheKey(overlay), () => createSshTmuxSubstrate({ node: overlay }));
@@ -35,7 +35,7 @@ export function substrateForNode(nodeName: string | undefined): Substrate {
     return localSubstrate();
   }
 
-  const node = loadNodeSync(resolved);
+  const node = loadNodeSync(resolved, { tolerateInvalid: true });
   if (!node) {
     throw new Error(`Unknown node: ${resolved}. Register it with: hive node register ${resolved} --kind ssh-tmux --endpoint user@host`);
   }
