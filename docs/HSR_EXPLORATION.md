@@ -425,3 +425,41 @@ to sit in a real terminal on the remote (slash-commands, TUI, eyeball a quirk).
 green. The **live** ssh-tmux suite (`ssh-tmux.live.test.ts`) + the remote-hsr
 real-host e2e both need a reachable ssh host and are exercised in APIA-98
 (loopback ssh key-auth is not provisioned in the dev sandbox — flagged).
+
+### 2026-07-04 — first REAL-ssh remote-hsr run (metal-1): two transport bugs the mocks hid
+
+Bootstrapped + drove a real remote node (`trmd-metal-1`, linux, node v24) over a
+real ssh forward. `hive node status <remote>` reported `offline` every time
+("ssh child exited early"). Root cause was TWO bugs that the mock-only Phase B
+tests (exec-hook + in-proc socket relay) structurally could not catch — both in
+`src/hsr/remoteTransport.ts`, fixed together:
+
+1. **The forward tunnel must NOT share the ControlPersist master.** `ssh -N -L`
+   with `ControlMaster=auto` + `ControlPersist` hands its forward to a
+   *backgrounded* master and the foreground `ssh` exits `0` at once —
+   `openSshSocketForward` (correctly) reads that foreground exit as the tunnel
+   dying, and worse, successive tunnels race for the local socket via
+   `StreamLocalBindUnlink`, so it flaps. Fix: the tunnel now gets a DEDICATED,
+   non-multiplexed connection (`ControlMaster=no`, no `ControlPath`) — the
+   foreground process lives for the tunnel's whole life. Costs one ~0.4s
+   handshake per node; irrelevant for a long-lived tunnel. Short exec commands
+   (`ensureRemoteServe`) still reuse the shared master.
+2. **`~` is not expanded in a `-L` forward target.** `DEFAULT_REMOTE_SOCKET` was
+   `~/.hive/…`; the remote *shell* expands `~` when starting the serve (so the
+   serve binds `/root/.hive/…`), but sshd does NOT expand `~` in a forward spec —
+   the local socket bound yet forwarded to a nonexistent remote path and carried
+   no RPC. Fix: `ensureRemoteServe` resolves `~/…` → absolute via the remote
+   `$HOME` and returns it; the forward targets the resolved path so serve-bind
+   and forward agree.
+
+**Validated over real ssh (zero credentials shipped, via the `stub` adapter driven
+directly against the runner-host's forwarded control socket):** bootstrap;
+`node status` → online ~0.5s cold; `spawn` (tier stream); `observe` + `send`
+streaming `turn_start`/`text`/`turn_end` home (APIA-94 event mirror path over real
+ssh); `list`/state; `kill` → empty; and RECONNECT — hard-killing the `ssh -N`
+forward mid-session emits `reconnect`→`up`, the tunnel re-establishes, a retried
+`send` succeeds and the `observe` subscription self-heals (events resume on the
+new tunnel). STILL DEFERRED (needs credential sign-off / a running daemon):
+account-bound real codex/claude bee via hive's `ephemeral-token` deliver+shred
+path (test tier 7), usage sampling against a live provider, and the daemon-hosted
+`remoteEventMirror` writing remote events into a local run dir.
