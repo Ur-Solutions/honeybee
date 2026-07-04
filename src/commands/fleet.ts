@@ -15,7 +15,7 @@ import { listSessions, type SessionRecord } from "../store.js";
 import { deriveState, formatStateCell, stateLabel, type BeeState } from "../state.js";
 import { loadLatestSeal, type SealRecord } from "../seal.js";
 import { buildStateContext, liveTargetsAcrossNodes, resolveBeeInCurrentPane, resolveSession } from "../cli/shared.js";
-import { fleetTree, flattenFleet, type FleetEdge, type FleetNode } from "../fleet.js";
+import { fleetForest, fleetTree, flattenFleet, type FleetEdge, type FleetNode } from "../fleet.js";
 
 type EnrichedNode = {
   record: SessionRecord;
@@ -50,30 +50,34 @@ function fmtIdle(ms: number | undefined): string {
   return `${Math.floor(h / 24)}d`;
 }
 
-/** Resolve the fleet root: an explicit ref, or the current bee (self). */
-async function resolveRoot(parsed: Parsed): Promise<SessionRecord> {
+/**
+ * Which fleet trees to show:
+ *  - `--all` or (no <ref> and not inside a bee) → every fleet (the forest).
+ *  - explicit <ref> → just that orchestrator's tree.
+ *  - no <ref> inside a bee → self's tree.
+ */
+async function resolveRoots(parsed: Parsed, records: SessionRecord[], opts: { includeForks?: boolean }): Promise<FleetNode[]> {
   const ref = parsed.args[0];
-  if (ref) return resolveSession(ref);
-  const self = await resolveBeeInCurrentPane();
-  if (!self) {
-    throw new Error("hive fleet: no <ref> given and not running inside a bee — pass a bee name/id, e.g. `hive fleet convex-orchestrator`");
+  if (truthy(flag(parsed, "all"))) return fleetForest(records, opts);
+  if (ref) {
+    const root = await resolveSession(ref);
+    const tree = fleetTree(root.id ?? root.name, records, opts);
+    if (!tree) throw new Error(`hive fleet: ${root.name} is not in the session store`);
+    return [tree];
   }
-  return self;
+  const self = await resolveBeeInCurrentPane();
+  if (self) {
+    const tree = fleetTree(self.id ?? self.name, records, opts);
+    return tree ? [tree] : [];
+  }
+  // Human shell, no ref → show every fleet.
+  return fleetForest(records, opts);
 }
 
-export async function cmdFleet(parsed: Parsed): Promise<void> {
-  const root = await resolveRoot(parsed);
-  const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
-  const rootKey = root.id ?? root.name;
-  const tree = fleetTree(rootKey, records, { includeForks: truthy(flag(parsed, "forks")) });
-  if (!tree) throw new Error(`hive fleet: ${root.name} is not in the session store`);
-
-  const nodesFlat = flattenFleet(tree);
-  const probe = await liveTargetsAcrossNodes(nodes);
-  const context = await buildStateContext(records, probe);
-
-  const enriched: EnrichedNode[] = await Promise.all(
-    nodesFlat.map(async (node: FleetNode) => {
+/** Enrich one tree's nodes with live state + last seal (root-first, flat). */
+async function enrichTree(tree: FleetNode, context: Awaited<ReturnType<typeof buildStateContext>>): Promise<EnrichedNode[]> {
+  return Promise.all(
+    flattenFleet(tree).map(async (node) => {
       const derived = deriveState(node.record, context);
       const activity = lastActivityMs(node.record);
       return {
@@ -88,12 +92,31 @@ export async function cmdFleet(parsed: Parsed): Promise<void> {
       };
     }),
   );
+}
+
+export async function cmdFleet(parsed: Parsed): Promise<void> {
+  const opts = { includeForks: truthy(flag(parsed, "forks")) };
+  const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const roots = await resolveRoots(parsed, records, opts);
+  const probe = await liveTargetsAcrossNodes(nodes);
+  const context = await buildStateContext(records, probe);
+  const fleets = await Promise.all(roots.map((tree) => enrichTree(tree, context)));
 
   if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify(toJson(enriched), null, 2));
+    // A single self/explicit root stays the flat reconcile object an orchestrator
+    // reads; the forest wraps them in { fleets: [...] }.
+    if (fleets.length === 1 && !truthy(flag(parsed, "all"))) {
+      console.log(JSON.stringify(toJson(fleets[0]!), null, 2));
+    } else {
+      console.log(JSON.stringify({ fleets: fleets.map(toJson) }, null, 2));
+    }
     return;
   }
-  console.log(renderFleet(enriched));
+  if (fleets.length === 0) {
+    console.log(dim("no fleets — no orchestrator has spawned children yet (lineage is captured going forward)"));
+    return;
+  }
+  console.log(fleets.map(renderFleet).join("\n"));
 }
 
 /** Machine-readable fleet: root, per-state counts, and a flat bee list. */

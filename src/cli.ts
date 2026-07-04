@@ -291,7 +291,7 @@ function printHelp() {
       rows: [
         ["list", "", "show all known sessions with state (alias: ps)"],
         ["bees", "", "grouped fuzzy fleet TUI (^g cycles colony/pro/folder/type grouping, tab previews; --sidebar)"],
-        ["fleet", "[<bee>]", "an orchestrator's spawned-child tree with live state + seals (default: self; --json for reconcile)"],
+        ["fleet", "[<bee>|--all]", "orchestrator fleet trees with live state + seals (no arg: self inside a bee, else all fleets; --all forces all; --json)"],
         ["tail", "<session>", "capture or follow pane content"],
         ["transcript", "<session>", "render structured transcript rows"],
         ["last", "<session>", "print the bee's most recent assistant message or seal"],

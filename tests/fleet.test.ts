@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fleetTree, fleetDescendants, flattenFleet, parentEdgeOf } from "../src/fleet.js";
+import { fleetTree, fleetDescendants, fleetForest, flattenFleet, parentEdgeOf } from "../src/fleet.js";
 import type { SessionRecord } from "../src/store.js";
 
 let seq = 0;
@@ -72,6 +72,24 @@ test("fleetTree: cycles do not loop forever", () => {
 test("fleetTree: unknown root returns null", () => {
   assert.equal(fleetTree("nope", [rec("x")]), null);
   assert.deepEqual(fleetDescendants("nope", [rec("x")]), []);
+});
+
+test("fleetForest: every top-level orchestrator with children, childless bees excluded", () => {
+  const orchA = rec("orchA");
+  const orchB = rec("orchB");
+  const lone = rec("lone"); // no children → not a fleet root
+  const a1 = rec("a1", { spawnedById: "orchA" });
+  const a2 = rec("a2", { spawnedById: "orchA" });
+  const b1 = rec("b1", { spawnedById: "orchB" });
+  const sub = rec("sub", { spawnedById: "b1" }); // nested under orchB, not its own root
+  const forest = fleetForest([orchA, orchB, lone, a1, a2, b1, sub]);
+  // Two fleets; `lone` (no kids) and the nested `sub`/`b1` are not top-level roots.
+  assert.deepEqual(forest.map((r) => r.record.name), ["orchA", "orchB"]);
+  assert.deepEqual(forest[1]!.children[0]!.children.map((n) => n.record.name), ["sub"]); // orchB→b1→sub
+});
+
+test("fleetForest: empty when no bee has spawned children", () => {
+  assert.deepEqual(fleetForest([rec("x"), rec("y")]), []);
 });
 
 test("fleetDescendants: multi-level fan-out", () => {

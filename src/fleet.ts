@@ -131,3 +131,26 @@ export function fleetDescendants(rootRef: string, sessions: SessionRecord[], opt
   if (!root) return [];
   return flattenFleet(root).filter((node) => node !== root);
 }
+
+/**
+ * Every distinct fleet, as a forest: each top-level orchestrator (a bee with no
+ * resolvable parent in the set) that has at least one descendant, rendered as a
+ * full tree. The operator's "show me all the fleets" view — no need to know the
+ * orchestrator names. Sorted by createdAt then name.
+ */
+export function fleetForest(sessions: SessionRecord[], opts?: { includeForks?: boolean }): FleetNode[] {
+  const roots: FleetNode[] = [];
+  for (const record of sessions) {
+    const parent = parentEdgeOf(record, opts);
+    // A resolvable parent inside the set means this bee sits UNDER another fleet,
+    // so it is not a top-level root (it still appears within its parent's tree).
+    if (parent && findSession(parent.ref, sessions)) continue;
+    const tree = fleetTree(record.id ?? record.name, sessions, opts);
+    if (tree && tree.children.length > 0) roots.push(tree);
+  }
+  return roots.sort(
+    (a, b) =>
+      (a.record.createdAt ?? "").localeCompare(b.record.createdAt ?? "") ||
+      (a.record.name ?? "").localeCompare(b.record.name ?? ""),
+  );
+}
