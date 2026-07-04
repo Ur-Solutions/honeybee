@@ -24,6 +24,7 @@ import { cmdDemote, cmdPromote, cmdRevive } from "./commands/migrate.js";
 import { cmdNode, cmdSubstrate } from "./commands/node.js";
 import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdTail, cmdTranscript, cmdUrls, cmdWait } from "./commands/observe.js";
 import { cmdFleet } from "./commands/fleet.js";
+import { cmdPool } from "./commands/pool.js";
 import { cmdOpen, cmdRun, cmdX, cmdXa } from "./commands/run.js";
 import { cmdSeals, cmdSearch } from "./commands/search.js";
 import { cmdLaunch, cmdNew, cmdSpawn } from "./commands/spawn.js";
@@ -166,6 +167,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       break;
     case "colony":
       await cmdColony(parsed);
+      break;
+    case "pool":
+      await cmdPool(parsed);
       break;
     case "frame":
       await cmdFrame(parsed);
@@ -336,6 +340,7 @@ function printHelp() {
       title: "Organize",
       rows: [
         ["colony", "<list|create|…>", "manage project-scoped namespaces"],
+        ["pool", "<list|status|spawn|…>", "checkout pools: claim clean pro clones round-robin (also: spawn --pool)"],
         ["swarm", "<list|inspect|destroy>", "manage live or destroyed bee cohorts"],
         ["frame", "<list|define|…>", "manage reusable swarm blueprints"],
         ["flow", "<list|run|runs|…>", "manage and run flow definitions"],

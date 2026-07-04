@@ -3,7 +3,7 @@ import { BUZ_TIERS as CANONICAL_BUZ_TIERS } from "../buz_tiers.js";
 export const COMMANDS = [
   "spawn", "new", "launch", "send", "tail", "cat", "transcript", "tx", "last", "wait",
   "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "next",
-  "colony", "frame", "swarm", "node", "substrate", "flow", "loop",
+  "colony", "pool", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
@@ -13,6 +13,7 @@ export const COMMANDS = [
 ];
 
 export const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
+export const POOL_SUBCOMMANDS = ["list", "ls", "status", "spawn", "extend", "sync", "claim", "release", "park", "unpark"];
 export const FRAME_SUBCOMMANDS = ["list", "ls", "define", "update", "reload", "edit", "inspect", "remove"];
 export const SWARM_SUBCOMMANDS = ["list", "ls", "inspect", "destroy"];
 export const NODE_SUBCOMMANDS = ["list", "ls", "register", "inspect", "update", "unregister"];
@@ -62,7 +63,8 @@ export const SHELL_FIRST_ARG = new Set(["completion"]);
 export const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 export const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
+  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
+  pool: ["--json", "--all", "--ttl", "--count", "--no-keep", "--here", "--yolo", "--name", "--account"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
@@ -81,7 +83,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   sync: ["--json"],
   node: ["--kind", "--endpoint", "--capabilities", "--description", "--ssh-command", "--ssh-args"],
   run: [
-    "--prompt", "-p", "--cwd", "--home", "--profile", "--account", "--ttl",
+    "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl",
     "--wait", "--last", "--transcript",
     "--rm", "--cleanup", "--keep",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
@@ -92,7 +94,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--include-paused", "--yes",
   ],
   x: [
-    "--prompt", "-p", "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony",
+    "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--name", "--colony",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
     "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate", "--here", "--include-paused", "--yes",
   ],
@@ -191,6 +193,7 @@ export const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagVal
 
 export const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   colony: COLONY_SUBCOMMANDS,
+  pool: POOL_SUBCOMMANDS,
   frame: FRAME_SUBCOMMANDS,
   swarm: SWARM_SUBCOMMANDS,
   node: NODE_SUBCOMMANDS,
