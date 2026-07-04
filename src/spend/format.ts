@@ -9,7 +9,7 @@
 // so a report row round-trips to a spreadsheet without a dependency.
 // ──────────────────────────────────────────────────────────────────────────
 
-import { formatTable, bold, dim, tildify, type TableColumn } from "../format.js";
+import { formatTable, bold, dim, cyan, green, yellow, magenta, tildify, type TableColumn } from "../format.js";
 import {
   TOKEN_TIERS,
   type BlendRow,
@@ -17,8 +17,10 @@ import {
   type LeveragePoint,
   type RateTable,
   type Seat,
+  type SessionDetail,
   type SessionRollup,
   type TokenCounts,
+  type UsageSummary,
 } from "./types.js";
 
 const WARN = "⚠";
@@ -36,8 +38,9 @@ export function fmtUsd(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
-/** Token counts as 1.2M / 12.3k / 42. */
+/** Token counts as 4.4G / 1.2M / 12.3k / 42. */
 export function fmtTokens(value: number): string {
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}G`;
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
   return `${value}`;
@@ -195,6 +198,150 @@ export function renderSeats(seats: Seat[]): string {
     ];
   });
   return formatTable(columns, body);
+}
+
+// ── Usage dashboard (bars + sparkline) ───────────────────────────────────────
+
+const EIGHTHS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+const SPARK = "▁▂▃▄▅▆▇█";
+
+/** A proportional bar of `width` cells for a 0..1 fraction: painted fill + dim track. */
+function bar(fraction: number, width: number, paint: (s: string) => string): string {
+  const f = Math.max(0, Math.min(1, Number.isFinite(fraction) ? fraction : 0));
+  const eighths = Math.round(f * width * 8);
+  const full = Math.min(Math.floor(eighths / 8), width);
+  const rem = eighths % 8;
+  let fill = "█".repeat(full);
+  if (rem > 0 && full < width) fill += EIGHTHS[rem];
+  const used = [...fill].length;
+  return paint(fill) + dim("·".repeat(Math.max(0, width - used)));
+}
+
+/** A one-line sparkline over a numeric series, scaled to its own peak. */
+function sparkline(values: number[]): string {
+  if (values.length === 0) return "";
+  const max = Math.max(...values, 0);
+  if (max <= 0) return dim(SPARK[0]!.repeat(values.length));
+  return values.map((v) => (v <= 0 ? dim(SPARK[0]!) : SPARK[Math.min(7, 1 + Math.round((v / max) * 6))]!)).join("");
+}
+
+/** Truncate-with-ellipsis then pad to a fixed visible width. */
+function padName(text: string, width: number): string {
+  return text.length > width ? `${text.slice(0, width - 1)}…` : text.padEnd(width);
+}
+
+/**
+ * A rich single-period print: a title, one painted bar per model (scaled so the
+ * top spender fills the bar), a total, the API-equivalent token-tier blend as a
+ * stacked bar with a legend, and — for week/month periods — a daily sparkline.
+ */
+export function renderUsage(summary: UsageSummary): string {
+  const lines: string[] = [];
+  const scope = summary.seat === "all" ? "all seats" : summary.seat;
+  const toDate = summary.partial ? " · to date" : "";
+  lines.push("");
+  lines.push(`  ${bold("Spend")} ${dim("·")} ${bold(summary.period)} ${dim(`· ${summary.granularity}${toDate} · ${scope}`)}`);
+  lines.push("");
+
+  if (summary.models.length === 0) {
+    lines.push(dim("  no spend recorded for this period"));
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  const BAR_W = 22;
+  const maxUsd = summary.models[0]!.usd || 1;
+  const nameW = Math.min(26, Math.max(5, ...summary.models.map((m) => m.model.length)));
+  const usdW = Math.max(...summary.models.map((m) => fmtUsd(m.usd).length), 5);
+  for (const m of summary.models) {
+    const usd = m.rateResolved ? fmtUsd(m.usd).padStart(usdW) : "—".padStart(usdW);
+    const frac = m.rateResolved ? m.usd / maxUsd : 0;
+    const share = `${(m.share * 100).toFixed(0)}%`.padStart(4);
+    const flag = m.rateResolved ? "" : ` ${dim(`${WARN} todo`)}`;
+    lines.push(`  ${padName(m.model, nameW)}  ${m.rateResolved ? usd : dim(usd)}  ${bar(frac, BAR_W, cyan)} ${dim(share)}${flag}`);
+  }
+  lines.push(`  ${" ".repeat(nameW)}  ${dim("─".repeat(usdW))}`);
+  lines.push(`  ${bold(padName("TOTAL", nameW))}  ${bold(fmtUsd(summary.totalUsd).padStart(usdW))}  ${dim(`${fmtTokens(summary.grandTokens)} tokens`)}`);
+
+  // Token-tier blend as a stacked, colored bar with a legend.
+  const tiers = [
+    { label: "fresh in", usd: summary.tierUsd.input, paint: cyan },
+    { label: "output", usd: summary.tierUsd.output, paint: green },
+    { label: "cache read", usd: summary.tierUsd.cacheRead, paint: yellow },
+    { label: "cache write", usd: summary.tierUsd.cacheWrite5m + summary.tierUsd.cacheWrite1h, paint: magenta },
+  ];
+  const blendTotal = tiers.reduce((sum, t) => sum + t.usd, 0);
+  if (blendTotal > 0) {
+    const W = 40;
+    const cells = tiers.map((t) => Math.floor((t.usd / blendTotal) * W));
+    const order = tiers.map((_, i) => i).sort((a, b) => tiers[b]!.usd - tiers[a]!.usd);
+    let used = cells.reduce((a, b) => a + b, 0);
+    for (let k = 0; used < W; k += 1, used += 1) cells[order[k % order.length]!] += 1;
+    const stacked = tiers.map((t, i) => t.paint("█".repeat(cells[i]!))).join("");
+    const legend = tiers.map((t) => `${t.paint("█")} ${t.label} ${dim(`${((t.usd / blendTotal) * 100).toFixed(0)}%`)}`).join("   ");
+    lines.push("");
+    lines.push(`  ${dim("Blend (API-equiv $)")}`);
+    lines.push(`  ${stacked}`);
+    lines.push(`  ${legend}`);
+  }
+
+  // Daily sparkline (only meaningful across a multi-day period).
+  if (summary.daily.length > 1) {
+    const peak = summary.daily.reduce((best, d) => (d.usd > best.usd ? d : best), summary.daily[0]!);
+    lines.push("");
+    lines.push(`  ${dim("Daily")}  ${sparkline(summary.daily.map((d) => d.usd))}  ${dim(`${summary.daily[0]!.day} → ${summary.daily[summary.daily.length - 1]!.day}`)}`);
+    if (peak.usd > 0) lines.push(`  ${dim(`peak ${peak.day} · ${fmtUsd(peak.usd)}`)}`);
+  }
+
+  if (summary.hasUnknownRate) {
+    lines.push("");
+    lines.push(dim(`  ${WARN} some models are unpriced — totals are a lower bound (hive spend rates --check)`));
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+/**
+ * A single-session efficiency drill-down: cost, model mix, token/caching
+ * stats, and a context-per-turn sparkline that shows whether the carried
+ * context ballooned over the session (the main cost lever for long orchestrators).
+ */
+export function renderSessionDetail(d: SessionDetail): string {
+  const lines: string[] = [];
+  const when = d.startTs
+    ? `${d.startTs.slice(0, 16).replace("T", " ")} → ${d.endTs.slice(5, 16).replace("T", " ")}`
+    : "";
+  lines.push("");
+  lines.push(`  ${bold("Session")} ${dim("·")} ${d.sessionId}`);
+  lines.push(`  ${dim(`${d.turns} turns · ${fmtDuration(d.durationMs)} · ${when}`)}`);
+  lines.push("");
+  lines.push(`  ${bold("API-equivalent")}  ${bold(fmtUsd(d.totalUsd))}${d.hasUnknownRate ? `  ${dim(`${WARN} incl. unpriced`)}` : ""}`);
+  for (const m of d.models) {
+    lines.push(`    ${padName(m.model, 26)} ${dim(`${m.turns} turns`.padStart(11))}  ${fmtUsd(m.usd)}`);
+  }
+  lines.push("");
+  lines.push(
+    `  ${dim("tokens")}   in ${fmtTokens(d.totalTokens.input)} · out ${fmtTokens(d.totalTokens.output)} · cacheR ${fmtTokens(d.totalTokens.cacheRead)} · cacheW ${fmtTokens(d.totalTokens.cacheWrite5m + d.totalTokens.cacheWrite1h)}`,
+  );
+  const thrash = d.cacheWriteOverRead < 0.1 ? "healthy — no prefix thrashing" : "elevated — prefix may be churning";
+  lines.push(`  ${dim("caching")}  cache-write/read ${(d.cacheWriteOverRead * 100).toFixed(1)}%  ${dim(`(${thrash})`)}`);
+  lines.push(
+    `  ${dim("context")}  cache-read/output ${d.cacheReadOverOutput.toFixed(0)}x · avg out/turn ${fmtTokens(Math.round(d.avgOutputPerTurn))} · peak ctx ${fmtTokens(d.peakContext)}`,
+  );
+
+  if (d.contextDeciles.length > 0) {
+    const peak = Math.max(...d.contextDeciles);
+    const first = d.contextDeciles[0]!;
+    const last = d.contextDeciles[d.contextDeciles.length - 1]!;
+    const stillHigh = peak > 0 && last > 0.7 * peak;
+    lines.push("");
+    lines.push(`  ${dim("context/turn over the session")}  ${sparkline(d.contextDeciles)}  ${dim(`peak ~${fmtTokens(Math.round(peak))}/turn`)}`);
+    lines.push(
+      `  ${dim(`start ~${fmtTokens(Math.round(first))} → end ~${fmtTokens(Math.round(last))}`)}${stillHigh ? `  ${dim(`${WARN} still near peak — compaction would cut re-read cost`)}` : ""}`,
+    );
+  }
+  lines.push("");
+  return lines.join("\n");
 }
 
 // ── Machine-readable serializers ─────────────────────────────────────────────

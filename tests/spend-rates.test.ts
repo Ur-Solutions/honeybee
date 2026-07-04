@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ensureRatesFile, loadRates, saveRates, seedRateTable, validateRateTable } from "../src/spend/rates.js";
-import { discoverConfigDirs, ensureSeats, loadSeats } from "../src/spend/seats.js";
+import { discoverConfigDirs, discoverHiveHomeSeats, ensureSeats, loadSeats } from "../src/spend/seats.js";
 import type { RateRule } from "../src/spend/types.js";
 
 function ruleFor(pattern: string): RateRule {
@@ -118,6 +118,38 @@ test("discoverConfigDirs finds claude/codex dirs and excludes backups", async ()
   }
 });
 
+test("discoverHiveHomeSeats: finds honeybee account homes that hold transcripts", async () => {
+  const store = await mkdtemp(join(tmpdir(), "honeybee-store-"));
+  try {
+    // A claude bee home with transcripts, a codex bee home with sessions,
+    // a login-home variant, a grok home (unpriced → skipped), and an empty
+    // claude home (no projects/ → skipped).
+    await mkdir(join(store, "homes", "claude-tormod-thto.no", "projects"), { recursive: true });
+    await mkdir(join(store, "homes", "codex-tormod-thto.no", "sessions"), { recursive: true });
+    await mkdir(join(store, "login-homes", "claude-tormod-thto.no", "projects"), { recursive: true });
+    await mkdir(join(store, "homes", "grok-tormod-thto.no", "projects"), { recursive: true });
+    await mkdir(join(store, "homes", "claude-empty-acct"), { recursive: true }); // no projects/
+
+    const seats = await discoverHiveHomeSeats(store);
+    const ids = seats.map((s) => s.id).sort();
+    assert.deepEqual(ids, [
+      "claude:tormod-thto.no",
+      "claude:tormod-thto.no@login",
+      "codex:tormod-thto.no",
+    ]);
+    const primary = seats.find((s) => s.id === "claude:tormod-thto.no")!;
+    assert.equal(primary.harness, "claude");
+    assert.equal(primary.accountId, "claude-tormod-thto.no");
+    assert.ok(primary.configDir.endsWith("homes/claude-tormod-thto.no"));
+  } finally {
+    await rm(store, { recursive: true, force: true });
+  }
+});
+
+test("discoverHiveHomeSeats: absent store yields no seats", async () => {
+  assert.deepEqual(await discoverHiveHomeSeats(join(tmpdir(), "honeybee-nonexistent-xyz")), []);
+});
+
 test("ensureSeats merge preserves a user-set monthlyUsd and adds new seats", async () => {
   const home = await mkdtemp(join(tmpdir(), "honeybee-home-"));
   const store = await mkdtemp(join(tmpdir(), "honeybee-seats-"));
@@ -143,7 +175,7 @@ test("ensureSeats merge preserves a user-set monthlyUsd and adds new seats", asy
       }),
     );
 
-    const merged = await ensureSeats(home, seatsFile);
+    const merged = await ensureSeats(home, seatsFile, store); // store has no homes/ → deterministic
     const byId = new Map(merged.seats.map((seat) => [seat.id, seat]));
 
     const primary = byId.get("claude:default")!;

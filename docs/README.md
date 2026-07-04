@@ -198,15 +198,23 @@ Subcommands:
   priced events to the ledger (idempotent; re-run any time). `--full` re-reads
   files even when unchanged; `--since <date>` ignores older events. Loudly lists
   any model ids it saw that have no resolved rate.
-- `hive spend report` — the daily `(day, seat, model)` ledger of tokens + USD.
-  `--day <YYYY-MM-DD>` filters to one day; `--json` / `--csv` for machine output.
-- `hive spend leverage` — the daily API-equiv ÷ subscription series, per seat
-  plus a `portfolio` aggregate, with trailing 7- and 30-day rolling averages.
-  `--seat <id>` restricts to one seat; `--window 7|30` emphasizes a column.
+- `hive spend usage` — a rich per-model dashboard for one period: a painted bar
+  per model (scaled to the top spender), the total, the API-equivalent token
+  blend as a stacked bar, and a daily sparkline. Defaults to the current month;
+  `--granularity day|week|month`, `--period <label>`, `--seat <id>`, `--json`.
+- `hive spend report` — the `(period, seat, model)` ledger of tokens + USD.
+  `--granularity day|week|month` (default `day`) sets the bucket — days, ISO
+  weeks (`2026-W27`), or months (`2026-07`). `--day`/`--period <label>` filters
+  to one bucket; `--json` / `--csv` for machine output.
+- `hive spend leverage` — the API-equiv ÷ subscription series, per seat plus a
+  `portfolio` aggregate. At day granularity it carries trailing 7- and 30-day
+  rolling averages; `--granularity week|month` sums each period's spend against
+  its summed daily proration. `--seat <id>` restricts to one seat; `--window
+  7|30` emphasizes a rolling column.
 - `hive spend sessions` — per-session rollups with an orchestrator vs subagent
   cost split and a model breakdown. `--top <N>` (default 20) keeps the leaders.
 - `hive spend blend` — token/USD blended by `(period, model)`. `--model <id>`
-  filters (substring); `--granularity day|month` sets the period.
+  filters (substring); `--granularity day|week|month` sets the period.
 - `hive spend rates` — show the rate table. `--check` lists every model in the
   ledger that hit the unknown/TODO path (so nothing prices silently at $0).
 - `hive spend seats` — discover config dirs and show the seat table, flagging

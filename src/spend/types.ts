@@ -183,6 +183,75 @@ export type SessionRollup = {
   hasUnknownRate: boolean;
 };
 
+// ── Usage dashboard: a single period, broken down by model, for a rich print ──
+
+export type UsageModelRow = {
+  model: string;
+  usd: number;
+  tokens: TokenCounts;
+  /** Sum across all tiers. */
+  totalTokens: number;
+  /** usd / summary.totalUsd, 0..1 (0 when the period has no priced spend). */
+  share: number;
+  /** False if any event for this model hit the unknown-rate path. */
+  rateResolved: boolean;
+};
+
+export type UsageDayPoint = { day: string; usd: number };
+
+export type UsageSummary = {
+  /** Bucket label, e.g. "2026-07", "2026-W27", or "2026-07-03". */
+  period: string;
+  /** "day" | "week" | "month" — kept as a string to avoid a types→time import. */
+  granularity: string;
+  /** Seat id the summary is scoped to, or "all". */
+  seat: string;
+  totalUsd: number;
+  /** Per-tier token totals across the whole period. */
+  totalTokens: TokenCounts;
+  /** Sum of totalTokens across tiers. */
+  grandTokens: number;
+  /** Models sorted by usd descending. */
+  models: UsageModelRow[];
+  /** API-equivalent USD split across the token tiers (the blend). */
+  tierUsd: Record<TokenTier, number>;
+  /** Dense per-Oslo-day usd series across the period, for a sparkline. */
+  daily: UsageDayPoint[];
+  /** True when the period extends past `today` (a to-date view of the current
+   * day/week/month); the daily series is clamped to today so future days don't
+   * masquerade as zero-spend. */
+  partial: boolean;
+  hasUnknownRate: boolean;
+};
+
+// ── Single-session drill-down (efficiency view) ──────────────────────────────
+
+export type SessionModelStat = { model: string; turns: number; usd: number };
+
+export type SessionDetail = {
+  sessionId: string;
+  /** Priced assistant messages (deduped) in this session. */
+  turns: number;
+  startTs: string;
+  endTs: string;
+  durationMs: number;
+  totalUsd: number;
+  totalTokens: TokenCounts;
+  tierUsd: Record<TokenTier, number>;
+  /** Model breakdown, sorted by turn count descending. */
+  models: SessionModelStat[];
+  /** Average carried context (input + cacheRead) per turn, in 10 time buckets. */
+  contextDeciles: number[];
+  /** Largest single-turn carried context (input + cacheRead). */
+  peakContext: number;
+  avgOutputPerTurn: number;
+  /** cacheWrite ÷ cacheRead tokens; low = healthy caching, high = prefix churn. */
+  cacheWriteOverRead: number;
+  /** cacheRead ÷ output tokens; how much context is re-read per unit of output. */
+  cacheReadOverOutput: number;
+  hasUnknownRate: boolean;
+};
+
 export type BlendRow = {
   /** Bucket label — Europe/Oslo day or month depending on the report granularity. */
   period: string;

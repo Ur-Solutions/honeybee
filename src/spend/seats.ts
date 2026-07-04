@@ -1,9 +1,14 @@
 // ──────────────────────────────────────────────────────────────────────────
 // Seats: the paying identities the ledger attributes spend to. A seat is one
-// harness config dir under the home directory (~/.claude, ~/.claude-2,
-// ~/.codex, ~/.codex-1, …). We discover them read-only, scaffold one entry per
-// dir with provider/plan/monthlyUsd left for the user to fill in, and merge on
-// re-discovery so those user-filled fields are never clobbered.
+// harness config dir. Two sources, both scanned read-only:
+//   1. Interactive CLIs under the home directory — ~/.claude, ~/.claude-2,
+//      ~/.codex, ~/.codex-1, …
+//   2. honeybee's own per-account agent homes under the store —
+//      ~/.hive/homes/<account>/ and ~/.hive/login-homes/<account>/, where bees
+//      run bound to a vault account. These hold the bulk of agent usage and
+//      were the big blind spot: without them the ledger sees almost nothing.
+// We scaffold one entry per dir with provider/plan/monthlyUsd left for the user
+// to fill in, and merge on re-discovery so those user-filled fields survive.
 //
 // Source transcript dirs are only ever READ here; nothing under a config dir is
 // written or moved. The only file this module writes is our own seats.json.
@@ -12,6 +17,7 @@
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
 import { seatsPath } from "./paths.js";
 import type { Harness, Seat, SeatsFile } from "./types.js";
@@ -60,6 +66,65 @@ export async function discoverConfigDirs(homeDir: string = homedir()): Promise<S
       configDir: resolve(join(homeDir, name)),
       label: name,
     });
+  }
+  seats.sort((a, b) => a.id.localeCompare(b.id));
+  return seats;
+}
+
+/** Map a honeybee account-home name to the harness spend can price, or null. */
+function harnessForAccountName(name: string): Harness | null {
+  if (name.startsWith("claude-") || name === "claude") return "claude";
+  if (name.startsWith("codex-") || name === "codex") return "codex";
+  return null; // grok/opencode/other: no priced extractor yet → not a seat
+}
+
+/** True when `dir` exists and is readable as a directory (holds transcripts). */
+async function dirExists(dir: string): Promise<boolean> {
+  try {
+    await readdir(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Discover honeybee's per-account agent homes as seats. Scans
+ * `<store>/homes/*` and `<store>/login-homes/*`; a home becomes a seat only when
+ * it actually holds this harness's transcripts (`projects/` for claude,
+ * `sessions/` for codex), so empty/login-only homes don't clutter seats.json.
+ * Seat id drops the redundant harness prefix from the account id, e.g.
+ * ~/.hive/homes/claude-tormod-thto.no -> claude:tormod-thto.no; the login-homes
+ * variant gets an `@login` suffix so it stays distinct. Global request-id dedup
+ * means a session mirrored across homes is still counted once.
+ */
+export async function discoverHiveHomeSeats(storeDir: string = storeRoot()): Promise<Seat[]> {
+  const seats: Seat[] = [];
+  for (const base of ["homes", "login-homes"] as const) {
+    const root = join(storeDir, base);
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await readdir(root, { withFileTypes: true });
+    } catch {
+      continue; // store or root absent → nothing to scan
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const harness = harnessForAccountName(entry.name);
+      if (!harness) continue;
+      const configDir = resolve(join(root, entry.name));
+      const transcriptSub = harness === "codex" ? "sessions" : "projects";
+      if (!(await dirExists(join(configDir, transcriptSub)))) continue;
+      const account = entry.name.startsWith(`${harness}-`) ? entry.name.slice(harness.length + 1) : entry.name;
+      const suffix = base === "login-homes" ? `${account}@login` : account;
+      seats.push({
+        id: `${harness}:${suffix}`,
+        harness,
+        configDir,
+        label: `${base}/${entry.name}`,
+        accountId: entry.name,
+      });
+    }
   }
   seats.sort((a, b) => a.id.localeCompare(b.id));
   return seats;
@@ -145,10 +210,14 @@ function mergeDiscoveredSeats(existing: SeatsFile, discovered: Seat[]): { file: 
  * ids without clobbering user edits on existing ones), write the result back,
  * and return the merged file. Newly added seat ids are logged for visibility.
  */
-export async function ensureSeats(homeDir: string = homedir(), path: string = seatsPath()): Promise<SeatsFile> {
+export async function ensureSeats(
+  homeDir: string = homedir(),
+  path: string = seatsPath(),
+  storeDir: string = storeRoot(),
+): Promise<SeatsFile> {
   const existing = await loadSeats(path);
-  const discovered = await discoverConfigDirs(homeDir);
-  const { file, added } = mergeDiscoveredSeats(existing, discovered);
+  const [flat, hive] = await Promise.all([discoverConfigDirs(homeDir), discoverHiveHomeSeats(storeDir)]);
+  const { file, added } = mergeDiscoveredSeats(existing, [...flat, ...hive]);
   await saveSeats(file, path);
   if (added.length > 0) {
     // Surface newly scaffolded seats so the user knows to fill in monthlyUsd.
