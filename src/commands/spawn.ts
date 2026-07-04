@@ -18,7 +18,8 @@ import { chooseLaunch, type LaunchTemplate } from "../launchTui.js";
 import { cachedAccountLimits, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
 import { LOCAL_NODE_NAME, authPolicyOf, type NodeRecord } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
-import { createProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, toProSlug } from "../proProjects.js";
+import { allocatePoolMembers, bindPoolClaim, releasePoolClaim, resolvePoolRef, type PoolAllocation, type ResolvedPool } from "../pool.js";
+import { createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, toProSlug } from "../proProjects.js";
 import { pickRoundRobinAccount } from "../limits/autoPick.js";
 import { startSpawnTimer, type SpawnTimer } from "../spawnTiming.js";
 import { chooseNewBee, type SpawnTuiAccount } from "../spawnTui.js";
@@ -31,7 +32,7 @@ import { linkHere } from "../spawnLink.js";
 import { randomUUID } from "node:crypto";
 import { readdir, realpath, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
-import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, ttlFlagMs } from "../cli/shared.js";
+import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { flowRun } from "../commands/flow.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 
@@ -140,6 +141,14 @@ export type SpawnOptions = {
   branch?: string;
   ref?: string;
   checkout?: string;
+  /**
+   * Checkout-pool attribution (CHECKOUT_POOLS_PRD §6.4): stamped on the
+   * SessionRecord when the cwd was allocated from a pool, so fleet/TUI can
+   * attribute the bee without re-deriving. The caller (spawnSingleBee/swarm)
+   * owns allocation, claim binding, and rollback.
+   */
+  poolKey?: string;
+  poolMember?: number;
   /**
    * Opt-in phase timer (HIVE_DEBUG_SPAWN). When passed, spawnBee marks its
    * internal phases on it and leaves reporting to the caller (so resolve/ready
@@ -383,6 +392,8 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(spawnedById ? { spawnedById } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
       ...(opts.autoswap ? { autoswap: true } : {}),
+      ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
+      ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
     };
     await saveSession(record);
     await writeSpawnOptions(record);
@@ -438,6 +449,8 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
     ...(opts.account ? { accountId: opts.account.id } : {}),
     ...(opts.autoswap ? { autoswap: true } : {}),
+    ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
+    ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
   };
   await saveSession(record);
   await writeSpawnOptions(record);
@@ -598,6 +611,69 @@ export function spawnArgvPrompt(parsed: Parsed): string {
 }
 
 
+// ── checkout-pool spawns (`hive spawn --pool <name>`, CHECKOUT_POOLS_PRD §6.4) ─
+
+export type PoolSpawnPlan = {
+  pool: ResolvedPool;
+  allocations: PoolAllocation[];
+  /** Default true — a spare clone is harmless and expensive to remake; --no-keep opts into rollback deletion. */
+  keepCreated: boolean;
+};
+
+/** `--pool <name>` value, validated against the flags it cannot combine with. */
+export function poolFlagRef(parsed: Parsed): string | undefined {
+  const ref = stringFlag(parsed, ["pool"]);
+  if (ref === undefined) return undefined;
+  if (!ref) throw new Error("--pool requires a pool name (e.g. --pool core)");
+  if (hasFlag(parsed, "cwd")) throw new Error("--pool and --cwd are mutually exclusive — the allocated pool member becomes the cwd");
+  return ref;
+}
+
+/**
+ * Resolve + allocate `count` pool members in ONE lock acquisition. Runs after
+ * node/substrate resolution so a doomed spawn (remote node) never burns an
+ * allocation — pool members are local paths; remote-node pools are out of
+ * scope (PRD §9).
+ */
+export async function allocatePoolForSpawn(parsed: Parsed, ref: string, count: number, node: NodeRecord | undefined): Promise<PoolSpawnPlan> {
+  if (node && node.kind !== "local-tmux") {
+    throw new Error(`--pool allocates a local checkout; it cannot combine with remote node ${node.name} (remote-node pools are out of scope)`);
+  }
+  const pool = await resolvePoolRef(ref, process.cwd());
+  const allocations = await allocatePoolMembers(pool, count);
+  for (const allocation of allocations) {
+    console.error(note(`pool ${pool.pool} → member ${pool.pool}-${allocation.member}${allocation.created ? " (created)" : ""} ${dim(tildify(allocation.path))}`));
+  }
+  return { pool, allocations, keepCreated: !truthy(flag(parsed, "no-keep")) };
+}
+
+/**
+ * Spawn-failure rollback, mirroring fork-launch (fork.ts): always drop the
+ * claim; delete the member only when THIS allocation created it AND the
+ * operator asked (--no-keep). Best-effort — claim expiry is the backstop.
+ */
+export async function rollbackPoolAllocation(plan: PoolSpawnPlan, allocation: PoolAllocation): Promise<void> {
+  await releasePoolClaim(plan.pool.key, allocation.claim.id).catch((error) => {
+    console.error(note(`warn: could not release pool claim on ${plan.pool.pool}-${allocation.member}: ${error instanceof Error ? error.message : String(error)} (it expires on its own)`));
+  });
+  if (!allocation.created || plan.keepCreated) return;
+  const memberName = `${plan.pool.pool}-${allocation.member}`;
+  try {
+    console.error(note(`removing fresh pool member ${memberName} after failed spawn (--no-keep)...`));
+    await deleteProSlot("checkout", plan.pool.repoPath, memberName);
+  } catch (error) {
+    console.error(note(`warn: failed to remove ${memberName}: ${error instanceof Error ? error.message : String(error)}`));
+  }
+}
+
+/** Tie the claim to the final bee name; best-effort (occupancy is cwd-derived anyway). */
+export async function bindPoolAllocationToBee(plan: PoolSpawnPlan, allocation: PoolAllocation, beeName: string): Promise<void> {
+  await bindPoolClaim(plan.pool.key, allocation.claim.id, beeName).catch((error) => {
+    console.error(note(`warn: could not bind pool claim to ${beeName}: ${error instanceof Error ? error.message : String(error)}`));
+  });
+}
+
+
 export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
@@ -611,7 +687,11 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const profile = await resolveProfileOverlay(requested);
   const agent = profile ? profile.account.tool : resolvedAgent;
   const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
-  const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
+  // A pool spawn defers cwd to the allocated member (validated exclusive with
+  // --cwd); allocation itself waits until node/substrate resolution below so a
+  // doomed spawn never burns a claim.
+  const poolRef = poolFlagRef(parsed);
+  let cwd = poolRef ? "" : await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const colony = await resolveSpawnColony(parsed);
@@ -642,10 +722,24 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const branch = typeof flag(parsed, "branch") === "string" ? String(flag(parsed, "branch")) : undefined;
   const ref = typeof flag(parsed, "ref") === "string" ? String(flag(parsed, "ref")) : undefined;
   const checkout = typeof flag(parsed, "checkout") === "string" ? String(flag(parsed, "checkout")) : undefined;
+  // Pool allocation (post node-resolution: remote nodes are rejected before a
+  // claim is written). The allocated member path becomes the spawn cwd.
+  const poolPlan = poolRef ? await allocatePoolForSpawn(parsed, poolRef, 1, node) : undefined;
+  const poolAllocation = poolPlan?.allocations[0];
+  if (poolPlan && poolAllocation) cwd = poolAllocation.path;
   // "resolve" folds in account/profile/node resolution above (remote node probe
   // lives here); spawnBee marks its own internal phases on the same timer.
   timer.mark("resolve");
-  let record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(useHsr ? { substrate: "hsr" } : {}) });
+  let record: SessionRecord;
+  try {
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+  } catch (error) {
+    // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
+    // this allocation created) when the spawn itself failed.
+    if (poolPlan && poolAllocation) await rollbackPoolAllocation(poolPlan, poolAllocation);
+    throw error;
+  }
+  if (poolPlan && poolAllocation) await bindPoolAllocationToBee(poolPlan, poolAllocation, record.name);
   const nodeSuffix = useHsr ? [dim("substrate:hsr")] : node && node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${useHsr ? "hsr" : node?.name ?? LOCAL_NODE_NAME}`);
@@ -998,13 +1092,17 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
   // (auto/rr) draw from pools that already exclude paused accounts.
   await confirmPausedAccount(account, parsed);
   // Model selector precedence: profile model override > the account default.
-  const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
+  const poolRef = poolFlagRef(parsed);
+  const cwd = poolRef ? "" : await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const colony = await resolveSpawnColony(parsed);
   const spec = resolveAgent(agent, extraArgs, { home, yolo });
   const node = await resolveSpawnNode(parsed, spec.kind);
   const swarmId = resolveSwarmIdHint(parsed, agent);
+  // Pool fan-out (§6.4): claim ALL N members in one lock acquisition,
+  // auto-extending as needed, then hand each bee its own member as cwd.
+  const poolPlan = poolRef ? await allocatePoolForSpawn(parsed, poolRef, count, node) : undefined;
 
   // PRESERVE (adversarial review fix #11): an account-first swarm behaves
   // exactly like an `--account` swarm does today — all N bees share ONE
@@ -1017,11 +1115,24 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
     const beeAccount = perBeeAccountAlias && !profile ? await perBeeAccountAlias.account() : account;
     const beeModel = beeAccount ? (profile?.model ?? beeAccount.model) : undefined;
     const beeProvider = beeAccount?.provider;
-    const record = await spawnBee({ agent, extraArgs, cwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider });
+    const allocation = poolPlan?.allocations[i];
+    const beeCwd = allocation ? allocation.path : cwd;
+    let record: SessionRecord;
+    try {
+      record = await spawnBee({ agent, extraArgs, cwd: beeCwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider, ...(poolPlan && allocation ? { poolKey: poolPlan.pool.key, poolMember: allocation.member } : {}) });
+    } catch (error) {
+      // Keep the bees already spawned; roll back only the unconsumed claims
+      // (this member and everything after it).
+      if (poolPlan) {
+        for (const unspawned of poolPlan.allocations.slice(i)) await rollbackPoolAllocation(poolPlan, unspawned);
+      }
+      throw error;
+    }
+    if (poolPlan && allocation) await bindPoolAllocationToBee(poolPlan, allocation, record.name);
     records.push(record);
     const nodeSuffix = node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
     if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(`@${swarmId}`), ...nodeSuffix]));
-    else console.log(`${record.name}\t${agent}\t${cwd}\t@${swarmId}\t${node.name}`);
+    else console.log(`${record.name}\t${agent}\t${beeCwd}\t@${swarmId}\t${node.name}`);
   }
 
   await confirmSpawnReadyAll(parsed, records);
@@ -1048,6 +1159,7 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
  */
 export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMessages?: string[]): Promise<SessionRecord[]> {
   if (hasFlag(parsed, "name")) throw new Error("--name cannot be combined with --frame; frame bees are auto-named");
+  if (hasFlag(parsed, "pool")) throw new Error("--pool cannot be combined with --frame; use hive spawn <bee> --pool <name> --count <n> for a pool fan-out");
   if (hasFlag(parsed, "brief")) throw new Error("--brief cannot be combined with --frame; briefs come from the frame's castes");
   const frame: Frame | null = await loadFrame(frameName);
   if (!frame) throw new Error(`Unknown frame: ${frameName}. Define one with: hive frame define <file>`);
