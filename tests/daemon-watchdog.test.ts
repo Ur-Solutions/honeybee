@@ -28,6 +28,7 @@ function emptyTickResult(): TickResult {
     buzDrains: [],
     needsInput: [],
     nodeReachability: [],
+    poolSweeps: [],
     usage: [],
     autoswaps: [],
     autoTitles: [],

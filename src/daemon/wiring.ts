@@ -13,6 +13,7 @@ import { dispatchAutoswaps } from "./autoswap.js";
 import { dispatchBuzDrains } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher } from "./needsInput.js";
 import { createNodeReachabilityTracker } from "./nodeReachability.js";
+import { createPoolSweeper } from "./poolSweep.js";
 import { createUsageSampler } from "./usageSampler.js";
 import { createTokenRefresher } from "./tokenRefresh.js";
 import { defaultCapturePanes, defaultProbeNodes } from "./probe.js";
@@ -126,6 +127,7 @@ export function buildDefaultDeps(): TickDeps {
     dispatchAutoswap: (records, usageOutcomes) => dispatchAutoswaps(records, usageOutcomes),
     dispatchAutoTitle: createAutoTitleDispatcher(),
     refreshRemoteTokens: createTokenRefresher(),
+    sweepPools: createPoolSweeper(),
     syncChains: async () => {
       const now = Date.now();
       if (now - lastChainSyncAt < CHAIN_SYNC_INTERVAL_MS) return;

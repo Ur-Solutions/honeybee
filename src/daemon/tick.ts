@@ -9,6 +9,7 @@ import type { BuzDispatchOutcome } from "./buzDispatcher.js";
 import type { NeedsInputOutcome } from "./needsInput.js";
 import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./nodeReachability.js";
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
+import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
 import type { UsageSampler, UsageTickOutcome } from "./usageSampler.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { LogInput } from "./log.js";
@@ -124,6 +125,13 @@ export type TickDeps = {
     nowMs: number,
   ) => Promise<TokenRefreshOutcome[]>;
   /**
+   * Optional checkout-pool sweep (CHECKOUT_POOLS_PRD §6.6): claim GC,
+   * refresh-on-vacate, dirty/parked flags, minFree pre-extend. Stateful across
+   * ticks (vacate-edge detection, flag de-dupe, background extends) and
+   * self-throttled — build once per daemon run.
+   */
+  sweepPools?: PoolSweeper;
+  /**
    * Optional credential sync: pulls rotated/refreshed auth from the accounts'
    * homes back into the vault. The default wiring throttles itself — most
    * ticks are a no-op.
@@ -171,6 +179,8 @@ export type DispatcherOutcomes = {
   autoTitles: AutoTitleOutcome[];
   /** Remote codex token-refresh outcomes (empty when nothing near-expiry / not wired). */
   tokenRefreshes: TokenRefreshOutcome[];
+  /** Checkout-pool sweep outcomes (empty on throttled/no-op sweeps / not wired). */
+  poolSweeps: PoolSweepOutcome[];
 };
 
 export type TickResult = DispatcherOutcomes & {
@@ -359,10 +369,30 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
             ...(outcome.error ? { error: outcome.error } : {}),
           },
   },
+  // Checkout-pool sweep (§6.6): claim GC, refresh-on-vacate, flags, minFree
+  // pre-extend. Self-throttled inside the sweeper — most ticks return [].
+  {
+    key: "poolSweeps",
+    name: "sweepPools",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed }) => deps.sweepPools?.(records, observed),
+    log: (outcome) => ({
+      level: outcome.error || outcome.flagged || outcome.warned ? "warn" : "info",
+      msg: "pool.sweep",
+      pool: outcome.pool,
+      ...(outcome.gcExpired !== undefined ? { gcExpired: outcome.gcExpired } : {}),
+      ...(outcome.synced ? { synced: outcome.synced.map((row) => `${row.member}:${row.status}`).join(",") } : {}),
+      ...(outcome.flagged ? { flagged: outcome.flagged.map((f) => `${f.member}:${f.reason}${f.nudged ? `→${f.nudged}` : ""}`).join(",") } : {}),
+      ...(outcome.extendStarted !== undefined ? { extendStarted: outcome.extendStarted } : {}),
+      ...(outcome.extended !== undefined ? { extended: outcome.extended } : {}),
+      ...(outcome.warned ? { warned: outcome.warned } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
 ];
 
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
-  return { buzDrains: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [] };
+  return { buzDrains: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [], poolSweeps: [] };
 }
 
 /**

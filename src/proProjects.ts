@@ -334,6 +334,12 @@ export type ProPoolConfig = {
   branch: string;
   maxOccupancy: number;
   maxSize: number;
+  /**
+   * Advisory free-member floor (trailing porcelain column, '-'/absent when
+   * unset — including pros predating the column). The daemon sweep pre-extends
+   * a pool whose free count dips below it; pro itself never acts on it.
+   */
+  minFree?: number;
 };
 
 export type ProPoolMember = {
@@ -393,16 +399,18 @@ export function parseProPoolPorcelain(stdout: string): ProPoolListing {
     if (!line.trim()) continue;
     const fields = line.split("\t");
     if (fields[0] === "pool") {
-      const [, repo, name, branch, maxOccupancy, maxSize] = fields;
+      const [, repo, name, branch, maxOccupancy, maxSize, minFreeRaw] = fields;
       if (!repo || !name || !branch) continue;
       const occ = Number(maxOccupancy);
       const max = Number(maxSize);
+      const minFree = count(minFreeRaw);
       pools.push({
         repo,
         name,
         branch,
         maxOccupancy: Number.isInteger(occ) && occ >= 1 ? occ : 1,
         maxSize: Number.isInteger(max) && max >= 1 ? max : 32,
+        ...(minFree !== undefined && Number.isInteger(minFree) && minFree >= 1 ? { minFree } : {}),
       });
     } else if (fields[0] === "member") {
       const [, repo, pool, nRaw, path, branch, dirty, aheadRaw, behindRaw] = fields;
