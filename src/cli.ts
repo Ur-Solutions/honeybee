@@ -29,6 +29,7 @@ import { cmdSeals, cmdSearch } from "./commands/search.js";
 import { cmdLaunch, cmdNew, cmdSpawn } from "./commands/spawn.js";
 import { cmdSpend } from "./commands/spend.js";
 import { cmdSwarm } from "./commands/swarm.js";
+import { closeAllSubstrates } from "./substrates/index.js";
 
 // Re-exports consumed by the unit tests (tests/*.test.ts import these from
 // "../src/cli.js"). The HIVE-15 decomposition moved the handlers into
@@ -55,6 +56,18 @@ async function main(argv: string[]) {
     return;
   }
   const parsed = parse(argv);
+  try {
+    await dispatch(parsed);
+  } finally {
+    // A one-shot command that probed a remote node leaves a cached remote-hsr
+    // substrate holding an `ssh -N -L` forward tunnel; its child keeps Node's
+    // event loop alive and the process would hang after printing. Tear those
+    // down so the CLI exits promptly. Best-effort — never fails the command.
+    await closeAllSubstrates();
+  }
+}
+
+async function dispatch(parsed: ReturnType<typeof parse>) {
   switch (parsed.command) {
     case "spawn":
       await cmdSpawn(parsed);

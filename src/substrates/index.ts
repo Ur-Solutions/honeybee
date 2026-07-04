@@ -122,3 +122,25 @@ function getOrCache(key: string, build: () => Substrate): Substrate {
 export function clearSubstrateCache(): void {
   cache.clear();
 }
+
+/**
+ * Tear down every cached substrate that holds a live resource, then drop them.
+ *
+ * Only remote-hsr substrates own a long-lived handle: the `ssh -N -L` forward
+ * tunnel child spawned to reach the runner host. That child keeps Node's event
+ * loop alive, so a one-shot CLI that merely *probed* a remote node (e.g.
+ * `hive ls` / `hive fleet` fanning out across nodes) would print its output and
+ * then hang until the tunnel died on its own. Closing the substrate chains
+ * RemoteRunnerClient.close → tunnel.close → child.kill, releasing the loop.
+ *
+ * Best-effort: a substrate without `close` (local-tmux, ssh-tmux) is skipped,
+ * and a close that throws is swallowed — teardown must never fail a command.
+ * Call this once, in a `finally`, after a one-shot command completes.
+ */
+export async function closeAllSubstrates(): Promise<void> {
+  const closables = [...cache.values()].filter(
+    (s): s is Substrate & { close(): Promise<void> } => typeof (s as { close?: unknown }).close === "function",
+  );
+  cache.clear();
+  await Promise.all(closables.map((s) => s.close().catch(() => undefined)));
+}
