@@ -409,15 +409,8 @@ test("generic file-backed sync covers every non-special identity harness", async
         fresh: JSON.stringify({ accessToken: "fresh-kimi" }),
         readToken: (value: Record<string, unknown>) => value.accessToken,
       },
-      {
-        tool: "cursor",
-        label: "cursor-table",
-        provider: "cursor",
-        rel: "cli-config.json",
-        old: JSON.stringify({ token: "old-cursor" }),
-        fresh: JSON.stringify({ token: "fresh-cursor" }),
-        readToken: (value: Record<string, unknown>) => value.token,
-      },
+      // cursor is no longer generic: it has a bespoke identity-guarded syncer
+      // (cursorAuth.ts, covered in tests/cursor-auth.test.ts).
     ];
 
     for (const item of cases) {
@@ -1008,7 +1001,7 @@ test("normalizeAccountRecord leaves opencode provider-less (ambiguous) and prese
 
   // PROVIDER_BY_CLI is the source of truth and excludes opencode.
   assert.equal(PROVIDER_BY_CLI.opencode, undefined);
-  assert.deepEqual(Object.keys(PROVIDER_BY_CLI).sort(), ["claude", "codex", "grok", "kimi"]);
+  assert.deepEqual(Object.keys(PROVIDER_BY_CLI).sort(), ["claude", "codex", "cursor", "grok", "kimi"]);
 });
 
 test("normalizeAccountRecord leaves an unknown/future CLI provider-less and untouched", () => {

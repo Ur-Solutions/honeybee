@@ -2,7 +2,7 @@
 // interactive tmux pane and a pane-less HSR runner (resume), and revive dead bees.
 // Extracted from cli.ts (HIVE-15).
 import { activateAccountIntoHome, findAccount } from "../accounts.js";
-import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, type AgentSpec } from "../agents.js";
+import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, type AgentSpec } from "../agents.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeSpawnOptions } from "../hiveState.js";
@@ -154,7 +154,10 @@ export async function buildResumeSpec(record: SessionRecord, tool: string, extra
   });
   if (record.accountId && spec.homePath) {
     const account = await findAccount(record.accountId, tool).catch(() => undefined);
-    if (account) await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+    if (account) {
+      await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+      refreshIdentityEnv(spec);
+    }
   }
   await assertExecutableAvailable(spec.command);
   return spec;

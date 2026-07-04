@@ -2,8 +2,9 @@
 // Extracted from cli.ts (HIVE-15).
 import { accountEmail, accountHasCredentials, accountsRegistryPath, activateAccountIntoHome, addAccount, captureAccountFromHome, defaultHomeForAccount, findAccount, listAccounts, removeAccount, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault, type AccountChainSyncOutcome, type AccountRecord } from "../accounts.js";
 import { canonicalAgentKind, resolveAgent, resolveHome } from "../agents.js";
+import { cursorLiveAuthDigest } from "../accounts/cursorAuth.js";
 import { parseAge } from "../clean.js";
-import { identityEnvForAgent, identityRecipeForAgent, type IdentityRecipe } from "../drivers.js";
+import { identityEnvForAgent, identityRecipeForAgent, loginSeatArgsForAgent, type IdentityRecipe } from "../drivers.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, formatTimeUntil, green, isPretty, note, red, tildify, yellow } from "../format.js";
 import { credentialDigest, readClaudeKeychain } from "../keychain.js";
 import { cachedAccountLimits, paceDelta, sortAccountsForLimitsDisplay, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
@@ -179,13 +180,14 @@ export async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
       await activateAccountIntoHome(account, seatHome).catch(() => undefined);
     }
     // The marker is the freshness baseline: its mtime for the credentials
-    // file, its recorded digest for the keychain entry (claude on macOS logs
-    // in to the Keychain, not the file). Written post-activation so re-seeded
-    // old creds stay stale.
-    const keychainBaseline = account.tool === "claude" ? await readClaudeKeychain(seatHome) : null;
-    const marker = { account: account.id, keychainDigest: keychainBaseline ? credentialDigest(keychainBaseline) : null };
+    // file, its recorded digest for the out-of-home store (claude on macOS
+    // logs in to the per-home Keychain entry; cursor to its machine-global
+    // store). Written post-activation so re-seeded old creds stay stale.
+    const marker = { account: account.id, keychainDigest: await loginSeatLiveDigest(account, seatHome) };
     await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
-    const spec = resolveAgent(account.tool, [], { home: seatHome, identity: true, yolo: false });
+    // Some tools log in via a subcommand rather than an in-TUI flow (cursor:
+    // `cursor-agent login`); the recipe's loginSeatArgs carry it.
+    const spec = resolveAgent(account.tool, loginSeatArgsForAgent(account.tool), { home: seatHome, identity: true, yolo: false });
     await substrate.newSession(target, process.cwd(), {
       command: spec.command,
       args: spec.args,
@@ -211,10 +213,10 @@ export async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
   const loggedIn = async (): Promise<boolean> => {
     const info = await stat(resolve(seatHome, primary)).catch(() => null);
     if (info?.isFile() && info.mtimeMs >= baselineMs) return true;
-    if (account.tool !== "claude") return false;
-    // claude on macOS logs in to the Keychain, not the credentials file.
-    const current = await readClaudeKeychain(seatHome);
-    return Boolean(current) && credentialDigest(current!) !== baselineDigest;
+    // Tools whose login lands OUTSIDE the seat home (claude: per-home
+    // keychain; cursor: machine-global store) are detected by digest drift.
+    const current = await loginSeatLiveDigest(account, seatHome);
+    return current !== null && current !== baselineDigest;
   };
   const captureIfLoggedIn = async (): Promise<boolean> => {
     if (!(await loggedIn())) return false;
@@ -253,6 +255,22 @@ export async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
     await sleep(2_000);
   }
   throw new Error(`Timed out waiting for ${primary} in ${seatHome}; the seat is still running — ${attachHint}`);
+}
+
+
+/**
+ * Digest of the OUT-OF-HOME live credential store a tool's login writes to,
+ * or null for tools whose login lands in the seat home's files (the mtime
+ * check covers those). The login seat records this as its freshness baseline
+ * and treats any drift as "a login happened".
+ */
+export async function loginSeatLiveDigest(account: AccountRecord, seatHome: string): Promise<string | null> {
+  if (account.tool === "claude") {
+    const keychain = await readClaudeKeychain(seatHome);
+    return keychain ? credentialDigest(keychain) : null;
+  }
+  if (account.tool === "cursor") return cursorLiveAuthDigest();
+  return null;
 }
 
 

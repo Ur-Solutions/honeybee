@@ -2,7 +2,7 @@
 // seeded from its state, with account-safety resolution.
 // Extracted from cli.ts (HIVE-15).
 import { activateAccountIntoHome, defaultHomeForAccount, type AccountRecord } from "../accounts.js";
-import { assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, resolveAgent, shellCommand } from "../agents.js";
+import { assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { agentKinds, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { modelArgsFor, pickForkSeed, type ForkSeedInput, type SeedMode } from "../fork.js";
@@ -217,6 +217,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
   if (account) {
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
     await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+    refreshIdentityEnv(spec);
   }
   if (!isRemote) {
     await assertExecutableAvailable(spec.command);

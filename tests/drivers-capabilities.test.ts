@@ -21,9 +21,9 @@ test("bootMsForAgent: per-kind boot timeouts with a shared default", () => {
   assert.equal(bootMsForAgent("grok"), 10_000);
   assert.equal(bootMsForAgent("droid"), 5_000);
   assert.equal(bootMsForAgent("pi"), 10_000);
-  // Kinds without a declared bootMs (kimi/cursor) and unknown kinds fall back.
+  assert.equal(bootMsForAgent("cursor"), 15_000);
+  // Kinds without a declared bootMs (kimi) and unknown kinds fall back.
   assert.equal(bootMsForAgent("kimi"), DEFAULT_BOOT_MS);
-  assert.equal(bootMsForAgent("cursor"), DEFAULT_BOOT_MS);
   assert.equal(bootMsForAgent("no-such-agent"), DEFAULT_BOOT_MS);
 });
 

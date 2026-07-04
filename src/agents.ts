@@ -2,9 +2,9 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { activateAccountIntoHome, assertGrokHomeAuthFresh, autoAccountTool, defaultHomeForAccount, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord } from "./accounts.js";
+import { activateAccountIntoHome, assertCursorHomeAuthFresh, assertGrokHomeAuthFresh, autoAccountTool, defaultHomeForAccount, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord } from "./accounts.js";
 import { beeConfig } from "./config.js";
-import { driverDefaultsToYolo, forcedSessionIdArgsForAgent, homeEnvForAgent, identityEnvForAgent, modelArgsForAgent, sessionPinnedInArgs } from "./drivers.js";
+import { driverDefaultsToYolo, forcedSessionIdArgsForAgent, homeEnvForAgent, identityEnvForAgent, modelArgsForAgent, secretEnvKeysForAgent, sessionPinnedInArgs } from "./drivers.js";
 import { assertExecutableAvailable } from "./execCheck.js";
 import { writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity } from "./ids.js";
@@ -160,15 +160,44 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   };
 }
 
-export function shellCommand(spec: AgentSpec): string {
-  const env = Object.entries(spec.env).map(([key, value]) => `${key}=${shellQuoteIfNeeded(value)}`);
+/**
+ * Render the spec as a one-line shell command. By default env values the
+ * driver marks secret (cursor's CURSOR_AUTH_TOKEN/CURSOR_API_KEY) are
+ * REDACTED — the default rendering feeds stored SessionRecords and `hive ls`
+ * display, where a raw token would leak into state files and screenshares.
+ * Pass `forExec: true` only where the string is actually executed or handed
+ * to the user to run (`hive open --window/--print`).
+ */
+export function shellCommand(spec: AgentSpec, options: { forExec?: boolean } = {}): string {
+  const secrets = options.forExec ? new Set<string>() : new Set(secretEnvKeysForAgent(spec.kind));
+  const env = Object.entries(spec.env).map(([key, value]) => `${key}=${secrets.has(key) ? "<redacted>" : shellQuoteIfNeeded(value)}`);
   return [...env, ...[spec.command, ...spec.args].map(shellQuoteIfNeeded)].join(" ");
 }
 
+/**
+ * Re-merge the driver's identity env AFTER credentials were activated into the
+ * home. resolveAgent computes identity env before activateAccountIntoHome
+ * runs; a recipe with a dynamic credentialEnv (cursor) reads the home's
+ * credential file, which only holds the account's fresh secret once activation
+ * has stamped it. Idempotent, and a no-op for static-env recipes or spawns
+ * without a home.
+ */
+export function refreshIdentityEnv(spec: AgentSpec): void {
+  if (!spec.homePath) return;
+  Object.assign(spec.env, identityEnvForAgent(spec.kind, spec.homePath));
+}
+
 export async function assertAgentAuthFreshForSpawn(spec: AgentSpec, accountId?: string): Promise<void> {
-  if (spec.kind !== "grok") return;
-  const homePath = spec.homePath ?? process.env.GROK_HOME ?? resolve(homedir(), ".grok");
-  await assertGrokHomeAuthFresh(homePath, accountId ? { accountId } : {});
+  if (spec.kind === "grok") {
+    const homePath = spec.homePath ?? process.env.GROK_HOME ?? resolve(homedir(), ".grok");
+    await assertGrokHomeAuthFresh(homePath, accountId ? { accountId } : {});
+    return;
+  }
+  if (spec.kind === "cursor" && spec.homePath) {
+    // Only a PRESENT home auth.json is judged: a plain --home spawn without
+    // one legitimately rides the machine-global cursor login.
+    await assertCursorHomeAuthFresh(spec.homePath, accountId ? { accountId } : {});
+  }
 }
 
 /**
@@ -366,6 +395,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     if (opts.node && opts.node.kind !== "local-tmux") throw new Error("account-bound flow spawns are local-only (the vault never leaves this machine)");
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
     await activateAccountIntoHome(account, spec.homePath);
+    refreshIdentityEnv(spec);
   }
   // Pin the bee to its own provider session id from birth (see forcedSessionIdArgs):
   // flow runs spawn many siblings in one cwd, the exact case the cwd-blind claude

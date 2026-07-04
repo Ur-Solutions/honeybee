@@ -17,6 +17,13 @@ import {
 } from "./claudeChain.js";
 import { accountEmail } from "./utils.js";
 import { evacuateForeignCodexAuth, syncCodexAuthToVaultLocked } from "./codexAuth.js";
+import {
+  cursorAuthUnavailableReason,
+  readCursorAuthFile,
+  readCursorAuthInfo,
+  readCursorLiveAuth,
+  syncCursorAuthToVaultLocked,
+} from "./cursorAuth.js";
 import { grokAuthUnavailableReason, readGrokAuthFile, syncGrokAuthToVaultLocked } from "./grokAuth.js";
 import { syncGenericCredentialsToVaultLocked } from "./genericSync.js";
 import { seedClaudeHomeAcceptance, seedClaudeHomeDefaults, seedCodexHomeDefaults } from "./homeDefaults.js";
@@ -41,10 +48,41 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
       captured.push(relative);
       capturedCredentials.push(relative);
     }
+    // cursor logs in to the MACHINE-GLOBAL store (macOS keychain / the global
+    // XDG auth.json), never into the seat home — the home only receives the
+    // non-secret cli-config.json. Synthesize the primary auth.json from the
+    // live store, gated on identity: the home's freshly-written authInfo (who
+    // just logged in) must match the account, and the live tokens must not
+    // verifiably belong to someone else.
+    const primary = recipe.credentialFiles[0]!;
+    if (account.tool === "cursor" && !capturedCredentials.includes(primary)) {
+      const live = await readCursorLiveAuth();
+      if (!live) {
+        throw new Error(
+          `No live cursor credentials found (keychain or ${primary}); complete \`cursor-agent login\` first`,
+        );
+      }
+      const seatInfo = await readCursorAuthInfo(homePath);
+      const expected = accountEmail(account);
+      if (expected && seatInfo?.email && seatInfo.email !== expected) {
+        throw new Error(
+          `The cursor login in ${homePath} belongs to ${seatInfo.email}, not ${expected} — capturing it would bill ${seatInfo.email}. Log in as ${expected} and retry.`,
+        );
+      }
+      if (seatInfo?.authId && live.subs.size > 0 && !live.subs.has(seatInfo.authId)) {
+        throw new Error(
+          `The live cursor tokens do not match the identity that logged in at ${homePath}; refusing to vault an unattributable credential`,
+        );
+      }
+      const target = join(accountDir(account), primary);
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      await atomicWriteFile(target, live.raw.endsWith("\n") ? live.raw : `${live.raw}\n`, { mode: 0o600 });
+      captured.push(primary);
+      capturedCredentials.push(primary);
+    }
     // On macOS, claude stores the primary credential in the Keychain rather
     // than .credentials.json — and when both exist, the on-disk file is often
     // a stale relic of an old login. Vault whichever is fresher.
-    const primary = recipe.credentialFiles[0]!;
     if (account.tool === "claude" && keychainAvailable()) {
       const keychainRaw = await readClaudeKeychain(homePath);
       if (keychainRaw) {
@@ -159,6 +197,21 @@ async function grokPreActivate({ account, homePath, options, warn }: ActivationC
   }
 }
 
+async function cursorPreActivate({ account, options, warn }: ActivationContext): Promise<void> {
+  // Pull the freshest ATTRIBUTED credential into the vault first: cursor
+  // persists whatever token a bee last used into the machine-global store, so
+  // the sync's identity guard (JWT sub ↔ recorded authId) decides whether the
+  // live store is this account's rotation or another account's session.
+  await syncCursorAuthToVaultLocked(account).catch((error) => {
+    warn(`could not sync refreshed cursor auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  const vault = await readCursorAuthFile(join(accountDir(account), "auth.json"), "vault");
+  const reason = cursorAuthUnavailableReason(vault, options.now?.() ?? Date.now());
+  if (reason) {
+    throw new Error(`Cannot activate ${account.id}: cursor ${reason}. Re-login with: hive login ${account.id}`);
+  }
+}
+
 async function genericPreActivate({ account, homePath, warn }: ActivationContext): Promise<void> {
   // Other identity recipes are file-based. Pull back changes only from the
   // account's attributed homes; arbitrary --home paths are not trusted here
@@ -265,6 +318,7 @@ const ACTIVATION_HOOKS: Record<string, ActivationHooks> = {
   claude: { preActivate: claudePreActivate, seedHomeDefaults: claudeSeedHomeDefaults },
   codex: { preActivate: codexPreActivate, seedHomeDefaults: codexSeedHomeDefaults },
   grok: { preActivate: grokPreActivate },
+  cursor: { preActivate: cursorPreActivate },
 };
 
 const GENERIC_ACTIVATION_HOOKS: ActivationHooks = { preActivate: genericPreActivate };

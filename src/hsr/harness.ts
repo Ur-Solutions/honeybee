@@ -83,6 +83,11 @@ export type HarnessDescriptor = {
 // adapter appends for tier "stream"; shared by both auth kinds.
 const CLAUDE_STREAM_FLAGS = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] as const;
 
+// The cursor turn-tier flag set. `--trust` pre-accepts the workspace-trust
+// prompt (print-mode only flag) — a turn child is unattended, so the prompt
+// would strand the turn; shared by both auth kinds.
+const CURSOR_TURN_FLAGS = ["-p", "--output-format", "stream-json", "--trust"] as const;
+
 export const HARNESSES = {
   // A real child process, but not a real harness — test scaffolding only
   // (adapters/stub.ts). No allowance rows, no ephemeral credentials.
@@ -169,6 +174,32 @@ export const HARNESSES = {
         since: "2026-07-02",
       },
     },
+  },
+  cursor: {
+    runner: true,
+    allowance: {
+      subscription: {
+        permittedTiers: ["turn", "pty"],
+        requiredFlags: CURSOR_TURN_FLAGS,
+        // No scrub: honeybee itself delivers the account identity via
+        // CURSOR_AUTH_TOKEN/CURSOR_API_KEY (drivers.ts credentialEnv), so
+        // deleting them here would strip the bound account's own credential.
+        scrubEnv: [],
+        fingerprints: [],
+        note: "cursor-agent -p stream-json, process-per-turn with --resume=<chatId> continuation; envelope verified against the 2026.06.24 bundle.",
+        since: "2026-07-03",
+      },
+      "api-key": {
+        permittedTiers: ["turn", "pty"],
+        requiredFlags: CURSOR_TURN_FLAGS,
+        scrubEnv: [],
+        fingerprints: [],
+        note: "cursor-agent -p stream-json via CURSOR_API_KEY; API-key billing is intentional.",
+        since: "2026-07-03",
+      },
+    },
+    // No ephemeral policy: cursor's macOS credential store is a machine-global
+    // keychain slot, so account-bound cursor bees stay local-only for now.
   },
   kimi: {
     runner: false,

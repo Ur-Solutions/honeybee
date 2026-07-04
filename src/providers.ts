@@ -27,6 +27,7 @@ export type ProviderId =
   | "openai"
   | "xai"
   | "moonshot"
+  | "cursor"
   | "minimax-coding-plan"
   | "zai-coding-plan"
   | "kimi-for-coding";
@@ -53,6 +54,9 @@ const PROVIDERS: Record<string, ProviderAdapter> = {
   openai: { id: "openai" },
   xai: { id: "xai" },
   moonshot: { id: "moonshot" },
+  // Anysphere's subscription behind the cursor CLI. No documented quota
+  // endpoint → fetchLimits stays undefined → limits degrade to `unsupported`.
+  cursor: { id: "cursor", baseURL: "https://api2.cursor.sh" },
   "minimax-coding-plan": { id: "minimax-coding-plan", fetchLimits: minimaxLimits },
   "zai-coding-plan": { id: "zai-coding-plan", fetchLimits: zaiLimits },
   // kimi-for-coding / moonshot have no documented quota endpoint → fetchLimits

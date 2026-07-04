@@ -41,6 +41,7 @@ export const PROVIDER_BY_CLI: Record<string, string> = {
   codex: "openai",
   grok: "xai",
   kimi: "moonshot",
+  cursor: "cursor",
 };
 
 /**
