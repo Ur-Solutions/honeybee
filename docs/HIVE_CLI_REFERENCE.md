@@ -1229,6 +1229,7 @@ that file is harmless: the cursor resets and claims rebuild from live bees.
 hive pool                          # pools in scope: occupancy like core 4/6 (2 busy · 4 free)
 hive pool status [<pool>] [--json] # member table: n, state, bees, branch, ahead/behind, path
 hive pool spawn <pool> <bee> [spawn flags…]   # allocate + spawn (= hive spawn <bee> --pool <pool>)
+hive pool launch                   # M-P popup: pick pool → pick agent → spawn (--here linked)
 hive pool extend <pool> [N]        # manual grow (delegates to pro pool extend)
 hive pool sync [<pool>|--all]      # occupancy-aware sync of FREE members only
 hive pool claim <pool> [n] [--ttl <age>]      # manual claim (specific member with n)
@@ -1236,6 +1237,14 @@ hive pool release <pool> <n>       # drop all claims on member n
 hive pool park <pool> <n>          # withhold a member from allocation
 hive pool unpark <pool> <n>
 ```
+
+`hive pool launch` is the fast tmux flow (recommended bind: **M-P** →
+`display-popup -E "hive pool launch"`; lowercase M-p belongs to the WezTerm
+Zellij ALT layer, the same collision that put fork on M-k). Two fuzzy steps —
+pool (rows like `core 4/6 free · 2 busy`; zero-free pools stay selectable and
+read `(will extend)`), then the same account-aware agent list `hive launch`
+offers. Inside tmux the spawned bee's window is `--here`-linked into your
+session; happy path is M-P, ↵, ↵.
 
 Scope: inside a pro project, verbs see that project's pools; outside, all
 projects. A pool argument resolves as the exact key first, else by unique
@@ -1266,6 +1275,22 @@ maxSize/size/busy/free/rrCursor/exceedsMaxSize` plus per member
 `n/path/branch/dirty/ahead/behind/parked/occupants/pendingClaims/free` — and
 an `adhocCheckouts` array (non-pool checkouts of the same repos with derived
 occupants).
+
+The daemon sweeps pools on its tick (every `HIVE_POOL_SWEEP_INTERVAL_MS`,
+default 60s): expired claims are GC'd; a member observed going inhabited→free
+is refreshed to `origin/<branch>` (§5.3 semantics, clean on-base members
+only); a member left **dirty or off-base by a departed bee is flagged, never
+auto-reset** — a `pool.member.flagged` ledger event, a warn log line, and a
+queue-tier buz nudge to the departed bee's living parent when it has one; and
+a pool whose free count dips below its `minFree` floor (`pro pool create
+--min-free N`) is pre-extended in the background so spawn latency never
+includes a clone. Every step is failure-tolerant: a broken pool (or pool-less
+pro) never breaks the tick.
+
+In `hive bees` (TUI + sidebar), pool bees carry their member in the slot
+glyph (`⎇ core-3`, from the record's `poolKey`/`poolMember` — never
+re-derived), and a pools capacity strip renders under the header
+(`pools: core 4/6 · 2 busy | fleet 0/3 (will extend)`).
 
 ## Nodes and Substrates
 

@@ -128,10 +128,15 @@ owns nothing new.
   "name": "honeybee",
   "path": "repos/honeybee",
   "pools": [
-    { "name": "core", "branch": "main", "maxOccupancy": 1, "maxSize": 12 }
+    { "name": "core", "branch": "main", "maxOccupancy": 1, "maxSize": 12, "minFree": 2 }
   ]
 }
 ```
+
+`minFree` is optional and advisory (**shipped 2026-07-04** with phase 3):
+`pro pool create --min-free N` stores it (omitted when 0/unset), `pro doctor`
+validates it, and pro itself never acts on it — hive's daemon pre-extends a
+pool whose free count dips below the floor (§6.6).
 
 - `name` must be a slug; `<pool>-<n>` member names must not collide with existing
   ad-hoc checkout names (creation refuses if a non-member checkout already matches
@@ -166,12 +171,14 @@ Porcelain format **(as shipped)** — lines are record-tagged and carry the repo
 since pool names are only unique per repo:
 
 ```
-pool	<repo>	<name>	<branch>	<maxOccupancy>	<maxSize>
+pool	<repo>	<name>	<branch>	<maxOccupancy>	<maxSize>	<minFree>
 member	<repo>	<pool>	<n>	<path>	<branch>	<dirty 0|1>	<ahead>	<behind>
 ```
 
 `ahead`/`behind` count against the last-fetched `origin/<branch>` ref, `-` when
-the ref is missing; listing never fetches.
+the ref is missing; listing never fetches. `<minFree>` is a phase-3 addition,
+appended LAST so earlier column positions never moved: `-` when unset, and
+absent entirely on pre-phase-3 pros (hive's parser treats both as unset).
 
 Implementation: new `lib/pool.sh` reusing `resolve_slot_target`, `_co_dir`,
 `cmd_co_create` internals, `refresh_project_repos`, `build_index`.
@@ -335,20 +342,38 @@ Piggyback the existing reconcile loop:
   and a `buz` nudge, never auto-reset. A human (or an explicit
   `hive pool reset <n> --hard`) decides.
 
+**As shipped (phase 3)**: `src/daemon/poolSweep.ts`, one registry stage on the
+tick (`sweepPools`, self-throttled by `HIVE_POOL_SWEEP_INTERVAL_MS`, default
+60s), consuming the tick's freshly derived states — no extra probing. Vacate
+edges are detected against the previous sweep's occupied set (a daemon restart
+re-baselines rather than mass-syncing). The "buz nudge" is delivered to the
+DEPARTED bee's living parent (`spawnedById`) at queue tier — there is no
+operator-addressed buz channel, so parentless flags surface via the
+`pool.member.flagged` ledger event, the warn-level daemon log, and
+`pool status` (same escalation model as the HSR needs-input router).
+`hive pool reset <n> --hard` remains unimplemented (park/release + pro are the
+manual path).
+
 ### 6.7 Fast tmux flow (requirement 7)
 
 - New canonical bind in `src/keybindings.ts` (`CANONICAL_TMUX_CONF` +
-  `RECOMMENDED_BINDS`): **`M-p`** → `display-popup -E "hive pool launch"`.
+  `RECOMMENDED_BINDS`): **`M-P`** → `display-popup -E "hive pool launch"`.
+  (Deviation from the original `M-p`: the collision ledger reserves lowercase
+  M-p for the WezTerm Zellij ALT layer — the same conflict that put fork on
+  M-k — so the pool launcher rides shift, cmd+shift+p via the WezTerm block.)
 - `hive pool launch`: fzf-style picker (pattern of `hive launch`/`fork launch`)
-  — step 1 pick pool (rows show `core 4/6 · 2 busy`, plus `new pool…`); step 2
-  agent/harness (reuse the `hive new` picker, prefilled defaults); ↵ allocates,
+  — step 1 pick pool (rows show `core 4/6 free · 2 busy`); step 2 agent/harness
+  (the same account-aware shorthand list `hive launch` offers); ↵ allocates,
   spawns, and links the bee's window into the current session (existing `--here`
-  path, `cli.ts:292` per fork-and-pane PRD). Zero-free pools show `(will extend)`
-  rather than being disabled.
-- Total keystrokes for the happy path: `M-p`, ↵ (pool), ↵ (agent) — bee running
+  path). Zero-free pools show `(will extend)` rather than being disabled.
+  As shipped there is no `new pool…` row — pool creation stays
+  `pro pool create` / Apiary's PATH-6 palette.
+- Total keystrokes for the happy path: `M-P`, ↵ (pool), ↵ (agent) — bee running
   on a clean main in its own pane link.
-- Fleet TUI/sidebar: extend the existing slot glyphs (`beesTui.ts:662`) with the
-  pool member (`⎇ core-3`), and a pools section showing capacity chips.
+- Fleet TUI/sidebar: extend the existing slot glyphs (`beesTui.ts` slotGlyph)
+  with the pool member (`⎇ core-3`, from `SessionRecord.poolKey`/`poolMember`),
+  and a pools capacity strip under the `hive bees` header
+  (`pools: core 4/6 · 2 busy | fleet 0/3 (will extend)`).
 
 ## 7. Concurrency & failure modes
 
@@ -400,9 +425,19 @@ Piggyback the existing reconcile loop:
 2. **hive core**: `src/pool.ts` (records, claims, allocation, occupancy
    derivation), `proProjects.ts` additions (`pro pool` porcelain parsing,
    extend), `hive pool` commands, `spawn --pool`, `SessionRecord.poolKey`.
+   **✅ Shipped 2026-07-04** — honeybee branch `checkout-pools` (commits
+   `212bfaf`…`85b4ce0` on dd75d04), check + 1582-test suite green, verified
+   live against the pool-enabled pro. Deviations: `hive pool sync` drives
+   `pro co sync <REPO:NAME…> --rebase` (pool sync takes no member list);
+   `hive pool spawn` requires an explicit `<bee>`; manual member claims don't
+   advance rrCursor.
 3. **hive UX + daemon**: `M-p` popup flow, TUI surfacing, daemon sweep
    (claim GC, refresh-on-vacate, minFree pre-extend), `HIVE_CLI_REFERENCE.md`,
    completion.
+   **✅ Shipped 2026-07-04** — same branch: `src/daemon/poolSweep.ts` tick
+   stage (§6.6 as-shipped notes), `hive pool launch` + **M-P** bind (§6.7
+   deviation note), `⎇ core-3` glyphs + pools capacity strip in `hive bees`,
+   pro `--min-free` (pro branch `checkout-pools` @ `efc16c6`, build green).
 4. **apiary**: ownership flip + PATH-6 UI against the new surfaces.
 
 Testing: pro gets bats-style tests beside existing `tests/` (rebase-revert
