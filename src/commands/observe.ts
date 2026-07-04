@@ -13,6 +13,7 @@ import { sessionDisplayName, shouldShowNodeColumn } from "../listView.js";
 import { DEFAULT_ATTENTION_STATES, attentionCount, parseStateList, pickNextBee, type BeeStateEntry } from "../next.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode } from "../node.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
+import { liveBeesFromSessions, poolsForProject, poolStatus, projectRepresentatives, type PoolStatus } from "../pool.js";
 import { listProRepoEntries, resolveProSlotForCwd, type ProRepoEntry, type ProSlotKind } from "../proProjects.js";
 import { repoTagFor } from "../repoTag.js";
 import { listSeals, loadLatestSeal } from "../seal.js";
@@ -249,7 +250,7 @@ export async function cmdBees(parsed: Parsed): Promise<void> {
     return;
   }
 
-  const { items, records } = await loadBeesTuiItems(parsed);
+  const { items, records, poolsLine } = await loadBeesTuiItems(parsed);
   const sidebar = truthy(flag(parsed, "sidebar"));
   const groupMode = (await readBeesGroupMode()) ?? undefined;
   // The sidebar lives beside one bee's window: start on that bee and mark it, so
@@ -260,6 +261,7 @@ export async function cmdBees(parsed: Parsed): Promise<void> {
     items,
     sidebar,
     groupMode,
+    ...(poolsLine ? { poolsLine } : {}),
     ...(currentName ? { currentName } : {}),
     onGroupChange: async (mode) => {
       // Persist globally so every sidebar (and the next launch) shares the facet.
@@ -305,7 +307,42 @@ export async function cmdBees(parsed: Parsed): Promise<void> {
 }
 
 
-export async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[]; records: SessionRecord[] }> {
+/** One pool's capacity chip for the TUI strip, e.g. "core 4/6 · 2 busy". */
+export function poolCapacityChip(status: Pick<PoolStatus, "pool" | "free" | "size" | "busy">): string {
+  return `${status.pool} ${status.free}/${status.size}${status.free === 0 ? " (will extend)" : ` · ${status.busy} busy`}`;
+}
+
+/**
+ * The pools capacity strip for `hive bees`: chips for every pool of the
+ * projects the visible bees live in, from the same derived-state pass the
+ * catalog used (no extra probing). Best-effort — no pro / no pools / any
+ * failure → undefined and the TUI simply omits the row.
+ */
+async function beesPoolsLine(
+  items: BeesTuiItem[],
+  records: SessionRecord[],
+  context: Parameters<typeof liveBeesFromSessions>[1],
+  entries: ProRepoEntry[],
+): Promise<string | undefined> {
+  try {
+    const projects = new Set(items.filter((item) => item.proArea).map((item) => `${item.proArea}/${item.proProject}`));
+    if (projects.size === 0) return undefined;
+    const liveBees = liveBeesFromSessions(records, context);
+    const chips: string[] = [];
+    for (const scope of projectRepresentatives(entries)) {
+      if (!projects.has(`${scope.area}/${scope.project}`)) continue;
+      const pools = await poolsForProject(scope, entries).catch(() => []);
+      for (const pool of pools) {
+        chips.push(poolCapacityChip(await poolStatus(pool, { liveBees })));
+      }
+    }
+    return chips.length > 0 ? `pools: ${chips.join(" | ")}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[]; records: SessionRecord[]; poolsLine?: string }> {
   const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
   const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")) : undefined;
   const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
@@ -362,6 +399,11 @@ export async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTui
             ...(pro.slot ? { proSlotKind: pro.kind as ProSlotKind, proSlotName: pro.slot } : {}),
           }
         : {}),
+      // Pool attribution comes from the record (poolKey/poolMember), never
+      // re-derived; the display label prefers the member dir name from the cwd.
+      ...(record.poolKey
+        ? { poolMemberLabel: pro?.slot ?? (record.poolMember !== undefined ? `#${record.poolMember}` : record.poolKey) }
+        : {}),
       searchText: beesTuiSearchText({
         name: record.name,
         displayName: displayName === "=" ? record.name : displayName,
@@ -375,7 +417,8 @@ export async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTui
       }),
     };
   });
-  return { items, records };
+  const poolsLine = await beesPoolsLine(items, records, context, proEntries);
+  return { items, records, ...(poolsLine ? { poolsLine } : {}) };
 }
 
 

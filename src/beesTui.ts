@@ -41,6 +41,12 @@ export type BeesTuiItem = {
    */
   proSlotKind?: ProSlotKind;
   proSlotName?: string;
+  /**
+   * Checkout-pool member attribution (from SessionRecord.poolKey/poolMember —
+   * never re-derived), e.g. "core-3". Upgrades the slot glyph to `⎇ core-3` so
+   * pool bees read apart from ad-hoc checkout bees at a glance.
+   */
+  poolMemberLabel?: string;
   /** Fuzzy index string (name, title, colony, swarm, agent, cwd, detail, slot). */
   searchText: string;
 };
@@ -78,6 +84,12 @@ export type RunBeesTuiOptions = {
    * it; the TUI re-renders afterward.
    */
   onPreview?: (item: BeesTuiItem) => void | Promise<void>;
+  /**
+   * Checkout-pool capacity strip rendered under the header (e.g.
+   * "pools: core 4/6 · 2 busy | fleet 0/3 (will extend)"). Static per launch;
+   * absent (or a narrow sidebar) hides the row.
+   */
+  poolsLine?: string;
   /** Initial grouping facet (default colony/swarm). */
   groupMode?: BeesGroupMode;
   /** Persist the grouping facet (global config) so every sidebar shares it. */
@@ -534,7 +546,9 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
       if (tui.done) return;
       const width = Math.max(12, stdout.columns || 80);
       const height = Math.max(8, stdout.rows || 24);
-      const bodyRows = Math.max(2, height - 5);
+      // The pools capacity strip takes one chrome row when present.
+      const poolsRow = options.poolsLine && width >= 38 ? [dim(truncate(options.poolsLine, width))] : [];
+      const bodyRows = Math.max(2, height - 5 - poolsRow.length);
       scroll = Math.min(scroll, Math.max(0, flat.length - bodyRows));
       if (cursor < scroll) scroll = cursor;
       if (cursor >= scroll + bodyRows) scroll = cursor - bodyRows + 1;
@@ -542,6 +556,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
       const lines = [
         renderTitle(width, catalog.length, query, matchCount),
         renderHelp(width),
+        ...poolsRow,
         "",
       ];
       if (confirmKill) {
@@ -665,8 +680,11 @@ export function stepBeesCursor(flat: FlatRow[], cursor: number, delta: number): 
  * Leading icon for a bee living in a pro worktree/checkout (⧉ worktree,
  * ⎇ checkout), prefixed onto the title column so two bees in the same repo read
  * apart at a glance. "" for canonical-repo bees so their title stays clean.
+ * A checkout-pool member carries its member name too (`⎇ core-3`) — exported
+ * for the glyph test so the convention can't silently drift.
  */
-function slotGlyph(item: BeesTuiItem): string {
+export function slotGlyph(item: Pick<BeesTuiItem, "proSlotKind" | "poolMemberLabel">): string {
+  if (item.poolMemberLabel) return `⎇ ${item.poolMemberLabel}`;
   if (!item.proSlotKind) return "";
   return item.proSlotKind === "worktree" ? "⧉" : "⎇";
 }
