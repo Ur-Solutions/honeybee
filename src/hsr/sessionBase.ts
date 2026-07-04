@@ -65,35 +65,27 @@ export async function spawnSessionChild(
   return child;
 }
 
-/** The shared per-session plumbing a runner builds its RunnerSession from. */
-export type SessionPlumbing = {
+/**
+ * The child-agnostic core of the session plumbing: the event queue backing the
+ * AsyncIterable, the ring buffer, ingest, and stream teardown. Extracted so
+ * tier-"turn" runners (turnRunner.ts) — whose SESSION outlives many short
+ * per-turn children — can own one plumbing across all of them, while the
+ * one-child tiers keep the attachSessionPlumbing wrapper below.
+ */
+export type SessionPlumbingCore = {
   /** The structured event stream backing RunnerSession.events. */
   events: AsyncIterable<RunnerEvent>;
   /** Stamp ts (when 0/absent), queue, persist to events.jsonl, ring on text. */
   ingestEvent(event: RunnerEvent): void;
   /** Rendered text tail (RunnerSession.snapshot). */
   snapshot(lines?: number): string;
-  /** True once the child has exited. */
-  hasExited(): boolean;
-  /** Resolves when the child has exited and the plumbing is torn down. */
-  exitedPromise: Promise<void>;
-  /** SIGTERM the child's process group, SIGKILL after a grace; awaits exit. */
-  stop(): Promise<void>;
+  /** Flush any debounced ring.txt write immediately. */
+  flushRing(): void;
+  /** End the event stream (idempotent); waiters see done immediately. */
+  endStream(): void;
 };
 
-/**
- * Install the shared plumbing on a freshly spawned session child: event queue,
- * ring buffer, ingest, exit teardown, and group stop. `onChildExit` runs FIRST
- * in the exit handler, before the exit event is ingested — a runner disposes
- * its transport there (e.g. the codex RPC peer).
- */
-export function attachSessionPlumbing(
-  bee: string,
-  child: ChildProcess,
-  hooks: { onChildExit?: () => void } = {},
-): SessionPlumbing {
-  const childPgid = child.pid as number; // detached ⇒ leader of its own group
-
+export function createSessionPlumbing(bee: string): SessionPlumbingCore {
   // --- structured event queue (backs the AsyncIterable) ----------------------
   const queue: RunnerEvent[] = [];
   const waiters: Array<(r: IteratorResult<RunnerEvent>) => void> = [];
@@ -157,6 +149,83 @@ export function attachSessionPlumbing(
     }
   };
 
+  function snapshot(lines?: number): string {
+    if (lines === undefined) return ringText;
+    const all = ringText.split("\n");
+    // Drop a trailing empty produced by the terminal newline before slicing.
+    if (all.length > 0 && all[all.length - 1] === "") all.pop();
+    return all.slice(Math.max(0, all.length - lines)).join("\n");
+  }
+
+  return { events, ingestEvent, snapshot, flushRing, endStream };
+}
+
+/**
+ * SIGTERM a detached child's process group, SIGKILL after a short grace, and
+ * wait for its exit. Shared by the one-child stop below and the turn runner's
+ * per-turn/stop teardown.
+ */
+export async function stopChildGroup(child: ChildProcess, hasExited: () => boolean, exitedPromise: Promise<void>): Promise<void> {
+  if (hasExited()) return exitedPromise;
+  const childPgid = child.pid as number; // detached ⇒ leader of its own group
+  try {
+    process.kill(-childPgid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+      // Fall back to signalling just the child if the group signal fails.
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+    }
+  }
+  const deadline = Date.now() + STOP_GRACE_MS;
+  while (!hasExited() && Date.now() < deadline) await sleep(STOP_POLL_MS);
+  if (!hasExited()) {
+    try {
+      process.kill(-childPgid, "SIGKILL");
+    } catch {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+    }
+  }
+  await exitedPromise;
+}
+
+/** The shared per-session plumbing a one-child runner builds its RunnerSession from. */
+export type SessionPlumbing = {
+  /** The structured event stream backing RunnerSession.events. */
+  events: AsyncIterable<RunnerEvent>;
+  /** Stamp ts (when 0/absent), queue, persist to events.jsonl, ring on text. */
+  ingestEvent(event: RunnerEvent): void;
+  /** Rendered text tail (RunnerSession.snapshot). */
+  snapshot(lines?: number): string;
+  /** True once the child has exited. */
+  hasExited(): boolean;
+  /** Resolves when the child has exited and the plumbing is torn down. */
+  exitedPromise: Promise<void>;
+  /** SIGTERM the child's process group, SIGKILL after a grace; awaits exit. */
+  stop(): Promise<void>;
+};
+
+/**
+ * Install the shared plumbing on a freshly spawned session child: event queue,
+ * ring buffer, ingest, exit teardown, and group stop. `onChildExit` runs FIRST
+ * in the exit handler, before the exit event is ingested — a runner disposes
+ * its transport there (e.g. the codex RPC peer). For tiers whose session spans
+ * MANY children (turn), use createSessionPlumbing + stopChildGroup directly.
+ */
+export function attachSessionPlumbing(
+  bee: string,
+  child: ChildProcess,
+  hooks: { onChildExit?: () => void } = {},
+): SessionPlumbing {
+  const core = createSessionPlumbing(bee);
+
   // --- child exit -------------------------------------------------------------
   let exited = false;
   let resolveExited!: () => void;
@@ -166,9 +235,9 @@ export function attachSessionPlumbing(
   child.once("exit", (code, signal) => {
     exited = true;
     hooks.onChildExit?.();
-    ingestEvent({ type: "exit", ts: Date.now(), code: code ?? null, signal: signal ?? undefined });
-    flushRing();
-    endStream();
+    core.ingestEvent({ type: "exit", ts: Date.now(), code: code ?? null, signal: signal ?? undefined });
+    core.flushRing();
+    core.endStream();
     // Node does NOT auto-close the parent-side stdio pipes on child exit — the
     // stdin write pipe in particular stays an open handle and would keep the
     // host's event loop alive forever (a zombie __hsr-run process that never
@@ -179,51 +248,12 @@ export function attachSessionPlumbing(
     resolveExited();
   });
 
-  function snapshot(lines?: number): string {
-    if (lines === undefined) return ringText;
-    const all = ringText.split("\n");
-    // Drop a trailing empty produced by the terminal newline before slicing.
-    if (all.length > 0 && all[all.length - 1] === "") all.pop();
-    return all.slice(Math.max(0, all.length - lines)).join("\n");
-  }
-
-  async function stop(): Promise<void> {
-    if (exited) return exitedPromise;
-    // SIGTERM the whole process group, then SIGKILL after a short grace.
-    try {
-      process.kill(-childPgid, "SIGTERM");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-        // Fall back to signalling just the child if the group signal fails.
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-      }
-    }
-    const deadline = Date.now() + STOP_GRACE_MS;
-    while (!exited && Date.now() < deadline) await sleep(STOP_POLL_MS);
-    if (!exited) {
-      try {
-        process.kill(-childPgid, "SIGKILL");
-      } catch {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // ignore
-        }
-      }
-    }
-    await exitedPromise;
-  }
-
   return {
-    events,
-    ingestEvent,
-    snapshot,
+    events: core.events,
+    ingestEvent: core.ingestEvent,
+    snapshot: core.snapshot,
     hasExited: () => exited,
     exitedPromise,
-    stop,
+    stop: () => stopChildGroup(child, () => exited, exitedPromise),
   };
 }
