@@ -64,7 +64,7 @@ async function withPoolFixture(fn: (fixture: Fixture) => Promise<void>): Promise
     await pro(["mk", "repo", "widget"], join(proRoot, "lab", "demo"));
     const repoPath = join(proRoot, "lab", "demo", "repos", "widget");
     await git(["-c", "user.email=t@e", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"], repoPath);
-    await pro(["pool", "create", "core", "--occupancy", "1", "--max-size", "2"], repoPath);
+    await pro(["pool", "create", "core", "--occupancy", "1", "--max-size", "2", "--min-free", "1"], repoPath);
     await pro(["pool", "extend", "core", "1"], repoPath);
     await fn({ proRoot, storeRoot, repoPath });
   } finally {
@@ -86,6 +86,7 @@ test("pool allocation against a real pro project: claim, rr cursor, auto-extend,
     // Name resolution from inside the repo cwd; exact key resolves too.
     const pool = await resolvePoolRef("core", repoPath);
     assert.equal(pool.key, "lab-demo-widget-core");
+    assert.equal(pool.config.minFree, 1, "minFree round-trips through the real porcelain");
     const byKey = await resolvePoolRef("lab-demo-widget-core", tmpdir());
     assert.equal(byKey.key, pool.key);
 

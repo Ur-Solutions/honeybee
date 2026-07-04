@@ -27,6 +27,17 @@ test("parseProPoolPorcelain parses pool and member records", () => {
   });
 });
 
+test("parseProPoolPorcelain reads the trailing minFree column; '-'/absent (older pro) → unset", () => {
+  const { pools } = parseProPoolPorcelain([
+    "pool\twidget\twarm\tmain\t1\t32\t2",
+    "pool\twidget\tcold\tmain\t1\t32\t-",
+    "pool\twidget\told\tmain\t1\t32", // pre-minFree pro: column missing entirely
+  ].join("\n"));
+  assert.equal(pools[0]!.minFree, 2);
+  assert.equal(pools[1]!.minFree, undefined);
+  assert.equal(pools[2]!.minFree, undefined);
+});
+
 test('parseProPoolPorcelain maps "-" ahead/behind (missing origin ref) to undefined', () => {
   const out = "member\twidget\tcore\t3\t/p/checkouts/widget/core-3\tmain\t0\t-\t-";
   const { members } = parseProPoolPorcelain(out);
