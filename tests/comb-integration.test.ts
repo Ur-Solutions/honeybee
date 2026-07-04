@@ -51,7 +51,10 @@ async function runCli(
   try {
     const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
       cwd: process.cwd(),
-      env: { ...process.env, ...env, NO_COLOR: "1" },
+      // HIVE_BEE cleared: the suite may itself run inside a bee (agents test
+      // hive with hive), and an inherited stamp would satisfy `hive here`'s
+      // pane-less HSR path and break the outside-tmux assertions.
+      env: { ...process.env, HIVE_BEE: "", ...env, NO_COLOR: "1" },
       timeout: 20_000,
       maxBuffer: 1024 * 1024,
     });

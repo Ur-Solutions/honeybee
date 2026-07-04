@@ -394,7 +394,9 @@ test("tick: repairs stale live hive state without recording a transition", async
 
 test("tick: does not mirror uncertain booting over an existing live hive state", async () => {
   await withTempStore(async () => {
-    const record = bee({ agent: "claude", command: "claude" });
+    // A fresh createdAt keeps the no-output state at "booting" — an old record
+    // would legitimately derive "wedged" (BOOT_WEDGE_MS) and dodge the point.
+    const record = bee({ agent: "claude", command: "claude", createdAt: new Date().toISOString() });
     const capture: Capture = { ledger: [], touches: [] };
     const mirrored: Array<{ name: string; state: BeeState }> = [];
     const deps: TickDeps = {
