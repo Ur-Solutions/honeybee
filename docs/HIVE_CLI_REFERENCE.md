@@ -197,6 +197,7 @@ hive kill ...
 hive clean ...
 hive attach ...
 hive colony ...
+hive pool ...
 hive frame ...
 hive swarm ...
 hive node ...
@@ -227,7 +228,8 @@ hive --version
 Start one or more bees in detached tmux sessions and persist session metadata.
 
 ```sh
-hive spawn <bee> [--name <id>] [--cwd <dir>] [--home|--profile <1|2|3|path>]
+hive spawn <bee> [--name <id>] [--cwd <dir>] [--pool <name> [--no-keep]]
+  [--home|--profile <1|2|3|path>]
   [--account <account>] [--autoswap] [--colony <name>]
   [--brief <text>] [--briefed] [--count <n>]
   [--swarm-id <id>|--swarm <id>] [--node <name>]
@@ -235,6 +237,15 @@ hive spawn <bee> [--name <id>] [--cwd <dir>] [--home|--profile <1|2|3|path>]
   [--accept-trust|--no-accept-trust] [--no-wait] [--boot-ms <ms>]
   [-- <bee-args...>]
 ```
+
+`--pool <name>` (also on `x`/`run`/`xa`/`open` — mutually exclusive with
+`--cwd`): allocate a member of a checkout pool and spawn the bee inside it —
+see [`hive pool`](#hive-pool). `--count N` claims N members in one lock
+acquisition, auto-extending the pool as needed; each bee lands in its own
+member. The bee's record carries `poolKey`/`poolMember` for attribution. If
+the spawn fails, the claim is dropped; a member the allocation freshly cloned
+is kept by default (`--no-keep` deletes it on rollback). Local substrates only
+(tmux/HSR) — pool members are local paths.
 
 Single bee:
 
@@ -1199,6 +1210,62 @@ hive swarm destroy @quick-review
 
 Destroy kills all member bees and marks the swarm destroyed only if all kills
 succeed.
+
+## Checkout Pools
+
+### `hive pool`
+
+Checkout pools (CHECKOUT_POOLS_PRD): named, elastically sized sets of
+pre-cloned `pro co` checkouts (`checkouts/<repo>/<pool>-<n>`) that bees claim
+round-robin and release by going terminal. Pool config (base branch,
+`maxOccupancy`, `maxSize`) and membership are **pro's** truth (`pro pool` —
+requires a pool-enabled `pro` on PATH; without one every pool verb fails with
+a typed, actionable error). hive owns only what cannot be derived — the
+round-robin cursor, in-flight claims, and parked members — in
+`~/.hive/pools/<key>.json` (key `<area>-<project>-<repo>-<pool>`). Deleting
+that file is harmless: the cursor resets and claims rebuild from live bees.
+
+```sh
+hive pool                          # pools in scope: occupancy like core 4/6 (2 busy · 4 free)
+hive pool status [<pool>] [--json] # member table: n, state, bees, branch, ahead/behind, path
+hive pool spawn <pool> <bee> [spawn flags…]   # allocate + spawn (= hive spawn <bee> --pool <pool>)
+hive pool extend <pool> [N]        # manual grow (delegates to pro pool extend)
+hive pool sync [<pool>|--all]      # occupancy-aware sync of FREE members only
+hive pool claim <pool> [n] [--ttl <age>]      # manual claim (specific member with n)
+hive pool release <pool> <n>       # drop all claims on member n
+hive pool park <pool> <n>          # withhold a member from allocation
+hive pool unpark <pool> <n>
+```
+
+Scope: inside a pro project, verbs see that project's pools; outside, all
+projects. A pool argument resolves as the exact key first, else by unique
+pool name in scope.
+
+Occupancy is **derived, never stored**: a member is inhabited by every live,
+non-terminal bee whose cwd is inside the member path. Claims are short-lived
+(~120 s, `HIVE_POOL_CLAIM_TTL_MS`) bridges between allocation and the bee's
+record existing; `hive kill`/`clean` drop a killed bee's claim eagerly, and
+expiry is the backstop. Free capacity per member is
+`maxOccupancy − (live inhabitants + unconsumed claims)`.
+
+Allocation picks the **emptiest** free member, ties broken round-robin (first
+member number past the cursor, wrapping). When nothing is free the pool
+**auto-extends** via `pro pool extend`; `maxSize` is a soft cap — extension
+past it proceeds with a loud warning.
+
+`hive pool sync` computes the free set and passes only those members to
+`pro co sync <members…> --rebase` (per-member: dirty → `skipped-dirty`,
+off-base → `skipped-parked`, conflicted rebase aborted + reverted
+byte-identical → `failed-rebase-reverted`). Inhabited or claimed members are
+reported as `skipped-inhabited` and never touched. Ad-hoc (non-pool)
+checkouts are pro's territory: `pro co sync [NAME…] [--all] [--rebase]`.
+
+`hive pool status --json` is the machine contract (Apiary): the full derived
+model — per pool `key/area/project/repo/pool/repoPath/branch/maxOccupancy/
+maxSize/size/busy/free/rrCursor/exceedsMaxSize` plus per member
+`n/path/branch/dirty/ahead/behind/parked/occupants/pendingClaims/free` — and
+an `adhocCheckouts` array (non-pool checkouts of the same repos with derived
+occupants).
 
 ## Nodes and Substrates
 
