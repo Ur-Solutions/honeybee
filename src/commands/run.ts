@@ -2,7 +2,7 @@
 // attach, or present it where you are.
 // Extracted from cli.ts (HIVE-15).
 import { activateAccountIntoHome, defaultHomeForAccount, seedClaudeHomeAcceptance, syncAccountCredentialsToVault } from "../accounts.js";
-import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand } from "../agents.js";
+import { assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { bootMsForAgent } from "../drivers.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeHiveState } from "../hiveState.js";
@@ -337,6 +337,7 @@ export async function cmdOpenRaw(parsed: Parsed) {
   if (account) {
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
     await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+    refreshIdentityEnv(spec);
   }
   const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
   // Re-merge the startup acceptances activation just clobbered (and seed them
@@ -345,7 +346,9 @@ export async function cmdOpenRaw(parsed: Parsed) {
   if (spec.kind === "claude" && spec.homePath) {
     await seedClaudeHomeAcceptance(spec.homePath, { yolo, trustCwd: acceptsTrust(parsed) ? cwd : undefined });
   }
-  const command = shellCommand(spec);
+  // This rendering is executed (window mode) or handed to the user (--print),
+  // so it must carry real secret env values — never store or display it.
+  const command = shellCommand(spec, { forExec: true });
   const appFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
   const wantsWindow = truthy(flag(parsed, "window")) || appFlag !== undefined;
   await appendLedger({

@@ -26,6 +26,7 @@ import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdTail, cmdTra
 import { cmdOpen, cmdRun, cmdX, cmdXa } from "./commands/run.js";
 import { cmdSeals, cmdSearch } from "./commands/search.js";
 import { cmdLaunch, cmdNew, cmdSpawn } from "./commands/spawn.js";
+import { cmdSpend } from "./commands/spend.js";
 import { cmdSwarm } from "./commands/swarm.js";
 
 // Re-exports consumed by the unit tests (tests/*.test.ts import these from
@@ -228,6 +229,9 @@ async function main(argv: string[]) {
     case "seals":
       await cmdSeals(parsed);
       break;
+    case "spend":
+      await cmdSpend(parsed);
+      break;
     case "help":
     case "--help":
     case "-h":
@@ -289,6 +293,7 @@ function printHelp() {
         ["wait", "<session>", "block until the bee goes idle or seals"],
         ["search", "<query>", "search seals, ledger, and session records (seals find: seals only)"],
         ["usage", "[<account>]", "progress against providers' real 5h/weekly limits (--live dashboard; alias: limits)"],
+        ["spend", "<ingest|report|leverage|…>", "local API-equivalent cost ledger + subscription leverage from transcripts"],
       ],
     },
     {

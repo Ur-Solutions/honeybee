@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { RunnerAdapter } from "./hsr/types.js";
 import { claudeAdapter } from "./hsr/adapters/claude.js";
 import { codexAdapter } from "./hsr/adapters/codex.js";
+import { cursorAdapter } from "./hsr/adapters/cursor.js";
 
 /**
  * IdentityRecipe describes how a provider's login materializes on disk so the
@@ -30,6 +33,27 @@ export type IdentityRecipe = {
   configFiles?: string[];
   /** Explicit extra env for activated spawns. "{home}" expands to the home path. */
   extraEnv?: Record<string, string>;
+  /**
+   * Dynamic identity env derived from the ACTIVATED home's credential files
+   * (cursor: CURSOR_AUTH_TOKEN/CURSOR_API_KEY from auth.json — the only
+   * per-process channel that beats its machine-global keychain slot). Applied
+   * wherever extraEnv is, and RE-MERGED post-activation by the spawn paths
+   * (refreshIdentityEnv), since resolveAgent may run before the fresh
+   * credential lands in the home. Must return {} when the file is
+   * absent/unreadable — never throw.
+   */
+  credentialEnv?: (homePath: string) => Record<string, string>;
+  /**
+   * Env keys whose values are secrets (injected by credentialEnv).
+   * shellCommand redacts them in the RENDERED command (stored records,
+   * `hive ls` display) — the real spawn env is never redacted.
+   */
+  secretEnvKeys?: string[];
+  /**
+   * Extra args for the login seat instead of the bare interactive TUI —
+   * cursor's login is a subcommand (`cursor-agent login`), not an in-TUI flow.
+   */
+  loginSeatArgs?: string[];
   /**
    * Whether a (re)login seat starts from the account's existing credentials.
    * Defaults to true: claude keeps its onboarding state and offers /login.
@@ -225,9 +249,30 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     kind: "cursor",
     homeEnv: "CURSOR_CONFIG_DIR",
     isReady: (pane) => /(?:^|\n)\s*[❯>]\s/.test(pane) || /Cursor Agent/i.test(pane),
+    // cursor-agent's credential store is NOT home-relative: macOS keeps the
+    // tokens in a machine-global keychain slot (services cursor-access-token /
+    // cursor-refresh-token, account cursor-user) and Linux in
+    // $XDG_CONFIG_HOME/cursor/auth.json — CURSOR_CONFIG_DIR relocates only
+    // cli-config.json. The vault therefore keeps a canonical auth.json
+    // ({accessToken,refreshToken,apiKey}, cursor's own file shape), activation
+    // stamps it into the home, and credentialEnv turns it into the
+    // CURSOR_API_KEY / CURSOR_AUTH_TOKEN env override — which beats the
+    // global store for API requests (verified), giving true per-bee identity.
     identity: {
-      credentialFiles: ["cli-config.json"],
+      credentialFiles: ["auth.json", "cli-config.json"],
+      credentialEnv: cursorCredentialEnv,
+      secretEnvKeys: ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"],
+      // `cursor-agent login` is a subcommand (browser OAuth), not an in-TUI
+      // flow; the seat runs it directly and exits when the login completes.
+      loginSeatArgs: ["login"],
+      seedLoginSeat: false,
     },
+    isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
+    modelArgs: (model) => (model ? ["--model", model] : []),
+    bootMs: 15_000,
+    resumeArgs: (sid) => (sid ? ["--resume", sid] : ["--continue"]),
+    resumeDetectFlags: ["--resume", "--continue"],
+    hsrAdapter: cursorAdapter,
   },
   pi: {
     kind: "pi",
@@ -285,17 +330,56 @@ export function identityRecipeForAgent(kind: string): IdentityRecipe | undefined
 
 /**
  * Explicit identity env for an activated home: the recipe's extraEnv with
- * "{home}" expanded. Returns {} for drivers without extras. Callers merge this
- * into the spawn env ONLY on identity-activation paths and log the result.
+ * "{home}" expanded, plus the recipe's dynamic credentialEnv (read from the
+ * home's credential files — empty until activation has stamped them, which is
+ * why spawn paths re-merge post-activation via refreshIdentityEnv). Returns {}
+ * for drivers without extras. Callers merge this into the spawn env ONLY on
+ * identity-activation paths and log the result.
  */
 export function identityEnvForAgent(kind: string, homePath: string): Record<string, string> {
-  const extra = agentDriver(kind)?.identity?.extraEnv;
-  if (!extra) return {};
+  const identity = agentDriver(kind)?.identity;
+  if (!identity) return {};
   const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(extra)) {
+  for (const [key, value] of Object.entries(identity.extraEnv ?? {})) {
     out[key] = value.replaceAll("{home}", homePath);
   }
+  if (identity.credentialEnv) Object.assign(out, identity.credentialEnv(homePath));
   return out;
+}
+
+/** Env keys the driver marks as secrets (redacted in RENDERED commands only). */
+export function secretEnvKeysForAgent(kind: string): string[] {
+  return agentDriver(kind)?.identity?.secretEnvKeys ?? [];
+}
+
+/** Extra args the login seat runs the tool with (cursor: `login`), or []. */
+export function loginSeatArgsForAgent(kind: string): string[] {
+  return agentDriver(kind)?.identity?.loginSeatArgs ?? [];
+}
+
+/**
+ * cursor's credentialEnv: turn the activated home's auth.json into the env
+ * override cursor-agent honors for API requests. An explicit apiKey wins
+ * (deliberate API billing, no expiry); else the OAuth accessToken rides
+ * CURSOR_AUTH_TOKEN. {} when the file is missing/invalid — the bee then falls
+ * back to the machine-global store, exactly like a plain un-accounted spawn.
+ */
+function cursorCredentialEnv(homePath: string): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(join(homePath, "auth.json"), "utf8")) as {
+      accessToken?: unknown;
+      apiKey?: unknown;
+    } | null;
+    if (parsed && typeof parsed.apiKey === "string" && parsed.apiKey.length > 0) {
+      return { CURSOR_API_KEY: parsed.apiKey };
+    }
+    if (parsed && typeof parsed.accessToken === "string" && parsed.accessToken.length > 0) {
+      return { CURSOR_AUTH_TOKEN: parsed.accessToken };
+    }
+    return {};
+  } catch {
+    return {};
+  }
 }
 
 export function exhaustionForAgent(kind: string, pane: string): ExhaustionHit | null {

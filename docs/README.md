@@ -183,6 +183,62 @@ shapes are preserved.
 End-to-end manual walkthrough lives in
 [`PHASE2_TEST_CHECKLIST.md`](./PHASE2_TEST_CHECKLIST.md).
 
+## Spend ledger (`hive spend`)
+
+`hive spend` builds a local, JSONL-backed ledger that prices your on-disk
+harness transcripts at published API list rates and reports the **leverage
+multiple** — API-equivalent USD (what the same tokens would have cost on the
+API) divided by your actual subscription cost — as a daily Europe/Oslo series.
+It is entirely local and never touches the network; all state lives under
+`~/.hive/spend/` (`events.jsonl`, `rates.json`, `seats.json`).
+
+Subcommands:
+
+- `hive spend ingest` — scan every seat's transcripts and append newly seen
+  priced events to the ledger (idempotent; re-run any time). `--full` re-reads
+  files even when unchanged; `--since <date>` ignores older events. Loudly lists
+  any model ids it saw that have no resolved rate.
+- `hive spend report` — the daily `(day, seat, model)` ledger of tokens + USD.
+  `--day <YYYY-MM-DD>` filters to one day; `--json` / `--csv` for machine output.
+- `hive spend leverage` — the daily API-equiv ÷ subscription series, per seat
+  plus a `portfolio` aggregate, with trailing 7- and 30-day rolling averages.
+  `--seat <id>` restricts to one seat; `--window 7|30` emphasizes a column.
+- `hive spend sessions` — per-session rollups with an orchestrator vs subagent
+  cost split and a model breakdown. `--top <N>` (default 20) keeps the leaders.
+- `hive spend blend` — token/USD blended by `(period, model)`. `--model <id>`
+  filters (substring); `--granularity day|month` sets the period.
+- `hive spend rates` — show the rate table. `--check` lists every model in the
+  ledger that hit the unknown/TODO path (so nothing prices silently at $0).
+- `hive spend seats` — discover config dirs and show the seat table, flagging
+  seats that still need a `monthlyUsd`.
+
+**Seat attribution** is deliberately simple: one *seat* == one harness config
+dir. `~/.claude` → `claude:default`, `~/.claude-2` → `claude:claude-2`,
+`~/.codex` → `codex:default`, and so on (backup/mirror dirs are skipped). A
+transcript is attributed to the seat whose config dir it lives under. `ingest`
+scaffolds one entry per discovered dir into `~/.hive/spend/seats.json` with
+`provider`/`plan`/`monthlyUsd` left blank — **fill in `monthlyUsd`** (your actual
+subscription cost per month) so that seat can participate in leverage. Seats
+without it are still counted in the daily ledger, just excluded from leverage.
+
+**Adjusting a model's rate:** edit `~/.hive/spend/rates.json`. Rules match a raw
+model id by substring or `*` wildcard (longest literal match wins). Each rule
+carries versioned prices (`effectiveFrom` dates; the latest version on or before
+an event's day is applied), so a mid-life price change is captured by adding a
+new version rather than rewriting history. Rates are USD per 1,000,000 tokens,
+split across `input`/`output`/`cacheRead`/`cacheWrite5m`/`cacheWrite1h`. A model
+you have seen but not yet priced is registered as a `todo:true` rule (empty
+versions): it is counted and flagged loudly, never priced at zero. To price it,
+set `todo:false` and add a version; a `null` price field is an explicit
+"unknown" that keeps the event on the unresolved path.
+
+**Adding a harness parser:** the ingest pipeline is per-harness. Add an
+extractor for the new harness in `src/spend/extract.ts` (map its usage rows to
+`SpendEvent` token tiers with a reproducible dedup `id`) and teach
+`src/spend/discover.ts` where that harness stores its transcripts under a config
+dir. Register the config-dir naming in `src/spend/seats.ts` so its seats are
+discovered, and add rate rules in `src/spend/rates.ts`.
+
 ## Naming notes
 
 The project is now **honeybee**, its CLI is **hive**, and interactive workers are **bees**. New session metadata is written under `~/.hive`; old `~/.agentpit` sessions are still visible for migration safety. The old `ap` binary name remains as a compatibility alias for the same CLI.

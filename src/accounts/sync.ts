@@ -2,6 +2,7 @@ import { identityRecipeForAgent } from "../drivers.js";
 import { listAccounts, type AccountRecord } from "./registry.js";
 import { syncClaudeChainToVault, type ChainSyncResult } from "./claudeChain.js";
 import { syncCodexAuthToVault, type CodexAuthSyncResult } from "./codexAuth.js";
+import { syncCursorAuthToVault, type CursorAuthSyncResult } from "./cursorAuth.js";
 import { syncGrokAuthToVault, type GrokAuthSyncResult } from "./grokAuth.js";
 import { syncGenericCredentialsToVault, type GenericCredentialSyncResult } from "./genericSync.js";
 import type { SyncAccountCredentialsOptions } from "./credentialSync.js";
@@ -9,6 +10,7 @@ import type { SyncAccountCredentialsOptions } from "./credentialSync.js";
 export type AccountCredentialSyncResult =
   | ChainSyncResult
   | CodexAuthSyncResult
+  | CursorAuthSyncResult
   | GrokAuthSyncResult
   | GenericCredentialSyncResult;
 
@@ -24,6 +26,7 @@ const SYNC_BY_TOOL: Record<
   claude: (account, extraHome) => syncClaudeChainToVault(account, extraHome),
   codex: (account, extraHome) => syncCodexAuthToVault(account, extraHome),
   grok: (account, extraHome, options) => syncGrokAuthToVault(account, extraHome, options),
+  cursor: (account, extraHome, options) => syncCursorAuthToVault(account, extraHome, options),
 };
 
 export async function syncAccountCredentialsToVault(

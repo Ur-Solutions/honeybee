@@ -82,6 +82,15 @@ export {
   syncGrokAuthToVault,
 } from "./accounts/grokAuth.js";
 
+export {
+  type CursorAuthSnapshot,
+  assertCursorHomeAuthFresh,
+  cursorLiveAuthDigest,
+  readCursorLiveAuth,
+  type CursorAuthSyncResult,
+  syncCursorAuthToVault,
+} from "./accounts/cursorAuth.js";
+
 export { type GenericCredentialSyncResult, syncGenericCredentialsToVault } from "./accounts/genericSync.js";
 
 export { type SyncAccountCredentialsOptions } from "./accounts/credentialSync.js";
