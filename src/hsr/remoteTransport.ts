@@ -62,6 +62,20 @@ const FORWARD_ARGS: string[] = [
   "-o", "ExitOnForwardFailure=yes",
   "-o", "StreamLocalBindUnlink=yes",
 ];
+// The long-lived `ssh -N -L` tunnel MUST NOT share the ControlPersist master:
+// `ControlMaster=auto` + `ControlPersist` makes the foreground `ssh -N` hand its
+// forward to a backgrounded master and exit 0 immediately — which openSshSocketForward
+// (rightly) treats as the tunnel dying, and which also lets successive tunnels
+// race one another for the local socket via StreamLocalBindUnlink. A dedicated,
+// non-multiplexed connection keeps the foreground process alive for the tunnel's
+// whole life (so the handle's kill()/closed semantics hold) at the cost of one
+// extra 0.4s handshake per node — negligible for a long-lived tunnel. Verified
+// against a real host: the shared-master form binds a flapping socket that never
+// carries RPC traffic; this form binds a stable, pingable socket. (APIA-97-live)
+const FORWARD_CONTROL_ARGS: string[] = [
+  "-o", "ControlMaster=no",
+  "-o", `ConnectTimeout=${DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS}`,
+];
 
 /** Per-call timeout default. Mirrors rpc.ts's per-call discipline and stays well
  *  under the daemon's 60s dispatch budget (HIVE_DAEMON_DISPATCH_TIMEOUT_MS). */
@@ -121,6 +135,12 @@ function controlArgsFor(node: NodeRecord): string[] {
   return node.sshArgs && node.sshArgs.length > 0 ? [...node.sshArgs] : CONTROL_MASTER_ARGS;
 }
 
+// The forward is a dedicated (non-master) connection — see FORWARD_CONTROL_ARGS.
+// User-supplied sshArgs still win wholesale (they may pin -F/-i for the node).
+function forwardControlArgsFor(node: NodeRecord): string[] {
+  return node.sshArgs && node.sshArgs.length > 0 ? [...node.sshArgs] : FORWARD_CONTROL_ARGS;
+}
+
 /** The `ssh <endpoint> <remoteCommand>` argv used by ensureRemoteServe. */
 export function buildServeExecArgv(node: NodeRecord, remoteCommand: string): string[] {
   return [sshBinaryFor(node), ...controlArgsFor(node), node.endpoint, remoteCommand];
@@ -131,7 +151,7 @@ export function buildSshForwardArgv(node: NodeRecord, localSocket: string, remot
   return [
     sshBinaryFor(node),
     "-N",
-    ...controlArgsFor(node),
+    ...forwardControlArgsFor(node),
     ...FORWARD_ARGS,
     "-L", `${localSocket}:${remoteSocket}`,
     node.endpoint,
@@ -155,6 +175,28 @@ function requireVersion(node: NodeRecord): string {
 
 // --- 1. ensureRemoteServe -----------------------------------------------------
 
+type RunRemote = (cmd: string) => ReturnType<SshExecHook>;
+
+/**
+ * Expand a `~/…`-relative remote socket path to an absolute one via the remote
+ * `$HOME`. Absolute paths pass through untouched. On any failure (odd shell, no
+ * HOME) the original path is returned so behaviour never regresses below the
+ * previous shell-expanded-only path. See ensureRemoteServe for why this matters.
+ */
+export async function resolveRemoteSocket(runRemote: RunRemote, remoteSocket: string): Promise<string> {
+  if (!remoteSocket.startsWith("~/")) return remoteSocket;
+  try {
+    const home = await runRemote(`printf %s "$HOME"`);
+    const resolved = home.stdout.trim();
+    if (home.exitCode === 0 && resolved.startsWith("/")) {
+      return resolved.replace(/\/$/, "") + remoteSocket.slice(1);
+    }
+  } catch {
+    // fall through to the original path
+  }
+  return remoteSocket;
+}
+
 export type EnsureServeOptions = RemoteTransportDeps & {
   remoteSocket?: string;
   pollAttempts?: number;
@@ -174,12 +216,19 @@ export async function ensureRemoteServe(
   const version = requireVersion(node);
   const exec = opts.execHook ?? defaultSshExecHook;
   const sleep = opts.sleep ?? defaultSleep;
-  const remoteSocket = opts.remoteSocket ?? DEFAULT_REMOTE_SOCKET;
   const bundle = remoteBundlePath(version);
   const attempts = opts.pollAttempts ?? DEFAULT_SERVE_POLL_ATTEMPTS;
   const intervalMs = opts.pollIntervalMs ?? DEFAULT_SERVE_POLL_INTERVAL_MS;
 
   const runRemote = (cmd: string) => exec(buildServeExecArgv(node, cmd));
+
+  // Resolve the socket to an ABSOLUTE remote path. The remote SHELL expands `~`
+  // when starting/probing the serve, but the ssh `-L` forward target is NOT
+  // shell-expanded by sshd — a `~`-relative socket binds the local end yet
+  // forwards to a non-existent remote path, so the tunnel carries no RPC traffic.
+  // Expand once via the remote `$HOME` ("$HOME" is safe to double-quote; `~` is
+  // not, as it would not expand inside quotes) so serve-bind and forward agree.
+  const remoteSocket = await resolveRemoteSocket(runRemote, opts.remoteSocket ?? DEFAULT_REMOTE_SOCKET);
 
   // Already up?
   const probe = await runRemote(`test -S ${remoteSocket}`);
@@ -434,8 +483,11 @@ export async function connectRemoteRunnerHost(
   }
 
   async function establish(): Promise<void> {
-    await ensureRemoteServe(node, serveOpts);
-    const tunnel = await openSshSocketForward(node, forwardOpts);
+    // ensureRemoteServe resolves `~/…` → an absolute remote path (sshd does not
+    // expand `~` in a `-L` forward target). Forward to THAT resolved path so the
+    // tunnel reaches the socket the serve actually bound.
+    const { remoteSocket: resolvedRemoteSocket } = await ensureRemoteServe(node, serveOpts);
+    const tunnel = await openSshSocketForward(node, { ...forwardOpts, remoteSocket: resolvedRemoteSocket });
     let client: RpcClient;
     try {
       client = await connect(tunnel.localSocket);

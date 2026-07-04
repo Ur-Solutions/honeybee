@@ -118,6 +118,8 @@ function serveUpExecHook(trace: string[]): SshExecHook {
   return async (argv) => {
     const cmd = argv[argv.length - 1] ?? "";
     trace.push(cmd);
+    // resolveRemoteSocket expands `~/…` via the remote $HOME before probing.
+    if (cmd.startsWith("printf")) return { stdout: "/home/me", stderr: "", exitCode: 0 };
     if (cmd.startsWith("test -S")) return { stdout: "", stderr: "", exitCode: 0 };
     return { stdout: "", stderr: "", exitCode: 0 };
   };
@@ -128,8 +130,10 @@ function serveUpExecHook(trace: string[]): SshExecHook {
 test("ensureRemoteServe: socket already present → single `test -S`, no serve start", async () => {
   const trace: string[] = [];
   const { remoteSocket } = await ensureRemoteServe(makeNode(), { execHook: serveUpExecHook(trace) });
-  assert.equal(remoteSocket, "~/.hive/runner-host/control.sock");
-  assert.deepEqual(trace, ["test -S ~/.hive/runner-host/control.sock"]);
+  // `~/…` is resolved to an absolute remote path (sshd does not expand `~` in a
+  // `-L` forward target), so serve-bind and forward agree on the same socket.
+  assert.equal(remoteSocket, "/home/me/.hive/runner-host/control.sock");
+  assert.deepEqual(trace, ['printf %s "$HOME"', "test -S /home/me/.hive/runner-host/control.sock"]);
 });
 
 test("ensureRemoteServe: missing socket → starts detached setsid node serve, then polls test -S", async () => {
@@ -138,6 +142,7 @@ test("ensureRemoteServe: missing socket → starts detached setsid node serve, t
   const execHook: SshExecHook = async (argv) => {
     const cmd = argv[argv.length - 1] ?? "";
     trace.push(cmd);
+    if (cmd.startsWith("printf")) return { stdout: "/home/me", stderr: "", exitCode: 0 };
     if (cmd.startsWith("test -S")) {
       return { stdout: "", stderr: "", exitCode: socketUp ? 0 : 1 };
     }
@@ -152,12 +157,13 @@ test("ensureRemoteServe: missing socket → starts detached setsid node serve, t
     sleep: async () => {},
     pollAttempts: 5,
   });
-  assert.equal(remoteSocket, "~/.hive/runner-host/control.sock");
-  // Sequence: probe (miss) → setsid start → probe (hit).
-  assert.equal(trace[0], "test -S ~/.hive/runner-host/control.sock");
+  assert.equal(remoteSocket, "/home/me/.hive/runner-host/control.sock");
+  // Sequence: resolve $HOME → probe (miss) → setsid start → probe (hit).
+  assert.equal(trace[0], 'printf %s "$HOME"');
+  assert.equal(trace[1], "test -S /home/me/.hive/runner-host/control.sock");
   const start = trace.find((c) => c.startsWith("setsid node"));
   assert.ok(start, "must issue a `setsid node <bundle> serve --socket` start");
-  assert.match(start!, /setsid node ~\/\.hive\/runner-host\/hive-runner-host-0\.0\.1\+deadbeef1234\.mjs serve --socket ~\/\.hive\/runner-host\/control\.sock/);
+  assert.match(start!, /setsid node ~\/\.hive\/runner-host\/hive-runner-host-0\.0\.1\+deadbeef1234\.mjs serve --socket \/home\/me\/\.hive\/runner-host\/control\.sock/);
   assert.ok(trace.filter((c) => c.startsWith("test -S")).length >= 2, "must poll test -S after starting");
 });
 
@@ -170,20 +176,22 @@ test("ensureRemoteServe: rejects a node without runnerHostVersion", async () => 
 
 // --- ssh forward argv (the real wire, asserted via the hook) ------------------
 
-test("buildSshForwardArgv: contains -N, -L <local>:<remote>, ControlMaster=auto, StreamLocalBindUnlink=yes", () => {
-  const argv = buildSshForwardArgv(makeNode(), "/local/control.sock", "~/.hive/runner-host/control.sock");
+test("buildSshForwardArgv: contains -N, -L <local>:<remote>, dedicated ControlMaster=no, StreamLocalBindUnlink=yes", () => {
+  const argv = buildSshForwardArgv(makeNode(), "/local/control.sock", "/home/me/.hive/runner-host/control.sock");
   assert.ok(argv.includes("-N"));
   const li = argv.indexOf("-L");
   assert.ok(li >= 0);
-  assert.equal(argv[li + 1], "/local/control.sock:~/.hive/runner-host/control.sock");
-  assert.ok(argv.includes("ControlMaster=auto"));
+  assert.equal(argv[li + 1], "/local/control.sock:/home/me/.hive/runner-host/control.sock");
   assert.ok(argv.includes("ConnectTimeout=8"));
   assert.ok(argv.includes("ExitOnForwardFailure=yes"));
   assert.ok(argv.includes("StreamLocalBindUnlink=yes"));
   assert.equal(argv[0], "ssh");
   assert.equal(argv[argv.length - 1], "me@remote-host");
-  // ControlPath uses the shared %C hash so it reuses the ssh-tmux master.
-  assert.ok(argv.includes("ControlPath=~/.ssh/hive-%C"));
+  // The long-lived tunnel is a DEDICATED connection: sharing the ControlPersist
+  // master makes `ssh -N` background itself and exit, which reads as tunnel death.
+  assert.ok(argv.includes("ControlMaster=no"), "forward must not join the shared master");
+  assert.ok(!argv.includes("ControlMaster=auto"));
+  assert.ok(!argv.includes("ControlPath=~/.ssh/hive-%C"), "forward must not reuse the %C master path");
 });
 
 test("buildServeExecArgv: `ssh <endpoint> <cmd>` with control-master options", () => {
