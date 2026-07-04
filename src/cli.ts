@@ -23,6 +23,7 @@ import { cmdAnswer, cmdBrief, cmdMove, cmdOwn, cmdRename, cmdSeal, cmdSend, cmdT
 import { cmdDemote, cmdPromote, cmdRevive } from "./commands/migrate.js";
 import { cmdNode, cmdSubstrate } from "./commands/node.js";
 import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdTail, cmdTranscript, cmdUrls, cmdWait } from "./commands/observe.js";
+import { cmdFleet } from "./commands/fleet.js";
 import { cmdOpen, cmdRun, cmdX, cmdXa } from "./commands/run.js";
 import { cmdSeals, cmdSearch } from "./commands/search.js";
 import { cmdLaunch, cmdNew, cmdSpawn } from "./commands/spawn.js";
@@ -81,6 +82,9 @@ async function main(argv: string[]) {
       break;
     case "bees":
       await cmdBees(parsed);
+      break;
+    case "fleet":
+      await cmdFleet(parsed);
       break;
     case "transcript":
     case "tx":
@@ -287,6 +291,7 @@ function printHelp() {
       rows: [
         ["list", "", "show all known sessions with state (alias: ps)"],
         ["bees", "", "grouped fuzzy fleet TUI (^g cycles colony/pro/folder/type grouping, tab previews; --sidebar)"],
+        ["fleet", "[<bee>]", "an orchestrator's spawned-child tree with live state + seals (default: self; --json for reconcile)"],
         ["tail", "<session>", "capture or follow pane content"],
         ["transcript", "<session>", "render structured transcript rows"],
         ["last", "<session>", "print the bee's most recent assistant message or seal"],

@@ -36,6 +36,15 @@ export type SessionRecord = {
   /** Operator-set owned-by/reports-to edge → target bee id. (Tags PRD Phase 2) */
   reportsToId?: string;
   /**
+   * The bee that spawned this one, captured automatically at spawn time when the
+   * spawning process is itself a bee (HIVE_BEE / agent-pane resolved). This is
+   * the durable orchestrator→worker edge the fleet surface walks, so a
+   * coordinator can reconcile its children from ground truth instead of holding
+   * the roster in context (which compaction drops). Absent for operator/daemon-
+   * launched roots. Stores the parent's `id ?? name`, like forkedFromId.
+   */
+  spawnedById?: string;
+  /**
    * Cross-comb fork lineage → source bee id. Written later by fork-and-pane
    * Phase C; added now so `forks-of:` can read it. (Tags PRD Phase 2)
    */
@@ -367,7 +376,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "runnerTier"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "runnerTier"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",

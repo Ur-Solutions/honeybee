@@ -10,6 +10,7 @@ import { writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity } from "./ids.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
 import { safeName, saveSession, type SessionRecord } from "./store.js";
+import { resolveSpawningBeeId } from "./spawnParent.js";
 import { localSubstrate, substrateForRecord } from "./substrates/index.js";
 import type { TmuxWindowOptions } from "./substrates/index.js";
 
@@ -350,6 +351,8 @@ export type SpawnBeeOptions = {
   swarmId?: string;
   caste?: string;
   brief?: string;
+  /** Spawning bee's id for the fleet edge; auto-captured when unset. */
+  spawnedById?: string;
   node?: NodeRecord;
   runId?: string;
   flowName?: string;
@@ -428,6 +431,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   const command = shellCommand(spec);
 
   const now = new Date().toISOString();
+  const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
   const record: SessionRecord = {
     name,
     agent: spec.kind,
@@ -452,6 +456,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
     ...(opts.caste ? { caste: opts.caste } : {}),
     ...(opts.brief ? { brief: opts.brief } : {}),
+    ...(spawnedById ? { spawnedById } : {}),
     ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
     ...(opts.runId ? { runId: opts.runId } : {}),
     ...(opts.flowName ? { flowName: opts.flowName } : {}),

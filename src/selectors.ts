@@ -9,7 +9,7 @@ import { effectiveTags } from "./tags.js";
  * same `reportsToId` edge; children-of reads `parentId`; forks-of reads
  * `forkedFromId`. (TAGS_AND_RELATIONSHIPS_PRD Phase 2)
  */
-export type RelVerb = "owns" | "owned-by" | "reports-to" | "children-of" | "forks-of";
+export type RelVerb = "owns" | "owned-by" | "reports-to" | "children-of" | "spawned-by" | "forks-of";
 
 export type Selector =
   | { kind: "bee"; query: string }
@@ -35,7 +35,7 @@ const SWARM_PREFIX = "@";
 const COLONY_PREFIX = "colony:";
 const TAG_PREFIX = "tag:";
 const TAG_HASH = "#";
-const REL_VERBS: RelVerb[] = ["owns", "owned-by", "reports-to", "children-of", "forks-of"];
+const REL_VERBS: RelVerb[] = ["owns", "owned-by", "reports-to", "children-of", "spawned-by", "forks-of"];
 
 export function parseSelector(query: string): Selector {
   const trimmed = query.trim();
@@ -122,14 +122,16 @@ function resolveBeeId(state: SelectorState, token: string): string | undefined {
 
 // Which SessionRecord field a rel verb reverse-queries. owns/owned-by/reports-to
 // are aliases for the operator-set reportsToId edge.
-function fieldFor(verb: RelVerb): "reportsToId" | "parentId" | "forkedFromId" {
+function fieldFor(verb: RelVerb): "reportsToId" | "parentId" | "spawnedById" | "forkedFromId" {
   switch (verb) {
     case "owns":
     case "owned-by":
     case "reports-to":
       return "reportsToId";
     case "children-of":
-      return "parentId";
+      return "parentId"; // legacy comb-split edge (kept as-is)
+    case "spawned-by":
+      return "spawnedById"; // the live orchestrator→worker edge the fleet walks
     case "forks-of":
       return "forkedFromId";
   }
