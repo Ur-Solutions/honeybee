@@ -165,13 +165,23 @@ test("ready (briefed): brief set but no prompt yet", () => {
   assert.match(result.detail, /briefed/);
 });
 
-test("booting: live tmux but no output yet", () => {
-  const result = deriveState(bee(), {
+test("booting: live tmux but no output yet (freshly spawned)", () => {
+  const result = deriveState(bee({ createdAt: new Date(NOW - 5_000).toISOString() }), {
     liveTargets: new Set(["alpha-target"]),
     panes: new Map([["alpha-target", ""]]),
     now: NOW,
   });
   assert.equal(result.state, "booting");
+});
+
+test("wedged: booting past the wedge threshold (alive but no output)", () => {
+  const result = deriveState(bee({ createdAt: new Date(NOW - 20 * 60_000).toISOString() }), {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map([["alpha-target", ""]]),
+    now: NOW,
+  });
+  assert.equal(result.state, "wedged");
+  assert.match(result.detail, /wedged/);
 });
 
 test("active wins over recent briefed-only without a prompt", () => {
@@ -201,6 +211,7 @@ const ALL_STATES: BeeState[] = [
   "active",
   "idle_with_output",
   "booting",
+  "wedged",
   "error",
   "kill_failed",
   "node_unreachable",

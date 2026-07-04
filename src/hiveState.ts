@@ -34,6 +34,7 @@ export function hiveStateFor(state: BeeState): HiveTmuxState | undefined {
     case "idle_with_output":
     case "sealed":
       return "done";
+    case "wedged":
     case "error":
     case "kill_failed":
       return "failed";

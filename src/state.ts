@@ -13,6 +13,7 @@ export type BeeState =
   | "active"
   | "idle_with_output"
   | "booting"
+  | "wedged"
   | "error"
   | "kill_failed"
   | "node_unreachable";
@@ -78,6 +79,39 @@ export type DerivedState = {
 
 const ACTIVE_WINDOW_MS = 30_000;
 const READY_PANE_MIN_BYTES = 200;
+
+/**
+ * How long a bee may stay in "booting" before it is reported "wedged" instead.
+ * A normal boot reaches ready/active in seconds to a minute or two; a runner
+ * that is alive but has produced no output/readiness past this window is stuck
+ * (concurrent-boot credential collision, an exhausted account, a hung login),
+ * not still coming up. Override with HIVE_BOOT_WEDGE_MS.
+ */
+const BOOT_WEDGE_MS = (() => {
+  const raw = Number(process.env.HIVE_BOOT_WEDGE_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 5 * 60_000;
+})();
+
+/** Compact duration for a wedge detail, e.g. 82m / 3h. */
+function describeSpan(ms: number): string {
+  const m = Math.floor(ms / 60_000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
+}
+
+/**
+ * A would-be "booting" result, promoted to "wedged" once the bee has been alive
+ * (since spawn) longer than BOOT_WEDGE_MS without ever reaching ready/active.
+ */
+function bootingOrWedged(record: SessionRecord, now: number): DerivedState {
+  const spawnedAt = record.createdAt ? Date.parse(record.createdAt) : NaN;
+  const age = Number.isFinite(spawnedAt) ? now - spawnedAt : NaN;
+  if (Number.isFinite(age) && age > BOOT_WEDGE_MS) {
+    return { state: "wedged", detail: `wedged — no output for ${describeSpan(age)}` };
+  }
+  return { state: "booting", detail: "starting up" };
+}
 
 export function deriveState(record: SessionRecord, context: StateContext): DerivedState {
   if (record.status === "kill_failed") {
@@ -165,8 +199,8 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
 
   if (!Number.isFinite(promptAt)) {
     if (paneReady) return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
-    if (!record.brief && !hasOutput) return { state: "booting", detail: "starting up" };
-    if (paneText && knownAgent && !paneReady) return { state: "booting", detail: "starting up" };
+    if (!record.brief && !hasOutput) return bootingOrWedged(record, now);
+    if (paneText && knownAgent && !paneReady) return bootingOrWedged(record, now);
     return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
   }
 
@@ -192,6 +226,7 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
  * tmux pane sets here — an HSR bee has no pane and no live target.
  */
 function deriveHsrState(record: SessionRecord, context: StateContext): DerivedState {
+  const now = context.now ?? Date.now();
   const live = context.hsrLive?.has(record.name) ?? false;
   if (!live) {
     if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
@@ -213,7 +248,7 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
       case "ready":
         return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
       case "booting":
-        return { state: "booting", detail: "starting up" };
+        return bootingOrWedged(record, now);
       case "dead":
         return { state: "dead", detail: lastActivityHint(record, context) };
       case "sealed":
@@ -233,14 +268,13 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
 
   // No structured signal yet: a recent prompt means the bee is working; else the
   // ring snapshot standing in for pane output decides booting vs idle.
-  const now = context.now ?? Date.now();
   const promptAt = record.lastPromptAt ? Date.parse(record.lastPromptAt) : NaN;
   if (Number.isFinite(promptAt) && now - promptAt < ACTIVE_WINDOW_MS) {
     return { state: "active", detail: describeActivity(record) };
   }
   const snapshot = context.hsrSnapshots?.get(record.name) ?? "";
   if (snapshot.length > 0) return { state: "idle_with_output", detail: describeIdle(record, now) };
-  return { state: "booting", detail: "starting up" };
+  return bootingOrWedged(record, now);
 }
 
 /** Wraps a string in an ANSI color (no-op when output is not a TTY). */
@@ -277,6 +311,7 @@ export const STATE_PRESENTATION: Record<BeeState, StatePresentation> = {
   active: { label: "active", glyph: "●", color: green, labelColor: green, cleanPriority: 8 },
   ready: { label: "ready", glyph: "●", color: green, labelColor: plain, cleanPriority: 4 },
   booting: { label: "booting", glyph: "●", color: cyan, labelColor: cyan, cleanPriority: 7 },
+  wedged: { label: "wedged", glyph: "⊘", color: red, labelColor: red, cleanPriority: 7 },
   blocked: { label: "blocked", glyph: "●", color: yellow, labelColor: yellow, cleanPriority: 5 },
   idle_with_output: { label: "idle", glyph: "●", color: dim, labelColor: plain, cleanPriority: 0 },
   sealed: { label: "sealed", glyph: "●", color: magenta, labelColor: magenta, cleanPriority: 2 },
@@ -320,6 +355,7 @@ function parseBeeState(value: string | undefined): BeeState | undefined {
     case "active":
     case "idle_with_output":
     case "booting":
+    case "wedged":
     case "error":
     case "dead":
     case "sealed":

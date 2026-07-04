@@ -372,6 +372,8 @@ function stateCell(state: BeeState): string {
       return green("ready");
     case "booting":
       return cyan("booting");
+    case "wedged":
+      return red("wedged");
     case "blocked":
       return yellow("blocked");
     case "idle_with_output":
