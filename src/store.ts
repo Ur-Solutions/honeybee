@@ -127,6 +127,14 @@ export type SessionRecord = {
    * token bytes. Updated to the new `exp` after each successful refresh.
    */
   remoteTokenExpiresAt?: number;
+  /**
+   * Checkout-pool attribution (CHECKOUT_POOLS_PRD §6.4): the pool key
+   * (`<area>-<project>-<repo>-<pool>`) this bee was allocated from, so
+   * fleet/TUI/ledger can attribute bees to pools without re-deriving.
+   */
+  poolKey?: string;
+  /** The allocated member number (the n of `<pool>-<n>`). */
+  poolMember?: number;
 };
 
 export { storeRoot } from "./fsx.js";
@@ -387,7 +395,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "runnerTier"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "runnerTier", "poolKey"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
@@ -396,6 +404,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "runnerPid",
   "remoteTokenExpiresAt",
   "launcherPgid",
+  "poolMember",
   "titleSource",
   "autoTitleAttempts",
   "buzAccept",
@@ -451,6 +460,10 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
   if (typeof object.launcherPgid === "number" && Number.isSafeInteger(object.launcherPgid) && object.launcherPgid > 0) {
     record.launcherPgid = object.launcherPgid;
+  }
+  // Pool member numbers are 1-based (`<pool>-<n>`); validated like launcherPgid.
+  if (typeof object.poolMember === "number" && Number.isSafeInteger(object.poolMember) && object.poolMember > 0) {
+    record.poolMember = object.poolMember;
   }
 
   // buzAccept is the per-bee acceptance policy for buz messages. The field

@@ -1,5 +1,6 @@
 import { appendLedger, deleteSession, updateSession, type SessionRecord } from "./store.js";
 import { LOCAL_NODE_NAME } from "./node.js";
+import { dropPoolClaimsForBee } from "./pool.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 
 export type TransactionalKillOptions = {
@@ -129,6 +130,10 @@ export async function transactionalKill(
   }
 
   await deleteSession(record.name);
+  // Eager pool-claim cleanup (CHECKOUT_POOLS_PRD §6.2): a killed bee's claim
+  // would otherwise count toward its member's occupancy until pendingUntil.
+  // Best-effort — claim expiry is the backstop.
+  if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
   if (emitLedger) {
     await appendLedger({
       type: "session.kill",

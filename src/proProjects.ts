@@ -39,6 +39,28 @@ function run(command: string, args: string[], opts: { cwd?: string; timeoutMs?: 
 }
 
 /**
+ * Like run(), but a nonzero exit still resolves with the captured stdout.
+ * `pro co sync` exits nonzero when ANY member failed while the per-member
+ * status lines on stdout remain the real result — rejecting would throw away
+ * the report the caller needs to show.
+ */
+function runTolerant(
+  command: string,
+  args: string[],
+  opts: { cwd?: string; timeoutMs?: number } = {},
+): Promise<{ ok: boolean; stdout: string; detail: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { cwd: opts.cwd, timeout: opts.timeoutMs ?? 5000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error && (error as NodeJS.ErrnoException).code === "ENOENT") {
+        reject(new Error(`\`${command}\` CLI not found on PATH — install it or pick "Path…" instead`));
+        return;
+      }
+      resolve({ ok: !error, stdout, detail: stderr.trim() || (error ? error.message : "") });
+    });
+  });
+}
+
+/**
  * Parse `pro ls repos` output (tab-separated `area/project<TAB>repo<TAB>abspath`).
  * Lines that don't carry an absolute path are skipped rather than shown as
  * broken rows. Kept pure (no I/O) so it can be unit-tested.
@@ -79,6 +101,11 @@ function cachedProReposStdout(): Promise<string> {
     if (proReposCache === entry) proReposCache = undefined;
   });
   return stdout;
+}
+
+/** Drop the cached `pro ls repos` result (tests that swap PRO_ROOT per fixture). */
+export function invalidateProReposCache(): void {
+  proReposCache = undefined;
 }
 
 /**
@@ -294,4 +321,213 @@ export function proSlotDeleteArgs(kind: ProSlotKind, name: string): string[] {
 /** Delete a pro slot from the repo that owns it. */
 export async function deleteProSlot(kind: ProSlotKind, repoPath: string, name: string): Promise<void> {
   await run("pro", proSlotDeleteArgs(kind, name), { cwd: repoPath, timeoutMs: 300_000 });
+}
+
+// ── checkout pools (`pro pool`) ──────────────────────────────────────────────
+// Bridge to the `pro pool` command family (CHECKOUT_POOLS_PRD §5.2). Pool
+// config and membership are pro's truth — hive only parses the porcelain and
+// drives extend/sync; it never keeps its own copy of branch/occupancy/members.
+
+export type ProPoolConfig = {
+  repo: string;
+  name: string;
+  branch: string;
+  maxOccupancy: number;
+  maxSize: number;
+};
+
+export type ProPoolMember = {
+  repo: string;
+  pool: string;
+  /** Member number from the `<pool>-<n>` directory name. */
+  n: number;
+  /** Absolute checkout path. */
+  path: string;
+  /** Current branch (≠ pool branch means the member is parked on WIP). */
+  branch: string;
+  dirty: boolean;
+  /** Commits ahead/behind the last-fetched origin ref; undefined when the ref is missing ("-"). */
+  ahead?: number;
+  behind?: number;
+};
+
+export type ProPoolListing = {
+  pools: ProPoolConfig[];
+  members: ProPoolMember[];
+};
+
+/**
+ * The `pro` on PATH predates the pool family (or `pro pool` failed outright).
+ * Callers surface `hint` verbatim — it tells the operator what to do, instead
+ * of leaking a bash usage error.
+ */
+export class ProPoolsUnavailableError extends Error {
+  constructor(detail: string) {
+    super(
+      `\`pro pool\` is unavailable: ${detail || "command failed"}\n` +
+        `Checkout pools need a pool-enabled pro. Upgrade the \`pro\` on PATH (pool support shipped on pro's checkout-pools branch).`,
+    );
+    this.name = "ProPoolsUnavailableError";
+  }
+}
+
+/**
+ * Parse `pro pool ls --porcelain` (record-tagged TSV; §5.2 as shipped):
+ *
+ *   pool\t<repo>\t<name>\t<branch>\t<maxOccupancy>\t<maxSize>
+ *   member\t<repo>\t<pool>\t<n>\t<path>\t<branch>\t<dirty 0|1>\t<ahead>\t<behind>
+ *
+ * ahead/behind count against the last-fetched origin ref and are "-" when the
+ * ref is missing (listing never fetches). Malformed lines are skipped rather
+ * than surfaced as broken rows. Pure (no I/O) so it can be unit-tested.
+ */
+export function parseProPoolPorcelain(stdout: string): ProPoolListing {
+  const pools: ProPoolConfig[] = [];
+  const members: ProPoolMember[] = [];
+  const count = (raw: string | undefined): number | undefined => {
+    if (raw === undefined || raw === "-") return undefined;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : undefined;
+  };
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    const fields = line.split("\t");
+    if (fields[0] === "pool") {
+      const [, repo, name, branch, maxOccupancy, maxSize] = fields;
+      if (!repo || !name || !branch) continue;
+      const occ = Number(maxOccupancy);
+      const max = Number(maxSize);
+      pools.push({
+        repo,
+        name,
+        branch,
+        maxOccupancy: Number.isInteger(occ) && occ >= 1 ? occ : 1,
+        maxSize: Number.isInteger(max) && max >= 1 ? max : 32,
+      });
+    } else if (fields[0] === "member") {
+      const [, repo, pool, nRaw, path, branch, dirty, aheadRaw, behindRaw] = fields;
+      const n = Number(nRaw);
+      if (!repo || !pool || !path || !path.startsWith("/") || !branch || !Number.isInteger(n)) continue;
+      const ahead = count(aheadRaw);
+      const behind = count(behindRaw);
+      members.push({
+        repo,
+        pool,
+        n,
+        path,
+        branch,
+        dirty: dirty === "1",
+        ...(ahead !== undefined ? { ahead } : {}),
+        ...(behind !== undefined ? { behind } : {}),
+      });
+    }
+  }
+  return { pools, members };
+}
+
+// Same rationale as the `pro ls repos` cache: `hive pool`/status/spawn call the
+// porcelain repeatedly within one interactive session, and the daemon may poll
+// it. Keyed by repoPath since the listing is project-relative. Mutations
+// (extend) bust the key so a fresh member is visible immediately.
+const PRO_POOL_CACHE_TTL_MS = 30_000;
+const proPoolCache = new Map<string, { at: number; listing: Promise<ProPoolListing> }>();
+
+export function invalidateProPoolCache(repoPath?: string): void {
+  if (repoPath === undefined) proPoolCache.clear();
+  else proPoolCache.delete(repoPath);
+}
+
+/**
+ * List pools + members visible from `repoPath` (the project the repo lives
+ * in), via `pro pool ls --porcelain`. Cached for 30s per repoPath. Throws
+ * ProPoolsUnavailableError when the `pro` on PATH has no pool family.
+ */
+export async function listProPools(repoPath: string): Promise<ProPoolListing> {
+  const now = Date.now();
+  const cached = proPoolCache.get(repoPath);
+  if (cached && now - cached.at < PRO_POOL_CACHE_TTL_MS) return cached.listing;
+  const listing = run("pro", ["pool", "ls", "--porcelain"], { cwd: repoPath, timeoutMs: 30_000 }).then(
+    parseProPoolPorcelain,
+    (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      // ENOENT keeps the existing friendly "not found on PATH" message; any
+      // other failure of `pro pool` means the installed pro predates pools
+      // (unknown command / usage error) — surface the typed, actionable error.
+      if (message.includes("not found on PATH")) throw error;
+      throw new ProPoolsUnavailableError(message.replace(/^`pro pool ls --porcelain` failed: /, ""));
+    },
+  );
+  const entry = { at: now, listing };
+  proPoolCache.set(repoPath, entry);
+  listing.catch(() => {
+    if (proPoolCache.get(repoPath) === entry) proPoolCache.delete(repoPath);
+  });
+  return listing;
+}
+
+/**
+ * Clone the next `count` members of a pool (`pro pool extend`). Returns the
+ * created checkout paths (one per line on stdout; git chatter goes to stderr).
+ * Long timeout like createProSlot — each member is a full `git clone --local`.
+ * Busts the porcelain cache so the fresh members are immediately visible.
+ */
+export async function extendProPool(repoPath: string, pool: string, count = 1): Promise<string[]> {
+  if (!Number.isInteger(count) || count < 1) throw new Error(`pool extend count must be a positive integer (got ${count})`);
+  try {
+    const stdout = await run("pro", ["pool", "extend", pool, String(count)], { cwd: repoPath, timeoutMs: 600_000 });
+    return stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("/"));
+  } finally {
+    invalidateProPoolCache(repoPath);
+  }
+}
+
+export type ProCheckoutSyncRow = {
+  /** e.g. synced-ff, synced-rebase, unchanged, skipped-dirty, failed-rebase-reverted (§5.3). */
+  status: string;
+  path: string;
+  /** Branch / failure detail — whatever pro appended after the path. */
+  detail?: string;
+};
+
+export type ProCheckoutSyncResult = {
+  /** False when pro exited nonzero (at least one member failed). */
+  ok: boolean;
+  rows: ProCheckoutSyncRow[];
+  /** stderr tail for diagnostics when something failed. */
+  detail: string;
+};
+
+/** Parse `pro co sync` per-member status lines (TSV: status, path, detail…). Pure. */
+export function parseProCheckoutSync(stdout: string): ProCheckoutSyncRow[] {
+  const rows: ProCheckoutSyncRow[] = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    // Single-target syncs print "status /path\tbranch"; multi-target prints
+    // "status\t/path\tdetail". Normalize the first separator to a tab.
+    const normalized = line.replace(/^(\S+) (\/)/, "$1\t$2");
+    const [status, path, ...rest] = normalized.split("\t");
+    if (!status || !path || !path.startsWith("/")) continue;
+    rows.push({ status, path, ...(rest.length > 0 ? { detail: rest.join("\t") } : {}) });
+  }
+  return rows;
+}
+
+/**
+ * Sync named checkouts to their origin base (`pro co sync <names…> --rebase`),
+ * per-member: dirty/parked members are skipped, a conflicted rebase is aborted
+ * and reverted byte-identical (§5.3). A nonzero pro exit (some member failed)
+ * still returns the parsed rows — callers report per-member outcomes.
+ */
+export async function syncProCheckouts(
+  repoPath: string,
+  names: string[],
+  opts: { rebase?: boolean } = {},
+): Promise<ProCheckoutSyncResult> {
+  if (names.length === 0) return { ok: true, rows: [], detail: "" };
+  const args = ["co", "sync", ...names, ...(opts.rebase === false ? [] : ["--rebase"])];
+  const result = await runTolerant("pro", args, { cwd: repoPath, timeoutMs: 600_000 });
+  return { ok: result.ok, rows: parseProCheckoutSync(result.stdout), detail: result.detail };
 }
