@@ -240,6 +240,7 @@ const STATE_RANK: Record<string, number> = {
   idle_with_output: 4,
   sealed: 5,
   booting: 6,
+  wedged: 7,
   error: 7,
   dead: 8,
 };
@@ -300,6 +301,7 @@ function stateCell(headline: string, live: boolean): string {
   const h = headline.toLowerCase();
   if (h === "working" || h === "active") return `${green("●")} ${truncate(headline, 8)}`;
   if (h === "waiting" || h === "ready" || h === "blocked") return `${yellow("●")} ${truncate(headline, 8)}`;
+  if (h === "wedged") return `${red("⊘")} ${truncate(headline, 8)}`;
   if (h === "failed" || h === "error") return `${red("●")} ${truncate(headline, 8)}`;
   if (!live) return `${dim("○")} ${dim(truncate(headline, 8))}`;
   return `${dim("●")} ${truncate(headline, 8)}`;
@@ -309,6 +311,7 @@ function stateGlyph(headline: string, live: boolean): string {
   const h = headline.toLowerCase();
   if (h === "working" || h === "active") return green("●");
   if (h === "waiting" || h === "ready" || h === "blocked") return yellow("●");
+  if (h === "wedged") return red("⊘");
   if (h === "failed" || h === "error") return red("●");
   if (!live) return dim("○");
   return dim("●");
