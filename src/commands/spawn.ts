@@ -31,7 +31,7 @@ import { linkHere } from "../spawnLink.js";
 import { randomUUID } from "node:crypto";
 import { readdir, realpath, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
-import { confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverSpawnBrief, hasFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, ttlFlagMs } from "../cli/shared.js";
+import { confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverSpawnBrief, hasFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, ttlFlagMs } from "../cli/shared.js";
 import { flowRun } from "../commands/flow.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 
@@ -561,6 +561,24 @@ export async function resolveProfileOverlay(requested: string): Promise<ProfileO
 }
 
 
+/**
+ * The prompt a spawn invocation carried in argv, or "" when there is none.
+ *
+ * Two shapes count: extra positionals after the bee kind (`hive spawn codex
+ * "task…"`) and a prose rest (`hive spawn codex -- "task…"`). A rest whose
+ * first token is flag-like (`-- -m gpt-5.5`) is bee-args, not a prompt, and is
+ * excluded — delivering it as a turn would hand the agent a garbage prompt
+ * (and `hive x`/`hive run` route through here with their real prompt already
+ * stripped from args, so flag-only rests must stay inert).
+ */
+export function spawnArgvPrompt(parsed: Parsed): string {
+  const positional = parsed.args.slice(1).join(" ").trim();
+  const restIsProse = parsed.rest.length > 0 && !parsed.rest[0]!.startsWith("-");
+  const rest = restIsProse ? parsed.rest.join(" ").trim() : "";
+  return [positional, rest].filter((part) => part.length > 0).join(" ");
+}
+
+
 export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
@@ -609,11 +627,32 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const nodeSuffix = useHsr ? [dim("substrate:hsr")] : node && node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${useHsr ? "hsr" : node?.name ?? LOCAL_NODE_NAME}`);
+  // HSR harness adapters build their own child argv and IGNORE a caller
+  // prompt: server-tier codex runs `codex app-server` (fixed argv; turns start
+  // only via the control socket — hsr/adapters/codex.ts) and stream-tier
+  // claude runs `claude -p --input-format stream-json` (turns arrive only as
+  // stdin JSON; an argv prompt is ignored and the child waits forever —
+  // hsr/adapters/claude.ts). So a prompt handed to `hive spawn <bee> "…"` or
+  // `… -- "…"` was silently dropped and the bee wedged in "booting" with no
+  // error. Deliver it over the control socket instead — the same channel
+  // `hive x`/`hive run` use (deliverPromptToBee).
+  const argvPrompt = spawnArgvPrompt(parsed);
   if (truthy(flag(parsed, "briefed")) && briefText) {
     const delivered = await deliverSpawnBrief(parsed, record, briefText);
     record = delivered.record;
     timer.mark(delivered.sent ? "brief" : "ready");
+  } else if (argvPrompt.length > 0 && record.substrate === "hsr") {
+    record = await deliverHsrPrompt(record, argvPrompt);
+    timer.mark("brief");
   } else {
+    // Extra positionals on a tmux bee are dropped by the parser today (only a
+    // prose rest reaches the agent's argv) — warn instead of losing the text
+    // silently; this exact silence is how the HSR wedge went unnoticed.
+    if (parsed.args.length > 1) {
+      const hint = `positional prompt is not delivered to a ${record.agent} pane; use: hive x ${parsed.args[0]} "<prompt>" (or --brief "<text>" --briefed)`;
+      if (isPretty()) console.error(actionLine("warn", "spawn", [bold(record.name), hint]));
+      else console.error(`warn\tspawn\t${record.name}\t${hint}`);
+    }
     await confirmSpawnReady(parsed, record);
     timer.mark("ready");
   }

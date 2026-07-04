@@ -108,6 +108,36 @@ export function warnSpawnReadiness(record: SessionRecord, error: AgentReadinessE
 
 
 /**
+ * Deliver an initial prompt to a freshly spawned HSR bee over its control
+ * socket, WITHOUT a readiness poll.
+ *
+ * HSR adapters ignore a caller prompt in argv: server-tier codex runs
+ * `codex app-server` (fixed argv — CODEX_APP_SERVER_ARGS — turns start only on
+ * a `turn/start` RPC) and stream-tier claude runs `claude -p --input-format
+ * stream-json` (turns arrive only as stdin JSON; an argv prompt is ignored and
+ * the child waits forever). So a prompt handed to `hive spawn <bee> "…"` was
+ * silently dropped and the bee wedged in "booting". This delivers it through
+ * the same `sendText` → `send` RPC path `hive x`/`hive run` use
+ * (deliverPromptToBee) — the only channel an HSR bee acts on.
+ *
+ * No `waitForAgentReady`: HSR bees have no pane to scrape, and the runner host
+ * was already confirmed live at spawn (its control socket is up). deliverBrief's
+ * readiness poll would only time out on a pane-less bee, so this mirrors
+ * deliverPromptToBee (run.ts) — direct send.
+ */
+export async function deliverHsrPrompt(record: SessionRecord, prompt: string): Promise<SessionRecord> {
+  await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
+  await writeHiveState(record, "working");
+  const now = new Date().toISOString();
+  const persisted = await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+  await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
+  if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
+  else console.log(`sent\t${record.name}\t${prompt.length} chars`);
+  return persisted ?? { ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now };
+}
+
+
+/**
  * After a bare spawn, wait for the freshly spawned bee to reach its prompt,
  * auto-accepting any startup trust/safety prompt along the way (e.g. codex's
  * "Do you trust the contents of this directory?"). Without this, a plain
