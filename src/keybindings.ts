@@ -25,6 +25,8 @@ export const TMUX_BLOCK_END = "# <<< honeybee keybindings <<<";
  *   M-F  hive launch           → same launcher (frames + flows in one wizard)
  *   M-l  hive loop launch      → loop launcher dialog (templates + minimal form)
  *   M-k  hive fork launch      → interactive fork window (M-f avoided: WezTerm ALT layer)
+ *   M-P  hive pool launch      → pool picker → agent → spawn on a clean member
+ *                                (M-p avoided: WezTerm Zellij ALT layer, like M-f)
  *   M-u  urls
  *
  * (M-x / `hive split` decompose was retired with combs — APIA-85; forks now run
@@ -58,6 +60,7 @@ bind -n M-B display-popup -E -w 80% -h 70% "hive launch"                        
 bind -n M-F display-popup -E -w 80% -h 70% "hive launch"                                                # cmd+shift+f launch a frame/flow (same wizard)
 bind -n M-l display-popup -E -w 80% -h 70% "hive loop launch"                                           # cmd+l launch a loop (dialog + templates)
 bind -n M-k display-popup -E -w 80% -h 70% "hive fork launch"                                           # cmd+k fork launcher (interactive: seed, worktree, agent, account)
+bind -n M-P display-popup -E -w 80% -h 70% "hive pool launch"                                           # cmd+shift+p pool launcher (clean checkout, round-robin; M-p is the ALT layer's)
 
 # Standalone affordances (owned here)
 bind -n M-u display-popup -E -w 70% -h 60% \\
@@ -77,6 +80,7 @@ export const CANONICAL_WEZTERM_BLOCK = `-- honeybee cmd→Meta additions — app
 { key = 'k', mods = 'SUPER',       action = meta('k') },   -- cmd+k  fork (M-f avoided: ALT layer)
 { key = 'f', mods = 'SUPER|SHIFT', action = meta('F') },   -- cmd+shift+f frame/flow launcher
 { key = 'l', mods = 'SUPER',       action = meta('l') },   -- cmd+l  loop launcher
+{ key = 'p', mods = 'SUPER|SHIFT', action = meta('P') },   -- cmd+shift+p pool launcher (M-p is the ALT layer's)
 { key = 'u', mods = 'SUPER',       action = meta('u') },   -- cmd+u  urls
 `;
 
@@ -94,6 +98,7 @@ export const RECOMMENDED_BINDS: RecommendedBind[] = [
   { key: "M-F", verb: "launch", note: "interactive frame/flow launcher" },
   { key: "M-l", verb: "loop", note: "loop launcher dialog (templates + minimal form)" },
   { key: "M-k", verb: "fork", note: "interactive fork launcher (seed, worktree, agent, account)" },
+  { key: "M-P", verb: "pool", note: "pool launcher — spawn onto a clean checkout-pool member (M-p is the ALT layer's)" },
   { key: "M-u", verb: "urls", note: "list + open URL" },
 ];
 

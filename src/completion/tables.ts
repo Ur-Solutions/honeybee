@@ -13,7 +13,7 @@ export const COMMANDS = [
 ];
 
 export const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
-export const POOL_SUBCOMMANDS = ["list", "ls", "status", "spawn", "extend", "sync", "claim", "release", "park", "unpark"];
+export const POOL_SUBCOMMANDS = ["list", "ls", "status", "spawn", "launch", "extend", "sync", "claim", "release", "park", "unpark"];
 export const FRAME_SUBCOMMANDS = ["list", "ls", "define", "update", "reload", "edit", "inspect", "remove"];
 export const SWARM_SUBCOMMANDS = ["list", "ls", "inspect", "destroy"];
 export const NODE_SUBCOMMANDS = ["list", "ls", "register", "inspect", "update", "unregister"];

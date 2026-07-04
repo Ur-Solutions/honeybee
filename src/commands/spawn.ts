@@ -938,24 +938,7 @@ export async function cmdLaunch(parsed: Parsed): Promise<void> {
       }
     },
     listSubdirs: (base) => listNewBeeSubdirs(base),
-    loadBeeOptions: async () => {
-      // Account-aware agent shorthands the bee picker offers: <kind>-auto and
-      // <kind>-rr (when ≥1 account), <kind>-<account-id> per account, or plain
-      // <kind> with none.
-      const out: Array<{ value: string; label: string; detail?: string }> = [];
-      for (const kind of agentKinds()) {
-        const accounts = await newBeeAccountRows(kind).catch(() => []);
-        if (accounts.length >= 1) {
-          out.push({ value: `${kind}-auto`, label: `${kind} · auto`, detail: "least-loaded account" });
-          if (accounts.length >= 2) out.push({ value: `${kind}-rr`, label: `${kind} · rr`, detail: "round-robin next account" });
-        }
-        for (const acct of accounts) {
-          out.push({ value: `${kind}-${acct.id}`, label: `${kind} · ${acct.label}`, ...(acct.usage ? { detail: acct.usage } : {}) });
-        }
-        if (accounts.length === 0) out.push({ value: kind, label: `${kind} · (no account)` });
-      }
-      return out;
-    },
+    loadBeeOptions: loadSpawnBeeOptions,
   });
 
   if (!plan) {
@@ -983,6 +966,29 @@ export async function cmdLaunch(parsed: Parsed): Promise<void> {
   const flowFlags = new Map<string, string | true | string[]>([["background", true]]);
   if (argEntries.length > 0) flowFlags.set("arg", argEntries);
   await flowRun({ command: "flow", args: ["run", plan.name], flags: flowFlags, rest: [] });
+}
+
+
+/**
+ * Account-aware agent shorthands for the launch/pool pickers: <kind>-auto and
+ * <kind>-rr (when ≥1 account), <kind>-<account-id> per account, or plain
+ * <kind> with none. Shared by `hive launch` and `hive pool launch` so the two
+ * popups can never drift on what an agent row means.
+ */
+export async function loadSpawnBeeOptions(): Promise<Array<{ value: string; label: string; detail?: string }>> {
+  const out: Array<{ value: string; label: string; detail?: string }> = [];
+  for (const kind of agentKinds()) {
+    const accounts = await newBeeAccountRows(kind).catch(() => []);
+    if (accounts.length >= 1) {
+      out.push({ value: `${kind}-auto`, label: `${kind} · auto`, detail: "least-loaded account" });
+      if (accounts.length >= 2) out.push({ value: `${kind}-rr`, label: `${kind} · rr`, detail: "round-robin next account" });
+    }
+    for (const acct of accounts) {
+      out.push({ value: `${kind}-${acct.id}`, label: `${kind} · ${acct.label}`, ...(acct.usage ? { detail: acct.usage } : {}) });
+    }
+    if (accounts.length === 0) out.push({ value: kind, label: `${kind} · (no account)` });
+  }
+  return out;
 }
 
 

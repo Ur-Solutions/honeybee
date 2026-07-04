@@ -23,6 +23,7 @@ import {
   type PoolStatus,
   type ResolvedPool,
 } from "../pool.js";
+import { choosePoolLaunch, poolCapacityCell, type PoolLaunchRow } from "../poolLaunchTui.js";
 import {
   extendProPool,
   listProRepoEntries,
@@ -31,7 +32,7 @@ import {
   syncProCheckouts,
   type ProRepoEntry,
 } from "../proProjects.js";
-import { cmdSpawn } from "./spawn.js";
+import { cmdSpawn, loadSpawnBeeOptions } from "./spawn.js";
 
 export async function cmdPool(parsed: Parsed) {
   const sub = parsed.args[0];
@@ -44,6 +45,8 @@ export async function cmdPool(parsed: Parsed) {
       return poolStatusCmd(parsed);
     case "spawn":
       return poolSpawnCmd(parsed);
+    case "launch":
+      return poolLaunchCmd(parsed);
     case "extend":
       return poolExtendCmd(parsed);
     case "sync":
@@ -57,7 +60,7 @@ export async function cmdPool(parsed: Parsed) {
     case "unpark":
       return poolParkCmd(parsed, false);
     default:
-      throw new Error(`Unknown pool subcommand: ${sub}\nUsage: hive pool <list|status|spawn|extend|sync|claim|release|park|unpark>`);
+      throw new Error(`Unknown pool subcommand: ${sub}\nUsage: hive pool <list|status|spawn|launch|extend|sync|claim|release|park|unpark>`);
   }
 }
 
@@ -288,6 +291,45 @@ export async function poolSpawnCmd(parsed: Parsed) {
   // Delegate to the normal spawn path: allocation, claim binding, rollback,
   // --count fan-out, --here linking all behave exactly like `spawn --pool`.
   await cmdSpawn({ command: "spawn", args: [bee, ...parsed.args.slice(3)], flags, rest: parsed.rest });
+}
+
+
+/**
+ * `hive pool launch` — the M-P popup (§6.7): pick pool → pick agent → allocate,
+ * spawn, and (inside tmux) --here-link the bee's window into the caller's
+ * session. Zero-free pools stay pickable and show "(will extend)".
+ */
+export async function poolLaunchCmd(parsed: Parsed) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('hive pool launch needs a TTY — bind it to a tmux popup: bind -n M-P display-popup -E "hive pool launch"');
+  }
+  const { pools } = await poolsInScope();
+  if (pools.length === 0) {
+    throw new Error("hive pool launch: no pools found. Create one with: pro pool create <name> [--size N]");
+  }
+  const liveBees = await poolLiveBees();
+  const rows: PoolLaunchRow[] = [];
+  for (const pool of pools) {
+    const status = await poolStatus(pool, { liveBees });
+    rows.push({
+      key: status.key,
+      pool: status.pool,
+      capacity: poolCapacityCell(status),
+      context: `${status.area}/${status.project}/${status.repo} @ ${status.branch}`,
+    });
+  }
+
+  const choice = await choosePoolLaunch({ pools: rows, loadBeeOptions: loadSpawnBeeOptions });
+  if (!choice) {
+    if (isPretty()) console.error(note("pool launch: cancelled"));
+    return;
+  }
+
+  const flags = new Map<string, string | true | string[]>([["pool", choice.poolKey]]);
+  // Land the bee where the operator is: link+select via the existing --here
+  // path (skipped automatically outside tmux by maybeLinkHere).
+  if (process.env.TMUX) flags.set("here", true);
+  await cmdSpawn({ command: "spawn", args: [choice.bee], flags, rest: [] });
 }
 
 
