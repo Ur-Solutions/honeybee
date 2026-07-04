@@ -23,6 +23,7 @@ import { pickRoundRobinAccount } from "../limits/autoPick.js";
 import { startSpawnTimer, type SpawnTimer } from "../spawnTiming.js";
 import { chooseNewBee, type SpawnTuiAccount } from "../spawnTui.js";
 import { safeName, saveSession, type SessionRecord } from "../store.js";
+import { resolveSpawningBeeId } from "../spawnParent.js";
 import { localSubstrate, remoteHsrSubstrateForNode, substrateForRecord } from "../substrates/index.js";
 import { createSwarm } from "../swarm.js";
 import { tmux } from "../tmux.js";
@@ -106,6 +107,13 @@ export type SpawnOptions = {
   swarmId?: string;
   caste?: string;
   brief?: string;
+  /**
+   * The spawning bee's id, for the durable orchestrator→worker edge. Normally
+   * left unset and captured automatically from the spawn context (HIVE_BEE /
+   * agent pane); set explicitly to override (e.g. a flow attributing children to
+   * its own orchestrator bee).
+   */
+  spawnedById?: string;
   node?: NodeRecord;
   /**
    * Substrate override. HSR ("hsr") runs the bee pane-lessly under a detached
@@ -147,6 +155,10 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // swarm bees still emit their internal breakdown under HIVE_DEBUG_SPAWN.
   const timer = opts.timer ?? startSpawnTimer(opts.agent);
   const ownsTimer = !opts.timer;
+  // Capture the spawning bee (if this spawn is itself running inside one) so the
+  // child carries a durable parent edge the fleet surface can walk. Undefined
+  // for operator/daemon-launched roots.
+  const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
   // An account-bound spawn gets a home (explicit or the account's dedicated
   // slot), the account's credentials activated into it, and the driver's
   // explicit identity env — never a blind HOME rewrite.
@@ -298,6 +310,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
       ...(opts.caste ? { caste: opts.caste } : {}),
       ...(opts.brief ? { brief: opts.brief } : {}),
+      ...(spawnedById ? { spawnedById } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
     };
     await saveSession(record);
@@ -349,6 +362,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
       ...(opts.caste ? { caste: opts.caste } : {}),
       ...(opts.brief ? { brief: opts.brief } : {}),
+      ...(spawnedById ? { spawnedById } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
       ...(opts.autoswap ? { autoswap: true } : {}),
     };
@@ -402,6 +416,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
     ...(opts.caste ? { caste: opts.caste } : {}),
     ...(opts.brief ? { brief: opts.brief } : {}),
+    ...(spawnedById ? { spawnedById } : {}),
     ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
     ...(opts.account ? { accountId: opts.account.id } : {}),
     ...(opts.autoswap ? { autoswap: true } : {}),
