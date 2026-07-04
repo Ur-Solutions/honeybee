@@ -51,6 +51,37 @@ async function updateLimitsCache(results: AccountLimits[], now: number): Promise
   });
 }
 
+/**
+ * How much cache-freshness a just-picked account keeps (HIVE-80). Within this
+ * grace a spawn burst still reads the snapshot (the pick debits cover the
+ * burst); after it, the entry is expired so the next auto pick re-reads live
+ * — right around when the provider's numbers start reflecting the new load.
+ */
+export const PICKED_ENTRY_GRACE_MS = 5 * 60 * 1000;
+
+/**
+ * Backdate one account's cache entry so it expires `graceMs` from now for
+ * readers using `ttlMs` (the auto pick's 1h by default). The snapshot itself
+ * is kept — the 429 fallback in cachedAccountLimits still needs it. No-op for
+ * an absent entry, and never makes an already-older entry look fresher.
+ */
+export async function agePickedLimitsCacheEntry(
+  accountId: string,
+  opts: { now?: number; ttlMs?: number; graceMs?: number } = {},
+): Promise<void> {
+  const now = opts.now ?? Date.now();
+  const ttlMs = opts.ttlMs ?? 60 * 60 * 1000;
+  const graceMs = Math.min(opts.graceMs ?? PICKED_ENTRY_GRACE_MS, ttlMs);
+  const agedFetchedAt = new Date(now - (ttlMs - graceMs)).toISOString();
+  await withFileLock(`${limitsCachePath()}.lock`, async () => {
+    const cache = await readLimitsCache();
+    const entry = cache[accountId];
+    if (!entry || entry.fetchedAt <= agedFetchedAt) return;
+    cache[accountId] = { ...entry, fetchedAt: agedFetchedAt };
+    await atomicWriteFile(limitsCachePath(), `${JSON.stringify(cache, null, 2)}\n`, { mode: 0o600 });
+  });
+}
+
 export type CachedLimitsOptions = LimitsDeps & {
   /** Serve cache entries younger than this; missing/0 → always fetch live. */
   ttlMs?: number;

@@ -31,14 +31,30 @@ export { accountLimits, allAccountLimits, sortAccountsForLimitsDisplay } from ".
 export {
   type LimitsCacheEntry,
   type CachedLimitsOptions,
+  PICKED_ENTRY_GRACE_MS,
   limitsCachePath,
   cachedAccountLimits,
+  agePickedLimitsCacheEntry,
 } from "./limits/cache.js";
+
+export {
+  AUTO_COMMITMENT_BUSY_PERCENT,
+  AUTO_COMMITMENT_PARKED_PERCENT,
+  AUTO_PICK_DEBIT_PERCENT,
+  AUTO_PICK_DEBIT_TTL_MS,
+  accountCommitments,
+  decayedPickDebit,
+  pendingPickDebits,
+  pendingPicksPath,
+  recordAutoPick,
+  sessionCommitmentPercent,
+} from "./limits/commitments.js";
 
 export {
   AUTO_FIVE_HOUR_SATURATION_PERCENT,
   AUTO_PACE_FULL_WEIGHT_HEADROOM_PERCENT,
   AUTO_ACCOUNT_TTL_MS,
+  AUTO_TIE_EPSILON_PERCENT,
   effectiveWindowLoad,
   selectLeastLoadedAccount,
   pickLeastLoadedAccount,
