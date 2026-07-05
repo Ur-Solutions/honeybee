@@ -31,6 +31,7 @@ function emptyTickResult(): TickResult {
     usage: [],
     autoswaps: [],
     autoTitles: [],
+    tokenRefreshes: [],
     durationMs: 0,
   };
 }

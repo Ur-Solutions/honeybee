@@ -116,6 +116,17 @@ export type SessionRecord = {
   accountId?: string;
   /** Opt-in: the daemon's autoswap dispatcher may swap accounts on exhaustion. */
   autoswap?: boolean;
+  /**
+   * NON-SECRET expiry (unix SECONDS) of the short-lived access token delivered to
+   * a REMOTE ephemeral-token codex bee at spawn — the shipped auth.json's JWT
+   * `exp` (see hsr/remoteCreds.ts mintCodexAccessTokenCredential). This is the
+   * daemon's source of truth for proactive token refresh (UNIT 2): the token
+   * refresher re-mints + re-delivers before it dies. Only set for account-bound
+   * remote codex spawns on an ephemeral-token node; absent everywhere else, so
+   * non-remote / non-ephemeral bees are skipped by the refresher. Carries no
+   * token bytes. Updated to the new `exp` after each successful refresh.
+   */
+  remoteTokenExpiresAt?: number;
 };
 
 export { storeRoot } from "./fsx.js";
@@ -383,6 +394,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   ...OPTIONAL_STRING_SESSION_KEYS,
   "substrate",
   "runnerPid",
+  "remoteTokenExpiresAt",
   "launcherPgid",
   "titleSource",
   "autoTitleAttempts",
@@ -425,6 +437,9 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
   if (typeof object.runnerPid === "number" && Number.isSafeInteger(object.runnerPid) && object.runnerPid > 0) {
     record.runnerPid = object.runnerPid;
+  }
+  if (typeof object.remoteTokenExpiresAt === "number" && Number.isFinite(object.remoteTokenExpiresAt) && object.remoteTokenExpiresAt > 0) {
+    record.remoteTokenExpiresAt = object.remoteTokenExpiresAt;
   }
 
   if (object.titleSource === "user" || object.titleSource === "auto" || object.titleSource === "provider") {

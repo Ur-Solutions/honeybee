@@ -44,6 +44,8 @@ const PROBE_TIMEOUT_MS = 2_500;
 
 /** A clone can be slow (network + checkout), so provision gets a long budget. */
 const PROVISION_TIMEOUT_MS = 120_000;
+/** A token refresh stops + re-delivers + restarts + resumes a codex boot — moderate budget. */
+const REFRESH_TIMEOUT_MS = 60_000;
 /** listCheckouts shells git across several dirs — a moderate budget over probe. */
 const LIST_CHECKOUTS_TIMEOUT_MS = 15_000;
 
@@ -93,6 +95,15 @@ export type RemoteSpawnParams = {
 export type RemoteSpawnResult = { bee: string; tier?: string; sessionId?: string; cwd?: string };
 
 /**
+ * UNIT 2 token refresh: re-deliver a FRESH ephemeral credential to a LIVE remote
+ * bee and have the runner adopt it (stop → shred old → write new → restart with
+ * resume). Only the fresh credential material crosses the wire — the vault stays
+ * local. Never logged.
+ */
+export type RemoteRefreshCredsParams = { bee: string; creds: DeliveredCredentials };
+export type RemoteRefreshCredsResult = { ok: boolean; sessionId?: string; error?: string };
+
+/**
  * APIA-95 working-copy provisioning params/result. Clone (or idempotently reuse)
  * a git checkout ON THE REMOTE under its `<storeRoot>/worktrees/<name>`, then run
  * the bee inside it. Groundwork for Apiary's "where-it-lives" selector on
@@ -125,6 +136,12 @@ export type RemoteHsrSubstrate = Substrate & {
    */
   ping(): Promise<{ ok: boolean; version?: string; reason?: string }>;
   spawnRemote(params: RemoteSpawnParams): Promise<RemoteSpawnResult>;
+  /**
+   * UNIT 2: re-deliver a fresh ephemeral credential to a live bee and restart its
+   * runner with resume so it adopts the new token. Never throws — a down tunnel /
+   * failed restart resolves `{ ok:false, reason/error }`.
+   */
+  refreshCredsRemote(params: RemoteRefreshCredsParams): Promise<RemoteRefreshCredsResult>;
   /**
    * APIA-95: clone (or idempotently reuse) a working copy on the remote and
    * return its path — the spawn path uses it as the bee's cwd.
@@ -353,6 +370,19 @@ export function createRemoteHsrSubstrate(
     };
   }
 
+  async function refreshCredsRemote(params: RemoteRefreshCredsParams): Promise<RemoteRefreshCredsResult> {
+    try {
+      const c = await client();
+      const res = (await c.call("refreshCreds", { bee: params.bee, creds: params.creds }, { timeoutMs: REFRESH_TIMEOUT_MS })) as
+        | { ok?: boolean; sessionId?: string; error?: string }
+        | null;
+      if (res && res.ok) return { ok: true, ...(typeof res.sessionId === "string" && res.sessionId ? { sessionId: res.sessionId } : {}) };
+      return { ok: false, error: res?.error ?? "remote refreshCreds failed" };
+    } catch (error) {
+      return { ok: false, error: messageOf(error) };
+    }
+  }
+
   async function provisionRemote(params: RemoteProvisionParams): Promise<RemoteProvisionResult> {
     const c = await client();
     const res = (await c.call(
@@ -455,6 +485,7 @@ export function createRemoteHsrSubstrate(
     },
     ping,
     spawnRemote,
+    refreshCredsRemote,
     provisionRemote,
     listCheckouts,
     observe,

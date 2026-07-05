@@ -8,6 +8,7 @@ import type { AutoswapOutcome } from "./autoswap.js";
 import type { BuzDispatchOutcome } from "./buzDispatcher.js";
 import type { NeedsInputOutcome } from "./needsInput.js";
 import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./nodeReachability.js";
+import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { UsageSampler, UsageTickOutcome } from "./usageSampler.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { LogInput } from "./log.js";
@@ -110,6 +111,19 @@ export type TickDeps = {
    */
   dispatchAutoTitle?: (records: SessionRecord[]) => Promise<AutoTitleOutcome[]>;
   /**
+   * Optional remote codex token refresher (UNIT 2): for each LIVE remote
+   * ephemeral-token codex bee, proactively re-delivers a fresh access token
+   * before its `remoteTokenExpiresAt` lapses, and reactively re-delivers on a
+   * mirrored `auth_expired` event. Mints centrally (the daemon has the vault) and
+   * restarts the remote runner with resume. Stateful across ticks (in-flight
+   * guard + cooldown + handled-expiry cursor) — build once per daemon run.
+   */
+  refreshRemoteTokens?: (
+    records: SessionRecord[],
+    hsrObs: ReadonlyMap<string, HsrObservation>,
+    nowMs: number,
+  ) => Promise<TokenRefreshOutcome[]>;
+  /**
    * Optional credential sync: pulls rotated/refreshed auth from the accounts'
    * homes back into the vault. The default wiring throttles itself — most
    * ticks are a no-op.
@@ -155,6 +169,8 @@ export type DispatcherOutcomes = {
   autoswaps: AutoswapOutcome[];
   /** Auto-title dispatcher outcomes (empty when nothing finished / not wired). */
   autoTitles: AutoTitleOutcome[];
+  /** Remote codex token-refresh outcomes (empty when nothing near-expiry / not wired). */
+  tokenRefreshes: TokenRefreshOutcome[];
 };
 
 export type TickResult = DispatcherOutcomes & {
@@ -321,10 +337,32 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
       ...(outcome.error ? { error: outcome.error } : {}),
     }),
   },
+  // Remote codex token refresher (UNIT 2): proactively re-deliver a fresh access
+  // token before expiry, and reactively on a mirrored auth_expired event.
+  {
+    key: "tokenRefreshes",
+    name: "refreshRemoteTokens",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, hsrObs, nowMs }) => deps.refreshRemoteTokens?.(records, hsrObs, nowMs),
+    // A pure skip (in-flight / cooldown / not-eligible) is not a refresh — don't log it.
+    log: (outcome) =>
+      outcome.skipped
+        ? null
+        : {
+            level: outcome.ok ? "info" : "warn",
+            msg: "token.refresh",
+            session: outcome.bee,
+            ...(outcome.account ? { account: outcome.account } : {}),
+            ...(outcome.trigger ? { trigger: outcome.trigger } : {}),
+            ok: outcome.ok,
+            ...(outcome.expiresAt ? { expiresAt: new Date(outcome.expiresAt * 1000).toISOString() } : {}),
+            ...(outcome.error ? { error: outcome.error } : {}),
+          },
+  },
 ];
 
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
-  return { buzDrains: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [] };
+  return { buzDrains: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [] };
 }
 
 /**

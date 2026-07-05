@@ -179,6 +179,7 @@ function fakeRemoteSubstrate(node: NodeRecord, liveSessions: Set<string>, lifecy
     attachSession: async () => undefined,
     ping: async () => ({ ok: true }),
     spawnRemote: async (params) => ({ bee: params.bee }),
+    refreshCredsRemote: async () => ({ ok: true }),
     provisionRemote: async (params) => ({ path: "/tmp/remote-checkout", repo: params.repo, branch: params.branch, reused: false }),
     listCheckouts: async () => [],
     observe: async () => {

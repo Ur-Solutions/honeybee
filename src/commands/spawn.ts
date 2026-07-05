@@ -326,6 +326,10 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.brief ? { brief: opts.brief } : {}),
       ...(spawnedById ? { spawnedById } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
+      // UNIT 2: persist the delivered access token's expiry (unix seconds) so the
+      // daemon can proactively re-deliver before it dies. Only the ephemeral-token
+      // codex path sets remoteCreds.expiresAt; absent otherwise → refresher skips.
+      ...(remoteCreds?.expiresAt ? { remoteTokenExpiresAt: remoteCreds.expiresAt } : {}),
     };
     await saveSession(record);
     timer.mark("persist");

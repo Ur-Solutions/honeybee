@@ -35,6 +35,15 @@ export type RunnerEvent =
   // account/rateLimits/updated). Feeds the usage sampler's account.exhausted
   // edge for pane-less HSR bees. resetHint is a verbatim/derived reset marker.
   | { type: "exhausted"; ts: number; resetHint?: string }
+  // Auth-credential expiry signal (UNIT 2): the harness's access token has
+  // expired and it CANNOT self-refresh (a remote codex bee runs on an
+  // access-token-only credential with a BLANKED refresh token — see
+  // remoteCreds.ts). codex surfaces this as a turn `error` whose message is a
+  // "Failed to refresh token … empty_string" / 401-unauthorized failure; the
+  // adapter classifies THAT into this distinct variant (everything else stays a
+  // generic `error`). The daemon reacts by minting a fresh token and restarting
+  // the runner with resume — mirrors how `exhausted` drives the autoswap edge.
+  | { type: "auth_expired"; ts: number }
   | {
       type: "needs_input";
       ts: number;

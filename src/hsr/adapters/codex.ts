@@ -82,6 +82,10 @@ export function codexNotificationToEvents(method: string, params: unknown): Runn
     case "error": {
       const err = asObject(p.error);
       const message = String(err?.message ?? p.message ?? "codex error");
+      // An access-token-only remote codex whose token expired cannot self-refresh
+      // (blanked refresh_token) — classify that failure into `auth_expired` so the
+      // daemon mints + re-delivers a fresh token; everything else stays `error`.
+      if (isCodexAuthExpiryError(message)) return [{ type: "auth_expired", ts: now }];
       return [{ type: "error", ts: now, message }];
     }
     default:
@@ -151,6 +155,27 @@ function usageFromThreadTokenUsage(value: unknown): (RunnerEvent & { type: "usag
   const tu = asObject(value);
   if (!tu) return undefined;
   return usageFromBreakdown(tu.last);
+}
+
+/**
+ * Classify a codex error/turn-failure MESSAGE as an access-token expiry that the
+ * harness cannot recover from on its own (UNIT 2). A remote codex bee runs on an
+ * access-token-only credential with a BLANKED refresh token (remoteCreds.ts), so
+ * once the access token dies codex CANNOT refresh — it emits one of:
+ *   - "Failed to refresh token: 400 Bad Request: Invalid 'refresh_token': empty
+ *     string … \"code\":\"empty_string\"" (confirmed on codex-cli 0.142.5), or
+ *   - an initial 401 unauthorized (a token already dead at boot).
+ * Match those (and the bare refresh_token / unauthorized signatures) so the
+ * daemon's backstop mints + re-delivers a fresh token. Pure + exported for tests.
+ */
+export function isCodexAuthExpiryError(message: string): boolean {
+  const m = message.toLowerCase();
+  if (m.includes("failed to refresh token")) return true;
+  if (m.includes("empty_string")) return true;
+  if (m.includes("refresh_token") || m.includes("refresh token")) return true;
+  if (m.includes("401") && m.includes("unauthor")) return true;
+  if (m.includes("unauthorized")) return true;
+  return false;
 }
 
 /** Encode one user turn as a codex UserInput "text" variant (TurnStartParams.input[0]). */
@@ -338,7 +363,14 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
     void peer
       .request("turn/start", { threadId, input: [encodeCodexUserInput(text)] })
       .catch((error: unknown) => {
-        ingestEvent({ type: "error", ts: Date.now(), message: `turn/start failed: ${String(error)}` });
+        const message = `turn/start failed: ${String(error)}`;
+        // An auth-expiry turn failure (the access token died between boot and this
+        // turn) is classified so the daemon backstop recovers it; else generic error.
+        ingestEvent(
+          isCodexAuthExpiryError(message)
+            ? { type: "auth_expired", ts: Date.now() }
+            : { type: "error", ts: Date.now(), message },
+        );
       });
   }
 

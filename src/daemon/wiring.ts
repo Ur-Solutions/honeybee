@@ -14,6 +14,7 @@ import { dispatchBuzDrains } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher } from "./needsInput.js";
 import { createNodeReachabilityTracker } from "./nodeReachability.js";
 import { createUsageSampler } from "./usageSampler.js";
+import { createTokenRefresher } from "./tokenRefresh.js";
 import { defaultCapturePanes, defaultProbeNodes } from "./probe.js";
 import type { TickDeps } from "./tick.js";
 import { envMs } from "./timeouts.js";
@@ -124,6 +125,7 @@ export function buildDefaultDeps(): TickDeps {
     sampleUsage: createUsageSampler(),
     dispatchAutoswap: (records, usageOutcomes) => dispatchAutoswaps(records, usageOutcomes),
     dispatchAutoTitle: createAutoTitleDispatcher(),
+    refreshRemoteTokens: createTokenRefresher(),
     syncChains: async () => {
       const now = Date.now();
       if (now - lastChainSyncAt < CHAIN_SYNC_INTERVAL_MS) return;

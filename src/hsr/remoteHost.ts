@@ -37,7 +37,7 @@ import {
   type RpcServer,
 } from "./rpc.js";
 import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, reapDeadHosts } from "./observe.js";
-import { readHsrMeta, hsrRunDir } from "./runDir.js";
+import { readHsrMeta, hsrRunDir, readHsrRestart, writeHsrRestart } from "./runDir.js";
 import {
   recordDeliveredCredentials,
   shredDeliveredCredentials,
@@ -47,7 +47,7 @@ import { runHsrHost, type HsrHostHandle } from "./host.js";
 import { adapterFor } from "./adapters/index.js";
 import { normalizeCreds } from "./credsParams.js";
 import { provisionCheckout, enumerateCheckouts, type ProvisionParams } from "./provisioning.js";
-import type { RunnerOpts } from "./types.js";
+import type { RunnerOpts, RunnerTier } from "./types.js";
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -148,6 +148,9 @@ export function buildController(): RunnerHostController {
   const relays = new Map<string, Relay>();
   // In-process runner hosts we spawned, so `kill` can stop them cleanly.
   const handles = new Map<string, HsrHostHandle>();
+  // Bees currently mid-refresh (UNIT 2), so a re-entrant refreshCreds is refused
+  // rather than racing a second stop→re-deliver→restart against the first.
+  const refreshing = new Set<string>();
   let server: RpcServer | undefined;
 
   /**
@@ -228,6 +231,148 @@ export function buildController(): RunnerHostController {
     }
   }
 
+  type SpawnLikeParams = {
+    bee?: unknown;
+    kind?: unknown;
+    cwd?: unknown;
+    sessionId?: unknown;
+    resume?: unknown;
+    authKind?: unknown;
+    model?: unknown;
+    comb?: unknown;
+    parent?: unknown;
+    creds?: unknown;
+    home?: unknown;
+    spec?: { command?: unknown; args?: unknown; env?: unknown };
+  };
+
+  type StartResult = { ok: boolean; bee?: string; tier?: RunnerTier; cwd?: string; sessionId?: string; error?: string };
+
+  /**
+   * Fork a runner host IN-PROCESS from a resolved spec (the local side already ran
+   * resolveAgent — no resolveAgent here). Shared by `spawn` (fresh) and
+   * `refreshCreds` (restart with resume, UNIT 2). `override.resume` / `.sessionId`
+   * let the refresh path force a resume onto the bee's learned thread id. Persists
+   * a restart descriptor (no creds) so a later refresh can restart faithfully.
+   * May throw (runner never started) — the caller's `guarded` maps that to error.
+   */
+  async function startRunner(params: unknown, override: { resume?: boolean; sessionId?: string } = {}): Promise<StartResult> {
+    const p = (params ?? {}) as SpawnLikeParams;
+    const bee = String(p.bee ?? "");
+    const kind = String(p.kind ?? "");
+    if (!bee) return { ok: false, error: "bee required" };
+    if (!kind) return { ok: false, error: "kind required" };
+    const adapter = adapterFor(kind);
+    if (!adapter) return { ok: false, error: `no HSR adapter for harness "${kind}"` };
+    const spec = p.spec ?? {};
+    const command = typeof spec.command === "string" ? spec.command : "";
+    const args = Array.isArray(spec.args) ? spec.args.map((a) => String(a)) : [];
+    const specEnv = spec.env && typeof spec.env === "object" ? (spec.env as Record<string, string>) : {};
+    // The harness child needs a complete env (PATH etc.), not just the spawn
+    // overrides — overlay spec.env on the serve process's own env.
+    const childEnv: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (typeof value === "string") childEnv[key] = value;
+    }
+    Object.assign(childEnv, specEnv);
+    childEnv.HIVE_BEE = bee;
+    childEnv.HIVE_COMB = typeof p.comb === "string" && p.comb ? p.comb : bee;
+    if (typeof p.parent === "string" && p.parent) childEnv.HIVE_PARENT = p.parent;
+
+    // Resolve the working dir the remote OWNS (derive per-bee under this store
+    // unless the client shipped a real remote checkout path). A local client cwd
+    // would not exist here → Node spawn() ENOENT (the bug this fixes).
+    const { cwd: cwdDir, derived: cwdDerived } = resolveRemoteSpawnCwd(bee, p.cwd);
+    if (cwdDerived) {
+      try {
+        await mkdir(cwdDir, { recursive: true, mode: 0o700 });
+      } catch {
+        return { ok: false, error: `could not create the remote working dir for ${bee}` };
+      }
+    }
+
+    // APIA-93 credential delivery: the ephemeral-token policy ships a SHORT-LIVED
+    // credential (opaque, base64 in transit) that we write into this bee's
+    // isolated home (0700 dir / 0600 files) BEFORE forking the runner, and record
+    // so `kill` (and the next refresh) can shred it. The vault never reaches the
+    // remote. Secrets are never logged.
+    const creds = normalizeCreds(p.creds);
+    let deliveredCredPaths: string[] = [];
+    if (creds?.env) Object.assign(childEnv, creds.env);
+    let homeDirResolved: string | undefined;
+    if (creds?.files?.length) {
+      const { homeDir, homeEnv } = resolveRemoteSpawnHome(bee, kind, p.home);
+      homeDirResolved = homeDir;
+      try {
+        deliveredCredPaths = await writeDeliveredCredentials(homeDir, creds);
+        // Record BEFORE forking so a failed runner start still shreds the creds.
+        await recordDeliveredCredentials(bee, deliveredCredPaths);
+      } catch {
+        await shredDeliveredCredentials(bee).catch(() => undefined);
+        return { ok: false, error: "failed to write delivered credentials into the remote home" };
+      }
+      if (homeEnv) childEnv[homeEnv] = homeDir;
+    }
+
+    const resume = override.resume ?? p.resume === true;
+    const sessionId =
+      typeof override.sessionId === "string" && override.sessionId
+        ? override.sessionId
+        : typeof p.sessionId === "string" && p.sessionId
+          ? p.sessionId
+          : undefined;
+
+    const opts: RunnerOpts = {
+      bee,
+      cwd: cwdDir,
+      env: childEnv,
+      ...(sessionId ? { sessionId } : {}),
+      ...(typeof p.authKind === "string" ? { authKind: p.authKind as "subscription" | "api-key" } : {}),
+      ...(typeof p.model === "string" && p.model ? { model: p.model } : {}),
+      ...(resume ? { resume: true } : {}),
+      command,
+      args,
+      runDir: hsrRunDir(bee),
+    };
+
+    // Persist a restart descriptor (spec + resolved cwd/home, NO creds and NO
+    // process.env) so a later `refreshCreds` restarts this runner faithfully with
+    // resume (UNIT 2). Best-effort: a failed write only degrades refresh, not spawn.
+    await writeHsrRestart(bee, {
+      kind,
+      command,
+      args,
+      env: specEnv,
+      cwd: cwdDir,
+      ...(homeDirResolved
+        ? { home: homeDirResolved }
+        : typeof p.home === "string" && p.home
+          ? { home: p.home }
+          : {}),
+      ...(typeof p.model === "string" && p.model ? { model: p.model } : {}),
+      ...(typeof p.authKind === "string" ? { authKind: p.authKind as "subscription" | "api-key" } : {}),
+      ...(typeof p.comb === "string" && p.comb ? { comb: p.comb } : {}),
+      ...(typeof p.parent === "string" && p.parent ? { parent: p.parent } : {}),
+    }).catch(() => undefined);
+
+    let handle: HsrHostHandle;
+    try {
+      handle = await runHsrHost({ bee, adapter, opts });
+    } catch (error) {
+      // Runner never started — do not leave the delivered credential on disk.
+      if (deliveredCredPaths.length > 0) await shredDeliveredCredentials(bee).catch(() => undefined);
+      throw error;
+    }
+    handles.set(bee, handle);
+    // Drop the handle once the session exits so `kill` doesn't retain a dead one.
+    void handle.done.then(() => {
+      if (handles.get(bee) === handle) handles.delete(bee);
+    });
+    // Echo the resolved remote cwd back so the local SessionRecord stores a real
+    // remote path (the derived per-bee dir, or the checkout the client sent).
+    return { ok: true, bee, tier: adapter.tier(), cwd: cwdDir, ...(sessionId ? { sessionId } : {}) };
+  }
+
   const methods: Record<string, RpcMethodHandler> = {
     // Handshake / health: cheap, side-effect-free, mirrors the --version target.
     ping: () => ({ ok: true, version }),
@@ -258,111 +403,60 @@ export function buildController(): RunnerHostController {
     }),
 
     // Fork a runner host IN-PROCESS from a resolved spec (the local side already
-    // ran resolveAgent — no resolveAgent on the remote). Mirrors the body of
-    // cli.ts runHsrHostFromPayload but invoked directly rather than via a
-    // detached `hive __hsr-run` child.
-    spawn: guarded(async (params) => {
-      const p = (params ?? {}) as {
-        bee?: unknown;
-        kind?: unknown;
-        cwd?: unknown;
-        sessionId?: unknown;
-        resume?: unknown;
-        authKind?: unknown;
-        model?: unknown;
-        comb?: unknown;
-        parent?: unknown;
-        creds?: unknown;
-        home?: unknown;
-        spec?: { command?: unknown; args?: unknown; env?: unknown };
-      };
+    // ran resolveAgent — no resolveAgent on the remote). Delegates to startRunner
+    // (shared with refreshCreds); guarded maps a thrown runner-start to error.
+    spawn: guarded((params) => startRunner(params)),
+
+    // UNIT 2 token refresh: re-deliver a FRESH access-token credential to a live
+    // bee and get the harness to adopt it. A running codex app-server holds the
+    // access token in memory and won't pick up a hot-swapped auth.json (on 401 it
+    // reads the BLANKED refresh_token and dies), so adoption REQUIRES a restart:
+    // stop the runner (keeping the run dir), shred the OLD credential, write the
+    // NEW one into the bee's home, then restart the SAME runner with resume + the
+    // learned thread id so codex re-reads auth.json at boot and resumes the thread.
+    // Atomic per bee (a re-entrant refresh is refused). The daemon side mints; the
+    // vault never reaches the remote.
+    refreshCreds: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; creds?: unknown };
       const bee = String(p.bee ?? "");
-      const kind = String(p.kind ?? "");
       if (!bee) return { ok: false, error: "bee required" };
-      if (!kind) return { ok: false, error: "kind required" };
-      const adapter = adapterFor(kind);
-      if (!adapter) return { ok: false, error: `no HSR adapter for harness "${kind}"` };
-      const spec = p.spec ?? {};
-      const command = typeof spec.command === "string" ? spec.command : "";
-      const args = Array.isArray(spec.args) ? spec.args.map((a) => String(a)) : [];
-      const specEnv = spec.env && typeof spec.env === "object" ? (spec.env as Record<string, string>) : {};
-      // The harness child needs a complete env (PATH etc.), not just the spawn
-      // overrides — overlay spec.env on the serve process's own env.
-      const childEnv: Record<string, string> = {};
-      for (const [key, value] of Object.entries(process.env)) {
-        if (typeof value === "string") childEnv[key] = value;
-      }
-      Object.assign(childEnv, specEnv);
-      childEnv.HIVE_BEE = bee;
-      childEnv.HIVE_COMB = typeof p.comb === "string" && p.comb ? p.comb : bee;
-      if (typeof p.parent === "string" && p.parent) childEnv.HIVE_PARENT = p.parent;
-
-      // Resolve the working dir the remote OWNS (derive per-bee under this store
-      // unless the client shipped a real remote checkout path). A local client cwd
-      // would not exist here → Node spawn() ENOENT (the bug this fixes).
-      const { cwd: cwdDir, derived: cwdDerived } = resolveRemoteSpawnCwd(bee, p.cwd);
-      if (cwdDerived) {
-        try {
-          await mkdir(cwdDir, { recursive: true, mode: 0o700 });
-        } catch {
-          return { ok: false, error: `could not create the remote working dir for ${bee}` };
-        }
-      }
-
-      // APIA-93 credential delivery: the ephemeral-token policy ships a SHORT-LIVED
-      // credential (opaque, base64 in transit) that we write into this bee's
-      // isolated home (0700 dir / 0600 files) BEFORE forking the runner, and
-      // record so `kill` can shred it. The vault itself never reaches the remote.
-      // Secrets are never logged — on failure we surface only a generic message.
       const creds = normalizeCreds(p.creds);
-      let deliveredCredPaths: string[] = [];
-      if (creds?.env) Object.assign(childEnv, creds.env);
-      if (creds?.files?.length) {
-        // Home derived → creds written there → harness home env set → spawn. The
-        // home is DERIVED on the remote (a shipped local path is meaningless), and
-        // the harness home env (CODEX_HOME / CLAUDE_CONFIG_DIR) is pointed at it so
-        // the child reads the delivered auth.json — overriding any (local) home env
-        // the shipped spec.env carried.
-        const { homeDir, homeEnv } = resolveRemoteSpawnHome(bee, kind, p.home);
-        try {
-          deliveredCredPaths = await writeDeliveredCredentials(homeDir, creds);
-          // Record BEFORE forking so a failed runner start still shreds the creds.
-          await recordDeliveredCredentials(bee, deliveredCredPaths);
-        } catch {
-          await shredDeliveredCredentials(bee).catch(() => undefined);
-          return { ok: false, error: "failed to write delivered credentials into the remote home" };
-        }
-        if (homeEnv) childEnv[homeEnv] = homeDir;
-      }
-      const opts: RunnerOpts = {
-        bee,
-        cwd: cwdDir,
-        env: childEnv,
-        ...(typeof p.sessionId === "string" && p.sessionId ? { sessionId: p.sessionId } : {}),
-        ...(typeof p.authKind === "string" ? { authKind: p.authKind as "subscription" | "api-key" } : {}),
-        ...(typeof p.model === "string" && p.model ? { model: p.model } : {}),
-        ...(p.resume === true ? { resume: true } : {}),
-        command,
-        args,
-        runDir: hsrRunDir(bee),
-      };
-      let handle: HsrHostHandle;
+      if (!creds?.files?.length) return { ok: false, error: "refreshCreds requires credential files" };
+      if (refreshing.has(bee)) return { ok: false, error: `refresh already in flight for ${bee}` };
+      const descriptor = await readHsrRestart(bee);
+      if (!descriptor) return { ok: false, error: `no restart descriptor for ${bee} (spawned before refresh support?)` };
+      // The learned provider session id (codex thread id) lives in THIS node's
+      // meta — read it before stopping so the restart can resume the same thread.
+      const meta = await readHsrMeta(bee);
+      const sessionId = meta?.sessionId;
+      if (!sessionId) return { ok: false, error: `no learned session id for ${bee}; cannot resume` };
+      refreshing.add(bee);
       try {
-        handle = await runHsrHost({ bee, adapter, opts });
-      } catch (error) {
-        // Runner never started — do not leave the delivered credential on disk.
-        if (deliveredCredPaths.length > 0) await shredDeliveredCredentials(bee).catch(() => undefined);
-        throw error;
+        // Stop the current runner but KEEP the run dir (meta / descriptor / events).
+        await stopRunner(bee);
+        // Destroy the OLD delivered credential BEFORE writing the fresh one, so the
+        // dead access token never lingers on the remote.
+        await shredDeliveredCredentials(bee).catch(() => undefined);
+        const result = await startRunner(
+          {
+            bee,
+            kind: descriptor.kind,
+            spec: { command: descriptor.command, args: descriptor.args, env: descriptor.env },
+            cwd: descriptor.cwd,
+            ...(descriptor.home ? { home: descriptor.home } : {}),
+            ...(descriptor.model ? { model: descriptor.model } : {}),
+            ...(descriptor.authKind ? { authKind: descriptor.authKind } : {}),
+            ...(descriptor.comb ? { comb: descriptor.comb } : {}),
+            ...(descriptor.parent ? { parent: descriptor.parent } : {}),
+            creds,
+          },
+          { resume: true, sessionId },
+        );
+        if (!result.ok) return result;
+        return { ok: true, bee, sessionId: result.sessionId ?? sessionId };
+      } finally {
+        refreshing.delete(bee);
       }
-      handles.set(bee, handle);
-      // Drop the handle once the session exits so `kill` doesn't retain a dead one.
-      void handle.done.then(() => {
-        if (handles.get(bee) === handle) handles.delete(bee);
-      });
-      // Echo the resolved remote cwd back so the local SessionRecord stores a real
-      // remote path (the derived per-bee dir, or the checkout the client sent)
-      // rather than a stale local one.
-      return { ok: true, bee, tier: adapter.tier(), cwd: cwdDir };
     }),
 
     send: guarded(async (params) => {

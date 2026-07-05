@@ -120,6 +120,55 @@ export async function ensureHsrRunDir(bee: string): Promise<void> {
   await mkdir(hsrRunDir(bee), { recursive: true, mode: 0o700 });
 }
 
+/**
+ * The spawn parameters a runner-host needs to RESTART a bee's runner faithfully
+ * with resume (UNIT 2 token refresh). Written on the remote at spawn so a later
+ * `refreshCreds` RPC can stop → re-deliver a fresh credential → restart the same
+ * runner, without the daemon having to re-ship the resolved spec. Holds NO
+ * delivered credential bytes — creds are delivered/shredded separately; the
+ * refresh path writes the fresh ones and the restart re-overlays process.env.
+ */
+export type HsrRestartDescriptor = {
+  kind: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  cwd: string;
+  home?: string;
+  model?: string;
+  authKind?: "subscription" | "api-key";
+  comb?: string;
+  parent?: string;
+};
+
+function hsrRestartPath(bee: string): string {
+  return join(hsrRunDir(bee), "restart.json");
+}
+
+/** Persist the restart descriptor (owner-only). Best-effort caller. */
+export async function writeHsrRestart(bee: string, descriptor: HsrRestartDescriptor): Promise<void> {
+  await atomicWriteFile(hsrRestartPath(bee), `${JSON.stringify(descriptor, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** Read the restart descriptor back; null when missing/garbage (tolerant like readHsrMeta). */
+export async function readHsrRestart(bee: string): Promise<HsrRestartDescriptor | null> {
+  let raw: string;
+  try {
+    raw = await readFile(hsrRestartPath(bee), "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const object = parsed as Record<string, unknown>;
+    if (typeof object.kind !== "string") return null;
+    return object as unknown as HsrRestartDescriptor;
+  } catch {
+    return null;
+  }
+}
+
 /** Atomically write meta.json (owner-only, pretty-printed for eyeballing). */
 export async function writeHsrMeta(bee: string, meta: HsrMeta): Promise<void> {
   await atomicWriteFile(hsrMetaPath(bee), `${JSON.stringify(meta, null, 2)}\n`, { mode: 0o600 });
