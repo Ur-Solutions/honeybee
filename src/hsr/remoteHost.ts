@@ -20,9 +20,15 @@
 
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
+// homeEnvForAgent maps a harness kind → its home env var (CODEX_HOME /
+// CLAUDE_CONFIG_DIR / …). drivers.js is already in the runner-host bundle closure
+// (via remoteCreds' homeDirForSpec) and imports NO accounts/vault graph, so this
+// keeps the esbuild DCE lean.
+import { homeEnvForAgent } from "../drivers.js";
 import {
   connectRpcClient,
   startRpcServer,
@@ -33,7 +39,6 @@ import {
 import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, reapDeadHosts } from "./observe.js";
 import { readHsrMeta, hsrRunDir } from "./runDir.js";
 import {
-  homeDirForSpec,
   recordDeliveredCredentials,
   shredDeliveredCredentials,
   writeDeliveredCredentials,
@@ -46,6 +51,34 @@ import type { RunnerOpts } from "./types.js";
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Resolve a remote-hsr spawn's working dir. The remote runner-host OWNS its
+ * filesystem layout: a client only ships a cwd when it is already a real REMOTE
+ * path (a provisioned checkout, APIA-95) — otherwise a local `/Users/…` path
+ * would not exist here and Node's `spawn()` throws ENOENT. When none is given we
+ * DERIVE a per-bee dir under this node's own store (`<storeRoot>/hsr/<bee>/cwd`),
+ * nested under the run dir so `kill`'s run-dir removal reclaims it. `derived`
+ * flags whether the caller must mkdir it.
+ */
+export function resolveRemoteSpawnCwd(bee: string, cwd: unknown): { cwd: string; derived: boolean } {
+  if (typeof cwd === "string" && cwd) return { cwd, derived: false };
+  return { cwd: join(hsrRunDir(bee), "cwd"), derived: true };
+}
+
+/**
+ * Resolve the isolated home + its harness env for a credential-delivering
+ * remote-hsr spawn. The remote DERIVES the home under its own store
+ * (`<storeRoot>/hsr/<bee>/home`) — a local home path shipped from the client is
+ * meaningless here (the vault stays local; only the ephemeral material crosses).
+ * An explicit REMOTE `home` is honored as-is. `homeEnv` is the harness's home
+ * env var (CODEX_HOME / CLAUDE_CONFIG_DIR / …) the child must read the delivered
+ * auth from; undefined for a harness with no home env (e.g. the test stub).
+ */
+export function resolveRemoteSpawnHome(bee: string, kind: string, home: unknown): { homeDir: string; homeEnv: string | undefined } {
+  const homeDir = (typeof home === "string" && home) ? home : join(hsrRunDir(bee), "home");
+  return { homeDir, homeEnv: homeEnvForAgent(kind) };
 }
 
 // The package version this host was built from. Bundle-time esbuild `define`
@@ -264,6 +297,18 @@ export function buildController(): RunnerHostController {
       childEnv.HIVE_COMB = typeof p.comb === "string" && p.comb ? p.comb : bee;
       if (typeof p.parent === "string" && p.parent) childEnv.HIVE_PARENT = p.parent;
 
+      // Resolve the working dir the remote OWNS (derive per-bee under this store
+      // unless the client shipped a real remote checkout path). A local client cwd
+      // would not exist here → Node spawn() ENOENT (the bug this fixes).
+      const { cwd: cwdDir, derived: cwdDerived } = resolveRemoteSpawnCwd(bee, p.cwd);
+      if (cwdDerived) {
+        try {
+          await mkdir(cwdDir, { recursive: true, mode: 0o700 });
+        } catch {
+          return { ok: false, error: `could not create the remote working dir for ${bee}` };
+        }
+      }
+
       // APIA-93 credential delivery: the ephemeral-token policy ships a SHORT-LIVED
       // credential (opaque, base64 in transit) that we write into this bee's
       // isolated home (0700 dir / 0600 files) BEFORE forking the runner, and
@@ -273,10 +318,12 @@ export function buildController(): RunnerHostController {
       let deliveredCredPaths: string[] = [];
       if (creds?.env) Object.assign(childEnv, creds.env);
       if (creds?.files?.length) {
-        // The local side is authoritative about the isolated home; fall back to
-        // the harness home env in the resolved spec if it did not thread one.
-        const homeDir = (typeof p.home === "string" && p.home) ? p.home : homeDirForSpec(kind, childEnv);
-        if (!homeDir) return { ok: false, error: `cannot deliver credentials: no isolated home resolved for harness "${kind}"` };
+        // Home derived → creds written there → harness home env set → spawn. The
+        // home is DERIVED on the remote (a shipped local path is meaningless), and
+        // the harness home env (CODEX_HOME / CLAUDE_CONFIG_DIR) is pointed at it so
+        // the child reads the delivered auth.json — overriding any (local) home env
+        // the shipped spec.env carried.
+        const { homeDir, homeEnv } = resolveRemoteSpawnHome(bee, kind, p.home);
         try {
           deliveredCredPaths = await writeDeliveredCredentials(homeDir, creds);
           // Record BEFORE forking so a failed runner start still shreds the creds.
@@ -285,10 +332,11 @@ export function buildController(): RunnerHostController {
           await shredDeliveredCredentials(bee).catch(() => undefined);
           return { ok: false, error: "failed to write delivered credentials into the remote home" };
         }
+        if (homeEnv) childEnv[homeEnv] = homeDir;
       }
       const opts: RunnerOpts = {
         bee,
-        cwd: typeof p.cwd === "string" && p.cwd ? p.cwd : process.cwd(),
+        cwd: cwdDir,
         env: childEnv,
         ...(typeof p.sessionId === "string" && p.sessionId ? { sessionId: p.sessionId } : {}),
         ...(typeof p.authKind === "string" ? { authKind: p.authKind as "subscription" | "api-key" } : {}),
@@ -311,7 +359,10 @@ export function buildController(): RunnerHostController {
       void handle.done.then(() => {
         if (handles.get(bee) === handle) handles.delete(bee);
       });
-      return { ok: true, bee, tier: adapter.tier() };
+      // Echo the resolved remote cwd back so the local SessionRecord stores a real
+      // remote path (the derived per-bee dir, or the checkout the client sent)
+      // rather than a stale local one.
+      return { ok: true, bee, tier: adapter.tier(), cwd: cwdDir };
     }),
 
     send: guarded(async (params) => {

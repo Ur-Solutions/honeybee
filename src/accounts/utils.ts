@@ -17,6 +17,18 @@ export function emailFromJwt(jwt: string): string | null {
   }
 }
 
+/** `exp` claim (unix SECONDS) from a JWT — decoded, not verified (local fact). */
+export function expFromJwt(jwt: string): number | undefined {
+  const payload = jwt.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown };
+    return typeof decoded.exp === "number" && Number.isFinite(decoded.exp) ? decoded.exp : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function parseTimeMs(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "string") return undefined;

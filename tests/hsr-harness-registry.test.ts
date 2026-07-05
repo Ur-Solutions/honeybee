@@ -78,11 +78,11 @@ test("legacy allowance behavior is preserved by the registry view", () => {
   assert.equal(allowanceFor("nope", "subscription"), undefined);
 });
 
-test("ephemeral policy: claude mints a token, codex ships its primary file", () => {
+test("ephemeral policy: claude mints a token, codex ships an access-token-only auth.json", () => {
   assert.deepEqual(ephemeralHarnesses(), ["claude", "codex"]);
   assert.equal(ephemeralPolicyFor("claude")?.strategy, "mint-token");
   assert.equal(ephemeralPolicyFor("claude")?.tokenEnv, "CLAUDE_CODE_OAUTH_TOKEN");
-  assert.equal(ephemeralPolicyFor("codex")?.strategy, "ship-primary-file");
+  assert.equal(ephemeralPolicyFor("codex")?.strategy, "ship-access-token");
   assert.equal(ephemeralPolicyFor("grok"), undefined, "grok has no ephemeral delivery wired");
   assert.equal(ephemeralPolicyFor("stub"), undefined);
 });

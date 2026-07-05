@@ -31,7 +31,7 @@ import { linkHere } from "../spawnLink.js";
 import { randomUUID } from "node:crypto";
 import { readdir, realpath, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
-import { confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverSpawnBrief, hasFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, ttlFlagMs } from "../cli/shared.js";
+import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, ttlFlagMs } from "../cli/shared.js";
 import { flowRun } from "../commands/flow.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 
@@ -251,9 +251,17 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   if (isRemoteHsr && opts.node) {
     const substrate = remoteHsrSubstrateForNode(opts.node);
     const adapter = adapterFor(spec.kind);
-    // APIA-95: if a working copy was requested, provision (or resolve) it on the
-    // remote FIRST and run the bee inside that checkout — overriding opts.cwd.
-    let spawnCwd = opts.cwd;
+    // The remote runner-host OWNS its own filesystem layout: a remote bee's cwd
+    // and isolated home must be REMOTE paths derived on the remote, never local
+    // paths shipped from this client (a local `/Users/…` cwd doesn't exist on the
+    // node → Node spawn() throws ENOENT; a local isolated-home path is where the
+    // remote would look for delivered auth in vain). So we ship NO local
+    // cwd/home for a remote-hsr spawn: the remote derives a per-bee cwd + home
+    // under its own storeRoot (see remoteHost.ts spawn handler).
+    //
+    // APIA-95: the one exception is a PROVISIONED CHECKOUT — that path is already
+    // a real remote path (cloned on the node), so we send it as the cwd verbatim.
+    let spawnCwd: string | undefined;
     if (opts.repo) {
       const prov = await substrate.provisionRemote({
         repo: opts.repo,
@@ -273,17 +281,23 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     const spawnResult = await substrate.spawnRemote({
       bee: name,
       kind: spec.kind,
-      cwd: spawnCwd,
+      // Only a provisioned checkout (a real remote path) is sent; otherwise the
+      // remote derives the cwd. The isolated home is likewise derived remotely —
+      // we never ship spec.homePath (a local path).
+      ...(spawnCwd ? { cwd: spawnCwd } : {}),
       comb: name, // solo comb
       ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
       authKind: "subscription",
       ...(opts.model ? { model: opts.model } : {}),
       // APIA-93: ephemeral credential material for an account-bound remote spawn.
-      // Delivered to the remote isolated home at spawn, shredded on kill. Opaque.
+      // Delivered to the remote-derived isolated home at spawn, shredded on kill.
       ...(remoteCreds ? { creds: { ...(remoteCreds.files.length ? { files: remoteCreds.files } : {}), ...(remoteCreds.env ? { env: remoteCreds.env } : {}) } } : {}),
-      ...(remoteCreds && spec.homePath ? { home: spec.homePath } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
+    // The remote resolves+returns the actual cwd it ran the bee in (the derived
+    // per-bee dir, or the checkout we sent). Record that remote path; fall back to
+    // the checkout path if an older serve didn't echo one.
+    const recordCwd = spawnResult.cwd ?? spawnCwd ?? "";
     timer.mark("session-create");
     const runnerTier = adapter?.tier() ?? spawnResult.tier;
     const command = shellCommand(spec);
@@ -291,7 +305,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     const record: SessionRecord = {
       name,
       agent: spec.kind,
-      cwd: spawnCwd,
+      cwd: recordCwd,
       command,
       tmuxTarget: name, // logical id — remote HSR has no tmux target
       node: opts.node.name,
@@ -453,10 +467,11 @@ export type SpawnAccountAliasResolver = {
 
 
 export function spawnAccountAliasResolver(requested: string, parsed: Parsed): SpawnAccountAliasResolver | undefined {
+  const includePaused = includePausedFlag(parsed);
   const rr = roundRobinAccountTool(requested);
-  if (rr) return { agent: rr, account: () => pickRoundRobinAccountForCli(rr) };
+  if (rr) return { agent: rr, account: () => pickRoundRobinAccountForCli(rr, includePaused) };
   const tool = autoAccountTool(requested);
-  if (tool) return { agent: tool, account: () => pickAutoAccount(tool, ttlFlagMs(parsed)) };
+  if (tool) return { agent: tool, account: () => pickAutoAccount(tool, ttlFlagMs(parsed), includePaused) };
   return undefined;
 }
 
@@ -483,9 +498,9 @@ export async function defaultSoleCredentialedAccount(requested: string, parsed: 
 
 
 /** `--account <query>` resolution; reserved queries: `auto` (least-loaded) and `rr` (round-robin). */
-export async function resolveAccountFlag(query: string, tool: string, ttlMs: number | undefined): Promise<AccountRecord> {
-  if (query === AUTO_ACCOUNT_QUERY) return pickAutoAccount(tool, ttlMs);
-  if (query === RR_ACCOUNT_QUERY) return pickRoundRobinAccountForCli(tool);
+export async function resolveAccountFlag(query: string, tool: string, ttlMs: number | undefined, includePaused = false): Promise<AccountRecord> {
+  if (query === AUTO_ACCOUNT_QUERY) return pickAutoAccount(tool, ttlMs, includePaused);
+  if (query === RR_ACCOUNT_QUERY) return pickRoundRobinAccountForCli(tool, includePaused);
   return findAccount(query, tool);
 }
 
@@ -495,8 +510,8 @@ export async function resolveAccountFlag(query: string, tool: string, ttlMs: num
 // hosts multiple providers (minimax + glm + kimi), an auto-pick for `opencode`
 // is provider-blind and may select a different provider than the user meant.
 // Account-first resolution (exact id) sidesteps this; left unchanged in S2.
-export async function pickAutoAccount(tool: string, ttlMs: number | undefined): Promise<AccountRecord> {
-  const choice = await pickLeastLoadedAccount(tool, ttlMs !== undefined ? { ttlMs } : {});
+export async function pickAutoAccount(tool: string, ttlMs: number | undefined, includePaused = false): Promise<AccountRecord> {
+  const choice = await pickLeastLoadedAccount(tool, { ...(ttlMs !== undefined ? { ttlMs } : {}), ...(includePaused ? { includePaused } : {}) });
   const usage = autoPickUsage(choice.limits);
   const freshness = choice.limits?.cached && choice.limits.asOf ? `, cached ${formatRelativeTime(choice.limits.asOf)} ago` : "";
   console.error(note(`account auto → ${choice.account.id}${usage ? ` (${usage}${freshness})` : ""} — ${choice.reason}`));
@@ -504,8 +519,8 @@ export async function pickAutoAccount(tool: string, ttlMs: number | undefined): 
 }
 
 
-export async function pickRoundRobinAccountForCli(tool: string): Promise<AccountRecord> {
-  const choice = await pickRoundRobinAccount(tool);
+export async function pickRoundRobinAccountForCli(tool: string, includePaused = false): Promise<AccountRecord> {
+  const choice = await pickRoundRobinAccount(tool, includePaused ? { includePaused } : {});
   console.error(note(`account rr → ${choice.account.id} — ${choice.reason}`));
   return choice.account;
 }
@@ -607,7 +622,10 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
   // Account binding precedence: explicit --account flag > profile account >
   // <tool>-<account> shorthand / account-id resolution.
-  const account = accountQuery ? await resolveAccountFlag(accountQuery, spec.kind, ttlFlagMs(parsed)) : (profile?.account ?? aliasAccount);
+  const account = accountQuery ? await resolveAccountFlag(accountQuery, spec.kind, ttlFlagMs(parsed), includePausedFlag(parsed)) : (profile?.account ?? aliasAccount);
+  // A paused account is only used deliberately: warn + confirm (or --yes),
+  // before any home activation or session creation happens.
+  await confirmPausedAccount(account, parsed);
   // Model selector precedence: profile model override > the account's default
   // model. Only meaningful when an account is bound.
   const model = account ? (profile?.model ?? account.model) : undefined;
@@ -884,7 +902,10 @@ export async function newBeeAccountRows(kind: string): Promise<SpawnTuiAccount[]
   const now = Date.now();
   return mine.map((account) => {
     const entry = byId.get(account.id);
-    const usage = newBeeUsageCell(entry, now);
+    const base = newBeeUsageCell(entry, now);
+    // Picking a paused account here still works — the spawn path asks for
+    // confirmation — but the picker should say so up front.
+    const usage = account.pausedAt ? (base ? `paused · ${base}` : "paused") : base;
     const saturated = Boolean(
       entry?.ok && entry.fiveHour && !windowRolledOver(entry.fiveHour, now) && entry.fiveHour.usedPercent >= 90,
     );
@@ -969,6 +990,9 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
   const agent = profile ? profile.account.tool : resolvedAgent;
   const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
   const account = profile?.account ?? aliasAccount;
+  // Once, before the loop: all N bees share this account. Per-bee alias picks
+  // (auto/rr) draw from pools that already exclude paused accounts.
+  await confirmPausedAccount(account, parsed);
   // Model selector precedence: profile model override > the account default.
   const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
@@ -1044,6 +1068,7 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
     const agent = profile ? profile.account.tool : resolvedAgent;
     const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
     const account = profile?.account ?? aliasAccount;
+    await confirmPausedAccount(account, parsed);
     const yolo = dangerousMode(parsed, agent, caste.bee, profile?.yolo);
     const home = caste.home ?? flagHome;
     const casteSpec = resolveAgent(agent, extraArgs, { home, yolo });

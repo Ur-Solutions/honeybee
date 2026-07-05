@@ -61,7 +61,13 @@ type RemoteListRow = {
 export type RemoteSpawnParams = {
   bee: string;
   kind: string;
-  cwd: string;
+  /**
+   * The bee's working dir. OMITTED for a plain remote-hsr spawn — a local path
+   * doesn't exist on the node (spawn() ENOENT), so the remote derives a per-bee
+   * cwd under its own storeRoot. Sent ONLY when it is already a real REMOTE path:
+   * a provisioned checkout (APIA-95).
+   */
+  cwd?: string;
   sessionId?: string;
   resume?: boolean;
   authKind?: "subscription" | "api-key";
@@ -75,15 +81,16 @@ export type RemoteSpawnParams = {
    */
   creds?: DeliveredCredentials;
   /**
-   * The isolated home the credential files are written into (the local side is
-   * authoritative — it resolved the AgentSpec's home). Only used when `creds`
-   * carry files; the remote creates it fresh (0700).
+   * Isolated-home override. Normally OMITTED — the remote derives the harness
+   * home under its own storeRoot (a local path is meaningless on the node) and
+   * writes delivered credentials there. An explicit REMOTE path is honored as-is
+   * (tests inject one). Only relevant when `creds` carry files.
    */
   home?: string;
   spec: { command: string; args: string[]; env: Record<string, string> };
 };
 
-export type RemoteSpawnResult = { bee: string; tier?: string; sessionId?: string };
+export type RemoteSpawnResult = { bee: string; tier?: string; sessionId?: string; cwd?: string };
 
 /**
  * APIA-95 working-copy provisioning params/result. Clone (or idempotently reuse)
@@ -324,7 +331,7 @@ export function createRemoteHsrSubstrate(
     const res = (await c.call("spawn", {
       bee: params.bee,
       kind: params.kind,
-      cwd: params.cwd,
+      ...(params.cwd ? { cwd: params.cwd } : {}),
       ...(params.sessionId ? { sessionId: params.sessionId } : {}),
       ...(params.resume ? { resume: true } : {}),
       ...(params.authKind ? { authKind: params.authKind } : {}),
@@ -334,13 +341,14 @@ export function createRemoteHsrSubstrate(
       ...(params.creds ? { creds: params.creds } : {}),
       ...(params.home ? { home: params.home } : {}),
       spec: params.spec,
-    })) as { ok?: boolean; bee?: string; tier?: string; error?: string } | null;
+    })) as { ok?: boolean; bee?: string; tier?: string; cwd?: string; error?: string } | null;
     if (!res || !res.ok) {
       throw new Error(`remote HSR spawn of ${params.bee} on ${node.name} failed: ${res?.error ?? "unknown"}`);
     }
     return {
       bee: res.bee ?? params.bee,
       ...(res.tier ? { tier: res.tier } : {}),
+      ...(typeof res.cwd === "string" && res.cwd ? { cwd: res.cwd } : {}),
       ...(params.sessionId ? { sessionId: params.sessionId } : {}),
     };
   }

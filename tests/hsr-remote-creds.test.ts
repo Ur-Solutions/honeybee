@@ -70,22 +70,104 @@ async function fileExists(path: string): Promise<boolean> {
 
 // ── mint side (local) ──────────────────────────────────────────────────────
 
-test("mintEphemeralCredential: codex ships the vaulted auth.json (0600), never leaking the secret", async () => {
+// A minimal, UNVERIFIED codex-style JWT: header.payload.sig with a chosen `exp`
+// (unix seconds). Not signed — remoteCreds only DECODES exp, never verifies.
+function fakeJwt(expSeconds: number): string {
+  const b64 = (obj: unknown): string => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  return `${b64({ alg: "none", typ: "JWT" })}.${b64({ exp: expSeconds })}.sig`;
+}
+
+function codexAuthJson(fields: { accessExpSeconds: number; refresh: string; idEmail?: string }): string {
+  return JSON.stringify({
+    auth_mode: "chatgpt",
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: fakeJwt(fields.accessExpSeconds), // stand-in id_token JWT
+      access_token: fakeJwt(fields.accessExpSeconds),
+      refresh_token: fields.refresh,
+      account_id: "acct-123",
+    },
+    last_refresh: "2026-07-05T00:00:00.000Z",
+  });
+}
+
+test("mintEphemeralCredential: codex ships an access-token-only auth.json (refresh_token blanked), preserving the other tokens, never leaking", async () => {
   await withTempStore(async () => {
     const account = fakeAccount({ id: "codex-fake", tool: "codex", label: "fake", provider: "openai" });
-    const SECRET = "SECRET-codex-auth-DO-NOT-LOG-abc123";
-    const raw = JSON.stringify({ tokens: { access_token: SECRET } });
+    const REFRESH_SECRET = "SECRET-refresh-token-DO-NOT-SHIP-abc123";
+    const freshExp = Math.floor(Date.now() / 1000) + 240 * 3600; // 10 days out
+    const raw = codexAuthJson({ accessExpSeconds: freshExp, refresh: REFRESH_SECRET });
+    const accessToken = (JSON.parse(raw) as { tokens: { access_token: string } }).tokens.access_token;
+    const idToken = (JSON.parse(raw) as { tokens: { id_token: string } }).tokens.id_token;
     await mkdir(accountDir(account), { recursive: true, mode: 0o700 });
     await writeFile(join(accountDir(account), "auth.json"), raw, { mode: 0o600 });
 
-    const cred = await mintEphemeralCredential(account, "codex");
+    // Fresh token → the injected central refresh is still called but is a no-op.
+    let ensureCalled = false;
+    const cred = await mintEphemeralCredential(account, "codex", {
+      ensureFreshCodexToken: async () => {
+        ensureCalled = true;
+      },
+    });
+    assert.ok(ensureCalled, "central freshness check runs before shipping");
     assert.equal(cred.files.length, 1);
     assert.equal(cred.files[0]!.homeRelPath, "auth.json");
     assert.equal(cred.files[0]!.mode, 0o600);
     assert.equal(cred.env, undefined);
-    assert.equal(Buffer.from(cred.files[0]!.contentB64, "base64").toString("utf8"), raw);
-    // Guardrail: the human note carries no secret bytes.
-    assert.ok(!cred.kindNote.includes(SECRET), "kindNote must not leak the credential");
+    assert.equal(cred.expiresAt, freshExp, "expiresAt carries the access token's exp (non-secret)");
+
+    const shipped = JSON.parse(Buffer.from(cred.files[0]!.contentB64, "base64").toString("utf8")) as {
+      tokens: { access_token: string; id_token: string; refresh_token: string; account_id: string };
+      auth_mode: string;
+    };
+    assert.equal(shipped.tokens.refresh_token, "", "refresh_token is blanked (field kept)");
+    assert.ok("refresh_token" in shipped.tokens, "refresh_token field is present (deleting it breaks codex serde)");
+    assert.equal(shipped.tokens.access_token, accessToken, "access_token preserved");
+    assert.equal(shipped.tokens.id_token, idToken, "id_token preserved");
+    assert.equal(shipped.tokens.account_id, "acct-123", "account_id preserved");
+    assert.equal(shipped.auth_mode, "chatgpt", "auth_mode preserved");
+
+    // Guardrails: neither the shipped bytes nor the note carry the refresh token.
+    assert.ok(!Buffer.from(cred.files[0]!.contentB64, "base64").toString("utf8").includes(REFRESH_SECRET), "refresh token never shipped");
+    assert.ok(!cred.kindNote.includes(REFRESH_SECRET), "kindNote must not leak the refresh token");
+    assert.match(cred.kindNote, /refresh_token blanked/);
+  });
+});
+
+test("mintEphemeralCredential: codex triggers the central refresh when the vaulted token is stale, then ships the refreshed token", async () => {
+  await withTempStore(async () => {
+    const account = fakeAccount({ id: "codex-stale", tool: "codex", label: "stale", provider: "openai" });
+    const authPath = join(accountDir(account), "auth.json");
+    await mkdir(accountDir(account), { recursive: true, mode: 0o700 });
+    // Start with a token that already expired.
+    const staleExp = Math.floor(Date.now() / 1000) - 60;
+    await writeFile(authPath, codexAuthJson({ accessExpSeconds: staleExp, refresh: "real-refresh" }), { mode: 0o600 });
+
+    // The injected refresh simulates codex rotating the vault token in place.
+    const freshExp = Math.floor(Date.now() / 1000) + 240 * 3600;
+    let refreshRan = false;
+    const cred = await mintEphemeralCredential(account, "codex", {
+      ensureFreshCodexToken: async () => {
+        refreshRan = true;
+        await writeFile(authPath, codexAuthJson({ accessExpSeconds: freshExp, refresh: "rotated-refresh" }), { mode: 0o600 });
+      },
+    });
+    assert.ok(refreshRan, "central refresh was triggered for the stale token");
+    assert.equal(cred.expiresAt, freshExp, "ships the refreshed token's exp");
+    const shipped = JSON.parse(Buffer.from(cred.files[0]!.contentB64, "base64").toString("utf8")) as { tokens: { refresh_token: string } };
+    assert.equal(shipped.tokens.refresh_token, "");
+  });
+});
+
+test("mintEphemeralCredential: codex auth.json with no access_token is refused", async () => {
+  await withTempStore(async () => {
+    const account = fakeAccount({ id: "codex-noat", tool: "codex", label: "noat", provider: "openai" });
+    await mkdir(accountDir(account), { recursive: true, mode: 0o700 });
+    await writeFile(join(accountDir(account), "auth.json"), JSON.stringify({ tokens: { refresh_token: "x" } }), { mode: 0o600 });
+    await assert.rejects(
+      () => mintEphemeralCredential(account, "codex", { ensureFreshCodexToken: async () => undefined }),
+      /no tokens\.access_token/,
+    );
   });
 });
 
@@ -337,7 +419,7 @@ test("hive spawn --account gating: local-only remote-hsr throws; ephemeral-token
     // NOT at the policy gate. That difference is the proof the gate allowed it.
     const epFail = await hiveExpectFail(dir, "spawn", "codex-fake", "--node", "epnode");
     assert.doesNotMatch(epFail, /auth-policy local-only/);
-    assert.match(epFail, /could not mint an ephemeral credential|no primary credential/);
+    assert.match(epFail, /could not mint an ephemeral credential|no primary credential|no vaulted codex auth/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

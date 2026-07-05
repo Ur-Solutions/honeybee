@@ -29,6 +29,7 @@ export {
   type AddAccountOptions,
   addAccount,
   removeAccount,
+  setAccountPaused,
 } from "./accounts/registry.js";
 
 export {
@@ -41,7 +42,7 @@ export {
   resolveSpawnAgent,
 } from "./accounts/resolve.js";
 
-export { accountEmail, emailFromJwt } from "./accounts/utils.js";
+export { accountEmail, emailFromJwt, expFromJwt } from "./accounts/utils.js";
 
 export { candidateHomes, defaultHomeForAccount } from "./accounts/homes.js";
 
@@ -72,6 +73,11 @@ export {
   codexHomesForAccount,
   type CodexAuthSyncResult,
   syncCodexAuthToVault,
+  codexAccessTokenExp,
+  CODEX_TOKEN_MIN_TTL_MS,
+  type CodexTokenFreshness,
+  type EnsureFreshCodexDeps,
+  ensureFreshCodexVaultToken,
 } from "./accounts/codexAuth.js";
 
 export {

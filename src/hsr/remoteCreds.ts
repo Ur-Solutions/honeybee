@@ -38,7 +38,7 @@ import { hsrRunDir } from "./runDir.js";
 // deliver/shred functions, so esbuild's tree-shake keeps accounts.ts out of the
 // remote runner-host bundle. Keep it that way: no accounts symbol may be used by
 // any export remoteHost.ts calls.
-import { accountDir, defaultHomeForAccount, type AccountRecord } from "../accounts.js";
+import { accountDir, defaultHomeForAccount, ensureFreshCodexVaultToken, expFromJwt, type AccountRecord } from "../accounts.js";
 
 const execFileP = promisify(execFile);
 
@@ -63,6 +63,13 @@ export type EphemeralCredential = {
   files: EphemeralCredentialFile[];
   env?: Record<string, string>;
   kindNote: string;
+  /**
+   * NON-SECRET expiry (unix SECONDS) of the delivered short-lived material, when
+   * known — e.g. the shipped codex access token's JWT `exp`. UNIT 2's daemon
+   * expiry tracking consumes this to re-deliver before a bee's token dies. Never
+   * carries token bytes.
+   */
+  expiresAt?: number;
 };
 
 // ── Per-kind policy ─────────────────────────────────────────────────────────
@@ -76,7 +83,16 @@ export type MintDeps = {
    * is minted). Returns the token string, or null to trigger the file fallback.
    */
   runClaudeSetupToken?: (homePath: string) => Promise<string | null>;
+  /**
+   * Injectable central codex token-freshness check (tests inject a fake so no
+   * real `codex exec` runs). Defaults to ensureFreshCodexVaultToken.
+   */
+  ensureFreshCodexToken?: (account: AccountRecord) => Promise<unknown>;
 };
+
+// Never ship a codex access token with less than this TTL remaining: below it
+// the token could die mid-run on the remote before UNIT 2 re-delivers.
+const CODEX_MIN_SHIP_TTL_MS = 15 * 60_000;
 
 /**
  * Mint the SHORT-LIVED credential material for `account` (harness `kind`) to
@@ -115,11 +131,68 @@ export async function mintEphemeralCredential(
     };
   }
 
+  if (policy.strategy === "ship-access-token") {
+    return mintCodexAccessTokenCredential(account, kind, deps);
+  }
+
   // ship-primary-file
   const file = await requirePrimaryCredential(account, kind);
   return {
     files: [file],
     kindNote: `${kind}: shipped ${file.homeRelPath} into the remote isolated home (0600)`,
+  };
+}
+
+/**
+ * ship-access-token (codex): deliver an auth.json carrying a FRESH access token
+ * with the refresh token BLANKED (`refresh_token: ""`, field kept — codex serde
+ * requires it present; deleting it hard-fails). The vault stays the sole holder
+ * of the real refresh token, so no two fleet bees ever present the same
+ * one-time-use refresh token. Because the access token lasts ~10 days, bees
+ * essentially never refresh mid-run.
+ */
+async function mintCodexAccessTokenCredential(account: AccountRecord, kind: string, deps: MintDeps): Promise<EphemeralCredential> {
+  // Keep the vault access token fresh BEFORE we read it: if it is near/at expiry
+  // this triggers a central refresh (codex rotates in place; the vault harvests
+  // the rotated token). Never ships a stale token to the remote.
+  const ensureFresh = deps.ensureFreshCodexToken ?? ensureFreshCodexVaultToken;
+  await ensureFresh(account);
+
+  const file = await requirePrimaryCredential(account, kind); // codex auth.json
+  const raw = Buffer.from(file.contentB64, "base64").toString("utf8");
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new Error(`codex auth.json for account ${account.id} is not valid JSON; re-login with: hive account login codex ${account.label}`);
+  }
+  const tokens =
+    parsed.tokens && typeof parsed.tokens === "object" && !Array.isArray(parsed.tokens)
+      ? (parsed.tokens as Record<string, unknown>)
+      : undefined;
+  const accessToken = tokens && typeof tokens.access_token === "string" ? (tokens.access_token as string) : undefined;
+  if (!accessToken) {
+    throw new Error(`codex auth.json for account ${account.id} has no tokens.access_token; cannot ship an access-token-only credential`);
+  }
+  const expSeconds = expFromJwt(accessToken);
+  if (expSeconds === undefined) {
+    throw new Error(`codex access token for account ${account.id} has no decodable expiry; refusing to ship`);
+  }
+  // Guardrail: never ship a stale token. The central refresh above should have
+  // freshened it, but re-check the emitted token (secret-free) so an
+  // unrefreshable account fails HERE instead of shipping a dead token.
+  if (expSeconds * 1000 - Date.now() <= CODEX_MIN_SHIP_TTL_MS) {
+    throw new Error(`codex access token for account ${account.id} is expired or near-expiry after refresh; not shipping a stale token`);
+  }
+
+  // Blank the refresh token, preserve everything else (access_token, id_token,
+  // account_id, auth_mode, OPENAI_API_KEY, last_refresh).
+  const blanked = { ...parsed, tokens: { ...tokens, refresh_token: "" } };
+  const body = `${JSON.stringify(blanked, null, 2)}\n`;
+  return {
+    files: [{ homeRelPath: file.homeRelPath, contentB64: Buffer.from(body, "utf8").toString("base64"), mode: 0o600 }],
+    expiresAt: expSeconds,
+    kindNote: `${kind}: shipped access-token-only auth.json (refresh_token blanked), exp ${new Date(expSeconds * 1000).toISOString()}`,
   };
 }
 

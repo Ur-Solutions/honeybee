@@ -52,12 +52,19 @@ export type HarnessAllowancePolicy = {
 /** Remote-HSR ephemeral credential delivery policy (see remoteCreds.ts). */
 export type EphemeralCredentialPolicy = {
   /**
-   * "mint-token"       — exec the genuine harness to mint a fresh short-lived
-   *                       token, delivered via `tokenEnv` (claude setup-token).
-   * "ship-primary-file"— ship the account's primary credential file into the
-   *                       remote home (codex auth.json — the documented flow).
+   * "mint-token"        — exec the genuine harness to mint a fresh short-lived
+   *                        token, delivered via `tokenEnv` (claude setup-token).
+   * "ship-primary-file" — ship the account's primary credential file verbatim
+   *                        into the remote home (legacy codex flow).
+   * "ship-access-token" — ship the codex auth.json with the REFRESH token
+   *                        blanked (`refresh_token: ""`, field KEPT — codex
+   *                        serde requires it present) and a fresh, long-lived
+   *                        (~10-day) access token. The vault stays the sole
+   *                        holder of the real refresh token, so fleet-wide
+   *                        refresh-reuse detection can never invalidate the
+   *                        grant. Central refresh keeps the vault token fresh.
    */
-  readonly strategy: "mint-token" | "ship-primary-file";
+  readonly strategy: "mint-token" | "ship-primary-file" | "ship-access-token";
   /** For "mint-token": the env var the token is delivered as. */
   readonly tokenEnv?: string;
   /** Secret-free human note. */
@@ -147,11 +154,14 @@ export const HARNESSES = {
         since: "2026-07-02",
       },
     },
-    // Ship auth.json (the identity recipe's primary credential) into the remote
-    // CODEX_HOME. codex treats auth.json "like a password" (research §2).
+    // Ship a REFRESH-TOKEN-BLANKED auth.json into the remote CODEX_HOME: a fresh
+    // ~10-day access token + `refresh_token: ""`. Shipping the full auth.json
+    // (with the one-time-use refresh token) across a fleet trips provider
+    // reuse-detection when two bees refresh the same token; blanking it keeps
+    // the vault the sole holder of the real refresh token (research §2).
     ephemeral: {
-      strategy: "ship-primary-file",
-      note: "ship auth.json into remote CODEX_HOME",
+      strategy: "ship-access-token",
+      note: "ship access-token-only auth.json (refresh_token blanked) into remote CODEX_HOME",
     },
   },
   opencode: {
