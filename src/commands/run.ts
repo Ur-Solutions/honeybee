@@ -15,7 +15,7 @@ import { substrateFor } from "../substrates/index.js";
 import { openInNewTerminal, runInCurrentTerminal } from "../terminal.js";
 import { formatShellCommand } from "../tmux.js";
 import { waitForIdle } from "../wait.js";
-import { acceptsTrust, cleanupAfterRun, dangerousMode, formatPaneExcerpt, hasFlag, hsrSubstrateRequested, resolveSpawnCwd, sleep, stringFlag, ttlFlagMs } from "../cli/shared.js";
+import { acceptsTrust, cleanupAfterRun, confirmPausedAccount, dangerousMode, formatPaneExcerpt, hasFlag, hsrSubstrateRequested, includePausedFlag, resolveSpawnCwd, sleep, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { cmdSpawn, resolveAccountFlag, resolveProfileOverlay, resolveSpawnAgentWithAuto } from "../commands/spawn.js";
 
 /**
@@ -323,7 +323,9 @@ export async function cmdOpenRaw(parsed: Parsed) {
   const profileArgs = profile?.args ?? [];
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
-  const account = accountQuery ? await resolveAccountFlag(accountQuery, canonicalAgentKind(agent), ttlFlagMs(parsed)) : (profile?.account ?? aliasAccount);
+  const account = accountQuery ? await resolveAccountFlag(accountQuery, canonicalAgentKind(agent), ttlFlagMs(parsed), includePausedFlag(parsed)) : (profile?.account ?? aliasAccount);
+  // Raw open skips cmdSpawn, so it needs its own paused-account gate.
+  await confirmPausedAccount(account, parsed);
   const model = account ? (profile?.model ?? account.model) : undefined;
   const provider = account?.provider;
   const home = (flag(parsed, "home") ?? flag(parsed, "profile")) ?? (account ? defaultHomeForAccount(account) : undefined);

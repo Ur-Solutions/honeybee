@@ -23,6 +23,7 @@ import {
   removeAccount,
   resolveSpawnAgent,
   roundRobinAccountTool,
+  setAccountPaused,
   syncAccountCredentialsToVault,
   syncClaudeChainToVault,
   syncCodexAuthToVault,
@@ -69,6 +70,23 @@ test("add/list/find/remove accounts round-trip", async () => {
 
     await removeAccount(account.id);
     assert.deepEqual(await listAccounts(), []);
+  });
+});
+
+test("setAccountPaused pauses and resumes an account in the registry", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "pause@example.com");
+    const paused = await setAccountPaused(account.id, true);
+    assert.ok(paused.pausedAt, "pause stamps pausedAt");
+    assert.ok((await listAccounts()).find((candidate) => candidate.id === account.id)?.pausedAt, "pause persists");
+
+    // Repeat pause is a no-op: the original timestamp survives.
+    const again = await setAccountPaused(account.id, true);
+    assert.equal(again.pausedAt, paused.pausedAt);
+
+    const resumed = await setAccountPaused(account.id, false);
+    assert.equal(resumed.pausedAt, undefined);
+    assert.equal((await listAccounts()).find((candidate) => candidate.id === account.id)?.pausedAt, undefined, "resume persists");
   });
 });
 

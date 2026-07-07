@@ -1,6 +1,6 @@
 // `hive account`/activate/login/swap-account/usage/limits — provider account vault.
 // Extracted from cli.ts (HIVE-15).
-import { accountEmail, accountHasCredentials, accountsRegistryPath, activateAccountIntoHome, addAccount, captureAccountFromHome, defaultHomeForAccount, findAccount, listAccounts, removeAccount, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault, type AccountChainSyncOutcome, type AccountRecord } from "../accounts.js";
+import { accountEmail, accountHasCredentials, accountsRegistryPath, activateAccountIntoHome, addAccount, captureAccountFromHome, defaultHomeForAccount, findAccount, listAccounts, removeAccount, setAccountPaused, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault, type AccountChainSyncOutcome, type AccountRecord } from "../accounts.js";
 import { canonicalAgentKind, resolveAgent, resolveHome } from "../agents.js";
 import { cursorLiveAuthDigest } from "../accounts/cursorAuth.js";
 import { parseAge } from "../clean.js";
@@ -70,6 +70,22 @@ export async function cmdAccount(parsed: Parsed) {
       else console.log(`captured\t${account.id}\t${homePath}\t${captured.join(",")}`);
       break;
     }
+    case "pause":
+    case "resume":
+    case "unpause": {
+      // Pause: keep the account (and its vaulted credentials), but take it out
+      // of everyday rotation — auto/rr skip it, and explicit spawns ask first.
+      const paused = sub === "pause";
+      const query = parsed.args[1];
+      if (!query) throw new Error(`Usage: hive account ${paused ? "pause" : "resume"} <account>`);
+      const account = await setAccountPaused(query, paused);
+      const detail = paused
+        ? "out of the auto/rr pools; explicit spawns ask for confirmation"
+        : "back in the auto/rr pools";
+      if (isPretty()) console.log(actionLine("ok", paused ? "pause" : "resume", [bold(account.id), dim(detail)]));
+      else console.log(`${paused ? "paused" : "resumed"}\t${account.id}`);
+      break;
+    }
     case "remove":
     case "rm": {
       const query = parsed.args[1];
@@ -103,7 +119,7 @@ export async function cmdAccount(parsed: Parsed) {
       break;
     }
     default:
-      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|sync|remove`);
+      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|sync|pause|resume|remove`);
   }
 }
 
@@ -120,11 +136,14 @@ export async function accountList(parsed: Parsed) {
     const exhausted = isRecentlyExhausted(summary, now);
     if (json) {
       return {
-        json: { ...account, credentials: hasCreds, exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null },
+        json: { ...account, credentials: hasCreds, paused: Boolean(account.pausedAt), exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null },
         row: null,
       };
     }
-    const state = !hasCreds ? yellow("no-creds") : exhausted ? red("exhausted") : green("ok");
+    // Paused outranks exhausted in the cell: it's the operator's own standing
+    // decision, while exhaustion is transient and visible in EXHAUSTED/RESET.
+    const plain = !hasCreds ? "no-creds" : account.pausedAt ? "paused" : exhausted ? "exhausted" : "ok";
+    const state = !hasCreds ? yellow(plain) : account.pausedAt ? yellow(plain) : exhausted ? red(plain) : green(plain);
     return {
       json: null,
       row: [
@@ -132,7 +151,7 @@ export async function accountList(parsed: Parsed) {
         account.tool,
         account.provider ?? "-",
         account.label,
-        isPretty() ? state : !hasCreds ? "no-creds" : exhausted ? "exhausted" : "ok",
+        isPretty() ? state : plain,
         summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
         summary.lastResetHint ?? "-",
       ],

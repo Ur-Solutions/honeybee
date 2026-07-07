@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { accountDir, addAccount } from "../src/accounts.js";
+import { accountDir, addAccount, setAccountPaused } from "../src/accounts.js";
 import { identityRecipeForAgent } from "../src/drivers.js";
 import { pickRoundRobinAccount } from "../src/limits/autoPick.js";
 import { storeRoot } from "../src/fsx.js";
@@ -85,6 +85,31 @@ test("pickRoundRobinAccount surfaces the same error shape as the auto picker", a
       () => pickRoundRobinAccount("claude"),
       /No claude account has vaulted credentials/,
     );
+  });
+});
+
+test("pickRoundRobinAccount skips paused accounts unless includePaused", async () => {
+  await withTempStore(async () => {
+    const a = await addAccount("claude", "a@x.example");
+    const b = await addAccount("claude", "b@x.example");
+    for (const acct of [a, b]) await vaultPrimaryCredential(acct);
+    await setAccountPaused(a.id, true);
+
+    // Paused `a` never appears, even across wraps.
+    for (let i = 0; i < 3; i += 1) {
+      assert.equal((await pickRoundRobinAccount("claude")).account.id, b.id);
+    }
+
+    // includePaused restores the full cycle.
+    const cycle = new Set<string>();
+    for (let i = 0; i < 2; i += 1) {
+      cycle.add((await pickRoundRobinAccount("claude", { includePaused: true })).account.id);
+    }
+    assert.deepEqual([...cycle].sort(), [a.id, b.id].sort());
+
+    // Everything paused: a dedicated error, distinct from the no-creds one.
+    await setAccountPaused(b.id, true);
+    await assert.rejects(() => pickRoundRobinAccount("claude"), /Every claude account is paused/);
   });
 });
 

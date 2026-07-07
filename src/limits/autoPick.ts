@@ -10,6 +10,9 @@
 //  - rr: the next account in a persistent round-robin order, advancing a
 //    cursor on disk. Explicitly NOT limits-aware — the operator wants the
 //    workload spread evenly regardless of remaining quota.
+//
+// Both pickers exclude PAUSED accounts (AccountRecord.pausedAt) by default;
+// `includePaused` opts back in (`--include-paused` on the spawn side).
 // ──────────────────────────────────────────────────────────────────────────
 
 import { readFile } from "node:fs/promises";
@@ -167,7 +170,25 @@ export type PickAccountDeps = CachedLimitsOptions & {
   hasCredentials?: typeof accountHasCredentials;
   /** Session records for the commitment penalty; defaults to the live store. */
   sessions?: SessionRecord[];
+  /** Consider paused accounts too (they are excluded from the pool by default). */
+  includePaused?: boolean;
 };
+
+/**
+ * The pool both pickers draw from: the tool's registered accounts minus the
+ * paused ones (unless `includePaused`). Throws the shared error shapes for
+ * "none registered" and "all paused" so auto and rr cannot drift apart.
+ */
+function pickableAccounts(kind: string, registered: AccountRecord[], includePaused: boolean): AccountRecord[] {
+  if (registered.length === 0) {
+    throw new Error(`No ${kind} accounts registered; add one with: hive account add ${kind} <label>`);
+  }
+  const pool = includePaused ? registered : registered.filter((account) => !account.pausedAt);
+  if (pool.length === 0) {
+    throw new Error(`Every ${kind} account is paused; resume one with: hive account resume <account>, or pass --include-paused`);
+  }
+  return pool;
+}
 
 /**
  * Resolve the `auto` account query: among the tool's accounts with vaulted
@@ -180,12 +201,10 @@ export type PickAccountDeps = CachedLimitsOptions & {
 export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps = {}): Promise<AutoAccountChoice> {
   const kind = canonicalAgentKind(tool).toLowerCase();
   const registered = (await listAccounts()).filter((account) => account.tool === kind);
-  if (registered.length === 0) {
-    throw new Error(`No ${kind} accounts registered; add one with: hive account add ${kind} <label>`);
-  }
+  const pool = pickableAccounts(kind, registered, deps.includePaused ?? false);
   const hasCredentials = deps.hasCredentials ?? accountHasCredentials;
   const candidates: AccountRecord[] = [];
-  for (const account of registered) {
+  for (const account of pool) {
     if (await hasCredentials(account)) candidates.push(account);
   }
   if (candidates.length === 0) {
@@ -300,14 +319,12 @@ async function writeCursor(cursor: CursorFile): Promise<void> {
  * Throws with the same error shapes as the auto picker when no candidates
  * exist / no candidate has credentials.
  */
-export async function pickRoundRobinAccount(tool: string): Promise<RoundRobinChoice> {
+export async function pickRoundRobinAccount(tool: string, options: { includePaused?: boolean } = {}): Promise<RoundRobinChoice> {
   const kind = canonicalAgentKind(tool).toLowerCase();
   const registered = (await listAccounts()).filter((account) => account.tool === kind);
-  if (registered.length === 0) {
-    throw new Error(`No ${kind} accounts registered; add one with: hive account add ${kind} <label>`);
-  }
+  const pool = pickableAccounts(kind, registered, options.includePaused ?? false);
   const candidates: AccountRecord[] = [];
-  for (const account of registered) {
+  for (const account of pool) {
     if (await accountHasCredentials(account)) candidates.push(account);
   }
   if (candidates.length === 0) {

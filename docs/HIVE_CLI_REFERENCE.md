@@ -1551,6 +1551,8 @@ hive account add <tool> <label> [--email <addr>]
 hive account login <tool> <label>
 hive account capture <account> --home <1|2|3|path>
 hive account sync [account]
+hive account pause <account>
+hive account resume <account>
 hive account remove <account>
 ```
 
@@ -1562,12 +1564,22 @@ hive account login codex work
 hive account list --json
 hive account capture codex-work --home ~/.codex-work
 hive account sync
+hive account pause codex-work
+hive account resume codex-work
 hive account remove codex-work
 ```
 
 Account IDs are safe lower-case IDs like `codex-work`, derived from tool and
 label. Account lookup supports exact id, exact label, unique partial id/label,
 and `<tool>-<query>` shorthand.
+
+`account pause` parks an account without removing it: its vaulted credentials
+and running bees are untouched, but the `auto`/`rr` pools skip it (pass
+`--include-paused` to opt back in for one spawn) and explicitly spawning on it
+(`hive spawn`/`x`/`xa`/`open`/`fork`) asks for confirmation first — `--yes`
+skips the question, and a non-interactive caller gets a hard error instead.
+`account resume` puts it back in rotation. Paused accounts show `paused` in
+`account list`, and the autoswap daemon never rotates a bee onto one.
 
 `account login` creates or reuses an account and opens a scratch tmux login
 seat. When fresh credentials appear, they are captured into the vault and the

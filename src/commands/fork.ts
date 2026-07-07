@@ -22,7 +22,7 @@ import { localSubstrate, substrateForRecord, type Substrate } from "../substrate
 import { formatShellCommand } from "../tmux.js";
 import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { confirmSpawnReady, dangerousMode, deliverBrief, hasFlag, resolveBeeInCurrentPane, resolveSpawnCwd, resolveSpawnSubstrate, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
+import { confirmPausedAccount, confirmSpawnReady, dangerousMode, deliverBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnCwd, resolveSpawnSubstrate, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { cmdSend } from "../commands/messaging.js";
 import { maybeLinkHere, newBeeAccountRows, resolveAccountFlag } from "../commands/spawn.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
@@ -63,7 +63,7 @@ export async function resolveForkAccountSafety(
   const wantsResume = context.requestedSeed === "resume";
 
   if (accountQuery) {
-    const account = await resolveAccountFlag(accountQuery, context.targetTool, ttlFlagMs(parsed));
+    const account = await resolveAccountFlag(accountQuery, context.targetTool, ttlFlagMs(parsed), includePausedFlag(parsed));
     // The fork's account must DIFFER from a live account-bound parent's. The
     // OAuth refresh token rotates per-ACCOUNT (not per-home), so two live bees
     // on one account log each other out even in separate homes — and when the
@@ -87,6 +87,9 @@ export async function resolveForkAccountSafety(
           `account ${account.id} has its own home — fork with a seal instead`,
       );
     }
+    // Last gate, after the hard guards: no point confirming a paused account
+    // the same-account/resume checks would refuse anyway.
+    await confirmPausedAccount(account, parsed);
     return { account };
   }
 

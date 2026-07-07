@@ -22,7 +22,7 @@ export const FLOW_SUBCOMMANDS = ["list", "ls", "define", "inspect", "remove", "r
 export const LOOP_SUBCOMMANDS = ["launch", "template", "start", "status", "logs", "stop", "list", "ls"];
 export const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "purge", "config"];
 export const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
-export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "remove"];
+export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "pause", "resume", "remove"];
 export const KEYS_SUBCOMMANDS = ["print", "path", "check"];
 export const SESSIONS_SUBCOMMANDS = ["reconcile"];
 export const SYNC_SUBCOMMANDS = ["manifest"];
@@ -62,7 +62,7 @@ export const SHELL_FIRST_ARG = new Set(["completion"]);
 export const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 export const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait"],
+  spawn: ["--name", "--cwd", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
@@ -70,9 +70,9 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   xa: [
     "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony", "--print",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
-    "--yolo", "--no-yolo", "--dangerous", "--boot-ms", "--here",
+    "--yolo", "--no-yolo", "--dangerous", "--boot-ms", "--here", "--include-paused", "--yes",
   ],
-  open: ["--raw", "--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust"],
+  open: ["--raw", "--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--include-paused", "--yes"],
   view: ["--name", "--new-client", "--close", "--print"],
   ws: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
   usage: ["--samples", "--json", "--ttl"],
@@ -89,11 +89,12 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--idle-ms", "--timeout-ms", "--poll-ms", "--boot-ms", "--wait-ms",
     "--node", "--substrate",
     "-n", "--limit", "--json",
+    "--include-paused", "--yes",
   ],
   x: [
     "--prompt", "-p", "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
-    "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate", "--here",
+    "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate", "--here", "--include-paused", "--yes",
   ],
   send: ["--prompt", "-p"],
   kill: ["--comb"],
@@ -102,7 +103,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   urls: ["--lines", "--open", "--json"],
   keys: ["--tmux", "--wezterm", "--against-recommended"],
   split: ["--brief", "--dir", "--cwd", "--home", "--profile", "--account", "--ttl", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--briefed"],
-  fork: ["--agent", "--model", "--node", "--cwd", "--seed", "--read-log", "--name", "--account", "--here", "--print"],
+  fork: ["--agent", "--model", "--node", "--cwd", "--seed", "--read-log", "--name", "--account", "--here", "--print", "--include-paused", "--yes"],
   brief: ["--brief", "-b", "--accept-trust", "--no-accept-trust", "--force-send", "--no-wait-footer", "--wait-footer", "--footer", "--no-footer"],
   rename: ["--auto", "--clear", "--here"],
   tag: ["--remove", "--list"],
@@ -213,7 +214,7 @@ export const NOUN_SUB_ARG: Record<string, Record<string, NounSubArgKind>> = {
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },
   flow: { inspect: "flow", remove: "flow", run: "flow", logs: "run", status: "run", cancel: "run" },
-  account: { capture: "account", sync: "account", remove: "account", rm: "account" },
+  account: { capture: "account", sync: "account", pause: "account", resume: "account", remove: "account", rm: "account" },
   // buz subcommands all take a selector as their first positional. We
   // accept any session (live or dead) since reading inbox/outbox/queue
   // is meaningful even for a sealed bee.

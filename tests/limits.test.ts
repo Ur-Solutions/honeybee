@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import { addAccount, accountDir } from "../src/accounts.js";
+import { addAccount, accountDir, setAccountPaused } from "../src/accounts.js";
 import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -883,6 +883,36 @@ test("pickLeastLoadedAccount filters to credentialed accounts of the tool and sh
       () => pickLeastLoadedAccount("claude", { hasCredentials: async () => false }),
       /vaulted credentials/,
     );
+  });
+});
+
+test("pickLeastLoadedAccount excludes paused accounts unless includePaused", async () => {
+  await withTempStore(async () => {
+    const one = await addAccount("claude", "one@a.b");
+    const two = await addAccount("claude", "two@a.b");
+    await setAccountPaused(two.id, true);
+
+    // `two` is out of the pool: `one` wins as the lone candidate, no limits fetch.
+    const choice = await pickLeastLoadedAccount("claude", {
+      hasCredentials: async () => true,
+      fetchLimits: async () => {
+        throw new Error("should not fetch limits for a lone candidate");
+      },
+    });
+    assert.equal(choice.account.id, one.id);
+
+    // includePaused puts `two` back in the pool — and it wins on lower usage.
+    const inclusive = await pickLeastLoadedAccount("claude", {
+      includePaused: true,
+      hasCredentials: async () => true,
+      fetchLimits: async () => [okLimits(one.id, 70, 10), okLimits(two.id, 30, 10)],
+      now: () => Date.parse("2026-06-10T12:00:00Z"),
+    });
+    assert.equal(inclusive.account.id, two.id);
+
+    // Everything paused: a dedicated error, distinct from the no-creds one.
+    await setAccountPaused(one.id, true);
+    await assert.rejects(() => pickLeastLoadedAccount("claude"), /Every claude account is paused/);
   });
 });
 

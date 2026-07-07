@@ -5,14 +5,15 @@
 // share so cli.ts stays a thin dispatcher.
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
-import { autoAccountTool } from "../accounts.js";
+import { createInterface } from "node:readline/promises";
+import { autoAccountTool, type AccountRecord } from "../accounts.js";
 import { agentDefaultsToYolo, canonicalAgentKind } from "../agents.js";
 import { parseAge } from "../clean.js";
 import { loadColony } from "../colony.js";
 import { mapWithConcurrency } from "../concurrency.js";
 import { beeConfig, briefFooter, spawnDefaultSubstrate } from "../config.js";
 import { autoAliasForcesYolo, bootMsForAgent } from "../drivers.js";
-import { actionLine, bold, cyan, dim, green, isPretty, note, red, tildify, yellow } from "../format.js";
+import { actionLine, bold, cyan, dim, formatRelativeTime, green, isPretty, note, red, tildify, yellow } from "../format.js";
 import { writeHiveState } from "../hiveState.js";
 import { hsrObservations, type HsrObservation } from "../hsr/observe.js";
 import { matchesSessionReference } from "../ids.js";
@@ -42,6 +43,46 @@ export function ttlFlagMs(parsed: Parsed): number | undefined {
   if (typeof raw !== "string") throw new Error("--ttl needs a duration (e.g. 30m, 2h; 0 forces a live read)");
   if (raw.trim() === "0") return 0;
   return parseAge(raw);
+}
+
+
+/** `--include-paused`: let the auto/rr pools consider paused accounts (excluded by default). */
+export function includePausedFlag(parsed: Parsed): boolean {
+  return truthy(flag(parsed, "include-paused"));
+}
+
+
+/**
+ * Gate spawn-side commands (spawn/x/xa/open/fork) on a paused account: the
+ * account stays usable, but only deliberately. `--yes` skips the question
+ * (`--include-paused` too — asking for paused pool members and then vetoing
+ * the pick would be circular); an interactive session asks y/N; a non-TTY
+ * caller gets a hard error naming the resume command. No-op when no account
+ * is bound or the account is active.
+ */
+export async function confirmPausedAccount(account: AccountRecord | undefined, parsed: Parsed): Promise<void> {
+  if (!account?.pausedAt) return;
+  const since = formatRelativeTime(account.pausedAt);
+  if (truthy(flag(parsed, "yes")) || includePausedFlag(parsed)) {
+    console.error(actionLine("warn", "account", [bold(account.id), `paused ${since} ago — proceeding`]));
+    return;
+  }
+  const resumeHint = `resume with: hive account resume ${account.id}`;
+  if (!process.stdin.isTTY || !process.stderr.isTTY) {
+    throw new Error(`Account ${account.id} is paused (${since} ago); ${resumeHint}, or pass --yes to use it anyway`);
+  }
+  // The question goes to stderr: spawn's stdout is machine-readable
+  // (`name\tagent\tcwd`) and must stay clean for pipelines.
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  let answer: string;
+  try {
+    const mark = isPretty() ? yellow("⚠") : "!";
+    answer = (await rl.question(`${mark} account ${bold(account.id)} was paused ${since} ago — use it anyway? [y/N] `)).trim().toLowerCase();
+  } finally {
+    rl.close();
+  }
+  if (answer === "y" || answer === "yes") return;
+  throw new Error(`Aborted: account ${account.id} is paused; ${resumeHint}`);
 }
 
 

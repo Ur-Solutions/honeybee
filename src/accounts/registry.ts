@@ -19,6 +19,12 @@ export type AccountRecord = {
   provider?: string; // NEW: required after normalization; legacy entries backfill on read
   model?: string; // NEW: optional default model for spawns
   email?: string;
+  /**
+   * Set while the account is paused: excluded from the `auto`/`rr` pools by
+   * default, and explicit use (spawn/x/xa) asks for confirmation first.
+   * Absent = active.
+   */
+  pausedAt?: string;
   addedAt: string;
 };
 
@@ -207,6 +213,26 @@ export async function removeAccount(idOrLabel: string): Promise<AccountRecord> {
       await appendLedger({ type: "account.remove", account: account.id, tool: account.tool, ...(account.provider ? { provider: account.provider } : {}) });
       return account;
     });
+  });
+}
+
+/**
+ * Pause or resume an account. Pausing is registry-only: vaulted credentials
+ * stay intact and already-running bees are unaffected — the flag only changes
+ * how NEW work lands on the account (auto/rr skip it; explicit spawns ask
+ * first). Resuming clears the flag. No-op (no rewrite, no ledger entry) when
+ * the account is already in the requested state.
+ */
+export async function setAccountPaused(idOrLabel: string, paused: boolean): Promise<AccountRecord> {
+  return withAccountsLock(async () => {
+    const accounts = await listAccounts();
+    const account = matchAccount(accounts, idOrLabel);
+    if (paused === Boolean(account.pausedAt)) return account;
+    const { pausedAt: _cleared, ...rest } = account;
+    const updated: AccountRecord = paused ? { ...rest, pausedAt: new Date().toISOString() } : rest;
+    await writeRegistry(accounts.map((candidate) => (candidate.id === account.id ? updated : candidate)));
+    await appendLedger({ type: paused ? "account.pause" : "account.resume", account: account.id, tool: account.tool });
+    return updated;
   });
 }
 

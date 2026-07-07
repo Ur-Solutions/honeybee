@@ -88,6 +88,24 @@ test("dispatchAutoswaps swaps an opted-in exhausted bee to the deterministic nex
   assert.deepEqual(outcomes, [{ bee: "CL.a", from: "claude-current", to: "claude-spare", ok: true }]);
 });
 
+test("dispatchAutoswaps never rotates a bee onto a paused account", async () => {
+  const outcomes = await dispatchAutoswaps([record()], [outcome("CL.a")], {
+    listAccounts: async () => [
+      account("claude-current", "2026-01-01T00:00:00Z"),
+      { ...account("claude-spare", "2026-01-02T00:00:00Z"), pausedAt: "2026-06-01T00:00:00Z" },
+    ],
+    accountHasCredentials: async () => true,
+    usageSummary: async (id) => summary(id),
+    swapAccount: async () => {
+      throw new Error("should not swap onto a paused account");
+    },
+    now: () => NOW,
+  });
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0]!.ok, false);
+  assert.match(outcomes[0]!.skipped ?? "", /no non-exhausted account/);
+});
+
 test("dispatchAutoswaps skips bees without opt-in and reports no-candidate cases", async () => {
   // Not opted in: no outcome at all.
   const ignored = await dispatchAutoswaps([record({ autoswap: undefined })], [outcome("CL.a")], {

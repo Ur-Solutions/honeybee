@@ -25,6 +25,8 @@ import {
   resolveDefineArgs,
   resolvePromptArg,
 } from "../src/cli.js";
+import { confirmPausedAccount } from "../src/cli/shared.js";
+import type { AccountRecord } from "../src/accounts.js";
 import type { Parsed } from "../src/parse.js";
 import type { SessionRecord } from "../src/store.js";
 
@@ -137,4 +139,24 @@ test("emitLog: lines 0 means the full log; empty text emits nothing", async () =
   assert.equal(full, "a\nb\n");
   const empty = await captureStdout(() => emitLog({ text: "", path: "/tmp/x.log" }));
   assert.equal(empty, "");
+});
+
+// --- confirmPausedAccount (paused-account spawn gate)
+function pausedAccount(over: Partial<AccountRecord> = {}): AccountRecord {
+  return { id: "claude-x", tool: "claude", label: "x", addedAt: "2026-01-01T00:00:00Z", pausedAt: "2026-06-01T00:00:00Z", ...over };
+}
+
+test("confirmPausedAccount: no account or an active account is a no-op", async () => {
+  await confirmPausedAccount(undefined, parsedWith());
+  const { pausedAt: _p, ...active } = pausedAccount();
+  await confirmPausedAccount(active, parsedWith());
+});
+
+test("confirmPausedAccount: paused account fails hard without a TTY", async () => {
+  await assert.rejects(() => confirmPausedAccount(pausedAccount(), parsedWith()), /paused.*hive account resume claude-x.*--yes/s);
+});
+
+test("confirmPausedAccount: --yes and --include-paused proceed with a warning", async () => {
+  await confirmPausedAccount(pausedAccount(), parsedWith({ yes: true }));
+  await confirmPausedAccount(pausedAccount(), parsedWith({ "include-paused": true }));
 });

@@ -90,10 +90,13 @@ export async function dispatchAutoswaps(
       // BOTH sides are defined; otherwise fall back to tool-only (legacy
       // single-provider-per-cli back-compat).
       const fromProvider = all.find((account) => account.id === record.accountId)?.provider;
+      // Paused accounts are out of every automatic pool, autoswap included —
+      // the daemon must never rotate a bee ONTO an account the operator parked.
       const accounts = all.filter(
         (account) =>
           account.tool === tool &&
           account.id !== record.accountId &&
+          !account.pausedAt &&
           (fromProvider === undefined || account.provider === undefined || account.provider === fromProvider),
       );
       const candidates: AutoswapCandidate[] = [];
