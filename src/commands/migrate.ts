@@ -14,6 +14,7 @@ import { hsrSubstrate } from "../hsr/substrate.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { waitForAgentReady } from "../readiness.js";
+import { loadLatestSeal } from "../seal.js";
 import { appendLedger, listSessions, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
@@ -491,8 +492,13 @@ export async function cmdRevive(parsed: Parsed): Promise<void> {
         }
         // --crashed revives only un-commanded deaths: a record still 'running'
         // whose session is gone was never retired/killed, so something under it
-        // failed (tmux server crash, external kill, harness exit).
+        // failed (tmux server crash, external kill, harness exit). A bee with a
+        // seal finished its work before exiting — deriveState reports it
+        // "sealed", not "crashed" — so --crashed must not resurrect it.
         if (bulkCrashed && record.status !== "running") {
+          continue;
+        }
+        if (bulkCrashed && (await loadLatestSeal(record.name))) {
           continue;
         }
         // Bulk revive only auto-revives bees we can resume precisely; resuming
@@ -555,6 +561,38 @@ async function diagnoseSubstrateCrash(): Promise<string | undefined> {
 }
 
 /**
+ * Waits for readiness, but fails fast when the bee's session disappears — a
+ * resumed harness that exits immediately (e.g. `claude --resume` of a
+ * never-persisted session) should fail the wait in seconds, not burn the full
+ * timeout. The liveness poll stops as soon as the readiness wait settles, so
+ * a finished revive never keeps the process alive on stray timers.
+ */
+async function waitReadyOrDead(record: SessionRecord, timeoutMs: number): Promise<void> {
+  const substrate = substrateFor(record);
+  let settled = false;
+  const watcher = (async (): Promise<never> => {
+    const deadline = Date.now() + timeoutMs;
+    while (!settled && Date.now() < deadline) {
+      await sleep(2000);
+      if (settled) break;
+      const alive = await substrate.hasSession(record.tmuxTarget).catch(() => true);
+      if (!alive) {
+        throw new Error(`${record.agent} exited right after relaunch (its resumed session may not exist on disk); try: hive revive ${record.name} --fresh`);
+      }
+    }
+    // Ready (or timed out) without death: park until the race is decided by
+    // waitForAgentReady. `settled` is already true or imminent, so this
+    // pending promise is dropped with the race and holds no timers.
+    return new Promise<never>(() => undefined);
+  })();
+  try {
+    await Promise.race([waitForAgentReady(record, { timeoutMs }), watcher]);
+  } finally {
+    settled = true;
+  }
+}
+
+/**
  * Post-relaunch smoothing: wait for each revived tmux bee to become ready,
  * auto-driving claude's startup dialogs (trust, bypass-permissions, the
  * resume-mode chooser, the renderer tour) so a revived bee lands at its
@@ -572,7 +610,7 @@ async function waitForRevivedReady(records: SessionRecord[], parsed: Parsed): Pr
     await Promise.all(
       chunk.map(async (record) => {
         try {
-          await waitForAgentReady(record, { timeoutMs });
+          await waitReadyOrDead(record, timeoutMs);
         } catch (error) {
           const message = error instanceof Error ? error.message.split("\n")[0]! : String(error);
           if (isPretty()) console.error(note(`${record.name}: not ready after revive — ${message}`));
