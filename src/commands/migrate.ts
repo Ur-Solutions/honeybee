@@ -1,7 +1,7 @@
 // `hive promote`/demote/revive — substrate migration: move a bee between an
 // interactive tmux pane and a pane-less HSR runner (resume), and revive dead bees.
 // Extracted from cli.ts (HIVE-15).
-import { activateAccountIntoHome, findAccount } from "../accounts.js";
+import { accountEmail, activateAccountIntoHome, findAccount, homeClaudeEmail, listAccounts, type AccountRecord } from "../accounts.js";
 import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, type AgentSpec } from "../agents.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
@@ -668,9 +668,33 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
     yolo: sniffYolo(record.command),
     identity: true,
   });
+  // Refresh the bee's HOME credentials from the vault before relaunch. A bee
+  // whose home token expired while it was dead otherwise boots logged-out: the
+  // daemon's chain sync only pulls home→vault (keeping the vault fresh, which
+  // is why `hive usage` still reports for a "logged out" account), and never
+  // pushes vault→home, so nothing refreshes a dead bee's home. Only a running
+  // claude or an activation does — and revive historically skipped activation
+  // to dodge cross-account OAuth hazards. We dodge that hazard WITHOUT skipping
+  // the refresh by resolving the account from the HOME's OWN login identity
+  // (its .claude.json email), never record.accountId — which drifts from the
+  // home after swap races (seen live 2026-07-08: 6 gmail-home bees whose
+  // records pointed at ursolutions/arbeidsark). Activating the home's own
+  // identity is the same safe refresh `hive activate` performs. (claude only;
+  // grok/cursor keep their existing assert path.)
+  let ownerId: string | undefined;
   if (!record.node) {
     await assertExecutableAvailable(spec.command);
-    await assertAgentAuthFreshForSpawn(spec, record.accountId);
+    if (tool === "claude" && record.homePath) {
+      const owner = await claudeAccountOwningHome(record.homePath);
+      if (owner) {
+        ownerId = owner.id;
+        await activateAccountIntoHome(owner, record.homePath).catch((error) => {
+          console.error(note(`revive: could not refresh ${record.name}'s home credentials (${owner.id}): ${error instanceof Error ? error.message : String(error)}`));
+        });
+      }
+    } else {
+      await assertAgentAuthFreshForSpawn(spec, record.accountId);
+    }
   }
 
   const launch = await substrate.newSession(record.tmuxTarget, record.cwd, {
@@ -688,6 +712,9 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
       ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
       ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
       ...(sessionOverride ? { providerSessionId: sessionOverride } : {}),
+      // Self-heal a drifted accountId: the home's true owner is authoritative,
+      // so a record that pointed at the wrong account is corrected on revive.
+      ...(ownerId && ownerId !== record.accountId ? { accountId: ownerId } : {}),
       // A fresh revive abandons the old provider session: keeping its id would
       // make the NEXT revive resume a session that no longer matches this bee
       // (or never existed), dying with "No conversation found". Explicit
@@ -706,6 +733,20 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
   return updated;
 }
 
+
+/**
+ * The claude account that TRULY owns a home, resolved from the home's own
+ * recorded login identity (.claude.json oauthAccount email), not from any
+ * session record's accountId — which can drift from the home after swap races.
+ * Used to refresh a home from the right vault on revive without a cross-account
+ * stamp. Returns undefined when the home has no recorded email or no matching
+ * claude account exists.
+ */
+async function claudeAccountOwningHome(homePath: string): Promise<AccountRecord | undefined> {
+  const email = await homeClaudeEmail(homePath).catch(() => null);
+  if (!email) return undefined;
+  return (await listAccounts()).find((account) => account.tool === "claude" && accountEmail(account) === email);
+}
 
 /** Relaunch one dead bee and resume (or, with --fresh, start anew) its session. */
 export async function reviveOne(record: SessionRecord, parsed: Parsed, opts: { skipReadyWait?: boolean } = {}): Promise<SessionRecord> {
