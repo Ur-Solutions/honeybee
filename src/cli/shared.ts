@@ -148,6 +148,42 @@ export function warnSpawnReadiness(record: SessionRecord, error: AgentReadinessE
 }
 
 
+/** How long spawn-time HSR prompt delivery keeps retrying while the runner host boots. */
+export const HSR_PROMPT_BOOT_TIMEOUT_MS = 30_000;
+
+/**
+ * Retry `attempt` with backoff until it succeeds or `timeoutMs` lapses, then
+ * rethrow the last error. Built for the HSR host-boot race: the detached
+ * runner host takes seconds to write meta + open its control socket (longer
+ * under burst spawns, where host boots serialize), so any error inside the
+ * boot window — "no live runner host", a connect refusal on a not-yet-listening
+ * socket — is treated as transient. Backoff: 250ms doubling to a 2s cap,
+ * clamped to the remaining budget. `onRetry` fires once, on the first failure.
+ */
+export async function retryWhileHsrHostBoots<T>(
+  attempt: () => Promise<T>,
+  opts: { timeoutMs?: number; sleepFn?: (ms: number) => Promise<unknown>; onRetry?: (error: unknown) => void } = {},
+): Promise<T> {
+  const wait = opts.sleepFn ?? sleep;
+  const deadline = Date.now() + (opts.timeoutMs ?? HSR_PROMPT_BOOT_TIMEOUT_MS);
+  let delayMs = 250;
+  let retried = false;
+  for (;;) {
+    try {
+      return await attempt();
+    } catch (error) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw error;
+      if (!retried) {
+        retried = true;
+        opts.onRetry?.(error);
+      }
+      await wait(Math.min(delayMs, remaining));
+      delayMs = Math.min(delayMs * 2, 2_000);
+    }
+  }
+}
+
 /**
  * Deliver an initial prompt to a freshly spawned HSR bee over its control
  * socket, WITHOUT a readiness poll.
@@ -161,13 +197,20 @@ export function warnSpawnReadiness(record: SessionRecord, error: AgentReadinessE
  * the same `sendText` → `send` RPC path `hive x`/`hive run` use
  * (deliverPromptToBee) — the only channel an HSR bee acts on.
  *
- * No `waitForAgentReady`: HSR bees have no pane to scrape, and the runner host
- * was already confirmed live at spawn (its control socket is up). deliverBrief's
- * readiness poll would only time out on a pane-less bee, so this mirrors
- * deliverPromptToBee (run.ts) — direct send.
+ * No `waitForAgentReady`: HSR bees have no pane to scrape. But the runner host
+ * is NOT guaranteed live yet — spawnBee only waits ~5s (waitForHsrHost) and
+ * returns the record on timeout, so a one-shot send here raced host boot and
+ * lost the prompt ("HSR bee X has no live runner host to steer") — reliably so
+ * on burst spawns. Retry over the boot window instead, so spawn+prompt is
+ * atomic across a slow host boot.
  */
 export async function deliverHsrPrompt(record: SessionRecord, prompt: string): Promise<SessionRecord> {
-  await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
+  await retryWhileHsrHostBoots(() => substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId), {
+    onRetry: () => {
+      if (isPretty()) console.error(actionLine("warn", "send", [bold(record.name), "waiting for the hsr runner host to boot"]));
+      else console.error(`wait\tsend\t${record.name}\thsr runner host still booting`);
+    },
+  });
   await writeHiveState(record, "working");
   const now = new Date().toISOString();
   const persisted = await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });

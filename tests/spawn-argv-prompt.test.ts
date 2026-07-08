@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { retryWhileHsrHostBoots } from "../src/cli/shared.js";
 import { spawnArgvPrompt } from "../src/commands/spawn.js";
 import { parse } from "../src/parse.js";
 
@@ -46,4 +47,55 @@ test("the x/run delegation shape (prompt already stripped, flag rest) stays iner
   // turn before the real prompt.
   const parsed = parse(["spawn", "codex", "--no-wait", "--", "-c", "service_tier=default"]);
   assert.equal(spawnArgvPrompt(parsed), "");
+});
+
+// The host-boot race (2026-07 follow-up to the wedge above): spawnBee waits
+// only ~5s for the detached runner host, so a one-shot control-socket send
+// raced host boot ("HSR bee X has no live runner host to steer") and the
+// prompt was lost — reliably on burst spawns. retryWhileHsrHostBoots is the
+// bounded retry deliverHsrPrompt now sends through; these pin its contract.
+
+test("host-boot retry: immediate success does not sleep or announce a retry", async () => {
+  const slept: number[] = [];
+  let retries = 0;
+  const result = await retryWhileHsrHostBoots(async () => "sent", {
+    sleepFn: async (ms) => void slept.push(ms),
+    onRetry: () => retries++,
+  });
+  assert.equal(result, "sent");
+  assert.deepEqual(slept, []);
+  assert.equal(retries, 0);
+});
+
+test("host-boot retry: delivers once the host comes up, backing off 250ms→doubling", async () => {
+  const slept: number[] = [];
+  let attempts = 0;
+  let retries = 0;
+  const result = await retryWhileHsrHostBoots(
+    async () => {
+      attempts++;
+      if (attempts <= 3) throw new Error("HSR bee b1 has no live runner host to steer");
+      return "sent";
+    },
+    { sleepFn: async (ms) => void slept.push(ms), onRetry: () => retries++ },
+  );
+  assert.equal(result, "sent");
+  assert.equal(attempts, 4);
+  assert.deepEqual(slept, [250, 500, 1000]);
+  assert.equal(retries, 1); // announced once, not per attempt
+});
+
+test("host-boot retry: rethrows the last error once the budget lapses", async () => {
+  let attempts = 0;
+  await assert.rejects(
+    retryWhileHsrHostBoots(
+      async () => {
+        attempts++;
+        throw new Error("HSR bee b1 has no live runner host to steer");
+      },
+      { timeoutMs: 0, sleepFn: async () => undefined },
+    ),
+    /no live runner host/,
+  );
+  assert.equal(attempts, 1); // budget already spent → no blind extra attempts
 });
