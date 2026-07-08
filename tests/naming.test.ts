@@ -245,8 +245,8 @@ test("generateTitle throws when the runner yields nothing usable", async () => {
 
 /* ------------------- provider title precedence on sync ------------------ */
 
-function tx(title: string): TranscriptFile {
-  return { provider: "claude", path: "/tmp/t.jsonl", sessionId: "s1", mtimeMs: 1, rows: [], score: 0, matchedBy: [], title };
+function tx(title: string, matchedBy: string[] = ["session-id"]): TranscriptFile {
+  return { provider: "claude", path: "/tmp/t.jsonl", sessionId: "s1", mtimeMs: 1, rows: [], score: 0, matchedBy, title };
 }
 
 test("persistSessionTranscriptMetadata: provider titles untitled records and stamps the source", async () => {
@@ -280,6 +280,61 @@ test("persistSessionTranscriptMetadata: provider never stomps user or auto title
       const stored = await loadSession(record.name);
       assert.equal(stored?.title, "Kept title");
       assert.equal(stored?.titleSource, source);
+    }
+  });
+});
+
+test("persistSessionTranscriptMetadata: a weakly matched transcript never overwrites identity or title", async () => {
+  await withTempStore(async () => {
+    // The mass-mis-title incident: a sibling's fresh transcript in the shared
+    // cwd folder matches on mtime/cwd/since alone and must not be adopted.
+    const record = bee({
+      title: "Original title",
+      titleSource: "provider",
+      providerSessionId: "own-session",
+      transcriptPath: "/tmp/own.jsonl",
+    });
+    await saveSession(record);
+    const sibling: TranscriptFile = {
+      provider: "claude",
+      path: "/tmp/sibling.jsonl",
+      sessionId: "sibling-session",
+      mtimeMs: 2,
+      rows: [],
+      score: 210,
+      matchedBy: ["mtime", "cwd", "since"],
+      title: "Sibling's title",
+    };
+    await persistSessionTranscriptMetadata(record, sibling);
+    const stored = await loadSession(record.name);
+    assert.equal(stored?.title, "Original title");
+    assert.equal(stored?.providerSessionId, "own-session");
+    assert.equal(stored?.transcriptPath, "/tmp/own.jsonl");
+  });
+});
+
+test("persistSessionTranscriptMetadata: a weak match still honors markRunning", async () => {
+  await withTempStore(async () => {
+    const record = bee({ status: "dead" });
+    await saveSession(record);
+    await persistSessionTranscriptMetadata(record, tx("Ignored title", ["mtime", "cwd"]), { markRunning: true });
+    const stored = await loadSession(record.name);
+    assert.equal(stored?.status, "running");
+    assert.equal(stored?.title, undefined);
+    assert.equal(stored?.transcriptPath, undefined);
+  });
+});
+
+test("persistSessionTranscriptMetadata: prompt and spawn-proximity matches adopt identity", async () => {
+  await withTempStore(async () => {
+    for (const anchor of ["prompt", "spawn-proximity"] as const) {
+      const record = bee({ name: `CL.${anchor}` });
+      await saveSession(record);
+      await persistSessionTranscriptMetadata(record, tx("Anchored title", ["mtime", anchor]));
+      const stored = await loadSession(record.name);
+      assert.equal(stored?.title, "Anchored title");
+      assert.equal(stored?.providerSessionId, "s1");
+      assert.equal(stored?.transcriptPath, "/tmp/t.jsonl");
     }
   });
 });

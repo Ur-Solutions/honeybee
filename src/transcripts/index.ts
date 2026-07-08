@@ -4,6 +4,8 @@ import { codexAdapter } from "./codex.js";
 import { grokAdapter } from "./grok.js";
 import { opencodeAdapter } from "./opencode.js";
 import { bestTranscript } from "./scoring.js";
+
+export { isAnchoredTranscriptMatch } from "./scoring.js";
 import type { TranscriptAdapter, TranscriptFile, TranscriptLookupOptions, TranscriptProvider } from "./types.js";
 import { isPathInside, sinceMillis } from "./util.js";
 

@@ -51,6 +51,19 @@ export function scoreTranscript(input: { rows: TranscriptRow[]; path: string; se
   return { score, matchedBy };
 }
 
+/**
+ * Did this transcript match on evidence that actually ties it to the bee
+ * (explicit path/session-id anchor, the bee's own prompt text, or spawn-time
+ * proximity) — as opposed to circumstantial mtime/cwd/since overlap? Weakly
+ * matched transcripts are fine to *display* as a best guess, but must never be
+ * persisted as a bee's identity or used to title it: any sibling in the same
+ * cwd folder "matches" that way, which is how one fresh bee's transcript
+ * mass-overwrote its neighbours' titles and session ids.
+ */
+export function isAnchoredTranscriptMatch(tx: { matchedBy: string[] }): boolean {
+  return tx.matchedBy.some((match) => match === "path" || match === "session-id" || match === "prompt" || match === "spawn-proximity");
+}
+
 function memoizedPromptMatch(rows: TranscriptRow[], prompt: string, memo?: Map<string, boolean>): boolean {
   if (!memo) return rowsContainPrompt(rows, prompt);
   const key = normalizeForMatch(prompt);

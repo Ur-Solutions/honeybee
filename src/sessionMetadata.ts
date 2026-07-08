@@ -1,7 +1,7 @@
 import { writeHiveTitle } from "./hiveState.js";
 import { canWriteTitle } from "./naming.js";
 import { touchSession, type SessionRecord } from "./store.js";
-import { latestTranscript, type TranscriptFile, type TranscriptLookupOptions } from "./transcripts.js";
+import { isAnchoredTranscriptMatch, latestTranscript, type TranscriptFile, type TranscriptLookupOptions } from "./transcripts.js";
 
 export type PersistTranscriptMetadataOptions = {
   markRunning?: boolean;
@@ -34,11 +34,20 @@ export async function persistSessionTranscriptMetadata(
 ): Promise<SessionRecord> {
   const fields: Partial<SessionRecord> = {};
 
-  if (tx.path !== record.transcriptPath) fields.transcriptPath = tx.path;
-  if (tx.sessionId !== record.providerSessionId) fields.providerSessionId = tx.sessionId;
-  if (tx.title && tx.title !== record.title && canWriteTitle(record, "provider")) {
-    fields.title = tx.title;
-    fields.titleSource = "provider";
+  // Identity (path/session-id) and title are only ever adopted from a
+  // transcript that matched on real evidence. A weak match (mtime/cwd/since
+  // only) is any sibling's newest file in the shared cwd folder — persisting it
+  // once poisons the record's anchors, and every later lookup then "confirms"
+  // the wrong transcript via its stored path. markRunning is still honored:
+  // fresh pane/transcript activity is a liveness signal either way.
+  const anchored = isAnchoredTranscriptMatch(tx);
+  if (anchored) {
+    if (tx.path !== record.transcriptPath) fields.transcriptPath = tx.path;
+    if (tx.sessionId !== record.providerSessionId) fields.providerSessionId = tx.sessionId;
+    if (tx.title && tx.title !== record.title && canWriteTitle(record, "provider")) {
+      fields.title = tx.title;
+      fields.titleSource = "provider";
+    }
   }
   if (options.markRunning && record.status !== "running") fields.status = "running";
 
