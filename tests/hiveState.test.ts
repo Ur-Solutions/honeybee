@@ -39,11 +39,25 @@ test("effectiveHiveState keeps 'working' while the pane agrees the bee is busy",
   assert.equal(effectiveHiveState("working", undefined), "working");
 });
 
-test("effectiveHiveState trusts non-'working' hook values verbatim and ignores empties", () => {
-  // waiting/done/failed come from real Stop/Notification events — never second-guessed.
+test("effectiveHiveState trusts hook-authoritative values verbatim and ignores empties", () => {
+  // waiting/done come from real Stop/Notification events — never second-guessed.
   assert.equal(effectiveHiveState("waiting", "active"), "waiting");
   assert.equal(effectiveHiveState("done", "active"), "done");
-  assert.equal(effectiveHiveState("failed", "ready"), "failed");
   assert.equal(effectiveHiveState("", "idle_with_output"), undefined);
   assert.equal(effectiveHiveState(undefined, "ready"), undefined);
+});
+test("effectiveHiveState drops a stale 'failed' when the live pane shows a healthy state", () => {
+  // "failed" is only ever daemon-mirrored from wedged/error — no hook sets it —
+  // so a "failed" hint that disagrees with a healthy pane is stale and yields.
+  assert.equal(effectiveHiveState("failed", "ready"), undefined, "ready pane overrides stale failed");
+  assert.equal(effectiveHiveState("failed", "idle_with_output"), undefined, "idle pane overrides stale failed");
+  assert.equal(effectiveHiveState("failed", "active"), undefined, "active pane overrides stale failed");
+});
+test("effectiveHiveState keeps 'failed' while the pane agrees the bee is failed", () => {
+  assert.equal(effectiveHiveState("failed", "wedged"), "failed");
+  assert.equal(effectiveHiveState("failed", "error"), "failed");
+  assert.equal(effectiveHiveState("failed", "kill_failed"), "failed");
+  // No derived state (dead/crashed/archived → undefined mapping) → trust the hint.
+  assert.equal(effectiveHiveState("failed", "crashed"), "failed");
+  assert.equal(effectiveHiveState("failed", undefined), "failed");
 });

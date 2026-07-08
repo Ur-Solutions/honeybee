@@ -177,6 +177,22 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   if (pane === undefined) {
     const held = heldStateForUnknownPane(record, context);
     if (held) return held;
+    // Capture was unavailable this tick (a busy tmux server drops captures
+    // under fleet-scale load) AND the prior observed state was non-holdable —
+    // typically a stale `wedged`/`crashed` from an earlier missed capture. For a
+    // NEVER-PROMPTED bee, missing pane data would otherwise fall through to
+    // bootingOrWedged and re-fabricate `wedged`, which self-sustains: wedged
+    // isn't holdable, so every later missed capture re-derives wedged forever,
+    // stranding a healthy idle bee as "failed" (real incident 2026-07-08).
+    // Missing data is not evidence of a stuck boot — a live, never-prompted bee
+    // we simply could not read is at its composer, so report `ready`. Real wedge
+    // detection still fires below when the pane IS seen (captured-but-unready),
+    // the only trustworthy wedge evidence. Prompted bees fall through to the
+    // existing "unknown pane + prompted → active" path and never reach here as
+    // wedged, so they are intentionally left to that logic.
+    if (!Number.isFinite(record.lastPromptAt ? Date.parse(record.lastPromptAt) : NaN)) {
+      return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
+    }
   }
   const paneText = pane ?? "";
   if (paneText) {

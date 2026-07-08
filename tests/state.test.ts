@@ -390,3 +390,42 @@ test("HSR structured terminal states do not reuse the last prompt as detail", ()
     assert.notEqual(result.detail, "deploy prod");
   }
 });
+
+test("capture failure does not fabricate wedged for a live never-prompted bee (self-sustaining wedge fix)", () => {
+  // A live bee whose pane could not be captured this tick, whose prior observed
+  // state was a stale non-holdable `wedged`. Must NOT re-derive wedged — that
+  // strands healthy idle bees as "failed" (real incident 2026-07-08).
+  const record = bee({ createdAt: "2026-05-01T00:00:00.000Z" }); // old bee, well past BOOT_WEDGE_MS
+  const context = {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map<string, string | undefined>([["alpha-target", undefined]]), // captured key, no content = capture failed
+    previousStates: new Map<string, BeeState>([["alpha", "wedged"]]),
+    now: NOW,
+  };
+  const result = deriveState(record, context);
+  assert.equal(result.state, "ready");
+  assert.notEqual(result.state, "wedged");
+});
+
+test("capture failure leaves a live prompted bee on the active path, never wedged", () => {
+  const record = bee({ createdAt: "2026-05-01T00:00:00.000Z", lastPromptAt: "2026-05-28T09:00:00.000Z", lastPrompt: "go" });
+  const context = {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map<string, string | undefined>([["alpha-target", undefined]]),
+    previousStates: new Map<string, BeeState>([["alpha", "wedged"]]),
+    now: NOW,
+  };
+  assert.notEqual(deriveState(record, context).state, "wedged");
+});
+
+test("a genuinely-seen unready pane still derives wedged for an old never-prompted bee", () => {
+  // The capture SUCCEEDED (pane present) but the agent never reached ready and
+  // there is no output — that is real wedge evidence and must still escalate.
+  const record = bee({ createdAt: "2026-05-01T00:00:00.000Z" });
+  const context = {
+    liveTargets: new Set(["alpha-target"]),
+    panes: new Map<string, string | undefined>([["alpha-target", ""]]), // seen, empty
+    now: NOW,
+  };
+  assert.equal(deriveState(record, context).state, "wedged");
+});

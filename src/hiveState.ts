@@ -55,14 +55,23 @@ export function hiveStateFor(state: BeeState): HiveTmuxState | undefined {
  * themselves, so a lagging or stopped daemon strands "working" on bees whose
  * live pane plainly shows them idle/ready/blocked. When the pane-derived state
  * contradicts a stale "working", the pane wins — it's the real-time truth.
- * Other @hive_state values (waiting/done/failed, set by real hook events) are
- * trusted as-is.
+ *
+ * "failed" is treated the same way: it is ONLY ever produced by the daemon's
+ * mirror of a derived wedged/error/kill_failed (no agent hook sets it), so a
+ * "failed" hint that disagrees with a healthy live pane is stale and must not
+ * mask it — otherwise a bee that briefly wedged (e.g. a slow boot) stays
+ * "failed" in `hive ps` long after its pane returned to a ready composer
+ * (real incident 2026-07-08). "waiting"/"done" DO come from real hook events
+ * and are trusted as-is.
  */
 export function effectiveHiveState(liveHive: string | undefined, derived: BeeState | undefined): string | undefined {
   if (!liveHive || liveHive.length === 0) return undefined;
-  if (liveHive !== "working" || derived === undefined) return liveHive;
+  if (derived === undefined) return liveHive;
+  // Only the daemon/spawn-stamped hints (working, failed) are overridable by a
+  // contradicting live pane; hook-authoritative hints (waiting, done) stand.
+  if (liveHive !== "working" && liveHive !== "failed") return liveHive;
   const derivedHive = hiveStateFor(derived);
-  return derivedHive !== undefined && derivedHive !== "working" ? undefined : liveHive;
+  return derivedHive !== undefined && derivedHive !== liveHive ? undefined : liveHive;
 }
 
 type SessionRef = Pick<SessionRecord, "node" | "tmuxTarget">;
