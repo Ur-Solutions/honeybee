@@ -76,6 +76,45 @@ test("latestTranscript: notBeforeIso refuses an older sibling's transcript that 
   }
 });
 
+test("latestTranscript: a stored transcriptPath outside the computed root is still honored", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-outside-root-"));
+  try {
+    const cwd = join(dir, "repo");
+    // The bee's real transcript lives under a DIFFERENT home (e.g. a hive
+    // account home the harness inherited from env) than the one the lookup
+    // computes its root from. Falling through to discovery in the wrong root
+    // is how sibling transcripts get cross-matched.
+    const realHome = join(dir, "real-home");
+    const wrongRootHome = join(dir, "assumed-home");
+    const ownPath = join(realHome, "projects", claudeEncode(cwd), "own.jsonl");
+    await mkdir(join(realHome, "projects", claudeEncode(cwd)), { recursive: true });
+    await writeFile(
+      ownPath,
+      [
+        JSON.stringify({ type: "user", timestamp: "2026-06-18T12:00:10.000Z", message: { role: "user", content: "fix bee renaming" } }),
+        JSON.stringify({ type: "assistant", timestamp: "2026-06-18T12:00:15.000Z", message: { role: "assistant", content: "on it" } }),
+      ].join("\n") + "\n",
+    );
+    // A fresh sibling in the assumed root that would win discovery on mtime.
+    const siblingDir = join(wrongRootHome, "projects", claudeEncode(cwd));
+    await mkdir(siblingDir, { recursive: true });
+    await writeFile(
+      siblingDir + "/sibling.jsonl",
+      JSON.stringify({ type: "user", timestamp: "2026-06-18T13:00:00.000Z", message: { role: "user", content: "unrelated sibling work" } }) + "\n",
+    );
+
+    const found = await latestTranscript("claude", cwd, { homePath: wrongRootHome, transcriptPath: ownPath });
+    assert.equal(found?.sessionId, "own");
+    assert.ok(found?.matchedBy.includes("path"));
+
+    // A stored path that no longer exists still falls back to discovery.
+    const fallback = await latestTranscript("claude", cwd, { homePath: wrongRootHome, transcriptPath: join(realHome, "gone.jsonl") });
+    assert.equal(fallback?.sessionId, "sibling");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("latestTranscript: Codex spawn proximity beats a newer same-cwd sibling", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-proximity-"));
   try {

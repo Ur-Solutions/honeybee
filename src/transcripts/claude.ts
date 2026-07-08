@@ -1,6 +1,6 @@
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { memoizedDerived, readJsonlCached } from "./cache.js";
 import { scoreTranscript, transcriptStartMs } from "./scoring.js";
 import { firstUserPromptTitle, normalizeTitleCandidate } from "./text.js";
@@ -11,6 +11,10 @@ export const claudeAdapter: TranscriptAdapter = {
   root: (cwd, options) => claudeProjectFolder(cwd, options.homePath),
   discover: async (root) => (await readdir(root).catch(() => [])).filter((name) => name.endsWith(".jsonl")).map((name) => join(root, name)),
   load: (path, _cwd, options, knownStat) => loadClaudeTranscript(path, options, knownStat),
+  // Every claude home keys project folders the same way, so a stored path
+  // whose parent folder is this cwd's project key is this bee's transcript
+  // under some OTHER home (e.g. an env-inherited one the lookup's root missed).
+  ownsPath: (path, cwd) => basename(dirname(path)) === projectKeyForCwd(cwd) && path.endsWith(".jsonl"),
 };
 
 export function claudeProjectFolder(cwd: string, configDir = join(homedir(), ".claude")) {

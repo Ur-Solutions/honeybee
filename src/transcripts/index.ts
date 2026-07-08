@@ -51,7 +51,14 @@ export function latestGrokTranscript(cwd: string, options: TranscriptLookupOptio
 async function latestFromAdapter(adapter: TranscriptAdapter, cwd: string, options: TranscriptLookupOptions): Promise<TranscriptFile | null> {
   const root = adapter.root(cwd, options);
   if (options.transcriptPath) {
-    const direct = isPathInside(options.transcriptPath, root) ? await adapter.load(options.transcriptPath, cwd, options) : null;
+    // A stored path outside the computed root is still authoritative when the
+    // adapter recognizes it as its own layout for this cwd (ownsPath) — the
+    // root can be wrong (e.g. a harness home inherited from env that the
+    // record never captured), and falling through to discovery in the wrong
+    // folder is how records get cross-matched to a sibling's transcript.
+    // Arbitrary out-of-root paths stay untrusted.
+    const trusted = isPathInside(options.transcriptPath, root) || adapter.ownsPath?.(options.transcriptPath, cwd) === true;
+    const direct = trusted ? await adapter.load(options.transcriptPath, cwd, options).catch(() => null) : null;
     if (direct) return direct;
   }
 

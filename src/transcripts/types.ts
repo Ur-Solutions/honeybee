@@ -64,4 +64,13 @@ export interface TranscriptAdapter {
   discover(root: string, options: TranscriptLookupOptions): Promise<string[]>;
   /** Parse + score one transcript file; null when it is not an eligible session. */
   load(path: string, cwd: string, options: TranscriptLookupOptions, knownStat?: StatHint): Promise<TranscriptFile | null>;
+  /**
+   * Does an out-of-root stored transcriptPath still structurally belong to
+   * this provider+cwd (e.g. a claude project folder under a DIFFERENT harness
+   * home than the lookup's root — inherited-env homes the record never
+   * captured)? The scan loop only direct-loads such a path when this says yes;
+   * adapters whose session metadata is derived from the directory layout
+   * (grok) omit it and stay root-confined.
+   */
+  ownsPath?(path: string, cwd: string): boolean;
 }
