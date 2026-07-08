@@ -688,6 +688,11 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
       ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
       ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
       ...(sessionOverride ? { providerSessionId: sessionOverride } : {}),
+      // A fresh revive abandons the old provider session: keeping its id would
+      // make the NEXT revive resume a session that no longer matches this bee
+      // (or never existed), dying with "No conversation found". Explicit
+      // undefined deletes the field.
+      ...(fresh ? { providerSessionId: undefined } : {}),
       updatedAt: new Date().toISOString(),
     })) ?? record;
   await writeSpawnOptions(updated);
