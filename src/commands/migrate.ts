@@ -2,7 +2,7 @@
 // interactive tmux pane and a pane-less HSR runner (resume), and revive dead bees.
 // Extracted from cli.ts (HIVE-15).
 import { accountEmail, activateAccountIntoHome, findAccount, homeClaudeEmail, listAccounts, type AccountRecord } from "../accounts.js";
-import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, type AgentSpec } from "../agents.js";
+import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, type AgentSpec } from "../agents.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeSpawnOptions } from "../hiveState.js";
@@ -161,6 +161,11 @@ export async function buildResumeSpec(record: SessionRecord, tool: string, extra
       refreshIdentityEnv(spec);
     }
   }
+  // Legacy records without homePath: a relaunch from inside another bee's
+  // session would silently inherit its home env var — make it explicit so the
+  // relaunched agent's home is deterministic and persistable (callers stamp
+  // spec.homePath back onto the record).
+  adoptInheritedHome(spec);
   await assertExecutableAvailable(spec.command);
   return spec;
 }
@@ -202,6 +207,7 @@ export async function reviveHsrRunner(record: SessionRecord, tool: string, opts:
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
     ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
+    ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
     updatedAt: new Date().toISOString(),
     status: "running",
   };
@@ -435,6 +441,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
     substrate: "hsr",
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
+    ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
     tmuxTarget: record.name,
     combId: record.name,
     updatedAt: new Date().toISOString(),

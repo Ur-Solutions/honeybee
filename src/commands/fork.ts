@@ -2,7 +2,7 @@
 // seeded from its state, with account-safety resolution.
 // Extracted from cli.ts (HIVE-15).
 import { activateAccountIntoHome, defaultHomeForAccount, type AccountRecord } from "../accounts.js";
-import { assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
+import { adoptInheritedHome, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { agentKinds, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { modelArgsFor, pickForkSeed, type ForkSeedInput, type SeedMode } from "../fork.js";
@@ -252,6 +252,9 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
         pinnedSessionId = sid;
       }
     }
+    // The runner host inherits this process's env — record the effective home
+    // (see adoptInheritedHome) before spec.env is shipped and command rendered.
+    adoptInheritedHome(spec);
     const adapter = adapterFor(spec.kind);
     const runnerTier = adapter?.tier();
     const hostPid = await spawnHsrHost({

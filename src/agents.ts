@@ -188,6 +188,28 @@ export function refreshIdentityEnv(spec: AgentSpec): void {
   Object.assign(spec.env, identityEnvForAgent(spec.kind, spec.homePath));
 }
 
+/**
+ * Make an env-inherited harness home explicit on the spec. An HSR runner host
+ * is a detached child of this CLI process, so a bee spawned without an
+ * explicit home still runs under whatever home env var this process carries
+ * (e.g. CLAUDE_CONFIG_DIR when `hive spawn` is run from inside another bee's
+ * session) — invisibly: the record showed homePath unset, so `hive ls`, the
+ * transcript matcher, and daemon host respawns all assumed the default home.
+ * That mismatch made every transcript lookup scan the wrong project folder,
+ * which is how sibling bees mass-adopted one fresh transcript's identity.
+ * Stamping the inherited value into spec.env/homePath changes nothing about
+ * what the child process sees; it only records reality and pins it across
+ * respawns. No-op for explicit homes, homeless drivers, or a clean env.
+ */
+export function adoptInheritedHome(spec: AgentSpec): void {
+  if (spec.homePath) return;
+  const homeEnv = homeEnvForAgent(spec.kind);
+  const inherited = homeEnv ? process.env[homeEnv] : undefined;
+  if (!homeEnv || !inherited) return;
+  spec.homePath = inherited;
+  spec.env[homeEnv] = inherited;
+}
+
 export async function assertAgentAuthFreshForSpawn(spec: AgentSpec, accountId?: string): Promise<void> {
   if (spec.kind === "grok") {
     const homePath = spec.homePath ?? process.env.GROK_HOME ?? resolve(homedir(), ".grok");

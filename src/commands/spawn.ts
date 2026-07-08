@@ -2,7 +2,7 @@
 // account/profile resolution, homogeneous swarms, and frame-driven cohorts.
 // Extracted from cli.ts (HIVE-15).
 import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAccountIntoHome, autoAccountTool, defaultHomeForAccount, findAccount, listAccounts, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord, type SpawnAgentSpec } from "../accounts.js";
-import { agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
+import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { syncBeesSidebarLayout } from "../beesSidebar.js";
 import { beeConfig } from "../config.js";
 import { agentKinds, defaultsToSoleCredentialedAccount, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
@@ -351,6 +351,9 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // tmux target), no pane. resolveAgent / account activation / session-id
   // pinning / exec-check above are reused verbatim (HSR_EXPLORATION.md §7).
   if (opts.substrate === "hsr") {
+    // The runner host inherits this process's env — record the effective home
+    // (see adoptInheritedHome) before spec.env is shipped and command rendered.
+    adoptInheritedHome(spec);
     const adapter = adapterFor(spec.kind);
     const runnerTier = adapter?.tier();
     const hostPid = await spawnHsrHost({

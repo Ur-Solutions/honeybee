@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { agentDefaultsToYolo, forcedSessionIdArgs, hasSessionIdArg, resolveAgent, spawnBeeForFlow, splitShellWords } from "../src/agents.js";
+import { adoptInheritedHome, agentDefaultsToYolo, forcedSessionIdArgs, hasSessionIdArg, resolveAgent, spawnBeeForFlow, splitShellWords, type AgentSpec } from "../src/agents.js";
 import { resetConfigCache } from "../src/config.js";
 import { assertExecutableAvailable } from "../src/execCheck.js";
 import { setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
@@ -28,6 +28,46 @@ after(async () => {
   else process.env.HIVE_STORE_ROOT = prevStoreRoot;
   resetConfigCache();
   await rm(cleanStoreDir, { recursive: true, force: true });
+});
+
+test("adoptInheritedHome: stamps the env-inherited home onto spec.homePath and spec.env", () => {
+  const spec = (): AgentSpec => ({ kind: "claude", command: "claude", args: [], env: {}, requestedKind: "claude" });
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = "/tmp/hive-home-x";
+  try {
+    // No explicit home → the inherited env home is recorded, not left implicit.
+    const inherited = spec();
+    adoptInheritedHome(inherited);
+    assert.equal(inherited.homePath, "/tmp/hive-home-x");
+    assert.equal(inherited.env.CLAUDE_CONFIG_DIR, "/tmp/hive-home-x");
+
+    // An explicit home always wins — inheritance never overrides it.
+    const explicit = { ...spec(), homePath: "/tmp/explicit", env: { CLAUDE_CONFIG_DIR: "/tmp/explicit" } };
+    adoptInheritedHome(explicit);
+    assert.equal(explicit.homePath, "/tmp/explicit");
+    assert.equal(explicit.env.CLAUDE_CONFIG_DIR, "/tmp/explicit");
+
+    // A homeless driver stays untouched.
+    const homeless = { ...spec(), kind: "pi", requestedKind: "pi" };
+    adoptInheritedHome(homeless);
+    assert.equal(homeless.homePath, undefined);
+    assert.deepEqual(homeless.env, {});
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+
+  // A clean env is a no-op.
+  const cleanPrev = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  try {
+    const clean = spec();
+    adoptInheritedHome(clean);
+    assert.equal(clean.homePath, undefined);
+    assert.deepEqual(clean.env, {});
+  } finally {
+    if (cleanPrev !== undefined) process.env.CLAUDE_CONFIG_DIR = cleanPrev;
+  }
 });
 
 test("forcedSessionIdArgs: claude pins a fresh session id; other providers do not", () => {
