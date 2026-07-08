@@ -388,6 +388,8 @@ function stateCell(state: BeeState): string {
       return red("kill_fail");
     case "dead":
       return gray("dead");
+    case "crashed":
+      return red("crashed");
     case "node_unreachable":
       return yellow("offline");
   }

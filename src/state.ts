@@ -6,6 +6,7 @@ import type { SessionRecord } from "./store.js";
 
 export type BeeState =
   | "dead"
+  | "crashed"
   | "sealed"
   | "archived"
   | "blocked"
@@ -161,7 +162,7 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
     : context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.liveTargets.has(record.tmuxTarget);
   if (!live) {
     if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
-    return { state: "dead", detail: lastActivityHint(record, context) };
+    return deadOrCrashed(record, context);
   }
 
   if (context.seals?.has(record.name)) {
@@ -230,7 +231,7 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
   const live = context.hsrLive?.has(record.name) ?? false;
   if (!live) {
     if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
-    return { state: "dead", detail: lastActivityHint(record, context) };
+    return deadOrCrashed(record, context);
   }
   if (context.seals?.has(record.name)) {
     return { state: "sealed", detail: "seal recorded" };
@@ -250,7 +251,8 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
       case "booting":
         return bootingOrWedged(record, now);
       case "dead":
-        return { state: "dead", detail: lastActivityHint(record, context) };
+      case "crashed":
+        return deadOrCrashed(record, context);
       case "sealed":
         return { state: "sealed", detail: "seal recorded" };
       case "archived":
@@ -275,6 +277,22 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
   const snapshot = context.hsrSnapshots?.get(record.name) ?? "";
   if (snapshot.length > 0) return { state: "idle_with_output", detail: describeIdle(record, now) };
   return bootingOrWedged(record, now);
+}
+
+/**
+ * A bee whose runtime is gone splits on recorded intent: a record still
+ * 'running' was never told to stop — nobody issued a retire/kill for it — so
+ * something under it failed (tmux server crash, external kill, harness exit)
+ * and it reports "crashed". Only a record explicitly marked 'dead' (legacy
+ * writers / deserialization fallback) reports plain "dead". This is what makes
+ * `hive revive --crashed` precise: deliberate retirement archives the record,
+ * so it can never be confused with a crash.
+ */
+function deadOrCrashed(record: SessionRecord, context: StateContext): DerivedState {
+  if (record.status === "running") {
+    return { state: "crashed", detail: `exited without retire/kill — ${lastActivityHint(record, context)}` };
+  }
+  return { state: "dead", detail: lastActivityHint(record, context) };
 }
 
 /** Wraps a string in an ANSI color (no-op when output is not a TTY). */
@@ -319,6 +337,7 @@ export const STATE_PRESENTATION: Record<BeeState, StatePresentation> = {
   error: { label: "error", glyph: "●", color: red, labelColor: red, cleanPriority: 6 },
   kill_failed: { label: "kill_failed", glyph: "●", color: red, labelColor: red, cleanPriority: 3 },
   dead: { label: "dead", glyph: "○", color: gray, labelColor: gray, cleanPriority: 1 },
+  crashed: { label: "crashed", glyph: "○", color: red, labelColor: red, cleanPriority: 1 },
   node_unreachable: { label: "offline", glyph: "?", color: yellow, labelColor: yellow, cleanPriority: 9 },
 };
 
@@ -339,7 +358,7 @@ export function cleanStatePriority(state: BeeState): number {
 
 export function isTerminalState(state: BeeState): boolean {
   // node_unreachable is transient — the node may come back online — and not terminal.
-  return state === "dead" || state === "sealed" || state === "archived" || state === "error" || state === "kill_failed";
+  return state === "dead" || state === "crashed" || state === "sealed" || state === "archived" || state === "error" || state === "kill_failed";
 }
 
 function heldStateForUnknownPane(record: SessionRecord, context: StateContext): DerivedState | null {
@@ -358,6 +377,7 @@ function parseBeeState(value: string | undefined): BeeState | undefined {
     case "wedged":
     case "error":
     case "dead":
+    case "crashed":
     case "sealed":
     case "archived":
     case "kill_failed":

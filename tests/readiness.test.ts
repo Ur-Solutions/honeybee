@@ -188,3 +188,58 @@ test("waitForAgentReady still reports timeout when no trust prompt is visible", 
     (error: unknown) => error instanceof AgentReadinessError && error.reason === "timeout",
   );
 });
+
+test("waitForAgentReady confirms the resume-mode chooser with Enter (recommended summary)", async () => {
+  const dialog = [
+    "This session is 21h 8m old and 349.2k tokens.",
+    "We recommend resuming from a summary.",
+    "❯ 1. Resume from summary (recommended)",
+    "  2. Resume full session as-is",
+    "Enter to confirm · Esc to cancel",
+  ].join("\n");
+  let enters = 0;
+  const substrate = {
+    capture: async () => (enters === 0 ? dialog : "\n❯ "),
+    sendEnter: async () => {
+      enters += 1;
+    },
+    sendKey: async () => {},
+  };
+
+  await waitForAgentReady(record("claude"), { timeoutMs: 3000, trustGraceMs: 0, substrate });
+  assert.equal(enters, 1, "should confirm the pre-selected recommended option once");
+});
+
+test("waitForAgentReady declines the fullscreen-renderer tour with Down+Enter", async () => {
+  const dialog = [
+    "Try the new fullscreen renderer?",
+    "· Selected text auto-copies to your clipboard",
+    "❯ 1. Yes, try it",
+    "  2. Not now",
+    "Enter to confirm · Esc to cancel",
+  ].join("\n");
+  let enters = 0;
+  const keys: string[] = [];
+  const substrate = {
+    capture: async () => (keys.length === 0 ? dialog : "\n❯ "),
+    sendEnter: async () => {
+      enters += 1;
+    },
+    sendKey: async (_target: string, key: string) => {
+      keys.push(key);
+    },
+  };
+
+  await waitForAgentReady(record("claude"), { timeoutMs: 3000, trustGraceMs: 0, substrate });
+  assert.deepEqual(keys, ["Down"], "should move the selector to 'Not now'");
+  assert.ok(enters >= 1, "should confirm the declined tour");
+});
+
+test("resume-time dialogs count as startup confirmations (not ready)", () => {
+  const resume = "❯ 1. Resume from summary (recommended)\n  2. Resume full session as-is\nEnter to confirm";
+  const tour = "Try the new fullscreen renderer?\n❯ 1. Yes, try it\n  2. Not now\nEnter to confirm";
+  assert.equal(isStartupConfirmationPane(resume), true);
+  assert.equal(isStartupConfirmationPane(tour), true);
+  assert.equal(isAgentReadyPane("claude", resume), false);
+  assert.equal(isAgentReadyPane("claude", tour), false);
+});

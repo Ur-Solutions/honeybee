@@ -6,7 +6,7 @@ import { assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, r
 import { bootMsForAgent } from "../drivers.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeHiveState } from "../hiveState.js";
-import { transactionalKill } from "../kill.js";
+import { transactionalRetire } from "../kill.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
@@ -156,14 +156,16 @@ export async function cmdRun(parsed: Parsed) {
 
 
 export async function cleanupRunSession(record: SessionRecord): Promise<void> {
-  const outcome = await transactionalKill(record);
+  // Retire (archive), don't purge: the one-shot's record and seals remain
+  // inspectable/revivable; `hive clean`/`hive kill` are the GC.
+  const outcome = await transactionalRetire(record);
   console.error("");
   if (!outcome.ok) {
-    console.error(note(`kill_failed ${record.name} (--rm/--cleanup): ${outcome.lastError}`));
+    console.error(note(`retire_failed ${record.name} (--rm/--cleanup): ${outcome.lastError}`));
     process.exitCode = 1;
     return;
   }
-  console.error(note(`${outcome.alreadyGone ? "removed stale" : "killed"} ${record.name} (--rm/--cleanup)`));
+  console.error(note(`${outcome.alreadyGone ? "archived stale" : "retired"} ${record.name} (--rm/--cleanup)`));
 }
 
 

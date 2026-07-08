@@ -37,25 +37,27 @@ function errorMessage(error: unknown): string {
   }
 }
 
+type TeardownVerdict = {
+  attempts: number;
+  alreadyGone: boolean;
+  killReturnedFailure: boolean;
+  stillRunning: boolean;
+  lastError?: string;
+};
+
 /**
- * Transactional kill: substrate.kill -> poll substrate.hasSession -> only then
- * deleteSession. On failure (session still exists after polling, or its absence
- * cannot be confirmed), the SessionRecord is updated with status='kill_failed'
- * and lastError. The record is NOT deleted while the bee may still be running.
- *
- * Returns a KillOutcome describing whether the bee is gone (ok=true) or still
- * suspected of running (ok=false), plus the captured lastError when applicable.
+ * Shared teardown core for kill and retire: substrate.kill -> poll
+ * substrate.hasSession until the session is confirmed gone (or we give up).
+ * Pure runtime work — the caller decides what happens to the SessionRecord.
  */
-export async function transactionalKill(
+async function teardownSession(
   record: SessionRecord,
-  options: TransactionalKillOptions = {},
-): Promise<KillOutcome> {
+  options: TransactionalKillOptions,
+): Promise<TeardownVerdict> {
   const substrate = options.substrate ?? substrateFor(record);
   const pollAttempts = Math.max(1, options.pollAttempts ?? DEFAULT_POLL_ATTEMPTS);
   const pollIntervalMs = Math.max(0, options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
   const sleep = options.sleep ?? defaultSleep;
-  const emitLedger = options.emitLedger !== false;
-  const node = record.node ?? LOCAL_NODE_NAME;
 
   let attempts = 0;
   let killReturnedFailure = false;
@@ -105,12 +107,43 @@ export async function transactionalKill(
     if (i < pollAttempts - 1 && pollIntervalMs > 0) await sleep(pollIntervalMs);
   }
 
+  return {
+    attempts,
+    alreadyGone,
+    killReturnedFailure,
+    stillRunning,
+    ...(stillRunning ? { lastError: lastProbeError ?? killStderr ?? "session still exists after kill" } : {}),
+  };
+}
+
+/**
+ * Transactional kill: substrate.kill -> poll substrate.hasSession -> only then
+ * deleteSession. On failure (session still exists after polling, or its absence
+ * cannot be confirmed), the SessionRecord is updated with status='kill_failed'
+ * and lastError. The record is NOT deleted while the bee may still be running.
+ *
+ * DESTRUCTIVE: the SessionRecord is removed from the store, so the bee cannot
+ * be revived afterwards. This is the GC half of the lifecycle (`hive kill`,
+ * `hive clean`); the everyday way to end a bee is transactionalRetire, which
+ * keeps the record.
+ *
+ * Returns a KillOutcome describing whether the bee is gone (ok=true) or still
+ * suspected of running (ok=false), plus the captured lastError when applicable.
+ */
+export async function transactionalKill(
+  record: SessionRecord,
+  options: TransactionalKillOptions = {},
+): Promise<KillOutcome> {
+  const emitLedger = options.emitLedger !== false;
+  const node = record.node ?? LOCAL_NODE_NAME;
+  const verdict = await teardownSession(record, options);
+
   // Only the poll verdict decides failure: when it confirmed the session is
   // gone (stillRunning === false) we proceed to deleteSession even if the
   // substrate's kill call reported failure — the session may have died
   // between the hasSession fast-path and the kill (a benign race).
-  if (stillRunning) {
-    const lastError = lastProbeError ?? killStderr ?? "session still exists after kill";
+  if (verdict.stillRunning) {
+    const lastError = verdict.lastError ?? "session still exists after kill";
     await updateSession(record.name, {
       status: "kill_failed",
       lastError,
@@ -122,11 +155,11 @@ export async function transactionalKill(
         session: record.name,
         node,
         ok: false,
-        attempts,
+        attempts: verdict.attempts,
         lastError,
       });
     }
-    return { ok: false, lastError, stillRunning, attempts };
+    return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
   }
 
   await deleteSession(record.name);
@@ -140,8 +173,66 @@ export async function transactionalKill(
       session: record.name,
       node,
       ok: true,
-      attempts,
+      attempts: verdict.attempts,
     });
   }
-  return { ok: true, alreadyGone: alreadyGone && !killReturnedFailure, attempts };
+  return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
+}
+
+/**
+ * Transactional retire: the everyday way to end a bee. Tears down the runtime
+ * exactly like transactionalKill (substrate.kill -> poll hasSession), then
+ * ARCHIVES the record (status='archived') instead of deleting it — the bee
+ * leaves the active list but its record, seals, ledger history, and provider
+ * session stay intact, so `hive revive` can bring it back and `hive seals` /
+ * `hive spend` keep working. Distinguishes deliberate retirement from a crash:
+ * a record still 'running' whose session is gone was never retired, so state
+ * derivation reports it 'crashed'.
+ */
+export async function transactionalRetire(
+  record: SessionRecord,
+  options: TransactionalKillOptions = {},
+): Promise<KillOutcome> {
+  const emitLedger = options.emitLedger !== false;
+  const node = record.node ?? LOCAL_NODE_NAME;
+  const verdict = await teardownSession(record, options);
+
+  if (verdict.stillRunning) {
+    const lastError = verdict.lastError ?? "session still exists after retire";
+    await updateSession(record.name, {
+      status: "kill_failed",
+      lastError,
+      updatedAt: new Date().toISOString(),
+    });
+    if (emitLedger) {
+      await appendLedger({
+        type: "session.retire",
+        session: record.name,
+        node,
+        ok: false,
+        attempts: verdict.attempts,
+        lastError,
+      });
+    }
+    return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
+  }
+
+  await updateSession(record.name, {
+    status: "archived",
+    updatedAt: new Date().toISOString(),
+    // A retired bee must not keep reporting a stale error from an earlier
+    // failed kill; explicit undefined deletes the field.
+    lastError: undefined,
+  });
+  if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
+  if (emitLedger) {
+    await appendLedger({
+      type: "session.retire",
+      session: record.name,
+      node,
+      ok: true,
+      attempts: verdict.attempts,
+    });
+  }
+  return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
 }

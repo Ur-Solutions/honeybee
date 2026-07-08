@@ -33,7 +33,7 @@ test("deriveState: a pinned bee is dead when its pane is gone, even if the sessi
 
   // Pane gone but session still alive → DEAD. This is the problem (c) fix:
   // killing the agent pane no longer reports the bee falsely alive.
-  assert.equal(deriveState(rec, { ...sessionLive, livePanes: new Set(["%9"]) }).state, "dead");
+  assert.equal(deriveState(rec, { ...sessionLive, livePanes: new Set(["%9"]) }).state, "crashed");
 });
 
 test("deriveState: legacy (unpinned) bees and missing livePanes fall back to session liveness", () => {

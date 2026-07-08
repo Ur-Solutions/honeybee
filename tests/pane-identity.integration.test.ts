@@ -58,7 +58,7 @@ test("newSession returns the pane id; killing that pane reports the bee dead tho
     assert.ok(!panesAfter.has(paneId), "the agent pane is gone");
 
     // The fix: pane-pinned liveness reports dead even though hasSession is true.
-    assert.equal(deriveState(rec, { liveTargets: new Set(["CL-pane"]), livePanes: panesAfter }).state, "dead");
+    assert.equal(deriveState(rec, { liveTargets: new Set(["CL-pane"]), livePanes: panesAfter }).state, "crashed");
   } finally {
     await tmux(["kill-session", "-t", "=CL-pane"], { reject: false });
   }

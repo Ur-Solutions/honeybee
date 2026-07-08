@@ -39,6 +39,7 @@ export function hiveStateFor(state: BeeState): HiveTmuxState | undefined {
     case "kill_failed":
       return "failed";
     case "dead":
+    case "crashed":
     case "archived":
     case "node_unreachable":
       // Session gone (or filed), or unknowable — nothing to write to.

@@ -16,6 +16,7 @@ test("hiveStateFor maps every BeeState to the coarse @hive_state vocabulary", ()
     error: "failed",
     kill_failed: "failed",
     dead: undefined,
+    crashed: undefined,
     node_unreachable: undefined,
   };
   for (const [state, mapped] of Object.entries(expected)) {

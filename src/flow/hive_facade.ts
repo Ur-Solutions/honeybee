@@ -20,7 +20,7 @@ import {
   listMessages,
   sendBuzMessage,
 } from "../buz.js";
-import { transactionalKill } from "../kill.js";
+import { transactionalRetire } from "../kill.js";
 import { LOCAL_NODE_NAME, loadNodeSync, type NodeRecord } from "../node.js";
 import { loadLatestSeal, recordSeal, type SealArtifact, type SealRecord } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
@@ -243,7 +243,7 @@ export class HiveFacade {
   async kill(target: BeeRef): Promise<void> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
-    const outcome = await transactionalKill(record);
+    const outcome = await transactionalRetire(record);
     if (!outcome.ok) {
       throw new Error(`kill failed for ${record.name}: ${outcome.lastError}`);
     }
@@ -346,7 +346,7 @@ export class HiveFacade {
       try {
         const fresh = await loadSession(record.name);
         if (!fresh) continue;
-        const outcome = await transactionalKill(fresh);
+        const outcome = await transactionalRetire(fresh);
         if (outcome.ok) {
           killed.push(record.name);
           const idx = this.spawned.findIndex((r) => r.name === record.name);

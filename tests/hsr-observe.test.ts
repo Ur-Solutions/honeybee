@@ -116,7 +116,8 @@ test("hsrObservations: live structured state feeds deriveState (not dead), dead 
 
       await waitFor(async () => (await hsrObservations()).get(bee)?.live === false, "bee not live after stop");
       const deadCtx = await contextFromObservations();
-      assert.equal(deriveState(record, deadCtx).state, "dead", "stopped HSR bee derives dead");
+      // The record is still status:"running" (nothing retired it), so a stopped host derives "crashed".
+      assert.equal(deriveState(record, deadCtx).state, "crashed", "stopped HSR bee derives crashed");
     } finally {
       client.close();
       await handle.stop().catch(() => undefined);

@@ -22,7 +22,7 @@ import { cmdLoop } from "./commands/loop.js";
 import { cmdAnswer, cmdBrief, cmdMove, cmdOwn, cmdRename, cmdSeal, cmdSend, cmdTag } from "./commands/messaging.js";
 import { cmdDemote, cmdPromote, cmdRevive } from "./commands/migrate.js";
 import { cmdNode, cmdSubstrate } from "./commands/node.js";
-import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdTail, cmdTranscript, cmdUrls, cmdWait } from "./commands/observe.js";
+import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdRetire, cmdTail, cmdTranscript, cmdUrls, cmdWait } from "./commands/observe.js";
 import { cmdFleet } from "./commands/fleet.js";
 import { cmdPool } from "./commands/pool.js";
 import { cmdOpen, cmdRun, cmdX, cmdXa } from "./commands/run.js";
@@ -112,6 +112,10 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       break;
     case "kill":
       await cmdKill(parsed);
+      break;
+    case "retire":
+    case "archive":
+      await cmdRetire(parsed);
       break;
     case "promote":
       await cmdPromote(parsed);
@@ -328,10 +332,11 @@ function printHelp() {
         ["spawn-picker", "[--frame|--flow]", "print frame/flow names for a display-popup spawn chord"],
         ["urls", "[<bee>]", "list URLs printed in a bee's pane (--lines, --open, --json)"],
         ["keys", "<print|path|check>", "print/verify the recommended tmux keybinding set"],
-        ["kill", "<session>", "stop a bee (its pane) or a whole comb (--comb)"],
+        ["retire", "<bee|@swarm|colony:name>", "stop a bee and archive its record (the everyday way to end bees; alias: archive)"],
+        ["kill", "<session>", "PURGE a bee: stop it and delete its record/seals/run data (rare; prompts, --yes)"],
         ["promote", "<bee>", "move an HSR bee onto an interactive tmux pane (resume; claude/codex, --now)"],
         ["demote", "<bee>", "move a tmux bee back to a pane-less HSR runner (resume; claude/codex, --now)"],
-        ["revive", "<bee>", "relaunch a dead bee and resume its session (--all, --fresh, --session <id>)"],
+        ["revive", "<bee>", "relaunch a dead bee and resume its session (--crashed, --all, --fresh, --session <id>, --no-wait)"],
         ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],
         ["loop", "<launch|start|status|stop|…>", "run a bee repeatedly until a stop condition (launch = interactive dialog)"],
       ],

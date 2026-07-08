@@ -545,7 +545,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     if (transitioned) {
       transitions.push({ name: record.name, from: prev, to: derived.state });
     }
-    const terminal = derived.state === "dead" || derived.state === "sealed";
+    const terminal = derived.state === "dead" || derived.state === "crashed" || derived.state === "sealed";
     return {
       record,
       state: derived.state,

@@ -72,7 +72,12 @@ test("run --rm cleans up when known driver readiness fails", async () => {
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /Timed out waiting for claude to become ready/);
     assert.equal(await hasSession(name), false);
-    assert.deepEqual(await sessionFiles(storeRoot), []);
+    // --rm now retires (archives) instead of deleting: the record survives as status=archived.
+    const files = await sessionFiles(storeRoot);
+    assert.equal(files.length, 1, "retired record should remain on disk");
+    const { readFile } = await import("node:fs/promises");
+    const raw = await readFile(join(storeRoot, "sessions", files[0]!), "utf8");
+    assert.equal((JSON.parse(raw) as { status: string }).status, "archived");
   } finally {
     await kill(name);
     await rm(storeRoot, { recursive: true, force: true });

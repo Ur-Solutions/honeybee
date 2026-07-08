@@ -294,7 +294,8 @@ test("hive list derives HSR liveness through the shared state context (HIVE-16)"
     assert.ok(liveRow, "live HSR bee should be listed");
     assert.ok(deadRow, "dead HSR bee should be listed");
     assert.notEqual(liveRow.beeState, "dead", "a live HSR bee must not derive as dead");
-    assert.equal(deadRow.beeState, "dead", "an HSR bee with a dead host derives as dead");
+    // A dead host under a never-retired record is an un-commanded death → "crashed".
+    assert.equal(deadRow.beeState, "crashed", "an HSR bee with a dead host derives as crashed");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -8,7 +8,7 @@ import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note,
 import { effectiveHiveState, hiveStateFor } from "../hiveState.js";
 import { highlightUniqueSessionReference } from "../ids.js";
 import { extractUrls } from "../keybindings.js";
-import { transactionalKill } from "../kill.js";
+import { transactionalKill, transactionalRetire } from "../kill.js";
 import { sessionDisplayName, shouldShowNodeColumn } from "../listView.js";
 import { DEFAULT_ATTENTION_STATES, attentionCount, parseStateList, pickNextBee, type BeeStateEntry } from "../next.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode } from "../node.js";
@@ -16,7 +16,8 @@ import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { liveBeesFromSessions, poolsForProject, poolStatus, projectRepresentatives, type PoolStatus } from "../pool.js";
 import { listProRepoEntries, resolveProSlotForCwd, type ProRepoEntry, type ProSlotKind } from "../proProjects.js";
 import { repoTagFor } from "../repoTag.js";
-import { listSeals, loadLatestSeal } from "../seal.js";
+import { hsrRunDir } from "../hsr/runDir.js";
+import { listSeals, loadLatestSeal, sealsRoot } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "../sessionMetadata.js";
 import { deriveState, formatStateCell, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
@@ -282,7 +283,9 @@ export async function cmdBees(parsed: Parsed): Promise<void> {
     onKill: async (item) => {
       const record = await resolveSession(item.name).catch(() => undefined);
       if (!record) return { ok: false, detail: "no matching bee record" };
-      const outcome = await transactionalKill(record);
+      // The TUI's kill action is an everyday stop, not GC: retire (archive)
+      // so the record and seals survive and the bee stays revivable.
+      const outcome = await transactionalRetire(record);
       return outcome.ok ? { ok: true } : { ok: false, detail: outcome.lastError };
     },
     onSelect: async (item) => {
@@ -530,10 +533,67 @@ export async function waitForSeal(record: SessionRecord, parsed: Parsed): Promis
 }
 
 
+/**
+ * hive retire <bee|@swarm|colony:name|tag> — the everyday way to end bees.
+ * Stops the runtime (tmux session / HSR runner) and archives the record;
+ * seals, ledger history, and the provider session all survive, and the bee
+ * stays revivable. Multi-selectors retire every matching bee.
+ */
+export async function cmdRetire(parsed: Parsed) {
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: hive retire <bee|@swarm|colony:name>");
+  const resolved = await resolveSelector(target);
+  const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
+  if (records.length === 0) throw new Error(`hive retire: no bees match ${target}`);
+
+  let failures = 0;
+  for (const record of records) {
+    const outcome = await transactionalRetire(record);
+    if (!outcome.ok) {
+      failures += 1;
+      if (isPretty()) {
+        console.log(actionLine("warn", "retire_failed", [bold(record.name), dim(outcome.lastError)]));
+        console.error(note(`bee may still be running; retry: hive retire ${record.name}`));
+      } else {
+        console.log(`retire_failed\t${record.name}\t${outcome.lastError}`);
+      }
+      continue;
+    }
+    if (isPretty()) {
+      console.log(actionLine("ok", "retire", [bold(record.name), dim(outcome.alreadyGone ? "already stopped — archived" : "stopped and archived")]));
+    } else {
+      console.log(`retired\t${record.name}`);
+    }
+  }
+  if (failures > 0) process.exitCode = 1;
+}
+
+/**
+ * hive kill <bee> — the RARE garbage collector, not the everyday stop (that is
+ * `hive retire`). Stops the bee if it is still running, then permanently
+ * deletes its session record, seals, and HSR run dir; the bee cannot be
+ * revived afterwards. Confirms interactively unless --yes/--force.
+ */
 export async function cmdKill(parsed: Parsed) {
   const target = parsed.args[0];
-  if (!target) throw new Error("Usage: hive kill <session>");
+  if (!target) throw new Error("Usage: hive kill <session> [--yes]");
   const record = await resolveSession(target);
+
+  const confirmed = truthy(flag(parsed, "yes")) || truthy(flag(parsed, "y")) || truthy(flag(parsed, "force"));
+  if (!confirmed) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new Error(
+        `hive kill permanently deletes ${record.name}'s record, seals, and run data (use hive retire to stop it and keep everything); pass --yes to confirm`,
+      );
+    }
+    const answer = await promptLine(
+      `hive kill permanently deletes ${record.name}'s record, seals, and run data — it cannot be revived afterwards. To stop the bee and keep its records use: hive retire ${record.name}. Proceed? [y/N] `,
+    );
+    if (!/^y(es)?$/i.test(answer.trim())) {
+      console.error(note("aborted — nothing deleted"));
+      return;
+    }
+  }
 
   // Combs are retired (APIA-85): every bee is solo (its own session/runner host),
   // so a kill always tears down the whole session via the transactional path.
@@ -549,11 +609,31 @@ export async function cmdKill(parsed: Parsed) {
     process.exitCode = 1;
     return;
   }
+  await purgeBeeArtifacts(record);
   if (isPretty()) {
-    console.log(actionLine(outcome.alreadyGone ? "warn" : "ok", outcome.alreadyGone ? "gone" : "kill", [bold(record.name)]));
+    console.log(actionLine(outcome.alreadyGone ? "warn" : "ok", outcome.alreadyGone ? "gone" : "kill", [bold(record.name), dim("record, seals, and run data deleted")]));
   } else {
     console.log(`${outcome.alreadyGone ? "gone" : "killed"}\t${record.name}`);
   }
+}
+
+/** Best-effort removal of the bee's per-bee stores (seals, HSR run dir). */
+async function purgeBeeArtifacts(record: SessionRecord): Promise<void> {
+  const { rm } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  await rm(join(sealsRoot(), record.name), { recursive: true, force: true }).catch(() => undefined);
+  await rm(hsrRunDir(record.name), { recursive: true, force: true }).catch(() => undefined);
+}
+
+async function promptLine(question: string): Promise<string> {
+  const { createInterface } = await import("node:readline");
+  return new Promise((resolvePrompt) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    rl.question(question, (answer: string) => {
+      rl.close();
+      resolvePrompt(answer);
+    });
+  });
 }
 
 // hive urls [<bee>] [--lines <n>] [--open] [--json]

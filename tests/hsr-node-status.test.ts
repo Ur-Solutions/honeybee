@@ -247,5 +247,5 @@ test("deriveState: a remote-hsr bee on an unreachable node is node_unreachable, 
   // Node reachable but no live target → it would read dead, proving the probe
   // (not a hardcoded state) is what surfaces node_unreachable above.
   const up: StateContext = { liveTargets: new Set(), unreachableNodes: new Set(), now: Date.now() };
-  assert.equal(deriveState(record, up).state, "dead");
+  assert.equal(deriveState(record, up).state, "crashed");
 });

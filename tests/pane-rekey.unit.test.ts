@@ -54,7 +54,7 @@ test("sub-bee liveness is its own pane: a dead pane reports dead though the comb
     panes: new Map(),
     now: Date.parse("2026-06-15T11:00:00.000Z"),
   };
-  assert.equal(deriveState(child, context).state, "dead");
+  assert.equal(deriveState(child, context).state, "crashed");
 });
 
 test("legacy solo bee (no agentPaneId) still reads the tmuxTarget-keyed pane", () => {

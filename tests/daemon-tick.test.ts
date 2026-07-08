@@ -226,7 +226,7 @@ test("tick: liveness keys qualified by node do not leak across nodes", async () 
       capture,
     });
     const result = await tick(deps, new Map());
-    assert.equal(result.observed.get(record.name), "dead");
+    assert.equal(result.observed.get(record.name), "crashed");
   });
 });
 
@@ -261,9 +261,9 @@ test("tick: identical state -> no transition recorded", async () => {
       now: NOW,
       capture,
     });
-    const previous = new Map<string, BeeState>([[record.name, "dead"]]);
+    const previous = new Map<string, BeeState>([[record.name, "crashed"]]);
     const result = await tick(deps, previous);
-    assert.equal(result.observed.get(record.name), "dead");
+    assert.equal(result.observed.get(record.name), "crashed");
     assert.equal(result.transitions.length, 0);
   });
 });

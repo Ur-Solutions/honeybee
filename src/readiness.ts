@@ -34,6 +34,8 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
   const started = Date.now();
   let deadline = started + options.timeoutMs;
   let trustAttempts = 0;
+  let resumeAttempts = 0;
+  let tourAttempts = 0;
   let droidYoloCycles = 0;
   let lastPane = "";
   const substrate = options.substrate ?? substrateFor(record);
@@ -69,6 +71,29 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
         continue;
       }
       // Three attempts didn't clear it — keep polling but stop sending keys.
+    }
+
+    // claude's resume-time dialogs (seen on `hive revive` / --resume): the
+    // resume-mode chooser pre-selects the recommended "Resume from summary",
+    // so Enter confirms it; the fullscreen-renderer tour pre-selects "Yes,
+    // try it" — Down+Enter declines so a revive never silently changes the
+    // bee's renderer behavior. Both are gated on acceptTrust: it is the
+    // caller's "drive startup dialogs for me" switch.
+    if (acceptTrust && isResumeChoicePane(pane) && resumeAttempts < 3) {
+      await substrate.sendEnter(record.tmuxTarget, record.agentPaneId);
+      resumeAttempts += 1;
+      deadline = Math.max(deadline, Date.now() + grace);
+      await sleep(1000);
+      continue;
+    }
+    if (acceptTrust && isRendererTourPane(pane) && tourAttempts < 3) {
+      await substrate.sendKey(record.tmuxTarget, "Down", record.agentPaneId);
+      await sleep(300);
+      await substrate.sendEnter(record.tmuxTarget, record.agentPaneId);
+      tourAttempts += 1;
+      deadline = Math.max(deadline, Date.now() + grace);
+      await sleep(1000);
+      continue;
     }
 
     if (record.agent === "droid" && options.raiseDroidAutonomy && shouldRaiseDroidAutonomy(pane) && droidYoloCycles < 4) {
@@ -117,10 +142,26 @@ export function isBypassPermissionsPane(pane: string): boolean {
   return /Bypass Permissions mode/i.test(recent) && /\bYes, I accept\b/i.test(recent);
 }
 
-// Startup confirmations the readiness loop auto-accepts with Enter: the
-// directory-trust prompt and claude's bypass-permissions warning.
+// claude's resume-mode chooser, shown when resuming an old/large session
+// ("Resume from summary (recommended) / Resume full session as-is"). The
+// recommended option is pre-selected, so Enter confirms it. Tail-scoped like
+// the other startup prompts.
+export function isResumeChoicePane(pane: string): boolean {
+  return /Resume from summary/i.test(recentPane(pane));
+}
+
+// claude's one-time fullscreen-renderer tour ("Try the new fullscreen
+// renderer?"), which pre-selects "Yes, try it". Surfaces on resumed sessions
+// whose config predates the feature. Tail-scoped.
+export function isRendererTourPane(pane: string): boolean {
+  return /Try the new fullscreen renderer|auto-copies to your clipboard/i.test(recentPane(pane));
+}
+
+// Startup confirmations the readiness loop auto-drives: the directory-trust
+// prompt, claude's bypass-permissions warning, and the resume-time dialogs
+// (resume-mode chooser, renderer tour).
 export function isStartupConfirmationPane(pane: string): boolean {
-  return isTrustPromptPane(pane) || isBypassPermissionsPane(pane);
+  return isTrustPromptPane(pane) || isBypassPermissionsPane(pane) || isResumeChoicePane(pane) || isRendererTourPane(pane);
 }
 
 export function isMcpWarningPane(pane: string): boolean {

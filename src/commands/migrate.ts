@@ -13,6 +13,7 @@ import { readHsrMeta } from "../hsr/runDir.js";
 import { hsrSubstrate } from "../hsr/substrate.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
+import { waitForAgentReady } from "../readiness.js";
 import { appendLedger, listSessions, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
@@ -460,31 +461,47 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
  * same id, name, colony, account binding. This is the swap-account relaunch
  * recipe minus the account switch.
  *
- *   --all     revive every dead local bee that has a precise providerSessionId
- *   --fresh   start a new session instead of resuming the old transcript
+ *   --all      revive every dead local bee that has a precise providerSessionId
+ *   --crashed  revive only bees that died WITHOUT a retire/kill (substrate
+ *              crash, external kill) — the recovery verb after a tmux crash
+ *   --fresh    start a new session instead of resuming the old transcript
+ *   --no-wait  skip the post-relaunch readiness wait (startup dialogs are
+ *              auto-driven during that wait; see waitForRevivedReady)
  */
 export async function cmdRevive(parsed: Parsed): Promise<void> {
-  if (truthy(flag(parsed, "all"))) {
-    if (stringFlag(parsed, ["session"])) throw new Error("hive revive --all cannot take --session (one id can't apply to many bees)");
+  const bulkCrashed = truthy(flag(parsed, "crashed"));
+  const bulkAll = truthy(flag(parsed, "all"));
+  if (bulkCrashed || bulkAll) {
+    const which = bulkCrashed ? "--crashed" : "--all";
+    if (stringFlag(parsed, ["session"])) throw new Error(`hive revive ${which} cannot take --session (one id can't apply to many bees)`);
     const records = await listSessions();
-    const local = records.filter((r) => !r.node || r.node === LOCAL_NODE_NAME);
+    // Retired (archived) bees are settled on purpose — bulk revive must never
+    // resurrect them. Reviving a retired bee stays possible one at a time.
+    const local = records.filter((r) => (!r.node || r.node === LOCAL_NODE_NAME) && r.status !== "archived");
     let revived = 0;
     let alive = 0;
     const skipped: string[] = [];
     const failed: Array<{ name: string; error: string }> = [];
+    const relaunched: SessionRecord[] = [];
     for (const record of local) {
       try {
         if (await substrateFor(record).hasSession(record.tmuxTarget)) {
           alive += 1;
           continue;
         }
-        // --all only auto-revives bees we can resume precisely; resuming "the
-        // latest session in the home" would grab a sibling's when homes are shared.
+        // --crashed revives only un-commanded deaths: a record still 'running'
+        // whose session is gone was never retired/killed, so something under it
+        // failed (tmux server crash, external kill, harness exit).
+        if (bulkCrashed && record.status !== "running") {
+          continue;
+        }
+        // Bulk revive only auto-revives bees we can resume precisely; resuming
+        // "the latest session in the home" would grab a sibling's when homes are shared.
         if (!record.providerSessionId && !truthy(flag(parsed, "fresh"))) {
           skipped.push(record.name);
           continue;
         }
-        await reviveOne(record, parsed);
+        relaunched.push(await reviveOne(record, parsed, { skipReadyWait: true }));
         revived += 1;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -493,22 +510,77 @@ export async function cmdRevive(parsed: Parsed): Promise<void> {
         else console.log(`revive_failed\t${record.name}\t${message}`);
       }
     }
+    if (bulkCrashed && (revived > 0 || failed.length > 0)) {
+      const diagnosis = await diagnoseSubstrateCrash().catch(() => undefined);
+      if (diagnosis) console.error(note(diagnosis));
+    }
+    await waitForRevivedReady(relaunched, parsed);
     if (isPretty()) {
       const parts = [`revived ${revived}`, `${alive} already alive`];
       if (skipped.length > 0) parts.push(`${skipped.length} skipped (no resumable session id: ${skipped.join(", ")})`);
       if (failed.length > 0) parts.push(`${failed.length} failed (${failed.map((failure) => failure.name).join(", ")})`);
       console.log(note(parts.join(" · ")));
     } else {
-      console.log(`revive\tall\t${revived}\t${alive}\t${skipped.length}`);
+      console.log(`revive\t${bulkCrashed ? "crashed" : "all"}\t${revived}\t${alive}\t${skipped.length}`);
     }
     if (failed.length > 0) process.exitCode = 1;
     return;
   }
 
   const target = parsed.args[0];
-  if (!target) throw new Error("Usage: hive revive <bee> [--all] [--fresh] [--session <id>]");
+  if (!target) throw new Error("Usage: hive revive <bee> [--all] [--crashed] [--fresh] [--session <id>] [--no-wait]");
   const record = await resolveSession(target);
   await reviveOne(record, parsed);
+}
+
+/**
+ * Best-effort explanation of WHY a fleet crashed: when the local tmux server's
+ * process started after the crashed bees last breathed, the server itself went
+ * down (crash or restart) and took every pane-bee with it — that is worth
+ * telling the operator, since it means the bees did nothing wrong.
+ */
+async function diagnoseSubstrateCrash(): Promise<string | undefined> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  try {
+    const pid = (await run("tmux", ["display-message", "-p", "#{pid}"])).stdout.trim();
+    if (!/^\d+$/.test(pid)) return undefined;
+    const lstart = (await run("ps", ["-o", "lstart=", "-p", pid])).stdout.trim();
+    if (!lstart) return undefined;
+    return `tmux server (pid ${pid}) has been running since ${lstart} — bees that crashed before that died with the previous server`;
+  } catch {
+    return "no tmux server is responding — it likely crashed or was stopped; reviving starts a fresh one";
+  }
+}
+
+/**
+ * Post-relaunch smoothing: wait for each revived tmux bee to become ready,
+ * auto-driving claude's startup dialogs (trust, bypass-permissions, the
+ * resume-mode chooser, the renderer tour) so a revived bee lands at its
+ * composer instead of stranded on a prompt. Bounded concurrency keeps a
+ * fleet-sized revive from hammering the tmux server with capture polls.
+ */
+async function waitForRevivedReady(records: SessionRecord[], parsed: Parsed): Promise<void> {
+  if (truthy(flag(parsed, "no-wait"))) return;
+  const waitable = records.filter((r) => r.substrate !== "hsr" && (!r.node || r.node === LOCAL_NODE_NAME));
+  if (waitable.length === 0) return;
+  const timeoutMs = 90_000;
+  const chunkSize = 8;
+  for (let i = 0; i < waitable.length; i += chunkSize) {
+    const chunk = waitable.slice(i, i + chunkSize);
+    await Promise.all(
+      chunk.map(async (record) => {
+        try {
+          await waitForAgentReady(record, { timeoutMs });
+        } catch (error) {
+          const message = error instanceof Error ? error.message.split("\n")[0]! : String(error);
+          if (isPretty()) console.error(note(`${record.name}: not ready after revive — ${message}`));
+          else console.log(`revive_not_ready\t${record.name}\t${message}`);
+        }
+      }),
+    );
+  }
 }
 
 
@@ -593,7 +665,7 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
 
 
 /** Relaunch one dead bee and resume (or, with --fresh, start anew) its session. */
-export async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<SessionRecord> {
+export async function reviveOne(record: SessionRecord, parsed: Parsed, opts: { skipReadyWait?: boolean } = {}): Promise<SessionRecord> {
   const substrate = substrateFor(record);
   if (await substrate.hasSession(record.tmuxTarget)) {
     throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
@@ -616,5 +688,6 @@ export async function reviveOne(record: SessionRecord, parsed: Parsed): Promise<
   const how = providerSessionId ? `resumed ${providerSessionId}` : "fresh session";
   if (isPretty()) console.log(actionLine("ok", "revive", [bold(record.name), record.agent, dim(how)]));
   else console.log(`revived\t${record.name}\t${record.agent}\t${how}`);
+  if (!opts.skipReadyWait) await waitForRevivedReady([updated], parsed);
   return updated;
 }

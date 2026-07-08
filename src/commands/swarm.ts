@@ -1,7 +1,7 @@
 // `hive swarm` — manage live or destroyed bee cohorts.
 // Extracted from cli.ts (HIVE-15).
 import { actionLine, bold, dim, formatRelativeTime, formatTable, gray, green, isPretty, note } from "../format.js";
-import { transactionalKill } from "../kill.js";
+import { transactionalRetire } from "../kill.js";
 import { type Parsed } from "../parse.js";
 import { listSessions } from "../store.js";
 import { destroySwarm, listSwarms, loadSwarm } from "../swarm.js";
@@ -75,7 +75,9 @@ export async function swarmDestroy(parsed: Parsed) {
   const members = records.filter((r) => r.swarmId === cleaned);
   let killFailed = 0;
   for (const member of members) {
-    const outcome = await transactionalKill(member);
+    // Retire, not purge: destroying a swarm ends its bees but keeps their
+    // records/seals for inspection and revival.
+    const outcome = await transactionalRetire(member);
     if (!outcome.ok) {
       killFailed += 1;
       if (isPretty()) console.log(actionLine("warn", "kill_failed", [bold(member.name), dim(outcome.lastError)]));

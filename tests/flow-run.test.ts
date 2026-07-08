@@ -263,13 +263,12 @@ test("cleanup=kill-on-end calls killAll() on flow-spawned bees at end", async ()
     });
     const outcome = await executeFlow(flow, { installSignalHandlers: false });
     assert.equal(outcome.status, "ok");
-    // The cleanup path runs transactionalKill which goes through substrate.kill.
-    // Since there's no tmux session for "kill-bee", substrate.hasSession returns
-    // false on the fast-path probe, and transactionalKill enters alreadyGone
-    // mode + deleteSession. So the record should be GONE.
+    // The cleanup path runs transactionalRetire which goes through substrate.kill.
+    // Since there's no tmux session for "kill-bee", the fast-path probe reports
+    // alreadyGone and the record is ARCHIVED (kept, revivable) — not deleted.
     const { loadSession } = await import("../src/store.js");
-    const gone = await loadSession("kill-bee");
-    assert.equal(gone, null, "cleanup=kill-on-end should delete the spawned record");
+    const kept = await loadSession("kill-bee");
+    assert.equal(kept?.status, "archived", "cleanup=kill-on-end should archive the spawned record");
   });
 });
 
@@ -329,8 +328,8 @@ test("cleanupOverride absent: kill-on-end still kills (regression guard)", async
     const outcome = await executeFlow(flow, { installSignalHandlers: false });
     assert.equal(outcome.status, "ok");
     const { loadSession } = await import("../src/store.js");
-    const gone = await loadSession("noovr-bee");
-    assert.equal(gone, null, "without an override, kill-on-end still deletes the record");
+    const kept = await loadSession("noovr-bee");
+    assert.equal(kept?.status, "archived", "without an override, kill-on-end still archives the record");
   });
 });
 

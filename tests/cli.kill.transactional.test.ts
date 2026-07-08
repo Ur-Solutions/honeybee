@@ -313,7 +313,7 @@ test("hive kill on a real local-tmux session: succeeds and removes the session r
     assert.equal(await tmuxHasSession(target), true);
     await writeRecord(dir, seed({ name: target, tmuxTarget: target, id: "CO.kts" }));
 
-    const result = await hive(dir, "kill", target);
+    const result = await hive(dir, "kill", target, "--yes");
     assert.equal(result.code, 0, `kill should exit 0; stderr=${result.stderr}`);
     assert.match(result.stdout, /^killed\t/m);
     assert.equal(await tmuxHasSession(target), false);
@@ -354,7 +354,7 @@ test("hive kill on a real local-tmux session that resists kill: persists kill_fa
     let stderr = "";
     let code = 0;
     try {
-      const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "kill", "stub-bee"], { cwd: process.cwd(), env, timeout: 15_000 });
+      const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "kill", "stub-bee", "--yes"], { cwd: process.cwd(), env, timeout: 15_000 });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (err) {
@@ -384,7 +384,7 @@ test("hive kill on a session that never had a tmux pane: reports gone, removes t
     // Write the record but do NOT create a tmux session.
     await writeRecord(dir, seed({ name: target, tmuxTarget: target, id: "CO.kgn" }));
 
-    const result = await hive(dir, "kill", target);
+    const result = await hive(dir, "kill", target, "--yes");
     assert.equal(result.code, 0, `kill should exit 0 even when bee was already gone; stderr=${result.stderr}`);
     assert.match(result.stdout, /^gone\t/m);
     const stillThere = await readFile(join(dir, "sessions", `${target}.json`), "utf8").catch(() => null);

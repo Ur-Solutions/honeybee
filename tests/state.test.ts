@@ -20,8 +20,13 @@ function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
 
 const NOW = Date.parse("2026-05-28T12:00:00.000Z");
 
-test("dead: tmux target is not live", () => {
+test("crashed: tmux target is not live and the record was never retired", () => {
   const result = deriveState(bee(), { liveTargets: new Set(), now: NOW });
+  assert.equal(result.state, "crashed");
+});
+
+test("dead: tmux target is not live and the record is explicitly marked dead", () => {
+  const result = deriveState(bee({ status: "dead" }), { liveTargets: new Set(), now: NOW });
   assert.equal(result.state, "dead");
 });
 
@@ -204,6 +209,7 @@ test("stateLabel returns human-readable forms", () => {
 // added to the union but forgotten in these coverage assertions.
 const ALL_STATES: BeeState[] = [
   "dead",
+  "crashed",
   "sealed",
   "archived",
   "blocked",
@@ -233,6 +239,7 @@ test("STATE_PRESENTATION covers every BeeState with a finite clean priority", ()
 test("cleanStatePriority preserves the original ordering", () => {
   assert.equal(cleanStatePriority("idle_with_output"), 0);
   assert.equal(cleanStatePriority("dead"), 1);
+  assert.equal(cleanStatePriority("crashed"), 1);
   assert.equal(cleanStatePriority("archived"), 1);
   assert.equal(cleanStatePriority("sealed"), 2);
   assert.equal(cleanStatePriority("kill_failed"), 3);
@@ -330,13 +337,13 @@ test("liveness honors node-qualified keys", () => {
   assert.equal(result.state, "ready");
 });
 
-test("dead: a same-named live session on ANOTHER node does not mask a dead bee", () => {
+test("crashed: a same-named live session on ANOTHER node does not mask a gone bee", () => {
   const result = deriveState(bee(), {
     // The bee is local; only node mini01 has a live "alpha-target" session.
     liveTargets: new Set([liveTargetKey("mini01", "alpha-target")]),
     now: NOW,
   });
-  assert.equal(result.state, "dead");
+  assert.equal(result.state, "crashed");
 });
 
 test("dead detail reports the MOST RECENT activity timestamp", () => {
@@ -348,8 +355,8 @@ test("dead detail reports the MOST RECENT activity timestamp", () => {
     }),
     { liveTargets: new Set(), now: NOW },
   );
-  assert.equal(result.state, "dead");
-  assert.equal(result.detail, "last activity 2026-05-28T11:30:00.000Z");
+  assert.equal(result.state, "crashed");
+  assert.ok(result.detail.endsWith("last activity 2026-05-28T11:30:00.000Z"), result.detail);
 });
 
 test("kill_failed still wins over node_unreachable", () => {
@@ -378,7 +385,8 @@ test("HSR structured terminal states do not reuse the last prompt as detail", ()
         now: NOW,
       },
     );
-    assert.equal(result.state, state);
+    // A structured "dead" on a record never retired/killed reports "crashed".
+    assert.equal(result.state, state === "dead" ? "crashed" : state);
     assert.notEqual(result.detail, "deploy prod");
   }
 });
