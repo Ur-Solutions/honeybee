@@ -19,7 +19,9 @@ import {
   codexServerRequestToNeedsInput,
   encodeCodexApprovalResponse,
   encodeCodexUserInput,
+  retryCodexThreadHandshake,
 } from "../src/hsr/adapters/codex.js";
+import { CodexRpcRequestTimeoutError } from "../src/hsr/adapters/codexRpc.js";
 import { adapterFor } from "../src/hsr/adapters/index.js";
 import type { RunnerEvent } from "../src/hsr/types.js";
 
@@ -162,4 +164,69 @@ test("adapterFor resolves codex; codexAdapter is harness codex, tier server", ()
   assert.equal(adapterFor("codex"), codexAdapter);
   assert.equal(codexAdapter.harness, "codex");
   assert.equal(codexAdapter.tier(), "server");
+});
+
+test("thread handshake timeout discards the wedged child and retries on a fresh attempt with backoff", async () => {
+  const runs: Array<{ attempt: number; delayMs: number; timeoutMs: number }> = [];
+  const discarded: number[] = [];
+  const retries: Array<{ attempt: number; nextDelayMs: number }> = [];
+  let created = 0;
+
+  const outcome = await retryCodexThreadHandshake(
+    async () => {
+      const attempt = ++created;
+      return {
+        async run(delayMs: number, timeoutMs: number): Promise<string> {
+          runs.push({ attempt, delayMs, timeoutMs });
+          if (attempt < 3) throw new CodexRpcRequestTimeoutError("thread/start", timeoutMs);
+          return "thread-ok";
+        },
+        async discard(): Promise<void> {
+          discarded.push(attempt);
+        },
+      };
+    },
+    {
+      delaysMs: [0, 20, 50],
+      requestTimeoutMs: 7,
+      onRetry: ({ attempt, nextDelayMs }) => retries.push({ attempt, nextDelayMs }),
+    },
+  );
+
+  assert.equal(outcome.result, "thread-ok");
+  assert.equal(created, 3, "each retry must create a new app-server attempt");
+  assert.deepEqual(runs, [
+    { attempt: 1, delayMs: 0, timeoutMs: 7 },
+    { attempt: 2, delayMs: 20, timeoutMs: 7 },
+    { attempt: 3, delayMs: 50, timeoutMs: 7 },
+  ]);
+  assert.deepEqual(discarded, [1, 2], "only wedged attempts are killed");
+  assert.deepEqual(retries, [
+    { attempt: 1, nextDelayMs: 20 },
+    { attempt: 2, nextDelayMs: 50 },
+  ]);
+});
+
+test("thread handshake does not hide non-timeout protocol failures", async () => {
+  let created = 0;
+  let discarded = 0;
+  await assert.rejects(
+    retryCodexThreadHandshake(
+      async () => {
+        created++;
+        return {
+          async run(): Promise<never> {
+            throw new Error("authentication rejected");
+          },
+          async discard(): Promise<void> {
+            discarded++;
+          },
+        };
+      },
+      { delaysMs: [0, 1, 2], requestTimeoutMs: 1 },
+    ),
+    /authentication rejected/,
+  );
+  assert.equal(created, 1);
+  assert.equal(discarded, 1);
 });

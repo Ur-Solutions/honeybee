@@ -24,10 +24,16 @@
  * Node builtins only.
  */
 
+import type { ChildProcess } from "node:child_process";
 import type { RunnerAdapter, RunnerEvent, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
 import { harnessAllowance } from "../harness.js";
-import { attachSessionPlumbing, spawnSessionChild } from "../sessionBase.js";
-import { createCodexRpcPeer, CODEX_RPC_METHOD_NOT_FOUND, type CodexRpcPeer } from "./codexRpc.js";
+import { attachSessionPlumbing, spawnSessionChild, stopChildGroup } from "../sessionBase.js";
+import {
+  createCodexRpcPeer,
+  CODEX_RPC_METHOD_NOT_FOUND,
+  CodexRpcRequestTimeoutError,
+  type CodexRpcPeer,
+} from "./codexRpc.js";
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -260,6 +266,67 @@ function isApproval(answer: string): boolean {
 /** codex app-server flags: fixed subcommand; caller argv is ignored for tier "server". */
 const CODEX_APP_SERVER_ARGS = ["app-server"];
 
+// codex-cli 0.144.0 acknowledges initialize before its asynchronous online
+// model refresh has made the app-server able to service thread/start. A request
+// sent inside that window is silently dropped and wedges that connection. There
+// is no protocol-level ready notification, so failed attempts must be killed and
+// respawned; retrying on the same peer cannot recover it.
+const CODEX_THREAD_REQUEST_TIMEOUT_MS = 5_000;
+const CODEX_THREAD_HANDSHAKE_DELAYS_MS = [0, 2_000, 5_000, 10_000, 20_000] as const;
+const CODEX_STDERR_LOG_LIMIT_BYTES = 1024 * 1024;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+export type CodexThreadHandshakeAttempt<T> = {
+  run(preRequestDelayMs: number, requestTimeoutMs: number): Promise<T>;
+  /** Kill and fully discard this attempt; a timed-out connection is unrecoverable. */
+  discard(): Promise<void>;
+};
+
+/**
+ * Retry a Codex thread handshake on a fresh app-server after a bounded timeout.
+ * Exported so the restart (rather than same-peer retry) contract is hermetically
+ * testable without a real Codex account.
+ */
+export async function retryCodexThreadHandshake<T>(
+  createAttempt: () => Promise<CodexThreadHandshakeAttempt<T>>,
+  opts: {
+    delaysMs?: readonly number[];
+    requestTimeoutMs?: number;
+    onRetry?: (info: { attempt: number; maxAttempts: number; nextDelayMs: number; error: CodexRpcRequestTimeoutError }) => void;
+  } = {},
+): Promise<{ attempt: CodexThreadHandshakeAttempt<T>; result: T }> {
+  const delaysMs = opts.delaysMs ?? CODEX_THREAD_HANDSHAKE_DELAYS_MS;
+  const requestTimeoutMs = opts.requestTimeoutMs ?? CODEX_THREAD_REQUEST_TIMEOUT_MS;
+  if (delaysMs.length === 0) throw new Error("codex thread handshake requires at least one attempt");
+
+  for (let index = 0; index < delaysMs.length; index++) {
+    const attempt = await createAttempt();
+    try {
+      const result = await attempt.run(delaysMs[index] as number, requestTimeoutMs);
+      return { attempt, result };
+    } catch (error) {
+      // Always discard a failed child. codex-cli 0.144.0 leaves the connection
+      // wedged after a premature thread request, including for later requests.
+      await attempt.discard().catch(() => undefined);
+      const retryable =
+        error instanceof CodexRpcRequestTimeoutError &&
+        (error.method === "thread/start" || error.method === "thread/resume");
+      const hasNext = index + 1 < delaysMs.length;
+      if (!retryable || !hasNext) throw error;
+      opts.onRetry?.({
+        attempt: index + 1,
+        maxAttempts: delaysMs.length,
+        nextDelayMs: delaysMs[index + 1] as number,
+        error,
+      });
+    }
+  }
+
+  // The non-empty loop either returns or throws; this only satisfies TS control flow.
+  throw new Error("codex thread handshake exhausted attempts");
+}
+
 /**
  * Build the codex spawn command/args + scrubbed env WITHOUT spawning. Pure —
  * exported so tests can exercise argv/env policy in isolation.
@@ -272,14 +339,125 @@ export function buildCodexSpawn(opts: RunnerOpts): { command: string; args: stri
   return { command, args: [...CODEX_APP_SERVER_ARGS], env };
 }
 
+type LiveCodexHandshakeAttempt = CodexThreadHandshakeAttempt<unknown> & {
+  child: ChildProcess;
+  peer: CodexRpcPeer;
+};
+
+function forwardCodexStderr(child: ChildProcess): void {
+  let capturedBytes = 0;
+  let truncated = false;
+  child.stderr?.on("data", (chunk: Buffer | string) => {
+    try {
+      // The detached HSR host already redirects its stderr to host.log. Forward
+      // the app-server's diagnostics there as well so startup failures retain
+      // the model-refresh/MCP context that led to them. Keep draining after the
+      // bound: RUST_LOG=info can otherwise grow one short turn by many megabytes.
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, CODEX_STDERR_LOG_LIMIT_BYTES - capturedBytes);
+      if (remaining > 0) {
+        const captured = buffer.subarray(0, remaining);
+        process.stderr.write(captured);
+        capturedBytes += captured.length;
+      }
+      if (!truncated && buffer.length > remaining) {
+        truncated = true;
+        process.stderr.write(`\nhive: codex app-server stderr capture truncated after ${CODEX_STDERR_LOG_LIMIT_BYTES} bytes\n`);
+      }
+    } catch {
+      // Logging must never crash the runner if the host stderr is closing.
+    }
+  });
+}
+
+async function createLiveCodexHandshakeAttempt(params: {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  opts: RunnerOpts;
+  method: "thread/start" | "thread/resume";
+  requestParams: Record<string, unknown>;
+}): Promise<LiveCodexHandshakeAttempt> {
+  const child = await spawnSessionChild(params.command, params.args, { cwd: params.opts.cwd, env: params.env });
+  forwardCodexStderr(child);
+  const peer = createCodexRpcPeer(child.stdin!, child.stdout!);
+
+  // Before durable session plumbing is attached, own enough lifecycle state to
+  // reject an in-flight RPC and group-kill a failed handshake attempt cleanly.
+  let exited = false;
+  let resolveExited!: () => void;
+  const exitedPromise = new Promise<void>((resolve) => {
+    resolveExited = resolve;
+  });
+  const markExited = (): void => {
+    if (exited) return;
+    exited = true;
+    peer.dispose(new Error("codex app-server exited during handshake"));
+    resolveExited();
+  };
+  if (child.exitCode !== null || child.signalCode !== null) markExited();
+  else child.once("exit", markExited);
+
+  // Do not leave an unexpected startup-time server request hanging. These
+  // handlers are replaced with the real event/session handlers after success.
+  peer.onNotificationCatchAll(() => undefined);
+  peer.onServerRequest((method, id) => {
+    peer.respondError(id, CODEX_RPC_METHOD_NOT_FOUND, `unsupported server request during handshake: ${method}`);
+  });
+
+  return {
+    child,
+    peer,
+    async run(preRequestDelayMs: number, requestTimeoutMs: number): Promise<unknown> {
+      await peer.request("initialize", {
+        clientInfo: { name: "hive-hsr", title: null, version: "0" },
+        capabilities: null,
+      });
+      if (preRequestDelayMs > 0) await sleep(preRequestDelayMs);
+      return peer.request(params.method, params.requestParams, { timeoutMs: requestTimeoutMs });
+    },
+    async discard(): Promise<void> {
+      peer.dispose(new Error("codex app-server handshake attempt discarded"));
+      await stopChildGroup(child, () => exited, exitedPromise).catch(() => undefined);
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    },
+  };
+}
+
 export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession> {
   const bee = opts.bee;
   const { command, args, env } = buildCodexSpawn(opts);
+  const method = opts.resume && opts.sessionId ? "thread/resume" : "thread/start";
+  const requestParams = method === "thread/resume"
+    ? {
+        threadId: opts.sessionId as string,
+        ...(opts.model ? { model: opts.model } : {}),
+        cwd: opts.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      }
+    : {
+        ...(opts.model ? { model: opts.model } : {}),
+        cwd: opts.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      };
 
-  const child = await spawnSessionChild(command, args, { cwd: opts.cwd, env });
-
-  // --- codex rpc peer over the child stdio ------------------------------------
-  const peer: CodexRpcPeer = createCodexRpcPeer(child.stdin!, child.stdout!);
+  const handshake = await retryCodexThreadHandshake(
+    () => createLiveCodexHandshakeAttempt({ command, args, env, opts, method, requestParams }),
+    {
+      onRetry: ({ attempt, maxAttempts, nextDelayMs, error }) => {
+        process.stderr.write(
+          `hive: ${error.message}; restarting codex app-server ` +
+          `(attempt ${attempt + 1}/${maxAttempts}, waiting ${nextDelayMs}ms before ${method})\n`,
+        );
+      },
+    },
+  );
+  const liveAttempt = handshake.attempt as LiveCodexHandshakeAttempt;
+  const { child, peer } = liveAttempt;
 
   // Shared event queue / ring buffer / ingest / exit teardown / group stop
   // (sessionBase.ts). The peer is disposed FIRST in the exit handler so
@@ -329,30 +507,8 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
     stop,
   };
 
-  // --- protocol handshake: initialize → thread/start (or resume) --------------
-  await peer.request("initialize", {
-    clientInfo: { name: "hive-hsr", title: null, version: "0" },
-    capabilities: null,
-  });
-
-  if (opts.resume && opts.sessionId) {
-    const res = await peer.request("thread/resume", {
-      threadId: opts.sessionId,
-      ...(opts.model ? { model: opts.model } : {}),
-      cwd: opts.cwd,
-      approvalPolicy: "never",
-      sandbox: "danger-full-access",
-    });
-    threadId = threadIdFromResponse(res) ?? opts.sessionId;
-  } else {
-    const res = await peer.request("thread/start", {
-      ...(opts.model ? { model: opts.model } : {}),
-      cwd: opts.cwd,
-      approvalPolicy: "never",
-      sandbox: "danger-full-access",
-    });
-    threadId = threadIdFromResponse(res) ?? "";
-  }
+  // --- protocol handshake completed on the surviving child -------------------
+  threadId = threadIdFromResponse(handshake.result) ?? (method === "thread/resume" ? opts.sessionId ?? "" : "");
   if (threadId.length > 0) session.sessionId = threadId;
 
   async function send(text: string): Promise<void> {

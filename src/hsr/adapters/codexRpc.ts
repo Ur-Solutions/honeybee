@@ -30,6 +30,19 @@ export const CODEX_RPC_METHOD_NOT_FOUND = -32601;
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
+/** A request-specific timeout that callers can classify without parsing text. */
+export class CodexRpcRequestTimeoutError extends Error {
+  readonly method: string;
+  readonly timeoutMs: number;
+
+  constructor(method: string, timeoutMs: number) {
+    super(`codex rpc request ${method} timed out after ${timeoutMs}ms`);
+    this.name = "CodexRpcRequestTimeoutError";
+    this.method = method;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export type CodexRpcPeer = {
   /** Send a JSON-RPC request; resolves with `result` or rejects on error/timeout. */
   request(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
@@ -150,7 +163,7 @@ export function createCodexRpcPeer(stdin: Writable, stdout: Readable): CodexRpcP
       return new Promise<unknown>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
-          reject(new Error(`codex rpc request ${method} timed out after ${timeoutMs}ms`));
+          reject(new CodexRpcRequestTimeoutError(method, timeoutMs));
         }, timeoutMs);
         pending.set(id, { resolve, reject, timer });
         const req = params === undefined

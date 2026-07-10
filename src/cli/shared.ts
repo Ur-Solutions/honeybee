@@ -148,8 +148,12 @@ export function warnSpawnReadiness(record: SessionRecord, error: AgentReadinessE
 }
 
 
-/** How long spawn-time HSR prompt delivery keeps retrying while the runner host boots. */
-export const HSR_PROMPT_BOOT_TIMEOUT_MS = 30_000;
+/**
+ * How long HSR prompt delivery keeps retrying while the runner host boots.
+ * Codex's bounded app-server respawn/backoff handshake can legitimately take
+ * over 30s when its online model refresh is slow, especially in burst spawns.
+ */
+export const HSR_PROMPT_BOOT_TIMEOUT_MS = 90_000;
 
 /**
  * Retry `attempt` with backoff until it succeeds or `timeoutMs` lapses, then
@@ -184,6 +188,22 @@ export async function retryWhileHsrHostBoots<T>(
   }
 }
 
+/** Send a prompt, tolerating a detached HSR host's bounded startup window. */
+export async function deliverPromptText(record: SessionRecord, prompt: string): Promise<void> {
+  const substrate = substrateFor(record);
+  const attempt = () => substrate.sendText(record.tmuxTarget, prompt, record.agentPaneId);
+  if (substrate.kind !== "hsr" && substrate.kind !== "remote-hsr") {
+    await attempt();
+    return;
+  }
+  await retryWhileHsrHostBoots(attempt, {
+    onRetry: () => {
+      if (isPretty()) console.error(actionLine("warn", "send", [bold(record.name), "waiting for the hsr runner host to boot"]));
+      else console.error(`wait\tsend\t${record.name}\thsr runner host still booting`);
+    },
+  });
+}
+
 /**
  * Deliver an initial prompt to a freshly spawned HSR bee over its control
  * socket, WITHOUT a readiness poll.
@@ -205,12 +225,7 @@ export async function retryWhileHsrHostBoots<T>(
  * atomic across a slow host boot.
  */
 export async function deliverHsrPrompt(record: SessionRecord, prompt: string): Promise<SessionRecord> {
-  await retryWhileHsrHostBoots(() => substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId), {
-    onRetry: () => {
-      if (isPretty()) console.error(actionLine("warn", "send", [bold(record.name), "waiting for the hsr runner host to boot"]));
-      else console.error(`wait\tsend\t${record.name}\thsr runner host still booting`);
-    },
-  });
+  await deliverPromptText(record, prompt);
   await writeHiveState(record, "working");
   const now = new Date().toISOString();
   const persisted = await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
@@ -862,4 +877,3 @@ export function sleep(ms: number) {
 export function safeTmuxTarget(value: string): string {
   return value.replace(/[^A-Za-z0-9_-]/g, "-");
 }
-

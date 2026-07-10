@@ -15,7 +15,7 @@ import { substrateFor } from "../substrates/index.js";
 import { openInNewTerminal, runInCurrentTerminal } from "../terminal.js";
 import { formatShellCommand } from "../tmux.js";
 import { waitForIdle } from "../wait.js";
-import { acceptsTrust, cleanupAfterRun, confirmPausedAccount, dangerousMode, formatPaneExcerpt, hasFlag, hsrSubstrateRequested, includePausedFlag, resolveSpawnCwd, sleep, stringFlag, ttlFlagMs } from "../cli/shared.js";
+import { acceptsTrust, cleanupAfterRun, confirmPausedAccount, dangerousMode, deliverPromptText, formatPaneExcerpt, hasFlag, hsrSubstrateRequested, includePausedFlag, resolveSpawnCwd, sleep, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { cmdSpawn, resolveAccountFlag, resolveProfileOverlay, resolveSpawnAgentWithAuto } from "../commands/spawn.js";
 
 /**
@@ -78,7 +78,7 @@ export async function waitForPromptReady(record: SessionRecord, parsed: Parsed):
  * Returns the stamp timestamp (cmdRun's waitForIdle needs it).
  */
 export async function deliverPromptToBee(record: SessionRecord, prompt: string): Promise<string> {
-  await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
+  await deliverPromptText(record, prompt);
   const now = new Date().toISOString();
   await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
   await writeHiveState(record, "working");
