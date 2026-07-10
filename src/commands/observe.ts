@@ -9,7 +9,7 @@ import { effectiveHiveState, hiveStateFor } from "../hiveState.js";
 import { highlightUniqueSessionReference } from "../ids.js";
 import { extractUrls } from "../keybindings.js";
 import { transactionalKill, transactionalRetire } from "../kill.js";
-import { sessionDisplayName, shouldShowNodeColumn } from "../listView.js";
+import { sessionDisplayName, shouldShowNodeColumn, substrateLabelFor } from "../listView.js";
 import { DEFAULT_ATTENTION_STATES, attentionCount, parseStateList, pickNextBee, type BeeStateEntry } from "../next.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode } from "../node.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
@@ -64,6 +64,8 @@ export async function followTail(record: SessionRecord, lines: number, pollMs: n
 
 export async function cmdList(parsed: Parsed) {
   const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const nodeKindByName = new Map(nodes.map((n) => [n.name, n.kind]));
+  const substrateOf = (r: SessionRecord) => substrateLabelFor(r, (name) => nodeKindByName.get(name));
 
   const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
   const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")).replace(/^@/, "") : undefined;
@@ -146,6 +148,7 @@ export async function cmdList(parsed: Parsed) {
           swarm: r.swarmId,
           comb: r.combId,
           node: r.node ?? LOCAL_NODE_NAME,
+          substrate: substrateOf(r),
           repo: repoTagFor(r.cwd),
           cwd: r.cwd,
           createdAt: r.createdAt,
@@ -189,7 +192,7 @@ export async function cmdList(parsed: Parsed) {
 
   const terminalWidth = process.stdout.columns ?? 100;
   const showNodeColumn = shouldShowNodeColumn(nodes, truthy(flag(parsed, "wide")));
-  const cwdMax = Math.max(20, Math.min(60, terminalWidth - (showNodeColumn ? 90 : 78)));
+  const cwdMax = Math.max(20, Math.min(60, terminalWidth - (showNodeColumn ? 103 : 91)));
   const now = Date.now();
 
   const rows = records.map((record) => {
@@ -202,38 +205,31 @@ export async function cmdList(parsed: Parsed) {
     const age = isTerminalState(derived.state) ? dim(ageText) : ageText;
     const nodeName = record.node ?? LOCAL_NODE_NAME;
     const live = liveHiveState(record);
-    const base = [
+    const row = [
       live ? formatHiveStateCell(live) : formatStateCell(derived.state),
       ref,
       name,
       truncate(record.agent, 12),
-      dim(truncate(derived.detail, 30)),
-      age,
-      dim(truncate(tildify(record.cwd), cwdMax)),
     ];
-    return showNodeColumn ? [...base.slice(0, 4), dim(truncate(nodeName, 12)), ...base.slice(4)] : base;
+    if (showNodeColumn) row.push(dim(truncate(nodeName, 12)));
+    row.push(dim(truncate(substrateOf(record), 10)));
+    row.push(dim(truncate(derived.detail, 30)));
+    row.push(age);
+    row.push(dim(truncate(tildify(record.cwd), cwdMax)));
+    return row;
   });
 
-  const columns = showNodeColumn
-    ? [
-        { header: "STATE" },
-        { header: "REF" },
-        { header: "NAME" },
-        { header: "BEE" },
-        { header: "NODE" },
-        { header: "DETAIL" },
-        { header: "AGE", align: "right" as const },
-        { header: "CWD" },
-      ]
-    : [
-        { header: "STATE" },
-        { header: "REF" },
-        { header: "NAME" },
-        { header: "BEE" },
-        { header: "DETAIL" },
-        { header: "AGE", align: "right" as const },
-        { header: "CWD" },
-      ];
+  const columns = [
+    { header: "STATE" },
+    { header: "REF" },
+    { header: "NAME" },
+    { header: "BEE" },
+    ...(showNodeColumn ? [{ header: "NODE" }] : []),
+    { header: "SUBSTRATE" },
+    { header: "DETAIL" },
+    { header: "AGE", align: "right" as const },
+    { header: "CWD" },
+  ];
 
   console.log(formatTable(columns, rows));
 

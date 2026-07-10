@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { sessionDisplayName, shouldShowNodeColumn } from "../src/listView.js";
+import { sessionDisplayName, shouldShowNodeColumn, substrateLabelFor } from "../src/listView.js";
+import type { NodeKind } from "../src/node.js";
 import type { SessionRecord } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
@@ -100,6 +101,27 @@ test("shouldShowNodeColumn shows the node column when --wide is forced, even on 
 test("shouldShowNodeColumn handles an empty node list gracefully", () => {
   assert.equal(shouldShowNodeColumn([], false), false);
   assert.equal(shouldShowNodeColumn([], true), true);
+});
+
+test("substrateLabelFor routes a record-level hsr bee to hsr, regardless of node", () => {
+  const none = (): NodeKind | undefined => undefined;
+  assert.equal(substrateLabelFor({ substrate: "hsr" }, none), "hsr");
+  assert.equal(substrateLabelFor({ substrate: "hsr", node: "mini01" }, () => "ssh-tmux"), "hsr");
+});
+
+test("substrateLabelFor falls back to local-tmux for a bare local bee", () => {
+  const none = (): NodeKind | undefined => undefined;
+  assert.equal(substrateLabelFor({}, none), "local-tmux");
+  assert.equal(substrateLabelFor({ substrate: "local-tmux" }, none), "local-tmux");
+});
+
+test("substrateLabelFor reports the node kind for a remote bee", () => {
+  const kinds: Record<string, NodeKind> = { mini01: "ssh-tmux", box: "remote-hsr" };
+  const lookup = (name: string): NodeKind | undefined => kinds[name];
+  assert.equal(substrateLabelFor({ node: "mini01" }, lookup), "ssh-tmux");
+  assert.equal(substrateLabelFor({ node: "box" }, lookup), "remote-hsr");
+  // An unknown node name degrades to the local-tmux default rather than throwing.
+  assert.equal(substrateLabelFor({ node: "ghost" }, lookup), "local-tmux");
 });
 
 test("sessionDisplayName prefers inherited title without changing identity", () => {
