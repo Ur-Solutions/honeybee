@@ -24,6 +24,8 @@ import {
   writeHsrMeta,
   type HsrMeta,
 } from "./runDir.js";
+import { codexStartupConcurrency, withCodexStartupSlot } from "./startupQueue.js";
+import { drainPendingHsrTurns, withHsrTurnDeliveryLock } from "./pendingTurns.js";
 
 export type HsrHostHandle = {
   bee: string;
@@ -43,25 +45,68 @@ export async function runHsrHost(params: {
   adapter: RunnerAdapter;
   opts: RunnerOpts;
   hostPid?: number;
+  /** Detached local hosts queue fragile Codex cold starts; in-process remote hosts opt out. */
+  queueStartup?: boolean;
 }): Promise<HsrHostHandle> {
   const { bee, adapter, opts } = params;
   const hostPid = params.hostPid ?? process.pid;
   const controlSocket = hsrControlSocketPath(bee);
 
   await ensureHsrRunDir(bee);
-  const session = await adapter.start(opts);
+  const tier = adapter.tier();
+  const queuedAt = new Date().toISOString();
+  const queueCodexStartup =
+    params.queueStartup === true &&
+    adapter.harness === "codex" &&
+    tier === "server" &&
+    codexStartupConcurrency() > 0;
+
+  let queuedMeta: HsrMeta | undefined;
+  if (queueCodexStartup) {
+    // Publish liveness before waiting for admission so `hive ps` reports an
+    // intentional queued bee instead of fabricating a crash/boot wedge.
+    queuedMeta = {
+      bee,
+      harness: adapter.harness,
+      tier,
+      hostPid,
+      startedAt: queuedAt,
+      queuedAt,
+      controlSocket,
+      status: "queued",
+    };
+    await writeHsrMeta(bee, queuedMeta);
+  }
+
+  let session: Awaited<ReturnType<RunnerAdapter["start"]>>;
+  try {
+    session = queueCodexStartup
+      ? await withCodexStartupSlot(bee, () => adapter.start(opts))
+      : await adapter.start(opts);
+  } catch (error) {
+    if (queuedMeta) {
+      await writeHsrMeta(bee, {
+        ...queuedMeta,
+        status: "exited",
+        exitCode: null,
+        endedAt: new Date().toISOString(),
+      }).catch(() => undefined);
+    }
+    throw error;
+  }
 
   let meta: HsrMeta = {
     bee,
     harness: adapter.harness,
-    tier: adapter.tier(),
+    tier,
     ...(session.sessionId ? { sessionId: session.sessionId } : {}),
     hostPid,
     childPid: session.pid,
     childPgid: session.pid, // detached ⇒ pgid === child pid
-    startedAt: new Date().toISOString(),
+    startedAt: queuedMeta?.startedAt ?? new Date().toISOString(),
+    ...(queuedMeta?.queuedAt ? { queuedAt: queuedMeta.queuedAt } : {}),
     controlSocket,
-    status: "running",
+    status: queueCodexStartup ? "queued" : "running",
   };
   await writeHsrMeta(bee, meta);
 
@@ -101,6 +146,29 @@ export async function runHsrHost(params: {
     await session.stop().catch(() => undefined);
     await writeHsrMeta(bee, { ...meta, status: "exited", exitCode: null, endedAt: new Date().toISOString() }).catch(() => undefined);
     throw error;
+  }
+
+  if (queueCodexStartup) {
+    try {
+      // Serialize the state flip with sendText's queued decision. A sender
+      // either sees queued and persists a turn that this drain consumes, or
+      // sees running after this lock is released and uses the live RPC socket.
+      await withHsrTurnDeliveryLock(bee, async () => {
+        meta = { ...meta, status: "running" };
+        await writeHsrMeta(bee, meta);
+        await drainPendingHsrTurns(bee, (text) => session.send(text));
+      });
+    } catch (error) {
+      await session.stop().catch(() => undefined);
+      await server.close().catch(() => undefined);
+      await writeHsrMeta(bee, {
+        ...meta,
+        status: "exited",
+        exitCode: null,
+        endedAt: new Date().toISOString(),
+      }).catch(() => undefined);
+      throw error;
+    }
   }
 
   // Learn the provider session id (captured by the runner from the init line,

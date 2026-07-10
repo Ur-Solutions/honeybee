@@ -333,6 +333,8 @@ export function cleanDisabledReason(state: BeeState): string | undefined {
   switch (state) {
     case "active":
       return "active";
+    case "queued":
+      return "queued";
     case "booting":
       return "booting";
     case "node_unreachable":

@@ -29,11 +29,12 @@ import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
 import { hsrSnapshot, killOrphanedChildGroup, listHsrBees } from "./observe.js";
 import { readHsrMeta } from "./runDir.js";
 import { connectRpcClient } from "./rpc.js";
+import { clearPendingHsrTurns, enqueuePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
 
-/** A runner host is live iff meta says running AND its host pid is alive. */
+/** A queued or running host is live while its detached host pid is alive. */
 async function hasSession(bee: string): Promise<boolean> {
   const meta = await readHsrMeta(bee);
-  return !!meta && meta.status === "running" && isPidAlive(meta.hostPid);
+  return !!meta && meta.status !== "exited" && isPidAlive(meta.hostPid);
 }
 
 /** Rendered text tail from ring.txt (Substrate.capture compat). */
@@ -43,24 +44,30 @@ async function capture(bee: string, lines?: number): Promise<string> {
 
 /** Deliver a user turn over the bee's control socket. Throws if no live host. */
 async function sendText(bee: string, text: string): Promise<void> {
-  const meta = await readHsrMeta(bee);
-  if (!meta || meta.status !== "running" || !isPidAlive(meta.hostPid)) {
-    throw new Error(`HSR bee ${bee} has no live runner host to steer`);
-  }
-  const client = await connectRpcClient(meta.controlSocket);
-  try {
-    await client.call("send", { text });
-  } finally {
-    client.close();
-  }
+  await withHsrTurnDeliveryLock(bee, async () => {
+    const meta = await readHsrMeta(bee);
+    if (meta?.status === "queued" && isPidAlive(meta.hostPid)) {
+      await enqueuePendingHsrTurn(bee, text);
+      return;
+    }
+    if (!meta || meta.status !== "running" || !isPidAlive(meta.hostPid)) {
+      throw new Error(`HSR bee ${bee} has no live runner host to steer`);
+    }
+    const client = await connectRpcClient(meta.controlSocket);
+    try {
+      await client.call("send", { text });
+    } finally {
+      client.close();
+    }
+  });
 }
 
-/** Poll meta until the host is no longer "running" (clean exit), or timeout. */
+/** Poll meta until the host is no longer queued/running (clean exit), or timeout. */
 async function waitUntilNotRunning(bee: string, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const meta = await readHsrMeta(bee);
-    if (!meta || meta.status !== "running" || !isPidAlive(meta.hostPid)) return true;
+    if (!meta || meta.status === "exited" || !isPidAlive(meta.hostPid)) return true;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return false;
@@ -94,7 +101,7 @@ async function kill(bee: string): Promise<KillResult> {
   // "exited" meta means the bee stopped cleanly (its socket file is gone, so the
   // stop attempt above throws) — signalling meta.hostPid then would target a
   // recycled/unrelated pid.
-  if (!stopped && meta && meta.status === "running") {
+  if (!stopped && meta && meta.status !== "exited") {
     if (isPidAlive(meta.hostPid)) {
       try {
         process.kill(meta.hostPid, "SIGTERM");
@@ -108,6 +115,7 @@ async function kill(bee: string): Promise<KillResult> {
       await killOrphanedChildGroup(meta);
     }
   }
+  await clearPendingHsrTurns(bee).catch(() => undefined);
   return { ok: true, stdout: "", stderr: "", exitCode: 0 };
 }
 

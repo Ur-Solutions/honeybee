@@ -107,7 +107,7 @@ export async function runHsrHostFromPayload(payloadPath: string | undefined): Pr
     args: payload.spec.args,
     runDir: hsrRunDir(payload.bee),
   };
-  const handle = await runHsrHost({ bee: payload.bee, adapter, opts });
+  const handle = await runHsrHost({ bee: payload.bee, adapter, opts, queueStartup: true });
   const shutdown = async (): Promise<void> => {
     try {
       await handle.stop();
@@ -167,4 +167,3 @@ export async function waitForHsrHost(bee: string, timeoutMs: number): Promise<bo
   }
   return false;
 }
-

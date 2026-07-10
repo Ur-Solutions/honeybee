@@ -173,6 +173,7 @@ function messageOf(error: unknown): string {
  */
 function coarseHiveState(state: BeeState | null): string {
   switch (state) {
+    case "queued":
     case "booting":
     case "active":
       return "working";

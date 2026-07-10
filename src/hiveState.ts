@@ -25,6 +25,7 @@ export const HIVE_STATE_OPTION = "@hive_state";
 
 export function hiveStateFor(state: BeeState): HiveTmuxState | undefined {
   switch (state) {
+    case "queued":
     case "booting":
     case "active":
       return "working";

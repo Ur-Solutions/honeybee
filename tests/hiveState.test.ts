@@ -5,6 +5,7 @@ import type { BeeState } from "../src/state.js";
 
 test("hiveStateFor maps every BeeState to the coarse @hive_state vocabulary", () => {
   const expected: Record<BeeState, string | undefined> = {
+    queued: "working",
     booting: "working",
     wedged: "failed",
     active: "working",

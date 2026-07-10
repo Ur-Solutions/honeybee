@@ -251,10 +251,11 @@ const STATE_RANK: Record<string, number> = {
   done: 4,
   idle_with_output: 4,
   sealed: 5,
-  booting: 6,
-  wedged: 7,
-  error: 7,
-  dead: 8,
+  queued: 6,
+  booting: 7,
+  wedged: 8,
+  error: 8,
+  dead: 9,
 };
 
 function sortItemsForDisplay(items: BeesTuiItem[]): BeesTuiItem[] {

@@ -96,9 +96,11 @@ export type HsrMeta = {
   hostPid: number;
   childPid?: number;
   childPgid?: number;
-  startedAt: string; // ISO
+  startedAt: string; // ISO — detached host startup (includes any queued wait)
+  /** Set when this host entered the bounded Codex cold-start queue. */
+  queuedAt?: string;
   controlSocket: string;
-  status: "running" | "exited";
+  status: "queued" | "running" | "exited";
   exitCode?: number | null;
   endedAt?: string; // ISO
   /**
@@ -192,7 +194,7 @@ export async function readHsrMeta(bee: string): Promise<HsrMeta | null> {
     const object = parsed as Record<string, unknown>;
     // Require the load-bearing identity fields; everything else is optional.
     if (typeof object.bee !== "string" || typeof object.hostPid !== "number") return null;
-    if (object.status !== "running" && object.status !== "exited") return null;
+    if (object.status !== "queued" && object.status !== "running" && object.status !== "exited") return null;
     return object as unknown as HsrMeta;
   } catch {
     return null;

@@ -6,7 +6,7 @@
  * reading run dirs: liveness from meta.json's host pid, snapshot from ring.txt.
  *
  * Liveness model: the HOST pid is authoritative. A bee is alive iff its meta
- * says `status: "running"` AND the host process is still alive — the host owns
+ * says `status: "queued"|"running"` AND the host process is still alive — the host owns
  * the harness child's pipes, so a dead host means the live protocol stream is
  * gone regardless of whether the harness child lingers. "Crash adoption v1"
  * (`reapDeadHosts`) reconciles stale `running` meta with dead host pids and
@@ -39,8 +39,8 @@ import type { RunnerEvent } from "./types.js";
  * list. So a mirror is live iff `status === "running"`; never pid-probed.
  */
 function isMetaLive(meta: HsrMeta | null): boolean {
-  if (!meta || meta.status !== "running") return false;
-  if (meta.mirrorOfNode) return true;
+  if (!meta || meta.status === "exited") return false;
+  if (meta.mirrorOfNode) return meta.status === "running";
   return isPidAlive(meta.hostPid);
 }
 
@@ -271,7 +271,9 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
       // A dead host's stream is gone — leave state undefined so deriveState
       // settles dead/sealed rather than reporting a stale structured state.
       const state = live
-        ? structuredStateFromEvents(eventSnapshot ? eventSnapshot.tailEvents : await readEventTail(bee))
+        ? meta?.status === "queued"
+          ? "queued"
+          : structuredStateFromEvents(eventSnapshot ? eventSnapshot.tailEvents : await readEventTail(bee))
         : undefined;
       observations.set(bee, {
         live,
@@ -441,7 +443,7 @@ export async function killOrphanedChildGroup(meta: HsrMeta | null): Promise<bool
 }
 
 /**
- * Reconcile stale `running` meta whose host pid is dead: kill the orphaned
+ * Reconcile stale `queued`/`running` meta whose host pid is dead: kill the orphaned
  * harness child group it left behind (HIVE-53), flip status to "exited" (with
  * endedAt) and return the reaped bee names. Crash-adoption v1 — no pipe
  * recovery.
@@ -450,7 +452,7 @@ export async function reapDeadHosts(): Promise<string[]> {
   const reaped: string[] = [];
   for (const bee of await listHsrBees()) {
     const meta = await readHsrMeta(bee);
-    if (!meta || meta.status !== "running") continue;
+    if (!meta || meta.status === "exited") continue;
     // A mirror has no local host pid to reap: the remoteEventMirror owns its
     // status (flips to "exited" when the bee leaves the remote list). Skip it.
     if (meta.mirrorOfNode) continue;

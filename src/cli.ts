@@ -408,6 +408,7 @@ function printHelp() {
   const envs = [
     `  ${env("HIVE_CLAUDE_CMD")}=${arg(`"claude --model sonnet"`)} hive spawn claude`,
     `  ${env("HIVE_CODEX_YOLO")}=${arg("1")} hive spawn codex`,
+    `  ${env("HIVE_CODEX_START_CONCURRENCY")}=${arg("2")} hive x codex "task"  ${dim("— bounded HSR cold starts; 0 disables")}`,
     `  ${env("HIVE_DEBUG_SPAWN")}=${arg("1")} hive spawn claude  ${dim("— print a per-phase spawn timing breakdown to stderr")}`,
     `  ${dim("hive spawn codex2 · hive spawn claude --home ~/.claude-3 · hive spawn cc3")}`,
   ].join("\n");

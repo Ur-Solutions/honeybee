@@ -13,6 +13,7 @@ export type BeeState =
   | "ready"
   | "active"
   | "idle_with_output"
+  | "queued"
   | "booting"
   | "wedged"
   | "error"
@@ -264,6 +265,8 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
         return { state: "blocked", detail: "awaiting input" };
       case "ready":
         return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
+      case "queued":
+        return { state: "queued", detail: "waiting for a startup slot" };
       case "booting":
         return bootingOrWedged(record, now);
       case "dead":
@@ -344,6 +347,7 @@ export type StatePresentation = {
 export const STATE_PRESENTATION: Record<BeeState, StatePresentation> = {
   active: { label: "active", glyph: "●", color: green, labelColor: green, cleanPriority: 8 },
   ready: { label: "ready", glyph: "●", color: green, labelColor: plain, cleanPriority: 4 },
+  queued: { label: "queued", glyph: "◌", color: cyan, labelColor: cyan, cleanPriority: 7 },
   booting: { label: "booting", glyph: "●", color: cyan, labelColor: cyan, cleanPriority: 7 },
   wedged: { label: "wedged", glyph: "⊘", color: red, labelColor: red, cleanPriority: 7 },
   blocked: { label: "blocked", glyph: "●", color: yellow, labelColor: yellow, cleanPriority: 5 },
@@ -390,6 +394,7 @@ function parseBeeState(value: string | undefined): BeeState | undefined {
     case "active":
     case "idle_with_output":
     case "booting":
+    case "queued":
     case "wedged":
     case "error":
     case "dead":
@@ -405,7 +410,7 @@ function parseBeeState(value: string | undefined): BeeState | undefined {
 }
 
 function isHoldableUnknownPaneState(state: BeeState): boolean {
-  return state === "active" || state === "blocked" || state === "ready" || state === "idle_with_output" || state === "booting";
+  return state === "active" || state === "blocked" || state === "ready" || state === "idle_with_output" || state === "booting" || state === "queued";
 }
 
 function detailForHeldState(state: BeeState, record: SessionRecord, now: number): string {
@@ -419,6 +424,8 @@ function detailForHeldState(state: BeeState, record: SessionRecord, now: number)
       return describeIdle(record, now);
     case "booting":
       return "starting up";
+    case "queued":
+      return "waiting for a startup slot";
     default:
       return describeActivity(record);
   }

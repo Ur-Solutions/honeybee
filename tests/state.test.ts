@@ -216,6 +216,7 @@ const ALL_STATES: BeeState[] = [
   "ready",
   "active",
   "idle_with_output",
+  "queued",
   "booting",
   "wedged",
   "error",
@@ -246,6 +247,7 @@ test("cleanStatePriority preserves the original ordering", () => {
   assert.equal(cleanStatePriority("ready"), 4);
   assert.equal(cleanStatePriority("blocked"), 5);
   assert.equal(cleanStatePriority("error"), 6);
+  assert.equal(cleanStatePriority("queued"), 7);
   assert.equal(cleanStatePriority("booting"), 7);
   assert.equal(cleanStatePriority("active"), 8);
   assert.equal(cleanStatePriority("node_unreachable"), 9);
@@ -255,6 +257,7 @@ test("formatStateCell renders the table's glyph and label", () => {
   // Strip color so the assertion holds whether or not stdout is a TTY.
   assert.equal(stripAnsi(formatStateCell("active")), "● active");
   assert.equal(stripAnsi(formatStateCell("ready")), "● ready");
+  assert.equal(stripAnsi(formatStateCell("queued")), "◌ queued");
   assert.equal(stripAnsi(formatStateCell("idle_with_output")), "● idle");
   assert.equal(stripAnsi(formatStateCell("archived")), "○ archived");
   assert.equal(stripAnsi(formatStateCell("dead")), "○ dead");
@@ -268,6 +271,7 @@ test("isTerminalState recognizes end states", () => {
   assert.equal(isTerminalState("archived"), true);
   assert.equal(isTerminalState("active"), false);
   assert.equal(isTerminalState("ready"), false);
+  assert.equal(isTerminalState("queued"), false);
   // node_unreachable is transient: the node may come back online.
   assert.equal(isTerminalState("node_unreachable"), false);
 });
