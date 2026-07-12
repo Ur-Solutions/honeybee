@@ -203,6 +203,7 @@ test("stateLabel returns human-readable forms", () => {
   assert.equal(stateLabel("kill_failed"), "kill_failed");
   assert.equal(stateLabel("node_unreachable"), "offline");
   assert.equal(stateLabel("archived"), "archived");
+  assert.equal(stateLabel("auth-needed"), "auth-needed");
 });
 
 // The full BeeState union, spelled out so the compiler flags any state that is
@@ -212,6 +213,7 @@ const ALL_STATES: BeeState[] = [
   "crashed",
   "sealed",
   "archived",
+  "auth-needed",
   "blocked",
   "ready",
   "active",

@@ -9,6 +9,7 @@ export type BeeState =
   | "crashed"
   | "sealed"
   | "archived"
+  | "auth-needed"
   | "blocked"
   | "ready"
   | "active"
@@ -263,6 +264,8 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
         return { state: "idle_with_output", detail: describeIdle(record, context.now ?? Date.now()) };
       case "blocked":
         return { state: "blocked", detail: "awaiting input" };
+      case "auth-needed":
+        return { state: "auth-needed", detail: "login required — sign in, then resume" };
       case "ready":
         return { state: "ready", detail: record.brief ? "briefed, awaiting prompt" : "awaiting prompt" };
       case "queued":
@@ -350,6 +353,7 @@ export const STATE_PRESENTATION: Record<BeeState, StatePresentation> = {
   queued: { label: "queued", glyph: "◌", color: cyan, labelColor: cyan, cleanPriority: 7 },
   booting: { label: "booting", glyph: "●", color: cyan, labelColor: cyan, cleanPriority: 7 },
   wedged: { label: "wedged", glyph: "⊘", color: red, labelColor: red, cleanPriority: 7 },
+  "auth-needed": { label: "auth-needed", glyph: "!", color: yellow, labelColor: yellow, cleanPriority: 6 },
   blocked: { label: "blocked", glyph: "●", color: yellow, labelColor: yellow, cleanPriority: 5 },
   idle_with_output: { label: "idle", glyph: "●", color: dim, labelColor: plain, cleanPriority: 0 },
   sealed: { label: "sealed", glyph: "●", color: magenta, labelColor: magenta, cleanPriority: 2 },
@@ -390,6 +394,7 @@ function heldStateForUnknownPane(record: SessionRecord, context: StateContext): 
 function parseBeeState(value: string | undefined): BeeState | undefined {
   switch (value) {
     case "blocked":
+    case "auth-needed":
     case "ready":
     case "active":
     case "idle_with_output":
@@ -410,7 +415,7 @@ function parseBeeState(value: string | undefined): BeeState | undefined {
 }
 
 function isHoldableUnknownPaneState(state: BeeState): boolean {
-  return state === "active" || state === "blocked" || state === "ready" || state === "idle_with_output" || state === "booting" || state === "queued";
+  return state === "active" || state === "blocked" || state === "auth-needed" || state === "ready" || state === "idle_with_output" || state === "booting" || state === "queued";
 }
 
 function detailForHeldState(state: BeeState, record: SessionRecord, now: number): string {
@@ -418,6 +423,8 @@ function detailForHeldState(state: BeeState, record: SessionRecord, now: number)
     case "active":
     case "blocked":
       return describeActivity(record);
+    case "auth-needed":
+      return "login required — sign in, then resume";
     case "ready":
       return record.brief ? "briefed, awaiting prompt" : "awaiting prompt";
     case "idle_with_output":

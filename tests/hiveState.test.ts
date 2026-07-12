@@ -11,6 +11,7 @@ test("hiveStateFor maps every BeeState to the coarse @hive_state vocabulary", ()
     active: "working",
     ready: "waiting",
     blocked: "waiting",
+    "auth-needed": "waiting",
     idle_with_output: "done",
     sealed: "done",
     archived: undefined,

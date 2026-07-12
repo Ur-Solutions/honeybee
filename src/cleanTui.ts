@@ -378,6 +378,8 @@ function stateCell(state: BeeState): string {
       return red("wedged");
     case "blocked":
       return yellow("blocked");
+    case "auth-needed":
+      return yellow("auth");
     case "idle_with_output":
       return "idle";
     case "sealed":

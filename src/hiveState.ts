@@ -31,6 +31,7 @@ export function hiveStateFor(state: BeeState): HiveTmuxState | undefined {
       return "working";
     case "ready":
     case "blocked":
+    case "auth-needed":
       return "waiting";
     case "idle_with_output":
     case "sealed":

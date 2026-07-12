@@ -179,6 +179,7 @@ function coarseHiveState(state: BeeState | null): string {
       return "working";
     case "ready":
     case "blocked":
+    case "auth-needed":
       return "waiting";
     case "idle_with_output":
     case "sealed":
