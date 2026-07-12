@@ -20,7 +20,7 @@ import { cmdHere, cmdSpawnPicker } from "./commands/here.js";
 import { cmdKeys } from "./commands/keys.js";
 import { cmdLoop } from "./commands/loop.js";
 import { cmdAnswer, cmdBrief, cmdMove, cmdOwn, cmdRename, cmdSeal, cmdSend, cmdTag } from "./commands/messaging.js";
-import { cmdDemote, cmdPromote, cmdRevive } from "./commands/migrate.js";
+import { cmdAuthResume, cmdDemote, cmdPromote, cmdRevive } from "./commands/migrate.js";
 import { cmdNode, cmdSubstrate } from "./commands/node.js";
 import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdRetire, cmdTail, cmdTranscript, cmdUrls, cmdWait } from "./commands/observe.js";
 import { cmdFleet } from "./commands/fleet.js";
@@ -144,6 +144,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       break;
     case "revive":
       await cmdRevive(parsed);
+      break;
+    case "auth-resume":
+      await cmdAuthResume(parsed);
       break;
     case "clean":
       await cmdClean(parsed);
@@ -337,6 +340,7 @@ function printHelp() {
         ["promote", "<bee>", "move an HSR bee onto an interactive tmux pane (resume; claude/codex, --now)"],
         ["demote", "<bee>", "move a tmux bee back to a pane-less HSR runner (resume; claude/codex, --now)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--crashed, --all, --fresh, --session <id>, --no-wait)"],
+        ["auth-resume", "<bee>", "capture a fresh login, stop an auth-needed bee, and resume its session"],
         ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],
         ["loop", "<launch|start|status|stop|…>", "run a bee repeatedly until a stop condition (launch = interactive dialog)"],
       ],

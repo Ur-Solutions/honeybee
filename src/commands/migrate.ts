@@ -1,7 +1,7 @@
 // `hive promote`/demote/revive — substrate migration: move a bee between an
 // interactive tmux pane and a pane-less HSR runner (resume), and revive dead bees.
 // Extracted from cli.ts (HIVE-15).
-import { accountEmail, activateAccountIntoHome, findAccount, homeClaudeEmail, listAccounts, type AccountRecord } from "../accounts.js";
+import { accountEmail, activateAccountIntoHome, captureAccountFromHome, findAccount, homeClaudeEmail, listAccounts, type AccountRecord } from "../accounts.js";
 import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, type AgentSpec } from "../agents.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
@@ -15,12 +15,16 @@ import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { waitForAgentReady } from "../readiness.js";
 import { loadLatestSeal } from "../seal.js";
-import { appendLedger, listSessions, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, listSessions, storeRoot, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
 import { formatShellCommand, hasSession } from "../tmux.js";
+import { identityRecipeForAgent } from "../drivers.js";
 import { resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
+import { loginSeatLiveDigest } from "./account.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
+import { readFile, stat } from "node:fs/promises";
+import { resolve } from "node:path";
 
 // Harnesses whose interactive↔headless resume genuinely carries history — the
 // only ones promote/demote accept. claude is EXCLUDED: its interactive-TUI and
@@ -544,6 +548,110 @@ export async function cmdRevive(parsed: Parsed): Promise<void> {
   if (!target) throw new Error("Usage: hive revive <bee> [--all] [--crashed] [--fresh] [--session <id>] [--no-wait]");
   const record = await resolveSession(target);
   await reviveOne(record, parsed);
+}
+
+/**
+ * hive auth-resume <bee>
+ *
+ * Human-login recovery for a live-but-stuck `auth-needed` bee:
+ *   1. capture fresh credentials from the account's login seat,
+ *   2. activate them into the bee's dedicated home,
+ *   3. stop the stuck runtime,
+ *   4. relaunch the same bee and resume the same provider session.
+ *
+ * Unlike `revive`, this intentionally accepts a LIVE runtime: `auth-needed`
+ * runners are alive enough to hold a record but unable to make progress.
+ */
+export async function cmdAuthResume(parsed: Parsed): Promise<void> {
+  const target = parsed.args[0];
+  if (!target) throw new Error("Usage: hive auth-resume <bee>");
+  const record = await resolveSession(target);
+  if (record.node && record.node !== LOCAL_NODE_NAME) {
+    throw new Error(`hive auth-resume: ${record.name} is on remote node ${record.node}; local login recovery only supports local bees`);
+  }
+  const tool = canonicalAgentKind(record.agent).toLowerCase();
+  if (!record.accountId) {
+    throw new Error(`hive auth-resume: ${record.name} has no bound account; re-run with hive login <account> and revive manually`);
+  }
+  if (!record.homePath) {
+    throw new Error(`hive auth-resume: ${record.name} has no dedicated home; refusing to overwrite the default ${tool} credentials`);
+  }
+  if (!record.providerSessionId) {
+    throw new Error(`hive auth-resume: ${record.name} has no recorded provider session id; use hive revive ${record.name} --fresh if you want a fresh session`);
+  }
+
+  const account = await findAccount(record.accountId, tool);
+  const seatHome = resolve(storeRoot(), "login-homes", account.id);
+  await assertLoginSeatFreshForAuthResume(account, seatHome);
+  const captured = await captureAccountFromHome(account, seatHome).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`hive auth-resume: no fresh login captured for ${account.id} (${message}); run hive login ${account.id} first`);
+  });
+
+  await activateAccountIntoHome(account, record.homePath, { onWarn: (message) => console.error(note(message)) });
+  await stopRuntimeForAuthResume(record);
+  const revived = await reviveRecord(record, { fresh: false });
+  const cleared =
+    (await updateSession(record.name, {
+      lastObservedState: undefined,
+      lastObservedStateAt: undefined,
+      updatedAt: new Date().toISOString(),
+    })) ?? revived;
+  await appendLedger({
+    type: "bee.auth_resume",
+    session: record.name,
+    account: account.id,
+    providerSessionId: record.providerSessionId,
+  });
+
+  if (isPretty()) {
+    console.log(actionLine("ok", "auth-resume", [bold(record.name), account.id, dim(`${captured.length} credential file(s)`)]));
+  } else {
+    console.log(`auth-resumed\t${record.name}\t${account.id}\t${cleared.providerSessionId ?? ""}`);
+  }
+}
+
+async function assertLoginSeatFreshForAuthResume(account: AccountRecord, seatHome: string): Promise<void> {
+  const recipe = identityRecipeForAgent(account.tool);
+  if (!recipe) throw new Error(`hive auth-resume: tool ${account.tool} has no identity recipe`);
+  const markerPath = resolve(seatHome, ".login-seat-started");
+  const marker = await stat(markerPath).catch(() => null);
+  if (!marker) throw new Error(`hive auth-resume: run hive login ${account.id} first`);
+
+  const primary = recipe.credentialFiles[0]!;
+  const primaryInfo = await stat(resolve(seatHome, primary)).catch(() => null);
+  if (primaryInfo?.isFile() && primaryInfo.mtimeMs >= marker.mtimeMs) return;
+
+  const baselineDigest = await readLoginMarkerDigest(markerPath);
+  const currentDigest = await loginSeatLiveDigest(account, seatHome);
+  if (currentDigest !== null && currentDigest !== baselineDigest) return;
+
+  throw new Error(`hive auth-resume: login for ${account.id} is not complete; finish the login seat first`);
+}
+
+async function readLoginMarkerDigest(markerPath: string): Promise<string | null> {
+  try {
+    const parsed = JSON.parse(await readFile(markerPath, "utf8")) as { keychainDigest?: unknown };
+    return typeof parsed.keychainDigest === "string" ? parsed.keychainDigest : null;
+  } catch {
+    return null;
+  }
+}
+
+async function stopRuntimeForAuthResume(record: SessionRecord): Promise<void> {
+  const substrate = substrateFor(record);
+  const target = record.substrate === "hsr" ? record.name : record.tmuxTarget;
+  if (!(await substrate.hasSession(target).catch(() => false))) return;
+  const result = await substrate.kill(target, { launcherPgid: record.launcherPgid });
+  if (!result.ok) {
+    throw new Error(`hive auth-resume: could not stop ${record.name}: ${result.stderr || result.stdout || `exit ${result.exitCode}`}`);
+  }
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (!(await substrate.hasSession(target).catch(() => true))) return;
+    await sleep(100);
+  }
+  throw new Error(`hive auth-resume: ${record.name} did not stop within 5s; retry after the runtime exits`);
 }
 
 /**
