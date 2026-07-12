@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { connectRpcClient } from "../src/hsr/rpc.js";
 import { runHsrHost } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
-import { hsrObservations } from "../src/hsr/observe.js";
+import { hsrObservations, isAuthNeededMessage, structuredStateFromEvents } from "../src/hsr/observe.js";
 import { hsrRunDir } from "../src/hsr/runDir.js";
 import { deriveState, type BeeState, type StateContext } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
@@ -123,4 +123,30 @@ test("hsrObservations: live structured state feeds deriveState (not dead), dead 
       await handle.stop().catch(() => undefined);
     }
   });
+});
+
+test("structuredStateFromEvents surfaces login-required auth failures as auth-needed", () => {
+  assert.equal(
+    isAuthNeededMessage("Your access token could not be refreshed. Please log out and sign in again."),
+    true,
+  );
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "error", ts: 2, message: "Your access token could not be refreshed. Please log out and sign in again." },
+      { type: "turn_end", ts: 3 },
+    ]),
+    "auth-needed",
+  );
+});
+
+test("structuredStateFromEvents does not confuse daemon-recoverable auth_expired with auth-needed", () => {
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "auth_expired", ts: 2 },
+      { type: "turn_end", ts: 3 },
+    ]),
+    "idle_with_output",
+  );
 });

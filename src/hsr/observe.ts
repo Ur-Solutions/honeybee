@@ -172,16 +172,18 @@ export type HsrObservationOptions = {
  * Derive a BeeState from the events.jsonl window. Only the LAST turn markers
  * matter, so we scan the parsed window for the last turn_start/turn_end and
  * the last needs_input:
+ *   - a login-required auth error in the latest turn → "auth-needed".
  *   - a needs_input with no later turn_end (unresolved) → "blocked".
  *   - a turn in flight (last marker is turn_start) → "active".
  *   - the last turn finished (turn_end) → "idle_with_output".
  *   - no turn markers yet: any assistant text already → "ready", else "booting".
  * Returns undefined when the tail carries no usable signal at all (empty log).
  */
-function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined {
+export function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined {
   let lastStart = -1;
   let lastEnd = -1;
   let lastNeeds = -1;
+  let lastAuthNeeded = -1;
   let hasText = false;
   for (let i = 0; i < events.length; i++) {
     const event = events[i]!;
@@ -198,10 +200,17 @@ function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined 
       case "text":
         if (event.text.length > 0) hasText = true;
         break;
+      case "error":
+        if (isAuthNeededMessage(event.message)) lastAuthNeeded = i;
+        break;
       default:
         break;
     }
   }
+  // A login-required auth failure is sticky for the turn it happened in. It is
+  // intentionally separate from `auth_expired`: remote ephemeral-token bees can
+  // recover that automatically, while this one requires a human login.
+  if (lastAuthNeeded >= 0 && lastAuthNeeded >= lastStart) return "auth-needed";
   // An unresolved needs_input (nothing finished the turn after it) blocks the bee.
   if (lastNeeds >= 0 && lastNeeds > lastEnd) return "blocked";
   // A turn is in flight when the last turn marker is a start with no later end.
@@ -212,6 +221,17 @@ function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined 
   // session is talking (ready); otherwise it is still booting.
   if (hasText) return "ready";
   return "booting";
+}
+
+export function isAuthNeededMessage(message: string): boolean {
+  const m = message.toLowerCase();
+  if (m.includes("please log out and sign in again")) return true;
+  if (m.includes("please sign out and sign in again")) return true;
+  if (m.includes("access token") && m.includes("could not be refreshed")) return true;
+  if (m.includes("access token") && m.includes("couldn't be refreshed")) return true;
+  if (m.includes("access token") && m.includes("cannot be refreshed")) return true;
+  if ((m.includes("please log in") || m.includes("please login") || m.includes("sign in again")) && m.includes("auth")) return true;
+  return false;
 }
 
 /**
