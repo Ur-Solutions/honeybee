@@ -170,18 +170,31 @@ export type HsrObservationOptions = {
 
 /**
  * Derive a BeeState from the events.jsonl window. Only the LAST turn markers
- * matter, so we scan the parsed window for the last turn_start/turn_end and
- * the last needs_input:
+ * matter, so we scan the parsed window for the last turn_start/turn_end, the
+ * last tool_use, and the last needs_input:
  *   - a login-required auth error in the latest turn → "auth-needed".
  *   - a needs_input with no later turn_end (unresolved) → "blocked".
  *   - a turn in flight (last marker is turn_start) → "active".
+ *   - a tool_use AFTER the last turn_end → "active" (see below).
  *   - the last turn finished (turn_end) → "idle_with_output".
  *   - no turn markers yet: any assistant text already → "ready", else "booting".
  * Returns undefined when the tail carries no usable signal at all (empty log).
+ *
+ * Why tool_use gates idle: turn_end comes from the harness's own end-of-turn
+ * line (claude stream-json `result`), and claude emits one MID-TURN during long
+ * tool chains — the log then shows dozens of further tool_use events with no
+ * new turn_start. Trusting that turn_end reported the bee idle while it was
+ * still working, which drained queued buz messages into the middle of a live
+ * tool call (observed 2026-07-13: a silent `Bash sleep` turn). A tool_use later
+ * than the last turn_end therefore means work resumed: the bee is active until
+ * a turn_end closes the tail. A stuck/never-returning tool leaves the bee
+ * reading active, which mirrors how an unterminated turn_start already behaves
+ * and is the safe direction — a false idle delivers messages mid-work.
  */
 export function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined {
   let lastStart = -1;
   let lastEnd = -1;
+  let lastTool = -1;
   let lastNeeds = -1;
   let lastAuthNeeded = -1;
   let hasText = false;
@@ -193,6 +206,9 @@ export function structuredStateFromEvents(events: RunnerEvent[]): BeeState | und
         break;
       case "turn_end":
         lastEnd = i;
+        break;
+      case "tool_use":
+        lastTool = i;
         break;
       case "needs_input":
         lastNeeds = i;
@@ -215,6 +231,9 @@ export function structuredStateFromEvents(events: RunnerEvent[]): BeeState | und
   if (lastNeeds >= 0 && lastNeeds > lastEnd) return "blocked";
   // A turn is in flight when the last turn marker is a start with no later end.
   if (lastStart > lastEnd) return "active";
+  // A tool fired after the last turn_end: the harness closed a turn mid-work
+  // (claude does this on long tool chains) and kept going. Still working.
+  if (lastTool > lastEnd) return "active";
   // A completed turn: the bee produced output and is now waiting.
   if (lastEnd >= 0) return "idle_with_output";
   // No turn markers yet — still coming up. Any assistant text already means the

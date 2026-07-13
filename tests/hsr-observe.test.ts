@@ -150,3 +150,60 @@ test("structuredStateFromEvents does not confuse daemon-recoverable auth_expired
     "idle_with_output",
   );
 });
+
+// ─── idle must not fire while a tool is open ───────────────────────────────
+// claude's stream-json emits a `result` (→ turn_end) MID-TURN on long tool
+// chains, then keeps calling tools with no new turn_start. Reading that as
+// idle_with_output drained queued buz messages into a live tool call (observed
+// 2026-07-13 on a silent `Bash sleep` turn).
+
+test("structuredStateFromEvents stays active when a tool fires after a mid-turn turn_end", () => {
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "tool_use", ts: 2, tool: "Read" },
+      { type: "turn_end", ts: 3 }, // harness closed the turn early…
+      { type: "tool_use", ts: 4, tool: "Bash" }, // …but it is still working
+    ]),
+    "active",
+  );
+});
+
+test("structuredStateFromEvents stays active through a silent long tool call", () => {
+  // The tail ends ON the tool_use: a `Bash sleep` produces no further events
+  // until it returns, so this window is exactly what the daemon observes.
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "text", ts: 2, text: "running it now" },
+      { type: "turn_end", ts: 3 },
+      { type: "tool_use", ts: 4, tool: "Bash" },
+    ]),
+    "active",
+  );
+});
+
+test("structuredStateFromEvents still reports idle after a turn whose tools all completed", () => {
+  // The normal shape — every tool_use PRECEDES the closing turn_end.
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "tool_use", ts: 2, tool: "Bash" },
+      { type: "text", ts: 3, text: "done" },
+      { type: "turn_end", ts: 4 },
+    ]),
+    "idle_with_output",
+  );
+});
+
+test("an unresolved needs_input still wins over an open tool", () => {
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "turn_end", ts: 2 },
+      { type: "tool_use", ts: 3, tool: "Bash" },
+      { type: "needs_input", ts: 4, kind: "permission", question: "run it?" },
+    ]),
+    "blocked",
+  );
+});
