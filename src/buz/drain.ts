@@ -37,6 +37,7 @@ export async function processQueueForBee(
   context: DaemonDrainContext,
 ): Promise<DrainResult> {
   const maxFailures = context.maxFailures ?? 3;
+  const deliverLimit = context.deliverLimit ?? Infinity;
   const queueDir = beeMailboxDir(record.name, "queue");
   const inboxDir = beeMailboxDir(record.name, "inbox");
   const quarantineDir = beeMailboxDir(record.name, "quarantine");
@@ -132,6 +133,9 @@ export async function processQueueForBee(
         tier: "queue",
         ok: true,
       });
+      // One-at-a-time sequencing: the paste above starts a new turn, so any
+      // further queued messages must wait for the NEXT idle observation.
+      if (result.delivered.length >= deliverLimit) break;
     }
   }, { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS });
 

@@ -262,7 +262,7 @@ test("completion: --tier value only completes under the buz command", async () =
   try {
     const buzTier = await hive(dir, "__complete", "hive", "buz", "send", "CO.aaa", "--tier", "");
     const tierLines = buzTier.stdout.trim().split("\n").filter(Boolean);
-    assert.deepEqual(tierLines.sort(), ["interrupt", "passive", "queue"]);
+    assert.deepEqual(tierLines.sort(), ["interrupt", "next-tool", "passive", "queue"]);
 
     // --tier under any other verb falls back to top-level flag completion
     // (or empty), NOT the buz-tier enum.
@@ -285,6 +285,67 @@ test("completion: buz subcommands and --accept values", async () => {
     const accept = await hive(dir, "__complete", "hive", "buz", "config", "CO.aaa", "--accept", "");
     const acceptLines = accept.stdout.trim().split("\n").filter(Boolean);
     assert.ok(acceptLines.includes("queue,passive"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz cancel removes a queued message before delivery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    await seedSession(dir, "CL.cc9");
+    await hive(dir, "buz", "send", "CO.aaa", "--sender", "CL.cc9", "--tier", "queue", "-p", "later");
+    const { stdout: listing } = await hive(dir, "buz", "queue", "CO.aaa");
+    const id = listing.split("\n")[0]!.split("\t")[2]!;
+    assert.ok(id, "queue listing yields a message id");
+
+    const { stdout } = await hive(dir, "buz", "cancel", "CO.aaa", id);
+    assert.match(stdout, new RegExp(`buz\\.cancel\\tCO\\.aaa\\t${id}`));
+    const queue = await readdir(join(dir, "buz", "CO.aaa", "queue")).catch(() => []);
+    assert.equal(queue.filter((f) => f.endsWith(".md")).length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz cancel refuses a message that is not in queue/", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    await seedSession(dir, "CL.cc9");
+    await hive(dir, "buz", "send", "CO.aaa", "--sender", "CL.cc9", "--tier", "passive", "-p", "fyi");
+    const inbox = await readdir(join(dir, "buz", "CO.aaa", "inbox"));
+    const id = inbox[0]!.replace(/\.md$/, "").split("-").at(-1)!;
+    const stderr = await hiveExpectFail(dir, "buz", "cancel", "CO.aaa", id);
+    assert.match(stderr, /only queued messages can be cancelled/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz send --sender-human --tier interrupt is honored without recipient opt-in (human bypass)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    // A dead session: the interrupt paste fails, which downgrades to queue —
+    // proving the POLICY no longer downgrades a human interrupt up front (the
+    // old behavior downgraded before ever attempting the paste).
+    await seedSession(dir, "CO.aaa");
+    const { stdout } = await hive(dir, "buz", "send", "CO.aaa", "--sender-human", "tormod", "--tier", "interrupt", "-p", "now please");
+    assert.match(stdout, /buz\.send\tCO\.aaa\t\S+\tinterrupt\tqueue\tdowngraded/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz send --tier next-tool on a tmux bee downgrades to queue (substrate cannot hold)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    const { stdout } = await hive(dir, "buz", "send", "CO.aaa", "--sender-human", "tormod", "--tier", "next-tool", "-p", "after the tool");
+    assert.match(stdout, /buz\.send\tCO\.aaa\t\S+\tnext-tool\tqueue\tdowngraded/);
+    const queue = await readdir(join(dir, "buz", "CO.aaa", "queue"));
+    assert.equal(queue.filter((f) => f.endsWith(".md")).length, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

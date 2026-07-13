@@ -1,6 +1,8 @@
 // `hive buz` — addressed bee-to-bee messaging (three-tier delivery + policy).
 // Extracted from cli.ts (HIVE-15).
-import { BUZ_TIERS, consumeMessage, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
+import { BUZ_TIERS, DELIVERY_LOCK_TIMEOUT_MS, consumeMessage, deliveryLockPath, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, recipientWriteLockPath, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
+import { withFileLock } from "../lock.js";
+import { rm } from "node:fs/promises";
 import { parseAge } from "../clean.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
@@ -22,12 +24,14 @@ export async function cmdBuz(parsed: Parsed) {
       return buzList(parsed, "queue");
     case "read":
       return buzRead(parsed);
+    case "cancel":
+      return buzCancel(parsed);
     case "purge":
       return buzPurge(parsed);
     case "config":
       return buzConfig(parsed);
     default:
-      throw new Error(`Unknown buz subcommand: ${sub ?? ""}\nUsage: hive buz <send|inbox|outbox|queue|read|purge|config>`);
+      throw new Error(`Unknown buz subcommand: ${sub ?? ""}\nUsage: hive buz <send|inbox|outbox|queue|read|cancel|purge|config>`);
   }
 }
 
@@ -73,7 +77,9 @@ export async function buzSend(parsed: Parsed) {
   if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
 
   for (const record of records) {
-    const transport = tier === "interrupt"
+    // Live tiers (interrupt, next-tool) need a transport to paste/hold through;
+    // queue/passive are pure mailbox writes.
+    const transport = tier === "interrupt" || tier === "next-tool"
       ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId }
       : undefined;
     const result = await sendBuzMessage({
@@ -207,6 +213,42 @@ export async function findBuzMessage(candidates: SessionRecord[], id: string): P
     if (found) return found;
   }
   return null;
+}
+
+
+/**
+ * Cancel a queued (not-yet-delivered) message: remove it from the recipient's
+ * queue/ under the write lock so a concurrent daemon drain either delivers it
+ * fully or never sees it. Only queue/ messages are cancellable — anything in
+ * inbox/read/quarantine has already settled.
+ */
+export async function buzCancel(parsed: Parsed) {
+  const target = parsed.args[1];
+  const id = parsed.args[2];
+  if (!target || !id) throw new Error("Usage: hive buz cancel <bee> <message-id>");
+
+  const record = await resolveSession(target);
+  // Lock order matches the drain (delivery -> write): holding the delivery
+  // lock means an in-flight drain has either fully delivered this message
+  // (rename to inbox done) or not read it yet — never pasted-but-still-queued.
+  const cancelled = await withFileLock(deliveryLockPath(record.name), () =>
+    withFileLock(recipientWriteLockPath(record.name), async () => {
+      const found = await readMessageById(record.name, id);
+      if (!found || found.mailbox !== "queue") return false;
+      await rm(found.path, { force: true });
+      await rm(`${found.path}.retries`, { force: true }).catch(() => undefined);
+      return true;
+    }), { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS });
+
+  if (!cancelled) {
+    const found = await readMessageById(record.name, id);
+    if (found) throw new Error(`message ${id} is in ${found.mailbox}/; only queued messages can be cancelled`);
+    throw new Error(`No queued buz message with id ${id} for ${record.name}`);
+  }
+
+  await appendLedger({ type: "buz.cancel", bee: record.name, messageId: id });
+  if (isPretty()) console.log(actionLine("ok", "buz", [bold(record.name), `cancelled:${id}`]));
+  else console.log(`buz.cancel\t${record.name}\t${id}`);
 }
 
 

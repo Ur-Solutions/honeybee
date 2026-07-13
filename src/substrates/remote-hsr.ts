@@ -35,6 +35,7 @@ import type {
   KillResult,
   NewSessionResult,
   ProbeResult,
+  SendTextOptions,
   Substrate,
   TmuxWindowOptions,
 } from "./types.js";
@@ -299,9 +300,13 @@ export function createRemoteHsrSubstrate(
     }
   }
 
-  async function sendText(bee: string, text: string): Promise<void> {
+  async function sendText(bee: string, text: string, _paneId?: string, options?: SendTextOptions): Promise<void> {
     const c = await client();
-    const res = (await c.call("send", { bee, text })) as { ok?: boolean; error?: string } | null;
+    const res = (await c.call("send", {
+      bee,
+      text,
+      ...(options?.mode === "next-tool" ? { mode: "next-tool" } : {}),
+    })) as { ok?: boolean; error?: string } | null;
     if (!res || !res.ok) throw new Error(`remote HSR send to ${bee} on ${node.name} failed: ${res?.error ?? "unknown"}`);
   }
 
@@ -447,6 +452,9 @@ export function createRemoteHsrSubstrate(
     kind: "remote-hsr",
     node: node.name,
     endpoint: node.endpoint,
+    // The remote runner host sees tool events inline; the mode forwards over
+    // the send RPC, so a next-tool hold works exactly as it does locally.
+    supportsNextTool: true,
     probe,
     hasSession,
     // Spawn goes through spawnRemote (the remote serve forks the runner host), so

@@ -82,6 +82,16 @@ export type RunnerOpts = {
 };
 
 /**
+ * How a send should land relative to the live turn. "now" (default) delivers
+ * immediately; "next-tool" asks the runner to HOLD the text until the next
+ * tool boundary (tool_use / turn_end) of the current turn — idle sessions
+ * deliver immediately. Only the stream tier implements the hold; turn tier
+ * already queues sends behind the live turn, and server/pty tiers ignore the
+ * option (harness-native semantics).
+ */
+export type RunnerSendOpts = { mode?: "now" | "next-tool" };
+
+/**
  * A live runner session. Steering, interruption, and permission answers route
  * here; `events` is the structured stream and `snapshot()` renders a text tail
  * so the daemon's existing capture/deriveState path keeps functioning.
@@ -90,7 +100,7 @@ export type RunnerSession = {
   sessionId: string; // provider session id (pinned or learned)
   tier: RunnerTier;
   pid?: number; // child pid (server tier: the shared server pid)
-  send(text: string): Promise<void>;
+  send(text: string, opts?: RunnerSendOpts): Promise<void>;
   interrupt(): Promise<void>;
   answer(requestId: string, answer: string): Promise<void>; // respond to a needs_input
   events: AsyncIterable<RunnerEvent>;

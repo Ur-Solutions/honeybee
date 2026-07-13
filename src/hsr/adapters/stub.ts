@@ -36,6 +36,13 @@ rl.on("line", (raw) => {
   if (!line) return;
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
+  // In-band turn interrupt (streamRunner encodeInterrupt): end the current
+  // turn with a result line, exactly like claude's control_request handling.
+  if (msg.interrupt) {
+    emit({ t: "result" });
+    pendingRequestId = null;
+    return;
+  }
   if (pendingRequestId) {
     const answer = typeof msg.answer === "string" ? msg.answer : "";
     emit({ t: "assistant", text: "answered:" + answer });
@@ -47,6 +54,20 @@ rl.on("line", (raw) => {
   if (text.includes("ask")) {
     pendingRequestId = "r1";
     emit({ t: "needs", requestId: "r1", question: "proceed?" });
+    return;
+  }
+  // A turn mentioning "slowtool" runs a slow tool: assistant text now, a tool
+  // event after a beat, the closing result after another — a window for tests
+  // to park a next-tool steer against a LIVE turn (queued-steering spec).
+  // A "hang" turn never ends on its own — the interrupt test's target.
+  if (text.includes("hang")) {
+    emit({ t: "assistant", text: "hanging:" + text });
+    return;
+  }
+  if (text.includes("slowtool")) {
+    emit({ t: "assistant", text: "starting:" + text });
+    setTimeout(() => emit({ t: "tool", tool: "hammer" }), 120);
+    setTimeout(() => { emit({ t: "assistant", text: "after-tool" }); emit({ t: "result" }); }, 240);
     return;
   }
   emit({ t: "assistant", text: "echo:" + text });
@@ -88,6 +109,8 @@ const stubConfig: StreamRunnerConfig = {
             requestId: typeof msg.requestId === "string" ? msg.requestId : undefined,
           },
         ];
+      case "tool":
+        return [{ type: "tool_use", ts: 0, tool: String(msg.tool ?? "") }];
       case "usage":
         return [
           {
@@ -108,6 +131,9 @@ const stubConfig: StreamRunnerConfig = {
   },
   encodeAnswer(_requestId: string, answer: string): string {
     return `${JSON.stringify({ answer })}\n`;
+  },
+  encodeInterrupt(): string {
+    return `${JSON.stringify({ interrupt: true })}\n`;
   },
   sessionIdFromEvent(_event: RunnerEvent, raw: unknown): string | undefined {
     if (raw && typeof raw === "object" && !Array.isArray(raw)) {

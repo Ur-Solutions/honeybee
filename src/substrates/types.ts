@@ -23,10 +23,22 @@ export type KillResult = {
   exitCode: number;
 };
 
+/**
+ * How a sendText should land relative to the recipient's live turn:
+ * - "now": deliver immediately (the default; interjects a running turn).
+ * - "next-tool": hold until the recipient's next tool boundary. Only the HSR
+ *   substrates can honor this (the runner host sees tool events inline);
+ *   substrates that cannot MUST ignore the option, and callers that need
+ *   deterministic semantics (buz) gate on `supportsNextTool` first.
+ */
+export type SendTextOptions = { mode?: "now" | "next-tool" };
+
 export type Substrate = {
   readonly kind: SubstrateKind;
   readonly node: string;
   readonly endpoint?: string;
+  /** True when sendText honors `{ mode: "next-tool" }` (HSR substrates). */
+  readonly supportsNextTool?: boolean;
   probe(): Promise<ProbeResult>;
   hasSession(target: string): Promise<boolean>;
   newSession(target: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult>;
@@ -42,7 +54,7 @@ export type Substrate = {
   // bees that were never pinned. This is the fix for I/O following the wrong
   // pane after a window is split.
   capture(target: string, lines?: number, paneId?: string): Promise<string>;
-  sendText(target: string, text: string, paneId?: string): Promise<void>;
+  sendText(target: string, text: string, paneId?: string, options?: SendTextOptions): Promise<void>;
   sendEnter(target: string, paneId?: string): Promise<void>;
   sendKey(target: string, key: string, paneId?: string): Promise<void>;
   listSessions(): Promise<string[]>;

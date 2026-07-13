@@ -730,3 +730,145 @@ test("normalizeSessionRecord persists buzAccept and drops unknown tiers", async 
     assert.deepEqual(second?.buzAccept, ["interrupt", "queue"]);
   });
 });
+
+// ─── Queued steering (docs/queued-steering.md): next-tool tier, human bypass,
+//     one-delivery-per-drain ──────────────────────────────────────────────────
+
+test("BUZ_TIERS places next-tool between interrupt and queue (downgrade chain order)", () => {
+  assert.deepEqual([...BUZ_TIERS], ["interrupt", "next-tool", "queue", "passive"]);
+  assert.deepEqual(downgradeTier("next-tool", ["queue", "passive"]), {
+    effective: "queue",
+    downgraded: true,
+    reason: "policy disallows next-tool",
+  });
+});
+
+test("tier=next-tool on a supportsNextTool substrate delivers with mode and copies to inbox/", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    let pasted = "";
+    let mode: string | undefined;
+    const sub = fakeSubstrate({
+      supportsNextTool: true,
+      sendText: async (_t, text, _p, options) => {
+        pasted = text;
+        mode = options?.mode;
+      },
+    });
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "human", name: "tormod" },
+      tier: "next-tool",
+      body: "NT",
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(result.message.deliveredAs, "next-tool");
+    assert.equal(result.downgraded, false);
+    assert.equal(pasted, "NT");
+    assert.equal(mode, "next-tool");
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "inbox"))).length, 1);
+    // No queue write for a live delivery (the dir may not even exist yet).
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue")).catch(() => [])).length, 0);
+  });
+});
+
+test("tier=next-tool downgrades to queue when the substrate cannot hold it", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa", { buzAccept: ["interrupt", "next-tool", "queue"] });
+    let pasteCount = 0;
+    // Default fakeSubstrate is local-tmux with NO supportsNextTool.
+    const sub = fakeSubstrate({ sendText: async () => { pasteCount += 1; } });
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.cc9" },
+      tier: "next-tool",
+      body: "NT",
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(result.message.deliveredAs, "queue");
+    assert.equal(result.downgraded, true);
+    assert.match(result.reason ?? "", /cannot hold next-tool/);
+    assert.equal(pasteCount, 0);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
+  });
+});
+
+test("tier=next-tool transport failure falls back to queue without losing the message", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    const sub = fakeSubstrate({
+      supportsNextTool: true,
+      sendText: async () => { throw new Error("socket gone"); },
+    });
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "human", name: "tormod" },
+      tier: "next-tool",
+      body: "NT",
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(result.message.deliveredAs, "queue");
+    assert.equal(result.downgraded, true);
+    assert.match(result.reason ?? "", /next-tool transport failed/);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
+  });
+});
+
+test("human sender bypasses the accept-list downgrade (interrupt with default policy)", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa"); // no buzAccept => DEFAULT (queue+passive)
+    let pasted = "";
+    const sub = fakeSubstrate({ sendText: async (_t, text) => { pasted = text; } });
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "human", name: "tormod" },
+      tier: "interrupt",
+      body: "NOW",
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(result.message.deliveredAs, "interrupt");
+    assert.equal(result.downgraded, false);
+    assert.equal(pasted, "NOW");
+  });
+});
+
+test("bee sender is still policy-downgraded (human bypass does not leak)", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa"); // DEFAULT policy
+    let pasteCount = 0;
+    const sub = fakeSubstrate({ sendText: async () => { pasteCount += 1; } });
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.cc9" },
+      tier: "interrupt",
+      body: "x",
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(result.message.deliveredAs, "queue");
+    assert.equal(pasteCount, 0);
+  });
+});
+
+test("processQueueForBee deliverLimit=1 delivers exactly one message per drain", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    const a = await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.x" }, tier: "queue", body: "first" });
+    await new Promise((r) => setTimeout(r, 10));
+    const b = await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.x" }, tier: "queue", body: "second" });
+
+    const calls: string[] = [];
+    const sub = fakeSubstrate({ sendText: async (_t, text) => { calls.push(text); } });
+    const transport = { substrate: sub, tmuxTarget: recipient.tmuxTarget };
+
+    const first = await processQueueForBee(recipient, { transport, deliverLimit: 1 });
+    assert.deepEqual(first.delivered, [a.message.id]);
+    assert.deepEqual(calls, ["first"]);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
+
+    // The NEXT idle observation delivers the next message.
+    const second = await processQueueForBee(recipient, { transport, deliverLimit: 1 });
+    assert.deepEqual(second.delivered, [b.message.id]);
+    assert.deepEqual(calls, ["first", "second"]);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 0);
+  });
+});

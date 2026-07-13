@@ -122,6 +122,16 @@ export type DaemonDrainContext = {
   maxFailures?: number;
   now?: () => number;
   /**
+   * Stop the drain after this many SUCCESSFUL deliveries (quarantines and
+   * failures don't count). The daemon dispatcher passes 1 so each
+   * idle_with_output observation delivers exactly one queued message: the
+   * first paste starts a new turn, and flushing the rest of the queue in the
+   * same drain would land messages 2..n mid-turn — exactly the uncontrolled
+   * interjection queue-tier senders opted out of. Unset = drain everything
+   * (manual/administrative drains).
+   */
+  deliverLimit?: number;
+  /**
    * Daemon dispatcher behavior: stop draining after the first substrate
    * failure (the broken substrate likely cannot deliver subsequent messages
    * either). Subsequent messages remain in queue and will be retried on the
@@ -147,9 +157,11 @@ export { generateMessageId } from "./buz/ids.js";
 export { downgradeTier, parseAcceptFlag, resolveBuzAccept, validateAcceptList } from "./buz/policy.js";
 
 export {
+  DELIVERY_LOCK_TIMEOUT_MS,
   beeMailboxDir,
   buzRoot,
   consumeMessage,
+  deliveryLockPath,
   externalOutboxDir,
   inboxFilename,
   listMessages,
@@ -158,6 +170,7 @@ export {
   purgeMailbox,
   readMessageById,
   recipientMailboxFilename,
+  recipientWriteLockPath,
   sanitizeHumanName,
   senderDisplay,
   senderToken,

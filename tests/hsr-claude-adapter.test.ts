@@ -161,3 +161,16 @@ test("adapterFor resolves stub and claude, undefined otherwise", () => {
   assert.equal(claudeAdapter.harness, "claude");
   assert.equal(claudeAdapter.tier(), "stream");
 });
+
+test("encodeInterrupt emits stream-json control_request interrupt lines with unique ids", () => {
+  const { config } = buildClaudeStreamConfig(optsFor());
+  assert.ok(config.encodeInterrupt, "claude config provides an in-band interrupt");
+  const first = JSON.parse(config.encodeInterrupt!().trim());
+  const second = JSON.parse(config.encodeInterrupt!().trim());
+  assert.equal(first.type, "control_request");
+  assert.deepEqual(first.request, { subtype: "interrupt" });
+  assert.ok(typeof first.request_id === "string" && first.request_id.length > 0);
+  assert.notEqual(first.request_id, second.request_id);
+  // The ack line claude sends back must parse to no events (unknown type).
+  assert.deepEqual(config.parseLine(JSON.stringify({ type: "control_response", response: { subtype: "success", request_id: first.request_id } })), []);
+});

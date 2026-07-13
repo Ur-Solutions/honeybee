@@ -118,7 +118,10 @@ export async function runHsrHost(params: {
 
   // --- control socket --------------------------------------------------------
   const methods: Record<string, RpcMethodHandler> = {
-    send: (params) => session.send(String((params as { text?: unknown })?.text ?? "")),
+    send: (params) => {
+      const p = (params ?? {}) as { text?: unknown; mode?: unknown };
+      return session.send(String(p.text ?? ""), p.mode === "next-tool" ? { mode: "next-tool" } : undefined);
+    },
     interrupt: () => session.interrupt(),
     answer: (params) => {
       const p = (params ?? {}) as { requestId?: unknown; answer?: unknown };

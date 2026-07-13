@@ -148,6 +148,9 @@ export async function dispatchBuzDrains(
       const result = await drain(record, {
         transport: { substrate, tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId },
         stopOnFirstFailure: true,
+        // One message per idle observation: the delivered message starts a new
+        // turn; the rest of the queue waits for the next idle_with_output tick.
+        deliverLimit: 1,
       });
       return { recipient: record.name, result };
     } catch (error) {

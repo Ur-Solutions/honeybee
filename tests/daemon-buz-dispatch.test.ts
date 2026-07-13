@@ -189,8 +189,20 @@ test("dispatchBuzDrains drains queue on active->idle_with_output and moves to in
       { resolveSubstrate: () => substrate },
     );
 
+    // One message per idle observation (queued-steering spec): the first
+    // delivery starts a new turn, so "second" waits for the NEXT idle tick.
     assert.equal(outcomes.length, 1);
-    assert.deepEqual(outcomes[0]!.result.delivered, [a.message.id, b.message.id]);
+    assert.deepEqual(outcomes[0]!.result.delivered, [a.message.id]);
+    assert.deepEqual(calls, ["first"]);
+    assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).length, 1);
+    assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 1);
+
+    const next = await dispatchBuzDrains(
+      [recipient],
+      [{ name: recipient.name, from: "active", to: "idle_with_output" }],
+      { resolveSubstrate: () => substrate },
+    );
+    assert.deepEqual(next[0]!.result.delivered, [b.message.id]);
     assert.deepEqual(calls, ["first", "second"]);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).length, 0);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 2);
@@ -270,7 +282,7 @@ test("dispatchBuzDrains does NOT drain when transition target is not idle_with_o
   });
 });
 
-test("dispatchBuzDrains delivers queued messages in id order across two senders", async () => {
+test("dispatchBuzDrains delivers queued messages in id order across two senders, one per tick", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa");
     const sent: { id: string; body: string }[] = [];
@@ -282,14 +294,19 @@ test("dispatchBuzDrains delivers queued messages in id order across two senders"
 
     const calls: string[] = [];
     const substrate = fakeSubstrate({ sendText: async (_t, text) => { calls.push(text); } });
-    const outcomes = await dispatchBuzDrains(
-      [recipient],
-      [{ name: recipient.name, from: "active", to: "idle_with_output" }],
-      { resolveSubstrate: () => substrate },
-    );
+    const delivered: string[] = [];
+    // One message per idle observation: three ticks drain three messages, in order.
+    for (let tick = 0; tick < 3; tick += 1) {
+      const outcomes = await dispatchBuzDrains(
+        [recipient],
+        [{ name: recipient.name, from: "active", to: "idle_with_output" }],
+        { resolveSubstrate: () => substrate },
+      );
+      delivered.push(...outcomes[0]!.result.delivered);
+    }
 
     assert.deepEqual(calls, sent.map((s) => s.body));
-    assert.deepEqual(outcomes[0]!.result.delivered, sent.map((s) => s.id));
+    assert.deepEqual(delivered, sent.map((s) => s.id));
   });
 });
 

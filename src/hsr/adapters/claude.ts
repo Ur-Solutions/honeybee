@@ -131,6 +131,22 @@ function encodeClaudeUserTurn(text: string): string {
 }
 
 /**
+ * Encode an in-band turn interrupt (stream-json control protocol): claude ends
+ * the current turn (emitting its result line) and keeps the session alive —
+ * unlike SIGINT, which kills the headless child and crashes the bee. The
+ * control_response ack line parses to [] in parseClaudeLine (unknown type).
+ */
+let interruptRequestCounter = 0;
+function encodeClaudeInterrupt(): string {
+  interruptRequestCounter += 1;
+  return `${JSON.stringify({
+    type: "control_request",
+    request_id: `hive-interrupt-${interruptRequestCounter}`,
+    request: { subtype: "interrupt" },
+  })}\n`;
+}
+
+/**
  * Drop any `--session-id <id>` pair from an arg list. A fresh spawn pins the
  * provider session with `--session-id`; a RESUME must instead carry `--resume
  * <id>` and MUST NOT also pass `--session-id` (claude rejects starting a session
@@ -196,6 +212,7 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
     args,
     parseLine: parseClaudeLine,
     encodeUserTurn: encodeClaudeUserTurn,
+    encodeInterrupt: encodeClaudeInterrupt,
     // encodeAnswer omitted for v1 — claude permission routing is deferred; yolo
     // mode has no prompts to answer.
     sessionIdFromEvent: sessionIdFromClaudeEvent,

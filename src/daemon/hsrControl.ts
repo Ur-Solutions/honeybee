@@ -158,8 +158,11 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
     }),
 
     send: guarded(async (params) => {
-      const p = (params ?? {}) as { bee?: unknown; text?: unknown };
-      const result = await proxyCall(String(p.bee ?? ""), "send", { text: String(p.text ?? "") });
+      const p = (params ?? {}) as { bee?: unknown; text?: unknown; mode?: unknown };
+      const result = await proxyCall(String(p.bee ?? ""), "send", {
+        text: String(p.text ?? ""),
+        ...(p.mode === "next-tool" ? { mode: "next-tool" } : {}),
+      });
       return result.ok ? { ok: true } : result;
     }),
 

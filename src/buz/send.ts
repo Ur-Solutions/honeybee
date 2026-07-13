@@ -29,13 +29,15 @@ type BuzDeliveryContext = {
 };
 
 type BuzDeliveryOutcome = {
-  interruptAttempted: boolean;
+  /** Set when a live substrate paste was attempted, to the tier it was attempted AS. */
+  liveTierAttempted?: BuzTier;
 };
 
 type BuzDeliveryHandler = (context: BuzDeliveryContext) => Promise<BuzDeliveryOutcome>;
 
 const BUZ_DELIVERY_HANDLERS = {
   interrupt: deliverInterruptTier,
+  "next-tool": deliverNextToolTier,
   queue: deliverQueueTier,
   passive: deliverPassiveTier,
 } satisfies Record<BuzTier, BuzDeliveryHandler>;
@@ -52,8 +54,16 @@ const RESULT_PATH_FIELD_BY_MAILBOX = {
 // ──────────────────────────────────────────────────────────────────────────
 
 export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult> {
+  // The accept-list downgrade exists to close the bee-to-bee interrupt
+  // spoof/DoS vector. A HUMAN sender (the desktop/CLI user steering their own
+  // bee) gets the tier they asked for: any local process can already
+  // `hive send` unconditionally, so honoring a human interrupt opens nothing
+  // that isn't already open. Substrate-capability downgrades (next-tool on a
+  // substrate that cannot hold it) still apply below.
   const accepted = resolveBuzAccept(input.recipient);
-  const downgrade = downgradeTier(input.tier, accepted);
+  const downgrade = input.sender.kind === "human"
+    ? { effective: input.tier, downgraded: false as const }
+    : downgradeTier(input.tier, accepted);
   const sentAt = new Date().toISOString();
   const id = generateMessageId();
   const message: BuzMessage = {
@@ -81,13 +91,13 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
 
   const delivery = await BUZ_DELIVERY_HANDLERS[message.deliveredAs]({ input, message, result });
 
-  if (delivery.interruptAttempted) {
-    const failed = message.deliveredAs !== "interrupt";
+  if (delivery.liveTierAttempted) {
+    const failed = message.deliveredAs !== delivery.liveTierAttempted;
     await appendLedger({
       type: "buz.deliver",
       messageId: message.id,
       recipient: message.to,
-      tier: "interrupt",
+      tier: delivery.liveTierAttempted,
       ok: !failed,
       ...(failed ? { error: result.reason } : {}),
       ...(input.node ? { node: input.node } : {}),
@@ -136,7 +146,7 @@ async function deliverInterruptTier(context: BuzDeliveryContext): Promise<BuzDel
     result.downgraded = true;
     result.reason = result.reason ?? "tier=interrupt without transport context; downgraded to queue";
     await BUZ_DELIVERY_HANDLERS.queue(context);
-    return { interruptAttempted: false };
+    return {};
   }
 
   const transport = input.transport;
@@ -154,21 +164,60 @@ async function deliverInterruptTier(context: BuzDeliveryContext): Promise<BuzDel
     result.downgraded = true;
     result.reason = `interrupt transport failed: ${error instanceof Error ? error.message : String(error)}`;
     await BUZ_DELIVERY_HANDLERS.queue(context);
-    return { interruptAttempted: true };
+    return { liveTierAttempted: "interrupt" };
   }
 
   await writeRecipientMailbox(context, "inbox");
-  return { interruptAttempted: true };
+  return { liveTierAttempted: "interrupt" };
+}
+
+async function deliverNextToolTier(context: BuzDeliveryContext): Promise<BuzDeliveryOutcome> {
+  const { input, message, result } = context;
+
+  // next-tool needs a substrate that can HOLD the message until the recipient's
+  // next tool boundary (the HSR runner host). Without a transport, or on a
+  // substrate that would just paste immediately (tmux), downgrade to queue so
+  // the semantics stay deterministic rather than silently becoming "now".
+  if (!input.transport || input.transport.substrate.supportsNextTool !== true) {
+    message.deliveredAs = "queue";
+    result.downgraded = true;
+    result.reason = result.reason ?? (input.transport
+      ? `substrate ${input.transport.substrate.kind} cannot hold next-tool delivery; downgraded to queue`
+      : "tier=next-tool without transport context; downgraded to queue");
+    await BUZ_DELIVERY_HANDLERS.queue(context);
+    return {};
+  }
+
+  const transport = input.transport;
+  try {
+    await withFileLock(
+      deliveryLockPath(input.recipient.name),
+      () => transport.substrate.sendText(transport.tmuxTarget, input.body, transport.agentPaneId, { mode: "next-tool" }),
+      { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS },
+    );
+    // deliveredAt marks the hand-off to the runner host; the host flushes at
+    // the next tool boundary (or immediately when the bee is idle).
+    message.deliveredAt = new Date().toISOString();
+  } catch (error) {
+    message.deliveredAs = "queue";
+    result.downgraded = true;
+    result.reason = `next-tool transport failed: ${error instanceof Error ? error.message : String(error)}`;
+    await BUZ_DELIVERY_HANDLERS.queue(context);
+    return { liveTierAttempted: "next-tool" };
+  }
+
+  await writeRecipientMailbox(context, "inbox");
+  return { liveTierAttempted: "next-tool" };
 }
 
 async function deliverQueueTier(context: BuzDeliveryContext): Promise<BuzDeliveryOutcome> {
   await writeRecipientMailbox(context, "queue");
-  return { interruptAttempted: false };
+  return {};
 }
 
 async function deliverPassiveTier(context: BuzDeliveryContext): Promise<BuzDeliveryOutcome> {
   await writeRecipientMailbox(context, "inbox");
-  return { interruptAttempted: false };
+  return {};
 }
 
 async function writeRecipientMailbox(context: BuzDeliveryContext, mailbox: RecipientDeliveryMailbox): Promise<void> {

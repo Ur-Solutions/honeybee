@@ -21,6 +21,7 @@ import type {
   LaunchSpec,
   NewSessionResult,
   ProbeResult,
+  SendTextOptions,
   Substrate,
   TmuxWindowOptions,
 } from "../substrates/types.js";
@@ -43,10 +44,12 @@ async function capture(bee: string, lines?: number): Promise<string> {
 }
 
 /** Deliver a user turn over the bee's control socket. Throws if no live host. */
-async function sendText(bee: string, text: string): Promise<void> {
+async function sendText(bee: string, text: string, _paneId?: string, options?: SendTextOptions): Promise<void> {
   await withHsrTurnDeliveryLock(bee, async () => {
     const meta = await readHsrMeta(bee);
     if (meta?.status === "queued" && isPidAlive(meta.hostPid)) {
+      // A queued host has no live turn — the pending turn drains on start, so
+      // the delivery mode is moot here.
       await enqueuePendingHsrTurn(bee, text);
       return;
     }
@@ -55,7 +58,7 @@ async function sendText(bee: string, text: string): Promise<void> {
     }
     const client = await connectRpcClient(meta.controlSocket);
     try {
-      await client.call("send", { text });
+      await client.call("send", { text, ...(options?.mode === "next-tool" ? { mode: "next-tool" } : {}) });
     } finally {
       client.close();
     }
@@ -127,6 +130,8 @@ export function hsrSubstrate(): Substrate {
   cached = {
     kind: "hsr",
     node: LOCAL_NODE,
+    // The runner host sees tool events inline, so it can hold a next-tool send.
+    supportsNextTool: true,
     async probe(): Promise<ProbeResult> {
       return { ok: true };
     },
@@ -140,7 +145,8 @@ export function hsrSubstrate(): Substrate {
     // killing its runner host (kill), since there is no pane.
     kill: (target: string) => kill(target),
     capture: (target: string, lines?: number) => capture(target, lines),
-    sendText: (target: string, text: string) => sendText(target, text),
+    sendText: (target: string, text: string, paneId?: string, options?: SendTextOptions) =>
+      sendText(target, text, paneId, options),
     // HSR turns are committed atomically by sendText (the runner encodes and
     // flushes one user message); there is no separate terminal Enter/keystroke
     // channel the way tmux has, so these are intentional no-ops.
