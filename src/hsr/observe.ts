@@ -168,10 +168,28 @@ export type HsrObservationOptions = {
   includeEvents?: boolean;
 };
 
+export type HsrEventDerivationOptions = {
+  /** Provider root thread id from meta.json; scoped lifecycle events from other threads are ignored. */
+  rootThreadId?: string;
+};
+
+function lifecycleThreadId(event: RunnerEvent): string | undefined {
+  if ((event.type !== "turn_start" && event.type !== "turn_end") || !("threadId" in event)) return undefined;
+  return typeof event.threadId === "string" && event.threadId.length > 0 ? event.threadId : undefined;
+}
+
+function lifecycleAppliesToRoot(event: RunnerEvent, rootThreadId: string | undefined): boolean {
+  if (!rootThreadId) return true;
+  const threadId = lifecycleThreadId(event);
+  // Legacy events predate lifecycle thread ids; keep treating them as root
+  // markers so older HSR logs and non-Codex adapters preserve their behavior.
+  return threadId === undefined || threadId === rootThreadId;
+}
+
 /**
  * Derive a BeeState from the events.jsonl window. Only the LAST turn markers
- * matter, so we scan the parsed window for the last turn_start/turn_end, the
- * last tool_use, and the last needs_input:
+ * on the root thread matter, so we scan the parsed window for the last
+ * root turn_start/turn_end, the last tool_use, and the last needs_input:
  *   - a login-required auth error in the latest turn → "auth-needed".
  *   - a needs_input with no later turn_end (unresolved) → "blocked".
  *   - a turn in flight (last marker is turn_start) → "active".
@@ -191,7 +209,11 @@ export type HsrObservationOptions = {
  * reading active, which mirrors how an unterminated turn_start already behaves
  * and is the safe direction — a false idle delivers messages mid-work.
  */
-export function structuredStateFromEvents(events: RunnerEvent[]): BeeState | undefined {
+export function structuredStateFromEvents(
+  events: RunnerEvent[],
+  options: HsrEventDerivationOptions = {},
+): BeeState | undefined {
+  const rootThreadId = options.rootThreadId;
   let lastStart = -1;
   let lastEnd = -1;
   let lastTool = -1;
@@ -202,10 +224,10 @@ export function structuredStateFromEvents(events: RunnerEvent[]): BeeState | und
     const event = events[i]!;
     switch (event.type) {
       case "turn_start":
-        lastStart = i;
+        if (lifecycleAppliesToRoot(event, rootThreadId)) lastStart = i;
         break;
       case "turn_end":
-        lastEnd = i;
+        if (lifecycleAppliesToRoot(event, rootThreadId)) lastEnd = i;
         break;
       case "tool_use":
         lastTool = i;
@@ -282,13 +304,13 @@ async function readEventTail(bee: string): Promise<RunnerEvent[]> {
   return raw === null ? [] : parseRunnerEvents(raw);
 }
 
-async function readEventSnapshot(bee: string): Promise<HsrEventSnapshot> {
+async function readEventSnapshot(bee: string, rootThreadId?: string): Promise<HsrEventSnapshot> {
   const events = await readEventTail(bee);
   return {
     events,
     tailEvents: events,
     usage: hsrUsageObservationFromEvents(events),
-    pendingNeedsInput: pendingNeedsInputFromEvents(events),
+    pendingNeedsInput: pendingNeedsInputFromEvents(events, { rootThreadId }),
   };
 }
 
@@ -306,13 +328,14 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
       const live = isMetaLive(meta);
       const snapshot = await hsrSnapshot(bee);
       const mirrorOf = meta?.mirrorOfNode;
-      const eventSnapshot = options.includeEvents ? await readEventSnapshot(bee) : undefined;
+      const rootThreadId = meta?.sessionId;
+      const eventSnapshot = options.includeEvents ? await readEventSnapshot(bee, rootThreadId) : undefined;
       // A dead host's stream is gone — leave state undefined so deriveState
       // settles dead/sealed rather than reporting a stale structured state.
       const state = live
         ? meta?.status === "queued"
           ? "queued"
-          : structuredStateFromEvents(eventSnapshot ? eventSnapshot.tailEvents : await readEventTail(bee))
+          : structuredStateFromEvents(eventSnapshot ? eventSnapshot.tailEvents : await readEventTail(bee), { rootThreadId })
         : undefined;
       observations.set(bee, {
         live,
@@ -344,13 +367,17 @@ export type PendingNeedsInput = {
   options?: string[];
 };
 
-function pendingNeedsInputFromEvents(events: RunnerEvent[]): PendingNeedsInput | null {
+function pendingNeedsInputFromEvents(
+  events: RunnerEvent[],
+  options: HsrEventDerivationOptions = {},
+): PendingNeedsInput | null {
+  const rootThreadId = options.rootThreadId;
   let lastNeeds = -1;
   let lastEnd = -1;
   for (let i = 0; i < events.length; i++) {
     const event = events[i]!;
     if (event.type === "needs_input") lastNeeds = i;
-    else if (event.type === "turn_end") lastEnd = i;
+    else if (event.type === "turn_end" && lifecycleAppliesToRoot(event, rootThreadId)) lastEnd = i;
   }
   // Unresolved iff a needs_input is the last turn marker (nothing ended after it).
   if (lastNeeds < 0 || lastNeeds <= lastEnd) return null;
@@ -372,8 +399,9 @@ function pendingNeedsInputFromEvents(events: RunnerEvent[]): PendingNeedsInput |
  * pending request. Never throws.
  */
 export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
-  if (!isMetaLive(await readHsrMeta(bee))) return null;
-  return pendingNeedsInputFromEvents(await readEventTail(bee));
+  const meta = await readHsrMeta(bee);
+  if (!isMetaLive(meta)) return null;
+  return pendingNeedsInputFromEvents(await readEventTail(bee), { rootThreadId: meta?.sessionId });
 }
 
 /**

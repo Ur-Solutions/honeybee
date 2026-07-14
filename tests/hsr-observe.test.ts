@@ -196,6 +196,36 @@ test("structuredStateFromEvents still reports idle after a turn whose tools all 
   );
 });
 
+test("structuredStateFromEvents ignores nested-thread turn_end while the root turn is active", () => {
+  assert.equal(
+    structuredStateFromEvents(
+      [
+        { type: "turn_start", ts: 1, threadId: "root-thread" },
+        { type: "turn_start", ts: 2, threadId: "nested-thread" },
+        { type: "text", ts: 3, text: "nested output" },
+        { type: "turn_end", ts: 4, threadId: "nested-thread" },
+      ],
+      { rootThreadId: "root-thread" },
+    ),
+    "active",
+  );
+});
+
+test("structuredStateFromEvents reports idle when the root turn_end arrives after nested work", () => {
+  assert.equal(
+    structuredStateFromEvents(
+      [
+        { type: "turn_start", ts: 1, threadId: "root-thread" },
+        { type: "turn_start", ts: 2, threadId: "nested-thread" },
+        { type: "turn_end", ts: 3, threadId: "nested-thread" },
+        { type: "turn_end", ts: 4, threadId: "root-thread" },
+      ],
+      { rootThreadId: "root-thread" },
+    ),
+    "idle_with_output",
+  );
+});
+
 test("an unresolved needs_input still wins over an open tool", () => {
   assert.equal(
     structuredStateFromEvents([

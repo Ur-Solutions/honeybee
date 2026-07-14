@@ -230,6 +230,10 @@ export const HSR_EVENTS_COMPACT_TARGET_BYTES = 512 * 1024;
 
 export type HsrEventsCompactLimits = { keepLines: number; targetBytes: number };
 
+function lifecycleScopeKey(event: Extract<RunnerEvent, { type: "turn_start" | "turn_end" }>): string {
+  return typeof event.threadId === "string" && event.threadId.length > 0 ? event.threadId : "";
+}
+
 /**
  * Compact a bee's events.jsonl: keep the trailing `keepLines` lines (fewer if
  * they exceed `targetBytes`; always at least the last line) and fold the
@@ -239,13 +243,15 @@ export type HsrEventsCompactLimits = { keepLines: number; targetBytes: number };
  *     hsrUsageObservation's cumulative sum is unchanged by compaction;
  *   - the latest dropped `exhausted` event, so the usage sampler's
  *     latest-by-ts exhaustion edge survives even when it fell in the prefix;
- *   - the LAST dropped turn_start / turn_end / needs_input lines, verbatim and
- *     in their original relative order (HIVE-55). The structured-state
- *     derivation and pendingNeedsInput only depend on the relative order of
- *     the last marker of each type, so preserving these makes the derived
- *     state invariant under compaction — a turn whose start scrolled into the
- *     dropped prefix still observes as "active", and an unresolved
- *     needs_input keeps its full payload for `hive answer`;
+ *   - the LAST dropped turn_start / turn_end line PER thread id, plus the last
+ *     needs_input, verbatim and in their original relative order (HIVE-55).
+ *     The structured-state derivation and pendingNeedsInput only depend on the
+ *     relative order of the last marker for the relevant root thread, so
+ *     preserving scoped lifecycle markers makes the derived state invariant
+ *     under compaction — a root turn whose start scrolled into the dropped
+ *     prefix still observes as "active" even if nested-thread markers arrived
+ *     later, and an unresolved needs_input keeps its full payload for `hive
+ *     answer`;
  *   - a minimal `text` stub when the prefix held assistant text but no turn
  *     markers at all, so a marker-less session keeps observing "ready"
  *     rather than regressing to "booting".
@@ -284,8 +290,8 @@ export async function compactHsrEvents(
   let sawUsage = false;
   let usageTs = 0;
   let latestExhausted: { ts: number; resetHint?: string } | undefined;
-  let lastTurnStart: { index: number; line: string } | undefined;
-  let lastTurnEnd: { index: number; line: string } | undefined;
+  let lastTurnStarts = new Map<string, { index: number; line: string }>();
+  let lastTurnEnds = new Map<string, { index: number; line: string }>();
   let lastNeedsInput: { index: number; line: string } | undefined;
   let lastTextTs: number | undefined;
   for (let i = 0; i < keepStart; i++) {
@@ -298,9 +304,9 @@ export async function compactHsrEvents(
       continue; // torn / partial line — drop it
     }
     if (event.type === "turn_start") {
-      lastTurnStart = { index: i, line: lines[i]! };
+      lastTurnStarts.set(lifecycleScopeKey(event), { index: i, line: lines[i]! });
     } else if (event.type === "turn_end") {
-      lastTurnEnd = { index: i, line: lines[i]! };
+      lastTurnEnds.set(lifecycleScopeKey(event), { index: i, line: lines[i]! });
     } else if (event.type === "needs_input") {
       lastNeedsInput = { index: i, line: lines[i]! };
     } else if (event.type === "text") {
@@ -326,8 +332,9 @@ export async function compactHsrEvents(
     checkpoint.push(JSON.stringify({ type: "exhausted", ...latestExhausted } satisfies RunnerEvent));
   }
   // Turn/needs markers in original relative order — observers derive state
-  // from the LAST marker of each type, so this keeps the derivation exact.
-  const markers = [lastTurnStart, lastTurnEnd, lastNeedsInput].filter(
+  // from the LAST marker per root thread, so this keeps the derivation exact
+  // even when Codex collaboration sub-threads emit their own lifecycle markers.
+  const markers = [...lastTurnStarts.values(), ...lastTurnEnds.values(), lastNeedsInput].filter(
     (marker): marker is { index: number; line: string } => marker !== undefined,
   );
   markers.sort((a, b) => a.index - b.index);

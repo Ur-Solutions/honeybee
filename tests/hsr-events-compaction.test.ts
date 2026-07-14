@@ -276,3 +276,29 @@ test("compaction preserves in-flight turn markers and unresolved needs_input (HI
     assert.equal(await pendingNeedsInput(idle), null, "a resolved needs_input must not resurface after compaction");
   });
 });
+
+test("compaction preserves scoped root lifecycle when nested turns are newer", async () => {
+  await withTempStore(async () => {
+    const bee = "compact-scoped-root";
+    await writeEvents(bee, [
+      { type: "turn_start", ts: 1, threadId: "root-thread" },
+      { type: "text", ts: 2, text: "root still working" },
+      { type: "turn_start", ts: 3, threadId: "nested-thread" },
+      { type: "turn_end", ts: 4, threadId: "nested-thread" },
+      ...Array.from({ length: 50 }, (_, i): RunnerEvent => ({ type: "text", ts: 5 + i, text: `chunk-${i}` })),
+    ]);
+    await writeHsrMeta(bee, { ...liveMeta(bee), harness: "codex", tier: "server", sessionId: "root-thread" });
+
+    await compactHsrEvents(bee, { keepLines: 10, targetBytes: 10_000 });
+
+    assert.equal(
+      (await hsrObservations()).get(bee)?.state,
+      "active",
+      "nested lifecycle checkpoints must not hide the root in-flight turn",
+    );
+    assert.ok(
+      (await readLines(bee)).some((line) => line.includes('"threadId":"root-thread"')),
+      "compaction must keep the dropped root lifecycle marker",
+    );
+  });
+});

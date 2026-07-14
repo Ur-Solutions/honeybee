@@ -26,8 +26,8 @@ export type RunnerTier = "server" | "stream" | "turn" | "pty";
  * ring buffer that backs `RunnerSession.snapshot()`.
  */
 export type RunnerEvent =
-  | { type: "turn_start"; ts: number }
-  | { type: "turn_end"; ts: number }
+  | { type: "turn_start"; ts: number; threadId?: string }
+  | { type: "turn_end"; ts: number; threadId?: string }
   | { type: "text"; ts: number; text: string } // assistant output chunk (feeds ring buffer)
   | { type: "tool_use"; ts: number; tool: string; input?: unknown }
   | { type: "usage"; ts: number; inputTokens?: number; outputTokens?: number; totalTokens?: number }
