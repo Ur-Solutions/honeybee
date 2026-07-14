@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { findFilesCached, memoizedDerived, readJsonlCached } from "./cache.js";
 import { parseTimestampMs, scoreTranscript, transcriptStartMs } from "./scoring.js";
-import { firstUserPromptTitle, normalizeForMatch, normalizeTitleCandidate, textFromContent } from "./text.js";
+import { firstUserPromptTitle, isInjectedUserContext, normalizeForMatch, normalizeTitleCandidate, textFromContent } from "./text.js";
 import type { StatHint, TranscriptAdapter, TranscriptFile, TranscriptLookupOptions, TranscriptRow } from "./types.js";
 import { isGeneratorTranscriptCwd } from "./util.js";
 
@@ -58,7 +58,7 @@ function codexEventMessages(rows: TranscriptRow[]): CodexEventMessages {
     if (!payload || typeof payload.message !== "string") continue;
     const role = codexEventRole(payload.type);
     if (!role) continue;
-    if (role === "user" && isInjectedCodexContext(payload.message)) continue;
+    if (role === "user" && isInjectedUserContext(payload.message)) continue;
     const text = normalizeForMatch(payload.message);
     if (text) seen[role].add(text);
   }
@@ -81,7 +81,7 @@ function normalizeCodexRow(row: TranscriptRow, eventMessages: CodexEventMessages
   if (!payload) return [];
   if (row.type === "event_msg") {
     if (payload.type === "user_message" && typeof payload.message === "string") {
-      if (isInjectedCodexContext(payload.message)) return [];
+      if (isInjectedUserContext(payload.message)) return [];
       return [{ type: "user", timestamp: row.timestamp, message: { role: "user", content: payload.message } }];
     }
     if (payload.type === "agent_message" && typeof payload.message === "string") {
@@ -95,20 +95,13 @@ function normalizeCodexRow(row: TranscriptRow, eventMessages: CodexEventMessages
     if (role !== "user" && role !== "assistant") return [];
     const content = textFromContent(payload.content);
     if (!content) return [];
-    if (role === "user" && isInjectedCodexContext(content)) return [];
+    if (role === "user" && isInjectedUserContext(content)) return [];
     // The event_msg stream already carries this exact conversation message;
     // keeping the response_item copy would duplicate it in the render.
     if (hasCodexEventMessage(eventMessages, role, content)) return [];
     return [{ type: role, timestamp: row.timestamp, message: { role, content } }];
   }
   return [];
-}
-
-// response_item user rows embed harness-injected blobs that should never be
-// rendered (or win the first-user-prompt title fallback).
-function isInjectedCodexContext(text: string): boolean {
-  const trimmed = text.trimStart();
-  return trimmed.startsWith("<environment_context>") || trimmed.startsWith("<user_instructions>");
 }
 
 function codexSessionStartMs(rows: TranscriptRow[]): number | null {

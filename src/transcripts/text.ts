@@ -28,6 +28,22 @@ export function renderTranscript(rows: TranscriptRow[], options: { limit?: numbe
 const COMMAND_NOISE_RE =
   /<(local-command-caveat|command-name|command-message|command-args|command-contents|local-command-stdout|system-reminder)\b[^>]*>[\s\S]*?<\/\1>/gi;
 
+/**
+ * User-role rows that are injected by a harness before the human's prompt.
+ * Keep this guard in the shared fallback as well as provider adapters: a new
+ * Codex carrier shape must not be able to turn bootstrap context into a bee
+ * title merely because an adapter has not learned that shape yet.
+ */
+export function isInjectedUserContext(text: string): boolean {
+  const trimmed = text.trimStart();
+  return (
+    trimmed.startsWith("<environment_context>") ||
+    trimmed.startsWith("<user_instructions>") ||
+    trimmed.startsWith("<recommended_plugins>") ||
+    /^#\s*agents\.md instructions\b/i.test(trimmed)
+  );
+}
+
 export function stripCommandNoise(text: string): string {
   return text.replace(COMMAND_NOISE_RE, "").replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -39,6 +55,7 @@ export function firstUserText(rows: TranscriptRow[]): string {
     // Skip rows that are pure command/harness noise; strip residual noise from
     // the first row that carries a real message.
     const text = stripCommandNoise(textFromContent(row.message?.content ?? row.content));
+    if (isInjectedUserContext(text)) continue;
     if (text) return text;
   }
   return "";
@@ -74,7 +91,9 @@ export function firstUserPromptTitle(rows: TranscriptRow[]): string | undefined 
   for (const row of rows) {
     const role = row.message?.role ?? row.type;
     if (role !== "user") continue;
-    const title = normalizeTitleCandidate(row.message?.content ?? row.content);
+    const content = textFromContent(row.message?.content ?? row.content);
+    if (isInjectedUserContext(content)) continue;
+    const title = normalizeTitleCandidate(content);
     if (title) return title;
   }
   return undefined;

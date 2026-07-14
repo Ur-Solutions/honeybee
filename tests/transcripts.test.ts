@@ -296,6 +296,8 @@ test("latestTranscript dedupes Codex dual-format rollouts and filters injected c
         JSON.stringify({ type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "# Instructions: you are Codex" }] } }),
         JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<user_instructions>\nfollow AGENTS.md\n</user_instructions>" }] } }),
         JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>\n<cwd>/tmp</cwd>\n</environment_context>" }] } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "# Agents.md instructions\n\nUse the repo guidance." } }),
+        JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "# AGENTS.md instructions\n\nUse the repo guidance." }] } }),
         JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Fix the flaky test" } }),
         JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Fix the flaky test" }] } }),
         JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done, the test is deflaked." }] } }),
@@ -479,6 +481,21 @@ test("firstUserText skips noise-only rows and returns the first real user messag
     { type: "user", message: { role: "user", content: "<local-command-caveat>noise</local-command-caveat>\nMigrate the store to SQLite" } },
   ];
   assert.equal(firstUserText(rows), "Migrate the store to SQLite");
+});
+
+test("firstUserText defensively skips Codex bootstrap rows before the real prompt", () => {
+  const rows: TranscriptRow[] = [
+    {
+      type: "user",
+      message: {
+        role: "user",
+        content:
+          "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>be good</INSTRUCTIONS>\n<environment_context><cwd>/repo</cwd></environment_context>",
+      },
+    },
+    { type: "user", message: { role: "user", content: "Repair the session titles" } },
+  ];
+  assert.equal(firstUserText(rows), "Repair the session titles");
 });
 
 test("firstUserText returns empty when every user row is pure command noise", () => {
