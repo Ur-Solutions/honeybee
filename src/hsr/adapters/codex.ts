@@ -25,7 +25,7 @@
  */
 
 import type { ChildProcess } from "node:child_process";
-import type { RunnerAdapter, RunnerEvent, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
+import type { RunnerAdapter, RunnerEvent, RunnerInputQuestion, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
 import { harnessAllowance } from "../harness.js";
 import { attachSessionPlumbing, spawnSessionChild, stopChildGroup } from "../sessionBase.js";
 import {
@@ -220,6 +220,22 @@ export function codexServerRequestToNeedsInput(
 ): RunnerEvent | null {
   if (!CODEX_APPROVAL_METHODS.has(method)) return null;
   const p = asObject(params) ?? {};
+  if (method === "item/tool/requestUserInput") {
+    const questions = codexInputQuestions(params);
+    const first = questions[0];
+    if (!first) return null;
+    return {
+      type: "needs_input",
+      ts: 0,
+      kind: "question",
+      question: first.question,
+      ...(first.options ? { options: first.options.map((option) => option.label), optionDetails: first.options } : {}),
+      questions,
+      tool: method,
+      input: params,
+      requestId: String(id),
+    };
+  }
   const reason = typeof p.reason === "string" && p.reason.length > 0 ? p.reason : undefined;
   const command = typeof p.command === "string" ? p.command : undefined;
   const question = reason ?? command ?? `codex requests approval: ${method}`;
@@ -234,6 +250,50 @@ export function codexServerRequestToNeedsInput(
   };
 }
 
+function codexInputQuestions(params: unknown): RunnerInputQuestion[] {
+  const questions = asObject(params)?.questions;
+  if (!Array.isArray(questions)) return [];
+  return questions.flatMap((raw): RunnerInputQuestion[] => {
+    const question = asObject(raw);
+    if (!question || typeof question.question !== "string" || question.question.length === 0) return [];
+    const options = Array.isArray(question.options)
+      ? question.options.flatMap((rawOption) => {
+          const option = asObject(rawOption);
+          if (!option || typeof option.label !== "string") return [];
+          return [{
+            label: option.label,
+            ...(typeof option.description === "string" ? { description: option.description } : {}),
+          }];
+        })
+      : undefined;
+    return [{
+      ...(typeof question.id === "string" ? { id: question.id } : {}),
+      ...(typeof question.header === "string" ? { header: question.header } : {}),
+      question: question.question,
+      ...(options && options.length > 0 ? { options } : {}),
+    }];
+  });
+}
+
+function codexQuestionAnswers(answer: string, params: unknown): Record<string, { answers: string[] }> {
+  const questions = codexInputQuestions(params);
+  let supplied: Record<string, unknown> | undefined;
+  try {
+    supplied = asObject(JSON.parse(answer));
+  } catch {
+    supplied = undefined;
+  }
+  const answers: Record<string, { answers: string[] }> = {};
+  for (const [index, question] of questions.entries()) {
+    if (!question.id) continue;
+    const value = supplied?.[question.id] ?? supplied?.[question.question] ?? (index === 0 ? answer : undefined);
+    if (Array.isArray(value)) answers[question.id] = { answers: value.map(String) };
+    else if (typeof value === "string") answers[question.id] = { answers: [value] };
+    else if (value !== undefined) answers[question.id] = { answers: [String(value)] };
+  }
+  return answers;
+}
+
 /**
  * Build the JSON-RPC RESPONSE body for an approval server-request, given the
  * method it answers and whether the user approved. Each server-request method
@@ -242,10 +302,15 @@ export function codexServerRequestToNeedsInput(
  *   item/commandExecution/requestApproval    → { decision: CommandExecutionApprovalDecision } ("accept"|"decline")
  *   item/fileChange/requestApproval          → { decision: FileChangeApprovalDecision }       ("accept"|"decline")
  *   item/permissions/requestApproval         → { permissions: {}, scope: "turn" }  (grant-based; no decision field)
- *   item/tool/requestUserInput               → { answers: {} }                     (structural; can't map yes/no)
+ *   item/tool/requestUserInput               → { answers: { [questionId]: { answers: string[] } } }
  * With approvalPolicy "never" these never fire — this is a best-effort fallback.
  */
-export function encodeCodexApprovalResponse(method: string, approved: boolean): unknown {
+export function encodeCodexApprovalResponse(
+  method: string,
+  approved: boolean,
+  answer = "",
+  params?: unknown,
+): unknown {
   switch (method) {
     case "execCommandApproval":
     case "applyPatchApproval":
@@ -259,7 +324,7 @@ export function encodeCodexApprovalResponse(method: string, approved: boolean): 
       // synthesize a broad grant here, so both paths send the minimal (empty) grant.
       return { permissions: {}, scope: "turn" };
     case "item/tool/requestUserInput":
-      return { answers: {} };
+      return { answers: codexQuestionAnswers(answer, params) };
     default:
       return { decision: approved ? "approved" : "denied" };
   }
@@ -515,7 +580,7 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   // Track the live thread + turn ids so interrupt/turn-start carry them.
   let threadId = "";
   let currentTurnId = "";
-  const requestMethods = new Map<string, string>(); // needs_input requestId → server method
+  const requestMethods = new Map<string, { method: string; params: unknown }>(); // requestId → response context
 
   const rememberTurnId = (params: unknown): void => {
     const p = asObject(params);
@@ -537,7 +602,7 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
       peer.respondError(id, CODEX_RPC_METHOD_NOT_FOUND, `unsupported server request: ${method}`);
       return;
     }
-    if (ev.type === "needs_input" && ev.requestId) requestMethods.set(ev.requestId, method);
+    if (ev.type === "needs_input" && ev.requestId) requestMethods.set(ev.requestId, { method, params });
     ingestEvent(ev);
   });
 
@@ -577,11 +642,11 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   }
 
   async function answer(requestId: string, answerText: string): Promise<void> {
-    const method = requestMethods.get(requestId);
-    if (!method) throw new Error(`hsr codex: no pending approval for requestId ${requestId}`);
+    const pending = requestMethods.get(requestId);
+    if (!pending) throw new Error(`hsr codex: no pending input for requestId ${requestId}`);
     requestMethods.delete(requestId);
     const id: string | number = /^\d+$/.test(requestId) ? Number(requestId) : requestId;
-    peer.respond(id, encodeCodexApprovalResponse(method, isApproval(answerText)));
+    peer.respond(id, encodeCodexApprovalResponse(pending.method, isApproval(answerText), answerText, pending.params));
   }
 
   async function interrupt(): Promise<void> {

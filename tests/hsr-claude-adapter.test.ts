@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { buildClaudeStreamConfig, claudeAdapter } from "../src/hsr/adapters/claude.js";
+import { buildClaudeStreamConfig, claudeAdapter, encodeClaudeQuestionAnswer } from "../src/hsr/adapters/claude.js";
 import { adapterFor } from "../src/hsr/adapters/index.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
@@ -70,6 +70,73 @@ test("parseLine returns [] on non-JSON and unknown types", () => {
   const { config } = buildClaudeStreamConfig(optsFor());
   assert.deepEqual(config.parseLine("not json {"), []);
   assert.deepEqual(config.parseLine(JSON.stringify({ type: "mystery" })), []);
+});
+
+test("AskUserQuestion control request maps to a rich needs_input event", () => {
+  const { config } = buildClaudeStreamConfig(optsFor());
+  const input = {
+    questions: [{
+      header: "Deploy",
+      question: "Where should this ship?",
+      options: [
+        { label: "Staging", description: "Deploy to the staging environment." },
+        { label: "Production", description: "Deploy to production." },
+      ],
+      multiSelect: false,
+    }],
+  };
+  const line = JSON.stringify({
+    type: "control_request",
+    request_id: "permission-1",
+    request: { subtype: "can_use_tool", tool_name: "AskUserQuestion", input },
+  });
+  assert.deepEqual(parseStripTs(config.parseLine, line), [{
+    type: "needs_input",
+    kind: "question",
+    question: "Where should this ship?",
+    options: ["Staging", "Production"],
+    optionDetails: input.questions[0]!.options,
+    multiSelect: false,
+    questions: [{ ...input.questions[0], options: input.questions[0]!.options }],
+    tool: "AskUserQuestion",
+    input,
+    requestId: "permission-1",
+  }]);
+});
+
+test("AskUserQuestion answer uses Claude's can_use_tool control response", () => {
+  const input = {
+    questions: [{ header: "Deploy", question: "Where should this ship?", options: [], multiSelect: false }],
+  };
+  assert.deepEqual(JSON.parse(encodeClaudeQuestionAnswer("permission-1", "Staging", input)), {
+    type: "control_response",
+    response: {
+      subtype: "success",
+      request_id: "permission-1",
+      response: {
+        behavior: "allow",
+        updatedInput: { ...input, answers: { "Where should this ship?": "Staging" } },
+      },
+    },
+  });
+});
+
+test("configured Claude encodeAnswer requires a live request and preserves multi-question JSON answers", () => {
+  const { config } = buildClaudeStreamConfig(optsFor());
+  const input = {
+    questions: [
+      { header: "Target", question: "Where?", options: [], multiSelect: false },
+      { header: "Checks", question: "Which checks?", options: [], multiSelect: true },
+    ],
+  };
+  config.parseLine(JSON.stringify({
+    type: "control_request",
+    request_id: "permission-2",
+    request: { subtype: "can_use_tool", tool_name: "AskUserQuestion", input },
+  }));
+  const encoded = JSON.parse(config.encodeAnswer!("permission-2", JSON.stringify({ Where: "ignored", "Where?": "Prod", "Which checks?": ["A", "B"] })));
+  assert.deepEqual(encoded.response.response.updatedInput.answers, { "Where?": "Prod", "Which checks?": "A, B" });
+  assert.throws(() => config.encodeAnswer!("missing", "answer"), /no pending question/);
 });
 
 test("sessionIdFromEvent returns the init line's session_id", () => {

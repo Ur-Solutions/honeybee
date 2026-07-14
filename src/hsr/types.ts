@@ -20,6 +20,21 @@
  */
 export type RunnerTier = "server" | "stream" | "turn" | "pty";
 
+/** Provider-neutral structured option/question payload for human input. */
+export type RunnerInputOption = {
+  label: string;
+  description?: string;
+};
+
+export type RunnerInputQuestion = {
+  /** Provider question key (Codex); Claude keys answers by question text. */
+  id?: string;
+  header?: string;
+  question: string;
+  options?: RunnerInputOption[];
+  multiSelect?: boolean;
+};
+
 /**
  * A structured event emitted by a running harness. Replaces screen-scraping:
  * these feed `deriveState`, needs-input detection, the usage sampler, and the
@@ -49,7 +64,13 @@ export type RunnerEvent =
       ts: number;
       kind: "permission" | "question";
       question: string;
+      /** Legacy flat labels for clients that only support one question. */
       options?: string[];
+      /** Rich form of `options`, retaining descriptions. */
+      optionDetails?: RunnerInputOption[];
+      /** Full provider payload; present when a tool asks one or more questions. */
+      questions?: RunnerInputQuestion[];
+      multiSelect?: boolean;
       tool?: string;
       input?: unknown;
       requestId?: string;

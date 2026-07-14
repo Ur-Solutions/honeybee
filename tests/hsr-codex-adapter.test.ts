@@ -159,6 +159,45 @@ test("codexServerRequestToNeedsInput handles legacy execCommandApproval + a stri
   assert.equal(ev.question, "codex requests approval: execCommandApproval");
 });
 
+test("codex requestUserInput preserves question ids, descriptions, and answer response shape", () => {
+  const params = {
+    threadId: "t-1",
+    turnId: "turn-1",
+    itemId: "i-1",
+    questions: [{
+      id: "environment",
+      header: "Deploy",
+      question: "Where should this ship?",
+      isOther: true,
+      isSecret: false,
+      options: [
+        { label: "Staging", description: "Use staging." },
+        { label: "Production", description: "Use production." },
+      ],
+    }],
+    autoResolutionMs: null,
+  };
+  const ev = codexServerRequestToNeedsInput("item/tool/requestUserInput", 8, params);
+  assert.ok(ev && ev.type === "needs_input");
+  assert.equal(ev.kind, "question");
+  assert.equal(ev.question, "Where should this ship?");
+  assert.deepEqual(ev.options, ["Staging", "Production"]);
+  assert.deepEqual(ev.optionDetails, params.questions[0]!.options);
+  assert.deepEqual(ev.questions, [{
+    id: "environment",
+    header: "Deploy",
+    question: "Where should this ship?",
+    options: params.questions[0]!.options,
+  }]);
+  assert.deepEqual(encodeCodexApprovalResponse("item/tool/requestUserInput", true, "Production", params), {
+    answers: { environment: { answers: ["Production"] } },
+  });
+  assert.deepEqual(
+    encodeCodexApprovalResponse("item/tool/requestUserInput", true, JSON.stringify({ environment: ["Staging", "Production"] }), params),
+    { answers: { environment: { answers: ["Staging", "Production"] } } },
+  );
+});
+
 test("codexServerRequestToNeedsInput returns null for unmodeled server requests", () => {
   assert.equal(codexServerRequestToNeedsInput("attestation/generate", 1, {}), null);
   assert.equal(codexServerRequestToNeedsInput("account/chatgptAuthTokens/refresh", 2, {}), null);

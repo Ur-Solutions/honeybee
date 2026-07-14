@@ -16,7 +16,14 @@
  * Node builtins only.
  */
 
-import type { RunnerAdapter, RunnerEvent, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
+import type {
+  RunnerAdapter,
+  RunnerEvent,
+  RunnerInputQuestion,
+  RunnerOpts,
+  RunnerSession,
+  RunnerTier,
+} from "../types.js";
 import { startStreamRunner, type StreamRunnerConfig } from "../streamRunner.js";
 import { harnessAllowance } from "../harness.js";
 
@@ -27,6 +34,50 @@ function asObject(value: unknown): Record<string, unknown> | undefined {
 
 function toNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Parse one raw claude stream-json line into zero or more RunnerEvents. */
+function parseClaudeQuestions(input: unknown): RunnerInputQuestion[] {
+  const questions = asObject(input)?.questions;
+  if (!Array.isArray(questions)) return [];
+  return questions.flatMap((raw): RunnerInputQuestion[] => {
+    const q = asObject(raw);
+    if (!q || typeof q.question !== "string" || q.question.length === 0) return [];
+    const options = Array.isArray(q.options)
+      ? q.options.flatMap((rawOption) => {
+          const option = asObject(rawOption);
+          if (!option || typeof option.label !== "string") return [];
+          return [{
+            label: option.label,
+            ...(typeof option.description === "string" ? { description: option.description } : {}),
+          }];
+        })
+      : undefined;
+    return [{
+      question: q.question,
+      ...(typeof q.header === "string" ? { header: q.header } : {}),
+      ...(options && options.length > 0 ? { options } : {}),
+      ...(typeof q.multiSelect === "boolean" ? { multiSelect: q.multiSelect } : {}),
+    }];
+  });
+}
+
+function claudeNeedsInput(requestId: string, input: unknown): RunnerEvent | null {
+  const questions = parseClaudeQuestions(input);
+  const first = questions[0];
+  if (!first) return null;
+  return {
+    type: "needs_input",
+    ts: Date.now(),
+    kind: "question",
+    question: first.question,
+    ...(first.options ? { options: first.options.map((option) => option.label), optionDetails: first.options } : {}),
+    ...(first.multiSelect !== undefined ? { multiSelect: first.multiSelect } : {}),
+    questions,
+    tool: "AskUserQuestion",
+    input,
+    requestId,
+  };
 }
 
 /** Parse one raw claude stream-json line into zero or more RunnerEvents. */
@@ -41,6 +92,16 @@ function parseClaudeLine(line: string): RunnerEvent[] {
   if (!msg || typeof msg.type !== "string") return [];
 
   switch (msg.type) {
+    case "control_request": {
+      const request = asObject(msg.request);
+      if (
+        request?.subtype !== "can_use_tool" ||
+        request.tool_name !== "AskUserQuestion" ||
+        typeof msg.request_id !== "string"
+      ) return [];
+      const event = claudeNeedsInput(msg.request_id, request.input);
+      return event ? [event] : [];
+    }
     case "system":
       // init → sessionId learned via sessionIdFromEvent; thinking_tokens → progress ping.
       return [];
@@ -130,6 +191,37 @@ function encodeClaudeUserTurn(text: string): string {
   return `${JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text }] } })}\n`;
 }
 
+function parsedAnswerMap(answer: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(answer);
+    return asObject(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Encode a response to Claude's stream-json can_use_tool control request. */
+export function encodeClaudeQuestionAnswer(requestId: string, answer: string, input: unknown): string {
+  const questions = parseClaudeQuestions(input);
+  const supplied = parsedAnswerMap(answer);
+  const answers: Record<string, string> = {};
+  for (const [index, question] of questions.entries()) {
+    const value = supplied?.[question.question] ?? supplied?.[question.id ?? ""] ?? (index === 0 ? answer : undefined);
+    if (typeof value === "string") answers[question.question] = value;
+    else if (Array.isArray(value)) answers[question.question] = value.map(String).join(", ");
+    else if (value !== undefined) answers[question.question] = String(value);
+  }
+  const original = asObject(input) ?? {};
+  return `${JSON.stringify({
+    type: "control_response",
+    response: {
+      subtype: "success",
+      request_id: requestId,
+      response: { behavior: "allow", updatedInput: { ...original, answers } },
+    },
+  })}\n`;
+}
+
 /**
  * Encode an in-band turn interrupt (stream-json control protocol): claude ends
  * the current turn (emitting its result line) and keeps the session alive —
@@ -205,16 +297,28 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
   const env: Record<string, string> = { ...opts.env };
   for (const key of policy?.scrubEnv ?? []) delete env[key];
 
+  const pendingQuestions = new Map<string, unknown>();
+  const parseLine = (line: string): RunnerEvent[] => {
+    const events = parseClaudeLine(line);
+    for (const event of events) {
+      if (event.type === "needs_input" && event.requestId) pendingQuestions.set(event.requestId, event.input);
+    }
+    return events;
+  };
   const config: StreamRunnerConfig = {
     harness: "claude",
     tier: "stream",
     command,
     args,
-    parseLine: parseClaudeLine,
+    parseLine,
     encodeUserTurn: encodeClaudeUserTurn,
     encodeInterrupt: encodeClaudeInterrupt,
-    // encodeAnswer omitted for v1 — claude permission routing is deferred; yolo
-    // mode has no prompts to answer.
+    encodeAnswer: (requestId, answer) => {
+      const input = pendingQuestions.get(requestId);
+      if (input === undefined) throw new Error(`hsr claude: no pending question for requestId ${requestId}`);
+      pendingQuestions.delete(requestId);
+      return encodeClaudeQuestionAnswer(requestId, answer, input);
+    },
     sessionIdFromEvent: sessionIdFromClaudeEvent,
   };
 

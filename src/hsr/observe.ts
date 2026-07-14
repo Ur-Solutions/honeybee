@@ -366,6 +366,10 @@ export type PendingNeedsInput = {
   question: string;
   tool?: string;
   options?: string[];
+  optionDetails?: Extract<RunnerEvent, { type: "needs_input" }>["optionDetails"];
+  questions?: Extract<RunnerEvent, { type: "needs_input" }>["questions"];
+  multiSelect?: boolean;
+  input?: unknown;
 };
 
 function pendingNeedsInputFromEvents(
@@ -390,6 +394,10 @@ function pendingNeedsInputFromEvents(
     question: event.question,
     ...(event.tool ? { tool: event.tool } : {}),
     ...(event.options ? { options: event.options } : {}),
+    ...(event.optionDetails ? { optionDetails: event.optionDetails } : {}),
+    ...(event.questions ? { questions: event.questions } : {}),
+    ...(event.multiSelect !== undefined ? { multiSelect: event.multiSelect } : {}),
+    ...(event.input !== undefined ? { input: event.input } : {}),
   };
 }
 
