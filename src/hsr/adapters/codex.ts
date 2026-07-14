@@ -44,6 +44,14 @@ function toNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function notificationThreadId(params: Record<string, unknown>): string | undefined {
+  return stringField(params.threadId) ?? stringField(params.thread_id);
+}
+
 // --- PURE MAPPERS (exported for hermetic tests) ------------------------------
 
 /**
@@ -64,14 +72,15 @@ export function codexNotificationToEvents(method: string, params: unknown): Runn
   const now = 0; // stamped downstream
   switch (method) {
     case "turn/started":
-      return [{ type: "turn_start", ts: now }];
+      return [{ type: "turn_start", ts: now, ...(notificationThreadId(p) ? { threadId: notificationThreadId(p) } : {}) }];
     case "item/agentMessage/delta": {
       const delta = typeof p.delta === "string" ? p.delta : "";
       if (delta.length === 0) return [];
       return [{ type: "text", ts: now, text: delta }];
     }
     case "turn/completed": {
-      const events: RunnerEvent[] = [{ type: "turn_end", ts: now }];
+      const threadId = notificationThreadId(p);
+      const events: RunnerEvent[] = [{ type: "turn_end", ts: now, ...(threadId ? { threadId } : {}) }];
       // Defensive: the base TurnCompletedNotification body is {threadId, turn}
       // and carries no tokens, but honor a token breakdown if a variant supplies
       // one on `usage` (TokenUsageBreakdown-shaped) or `tokenUsage` (ThreadTokenUsage).
@@ -263,7 +272,7 @@ function isApproval(answer: string): boolean {
 
 // --- adapter -----------------------------------------------------------------
 
-/** codex app-server flags: fixed subcommand; caller argv is ignored for tier "server". */
+/** codex app-server flags: fixed subcommand; most caller argv is ignored for tier "server". */
 const CODEX_APP_SERVER_ARGS = ["app-server"];
 
 // codex-cli 0.144.0 acknowledges initialize before its asynchronous online
@@ -337,6 +346,56 @@ export function buildCodexSpawn(opts: RunnerOpts): { command: string; args: stri
   const env: Record<string, string> = { ...opts.env };
   for (const key of harnessAllowance("codex", authKind)?.scrubEnv ?? []) delete env[key];
   return { command, args: [...CODEX_APP_SERVER_ARGS], env };
+}
+
+/**
+ * Codex HSR runs `codex app-server`, whose child argv ignores normal TUI model
+ * flags. Recover the effective CLI model selector and pass it through the
+ * app-server `thread/start` request instead. Last flag wins, matching Codex CLI
+ * config precedence (`--model gpt-5.5 --model gpt-5.6-sol` -> Sol).
+ */
+export function codexModelFromArgs(args: readonly string[] | undefined): string | undefined {
+  let model: string | undefined;
+  const list = args ?? [];
+  for (let i = 0; i < list.length; i++) {
+    const arg = list[i]!;
+    if ((arg === "-m" || arg === "--model") && list[i + 1]) {
+      model = list[i + 1]!;
+      i++;
+      continue;
+    }
+    if (arg.startsWith("--model=")) {
+      const value = arg.slice("--model=".length);
+      if (value.length > 0) model = value;
+      continue;
+    }
+    if (arg.startsWith("-m=")) {
+      const value = arg.slice("-m=".length);
+      if (value.length > 0) model = value;
+    }
+  }
+  return model;
+}
+
+export function buildCodexThreadRequestParams(
+  opts: RunnerOpts,
+  method: "thread/start" | "thread/resume",
+): Record<string, unknown> {
+  const model = codexModelFromArgs(opts.args) ?? opts.model;
+  return method === "thread/resume"
+    ? {
+        threadId: opts.sessionId as string,
+        ...(model ? { model } : {}),
+        cwd: opts.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      }
+    : {
+        ...(model ? { model } : {}),
+        cwd: opts.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      };
 }
 
 type LiveCodexHandshakeAttempt = CodexThreadHandshakeAttempt<unknown> & {
@@ -430,20 +489,7 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   const bee = opts.bee;
   const { command, args, env } = buildCodexSpawn(opts);
   const method = opts.resume && opts.sessionId ? "thread/resume" : "thread/start";
-  const requestParams = method === "thread/resume"
-    ? {
-        threadId: opts.sessionId as string,
-        ...(opts.model ? { model: opts.model } : {}),
-        cwd: opts.cwd,
-        approvalPolicy: "never",
-        sandbox: "danger-full-access",
-      }
-    : {
-        ...(opts.model ? { model: opts.model } : {}),
-        cwd: opts.cwd,
-        approvalPolicy: "never",
-        sandbox: "danger-full-access",
-      };
+  const requestParams = buildCodexThreadRequestParams(opts, method);
 
   const handshake = await retryCodexThreadHandshake(
     () => createLiveCodexHandshakeAttempt({ command, args, env, opts, method, requestParams }),

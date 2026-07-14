@@ -14,7 +14,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  buildCodexThreadRequestParams,
   codexAdapter,
+  codexModelFromArgs,
   codexNotificationToEvents,
   codexServerRequestToNeedsInput,
   encodeCodexApprovalResponse,
@@ -23,7 +25,7 @@ import {
 } from "../src/hsr/adapters/codex.js";
 import { CodexRpcRequestTimeoutError } from "../src/hsr/adapters/codexRpc.js";
 import { adapterFor } from "../src/hsr/adapters/index.js";
-import type { RunnerEvent } from "../src/hsr/types.js";
+import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
 
 /** Strip the ts field so event shapes assert deterministically. */
 function stripTs(events: RunnerEvent[]): unknown[] {
@@ -36,7 +38,9 @@ function stripTs(events: RunnerEvent[]): unknown[] {
 test("codexNotificationToEvents maps turn/started → [turn_start]", () => {
   // TurnStartedNotification = { threadId, turn }
   const params = { threadId: "t-1", turn: { id: "turn-1", status: "in_progress" } };
-  assert.deepEqual(stripTs(codexNotificationToEvents("turn/started", params)), [{ type: "turn_start" }]);
+  assert.deepEqual(stripTs(codexNotificationToEvents("turn/started", params)), [
+    { type: "turn_start", threadId: "t-1" },
+  ]);
 });
 
 test("codexNotificationToEvents maps item/agentMessage/delta → [text]", () => {
@@ -52,7 +56,9 @@ test("codexNotificationToEvents maps item/agentMessage/delta → [text]", () => 
 test("codexNotificationToEvents maps turn/completed → [turn_end]; +usage when a token breakdown is present", () => {
   // Base TurnCompletedNotification = { threadId, turn } carries no tokens.
   const bare = { threadId: "t-1", turn: { id: "turn-1", status: "completed" } };
-  assert.deepEqual(stripTs(codexNotificationToEvents("turn/completed", bare)), [{ type: "turn_end" }]);
+  assert.deepEqual(stripTs(codexNotificationToEvents("turn/completed", bare)), [
+    { type: "turn_end", threadId: "t-1" },
+  ]);
 
   // Defensive: honor a TokenUsageBreakdown-shaped `usage` if a variant supplies it.
   const withUsage = {
@@ -61,8 +67,17 @@ test("codexNotificationToEvents maps turn/completed → [turn_end]; +usage when 
     usage: { totalTokens: 50, inputTokens: 9, cachedInputTokens: 0, outputTokens: 41, reasoningOutputTokens: 0 },
   };
   assert.deepEqual(stripTs(codexNotificationToEvents("turn/completed", withUsage)), [
-    { type: "turn_end" },
+    { type: "turn_end", threadId: "t-1" },
     { type: "usage", inputTokens: 9, outputTokens: 41, totalTokens: 50 },
+  ]);
+});
+
+test("codexNotificationToEvents leaves unscoped lifecycle events backward-compatible", () => {
+  assert.deepEqual(stripTs(codexNotificationToEvents("turn/started", { turn: { id: "turn-1" } })), [
+    { type: "turn_start" },
+  ]);
+  assert.deepEqual(stripTs(codexNotificationToEvents("turn/completed", { turn: { id: "turn-1" } })), [
+    { type: "turn_end" },
   ]);
 });
 
@@ -94,7 +109,9 @@ test("codexNotificationToEvents never maps cumulative tokenUsage.total as a usag
   };
 
   assert.deepEqual(codexNotificationToEvents("thread/tokenUsage/updated", params), []);
-  assert.deepEqual(stripTs(codexNotificationToEvents("turn/completed", params)), [{ type: "turn_end" }]);
+  assert.deepEqual(stripTs(codexNotificationToEvents("turn/completed", params)), [
+    { type: "turn_end", threadId: "t-1" },
+  ]);
 });
 
 test("codexNotificationToEvents maps error → [error] from error.message", () => {
@@ -164,6 +181,38 @@ test("adapterFor resolves codex; codexAdapter is harness codex, tier server", ()
   assert.equal(adapterFor("codex"), codexAdapter);
   assert.equal(codexAdapter.harness, "codex");
   assert.equal(codexAdapter.tier(), "server");
+});
+
+test("codexModelFromArgs recovers the effective CLI model for HSR thread/start", () => {
+  assert.equal(codexModelFromArgs(["-m", "gpt-5.6-sol"]), "gpt-5.6-sol");
+  assert.equal(codexModelFromArgs(["--model", "gpt-5.5", "-m", "gpt-5.6-terra"]), "gpt-5.6-terra");
+  assert.equal(codexModelFromArgs(["--model=gpt-5.6-luna"]), "gpt-5.6-luna");
+  assert.equal(codexModelFromArgs(["-c", 'model_reasoning_effort="xhigh"']), undefined);
+});
+
+test("buildCodexThreadRequestParams passes the argv model out-of-band to codex app-server", () => {
+  const opts: RunnerOpts = {
+    bee: "CO.test",
+    cwd: "/repo",
+    env: {},
+    runDir: "/tmp/run",
+    args: ["--model", "gpt-5.5", "-m", "gpt-5.6-sol"],
+    model: "gpt-5.4",
+  };
+
+  assert.deepEqual(buildCodexThreadRequestParams(opts, "thread/start"), {
+    model: "gpt-5.6-sol",
+    cwd: "/repo",
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+  });
+  assert.deepEqual(buildCodexThreadRequestParams({ ...opts, sessionId: "thread-1" }, "thread/resume"), {
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    cwd: "/repo",
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+  });
 });
 
 test("thread handshake timeout discards the wedged child and retries on a fresh attempt with backoff", async () => {
