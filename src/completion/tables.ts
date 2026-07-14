@@ -9,7 +9,7 @@ export const COMMANDS = [
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals",
   "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
-  "fork", "here", "spawn-picker", "urls", "keys", "revive", "auth-resume", "retire", "archive",
+  "fork", "here", "spawn-picker", "urls", "keys", "revive", "auth-resume", "retire", "archive", "set-model",
 ];
 
 export const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
@@ -56,7 +56,7 @@ export const SHELLS = ["bash", "zsh", "fish"];
 export const TOP_LEVEL_FLAGS = ["--version", "--help"];
 
 export const SESSION_LIVE_ONLY = new Set(["send", "brief", "tail", "cat", "transcript", "tx", "wait", "attach"]);
-export const SESSION_ANY = new Set(["kill", "retire", "archive", "last", "seal", "rename", "tag", "own", "move", "split", "fork", "revive", "auth-resume", "urls"]);
+export const SESSION_ANY = new Set(["kill", "retire", "archive", "last", "seal", "rename", "tag", "own", "move", "split", "fork", "revive", "auth-resume", "urls", "set-model"]);
 export const BEE_FIRST_ARG = new Set(["spawn", "run", "x", "xa", "open"]);
 export const SHELL_FIRST_ARG = new Set(["completion"]);
 // Commands whose first positional is a vault account.
@@ -69,6 +69,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   activate: ["--home"],
   login: ["--no-wait", "--popup", "--timeout-ms"],
   revive: ["--all", "--crashed", "--fresh", "--session", "--no-wait"],
+  "set-model": ["--clear", "--fresh", "--now"],
   xa: [
     "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony", "--print",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",

@@ -68,6 +68,15 @@ export type SessionRecord = {
    */
   model?: string;
   /**
+   * Harness CLI flags re-applied on every relaunch alongside the model
+   * selector — reasoning/effort switches like `--effort high` or
+   * `-c model_reasoning_effort="high"` that would otherwise live only in the
+   * frozen `command` and be silently dropped by resume/revive. One
+   * shell-words line; set (or replaced) by `hive set-model <bee> <model>
+   * -- <flags>`.
+   */
+  modelExtraArgs?: string;
+  /**
    * Free-form user tags (first-class). Holds ONLY bare or power-user-namespaced
    * labels, e.g. ["migration", "waiting-review", "prio:p1"]. Reserved-namespace
    * tags (colony:/swarm:/…) are NEVER stored here — they are derived on read by
@@ -395,7 +404,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "runnerTier", "poolKey"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",

@@ -293,7 +293,7 @@ function ensureDroidYoloSettings(): void {
   writeFileSync(DROID_YOLO_SETTINGS_PATH, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
 }
 
-function shellQuoteIfNeeded(value: string): string {
+export function shellQuoteIfNeeded(value: string): string {
   if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) return value;
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }

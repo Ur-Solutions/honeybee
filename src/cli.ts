@@ -20,7 +20,7 @@ import { cmdHere, cmdSpawnPicker } from "./commands/here.js";
 import { cmdKeys } from "./commands/keys.js";
 import { cmdLoop } from "./commands/loop.js";
 import { cmdAnswer, cmdBrief, cmdMove, cmdOwn, cmdRename, cmdSeal, cmdSend, cmdTag } from "./commands/messaging.js";
-import { cmdAuthResume, cmdDemote, cmdPromote, cmdRevive } from "./commands/migrate.js";
+import { cmdAuthResume, cmdDemote, cmdPromote, cmdRevive, cmdSetModel } from "./commands/migrate.js";
 import { cmdNode, cmdSubstrate } from "./commands/node.js";
 import { cmdAttach, cmdBees, cmdKill, cmdLast, cmdList, cmdNext, cmdRetire, cmdTail, cmdTranscript, cmdUrls, cmdWait } from "./commands/observe.js";
 import { cmdFleet } from "./commands/fleet.js";
@@ -119,6 +119,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       break;
     case "promote":
       await cmdPromote(parsed);
+      break;
+    case "set-model":
+      await cmdSetModel(parsed);
       break;
     case "demote":
       await cmdDemote(parsed);
@@ -338,6 +341,7 @@ function printHelp() {
         ["retire", "<bee|@swarm|colony:name>", "stop a bee and archive its record (the everyday way to end bees; alias: archive)"],
         ["kill", "<session>", "PURGE a bee: stop it and delete its record/seals/run data (rare; prompts, --yes)"],
         ["promote", "<bee>", "move an HSR bee onto an interactive tmux pane (resume; claude/codex, --now)"],
+        ["set-model", "<bee> <model>", "change a bee's model in place, resuming its session (--clear, --fresh, --now, -- <harness flags>)"],
         ["demote", "<bee>", "move a tmux bee back to a pane-less HSR runner (resume; claude/codex, --now)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--crashed, --all, --fresh, --session <id>, --no-wait)"],
         ["auth-resume", "<bee>", "capture a fresh login, stop an auth-needed bee, and resume its session"],

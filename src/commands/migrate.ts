@@ -2,7 +2,7 @@
 // interactive tmux pane and a pane-less HSR runner (resume), and revive dead bees.
 // Extracted from cli.ts (HIVE-15).
 import { accountEmail, activateAccountIntoHome, captureAccountFromHome, findAccount, homeClaudeEmail, listAccounts, type AccountRecord } from "../accounts.js";
-import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, type AgentSpec } from "../agents.js";
+import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, shellQuoteIfNeeded, splitShellWords, type AgentSpec } from "../agents.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeSpawnOptions } from "../hiveState.js";
@@ -19,7 +19,7 @@ import { appendLedger, listSessions, storeRoot, updateSession, type SessionRecor
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
 import { formatShellCommand, hasSession } from "../tmux.js";
-import { identityRecipeForAgent } from "../drivers.js";
+import { identityRecipeForAgent, modelArgsForAgent } from "../drivers.js";
 import { resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
 import { loginSeatLiveDigest } from "./account.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
@@ -63,7 +63,7 @@ export function assertResumable(record: SessionRecord, verb: "promote" | "demote
  * we connect the socket directly). Otherwise wait for the current turn to finish
  * (structured state leaves "active") up to 30s, then tell the user to use --now.
  */
-export async function quiesceHsrBee(record: SessionRecord, now: boolean): Promise<void> {
+export async function quiesceHsrBee(record: SessionRecord, now: boolean, verb = "promote"): Promise<void> {
   if (now) {
     const meta = await readHsrMeta(record.name);
     if (meta?.controlSocket) {
@@ -85,7 +85,7 @@ export async function quiesceHsrBee(record: SessionRecord, now: boolean): Promis
     if (state !== "active") return;
     await sleep(500);
   }
-  throw new Error(`hive promote: ${record.name} is still mid-turn after 30s; retry with --now to interrupt`);
+  throw new Error(`hive ${verb}: ${record.name} is still mid-turn after 30s; retry with --now to interrupt`);
 }
 
 
@@ -152,7 +152,7 @@ export async function tmuxSessionSurvives(
  * resumeArgs(tool, id).
  */
 export async function buildResumeSpec(record: SessionRecord, tool: string, extraArgs: string[]): Promise<AgentSpec> {
-  const spec = resolveAgent(record.requestedAgent ?? record.agent, extraArgs, {
+  const spec = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtraArgsFor(record), ...extraArgs], {
     home: record.homePath,
     yolo: agentDefaultsToYolo(tool),
     identity: Boolean(record.accountId),
@@ -245,8 +245,8 @@ export async function hsrChildSurvives(bee: string, windowMs: number): Promise<b
  * restores the interactive bee where it started (interactive→interactive resume
  * works, so the recovery keeps continuity).
  */
-export async function reviveTmuxPane(record: SessionRecord, tool: string): Promise<void> {
-  const spec = await buildResumeSpec(record, tool, resumeArgs(tool, record.providerSessionId));
+export async function reviveTmuxPane(record: SessionRecord, tool: string, opts: { fresh?: boolean } = {}): Promise<void> {
+  const spec = await buildResumeSpec(record, tool, opts.fresh ? [] : resumeArgs(tool, record.providerSessionId));
   const tmuxTarget = safeTmuxTarget(record.name);
   const substrate = localSubstrate();
   const launch = await substrate.newSession(tmuxTarget, record.cwd, {
@@ -269,6 +269,9 @@ export async function reviveTmuxPane(record: SessionRecord, tool: string): Promi
     substrate: undefined,
     runnerPid: undefined,
     runnerTier: undefined,
+    // A fresh relaunch abandons the old provider session — keeping its id
+    // would make the next resume rejoin a conversation this bee left behind.
+    ...(opts.fresh ? { providerSessionId: undefined } : {}),
   });
   if (restored) await writeSpawnOptions(restored);
 }
@@ -778,10 +781,14 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
 
   // Mirror the swap relaunch: rebuild the agent command from the configured
   // kind (preserving the original permission mode) and append the resume args.
-  const spec = resolveAgent(record.requestedAgent ?? record.agent, fresh ? [] : resumeArgs(tool, providerSessionId), {
+  // The first-class model + its persisted extra flags ride along — without
+  // them a revived bee silently falls back to the harness default model
+  // (the HSR path via buildResumeSpec always applied them; this path must too).
+  const spec = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtraArgsFor(record), ...(fresh ? [] : resumeArgs(tool, providerSessionId))], {
     home: record.homePath,
     yolo: sniffYolo(record.command),
     identity: true,
+    ...(record.model ? { model: record.model } : {}),
   });
   // Refresh the bee's HOME credentials from the vault before relaunch. A bee
   // whose home token expired while it was dead otherwise boots logged-out: the
@@ -889,4 +896,173 @@ export async function reviveOne(record: SessionRecord, parsed: Parsed, opts: { s
   else console.log(`revived\t${record.name}\t${record.agent}\t${how}`);
   if (!opts.skipReadyWait) await waitForRevivedReady([updated], parsed);
   return updated;
+}
+
+
+/** The persisted model extra flags as argv words, [] when none are recorded. */
+function modelExtraArgsFor(record: SessionRecord): string[] {
+  return record.modelExtraArgs ? splitShellWords(record.modelExtraArgs) : [];
+}
+
+
+/**
+ * hive set-model <bee> <model> [--clear] [--fresh] [--now] [-- <harness flags>]
+ *
+ * Change an existing bee's model IN PLACE: same record identity, same
+ * substrate, and (by default) the same provider conversation. The model lands
+ * on the first-class record field; anything after `--` (reasoning/effort
+ * switches like `--effort high`) is persisted as modelExtraArgs so every later
+ * relaunch re-applies it. Each call REPLACES the whole selection — omitting
+ * `--` clears previously recorded extra flags, and `--clear` (instead of a
+ * model) returns the bee to its harness default.
+ *
+ * A live bee is quiesced (HSR waits for turn end, `--now` interrupts; tmux is
+ * killed outright like swap-account), then relaunched resuming the same
+ * provider session. Unlike promote/demote this never crosses the
+ * interactive/headless store boundary — HSR resumes headlessly, tmux resumes
+ * interactively — so every resumable harness keeps its history. If the
+ * relaunched agent exits within the settle window (bad model name, rejected
+ * resume) the previous selection is restored and relaunched.
+ *
+ * A dead bee just gets the fields recorded; the next revive applies them
+ * (reviveRecord/buildResumeSpec both honor model + modelExtraArgs).
+ */
+export async function cmdSetModel(parsed: Parsed): Promise<void> {
+  const usage = "Usage: hive set-model <bee> <model> [--clear] [--fresh] [--now] [-- <harness flags>]";
+  const target = parsed.args[0];
+  const clear = truthy(flag(parsed, "clear"));
+  const model = parsed.args[1];
+  if (!target || (!model && !clear)) throw new Error(usage);
+  if (model && clear) throw new Error(`hive set-model: pass either <model> or --clear, not both\n${usage}`);
+  const record = await resolveSession(target);
+  if (record.node && record.node !== LOCAL_NODE_NAME) {
+    throw new Error(`hive set-model: ${record.name} is on remote node ${record.node}; set-model only supports local bees`);
+  }
+  const tool = canonicalAgentKind(record.agent).toLowerCase();
+  // opencode's selector is `--model <provider>/<model>` and the record has no
+  // provider field to rebuild it from on later relaunches — half-persisting
+  // would silently drop the model at the next revive.
+  if (!clear && tool === "opencode") {
+    throw new Error("hive set-model: opencode is not supported (its --model needs a provider prefix the record cannot persist yet)");
+  }
+  if (!clear && modelArgsForAgent(tool, model).length === 0) {
+    throw new Error(`hive set-model: ${record.agent} has no model selector (no model flag known for ${tool})`);
+  }
+  const fresh = truthy(flag(parsed, "fresh"));
+  const now = truthy(flag(parsed, "now"));
+  const extraLine = parsed.rest.length > 0 ? parsed.rest.map(shellQuoteIfNeeded).join(" ") : undefined;
+
+  // Server-tier harnesses mint their provider thread id at RUNTIME — backfill
+  // it from the HSR meta (mirrors promote) so the resume gate below can see it.
+  if (record.substrate === "hsr" && !record.providerSessionId) {
+    const meta = await readHsrMeta(record.name).catch(() => null);
+    if (meta?.sessionId) {
+      record.providerSessionId = meta.sessionId;
+      await updateSession(record.name, { providerSessionId: meta.sessionId });
+    }
+  }
+
+  const substrate = substrateFor(record);
+  const alive = await substrate.hasSession(record.tmuxTarget).catch(() => false);
+  if (alive && !fresh && !record.providerSessionId) {
+    throw new Error(
+      `hive set-model: ${record.name} has no recorded provider session id to resume; retry with --fresh to relaunch on a new provider session`,
+    );
+  }
+
+  const previous = { model: record.model, modelExtraArgs: record.modelExtraArgs };
+  // Explicit undefined deletes the field (replace semantics; see updateSession).
+  const applyFields: Partial<SessionRecord> = {
+    model: clear ? undefined : model,
+    modelExtraArgs: extraLine,
+    ...(fresh ? { providerSessionId: undefined } : {}),
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (!alive) {
+    const updated = (await updateSession(record.name, applyFields)) ?? { ...record, ...applyFields };
+    await appendLedger({
+      type: "bee.set_model",
+      session: record.name,
+      from: previous.model ?? null,
+      to: updated.model ?? null,
+      extraArgs: extraLine ?? null,
+      relaunched: false,
+    });
+    if (isPretty()) console.log(actionLine("ok", "set-model", [bold(record.name), updated.model ?? "harness default", dim("recorded; applies on next revive")]));
+    else console.log(`set-model\t${record.name}\t${updated.model ?? ""}\trecorded`);
+    return;
+  }
+
+  // Stop the runtime BEFORE persisting the new selection — a failed quiesce/
+  // kill must leave the record describing what is actually still running.
+  if (record.substrate === "hsr") {
+    await quiesceHsrBee(record, now, "set-model");
+    await stopHsrRunner(record);
+  } else {
+    // tmux: a pane's mid-turn state is heuristic (mirrors demote) — interrupt
+    // with --now, then kill the session outright like swap-account does.
+    if (now) {
+      await localSubstrate().sendKey(record.tmuxTarget, "C-c", record.agentPaneId).catch(() => undefined);
+      await sleep(300);
+    }
+    await localSubstrate().kill(record.tmuxTarget, { launcherPgid: record.launcherPgid }).catch(() => undefined);
+    const deadline = Date.now() + 4_000;
+    while (Date.now() < deadline) {
+      if (!(await substrate.hasSession(record.tmuxTarget).catch(() => true))) break;
+      await sleep(250);
+    }
+    if (await substrate.hasSession(record.tmuxTarget).catch(() => false)) {
+      throw new Error(`hive set-model: ${record.tmuxTarget} is still alive after kill; aborting before relaunch`);
+    }
+  }
+
+  const updated = (await updateSession(record.name, applyFields)) ?? { ...record, ...applyFields };
+
+  // Restore the previous selection and relaunch it — the recovery mirror of
+  // promote/demote's rollback, so a bad model name never leaves a dead bee.
+  const rollback = async (): Promise<void> => {
+    const restoredFields: Partial<SessionRecord> = {
+      model: previous.model,
+      modelExtraArgs: previous.modelExtraArgs,
+      updatedAt: new Date().toISOString(),
+    };
+    const restored = (await updateSession(record.name, restoredFields)) ?? { ...record, ...restoredFields };
+    if (record.substrate === "hsr") await reviveHsrRunner(restored, tool, { fresh });
+    else await reviveTmuxPane(restored, tool, { fresh });
+  };
+
+  if (record.substrate === "hsr") {
+    await reviveHsrRunner(updated, tool, { fresh });
+    if (!(await hsrChildSurvives(record.name, RESUME_LIVENESS_SETTLE_MS))) {
+      await rollback().catch(() => undefined);
+      throw new Error(
+        `hive set-model: ${record.agent} exited immediately on model ${model ?? "(default)"} — bad model name or rejected resume; previous model restored`,
+      );
+    }
+  } else {
+    await reviveTmuxPane(updated, tool, { fresh });
+    if (!(await tmuxSessionSurvives(substrate, record.tmuxTarget, RESUME_LIVENESS_SETTLE_MS))) {
+      await rollback().catch(() => undefined);
+      throw new Error(
+        `hive set-model: ${record.agent} exited immediately on model ${model ?? "(default)"} — bad model name or rejected resume; previous model restored`,
+      );
+    }
+  }
+
+  await appendLedger({
+    type: "bee.set_model",
+    session: record.name,
+    from: previous.model ?? null,
+    to: updated.model ?? null,
+    extraArgs: extraLine ?? null,
+    relaunched: true,
+    providerSessionId: fresh ? null : (record.providerSessionId ?? null),
+  });
+  const how = fresh ? "fresh session" : `resumed ${record.providerSessionId}`;
+  if (isPretty()) {
+    console.log(actionLine("ok", "set-model", [bold(record.name), `${previous.model ?? "default"} → ${updated.model ?? "default"}`, dim(how)]));
+  } else {
+    console.log(`set-model\t${record.name}\t${updated.model ?? ""}\t${how}`);
+  }
 }

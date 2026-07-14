@@ -1,5 +1,5 @@
 import { activateAccountIntoHome, listAccounts, syncAccountCredentialsToVault, type AccountRecord } from "./accounts.js";
-import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand } from "./agents.js";
+import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, splitShellWords } from "./agents.js";
 import { resumeArgsForAgent } from "./drivers.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
@@ -99,15 +99,19 @@ export async function swapAccount(
     await activate(account, record.homePath!);
 
     // 3. Resume the same provider session in the same provider home, with the
-    //    driver's explicit identity env. Thread the NEW account's model/provider
-    //    so a swapped opencode bee keeps its `--model <provider>/<model>`
-    //    selector (adversarial review fix #4); account.model may be undefined
-    //    (fine → the driver hook returns []).
-    const spec = resolveAgent(record.requestedAgent ?? record.agent, resumeArgs(tool, record.providerSessionId), {
+    //    driver's explicit identity env. The record's own model (a deliberate
+    //    `hive set-model` choice) wins over the NEW account's default model;
+    //    the account still supplies opencode's provider so a swapped bee keeps
+    //    its `--model <provider>/<model>` selector (adversarial review fix #4).
+    //    Both may be undefined (fine → the driver hook returns []). Persisted
+    //    model extra flags (effort/reasoning) ride along like every relaunch.
+    const model = current.model ?? account.model;
+    const modelExtra = current.modelExtraArgs ? splitShellWords(current.modelExtraArgs) : [];
+    const spec = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtra, ...resumeArgs(tool, record.providerSessionId)], {
       home: record.homePath,
       yolo: sniffYolo(record.command),
       identity: true,
-      ...(account.model ? { model: account.model } : {}),
+      ...(model ? { model } : {}),
       ...(account.provider ? { provider: account.provider } : {}),
     });
     if (!record.node) await assertAgentAuthFreshForSpawn(spec, account.id);
