@@ -1081,6 +1081,7 @@ Remove stale metadata, kill idle bees, or choose targets in the cleanup TUI.
 
 ```sh
 hive clean --dead [--older-than <age>] [--dry-run|-n]
+hive clean --crashed [--older-than <age>] [--dry-run|-n]
 hive clean --idle [--older-than <age>] [--dry-run|-n]
 hive clean -i
 hive clean --interactive
@@ -1090,6 +1091,7 @@ Examples:
 
 ```sh
 hive clean --dead --dry-run
+hive clean --crashed --dry-run
 hive clean --dead --older-than 7d
 hive clean --idle --dry-run
 hive clean -i
@@ -1101,8 +1103,9 @@ Age units are parsed by `parseAge` and include units such as `s`, `m`, `h`,
 Important behavior:
 
 - `--dead` deletes records for sessions that no longer exist.
+- `--crashed` deletes records whose runtime disappeared without a retire/kill.
 - `--idle` kills live bees in the `idle_with_output` state.
-- `-i`/`--interactive` cannot be combined with `--dead`, `--idle`,
+- `-i`/`--interactive` cannot be combined with `--dead`, `--crashed`, `--idle`,
   `--dry-run`, or `--older-than`.
 - Bees on unreachable or unregistered nodes are not treated as dead.
 
@@ -2079,6 +2082,7 @@ Clean safely:
 
 ```sh
 hive clean --dead --dry-run
+hive clean --crashed --dry-run
 hive clean --dead --older-than 7d
 hive clean --idle --dry-run
 hive clean -i

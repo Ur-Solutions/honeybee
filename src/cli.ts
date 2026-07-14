@@ -341,7 +341,7 @@ function printHelp() {
         ["demote", "<bee>", "move a tmux bee back to a pane-less HSR runner (resume; claude/codex, --now)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--crashed, --all, --fresh, --session <id>, --no-wait)"],
         ["auth-resume", "<bee>", "capture a fresh login, stop an auth-needed bee, and resume its session"],
-        ["clean", "--dead|--idle|-i", "remove dead metadata, kill idle bees, or clean interactively"],
+        ["clean", "--dead|--crashed|--idle|-i", "remove dead/crashed metadata, kill idle bees, or clean interactively"],
         ["loop", "<launch|start|status|stop|…>", "run a bee repeatedly until a stop condition (launch = interactive dialog)"],
       ],
     },

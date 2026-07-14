@@ -118,7 +118,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   cat: ["-n", "--lines"],
   transcript: ["-n", "--limit", "--json"],
   tx: ["-n", "--limit", "--json"],
-  clean: ["--dead", "--idle", "--interactive", "-i", "--older-than", "--older", "--dry-run", "-n"],
+  clean: ["--dead", "--crashed", "--idle", "--interactive", "-i", "--older-than", "--older", "--dry-run", "-n"],
   list: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--tag", "--archived", "--json", "--wide"],
   ps: ["--colony", "--swarm", "--node", "--state", "--agent", "--repo", "--tag", "--archived", "--json", "--wide"],
   bees: ["--colony", "--swarm", "--node", "--sidebar", "--toggle-sidebar", "--width", "-w"],

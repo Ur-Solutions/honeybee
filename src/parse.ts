@@ -18,6 +18,7 @@ export const BOOLEAN_FLAGS = new Set([
   "clear",
   "comb",
   "consume",
+  "crashed",
   "dangerous",
   "dashboard",
   "dead",

@@ -40,7 +40,7 @@ type PreviewCacheEntry =
 
 export async function chooseCleanTargets(items: CleanTuiItem[], options: CleanTuiOptions = {}): Promise<CleanTuiResult> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error("hive clean --interactive requires a TTY. Use hive clean --idle or hive clean --dead in scripts.");
+    throw new Error("hive clean --interactive requires a TTY. Use hive clean --dead, --crashed, or --idle in scripts.");
   }
   if (items.length === 0) return { cleaned: 0, failed: 0, cancelled: false };
 

@@ -184,6 +184,44 @@ test("hive clean --dead removes dead session metadata", async () => {
   }
 });
 
+test("hive clean --crashed removes only uncommanded dead running records", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-crashed-"));
+  try {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    const crashed = session("crashed", "crashed-target");
+    crashed.id = "CO.crs";
+    crashed.updatedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const dead = session("dead", "dead-target");
+    dead.id = "CO.ded";
+    dead.status = "dead";
+    dead.updatedAt = crashed.updatedAt;
+    await writeFile(join(dir, "sessions", "crashed.json"), `${JSON.stringify(crashed)}\n`);
+    await writeFile(join(dir, "sessions", "dead.json"), `${JSON.stringify(dead)}\n`);
+
+    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--crashed", "--dry-run"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+
+    assert.match(dryRun.stdout, /crashed\tCO\.crs\tcrashed\tcodex\t\d+[smhdwoy]\t\/tmp/);
+    assert.doesNotMatch(dryRun.stdout, /dead/);
+    await readFile(join(dir, "sessions", "crashed.json"), "utf8");
+    await readFile(join(dir, "sessions", "dead.json"), "utf8");
+
+    const cleaned = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--crashed"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+
+    assert.match(cleaned.stdout, /cleaned\tcrashed/);
+    assert.doesNotMatch(cleaned.stdout, /dead/);
+    await assert.rejects(readFile(join(dir, "sessions", "crashed.json"), "utf8"), /ENOENT/);
+    await readFile(join(dir, "sessions", "dead.json"), "utf8");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hive clean --dead --older-than only removes stale dead sessions", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-"));
   try {

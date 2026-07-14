@@ -129,6 +129,7 @@ test("completes flags when current word starts with dash", () => {
 
   const cleanFlags = getCompletionsFromState(["hive", "clean", "--"], empty);
   assert.ok(cleanFlags.includes("--dead"));
+  assert.ok(cleanFlags.includes("--crashed"));
   assert.ok(cleanFlags.includes("--dry-run"));
 
   assert.deepEqual(getCompletionsFromState(["hive", "cat", "--"], empty), ["-n", "--lines"]);
@@ -372,4 +373,3 @@ test("--node and --kind are listed in spawn / node flag completion", () => {
   assert.ok(nodeFlags.includes("--endpoint"), "node flags include --endpoint");
   assert.ok(nodeFlags.includes("--capabilities"), "node flags include --capabilities");
 });
-

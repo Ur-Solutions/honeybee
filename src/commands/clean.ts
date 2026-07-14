@@ -19,21 +19,24 @@ import { ageFlag, buildStateContext, hasFlag, liveTargetsAcrossNodes, observeHsr
 export async function cmdClean(parsed: Parsed) {
   const interactive = hasFlag(parsed, "interactive") || hasFlag(parsed, "i");
   const wantsDead = hasFlag(parsed, "dead");
+  const wantsCrashed = hasFlag(parsed, "crashed");
   const wantsIdle = hasFlag(parsed, "idle");
 
   if (interactive) {
-    if (wantsDead || wantsIdle) {
-      throw new Error("hive clean -i/--interactive cannot be combined with --dead/--idle; pick targets in the TUI instead.");
+    if (wantsDead || wantsCrashed || wantsIdle) {
+      throw new Error("hive clean -i/--interactive cannot be combined with --dead/--crashed/--idle; pick targets in the TUI instead.");
     }
     if (hasFlag(parsed, "dry-run") || hasFlag(parsed, "n") || hasFlag(parsed, "older-than") || hasFlag(parsed, "older")) {
       throw new Error("hive clean -i/--interactive does not support --dry-run/--older-than; pick targets in the TUI instead.");
     }
     return cmdCleanInteractive(parsed);
   }
-  if (wantsDead && wantsIdle) throw new Error("Choose either hive clean --dead or hive clean --idle, not both.");
+  const selectedModes = [wantsDead, wantsCrashed, wantsIdle].filter(Boolean).length;
+  if (selectedModes > 1) throw new Error("Choose one of hive clean --dead, --crashed, or --idle.");
   if (wantsIdle) return cmdCleanIdle(parsed);
+  if (wantsCrashed) return cmdCleanCrashed(parsed);
   if (wantsDead) return cmdCleanDead(parsed);
-  throw new Error("Usage: hive clean (--dead|--idle|-i|--interactive) [--older-than <age>] [--dry-run|-n]");
+  throw new Error("Usage: hive clean (--dead|--crashed|--idle|-i|--interactive) [--older-than <age>] [--dry-run|-n]");
 }
 
 
@@ -164,6 +167,31 @@ export async function cmdCleanIdle(parsed: Parsed) {
   }
 
   await cleanCandidates(idle);
+}
+
+
+export async function cmdCleanCrashed(parsed: Parsed) {
+  const { candidates } = await collectCleanCandidates();
+  let crashed = candidates.filter((candidate) => candidate.state === "crashed");
+  const olderThan = ageFlag(parsed, ["older-than", "older"]);
+  if (olderThan !== undefined) crashed = crashed.filter((candidate) => candidate.ageMs >= olderThan);
+  const dryRun = truthy(flag(parsed, "dry-run")) || truthy(flag(parsed, "n"));
+
+  if (crashed.length === 0) {
+    if (isPretty()) console.log(dim("No crashed bees to clean."));
+    else console.log("cleaned\t0");
+    return;
+  }
+
+  if (dryRun) {
+    printCrashedDryRun(crashed);
+    return;
+  }
+
+  for (const candidate of crashed) {
+    await deleteSession(candidate.record.name);
+    printCleanSuccess(candidate.record, "removed crashed");
+  }
 }
 
 
@@ -393,6 +421,37 @@ export function printIdleDryRun(idle: CleanCandidate[]) {
     }),
   ));
   console.error(note("dry run; remove these with: hive clean --idle"));
+}
+
+
+export function printCrashedDryRun(crashed: CleanCandidate[]) {
+  if (!isPretty()) {
+    for (const candidate of crashed) {
+      const record = candidate.record;
+      console.log(`crashed\t${record.id ?? record.name}\t${record.name}\t${record.agent}\t${candidate.age}\t${record.cwd}`);
+    }
+    return;
+  }
+  console.log(formatTable(
+    [
+      { header: "REF" },
+      { header: "NAME" },
+      { header: "BEE" },
+      { header: "AGE", align: "right" },
+      { header: "CWD" },
+    ],
+    crashed.map((candidate) => {
+      const record = candidate.record;
+      return [
+        truncate(candidate.ref, 16),
+        truncate(record.name, 22),
+        truncate(record.agent, 12),
+        dim(candidate.age),
+        dim(truncate(tildify(record.cwd), Math.max(20, Math.min(60, (process.stdout.columns ?? 100) - 68)))),
+      ];
+    }),
+  ));
+  console.error(note("dry run; remove these with: hive clean --crashed"));
 }
 
 

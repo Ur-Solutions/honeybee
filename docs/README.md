@@ -40,6 +40,7 @@ hive transcript <session>
 hive last <session>
 hive list
 hive clean --dead --dry-run
+hive clean --crashed --dry-run
 hive clean --dead
 hive kill <session>
 ```
@@ -109,11 +110,12 @@ Dead session metadata can be pruned after tmux sessions exit:
 
 ```sh
 hive clean --dead --dry-run
+hive clean --crashed --dry-run
 hive clean --dead --older-than 7d --dry-run
 hive clean --dead
 ```
 
-The dry run includes each dead bee's age based on its last session update. Use `--older-than <age>` to prune only stale dead bees; supported units include `s`, `m`, `h`, `d`, `w`, `mo`, and `y`.
+The dry run includes each dead or crashed bee's age based on its last session update. Use `--older-than <age>` to prune only stale records; supported units include `s`, `m`, `h`, `d`, `w`, `mo`, and `y`.
 
 ## Transcript readers
 
