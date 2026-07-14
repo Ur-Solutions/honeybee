@@ -266,6 +266,7 @@ export function structuredStateFromEvents(
 
 export function isAuthNeededMessage(message: string): boolean {
   const m = message.toLowerCase();
+  if (m.includes("not logged in") && m.includes("/login")) return true;
   if (m.includes("please log out and sign in again")) return true;
   if (m.includes("please sign out and sign in again")) return true;
   if (m.includes("access token") && m.includes("could not be refreshed")) return true;

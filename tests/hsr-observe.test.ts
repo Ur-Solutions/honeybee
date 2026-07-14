@@ -140,6 +140,19 @@ test("structuredStateFromEvents surfaces login-required auth failures as auth-ne
   );
 });
 
+test("structuredStateFromEvents recognizes Claude's /login error as auth-needed", () => {
+  const message = "authentication_failed: Not logged in · Please run /login";
+  assert.equal(isAuthNeededMessage(message), true);
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "error", ts: 2, message },
+      { type: "turn_end", ts: 3 },
+    ]),
+    "auth-needed",
+  );
+});
+
 test("structuredStateFromEvents does not confuse daemon-recoverable auth_expired with auth-needed", () => {
   assert.equal(
     structuredStateFromEvents([
