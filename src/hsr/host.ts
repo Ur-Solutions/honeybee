@@ -26,6 +26,7 @@ import {
 } from "./runDir.js";
 import { codexStartupConcurrency, withCodexStartupSlot } from "./startupQueue.js";
 import { drainPendingHsrTurns, withHsrTurnDeliveryLock } from "./pendingTurns.js";
+import { pendingNeedsInput } from "./observe.js";
 
 export type HsrHostHandle = {
   bee: string;
@@ -127,6 +128,7 @@ export async function runHsrHost(params: {
       const p = (params ?? {}) as { requestId?: unknown; answer?: unknown };
       return session.answer(String(p.requestId ?? ""), String(p.answer ?? ""));
     },
+    pendingInput: () => pendingNeedsInput(bee),
     snapshot: (params) => {
       const lines = (params as { lines?: unknown })?.lines;
       return session.snapshot(typeof lines === "number" ? lines : undefined);

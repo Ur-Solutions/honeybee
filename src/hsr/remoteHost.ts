@@ -486,6 +486,11 @@ export function buildController(): RunnerHostController {
       return result.ok ? { ok: true } : result;
     }),
 
+    pendingInput: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown };
+      return pendingNeedsInput(String(p.bee ?? ""));
+    }),
+
     stop: guarded(async (params) => {
       const p = (params ?? {}) as { bee?: unknown };
       const result = await proxyCall(String(p.bee ?? ""), "stop");

@@ -114,6 +114,13 @@ test("runner-host: spawn+turn, sessionId, needs_input, snapshot, liveness, stop"
         () => events.slice(beforeAsk).some((e) => e.type === "needs_input" && e.requestId === "r1"),
         "needs_input r1",
       );
+      const needs = events.slice().reverse().find((event) => event.type === "needs_input") as Extract<RunnerEvent, { type: "needs_input" }>;
+      assert.deepEqual(await client.call("pendingInput"), {
+        requestId: "r1",
+        ts: needs.ts,
+        kind: "question",
+        question: "proceed?",
+      });
       const beforeAnswer = events.length;
       await client.call("answer", { requestId: "r1", answer: "yes" });
       await waitFor(

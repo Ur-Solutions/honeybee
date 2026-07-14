@@ -90,6 +90,17 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
         "relayed hsr.event turn_end",
       );
 
+      await client.call("send", { bee, text: "ask me" });
+      await waitFor(
+        () => relayed.some((r) => r.bee === bee && r.event.type === "needs_input"),
+        "relayed needs_input",
+      );
+      const pending = (await client.call("pendingInput", { bee })) as Record<string, unknown>;
+      assert.equal(pending.requestId, "r1");
+      assert.equal(pending.question, "proceed?");
+      assert.equal(pending.kind, "question");
+      assert.equal((await client.call("answer", { bee, requestId: "r1", answer: "yes" }) as { ok: boolean }).ok, true);
+
       // send to a non-existent bee → { ok:false } (no throw).
       const bad = (await client.call("send", { bee: "nope", text: "x" })) as { ok: boolean };
       assert.equal(bad.ok, false, "send to unknown bee should be ok:false");
