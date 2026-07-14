@@ -20,6 +20,11 @@ type CodexRateLimits = {
   plan_type?: string | null;
 };
 
+type CodexWindowSlot = "fiveHour" | "weekly";
+
+const CODEX_FIVE_HOUR_WINDOW_MINUTES = 5 * 60;
+const CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+
 export async function codexLimits(account: AccountRecord, deps: LimitsDeps = {}): Promise<AccountLimits> {
   const homes = await codexHomesForAccount(account);
   if (homes.length === 0) {
@@ -39,8 +44,13 @@ export async function codexLimits(account: AccountRecord, deps: LimitsDeps = {})
       source: "app-server",
       ...(limits.planType ? { plan: limits.planType } : {}),
     };
-    if (limits.primary) result.fiveHour = liveWindow(limits.primary);
-    if (limits.secondary) result.weekly = liveWindow(limits.secondary);
+    assignCodexWindows(
+      result,
+      limits.primary,
+      limits.secondary,
+      (window) => window.windowDurationMins,
+      liveWindow,
+    );
     if (result.fiveHour || result.weekly) return result;
   }
 
@@ -61,21 +71,57 @@ export async function codexLimits(account: AccountRecord, deps: LimitsDeps = {})
     asOf: best.ts,
     ...(best.limits.plan_type ? { plan: best.limits.plan_type } : {}),
   };
-  if (typeof best.limits.primary?.used_percent === "number") {
-    result.fiveHour = {
-      usedPercent: best.limits.primary.used_percent,
-      ...(best.limits.primary.resets_at ? { resetsAt: new Date(best.limits.primary.resets_at * 1000).toISOString() } : {}),
-      ...(typeof best.limits.primary.window_minutes === "number" ? { windowMinutes: best.limits.primary.window_minutes } : {}),
-    };
-  }
-  if (typeof best.limits.secondary?.used_percent === "number") {
-    result.weekly = {
-      usedPercent: best.limits.secondary.used_percent,
-      ...(best.limits.secondary.resets_at ? { resetsAt: new Date(best.limits.secondary.resets_at * 1000).toISOString() } : {}),
-      ...(typeof best.limits.secondary.window_minutes === "number" ? { windowMinutes: best.limits.secondary.window_minutes } : {}),
-    };
-  }
+  assignCodexWindows(
+    result,
+    best.limits.primary,
+    best.limits.secondary,
+    (window) => window.window_minutes,
+    snapshotWindow,
+  );
   return result;
+}
+
+/**
+ * Codex normally calls the 5h window `primary` and the weekly window
+ * `secondary`, but it promotes the weekly window to `primary` when the 5h
+ * limit is disabled. Prefer the explicit duration so that temporary provider
+ * changes do not shift a weekly value into the 5h column. Positional fallback
+ * keeps older snapshots/responses without duration metadata compatible.
+ */
+function assignCodexWindows<T>(
+  result: AccountLimits,
+  primary: T | null | undefined,
+  secondary: T | null | undefined,
+  windowMinutes: (window: T) => number | undefined,
+  toUsage: (window: T) => WindowUsage | null,
+): void {
+  const candidates: Array<{ usage: WindowUsage; duration: number | undefined; fallback: CodexWindowSlot }> = [];
+  const add = (window: T | null | undefined, fallback: CodexWindowSlot) => {
+    if (!window) return;
+    const usage = toUsage(window);
+    if (usage) candidates.push({ usage, duration: windowMinutes(window), fallback });
+  };
+  add(primary, "fiveHour");
+  add(secondary, "weekly");
+
+  // Duration-classified windows win over positional guesses.
+  for (const candidate of candidates) {
+    const slot = codexWindowSlot(candidate.duration);
+    if (slot && !result[slot]) result[slot] = candidate.usage;
+  }
+
+  for (const candidate of candidates) {
+    if (codexWindowSlot(candidate.duration)) continue;
+    const alternate: CodexWindowSlot = candidate.fallback === "fiveHour" ? "weekly" : "fiveHour";
+    const slot = !result[candidate.fallback] ? candidate.fallback : !result[alternate] ? alternate : null;
+    if (slot) result[slot] = candidate.usage;
+  }
+}
+
+function codexWindowSlot(windowMinutes: number | undefined): CodexWindowSlot | null {
+  if (windowMinutes === CODEX_FIVE_HOUR_WINDOW_MINUTES) return "fiveHour";
+  if (windowMinutes === CODEX_WEEKLY_WINDOW_MINUTES) return "weekly";
+  return null;
 }
 
 function liveWindow(window: CodexLiveWindow): WindowUsage {
@@ -83,6 +129,15 @@ function liveWindow(window: CodexLiveWindow): WindowUsage {
     usedPercent: typeof window.usedPercent === "number" ? window.usedPercent : 0,
     ...(window.resetsAt ? { resetsAt: new Date(window.resetsAt * 1000).toISOString() } : {}),
     ...(typeof window.windowDurationMins === "number" ? { windowMinutes: window.windowDurationMins } : {}),
+  };
+}
+
+function snapshotWindow(window: NonNullable<CodexRateLimits["primary"]>): WindowUsage | null {
+  if (typeof window.used_percent !== "number") return null;
+  return {
+    usedPercent: window.used_percent,
+    ...(window.resets_at ? { resetsAt: new Date(window.resets_at * 1000).toISOString() } : {}),
+    ...(typeof window.window_minutes === "number" ? { windowMinutes: window.window_minutes } : {}),
   };
 }
 

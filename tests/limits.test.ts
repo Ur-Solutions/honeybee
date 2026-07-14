@@ -668,6 +668,27 @@ test("codex prefers live app-server limits and falls back to disk snapshots", as
   });
 });
 
+test("codex keeps a weekly-only primary window out of the 5h column", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "weekly-only@a.b");
+    await mkdir(join(dir, "homes", account.id), { recursive: true });
+
+    const [result] = await accountLimits([account], {
+      codexLiveRateLimits: async () => ({
+        primary: { usedPercent: 23, windowDurationMins: 10_080, resetsAt: 1784488848 },
+        secondary: null,
+        planType: "pro",
+      }),
+    });
+
+    assert.equal(result!.ok, true);
+    assert.equal(result!.source, "app-server");
+    assert.equal(result!.fiveHour, undefined);
+    assert.equal(result!.weekly?.usedPercent, 23);
+    assert.equal(result!.weekly?.windowMinutes, 10_080);
+  });
+});
+
 test("accountLimits caps codex live app-server fan-out", async () => {
   await withTempStore(async (dir) => {
     const accounts = [];
@@ -695,6 +716,8 @@ test("accountLimits caps codex live app-server fan-out", async () => {
     assert.ok(maxActive <= 4, `expected at most 4 concurrent live Codex reads, saw ${maxActive}`);
     assert.deepEqual(results.map((result) => result.account), accounts.map((account) => account.id));
     assert.deepEqual(results.map((result) => result.source), accounts.map(() => "app-server"));
+    assert.deepEqual(results.map((result) => result.fiveHour?.usedPercent), accounts.map(() => 1));
+    assert.deepEqual(results.map((result) => result.weekly), accounts.map(() => undefined));
   });
 });
 
@@ -1120,6 +1143,36 @@ test("codex snapshot fallback reads the newest date partitions, not the whole se
     assert.equal(result!.source, "session-snapshot");
     assert.equal(result!.asOf, "2026-07-03T09:00:00Z");
     assert.equal(result!.fiveHour?.usedPercent, 77);
+  });
+});
+
+test("codex snapshot fallback classifies a weekly-only primary window by duration", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "weekly-snapshot@a.b");
+    const sessions = join(dir, "homes", account.id, "sessions", "2026", "07", "14");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(
+      join(sessions, "rollout-weekly.jsonl"),
+      `${JSON.stringify({
+        timestamp: "2026-07-14T09:00:00Z",
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          rate_limits: {
+            primary: { used_percent: 31, window_minutes: 10_080, resets_at: 1784488848 },
+            secondary: null,
+            plan_type: "pro",
+          },
+        },
+      })}\n`,
+    );
+
+    const [result] = await accountLimits([account], { codexLiveRateLimits: async () => null });
+    assert.equal(result!.ok, true);
+    assert.equal(result!.source, "session-snapshot");
+    assert.equal(result!.fiveHour, undefined);
+    assert.equal(result!.weekly?.usedPercent, 31);
+    assert.equal(result!.weekly?.windowMinutes, 10_080);
   });
 });
 
