@@ -249,7 +249,7 @@ export const OPEN_OWN_FLAGS = new Set([
 export const OPEN_SPAWN_CONTROL_FLAGS = new Set([
   "name", "colony", "swarm", "swarm-id", "count", "frame", "node", "substrate",
   "brief", "briefed", "autoswap", "boot-ms", "no-wait", "force-send", "here",
-  "pool", "no-keep",
+  "pool", "no-keep", "kit-profile",
 ]);
 
 

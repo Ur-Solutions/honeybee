@@ -83,6 +83,14 @@ export type SessionRecord = {
    * src/tags.ts effectiveTags(). (TAGS_AND_RELATIONSHIPS_PRD Phase 1)
    */
   tags?: string[];
+  /**
+   * trmdy/kit capability pin: the kit content version and profile the bee's
+   * home carried at spawn ("this bee ran on kit 0.2.0 / web-qa"), read from
+   * the home's kit ownership manifest. Absent when the home isn't kit-managed
+   * or the spawn was remote (kit bundle distribution pending).
+   */
+  kitVersion?: string;
+  kitProfile?: string;
   createdAt: string;
   updatedAt: string;
   status: "running" | "dead" | "kill_failed" | "archived";

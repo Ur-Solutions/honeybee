@@ -14,6 +14,7 @@ import { writeSpawnOptions } from "../hiveState.js";
 import { adapterFor } from "../hsr/adapters/index.js";
 import { mintEphemeralCredential, type EphemeralCredential } from "../hsr/remoteCreds.js";
 import { allocateBeeIdentity } from "../ids.js";
+import { kitMaterializeHome, readKitHomeStamp } from "../kit.js";
 import { chooseLaunch, type LaunchTemplate } from "../launchTui.js";
 import { cachedAccountLimits, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
 import { LOCAL_NODE_NAME, authPolicyOf, type NodeRecord } from "../node.js";
@@ -156,6 +157,14 @@ export type SpawnOptions = {
    * owns a self-reporting timer covering just its internal phases.
    */
   timer?: SpawnTimer;
+  /**
+   * trmdy/kit capability profile (--kit-profile): re-materialize the bee's home
+   * with this profile before launch. Strict — the caller asked for a specific
+   * capability set, so a missing kit binary or unknown profile fails the spawn.
+   * Local-only until kit bundle distribution reaches remote nodes. The default
+   * (absent) still gets the home's standing profile via account activation.
+   */
+  kitProfile?: string;
 };
 
 export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
@@ -213,6 +222,22 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       refreshIdentityEnv(spec);
     }
   }
+  // trmdy/kit: an explicit capability profile re-materializes the home before
+  // launch. Homes are per-account (shared by that account's bees), so the
+  // profile is a home-level, last-spawn-wins setting — see kit DESIGN.md §7.
+  const isRemoteSpawn = Boolean(opts.node && opts.node.kind !== "local-tmux");
+  if (opts.kitProfile) {
+    if (isRemoteSpawn) {
+      throw new Error("--kit-profile is local-only for now (kit bundle distribution to remote nodes is pending)");
+    }
+    if (!spec.homePath) {
+      throw new Error(`--kit-profile needs a dedicated home for ${spec.kind}; bind an account (--account) or pass --home`);
+    }
+    await kitMaterializeHome(spec.homePath, spec.kind, { profile: opts.kitProfile, strict: true });
+  }
+  // Capability pin for the session record: what kit version/profile the home
+  // actually carries after activation (empty when not kit-managed / remote).
+  const kitStamp = !isRemoteSpawn && spec.homePath ? await readKitHomeStamp(spec.homePath) : {};
   // "activate" folds in resolveAgent + account activation (the OAuth-refresh
   // network call and accounts-lock wait live here); near-zero without --account.
   timer.mark("activate");
@@ -397,6 +422,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.autoswap ? { autoswap: true } : {}),
       ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
       ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
+      ...kitStamp,
     };
     await saveSession(record);
     await writeSpawnOptions(record);
@@ -454,6 +480,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.autoswap ? { autoswap: true } : {}),
     ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
     ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
+    ...kitStamp,
   };
   await saveSession(record);
   await writeSpawnOptions(record);
@@ -679,7 +706,7 @@ export async function bindPoolAllocationToBee(plan: PoolSpawnPlan, allocation: P
 
 export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
+  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--kit-profile <p>] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
   const timer = startSpawnTimer(requested);
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
@@ -725,6 +752,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const branch = typeof flag(parsed, "branch") === "string" ? String(flag(parsed, "branch")) : undefined;
   const ref = typeof flag(parsed, "ref") === "string" ? String(flag(parsed, "ref")) : undefined;
   const checkout = typeof flag(parsed, "checkout") === "string" ? String(flag(parsed, "checkout")) : undefined;
+  const kitProfile = typeof flag(parsed, "kit-profile") === "string" ? String(flag(parsed, "kit-profile")) : undefined;
   // Pool allocation (post node-resolution: remote nodes are rejected before a
   // claim is written). The allocated member path becomes the spawn cwd.
   const poolPlan = poolRef ? await allocatePoolForSpawn(parsed, poolRef, 1, node) : undefined;
@@ -735,7 +763,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.
