@@ -9,6 +9,8 @@ import {
   readKitHomeStamp,
   resetKitProbeForTests,
 } from "../src/kit.js";
+import { resolveKitProfileFlag } from "../src/commands/spawn.js";
+import { parse } from "../src/parse.js";
 
 async function makeStubKit(dir: string, body: string): Promise<string> {
   const bin = join(dir, "kit");
@@ -87,6 +89,15 @@ test("HIVE_KIT_DISABLE forces the integration off", async () => {
     delete process.env.HIVE_KIT_DISABLE;
     resetKitProbeForTests();
   }
+});
+
+test("resolveKitProfileFlag: value ok, absent → undefined, bare → throws", () => {
+  assert.equal(resolveKitProfileFlag(parse(["spawn", "claude", "--kit-profile", "web-qa"])), "web-qa");
+  assert.equal(resolveKitProfileFlag(parse(["spawn", "claude"])), undefined);
+  assert.throws(
+    () => resolveKitProfileFlag(parse(["spawn", "claude", "--kit-profile"])),
+    /requires a profile name/,
+  );
 });
 
 test("readKitHomeStamp reads the ownership manifest, {} otherwise", async () => {

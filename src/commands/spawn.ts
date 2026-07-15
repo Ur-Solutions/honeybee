@@ -98,6 +98,19 @@ export function resolveSpawnCount(parsed: Parsed): number {
 }
 
 
+/**
+ * Read `--kit-profile <name>`. A bare `--kit-profile` (no value) is a user
+ * error, not "no profile" — throw rather than silently launch on the home's
+ * standing profile (which would be a foot-gun, and mirrors raw open's explicit
+ * rejection).
+ */
+export function resolveKitProfileFlag(parsed: Parsed): string | undefined {
+  const value = flag(parsed, "kit-profile");
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error("--kit-profile requires a profile name (e.g. --kit-profile web-qa)");
+  return value;
+}
+
 export type SpawnOptions = {
   agent: string;
   extraArgs: string[];
@@ -756,7 +769,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const branch = typeof flag(parsed, "branch") === "string" ? String(flag(parsed, "branch")) : undefined;
   const ref = typeof flag(parsed, "ref") === "string" ? String(flag(parsed, "ref")) : undefined;
   const checkout = typeof flag(parsed, "checkout") === "string" ? String(flag(parsed, "checkout")) : undefined;
-  const kitProfile = typeof flag(parsed, "kit-profile") === "string" ? String(flag(parsed, "kit-profile")) : undefined;
+  const kitProfile = resolveKitProfileFlag(parsed);
   // Pool allocation (post node-resolution: remote nodes are rejected before a
   // claim is written). The allocated member path becomes the spawn cwd.
   const poolPlan = poolRef ? await allocatePoolForSpawn(parsed, poolRef, 1, node) : undefined;
@@ -1120,7 +1133,7 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
   if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
     throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
   }
-  const kitProfile = typeof flag(parsed, "kit-profile") === "string" ? String(flag(parsed, "kit-profile")) : undefined;
+  const kitProfile = resolveKitProfileFlag(parsed);
   const perBeeAccountAlias = spawnAccountAliasResolver(requested, parsed);
   const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
     ? { agent: perBeeAccountAlias.agent, account: undefined }
@@ -1211,7 +1224,7 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
 
   const briefed = truthy(flag(parsed, "briefed"));
   const flagHome = flag(parsed, "home") ?? flag(parsed, "profile");
-  const kitProfile = typeof flag(parsed, "kit-profile") === "string" ? String(flag(parsed, "kit-profile")) : undefined;
+  const kitProfile = resolveKitProfileFlag(parsed);
   const records: SessionRecord[] = [];
   // deliverBrief already waits for readiness, so just-briefed bees are excluded
   // from the post-spawn confirmation (mirrors spawnSingleBee's exclusivity).

@@ -53,7 +53,7 @@ let kitProbe: Promise<string | null> | undefined;
 
 export function kitAvailableVersion(): Promise<string | null> {
   if (kitDisabled()) return Promise.resolve(null);
-  kitProbe ??= execFileP(kitBin(), ["version", "--json"], { timeout: 10_000 })
+  kitProbe ??= execFileP(kitBin(), ["version", "--json"], { timeout: 10_000, killSignal: "SIGKILL" })
     .then(({ stdout }) => {
       const version = (JSON.parse(stdout) as { version?: string }).version;
       return typeof version === "string" ? version : null;
@@ -69,8 +69,10 @@ export function resetKitProbeForTests(): void {
 
 /**
  * Materialize a home's capability set via `kit sync --home … --json`.
- * Idempotent and merge-based on kit's side; concurrent activations of the same
- * home are already serialized by the account lock at the call site.
+ * Idempotent and merge-based on kit's side. Concurrent syncs to the SAME home
+ * (e.g. an activation sync racing an explicit --kit-profile sync) are
+ * serialized by kit's own per-home lock, so this is safe to call from both the
+ * lock-held activation path and the lock-free explicit path.
  */
 export async function kitMaterializeHome(
   homePath: string,
@@ -98,10 +100,14 @@ export async function kitMaterializeHome(
     "--json",
   ];
   try {
-    // Budget: the best-effort activation path runs INSIDE the account lock,
-    // whose waiters give up after 30s (registry.ts) — so it gets 15s and a
-    // hard kill, like the OAuth refresh it shares the lock with. Only the
-    // explicit strict --kit-profile path (outside the lock) gets long rope.
+    // Timeout budget: the best-effort activation path runs inside the account
+    // lock, whose waiters give up after 30s (registry.ts). 15s + hard kill
+    // bounds kit's OWN hang so a wedged binary can't hold the lock indefinitely
+    // — but it is additive to the other lock-held work (credential copy + OAuth
+    // refresh), so a slow-but-not-hung kit can still contribute to lock
+    // pressure. kit self-serializes per home (its own .kit/sync lock), so
+    // concurrent syncs to one home don't corrupt regardless of this lock. The
+    // explicit strict --kit-profile path (outside the account lock) gets 120s.
     await execFileP(kitBin(), args, {
       timeout: options.strict ? 120_000 : 15_000,
       killSignal: "SIGKILL",
