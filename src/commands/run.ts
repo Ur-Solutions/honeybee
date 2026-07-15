@@ -319,6 +319,13 @@ export async function cmdOpen(parsed: Parsed) {
 // tmux session, no SessionRecord. Activation and launch are ledger-logged.
 export async function cmdOpenRaw(parsed: Parsed) {
   const requested = parsed.args[0]!;
+  // Raw open forwards unrecognized flags straight to the agent CLI, which knows
+  // nothing about --kit-profile (it would fail on an unknown flag). Kit-profile
+  // materialization only runs on the delegated spawn path, so reject it here
+  // rather than leaking it downstream.
+  if (hasFlag(parsed, "kit-profile")) {
+    throw new Error("--kit-profile is not supported with raw open (--raw/--window/--app); use the default registered open or hive spawn --kit-profile");
+  }
   const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
   // Thin profile → account (same overlay as spawnSingleBee).
   const profile = await resolveProfileOverlay(requested);

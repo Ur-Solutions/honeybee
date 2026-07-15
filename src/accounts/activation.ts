@@ -2,7 +2,7 @@ import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { identityRecipeForAgent, type IdentityRecipe } from "../drivers.js";
 import { keychainAvailable, readClaudeKeychain, writeClaudeKeychainEntry } from "../keychain.js";
-import { kitMaterializeHome } from "../kit.js";
+import { kitMaterializeHome, readKitHomeStamp } from "../kit.js";
 import { atomicWriteFile } from "../fsx.js";
 import { appendLedger } from "../store.js";
 import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./registry.js";
@@ -383,10 +383,13 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     await hooks.seedHomeDefaults?.(ctx);
     // trmdy/kit: converge the home's capability set (skills, MCP config,
     // instruction regions) on every activation, mirroring the seeders'
-    // merge discipline. Kit owns only manifest-claimed files; best-effort —
-    // activation never fails on capability sync, and this is a no-op on
-    // machines without a kit binary.
-    await kitMaterializeHome(homePath, account.tool, { warn });
+    // merge discipline. Converge toward the home's STANDING profile (its
+    // ownership-manifest stamp), so a plain activation never reverts a home
+    // that was explicitly materialized with --kit-profile. Kit owns only
+    // manifest-claimed files; best-effort — activation never fails on
+    // capability sync, and this is a no-op without a kit binary.
+    const kitStamp = await readKitHomeStamp(homePath);
+    await kitMaterializeHome(homePath, account.tool, { warn, profile: kitStamp.kitProfile });
     await appendLedger({ type: "account.activate", account: account.id, tool: account.tool, home: homePath, files: written });
     return written;
   });

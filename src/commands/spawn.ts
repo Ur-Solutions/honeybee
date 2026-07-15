@@ -379,6 +379,10 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     // The runner host inherits this process's env — record the effective home
     // (see adoptInheritedHome) before spec.env is shipped and command rendered.
     adoptInheritedHome(spec);
+    // adoptInheritedHome may set spec.homePath to an inherited home (e.g. a bee
+    // spawning a sub-bee) that the earlier kitStamp read didn't see — re-read so
+    // the record pins the capability set the bee actually runs with.
+    const hsrKitStamp = spec.homePath ? await readKitHomeStamp(spec.homePath) : kitStamp;
     const adapter = adapterFor(spec.kind);
     const runnerTier = adapter?.tier();
     const hostPid = await spawnHsrHost({
@@ -422,7 +426,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.autoswap ? { autoswap: true } : {}),
       ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
       ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
-      ...kitStamp,
+      ...hsrKitStamp,
     };
     await saveSession(record);
     await writeSpawnOptions(record);
@@ -1116,6 +1120,7 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
   if (hasFlag(parsed, "brief") || hasFlag(parsed, "briefed")) {
     throw new Error("--brief/--briefed cannot be combined with --count > 1; spawn first, then: hive brief @<swarm-id> <text>");
   }
+  const kitProfile = typeof flag(parsed, "kit-profile") === "string" ? String(flag(parsed, "kit-profile")) : undefined;
   const perBeeAccountAlias = spawnAccountAliasResolver(requested, parsed);
   const { agent: resolvedAgent, account: aliasAccount } = perBeeAccountAlias
     ? { agent: perBeeAccountAlias.agent, account: undefined }
@@ -1156,7 +1161,7 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
     const beeCwd = allocation ? allocation.path : cwd;
     let record: SessionRecord;
     try {
-      record = await spawnBee({ agent, extraArgs, cwd: beeCwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider, ...(poolPlan && allocation ? { poolKey: poolPlan.pool.key, poolMember: allocation.member } : {}) });
+      record = await spawnBee({ agent, extraArgs, cwd: beeCwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider, ...(kitProfile ? { kitProfile } : {}), ...(poolPlan && allocation ? { poolKey: poolPlan.pool.key, poolMember: allocation.member } : {}) });
     } catch (error) {
       // Keep the bees already spawned; roll back only the unconsumed claims
       // (this member and everything after it).
@@ -1206,6 +1211,7 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
 
   const briefed = truthy(flag(parsed, "briefed"));
   const flagHome = flag(parsed, "home") ?? flag(parsed, "profile");
+  const kitProfile = typeof flag(parsed, "kit-profile") === "string" ? String(flag(parsed, "kit-profile")) : undefined;
   const records: SessionRecord[] = [];
   // deliverBrief already waits for readiness, so just-briefed bees are excluded
   // from the post-spawn confirmation (mirrors spawnSingleBee's exclusivity).
@@ -1251,6 +1257,7 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
         account: beeAccount,
         model: beeModel,
         provider: beeProvider,
+        ...(kitProfile ? { kitProfile } : {}),
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
       if (toDeliver) {

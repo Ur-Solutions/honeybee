@@ -46,6 +46,9 @@ function kitDisabled(): boolean {
 
 // One probe per process; a missing binary is the common steady state on
 // machines without kit and must cost one failed exec, not one per activation.
+// Deliberately caches for the process lifetime: a long-lived daemon that saw a
+// transient probe failure (or had kit installed after start) skips kit until
+// restart — acceptable for best-effort capability sync.
 let kitProbe: Promise<string | null> | undefined;
 
 export function kitAvailableVersion(): Promise<string | null> {
@@ -95,7 +98,15 @@ export async function kitMaterializeHome(
     "--json",
   ];
   try {
-    await execFileP(kitBin(), args, { timeout: 120_000, maxBuffer: 4_000_000 });
+    // Budget: the best-effort activation path runs INSIDE the account lock,
+    // whose waiters give up after 30s (registry.ts) — so it gets 15s and a
+    // hard kill, like the OAuth refresh it shares the lock with. Only the
+    // explicit strict --kit-profile path (outside the lock) gets long rope.
+    await execFileP(kitBin(), args, {
+      timeout: options.strict ? 120_000 : 15_000,
+      killSignal: "SIGKILL",
+      maxBuffer: 4_000_000,
+    });
   } catch (error) {
     const detail = describeExecError(error);
     if (options.strict) {

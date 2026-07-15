@@ -12,6 +12,9 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+// Hermeticity: activation calls the external `kit` CLI — force it off so these
+// tests never exec a real kit binary against temp homes.
+process.env.HIVE_KIT_DISABLE = "1";
 import {
   accountDir,
   activateAccountIntoHome,

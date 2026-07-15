@@ -3,6 +3,10 @@ import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+// Hermeticity: account activation now calls the external `kit` CLI. Force it
+// off so these unit tests never exec a real kit binary against temp homes
+// (non-deterministic, and dev-with-kit vs CI-without-kit would diverge).
+process.env.HIVE_KIT_DISABLE = "1";
 import {
   accountCli,
   accountDir,

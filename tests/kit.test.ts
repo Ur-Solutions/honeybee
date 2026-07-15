@@ -103,3 +103,36 @@ test("readKitHomeStamp reads the ownership manifest, {} otherwise", async () => 
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("materialize passes the standing profile through so activation never reverts it", async () => {
+  // Regression for the review HIGH: a plain activation must converge toward the
+  // home's existing (manifest-stamped) profile, not the machine default.
+  const dir = await mkdtemp(join(tmpdir(), "hive-kit-"));
+  try {
+    await makeStubKit(
+      dir,
+      `if [ "$1" = "version" ]; then echo '{"version":"9.9.9"}'; exit 0; fi
+echo "$@" > "${dir}/argv.txt"
+echo '[]'`,
+    );
+    process.env.HIVE_KIT_BIN = join(dir, "kit");
+    resetKitProbeForTests();
+    // Simulate what activation.ts does: read stamp, pass its profile through.
+    const home = await mkdtemp(join(tmpdir(), "hive-kit-home-"));
+    await mkdir(join(home, ".kit"), { recursive: true });
+    await writeFile(
+      join(home, ".kit", "manifest.json"),
+      JSON.stringify({ schema: 1, kitVersion: "0.1.0", profile: "web-qa", entries: [] }),
+    );
+    const stamp = await readKitHomeStamp(home);
+    await kitMaterializeHome(home, "claude", { profile: stamp.kitProfile });
+    const { readFile } = await import("node:fs/promises");
+    const argv = (await readFile(join(dir, "argv.txt"), "utf8")).trim();
+    assert.match(argv, /--profile web-qa/, "converges to the home's standing profile, not the default");
+    await rm(home, { recursive: true, force: true });
+  } finally {
+    delete process.env.HIVE_KIT_BIN;
+    resetKitProbeForTests();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
