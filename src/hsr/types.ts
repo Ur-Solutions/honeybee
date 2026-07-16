@@ -59,6 +59,13 @@ export type RunnerEvent =
   // generic `error`). The daemon reacts by minting a fresh token and restarting
   // the runner with resume — mirrors how `exhausted` drives the autoswap edge.
   | { type: "auth_expired"; ts: number }
+  // Human-login recovery marker: appended by `hive auth-resume` after it
+  // captures the fresh login and relaunches the runner. It un-sticks the
+  // auth-needed classification — a resumed bee sits idle, so WITHOUT this
+  // boundary the stale login-required `error` stays the tail's last turn and
+  // the daemon re-derives auth-needed forever (observed on CL.8d7,
+  // 2026-07-16). An auth error AFTER the marker (creds still bad) re-wins.
+  | { type: "auth_resume"; ts: number }
   | {
       type: "needs_input";
       ts: number;

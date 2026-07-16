@@ -164,6 +164,37 @@ test("structuredStateFromEvents does not confuse daemon-recoverable auth_expired
   );
 });
 
+test("an auth_resume marker un-sticks a stale auth-needed tail (CL.8d7, 2026-07-16)", () => {
+  // The exact shape auth-resume leaves behind: the old error turn, the SIGTERM
+  // exit from stopping the stuck runtime, then the marker. The resumed bee
+  // sits idle without starting a new turn — it must NOT re-derive auth-needed.
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "error", ts: 2, message: "Not logged in · Please run /login" },
+      { type: "turn_end", ts: 3 },
+      { type: "exit", ts: 4, code: 143 },
+      { type: "auth_resume", ts: 5 },
+    ]),
+    "idle_with_output",
+  );
+});
+
+test("an auth error AFTER an auth_resume marker still wins (the login didn't take)", () => {
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "error", ts: 2, message: "Not logged in · Please run /login" },
+      { type: "turn_end", ts: 3 },
+      { type: "auth_resume", ts: 4 },
+      { type: "turn_start", ts: 5 },
+      { type: "error", ts: 6, message: "Not logged in · Please run /login" },
+      { type: "turn_end", ts: 7 },
+    ]),
+    "auth-needed",
+  );
+});
+
 // ─── idle must not fire while a tool is open ───────────────────────────────
 // claude's stream-json emits a `result` (→ turn_end) MID-TURN on long tool
 // chains, then keeps calling tools with no new turn_start. Reading that as

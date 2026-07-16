@@ -9,7 +9,7 @@ import { writeSpawnOptions } from "../hiveState.js";
 import { adapterFor } from "../hsr/adapters/index.js";
 import { hsrObservations, type HsrObservation } from "../hsr/observe.js";
 import { connectRpcClient } from "../hsr/rpc.js";
-import { readHsrMeta } from "../hsr/runDir.js";
+import { hsrEventsPath, readHsrMeta } from "../hsr/runDir.js";
 import { hsrSubstrate } from "../hsr/substrate.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
@@ -23,7 +23,7 @@ import { identityRecipeForAgent, modelArgsForAgent } from "../drivers.js";
 import { resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
 import { loginSeatLiveDigest } from "./account.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
-import { readFile, stat } from "node:fs/promises";
+import { appendFile, readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
 // Harnesses whose interactive↔headless resume genuinely carries history — the
@@ -594,6 +594,14 @@ export async function cmdAuthResume(parsed: Parsed): Promise<void> {
   await activateAccountIntoHome(account, record.homePath, { onWarn: (message) => console.error(note(message)) });
   await stopRuntimeForAuthResume(record);
   const revived = await reviveRecord(record, { fresh: false });
+  // Bound the auth-needed stickiness in the events tail: a resumed bee sits
+  // idle, so without this marker structuredStateFromEvents keeps re-deriving
+  // auth-needed from the stale login-required error turn (CL.8d7, 2026-07-16).
+  // Best-effort — an HSR-less (tmux) bee has no events log and that's fine.
+  await appendFile(
+    hsrEventsPath(record.name),
+    `${JSON.stringify({ type: "auth_resume", ts: Date.now() })}\n`,
+  ).catch(() => {});
   const cleared =
     (await updateSession(record.name, {
       lastObservedState: undefined,

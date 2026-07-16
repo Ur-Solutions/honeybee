@@ -219,6 +219,7 @@ export function structuredStateFromEvents(
   let lastTool = -1;
   let lastNeeds = -1;
   let lastAuthNeeded = -1;
+  let lastAuthResume = -1;
   let hasText = false;
   for (let i = 0; i < events.length; i++) {
     const event = events[i]!;
@@ -241,14 +242,23 @@ export function structuredStateFromEvents(
       case "error":
         if (isAuthNeededMessage(event.message)) lastAuthNeeded = i;
         break;
+      case "auth_resume":
+        lastAuthResume = i;
+        break;
       default:
         break;
     }
   }
   // A login-required auth failure is sticky for the turn it happened in. It is
   // intentionally separate from `auth_expired`: remote ephemeral-token bees can
-  // recover that automatically, while this one requires a human login.
-  if (lastAuthNeeded >= 0 && lastAuthNeeded >= lastStart) return "auth-needed";
+  // recover that automatically, while this one requires a human login. The
+  // `auth_resume` marker (written by `hive auth-resume` after capture+revive)
+  // bounds the stickiness: a resumed bee sits idle without starting a new
+  // turn, so the stale error must not keep re-deriving auth-needed. An auth
+  // error AFTER the marker (the resumed runner failed again) still wins.
+  if (lastAuthNeeded >= 0 && lastAuthNeeded >= lastStart && lastAuthNeeded > lastAuthResume) {
+    return "auth-needed";
+  }
   // An unresolved needs_input (nothing finished the turn after it) blocks the bee.
   if (lastNeeds >= 0 && lastNeeds > lastEnd) return "blocked";
   // A turn is in flight when the last turn marker is a start with no later end.
