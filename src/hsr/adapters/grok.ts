@@ -701,6 +701,9 @@ export async function startGrokRunner(opts: RunnerOpts, dependencies: GrokRunner
     async answer(requestId, answer): Promise<void> {
       const pending = pendingInputs.get(requestId);
       if (!pending) throw new Error(`hsr grok: no pending input for requestId ${requestId}`);
+      if (typeof answer !== "string") {
+        throw new Error("hsr grok: native answer matrices are only supported by OpenCode");
+      }
       const response = pending.kind === "question"
         ? encodeGrokQuestionAnswer(pending.params, answer)
         : encodeGrokPermissionAnswer(pending.params, answer);

@@ -266,6 +266,10 @@ test("Grok ACP maps standard permissions and structured multi-question answers",
       assert.equal(question.questions?.length, 2);
       assert.equal(question.questions?.[0]?.options?.[1]?.preview, "A blue preview");
       assert.equal(question.questions?.[1]?.multiSelect, true);
+      await assert.rejects(
+        running.session.answer(question.requestId!, [["Blue"], ["Lint", "Tests"]]),
+        /answer matrices are only supported by OpenCode/,
+      );
       await running.session.answer(question.requestId!, JSON.stringify({ q0: "Blue", q1: ["Lint", "Tests"] }));
     }
     const completed = await until(iterator, (event) => event.type === "turn_end");
