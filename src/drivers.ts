@@ -4,6 +4,7 @@ import type { RunnerAdapter } from "./hsr/types.js";
 import { claudeAdapter } from "./hsr/adapters/claude.js";
 import { codexAdapter } from "./hsr/adapters/codex.js";
 import { cursorAdapter } from "./hsr/adapters/cursor.js";
+import { grokAdapter } from "./hsr/adapters/grok.js";
 import { kimiAdapter, normalizeKimiModel } from "./hsr/adapters/kimi.js";
 
 /**
@@ -232,6 +233,8 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
     modelArgs: (model) => (model ? ["--model", model] : []),
     bootMs: 10_000,
+    resumeArgs: (sid) => (sid ? ["--resume", sid] : ["--continue"]),
+    hsrAdapter: grokAdapter,
     soleCredentialedAccountDefault: true,
   },
   kimi: {

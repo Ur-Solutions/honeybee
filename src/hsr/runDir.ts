@@ -287,6 +287,10 @@ export async function compactHsrEvents(
   let inputTokens = 0;
   let outputTokens = 0;
   let totalTokens = 0;
+  let cacheReadTokens = 0;
+  let reasoningTokens = 0;
+  let sawCacheReadTokens = false;
+  let sawReasoningTokens = false;
   let sawUsage = false;
   let usageTs = 0;
   let latestExhausted: { ts: number; resetHint?: string } | undefined;
@@ -316,6 +320,14 @@ export async function compactHsrEvents(
       if (typeof event.inputTokens === "number" && Number.isFinite(event.inputTokens)) inputTokens += event.inputTokens;
       if (typeof event.outputTokens === "number" && Number.isFinite(event.outputTokens)) outputTokens += event.outputTokens;
       if (typeof event.totalTokens === "number" && Number.isFinite(event.totalTokens)) totalTokens += event.totalTokens;
+      if (typeof event.cacheReadTokens === "number" && Number.isFinite(event.cacheReadTokens)) {
+        cacheReadTokens += event.cacheReadTokens;
+        sawCacheReadTokens = true;
+      }
+      if (typeof event.reasoningTokens === "number" && Number.isFinite(event.reasoningTokens)) {
+        reasoningTokens += event.reasoningTokens;
+        sawReasoningTokens = true;
+      }
       if (typeof event.ts === "number" && Number.isFinite(event.ts) && event.ts > usageTs) usageTs = event.ts;
     } else if (event.type === "exhausted") {
       const ts = typeof event.ts === "number" && Number.isFinite(event.ts) ? event.ts : 0;
@@ -326,7 +338,15 @@ export async function compactHsrEvents(
   }
   const checkpoint: string[] = [];
   if (sawUsage) {
-    checkpoint.push(JSON.stringify({ type: "usage", ts: usageTs, inputTokens, outputTokens, totalTokens } satisfies RunnerEvent));
+    checkpoint.push(JSON.stringify({
+      type: "usage",
+      ts: usageTs,
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      ...(sawCacheReadTokens ? { cacheReadTokens } : {}),
+      ...(sawReasoningTokens ? { reasoningTokens } : {}),
+    } satisfies RunnerEvent));
   }
   if (latestExhausted) {
     checkpoint.push(JSON.stringify({ type: "exhausted", ...latestExhausted } satisfies RunnerEvent));

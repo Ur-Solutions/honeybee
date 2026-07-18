@@ -74,15 +74,20 @@ test("legacy allowance behavior is preserved by the registry view", () => {
   assert.equal(bestTier("claude", "subscription"), "stream");
   assert.equal(bestTier("codex", "subscription"), "server");
   assert.equal(bestTier("kimi", "subscription"), "stream");
+  assert.equal(bestTier("grok", "subscription"), "stream");
   assert.deepEqual(allowanceFor("kimi", "subscription")?.requiredFlags, ["acp"]);
+  assert.deepEqual(allowanceFor("grok", "subscription")?.requiredFlags, ["--no-auto-update", "agent", "--no-leader", "stdio"]);
+  assert.deepEqual(scrubEnvFor("grok", "subscription"), ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"]);
+  assert.deepEqual(scrubEnvFor("grok", "api-key"), []);
   assert.deepEqual(scrubEnvFor("claude", "subscription"), ["ANTHROPIC_API_KEY"]);
   assert.deepEqual(scrubEnvFor("claude", "api-key"), []);
   assert.equal(allowanceFor("stub", "subscription"), undefined, "stub is test-only: no allowance rows");
   assert.equal(allowanceFor("nope", "subscription"), undefined);
 });
 
-test("Kimi HSR is explicitly local-only while other established remote runners remain allowed", () => {
+test("Kimi and Grok HSR are explicitly local-only while established remote runners remain allowed", () => {
   assert.equal(harnessSupportsRemoteHsr("kimi"), false);
+  assert.equal(harnessSupportsRemoteHsr("grok"), false);
   assert.equal(harnessSupportsRemoteHsr("claude"), true);
   assert.equal(harnessSupportsRemoteHsr("codex"), true);
 });

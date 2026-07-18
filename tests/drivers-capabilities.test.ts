@@ -50,7 +50,8 @@ test("resumeArgsForAgent: per-provider resume forms from the registry", () => {
   assert.deepEqual(resumeArgsForAgent("opencode", undefined), ["--continue"]);
   assert.deepEqual(resumeArgsForAgent("kimi", "abc"), ["--session", "abc"]);
   assert.deepEqual(resumeArgsForAgent("kimi", undefined), ["--continue"]);
-  assert.deepEqual(resumeArgsForAgent("grok", "abc"), []);
+  assert.deepEqual(resumeArgsForAgent("grok", "abc"), ["--resume", "abc"]);
+  assert.deepEqual(resumeArgsForAgent("grok", undefined), ["--continue"]);
   assert.deepEqual(resumeArgsForAgent("no-such-agent", "abc"), []);
 });
 
@@ -87,11 +88,12 @@ test("hsrAdapterForAgent + adapterFor: registry-backed adapters and their tiers"
   assert.equal(hsrAdapterForAgent("claude")?.tier(), "stream");
   assert.equal(hsrAdapterForAgent("codex")?.tier(), "server");
   assert.equal(hsrAdapterForAgent("kimi")?.tier(), "stream");
-  assert.equal(hsrAdapterForAgent("grok"), undefined);
+  assert.equal(hsrAdapterForAgent("grok")?.tier(), "stream");
   // adapterFor delegates to the registry and keeps the test-only stub.
   assert.equal(adapterFor("claude"), hsrAdapterForAgent("claude"));
   assert.equal(adapterFor("codex"), hsrAdapterForAgent("codex"));
   assert.equal(adapterFor("kimi"), hsrAdapterForAgent("kimi"));
+  assert.equal(adapterFor("grok"), hsrAdapterForAgent("grok"));
   assert.equal(adapterFor("stub")?.tier(), "stream");
   assert.equal(adapterFor("opencode"), undefined);
 });

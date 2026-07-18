@@ -74,8 +74,8 @@ test("compactHsrEvents folds dropped usage/exhausted into checkpoints, keeps the
   await withTempStore(async () => {
     const bee = "compactee";
     const events: RunnerEvent[] = [
-      { type: "usage", ts: 1, inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-      { type: "usage", ts: 2, inputTokens: 50, outputTokens: 5, totalTokens: 55 },
+      { type: "usage", ts: 1, inputTokens: 100, outputTokens: 10, totalTokens: 110, cacheReadTokens: 40, reasoningTokens: 3 },
+      { type: "usage", ts: 2, inputTokens: 50, outputTokens: 5, totalTokens: 55, cacheReadTokens: 20, reasoningTokens: 2 },
       { type: "exhausted", ts: 3, resetHint: "R1" },
       ...Array.from({ length: 10 }, (_, i): RunnerEvent => ({ type: "text", ts: 4 + i, text: `chunk-${i}` })),
       { type: "turn_start", ts: 14 },
@@ -95,7 +95,15 @@ test("compactHsrEvents folds dropped usage/exhausted into checkpoints, keeps the
     // usage checkpoint + exhausted checkpoint + text stub (the dropped prefix
     // held assistant text but no turn markers) + the 4 kept tail lines.
     assert.equal(lines.length, 7);
-    assert.deepEqual(JSON.parse(lines[0]!), { type: "usage", ts: 2, inputTokens: 150, outputTokens: 15, totalTokens: 165 });
+    assert.deepEqual(JSON.parse(lines[0]!), {
+      type: "usage",
+      ts: 2,
+      inputTokens: 150,
+      outputTokens: 15,
+      totalTokens: 165,
+      cacheReadTokens: 60,
+      reasoningTokens: 5,
+    });
     assert.deepEqual(JSON.parse(lines[1]!), { type: "exhausted", ts: 3, resetHint: "R1" });
     assert.deepEqual(JSON.parse(lines[2]!), { type: "text", ts: 11, text: "…" });
     assert.deepEqual(lines.slice(3), before.slice(-4), "kept tail must be preserved verbatim");

@@ -13,8 +13,8 @@
  * - "server": one long-lived server process multiplexes N sessions over RPC
  *   (codex `app-server`, opencode `serve`) — best process economics.
  * - "stream": one bidirectional stdin/stdout process per bee, multi-turn
- *   (claude `-p` stream-json, kimi `acp`).
- * - "turn": process per turn, state carried by harness resume (grok `-p`).
+ *   (claude `-p` stream-json, kimi `acp`, grok `agent stdio`).
+ * - "turn": process per turn, state carried by harness resume (cursor `-p`).
  * - "pty": node-pty around the interactive TUI — the fallback when no
  *   structured path is available or allowed.
  */
@@ -24,6 +24,8 @@ export type RunnerTier = "server" | "stream" | "turn" | "pty";
 export type RunnerInputOption = {
   label: string;
   description?: string;
+  /** Optional richer comparison content (Grok ask_user_question extension). */
+  preview?: string;
 };
 
 export type RunnerInputQuestion = {
@@ -44,8 +46,19 @@ export type RunnerEvent =
   | { type: "turn_start"; ts: number; threadId?: string }
   | { type: "turn_end"; ts: number; threadId?: string }
   | { type: "text"; ts: number; text: string } // assistant output chunk (feeds ring buffer)
+  | { type: "thought"; ts: number; text: string } // reasoning chunk (structured stream only; never rendered into ring text)
   | { type: "tool_use"; ts: number; tool: string; input?: unknown }
-  | { type: "usage"; ts: number; inputTokens?: number; outputTokens?: number; totalTokens?: number }
+  | {
+      type: "usage";
+      ts: number;
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+      /** Cache reads are a subset of inputTokens when the provider reports them. */
+      cacheReadTokens?: number;
+      /** Reasoning tokens are a subset of outputTokens when the provider reports them. */
+      reasoningTokens?: number;
+    }
   // Provider rate-limit / exhaustion signal (claude rate_limit_event, codex
   // account/rateLimits/updated). Feeds the usage sampler's account.exhausted
   // edge for pane-less HSR bees. resetHint is a verbatim/derived reset marker.
@@ -58,7 +71,7 @@ export type RunnerEvent =
   // adapter classifies THAT into this distinct variant (everything else stays a
   // generic `error`). The daemon reacts by minting a fresh token and restarting
   // the runner with resume — mirrors how `exhausted` drives the autoswap edge.
-  | { type: "auth_expired"; ts: number }
+  | { type: "auth_expired"; ts: number; detail?: string; requiresLogin?: boolean }
   // Human-login recovery marker: appended by `hive auth-resume` after it
   // captures the fresh login and relaunches the runner. It un-sticks the
   // auth-needed classification — a resumed bee sits idle, so WITHOUT this

@@ -14,6 +14,7 @@ import type { RunnerHarness } from "../harness.js";
 import { claudeAdapter } from "./claude.js";
 import { codexAdapter } from "./codex.js";
 import { cursorAdapter } from "./cursor.js";
+import { grokAdapter } from "./grok.js";
 import { kimiAdapter } from "./kimi.js";
 import { stubAdapter } from "./stub.js";
 
@@ -22,6 +23,7 @@ const ADAPTERS = {
   claude: claudeAdapter,
   codex: codexAdapter,
   cursor: cursorAdapter,
+  grok: grokAdapter,
   kimi: kimiAdapter,
 } satisfies Record<RunnerHarness, RunnerAdapter>;
 
