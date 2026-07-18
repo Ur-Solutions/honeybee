@@ -15,12 +15,14 @@ import { claudeAdapter } from "./claude.js";
 import { codexAdapter } from "./codex.js";
 import { cursorAdapter } from "./cursor.js";
 import { kimiAdapter } from "./kimi.js";
+import { openCodeAdapter } from "./opencode.js";
 import { stubAdapter } from "./stub.js";
 
 const ADAPTERS = {
   stub: stubAdapter,
   claude: claudeAdapter,
   codex: codexAdapter,
+  opencode: openCodeAdapter,
   cursor: cursorAdapter,
   kimi: kimiAdapter,
 } satisfies Record<RunnerHarness, RunnerAdapter>;

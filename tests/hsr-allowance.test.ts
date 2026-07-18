@@ -10,6 +10,14 @@ test("bestTier: codex subscription prefers the server tier", () => {
   assert.equal(bestTier("codex", "subscription"), "server");
 });
 
+test("bestTier: OpenCode uses authenticated loopback serve with PTY fallback", () => {
+  assert.equal(bestTier("opencode", "subscription"), "server");
+  assert.deepEqual(allowanceFor("opencode", "subscription")?.permittedTiers, ["server", "pty"]);
+  assert.deepEqual(allowanceFor("opencode", "subscription")?.requiredFlags, [
+    "serve", "--hostname", "127.0.0.1", "--port", "0",
+  ]);
+});
+
 test("scrubEnvFor: claude subscription scrubs ANTHROPIC_API_KEY", () => {
   assert.ok(scrubEnvFor("claude", "subscription").includes("ANTHROPIC_API_KEY"));
 });

@@ -86,14 +86,29 @@ test("sessionPinResumeExtrasForAgent: claude resumes need --fork-session next to
 test("hsrAdapterForAgent + adapterFor: registry-backed adapters and their tiers", () => {
   assert.equal(hsrAdapterForAgent("claude")?.tier(), "stream");
   assert.equal(hsrAdapterForAgent("codex")?.tier(), "server");
+  assert.equal(hsrAdapterForAgent("opencode")?.tier(), "server");
   assert.equal(hsrAdapterForAgent("kimi")?.tier(), "stream");
   assert.equal(hsrAdapterForAgent("grok"), undefined);
   // adapterFor delegates to the registry and keeps the test-only stub.
   assert.equal(adapterFor("claude"), hsrAdapterForAgent("claude"));
   assert.equal(adapterFor("codex"), hsrAdapterForAgent("codex"));
+  assert.equal(adapterFor("opencode"), hsrAdapterForAgent("opencode"));
   assert.equal(adapterFor("kimi"), hsrAdapterForAgent("kimi"));
   assert.equal(adapterFor("stub")?.tier(), "stream");
-  assert.equal(adapterFor("opencode"), undefined);
+});
+
+test("OpenCode driver preserves qualified models and qualifies account models once", () => {
+  assert.deepEqual(modelArgsForAgent("opencode", "zai-coding-plan/glm-5"), [
+    "--model",
+    "zai-coding-plan/glm-5",
+  ]);
+  assert.deepEqual(modelArgsForAgent("opencode", "glm-5", "zai-coding-plan"), [
+    "--model",
+    "zai-coding-plan/glm-5",
+  ]);
+  assert.deepEqual(modelArgsForAgent("opencode", "glm-5"), []);
+  assert.deepEqual(modelArgsForAgent("opencode", "/glm-5"), []);
+  assert.deepEqual(modelArgsForAgent("opencode", "zai-coding-plan/"), []);
 });
 
 test("Kimi driver registers model and config identity capabilities", () => {

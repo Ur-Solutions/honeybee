@@ -128,6 +128,23 @@ test("runner-host: spawn+turn, sessionId, needs_input, snapshot, liveness, stop"
         "answered:yes text",
       );
 
+      // The host preserves OpenCode's native multi-question matrix over RPC;
+      // legacy string-only adapters receive its JSON compatibility form.
+      const beforeStructuredAsk = events.length;
+      await client.call("send", { text: "ask structured" });
+      await waitFor(
+        () => events.slice(beforeStructuredAsk).some((e) => e.type === "needs_input" && e.requestId === "r1"),
+        "structured needs_input r1",
+      );
+      const beforeStructuredAnswer = events.length;
+      await client.call("answer", { requestId: "r1", answer: [["core", "cli"], ["safe"]] });
+      await waitFor(
+        () => events.slice(beforeStructuredAnswer).some(
+          (e) => e.type === "text" && e.text === 'answered:[["core","cli"],["safe"]]',
+        ),
+        "structured answer preserved over host RPC",
+      );
+
       // 4. snapshot returns the echoed output tail.
       const snap = (await client.call("snapshot", { lines: 5 })) as string;
       assert.match(snap, /echo:hello/);

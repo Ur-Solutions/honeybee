@@ -73,7 +73,11 @@ test("allowance.ts serves rows derived from the registry", () => {
 test("legacy allowance behavior is preserved by the registry view", () => {
   assert.equal(bestTier("claude", "subscription"), "stream");
   assert.equal(bestTier("codex", "subscription"), "server");
+  assert.equal(bestTier("opencode", "subscription"), "server");
   assert.equal(bestTier("kimi", "subscription"), "stream");
+  assert.deepEqual(allowanceFor("opencode", "subscription")?.requiredFlags, [
+    "serve", "--hostname", "127.0.0.1", "--port", "0",
+  ]);
   assert.deepEqual(allowanceFor("kimi", "subscription")?.requiredFlags, ["acp"]);
   assert.deepEqual(scrubEnvFor("claude", "subscription"), ["ANTHROPIC_API_KEY"]);
   assert.deepEqual(scrubEnvFor("claude", "api-key"), []);
@@ -81,7 +85,8 @@ test("legacy allowance behavior is preserved by the registry view", () => {
   assert.equal(allowanceFor("nope", "subscription"), undefined);
 });
 
-test("Kimi HSR is explicitly local-only while other established remote runners remain allowed", () => {
+test("OpenCode and Kimi HSR are explicitly local-only while filtered-credential runners remain allowed", () => {
+  assert.equal(harnessSupportsRemoteHsr("opencode"), false);
   assert.equal(harnessSupportsRemoteHsr("kimi"), false);
   assert.equal(harnessSupportsRemoteHsr("claude"), true);
   assert.equal(harnessSupportsRemoteHsr("codex"), true);

@@ -81,6 +81,16 @@ test("agent-origin Kimi spawn defaults to its now-registered HSR runner", async 
   });
 });
 
+test("agent-origin OpenCode spawn defaults to its server-tier HSR runner", async () => {
+  await withTempStore(async () => {
+    await saveSession(stubRecord("parentbee"));
+    process.env.HIVE_BEE = "parentbee";
+    const { useHsr, node } = await resolveSpawnSubstrate(parse(["spawn", "opencode"]), "opencode");
+    assert.equal(useHsr, true);
+    assert.equal(node, undefined);
+  });
+});
+
 test("user origin (no HIVE_BEE/TMUX) defaults to local-tmux node", async () => {
   await withTempStore(async () => {
     const { useHsr, node } = await resolveSpawnSubstrate(spawnArgs(), "claude");

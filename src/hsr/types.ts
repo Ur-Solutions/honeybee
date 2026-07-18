@@ -36,6 +36,14 @@ export type RunnerInputQuestion = {
 };
 
 /**
+ * Provider-neutral answer accepted by RunnerSession.answer(). The legacy text
+ * form remains valid for permissions and single questions. Providers with a
+ * multi-question form (OpenCode) can retain their native ordered, multi-select
+ * answer matrix instead of flattening it through a string.
+ */
+export type RunnerInputAnswer = string | string[][];
+
+/**
  * A structured event emitted by a running harness. Replaces screen-scraping:
  * these feed `deriveState`, needs-input detection, the usage sampler, and the
  * ring buffer that backs `RunnerSession.snapshot()`.
@@ -44,8 +52,32 @@ export type RunnerEvent =
   | { type: "turn_start"; ts: number; threadId?: string }
   | { type: "turn_end"; ts: number; threadId?: string }
   | { type: "text"; ts: number; text: string } // assistant output chunk (feeds ring buffer)
-  | { type: "tool_use"; ts: number; tool: string; input?: unknown }
-  | { type: "usage"; ts: number; inputTokens?: number; outputTokens?: number; totalTokens?: number }
+  | { type: "reasoning"; ts: number; text: string }
+  | { type: "tool_use"; ts: number; tool: string; callId?: string; input?: unknown }
+  | {
+      type: "tool_update";
+      ts: number;
+      tool: string;
+      callId?: string;
+      status: "pending" | "running" | "completed" | "error";
+      input?: unknown;
+      output?: unknown;
+      error?: string;
+    }
+  | {
+      type: "usage";
+      ts: number;
+      /** Non-cached input tokens when cache fields are present. */
+      inputTokens?: number;
+      /** Non-reasoning output tokens when reasoningTokens is present. */
+      outputTokens?: number;
+      /** Provider-reported total, when supplied. */
+      totalTokens?: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      reasoningTokens?: number;
+      cost?: number;
+    }
   // Provider rate-limit / exhaustion signal (claude rate_limit_event, codex
   // account/rateLimits/updated). Feeds the usage sampler's account.exhausted
   // edge for pane-less HSR bees. resetHint is a verbatim/derived reset marker.
@@ -58,7 +90,7 @@ export type RunnerEvent =
   // adapter classifies THAT into this distinct variant (everything else stays a
   // generic `error`). The daemon reacts by minting a fresh token and restarting
   // the runner with resume — mirrors how `exhausted` drives the autoswap edge.
-  | { type: "auth_expired"; ts: number }
+  | { type: "auth_expired"; ts: number; detail?: string }
   // Human-login recovery marker: appended by `hive auth-resume` after it
   // captures the fresh login and relaunches the runner. It un-sticks the
   // auth-needed classification — a resumed bee sits idle, so WITHOUT this
@@ -113,9 +145,9 @@ export type RunnerOpts = {
  * How a send should land relative to the live turn. "now" (default) delivers
  * immediately; "next-tool" asks the runner to HOLD the text until the next
  * tool boundary (tool_use / turn_end) of the current turn — idle sessions
- * deliver immediately. Only the stream tier implements the hold; turn tier
- * already queues sends behind the live turn, and server/pty tiers ignore the
- * option (harness-native semantics).
+ * deliver immediately. Stream runners and server adapters with native tool
+ * events (OpenCode) implement the hold; turn runners already queue behind the
+ * live turn, while other server/pty adapters use harness-native semantics.
  */
 export type RunnerSendOpts = { mode?: "now" | "next-tool" };
 
@@ -130,7 +162,7 @@ export type RunnerSession = {
   pid?: number; // child pid (server tier: the shared server pid)
   send(text: string, opts?: RunnerSendOpts): Promise<void>;
   interrupt(): Promise<void>;
-  answer(requestId: string, answer: string): Promise<void>; // respond to a needs_input
+  answer(requestId: string, answer: RunnerInputAnswer): Promise<void>; // respond to a needs_input
   events: AsyncIterable<RunnerEvent>;
   snapshot(lines?: number): string; // rendered tail for Substrate.capture() compat
   stop(): Promise<void>;

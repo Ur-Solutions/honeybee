@@ -42,8 +42,13 @@ test("assertResumable: Kimi ACP and interactive sessions share a resumable sessi
   assert.equal(assertResumable(recordFor({ agent: "kimi", providerSessionId: "session_123" }), "demote"), "kimi");
 });
 
+test("assertResumable: OpenCode REST and interactive sessions share a resumable session id", () => {
+  assert.equal(assertResumable(recordFor({ agent: "opencode", providerSessionId: "ses_123" }), "promote"), "opencode");
+  assert.equal(assertResumable(recordFor({ agent: "opencode", providerSessionId: "ses_123" }), "demote"), "opencode");
+});
+
 test("assertResumable: a non-resume-gated harness is rejected", () => {
-  assert.throws(() => assertResumable(recordFor({ agent: "opencode" }), "demote"), /only codex and kimi/);
+  assert.throws(() => assertResumable(recordFor({ agent: "grok" }), "demote"), /only codex, opencode, and kimi/);
 });
 
 /** A minimal RunnerOpts; individual tests override command/args/resume/etc. */
@@ -65,9 +70,14 @@ test("resumeArgs: Kimi interactive resume uses --session <id>", () => {
   assert.deepEqual(resumeArgs("kimi", "session_9"), ["--session", "session_9"]);
 });
 
+test("resumeArgs: OpenCode interactive resume uses --session <id>", () => {
+  assert.deepEqual(resumeArgs("opencode", "ses_9"), ["--session", "ses_9"]);
+});
+
 test("resumeArgs: missing session id falls back to the continue/last form", () => {
   assert.deepEqual(resumeArgs("claude", undefined), ["--continue"]);
   assert.deepEqual(resumeArgs("codex", undefined), ["resume", "--last"]);
+  assert.deepEqual(resumeArgs("opencode", undefined), ["--continue"]);
   assert.deepEqual(resumeArgs("kimi", undefined), ["--continue"]);
 });
 

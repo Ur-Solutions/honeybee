@@ -5,6 +5,7 @@ import { claudeAdapter } from "./hsr/adapters/claude.js";
 import { codexAdapter } from "./hsr/adapters/codex.js";
 import { cursorAdapter } from "./hsr/adapters/cursor.js";
 import { kimiAdapter, normalizeKimiModel } from "./hsr/adapters/kimi.js";
+import { openCodeAdapter } from "./hsr/adapters/opencode.js";
 
 /**
  * IdentityRecipe describes how a provider's login materializes on disk so the
@@ -210,12 +211,18 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     // name the provider: `--model <provider>/<model>`. Both halves are required
     // — a provider-less account yields no selector (falls back to opencode's
     // config default) rather than the malformed `--model undefined/<model>`.
-    modelArgs: (model, provider) => (model && provider ? ["--model", `${provider}/${model}`] : []),
+    modelArgs: (model, provider) => {
+      if (!model) return [];
+      const slash = model.indexOf("/");
+      if (slash > 0 && slash < model.length - 1) return ["--model", model];
+      return provider ? ["--model", `${provider}/${model}`] : [];
+    },
     // opencode surfaces several providers' limit messages; the shared
     // verb-anchored matcher keeps it narrow to avoid false positives.
     isExhausted: (pane) => matchExhaustion(pane, RATE_LIMIT_EXHAUSTED),
     bootMs: 15_000,
     resumeArgs: (sid) => (sid ? ["--session", sid] : ["--continue"]),
+    hsrAdapter: openCodeAdapter,
   },
   grok: {
     kind: "grok",

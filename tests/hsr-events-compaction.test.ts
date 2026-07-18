@@ -74,8 +74,14 @@ test("compactHsrEvents folds dropped usage/exhausted into checkpoints, keeps the
   await withTempStore(async () => {
     const bee = "compactee";
     const events: RunnerEvent[] = [
-      { type: "usage", ts: 1, inputTokens: 100, outputTokens: 10, totalTokens: 110 },
-      { type: "usage", ts: 2, inputTokens: 50, outputTokens: 5, totalTokens: 55 },
+      {
+        type: "usage", ts: 1, inputTokens: 100, outputTokens: 10, totalTokens: 120,
+        cacheReadTokens: 5, cacheWriteTokens: 2, reasoningTokens: 3, cost: 0.125,
+      },
+      {
+        type: "usage", ts: 2, inputTokens: 50, outputTokens: 5, totalTokens: 67,
+        cacheReadTokens: 7, cacheWriteTokens: 0, reasoningTokens: 5, cost: 0.25,
+      },
       { type: "exhausted", ts: 3, resetHint: "R1" },
       ...Array.from({ length: 10 }, (_, i): RunnerEvent => ({ type: "text", ts: 4 + i, text: `chunk-${i}` })),
       { type: "turn_start", ts: 14 },
@@ -95,14 +101,17 @@ test("compactHsrEvents folds dropped usage/exhausted into checkpoints, keeps the
     // usage checkpoint + exhausted checkpoint + text stub (the dropped prefix
     // held assistant text but no turn markers) + the 4 kept tail lines.
     assert.equal(lines.length, 7);
-    assert.deepEqual(JSON.parse(lines[0]!), { type: "usage", ts: 2, inputTokens: 150, outputTokens: 15, totalTokens: 165 });
+    assert.deepEqual(JSON.parse(lines[0]!), {
+      type: "usage", ts: 2, inputTokens: 150, outputTokens: 15, totalTokens: 187,
+      cacheReadTokens: 12, cacheWriteTokens: 2, reasoningTokens: 8, cost: 0.375,
+    });
     assert.deepEqual(JSON.parse(lines[1]!), { type: "exhausted", ts: 3, resetHint: "R1" });
     assert.deepEqual(JSON.parse(lines[2]!), { type: "text", ts: 11, text: "…" });
     assert.deepEqual(lines.slice(3), before.slice(-4), "kept tail must be preserved verbatim");
 
     // The cumulative usage observation is EXACTLY what it was pre-compaction.
     const usage = await hsrUsageObservation(bee);
-    assert.deepEqual(usage.totals, { inputTokens: 150, outputTokens: 15 });
+    assert.deepEqual(usage.totals, { inputTokens: 164, outputTokens: 23 });
     assert.deepEqual(usage.latestExhausted, { ts: 3, resetHint: "R1" });
 
     // The unresolved needs_input in the kept tail still observes: blocked + pending.
@@ -110,7 +119,7 @@ test("compactHsrEvents folds dropped usage/exhausted into checkpoints, keeps the
     assert.equal(observation?.live, true);
     assert.equal(observation?.state, "blocked");
     const observedWithEvents = (await hsrObservations({ includeEvents: true })).get(bee);
-    assert.deepEqual(observedWithEvents?.eventSnapshot?.usage.totals, { inputTokens: 150, outputTokens: 15 });
+    assert.deepEqual(observedWithEvents?.eventSnapshot?.usage.totals, { inputTokens: 164, outputTokens: 23 });
     assert.deepEqual(observedWithEvents?.eventSnapshot?.usage.latestExhausted, { ts: 3, resetHint: "R1" });
     assert.equal(observedWithEvents?.eventSnapshot?.pendingNeedsInput?.requestId, "req-1");
     const pending = await pendingNeedsInput(bee);

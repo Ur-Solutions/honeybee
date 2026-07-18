@@ -97,6 +97,8 @@ const CLAUDE_STREAM_FLAGS = ["-p", "--input-format", "stream-json", "--output-fo
 // would strand the turn; shared by both auth kinds.
 const CURSOR_TURN_FLAGS = ["-p", "--output-format", "stream-json", "--trust"] as const;
 
+const OPENCODE_SERVER_FLAGS = ["serve", "--hostname", "127.0.0.1", "--port", "0"] as const;
+
 export const HARNESSES = {
   // A real child process, but not a real harness — test scaffolding only
   // (adapters/stub.ts). No allowance rows, no ephemeral credentials.
@@ -167,23 +169,24 @@ export const HARNESSES = {
     },
   },
   opencode: {
-    runner: false,
+    runner: true,
+    remoteHsr: "local-only",
     allowance: {
       subscription: {
         permittedTiers: ["server", "pty"],
-        requiredFlags: [],
+        requiredFlags: OPENCODE_SERVER_FLAGS,
         scrubEnv: [],
         fingerprints: [],
-        note: "opencode serve REST + official SDK; best embedding story. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "OpenCode 1.17.18 serve REST/SSE with per-bee Basic auth; full permission/question endpoints and native session resume verified. Local-only until provider-filtered auth.json delivery is safe.",
+        since: "2026-07-18",
       },
       "api-key": {
         permittedTiers: ["server", "pty"],
-        requiredFlags: [],
+        requiredFlags: OPENCODE_SERVER_FLAGS,
         scrubEnv: [],
         fingerprints: [],
-        note: "opencode serve REST + official SDK. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "OpenCode 1.17.18 serve REST/SSE with intentional provider API-key billing and per-bee Basic auth. Local-only until selected-provider credential filtering is implemented.",
+        since: "2026-07-18",
       },
     },
   },
