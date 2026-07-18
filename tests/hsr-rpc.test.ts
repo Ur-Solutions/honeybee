@@ -126,6 +126,10 @@ test("broadcast backpressure: slow client gets bounded drop-oldest queue; fast c
     // Fast client: a normal rpc client that reads promptly.
     const fast = await connectRpcClient(socketPath);
     const fastMarkers: string[] = [];
+    let fastFillers = 0;
+    fast.on("filler", () => {
+      fastFillers++;
+    });
     fast.on("marker", (params) => {
       fastMarkers.push((params as { t: string }).t);
     });
@@ -148,11 +152,17 @@ test("broadcast backpressure: slow client gets bounded drop-oldest queue; fast c
       // The sleep between broadcasts lets the fast client's socket flush, so it
       // never blocks and every drop is attributable to the slow connection.
       const pad = "x".repeat(512 * 1024);
+      let fillersSent = 0;
       for (let i = 0; i < 20 && server.broadcastDroppedCount() === 0; i++) {
         server.broadcast("filler", { pad });
+        fillersSent++;
         await sleep(5);
       }
       assert.ok(server.broadcastDroppedCount() > 0, "expected drop-oldest to engage on the slow connection");
+      // Under the full parallel suite, the fast client can still have large
+      // filler frames queued despite the inter-broadcast sleeps. Drain those
+      // before taking the marker-loop drop baseline.
+      await waitFor(() => fastFillers === fillersSent);
       const droppedAfterFill = server.broadcastDroppedCount();
 
       // With the slow connection blocked and its queue full, each further
