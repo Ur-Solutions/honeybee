@@ -351,5 +351,6 @@ test("resumeArgs picks per-provider resume forms", () => {
   assert.deepEqual(resumeArgs("claude", undefined), ["--continue"]);
   assert.deepEqual(resumeArgs("codex", "abc"), ["resume", "abc"]);
   assert.deepEqual(resumeArgs("codex", undefined), ["resume", "--last"]);
-  assert.deepEqual(resumeArgs("grok", "abc"), []);
+  assert.deepEqual(resumeArgs("grok", "abc"), ["--resume", "abc"]);
+  assert.deepEqual(resumeArgs("grok", undefined), ["--continue"]);
 });

@@ -236,23 +236,26 @@ export const HARNESSES = {
     },
   },
   grok: {
-    runner: false,
+    runner: true,
+    remoteHsr: "local-only",
     allowance: {
       subscription: {
-        permittedTiers: ["turn", "pty"],
-        requiredFlags: [],
-        scrubEnv: [],
+        permittedTiers: ["stream", "pty"],
+        requiredFlags: ["--no-auto-update", "agent", "--no-leader", "stdio"],
+        // A subscription bee must never silently fall back to developer API
+        // billing when its cached OAuth token is absent or expired.
+        scrubEnv: ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"],
         fingerprints: [],
-        note: "grok -p headless streaming JSON; no server mode found, per-turn only. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "Grok 0.2.102 native ACP stdio with cached-token authentication; local HSR only because OAuth refresh tokens are not safe to copy across nodes.",
+        since: "2026-07-18",
       },
       "api-key": {
-        permittedTiers: ["turn", "pty"],
-        requiredFlags: [],
+        permittedTiers: ["stream", "pty"],
+        requiredFlags: ["--no-auto-update", "agent", "--no-leader", "stdio"],
         scrubEnv: [],
         fingerprints: [],
-        note: "grok -p headless streaming JSON. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "Grok 0.2.102 ACP authenticates explicitly with xai.api_key and preserves XAI_API_KEY; still local-only until remote secret delivery/shredding is implemented.",
+        since: "2026-07-18",
       },
     },
   },

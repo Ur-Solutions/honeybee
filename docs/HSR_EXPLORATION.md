@@ -66,7 +66,7 @@ Per harness (verified where noted; ? = verify during build):
 | **codex** | **S** | `codex app-server` (JSON-RPC over stdio; the official embedding protocol — `codex proto` is gone). One server per (home/account) hosts many conversations; approvals arrive as RPC callbacks | ✅ | `codex resume <id>` / `codex exec resume` — rollout id learned from server | ✅ rollout JSONL under `$CODEX_HOME/sessions/…` | high |
 | **opencode** | S | `opencode serve` REST (+ official SDK); sessions server-side | ✅ | TUI can attach to a running server / session (`opencode run --attach`-family — pin exact flags) | ✅ SQLite (Apiary already reads it) | med-high |
 | **kimi** | B | `kimi acp` — bidirectional ACP JSON-RPC over stdio; Honeybee owns initialize/session/prompt/cancel and permission callbacks | ✅ (queued turns) | ✅ `session/resume` over ACP and `kimi --session <id>` in the TUI share the native session store (0.27.0, 2026-07-17) | ✅ `$KIMI_CODE_HOME/sessions/…/<session>/agents/main/wire.jsonl` | high |
-| **grok** | T | `grok -p` headless with streaming JSON; no server mode found | per-turn | ? — resume flag unverified; if absent, HSR keeps context via prompt re-injection or stays P | ✅ per-session dir (Apiary reads it) | med |
+| **grok** | B | `grok --no-auto-update agent --no-leader stdio` — native ACP JSON-RPC over stdio | ✅ (queued turns) | ✅ ACP `session/load`; interactive `grok --resume <id>` / `--continue` shares the native session store (0.2.102, 2026-07-18) | ✅ per-session dir under `$GROK_HOME` (Apiary reads it) | high |
 | **cursor** | T? | `cursor-agent -p/--print` headless exists; resume support decent | per-turn | `cursor-agent resume`? verify | ? | low-med |
 | **droid** | T | `droid exec` headless (Factory) | per-turn | session id in output; verify | ? | med |
 | **pi** | P | no known structured mode | — | — | ? | low |
@@ -81,6 +81,11 @@ Notes:
   `session/set_config_option`. Supported model ids are `kimi-code/k3`,
   `kimi-code/kimi-for-coding`, and
   `kimi-code/kimi-for-coding-highspeed`.
+- **Grok model/reasoning and input**: the Grok adapter starts ACP with the
+  selected `--model` and `--reasoning-effort`, then applies the negotiated
+  model/reasoning and permission mode to the new or loaded session. It handles
+  standard ACP permission requests plus Grok's `x.ai/ask_user_question`
+  extension without flattening multiple questions or multi-select choices.
 - **Accounts/limits**: HSR structured events include token usage (claude
   `result` messages; codex token-count RPCs) → the usage sampler gets exact
   numbers for HSR bees instead of pane-scrape estimates. Autoswap keeps
@@ -149,6 +154,11 @@ An HSR bee is a first-class bee:
   text remains single-sourced from ACP. Auth, rate-limit, and generic errors
   are de-duplicated against prompt RPC failures before entering the durable
   HSR event log.
+- **Grok telemetry:** each ACP prompt result carries exact aggregate input,
+  output, cache-read, and reasoning-token usage. Honeybee persists that usage
+  even when the prompt RPC fails. JSON-RPC `-32003` becomes an exhausted event
+  with the provider reset/login detail; failures that require a fresh login
+  become `auth_expired { requiresLogin: true }` with actionable recovery detail.
 
 ### Apiary visibility — yes, and mostly for free
 
@@ -218,8 +228,8 @@ Mechanics — `hive promote <bee>` (and `hive demote <bee>` symmetric):
    safe).
 
 Per-harness feasibility = the *Resume* column in §2. `hive promote`/`demote`
-is enabled for codex and Kimi. Claude remains rejected because its stores are
-disjoint; opencode/grok/cursor/droid wait for verified round trips; pi never
+is enabled for codex, Grok, and Kimi. Claude remains rejected because its stores
+are disjoint; opencode/cursor/droid wait for verified round trips; pi never
 (tier P can instead "re-parent" by spawning a
 fresh tmux TUI with a context re-injection brief — lossy, labeled as such).
 
@@ -290,12 +300,12 @@ Agreed — this should be the default, and hive can detect the context cleanly.
 4. **Apiary read-path validation** (should be zero-change; fix the terminal
    pane to show ring-buffer console for HSR bees).
 5. **Promote/demote** for claude/codex.
-6. **opencode tier S, kimi ACP**, then grok/cursor/droid tier T probing.
+6. **opencode tier S, Kimi/Grok ACP**, then cursor/droid tier T probing.
 7. **Tier P fallback** (node-pty ≥1.2.0-beta.14, ring buffer, governor) —
    last, because tiers S/B/T cover current policy reality; P is insurance.
 
-Open questions carried forward: exact opencode TUI-attach flags; kimi/grok/
-cursor/droid resume verification; whether the Agent SDK (in-proc) or
+Open questions carried forward: exact opencode TUI-attach flags; cursor/droid
+resume verification; whether the Agent SDK (in-proc) or
 `claude -p` stream-json (subprocess) is the better claude tier B (SDK gives
 `canUseTool` + hooks; subprocess gives cleaner process isolation and env
 scrubbing — lean subprocess first, SDK when permission-routing lands);
@@ -489,3 +499,30 @@ remote transport or account credential handling. Remaining remote work is to
 design and test a short-lived or refresh-token-safe Kimi credential delivery
 and shredding policy; the existing Claude/Codex policy is not generalized by
 assumption.
+
+### 2026-07-18 — production Grok ACP runner
+
+The locally installed `grok 0.2.102 (ab5ebf69acec) [stable]` exposes a native,
+long-lived ACP process at `grok --no-auto-update agent … stdio`. Honeybee now
+owns the full local lifecycle: ACP initialize/authenticate, new/load, queued
+prompts, cancel, model/reasoning/mode selection, standard text/thought/tool
+updates, standard permission callbacks, Grok structured questions, exact
+per-prompt usage, rate/auth classification, and orderly process-group stop.
+The deterministic fixture covers prompt errors that still carry usage and
+verifies next-tool delivery waits for an actual tool boundary.
+
+The guarded live smoke on 2026-07-18 exercised cached-token authentication,
+`session/new`, one no-tools marker prompt, a native usage envelope with a
+non-zero total, orderly stop, `session/load` of that exact session, and a
+second orderly stop. It deliberately did not spend additional turns on live
+permissions/questions/rate-limit paths; those remain deterministic-fixture
+coverage.
+
+Remote Grok HSR is deliberately **local-only** for both auth kinds. Subscription
+spawns explicitly select cached-token authentication, scrub `XAI_API_KEY` and
+`GROK_CODE_XAI_API_KEY`, and never copy Grok's rotating OAuth material to a
+node. API-key spawns explicitly select `xai.api_key` and preserve those env
+variables because developer-API billing is intentional, but remote delivery is
+still rejected until Honeybee has a tested ephemeral secret delivery and
+shredding path. This keeps API-key behavior explicit without treating a static
+key as permission to generalize the subscription credential policy.

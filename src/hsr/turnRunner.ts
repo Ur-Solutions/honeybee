@@ -3,8 +3,8 @@
  *
  * `startTurnRunner` is the reusable RunnerSession for tier-"turn" harnesses:
  * ONE short-lived child process PER TURN, with conversation state carried by
- * the harness's own resume mechanism (cursor `-p … --resume=<chatId>`,
- * grok `-p`). The session outlives its children: the event queue / ring buffer
+ * the harness's own resume mechanism (cursor `-p … --resume=<chatId>`). The
+ * session outlives its children: the event queue / ring buffer
  * (createSessionPlumbing) span all turns, the provider session id is learned
  * from the first turn's init line, and every later turn resumes it.
  *

@@ -42,8 +42,13 @@ test("assertResumable: Kimi ACP and interactive sessions share a resumable sessi
   assert.equal(assertResumable(recordFor({ agent: "kimi", providerSessionId: "session_123" }), "demote"), "kimi");
 });
 
+test("assertResumable: Grok ACP and interactive sessions share a resumable session id", () => {
+  assert.equal(assertResumable(recordFor({ agent: "grok", providerSessionId: "grok_123" }), "promote"), "grok");
+  assert.equal(assertResumable(recordFor({ agent: "grok", providerSessionId: "grok_123" }), "demote"), "grok");
+});
+
 test("assertResumable: a non-resume-gated harness is rejected", () => {
-  assert.throws(() => assertResumable(recordFor({ agent: "opencode" }), "demote"), /only codex and kimi/);
+  assert.throws(() => assertResumable(recordFor({ agent: "opencode" }), "demote"), /only codex, grok, and kimi/);
 });
 
 /** A minimal RunnerOpts; individual tests override command/args/resume/etc. */
@@ -65,10 +70,15 @@ test("resumeArgs: Kimi interactive resume uses --session <id>", () => {
   assert.deepEqual(resumeArgs("kimi", "session_9"), ["--session", "session_9"]);
 });
 
+test("resumeArgs: Grok interactive resume uses --resume <id>", () => {
+  assert.deepEqual(resumeArgs("grok", "grok_9"), ["--resume", "grok_9"]);
+});
+
 test("resumeArgs: missing session id falls back to the continue/last form", () => {
   assert.deepEqual(resumeArgs("claude", undefined), ["--continue"]);
   assert.deepEqual(resumeArgs("codex", undefined), ["resume", "--last"]);
   assert.deepEqual(resumeArgs("kimi", undefined), ["--continue"]);
+  assert.deepEqual(resumeArgs("grok", undefined), ["--continue"]);
 });
 
 // --- claude adapter RESUME (demote headless path) ----------------------------

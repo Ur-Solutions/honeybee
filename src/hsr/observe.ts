@@ -242,6 +242,9 @@ export function structuredStateFromEvents(
       case "error":
         if (isAuthNeededMessage(event.message)) lastAuthNeeded = i;
         break;
+      case "auth_expired":
+        if (event.requiresLogin) lastAuthNeeded = i;
+        break;
       case "auth_resume":
         lastAuthResume = i;
         break;
