@@ -139,7 +139,11 @@ test("set-model validates its inputs before touching anything", async () => {
 
     const oc = "OC.no-provider";
     await seedBee(store, oc, { agent: "opencode", requestedAgent: "opencode", command: "opencode" });
-    await assert.rejects(() => hive(store, socket, ["set-model", oc, "kimi-k2"]), /opencode is not supported/);
+    await assert.rejects(() => hive(store, socket, ["set-model", oc, "kimi-k2"]), /qualified provider\/model/);
+
+    const qualified = await hive(store, socket, ["set-model", oc, "zai-coding-plan/glm-5"]);
+    assert.match(qualified.stdout, /set-model\tOC\.no-provider\tzai-coding-plan\/glm-5\trecorded/);
+    assert.equal((await readBee(store, oc)).model, "zai-coding-plan/glm-5");
 
     const record = await readBee(store, bee);
     assert.equal(record.model, "gpt-5-codex", "failed validations leave the record untouched");

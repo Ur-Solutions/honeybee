@@ -16,12 +16,14 @@ import { codexAdapter } from "./codex.js";
 import { cursorAdapter } from "./cursor.js";
 import { grokAdapter } from "./grok.js";
 import { kimiAdapter } from "./kimi.js";
+import { openCodeAdapter } from "./opencode.js";
 import { stubAdapter } from "./stub.js";
 
 const ADAPTERS = {
   stub: stubAdapter,
   claude: claudeAdapter,
   codex: codexAdapter,
+  opencode: openCodeAdapter,
   cursor: cursorAdapter,
   grok: grokAdapter,
   kimi: kimiAdapter,

@@ -13,7 +13,7 @@
  * Node builtins only.
  */
 
-import type { RunnerEvent, RunnerOpts, RunnerSendOpts, RunnerSession, RunnerTier } from "./types.js";
+import type { RunnerEvent, RunnerInputAnswer, RunnerOpts, RunnerSendOpts, RunnerSession, RunnerTier } from "./types.js";
 import { attachSessionPlumbing, spawnSessionChild } from "./sessionBase.js";
 import { makeLineReader } from "./lineReader.js";
 
@@ -174,8 +174,9 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     await writeTurn(text);
   }
 
-  async function answer(requestId: string, answerText: string): Promise<void> {
+  async function answer(requestId: string, answerValue: RunnerInputAnswer): Promise<void> {
     if (!config.encodeAnswer) throw new Error("answer not supported by this harness");
+    const answerText = typeof answerValue === "string" ? answerValue : JSON.stringify(answerValue);
     const stdin = child.stdin;
     if (!stdin || stdin.destroyed || !stdin.writable) {
       throw new Error("hsr stream: child stdin is not writable (session ended?)");

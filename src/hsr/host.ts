@@ -15,7 +15,7 @@
  * Node builtins only. No cli.ts / daemon / SubstrateHsr coupling.
  */
 
-import type { RunnerAdapter, RunnerOpts } from "./types.js";
+import type { RunnerAdapter, RunnerInputAnswer, RunnerOpts } from "./types.js";
 import { startRpcServer, type RpcMethodHandler } from "./rpc.js";
 import {
   ensureHsrRunDir,
@@ -36,6 +36,16 @@ export type HsrHostHandle = {
   /** Stop the session (SIGTERM→SIGKILL its group) and await finalization. */
   stop(): Promise<void>;
 };
+
+function runnerInputAnswer(value: unknown): RunnerInputAnswer {
+  if (
+    Array.isArray(value) &&
+    value.every((answer) => Array.isArray(answer) && answer.every((item) => typeof item === "string"))
+  ) {
+    return value as string[][];
+  }
+  return String(value ?? "");
+}
 
 // Delay before the host reconciles a learned-at-init session id into meta.json,
 // covering the no-turn case (the init line lands shortly after spawn).
@@ -126,7 +136,7 @@ export async function runHsrHost(params: {
     interrupt: () => session.interrupt(),
     answer: (params) => {
       const p = (params ?? {}) as { requestId?: unknown; answer?: unknown };
-      return session.answer(String(p.requestId ?? ""), String(p.answer ?? ""));
+      return session.answer(String(p.requestId ?? ""), runnerInputAnswer(p.answer));
     },
     pendingInput: () => pendingNeedsInput(bee),
     snapshot: (params) => {

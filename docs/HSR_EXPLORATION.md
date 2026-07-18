@@ -64,7 +64,7 @@ Per harness (verified where noted; ? = verify during build):
 |---|---|---|---|---|---|---|
 | **claude** | B | `claude -p --input-format stream-json --output-format stream-json` (process stays alive across turns) or Agent SDK in-proc | ✅ | ⚠️ headless↔headless only — interactive `--resume` CANNOT rejoin a `-p` session (§7 2026-07-03) | ✅ JSONL under `$CLAUDE_CONFIG_DIR/projects/…` (also in `-p` mode) | high |
 | **codex** | **S** | `codex app-server` (JSON-RPC over stdio; the official embedding protocol — `codex proto` is gone). One server per (home/account) hosts many conversations; approvals arrive as RPC callbacks | ✅ | `codex resume <id>` / `codex exec resume` — rollout id learned from server | ✅ rollout JSONL under `$CODEX_HOME/sessions/…` | high |
-| **opencode** | S | `opencode serve` REST (+ official SDK); sessions server-side | ✅ | TUI can attach to a running server / session (`opencode run --attach`-family — pin exact flags) | ✅ SQLite (Apiary already reads it) | med-high |
+| **opencode** | **S** | `opencode serve --hostname 127.0.0.1 --port 0`; authenticated REST + SSE, one isolated server/session per bee | ✅ (strict queued prompts; next-tool steering at native tool events) | ✅ REST session id is the same SQLite-backed id accepted by interactive `opencode --session <id>` (1.17.18, 2026-07-18) | ✅ SQLite (Apiary already reads it) | high |
 | **kimi** | B | `kimi acp` — bidirectional ACP JSON-RPC over stdio; Honeybee owns initialize/session/prompt/cancel and permission callbacks | ✅ (queued turns) | ✅ `session/resume` over ACP and `kimi --session <id>` in the TUI share the native session store (0.27.0, 2026-07-17) | ✅ `$KIMI_CODE_HOME/sessions/…/<session>/agents/main/wire.jsonl` | high |
 | **grok** | B | `grok --no-auto-update agent --no-leader stdio` — native ACP JSON-RPC over stdio | ✅ (queued turns) | ✅ ACP `session/load`; interactive `grok --resume <id>` / `--continue` shares the native session store (0.2.102, 2026-07-18) | ✅ per-session dir under `$GROK_HOME` (Apiary reads it) | high |
 | **cursor** | T? | `cursor-agent -p/--print` headless exists; resume support decent | per-turn | `cursor-agent resume`? verify | ? | low-med |
@@ -87,7 +87,9 @@ Notes:
   standard ACP permission requests plus Grok's `x.ai/ask_user_question`
   extension without flattening multiple questions or multi-select choices.
 - **Accounts/limits**: HSR structured events include token usage (claude
-  `result` messages; codex token-count RPCs) → the usage sampler gets exact
+  `result` messages; codex token-count RPCs; OpenCode completed assistant
+  messages with separate non-cached input, output, cache read/write, reasoning,
+  total, and cost fields) → the usage sampler gets exact
   numbers for HSR bees instead of pane-scrape estimates. Autoswap keeps
   working (it operates on SessionRecords + accounts, not panes); "exhausted"
   detection improves from regex to typed error events.
@@ -228,8 +230,8 @@ Mechanics — `hive promote <bee>` (and `hive demote <bee>` symmetric):
    safe).
 
 Per-harness feasibility = the *Resume* column in §2. `hive promote`/`demote`
-is enabled for codex, Grok, and Kimi. Claude remains rejected because its stores
-are disjoint; opencode/cursor/droid wait for verified round trips; pi never
+is enabled for Codex, Grok, OpenCode, and Kimi. Claude remains rejected because
+its stores are disjoint; cursor/droid wait for verified round trips; pi never
 (tier P can instead "re-parent" by spawning a
 fresh tmux TUI with a context re-injection brief — lossy, labeled as such).
 
@@ -299,13 +301,14 @@ Agreed — this should be the default, and hive can detect the context cleanly.
    → parent buz routing).
 4. **Apiary read-path validation** (should be zero-change; fix the terminal
    pane to show ring-buffer console for HSR bees).
-5. **Promote/demote** for claude/codex.
-6. **opencode tier S, Kimi/Grok ACP**, then cursor/droid tier T probing.
+5. **Promote/demote** for verified shared-session-store harnesses (Codex,
+   Grok, OpenCode, and Kimi; Claude is explicitly gated).
+6. **Grok and Kimi ACP plus OpenCode tier S**, then cursor/droid tier T probing.
 7. **Tier P fallback** (node-pty ≥1.2.0-beta.14, ring buffer, governor) —
    last, because tiers S/B/T cover current policy reality; P is insurance.
 
-Open questions carried forward: exact opencode TUI-attach flags; cursor/droid
-resume verification; whether the Agent SDK (in-proc) or
+Open questions carried forward: cursor/droid resume verification; whether
+the Agent SDK (in-proc) or
 `claude -p` stream-json (subprocess) is the better claude tier B (SDK gives
 `canUseTool` + hooks; subprocess gives cleaner process isolation and env
 scrubbing — lean subprocess first, SDK when permission-routing lands);
@@ -319,6 +322,37 @@ later).
 ## 7. Implementation corrections (living)
 
 Dated notes where building against the real code/binaries refined §1–§6.
+
+### 2026-07-18 — OpenCode 1.17.18 uses authenticated REST/SSE, not ACP
+
+Inspection of the installed 1.17.18 binary and matching official source
+confirmed that ACP still bridges permission requests but not `question.asked`.
+Shipping ACP would therefore strand a turn that uses OpenCode's structured
+question tool. The production adapter instead owns a per-bee
+`opencode serve --hostname 127.0.0.1 --port 0` process and:
+
+- generates a random `OPENCODE_SERVER_PASSWORD`, authenticates every health,
+  REST, and SSE request with Basic auth, parses the actual loopback port, and
+  terminates the detached process group on stop;
+- creates or validates a directory-owned session, subscribes to `/event`
+  before the first asynchronous prompt, filters every provider event by
+  session, and reconciles messages/status/pending inputs after SSE reconnect;
+- maps assistant text and reasoning deltas, tool lifecycle, exact completed
+  message usage/cost, idle/error/auth/rate state, permissions, and all native
+  structured questions into runner events;
+- replies to questions as ordered `string[][]` data, preserving multiple
+  questions and multi-select answers, and replies to permissions through the
+  native permission endpoint;
+- queues normal sends one turn at a time, holds `next-tool` sends for a real
+  tool boundary, aborts through the session API, and resumes the existing id
+  only after cwd and Honeybee ownership checks;
+- accepts only qualified `provider/model` selectors and maps OpenCode's
+  reasoning effort to its `variant` field.
+
+OpenCode HSR is intentionally **local-only** for now. Its `auth.json` can hold
+credentials for several providers, so Honeybee must never ship that whole file
+to a remote node. Remote support waits for safe filtering to the selected
+provider credential.
 
 ### 2026-07-02 — Runner host process model (refines §3 crash recovery, §5.2)
 

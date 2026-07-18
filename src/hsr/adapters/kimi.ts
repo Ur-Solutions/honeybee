@@ -497,7 +497,8 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
     async answer(requestId, answer): Promise<void> {
       const pending = pendingInputs.get(requestId);
       if (!pending) throw new Error(`hsr kimi: no pending input for requestId ${requestId}`);
-      const response = encodeKimiPermissionAnswer(pending.params, answer);
+      const answerText = typeof answer === "string" ? answer : JSON.stringify(answer);
+      const response = encodeKimiPermissionAnswer(pending.params, answerText);
       pendingInputs.delete(requestId);
       peer.respond(pending.id, response);
     },

@@ -893,7 +893,9 @@ hive fork <bee> [checkpoint]
 - `--agent <kind>` — fork into a different harness (defaults to the source's
   agent). Cross-harness forks cannot use native resume (see below).
 - `--model <m>` — first-class model, also baked into the spawned command via the
-  per-harness flag (claude `--model <m>`, codex `-m <m>`).
+  per-harness flag (Claude `--model <m>`, Codex `-m <m>`, OpenCode
+  `--model <provider>/<model>`). OpenCode selectors must stay provider-qualified
+  so a resumed server session cannot silently switch among configured providers.
 - `--node <n>` / `--cwd <dir>` — node and working directory (cwd defaults to the
   source's).
 - `--seed <mode>` — force a seeding rung; `--read-log` is shorthand for log

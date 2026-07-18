@@ -492,7 +492,8 @@ export function buildController(): RunnerHostController {
         const pending = await pendingNeedsInput(bee).catch(() => null);
         requestId = pending?.requestId;
       }
-      const result = await proxyCall(bee, "answer", { requestId: requestId ?? "", answer: String(p.answer ?? "") });
+      const answer = Array.isArray(p.answer) ? p.answer : String(p.answer ?? "");
+      const result = await proxyCall(bee, "answer", { requestId: requestId ?? "", answer });
       return result.ok ? { ok: true } : result;
     }),
 
