@@ -42,11 +42,35 @@ test("seed versions Sonnet 5 so an in-window event prices at the intro rate", ()
   assert.equal(standard!.effectiveFrom, "2026-09-01");
 });
 
-test("seed marks an uncertain codex/gpt model as todo with empty versions", () => {
-  const gpt = ruleFor("gpt-5");
-  assert.equal(gpt.todo, true);
-  assert.deepEqual(gpt.versions, []);
+test("seed prices exact OpenAI models but leaves the broad family fallback unresolved", () => {
+  const gpt = ruleFor("gpt-5.6-sol");
+  assert.equal(gpt.todo, undefined);
   assert.equal(gpt.provider, "openai");
+  assert.deepEqual(gpt.versions[0], {
+    effectiveFrom: "2026-07-09",
+    inputPerMTok: 5,
+    outputPerMTok: 30,
+    cacheReadPerMTok: 0.5,
+    cacheWrite5mPerMTok: 6.25,
+    cacheWrite1hPerMTok: 6.25,
+  });
+
+  const fallback = ruleFor("gpt-5");
+  assert.equal(fallback.todo, true);
+  assert.deepEqual(fallback.versions, []);
+});
+
+test("seed prices Fable caching and resolves zero-token synthetic rows", () => {
+  const fable = ruleFor("claude-fable-5").versions[0]!;
+  assert.deepEqual(fable, {
+    effectiveFrom: "2026-06-09",
+    inputPerMTok: 10,
+    outputPerMTok: 50,
+    cacheReadPerMTok: 1,
+    cacheWrite5mPerMTok: 12.5,
+    cacheWrite1hPerMTok: 20,
+  });
+  assert.equal(ruleFor("<synthetic>").todo, undefined);
 });
 
 test("validateRateTable rejects malformed input", () => {
@@ -72,8 +96,42 @@ test("ensureRatesFile writes the seed once and never clobbers user edits", async
     await saveRates(edited, path);
     await ensureRatesFile(path);
     const after = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(after.rules.length, 1);
+    assert.ok(after.rules.length > 1, "new seed rules should merge into a stale table");
     assert.equal(after.rules[0].modelPattern, "claude-opus-4-8");
+    assert.deepEqual(after.rules[0].versions, [], "an explicit user override must survive");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensureRatesFile upgrades stale TODO rules but preserves priced overrides", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-rates-"));
+  try {
+    const path = join(dir, "rates.json");
+    await writeFile(path, JSON.stringify({ rules: [
+      { modelPattern: "gpt-5.6-sol", provider: "openai", todo: true, versions: [] },
+      {
+        modelPattern: "gpt-5.5",
+        provider: "custom",
+        versions: [{
+          effectiveFrom: "2026-01-01",
+          inputPerMTok: 99,
+          outputPerMTok: 99,
+          cacheReadPerMTok: 99,
+          cacheWrite5mPerMTok: 99,
+          cacheWrite1hPerMTok: 99,
+        }],
+      },
+    ] }));
+
+    await ensureRatesFile(path);
+    const table = await loadRates(path);
+    const sol = table.rules.find((rule) => rule.modelPattern === "gpt-5.6-sol")!;
+    const custom = table.rules.find((rule) => rule.modelPattern === "gpt-5.5")!;
+    assert.equal(sol.todo, undefined);
+    assert.equal(sol.versions[0]!.inputPerMTok, 5);
+    assert.equal(custom.provider, "custom");
+    assert.equal(custom.versions[0]!.inputPerMTok, 99);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
