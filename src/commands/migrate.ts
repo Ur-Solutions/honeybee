@@ -31,9 +31,11 @@ import { resolve } from "node:path";
 // headless (`-p`) session stores are disjoint, so `claude --resume <id>` cannot
 // rejoin a headless HSR session (and vice-versa) — a resumed process errors and
 // exits. codex has no such split (`codex resume <threadId>` rejoins an
-// app-server thread). See docs/HSR_EXPLORATION.md §7 (2026-07-03). Re-add
+// app-server thread). Kimi's interactive CLI and ACP share the native session
+// store and both accept the same session id. See docs/HSR_EXPLORATION.md §7.
+// Re-add
 // "claude" here the day a claude release unifies the two stores.
-export const RESUME_GATED_HARNESSES = new Set(["codex"]);
+export const RESUME_GATED_HARNESSES = new Set(["codex", "kimi"]);
 
 
 /**
@@ -44,11 +46,11 @@ export function assertResumable(record: SessionRecord, verb: "promote" | "demote
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   if (tool === "claude") {
     throw new Error(
-      `hive ${verb} does not support claude: its interactive and headless (-p) session stores are disjoint, so a resumed session cannot carry history (docs/HSR_EXPLORATION.md §7). codex is supported.`,
+      `hive ${verb} does not support claude: its interactive and headless (-p) session stores are disjoint, so a resumed session cannot carry history (docs/HSR_EXPLORATION.md §7). codex and kimi are supported.`,
     );
   }
   if (!RESUME_GATED_HARNESSES.has(tool)) {
-    throw new Error(`hive ${verb} needs a resumable provider session; ${record.agent} is not resume-gated (only codex)`);
+    throw new Error(`hive ${verb} needs a resumable provider session; ${record.agent} is not resume-gated (only codex and kimi)`);
   }
   if (!record.providerSessionId) {
     throw new Error(`hive ${verb} needs a resumable provider session; ${record.name} has no recorded provider session id`);

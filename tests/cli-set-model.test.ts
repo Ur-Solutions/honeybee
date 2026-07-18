@@ -133,9 +133,9 @@ test("set-model validates its inputs before touching anything", async () => {
     await assert.rejects(() => hive(store, socket, ["set-model", bee]), /Usage: hive set-model/);
     await assert.rejects(() => hive(store, socket, ["set-model", bee, "gpt-5.5", "--clear"]), /either <model> or --clear/);
 
-    const kimi = "KI.no-selector";
-    await seedBee(store, kimi, { agent: "kimi", requestedAgent: "kimi", command: "kimi" });
-    await assert.rejects(() => hive(store, socket, ["set-model", kimi, "k2"]), /no model selector/);
+    const pi = "PI.no-selector";
+    await seedBee(store, pi, { agent: "pi", requestedAgent: "pi", command: "pi" });
+    await assert.rejects(() => hive(store, socket, ["set-model", pi, "some-model"]), /no model selector/);
 
     const oc = "OC.no-provider";
     await seedBee(store, oc, { agent: "opencode", requestedAgent: "opencode", command: "opencode" });

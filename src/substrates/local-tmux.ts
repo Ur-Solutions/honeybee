@@ -319,12 +319,17 @@ export async function listPanes(): Promise<Set<string>> {
 
 export async function listSessionStates(): Promise<Map<string, string>> {
   const states = new Map<string, string>();
-  const result = await tmux(["list-sessions", "-F", "#{session_name}\t#{@hive_state}"], { reject: false });
+  // Do not use a literal control character as the field separator. tmux 3.6a
+  // sanitizes it to "_" when the server has no UTF-8 locale (as with launchd),
+  // which makes every row unparsable. A colon is locale-independent ASCII and
+  // cannot occur in a tmux session name (tmux replaces it with "_"), because it
+  // is the session/window target separator.
+  const result = await tmux(["list-sessions", "-F", "#{session_name}:#{@hive_state}"], { reject: false });
   if (!result.ok) return states;
   for (const line of result.stdout.split("\n")) {
-    const tab = line.indexOf("\t");
-    if (tab <= 0) continue;
-    states.set(line.slice(0, tab), line.slice(tab + 1).trim());
+    const separator = line.indexOf(":");
+    if (separator <= 0) continue;
+    states.set(line.slice(0, separator), line.slice(separator + 1).trim());
   }
   return states;
 }

@@ -65,7 +65,7 @@ Per harness (verified where noted; ? = verify during build):
 | **claude** | B | `claude -p --input-format stream-json --output-format stream-json` (process stays alive across turns) or Agent SDK in-proc | ✅ | ⚠️ headless↔headless only — interactive `--resume` CANNOT rejoin a `-p` session (§7 2026-07-03) | ✅ JSONL under `$CLAUDE_CONFIG_DIR/projects/…` (also in `-p` mode) | high |
 | **codex** | **S** | `codex app-server` (JSON-RPC over stdio; the official embedding protocol — `codex proto` is gone). One server per (home/account) hosts many conversations; approvals arrive as RPC callbacks | ✅ | `codex resume <id>` / `codex exec resume` — rollout id learned from server | ✅ rollout JSONL under `$CODEX_HOME/sessions/…` | high |
 | **opencode** | S | `opencode serve` REST (+ official SDK); sessions server-side | ✅ | TUI can attach to a running server / session (`opencode run --attach`-family — pin exact flags) | ✅ SQLite (Apiary already reads it) | med-high |
-| **kimi** | B | `kimi acp` — Agent Client Protocol over stdio (Zed's protocol); subscription explicitly permits third-party embedding | ✅ | ? — check session resume in kimi CLI | ✅ (claude-compatible home layout) | med |
+| **kimi** | B | `kimi acp` — bidirectional ACP JSON-RPC over stdio; Honeybee owns initialize/session/prompt/cancel and permission callbacks | ✅ (queued turns) | ✅ `session/resume` over ACP and `kimi --session <id>` in the TUI share the native session store (0.27.0, 2026-07-17) | ✅ `$KIMI_CODE_HOME/sessions/…/<session>/agents/main/wire.jsonl` | high |
 | **grok** | T | `grok -p` headless with streaming JSON; no server mode found | per-turn | ? — resume flag unverified; if absent, HSR keeps context via prompt re-injection or stays P | ✅ per-session dir (Apiary reads it) | med |
 | **cursor** | T? | `cursor-agent -p/--print` headless exists; resume support decent | per-turn | `cursor-agent resume`? verify | ? | low-med |
 | **droid** | T | `droid exec` headless (Factory) | per-turn | session id in output; verify | ? | med |
@@ -76,9 +76,11 @@ Notes:
   codex subagents = *one* `app-server` process per account-home, not 20 TUIs
   in 20 panes. This is where "abstracts the different CLIs in the most
   efficient way possible" cashes out.
-- **Model/reasoning**: all structured modes accept the same model flags the
-  drivers already emit (`--model`, provider-qualified for opencode), so
-  Apiary's model catalog and the compose chip work unchanged.
+- **Model/reasoning**: Kimi ACP does not honor the top-level TUI model/mode
+  flags. Its adapter applies `model` and `mode` after new/resume with
+  `session/set_config_option`. Supported model ids are `kimi-code/k3`,
+  `kimi-code/kimi-for-coding`, and
+  `kimi-code/kimi-for-coding-highspeed`.
 - **Accounts/limits**: HSR structured events include token usage (claude
   `result` messages; codex token-count RPCs) → the usage sampler gets exact
   numbers for HSR bees instead of pane-scrape estimates. Autoswap keeps
@@ -140,6 +142,13 @@ An HSR bee is a first-class bee:
   `~/.hive/hsr/<bee>/{meta,events.jsonl,ring.txt}`. If the daemon restarts,
   it re-adopts children from meta files (pid + pgid + start-time check);
   orphans whose process died get `status: "dead"` like any bee.
+- **Kimi telemetry:** ACP supplies transcript/tool/input events but no token or
+  rate-limit stream. The adapter safely tails only `usage.record` and terminal
+  structured error records from the matching native `wire.jsonl`, starting at
+  EOF on resume. It never re-emits context or content records, so assistant
+  text remains single-sourced from ACP. Auth, rate-limit, and generic errors
+  are de-duplicated against prompt RPC failures before entering the durable
+  HSR event log.
 
 ### Apiary visibility — yes, and mostly for free
 
@@ -208,9 +217,10 @@ Mechanics — `hive promote <bee>` (and `hive demote <bee>` symmetric):
    now background it again" — and it makes promote non-scary (round-trip
    safe).
 
-Per-harness feasibility = the *Resume* column in §2. Gate `hive promote` on
-it: claude/codex/opencode day one; kimi/grok/cursor/droid after their resume
-paths are verified; pi never (tier P can instead "re-parent" by spawning a
+Per-harness feasibility = the *Resume* column in §2. `hive promote`/`demote`
+is enabled for codex and Kimi. Claude remains rejected because its stores are
+disjoint; opencode/grok/cursor/droid wait for verified round trips; pi never
+(tier P can instead "re-parent" by spawning a
 fresh tmux TUI with a context re-injection brief — lossy, labeled as such).
 
 Edge cases: mid-turn interrupt loses in-flight tool output (harnesses handle
@@ -463,3 +473,19 @@ new tunnel). STILL DEFERRED (needs credential sign-off / a running daemon):
 account-bound real codex/claude bee via hive's `ephemeral-token` deliver+shred
 path (test tier 7), usage sampling against a live provider, and the daemon-hosted
 `remoteEventMirror` writing remote events into a local run dir.
+
+### 2026-07-17 — production Kimi ACP runner
+
+Kimi Code 0.27.0 was verified against its live ACP process and native session
+store. Honeybee now implements the complete local lifecycle: initialize,
+new/resume, explicit model/mode config, queued prompts, tool and assistant
+updates, permission/question callbacks, cancellation, stop, and process exit.
+The adapter tails native wire telemetry only for usage and structured failures;
+ACP remains the sole transcript source.
+
+Remote Kimi HSR remains deliberately **local-only**. No Kimi credential is
+minted or copied to a remote node, and `spawnBee` rejects the request before
+remote transport or account credential handling. Remaining remote work is to
+design and test a short-lived or refresh-token-safe Kimi credential delivery
+and shredding policy; the existing Claude/Codex policy is not generalized by
+assumption.

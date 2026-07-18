@@ -84,6 +84,8 @@ export type HarnessDescriptor = {
   readonly allowance?: Readonly<Record<AuthKind, HarnessAllowancePolicy>>;
   /** Remote-HSR ephemeral credential delivery policy, when wired. */
   readonly ephemeral?: EphemeralCredentialPolicy;
+  /** Explicit remote-HSR restriction when no defensible credential policy exists yet. */
+  readonly remoteHsr?: "local-only";
 };
 
 // The claude stream-json flag set. Descriptive — these are the tokens the
@@ -212,23 +214,24 @@ export const HARNESSES = {
     // keychain slot, so account-bound cursor bees stay local-only for now.
   },
   kimi: {
-    runner: false,
+    runner: true,
+    remoteHsr: "local-only",
     allowance: {
       subscription: {
         permittedTiers: ["stream", "pty"],
-        requiredFlags: [],
+        requiredFlags: ["acp"],
         scrubEnv: [],
         fingerprints: [],
-        note: "kimi acp (Agent Client Protocol over stdio); subscription permits third-party embedding. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "Kimi Code 0.27 ACP JSON-RPC over stdio, with model/mode applied through session config; local HSR only until remote credentials have a tested delivery policy.",
+        since: "2026-07-17",
       },
       "api-key": {
         permittedTiers: ["stream", "pty"],
-        requiredFlags: [],
+        requiredFlags: ["acp"],
         scrubEnv: [],
         fingerprints: [],
-        note: "kimi acp over stdio. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "Kimi Code 0.27 ACP JSON-RPC over stdio; local HSR only until remote API-key delivery is implemented and tested.",
+        since: "2026-07-17",
       },
     },
   },
@@ -313,6 +316,11 @@ export function ephemeralPolicyFor(harness: string): EphemeralCredentialPolicy |
 /** Harnesses with an ephemeral-credential policy, in registration order. */
 export function ephemeralHarnesses(): string[] {
   return harnessNames().filter((name) => REGISTRY[name]?.ephemeral !== undefined);
+}
+
+/** Whether the harness may be started on a remote-HSR node. */
+export function harnessSupportsRemoteHsr(harness: string): boolean {
+  return REGISTRY[harness]?.remoteHsr !== "local-only";
 }
 
 /**
