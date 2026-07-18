@@ -4,12 +4,17 @@ import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { appendLedger } from "./store.js";
 
-export type SealStatus = "done" | "blocked" | "needs_input" | "failed";
-export type SealType = "implementation" | "review" | "risk" | "test" | "witness";
+export const SEAL_STATUSES = ["done", "blocked", "needs_input", "failed"] as const;
+export const SEAL_TYPES = ["implementation", "review", "risk", "test", "witness"] as const;
+export const TEST_RUN_RESULTS = ["passed", "failed", "skipped"] as const;
+
+export type SealStatus = (typeof SEAL_STATUSES)[number];
+export type SealType = (typeof SEAL_TYPES)[number];
+export type TestRunResult = (typeof TEST_RUN_RESULTS)[number];
 
 export type TestRun = {
   command: string;
-  result: "passed" | "failed" | "skipped";
+  result: TestRunResult;
   notes?: string;
 };
 
@@ -37,8 +42,65 @@ export type LatestSealScan = {
   highWaterFilename: string | null;
 };
 
-const SEAL_STATUSES = new Set<SealStatus>(["done", "blocked", "needs_input", "failed"]);
-const SEAL_TYPES = new Set<SealType>(["implementation", "review", "risk", "test", "witness"]);
+const SEAL_STATUS_SET = new Set<string>(SEAL_STATUSES);
+const SEAL_TYPE_SET = new Set<string>(SEAL_TYPES);
+const TEST_RUN_RESULT_SET = new Set<string>(TEST_RUN_RESULTS);
+
+/** Canonical representative input, shared by `hive seal --example` and help. */
+export const SEAL_ARTIFACT_EXAMPLE = {
+  status: "done",
+  summary: "Implemented discoverable seal help and verified the CLI behavior.",
+  type: "implementation",
+  filesChanged: ["src/seal.ts", "src/commands/messaging.ts"],
+  testsRun: [
+    {
+      command: "npm test",
+      result: "passed",
+      notes: "All tests passed.",
+    },
+  ],
+  risks: ["None known."],
+  nextActions: ["Review the diff."],
+  confidence: 0.95,
+} satisfies SealArtifact;
+
+export function sealArtifactExampleJson(): string {
+  return JSON.stringify(SEAL_ARTIFACT_EXAMPLE, null, 2);
+}
+
+/** Detailed command help kept beside the artifact validator to limit drift. */
+export function sealHelpText(): string {
+  return `hive seal — record a typed handoff artifact
+
+Usage
+  hive seal <selector> --from <path-to-seal.json>
+  hive seal --example
+  hive seal --help
+
+Artifact contract
+  status        required  string enum: ${SEAL_STATUSES.join(" | ")}
+  summary       required  non-empty string
+  type          optional  string enum: ${SEAL_TYPES.join(" | ")}
+  filesChanged  optional  string[]
+  testsRun      optional  object[] with:
+    command     required  non-empty string
+    result      required  string enum: ${TEST_RUN_RESULTS.join(" | ")}
+    notes       optional  string
+  risks         optional  string[]
+  nextActions   optional  string[]
+  confidence    optional  finite number from 0 through 1 (inclusive)
+
+Example artifact JSON
+${sealArtifactExampleJson()}
+
+Self-seal the current bee
+  bee="$(hive here --id)"
+  artifact="$(mktemp "\${TMPDIR:-/tmp}/hive-seal.XXXXXX")"
+  hive seal --example > "$artifact"
+  \${EDITOR:-vi} "$artifact"
+  hive seal "$bee" --from "$artifact"
+  rm -f "$artifact"`;
+}
 
 export function validateSealArtifact(value: unknown): SealArtifact {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -46,8 +108,8 @@ export function validateSealArtifact(value: unknown): SealArtifact {
   }
   const object = value as Record<string, unknown>;
   const status = object.status;
-  if (typeof status !== "string" || !SEAL_STATUSES.has(status as SealStatus)) {
-    throw new Error(`Invalid seal status: ${String(status)}. Use one of: done, blocked, needs_input, failed.`);
+  if (typeof status !== "string" || !SEAL_STATUS_SET.has(status)) {
+    throw new Error(`Invalid seal status: ${String(status)}. Use one of: ${SEAL_STATUSES.join(", ")}.`);
   }
   const summary = object.summary;
   if (typeof summary !== "string" || summary.trim().length === 0) {
@@ -56,8 +118,8 @@ export function validateSealArtifact(value: unknown): SealArtifact {
   const artifact: SealArtifact = { status: status as SealStatus, summary };
 
   if (object.type !== undefined) {
-    if (typeof object.type !== "string" || !SEAL_TYPES.has(object.type as SealType)) {
-      throw new Error(`Invalid seal type: ${String(object.type)}. Use one of: implementation, review, risk, test, witness.`);
+    if (typeof object.type !== "string" || !SEAL_TYPE_SET.has(object.type)) {
+      throw new Error(`Invalid seal type: ${String(object.type)}. Use one of: ${SEAL_TYPES.join(", ")}.`);
     }
     artifact.type = object.type as SealType;
   }
@@ -107,10 +169,10 @@ function validateTestRun(value: unknown, index: number): TestRun {
     throw new Error(`Invalid testsRun[${index}]: command must be a non-empty string`);
   }
   const result = object.result;
-  if (result !== "passed" && result !== "failed" && result !== "skipped") {
-    throw new Error(`Invalid testsRun[${index}]: result must be passed, failed, or skipped`);
+  if (typeof result !== "string" || !TEST_RUN_RESULT_SET.has(result)) {
+    throw new Error(`Invalid testsRun[${index}]: result must be ${TEST_RUN_RESULTS.slice(0, -1).join(", ")}, or ${TEST_RUN_RESULTS.at(-1)}`);
   }
-  const run: TestRun = { command: object.command, result };
+  const run: TestRun = { command: object.command, result: result as TestRunResult };
   if (typeof object.notes === "string") run.notes = object.notes;
   return run;
 }

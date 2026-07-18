@@ -1815,22 +1815,32 @@ Record a typed handoff artifact for one bee, swarm, or colony.
 
 ```sh
 hive seal <selector> --from <path-to-seal.json>
+hive seal --example
+hive seal --help
 ```
+
+`hive help seal` prints the same detailed help as `hive seal --help`.
+`hive seal --example` prints the representative input artifact below to stdout;
+it does not require a selector or `--from`, and it does not write Hive state.
 
 Seal JSON shape:
 
 ```json
 {
   "status": "done",
-  "summary": "Implemented the requested change.",
+  "summary": "Implemented discoverable seal help and verified the CLI behavior.",
   "type": "implementation",
-  "filesChanged": ["src/example.ts"],
+  "filesChanged": ["src/seal.ts", "src/commands/messaging.ts"],
   "testsRun": [
-    { "command": "npm test", "result": "passed" }
+    {
+      "command": "npm test",
+      "result": "passed",
+      "notes": "All tests passed."
+    }
   ],
-  "risks": ["None known"],
-  "nextActions": ["Review the diff"],
-  "confidence": 0.86
+  "risks": ["None known."],
+  "nextActions": ["Review the diff."],
+  "confidence": 0.95
 }
 ```
 

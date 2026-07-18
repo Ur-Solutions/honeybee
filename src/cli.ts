@@ -30,6 +30,7 @@ import { cmdSeals, cmdSearch } from "./commands/search.js";
 import { cmdLaunch, cmdNew, cmdSpawn } from "./commands/spawn.js";
 import { cmdSpend } from "./commands/spend.js";
 import { cmdSwarm } from "./commands/swarm.js";
+import { sealHelpText } from "./seal.js";
 import { closeAllSubstrates } from "./substrates/index.js";
 
 // Re-exports consumed by the unit tests (tests/*.test.ts import these from
@@ -264,6 +265,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       await cmdSpend(parsed);
       break;
     case "help":
+      if (parsed.args[0] === "seal") console.log(sealHelpText());
+      else printHelp();
+      break;
     case "--help":
     case "-h":
     case "":
