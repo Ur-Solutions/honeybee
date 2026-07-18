@@ -13,6 +13,7 @@ import { listFrames, loadFrame, type Frame } from "../frame.js";
 import { writeSpawnOptions } from "../hiveState.js";
 import { adapterFor } from "../hsr/adapters/index.js";
 import { mintEphemeralCredential, type EphemeralCredential } from "../hsr/remoteCreds.js";
+import { harnessSupportsRemoteHsr } from "../hsr/harness.js";
 import { allocateBeeIdentity } from "../ids.js";
 import { kitMaterializeHome, readKitHomeStamp } from "../kit.js";
 import { chooseLaunch, type LaunchTemplate } from "../launchTui.js";
@@ -201,6 +202,11 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.provider ? { provider: opts.provider } : {}),
   });
+  if (opts.node?.kind === "remote-hsr" && !harnessSupportsRemoteHsr(spec.kind)) {
+    throw new Error(
+      `${spec.kind} HSR is local-only: remote credential delivery is not implemented or tested; use local HSR or a local tmux substrate`,
+    );
+  }
   // APIA-93: an account-bound spawn on a REMOTE node is gated by the node's
   // credential-delivery policy. local-only (the default, and every non-remote-hsr
   // remote kind) keeps the historical "vault never leaves this machine" rule; an

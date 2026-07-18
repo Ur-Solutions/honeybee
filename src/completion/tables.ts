@@ -1,4 +1,5 @@
 import { BUZ_TIERS as CANONICAL_BUZ_TIERS } from "../buz_tiers.js";
+import { SEAL_STATUSES } from "../seal.js";
 
 export const COMMANDS = [
   "spawn", "new", "launch", "send", "tail", "cat", "transcript", "tx", "last", "wait",
@@ -29,7 +30,7 @@ export const SESSIONS_SUBCOMMANDS = ["reconcile"];
 export const SYNC_SUBCOMMANDS = ["manifest"];
 
 export const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
-export const SEAL_STATUS_VALUES = ["done", "blocked", "needs_input", "failed"];
+export const SEAL_STATUS_VALUES = [...SEAL_STATUSES];
 export const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
 export const BUZ_TIERS: readonly string[] = CANONICAL_BUZ_TIERS;
 export const BUZ_ACCEPT_VALUES = buzAcceptValues();
@@ -112,7 +113,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   tag: ["--remove", "--list"],
   own: ["--clear"],
   move: ["--colony", "--owner"],
-  seal: ["--from"],
+  seal: ["--from", "--example", "--help"],
   last: ["-n", "--lines", "--seal"],
   wait: ["--idle-ms", "--idle", "--timeout-ms", "--timeout", "--poll-ms", "--poll", "--last", "--transcript", "--seal", "-n", "--limit", "--json"],
   tail: ["-n", "--lines"],

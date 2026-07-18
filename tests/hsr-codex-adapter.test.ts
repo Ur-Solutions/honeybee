@@ -14,6 +14,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  buildCodexSpawn,
   buildCodexThreadRequestParams,
   codexAdapter,
   codexModelFromArgs,
@@ -227,6 +228,25 @@ test("codexModelFromArgs recovers the effective CLI model for HSR thread/start",
   assert.equal(codexModelFromArgs(["--model", "gpt-5.5", "-m", "gpt-5.6-terra"]), "gpt-5.6-terra");
   assert.equal(codexModelFromArgs(["--model=gpt-5.6-luna"]), "gpt-5.6-luna");
   assert.equal(codexModelFromArgs(["-c", 'model_reasoning_effort="xhigh"']), undefined);
+});
+
+test("buildCodexSpawn re-applies -c config overrides to the app-server child", () => {
+  const opts: RunnerOpts = {
+    bee: "CO.test",
+    cwd: "/repo",
+    env: {},
+    runDir: "/tmp/run",
+    args: ["--model", "gpt-5.5", "-c", 'model_reasoning_effort="high"', "--config=sandbox_mode=read-only"],
+  };
+  const { args } = buildCodexSpawn(opts);
+  assert.deepEqual(args, [
+    "app-server",
+    "-c", 'model_reasoning_effort="high"',
+    "-c", "sandbox_mode=read-only",
+  ]);
+  // Model flags stay OUT of the child argv — they travel per-thread instead.
+  assert.ok(!args.includes("--model"));
+  assert.deepEqual(buildCodexSpawn({ ...opts, args: [] }).args, ["app-server"]);
 });
 
 test("buildCodexThreadRequestParams passes the argv model out-of-band to codex app-server", () => {

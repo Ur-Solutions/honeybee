@@ -9,7 +9,7 @@ import { readHsrMeta } from "../hsr/runDir.js";
 import { gatherTitleContext, generateTitle } from "../naming.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
-import { recordSeal, validateSealArtifact } from "../seal.js";
+import { recordSeal, sealArtifactExampleJson, sealHelpText, validateSealArtifact } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { appendLedger, updateSession, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
@@ -19,6 +19,15 @@ import { readFile } from "node:fs/promises";
 import { arrayFlag, deliverBrief, resolveBeeInCurrentPane, resolveSession, stringFlag } from "../cli/shared.js";
 
 export async function cmdSeal(parsed: Parsed) {
+  if (truthy(flag(parsed, "help")) || truthy(flag(parsed, "h"))) {
+    console.log(sealHelpText());
+    return;
+  }
+  if (truthy(flag(parsed, "example"))) {
+    console.log(sealArtifactExampleJson());
+    return;
+  }
+
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive seal <selector> --from <path-to-seal.json>");
   const fromPath = typeof flag(parsed, "from") === "string" ? String(flag(parsed, "from")) : undefined;

@@ -1,6 +1,7 @@
 import { activateAccountIntoHome, listAccounts, syncAccountCredentialsToVault, type AccountRecord } from "./accounts.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, splitShellWords } from "./agents.js";
 import { resumeArgsForAgent } from "./drivers.js";
+import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 
@@ -21,6 +22,10 @@ export type SwapAccountOptions = {
   activate?: typeof activateAccountIntoHome;
   /** Registry reader (tests). Defaults to listAccounts; used for the provider-match guard. */
   listAccounts?: typeof listAccounts;
+  /** Local HSR runner-host launcher (tests). Defaults to spawnHsrHost. */
+  spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
+  /** Local HSR runner-host readiness probe (tests). Defaults to waitForHsrHost. */
+  waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
 };
 
 const DEFAULT_POLL_ATTEMPTS = 8;
@@ -96,33 +101,83 @@ export async function swapAccount(
     if (currentAccount && currentAccount.tool === tool && currentAccount.id !== account.id) {
       await syncAccountCredentialsToVault(currentAccount, record.homePath!, { trustExtraHome: true }).catch(() => undefined);
     }
-    await activate(account, record.homePath!);
+    let spec: ReturnType<typeof resolveAgent>;
+    let paneId: string | undefined;
+    let launcherPgid: number | undefined;
+    let runnerPid: number | undefined;
+    try {
+      await activate(account, record.homePath!);
 
-    // 3. Resume the same provider session in the same provider home, with the
-    //    driver's explicit identity env. The record's own model (a deliberate
-    //    `hive set-model` choice) wins over the NEW account's default model;
-    //    the account still supplies opencode's provider so a swapped bee keeps
-    //    its `--model <provider>/<model>` selector (adversarial review fix #4).
-    //    Both may be undefined (fine → the driver hook returns []). Persisted
-    //    model extra flags (effort/reasoning) ride along like every relaunch.
-    const model = current.model ?? account.model;
-    const modelExtra = current.modelExtraArgs ? splitShellWords(current.modelExtraArgs) : [];
-    const spec = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtra, ...resumeArgs(tool, record.providerSessionId)], {
-      home: record.homePath,
-      yolo: sniffYolo(record.command),
-      identity: true,
-      ...(model ? { model } : {}),
-      ...(account.provider ? { provider: account.provider } : {}),
-    });
-    if (!record.node) await assertAgentAuthFreshForSpawn(spec, account.id);
-    // The swap re-creates the session, so the agent runs in a fresh pane —
-    // re-pin to it (the old agentPaneId is now dead).
-    const launch = await substrate.newSession(record.tmuxTarget, record.cwd, {
-      command: spec.command,
-      args: spec.args,
-      env: spec.env,
-      tmuxOptions: spec.tmuxOptions,
-    });
+      // 3. Resume the same provider session in the same provider home, with the
+      //    driver's explicit identity env. The record's own model (a deliberate
+      //    `hive set-model` choice) wins over the NEW account's default model;
+      //    the account still supplies opencode's provider so a swapped bee keeps
+      //    its `--model <provider>/<model>` selector (adversarial review fix #4).
+      //    Both may be undefined (fine → the driver hook returns []). Persisted
+      //    model extra flags (effort/reasoning) ride along like every relaunch.
+      //
+      //    HSR resumes through its detached runner host, not Substrate.newSession
+      //    (that verb intentionally throws for pane-less HSR bees). The HSR
+      //    adapter owns the provider-specific resume protocol, so do not append
+      //    interactive CLI resume args to its base spec.
+      const hsr = current.substrate === "hsr";
+      if (hsr && !current.providerSessionId) {
+        throw new Error(`Bee ${current.name} has no recorded provider session id; refusing to switch accounts without session continuity`);
+      }
+      const model = current.model ?? account.model;
+      const modelExtra = current.modelExtraArgs ? splitShellWords(current.modelExtraArgs) : [];
+      spec = resolveAgent(current.requestedAgent ?? current.agent, [...modelExtra, ...(hsr ? [] : resumeArgs(tool, current.providerSessionId))], {
+        home: current.homePath,
+        yolo: sniffYolo(current.command),
+        identity: true,
+        ...(model ? { model } : {}),
+        ...(account.provider ? { provider: account.provider } : {}),
+      });
+      if (!current.node) await assertAgentAuthFreshForSpawn(spec, account.id);
+
+      if (hsr) {
+        runnerPid = await (options.spawnHsrHost ?? spawnHsrHost)({
+          bee: current.name,
+          comb: current.combId ?? current.name,
+          ...(current.parentId ? { parent: current.parentId } : {}),
+          kind: tool,
+          cwd: current.cwd,
+          sessionId: current.providerSessionId!,
+          resume: true,
+          authKind: "subscription",
+          ...(model ? { model } : {}),
+          spec: { command: spec.command, args: spec.args, env: spec.env },
+        });
+        if (!(await (options.waitForHsrHost ?? waitForHsrHost)(current.name, 5_000))) {
+          console.error(`hsr host for ${current.name} did not report live within 5s; the daemon will reconcile`);
+        }
+      } else {
+        // The swap re-creates the session, so the agent runs in a fresh pane —
+        // re-pin to it (the old agentPaneId is now dead).
+        const launch = await substrate.newSession(current.tmuxTarget, current.cwd, {
+          command: spec.command,
+          args: spec.args,
+          env: spec.env,
+          tmuxOptions: spec.tmuxOptions,
+        });
+        paneId = launch.paneId;
+        launcherPgid = launch.launcherPgid;
+      }
+    } catch (error) {
+      // Activation happens before relaunch. If anything after it fails, restore
+      // the old account into the home so the persisted binding and on-disk
+      // credentials cannot diverge (the exact failure mode fixed here).
+      if (currentAccount) {
+        try {
+          await activate(currentAccount, record.homePath!);
+        } catch (rollbackError) {
+          const original = error instanceof Error ? error.message : String(error);
+          const rollback = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+          throw new Error(`${original}; restoring account ${currentAccount.id} also failed: ${rollback}`);
+        }
+      }
+      throw error;
+    }
 
     // 4. Persist the new binding and command from the under-lock snapshot so
     //    a concurrent daemon merge (title, transcript metadata, observed
@@ -132,8 +187,9 @@ export async function swapAccount(
       ...current,
       accountId: account.id,
       command: shellCommand(spec),
-      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+      ...(paneId ? { agentPaneId: paneId } : {}),
+      ...(launcherPgid ? { launcherPgid } : {}),
+      ...(runnerPid ? { runnerPid } : {}),
       status: "running",
       updatedAt: new Date().toISOString(),
     };

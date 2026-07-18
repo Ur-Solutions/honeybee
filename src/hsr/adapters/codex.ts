@@ -410,7 +410,34 @@ export function buildCodexSpawn(opts: RunnerOpts): { command: string; args: stri
   const authKind = opts.authKind ?? "subscription";
   const env: Record<string, string> = { ...opts.env };
   for (const key of harnessAllowance("codex", authKind)?.scrubEnv ?? []) delete env[key];
-  return { command, args: [...CODEX_APP_SERVER_ARGS], env };
+  return { command, args: [...CODEX_APP_SERVER_ARGS, ...codexConfigOverridesFromArgs(opts.args)], env };
+}
+
+/**
+ * `-c key=value` config overrides recovered from the caller argv and re-applied
+ * to the `codex app-server` child (`-c` is a root-level codex flag; process-wide,
+ * which matches the one-bee-per-host model). The app-server otherwise ignores
+ * TUI argv, so a bee's spawn/set-model reasoning override
+ * (`-c model_reasoning_effort="high"`) silently lost to the home config.toml —
+ * whose effort may be 5.6-only (ultra), 400-ing every turn once the bee moves
+ * to a non-5.6 model.
+ */
+export function codexConfigOverridesFromArgs(args: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  const list = args ?? [];
+  for (let i = 0; i < list.length; i += 1) {
+    const arg = list[i]!;
+    if ((arg === "-c" || arg === "--config") && list[i + 1] !== undefined) {
+      out.push("-c", list[i + 1]!);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--config=")) {
+      const value = arg.slice("--config=".length);
+      if (value.length > 0) out.push("-c", value);
+    }
+  }
+  return out;
 }
 
 /**

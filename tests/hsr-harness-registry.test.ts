@@ -16,6 +16,7 @@ import {
   harnessAllowance,
   harnessDescriptor,
   harnessNames,
+  harnessSupportsRemoteHsr,
   validateHarnessRegistry,
 } from "../src/hsr/harness.js";
 import { adapterFor } from "../src/hsr/adapters/index.js";
@@ -72,10 +73,18 @@ test("allowance.ts serves rows derived from the registry", () => {
 test("legacy allowance behavior is preserved by the registry view", () => {
   assert.equal(bestTier("claude", "subscription"), "stream");
   assert.equal(bestTier("codex", "subscription"), "server");
+  assert.equal(bestTier("kimi", "subscription"), "stream");
+  assert.deepEqual(allowanceFor("kimi", "subscription")?.requiredFlags, ["acp"]);
   assert.deepEqual(scrubEnvFor("claude", "subscription"), ["ANTHROPIC_API_KEY"]);
   assert.deepEqual(scrubEnvFor("claude", "api-key"), []);
   assert.equal(allowanceFor("stub", "subscription"), undefined, "stub is test-only: no allowance rows");
   assert.equal(allowanceFor("nope", "subscription"), undefined);
+});
+
+test("Kimi HSR is explicitly local-only while other established remote runners remain allowed", () => {
+  assert.equal(harnessSupportsRemoteHsr("kimi"), false);
+  assert.equal(harnessSupportsRemoteHsr("claude"), true);
+  assert.equal(harnessSupportsRemoteHsr("codex"), true);
 });
 
 test("ephemeral policy: claude mints a token, codex ships an access-token-only auth.json", () => {

@@ -9,9 +9,9 @@
 //   cache write 5m = 1.25 x input   (5-minute ephemeral write)
 //   cache write 1h = 2.00 x input   (1-hour ephemeral write)
 //
-// Non-Anthropic models (codex/gpt-5.x, grok, …) are registered as `todo:true`
-// rules with empty versions: they are counted and flagged loudly rather than
-// silently priced at zero. Fill in real list prices before trusting their USD.
+// Published OpenAI model rates are represented explicitly per model. Broad
+// family rules remain TODO fallbacks because prices differ substantially across
+// variants and guessing a family rate would silently corrupt spend reports.
 // ──────────────────────────────────────────────────────────────────────────
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -40,6 +40,50 @@ function anthropicRule(modelPattern: string, effectiveFrom: string, input: numbe
     provider: "anthropic",
     ...(note ? { note } : {}),
     versions: [anthropicVersion(effectiveFrom, input, output)],
+  };
+}
+
+/** Build an OpenAI rate version from its published standard token rates. */
+function openaiRule(
+  modelPattern: string,
+  effectiveFrom: string,
+  input: number,
+  cachedInput: number,
+  output: number,
+  note?: string,
+  cacheWrite: number = input,
+): RateRule {
+  return {
+    modelPattern,
+    provider: "openai",
+    ...(note ? { note } : {}),
+    versions: [{
+      effectiveFrom,
+      inputPerMTok: input,
+      outputPerMTok: output,
+      cacheReadPerMTok: cachedInput,
+      // Before GPT-5.6, OpenAI did not expose a distinct cache-write meter;
+      // use ordinary input price if an adapter ever reports one.
+      cacheWrite5mPerMTok: cacheWrite,
+      cacheWrite1hPerMTok: cacheWrite,
+    }],
+  };
+}
+
+/** A bookkeeping model which is known to carry no billable tokens. */
+function nonBillableRule(modelPattern: string, note: string): RateRule {
+  return {
+    modelPattern,
+    provider: "internal",
+    note,
+    versions: [{
+      effectiveFrom: "1970-01-01",
+      inputPerMTok: 0,
+      outputPerMTok: 0,
+      cacheReadPerMTok: 0,
+      cacheWrite5mPerMTok: 0,
+      cacheWrite1hPerMTok: 0,
+    }],
   };
 }
 
@@ -89,6 +133,27 @@ export function seedRateTable(): RateTable {
     // ── Claude Haiku 4.5, $1 / $5 tier ──────────────────────────────────────
     anthropicRule("claude-haiku-4-5", "2025-10-01", 1, 5),
 
+    // ── Claude Fable 5, $10 / $50 tier ──────────────────────────────────────
+    anthropicRule("claude-fable-5", "2026-06-09", 10, 50),
+
+    // ── OpenAI/Codex published standard API rates ───────────────────────────
+    // USD per MTok: input / cached input / output. Exact model rules precede
+    // the TODO family fallbacks below and win by longest-literal matching.
+    openaiRule("gpt-5.6-sol", "2026-07-09", 5, 0.5, 30, "Prompts over 272K input tokens have a published long-context uplift not yet represented by this flat rate; cache writes are 1.25x input.", 6.25),
+    openaiRule("gpt-5.5", "2026-04-24", 5, 0.5, 30, "Standard API rate; Codex Fast mode and long-context/service-tier uplifts are not represented."),
+    openaiRule("gpt-5.4-mini", "2026-03-17", 0.75, 0.075, 4.5),
+    openaiRule("gpt-5.4", "2026-03-05", 2.5, 0.25, 15, "Prompts over 272K input tokens have a published long-context uplift not yet represented by this flat rate."),
+    openaiRule("gpt-5.3-codex", "2026-02-05", 1.75, 0.175, 14),
+    openaiRule("gpt-5.2-codex", "2025-12-11", 1.75, 0.175, 14),
+    openaiRule("gpt-5.2", "2025-12-11", 1.75, 0.175, 14),
+    openaiRule("gpt-5.1-codex-max", "2025-11-19", 1.25, 0.125, 10),
+    openaiRule("gpt-5-codex", "2025-08-07", 1.25, 0.125, 10),
+    openaiRule("codex-auto-review", "2025-08-07", 1.25, 0.125, 10, "Hidden Codex review model; local model metadata identifies it as GPT-5-based, so GPT-5 standard API rates apply."),
+
+    // Claude emits bookkeeping rows with this model id and zero tokens. Mark
+    // them resolved so they do not make otherwise complete reports partial.
+    nonBillableRule("<synthetic>", "Claude bookkeeping row; extractor only emits this id with zero tokens."),
+
     // ── Family fallbacks: newest-tier prices when a specific rule misses. ────
     // Longer literals above win; these catch unseen point releases at the
     // current per-tier list price. Anything not even matching these hits the
@@ -97,10 +162,8 @@ export function seedRateTable(): RateTable {
     anthropicRule("claude-sonnet", "2025-05-22", 3, 15, "Fallback: current Sonnet $3/$15 tier."),
     anthropicRule("claude-haiku", "2025-10-01", 1, 5, "Fallback: current Haiku $1/$5 tier."),
 
-    // ── Non-Anthropic models: registered but unpriced (never zero). ─────────
-    // OpenAI/codex (gpt-5.x) and grok list prices are not confirmed here; leave
-    // as todo so they surface loudly instead of being silently mis-priced.
-    todoRule("gpt-5", "openai", "codex/gpt-5.x: list price unconfirmed — fill input/output/cache before trusting USD."),
+    // ── Unpriced family fallbacks (never guess a variant's rate). ───────────
+    todoRule("gpt-5", "openai", "Unknown GPT-5 variant — add an exact published rate."),
     todoRule("gpt-4", "openai", "codex/gpt-4.x: list price unconfirmed."),
     todoRule("o3", "openai", "OpenAI o3: list price unconfirmed."),
     todoRule("o4", "openai", "OpenAI o4: list price unconfirmed."),
@@ -204,9 +267,31 @@ export async function ensureRatesFile(path: string = ratesPath()): Promise<strin
       // wx: create-only — a concurrent writer or a pre-existing file both land
       // in EEXIST, which we swallow so an existing table is never clobbered.
       await writeFile(path, `${JSON.stringify(seedRateTable(), null, 2)}\n`, { flag: "wx", mode: 0o600 });
+      return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
+
+    // Existing installs keep a generated rates.json forever. Merge newly
+    // published exact rules into stale tables without replacing user-priced
+    // overrides: only absent rules and still-TODO/empty versions are upgraded.
+    const current = validateRateTable(JSON.parse(await readFile(path, "utf8")));
+    const seeded = seedRateTable();
+    let changed = false;
+    for (const seedRule of seeded.rules) {
+      const index = current.rules.findIndex((rule) => rule.modelPattern === seedRule.modelPattern);
+      if (index === -1) {
+        current.rules.push(seedRule);
+        changed = true;
+        continue;
+      }
+      const existing = current.rules[index]!;
+      if (seedRule.todo !== true && existing.todo === true && existing.versions.length === 0) {
+        current.rules[index] = seedRule;
+        changed = true;
+      }
+    }
+    if (changed) await writeFile(path, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o600 });
   });
   return path;
 }

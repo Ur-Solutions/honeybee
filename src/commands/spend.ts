@@ -77,6 +77,7 @@ function knownModelPredicate(table: RateTable): (id: string) => boolean {
 
 /** Load every event and price it against the on-disk (or seeded) rate table. */
 async function loadCostedEvents() {
+  await ensureRatesFile();
   const [events, rates] = await Promise.all([readAllEvents(), loadRates()]);
   return { costed: priceEvents(events, rates), rates };
 }
@@ -242,6 +243,7 @@ async function runBlend(parsed: Parsed): Promise<void> {
 }
 
 async function runRates(parsed: Parsed): Promise<void> {
+  await ensureRatesFile();
   const rates = await loadRates();
   if (truthy(flag(parsed, "check"))) {
     const costed = priceEvents(await readAllEvents(), rates);

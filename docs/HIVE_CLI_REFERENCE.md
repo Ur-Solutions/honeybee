@@ -1815,22 +1815,32 @@ Record a typed handoff artifact for one bee, swarm, or colony.
 
 ```sh
 hive seal <selector> --from <path-to-seal.json>
+hive seal --example
+hive seal --help
 ```
+
+`hive help seal` prints the same detailed help as `hive seal --help`.
+`hive seal --example` prints the representative input artifact below to stdout;
+it does not require a selector or `--from`, and it does not write Hive state.
 
 Seal JSON shape:
 
 ```json
 {
   "status": "done",
-  "summary": "Implemented the requested change.",
+  "summary": "Implemented discoverable seal help and verified the CLI behavior.",
   "type": "implementation",
-  "filesChanged": ["src/example.ts"],
+  "filesChanged": ["src/seal.ts", "src/commands/messaging.ts"],
   "testsRun": [
-    { "command": "npm test", "result": "passed" }
+    {
+      "command": "npm test",
+      "result": "passed",
+      "notes": "All tests passed."
+    }
   ],
-  "risks": ["None known"],
-  "nextActions": ["Review the diff"],
-  "confidence": 0.86
+  "risks": ["None known."],
+  "nextActions": ["Review the diff."],
+  "confidence": 0.95
 }
 ```
 
@@ -1849,7 +1859,28 @@ Valid types:
 - `test`
 - `witness`
 
-`confidence` must be between 0 and 1.
+Artifact fields:
+
+- `status` (required): one of the statuses above.
+- `summary` (required): a non-empty string.
+- `type` (optional): one of the types above.
+- `filesChanged`, `risks`, and `nextActions` (optional): arrays of strings.
+- `testsRun` (optional): an array of objects. Each object requires a non-empty
+  `command` and a `result` of `passed`, `failed`, or `skipped`; `notes` is an
+  optional string.
+- `confidence` (optional): a finite number from 0 through 1, inclusive.
+
+To self-seal from inside a bee, resolve the current ID, write or edit a truthful
+artifact, record it, and clean up the temporary file:
+
+```sh
+bee="$(hive here --id)"
+artifact="$(mktemp "${TMPDIR:-/tmp}/hive-seal.XXXXXX")"
+hive seal --example > "$artifact"
+${EDITOR:-vi} "$artifact"
+hive seal "$bee" --from "$artifact"
+rm -f "$artifact"
+```
 
 Seals are stored under:
 
