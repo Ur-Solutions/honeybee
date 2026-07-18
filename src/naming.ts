@@ -52,7 +52,7 @@ export async function gatherTitleContext(
   record: SessionRecord,
   options: GatherTitleContextOptions = {},
 ): Promise<TitleContext | null> {
-  const tx = await latestTranscript(record.agent, record.cwd, {
+  const lookup = {
     sinceIso: record.lastPromptAt ?? record.createdAt,
     prompt: record.lastPrompt,
     transcriptPath: record.transcriptPath,
@@ -61,8 +61,9 @@ export async function gatherTitleContext(
     // Don't let an untitled bee borrow an older sibling's transcript (the
     // cwd-shared cross-match that mis-titles bees). See notBeforeIso.
     notBeforeIso: record.createdAt,
-  }).catch(() => null);
-  const reliableTx = tx && isAnchoredTranscriptMatch(tx) ? tx : null;
+  };
+  const tx = await latestTranscript(record.agent, record.cwd, lookup).catch(() => null);
+  const reliableTx = tx && isAnchoredTranscriptMatch(tx, lookup) ? tx : null;
 
   const firstUser = clampContext(reliableTx ? firstUserText(reliableTx.rows) : "");
   const lastAssistant = clampContext(reliableTx ? lastAssistantText(reliableTx.rows) : "");

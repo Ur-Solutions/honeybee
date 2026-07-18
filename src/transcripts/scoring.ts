@@ -52,16 +52,20 @@ export function scoreTranscript(input: { rows: TranscriptRow[]; path: string; se
 }
 
 /**
- * Did this transcript match on evidence that actually ties it to the bee
- * (explicit path/session-id anchor, the bee's own prompt text, or spawn-time
- * proximity) — as opposed to circumstantial mtime/cwd/since overlap? Weakly
- * matched transcripts are fine to *display* as a best guess, but must never be
- * persisted as a bee's identity or used to title it: any sibling in the same
- * cwd folder "matches" that way, which is how one fresh bee's transcript
- * mass-overwrote its neighbours' titles and session ids.
+ * Did this transcript match on evidence strong enough to own the bee record?
+ * An existing path/session id is authoritative and must itself match. A fresh,
+ * unanchored record may bootstrap from its own prompt text. Spawn proximity is
+ * intentionally NOT ownership evidence: it remains useful for ranking a fresh
+ * provider's candidates, but any sibling started in the same short window also
+ * satisfies it. Persisting that guess poisons the record's identity forever.
  */
-export function isAnchoredTranscriptMatch(tx: { matchedBy: string[] }): boolean {
-  return tx.matchedBy.some((match) => match === "path" || match === "session-id" || match === "prompt" || match === "spawn-proximity");
+export function isAnchoredTranscriptMatch(
+  tx: { matchedBy: string[] },
+  expected: Pick<TranscriptLookupOptions, "transcriptPath" | "sessionId"> = {},
+): boolean {
+  const identityMatch = tx.matchedBy.some((match) => match === "path" || match === "session-id");
+  if (expected.transcriptPath || expected.sessionId) return identityMatch;
+  return identityMatch || tx.matchedBy.includes("prompt");
 }
 
 function memoizedPromptMatch(rows: TranscriptRow[], prompt: string, memo?: Map<string, boolean>): boolean {

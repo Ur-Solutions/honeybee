@@ -325,16 +325,22 @@ test("persistSessionTranscriptMetadata: a weak match still honors markRunning", 
   });
 });
 
-test("persistSessionTranscriptMetadata: prompt and spawn-proximity matches adopt identity", async () => {
+test("persistSessionTranscriptMetadata: prompt matches adopt identity but spawn proximity does not", async () => {
   await withTempStore(async () => {
-    for (const anchor of ["prompt", "spawn-proximity"] as const) {
-      const record = bee({ name: `CL.${anchor}` });
-      await saveSession(record);
-      await persistSessionTranscriptMetadata(record, tx("Anchored title", ["mtime", anchor]));
-      const stored = await loadSession(record.name);
-      assert.equal(stored?.title, "Anchored title");
-      assert.equal(stored?.providerSessionId, "s1");
-      assert.equal(stored?.transcriptPath, "/tmp/t.jsonl");
-    }
+    const prompted = bee({ name: "CL.prompt" });
+    await saveSession(prompted);
+    await persistSessionTranscriptMetadata(prompted, tx("Anchored title", ["mtime", "prompt"]));
+    const promptedStored = await loadSession(prompted.name);
+    assert.equal(promptedStored?.title, "Anchored title");
+    assert.equal(promptedStored?.providerSessionId, "s1");
+    assert.equal(promptedStored?.transcriptPath, "/tmp/t.jsonl");
+
+    const nearby = bee({ name: "CL.spawn-proximity" });
+    await saveSession(nearby);
+    await persistSessionTranscriptMetadata(nearby, tx("Sibling title", ["mtime", "spawn-proximity"]));
+    const nearbyStored = await loadSession(nearby.name);
+    assert.equal(nearbyStored?.title, undefined);
+    assert.equal(nearbyStored?.providerSessionId, undefined);
+    assert.equal(nearbyStored?.transcriptPath, undefined);
   });
 });
