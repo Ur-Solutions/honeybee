@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { accountDir, type AccountRecord } from "../src/accounts.js";
+import type { HsrRunPayload } from "../src/hsr/runnerHost.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { LaunchSpec, Substrate } from "../src/substrates/types.js";
 import { resumeArgs, swapAccount } from "../src/swap.js";
@@ -190,6 +191,84 @@ test("swapAccount relaunches codex with CODEX_HOME but not HOME", async () => {
     assert.deepEqual(relaunch.spec!.args.slice(-2), ["resume", "--last"]);
     assert.equal(relaunch.spec!.env?.CODEX_HOME, "/tmp/home-c");
     assert.equal(relaunch.spec!.env?.HOME, undefined);
+  });
+});
+
+test("swapAccount relaunches an HSR bee through the runner host", async () => {
+  await withTempStore(async () => {
+    const { substrate, calls } = fakeSubstrate(false);
+    const codexAccount: AccountRecord = { id: "codex-new", tool: "codex", label: "c@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
+    const existing = record({
+      name: "CO.test",
+      agent: "codex",
+      command: "CODEX_HOME=/tmp/home-c codex --yolo",
+      tmuxTarget: "CO.test",
+      substrate: "hsr",
+      homePath: "/tmp/home-c",
+      accountId: "codex-old",
+      providerSessionId: "thread-123",
+    });
+    await saveSession(existing);
+    let payload: HsrRunPayload | undefined;
+
+    const updated = await swapAccount(existing, codexAccount, {
+      substrate,
+      sleep: async () => undefined,
+      activate: async () => ["auth.json"],
+      spawnHsrHost: async (next) => {
+        payload = next;
+        return 4321;
+      },
+      waitForHsrHost: async () => true,
+    });
+
+    assert.equal(calls.some((call) => call.method === "newSession"), false);
+    assert.equal(payload?.bee, "CO.test");
+    assert.equal(payload?.sessionId, "thread-123");
+    assert.equal(payload?.resume, true);
+    assert.equal(payload?.spec.env.CODEX_HOME, "/tmp/home-c");
+    assert.equal(payload?.spec.args.includes("resume"), false);
+    assert.equal(updated.runnerPid, 4321);
+    assert.equal(updated.accountId, "codex-new");
+  });
+});
+
+test("swapAccount restores the old credentials when HSR relaunch fails", async () => {
+  await withTempStore(async () => {
+    const { substrate } = fakeSubstrate(false);
+    const oldAccount: AccountRecord = { id: "codex-old", tool: "codex", label: "old@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
+    const targetAccount: AccountRecord = { id: "codex-new", tool: "codex", label: "new@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
+    const existing = record({
+      name: "CO.test",
+      agent: "codex",
+      command: "CODEX_HOME=/tmp/home-c codex --yolo",
+      tmuxTarget: "CO.test",
+      substrate: "hsr",
+      homePath: "/tmp/home-c",
+      accountId: oldAccount.id,
+      providerSessionId: "thread-123",
+    });
+    await saveSession(existing);
+    const activated: string[] = [];
+
+    await assert.rejects(
+      () => swapAccount(existing, targetAccount, {
+        substrate,
+        sleep: async () => undefined,
+        listAccounts: async () => [oldAccount, targetAccount],
+        activate: async (next) => {
+          activated.push(next.id);
+          return ["auth.json"];
+        },
+        spawnHsrHost: async () => {
+          throw new Error("runner launch failed");
+        },
+      }),
+      /runner launch failed/,
+    );
+
+    assert.deepEqual(activated, ["codex-new", "codex-old"]);
+    assert.equal((await loadSession(existing.name))?.accountId, "codex-old");
   });
 });
 
