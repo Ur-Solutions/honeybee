@@ -242,6 +242,9 @@ export function structuredStateFromEvents(
       case "error":
         if (isAuthNeededMessage(event.message)) lastAuthNeeded = i;
         break;
+      case "auth_expired":
+        if (event.requiresLogin) lastAuthNeeded = i;
+        break;
       case "auth_resume":
         lastAuthResume = i;
         break;
@@ -456,7 +459,10 @@ export function hsrUsageObservationFromEvents(events: RunnerEvent[]): HsrUsageOb
     if (event.type === "usage") {
       sawUsage = true;
       if (typeof event.inputTokens === "number" && Number.isFinite(event.inputTokens)) input += event.inputTokens;
+      if (typeof event.cacheReadTokens === "number" && Number.isFinite(event.cacheReadTokens)) input += event.cacheReadTokens;
+      if (typeof event.cacheWriteTokens === "number" && Number.isFinite(event.cacheWriteTokens)) input += event.cacheWriteTokens;
       if (typeof event.outputTokens === "number" && Number.isFinite(event.outputTokens)) output += event.outputTokens;
+      if (typeof event.reasoningTokens === "number" && Number.isFinite(event.reasoningTokens)) output += event.reasoningTokens;
     } else if (event.type === "exhausted") {
       const ts = typeof event.ts === "number" && Number.isFinite(event.ts) ? event.ts : 0;
       if (!latestExhausted || ts >= latestExhausted.ts) {

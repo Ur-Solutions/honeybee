@@ -45,12 +45,20 @@ import {
 } from "./remoteCreds.js";
 import { runHsrHost, type HsrHostHandle } from "./host.js";
 import { adapterFor } from "./adapters/index.js";
+import { harnessSupportsRemoteHsr } from "./harness.js";
 import { normalizeCreds } from "./credsParams.js";
 import { provisionCheckout, enumerateCheckouts, type ProvisionParams } from "./provisioning.js";
 import type { RunnerOpts, RunnerTier } from "./types.js";
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Secret-free policy failure used by both the RPC path and hermetic tests. */
+export function remoteHarnessPolicyError(kind: string): string | undefined {
+  return harnessSupportsRemoteHsr(kind)
+    ? undefined
+    : `${kind} HSR is local-only: remote credential delivery is not implemented or tested`;
 }
 
 /**
@@ -262,6 +270,8 @@ export function buildController(): RunnerHostController {
     const kind = String(p.kind ?? "");
     if (!bee) return { ok: false, error: "bee required" };
     if (!kind) return { ok: false, error: "kind required" };
+    const policyError = remoteHarnessPolicyError(kind);
+    if (policyError) return { ok: false, error: policyError };
     const adapter = adapterFor(kind);
     if (!adapter) return { ok: false, error: `no HSR adapter for harness "${kind}"` };
     const spec = p.spec ?? {};
@@ -482,7 +492,8 @@ export function buildController(): RunnerHostController {
         const pending = await pendingNeedsInput(bee).catch(() => null);
         requestId = pending?.requestId;
       }
-      const result = await proxyCall(bee, "answer", { requestId: requestId ?? "", answer: String(p.answer ?? "") });
+      const answer = Array.isArray(p.answer) ? p.answer : String(p.answer ?? "");
+      const result = await proxyCall(bee, "answer", { requestId: requestId ?? "", answer });
       return result.ok ? { ok: true } : result;
     }),
 

@@ -416,9 +416,28 @@ export async function cmdAnswer(parsed: Parsed) {
   const meta = await readHsrMeta(record.name);
   if (!meta?.controlSocket) throw new Error(`No control socket for ${record.name}`);
 
+  // Keep the legacy plain-text answer path, while allowing a structured
+  // OpenCode response to travel losslessly as JSON, e.g.
+  // `hive answer OP.x '[["A","B"],["C"]]'`.
+  let wireAnswer: string | string[][] = answer;
+  if (pending.kind === "question" && answer.trim().startsWith("[")) {
+    try {
+      const parsedAnswer = JSON.parse(answer) as unknown;
+      if (
+        Array.isArray(parsedAnswer) &&
+        parsedAnswer.every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"))
+      ) {
+        wireAnswer = parsedAnswer as string[][];
+      }
+    } catch {
+      // The adapter will treat malformed/non-matrix JSON as a plain answer,
+      // retaining the pre-existing CLI behavior.
+    }
+  }
+
   const client = await connectRpcClient(meta.controlSocket);
   try {
-    await client.call("answer", { requestId: pending.requestId, answer });
+    await client.call("answer", { requestId: pending.requestId, answer: wireAnswer });
   } finally {
     client.close();
   }

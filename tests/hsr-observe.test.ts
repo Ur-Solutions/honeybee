@@ -164,6 +164,17 @@ test("structuredStateFromEvents does not confuse daemon-recoverable auth_expired
   );
 });
 
+test("structuredStateFromEvents treats an explicitly login-required auth expiry as auth-needed", () => {
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "auth_expired", ts: 2, requiresLogin: true, detail: "Run grok login, then resume." },
+      { type: "turn_end", ts: 3 },
+    ]),
+    "auth-needed",
+  );
+});
+
 test("an auth_resume marker un-sticks a stale auth-needed tail (CL.8d7, 2026-07-16)", () => {
   // The exact shape auth-resume leaves behind: the old error turn, the SIGTERM
   // exit from stopping the stuck runtime, then the marker. The resumed bee

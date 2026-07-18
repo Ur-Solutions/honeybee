@@ -8,6 +8,8 @@ import {
   driverDefaultsToYolo,
   forcedSessionIdArgsForAgent,
   hsrAdapterForAgent,
+  identityRecipeForAgent,
+  modelArgsForAgent,
   resumeArgsForAgent,
   sessionPinnedInArgs,
   sessionPinResumeExtrasForAgent,
@@ -22,8 +24,7 @@ test("bootMsForAgent: per-kind boot timeouts with a shared default", () => {
   assert.equal(bootMsForAgent("droid"), 5_000);
   assert.equal(bootMsForAgent("pi"), 10_000);
   assert.equal(bootMsForAgent("cursor"), 15_000);
-  // Kinds without a declared bootMs (kimi) and unknown kinds fall back.
-  assert.equal(bootMsForAgent("kimi"), DEFAULT_BOOT_MS);
+  assert.equal(bootMsForAgent("kimi"), 15_000);
   assert.equal(bootMsForAgent("no-such-agent"), DEFAULT_BOOT_MS);
 });
 
@@ -47,7 +48,10 @@ test("resumeArgsForAgent: per-provider resume forms from the registry", () => {
   assert.deepEqual(resumeArgsForAgent("codex", undefined), ["resume", "--last"]);
   assert.deepEqual(resumeArgsForAgent("opencode", "abc"), ["--session", "abc"]);
   assert.deepEqual(resumeArgsForAgent("opencode", undefined), ["--continue"]);
-  assert.deepEqual(resumeArgsForAgent("grok", "abc"), []);
+  assert.deepEqual(resumeArgsForAgent("kimi", "abc"), ["--session", "abc"]);
+  assert.deepEqual(resumeArgsForAgent("kimi", undefined), ["--continue"]);
+  assert.deepEqual(resumeArgsForAgent("grok", "abc"), ["--resume", "abc"]);
+  assert.deepEqual(resumeArgsForAgent("grok", undefined), ["--continue"]);
   assert.deepEqual(resumeArgsForAgent("no-such-agent", "abc"), []);
 });
 
@@ -83,12 +87,39 @@ test("sessionPinResumeExtrasForAgent: claude resumes need --fork-session next to
 test("hsrAdapterForAgent + adapterFor: registry-backed adapters and their tiers", () => {
   assert.equal(hsrAdapterForAgent("claude")?.tier(), "stream");
   assert.equal(hsrAdapterForAgent("codex")?.tier(), "server");
-  assert.equal(hsrAdapterForAgent("grok"), undefined);
+  assert.equal(hsrAdapterForAgent("opencode")?.tier(), "server");
+  assert.equal(hsrAdapterForAgent("kimi")?.tier(), "stream");
+  assert.equal(hsrAdapterForAgent("grok")?.tier(), "stream");
   // adapterFor delegates to the registry and keeps the test-only stub.
   assert.equal(adapterFor("claude"), hsrAdapterForAgent("claude"));
   assert.equal(adapterFor("codex"), hsrAdapterForAgent("codex"));
+  assert.equal(adapterFor("opencode"), hsrAdapterForAgent("opencode"));
+  assert.equal(adapterFor("kimi"), hsrAdapterForAgent("kimi"));
+  assert.equal(adapterFor("grok"), hsrAdapterForAgent("grok"));
   assert.equal(adapterFor("stub")?.tier(), "stream");
-  assert.equal(adapterFor("opencode"), undefined);
+});
+
+test("OpenCode driver preserves qualified models and qualifies account models once", () => {
+  assert.deepEqual(modelArgsForAgent("opencode", "zai-coding-plan/glm-5"), [
+    "--model",
+    "zai-coding-plan/glm-5",
+  ]);
+  assert.deepEqual(modelArgsForAgent("opencode", "glm-5", "zai-coding-plan"), [
+    "--model",
+    "zai-coding-plan/glm-5",
+  ]);
+  assert.deepEqual(modelArgsForAgent("opencode", "glm-5"), []);
+  assert.deepEqual(modelArgsForAgent("opencode", "/glm-5"), []);
+  assert.deepEqual(modelArgsForAgent("opencode", "zai-coding-plan/"), []);
+});
+
+test("Kimi driver registers model and config identity capabilities", () => {
+  assert.deepEqual(modelArgsForAgent("kimi", "k3"), ["--model", "kimi-code/k3"]);
+  assert.deepEqual(modelArgsForAgent("kimi", "kimi-code/kimi-for-coding-highspeed"), [
+    "--model",
+    "kimi-code/kimi-for-coding-highspeed",
+  ]);
+  assert.deepEqual(identityRecipeForAgent("kimi")?.configFiles, ["config.toml", "tui.toml"]);
 });
 
 test("defaultsToSoleCredentialedAccount: grok-only bare-spawn account default", () => {

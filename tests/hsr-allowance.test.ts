@@ -10,6 +10,24 @@ test("bestTier: codex subscription prefers the server tier", () => {
   assert.equal(bestTier("codex", "subscription"), "server");
 });
 
+test("bestTier: grok subscription prefers native ACP stream", () => {
+  assert.equal(bestTier("grok", "subscription"), "stream");
+  assert.deepEqual(allowanceFor("grok", "subscription")?.requiredFlags, ["--no-auto-update", "agent", "--no-leader", "stdio"]);
+});
+
+test("scrubEnvFor: Grok subscription cannot fall through to API billing", () => {
+  assert.deepEqual(scrubEnvFor("grok", "subscription"), ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"]);
+  assert.deepEqual(scrubEnvFor("grok", "api-key"), []);
+});
+
+test("bestTier: OpenCode uses authenticated loopback serve with PTY fallback", () => {
+  assert.equal(bestTier("opencode", "subscription"), "server");
+  assert.deepEqual(allowanceFor("opencode", "subscription")?.permittedTiers, ["server", "pty"]);
+  assert.deepEqual(allowanceFor("opencode", "subscription")?.requiredFlags, [
+    "serve", "--hostname", "127.0.0.1", "--port", "0",
+  ]);
+});
+
 test("scrubEnvFor: claude subscription scrubs ANTHROPIC_API_KEY", () => {
   assert.ok(scrubEnvFor("claude", "subscription").includes("ANTHROPIC_API_KEY"));
 });

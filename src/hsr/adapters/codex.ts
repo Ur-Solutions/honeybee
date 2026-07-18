@@ -25,7 +25,7 @@
  */
 
 import type { ChildProcess } from "node:child_process";
-import type { RunnerAdapter, RunnerEvent, RunnerInputQuestion, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
+import type { RunnerAdapter, RunnerEvent, RunnerInputAnswer, RunnerInputQuestion, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
 import { harnessAllowance } from "../harness.js";
 import { attachSessionPlumbing, spawnSessionChild, stopChildGroup } from "../sessionBase.js";
 import {
@@ -668,10 +668,11 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
       });
   }
 
-  async function answer(requestId: string, answerText: string): Promise<void> {
+  async function answer(requestId: string, answerValue: RunnerInputAnswer): Promise<void> {
     const pending = requestMethods.get(requestId);
     if (!pending) throw new Error(`hsr codex: no pending input for requestId ${requestId}`);
     requestMethods.delete(requestId);
+    const answerText = typeof answerValue === "string" ? answerValue : JSON.stringify(answerValue);
     const id: string | number = /^\d+$/.test(requestId) ? Number(requestId) : requestId;
     peer.respond(id, encodeCodexApprovalResponse(pending.method, isApproval(answerText), answerText, pending.params));
   }

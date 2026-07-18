@@ -84,6 +84,8 @@ export type HarnessDescriptor = {
   readonly allowance?: Readonly<Record<AuthKind, HarnessAllowancePolicy>>;
   /** Remote-HSR ephemeral credential delivery policy, when wired. */
   readonly ephemeral?: EphemeralCredentialPolicy;
+  /** Explicit remote-HSR restriction when no defensible credential policy exists yet. */
+  readonly remoteHsr?: "local-only";
 };
 
 // The claude stream-json flag set. Descriptive — these are the tokens the
@@ -94,6 +96,8 @@ const CLAUDE_STREAM_FLAGS = ["-p", "--input-format", "stream-json", "--output-fo
 // prompt (print-mode only flag) — a turn child is unattended, so the prompt
 // would strand the turn; shared by both auth kinds.
 const CURSOR_TURN_FLAGS = ["-p", "--output-format", "stream-json", "--trust"] as const;
+
+const OPENCODE_SERVER_FLAGS = ["serve", "--hostname", "127.0.0.1", "--port", "0"] as const;
 
 export const HARNESSES = {
   // A real child process, but not a real harness — test scaffolding only
@@ -165,23 +169,24 @@ export const HARNESSES = {
     },
   },
   opencode: {
-    runner: false,
+    runner: true,
+    remoteHsr: "local-only",
     allowance: {
       subscription: {
         permittedTiers: ["server", "pty"],
-        requiredFlags: [],
+        requiredFlags: OPENCODE_SERVER_FLAGS,
         scrubEnv: [],
         fingerprints: [],
-        note: "opencode serve REST + official SDK; best embedding story. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "OpenCode 1.17.18 serve REST/SSE with per-bee Basic auth; full permission/question endpoints and native session resume verified. Local-only until provider-filtered auth.json delivery is safe.",
+        since: "2026-07-18",
       },
       "api-key": {
         permittedTiers: ["server", "pty"],
-        requiredFlags: [],
+        requiredFlags: OPENCODE_SERVER_FLAGS,
         scrubEnv: [],
         fingerprints: [],
-        note: "opencode serve REST + official SDK. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "OpenCode 1.17.18 serve REST/SSE with intentional provider API-key billing and per-bee Basic auth. Local-only until selected-provider credential filtering is implemented.",
+        since: "2026-07-18",
       },
     },
   },
@@ -212,44 +217,48 @@ export const HARNESSES = {
     // keychain slot, so account-bound cursor bees stay local-only for now.
   },
   kimi: {
-    runner: false,
+    runner: true,
+    remoteHsr: "local-only",
     allowance: {
       subscription: {
         permittedTiers: ["stream", "pty"],
-        requiredFlags: [],
+        requiredFlags: ["acp"],
         scrubEnv: [],
         fingerprints: [],
-        note: "kimi acp (Agent Client Protocol over stdio); subscription permits third-party embedding. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "Kimi Code 0.27 ACP JSON-RPC over stdio, with model/mode applied through session config; local HSR only until remote credentials have a tested delivery policy.",
+        since: "2026-07-17",
       },
       "api-key": {
         permittedTiers: ["stream", "pty"],
-        requiredFlags: [],
+        requiredFlags: ["acp"],
         scrubEnv: [],
         fingerprints: [],
-        note: "kimi acp over stdio. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "Kimi Code 0.27 ACP JSON-RPC over stdio; local HSR only until remote API-key delivery is implemented and tested.",
+        since: "2026-07-17",
       },
     },
   },
   grok: {
-    runner: false,
+    runner: true,
+    remoteHsr: "local-only",
     allowance: {
       subscription: {
-        permittedTiers: ["turn", "pty"],
-        requiredFlags: [],
-        scrubEnv: [],
+        permittedTiers: ["stream", "pty"],
+        requiredFlags: ["--no-auto-update", "agent", "--no-leader", "stdio"],
+        // A subscription bee must never silently fall back to developer API
+        // billing when its cached OAuth token is absent or expired.
+        scrubEnv: ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"],
         fingerprints: [],
-        note: "grok -p headless streaming JSON; no server mode found, per-turn only. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "Grok 0.2.102 native ACP stdio with cached-token authentication; local HSR only because OAuth refresh tokens are not safe to copy across nodes.",
+        since: "2026-07-18",
       },
       "api-key": {
-        permittedTiers: ["turn", "pty"],
-        requiredFlags: [],
+        permittedTiers: ["stream", "pty"],
+        requiredFlags: ["--no-auto-update", "agent", "--no-leader", "stdio"],
         scrubEnv: [],
         fingerprints: [],
-        note: "grok -p headless streaming JSON. unverified — refine in APIA-87/88.",
-        since: "2026-07-02",
+        note: "Grok 0.2.102 ACP authenticates explicitly with xai.api_key and preserves XAI_API_KEY; still local-only until remote secret delivery/shredding is implemented.",
+        since: "2026-07-18",
       },
     },
   },
@@ -313,6 +322,11 @@ export function ephemeralPolicyFor(harness: string): EphemeralCredentialPolicy |
 /** Harnesses with an ephemeral-credential policy, in registration order. */
 export function ephemeralHarnesses(): string[] {
   return harnessNames().filter((name) => REGISTRY[name]?.ephemeral !== undefined);
+}
+
+/** Whether the harness may be started on a remote-HSR node. */
+export function harnessSupportsRemoteHsr(harness: string): boolean {
+  return REGISTRY[harness]?.remoteHsr !== "local-only";
 }
 
 /**

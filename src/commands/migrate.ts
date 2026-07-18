@@ -31,9 +31,13 @@ import { resolve } from "node:path";
 // headless (`-p`) session stores are disjoint, so `claude --resume <id>` cannot
 // rejoin a headless HSR session (and vice-versa) — a resumed process errors and
 // exits. codex has no such split (`codex resume <threadId>` rejoins an
-// app-server thread). See docs/HSR_EXPLORATION.md §7 (2026-07-03). Re-add
+// app-server thread). Kimi's and Grok's interactive CLIs and ACP runners share
+// their native session stores and accept the same session ids. OpenCode's TUI
+// and REST server use the same SQLite-backed session id and directory ownership. See
+// docs/HSR_EXPLORATION.md §7.
+// Re-add
 // "claude" here the day a claude release unifies the two stores.
-export const RESUME_GATED_HARNESSES = new Set(["codex"]);
+export const RESUME_GATED_HARNESSES = new Set(["codex", "grok", "opencode", "kimi"]);
 
 
 /**
@@ -44,11 +48,11 @@ export function assertResumable(record: SessionRecord, verb: "promote" | "demote
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   if (tool === "claude") {
     throw new Error(
-      `hive ${verb} does not support claude: its interactive and headless (-p) session stores are disjoint, so a resumed session cannot carry history (docs/HSR_EXPLORATION.md §7). codex is supported.`,
+      `hive ${verb} does not support claude: its interactive and headless (-p) session stores are disjoint, so a resumed session cannot carry history (docs/HSR_EXPLORATION.md §7). codex, grok, opencode, and kimi are supported.`,
     );
   }
   if (!RESUME_GATED_HARNESSES.has(tool)) {
-    throw new Error(`hive ${verb} needs a resumable provider session; ${record.agent} is not resume-gated (only codex)`);
+    throw new Error(`hive ${verb} needs a resumable provider session; ${record.agent} is not resume-gated (only codex, grok, opencode, and kimi)`);
   }
   if (!record.providerSessionId) {
     throw new Error(`hive ${verb} needs a resumable provider session; ${record.name} has no recorded provider session id`);
@@ -947,11 +951,12 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
     throw new Error(`hive set-model: ${record.name} is on remote node ${record.node}; set-model only supports local bees`);
   }
   const tool = canonicalAgentKind(record.agent).toLowerCase();
-  // opencode's selector is `--model <provider>/<model>` and the record has no
-  // provider field to rebuild it from on later relaunches — half-persisting
-  // would silently drop the model at the next revive.
-  if (!clear && tool === "opencode") {
-    throw new Error("hive set-model: opencode is not supported (its --model needs a provider prefix the record cannot persist yet)");
+  // OpenCode multiplexes providers. Persist the qualified selector as the
+  // first-class model so revive/promote/demote can rebuild it without a
+  // separate provider field on SessionRecord.
+  const modelSlash = model?.indexOf("/") ?? -1;
+  if (!clear && tool === "opencode" && (modelSlash <= 0 || modelSlash === (model?.length ?? 0) - 1)) {
+    throw new Error("hive set-model: opencode requires a qualified provider/model selector");
   }
   if (!clear && modelArgsForAgent(tool, model).length === 0) {
     throw new Error(`hive set-model: ${record.agent} has no model selector (no model flag known for ${tool})`);

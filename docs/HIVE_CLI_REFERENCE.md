@@ -893,7 +893,9 @@ hive fork <bee> [checkpoint]
 - `--agent <kind>` — fork into a different harness (defaults to the source's
   agent). Cross-harness forks cannot use native resume (see below).
 - `--model <m>` — first-class model, also baked into the spawned command via the
-  per-harness flag (claude `--model <m>`, codex `-m <m>`).
+  per-harness flag (Claude `--model <m>`, Codex `-m <m>`, OpenCode
+  `--model <provider>/<model>`). OpenCode selectors must stay provider-qualified
+  so a resumed server session cannot silently switch among configured providers.
 - `--node <n>` / `--cwd <dir>` — node and working directory (cwd defaults to the
   source's).
 - `--seed <mode>` — force a seeding rung; `--read-log` is shorthand for log
@@ -1859,7 +1861,28 @@ Valid types:
 - `test`
 - `witness`
 
-`confidence` must be between 0 and 1.
+Artifact fields:
+
+- `status` (required): one of the statuses above.
+- `summary` (required): a non-empty string.
+- `type` (optional): one of the types above.
+- `filesChanged`, `risks`, and `nextActions` (optional): arrays of strings.
+- `testsRun` (optional): an array of objects. Each object requires a non-empty
+  `command` and a `result` of `passed`, `failed`, or `skipped`; `notes` is an
+  optional string.
+- `confidence` (optional): a finite number from 0 through 1, inclusive.
+
+To self-seal from inside a bee, resolve the current ID, write or edit a truthful
+artifact, record it, and clean up the temporary file:
+
+```sh
+bee="$(hive here --id)"
+artifact="$(mktemp "${TMPDIR:-/tmp}/hive-seal.XXXXXX")"
+hive seal --example > "$artifact"
+${EDITOR:-vi} "$artifact"
+hive seal "$bee" --from "$artifact"
+rm -f "$artifact"
+```
 
 Seals are stored under:
 

@@ -344,9 +344,9 @@ function printHelp() {
         ["keys", "<print|path|check>", "print/verify the recommended tmux keybinding set"],
         ["retire", "<bee|@swarm|colony:name>", "stop a bee and archive its record (the everyday way to end bees; alias: archive)"],
         ["kill", "<session>", "PURGE a bee: stop it and delete its record/seals/run data (rare; prompts, --yes)"],
-        ["promote", "<bee>", "move an HSR bee onto an interactive tmux pane (resume; claude/codex, --now)"],
+        ["promote", "<bee>", "move an HSR bee onto an interactive tmux pane (resume; codex/grok/opencode/kimi, --now)"],
         ["set-model", "<bee> <model>", "change a bee's model in place, resuming its session (--clear, --fresh, --now, -- <harness flags>)"],
-        ["demote", "<bee>", "move a tmux bee back to a pane-less HSR runner (resume; claude/codex, --now)"],
+        ["demote", "<bee>", "move a tmux bee back to a pane-less HSR runner (resume; codex/grok/opencode/kimi, --now)"],
         ["revive", "<bee>", "relaunch a dead bee and resume its session (--crashed, --all, --fresh, --session <id>, --no-wait)"],
         ["auth-resume", "<bee>", "capture a fresh login, stop an auth-needed bee, and resume its session"],
         ["clean", "--dead|--crashed|--idle|-i", "remove dead/crashed metadata, kill idle bees, or clean interactively"],
@@ -411,7 +411,7 @@ function printHelp() {
     .join("\n\n");
 
   const bees = [
-    "  claude, codex, opencode, grok, pi, droid, cursor — or any executable on PATH",
+    "  claude, codex, opencode, grok, kimi, pi, droid, cursor — or any executable on PATH",
     `  ${dim("home aliases: codex1, codex2, codex3, cc1, cc2, cc3")}`,
     `  ${dim("account shorthands: <tool>-<account fragment> (codex-ur, claude-thto) — see hive account list")}`,
     `  ${dim("<tool>-auto / --account auto: pick the least-loaded account (pace-aware: prefers unused quota expiring at the next reset)")}`,
