@@ -146,11 +146,14 @@ test("tick: invokes transcript metadata refresh for observed records", async () 
   });
 });
 
-test("tick: skips transcript metadata refresh for dead/sealed records whose transcript is already captured", async () => {
+test("tick: skips transcript metadata refresh for archived and captured terminal records", async () => {
   await withTempStore(async () => {
     // Captured metadata -> the refresh is skipped for terminal bees.
     const dead = bee({ name: "dead-bee", tmuxTarget: "hive:dead", transcriptPath: "/tmp/dead.jsonl" });
     const sealed = bee({ name: "sealed-bee", tmuxTarget: "hive:sealed", transcriptPath: "/tmp/sealed.jsonl" });
+    // Archived records are immutable and must never be revisited, even when an
+    // older record has no transcript path.
+    const archived = bee({ name: "archived-bee", tmuxTarget: "hive:archived", status: "archived" });
     // A bee that exited before its first refresh (fast finish between ticks)
     // still gets one pass so list/search metadata is not permanently missing.
     const fastExit = bee({ name: "fast-exit-bee", tmuxTarget: "hive:fast" });
@@ -158,7 +161,7 @@ test("tick: skips transcript metadata refresh for dead/sealed records whose tran
     const capture: Capture = { ledger: [], touches: [] };
     const refreshed: string[] = [];
     const deps = buildDeps({
-      records: [dead, sealed, fastExit, live],
+      records: [dead, sealed, archived, fastExit, live],
       liveTargets: new Set([live.tmuxTarget]),
       panes: new Map([[live.tmuxTarget, "done\n\n› next task"]]),
       seals: new Set(["sealed-bee"]),

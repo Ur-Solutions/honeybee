@@ -1,7 +1,7 @@
 import { hiveStateFor } from "../hiveState.js";
 import type { NodeRecord } from "../node.js";
 import type { HsrObservation } from "../hsr/observe.js";
-import { deriveState, liveTargetKey, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
+import { deriveState, isTerminalState, liveTargetKey, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
 import type { SessionRecord } from "../store.js";
 import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AutoswapOutcome } from "./autoswap.js";
@@ -545,12 +545,13 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     if (transitioned) {
       transitions.push({ name: record.name, from: prev, to: derived.state });
     }
-    const terminal = derived.state === "dead" || derived.state === "crashed" || derived.state === "sealed";
+    const terminal = isTerminalState(derived.state);
+    const archived = derived.state === "archived";
     return {
       record,
       state: derived.state,
       mirrorHiveState: (transitioned || staleHiveState) && !uncertainBooting,
-      refreshTranscriptMetadata: (!terminal || !record.transcriptPath) && deps.refreshTranscriptMetadata !== undefined,
+      refreshTranscriptMetadata: !archived && (!terminal || !record.transcriptPath) && deps.refreshTranscriptMetadata !== undefined,
     };
   });
 
@@ -582,7 +583,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
         errors.push(toError(error));
       }
 
-      // Dead/sealed bees no longer produce transcript updates — skip the
+      // Archived bees are immutable, and dead/sealed bees no longer produce transcript updates — skip the
       // refresh once transcript metadata has been captured. A bee that exited
       // before its first refresh (fast finish between ticks) still gets one
       // pass so list/search/tail metadata is not permanently missing.
