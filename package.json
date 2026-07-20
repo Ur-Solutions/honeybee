@@ -5,11 +5,12 @@
   "type": "module",
   "bin": {
     "hive": "dist/cli.js",
+    "hive-x": "dist/cli-x.js",
     "ap": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "postbuild": "chmod +x dist/cli.js",
+    "postbuild": "chmod +x dist/cli.js dist/cli-x.js",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "dev": "tsx src/cli.ts",
