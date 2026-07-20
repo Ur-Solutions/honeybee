@@ -36,6 +36,7 @@ function parseArgs(argv) {
     pollMs: integer("poll-ms", 10),
     cwd: resolve(values.get("cwd") ?? process.cwd()),
     prompt: values.get("prompt") ?? "Reply exactly READY.",
+    model: values.get("model"),
     until,
     output: values.get("output") ? resolve(values.get("output")) : undefined,
     hiveBin: values.get("hive-bin") ?? process.env.HIVE_BENCH_BIN ?? "hive",
@@ -177,6 +178,7 @@ async function oneSample(config, index) {
     "--yolo",
   ];
   if (config.account) xArgs.push("--account", config.account);
+  if (config.model) xArgs.push("--", "--model", config.model);
   const spawnArgs = config.xBin ? xArgs : ["x", ...xArgs];
   const spawnBin = config.xBin ?? config.hiveBin;
 
@@ -297,6 +299,8 @@ const report = {
     pollMs: config.pollMs,
     until: config.until,
     cwd: config.cwd,
+    prompt: config.prompt,
+    model: config.model ?? "harness-default",
     hiveBin: config.hiveBin,
     ...(config.xBin ? { xBin: config.xBin } : {}),
   },
