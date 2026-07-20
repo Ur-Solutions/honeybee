@@ -1,0 +1,176 @@
+{
+  "schema": 1,
+  "startedAt": "2026-07-20T08:08:18.513Z",
+  "finishedAt": "2026-07-20T08:08:19.882Z",
+  "config": {
+    "harness": "codex",
+    "account": "codex-tormod-ursolutions.no",
+    "samples": 4,
+    "concurrency": 2,
+    "timeoutMs": 90000,
+    "pollMs": 10,
+    "until": "turn-start",
+    "cwd": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed",
+    "hiveBin": "hive"
+  },
+  "failures": 0,
+  "summary": {
+    "request_to_cli_return_ms": {
+      "n": 4,
+      "min": 299,
+      "p50": 303,
+      "p95": 401,
+      "max": 401
+    },
+    "request_to_session_record_ms": {
+      "n": 4,
+      "min": 182,
+      "p50": 186,
+      "p95": 285,
+      "max": 285
+    },
+    "request_to_host_start_ms": {
+      "n": 4,
+      "min": 262,
+      "p50": 263,
+      "p95": 365,
+      "max": 365
+    },
+    "request_to_running_observed_ms": {
+      "n": 4,
+      "min": 411,
+      "p50": 416,
+      "p95": 508,
+      "max": 508
+    },
+    "request_to_turn_start_ms": {
+      "n": 4,
+      "min": 429,
+      "p50": 433,
+      "p95": 530,
+      "max": 530
+    },
+    "request_to_first_text_ms": {
+      "n": 0
+    },
+    "request_to_turn_end_ms": {
+      "n": 0
+    },
+    "observation_total_ms": {
+      "n": 4,
+      "min": 433,
+      "p50": 437,
+      "p95": 530,
+      "max": 530
+    },
+    "codex_handshake_retries": {
+      "n": 4,
+      "min": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "samples": [
+    {
+      "index": 0,
+      "name": "startup-bench-codex-mrsy047m-41050-0",
+      "requestedAt": "2026-07-20T08:08:18.514Z",
+      "metrics": {
+        "request_to_cli_return_ms": 299,
+        "request_to_session_record_ms": 182,
+        "request_to_host_start_ms": 262,
+        "request_to_running_observed_ms": 411,
+        "request_to_turn_start_ms": 429,
+        "observation_total_ms": 433,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 95,
+        "exec-check": 0,
+        "allocate": 2,
+        "session-create": 1,
+        "persist": 10,
+        "ready": 101,
+        "total": 211
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 1,
+      "name": "startup-bench-codex-mrsy047o-41050-1",
+      "requestedAt": "2026-07-20T08:08:18.516Z",
+      "metrics": {
+        "request_to_cli_return_ms": 401,
+        "request_to_session_record_ms": 285,
+        "request_to_host_start_ms": 365,
+        "request_to_running_observed_ms": 508,
+        "request_to_turn_start_ms": 530,
+        "observation_total_ms": 530,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 200,
+        "exec-check": 0,
+        "allocate": 2,
+        "session-create": 1,
+        "persist": 10,
+        "ready": 101,
+        "total": 316
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 2,
+      "name": "startup-bench-codex-mrsy04ol-41050-2",
+      "requestedAt": "2026-07-20T08:08:19.125Z",
+      "metrics": {
+        "request_to_cli_return_ms": 303,
+        "request_to_session_record_ms": 186,
+        "request_to_host_start_ms": 263,
+        "request_to_running_observed_ms": 416,
+        "request_to_turn_start_ms": 433,
+        "observation_total_ms": 437,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 3,
+        "activate": 96,
+        "exec-check": 0,
+        "allocate": 1,
+        "session-create": 1,
+        "persist": 11,
+        "ready": 101,
+        "total": 213
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 3,
+      "name": "startup-bench-codex-mrsy04r9-41050-3",
+      "requestedAt": "2026-07-20T08:08:19.221Z",
+      "metrics": {
+        "request_to_cli_return_ms": 327,
+        "request_to_session_record_ms": 209,
+        "request_to_host_start_ms": 292,
+        "request_to_running_observed_ms": 440,
+        "request_to_turn_start_ms": 475,
+        "observation_total_ms": 484,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 122,
+        "exec-check": 1,
+        "allocate": 1,
+        "session-create": 1,
+        "persist": 10,
+        "ready": 102,
+        "total": 239
+      },
+      "finalHostStatus": "running"
+    }
+  ]
+}

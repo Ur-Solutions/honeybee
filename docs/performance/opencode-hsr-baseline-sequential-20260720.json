@@ -1,0 +1,151 @@
+{
+  "schema": 1,
+  "startedAt": "2026-07-20T08:09:37.239Z",
+  "finishedAt": "2026-07-20T08:09:41.836Z",
+  "config": {
+    "harness": "opencode",
+    "account": "opencode-minimax",
+    "samples": 3,
+    "concurrency": 1,
+    "timeoutMs": 90000,
+    "pollMs": 10,
+    "until": "turn-start",
+    "cwd": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed",
+    "hiveBin": "hive"
+  },
+  "failures": 0,
+  "summary": {
+    "request_to_cli_return_ms": {
+      "n": 3,
+      "min": 907,
+      "p50": 910,
+      "p95": 2232,
+      "max": 2232
+    },
+    "request_to_session_record_ms": {
+      "n": 3,
+      "min": 180,
+      "p50": 182,
+      "p95": 189,
+      "max": 189
+    },
+    "request_to_host_start_ms": {
+      "n": 3,
+      "min": 822,
+      "p50": 849,
+      "p95": 2128,
+      "max": 2128
+    },
+    "request_to_running_observed_ms": {
+      "n": 3,
+      "min": 832,
+      "p50": 859,
+      "p95": 2139,
+      "max": 2139
+    },
+    "request_to_turn_start_ms": {
+      "n": 3,
+      "min": 901,
+      "p50": 903,
+      "p95": 2226,
+      "max": 2226
+    },
+    "request_to_first_text_ms": {
+      "n": 0
+    },
+    "request_to_turn_end_ms": {
+      "n": 0
+    },
+    "observation_total_ms": {
+      "n": 3,
+      "min": 907,
+      "p50": 910,
+      "p95": 2232,
+      "max": 2232
+    },
+    "codex_handshake_retries": {
+      "n": 3,
+      "min": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "samples": [
+    {
+      "index": 0,
+      "name": "startup-bench-opencode-mrsy1syf-57816-0",
+      "requestedAt": "2026-07-20T08:09:37.239Z",
+      "metrics": {
+        "request_to_cli_return_ms": 2232,
+        "request_to_session_record_ms": 189,
+        "request_to_host_start_ms": 2128,
+        "request_to_running_observed_ms": 2139,
+        "request_to_turn_start_ms": 2226,
+        "observation_total_ms": 2232,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 3,
+        "activate": 96,
+        "exec-check": 1,
+        "allocate": 1,
+        "session-create": 1,
+        "persist": 12,
+        "ready": 2024,
+        "total": 2138
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 1,
+      "name": "startup-bench-opencode-mrsy1utj-57816-1",
+      "requestedAt": "2026-07-20T08:09:39.655Z",
+      "metrics": {
+        "request_to_cli_return_ms": 907,
+        "request_to_session_record_ms": 180,
+        "request_to_host_start_ms": 849,
+        "request_to_running_observed_ms": 859,
+        "request_to_turn_start_ms": 901,
+        "observation_total_ms": 907,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 3,
+        "activate": 95,
+        "exec-check": 0,
+        "allocate": 2,
+        "session-create": 1,
+        "persist": 11,
+        "ready": 709,
+        "total": 821
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 2,
+      "name": "startup-bench-opencode-mrsy1vnt-57816-2",
+      "requestedAt": "2026-07-20T08:09:40.745Z",
+      "metrics": {
+        "request_to_cli_return_ms": 910,
+        "request_to_session_record_ms": 182,
+        "request_to_host_start_ms": 822,
+        "request_to_running_observed_ms": 832,
+        "request_to_turn_start_ms": 903,
+        "observation_total_ms": 910,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 98,
+        "exec-check": 0,
+        "allocate": 2,
+        "session-create": 1,
+        "persist": 12,
+        "ready": 708,
+        "total": 823
+      },
+      "finalHostStatus": "running"
+    }
+  ]
+}

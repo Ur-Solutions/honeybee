@@ -1,0 +1,161 @@
+{
+  "schema": 1,
+  "startedAt": "2026-07-20T08:18:55.593Z",
+  "finishedAt": "2026-07-20T08:18:57.506Z",
+  "config": {
+    "harness": "claude",
+    "account": "claude-tormod-ursolutions.no",
+    "samples": 3,
+    "concurrency": 1,
+    "timeoutMs": 90000,
+    "pollMs": 10,
+    "until": "turn-start",
+    "cwd": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed",
+    "hiveBin": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed/dist/cli.js"
+  },
+  "failures": 0,
+  "summary": {
+    "request_to_cli_return_ms": {
+      "n": 3,
+      "min": 325,
+      "p50": 341,
+      "p95": 702,
+      "max": 702
+    },
+    "request_to_session_record_ms": {
+      "n": 3,
+      "min": 208,
+      "p50": 222,
+      "p95": 582,
+      "max": 582
+    },
+    "request_to_host_start_ms": {
+      "n": 3,
+      "min": 283,
+      "p50": 300,
+      "p95": 659,
+      "max": 659
+    },
+    "request_to_running_ms": {
+      "n": 3,
+      "min": 304,
+      "p50": 309,
+      "p95": 663,
+      "max": 663
+    },
+    "request_to_running_observed_ms": {
+      "n": 3,
+      "min": 311,
+      "p50": 319,
+      "p95": 670,
+      "max": 670
+    },
+    "request_to_turn_start_ms": {
+      "n": 3,
+      "min": 320,
+      "p50": 336,
+      "p95": 696,
+      "max": 696
+    },
+    "request_to_first_text_ms": {
+      "n": 0
+    },
+    "request_to_turn_end_ms": {
+      "n": 0
+    },
+    "observation_total_ms": {
+      "n": 3,
+      "min": 329,
+      "p50": 343,
+      "p95": 703,
+      "max": 703
+    },
+    "codex_handshake_retries": {
+      "n": 3,
+      "min": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "samples": [
+    {
+      "index": 0,
+      "name": "startup-bench-claude-mrsydrsa-1441-0",
+      "requestedAt": "2026-07-20T08:18:55.594Z",
+      "metrics": {
+        "request_to_cli_return_ms": 702,
+        "request_to_session_record_ms": 582,
+        "request_to_host_start_ms": 659,
+        "request_to_running_ms": 663,
+        "request_to_running_observed_ms": 670,
+        "request_to_turn_start_ms": 696,
+        "observation_total_ms": 703,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 3,
+        "activate": 137,
+        "exec-check": 1,
+        "allocate": 2,
+        "session-create": 1,
+        "persist": 11,
+        "ready": 102,
+        "total": 257
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 1,
+      "name": "startup-bench-claude-mrsydsgu-1441-1",
+      "requestedAt": "2026-07-20T08:18:56.478Z",
+      "metrics": {
+        "request_to_cli_return_ms": 341,
+        "request_to_session_record_ms": 222,
+        "request_to_host_start_ms": 300,
+        "request_to_running_ms": 304,
+        "request_to_running_observed_ms": 311,
+        "request_to_turn_start_ms": 336,
+        "observation_total_ms": 343,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 4,
+        "activate": 131,
+        "exec-check": 1,
+        "allocate": 1,
+        "session-create": 1,
+        "persist": 11,
+        "ready": 101,
+        "total": 250
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 2,
+      "name": "startup-bench-claude-mrsydsvd-1441-2",
+      "requestedAt": "2026-07-20T08:18:57.001Z",
+      "metrics": {
+        "request_to_cli_return_ms": 325,
+        "request_to_session_record_ms": 208,
+        "request_to_host_start_ms": 283,
+        "request_to_running_ms": 309,
+        "request_to_running_observed_ms": 319,
+        "request_to_turn_start_ms": 320,
+        "observation_total_ms": 329,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 122,
+        "exec-check": 1,
+        "allocate": 1,
+        "session-create": 2,
+        "persist": 9,
+        "ready": 102,
+        "total": 239
+      },
+      "finalHostStatus": "running"
+    }
+  ]
+}

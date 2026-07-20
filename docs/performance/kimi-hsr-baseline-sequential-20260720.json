@@ -1,0 +1,151 @@
+{
+  "schema": 1,
+  "startedAt": "2026-07-20T08:08:53.363Z",
+  "finishedAt": "2026-07-20T08:09:05.215Z",
+  "config": {
+    "harness": "kimi",
+    "account": "kimi-default",
+    "samples": 3,
+    "concurrency": 1,
+    "timeoutMs": 90000,
+    "pollMs": 10,
+    "until": "turn-start",
+    "cwd": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed",
+    "hiveBin": "hive"
+  },
+  "failures": 0,
+  "summary": {
+    "request_to_cli_return_ms": {
+      "n": 3,
+      "min": 812,
+      "p50": 815,
+      "p95": 3647,
+      "max": 3647
+    },
+    "request_to_session_record_ms": {
+      "n": 3,
+      "min": 185,
+      "p50": 188,
+      "p95": 190,
+      "max": 190
+    },
+    "request_to_host_start_ms": {
+      "n": 3,
+      "min": 769,
+      "p50": 787,
+      "p95": 3582,
+      "max": 3582
+    },
+    "request_to_running_observed_ms": {
+      "n": 3,
+      "min": 777,
+      "p50": 793,
+      "p95": 3588,
+      "max": 3588
+    },
+    "request_to_turn_start_ms": {
+      "n": 3,
+      "min": 806,
+      "p50": 810,
+      "p95": 3640,
+      "max": 3640
+    },
+    "request_to_first_text_ms": {
+      "n": 0
+    },
+    "request_to_turn_end_ms": {
+      "n": 0
+    },
+    "observation_total_ms": {
+      "n": 3,
+      "min": 815,
+      "p50": 815,
+      "p95": 3647,
+      "max": 3647
+    },
+    "codex_handshake_retries": {
+      "n": 3,
+      "min": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "samples": [
+    {
+      "index": 0,
+      "name": "startup-bench-kimi-mrsy0v3o-48880-0",
+      "requestedAt": "2026-07-20T08:08:53.364Z",
+      "metrics": {
+        "request_to_cli_return_ms": 3647,
+        "request_to_session_record_ms": 185,
+        "request_to_host_start_ms": 3582,
+        "request_to_running_observed_ms": 3588,
+        "request_to_turn_start_ms": 3640,
+        "observation_total_ms": 3647,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 98,
+        "exec-check": 0,
+        "allocate": 1,
+        "session-create": 1,
+        "persist": 11,
+        "ready": 3442,
+        "total": 3556
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 1,
+      "name": "startup-bench-kimi-mrsy0zlz-48880-1",
+      "requestedAt": "2026-07-20T08:08:59.207Z",
+      "metrics": {
+        "request_to_cli_return_ms": 812,
+        "request_to_session_record_ms": 188,
+        "request_to_host_start_ms": 787,
+        "request_to_running_observed_ms": 793,
+        "request_to_turn_start_ms": 806,
+        "observation_total_ms": 815,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 97,
+        "exec-check": 1,
+        "allocate": 1,
+        "session-create": 1,
+        "persist": 10,
+        "ready": 607,
+        "total": 719
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 2,
+      "name": "startup-bench-kimi-mrsy11xu-48880-2",
+      "requestedAt": "2026-07-20T08:09:02.226Z",
+      "metrics": {
+        "request_to_cli_return_ms": 815,
+        "request_to_session_record_ms": 190,
+        "request_to_host_start_ms": 769,
+        "request_to_running_observed_ms": 777,
+        "request_to_turn_start_ms": 810,
+        "observation_total_ms": 815,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 3,
+        "activate": 95,
+        "exec-check": 1,
+        "allocate": 1,
+        "session-create": 2,
+        "persist": 10,
+        "ready": 608,
+        "total": 720
+      },
+      "finalHostStatus": "running"
+    }
+  ]
+}

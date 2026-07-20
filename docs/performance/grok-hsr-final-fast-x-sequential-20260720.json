@@ -1,0 +1,214 @@
+{
+  "schema": 1,
+  "startedAt": "2026-07-20T08:49:25.262Z",
+  "finishedAt": "2026-07-20T08:49:31.312Z",
+  "config": {
+    "harness": "grok",
+    "account": "grok-tormod.haugland-gmail.com",
+    "samples": 5,
+    "concurrency": 1,
+    "timeoutMs": 90000,
+    "pollMs": 10,
+    "until": "turn-start",
+    "cwd": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed",
+    "hiveBin": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed/dist/cli.js",
+    "xBin": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed/dist/cli-x.js"
+  },
+  "failures": 0,
+  "summary": {
+    "request_to_cli_return_ms": {
+      "n": 5,
+      "min": 117,
+      "p50": 123,
+      "p95": 280,
+      "max": 280
+    },
+    "request_to_session_record_ms": {
+      "n": 5,
+      "min": 76,
+      "p50": 82,
+      "p95": 236,
+      "max": 236
+    },
+    "request_to_host_start_ms": {
+      "n": 5,
+      "min": 104,
+      "p50": 114,
+      "p95": 264,
+      "max": 264
+    },
+    "request_to_running_ms": {
+      "n": 5,
+      "min": 853,
+      "p50": 917,
+      "p95": 1204,
+      "max": 1204
+    },
+    "request_to_running_observed_ms": {
+      "n": 5,
+      "min": 863,
+      "p50": 928,
+      "p95": 1216,
+      "max": 1216
+    },
+    "request_to_turn_start_ms": {
+      "n": 5,
+      "min": 854,
+      "p50": 917,
+      "p95": 1205,
+      "max": 1205
+    },
+    "request_to_first_text_ms": {
+      "n": 0
+    },
+    "request_to_turn_end_ms": {
+      "n": 0
+    },
+    "observation_total_ms": {
+      "n": 5,
+      "min": 864,
+      "p50": 928,
+      "p95": 1216,
+      "max": 1216
+    },
+    "codex_handshake_retries": {
+      "n": 5,
+      "min": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "samples": [
+    {
+      "index": 0,
+      "name": "startup-bench-grok-mrszgzkf-47077-0",
+      "requestedAt": "2026-07-20T08:49:25.263Z",
+      "metrics": {
+        "request_to_cli_return_ms": 280,
+        "request_to_session_record_ms": 236,
+        "request_to_host_start_ms": 264,
+        "request_to_running_ms": 1204,
+        "request_to_running_observed_ms": 1216,
+        "request_to_turn_start_ms": 1205,
+        "observation_total_ms": 1216,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 3,
+        "activate": 121,
+        "exec-check": 1,
+        "allocate": 2,
+        "session-create": 2,
+        "persist": 13,
+        "ready": 25,
+        "total": 167
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 1,
+      "name": "startup-bench-grok-mrszh0pb-47077-1",
+      "requestedAt": "2026-07-20T08:49:26.735Z",
+      "metrics": {
+        "request_to_cli_return_ms": 117,
+        "request_to_session_record_ms": 76,
+        "request_to_host_start_ms": 104,
+        "request_to_running_ms": 900,
+        "request_to_running_observed_ms": 909,
+        "request_to_turn_start_ms": 901,
+        "observation_total_ms": 909,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 5,
+        "exec-check": 1,
+        "allocate": 1,
+        "session-create": 2,
+        "persist": 12,
+        "ready": 25,
+        "total": 48
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 2,
+      "name": "startup-bench-grok-mrszh1ky-47077-2",
+      "requestedAt": "2026-07-20T08:49:27.874Z",
+      "metrics": {
+        "request_to_cli_return_ms": 123,
+        "request_to_session_record_ms": 82,
+        "request_to_host_start_ms": 113,
+        "request_to_running_ms": 853,
+        "request_to_running_observed_ms": 863,
+        "request_to_turn_start_ms": 854,
+        "observation_total_ms": 864,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 6,
+        "exec-check": 1,
+        "allocate": 2,
+        "session-create": 2,
+        "persist": 11,
+        "ready": 24,
+        "total": 48
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 3,
+      "name": "startup-bench-grok-mrszh2fi-47077-3",
+      "requestedAt": "2026-07-20T08:49:28.974Z",
+      "metrics": {
+        "request_to_cli_return_ms": 131,
+        "request_to_session_record_ms": 87,
+        "request_to_host_start_ms": 120,
+        "request_to_running_ms": 967,
+        "request_to_running_observed_ms": 970,
+        "request_to_turn_start_ms": 968,
+        "observation_total_ms": 971,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 6,
+        "exec-check": 0,
+        "allocate": 2,
+        "session-create": 2,
+        "persist": 12,
+        "ready": 25,
+        "total": 49
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 4,
+      "name": "startup-bench-grok-mrszh3cm-47077-4",
+      "requestedAt": "2026-07-20T08:49:30.166Z",
+      "metrics": {
+        "request_to_cli_return_ms": 123,
+        "request_to_session_record_ms": 81,
+        "request_to_host_start_ms": 114,
+        "request_to_running_ms": 917,
+        "request_to_running_observed_ms": 928,
+        "request_to_turn_start_ms": 917,
+        "observation_total_ms": 928,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 2,
+        "activate": 5,
+        "exec-check": 1,
+        "allocate": 1,
+        "session-create": 2,
+        "persist": 12,
+        "ready": 25,
+        "total": 48
+      },
+      "finalHostStatus": "running"
+    }
+  ]
+}

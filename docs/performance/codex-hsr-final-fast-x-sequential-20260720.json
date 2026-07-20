@@ -1,0 +1,292 @@
+{
+  "schema": 1,
+  "startedAt": "2026-07-20T08:44:27.478Z",
+  "finishedAt": "2026-07-20T08:44:39.098Z",
+  "config": {
+    "harness": "codex",
+    "account": "codex-tormod-ursolutions.no",
+    "samples": 8,
+    "concurrency": 1,
+    "timeoutMs": 90000,
+    "pollMs": 10,
+    "until": "turn-start",
+    "cwd": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed",
+    "hiveBin": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed/dist/cli.js",
+    "xBin": "/Users/tormodhaugland/Projects/trmd/honeybee/checkouts/hsr-startup-speed/dist/cli-x.js"
+  },
+  "failures": 0,
+  "summary": {
+    "request_to_cli_return_ms": {
+      "n": 8,
+      "min": 215,
+      "p50": 233,
+      "p95": 603,
+      "max": 603
+    },
+    "request_to_session_record_ms": {
+      "n": 8,
+      "min": 136,
+      "p50": 168,
+      "p95": 535,
+      "max": 535
+    },
+    "request_to_host_start_ms": {
+      "n": 8,
+      "min": 184,
+      "p50": 205,
+      "p95": 584,
+      "max": 584
+    },
+    "request_to_running_ms": {
+      "n": 8,
+      "min": 561,
+      "p50": 633,
+      "p95": 983,
+      "max": 983
+    },
+    "request_to_running_observed_ms": {
+      "n": 8,
+      "min": 572,
+      "p50": 640,
+      "p95": 987,
+      "max": 987
+    },
+    "request_to_turn_start_ms": {
+      "n": 8,
+      "min": 618,
+      "p50": 697,
+      "p95": 1033,
+      "max": 1033
+    },
+    "request_to_first_text_ms": {
+      "n": 0
+    },
+    "request_to_turn_end_ms": {
+      "n": 0
+    },
+    "observation_total_ms": {
+      "n": 8,
+      "min": 628,
+      "p50": 702,
+      "p95": 1043,
+      "max": 1043
+    },
+    "codex_handshake_retries": {
+      "n": 8,
+      "min": 0,
+      "p50": 0,
+      "p95": 0,
+      "max": 0
+    }
+  },
+  "samples": [
+    {
+      "index": 0,
+      "name": "startup-bench-codex-mrszalsn-42695-0",
+      "requestedAt": "2026-07-20T08:44:27.479Z",
+      "metrics": {
+        "request_to_cli_return_ms": 603,
+        "request_to_session_record_ms": 535,
+        "request_to_host_start_ms": 584,
+        "request_to_running_ms": 983,
+        "request_to_running_observed_ms": 987,
+        "request_to_turn_start_ms": 1033,
+        "observation_total_ms": 1043,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 5,
+        "activate": 332,
+        "exec-check": 3,
+        "allocate": 4,
+        "session-create": 3,
+        "persist": 20,
+        "ready": 34,
+        "total": 401
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 1,
+      "name": "startup-bench-codex-mrszan3c-42695-1",
+      "requestedAt": "2026-07-20T08:44:29.160Z",
+      "metrics": {
+        "request_to_cli_return_ms": 233,
+        "request_to_session_record_ms": 151,
+        "request_to_host_start_ms": 205,
+        "request_to_running_ms": 675,
+        "request_to_running_observed_ms": 684,
+        "request_to_turn_start_ms": 743,
+        "observation_total_ms": 754,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 4,
+        "activate": 27,
+        "exec-check": 3,
+        "allocate": 3,
+        "session-create": 4,
+        "persist": 31,
+        "ready": 34,
+        "total": 106
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 2,
+      "name": "startup-bench-codex-mrszao9l-42695-2",
+      "requestedAt": "2026-07-20T08:44:30.681Z",
+      "metrics": {
+        "request_to_cli_return_ms": 369,
+        "request_to_session_record_ms": 288,
+        "request_to_host_start_ms": 337,
+        "request_to_running_ms": 633,
+        "request_to_running_observed_ms": 640,
+        "request_to_turn_start_ms": 697,
+        "observation_total_ms": 702,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 4,
+        "activate": 45,
+        "exec-check": 79,
+        "allocate": 6,
+        "session-create": 4,
+        "persist": 23,
+        "ready": 34,
+        "total": 195
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 3,
+      "name": "startup-bench-codex-mrszapi4-42695-3",
+      "requestedAt": "2026-07-20T08:44:32.284Z",
+      "metrics": {
+        "request_to_cli_return_ms": 296,
+        "request_to_session_record_ms": 211,
+        "request_to_host_start_ms": 261,
+        "request_to_running_ms": 572,
+        "request_to_running_observed_ms": 581,
+        "request_to_turn_start_ms": 639,
+        "observation_total_ms": 649,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 37,
+        "activate": 27,
+        "exec-check": 3,
+        "allocate": 3,
+        "session-create": 5,
+        "persist": 29,
+        "ready": 27,
+        "total": 131
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 4,
+      "name": "startup-bench-codex-mrszaqgp-42695-4",
+      "requestedAt": "2026-07-20T08:44:33.529Z",
+      "metrics": {
+        "request_to_cli_return_ms": 228,
+        "request_to_session_record_ms": 168,
+        "request_to_host_start_ms": 193,
+        "request_to_running_ms": 561,
+        "request_to_running_observed_ms": 572,
+        "request_to_turn_start_ms": 618,
+        "observation_total_ms": 628,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 5,
+        "activate": 19,
+        "exec-check": 2,
+        "allocate": 3,
+        "session-create": 26,
+        "persist": 43,
+        "ready": 2,
+        "total": 100
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 5,
+      "name": "startup-bench-codex-mrszarfh-42695-5",
+      "requestedAt": "2026-07-20T08:44:34.781Z",
+      "metrics": {
+        "request_to_cli_return_ms": 215,
+        "request_to_session_record_ms": 136,
+        "request_to_host_start_ms": 184,
+        "request_to_running_ms": 578,
+        "request_to_running_observed_ms": 589,
+        "request_to_turn_start_ms": 625,
+        "observation_total_ms": 633,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 4,
+        "activate": 17,
+        "exec-check": 2,
+        "allocate": 3,
+        "session-create": 3,
+        "persist": 26,
+        "ready": 37,
+        "total": 92
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 6,
+      "name": "startup-bench-codex-mrszasgd-42695-6",
+      "requestedAt": "2026-07-20T08:44:36.109Z",
+      "metrics": {
+        "request_to_cli_return_ms": 399,
+        "request_to_session_record_ms": 205,
+        "request_to_host_start_ms": 264,
+        "request_to_running_ms": 920,
+        "request_to_running_observed_ms": 934,
+        "request_to_turn_start_ms": 996,
+        "observation_total_ms": 1006,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 18,
+        "activate": 30,
+        "exec-check": 8,
+        "allocate": 22,
+        "session-create": 13,
+        "persist": 106,
+        "ready": 69,
+        "total": 266
+      },
+      "finalHostStatus": "running"
+    },
+    {
+      "index": 7,
+      "name": "startup-bench-codex-mrszatn2-42695-7",
+      "requestedAt": "2026-07-20T08:44:37.646Z",
+      "metrics": {
+        "request_to_cli_return_ms": 222,
+        "request_to_session_record_ms": 150,
+        "request_to_host_start_ms": 201,
+        "request_to_running_ms": 678,
+        "request_to_running_observed_ms": 685,
+        "request_to_turn_start_ms": 750,
+        "observation_total_ms": 753,
+        "codex_handshake_retries": 0
+      },
+      "phases": {
+        "resolve": 4,
+        "activate": 22,
+        "exec-check": 2,
+        "allocate": 3,
+        "session-create": 4,
+        "persist": 24,
+        "ready": 35,
+        "total": 94
+      },
+      "finalHostStatus": "running"
+    }
+  ]
+}
