@@ -128,6 +128,7 @@ export async function runHsrHost(params: {
     childPgid: session.pid, // detached ⇒ pgid === child pid
     startedAt: startupMeta?.startedAt ?? new Date().toISOString(),
     ...(startupMeta?.queuedAt ? { queuedAt: startupMeta.queuedAt } : {}),
+    ...(startupMeta?.startupPhase ? { startupPhase: startupMeta.startupPhase } : {}),
     controlSocket,
     status: startupMeta ? "queued" : "running",
     ...(!startupMeta ? { runningAt: new Date().toISOString() } : {}),
