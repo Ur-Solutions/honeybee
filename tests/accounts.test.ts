@@ -21,6 +21,7 @@ import {
   findAccount,
   listAccounts,
   mergeCredentialsJson,
+  claudeCredentialsEquivalent,
   normalizeAccountRecord,
   parseClaudeChain,
   PROVIDER_BY_CLI,
@@ -34,6 +35,7 @@ import {
   type AccountRecord,
 } from "../src/accounts.js";
 import { verifyActivatedClaudeIdentity, type ActivationContext } from "../src/accounts/activation.js";
+import { buildAddGenericPasswordCommand, identityOnlyCredentials } from "../src/keychain.js";
 import { identityRecipeForAgent } from "../src/drivers.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -897,6 +899,89 @@ test("mergeCredentialsJson overlays the new chain and preserves sibling keys", (
   // Unparseable or missing targets fall back to the source verbatim.
   assert.equal(mergeCredentialsJson("not-json", `{"a":1}`), `{"a":1}`);
   assert.equal(JSON.parse(mergeCredentialsJson(null, `{"a":1}`)).a, 1);
+});
+
+test("claudeCredentialsEquivalent proves redundant writes without eliding real ones", () => {
+  const expiry = 1_797_782_400_000;
+  const compact = JSON.stringify({
+    claudeAiOauth: { accessToken: "tok", expiresAt: expiry, refreshToken: "r" },
+    mcpOAuth: { s: 1 },
+  });
+  // (1) Same JSON, different key ORDER and FORMATTING (pretty vs compact) — equivalent.
+  const reordered = JSON.stringify(
+    { mcpOAuth: { s: 1 }, claudeAiOauth: { refreshToken: "r", expiresAt: expiry, accessToken: "tok" } },
+    null,
+    2,
+  );
+  assert.equal(claudeCredentialsEquivalent(compact, reordered), true);
+
+  // (2) HEX-encoded existing entry (how the keychain returns -X payloads) is decoded first.
+  assert.equal(claudeCredentialsEquivalent(hexPayload(compact), reordered), true);
+  assert.equal(claudeCredentialsEquivalent(hexPayload(reordered), compact), true);
+
+  // (3) A different identity — stale expiry or foreign token — is NEVER equivalent.
+  assert.equal(claudeCredentialsEquivalent(compact, chainJson("tok-foreign", expiry, "r")), false);
+  assert.equal(claudeCredentialsEquivalent(chainJson("tok", expiry, "r"), chainJson("tok", expiry + 1, "r")), false);
+  // A dropped sibling key is a real difference, not a formatting one.
+  assert.equal(claudeCredentialsEquivalent(compact, chainJson("tok", expiry, "r")), false);
+
+  // (4) A parse failure on EITHER side NEVER reports equivalent — the write must run.
+  assert.equal(claudeCredentialsEquivalent(null, compact), false);
+  assert.equal(claudeCredentialsEquivalent(compact, null), false);
+  assert.equal(claudeCredentialsEquivalent("", compact), false);
+  assert.equal(claudeCredentialsEquivalent("not json", compact), false);
+  assert.equal(claudeCredentialsEquivalent(compact, "not json"), false);
+  assert.equal(claudeCredentialsEquivalent("deadbeef", compact), false); // valid hex, decodes to non-JSON bytes
+  // JSON `null` parses to a value (not a parse failure): the undefined sentinel
+  // distinguishes "parsed to null" from "failed to parse".
+  assert.equal(claudeCredentialsEquivalent("null", "null"), true);
+});
+
+test("keychain write-elision uses the merged target and never elides a foreign entry", () => {
+  const expiry = 1_797_782_400_000;
+  const accountCreds = chainJson("tok-account", expiry, "r-account");
+
+  // Already-live home: keychain holds the account identity plus a home-local
+  // sibling (mcpOAuth). The merge is a semantic no-op, so the write is redundant
+  // — and eliding it preserves the sibling that a rewrite could otherwise drop.
+  const existingLive = JSON.stringify({
+    claudeAiOauth: { accessToken: "tok-account", expiresAt: expiry, refreshToken: "r-account" },
+    mcpOAuth: { server: "kept" },
+  });
+  const mergedLive = mergeCredentialsJson(existingLive, accountCreds);
+  assert.equal(claudeCredentialsEquivalent(existingLive, mergedLive), true);
+  assert.deepEqual(JSON.parse(mergedLive).mcpOAuth, { server: "kept" });
+
+  // External mutation / stale swap: the entry now holds ANOTHER account. The
+  // merge overlays our own claudeAiOauth, so merged != existing → NOT elided.
+  // (The independent post-activation identity reread is the second guard.)
+  const existingForeign = JSON.stringify({
+    claudeAiOauth: { accessToken: "tok-foreign", expiresAt: expiry, refreshToken: "r-foreign" },
+    mcpOAuth: { server: "kept" },
+  });
+  const mergedOverForeign = mergeCredentialsJson(existingForeign, accountCreds);
+  assert.equal(claudeCredentialsEquivalent(existingForeign, mergedOverForeign), false);
+});
+
+test("oversized entries: equivalence gates the identity-only fallback correctly", () => {
+  const expiry = 1_797_782_400_000;
+  const oauth = { accessToken: "tok-account", expiresAt: expiry, refreshToken: "r-account" };
+  const fullWithSiblings = JSON.stringify({ claudeAiOauth: oauth, mcpOAuth: { blob: "x".repeat(4000) } });
+  const accountCreds = JSON.stringify({ claudeAiOauth: oauth });
+  const mergedFull = mergeCredentialsJson(fullWithSiblings, accountCreds);
+
+  // Precondition: the merged target genuinely overflows the security line
+  // buffer, so a write of it would degrade to the identity-only fallback.
+  assert.equal(buildAddGenericPasswordCommand("u", "s", mergedFull), null);
+  assert.notEqual(buildAddGenericPasswordCommand("u", "s", identityOnlyCredentials(mergedFull)!), null);
+
+  // Home already holds the FULL entry: elide. A rewrite would overflow and drop
+  // the siblings via the identity-only fallback; the elision preserves them.
+  assert.equal(claudeCredentialsEquivalent(fullWithSiblings, mergedFull), true);
+
+  // Home holds only the identity-only subset (a prior degraded write): the full
+  // merged target differs, so it is NOT elided — the writer runs and re-attempts.
+  assert.equal(claudeCredentialsEquivalent(identityOnlyCredentials(fullWithSiblings)!, mergedFull), false);
 });
 
 test("findAccount resolves <tool>-<query> shorthands (codex-ur, claude-thto)", async () => {

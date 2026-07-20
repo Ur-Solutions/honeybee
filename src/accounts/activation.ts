@@ -7,6 +7,7 @@ import { atomicWriteFile } from "../fsx.js";
 import { appendLedger } from "../store.js";
 import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./registry.js";
 import {
+  claudeCredentialsEquivalent,
   claudeProfileEmailCached,
   claudeTokenExpiry,
   evacuateForeignClaudeChain,
@@ -254,16 +255,29 @@ async function claudeSeedHomeDefaults(ctx: ActivationContext): Promise<void> {
   if (keychainAvailable()) {
     const credentials = (await readFile(join(accountDir(account), recipe.credentialFiles[0]!), "utf8")).trim();
     const existing = await readClaudeKeychain(homePath);
-    const write = await writeClaudeKeychainEntry(homePath, mergeCredentialsJson(existing, credentials));
-    if (write.ok) {
-      written.push(write.mode === "identity-only" ? "keychain (identity-only)" : "keychain");
-      if (write.mode === "identity-only") {
-        warn(`keychain entry for ${homePath} was too large to store whole; stamped the identity alone (MCP connectors on this home may need re-auth)`);
+    const merged = mergeCredentialsJson(existing, credentials);
+    // Elide a provably-redundant keychain write. When the existing entry is
+    // already semantically identical to the merged target (order/format and
+    // hex-encoding aside), the `security -i` subprocess would re-stamp the
+    // exact same identity — the dominant cost of re-activating an already-live
+    // home. claudeCredentialsEquivalent only reports true on a proven parse of
+    // both sides, so a parse failure (or an absent/foreign entry) always falls
+    // through to the write. The independent identity reread below still runs,
+    // catching any post-read external mutation exactly as on the write path.
+    if (existing !== null && claudeCredentialsEquivalent(existing, merged)) {
+      written.push("keychain");
+    } else {
+      const write = await writeClaudeKeychainEntry(homePath, merged);
+      if (write.ok) {
+        written.push(write.mode === "identity-only" ? "keychain (identity-only)" : "keychain");
+        if (write.mode === "identity-only") {
+          warn(`keychain entry for ${homePath} was too large to store whole; stamped the identity alone (MCP connectors on this home may need re-auth)`);
+        }
+      } else if (existing) {
+        // A stale entry exists and we could not replace it: claude would keep
+        // using the OLD account. Refuse rather than activate a lie.
+        throw new Error(`Could not update the macOS Keychain entry for ${homePath}; claude would keep its previous identity`);
       }
-    } else if (existing) {
-      // A stale entry exists and we could not replace it: claude would keep
-      // using the OLD account. Refuse rather than activate a lie.
-      throw new Error(`Could not update the macOS Keychain entry for ${homePath}; claude would keep its previous identity`);
     }
   }
   await verifyActivatedClaudeIdentity(ctx);

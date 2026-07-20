@@ -57,6 +57,7 @@ export {
   claudeHomesForAccount,
   homeBelongsToAccount,
   mergeCredentialsJson,
+  claudeCredentialsEquivalent,
   saveClaudeOauthToVault,
   type ChainSyncResult,
   type ChainSyncDeps,
