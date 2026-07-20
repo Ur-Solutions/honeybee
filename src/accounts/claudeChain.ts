@@ -176,7 +176,13 @@ export function claudeCredentialsEquivalent(a: string | null, b: string | null):
   const pa = parseCredentialsForCompare(a);
   const pb = parseCredentialsForCompare(b);
   if (pa === undefined || pb === undefined) return false;
-  return canonicalJson(pa) === canonicalJson(pb);
+  try {
+    return canonicalJson(pa) === canonicalJson(pb);
+  } catch {
+    // Excessive nesting or another canonicalization failure must take the
+    // original write path, never turn ambiguous input into a no-op.
+    return false;
+  }
 }
 
 function parseCredentialsForCompare(raw: string | null): unknown {
@@ -197,7 +203,9 @@ function canonicalJson(value: unknown): string {
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === "object") {
-    const sorted: Record<string, unknown> = {};
+    // Null-prototype storage keeps JSON keys such as "__proto__" as ordinary
+    // data instead of invoking Object.prototype's legacy setter.
+    const sorted: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       sorted[key] = canonicalize((value as Record<string, unknown>)[key]);
     }

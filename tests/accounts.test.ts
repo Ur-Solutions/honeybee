@@ -932,6 +932,11 @@ test("claudeCredentialsEquivalent proves redundant writes without eliding real o
   assert.equal(claudeCredentialsEquivalent("not json", compact), false);
   assert.equal(claudeCredentialsEquivalent(compact, "not json"), false);
   assert.equal(claudeCredentialsEquivalent("deadbeef", compact), false); // valid hex, decodes to non-JSON bytes
+  assert.equal(
+    claudeCredentialsEquivalent('{"__proto__":{"accessToken":"foreign"}}', '{}'),
+    false,
+    "prototype-shaped JSON keys remain comparison data",
+  );
   // JSON `null` parses to a value (not a parse failure): the undefined sentinel
   // distinguishes "parsed to null" from "failed to parse".
   assert.equal(claudeCredentialsEquivalent("null", "null"), true);
