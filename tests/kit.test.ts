@@ -147,3 +147,53 @@ echo '[]'`,
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("recent best-effort materialization skips Kit subprocesses but strict requests do not", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-kit-fresh-"));
+  const home = join(dir, "home");
+  const calls = join(dir, "calls.txt");
+  const now = Date.parse("2026-07-20T08:00:00.000Z");
+  try {
+    await makeStubKit(
+      dir,
+      `echo "$@" >> "${calls}"
+if [ "$1" = "version" ]; then echo '{"version":"9.9.9"}'; exit 0; fi
+echo '[]'`,
+    );
+    await mkdir(join(home, ".kit"), { recursive: true });
+    await writeFile(
+      join(home, ".kit", "manifest.json"),
+      JSON.stringify({
+        schema: 1,
+        kitVersion: "9.9.9",
+        profile: "base",
+        materializedAt: new Date(now - 5_000).toISOString(),
+        entries: [],
+      }),
+    );
+    process.env.HIVE_KIT_BIN = join(dir, "kit");
+    resetKitProbeForTests();
+
+    await kitMaterializeHome(home, "codex", {
+      profile: "base",
+      freshnessTtlMs: 60_000,
+      now: () => now,
+    });
+    const { readFile } = await import("node:fs/promises");
+    await assert.rejects(readFile(calls, "utf8"), /ENOENT/, "fresh fast path never probes or syncs Kit");
+
+    await kitMaterializeHome(home, "codex", {
+      profile: "base",
+      strict: true,
+      freshnessTtlMs: 60_000,
+      now: () => now,
+    });
+    const invoked = await readFile(calls, "utf8");
+    assert.match(invoked, /^version --json/m);
+    assert.match(invoked, /sync --home .* --harness codex --profile base --json/);
+  } finally {
+    delete process.env.HIVE_KIT_BIN;
+    resetKitProbeForTests();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

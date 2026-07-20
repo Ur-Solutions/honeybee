@@ -34,7 +34,17 @@ export interface KitMaterializeOptions {
    */
   strict?: boolean;
   warn?: (message: string) => void;
+  /**
+   * Best-effort sync freshness window. A recently materialized home can skip
+   * both Kit subprocesses during a spawn burst; strict profile requests always
+   * synchronize. Defaults to HIVE_KIT_SYNC_TTL_MS or 60 seconds.
+   */
+  freshnessTtlMs?: number;
+  /** Clock seam for freshness tests. */
+  now?: () => number;
 }
+
+export const DEFAULT_KIT_SYNC_TTL_MS = 60_000;
 
 function kitBin(): string {
   return process.env.HIVE_KIT_BIN || "kit";
@@ -42,6 +52,35 @@ function kitBin(): string {
 
 function kitDisabled(): boolean {
   return process.env.HIVE_KIT_DISABLE === "1";
+}
+
+function kitSyncTtlMs(override: number | undefined): number {
+  if (override !== undefined) return Number.isFinite(override) ? Math.max(0, override) : DEFAULT_KIT_SYNC_TTL_MS;
+  const configured = Number(process.env.HIVE_KIT_SYNC_TTL_MS);
+  if (!Number.isFinite(configured) || configured < 0) return DEFAULT_KIT_SYNC_TTL_MS;
+  return configured;
+}
+
+async function kitHomeWasMaterializedRecently(
+  homePath: string,
+  profile: string | undefined,
+  ttlMs: number,
+  now: number,
+): Promise<boolean> {
+  if (ttlMs <= 0) return false;
+  try {
+    const manifest = JSON.parse(await readFile(join(homePath, ".kit", "manifest.json"), "utf8")) as {
+      materializedAt?: unknown;
+      profile?: unknown;
+    };
+    if (profile !== undefined && manifest.profile !== profile) return false;
+    if (typeof manifest.materializedAt !== "string") return false;
+    const materializedAt = Date.parse(manifest.materializedAt);
+    const age = now - materializedAt;
+    return Number.isFinite(materializedAt) && age >= 0 && age < ttlMs;
+  } catch {
+    return false;
+  }
 }
 
 // One probe per process; a missing binary is the common steady state on
@@ -84,6 +123,21 @@ export async function kitMaterializeHome(
     if (options.strict) throw new Error("kit integration is disabled (HIVE_KIT_DISABLE=1)");
     return;
   }
+  // Apiary fan-outs commonly activate the same account home several times in
+  // one second. A successful Kit sync stamps materializedAt in its ownership
+  // manifest; within this small freshness window the exact same convergence
+  // work is redundant and costs two Node subprocesses (~100ms locally). Keep
+  // explicit --kit-profile strict: it is a requested capability transition,
+  // not best-effort background convergence.
+  if (
+    !options.strict &&
+    await kitHomeWasMaterializedRecently(
+      homePath,
+      options.profile,
+      kitSyncTtlMs(options.freshnessTtlMs),
+      options.now?.() ?? Date.now(),
+    )
+  ) return;
   if ((await kitAvailableVersion()) === null) {
     if (options.strict) {
       throw new Error("kit binary not found — install trmdy/kit (npm link) or set HIVE_KIT_BIN");
