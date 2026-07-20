@@ -158,6 +158,54 @@ export function mergeCredentialsJson(targetRaw: string | null, sourceRaw: string
   }
 }
 
+/**
+ * Deep, key-order-independent semantic equality of two credential blobs. Both
+ * are decoded (hex keychain payloads too, via decodeClaudeCredentialsRaw) and
+ * JSON-parsed; a null/empty value or a parse failure on EITHER side yields
+ * false. That asymmetry is the safety contract: this only ever answers "these
+ * are provably the same JSON," never "assume equal," so a caller that elides a
+ * write on `true` can never skip on unparseable/ambiguous input.
+ *
+ * Used to prove a keychain entry already holds exactly the merged identity
+ * before spending a `security -i` subprocess on activation. It compares the
+ * merged TARGET (what we would write) against the existing entry; because the
+ * merge always overlays the account's own claudeAiOauth, a stale or foreign
+ * existing entry can never test equal — it is always rewritten, never elided.
+ */
+export function claudeCredentialsEquivalent(a: string | null, b: string | null): boolean {
+  const pa = parseCredentialsForCompare(a);
+  const pb = parseCredentialsForCompare(b);
+  if (pa === undefined || pb === undefined) return false;
+  return canonicalJson(pa) === canonicalJson(pb);
+}
+
+function parseCredentialsForCompare(raw: string | null): unknown {
+  const decoded = decodeClaudeCredentialsRaw(raw);
+  if (decoded === null) return undefined;
+  try {
+    return JSON.parse(decoded) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Deterministic stringification: recursively sort object keys, keep array order. */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[key] = canonicalize((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
 export async function saveClaudeChainToVaultLocked(account: AccountRecord, sourceRaw: string): Promise<void> {
   const vaultPath = join(accountDir(account), ".credentials.json");
   const existing = await readFile(vaultPath, "utf8").catch(() => null);
