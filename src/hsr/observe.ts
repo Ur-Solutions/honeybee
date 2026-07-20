@@ -348,7 +348,7 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
       // settles dead/sealed rather than reporting a stale structured state.
       const state = live
         ? meta?.status === "queued"
-          ? "queued"
+          ? meta.startupPhase === "harness" ? "booting" : "queued"
           : structuredStateFromEvents(eventSnapshot ? eventSnapshot.tailEvents : await readEventTail(bee), { rootThreadId })
         : undefined;
       observations.set(bee, {

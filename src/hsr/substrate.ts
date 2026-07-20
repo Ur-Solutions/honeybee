@@ -48,8 +48,8 @@ async function sendText(bee: string, text: string, _paneId?: string, options?: S
   await withHsrTurnDeliveryLock(bee, async () => {
     const meta = await readHsrMeta(bee);
     if (meta?.status === "queued" && isPidAlive(meta.hostPid)) {
-      // A queued host has no live turn — the pending turn drains on start, so
-      // the delivery mode is moot here.
+      // A queued/booting host has no live turn — the pending turn drains once
+      // its harness and control socket are ready, so delivery mode is moot.
       await enqueuePendingHsrTurn(bee, text);
       return;
     }

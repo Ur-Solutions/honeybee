@@ -69,7 +69,10 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
       opts: optsFor("queued-one"),
       queueStartup: true,
     });
-    await waitFor(async () => (await readHsrMeta("queued-one"))?.status === "queued", "first queued meta");
+    await waitFor(
+      async () => (await readHsrMeta("queued-one"))?.startupPhase === "harness",
+      "first harness-starting meta",
+    );
     assert.equal(firstStarts, 1, "first host owns the only startup slot");
 
     const second = runHsrHost({
@@ -84,7 +87,7 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
 
     const observations = await hsrObservations();
     assert.equal(observations.get("queued-one")?.live, true);
-    assert.equal(observations.get("queued-one")?.state, "queued");
+    assert.equal(observations.get("queued-one")?.state, "booting");
     assert.equal(observations.get("queued-two")?.live, true);
     assert.equal(observations.get("queued-two")?.state, "queued");
 
@@ -109,6 +112,54 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
     else process.env.HIVE_STORE_ROOT = previousRoot;
     if (previousConcurrency === undefined) delete process.env.HIVE_CODEX_START_CONCURRENCY;
     else process.env.HIVE_CODEX_START_CONCURRENCY = previousConcurrency;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("every detached HSR harness publishes booting and accepts a durable first turn", async () => {
+  const previousRoot = process.env.HIVE_STORE_ROOT;
+  const root = await mkdtemp(join(tmpdir(), "honeybee-hsr-startup-publish-"));
+  process.env.HIVE_STORE_ROOT = root;
+  const releaseStart = deferred();
+  let handle: HsrHostHandle | undefined;
+  let starting: Promise<HsrHostHandle> | undefined;
+  const adapter: RunnerAdapter = {
+    harness: "claude",
+    tier: () => "stream",
+    async start(opts) {
+      await releaseStart.promise;
+      return stubAdapter.start(opts);
+    },
+  };
+
+  try {
+    starting = runHsrHost({
+      bee: "starting-claude",
+      adapter,
+      opts: optsFor("starting-claude"),
+      queueStartup: true,
+    });
+    await waitFor(
+      async () => (await readHsrMeta("starting-claude"))?.startupPhase === "harness",
+      "non-codex starting meta",
+    );
+
+    await hsrSubstrate().sendText("starting-claude", "hello before the harness is ready");
+    releaseStart.resolve();
+    handle = await starting;
+    await waitFor(
+      async () => (await hsrSubstrate().capture("starting-claude")).includes("echo:hello before the harness is ready"),
+      "pre-ready prompt drained",
+    );
+    const meta = await readHsrMeta("starting-claude");
+    assert.equal(meta?.status, "running");
+    assert.ok(meta?.runningAt, "running transition is durably timestamped");
+  } finally {
+    releaseStart.resolve();
+    handle ??= await starting?.catch(() => undefined);
+    await handle?.stop().catch(() => undefined);
+    if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousRoot;
     await rm(root, { recursive: true, force: true });
   }
 });

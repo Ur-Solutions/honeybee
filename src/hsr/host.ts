@@ -56,7 +56,7 @@ export async function runHsrHost(params: {
   adapter: RunnerAdapter;
   opts: RunnerOpts;
   hostPid?: number;
-  /** Detached local hosts queue fragile Codex cold starts; in-process remote hosts opt out. */
+  /** Detached local hosts publish startup immediately; in-process remote hosts opt out. */
   queueStartup?: boolean;
 }): Promise<HsrHostHandle> {
   const { bee, adapter, opts } = params;
@@ -65,39 +65,51 @@ export async function runHsrHost(params: {
 
   await ensureHsrRunDir(bee);
   const tier = adapter.tier();
-  const queuedAt = new Date().toISOString();
+  const startedAt = new Date().toISOString();
+  const publishStartup = params.queueStartup === true;
   const queueCodexStartup =
-    params.queueStartup === true &&
+    publishStartup &&
     adapter.harness === "codex" &&
     tier === "server" &&
     codexStartupConcurrency() > 0;
 
-  let queuedMeta: HsrMeta | undefined;
-  if (queueCodexStartup) {
-    // Publish liveness before waiting for admission so `hive ps` reports an
-    // intentional queued bee instead of fabricating a crash/boot wedge.
-    queuedMeta = {
+  let startupMeta: HsrMeta | undefined;
+  if (publishStartup) {
+    // Publish liveness before the native harness handshake. This lets x/run
+    // durably enqueue the first turn and return immediately for every local
+    // HSR harness. Keep the established `queued` status for rolling-version
+    // compatibility; startupPhase refines admission backpressure vs harness
+    // boot for new observers without making older daemons reject the meta.
+    startupMeta = {
       bee,
       harness: adapter.harness,
       tier,
       hostPid,
-      startedAt: queuedAt,
-      queuedAt,
+      startedAt,
+      ...(queueCodexStartup ? { queuedAt: startedAt } : {}),
+      startupPhase: queueCodexStartup ? "admission" : "harness",
       controlSocket,
       status: "queued",
     };
-    await writeHsrMeta(bee, queuedMeta);
+    await writeHsrMeta(bee, startupMeta);
   }
 
   let session: Awaited<ReturnType<RunnerAdapter["start"]>>;
   try {
+    const startAdapter = async () => {
+      if (startupMeta?.startupPhase === "admission") {
+        startupMeta = { ...startupMeta, startupPhase: "harness" };
+        await writeHsrMeta(bee, startupMeta);
+      }
+      return adapter.start(opts);
+    };
     session = queueCodexStartup
-      ? await withCodexStartupSlot(bee, () => adapter.start(opts))
-      : await adapter.start(opts);
+      ? await withCodexStartupSlot(bee, startAdapter)
+      : await startAdapter();
   } catch (error) {
-    if (queuedMeta) {
+    if (startupMeta) {
       await writeHsrMeta(bee, {
-        ...queuedMeta,
+        ...startupMeta,
         status: "exited",
         exitCode: null,
         endedAt: new Date().toISOString(),
@@ -114,10 +126,11 @@ export async function runHsrHost(params: {
     hostPid,
     childPid: session.pid,
     childPgid: session.pid, // detached ⇒ pgid === child pid
-    startedAt: queuedMeta?.startedAt ?? new Date().toISOString(),
-    ...(queuedMeta?.queuedAt ? { queuedAt: queuedMeta.queuedAt } : {}),
+    startedAt: startupMeta?.startedAt ?? new Date().toISOString(),
+    ...(startupMeta?.queuedAt ? { queuedAt: startupMeta.queuedAt } : {}),
     controlSocket,
-    status: queueCodexStartup ? "queued" : "running",
+    status: startupMeta ? "queued" : "running",
+    ...(!startupMeta ? { runningAt: new Date().toISOString() } : {}),
   };
   await writeHsrMeta(bee, meta);
 
@@ -163,13 +176,13 @@ export async function runHsrHost(params: {
     throw error;
   }
 
-  if (queueCodexStartup) {
+  if (startupMeta) {
     try {
-      // Serialize the state flip with sendText's queued decision. A sender
-      // either sees queued and persists a turn that this drain consumes, or
-      // sees running after this lock is released and uses the live RPC socket.
+      // Serialize the state flip with sendText's queued/booting decision. A
+      // sender either persists a turn that this drain consumes, or sees running
+      // after the lock is released and uses the live RPC socket.
       await withHsrTurnDeliveryLock(bee, async () => {
-        meta = { ...meta, status: "running" };
+        meta = { ...meta, status: "running", runningAt: new Date().toISOString() };
         await writeHsrMeta(bee, meta);
         await drainPendingHsrTurns(bee, (text) => session.send(text));
       });

@@ -96,9 +96,13 @@ export type HsrMeta = {
   hostPid: number;
   childPid?: number;
   childPgid?: number;
-  startedAt: string; // ISO — detached host startup (includes any queued wait)
+  startedAt: string; // ISO — detached host startup (includes any queued/starting wait)
   /** Set when this host entered the bounded Codex cold-start queue. */
   queuedAt?: string;
+  /** Refines queued without breaking older daemon/CLI readers. */
+  startupPhase?: "admission" | "harness";
+  /** Set once the harness session and control socket are ready for direct turns. */
+  runningAt?: string;
   controlSocket: string;
   status: "queued" | "running" | "exited";
   exitCode?: number | null;
