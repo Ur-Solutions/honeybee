@@ -170,13 +170,18 @@ export const AUTO_ACCOUNT_TTL_MS = 60 * 60 * 1000;
 /**
  * Stale-while-revalidate ceiling for the auto pick: a snapshot older than the
  * ttl but younger than this is still served (the spawn path never blocks on
- * provider round-trips — measured at 2-10s for a multi-account codex fleet),
+ * provider round-trips — measured at 1-10s for a multi-account codex fleet),
  * with a detached `hive limits` sweep forked to re-warm the cache for the
  * next pick. The pick debits (HIVE-80) layer concurrent load in the interim.
- * Beyond this ceiling the snapshot is too old to trust and the pick fetches
- * live as before.
+ *
+ * Deliberately generous (a week): an account whose live fetch always FAILS
+ * (broken auth, no rollout) never refreshes its snapshot — failures are not
+ * cached — and a tight ceiling would put that account's doomed fetch back on
+ * EVERY spawn (measured: +1.2s per pick for one such account). An ancient
+ * snapshot mis-ranking one account is cheaper than taxing every spawn; only
+ * a candidate with no snapshot at all is fetched inline (first use).
  */
-export const AUTO_STALE_LIMITS_MAX_MS = 6 * 60 * 60 * 1000;
+export const AUTO_STALE_LIMITS_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type PickAccountDeps = CachedLimitsOptions & {
   hasCredentials?: typeof accountHasCredentials;
