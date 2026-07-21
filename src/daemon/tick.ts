@@ -488,11 +488,16 @@ export function logTickResult(result: TickResult): LogInput[] {
     entries.push({ level: "warn", msg: "tick.partial", error: err.message });
   }
   for (const transition of result.transitions) {
+    // First observations (daemon restart: EVERY session "transitions" from
+    // undefined) are not events — on a large registry they flooded the log
+    // with hundreds of `from:null → archived` rows written sequentially
+    // inside the loop body (2026-07-21 canary). Same rule as the ledger.
+    if (transition.from === undefined) continue;
     entries.push({
       level: "info",
       msg: "state.transition",
       session: transition.name,
-      from: transition.from ?? null,
+      from: transition.from,
       to: transition.to,
     });
   }

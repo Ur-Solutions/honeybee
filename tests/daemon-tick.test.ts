@@ -798,3 +798,32 @@ test("tick: reports per-stage timings for the fixed stages", async () => {
     }
   });
 });
+
+test("tick: a large archived registry's first observation floods neither the ledger nor the daemon log", async () => {
+  await withTempStore(async () => {
+    const { logTickResult } = await import("../src/daemon/tick.js");
+    // 400 archived sessions + one live bee, fresh daemon (empty previousObserved).
+    const records = Array.from({ length: 400 }, (_, i) => bee({ name: `old-${i}`, tmuxTarget: `hive:old-${i}`, status: "archived" }));
+    records.push(bee({ name: "live-1", tmuxTarget: "hive:live-1" }));
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records, liveTargets: new Set(["hive:live-1"]), capture });
+    const result = await tick(deps, new Map());
+
+    // Every record is a first observation — real state for consumers...
+    assert.equal(result.observed.size, 401);
+    // ...but ZERO ledger events and ZERO daemon-log rows (2026-07-21 canary:
+    // hundreds of sequential from:null→archived appends per restart).
+    assert.equal(capture.ledger.filter((e) => e.type === "state.transition").length, 0);
+    const logged = logTickResult(result).filter((entry) => entry.msg === "state.transition");
+    assert.equal(logged.length, 0);
+
+    // A REAL transition on the next tick (live-1's tmux target vanishes) still
+    // logs and ledgers.
+    const secondDeps = buildDeps({ records, liveTargets: new Set(), capture });
+    const second = await tick(secondDeps, result.observed);
+    const realRows = logTickResult(second).filter((entry) => entry.msg === "state.transition");
+    assert.equal(realRows.length, 1);
+    assert.equal(realRows[0]!.session, "live-1");
+    assert.equal(capture.ledger.filter((e) => e.type === "state.transition").length, 1);
+  });
+});
