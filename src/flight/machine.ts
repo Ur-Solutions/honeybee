@@ -171,9 +171,19 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
     return finish();
   }
 
-  // 2b) Liveness: a dead host/record is unambiguous structured evidence.
+  // 2b) A missing session record is UNKNOWN for every state, not just claimed
+  // ones (2026-07-21 production incident: a listSessions timeout handed the
+  // sweep an empty snapshot and all ten working slots were crash-vacated
+  // while their bees ran, spawning duplicates into the same worktrees). Only
+  // POSITIVE evidence — a record that says dead, or a crash-flavored derived
+  // state — may kill an attempt. A genuinely purged bee is caught by the
+  // stall clock instead: activity stops → stalled → nudge fails → escalated,
+  // which is judgment's problem, exactly where an ambiguous disappearance
+  // belongs.
+  if (evidence.beeStatus === undefined) return finish();
+
+  // 2c) Liveness: a dead host/record is unambiguous structured evidence.
   const beeDead =
-    evidence.beeStatus === undefined ||
     evidence.beeStatus === "dead" ||
     evidence.beeStatus === "kill_failed" ||
     evidence.beeStatus === "archived" ||

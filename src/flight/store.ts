@@ -211,6 +211,24 @@ export async function finishTask(
   await rm(join(queueDir(flightId, "leased"), taskFilename(taskId)), { force: true });
 }
 
+/**
+ * Move a failed (or done — operator's call) task back to pending/, stripped of
+ * its lease and outcome, so a lane can claim it fresh. Recovery surface for
+ * falsely-failed packets (e.g. attempts burned by infrastructure faults, not
+ * by the work).
+ */
+export async function requeueTask(flightId: string, taskId: string): Promise<FlightTaskPacket> {
+  for (const bucket of ["failed", "done"] as const) {
+    const task = await readTask(flightId, bucket, taskId);
+    if (!task) continue;
+    const fresh: FlightTaskPacket = { taskId: task.taskId, brief: task.brief, ...(task.cwd ? { cwd: task.cwd } : {}), enqueuedAt: task.enqueuedAt };
+    await writeTask(flightId, "pending", fresh);
+    await rm(join(queueDir(flightId, bucket), taskFilename(taskId)), { force: true });
+    return fresh;
+  }
+  throw new Error(`no failed/done task ${taskId} in ${flightId} to requeue`);
+}
+
 function normalizeTask(value: unknown): FlightTaskPacket | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const object = value as Record<string, unknown>;

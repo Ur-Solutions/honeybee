@@ -241,6 +241,12 @@ export type DispatchContext = {
    * boot tick proves the loop healthy in seconds, not minutes.
    */
   firstTick: boolean;
+  /**
+   * False when listSessions failed and the records snapshot is the guard's
+   * empty fallback. Stages whose ACTIONS treat record-absence as meaningful
+   * (the flight reconciler) must not run on an untrusted snapshot.
+   */
+  sessionsSnapshotTrusted: boolean;
   nowMs: number;
   /**
    * Outcomes of the stages that already ran this tick, in registry order —
@@ -358,7 +364,9 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
     key: "flightSweeps",
     name: "sweepFlights",
     timeoutKey: "dispatchMs",
-    run: ({ deps, records, observed }) => deps.sweepFlights?.(records, observed),
+    // NEVER against an untrusted snapshot: absence must not read as death.
+    run: ({ deps, records, observed, sessionsSnapshotTrusted }) =>
+      sessionsSnapshotTrusted ? deps.sweepFlights?.(records, observed) : undefined,
     log: (outcome) => ({
       level: outcome.action === "error" ? "warn" : "info",
       msg: `flight.${outcome.action}`,
@@ -591,8 +599,14 @@ export async function tick(
     }
   };
 
+  const errorsBeforeListSessions = errors.length;
   const records: SessionRecord[] = await timeStage("listSessions", () =>
     guard(withTimeout(deps.listSessions(), timeouts.fsMs, "listSessions"), errors, []));
+  // A failed listSessions yields an EMPTY snapshot via the guard — usable for
+  // passive observation (held states), but NEVER as evidence of absence: the
+  // flight reconciler must not run against it (2026-07-21 incident: an fs
+  // storm's empty snapshot crash-vacated ten working slots at once).
+  const sessionsSnapshotTrusted = errors.length === errorsBeforeListSessions;
   const nodes: NodeRecord[] = await timeStage("listNodes", () =>
     guard(withTimeout(deps.listNodes(), timeouts.fsMs, "listNodes"), errors, []));
   const probe: ProbeResult = await timeStage("probeNodes", () =>
@@ -797,6 +811,7 @@ export async function tick(
     transitions,
     observed,
     firstTick: options.firstTick === true,
+    sessionsSnapshotTrusted,
     nowMs,
     outcomes: emptyDispatcherOutcomes(),
   };
