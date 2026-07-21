@@ -169,12 +169,17 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
 
   // Crash adoption v1: a daemon restart reconciles any HSR bee whose meta still
   // says "running" but whose host pid is dead (the host owns the harness pipes,
-  // so a dead host is an unrecoverable session). Best-effort — a bad HSR root
-  // must never block startup.
-  const reaped = await reapDeadHosts().catch(() => [] as string[]);
-  if (reaped.length > 0) {
-    await appendDaemonLog({ level: "info", msg: "hsr.reaped", bees: reaped }).catch(() => undefined);
-  }
+  // so a dead host is an unrecoverable session). DETACHED (2026-07-21 canary
+  // breach): this scans every HSR run dir — 62 seconds at ~1000 dirs — and it
+  // used to run BEFORE the sentinel/watchdog/loop started, so a large registry
+  // delayed every defense while the daemon sat unprotected. Adoption is not
+  // urgent (the tick's observation reaches the same verdict per bee); let it
+  // finish in the background.
+  void reapDeadHosts()
+    .then((reaped) =>
+      reaped.length > 0 ? appendDaemonLog({ level: "info", msg: "hsr.reaped", bees: reaped }).catch(() => undefined) : undefined,
+    )
+    .catch(() => undefined);
 
   if (options.shutdownSignal) {
     if (options.shutdownSignal.aborted) {

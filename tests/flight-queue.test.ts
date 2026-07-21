@@ -296,3 +296,49 @@ test("queue store: enqueue → claim → finish round-trip on disk with duplicat
     assert.equal(remaining[0]!.cwd, "/tmp/wt");
   });
 });
+
+test("canary regression: the daemon sweep stage never awaits spawn-shaped work", async () => {
+  await withTempStore(async () => {
+    const { createFlightSweeper } = await import("../src/daemon/flightSweep.js");
+    const { saveFlight, saveSlot } = await import("../src/flight/store.js");
+    const f = flight({ id: "FL.slow1", target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+    await saveFlight(f);
+    await saveSlot({ ...vacantSlot("s1"), flightId: f.id });
+    await enqueueTask(f.id, { taskId: "t1", brief: "slow one" });
+
+    // spawnSlot hangs until we release it — the exact shape (account pick,
+    // keychain activation, 90s brief retry) that blew the 120s tick budget.
+    let releaseSpawn!: () => void;
+    const spawnGate = new Promise<void>((resolve) => (releaseSpawn = resolve));
+    const spawnCalls: string[] = [];
+    const sweeper = createFlightSweeper({
+      spawnSlot: async (_f, slot) => {
+        spawnCalls.push(slot.slotId);
+        await spawnGate;
+        return { beeName: "slow-bee" };
+      },
+      nudge: async () => undefined,
+      retireBee: async () => undefined,
+      withFlightLock: (_id, fn) => fn(),
+      appendLedger: async () => undefined,
+    });
+
+    // The tick-facing call returns immediately even though the spawn hangs.
+    const t0 = Date.now();
+    const first = await sweeper([], new Map());
+    assert.ok(Date.now() - t0 < 500, `stage took ${Date.now() - t0}ms — must not await the spawn`);
+    assert.deepEqual(first, []);
+
+    // While the sweep is in flight, subsequent ticks report it and skip.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(spawnCalls, ["s1"], "the detached sweep really ran");
+    const second = await sweeper([], new Map());
+    assert.ok(second.some((o) => o.action === "skipped" && /still running/.test(o.detail ?? "")));
+
+    // Release the spawn; the completed sweep's outcomes surface on a later tick.
+    releaseSpawn();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const third = await sweeper([], new Map());
+    assert.ok(third.some((o) => o.action === "spawn" && o.detail === "slow-bee"), JSON.stringify(third));
+  });
+});

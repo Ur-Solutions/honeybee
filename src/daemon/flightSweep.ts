@@ -119,19 +119,41 @@ export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): F
     now: () => Date.now(),
     ...overrides,
   };
-  // In-process single-flight guard: a sweep that outlives its dispatch budget
-  // keeps running (withTimeout never cancels) — the next tick must not start
-  // a second reconciler over the same slots (CR-1).
+  // DETACHED execution (2026-07-21 canary breach): a sweep's side effects —
+  // account auto-pick (live limits fetch), credential activation
+  // (keychain/OAuth), HSR spawn, brief delivery with its ~90s boot-retry
+  // window — can legitimately take minutes. Awaiting them inside the tick
+  // blew the 120s tick budget the moment a live flight had a lane to fill
+  // (first canary tick: 131s → budget breach → sentinel kill). The tick
+  // stage now only STARTS a sweep (single-flight guarded; the per-flight
+  // file lock still serializes against CLI sweepers) and reports the
+  // PREVIOUS completed sweep's outcomes — the tick path never waits on
+  // spawn-shaped work, mirroring how chain sync was moved off-tick in
+  // phase 0.
   let inFlight = false;
+  let startedAtMs = 0;
+  let pendingOutcomes: FlightSweepOutcome[] = [];
   return async (records, observed) => {
+    // Surface what the last completed sweep did (once).
+    const report = pendingOutcomes;
+    pendingOutcomes = [];
     if (inFlight) {
-      return [{ flight: "*", action: "skipped", detail: "previous sweep still running" }];
+      const runningForS = Math.round((Date.now() - startedAtMs) / 1000);
+      report.push({ flight: "*", action: "skipped", detail: `sweep still running (${runningForS}s)` });
+      return report;
     }
     inFlight = true;
-    try {
-      return await sweepFlights(deps, records, observed);
-    } finally {
-      inFlight = false;
-    }
+    startedAtMs = Date.now();
+    void sweepFlights(deps, records, observed)
+      .then((outcomes) => {
+        pendingOutcomes = outcomes;
+      })
+      .catch((error: unknown) => {
+        pendingOutcomes = [{ flight: "*", action: "error", error: error instanceof Error ? error.message : String(error) }];
+      })
+      .finally(() => {
+        inFlight = false;
+      });
+    return report;
   };
 }
