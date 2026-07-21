@@ -827,3 +827,86 @@ test("tick: a large archived registry's first observation floods neither the led
     assert.equal(capture.ledger.filter((e) => e.type === "state.transition").length, 1);
   });
 });
+
+test("canary round 2: cold-cache samplers skip the first tick, run on the second", async () => {
+  await withTempStore(async () => {
+    const record = bee({ lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const invoked: string[] = [];
+    const deps = buildDeps({
+      records: [record],
+      liveTargets: new Set([record.tmuxTarget]),
+      panes: new Map([[record.tmuxTarget, "done\n\n› next task"]]),
+      capture,
+    });
+    deps.sampleUsage = async () => {
+      invoked.push("sampleUsage");
+      return [];
+    };
+    deps.dispatchAutoTitle = async () => {
+      invoked.push("dispatchAutoTitle");
+      return [];
+    };
+    deps.sweepPools = async () => {
+      invoked.push("sweepPools");
+      return [];
+    };
+    deps.dispatchBuzDrain = async () => {
+      invoked.push("dispatchBuzDrain");
+      return [];
+    };
+
+    const first = await tick(deps, new Map(), { firstTick: true });
+    // Heavy periodic samplers sit the boot tick out; event-driven stages run.
+    assert.ok(!invoked.includes("sampleUsage"));
+    assert.ok(!invoked.includes("dispatchAutoTitle"));
+    assert.ok(!invoked.includes("sweepPools"));
+    assert.ok(invoked.includes("dispatchBuzDrain"));
+    assert.equal(first.errors.length, 0);
+
+    invoked.length = 0;
+    await tick(deps, first.observed, { firstTick: false });
+    assert.ok(invoked.includes("sampleUsage"));
+    assert.ok(invoked.includes("dispatchAutoTitle"));
+    assert.ok(invoked.includes("sweepPools"));
+  });
+});
+
+test("canary round 3: the shared dispatch pool bounds the registry — stages cannot sum past it", async () => {
+  await withTempStore(async () => {
+    const record = bee({ lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps: TickDeps = {
+      ...buildDeps({
+        records: [record],
+        liveTargets: new Set([record.tmuxTarget]),
+        panes: new Map([[record.tmuxTarget, "done\n\n› next task"]]),
+        capture,
+      }),
+      // Real clock: this test measures wall-time bounding.
+      now: () => Date.now(),
+      timeouts: { dispatchMs: 10_000, dispatchTotalMs: 120 },
+    };
+    const slow = (ms: number) => new Promise<never[]>((resolve) => setTimeout(() => resolve([]), ms));
+    let poolRan = false;
+    deps.sampleUsage = () => slow(500) as never; // eats the whole 120ms pool (timed out at ~120ms)
+    deps.dispatchAutoTitle = () => slow(500) as never; // pool dry → skipped or truncated
+    deps.sweepPools = async () => {
+      poolRan = true;
+      return [];
+    };
+
+    const start = Date.now();
+    const result = await tick(deps, new Map(), { firstTick: false });
+    const elapsed = Date.now() - start;
+
+    // Without the shared pool this would take >=1000ms (two 500ms stages) —
+    // with it, the dispatcher phase is bounded near dispatchTotalMs.
+    assert.ok(elapsed < 700, `dispatcher phase took ${elapsed}ms — pool did not bound it`);
+    // The starved stages are recorded, never fatal.
+    assert.ok(result.errors.some((e) => /sampleUsage timed out|sampleUsage skipped/.test(e.message)));
+    assert.ok(
+      result.errors.some((e) => /dispatchAutoTitle (timed out|skipped)/.test(e.message)) || poolRan === false,
+    );
+  });
+});

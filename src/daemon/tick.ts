@@ -227,6 +227,12 @@ export type DispatchContext = {
   transitions: TickTransition[];
   /** This tick's freshly derived state per bee (authoritative current state). */
   observed: Map<string, BeeState>;
+  /**
+   * True on the daemon's first tick after boot (no tick has completed yet).
+   * Cold-cache periodic samplers marked skipFirstTick sit this one out so the
+   * boot tick proves the loop healthy in seconds, not minutes.
+   */
+  firstTick: boolean;
   nowMs: number;
   /**
    * Outcomes of the stages that already ran this tick, in registry order —
@@ -251,6 +257,13 @@ export type TickDispatcher<K extends keyof DispatcherOutcomes> = {
   name: string;
   /** Which TickTimeouts budget bounds the stage. */
   timeoutKey: keyof TickTimeouts;
+  /**
+   * Periodic samplers with cold-cache first runs (usage sampler ~60s, auto
+   * titler ~22s on a large fleet) skip the daemon's FIRST tick entirely: the
+   * boot tick's one job is proving the loop healthy before the watchdogs and
+   * before deferred boot work (crash-adoption reap) starts competing.
+   */
+  skipFirstTick?: boolean;
   /**
    * Start the stage. Return undefined to skip it — dep not wired, or the
    * stage's trigger condition not met — leaving its outcomes empty.
@@ -323,6 +336,7 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
   {
     key: "usage",
     name: "sampleUsage",
+    skipFirstTick: true,
     timeoutKey: "dispatchMs",
     run: ({ deps, records, panes, nowMs, hsrObs }) => deps.sampleUsage?.(records, panes, nowMs, hsrObs),
     log: (outcome) =>
@@ -361,6 +375,7 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
   {
     key: "autoTitles",
     name: "dispatchAutoTitle",
+    skipFirstTick: true,
     timeoutKey: "dispatchMs",
     run: ({ deps, records }) => deps.dispatchAutoTitle?.(records),
     log: (outcome) => ({
@@ -416,6 +431,7 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
   {
     key: "poolSweeps",
     name: "sweepPools",
+    skipFirstTick: true,
     timeoutKey: "dispatchMs",
     run: ({ deps, records, observed }) => deps.sweepPools?.(records, observed),
     log: (outcome) => ({
@@ -449,12 +465,19 @@ async function runTickDispatcher<K extends keyof DispatcherOutcomes>(
   timeouts: TickTimeouts,
   errors: Error[],
   stageMs: Record<string, number>,
+  /** Remaining shared dispatcher pool (ms); the effective timeout is the min. */
+  remainingMs: number,
 ): Promise<void> {
+  if (dispatcher.skipFirstTick && ctx.firstTick) return;
   const pending = dispatcher.run(ctx);
   if (!pending) return;
   const start = ctx.deps.now();
   try {
-    ctx.outcomes[dispatcher.key] = await withTimeout(pending, timeouts[dispatcher.timeoutKey], dispatcher.name);
+    ctx.outcomes[dispatcher.key] = await withTimeout(
+      pending,
+      Math.max(1, Math.min(timeouts[dispatcher.timeoutKey], remainingMs)),
+      dispatcher.name,
+    );
   } catch (error) {
     errors.push(toError(error));
   } finally {
@@ -515,7 +538,11 @@ export function logTickResult(result: TickResult): LogInput[] {
  * the new observed map for the next tick. No timers, signals, PID, or log
  * writes happen here — those are owned by runDaemon().
  */
-export async function tick(deps: TickDeps, previousObserved: Map<string, BeeState>): Promise<TickResult> {
+export async function tick(
+  deps: TickDeps,
+  previousObserved: Map<string, BeeState>,
+  options: { firstTick?: boolean } = {},
+): Promise<TickResult> {
   const start = deps.now();
   const errors: Error[] = [];
   const timeouts: TickTimeouts = { ...defaultTickTimeouts(), ...(deps.timeouts ?? {}) };
@@ -734,11 +761,28 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     hsrObs,
     transitions,
     observed,
+    firstTick: options.firstTick === true,
     nowMs,
     outcomes: emptyDispatcherOutcomes(),
   };
+  // The registry runs under a SHARED pool (dispatchTotalMs) in addition to
+  // each stage's own budget: N sequential 60s-budgeted stages must never be
+  // able to sum past the whole-tick watchdog (2026-07-21 canary breach,
+  // round 3). A dry pool skips the remaining stages — recorded, never fatal;
+  // they run again next tick.
+  const dispatchDeadline = deps.now() + timeouts.dispatchTotalMs;
   for (const dispatcher of tickDispatchers) {
-    await runTickDispatcher(dispatcher, dispatchContext, timeouts, errors, stageMs);
+    const remainingMs = dispatchDeadline - deps.now();
+    if (remainingMs <= 0) {
+      // Never call run() here — that would START the stage's side effects
+      // only to abandon them. Record the skip (skipFirstTick stages that
+      // weren't going to run anyway stay silent) and move on.
+      if (!(dispatcher.skipFirstTick && dispatchContext.firstTick)) {
+        errors.push(new Error(`${dispatcher.name} skipped: shared dispatch budget (${timeouts.dispatchTotalMs}ms) exhausted`));
+      }
+      continue;
+    }
+    await runTickDispatcher(dispatcher, dispatchContext, timeouts, errors, stageMs, remainingMs);
   }
 
   // Chain sync deliberately does NOT run here: runDaemon drives deps.syncChains

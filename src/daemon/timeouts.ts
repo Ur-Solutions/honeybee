@@ -24,6 +24,15 @@ export type TickTimeouts = {
   transcriptMs: number;
   /** dispatchers: buz drain, usage sampler, autoswap, auto-title. */
   dispatchMs: number;
+  /**
+   * SHARED budget for the whole dispatcher registry per tick. Per-stage
+   * dispatchMs budgets are independent, so N sequential stages could sum past
+   * the whole-tick watchdog by construction (2026-07-21 canary: 60s
+   * sampleUsage + 60s of other stages > the 120s tick budget → breach). Each
+   * stage's effective timeout is min(dispatchMs, remaining pool); when the
+   * pool is dry, remaining stages are SKIPPED (recorded, never fatal).
+   */
+  dispatchTotalMs: number;
   /** credential chain sync (keychain + a sweep over many homes). */
   chainSyncMs: number;
 };
@@ -34,6 +43,7 @@ export function defaultTickTimeouts(): TickTimeouts {
     substrateMs: envMs("HIVE_DAEMON_SUBSTRATE_TIMEOUT_MS", 20_000),
     transcriptMs: envMs("HIVE_DAEMON_TRANSCRIPT_TIMEOUT_MS", 15_000),
     dispatchMs: envMs("HIVE_DAEMON_DISPATCH_TIMEOUT_MS", 60_000),
+    dispatchTotalMs: envMs("HIVE_DAEMON_DISPATCH_TOTAL_MS", 60_000),
     chainSyncMs: envMs("HIVE_DAEMON_CHAIN_SYNC_TIMEOUT_MS", 120_000),
   };
 }
