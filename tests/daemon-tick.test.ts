@@ -948,3 +948,33 @@ test("canary round 4: a slow usage sampler starves itself, never the flight stag
     assert.equal(result.errors.length, 0, "budget enforcement must not manufacture errors");
   });
 });
+
+test("PROD INCIDENT 2026-07-21: the flight sweep never runs against a failed listSessions snapshot", async () => {
+  await withTempStore(async () => {
+    const capture: Capture = { ledger: [], touches: [] };
+    let sweeps = 0;
+    const good = buildDeps({ records: [bee()], liveTargets: new Set(), capture });
+    const deps: TickDeps = {
+      ...good,
+      listSessions: async () => {
+        throw new Error("listSessions timed out after 15000ms");
+      },
+      sweepFlights: async () => {
+        sweeps += 1;
+        return [];
+      },
+    };
+
+    const result = await tick(deps, new Map());
+    assert.equal(sweeps, 0, "sweepFlights must not act on the guard's empty fallback snapshot");
+    assert.ok(result.errors.some((e) => /listSessions timed out/.test(e.message)));
+
+    // With a healthy snapshot the stage runs normally.
+    good.sweepFlights = async () => {
+      sweeps += 1;
+      return [];
+    };
+    await tick(good, new Map());
+    assert.equal(sweeps, 1);
+  });
+});

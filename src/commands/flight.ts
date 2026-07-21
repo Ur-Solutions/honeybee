@@ -17,6 +17,7 @@ import {
   allocateFlightId,
   enqueueTask,
   finishTask,
+  requeueTask,
   listFlights,
   listSlots,
   listTasks,
@@ -43,6 +44,7 @@ const USAGE = `Usage:
   hive flight status <id|name> [--json]
   hive flight sweep [<id|name>]
   hive flight resolve <id|name> <slotId> (--retry | --abandon | --accept)
+  hive flight requeue <id|name> <taskId>
   hive flight drain <id|name>
   hive flight close <id|name>`;
 
@@ -64,6 +66,8 @@ export async function cmdFlight(parsed: Parsed): Promise<void> {
       return flightQueue(parsed);
     case "resolve":
       return flightResolve(parsed);
+    case "requeue":
+      return flightRequeue(parsed);
     case "drain":
       return flightSetStatus(parsed, "draining");
     case "close":
@@ -500,6 +504,17 @@ async function flightResolve(parsed: Parsed): Promise<void> {
 
   if (isPretty()) console.log(actionLine("ok", "flight", [bold(flight.id), slotId, `resolved: ${resolution}`]));
   else console.log(`resolved\t${flight.id}\t${slotId}\t${resolution}`);
+}
+
+/** `hive flight requeue <flight> <taskId>` — return a failed/done packet to pending. */
+async function flightRequeue(parsed: Parsed): Promise<void> {
+  const flight = await resolveFlight(parsed.args[1]);
+  const taskId = parsed.args[2];
+  if (!taskId) throw new Error(`task id required\n${USAGE}`);
+  const fresh = await requeueTask(flight.id, taskId);
+  await appendLedger({ type: "flight.task.requeued", flight: flight.id, task: fresh.taskId });
+  if (isPretty()) console.log(actionLine("ok", "flight", [bold(flight.id), fresh.taskId, "requeued"]));
+  else console.log(`requeued\t${flight.id}\t${fresh.taskId}`);
 }
 
 async function flightSetStatus(parsed: Parsed, status: "draining" | "closed"): Promise<void> {

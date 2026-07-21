@@ -28,7 +28,7 @@ export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sy
 export const KEYS_SUBCOMMANDS = ["print", "path", "check"];
 export const SESSIONS_SUBCOMMANDS = ["reconcile"];
 export const SYNC_SUBCOMMANDS = ["manifest"];
-export const FLIGHT_SUBCOMMANDS = ["start", "ls", "list", "status", "sweep", "enqueue", "queue", "resolve", "drain", "close"];
+export const FLIGHT_SUBCOMMANDS = ["start", "ls", "list", "status", "sweep", "enqueue", "queue", "resolve", "requeue", "drain", "close"];
 
 export const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 export const SEAL_STATUS_VALUES = [...SEAL_STATUSES];

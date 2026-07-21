@@ -165,10 +165,26 @@ test("a crashed bee vacates the slot; attempts exhausted → abandoned + mix vio
   assert.equal(exhausted.wantsSpawn, false);
 });
 
-test("a missing session record reads as death, not as idleness", () => {
-  const plan = planSlot(flight(), slot(), { seal: null }, T0 + 1_000);
-  assert.equal(plan.slot.state, "vacant");
-  assert.ok(plan.events.some((e) => e.type === "flight.slot.crashed"));
+test("PROD INCIDENT 2026-07-21: a missing session record HOLDS every state — absence is not death", () => {
+  // An fs storm handed the sweep an empty listSessions snapshot and all ten
+  // working slots were crash-vacated while their bees ran. Only POSITIVE
+  // evidence may kill an attempt.
+  for (const state of ["working", "stalled", "blocked", "escalated"] as const) {
+    const plan = planSlot(flight(), slot({ state }), { seal: null }, T0 + 60_000);
+    assert.equal(plan.slot.state, state, `${state} must hold on a missing record`);
+    assert.equal(plan.changed, false);
+    assert.equal(plan.events.length, 0);
+    assert.equal(plan.wantsSpawn, false);
+  }
+  // Positive evidence still kills: a record that SAYS dead.
+  const dead = planSlot(flight(), slot(), { beeStatus: "dead", seal: null }, T0 + 60_000);
+  assert.equal(dead.slot.state, "vacant");
+  assert.ok(dead.events.some((e) => e.type === "flight.slot.crashed"));
+  // And claimed-but-recordless slots still wedge at the readiness deadline.
+  const claimed = slot({ state: "provisioning", evidence: {} });
+  delete (claimed as Record<string, unknown>).beeName;
+  const late = planSlot(flight(), claimed, { seal: null }, T0 + flight().contract.readinessDeadlineMs + 1_000);
+  assert.equal(late.slot.state, "vacant");
 });
 
 test("node_unreachable holds every clock — no transition, no stall", () => {
