@@ -20,6 +20,7 @@ import {
   codexModelFromArgs,
   codexNotificationToEvents,
   codexServerRequestToNeedsInput,
+  codexTurnLifecycleAfterNotification,
   encodeCodexApprovalResponse,
   encodeCodexUserInput,
   retryCodexThreadHandshake,
@@ -71,6 +72,28 @@ test("codexNotificationToEvents maps turn/completed → [turn_end]; +usage when 
     { type: "turn_end", threadId: "t-1" },
     { type: "usage", inputTokens: 9, outputTokens: 41, totalTokens: 50 },
   ]);
+});
+
+test("codex interrupt lifecycle clears the completed turn instead of retaining a stale id", () => {
+  const idle = { active: false, turnId: "" };
+  const active = codexTurnLifecycleAfterNotification(idle, "turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-1", status: "in_progress" },
+  });
+  assert.deepEqual(active, { active: true, turnId: "turn-1" });
+
+  const afterUsage = codexTurnLifecycleAfterNotification(active, "thread/tokenUsage/updated", {
+    turnId: "turn-1",
+  });
+  assert.equal(afterUsage, active, "non-lifecycle notifications must not retarget interrupt");
+
+  assert.deepEqual(
+    codexTurnLifecycleAfterNotification(active, "turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed" },
+    }),
+    idle,
+  );
 });
 
 test("codexNotificationToEvents leaves unscoped lifecycle events backward-compatible", () => {

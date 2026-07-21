@@ -5,6 +5,7 @@ import { listNodes } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { hsrObservations } from "../hsr/observe.js";
+import { createIsolatedHsrObservations } from "./observerProcess.js";
 import { createRemoteEventMirror } from "../hsr/remoteEventMirror.js";
 import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
@@ -14,6 +15,7 @@ import { dispatchBuzDrains } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher } from "./needsInput.js";
 import { createNodeReachabilityTracker } from "./nodeReachability.js";
 import { createPoolSweeper } from "./poolSweep.js";
+import { createFlightSweeper } from "./flightSweep.js";
 import { createUsageSampler } from "./usageSampler.js";
 import { createTokenRefresher } from "./tokenRefresh.js";
 import { defaultCapturePanes, defaultProbeNodes } from "./probe.js";
@@ -21,11 +23,6 @@ import type { TickDeps } from "./tick.js";
 import { envMs } from "./timeouts.js";
 
 const DEFAULT_TRANSCRIPT_REFRESH_INTERVAL_MS = 15_000;
-
-// Credential sync may read keychain entries and many homes — far too heavy per
-// tick. Every few minutes is plenty: the sweep only has to beat the NEXT
-// activation, not the next tick.
-const CHAIN_SYNC_INTERVAL_MS = 5 * 60_000;
 
 type TranscriptFileStat = { mtimeMs: number; size: number };
 
@@ -102,7 +99,6 @@ async function defaultTranscriptFileStat(path: string): Promise<TranscriptFileSt
 }
 
 export function buildDefaultDeps(): TickDeps {
-  let lastChainSyncAt = 0;
   const refreshTranscriptMetadata = createThrottledTranscriptMetadataRefresh();
   return {
     listSessions,
@@ -110,7 +106,13 @@ export function buildDefaultDeps(): TickDeps {
     probeNodes: defaultProbeNodes,
     capturePanes: defaultCapturePanes,
     livePanes: () => localSubstrate().listPanes(),
-    hsrObservations: () => hsrObservations({ includeEvents: true }),
+    // The run-dir sweep runs in a disposable child process so a wedged fs call
+    // dies with the child instead of poisoning the daemon's threadpool
+    // (CL.701 §5). HIVE_DAEMON_ISOLATED_OBSERVER=0 opts back into in-process.
+    hsrObservations:
+      process.env.HIVE_DAEMON_ISOLATED_OBSERVER === "0"
+        ? (beeNames) => hsrObservations({ includeEvents: true, bees: beeNames })
+        : createIsolatedHsrObservations(),
     mirrorRemoteEvents: createRemoteEventMirror(),
     sealedBeeNames,
     touchSession,
@@ -128,10 +130,10 @@ export function buildDefaultDeps(): TickDeps {
     dispatchAutoTitle: createAutoTitleDispatcher(),
     refreshRemoteTokens: createTokenRefresher(),
     sweepPools: createPoolSweeper(),
+    sweepFlights: createFlightSweeper(),
+    // Pacing lives in runDaemon's dedicated chain-sync loop (every few minutes,
+    // never inside the tick path): each call here is a real sweep.
     syncChains: async () => {
-      const now = Date.now();
-      if (now - lastChainSyncAt < CHAIN_SYNC_INTERVAL_MS) return;
-      lastChainSyncAt = now;
       await syncAllAccountCredentialsToVault();
       // Account-bound bees may run in homes the sweep cannot find on its own
       // (arbitrary --home paths outside ~/.claude*/~/.codex*); the session

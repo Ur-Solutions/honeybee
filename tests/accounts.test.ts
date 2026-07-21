@@ -316,7 +316,7 @@ function opencodeAuthJson(provider: string, token: string): string {
   return JSON.stringify({ [provider]: { type: "api", key: token } });
 }
 
-function grokAuthJson(email: string, createTime: string, token: string): string {
+function grokAuthJson(email: string, createTime: string, token: string, refreshable = true): string {
   const created = new Date(createTime);
   const expiresAt = new Date(created.getTime() + 6 * 60 * 60 * 1000).toISOString();
   return JSON.stringify({
@@ -324,7 +324,7 @@ function grokAuthJson(email: string, createTime: string, token: string): string 
       auth_mode: "oidc",
       email,
       key: `key-${token}`,
-      refresh_token: `refresh-${token}`,
+      ...(refreshable ? { refresh_token: `refresh-${token}` } : {}),
       create_time: createTime,
       expires_at: expiresAt,
       principal_type: "User",
@@ -526,12 +526,22 @@ test("grok sync refuses a newer shared-home auth that belongs to another email",
   });
 });
 
-test("grok auth freshness check rejects expired or nearly expired OAuth", async () => {
+test("grok auth freshness allows refreshable OAuth but rejects stale access-only credentials", async () => {
   await withTempStore(async (dir) => {
     const home = join(dir, "homes", "grok");
     await writeDatedFile(
       join(home, "auth.json"),
       grokAuthJson("stale@a.b", "2026-06-01T00:00:00.000Z", "stale"),
+      "2026-06-01T00:00:00.000Z",
+    );
+
+    await assert.doesNotReject(
+      () => assertGrokHomeAuthFresh(home, { accountId: "grok-stale", now: () => Date.parse("2026-06-01T06:01:00.000Z") }),
+    );
+
+    await writeDatedFile(
+      join(home, "auth.json"),
+      grokAuthJson("stale@a.b", "2026-06-01T00:00:00.000Z", "stale", false),
       "2026-06-01T00:00:00.000Z",
     );
 
@@ -547,10 +557,24 @@ test("grok auth freshness check rejects expired or nearly expired OAuth", async 
   });
 });
 
-test("grok activation refuses to stamp expired auth into a home", async () => {
+test("grok activation stamps an expired refreshable chain so Grok can rotate it", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("grok", "refreshable@a.b");
+    const auth = grokAuthJson("refreshable@a.b", "2026-06-01T00:00:00.000Z", "refreshable");
+    await writeFile(join(accountDir(account), "auth.json"), auth);
+    const home = join(dir, "homes", account.id);
+
+    await assert.doesNotReject(
+      () => activateAccountIntoHome(account, home, { now: () => Date.parse("2026-06-01T06:01:00.000Z") }),
+    );
+    assert.equal(await readFile(join(home, "auth.json"), "utf8"), auth);
+  });
+});
+
+test("grok activation refuses to stamp expired access-only auth into a home", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("grok", "expired@a.b");
-    await writeFile(join(accountDir(account), "auth.json"), grokAuthJson("expired@a.b", "2026-06-01T00:00:00.000Z", "expired"));
+    await writeFile(join(accountDir(account), "auth.json"), grokAuthJson("expired@a.b", "2026-06-01T00:00:00.000Z", "expired", false));
     const home = join(dir, "homes", account.id);
 
     await assert.rejects(

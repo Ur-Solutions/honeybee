@@ -34,16 +34,19 @@ test("providerAdapter / hasProviderAdapter reject unknown and undefined ids", ()
   assert.equal(providerAdapter(undefined), undefined);
 });
 
-test("S3 wires fetchLimits for zai/minimax only; isExhausted/login stay unwired", () => {
-  // S3: the two opencode-hosted providers with documented quota endpoints get
-  // a fetchLimits; everyone else stays unsupported (degrades gracefully).
-  const FETCH_PROVIDERS = new Set<ProviderId>(["zai-coding-plan", "minimax-coding-plan"]);
+test("every provider except the anthropic/openai dispatch paths wires fetchLimits; isExhausted/login stay unwired", () => {
+  // anthropic/openai route through the heavyweight ./limits/claude and
+  // ./limits/codex paths via an explicit dispatch check (cycle avoidance);
+  // every other provider carries its own registry fetcher — real quota
+  // endpoints for zai/minimax/moonshot/kimi-for-coding/cursor, session
+  // exhaustion facts for xai (which has no quota API).
+  const DISPATCH_PROVIDERS = new Set<ProviderId>(["anthropic", "openai"]);
   for (const id of ALL_IDS) {
     const adapter = providerAdapter(id)!;
-    if (FETCH_PROVIDERS.has(id)) {
-      assert.equal(typeof adapter.fetchLimits, "function", `${id}.fetchLimits wired in S3`);
+    if (DISPATCH_PROVIDERS.has(id)) {
+      assert.equal(adapter.fetchLimits, undefined, `${id}.fetchLimits stays on the dispatch path`);
     } else {
-      assert.equal(adapter.fetchLimits, undefined, `${id}.fetchLimits stays unsupported`);
+      assert.equal(typeof adapter.fetchLimits, "function", `${id}.fetchLimits wired`);
     }
     // Pane signals stay on the DRIVER (CLI-keyed), not the provider adapter.
     assert.equal(adapter.isExhausted, undefined, `${id}.isExhausted unwired`);

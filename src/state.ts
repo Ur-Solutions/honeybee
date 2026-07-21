@@ -66,6 +66,12 @@ export type StateContext = {
    * mirror.
    */
   hsrMirrors?: Set<string>;
+  /**
+   * HSR records whose batch observation failed this tick. Missing evidence is
+   * not death: deriveState holds their last trustworthy state and the daemon
+   * skips persistence until observation recovers.
+   */
+  hsrUnavailable?: Set<string>;
   now?: number;
 };
 
@@ -135,6 +141,11 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   const nodeName = record.node && record.node.length > 0 ? record.node : LOCAL_NODE_NAME;
   if (context.unreachableNodes?.has(nodeName)) {
     return { state: "node_unreachable", detail: `node ${nodeName} offline` };
+  }
+
+  if (context.hsrUnavailable?.has(record.name)) {
+    if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
+    return heldHsrStateForUnavailableObservation(record, context);
   }
 
   // HSR bees are pane-less: they have neither a live pane nor a live tmux target,
@@ -299,6 +310,21 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
   const snapshot = context.hsrSnapshots?.get(record.name) ?? "";
   if (snapshot.length > 0) return { state: "idle_with_output", detail: describeIdle(record, now) };
   return bootingOrWedged(record, now);
+}
+
+/** Preserve state when the HSR observer itself failed; absence is not liveness evidence. */
+function heldHsrStateForUnavailableObservation(record: SessionRecord, context: StateContext): DerivedState {
+  const previous = context.previousStates?.get(record.name) ?? parseBeeState(record.lastObservedState);
+  if (previous) {
+    return { state: previous, detail: "HSR observation unavailable — keeping previous state" };
+  }
+
+  const now = context.now ?? Date.now();
+  const promptAt = record.lastPromptAt ? Date.parse(record.lastPromptAt) : NaN;
+  if (Number.isFinite(promptAt) && now - promptAt < ACTIVE_WINDOW_MS) {
+    return { state: "active", detail: describeActivity(record) };
+  }
+  return { state: "ready", detail: "HSR observation unavailable" };
 }
 
 /**

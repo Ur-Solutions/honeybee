@@ -144,7 +144,7 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
     interrupt: guarded(async (params) => {
       const p = (params ?? {}) as { bee?: unknown };
       const result = await proxyCall(String(p.bee ?? ""), "interrupt");
-      return result.ok ? { ok: true } : result;
+      return result.ok ? { ok: true, result: result.result } : result;
     }),
 
     answer: guarded(async (params) => {

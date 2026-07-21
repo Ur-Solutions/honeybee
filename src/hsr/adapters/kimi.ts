@@ -479,10 +479,10 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
       else queued.push(text);
       void pump();
     },
-    async interrupt(): Promise<void> {
-      if (hasExited()) return;
+    async interrupt() {
+      if (hasExited()) return { status: "already_idle" } as const;
       cancelPendingInputs();
-      if (!active) return;
+      if (!active) return { status: "already_idle" } as const;
       const settlement = activeSettlement;
       const generation = activeGeneration;
       cancelledGenerations.add(generation);
@@ -493,6 +493,7 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
           throw new Error(`hsr kimi: session/cancel did not settle within ${INTERRUPT_SETTLE_TIMEOUT_MS}ms`);
         }),
       ]);
+      return { status: "interrupt_requested" } as const;
     },
     async answer(requestId, answer): Promise<void> {
       const pending = pendingInputs.get(requestId);

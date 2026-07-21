@@ -90,12 +90,49 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
         "relayed hsr.event turn_end",
       );
 
+      // Interrupting an already-idle runner is an idempotent success. The
+      // structured result is preserved through host → daemon, and no fake
+      // turn_end is emitted for clients to wait on.
+      const idleEndCount = relayed.filter((r) => r.event.type === "turn_end").length;
+      const idleInterrupt = (await client.call("interrupt", { bee })) as Record<string, unknown>;
+      assert.deepEqual(idleInterrupt, {
+        ok: true,
+        result: { status: "already_idle" },
+      });
+      await sleep(30);
+      assert.equal(
+        relayed.filter((r) => r.event.type === "turn_end").length,
+        idleEndCount,
+        "idle interrupt must not synthesize a lifecycle boundary",
+      );
+
+      // A live turn reports that an interrupt was requested and then emits the
+      // real turn_end boundary consumed by Apiary.
+      await client.call("send", { bee, text: "hang forever" });
+      await waitFor(
+        () => relayed.some((r) => r.event.type === "text" && r.event.text === "hanging:hang forever"),
+        "hanging turn started",
+      );
+      const activeInterrupt = (await client.call("interrupt", { bee })) as Record<string, unknown>;
+      assert.deepEqual(activeInterrupt, {
+        ok: true,
+        result: { status: "interrupt_requested" },
+      });
+      await waitFor(
+        () => relayed.filter((r) => r.event.type === "turn_end").length > idleEndCount,
+        "interrupted turn ended",
+      );
+
       await client.call("send", { bee, text: "ask me" });
       await waitFor(
         () => relayed.some((r) => r.bee === bee && r.event.type === "needs_input"),
         "relayed needs_input",
       );
-      const pending = (await client.call("pendingInput", { bee })) as Record<string, unknown>;
+      await waitFor(async () => {
+        return (await client.call("pendingInput", { bee })) !== null;
+      }, "pending input persisted");
+      const pending = (await client.call("pendingInput", { bee })) as Record<string, unknown> | null;
+      assert.ok(pending);
       assert.equal(pending.requestId, "r1");
       assert.equal(pending.question, "proceed?");
       assert.equal(pending.kind, "question");

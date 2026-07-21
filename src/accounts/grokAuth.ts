@@ -13,6 +13,8 @@ import {
 export type GrokAuthSnapshot = {
   raw: string;
   emails: Set<string>;
+  /** Grok can silently rotate an expired access token when this is present. */
+  hasRefreshToken: boolean;
   createTimeMs?: number;
   expiresAtMs?: number;
   mtimeMs: number;
@@ -38,10 +40,12 @@ function parseGrokAuth(raw: string | null, source: string, mtimeMs: number): Gro
     let createTimeMs: number | undefined;
     let expiresAtMs: number | undefined;
     let hasCredentialEntry = false;
+    let hasRefreshToken = false;
     for (const entry of entries) {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
       const object = entry as Record<string, unknown>;
       if (typeof object.key === "string" || typeof object.refresh_token === "string") hasCredentialEntry = true;
+      if (typeof object.refresh_token === "string" && object.refresh_token.length > 0) hasRefreshToken = true;
       if (typeof object.email === "string") emails.add(object.email);
       const create = parseTimeMs(object.create_time);
       const expires = parseTimeMs(object.expires_at);
@@ -49,7 +53,7 @@ function parseGrokAuth(raw: string | null, source: string, mtimeMs: number): Gro
       if (expires !== undefined) expiresAtMs = Math.max(expiresAtMs ?? expires, expires);
     }
     if (!hasCredentialEntry) return null;
-    return { raw, emails, ...(createTimeMs !== undefined ? { createTimeMs } : {}), ...(expiresAtMs !== undefined ? { expiresAtMs } : {}), mtimeMs, source };
+    return { raw, emails, hasRefreshToken, ...(createTimeMs !== undefined ? { createTimeMs } : {}), ...(expiresAtMs !== undefined ? { expiresAtMs } : {}), mtimeMs, source };
   } catch {
     return null;
   }
@@ -72,6 +76,11 @@ function isFresherGrokAuth(candidate: GrokAuthSnapshot, current: GrokAuthSnapsho
 export function grokAuthUnavailableReason(snapshot: GrokAuthSnapshot | null, now: number, skewMs = GROK_AUTH_EXPIRY_SKEW_MS): string | null {
   if (!snapshot) return "missing auth.json";
   if (snapshot.expiresAtMs === undefined) return null;
+  // Grok owns refresh-token rotation and refreshes the access token during
+  // startup. Rejecting a refreshable chain here prevents the harness from ever
+  // reaching that path and turns every ordinary access-token expiry into a
+  // needless interactive login. Keep the hard gate for non-refreshable tokens.
+  if (snapshot.hasRefreshToken) return null;
   const expiresAt = new Date(snapshot.expiresAtMs).toISOString();
   if (snapshot.expiresAtMs <= now) return `OAuth token expired at ${expiresAt}`;
   if (snapshot.expiresAtMs <= now + skewMs) return `OAuth token expires soon at ${expiresAt}`;

@@ -5,6 +5,7 @@ import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAc
 import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { syncBeesSidebarLayout } from "../beesSidebar.js";
 import { beeConfig } from "../config.js";
+import { parseContractFlag, withContractPostscript, type BeeContract } from "../contract.js";
 import { agentKinds, defaultsToSoleCredentialedAccount, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { listFlows } from "../flow/index.js";
@@ -25,7 +26,7 @@ import { createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarm
 import { pickRoundRobinAccount } from "../limits/autoPick.js";
 import { startSpawnTimer, type SpawnTimer } from "../spawnTiming.js";
 import { chooseNewBee, type SpawnTuiAccount } from "../spawnTui.js";
-import { safeName, saveSession, type SessionRecord } from "../store.js";
+import { loadSession, safeName, saveSession, type SessionRecord } from "../store.js";
 import { resolveSpawningBeeId } from "../spawnParent.js";
 import { localSubstrate, remoteHsrSubstrateForNode, substrateForRecord } from "../substrates/index.js";
 import { createSwarm } from "../swarm.js";
@@ -125,6 +126,13 @@ export type SpawnOptions = {
   caste?: string;
   brief?: string;
   /**
+   * Completion contract (CL.701 §4.1). A seal contract appends a deterministic
+   * postscript to the brief (record + delivery) demanding a typed seal with
+   * the contract's taskId/attempt, and is persisted on the SessionRecord so
+   * consumers can enforce it mechanically.
+   */
+  contract?: BeeContract;
+  /**
    * The spawning bee's id, for the durable orchestrator→worker edge. Normally
    * left unset and captured automatically from the spawn context (HIVE_BEE /
    * agent pane); set explicitly to override (e.g. a flow attributing children to
@@ -200,6 +208,9 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // child carries a durable parent edge the fleet surface can walk. Undefined
   // for operator/daemon-launched roots.
   const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
+  // A seal contract appends its deterministic postscript to the brief so the
+  // record AND every delivery path carry the demand (CL.701 §4.1).
+  const brief = withContractPostscript(opts.brief, opts.contract);
   // An account-bound spawn gets a home (explicit or the account's dedicated
   // slot), the account's credentials activated into it, and the driver's
   // explicit identity env — never a blind HOME rewrite.
@@ -304,6 +315,18 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   timer.mark("allocate");
   const name = safeName(opts.name ?? identity.id);
 
+  // Pane-less spawns (HSR / remote-hsr) have no tmux hasSession guard, so a
+  // duplicate name would silently OVERWRITE the existing session record and
+  // orphan its live runner host (two hosts, one run dir — review CR-1). Refuse
+  // while a running record holds the name; a dead/archived record may be
+  // reused (the overwrite is then deliberate re-creation).
+  if (opts.substrate === "hsr" || opts.node?.kind === "remote-hsr") {
+    const existing = await loadSession(name);
+    if (existing && existing.status === "running") {
+      throw new Error(`session record already exists and is running: ${name} (retire it first, or pick another --name)`);
+    }
+  }
+
   // Remote HSR (APIA-92): the runner host lives ON the remote node. Resolve the
   // AgentSpec LOCALLY (above), then hand the resolved spec to the remote `spawn`
   // RPC — no resolveAgent on the remote. The record carries `node` (routed by
@@ -385,7 +408,8 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.colony ? { colony: opts.colony } : {}),
       ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
       ...(opts.caste ? { caste: opts.caste } : {}),
-      ...(opts.brief ? { brief: opts.brief } : {}),
+      ...(brief ? { brief } : {}),
+      ...(opts.contract ? { contract: opts.contract } : {}),
       ...(spawnedById ? { spawnedById } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
       // UNIT 2: persist the delivered access token's expiry (unix seconds) so the
@@ -465,7 +489,8 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.colony ? { colony: opts.colony } : {}),
       ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
       ...(opts.caste ? { caste: opts.caste } : {}),
-      ...(opts.brief ? { brief: opts.brief } : {}),
+      ...(brief ? { brief } : {}),
+      ...(opts.contract ? { contract: opts.contract } : {}),
       ...(spawnedById ? { spawnedById } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
       ...(opts.autoswap ? { autoswap: true } : {}),
@@ -525,7 +550,8 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.colony ? { colony: opts.colony } : {}),
     ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
     ...(opts.caste ? { caste: opts.caste } : {}),
-    ...(opts.brief ? { brief: opts.brief } : {}),
+    ...(brief ? { brief } : {}),
+    ...(opts.contract ? { contract: opts.contract } : {}),
     ...(spawnedById ? { spawnedById } : {}),
     ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
     ...(opts.account ? { accountId: opts.account.id } : {}),
@@ -758,7 +784,7 @@ export async function bindPoolAllocationToBee(plan: PoolSpawnPlan, allocation: P
 
 export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--kit-profile <p>] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
+  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
   const timer = startSpawnTimer(requested);
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
@@ -785,6 +811,8 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const { useHsr, node } = await resolveSpawnSubstrate(parsed, spec.kind);
   const name = typeof flag(parsed, "name") === "string" ? String(flag(parsed, "name")) : undefined;
   const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
+  const contractRaw = stringFlag(parsed, ["contract"]);
+  const contract = contractRaw !== undefined ? parseContractFlag(contractRaw) : undefined;
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
   // Account binding precedence: explicit --account flag > profile account >
   // <tool>-<account> shorthand / account-id resolution.
@@ -815,7 +843,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, ...(contract ? { contract } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.
@@ -836,12 +864,17 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   // error. Deliver it over the control socket instead — the same channel
   // `hive x`/`hive run` use (deliverPromptToBee).
   const argvPrompt = spawnArgvPrompt(parsed);
-  if (truthy(flag(parsed, "briefed")) && briefText) {
-    const delivered = await deliverSpawnBrief(parsed, record, briefText);
+  // Deliver the record's brief (which carries the contract postscript when a
+  // seal contract was demanded), not the raw --brief text.
+  if (truthy(flag(parsed, "briefed")) && (record.brief ?? briefText)) {
+    const delivered = await deliverSpawnBrief(parsed, record, record.brief ?? briefText!);
     record = delivered.record;
     timer.mark(delivered.sent ? "brief" : "ready");
   } else if (argvPrompt.length > 0 && record.substrate === "hsr") {
-    record = await deliverHsrPrompt(record, argvPrompt);
+    // A seal contract must reach the bee on THIS path too: without --briefed
+    // the postscript lived only on record.brief and the bee was never told to
+    // seal (review CR-9).
+    record = await deliverHsrPrompt(record, withContractPostscript(argvPrompt, contract)!);
     timer.mark("brief");
   } else {
     // Extra positionals on a tmux bee are dropped by the parser today (only a

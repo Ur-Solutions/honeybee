@@ -7,10 +7,12 @@ import { appendLedger } from "./store.js";
 export const SEAL_STATUSES = ["done", "blocked", "needs_input", "failed"] as const;
 export const SEAL_TYPES = ["implementation", "review", "risk", "test", "witness"] as const;
 export const TEST_RUN_RESULTS = ["passed", "failed", "skipped"] as const;
+export const SEAL_ARTIFACT_KINDS = ["branch", "diff", "url", "fixture"] as const;
 
 export type SealStatus = (typeof SEAL_STATUSES)[number];
 export type SealType = (typeof SEAL_TYPES)[number];
 export type TestRunResult = (typeof TEST_RUN_RESULTS)[number];
+export type SealArtifactKind = (typeof SEAL_ARTIFACT_KINDS)[number];
 
 export type TestRun = {
   command: string;
@@ -18,10 +20,37 @@ export type TestRun = {
   notes?: string;
 };
 
+/** A machine-checkable output reference carried inside `evidence.artifacts`. */
+export type SealEvidenceArtifact = {
+  kind: SealArtifactKind;
+  ref: string;
+};
+
+/**
+ * Machine-checkable claims backing a seal (Seal v2). Deliberately additive:
+ * the top-level filesChanged/testsRun stay valid; evidence groups the claims a
+ * downstream validator (flight collection gate, review desk) can check.
+ */
+export type SealEvidence = {
+  filesChanged?: string[];
+  testsRun?: TestRun[];
+  artifacts?: SealEvidenceArtifact[];
+};
+
 export type SealArtifact = {
   status: SealStatus;
   summary: string;
   type?: SealType;
+  /**
+   * Correlation key tying this seal to the unit of work that demanded it —
+   * a flight slot ("FL.3k2/s3"), shard id, or comb activation. Completion
+   * contracts match on it: a seal without the demanded taskId never satisfies
+   * the contract, so a stale or unrelated seal can't be laundered into "done".
+   */
+  taskId?: string;
+  /** Which lease attempt produced this seal (flight slots; 1-based). */
+  attempt?: number;
+  evidence?: SealEvidence;
   filesChanged?: string[];
   testsRun?: TestRun[];
   risks?: string[];
@@ -45,6 +74,7 @@ export type LatestSealScan = {
 const SEAL_STATUS_SET = new Set<string>(SEAL_STATUSES);
 const SEAL_TYPE_SET = new Set<string>(SEAL_TYPES);
 const TEST_RUN_RESULT_SET = new Set<string>(TEST_RUN_RESULTS);
+const SEAL_ARTIFACT_KIND_SET = new Set<string>(SEAL_ARTIFACT_KINDS);
 
 /** Canonical representative input, shared by `hive seal --example` and help. */
 export const SEAL_ARTIFACT_EXAMPLE = {
@@ -81,6 +111,17 @@ Artifact contract
   status        required  string enum: ${SEAL_STATUSES.join(" | ")}
   summary       required  non-empty string
   type          optional  string enum: ${SEAL_TYPES.join(" | ")}
+  taskId        optional  non-empty string — correlation key for completion
+                          contracts (flight slot / shard id); copy it verbatim
+                          from your brief's contract postscript when present
+  attempt       optional  positive integer — the lease attempt that produced
+                          this seal (from the contract postscript)
+  evidence      optional  object with machine-checkable claims:
+    filesChanged  optional  string[]
+    testsRun      optional  object[] (same shape as top-level testsRun)
+    artifacts     optional  object[] with:
+      kind        required  string enum: ${SEAL_ARTIFACT_KINDS.join(" | ")}
+      ref         required  non-empty string
   filesChanged  optional  string[]
   testsRun      optional  object[] with:
     command     required  non-empty string
@@ -124,6 +165,24 @@ export function validateSealArtifact(value: unknown): SealArtifact {
     artifact.type = object.type as SealType;
   }
 
+  if (object.taskId !== undefined) {
+    if (typeof object.taskId !== "string" || object.taskId.trim().length === 0) {
+      throw new Error("Invalid seal: taskId must be a non-empty string");
+    }
+    artifact.taskId = object.taskId;
+  }
+
+  if (object.attempt !== undefined) {
+    if (typeof object.attempt !== "number" || !Number.isSafeInteger(object.attempt) || object.attempt < 1) {
+      throw new Error("Invalid seal: attempt must be a positive integer");
+    }
+    artifact.attempt = object.attempt;
+  }
+
+  if (object.evidence !== undefined) {
+    artifact.evidence = validateSealEvidence(object.evidence);
+  }
+
   if (object.filesChanged !== undefined) {
     if (!Array.isArray(object.filesChanged) || object.filesChanged.some((v) => typeof v !== "string")) {
       throw new Error("Invalid seal: filesChanged must be an array of strings");
@@ -160,6 +219,41 @@ export function validateSealArtifact(value: unknown): SealArtifact {
   return artifact;
 }
 
+function validateSealEvidence(value: unknown): SealEvidence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid seal: evidence must be an object");
+  }
+  const object = value as Record<string, unknown>;
+  const evidence: SealEvidence = {};
+  if (object.filesChanged !== undefined) {
+    if (!Array.isArray(object.filesChanged) || object.filesChanged.some((v) => typeof v !== "string")) {
+      throw new Error("Invalid seal: evidence.filesChanged must be an array of strings");
+    }
+    evidence.filesChanged = object.filesChanged as string[];
+  }
+  if (object.testsRun !== undefined) {
+    if (!Array.isArray(object.testsRun)) throw new Error("Invalid seal: evidence.testsRun must be an array");
+    evidence.testsRun = object.testsRun.map((entry, index) => validateTestRun(entry, index));
+  }
+  if (object.artifacts !== undefined) {
+    if (!Array.isArray(object.artifacts)) throw new Error("Invalid seal: evidence.artifacts must be an array");
+    evidence.artifacts = object.artifacts.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(`Invalid evidence.artifacts[${index}]: expected an object`);
+      }
+      const row = entry as Record<string, unknown>;
+      if (typeof row.kind !== "string" || !SEAL_ARTIFACT_KIND_SET.has(row.kind)) {
+        throw new Error(`Invalid evidence.artifacts[${index}]: kind must be ${SEAL_ARTIFACT_KINDS.join(", ")}`);
+      }
+      if (typeof row.ref !== "string" || row.ref.trim().length === 0) {
+        throw new Error(`Invalid evidence.artifacts[${index}]: ref must be a non-empty string`);
+      }
+      return { kind: row.kind as SealArtifactKind, ref: row.ref };
+    });
+  }
+  return evidence;
+}
+
 function validateTestRun(value: unknown, index: number): TestRun {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`Invalid testsRun[${index}]: expected an object`);
@@ -183,7 +277,15 @@ export async function recordSeal(beeName: string, artifact: SealArtifact): Promi
   await ensureBeeDir(beeName);
   const path = sealPath(beeName, sealedAt);
   await atomicWriteFile(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-  await appendLedger({ type: "seal", session: beeName, sealStatus: artifact.status, sealKind: artifact.type, path });
+  await appendLedger({
+    type: "seal",
+    session: beeName,
+    sealStatus: artifact.status,
+    sealKind: artifact.type,
+    ...(artifact.taskId ? { taskId: artifact.taskId } : {}),
+    ...(artifact.attempt !== undefined ? { attempt: artifact.attempt } : {}),
+    path,
+  });
   return record;
 }
 

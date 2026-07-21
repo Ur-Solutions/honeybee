@@ -216,6 +216,51 @@ test("tick: a throwing dispatchAutoTitle is captured and the tick still complete
   });
 });
 
+test("tick: failed HSR observation holds trusted state and never persists a crash", async () => {
+  await withTempStore(async () => {
+    const activeHsr = bee({
+      name: "active-hsr",
+      tmuxTarget: "active-hsr",
+      substrate: "hsr",
+      lastObservedState: "idle_with_output",
+    });
+    const idleHsr = bee({
+      name: "idle-hsr",
+      tmuxTarget: "idle-hsr",
+      substrate: "hsr",
+      lastObservedState: "idle_with_output",
+    });
+    const tmux = bee({
+      name: "tmux-bee",
+      tmuxTarget: "hive:tmux-bee",
+      lastPromptAt: "2026-06-03T09:59:00.000Z",
+    });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({
+      records: [activeHsr, idleHsr, tmux],
+      liveTargets: new Set([tmux.tmuxTarget]),
+      panes: new Map([[tmux.tmuxTarget, "done\n\n› next task"]]),
+      capture,
+    });
+    const requested: string[][] = [];
+    deps.hsrObservations = async (beeNames) => {
+      requested.push([...beeNames]);
+      return new Promise<Map<string, never>>(() => undefined);
+    };
+    deps.timeouts = { substrateMs: 20 };
+
+    const result = await tick(deps, new Map([[activeHsr.name, "active"]]));
+
+    assert.deepEqual(requested, [[activeHsr.name, idleHsr.name]]);
+    assert.match(result.errors.find((error) => /hsrObservations/.test(error.message))?.message ?? "", /timed out/);
+    assert.equal(result.observed.get(activeHsr.name), "active", "in-memory observation is held while the observer is unavailable");
+    assert.equal(result.observed.get(idleHsr.name), "idle_with_output", "stored observation survives daemon restart");
+    assert.equal(result.transitions.some((transition) => transition.name === activeHsr.name || transition.name === idleHsr.name), false);
+    assert.deepEqual(capture.touches.map((touch) => touch.name), [tmux.name], "unrelated tmux state still persists");
+    assert.equal(capture.touches.some((touch) => touch.fields.lastObservedState === "crashed"), false);
+  });
+});
+
 test("tick: liveness keys qualified by node do not leak across nodes", async () => {
   await withTempStore(async () => {
     const NOW = Date.parse("2026-06-03T10:00:00.000Z");
@@ -724,17 +769,32 @@ test("dispatcher registry: log mappings preserve the daemon log formats", () => 
   assert.equal(autoTitles.log({ bee: "alpha", ok: false, error: "boom" })?.level, "warn");
 });
 
-test("tick: a hung syncChains is timed out and does not block the tick result", async () => {
+test("tick: never calls syncChains — chain sync runs on runDaemon's own track", async () => {
   await withTempStore(async () => {
     const capture: Capture = { ledger: [], touches: [] };
+    let called = 0;
     const deps: TickDeps = {
       ...buildDeps({ records: [], liveTargets: new Set(), capture }),
-      syncChains: () => never(),
-      timeouts: { chainSyncMs: 30 },
+      syncChains: async () => {
+        called += 1;
+      },
     };
 
     const result = await tick(deps, new Map());
 
-    assert.ok(result.errors.some((e) => /syncChains timed out after 30ms/.test(e.message)));
+    assert.equal(called, 0);
+    assert.equal(result.errors.length, 0);
+  });
+});
+
+test("tick: reports per-stage timings for the fixed stages", async () => {
+  await withTempStore(async () => {
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records: [bee()], liveTargets: new Set(), capture });
+    const result = await tick(deps, new Map());
+    for (const stage of ["listSessions", "listNodes", "probeNodes", "capturePanes", "sealedBeeNames", "records", "ledger"]) {
+      assert.ok(stage in result.stageMs, `missing stage timing: ${stage}`);
+      assert.ok(typeof result.stageMs[stage] === "number" && result.stageMs[stage]! >= 0);
+    }
   });
 });

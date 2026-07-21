@@ -63,6 +63,14 @@ export type DaemonState = {
   version: string;
   pid: number;
   recentErrors: RecentError[];
+  /**
+   * Per-stage wall-clock ms of the last COMPLETED tick (listSessions, probes,
+   * per-record loop, each dispatcher). Surfaced by `hive daemon status --json`
+   * so a slow or timing-out stage is diagnosable from status output alone.
+   */
+  lastTickStageMs?: Record<string, number>;
+  /** Total duration of the last completed tick. */
+  lastTickDurationMs?: number;
 };
 
 export type DaemonStaleReason = "loop-stale" | "tick-progress-stale" | "recent-errors-saturated" | "missing-state";
@@ -167,6 +175,16 @@ export async function readDaemonState(): Promise<DaemonState | null> {
           .filter((e): e is { ts: string; msg: string } => !!e && typeof e === "object" && typeof (e as RecentError).ts === "string" && typeof (e as RecentError).msg === "string")
           .map((e) => ({ ts: e.ts, msg: e.msg }))
       : [];
+    const lastTickStageMs =
+      obj.lastTickStageMs && typeof obj.lastTickStageMs === "object" && !Array.isArray(obj.lastTickStageMs)
+        ? Object.fromEntries(
+            Object.entries(obj.lastTickStageMs as Record<string, unknown>).filter(
+              (entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]),
+            ),
+          )
+        : undefined;
+    const lastTickDurationMs =
+      typeof obj.lastTickDurationMs === "number" && Number.isFinite(obj.lastTickDurationMs) ? obj.lastTickDurationMs : undefined;
     return {
       startedAt: obj.startedAt,
       lastTickAt,
@@ -175,6 +193,8 @@ export async function readDaemonState(): Promise<DaemonState | null> {
       pid: obj.pid,
       recentErrors,
       ...(lastSuccessfulTickAt !== undefined ? { lastSuccessfulTickAt } : {}),
+      ...(lastTickStageMs !== undefined ? { lastTickStageMs } : {}),
+      ...(lastTickDurationMs !== undefined ? { lastTickDurationMs } : {}),
     };
   } catch {
     return null;

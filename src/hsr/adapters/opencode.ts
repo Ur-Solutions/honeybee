@@ -1008,11 +1008,15 @@ export async function startOpenCodeRunner(
       else normalQueue.push({ text });
       drain();
     },
-    async interrupt(): Promise<void> {
-      if (stopping || hasExited() || !active) return;
-      await jsonRequest(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }).catch((error) => {
+    async interrupt() {
+      if (stopping || hasExited() || !active) return { status: "already_idle" } as const;
+      try {
+        await jsonRequest(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" });
+      } catch (error) {
         ingestEvent({ type: "error", ts: Date.now(), message: `OpenCode abort failed: ${error instanceof Error ? error.message : String(error)}` });
-      });
+        throw error;
+      }
+      return { status: "interrupt_requested" } as const;
     },
     async answer(requestId: string, answer: RunnerInputAnswer): Promise<void> {
       const pending = pendingInputs.get(requestId);

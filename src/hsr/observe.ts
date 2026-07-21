@@ -31,6 +31,38 @@ import {
 } from "./runDir.js";
 import type { RunnerEvent } from "./types.js";
 
+const DEFAULT_HSR_DISCOVERY_CONCURRENCY = 64;
+const DEFAULT_HSR_OBSERVATION_CONCURRENCY = 32;
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const limit = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
+  const results = new Array<R>(items.length);
+  let next = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index]!, index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  return results;
+}
+
+function observationConcurrency(value: number | undefined): number {
+  const raw = value ?? Number(process.env.HIVE_HSR_OBSERVATION_CONCURRENCY);
+  if (!Number.isFinite(raw) || raw < 1) return DEFAULT_HSR_OBSERVATION_CONCURRENCY;
+  return Math.max(1, Math.floor(raw));
+}
+
 /**
  * Whether a meta record represents a live bee. For a LOCAL host the host pid is
  * authoritative (see file docs). For a MIRROR (APIA-94: `mirrorOfNode` set)
@@ -52,23 +84,31 @@ export async function listHsrBees(): Promise<string[]> {
   } catch {
     return []; // no hsr root yet
   }
-  const bees: string[] = [];
-  for (const name of names) {
-    try {
-      await stat(hsrMetaPath(name));
-      bees.push(name);
-    } catch {
-      // no meta.json (or not a dir) — not an HSR run dir
-    }
-  }
-  return bees.sort();
+  const present = await mapWithConcurrency(
+    names,
+    DEFAULT_HSR_DISCOVERY_CONCURRENCY,
+    async (name) => {
+      try {
+        await stat(hsrMetaPath(name));
+        return name;
+      } catch {
+        return undefined; // no meta.json (or not a dir) — not an HSR run dir
+      }
+    },
+  );
+  return present.filter((name): name is string => name !== undefined).sort();
 }
 
 /** bee → alive (host-pid authoritative; see file docs). */
 export async function hsrLiveness(): Promise<Map<string, boolean>> {
   const liveness = new Map<string, boolean>();
-  for (const bee of await listHsrBees()) {
-    liveness.set(bee, isMetaLive(await readHsrMeta(bee)));
+  const bees = await listHsrBees();
+  const rows = await mapWithConcurrency(bees, observationConcurrency(undefined), async (bee) => ({
+    bee,
+    live: isMetaLive(await readHsrMeta(bee)),
+  }));
+  for (const row of rows) {
+    liveness.set(row.bee, row.live);
   }
   return liveness;
 }
@@ -166,6 +206,14 @@ export type HsrEventSnapshot = {
 
 export type HsrObservationOptions = {
   includeEvents?: boolean;
+  /**
+   * Optional exact bee set. The daemon supplies its running HSR session names
+   * so an observation tick never scans historical/deleted run directories.
+   * Other callers omit this to retain the all-run-dirs behavior.
+   */
+  bees?: Iterable<string>;
+  /** Bounded run-dir read concurrency; defaults to HIVE_HSR_OBSERVATION_CONCURRENCY or 32. */
+  concurrency?: number;
 };
 
 export type HsrEventDerivationOptions = {
@@ -329,38 +377,72 @@ async function readEventSnapshot(bee: string, rootThreadId?: string): Promise<Hs
 }
 
 /**
- * Batch structured observation of every HSR bee, read purely from run dirs (no
- * tmux). Threaded through StateContext so BOTH `hive bees` and the daemon tick
- * derive HSR state and drive transitions/buz-drain from the same source. Never
- * throws: a bad bee yields `{ live: false, snapshot: "" }`.
+ * Batch structured observation of HSR bees, read purely from run dirs (no
+ * tmux). By default every run dir is included; callers with an authoritative
+ * session set can pass `bees` and avoid historical directory discovery.
+ *
+ * Run dirs are observed with bounded concurrency. Exited hosts are metadata-
+ * only: stale ring/events cannot affect state, usage, or needs-input routing,
+ * so rereading them every tick is pure waste. For live hosts, ring and event
+ * reads run concurrently and a requested event snapshot is reused for state.
+ * Never throws: a bad bee yields `{ live: false, snapshot: "" }`.
  */
 export async function hsrObservations(options: HsrObservationOptions = {}): Promise<Map<string, HsrObservation>> {
   const observations = new Map<string, HsrObservation>();
-  for (const bee of await listHsrBees()) {
+  const bees = options.bees === undefined
+    ? await listHsrBees()
+    : [...new Set(options.bees)].sort();
+  const rows = await mapWithConcurrency(bees, observationConcurrency(options.concurrency), async (bee) => {
     try {
       const meta = await readHsrMeta(bee);
+      if (!meta) return undefined;
       const live = isMetaLive(meta);
-      const snapshot = await hsrSnapshot(bee);
       const mirrorOf = meta?.mirrorOfNode;
+      if (!live) {
+        return [bee, {
+          live: false,
+          snapshot: "",
+          ...(mirrorOf ? { mirrorOf } : {}),
+        }] as const;
+      }
+
       const rootThreadId = meta?.sessionId;
-      const eventSnapshot = options.includeEvents ? await readEventSnapshot(bee, rootThreadId) : undefined;
-      // A dead host's stream is gone — leave state undefined so deriveState
-      // settles dead/sealed rather than reporting a stale structured state.
-      const state = live
-        ? meta?.status === "queued"
+      if (options.includeEvents) {
+        const [snapshot, eventSnapshot] = await Promise.all([
+          hsrSnapshot(bee),
+          readEventSnapshot(bee, rootThreadId),
+        ]);
+        const state = meta.status === "queued"
           ? meta.startupPhase === "harness" ? "booting" : "queued"
-          : structuredStateFromEvents(eventSnapshot ? eventSnapshot.tailEvents : await readEventTail(bee), { rootThreadId })
-        : undefined;
-      observations.set(bee, {
+          : structuredStateFromEvents(eventSnapshot.tailEvents, { rootThreadId });
+        return [bee, {
+          live: true,
+          snapshot,
+          state,
+          ...(mirrorOf ? { mirrorOf } : {}),
+          eventSnapshot,
+        }] as const;
+      }
+
+      const [snapshot, events] = await Promise.all([
+        hsrSnapshot(bee),
+        readEventTail(bee),
+      ]);
+      const state = meta.status === "queued"
+        ? meta.startupPhase === "harness" ? "booting" : "queued"
+        : structuredStateFromEvents(events, { rootThreadId });
+      return [bee, {
         live,
         snapshot,
-        ...(state === undefined ? {} : { state }),
+        state,
         ...(mirrorOf ? { mirrorOf } : {}),
-        ...(eventSnapshot ? { eventSnapshot } : {}),
-      });
+      }] as const;
     } catch {
-      observations.set(bee, { live: false, snapshot: "" });
+      return [bee, { live: false, snapshot: "" }] as const;
     }
+  });
+  for (const row of rows) {
+    if (row) observations.set(row[0], row[1]);
   }
   return observations;
 }

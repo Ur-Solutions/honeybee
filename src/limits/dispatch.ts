@@ -3,9 +3,9 @@
 // relative to the REAL limits, per account.
 //
 // This is the dispatch layer: it routes each account to its provider's fetcher
-// (the self-contained zai/minimax adapters on the registry, or the heavyweight
-// claude/codex paths in ./claude and ./codex) and stamps the additive
-// `provider` field uniformly.
+// (the self-contained zai/minimax/moonshot/cursor/xai adapters on the
+// registry, or the heavyweight claude/codex paths in ./claude and ./codex)
+// and stamps the additive `provider` field uniformly.
 // ──────────────────────────────────────────────────────────────────────────
 
 import { resolve } from "node:path";

@@ -155,6 +155,15 @@ export type RunnerOpts = {
 export type RunnerSendOpts = { mode?: "now" | "next-tool" };
 
 /**
+ * Result of requesting a turn interrupt. Interrupt is idempotent: callers must
+ * be able to distinguish an idle no-op from a request that will produce a
+ * future turn_end boundary.
+ */
+export type RunnerInterruptResult =
+  | { status: "already_idle" }
+  | { status: "interrupt_requested" };
+
+/**
  * A live runner session. Steering, interruption, and permission answers route
  * here; `events` is the structured stream and `snapshot()` renders a text tail
  * so the daemon's existing capture/deriveState path keeps functioning.
@@ -164,7 +173,7 @@ export type RunnerSession = {
   tier: RunnerTier;
   pid?: number; // child pid (server tier: the shared server pid)
   send(text: string, opts?: RunnerSendOpts): Promise<void>;
-  interrupt(): Promise<void>;
+  interrupt(): Promise<RunnerInterruptResult>;
   answer(requestId: string, answer: RunnerInputAnswer): Promise<void>; // respond to a needs_input
   events: AsyncIterable<RunnerEvent>;
   snapshot(lines?: number): string; // rendered tail for Substrate.capture() compat

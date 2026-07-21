@@ -23,7 +23,7 @@
  */
 
 import type { ChildProcess } from "node:child_process";
-import type { RunnerEvent, RunnerOpts, RunnerSession } from "./types.js";
+import type { RunnerEvent, RunnerInterruptResult, RunnerOpts, RunnerSession } from "./types.js";
 import { createSessionPlumbing, spawnSessionChild, stopChildGroup } from "./sessionBase.js";
 import { makeLineReader } from "./lineReader.js";
 
@@ -199,14 +199,15 @@ export async function startTurnRunner(config: TurnRunnerConfig, opts: RunnerOpts
     throw new Error("answer not supported by this harness (turn tier)");
   }
 
-  async function interrupt(): Promise<void> {
+  async function interrupt(): Promise<RunnerInterruptResult> {
     const child = currentChild;
-    if (!child) return;
+    if (!child) return { status: "already_idle" };
     try {
       child.kill("SIGINT");
     } catch {
       // best-effort
     }
+    return { status: "interrupt_requested" };
   }
 
   async function stop(): Promise<void> {

@@ -33,7 +33,9 @@ function emptyTickResult(): TickResult {
     autoswaps: [],
     autoTitles: [],
     tokenRefreshes: [],
+    flightSweeps: [],
     durationMs: 0,
+    stageMs: {},
   };
 }
 
