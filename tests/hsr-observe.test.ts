@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -7,7 +7,7 @@ import { connectRpcClient } from "../src/hsr/rpc.js";
 import { runHsrHost } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { hsrObservations, isAuthNeededMessage, structuredStateFromEvents } from "../src/hsr/observe.js";
-import { hsrRunDir } from "../src/hsr/runDir.js";
+import { ensureHsrRunDir, hsrRingPath, hsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { deriveState, type BeeState, type StateContext } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
@@ -75,6 +75,43 @@ function hsrRecord(name: string): SessionRecord {
     status: "running",
   };
 }
+
+test("hsrObservations: scopes reads to requested bees and skips exited payloads", async () => {
+  await withTempStore(async () => {
+    const requested = "requested-live";
+    const ignored = "ignored-live";
+    const exited = "requested-exited";
+    const startedAt = new Date().toISOString();
+
+    for (const bee of [requested, ignored, exited]) {
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, {
+        bee,
+        harness: "stub",
+        tier: "stream",
+        hostPid: process.pid,
+        startedAt,
+        controlSocket: "/tmp/unused.sock",
+        status: bee === exited ? "exited" : "running",
+      });
+    }
+    await writeFile(hsrRingPath(requested), "live output\n");
+    await writeFile(hsrRingPath(ignored), "must not be observed\n");
+    await writeFile(hsrRingPath(exited), "stale exited output\n");
+
+    const observations = await hsrObservations({
+      bees: [requested, exited, "missing", requested],
+      includeEvents: true,
+      concurrency: 2,
+    });
+
+    assert.deepEqual([...observations.keys()], [requested, exited].sort());
+    assert.equal(observations.has(ignored), false);
+    assert.equal(observations.get(requested)?.live, true);
+    assert.equal(observations.get(requested)?.snapshot, "live output\n");
+    assert.deepEqual(observations.get(exited), { live: false, snapshot: "" });
+  });
+});
 
 test("hsrObservations: live structured state feeds deriveState (not dead), dead host → dead", async () => {
   await withTempStore(async () => {

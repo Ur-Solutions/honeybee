@@ -13,7 +13,7 @@
  * Node builtins only.
  */
 
-import type { RunnerEvent, RunnerInputAnswer, RunnerOpts, RunnerSendOpts, RunnerSession, RunnerTier } from "./types.js";
+import type { RunnerEvent, RunnerInputAnswer, RunnerInterruptResult, RunnerOpts, RunnerSendOpts, RunnerSession, RunnerTier } from "./types.js";
 import { attachSessionPlumbing, spawnSessionChild } from "./sessionBase.js";
 import { makeLineReader } from "./lineReader.js";
 
@@ -186,8 +186,8 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     });
   }
 
-  async function interrupt(): Promise<void> {
-    if (plumbing.hasExited()) return;
+  async function interrupt(): Promise<RunnerInterruptResult> {
+    if (plumbing.hasExited() || !turnActive) return { status: "already_idle" };
     // Prefer the harness's in-band interrupt: it ends the TURN and keeps the
     // session alive. SIGINT (the fallback) kills a headless child outright —
     // the host then finalizes the bee as exited, which reads as crashed.
@@ -197,7 +197,7 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
         await new Promise<void>((resolve, reject) => {
           stdin.write(config.encodeInterrupt!(), (err) => (err ? reject(err) : resolve()));
         });
-        return;
+        return { status: "interrupt_requested" };
       } catch {
         // stdin gone — fall through to the signal path.
       }
@@ -207,6 +207,7 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     } catch {
       // best-effort
     }
+    return { status: "interrupt_requested" };
   }
 
   return session;

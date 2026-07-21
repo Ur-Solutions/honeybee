@@ -25,7 +25,7 @@
  */
 
 import type { ChildProcess } from "node:child_process";
-import type { RunnerAdapter, RunnerEvent, RunnerInputAnswer, RunnerInputQuestion, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
+import type { RunnerAdapter, RunnerEvent, RunnerInputAnswer, RunnerInputQuestion, RunnerInterruptResult, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
 import { harnessAllowance } from "../harness.js";
 import { attachSessionPlumbing, spawnSessionChild, stopChildGroup } from "../sessionBase.js";
 import {
@@ -196,6 +196,30 @@ export function isCodexAuthExpiryError(message: string): boolean {
 /** Encode one user turn as a codex UserInput "text" variant (TurnStartParams.input[0]). */
 export function encodeCodexUserInput(text: string): unknown {
   return { type: "text", text, text_elements: [] };
+}
+
+export type CodexTurnLifecycle = {
+  active: boolean;
+  turnId: string;
+};
+
+/** Keep the interrupt target scoped to the currently-live root turn only. */
+export function codexTurnLifecycleAfterNotification(
+  current: CodexTurnLifecycle,
+  method: string,
+  params: unknown,
+): CodexTurnLifecycle {
+  if (method === "turn/completed") return { active: false, turnId: "" };
+  if (method !== "turn/started") return current;
+  const p = asObject(params);
+  const turn = asObject(p?.turn);
+  const turnId =
+    turn && typeof turn.id === "string"
+      ? turn.id
+      : typeof p?.turnId === "string"
+        ? p.turnId
+        : "";
+  return { active: true, turnId };
 }
 
 // The server-request (child→us) methods that are approval/input prompts.
@@ -604,21 +628,15 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
     onChildExit: () => peer.dispose(new Error("codex app-server exited")),
   });
 
-  // Track the live thread + turn ids so interrupt/turn-start carry them.
+  // Track whether the root turn is actually live. Retaining the last completed
+  // turn id makes an idle interrupt look accepted even though no future
+  // turn/completed event can exist for callers waiting on that boundary.
   let threadId = "";
-  let currentTurnId = "";
+  let turnLifecycle: CodexTurnLifecycle = { active: false, turnId: "" };
   const requestMethods = new Map<string, { method: string; params: unknown }>(); // requestId → response context
 
-  const rememberTurnId = (params: unknown): void => {
-    const p = asObject(params);
-    if (!p) return;
-    const turn = asObject(p.turn);
-    if (turn && typeof turn.id === "string") currentTurnId = turn.id;
-    else if (typeof p.turnId === "string") currentTurnId = p.turnId;
-  };
-
   peer.onNotificationCatchAll((method, params) => {
-    rememberTurnId(params);
+    turnLifecycle = codexTurnLifecycleAfterNotification(turnLifecycle, method, params);
     for (const ev of codexNotificationToEvents(method, params)) ingestEvent(ev);
   });
 
@@ -677,11 +695,19 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
     peer.respond(id, encodeCodexApprovalResponse(pending.method, isApproval(answerText), answerText, pending.params));
   }
 
-  async function interrupt(): Promise<void> {
-    if (hasExited() || !threadId) return;
-    await peer
-      .request("turn/interrupt", { threadId, turnId: currentTurnId })
-      .catch(() => undefined);
+  async function interrupt(): Promise<RunnerInterruptResult> {
+    if (hasExited() || !threadId || !turnLifecycle.active) return { status: "already_idle" };
+    if (!turnLifecycle.turnId) throw new Error("hsr codex: active turn has no turn id");
+    try {
+      await peer.request("turn/interrupt", { threadId, turnId: turnLifecycle.turnId });
+    } catch (error) {
+      // The turn may have completed between the active check and the RPC
+      // response. That race is an idempotent idle success; real failures while
+      // the same turn remains live must reach the caller.
+      if (!turnLifecycle.active) return { status: "already_idle" };
+      throw error;
+    }
+    return { status: "interrupt_requested" };
   }
 
   return session;
