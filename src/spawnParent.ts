@@ -9,7 +9,7 @@
 // builders in spawn.ts and agents.ts can both import it without an import cycle.
 // ──────────────────────────────────────────────────────────────────────────
 
-import { listSessions } from "./store.js";
+import { listSessions, loadSession } from "./store.js";
 
 /**
  * The id (or name) of the bee the CURRENT process is running inside, or
@@ -27,12 +27,14 @@ export async function resolveSpawningBeeId(): Promise<string | undefined> {
   const hiveBee = process.env.HIVE_BEE;
   const paneId = process.env.TMUX ? process.env.TMUX_PANE : undefined;
   if (!hiveBee && !paneId) return undefined;
-  const records = await listSessions();
   if (hiveBee && hiveBee.length > 0) {
-    const byEnv = records.find((record) => record.name === hiveBee);
+    // HIVE_BEE names the record directly (HSR children — the agent-spawn hot
+    // path): one record read instead of a full store scan.
+    const byEnv = await loadSession(hiveBee);
     if (byEnv) return byEnv.id ?? byEnv.name;
   }
   if (paneId && paneId.length > 0) {
+    const records = await listSessions();
     const byPane = records.find((record) => record.agentPaneId === paneId);
     if (byPane) return byPane.id ?? byPane.name;
   }

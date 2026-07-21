@@ -37,6 +37,7 @@ import { basename, resolve } from "node:path";
 import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { flowRun } from "../commands/flow.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
+import { hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../hsr/runDir.js";
 
 export async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
   const frameName = typeof flag(parsed, "frame") === "string" ? String(flag(parsed, "frame")) : undefined;
@@ -179,6 +180,14 @@ export type SpawnOptions = {
    * (absent) still gets the home's standing profile via account activation.
    */
   kitProfile?: string;
+  /**
+   * Local HSR only (`--wait-host`): block until the detached runner host
+   * publishes its first meta.json (≤5s) before returning. Off by default — the
+   * record is durable before the fork and the first prompt rides the pending-
+   * turn queue, so nothing on the spawn path needs the child's Node cold start;
+   * opt in when a script wants a confirmed-live host at return.
+   */
+  waitForHost?: boolean;
 };
 
 export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
@@ -414,6 +423,23 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.model ? { model: opts.model } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
+    // Publish a provisional "queued" meta NOW: spawn no longer waits for the
+    // child's cold start, so without this every observer (hasSession, hive run
+    // --wait, the daemon reconciler, Apiary) would read the fresh bee as dead
+    // during the boot window. The child overwrites this with its own startup
+    // meta; skip the write if the child already won that race.
+    if (runnerTier && !(await readHsrMeta(name))) {
+      await writeHsrMeta(name, {
+        bee: name,
+        harness: spec.kind,
+        tier: runnerTier,
+        hostPid,
+        startedAt: new Date().toISOString(),
+        startupPhase: "harness",
+        controlSocket: hsrControlSocketPath(name),
+        status: "queued",
+      }).catch(() => undefined);
+    }
     timer.mark("session-create");
     const command = shellCommand(spec);
     const now = new Date().toISOString();
@@ -450,9 +476,12 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     await saveSession(record);
     await writeSpawnOptions(record);
     timer.mark("persist");
-    // Wait briefly for the host to come up so the spawn returns a live bee. On
-    // timeout still return the record — observe/deriveState will reconcile.
-    if (!(await waitForHsrHost(name, 5000))) {
+    // The record is durable and a first prompt rides the pending-turn queue
+    // (deliverPromptText enqueues against the forked host pid), so the spawn
+    // returns without waiting for the child's Node cold start. `--wait-host`
+    // opts back into a confirmed-live host; observe/deriveState reconcile a
+    // host that never comes up either way.
+    if (opts.waitForHost && !(await waitForHsrHost(name, 5000))) {
       console.error(note(`hsr host for ${name} did not report live within 5s; the daemon will reconcile`));
     }
     if (ownsTimer) timer.report(record.name);
@@ -786,7 +815,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.

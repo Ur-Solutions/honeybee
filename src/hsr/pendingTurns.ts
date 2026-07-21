@@ -11,9 +11,9 @@
 import { randomUUID, createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { atomicWriteFile, storeRoot } from "../fsx.js";
+import { atomicWriteFile, defaultIsPidAlive, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
-import { hsrRunDir } from "./runDir.js";
+import { hsrRunDir, readHsrMeta } from "./runDir.js";
 
 type PendingTurn = {
   id: string;
@@ -82,6 +82,31 @@ export async function drainPendingHsrTurns(bee: string, send: (text: string) => 
     delivered += 1;
   }
   return delivered;
+}
+
+/**
+ * Enqueue a turn for a host that may not have published its meta.json yet.
+ *
+ * spawnBee returns without waiting for the detached host's cold start, so a
+ * bee's first prompt routinely arrives BEFORE meta.json exists. Under the
+ * delivery lock, a missing or "queued" meta means the host's queued→running
+ * drain has not run yet (the running flip and the drain share this same lock —
+ * host.ts), so a turn persisted here is guaranteed to be picked up. Returns
+ * false when the host is past booting (running/exited) or provably dead — the
+ * caller then falls back to the live-send path or its normal error.
+ */
+export async function enqueueTurnForBootingHsrHost(bee: string, hostPid: number | undefined, text: string): Promise<boolean> {
+  return withHsrTurnDeliveryLock(bee, async () => {
+    const meta = await readHsrMeta(bee);
+    if (meta) {
+      if (meta.status !== "queued" || !defaultIsPidAlive(meta.hostPid)) return false;
+      await enqueuePendingHsrTurn(bee, text);
+      return true;
+    }
+    if (hostPid === undefined || !defaultIsPidAlive(hostPid)) return false;
+    await enqueuePendingHsrTurn(bee, text);
+    return true;
+  });
 }
 
 /** Intentional retire/kill cancels prompts that never reached the harness. */

@@ -20,8 +20,6 @@
  * this best-effort — a socket failure must NOT stop the daemon (see run.ts).
  */
 
-import { spawn } from "node:child_process";
-import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
   connectRpcClient,
@@ -50,34 +48,6 @@ export function hsrControlSocketPath(): string {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-/** process.execArgv minus flags that would change the child's execution mode. */
-function inheritableExecArgv(): string[] {
-  return process.execArgv.filter(
-    (arg) => arg !== "--test" && !arg.startsWith("--test=") && arg !== "--watch" && !arg.startsWith("--watch="),
-  );
-}
-
-/** Resolve the CLI entry path (matches runHsrHostFromPayload/spawnDetachedRun). */
-async function resolveEntry(): Promise<string> {
-  const raw = process.argv[1];
-  if (!raw) throw new Error("hsr-control: could not resolve CLI entry (process.argv[1] empty)");
-  try {
-    return await realpath(raw);
-  } catch {
-    return raw;
-  }
-}
-
-/** First tab field of the first tab-bearing porcelain line = the spawned bee name. */
-function parseBeeFromPorcelain(stdout: string): string | null {
-  for (const line of stdout.split("\n")) {
-    if (!line.includes("\t")) continue;
-    const bee = line.split("\t")[0]?.trim();
-    if (bee) return bee;
-  }
-  return null;
 }
 
 export async function startHsrControlServer(opts?: { socketPath?: string }): Promise<HsrControlServer> {
@@ -133,6 +103,11 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
   }
 
   const methods: Record<string, RpcMethodHandler> = {
+    // Feature handshake for clients that must not guess across daemon versions:
+    // spawn:2 = in-process spawnSingleBee with prompt/flags/rest support. An
+    // older daemon rejects this method outright, which reads as "CLI fallback".
+    capabilities: guarded(async () => ({ ok: true, spawn: 2 })),
+
     liveness: guarded(async () => {
       const out: Record<string, boolean> = {};
       for (const [bee, observation] of await hsrObservations()) out[bee] = observation.live;
@@ -240,56 +215,60 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
       return { ok: true };
     }),
 
-    // spawn is a thin shell to `hive spawn` — it needs resolveAgent/account
-    // activation the CLI owns, so we shell the CLI rather than reimplement it.
+    // spawn runs IN-PROCESS in the warm daemon: the whole CLI Node cold-start
+    // (~100ms+) is off the critical path, and the spawn itself is resolve +
+    // persist + fork (spawnBee no longer waits for the runner host either).
+    // spawnSingleBee is the exact code path `hive spawn` runs, so account
+    // aliases, profiles, yolo, and prompt delivery behave identically; the
+    // command graph is imported lazily so daemon boot stays lean and no static
+    // daemon↔commands cycle forms.
     spawn: guarded(async (params) => {
-      const p = (params ?? {}) as { kind?: unknown; cwd?: unknown; model?: unknown; name?: unknown; yolo?: unknown };
+      const p = (params ?? {}) as {
+        kind?: unknown;
+        cwd?: unknown;
+        model?: unknown;
+        name?: unknown;
+        yolo?: unknown;
+        prompt?: unknown;
+        flags?: unknown;
+        rest?: unknown;
+      };
       const kind = String(p.kind ?? "");
       if (!kind) return { ok: false, error: "kind required" };
       const cwd = typeof p.cwd === "string" ? p.cwd : undefined;
       const name = typeof p.name === "string" ? p.name : undefined;
       const model = typeof p.model === "string" ? p.model : undefined;
+      const prompt = typeof p.prompt === "string" && p.prompt.trim().length > 0 ? p.prompt : undefined;
       const yolo = p.yolo === true;
-      const entry = await resolveEntry();
-      const argv = [
-        ...inheritableExecArgv(),
-        entry,
-        "spawn",
-        kind,
-        "--substrate",
-        "hsr",
-        ...(name ? ["--name", name] : []),
-        ...(cwd ? ["--cwd", cwd] : []),
-        ...(yolo ? ["--yolo"] : []),
-        ...(model ? ["--", "--model", model] : []),
-      ];
-      return await new Promise<{ ok: boolean; bee?: string; error?: string }>((resolve) => {
-        const child = spawn(process.execPath, argv, {
-          cwd: cwd ?? process.cwd(),
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        let stdout = "";
-        let stderr = "";
-        child.stdout.on("data", (chunk) => {
-          stdout += chunk.toString();
-        });
-        child.stderr.on("data", (chunk) => {
-          stderr += chunk.toString();
-        });
-        child.on("error", (error) => resolve({ ok: false, error: error.message }));
-        child.on("close", (code) => {
-          if (code !== 0) {
-            resolve({ ok: false, error: stderr.trim() || `hive spawn exited ${code ?? "null"}` });
-            return;
-          }
-          const bee = parseBeeFromPorcelain(stdout);
-          if (!bee) {
-            resolve({ ok: false, error: `could not parse bee from spawn output: ${stdout.trim()}` });
-            return;
-          }
-          resolve({ ok: true, bee });
-        });
+      const { spawnSingleBee } = await import("../commands/spawn.js");
+      // Generic passthrough for callers (Apiary) that speak full spawn flags —
+      // `--account auto`, `--pool`, etc. — plus a harness-flag rest group. The
+      // named params stay for simple callers and win over the passthrough.
+      const flags = new Map<string, string | true | string[]>();
+      if (p.flags && typeof p.flags === "object") {
+        for (const [key, value] of Object.entries(p.flags as Record<string, unknown>)) {
+          if (value === true) flags.set(key, true);
+          else if (typeof value === "string") flags.set(key, value);
+          else if (Array.isArray(value) && value.every((item) => typeof item === "string")) flags.set(key, value as string[]);
+        }
+      }
+      flags.set("substrate", "hsr");
+      if (name) flags.set("name", name);
+      if (cwd) flags.set("cwd", cwd);
+      if (yolo) flags.set("yolo", true);
+      const rest = Array.isArray(p.rest) && (p.rest as unknown[]).every((item) => typeof item === "string")
+        ? [...(p.rest as string[])]
+        : [];
+      if (model) rest.push("--model", model);
+      const record = await spawnSingleBee({
+        command: "spawn",
+        // A positional prompt rides the pending-turn queue (deliverHsrPrompt),
+        // exactly like `hive spawn <kind> "<prompt>" --substrate hsr`.
+        args: prompt ? [kind, prompt] : [kind],
+        flags,
+        rest,
       });
+      return { ok: true, bee: record.name, ...(record.id ? { id: record.id } : {}) };
     }),
   };
 

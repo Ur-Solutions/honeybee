@@ -117,7 +117,24 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
   });
 });
 
-// NOTE: `spawn` is intentionally not exercised here — it shells out to the real
-// `hive spawn` CLI (resolveAgent/account activation), which a store-only unit
-// test cannot drive. Verified manually via the daemon endpoint against a real
-// harness.
+// NOTE: `spawn` now runs spawnSingleBee IN-PROCESS (no CLI shell-out). The
+// happy path needs a real harness binary (resolveAgent/exec-check), which a
+// store-only unit test cannot drive — verified manually via the daemon
+// endpoint. The guarded error path IS exercised below: it must come back as
+// { ok:false, error } over the socket, never a throw.
+test("hsr control socket: spawn with an unknown kind returns ok:false", async () => {
+  await withTempStore(async () => {
+    const server = await startHsrControlServer();
+    const client = await connectRpcClient(server.path);
+    try {
+      const missing = (await client.call("spawn", {})) as { ok: boolean; error?: string };
+      assert.equal(missing.ok, false, "spawn without kind should be ok:false");
+      const unknown = (await client.call("spawn", { kind: "definitely-not-a-harness" })) as { ok: boolean; error?: string };
+      assert.equal(unknown.ok, false, "spawn with an unknown kind should be ok:false");
+      assert.ok((unknown.error ?? "").length > 0, "error message expected");
+    } finally {
+      client.close();
+      await server.close();
+    }
+  });
+});

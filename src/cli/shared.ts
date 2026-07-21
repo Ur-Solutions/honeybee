@@ -16,6 +16,7 @@ import { autoAliasForcesYolo, bootMsForAgent } from "../drivers.js";
 import { actionLine, bold, cyan, dim, formatRelativeTime, green, isPretty, note, red, tildify, yellow } from "../format.js";
 import { writeHiveState } from "../hiveState.js";
 import { hsrObservations, type HsrObservation } from "../hsr/observe.js";
+import { enqueueTurnForBootingHsrHost } from "../hsr/pendingTurns.js";
 import { matchesSessionReference } from "../ids.js";
 import { LOCAL_NODE_NAME, loadNode, loadNodeSync, supportsCapability, type NodeRecord } from "../node.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
@@ -87,18 +88,23 @@ export async function confirmPausedAccount(account: AccountRecord | undefined, p
 
 
 export async function deliverBrief(parsed: Parsed, record: SessionRecord, briefText: string): Promise<SessionRecord> {
-  try {
-    await waitForAgentReady(record, {
-      timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
-      acceptTrust: acceptsTrust(parsed),
-      raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
-    });
-  } catch (error) {
-    if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
-    console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, briefing anyway`]));
+  // HSR bees have no pane to scrape for readiness; their brief rides the
+  // durable pending-turn queue (deliverPromptText) and is handed to the harness
+  // when its host finishes booting.
+  if (record.substrate !== "hsr") {
+    try {
+      await waitForAgentReady(record, {
+        timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
+        acceptTrust: acceptsTrust(parsed),
+        raiseDroidAutonomy: dangerousMode(parsed, record.agent, record.requestedAgent),
+      });
+    } catch (error) {
+      if (!(error instanceof AgentReadinessError) || error.reason !== "timeout" || !truthy(flag(parsed, "force-send"))) throw error;
+      console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, briefing anyway`]));
+    }
   }
   const delivered = augmentBrief(parsed, briefText);
-  await substrateFor(record).sendText(record.tmuxTarget, delivered, record.agentPaneId);
+  await deliverPromptText(record, delivered);
   await writeHiveState(record, "working");
   const now = new Date().toISOString();
   const persisted = await updateSession(record.name, {
@@ -196,6 +202,14 @@ export async function deliverPromptText(record: SessionRecord, prompt: string): 
     await attempt();
     return;
   }
+  // Local HSR fast path: spawn no longer waits for the detached host's cold
+  // start, so a fresh bee's first prompt usually arrives before meta.json
+  // exists. The pending-turn queue is durable from birth — persist the turn and
+  // return instead of polling the boot. (remote-hsr keeps the retry loop:
+  // runnerPid there is a pid on the remote node, unverifiable here.)
+  if (substrate.kind === "hsr" && record.runnerPid !== undefined) {
+    if (await enqueueTurnForBootingHsrHost(record.tmuxTarget, record.runnerPid, prompt)) return;
+  }
   await retryWhileHsrHostBoots(attempt, {
     onRetry: () => {
       if (isPretty()) console.error(actionLine("warn", "send", [bold(record.name), "waiting for the hsr runner host to boot"]));
@@ -217,12 +231,12 @@ export async function deliverPromptText(record: SessionRecord, prompt: string): 
  * the same `sendText` → `send` RPC path `hive x`/`hive run` use
  * (deliverPromptToBee) — the only channel an HSR bee acts on.
  *
- * No `waitForAgentReady`: HSR bees have no pane to scrape. But the runner host
- * is NOT guaranteed live yet — spawnBee only waits ~5s (waitForHsrHost) and
- * returns the record on timeout, so a one-shot send here raced host boot and
- * lost the prompt ("HSR bee X has no live runner host to steer") — reliably so
- * on burst spawns. Retry over the boot window instead, so spawn+prompt is
- * atomic across a slow host boot.
+ * No `waitForAgentReady`: HSR bees have no pane to scrape. And the runner host
+ * is NOT guaranteed live yet — spawnBee returns as soon as the record is
+ * durable, without waiting for the detached host's cold start. deliverPromptText
+ * handles that window: it persists the turn into the host's pending-turn queue
+ * (enqueueTurnForBootingHsrHost) and falls back to a bounded retry only when
+ * the queue is not usable, so spawn+prompt stays atomic across host boot.
  */
 export async function deliverHsrPrompt(record: SessionRecord, prompt: string): Promise<SessionRecord> {
   await deliverPromptText(record, prompt);
@@ -515,9 +529,12 @@ export async function spawnOriginIsAgent(): Promise<boolean> {
   const hiveBee = process.env.HIVE_BEE;
   const paneId = process.env.TMUX ? process.env.TMUX_PANE : undefined;
   if (!hiveBee && !paneId) return false;
+  // HIVE_BEE names the record directly (HSR children — the agent-spawn hot
+  // path): one record read instead of a full store scan.
+  if (hiveBee && (await loadSession(hiveBee))) return true;
+  if (!paneId) return false;
   const records = await listSessions();
-  if (hiveBee && records.some((record) => record.name === hiveBee)) return true;
-  return Boolean(paneId && records.some((record) => record.agentPaneId === paneId));
+  return records.some((record) => record.agentPaneId === paneId);
 }
 
 
