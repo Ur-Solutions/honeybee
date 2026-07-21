@@ -704,7 +704,9 @@ test("tick: a timed-out dispatcher stage is captured and later stages still run"
 
     const result = await tick(deps, new Map());
 
-    assert.ok(result.errors.some((e) => /sampleUsage timed out after 30ms/.test(e.message)));
+    // Budget timeouts are policy: recorded as truncation, never as errors.
+    assert.ok(result.truncated.some((name) => name.startsWith("sampleUsage@")));
+    assert.equal(result.errors.length, 0);
     assert.deepEqual(result.usage, []);
     assert.deepEqual(result.autoTitles, [{ bee: record.name, ok: true, title: "Still titled" }]);
   });
@@ -903,11 +905,10 @@ test("canary round 3: the shared dispatch pool bounds the registry — stages ca
     // Without the shared pool this would take >=1000ms (two 500ms stages) —
     // with it, the dispatcher phase is bounded near dispatchTotalMs.
     assert.ok(elapsed < 700, `dispatcher phase took ${elapsed}ms — pool did not bound it`);
-    // The starved stages are recorded, never fatal.
-    assert.ok(result.errors.some((e) => /sampleUsage timed out|sampleUsage skipped/.test(e.message)));
-    assert.ok(
-      result.errors.some((e) => /dispatchAutoTitle (timed out|skipped)/.test(e.message)) || poolRan === false,
-    );
+    // The starved stages are recorded as TRUNCATED (policy), never as errors.
+    assert.ok(result.truncated.some((name) => name.startsWith("sampleUsage@")));
+    assert.ok(result.truncated.some((name) => name.startsWith("dispatchAutoTitle@")) || poolRan === false);
+    assert.equal(result.errors.length, 0, "budget enforcement must not manufacture errors");
   });
 });
 
@@ -943,6 +944,7 @@ test("canary round 4: a slow usage sampler starves itself, never the flight stag
     // was bounded; whatever followed it was starved instead of the flights.
     assert.deepEqual(ran.filter((name) => name === "sweepFlights"), ["sweepFlights"]);
     assert.ok(result.stageMs.sweepFlights !== undefined, "flight stage executed and was timed");
-    assert.ok(result.errors.some((e) => /sampleUsage timed out/.test(e.message)));
+    assert.ok(result.truncated.some((name) => name.startsWith("sampleUsage@")));
+    assert.equal(result.errors.length, 0, "budget enforcement must not manufacture errors");
   });
 });

@@ -36,6 +36,7 @@ function emptyTickResult(): TickResult {
     flightSweeps: [],
     durationMs: 0,
     stageMs: {},
+    truncated: [],
   };
 }
 
