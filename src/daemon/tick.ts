@@ -10,6 +10,8 @@ import type { NeedsInputOutcome } from "./needsInput.js";
 import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./nodeReachability.js";
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
+import type { FlightSweeper } from "./flightSweep.js";
+import type { FlightSweepOutcome } from "../flight/controller.js";
 import type { UsageSampler, UsageTickOutcome } from "./usageSampler.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { LogInput } from "./log.js";
@@ -37,9 +39,12 @@ export type TickDeps = {
    * Cross-process observation of pane-less HSR bees, read from run dirs (host-pid
    * liveness + structured event state). Threaded into the tick's StateContext so
    * the daemon derives HSR state and drives transitions/buz-drain for HSR bees
-   * exactly like tmux bees. Absent → no HSR bees observed this tick.
+   * exactly like tmux bees. Absent → no HSR bees observed this tick. The default
+   * wiring runs the sweep in a disposable child process (observerProcess.ts) so
+   * a wedged fs call can never poison the daemon's own threadpool; `close`
+   * tears the child down at shutdown.
    */
-  hsrObservations?: () => Promise<Map<string, HsrObservation>>;
+  hsrObservations?: ((beeNames: readonly string[]) => Promise<Map<string, HsrObservation>>) & { close?: () => Promise<void> };
   /**
    * Optional remote-event mirror (APIA-94): for each live remote-hsr bee,
    * maintains an `observe` subscription to its node's serve and replays every
@@ -132,9 +137,19 @@ export type TickDeps = {
    */
   sweepPools?: PoolSweeper;
   /**
+   * Optional flight reconciler (CL.701 §4.2): drives slot leases from this
+   * tick's records + observed states — contract-matched seal completion,
+   * readiness/first-evidence/stall deadlines, idempotent replacement under
+   * backpressure. Build once per daemon run (createFlightSweeper).
+   */
+  sweepFlights?: FlightSweeper;
+  /**
    * Optional credential sync: pulls rotated/refreshed auth from the accounts'
    * homes back into the vault. The default wiring throttles itself — most
-   * ticks are a no-op.
+   * runs are a no-op. NOT called by tick(): runDaemon drives it on its own
+   * track so a keychain prompt or a sweep over hundreds of homes can never
+   * starve the observation loop (the recurring listSessions-timeout breach
+   * cycle traced back to heavy fs work sharing the tick's sequential path).
    */
   syncChains?: () => Promise<void>;
   /** Per-call hard budgets; unset fields fall back to defaultTickTimeouts(). */
@@ -181,6 +196,8 @@ export type DispatcherOutcomes = {
   tokenRefreshes: TokenRefreshOutcome[];
   /** Checkout-pool sweep outcomes (empty on throttled/no-op sweeps / not wired). */
   poolSweeps: PoolSweepOutcome[];
+  /** Flight reconciler outcomes (empty when no active flights / not wired). */
+  flightSweeps: FlightSweepOutcome[];
 };
 
 export type TickResult = DispatcherOutcomes & {
@@ -189,6 +206,14 @@ export type TickResult = DispatcherOutcomes & {
   unreachableNodes: Set<string>;
   errors: Error[];
   durationMs: number;
+  /**
+   * Wall-clock milliseconds spent per tick stage (fs reads, probes, the
+   * per-record loop, each dispatcher). Persisted into DaemonState as
+   * lastTickStageMs so `hive daemon status --json` makes a slow stage
+   * diagnosable from the status output alone — the listSessions-timeout
+   * incident was only attributable after ad-hoc log archaeology.
+   */
+  stageMs: Record<string, number>;
 };
 
 /** Everything a tick has observed by the time the dispatcher stages run. */
@@ -240,8 +265,9 @@ type AnyTickDispatcher = { [K in keyof DispatcherOutcomes]: TickDispatcher<K> }[
 /**
  * The dispatcher registry: state-derived work that runs at the end of every
  * tick, strictly in this order (autoswap consumes the usage stage's outcomes).
- * Void periodic tasks with positional constraints (mirrorRemoteEvents,
- * syncChains) stay inline in tick() — they produce no outcomes to log.
+ * Void periodic tasks with positional constraints (mirrorRemoteEvents) stay
+ * inline in tick() — they produce no outcomes to log. syncChains runs on its
+ * own track in runDaemon, outside the tick path entirely.
  */
 export const tickDispatchers: readonly AnyTickDispatcher[] = [
   // The buz queue dispatcher drains tier-B messages for any bee that
@@ -369,6 +395,22 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
             ...(outcome.error ? { error: outcome.error } : {}),
           },
   },
+  // Flight reconciler (CL.701): drive slot leases from this tick's evidence —
+  // seal completion, deadlines, idempotent replacement under backpressure.
+  {
+    key: "flightSweeps",
+    name: "sweepFlights",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed }) => deps.sweepFlights?.(records, observed),
+    log: (outcome) => ({
+      level: outcome.action === "error" ? "warn" : "info",
+      msg: `flight.${outcome.action}`,
+      flight: outcome.flight,
+      ...(outcome.slot ? { slot: outcome.slot } : {}),
+      ...(outcome.detail ? { detail: outcome.detail } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
   // Checkout-pool sweep (§6.6): claim GC, refresh-on-vacate, flags, minFree
   // pre-extend. Self-throttled inside the sweeper — most ticks return [].
   {
@@ -392,7 +434,7 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
 ];
 
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
-  return { buzDrains: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [], poolSweeps: [] };
+  return { buzDrains: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [], flightSweeps: [], poolSweeps: [] };
 }
 
 /**
@@ -406,13 +448,17 @@ async function runTickDispatcher<K extends keyof DispatcherOutcomes>(
   ctx: DispatchContext,
   timeouts: TickTimeouts,
   errors: Error[],
+  stageMs: Record<string, number>,
 ): Promise<void> {
   const pending = dispatcher.run(ctx);
   if (!pending) return;
+  const start = ctx.deps.now();
   try {
     ctx.outcomes[dispatcher.key] = await withTimeout(pending, timeouts[dispatcher.timeoutKey], dispatcher.name);
   } catch (error) {
     errors.push(toError(error));
+  } finally {
+    stageMs[dispatcher.name] = Math.max(0, ctx.deps.now() - start);
   }
 }
 
@@ -468,22 +514,37 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   const start = deps.now();
   const errors: Error[] = [];
   const timeouts: TickTimeouts = { ...defaultTickTimeouts(), ...(deps.timeouts ?? {}) };
+  const stageMs: Record<string, number> = {};
+  const timeStage = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
+    const stageStart = deps.now();
+    try {
+      return await run();
+    } finally {
+      stageMs[name] = Math.max(0, deps.now() - stageStart);
+    }
+  };
 
-  const records: SessionRecord[] = await guard(withTimeout(deps.listSessions(), timeouts.fsMs, "listSessions"), errors, []);
-  const nodes: NodeRecord[] = await guard(withTimeout(deps.listNodes(), timeouts.fsMs, "listNodes"), errors, []);
-  const probe: ProbeResult = await guard(
-    withTimeout(deps.probeNodes(nodes), timeouts.substrateMs, "probeNodes"),
-    errors,
-    { liveTargets: new Set<string>(), unreachableNodes: new Set<string>() },
-  );
-  const panes: PaneCaptureMap = await guard(
-    withTimeout(deps.capturePanes(records, probe.liveTargets), timeouts.substrateMs, "capturePanes"),
-    errors,
-    new Map(),
-  );
-  const seals: Set<string> = await guard(withTimeout(deps.sealedBeeNames(), timeouts.fsMs, "sealedBeeNames"), errors, new Set());
+  const records: SessionRecord[] = await timeStage("listSessions", () =>
+    guard(withTimeout(deps.listSessions(), timeouts.fsMs, "listSessions"), errors, []));
+  const nodes: NodeRecord[] = await timeStage("listNodes", () =>
+    guard(withTimeout(deps.listNodes(), timeouts.fsMs, "listNodes"), errors, []));
+  const probe: ProbeResult = await timeStage("probeNodes", () =>
+    guard(
+      withTimeout(deps.probeNodes(nodes), timeouts.substrateMs, "probeNodes"),
+      errors,
+      { liveTargets: new Set<string>(), unreachableNodes: new Set<string>() },
+    ));
+  const panes: PaneCaptureMap = await timeStage("capturePanes", () =>
+    guard(
+      withTimeout(deps.capturePanes(records, probe.liveTargets), timeouts.substrateMs, "capturePanes"),
+      errors,
+      new Map(),
+    ));
+  const seals: Set<string> = await timeStage("sealedBeeNames", () =>
+    guard(withTimeout(deps.sealedBeeNames(), timeouts.fsMs, "sealedBeeNames"), errors, new Set()));
   const livePanes: Set<string> = deps.livePanes
-    ? await guard(withTimeout(deps.livePanes(), timeouts.substrateMs, "livePanes"), errors, new Set<string>())
+    ? await timeStage("livePanes", () =>
+        guard(withTimeout(deps.livePanes!(), timeouts.substrateMs, "livePanes"), errors, new Set<string>()))
     : new Set<string>();
 
   // Remote-event mirror (APIA-94): refresh subscriptions + replay remote-hsr
@@ -491,19 +552,42 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
   // guard as the other dispatchers; errors are captured, never fatal.
   if (deps.mirrorRemoteEvents) {
     try {
-      await withTimeout(deps.mirrorRemoteEvents(records), timeouts.dispatchMs, "mirrorRemoteEvents");
+      await timeStage("mirrorRemoteEvents", () => withTimeout(deps.mirrorRemoteEvents!(records), timeouts.dispatchMs, "mirrorRemoteEvents"));
     } catch (error) {
       errors.push(toError(error));
     }
   }
 
-  // Observe pane-less HSR bees from their run dirs. Same per-call budget +
-  // guard as every other external await in the tick — a wedged fs read is
-  // converted into a skipped stage (empty map) and a recentErrors entry, never
-  // an unbounded await that freezes the loop.
-  const hsrObs: Map<string, HsrObservation> = deps.hsrObservations
-    ? await guard(withTimeout(deps.hsrObservations(), timeouts.substrateMs, "hsrObservations"), errors, new Map())
-    : new Map();
+  // Observe only RUNNING records whose substrate is local HSR or whose node is
+  // remote-hsr. The observer used to enumerate every historical run dir on
+  // every tick (hundreds in a busy hive), including exited bees whose events
+  // can no longer affect state.
+  const remoteHsrNodes = new Set(nodes.filter((node) => node.kind === "remote-hsr").map((node) => node.name));
+  const hsrBeeNames = records
+    .filter((record) => record.status === "running" && (
+      record.substrate === "hsr" || (record.node !== undefined && remoteHsrNodes.has(record.node))
+    ))
+    .map((record) => record.name);
+
+  // A failed observation batch is UNKNOWN, not an authoritative empty result.
+  // Keep the last trustworthy state for its records and do not persist/mirror a
+  // fabricated terminal state. This is deliberately separate from a successful
+  // empty map, which really does mean the requested run dirs are gone.
+  let hsrObs = new Map<string, HsrObservation>();
+  const hsrUnavailable = new Set<string>();
+  if (hsrBeeNames.length > 0) {
+    if (deps.hsrObservations) {
+      try {
+        hsrObs = await timeStage("hsrObservations", () =>
+          withTimeout(deps.hsrObservations!(hsrBeeNames), timeouts.substrateMs, "hsrObservations"));
+      } catch (error) {
+        errors.push(toError(error));
+        for (const bee of hsrBeeNames) hsrUnavailable.add(bee);
+      }
+    } else {
+      for (const bee of hsrBeeNames) hsrUnavailable.add(bee);
+    }
+  }
   const hsrLive = new Set<string>();
   const hsrStates = new Map<string, BeeState>();
   const hsrSnapshots = new Map<string, string>();
@@ -527,6 +611,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     hsrStates,
     hsrSnapshots,
     hsrMirrors,
+    hsrUnavailable,
     now: nowMs,
   };
 
@@ -541,7 +626,11 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     const liveHiveState = liveHiveStateFor(record, probe);
     const staleHiveState = mappedHiveState !== undefined && liveHiveState !== undefined && liveHiveState !== mappedHiveState;
     const uncertainBooting = derived.state === "booting" && liveHiveState !== undefined && liveHiveState.length > 0;
-    const transitioned = prev !== derived.state;
+    const observationUnavailable = hsrUnavailable.has(record.name);
+    // A seal or offline node is independently trustworthy even when the local
+    // HSR run-dir batch failed. Every other HSR state is held, not republished.
+    const observationTrusted = !observationUnavailable || derived.state === "sealed" || derived.state === "node_unreachable";
+    const transitioned = observationTrusted && prev !== derived.state;
     if (transitioned) {
       transitions.push({ name: record.name, from: prev, to: derived.state });
     }
@@ -550,12 +639,14 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     return {
       record,
       state: derived.state,
-      mirrorHiveState: (transitioned || staleHiveState) && !uncertainBooting,
-      refreshTranscriptMetadata: !archived && (!terminal || !record.transcriptPath) && deps.refreshTranscriptMetadata !== undefined,
+      persistObservation: observationTrusted,
+      mirrorHiveState: observationTrusted && (transitioned || staleHiveState) && !uncertainBooting,
+      refreshTranscriptMetadata:
+        observationTrusted && !archived && (!terminal || !record.transcriptPath) && deps.refreshTranscriptMetadata !== undefined,
     };
   });
 
-  await mapWithConcurrency(
+  await timeStage("records", () => mapWithConcurrency(
     recordPlans,
     envConcurrency("HIVE_DAEMON_RECORD_CONCURRENCY", DEFAULT_RECORD_CONCURRENCY),
     async (plan) => {
@@ -569,18 +660,21 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
         }
       }
 
-      // Persist the latest observed state. Errors are captured but do not abort the loop.
-      try {
-        await withTimeout(
-          deps.touchSession(record.name, {
-            lastObservedState: plan.state,
-            lastObservedStateAt: observedAtIso,
-          }),
-          timeouts.fsMs,
-          `touchSession(${record.name})`,
-        );
-      } catch (error) {
-        errors.push(toError(error));
+      // Persist only trustworthy observations. On an HSR batch timeout the
+      // previous state remains on disk with its original timestamp.
+      if (plan.persistObservation) {
+        try {
+          await withTimeout(
+            deps.touchSession(record.name, {
+              lastObservedState: plan.state,
+              lastObservedStateAt: observedAtIso,
+            }),
+            timeouts.fsMs,
+            `touchSession(${record.name})`,
+          );
+        } catch (error) {
+          errors.push(toError(error));
+        }
       }
 
       // Archived bees are immutable, and dead/sealed bees no longer produce transcript updates — skip the
@@ -595,29 +689,33 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
         }
       }
     },
-  );
+  ));
 
-  // Emit a ledger event for each transition into idle_with_output (the daemon's
-  // headline signal — the buz dispatcher subscribes to this).
-  for (const transition of transitions) {
-    if (transition.to !== "idle_with_output") continue;
-    if (transition.from === undefined) continue; // first observation isn't a transition
-    try {
-      await withTimeout(
-        deps.appendLedger({
-          type: "state.transition",
-          session: transition.name,
-          from: transition.from,
-          to: transition.to,
-          ts: observedAtIso,
-        }),
-        timeouts.fsMs,
-        `appendLedger(state.transition ${transition.name})`,
-      );
-    } catch (error) {
-      errors.push(toError(error));
+  // Emit a ledger event for EVERY state transition — not just into
+  // idle_with_output. The ledger is the event substrate observers (hive
+  // events, Pollinate, flights) subscribe to; ledgering only the buz
+  // dispatcher's headline signal left wedged/crashed/blocked/sealed edges
+  // invisible to anything that doesn't poll derived state itself.
+  await timeStage("ledger", async () => {
+    for (const transition of transitions) {
+      if (transition.from === undefined) continue; // first observation isn't a transition
+      try {
+        await withTimeout(
+          deps.appendLedger({
+            type: "state.transition",
+            session: transition.name,
+            from: transition.from,
+            to: transition.to,
+            ts: observedAtIso,
+          }),
+          timeouts.fsMs,
+          `appendLedger(state.transition ${transition.name})`,
+        );
+      } catch (error) {
+        errors.push(toError(error));
+      }
     }
-  }
+  });
 
   // Run the dispatcher registry for state-derived work, strictly in registry
   // order (autoswap consumes the usage stage's outcomes). Each stage runs
@@ -635,18 +733,12 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     outcomes: emptyDispatcherOutcomes(),
   };
   for (const dispatcher of tickDispatchers) {
-    await runTickDispatcher(dispatcher, dispatchContext, timeouts, errors);
+    await runTickDispatcher(dispatcher, dispatchContext, timeouts, errors, stageMs);
   }
 
-  // Chain sync: keep the vault tracking rotated OAuth chains. Self-throttled
-  // by the default wiring; errors are captured, never fatal to the tick.
-  if (deps.syncChains) {
-    try {
-      await withTimeout(deps.syncChains(), timeouts.chainSyncMs, "syncChains");
-    } catch (error) {
-      errors.push(toError(error));
-    }
-  }
+  // Chain sync deliberately does NOT run here: runDaemon drives deps.syncChains
+  // on its own interval so keychain prompts and multi-home sweeps can never
+  // starve the observation loop (see runChainSyncLoop in run.ts).
 
   return {
     transitions,
@@ -655,6 +747,7 @@ export async function tick(deps: TickDeps, previousObserved: Map<string, BeeStat
     errors,
     ...dispatchContext.outcomes,
     durationMs: Math.max(0, deps.now() - start),
+    stageMs,
   };
 }
 

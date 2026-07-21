@@ -15,7 +15,7 @@ import {
   type DaemonState,
 } from "./index.js";
 import { logTickResult, tick, type TickResult } from "./tick.js";
-import { defaultTickTimeouts, toError, withTimeout } from "./timeouts.js";
+import { defaultTickTimeouts, envMs, toError, withTimeout } from "./timeouts.js";
 import { buildDefaultDeps } from "./wiring.js";
 import { createSupervisor, pushRecentError, spawnSentinel } from "./supervision.js";
 
@@ -227,6 +227,28 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   };
 
+  // Chain sync runs on its OWN track, never inside the tick path: a keychain
+  // prompt or a sweep over hundreds of session homes is far too heavy to share
+  // the observation loop's sequential budget (the listSessions-timeout breach
+  // cycle was starvation of exactly that path). The loop sleeps first, so a
+  // supervised-restart storm never front-loads keychain sweeps into boot.
+  const chainSyncIntervalMs = envMs("HIVE_DAEMON_CHAIN_SYNC_INTERVAL_MS", 5 * 60_000);
+  const chainSyncBudgetMs = defaultTickTimeouts().chainSyncMs;
+  const chainSyncLoop = deps.syncChains
+    ? (async () => {
+        while (!stopping) {
+          await sleep(chainSyncIntervalMs, () => stopping);
+          if (stopping) return;
+          try {
+            await withTimeout(deps.syncChains!(), chainSyncBudgetMs, "syncChains");
+          } catch (error) {
+            pushRecentError(state, toError(error));
+            await safeLog({ level: "warn", msg: "chain.sync.failed", error: toError(error).message });
+          }
+        }
+      })()
+    : Promise.resolve();
+
   // Tick loop: an async sleep loop (not setInterval), with ticks strictly
   // serialized — at most one tick is ever in flight. A budget-abandoned tick
   // keeps running in the background, and the tick path is NOT reentrant: the
@@ -291,6 +313,8 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         state.tickCount += 1;
         state.lastTickAt = new Date().toISOString();
         state.lastSuccessfulTickAt = state.lastTickAt;
+        state.lastTickStageMs = result.stageMs;
+        state.lastTickDurationMs = result.durationMs;
         // Record every partial-tick error into recentErrors, then flush the
         // tick's log fan-out (partials, transitions, dispatcher outcomes) in a
         // fixed order — see logTickResult().
@@ -338,6 +362,10 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
       await sleep(config.tickMs, () => stopping);
       supervisor.beat();
     }
+    // The loop can exit without requestShutdown (maxTicks): flip `stopping` so
+    // the chain-sync track (which keys on it) winds down instead of keeping
+    // the process alive on its interval forever.
+    stopping = true;
 
     await appendDaemonLog({ level: "info", msg: "daemon.shutdown", reason: stopReason });
     await appendLedger({ type: "daemon.stop", pid: process.pid, reason: stopReason, stoppedAt: new Date().toISOString() }).catch(() => undefined);
@@ -347,6 +375,9 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   } finally {
     supervisor.stop();
+    // Give the chain-sync loop a beat to notice `stopping`; a sync wedged
+    // mid-flight is bounded by its own withTimeout and must not hold shutdown.
+    await Promise.race([chainSyncLoop, new Promise((resolve) => setTimeout(resolve, 500))]);
     if (sentinel) {
       try {
         sentinel.kill("SIGTERM");
@@ -356,6 +387,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
     if (hsrControl) await hsrControl.close().catch(() => undefined);
     await deps.mirrorRemoteEvents?.close?.().catch(() => undefined);
+    await deps.hsrObservations?.close?.().catch(() => undefined);
     if (lock) {
       try {
         await lock.release();

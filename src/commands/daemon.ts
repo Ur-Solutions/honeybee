@@ -1,6 +1,6 @@
 // `hive daemon` — manage the hive daemon LaunchAgent; sessions/sync maintenance.
 // Extracted from cli.ts (HIVE-15).
-import { readDaemonStatus } from "../daemon/index.js";
+import { readDaemonStatus, type DaemonState } from "../daemon/index.js";
 import { DEFAULT_LAUNCH_LABEL, installAgent, isAgentInstalled, isLaunchctlSupported, restartAgent, startAgent, stopAgent, uninstallAgent } from "../daemon/install.js";
 import { tailDaemonLog } from "../daemon/logs.js";
 import { renderSystemdUnit } from "../daemon/plist.js";
@@ -35,6 +35,12 @@ export async function cmdDaemon(parsed: Parsed) {
     // Deliberately absent from the usage string.
     case "sentinel":
       return daemonSentinel(parsed);
+    // Internal: the disposable HSR observation child spawned by the daemon's
+    // default wiring (observerProcess.ts). Deliberately absent from usage.
+    case "hsr-observe-worker": {
+      const { runHsrObserveWorker } = await import("../daemon/observerProcess.js");
+      return runHsrObserveWorker();
+    }
     default:
       throw new Error(
         `Unknown daemon subcommand: ${sub}\nUsage: hive daemon <install|uninstall|start|stop|restart|status|logs|run>`,
@@ -244,6 +250,8 @@ export async function daemonStatus(parsed: Parsed) {
       if (status.state) {
         console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
         console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
+        const stages = tickStageSummary(status.state);
+        if (stages) console.log(dim(`  ${stages}`));
         if (status.state.recentErrors.length > 0) {
           console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
           for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
@@ -261,6 +269,8 @@ export async function daemonStatus(parsed: Parsed) {
       if (status.state) {
         console.log(`  ticks ${status.state.tickCount}  lastTickAt ${status.state.lastTickAt ?? dim("(none)")}`);
         if (status.state.lastSuccessfulTickAt !== undefined) console.log(`  lastSuccessfulTickAt ${status.state.lastSuccessfulTickAt ?? dim("(none)")}`);
+        const stages = tickStageSummary(status.state);
+        if (stages) console.log(dim(`  ${stages}`));
         if (status.state.recentErrors.length > 0) {
           console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
           for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
@@ -269,6 +279,20 @@ export async function daemonStatus(parsed: Parsed) {
     }
   }
   process.exit(exitCode);
+}
+
+
+/** "last tick 812ms (listSessions 610, capturePanes 120, records 44)" — slowest stages first. */
+export function tickStageSummary(state: DaemonState): string | null {
+  const stages = state.lastTickStageMs;
+  if (!stages) return null;
+  const top = Object.entries(stages)
+    .filter(([, ms]) => ms > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4);
+  if (top.length === 0) return null;
+  const total = state.lastTickDurationMs !== undefined ? ` ${Math.round(state.lastTickDurationMs)}ms` : "";
+  return `last tick${total} (${top.map(([name, ms]) => `${name} ${Math.round(ms)}`).join(", ")})`;
 }
 
 

@@ -206,3 +206,55 @@ test("sealedBeeNames returns every bee with at least one seal", async () => {
     assert.deepEqual([...names].sort(), ["CL.bbb", "CO.aaa"]);
   });
 });
+
+test("validateSealArtifact accepts Seal v2 fields (taskId, attempt, evidence)", () => {
+  const artifact = validateSealArtifact({
+    ...VALID,
+    taskId: "FL.3k2/s3",
+    attempt: 2,
+    evidence: {
+      filesChanged: ["src/a.ts"],
+      testsRun: [{ command: "npm test", result: "passed" }],
+      artifacts: [
+        { kind: "branch", ref: "feature/parity-s3" },
+        { kind: "fixture", ref: "fixtures/route-3.json" },
+      ],
+    },
+  });
+  assert.equal(artifact.taskId, "FL.3k2/s3");
+  assert.equal(artifact.attempt, 2);
+  assert.equal(artifact.evidence?.artifacts?.length, 2);
+  assert.equal(artifact.evidence?.artifacts?.[0]?.kind, "branch");
+});
+
+test("validateSealArtifact rejects invalid Seal v2 fields", () => {
+  assert.throws(() => validateSealArtifact({ ...VALID, taskId: "" }), /taskId must be a non-empty string/);
+  assert.throws(() => validateSealArtifact({ ...VALID, attempt: 0 }), /attempt must be a positive integer/);
+  assert.throws(() => validateSealArtifact({ ...VALID, attempt: 1.5 }), /attempt must be a positive integer/);
+  assert.throws(() => validateSealArtifact({ ...VALID, evidence: [] }), /evidence must be an object/);
+  assert.throws(
+    () => validateSealArtifact({ ...VALID, evidence: { artifacts: [{ kind: "tarball", ref: "x" }] } }),
+    /kind must be branch, diff, url, fixture/,
+  );
+  assert.throws(
+    () => validateSealArtifact({ ...VALID, evidence: { artifacts: [{ kind: "url", ref: " " }] } }),
+    /ref must be a non-empty string/,
+  );
+});
+
+test("recordSeal round-trips Seal v2 fields through listSeals", async () => {
+  await withTempStore(async () => {
+    await recordSeal("v2-bee", {
+      status: "done",
+      summary: "Slot 3 complete.",
+      taskId: "FL.3k2/s3",
+      attempt: 1,
+      evidence: { artifacts: [{ kind: "diff", ref: "worktrees/s3.diff" }] },
+    });
+    const seals = await listSeals("v2-bee");
+    assert.equal(seals.length, 1);
+    assert.equal(seals[0]!.taskId, "FL.3k2/s3");
+    assert.equal(seals[0]!.attempt, 1);
+    assert.equal(seals[0]!.evidence?.artifacts?.[0]?.ref, "worktrees/s3.diff");
+  });
+});

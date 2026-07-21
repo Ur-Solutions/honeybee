@@ -8,7 +8,7 @@ export const COMMANDS = [
   "buz",
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
-  "search", "seals",
+  "search", "seals", "events", "flight",
   "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
   "fork", "here", "spawn-picker", "urls", "keys", "revive", "auth-resume", "retire", "archive", "set-model",
 ];
@@ -28,6 +28,7 @@ export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sy
 export const KEYS_SUBCOMMANDS = ["print", "path", "check"];
 export const SESSIONS_SUBCOMMANDS = ["reconcile"];
 export const SYNC_SUBCOMMANDS = ["manifest"];
+export const FLIGHT_SUBCOMMANDS = ["start", "ls", "list", "status", "sweep", "resolve", "drain", "close"];
 
 export const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 export const SEAL_STATUS_VALUES = [...SEAL_STATUSES];
@@ -64,7 +65,7 @@ export const SHELL_FIRST_ARG = new Set(["completion"]);
 export const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 export const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
+  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--contract", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
   pool: ["--json", "--all", "--ttl", "--count", "--no-keep", "--here", "--yolo", "--name", "--account"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
@@ -134,6 +135,13 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--accept",
   ],
   daemon: ["--tick-ms", "--json", "--label", "--force", "--follow", "--lines", "-n"],
+  events: ["--follow", "-f", "--json", "--type", "--session", "--since", "--lines", "-n"],
+  flight: [
+    "--name", "--cwd", "--mix", "--agent", "--slots", "--model", "--account",
+    "--brief", "--brief-file", "--colony", "--completion", "--seal-type",
+    "--readiness-ms", "--first-evidence-ms", "--stall-ms", "--max-attempts", "--max-boots",
+    "--retry", "--abandon", "--accept", "--json",
+  ],
   flow: ["--arg", "--foreground", "--background", "--flow", "--json", "-n", "--lines"],
   loop: [
     "--bee", "--cwd", "--context", "--prompt", "--prompt-file",
@@ -205,6 +213,7 @@ export const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   loop: LOOP_SUBCOMMANDS,
   buz: BUZ_SUBCOMMANDS,
   daemon: DAEMON_SUBCOMMANDS,
+  flight: FLIGHT_SUBCOMMANDS,
   account: ACCOUNT_SUBCOMMANDS,
   sessions: SESSIONS_SUBCOMMANDS,
   sync: SYNC_SUBCOMMANDS,

@@ -13,6 +13,8 @@ import { cmdClean } from "./commands/clean.js";
 import { cmdColony } from "./commands/colony.js";
 import { cmdCompletion, cmdConfig } from "./commands/config.js";
 import { cmdDaemon, cmdSessions, cmdSync } from "./commands/daemon.js";
+import { cmdEvents } from "./commands/events.js";
+import { cmdFlight } from "./commands/flight.js";
 import { cmdFlow, runFlowExec } from "./commands/flow.js";
 import { cmdFork, cmdForkLaunch, cmdSplit } from "./commands/fork.js";
 import { cmdFrame } from "./commands/frame.js";
@@ -261,6 +263,12 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "seals":
       await cmdSeals(parsed);
       break;
+    case "events":
+      await cmdEvents(parsed);
+      break;
+    case "flight":
+      await cmdFlight(parsed);
+      break;
     case "spend":
       await cmdSpend(parsed);
       break;
@@ -328,6 +336,7 @@ function printHelp() {
         ["last", "<session>", "print the bee's most recent assistant message or seal"],
         ["wait", "<session>", "block until the bee goes idle or seals"],
         ["search", "<query>", "search seals, ledger, and session records (seals find: seals only)"],
+        ["events", "", "tail the ledger's event stream (--follow, --type <glob>, --session <bee>, --since 15m, --json)"],
         ["usage", "[<account>]", "progress against providers' real 5h/weekly limits (--live dashboard; alias: limits)"],
         ["spend", "<ingest|report|leverage|…>", "local API-equivalent cost ledger + subscription leverage from transcripts"],
       ],
@@ -351,6 +360,7 @@ function printHelp() {
         ["auth-resume", "<bee>", "capture a fresh login, stop an auth-needed bee, and resume its session"],
         ["clean", "--dead|--crashed|--idle|-i", "remove dead/crashed metadata, kill idle bees, or clean interactively"],
         ["loop", "<launch|start|status|stop|…>", "run a bee repeatedly until a stop condition (launch = interactive dialog)"],
+        ["flight", "<start|status|ls|sweep|…>", "fixed-capacity worker flights: slot leases, seal contracts, deterministic replacement"],
       ],
     },
     {

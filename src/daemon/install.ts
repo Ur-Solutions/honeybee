@@ -180,6 +180,13 @@ export async function renderCandidatePlist(options: InstallOptions = {}): Promis
   // where Homebrew-installed tmux does not exist — the daemon would "run" while
   // every tmux probe ENOENTs.
   env.PATH = process.env.PATH || DEFAULT_LAUNCHD_PATH;
+  // Widen libuv's threadpool (default 4): the daemon's fs fan-out (hundreds of
+  // session/run-dir reads per tick) plus any orphaned budget-abandoned fs call
+  // can saturate 4 threads — once a wedged completion poisons the pool, every
+  // fs stage times out forever (the listSessions-timeout breach cycle, CL.701
+  // §5). More threads is the cheap interim mitigation; observation isolation
+  // is the structural one.
+  env.UV_THREADPOOL_SIZE = process.env.UV_THREADPOOL_SIZE || "16";
 
   return renderPlist({
     label,

@@ -2,6 +2,7 @@ import { appendFile, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { isBuzTier, type BuzTier } from "./buz_tiers.js";
+import { normalizeContract, type BeeContract } from "./contract.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
 import { dedupeTags, isValidSessionTag, MAX_TAGS_PER_BEE } from "./tags.js";
@@ -152,6 +153,12 @@ export type SessionRecord = {
   poolKey?: string;
   /** The allocated member number (the n of `<pool>-<n>`). */
   poolMember?: number;
+  /**
+   * Completion contract (CL.701 §4.1): how this bee signals task completion.
+   * Set at spawn (`--contract`); consumers (flight controller, waiters) treat
+   * idle-without-seal on a seal contract as a stall, never as done.
+   */
+  contract?: BeeContract;
 };
 
 export { storeRoot } from "./fsx.js";
@@ -426,6 +433,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "autoTitleAttempts",
   "buzAccept",
   "tags",
+  "contract",
 ]);
 
 function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
@@ -454,6 +462,13 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
 
   if (object.autoswap === true) record.autoswap = true;
+
+  // Completion contract: forward-compatible like buzAccept — an invalid or
+  // unknown-shaped contract is dropped on load, never thrown.
+  if (object.contract !== undefined) {
+    const contract = normalizeContract(object.contract);
+    if (contract) record.contract = contract;
+  }
 
   // HSR fields. `substrate` is a closed union (absent = local-tmux); an
   // unrecognized value is dropped rather than trusted. runnerPid is validated
