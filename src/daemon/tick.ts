@@ -214,6 +214,14 @@ export type TickResult = DispatcherOutcomes & {
    * incident was only attributable after ad-hoc log archaeology.
    */
   stageMs: Record<string, number>;
+  /**
+   * Dispatcher stages bounded by budget policy this tick (per-stage cap or
+   * the shared pool: timed out or skipped dry). EXPECTED degradation, not
+   * failure — kept out of errors[] so routine cap enforcement can never
+   * saturate recentErrors and flip status to UNHEALTHY (2026-07-21 canary
+   * round 5). Logged as one `tick.truncated` row.
+   */
+  truncated: string[];
 };
 
 /** Everything a tick has observed by the time the dispatcher stages run. */
@@ -481,6 +489,7 @@ async function runTickDispatcher<K extends keyof DispatcherOutcomes>(
   timeouts: TickTimeouts,
   errors: Error[],
   stageMs: Record<string, number>,
+  truncated: string[],
   /** Remaining shared dispatcher pool (ms); the effective timeout is the min. */
   remainingMs: number,
 ): Promise<void> {
@@ -488,14 +497,20 @@ async function runTickDispatcher<K extends keyof DispatcherOutcomes>(
   const pending = dispatcher.run(ctx);
   if (!pending) return;
   const start = ctx.deps.now();
+  const budgetMs = Math.max(1, Math.min(timeouts[dispatcher.timeoutKey], dispatcher.capMs ?? Number.POSITIVE_INFINITY, remainingMs));
   try {
-    ctx.outcomes[dispatcher.key] = await withTimeout(
-      pending,
-      Math.max(1, Math.min(timeouts[dispatcher.timeoutKey], dispatcher.capMs ?? Number.POSITIVE_INFINITY, remainingMs)),
-      dispatcher.name,
-    );
+    ctx.outcomes[dispatcher.key] = await withTimeout(pending, budgetMs, dispatcher.name);
   } catch (error) {
-    errors.push(toError(error));
+    // A budget timeout is POLICY (bounded best-effort; the stage retries next
+    // tick) — record it as truncation, not as an error: routine enforcement
+    // must never saturate recentErrors into a false UNHEALTHY. Anything else
+    // a stage throws is a real failure.
+    const err = toError(error);
+    if (new RegExp(`^${dispatcher.name} timed out after `).test(err.message)) {
+      truncated.push(`${dispatcher.name}@${budgetMs}ms`);
+    } else {
+      errors.push(err);
+    }
   } finally {
     stageMs[dispatcher.name] = Math.max(0, ctx.deps.now() - start);
   }
@@ -525,6 +540,9 @@ export function logTickResult(result: TickResult): LogInput[] {
   const entries: LogInput[] = [];
   for (const err of result.errors) {
     entries.push({ level: "warn", msg: "tick.partial", error: err.message });
+  }
+  if (result.truncated.length > 0) {
+    entries.push({ level: "info", msg: "tick.truncated", stages: result.truncated.join(",") });
   }
   for (const transition of result.transitions) {
     // First observations (daemon restart: EVERY session "transitions" from
@@ -563,6 +581,7 @@ export async function tick(
   const errors: Error[] = [];
   const timeouts: TickTimeouts = { ...defaultTickTimeouts(), ...(deps.timeouts ?? {}) };
   const stageMs: Record<string, number> = {};
+  const truncated: string[] = [];
   const timeStage = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
     const stageStart = deps.now();
     try {
@@ -794,11 +813,11 @@ export async function tick(
       // only to abandon them. Record the skip (skipFirstTick stages that
       // weren't going to run anyway stay silent) and move on.
       if (!(dispatcher.skipFirstTick && dispatchContext.firstTick)) {
-        errors.push(new Error(`${dispatcher.name} skipped: shared dispatch budget (${timeouts.dispatchTotalMs}ms) exhausted`));
+        truncated.push(`${dispatcher.name}@pool-dry`);
       }
       continue;
     }
-    await runTickDispatcher(dispatcher, dispatchContext, timeouts, errors, stageMs, remainingMs);
+    await runTickDispatcher(dispatcher, dispatchContext, timeouts, errors, stageMs, truncated, remainingMs);
   }
 
   // Chain sync deliberately does NOT run here: runDaemon drives deps.syncChains
@@ -813,6 +832,7 @@ export async function tick(
     ...dispatchContext.outcomes,
     durationMs: Math.max(0, deps.now() - start),
     stageMs,
+    truncated,
   };
 }
 
