@@ -84,10 +84,15 @@ export type LimitsDeps = {
   persistVaultCredentials?: (account: AccountRecord, oauth: Record<string, unknown>) => Promise<void>;
   readKeychain?: typeof readClaudeKeychain;
   /**
-   * Injectable JSON GET for provider quota endpoints (zai/minimax). Tests pass
-   * a mock; production falls back to the provider's own global-fetch impl. NO
-   * real network in tests. The provider fetchers read this off deps.
+   * Injectable JSON GET for provider quota endpoints (zai/minimax/moonshot).
+   * Tests pass a mock; production falls back to the provider's own
+   * global-fetch impl. NO real network in tests. The provider fetchers read
+   * this off deps.
    */
   httpGetJson?: (url: string, headers: Record<string, string>) => Promise<unknown>;
+  /** Injectable JSON POST for RPC-style quota endpoints (cursor). Same contract as httpGetJson. */
+  httpPostJson?: (url: string, headers: Record<string, string>, body: unknown) => Promise<unknown>;
+  /** Injectable form-encoded POST for OAuth token grants (kimi refresh). Same contract as httpGetJson. */
+  httpPostForm?: (url: string, headers: Record<string, string>, form: Record<string, string>) => Promise<unknown>;
   now?: () => number;
 };
