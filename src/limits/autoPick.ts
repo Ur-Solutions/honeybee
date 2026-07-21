@@ -24,6 +24,7 @@ import { withFileLock } from "../lock.js";
 import type { SessionRecord } from "../store.js";
 import { type CachedLimitsOptions, agePickedLimitsCacheEntry, cachedAccountLimits } from "./cache.js";
 import { accountCommitments, pendingPickDebits, recordAutoPick } from "./commitments.js";
+import { scheduleDetachedLimitsRefresh } from "./refresh.js";
 import type { AccountLimits, WindowUsage } from "./types.js";
 import { paceDelta, windowRolledOver } from "./window.js";
 
@@ -166,12 +167,29 @@ function autoPickWeeklyReason(limits: AccountLimits | undefined, now: number): s
 /** Default freshness budget for the auto pick: cached limits younger than this are good enough. */
 export const AUTO_ACCOUNT_TTL_MS = 60 * 60 * 1000;
 
+/**
+ * Stale-while-revalidate ceiling for the auto pick: a snapshot older than the
+ * ttl but younger than this is still served (the spawn path never blocks on
+ * provider round-trips — measured at 2-10s for a multi-account codex fleet),
+ * with a detached `hive limits` sweep forked to re-warm the cache for the
+ * next pick. The pick debits (HIVE-80) layer concurrent load in the interim.
+ * Beyond this ceiling the snapshot is too old to trust and the pick fetches
+ * live as before.
+ */
+export const AUTO_STALE_LIMITS_MAX_MS = 6 * 60 * 60 * 1000;
+
 export type PickAccountDeps = CachedLimitsOptions & {
   hasCredentials?: typeof accountHasCredentials;
   /** Session records for the commitment penalty; defaults to the live store. */
   sessions?: SessionRecord[];
   /** Consider paused accounts too (they are excluded from the pool by default). */
   includePaused?: boolean;
+  /**
+   * Revalidate hook fired when stale snapshots were served. Defaults to the
+   * detached `hive limits` sweep — but only for production reads (fetchLimits
+   * unset); a test that stubs the fetch never forks a real process.
+   */
+  scheduleStaleRefresh?: () => unknown;
 };
 
 /**
@@ -216,7 +234,18 @@ export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps
     return { account: candidates[0]!, reason: `only ${kind} account with credentials`, nearTieIds: [candidates[0]!.id] };
   }
   const ttlMs = deps.ttlMs ?? AUTO_ACCOUNT_TTL_MS;
-  const results = await cachedAccountLimits(candidates, { ...deps, ttlMs });
+  let staleServed: string[] = [];
+  const results = await cachedAccountLimits(candidates, {
+    ...deps,
+    ttlMs,
+    ...(ttlMs > 0
+      ? { serveStaleUpToMs: AUTO_STALE_LIMITS_MAX_MS, onStaleServed: (ids: string[]) => { staleServed = ids; } }
+      : {}),
+  });
+  if (staleServed.length > 0) {
+    const schedule = deps.scheduleStaleRefresh ?? (deps.fetchLimits ? undefined : scheduleDetachedLimitsRefresh);
+    if (schedule) void schedule();
+  }
   const byId = new Map(results.map((result) => [result.account, result]));
   const now = (deps.now ?? Date.now)();
   const [commitments, debits] = await Promise.all([accountCommitments(kind, deps.sessions), pendingPickDebits(now)]);

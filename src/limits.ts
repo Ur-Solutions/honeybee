@@ -51,9 +51,16 @@ export {
 } from "./limits/commitments.js";
 
 export {
+  LIMITS_REFRESH_THROTTLE_MS,
+  limitsRefreshCliEntry,
+  scheduleDetachedLimitsRefresh,
+} from "./limits/refresh.js";
+
+export {
   AUTO_FIVE_HOUR_SATURATION_PERCENT,
   AUTO_PACE_FULL_WEIGHT_HEADROOM_PERCENT,
   AUTO_ACCOUNT_TTL_MS,
+  AUTO_STALE_LIMITS_MAX_MS,
   AUTO_TIE_EPSILON_PERCENT,
   effectiveWindowLoad,
   selectLeastLoadedAccount,

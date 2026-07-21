@@ -1072,21 +1072,33 @@ test("pickLeastLoadedAccount reuses cached limits inside the default 1h ttl, re-
     assert.equal(second.limits?.cached, true);
     assert.equal(fetched.length, 1);
 
-    // Past the grace, ONLY the picked (aged) account re-reads live; the
-    // untouched account still rides the cache (HIVE-80 pick bookkeeping).
-    const third = await pickLeastLoadedAccount("claude", deps(t0 + 10 * 60 * 1000));
+    // Past the grace the picked (aged) account is past its ttl — but the pick
+    // no longer blocks on a live re-read: the snapshot is served stale and a
+    // detached refresh is scheduled instead (HIVE-80 bookkeeping still ages
+    // the entry; the revalidate just moved off the spawn's critical path).
+    let refreshes = 0;
+    const third = await pickLeastLoadedAccount("claude", {
+      ...deps(t0 + 10 * 60 * 1000),
+      scheduleStaleRefresh: () => { refreshes += 1; },
+    });
     assert.equal(third.account.id, two.id);
-    assert.equal(fetched.length, 2);
-    assert.deepEqual(fetched[1], [two.id]);
+    assert.equal(fetched.length, 1, "aged entry is served stale, not re-read inline");
+    assert.equal(refreshes, 1);
 
-    // ttlMs 0 forces a live read of everything.
+    // ttlMs 0 forces a live read of everything (SWR only applies with a ttl).
     await pickLeastLoadedAccount("claude", { ...deps(t0 + 20 * 60 * 1000), ttlMs: 0 });
-    assert.equal(fetched.length, 3);
-    assert.deepEqual(fetched[2], [one.id, two.id]);
+    assert.equal(fetched.length, 2);
+    assert.deepEqual(fetched[1], [one.id, two.id]);
 
-    // Past the default 1h ttl the pick refetches on its own.
-    await pickLeastLoadedAccount("claude", deps(t0 + 90 * 60 * 1000));
-    assert.equal(fetched.length, 4);
+    // Past the default 1h ttl but inside the 6h SWR window: still snapshot-
+    // served with a refresh scheduled, never an inline provider round-trip.
+    refreshes = 0;
+    await pickLeastLoadedAccount("claude", {
+      ...deps(t0 + 110 * 60 * 1000),
+      scheduleStaleRefresh: () => { refreshes += 1; },
+    });
+    assert.equal(fetched.length, 2);
+    assert.equal(refreshes, 1);
   });
 });
 
@@ -1319,4 +1331,85 @@ test("pickLeastLoadedAccount steers around an account with live bees", async () 
     });
     assert.equal(choice.account.id, quiet.id);
   });
+});
+
+test("cachedAccountLimits serves stale entries within the SWR window and reports them", async () => {
+  await withTempStore(async () => {
+    const one = await addAccount("claude", "swr1@a.b");
+    const two = await addAccount("claude", "swr2@a.b");
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+    let calls: string[][] = [];
+    const fetchLimits = async (accounts: import("../src/accounts.js").AccountRecord[]) => {
+      calls.push(accounts.map((account) => account.id));
+      return accounts.map((account) => okLimits(account.id, 30, 10));
+    };
+
+    // Seed the cache at t0.
+    await cachedAccountLimits([one, two], { ttlMs: 60 * 60 * 1000, fetchLimits, now: () => t0 });
+    assert.deepEqual(calls, [[one.id, two.id]]);
+
+    // 3h later: past the 1h ttl but inside a 6h SWR window → both served from
+    // the snapshot, no fetch, both reported stale.
+    calls = [];
+    let stale: string[] = [];
+    const served = await cachedAccountLimits([one, two], {
+      ttlMs: 60 * 60 * 1000,
+      serveStaleUpToMs: 6 * 60 * 60 * 1000,
+      onStaleServed: (ids) => { stale = ids; },
+      fetchLimits,
+      now: () => t0 + 3 * 60 * 60 * 1000,
+    });
+    assert.deepEqual(calls, []);
+    assert.deepEqual(stale.sort(), [one.id, two.id].sort());
+    assert.ok(served.every((result) => result.cached === true));
+
+    // 7h later: past the SWR window too → live fetch, nothing reported stale.
+    calls = [];
+    stale = [];
+    await cachedAccountLimits([one, two], {
+      ttlMs: 60 * 60 * 1000,
+      serveStaleUpToMs: 6 * 60 * 60 * 1000,
+      onStaleServed: (ids) => { stale = ids; },
+      fetchLimits,
+      now: () => t0 + 7 * 60 * 60 * 1000,
+    });
+    assert.deepEqual(calls, [[one.id, two.id]]);
+    assert.deepEqual(stale, []);
+  });
+});
+
+test("pickLeastLoadedAccount picks from stale snapshots without blocking and schedules a refresh", async () => {
+  await withTempStore(async () => {
+    const one = await addAccount("claude", "swrpick1@a.b");
+    const two = await addAccount("claude", "swrpick2@a.b");
+    const t0 = Date.parse("2026-06-10T12:00:00Z");
+
+    // Seed the cache, then age it past the 1h auto ttl (but inside 6h SWR).
+    await cachedAccountLimits([one, two], {
+      ttlMs: 60 * 60 * 1000,
+      fetchLimits: async () => [okLimits(one.id, 70, 10), okLimits(two.id, 20, 10)],
+      now: () => t0,
+    });
+
+    let refreshes = 0;
+    const choice = await pickLeastLoadedAccount("claude", {
+      hasCredentials: async () => true,
+      fetchLimits: async () => {
+        throw new Error("SWR pick must not block on a live limits fetch");
+      },
+      now: () => t0 + 2 * 60 * 60 * 1000,
+      scheduleStaleRefresh: () => { refreshes += 1; },
+    });
+    assert.equal(choice.account.id, two.id, "pick still ranks from the snapshot");
+    assert.equal(refreshes, 1, "a detached refresh is scheduled for the stale snapshot");
+  });
+});
+
+test("limitsRefreshCliEntry maps cli-x entries to the full cli sibling", async () => {
+  const { limitsRefreshCliEntry } = await import("../src/limits.js");
+  assert.equal(limitsRefreshCliEntry("/x/dist/cli.js"), "/x/dist/cli.js");
+  assert.equal(limitsRefreshCliEntry("/x/dist/cli-x.js"), "/x/dist/cli.js");
+  assert.equal(limitsRefreshCliEntry("/x/src/cli-x.ts"), "/x/src/cli.ts");
+  assert.equal(limitsRefreshCliEntry("/x/bin/other.js"), null);
+  assert.equal(limitsRefreshCliEntry(undefined), null);
 });

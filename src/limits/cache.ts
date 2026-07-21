@@ -85,6 +85,16 @@ export async function agePickedLimitsCacheEntry(
 export type CachedLimitsOptions = LimitsDeps & {
   /** Serve cache entries younger than this; missing/0 → always fetch live. */
   ttlMs?: number;
+  /**
+   * Stale-while-revalidate: entries older than ttlMs but younger than this are
+   * still served from the snapshot (so the caller never blocks on provider
+   * round-trips), and their account ids are reported via onStaleServed so the
+   * caller can schedule an off-path refresh. Absent/0 → stale entries fetch
+   * live as before. Only meaningful with ttlMs > 0.
+   */
+  serveStaleUpToMs?: number;
+  /** Fires (once, before returning) with the accounts served past their ttl. */
+  onStaleServed?: (accountIds: string[]) => void;
   /** Live fetch override (tests). Defaults to accountLimits. */
   fetchLimits?: typeof accountLimits;
 };
@@ -106,18 +116,24 @@ export async function cachedAccountLimits(accounts: AccountRecord[], options: Ca
   const ttlMs = options.ttlMs ?? 0;
   // The cache is read even for ttl-less calls: a rate-limited live read falls
   // back to the last good snapshot below.
+  const serveStaleUpToMs = ttlMs > 0 ? Math.max(options.serveStaleUpToMs ?? 0, ttlMs) : 0;
   const cache = await readLimitsCache();
   const hits = new Map<string, AccountLimits>();
   const misses: AccountRecord[] = [];
+  const staleServed: string[] = [];
   for (const account of accounts) {
     const entry = cache[account.id];
     const age = entry ? now - Date.parse(entry.fetchedAt) : Number.NaN;
     if (ttlMs > 0 && entry && Number.isFinite(age) && age >= 0 && age <= ttlMs) {
       hits.set(account.id, { ...entry.limits, cached: true, asOf: entry.limits.asOf ?? entry.fetchedAt });
+    } else if (serveStaleUpToMs > ttlMs && entry && Number.isFinite(age) && age >= 0 && age <= serveStaleUpToMs) {
+      hits.set(account.id, { ...entry.limits, cached: true, asOf: entry.limits.asOf ?? entry.fetchedAt });
+      staleServed.push(account.id);
     } else {
       misses.push(account);
     }
   }
+  if (staleServed.length > 0) options.onStaleServed?.(staleServed);
   const fetchLimits = options.fetchLimits ?? accountLimits;
   const fetched = misses.length > 0 ? await fetchLimits(misses, options) : [];
   if (fetched.length > 0) await updateLimitsCache(fetched, now).catch(() => undefined);
