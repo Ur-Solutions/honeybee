@@ -11,11 +11,15 @@ import {
   FLIGHT_CONTRACT_DEFAULTS,
   FLIGHT_REPLACEMENT_DEFAULTS,
   SLOT_STATES,
+  TASK_BUCKETS,
   type FlightMixEntry,
   type FlightRecord,
+  type FlightTaskPacket,
   type SlotRecord,
   type SlotState,
+  type TaskBucket,
 } from "./types.js";
+import { safeName } from "../store.js";
 
 export function flightsRoot(): string {
   return join(storeRoot(), "flights");
@@ -89,6 +93,150 @@ export async function deleteFlight(flightId: string): Promise<void> {
   await rm(flightDir(flightId), { recursive: true, force: true });
 }
 
+/* ------------------------------------------------------------------ */
+/* Task queue (flight v1.1 — perpetual lane refill)                    */
+/*                                                                     */
+/* One JSON file per packet, bucketed by lifecycle:                    */
+/*   queue/pending/  → authored, unclaimed                             */
+/*   queue/leased/   → bound to a lane (slotId+generation)             */
+/*   queue/done/     → completed with a contract-matching seal         */
+/*   queue/failed/   → attempts exhausted / operator-abandoned         */
+/* Moves are write-target-then-remove-source, executed by the          */
+/* controller UNDER the per-flight sweep lock, so claims are           */
+/* exactly-once across the daemon and CLI sweepers. Enqueue only ever  */
+/* CREATES a file in pending/ and needs no lock.                       */
+/* ------------------------------------------------------------------ */
+
+function queueDir(flightId: string, bucket: TaskBucket): string {
+  return join(flightDir(flightId), "queue", bucket);
+}
+
+function taskFilename(taskId: string): string {
+  return `${safeName(taskId)}.json`;
+}
+
+async function writeTask(flightId: string, bucket: TaskBucket, task: FlightTaskPacket): Promise<void> {
+  await mkdir(queueDir(flightId, bucket), { recursive: true });
+  await atomicWriteFile(join(queueDir(flightId, bucket), taskFilename(task.taskId)), `${JSON.stringify(task, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** Enqueue a packet; refuses a taskId already present in ANY bucket. */
+export async function enqueueTask(flightId: string, task: Omit<FlightTaskPacket, "enqueuedAt"> & { enqueuedAt?: string }): Promise<FlightTaskPacket> {
+  if (!task.taskId || !task.brief) throw new Error("enqueueTask: taskId and brief are required");
+  for (const bucket of TASK_BUCKETS) {
+    const existing = await readTask(flightId, bucket, task.taskId);
+    if (existing) throw new Error(`task ${task.taskId} already exists in ${flightId} (${bucket})`);
+  }
+  const packet: FlightTaskPacket = { ...task, enqueuedAt: task.enqueuedAt ?? new Date().toISOString() };
+  await writeTask(flightId, "pending", packet);
+  return packet;
+}
+
+export async function readTask(flightId: string, bucket: TaskBucket, taskId: string): Promise<FlightTaskPacket | null> {
+  try {
+    return normalizeTask(JSON.parse(await readFile(join(queueDir(flightId, bucket), taskFilename(taskId)), "utf8")) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+export async function listTasks(flightId: string, bucket: TaskBucket): Promise<FlightTaskPacket[]> {
+  const files = (await readdir(queueDir(flightId, bucket)).catch(() => [] as string[])).filter((f) => f.endsWith(".json"));
+  const tasks: FlightTaskPacket[] = [];
+  for (const file of files) {
+    try {
+      const task = normalizeTask(JSON.parse(await readFile(join(queueDir(flightId, bucket), file), "utf8")) as unknown);
+      if (task) tasks.push(task);
+    } catch {
+      // skip corrupt packets; they surface via counts drift in status
+    }
+  }
+  return tasks.sort((a, b) => a.enqueuedAt.localeCompare(b.enqueuedAt) || a.taskId.localeCompare(b.taskId));
+}
+
+export type TaskCounts = Record<TaskBucket, number>;
+
+export async function taskCounts(flightId: string): Promise<TaskCounts> {
+  const counts = { pending: 0, leased: 0, done: 0, failed: 0 } as TaskCounts;
+  for (const bucket of TASK_BUCKETS) {
+    counts[bucket] = (await readdir(queueDir(flightId, bucket)).catch(() => [] as string[])).filter((f) => f.endsWith(".json")).length;
+  }
+  return counts;
+}
+
+/** True when this flight has EVER been given queue work (any bucket non-empty). */
+export async function isQueueBacked(flightId: string): Promise<boolean> {
+  const counts = await taskCounts(flightId);
+  return counts.pending + counts.leased + counts.done + counts.failed > 0;
+}
+
+/**
+ * Claim the oldest pending task for a lane: write it into leased/ with the
+ * lease stamp, then remove it from pending/. Caller MUST hold the flight
+ * sweep lock. Returns null when pending/ is empty.
+ */
+export async function claimNextTask(
+  flightId: string,
+  lease: { slotId: string; generation: number },
+): Promise<FlightTaskPacket | null> {
+  const pending = await listTasks(flightId, "pending");
+  const next = pending[0];
+  if (!next) return null;
+  const leased: FlightTaskPacket = { ...next, lease: { ...lease, leasedAt: new Date().toISOString() } };
+  await writeTask(flightId, "leased", leased);
+  await rm(join(queueDir(flightId, "pending"), taskFilename(next.taskId)), { force: true });
+  return leased;
+}
+
+/**
+ * The leased task bound to a slot, if any — crash reconciliation: a task
+ * claimed for a lane whose slot prepare was lost is re-bound instead of
+ * stranded in leased/ forever.
+ */
+export async function leasedTaskForSlot(flightId: string, slotId: string): Promise<FlightTaskPacket | null> {
+  const leased = await listTasks(flightId, "leased");
+  return leased.find((task) => task.lease?.slotId === slotId) ?? null;
+}
+
+/** Move a leased task to done/ or failed/ with its outcome stamp. */
+export async function finishTask(
+  flightId: string,
+  taskId: string,
+  bucket: "done" | "failed",
+  outcome: { sealFilename?: string; reason?: string },
+): Promise<void> {
+  const task = await readTask(flightId, "leased", taskId);
+  if (!task) return; // already finished (idempotent under re-sweeps)
+  await writeTask(flightId, bucket, { ...task, outcome: { at: new Date().toISOString(), ...outcome } });
+  await rm(join(queueDir(flightId, "leased"), taskFilename(taskId)), { force: true });
+}
+
+function normalizeTask(value: unknown): FlightTaskPacket | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const object = value as Record<string, unknown>;
+  if (typeof object.taskId !== "string" || typeof object.brief !== "string" || typeof object.enqueuedAt !== "string") return null;
+  const leaseRaw = object.lease as Record<string, unknown> | undefined;
+  const outcomeRaw = object.outcome as Record<string, unknown> | undefined;
+  return {
+    taskId: object.taskId,
+    brief: object.brief,
+    ...(typeof object.cwd === "string" ? { cwd: object.cwd } : {}),
+    enqueuedAt: object.enqueuedAt,
+    ...(leaseRaw && typeof leaseRaw.slotId === "string" && typeof leaseRaw.generation === "number" && typeof leaseRaw.leasedAt === "string"
+      ? { lease: { slotId: leaseRaw.slotId, generation: leaseRaw.generation, leasedAt: leaseRaw.leasedAt } }
+      : {}),
+    ...(outcomeRaw && typeof outcomeRaw.at === "string"
+      ? {
+          outcome: {
+            at: outcomeRaw.at,
+            ...(typeof outcomeRaw.sealFilename === "string" ? { sealFilename: outcomeRaw.sealFilename } : {}),
+            ...(typeof outcomeRaw.reason === "string" ? { reason: outcomeRaw.reason } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
 function normalizeFlight(value: unknown): FlightRecord | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const object = value as Record<string, unknown>;
@@ -152,19 +300,29 @@ function normalizeSlot(value: unknown): SlotRecord | null {
   if (typeof object.state !== "string" || !SLOT_STATE_SET.has(object.state)) return null;
   if (typeof object.since !== "string") return null;
   const attempt = typeof object.attempt === "number" && Number.isSafeInteger(object.attempt) && object.attempt >= 0 ? object.attempt : 0;
+  const generation = typeof object.generation === "number" && Number.isSafeInteger(object.generation) && object.generation >= 0 ? object.generation : 0;
   const evidenceRaw = (object.evidence ?? {}) as Record<string, unknown>;
   const history = Array.isArray(object.history)
     ? (object.history as unknown[]).flatMap((entry) => {
         if (!entry || typeof entry !== "object") return [];
         const row = entry as Record<string, unknown>;
         if (typeof row.attempt !== "number" || typeof row.outcome !== "string" || typeof row.at !== "string") return [];
-        return [{ attempt: row.attempt, outcome: row.outcome, at: row.at, ...(typeof row.beeName === "string" ? { beeName: row.beeName } : {}) }];
+        return [{
+          attempt: row.attempt,
+          outcome: row.outcome,
+          at: row.at,
+          ...(typeof row.generation === "number" ? { generation: row.generation } : {}),
+          ...(typeof row.taskId === "string" ? { taskId: row.taskId } : {}),
+          ...(typeof row.beeName === "string" ? { beeName: row.beeName } : {}),
+        }];
       })
     : [];
   return {
     flightId: object.flightId,
     slotId: object.slotId,
     mixKey: object.mixKey,
+    generation,
+    ...(typeof object.taskId === "string" ? { taskId: object.taskId } : {}),
     attempt,
     ...(typeof object.beeName === "string" ? { beeName: object.beeName } : {}),
     ...(typeof object.beeId === "string" ? { beeId: object.beeId } : {}),

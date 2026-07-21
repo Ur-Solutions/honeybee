@@ -55,6 +55,7 @@ test("flight store: flight + slot round-trip preserves every field", async () =>
       flightId: id,
       slotId: "s1",
       mixKey: "fable",
+      generation: 0,
       attempt: 2,
       beeName: "parity-07-s1-a2",
       beeId: "CL.9fe",

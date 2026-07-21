@@ -10,7 +10,7 @@
 import { judgeActivationEvidence, type ActivationEvidenceVerdict } from "../activation.js";
 import type { BeeState } from "../state.js";
 import {
-  slotTaskId,
+  slotContractTaskId,
   type FlightRecord,
   type SlotRecord,
   type SlotSealObservation,
@@ -51,7 +51,7 @@ export type SlotPlan = {
 export function judgeSeal(slot: SlotRecord, seal: SlotSealObservation | null | undefined): ActivationEvidenceVerdict {
   return judgeActivationEvidence(
     {
-      taskId: slotTaskId(slot.flightId, slot.slotId),
+      taskId: slotContractTaskId(slot),
       attempt: slot.attempt,
       ...(slot.attemptStartedAt ? { attemptStartedAt: slot.attemptStartedAt } : {}),
     },
@@ -86,7 +86,7 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
   /** Close the current attempt and open the vacancy (replacement path). */
   const vacate = (outcome: string, extra?: Record<string, unknown>) => {
     events.push({ type: `flight.slot.${outcome}`, data: { ...beeData(), ...(extra ?? {}) } });
-    next.history.push({ attempt: next.attempt, ...(next.beeName ? { beeName: next.beeName } : {}), outcome, at: nowIso });
+    next.history.push({ attempt: next.attempt, generation: next.generation, ...(next.taskId ? { taskId: next.taskId } : {}), ...(next.beeName ? { beeName: next.beeName } : {}), outcome, at: nowIso });
     delete next.beeName;
     delete next.beeId;
     delete next.nudgedAt;
@@ -115,7 +115,7 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
   });
 
   // Terminal states and closed flights: nothing to drive.
-  if (slot.state === "done" || slot.state === "abandoned" || flight.status === "closed") return finish();
+  if (slot.state === "done" || slot.state === "abandoned" || slot.state === "drained" || flight.status === "closed") return finish();
 
   // Vacant: the desire to spawn is the only output (the controller owns the
   // durable attempt claim + backpressure).
@@ -140,7 +140,7 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
     if (seal.status === "done") {
       next.evidence.sealFilename = seal.filename;
       transition("done", { seal: seal.filename });
-      next.history.push({ attempt: next.attempt, ...(next.beeName ? { beeName: next.beeName } : {}), outcome: "done", at: nowIso });
+      next.history.push({ attempt: next.attempt, generation: next.generation, ...(next.taskId ? { taskId: next.taskId } : {}), ...(next.beeName ? { beeName: next.beeName } : {}), outcome: "done", at: nowIso });
       return finish();
     }
     // A contract-matching seal that says blocked/failed/needs_input is honest
@@ -190,7 +190,7 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
       (evidence.beeState !== undefined && evidence.beeState !== "dead" && DEAD_BEE_STATES.has(evidence.beeState));
     if (flight.contract.completion === "exit" && !crashFlavored && (next.evidence.firstEvidenceAt || evidence.beeStatus === "dead")) {
       transition("done", { completion: "exit" });
-      next.history.push({ attempt: next.attempt, ...(next.beeName ? { beeName: next.beeName } : {}), outcome: "done", at: nowIso });
+      next.history.push({ attempt: next.attempt, generation: next.generation, ...(next.taskId ? { taskId: next.taskId } : {}), ...(next.beeName ? { beeName: next.beeName } : {}), outcome: "done", at: nowIso });
       return finish();
     }
     vacate("crashed", { ...(evidence.beeStatus ? { beeStatus: evidence.beeStatus } : {}), ...(evidence.beeState ? { beeState: evidence.beeState } : {}) });

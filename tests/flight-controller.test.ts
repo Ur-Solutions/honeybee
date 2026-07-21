@@ -33,7 +33,7 @@ function flight(overrides: Partial<FlightRecord> = {}): FlightRecord {
 }
 
 function vacantSlot(slotId: string): SlotRecord {
-  return { flightId: "FL.abc", slotId, mixKey: "fable", attempt: 0, state: "vacant", since: iso(T0), evidence: {}, history: [] };
+  return { flightId: "FL.abc", slotId, mixKey: "fable", generation: 0, attempt: 0, state: "vacant", since: iso(T0), evidence: {}, history: [] };
 }
 
 function bee(name: string, overrides: Partial<SessionRecord> = {}): SessionRecord {
@@ -76,7 +76,7 @@ function harness(flightRecord: FlightRecord, initialSlots: SlotRecord[], nowMs: 
     nudged,
     seals,
     spawnImpl: async (f, slot) => {
-      const name = slotBeeName(f.id, slot.slotId, slot.attempt);
+      const name = slotBeeName(f.id, slot.slotId, slot.generation, slot.attempt);
       spawned.push(name);
       return { beeName: name };
     },
@@ -114,8 +114,8 @@ test("vacancy fill: durable idempotency claim before spawn, confirm after, backp
   const s1 = h.slots.get("s1")!;
   assert.equal(s1.state, "booting");
   assert.equal(s1.attempt, 1);
-  assert.equal(s1.idempotencyKey, slotIdempotencyKey(f.id, "s1", 1));
-  assert.equal(s1.beeName, slotBeeName(f.id, "s1", 1));
+  assert.equal(s1.idempotencyKey, slotIdempotencyKey(f.id, "s1", 0, 1));
+  assert.equal(s1.beeName, slotBeeName(f.id, "s1", 0, 1));
   assert.ok(h.ledger.some((e) => e.type === "flight.slot.provisioning" && e.slot === "s1"));
   assert.ok(h.ledger.some((e) => e.type === "flight.slot.booting" && e.slot === "s1"));
 
@@ -138,10 +138,10 @@ test("crash between spawn and confirm: the next sweep ADOPTS the orphan instead 
     attempt: 1,
     state: "provisioning",
     attemptStartedAt: iso(T0),
-    idempotencyKey: slotIdempotencyKey(f.id, "s1", 1),
+    idempotencyKey: slotIdempotencyKey(f.id, "s1", 0, 1),
   };
   const h = harness(f, [claimed], T0 + 1_000);
-  const orphanName = slotBeeName(f.id, "s1", 1);
+  const orphanName = slotBeeName(f.id, "s1", 0, 1);
   const outcomes = await sweepFlights(h.deps, [bee(orphanName)], new Map([[orphanName, "booting" as BeeState]]));
 
   assert.equal(h.spawned.length, 0, "no duplicate spawn for a claimed attempt");
@@ -173,7 +173,7 @@ test("spawn failure burns the attempt and abandons at maxAttempts with a mix vio
 
 test("simultaneous batch completion: all slots seal in one sweep → all done + flight.complete + closed", async () => {
   const f = flight({ target: { slots: 3, mix: [{ key: "fable", agent: "claude", count: 3 }] } });
-  const names = ["s1", "s2", "s3"].map((slotId) => slotBeeName(f.id, slotId, 1));
+  const names = ["s1", "s2", "s3"].map((slotId) => slotBeeName(f.id, slotId, 0, 1));
   const slots = ["s1", "s2", "s3"].map((slotId, index): SlotRecord => ({
     ...vacantSlot(slotId),
     attempt: 1,
@@ -205,7 +205,7 @@ test("simultaneous batch completion: all slots seal in one sweep → all done + 
 
 test("stalled slots get exactly one deterministic nudge", async () => {
   const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
-  const name = slotBeeName(f.id, "s1", 1);
+  const name = slotBeeName(f.id, "s1", 0, 1);
   const working: SlotRecord = {
     ...vacantSlot("s1"),
     attempt: 1,
@@ -235,7 +235,7 @@ test("closed flights are left alone entirely", async () => {
 
 test("CR-5: nudgedAt is stamped only after delivery succeeds; failures retry next sweep", async () => {
   const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
-  const name = slotBeeName(f.id, "s1", 1);
+  const name = slotBeeName(f.id, "s1", 0, 1);
   const working: SlotRecord = {
     ...vacantSlot("s1"),
     attempt: 1,
@@ -264,7 +264,7 @@ test("CR-5: nudgedAt is stamped only after delivery succeeds; failures retry nex
 
 test("CR-6: missing slot files are re-created as vacant and completion honors target.slots", async () => {
   const f = flight({ target: { slots: 2, mix: [{ key: "fable", agent: "claude", count: 2 }] } });
-  const name1 = slotBeeName(f.id, "s1", 1);
+  const name1 = slotBeeName(f.id, "s1", 0, 1);
   const doneSlot: SlotRecord = {
     ...vacantSlot("s1"),
     attempt: 1,
@@ -299,7 +299,7 @@ test("CR-7c: a draining flight completes once live slots finish, counting vacanc
 
 test("grok M2: a wedged replacement retires the written-off live bee", async () => {
   const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
-  const name = slotBeeName(f.id, "s1", 1);
+  const name = slotBeeName(f.id, "s1", 0, 1);
   const stuck: SlotRecord = {
     ...vacantSlot("s1"),
     attempt: 1,

@@ -12,8 +12,8 @@ import { resolveAccountFlag } from "../commands/spawn.js";
 import { transactionalRetire } from "../kill.js";
 import { withFileLock } from "../lock.js";
 import { sweepFlights, stallNudgeText, type FlightSweepDeps, type FlightSweepOutcome } from "../flight/controller.js";
-import { flightDir, listFlights, listSlots, saveFlight, saveSlot } from "../flight/store.js";
-import { slotBeeName, slotTaskId, type SlotSealObservation } from "../flight/types.js";
+import { claimNextTask, finishTask, flightDir, leasedTaskForSlot, listFlights, listSlots, saveFlight, saveSlot, taskCounts } from "../flight/store.js";
+import { slotBeeName, slotContractTaskId, type SlotSealObservation } from "../flight/types.js";
 import type { BeeState } from "../state.js";
 import { appendLedger, loadSession, type SessionRecord } from "../store.js";
 
@@ -37,26 +37,30 @@ export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): F
         ...(scan.seal.attempt !== undefined ? { attempt: scan.seal.attempt } : {}),
       };
     },
-    spawnSlot: async (flight, slot, mix) => {
+    spawnSlot: async (flight, slot, mix, task) => {
       const account = mix.account ? await resolveAccountFlag(mix.account, mix.agent, undefined) : undefined;
+      // A queue task's packet overrides the flight defaults: its brief IS the
+      // route packet, and its cwd points the lane at the task's own
+      // worktree/checkout.
+      const brief = task?.brief ?? flight.brief;
       // HSR substrate: pane-less, daemon-spawnable, and the brief goes over
       // the control socket — no tmux interaction from inside the daemon.
       const record = await spawnBee({
         agent: mix.agent,
         extraArgs: [],
-        cwd: flight.cwd,
+        cwd: task?.cwd ?? flight.cwd,
         yolo: true,
-        name: slotBeeName(flight.id, slot.slotId, slot.attempt),
+        name: slotBeeName(flight.id, slot.slotId, slot.generation, slot.attempt),
         ...(flight.colony ? { colony: flight.colony } : {}),
         ...(flight.createdBy ? { spawnedById: flight.createdBy } : {}),
         substrate: "hsr",
         ...(account ? { account } : {}),
         ...(mix.model ?? account?.model ? { model: mix.model ?? account?.model } : {}),
-        ...(flight.brief ? { brief: flight.brief } : {}),
+        ...(brief ? { brief } : {}),
         contract: {
           completion: flight.contract.completion,
           ...(flight.contract.sealType ? { sealType: flight.contract.sealType } : {}),
-          taskId: slotTaskId(flight.id, slot.slotId),
+          taskId: slotContractTaskId(slot),
           attempt: slot.attempt,
         },
       });
@@ -104,6 +108,12 @@ export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): F
       const record = await loadSession(beeName);
       if (!record || record.status !== "running") return;
       await transactionalRetire(record);
+    },
+    queue: {
+      counts: taskCounts,
+      claimNext: claimNextTask,
+      leasedForSlot: leasedTaskForSlot,
+      finish: finishTask,
     },
     appendLedger,
     now: () => Date.now(),

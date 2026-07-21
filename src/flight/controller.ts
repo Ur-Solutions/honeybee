@@ -10,15 +10,28 @@ import type { SessionRecord } from "../store.js";
 import { planSlot, type SlotEvidence } from "./machine.js";
 import {
   SLOT_BOOTING_STATES,
-  SLOT_TERMINAL_STATES,
+  SLOT_COMPLETION_STATES,
   slotBeeName,
+  slotContractTaskId,
   slotIdempotencyKey,
-  slotTaskId,
   type FlightMixEntry,
   type FlightRecord,
+  type FlightTaskPacket,
   type SlotRecord,
   type SlotSealObservation,
+  type TaskBucket,
 } from "./types.js";
+
+/** Queue operations the reconciler drives (flight v1.1). Absent → v1 fixed batch. */
+export type FlightQueueOps = {
+  counts: (flightId: string) => Promise<Record<TaskBucket, number>>;
+  /** Claim the oldest pending task for a lane (caller holds the flight lock). */
+  claimNext: (flightId: string, lease: { slotId: string; generation: number }) => Promise<FlightTaskPacket | null>;
+  /** The leased task already bound to a slot (crash/retry reconciliation). */
+  leasedForSlot: (flightId: string, slotId: string) => Promise<FlightTaskPacket | null>;
+  /** Move a leased task to done/ or failed/ with its outcome. */
+  finish: (flightId: string, taskId: string, bucket: "done" | "failed", outcome: { sealFilename?: string; reason?: string }) => Promise<void>;
+};
 
 export type FlightSweepDeps = {
   listFlights: () => Promise<FlightRecord[]>;
@@ -29,9 +42,11 @@ export type FlightSweepDeps = {
   latestSeal: (beeName: string) => Promise<SlotSealObservation | null>;
   /**
    * Spawn a slot bee: agent/model/account from the mix, cwd/brief/colony from
-   * the flight, contract carrying taskId + attempt, and deliver the brief.
+   * the flight — overridden by the task packet's cwd/brief when the lane is
+   * working queue work — contract carrying the lane's contract taskId +
+   * attempt, and deliver the brief.
    */
-  spawnSlot: (flight: FlightRecord, slot: SlotRecord, mix: FlightMixEntry) => Promise<{ beeName: string; beeId?: string }>;
+  spawnSlot: (flight: FlightRecord, slot: SlotRecord, mix: FlightMixEntry, task?: FlightTaskPacket) => Promise<{ beeName: string; beeId?: string }>;
   /** Deterministic stall nudge (interrupt-tier buz). */
   nudge: (flight: FlightRecord, slot: SlotRecord, beeName: string) => Promise<void>;
   /**
@@ -46,6 +61,15 @@ export type FlightSweepDeps = {
    * replaced attempts don't leak runner hosts/accounts. Absent → skipped.
    */
   retireBee?: (beeName: string) => Promise<void>;
+  /**
+   * Durable task queue (v1.1): with queue work present, lanes RECYCLE — a
+   * completed/failed task moves to its bucket, the lane bumps its generation
+   * and claims the next packet, keeping N lanes productive until the queue is
+   * exhausted (the chronic-underpopulation goal from the CL.701 incident).
+   * Absent, or with no queue work ever enqueued, flights behave as v1 fixed
+   * batches.
+   */
+  queue?: FlightQueueOps;
   appendLedger: (event: Record<string, unknown>) => Promise<void>;
   now: () => number;
 };
@@ -111,6 +135,7 @@ async function sweepOneFlight(
         flightId: flight.id,
         slotId,
         mixKey: mixEntry.key,
+        generation: 0,
         attempt: 0,
         state: "vacant",
         since: nowIso,
@@ -125,6 +150,12 @@ async function sweepOneFlight(
   }
   slots = slots.sort((a, b) => a.slotId.localeCompare(b.slotId, undefined, { numeric: true }));
 
+  // Queue mode (v1.1): a flight that has EVER been given queue work runs as a
+  // lane-keeper — completed tasks recycle their lane onto the next packet
+  // until pending/ is empty. A flight never enqueued behaves exactly as v1.
+  const counts = deps.queue ? await deps.queue.counts(flight.id) : null;
+  const queueBacked = counts !== null && counts.pending + counts.leased + counts.done + counts.failed > 0;
+
   const nudges: SlotRecord[] = [];
   const spawnQueue: SlotRecord[] = [];
 
@@ -135,13 +166,22 @@ async function sweepOneFlight(
     // instead of burning (or worse, double-spawning) the attempt. Keyed on
     // the flight ID — names are not unique (review CR-4).
     let subject = slot;
+    let adopted = false;
+    let revived = false;
     if (!slot.beeName && slot.state === "provisioning") {
-      const orphan = recordsByName.get(slotBeeName(flight.id, slot.slotId, slot.attempt));
+      const orphan = recordsByName.get(slotBeeName(flight.id, slot.slotId, slot.generation, slot.attempt));
       if (orphan) {
         subject = { ...slot, beeName: orphan.name, ...(orphan.id ? { beeId: orphan.id } : {}) };
+        adopted = true;
       }
     }
-    const adopted = subject !== slot;
+    // Revive: a drained lane wakes up the moment new queue work appears.
+    if (slot.state === "drained" && queueBacked && counts!.pending > 0 && flight.status === "active") {
+      subject = { ...subject, state: "vacant", since: new Date(nowMs).toISOString() };
+      revived = true;
+      await deps.appendLedger({ type: "flight.vacancy", flight: flight.id, slot: slot.slotId, mixKey: slot.mixKey, reason: "task-available" });
+    }
+    const adjusted = adopted || revived;
     const record = subject.beeName ? recordsByName.get(subject.beeName) : undefined;
     const evidence: SlotEvidence = {
       ...(record ? { beeStatus: record.status } : {}),
@@ -149,20 +189,65 @@ async function sweepOneFlight(
       seal: subject.beeName ? await deps.latestSeal(subject.beeName) : null,
     };
     const plan = planSlot(flight, subject, evidence, nowMs);
-    if (plan.changed || adopted) {
-      await deps.saveSlot(plan.slot);
+    let planned = plan.slot;
+
+    // Lane recycling (v1.1): a finished TASK is not a finished LANE. Move the
+    // packet to its outcome bucket, bump the generation, and reopen the
+    // vacancy so the spawn phase can claim the next packet. Attempt
+    // exhaustion fails the TASK (queue's failed/) but recycles the lane —
+    // one poisoned packet must not kill lane capacity. The completed bee is
+    // deliberately NOT retired: replace-before-collect leaves collection to
+    // the manager at its leisure; retire after collecting.
+    if (queueBacked && planned.taskId && (planned.state === "done" || planned.state === "abandoned")) {
+      const bucket = planned.state === "done" ? "done" : "failed";
+      await deps.queue!.finish(flight.id, planned.taskId, bucket, bucket === "done"
+        ? { ...(planned.evidence.sealFilename ? { sealFilename: planned.evidence.sealFilename } : {}) }
+        : { reason: "attempts-exhausted" });
+      await deps.appendLedger({
+        type: `flight.task.${bucket}`,
+        flight: flight.id,
+        slot: slot.slotId,
+        task: planned.taskId,
+        generation: planned.generation,
+        ...(planned.beeName ? { bee: planned.beeName } : {}),
+        ...(planned.evidence.sealFilename ? { seal: planned.evidence.sealFilename } : {}),
+      });
+      const recycleIso = new Date(deps.now()).toISOString();
+      const recycled: SlotRecord = {
+        ...planned,
+        generation: planned.generation + 1,
+        attempt: 0,
+        state: "vacant",
+        since: recycleIso,
+        evidence: {},
+        history: [
+          ...planned.history,
+          { attempt: planned.attempt, generation: planned.generation, taskId: planned.taskId, outcome: `task-${bucket}`, at: recycleIso },
+        ],
+      };
+      delete recycled.taskId;
+      delete recycled.beeName;
+      delete recycled.beeId;
+      delete recycled.nudgedAt;
+      delete recycled.attemptStartedAt;
+      delete recycled.idempotencyKey;
+      planned = recycled;
+    }
+
+    if (plan.changed || adjusted || planned !== plan.slot) {
+      await deps.saveSlot(planned);
       outcomes.push({
         flight: flight.id,
         slot: slot.slotId,
         action: "transition",
-        detail: `${slot.state}→${plan.slot.state}${adopted ? " (adopted)" : ""}`,
+        detail: `${slot.state}→${planned.state}${adopted ? " (adopted)" : ""}${revived ? " (revived)" : ""}${planned !== plan.slot ? " (recycled)" : ""}`,
       });
     }
     for (const event of plan.events) {
       await deps.appendLedger({ type: event.type, flight: flight.id, ...(event.data ?? {}) });
     }
-    if (plan.wantsNudge && plan.slot.beeName) nudges.push(plan.slot);
-    if (plan.wantsSpawn) spawnQueue.push(plan.slot);
+    if (plan.wantsNudge && planned.beeName) nudges.push(planned);
+    if (planned.state === "vacant" && flight.status === "active") spawnQueue.push(planned);
     // A wedged replacement writes off a bee that may still be alive (stuck
     // boot) — retire it so replaced attempts don't leak hosts/accounts.
     if (deps.retireBee) {
@@ -177,7 +262,7 @@ async function sweepOneFlight(
         }
       }
     }
-    applied.push(plan.slot);
+    applied.push(planned);
   }
 
   // Deterministic stall nudges. nudgedAt is stamped ONLY after the send
@@ -210,15 +295,45 @@ async function sweepOneFlight(
       outcomes.push({ flight: flight.id, slot: slot.slotId, action: "error", error: `no mix entry for key ${slot.mixKey}` });
       continue;
     }
+
+    // Task binding (v1.1): a lane in a queue-backed flight works a PACKET.
+    // Order of precedence — the lease already bound to this slot (retry of an
+    // in-flight task, or a claim whose slot prepare was lost to a crash),
+    // else the oldest pending packet (claimed durably BEFORE the slot
+    // prepare, under the flight lock). No packet → the lane parks as drained
+    // until someone enqueues more work.
+    let task: FlightTaskPacket | null = null;
+    if (queueBacked) {
+      task = await deps.queue!.leasedForSlot(flight.id, slot.slotId);
+      if (!task) {
+        task = await deps.queue!.claimNext(flight.id, { slotId: slot.slotId, generation: slot.generation });
+        if (task) {
+          await deps.appendLedger({ type: "flight.task.claimed", flight: flight.id, slot: slot.slotId, task: task.taskId, generation: slot.generation });
+        }
+      }
+      if (!task) {
+        const drainedIso = new Date(deps.now()).toISOString();
+        const drained: SlotRecord = { ...slot, state: "drained", since: drainedIso };
+        delete drained.taskId;
+        await deps.saveSlot(drained);
+        await deps.appendLedger({ type: "flight.slot.drained", flight: flight.id, slot: slot.slotId, mixKey: slot.mixKey });
+        const index = applied.findIndex((entry) => entry.slotId === slot.slotId);
+        if (index >= 0) applied[index] = drained;
+        outcomes.push({ flight: flight.id, slot: slot.slotId, action: "transition", detail: "vacant→drained" });
+        continue;
+      }
+    }
+
     // PREPARE: durably claim the attempt before any side effect.
     const nowIso = new Date(deps.now()).toISOString();
     const prepared: SlotRecord = {
       ...slot,
+      ...(task ? { taskId: task.taskId } : {}),
       attempt: slot.attempt + 1,
       state: "provisioning",
       since: nowIso,
       attemptStartedAt: nowIso,
-      idempotencyKey: slotIdempotencyKey(flight.id, slot.slotId, slot.attempt + 1),
+      idempotencyKey: slotIdempotencyKey(flight.id, slot.slotId, slot.generation, slot.attempt + 1),
       evidence: {},
       history: slot.history,
     };
@@ -226,11 +341,11 @@ async function sweepOneFlight(
     delete prepared.beeId;
     delete prepared.nudgedAt;
     await deps.saveSlot(prepared);
-    await deps.appendLedger({ type: "flight.slot.provisioning", flight: flight.id, slot: slot.slotId, attempt: prepared.attempt, mixKey: slot.mixKey });
+    await deps.appendLedger({ type: "flight.slot.provisioning", flight: flight.id, slot: slot.slotId, generation: prepared.generation, attempt: prepared.attempt, mixKey: slot.mixKey, ...(task ? { task: task.taskId } : {}) });
     booting += 1;
     // EXECUTE + CONFIRM.
     try {
-      const spawned = await deps.spawnSlot(flight, prepared, mix);
+      const spawned = await deps.spawnSlot(flight, prepared, mix, task ?? undefined);
       const confirmed: SlotRecord = {
         ...prepared,
         beeName: spawned.beeName,
@@ -262,20 +377,38 @@ async function sweepOneFlight(
     }
   }
 
-  // Flight completion: the FULL declared slot set terminal → close + one
+  // Flight completion: the FULL declared slot set finished → close + one
   // flight.complete. Requiring target.slots files prevents a lost slot file
-  // from closing the flight early (CR-6); under `draining`, `vacant` counts
-  // as terminal — a drained flight never refills, so an open vacancy would
-  // otherwise pin it in draining forever (CR-7c).
+  // from closing the flight early (CR-6). Drained lanes count as finished —
+  // that IS the queue-exhausted end state. Under `draining`, `vacant` counts
+  // too (a drained flight never refills — CR-7c), and pending/leased tasks
+  // are deliberately ignored: draining means "finish current work, run
+  // nothing new", so frozen queue work must not pin the flight open (the
+  // complete event reports what was left behind). An ACTIVE queue-backed
+  // flight only completes once pending AND leased are both empty.
   const finalSlots = await deps.listSlots(flight.id);
+  const finalCounts = queueBacked ? await deps.queue!.counts(flight.id) : null;
+  const queueOpen = flight.status === "active" && finalCounts !== null && finalCounts.pending + finalCounts.leased > 0;
   const terminalUnderStatus = (slot: SlotRecord) =>
-    SLOT_TERMINAL_STATES.includes(slot.state) || (flight.status === "draining" && slot.state === "vacant");
-  if (finalSlots.length >= flight.target.slots && finalSlots.every(terminalUnderStatus)) {
+    SLOT_COMPLETION_STATES.includes(slot.state) || (flight.status === "draining" && slot.state === "vacant");
+  if (finalSlots.length >= flight.target.slots && finalSlots.every(terminalUnderStatus) && !queueOpen) {
     const done = finalSlots.filter((slot) => slot.state === "done").length;
     const closed: FlightRecord = { ...flight, status: "closed", updatedAt: new Date(deps.now()).toISOString() };
     await deps.saveFlight(closed);
-    await deps.appendLedger({ type: "flight.complete", flight: flight.id, done, abandoned: finalSlots.length - done });
-    outcomes.push({ flight: flight.id, action: "complete", detail: `${done}/${finalSlots.length} done` });
+    await deps.appendLedger({
+      type: "flight.complete",
+      flight: flight.id,
+      done,
+      abandoned: finalSlots.filter((slot) => slot.state === "abandoned").length,
+      ...(finalCounts
+        ? { tasksDone: finalCounts.done, tasksFailed: finalCounts.failed, tasksLeft: finalCounts.pending + finalCounts.leased }
+        : {}),
+    });
+    outcomes.push({
+      flight: flight.id,
+      action: "complete",
+      detail: finalCounts ? `tasks ${finalCounts.done} done, ${finalCounts.failed} failed` : `${done}/${finalSlots.length} done`,
+    });
   }
   return outcomes;
 }
@@ -285,7 +418,7 @@ export function stallNudgeText(flight: FlightRecord, slot: SlotRecord): string {
   return [
     `[flight ${flight.id}] Your slot ${slot.slotId} (attempt ${slot.attempt}) has shown no progress past its stall deadline.`,
     flight.contract.completion === "seal"
-      ? `If your task is finished or blocked, record your seal NOW with taskId "${slotTaskId(flight.id, slot.slotId)}" and attempt ${slot.attempt} (see the completion contract in your brief). Otherwise continue working — any tool activity resets the stall clock.`
+      ? `If your task is finished or blocked, record your seal NOW with taskId "${slotContractTaskId(slot)}" and attempt ${slot.attempt} (see the completion contract in your brief). Otherwise continue working — any tool activity resets the stall clock.`
       : "If your task is finished, exit; otherwise continue working — any tool activity resets the stall clock.",
     "No reply is needed. Going quiet again without a seal escalates this slot.",
   ].join(" ");

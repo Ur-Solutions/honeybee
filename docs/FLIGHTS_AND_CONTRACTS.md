@@ -55,13 +55,43 @@ exceptions; it never judges.
 ```
 hive flight start --name parity-07 --cwd ~/repo \
   --mix "fable=claude/claude-fable-5@auto:5" --mix "codex=codex@auto:5" \
-  --brief-file ./route-packet.md --seal-type implementation
+  --seal-type implementation
+hive flight enqueue parity-07 --task-id shard-01 --brief-file packets/shard-01.md --cwd ~/wt/shard-01
+hive flight enqueue parity-07 --from-dir ./packets     # bulk: one packet per file
+hive flight queue parity-07         # pending/leased/done/failed buckets
 hive flight status parity-07        # disk-derived; works with the daemon down
 hive flight sweep parity-07         # one inline reconcile pass (live-observed, lock-safe vs the daemon)
-hive flight resolve parity-07 s3 --retry|--abandon|--accept   # operator verdict on an escalated slot
+hive flight resolve parity-07 s3 --retry|--abandon|--accept   # operator verdict on an escalated slot/task
 hive events -f --type 'flight.*'    # the live feed
 hive flight drain|close parity-07
 ```
+
+### v1.1 — the lane-keeper (durable task queue + slot generations)
+
+A flight with queue work is a **lane-keeper**, not a fixed batch: it keeps N
+lanes productive over the queue until `pending/` is empty — the chronic-
+underpopulation goal from the original parity incident. Mechanics:
+
+- Packets live in `flights/<id>/queue/{pending,leased,done,failed}/`, one
+  JSON file each (`taskId`, `brief`, optional per-task `cwd` for its
+  worktree). Content is project-authored; enqueue is the manager API.
+- A lane claims the oldest pending packet DURABLY (under the flight lock,
+  before the slot prepare) — lease identity is (slotId, generation, attempt),
+  so evidence and idempotency never bleed across tasks. The packet's taskId
+  becomes the lane's completion-contract key.
+- On a contract-matching done seal the packet is filed to `done/` (with the
+  seal ref), the lane bumps its generation, and the spawn phase claims the
+  next packet — replace-before-collect: the finished bee stays alive for the
+  manager to collect and retire at leisure.
+- Attempt exhaustion fails the TASK (`failed/`), never the lane: one poisoned
+  packet cannot kill lane capacity. `resolve --accept|--abandon` files the
+  current packet and recycles the lane; `--retry` re-runs the same packet.
+- Queue empty → lanes park as `drained`; enqueueing new work revives them on
+  the next sweep. The flight completes (and closes) only when pending and
+  leased are both empty and every lane is drained/done/abandoned.
+- Flights never enqueued behave exactly as v1 fixed batches.
+- Events: `flight.task.{enqueued,claimed,done,failed}`, `flight.slot.drained`,
+  plus the v1 vocabulary; `flight.complete` reports task totals.
 
 - The activation rule (durable attempt claims, evidence scoped to
   `attemptStartedAt`, stale = none / key-mismatch = escalate) lives in the

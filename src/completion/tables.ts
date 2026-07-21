@@ -28,7 +28,7 @@ export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sy
 export const KEYS_SUBCOMMANDS = ["print", "path", "check"];
 export const SESSIONS_SUBCOMMANDS = ["reconcile"];
 export const SYNC_SUBCOMMANDS = ["manifest"];
-export const FLIGHT_SUBCOMMANDS = ["start", "ls", "list", "status", "sweep", "resolve", "drain", "close"];
+export const FLIGHT_SUBCOMMANDS = ["start", "ls", "list", "status", "sweep", "enqueue", "queue", "resolve", "drain", "close"];
 
 export const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 export const SEAL_STATUS_VALUES = [...SEAL_STATUSES];
@@ -140,7 +140,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--name", "--cwd", "--mix", "--agent", "--slots", "--model", "--account",
     "--brief", "--brief-file", "--colony", "--completion", "--seal-type",
     "--readiness-ms", "--first-evidence-ms", "--stall-ms", "--max-attempts", "--max-boots",
-    "--retry", "--abandon", "--accept", "--json",
+    "--task-id", "--from-dir", "--retry", "--abandon", "--accept", "--json",
   ],
   flow: ["--arg", "--foreground", "--background", "--flow", "--json", "-n", "--lines"],
   loop: [

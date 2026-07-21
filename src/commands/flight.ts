@@ -4,6 +4,7 @@
 // daemon's sweeper (or an explicit `hive flight sweep`) reconciles toward it.
 // `status` is computed from disk and works with the daemon down.
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { actionLine, bold, dim, formatRelativeTime, isPretty, note } from "../format.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { stringFlag } from "../cli/shared.js";
@@ -14,11 +15,15 @@ import type { BeeState } from "../state.js";
 import { createFlightSweeper } from "../daemon/flightSweep.js";
 import {
   allocateFlightId,
+  enqueueTask,
+  finishTask,
   listFlights,
   listSlots,
+  listTasks,
   loadFlight,
   saveFlight,
   saveSlot,
+  taskCounts,
 } from "../flight/store.js";
 import {
   FLIGHT_CONTRACT_DEFAULTS,
@@ -32,6 +37,8 @@ const USAGE = `Usage:
   hive flight start --name <name> --cwd <dir> (--mix <key=agent[/model][@account]:count>... | --agent <a> --slots <n>)
                     [--brief <text> | --brief-file <path>] [--colony <c>] [--completion seal|exit] [--seal-type <${SEAL_TYPES.join("|")}>]
                     [--readiness-ms <n>] [--first-evidence-ms <n>] [--stall-ms <n>] [--max-attempts <n>] [--max-boots <n>]
+  hive flight enqueue <id|name> (--task-id <id> (--brief <text> | --brief-file <path>) [--cwd <dir>] | --from-dir <dir>)
+  hive flight queue <id|name> [--json]
   hive flight ls [--json]
   hive flight status <id|name> [--json]
   hive flight sweep [<id|name>]
@@ -51,6 +58,10 @@ export async function cmdFlight(parsed: Parsed): Promise<void> {
       return flightStatus(parsed);
     case "sweep":
       return flightSweep(parsed);
+    case "enqueue":
+      return flightEnqueue(parsed);
+    case "queue":
+      return flightQueue(parsed);
     case "resolve":
       return flightResolve(parsed);
     case "drain":
@@ -156,6 +167,7 @@ async function flightStart(parsed: Parsed): Promise<void> {
         flightId: flight.id,
         slotId: `s${slotIndex}`,
         mixKey: entry.key,
+        generation: 0,
         attempt: 0,
         state: "vacant",
         since: now,
@@ -231,9 +243,12 @@ export type FlightStatusReport = {
     productive: number;
     booting: number;
     vacant: number;
+    drained: number;
     attention: number;
     abandoned: number;
   };
+  /** Queue bucket counts (v1.1); absent for fixed-batch flights. */
+  queue?: { pending: number; leased: number; done: number; failed: number };
 };
 
 export async function buildFlightStatus(flight: FlightRecord, sessions: SessionRecord[]): Promise<FlightStatusReport> {
@@ -243,6 +258,8 @@ export async function buildFlightStatus(flight: FlightRecord, sessions: SessionR
     ...slot,
     ...(slot.beeName && byName.get(slot.beeName)?.lastObservedState ? { beeState: byName.get(slot.beeName)!.lastObservedState! } : {}),
   }));
+  const counts = await taskCounts(flight.id);
+  const queueBacked = counts.pending + counts.leased + counts.done + counts.failed > 0;
   return {
     flight,
     slots: rows,
@@ -252,9 +269,11 @@ export async function buildFlightStatus(flight: FlightRecord, sessions: SessionR
       productive: slots.filter((slot) => slot.state === "working" && slot.evidence.firstEvidenceAt).length,
       booting: slots.filter((slot) => slot.state === "provisioning" || slot.state === "booting").length,
       vacant: slots.filter((slot) => slot.state === "vacant").length,
+      drained: slots.filter((slot) => slot.state === "drained").length,
       attention: slots.filter((slot) => slot.state === "stalled" || slot.state === "blocked" || slot.state === "escalated").length,
       abandoned: slots.filter((slot) => slot.state === "abandoned").length,
     },
+    ...(queueBacked ? { queue: counts } : {}),
   };
 }
 
@@ -266,18 +285,22 @@ async function flightStatus(parsed: Parsed): Promise<void> {
     return;
   }
   const s = report.summary;
+  const queueLine = report.queue
+    ? `  queue: pending ${report.queue.pending} leased ${report.queue.leased} done ${report.queue.done} failed ${report.queue.failed}`
+    : "";
   if (isPretty()) {
-    console.log(`${bold(flight.id)} ${flight.name} ${dim(flight.status)}  done ${s.done}/${s.total}  productive ${s.productive}  booting ${s.booting}  vacant ${s.vacant}${s.attention > 0 ? `  ${bold("attention " + s.attention)}` : ""}${s.abandoned > 0 ? `  abandoned ${s.abandoned}` : ""}`);
+    console.log(`${bold(flight.id)} ${flight.name} ${dim(flight.status)}  done ${s.done}/${s.total}  productive ${s.productive}  booting ${s.booting}  vacant ${s.vacant}${s.drained > 0 ? `  drained ${s.drained}` : ""}${s.attention > 0 ? `  ${bold("attention " + s.attention)}` : ""}${s.abandoned > 0 ? `  abandoned ${s.abandoned}` : ""}`);
+    if (queueLine) console.log(dim(queueLine));
     for (const slot of report.slots) {
       const age = formatRelativeTime(slot.since);
       console.log(
-        `  ${slot.slotId.padEnd(4)} ${slot.state.padEnd(12)} ${dim(`a${slot.attempt}`)} ${slot.beeName ?? dim("(no bee)")}${slot.beeState ? dim(` [${slot.beeState}]`) : ""} ${dim(`${age} ago`)}${slot.evidence.sealFilename ? dim(" sealed") : ""}`,
+        `  ${slot.slotId.padEnd(4)} ${slot.state.padEnd(12)} ${dim(`g${slot.generation} a${slot.attempt}`)} ${slot.taskId ? `${slot.taskId} ` : ""}${slot.beeName ?? dim("(no bee)")}${slot.beeState ? dim(` [${slot.beeState}]`) : ""} ${dim(`${age} ago`)}${slot.evidence.sealFilename ? dim(" sealed") : ""}`,
       );
     }
   } else {
-    console.log(`${flight.id}\t${flight.name}\t${flight.status}\t${s.done}/${s.total}\t${s.productive}\t${s.attention}`);
+    console.log(`${flight.id}\t${flight.name}\t${flight.status}\t${s.done}/${s.total}\t${s.productive}\t${s.attention}${report.queue ? `\tq:${report.queue.pending}/${report.queue.leased}/${report.queue.done}/${report.queue.failed}` : ""}`);
     for (const slot of report.slots) {
-      console.log(`${slot.slotId}\t${slot.state}\t${slot.attempt}\t${slot.beeName ?? ""}\t${slot.beeState ?? ""}\t${slot.since}`);
+      console.log(`${slot.slotId}\t${slot.state}\tg${slot.generation}a${slot.attempt}\t${slot.taskId ?? ""}\t${slot.beeName ?? ""}\t${slot.beeState ?? ""}\t${slot.since}`);
     }
   }
 }
@@ -329,10 +352,91 @@ async function flightSweep(parsed: Parsed): Promise<void> {
 }
 
 /**
+ * `hive flight enqueue` — author queue packets (flight v1.1). Enqueueing is
+ * the manager/orchestrator API boundary: packet CONTENT (one-screen brief,
+ * worktree cwd, ports/fixtures in the text) stays project-authored; the
+ * controller only feeds packets to lanes. Enqueue never takes the sweep lock
+ * (it only creates files in pending/), so it is safe to call anytime the
+ * flight is active — including while lanes are drained; they revive on the
+ * next sweep.
+ */
+async function flightEnqueue(parsed: Parsed): Promise<void> {
+  const flight = await resolveFlight(parsed.args[1]);
+  if (flight.status !== "active") {
+    throw new Error(`flight ${flight.id} is ${flight.status}; enqueue requires an active flight`);
+  }
+  const fromDir = stringFlag(parsed, ["from-dir"]);
+  const enqueued: string[] = [];
+  if (fromDir) {
+    const { readdir: readDir } = await import("node:fs/promises");
+    const files = (await readDir(fromDir)).filter((file) => !file.startsWith(".")).sort();
+    if (files.length === 0) throw new Error(`--from-dir ${fromDir} contains no packet files`);
+    for (const file of files) {
+      const brief = await readFile(join(fromDir, file), "utf8");
+      const taskId = file.replace(/\.[^.]+$/, "");
+      await enqueueTask(flight.id, { taskId, brief });
+      await appendLedger({ type: "flight.task.enqueued", flight: flight.id, task: taskId });
+      enqueued.push(taskId);
+    }
+  } else {
+    const taskId = stringFlag(parsed, ["task-id"]);
+    if (!taskId) throw new Error(`--task-id (or --from-dir) is required\n${USAGE}`);
+    const briefFile = stringFlag(parsed, ["brief-file"]);
+    const briefText = stringFlag(parsed, ["brief"]);
+    if (briefFile && briefText) throw new Error("--brief and --brief-file are mutually exclusive");
+    const brief = briefFile ? await readFile(briefFile, "utf8") : briefText;
+    if (!brief) throw new Error("a packet needs --brief or --brief-file");
+    const cwd = stringFlag(parsed, ["cwd"]);
+    await enqueueTask(flight.id, { taskId, brief, ...(cwd ? { cwd } : {}) });
+    await appendLedger({ type: "flight.task.enqueued", flight: flight.id, task: taskId });
+    enqueued.push(taskId);
+  }
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify({ flight: flight.id, enqueued }, null, 2));
+  } else if (isPretty()) {
+    console.log(actionLine("ok", "flight", [bold(flight.id), `enqueued ${enqueued.length} task${enqueued.length === 1 ? "" : "s"}`, dim(enqueued.join(", "))]));
+  } else {
+    console.log(`enqueued\t${flight.id}\t${enqueued.join(",")}`);
+  }
+}
+
+/** `hive flight queue` — bucket counts + per-task rows, straight off disk. */
+async function flightQueue(parsed: Parsed): Promise<void> {
+  const flight = await resolveFlight(parsed.args[1]);
+  const buckets = {
+    pending: await listTasks(flight.id, "pending"),
+    leased: await listTasks(flight.id, "leased"),
+    done: await listTasks(flight.id, "done"),
+    failed: await listTasks(flight.id, "failed"),
+  };
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify({ flight: flight.id, ...buckets }, null, 2));
+    return;
+  }
+  const counts = Object.entries(buckets).map(([bucket, tasks]) => `${bucket} ${tasks.length}`).join("  ");
+  if (isPretty()) console.log(`${bold(flight.id)} ${flight.name} ${dim("queue:")} ${counts}`);
+  else console.log(`${flight.id}\t${counts}`);
+  for (const [bucket, tasks] of Object.entries(buckets)) {
+    for (const task of tasks) {
+      const extra =
+        bucket === "leased" && task.lease
+          ? `→ ${task.lease.slotId} g${task.lease.generation}`
+          : bucket !== "pending" && task.outcome
+            ? task.outcome.sealFilename ?? task.outcome.reason ?? ""
+            : "";
+      if (isPretty()) console.log(`  ${bucket.padEnd(8)} ${bold(task.taskId)} ${dim(extra)}`);
+      else console.log(`${bucket}\t${task.taskId}\t${extra}`);
+    }
+  }
+}
+
+/**
  * `hive flight resolve <flight> <slot> --retry|--abandon|--accept` — the
  * operator verdict on a slot the controller escalated (review CR-7b). The
  * controller never judges; this is where judgment lands. Escalated slots are
- * otherwise immortal and block flight completion.
+ * otherwise immortal and block flight completion. On a queue lane the verdict
+ * lands on the TASK — accept/abandon file the packet as done/failed and
+ * recycle the lane onto the next packet; retry re-runs the same packet.
  */
 async function flightResolve(parsed: Parsed): Promise<void> {
   const flight = await resolveFlight(parsed.args[1]);
@@ -349,21 +453,38 @@ async function flightResolve(parsed: Parsed): Promise<void> {
   }
 
   const now = new Date().toISOString();
-  const history = [...slot.history, { attempt: slot.attempt, ...(slot.beeName ? { beeName: slot.beeName } : {}), outcome: `operator-${resolution}`, at: now }];
+  const history = [
+    ...slot.history,
+    { attempt: slot.attempt, generation: slot.generation, ...(slot.taskId ? { taskId: slot.taskId } : {}), ...(slot.beeName ? { beeName: slot.beeName } : {}), outcome: `operator-${resolution}`, at: now },
+  ];
   let next: SlotRecord;
   if (resolution === "retry") {
+    // Retry keeps the lease: same generation, same taskId (if any) — the next
+    // sweep re-attempts the SAME packet.
     next = { ...slot, state: "vacant", since: now, evidence: {}, history };
     delete next.beeName;
     delete next.beeId;
     delete next.nudgedAt;
     delete next.attemptStartedAt;
+  } else if (slot.taskId) {
+    // Queue lane: the verdict lands on the TASK — file the packet and recycle
+    // the lane onto the next one instead of killing lane capacity.
+    await finishTask(flight.id, slot.taskId, resolution === "accept" ? "done" : "failed", { reason: `operator-${resolution}` });
+    await appendLedger({ type: `flight.task.${resolution === "accept" ? "done" : "failed"}`, flight: flight.id, slot: slotId, task: slot.taskId, generation: slot.generation, reason: `operator-${resolution}` });
+    next = { ...slot, generation: slot.generation + 1, attempt: 0, state: "vacant", since: now, evidence: {}, history };
+    delete next.taskId;
+    delete next.beeName;
+    delete next.beeId;
+    delete next.nudgedAt;
+    delete next.attemptStartedAt;
+    delete next.idempotencyKey;
   } else if (resolution === "abandon") {
     next = { ...slot, state: "abandoned", since: now, history };
   } else {
     next = { ...slot, state: "done", since: now, history };
   }
   await saveSlot(next);
-  await appendLedger({ type: "flight.slot.resolved", flight: flight.id, slot: slotId, resolution, ...(slot.beeName ? { bee: slot.beeName } : {}) });
+  await appendLedger({ type: "flight.slot.resolved", flight: flight.id, slot: slotId, resolution, ...(slot.taskId ? { task: slot.taskId } : {}), ...(slot.beeName ? { bee: slot.beeName } : {}) });
 
   // Retry/abandon write the current bee off — retire it (best effort) so the
   // verdict doesn't leak a live runner host.

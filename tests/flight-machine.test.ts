@@ -33,6 +33,7 @@ function slot(overrides: Partial<SlotRecord> = {}): SlotRecord {
     flightId: "FL.abc",
     slotId: "s1",
     mixKey: "fable",
+    generation: 0,
     attempt: 1,
     beeName: "parity-07-s1-a1",
     state: "working",
