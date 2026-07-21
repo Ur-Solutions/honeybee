@@ -265,6 +265,13 @@ export type TickDispatcher<K extends keyof DispatcherOutcomes> = {
    */
   skipFirstTick?: boolean;
   /**
+   * Hard per-stage cap BELOW the shared pool, for best-effort stages that
+   * would otherwise drain it (2026-07-21 canary round 4: sampleUsage consumed
+   * 59.8s of the 60s pool and starved every stage behind it). Effective
+   * timeout = min(timeoutKey budget, capMs, remaining pool).
+   */
+  capMs?: number;
+  /**
    * Start the stage. Return undefined to skip it — dep not wired, or the
    * stage's trigger condition not met — leaving its outcomes empty.
    */
@@ -277,7 +284,12 @@ type AnyTickDispatcher = { [K in keyof DispatcherOutcomes]: TickDispatcher<K> }[
 
 /**
  * The dispatcher registry: state-derived work that runs at the end of every
- * tick, strictly in this order (autoswap consumes the usage stage's outcomes).
+ * tick, strictly in this order. SAFETY-CRITICAL, cheap stages come FIRST
+ * (buz drain, needs-input routing, node edges, the detached flight starter,
+ * token refresh) and best-effort samplers LAST (usage, auto-title, pool
+ * sweep) — under the shared dispatch pool, order is priority: a slow sampler
+ * must starve itself, never the flight reconciler (2026-07-21 canary round
+ * 4). Autoswap consumes the usage stage's outcomes and must follow it.
  * Void periodic tasks with positional constraints (mirrorRemoteEvents) stay
  * inline in tick() — they produce no outcomes to log. syncChains runs on its
  * own track in runDaemon, outside the tick path entirely.
@@ -332,11 +344,52 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
       node: outcome.node,
     }),
   },
+  // Flight reconciler (CL.701): drive slot leases from this tick's evidence —
+  // seal completion, deadlines, idempotent replacement under backpressure.
+  {
+    key: "flightSweeps",
+    name: "sweepFlights",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed }) => deps.sweepFlights?.(records, observed),
+    log: (outcome) => ({
+      level: outcome.action === "error" ? "warn" : "info",
+      msg: `flight.${outcome.action}`,
+      flight: outcome.flight,
+      ...(outcome.slot ? { slot: outcome.slot } : {}),
+      ...(outcome.detail ? { detail: outcome.detail } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
+  // Remote codex token refresher (UNIT 2): proactively re-deliver a fresh access
+  // token before expiry, and reactively on a mirrored auth_expired event.
+  {
+    key: "tokenRefreshes",
+    name: "refreshRemoteTokens",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, hsrObs, nowMs }) => deps.refreshRemoteTokens?.(records, hsrObs, nowMs),
+    // A pure skip (in-flight / cooldown / not-eligible) is not a refresh — don't log it.
+    log: (outcome) =>
+      outcome.skipped
+        ? null
+        : {
+            level: outcome.ok ? "info" : "warn",
+            msg: "token.refresh",
+            session: outcome.bee,
+            ...(outcome.account ? { account: outcome.account } : {}),
+            ...(outcome.trigger ? { trigger: outcome.trigger } : {}),
+            ok: outcome.ok,
+            ...(outcome.expiresAt ? { expiresAt: new Date(outcome.expiresAt * 1000).toISOString() } : {}),
+            ...(outcome.error ? { error: outcome.error } : {}),
+          },
+  },
   // Usage sampler: factual per-account token samples + exhaustion events.
   {
     key: "usage",
     name: "sampleUsage",
     skipFirstTick: true,
+    // Best-effort: half the shared pool at most, so a slow sampler can never
+    // starve the stages behind it (it retries with warm caches next tick).
+    capMs: 20_000,
     timeoutKey: "dispatchMs",
     run: ({ deps, records, panes, nowMs, hsrObs }) => deps.sampleUsage?.(records, panes, nowMs, hsrObs),
     log: (outcome) =>
@@ -376,6 +429,7 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
     key: "autoTitles",
     name: "dispatchAutoTitle",
     skipFirstTick: true,
+    capMs: 15_000,
     timeoutKey: "dispatchMs",
     run: ({ deps, records }) => deps.dispatchAutoTitle?.(records),
     log: (outcome) => ({
@@ -385,44 +439,6 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
       ok: outcome.ok,
       ...(outcome.title ? { title: outcome.title } : {}),
       ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
-      ...(outcome.error ? { error: outcome.error } : {}),
-    }),
-  },
-  // Remote codex token refresher (UNIT 2): proactively re-deliver a fresh access
-  // token before expiry, and reactively on a mirrored auth_expired event.
-  {
-    key: "tokenRefreshes",
-    name: "refreshRemoteTokens",
-    timeoutKey: "dispatchMs",
-    run: ({ deps, records, hsrObs, nowMs }) => deps.refreshRemoteTokens?.(records, hsrObs, nowMs),
-    // A pure skip (in-flight / cooldown / not-eligible) is not a refresh — don't log it.
-    log: (outcome) =>
-      outcome.skipped
-        ? null
-        : {
-            level: outcome.ok ? "info" : "warn",
-            msg: "token.refresh",
-            session: outcome.bee,
-            ...(outcome.account ? { account: outcome.account } : {}),
-            ...(outcome.trigger ? { trigger: outcome.trigger } : {}),
-            ok: outcome.ok,
-            ...(outcome.expiresAt ? { expiresAt: new Date(outcome.expiresAt * 1000).toISOString() } : {}),
-            ...(outcome.error ? { error: outcome.error } : {}),
-          },
-  },
-  // Flight reconciler (CL.701): drive slot leases from this tick's evidence —
-  // seal completion, deadlines, idempotent replacement under backpressure.
-  {
-    key: "flightSweeps",
-    name: "sweepFlights",
-    timeoutKey: "dispatchMs",
-    run: ({ deps, records, observed }) => deps.sweepFlights?.(records, observed),
-    log: (outcome) => ({
-      level: outcome.action === "error" ? "warn" : "info",
-      msg: `flight.${outcome.action}`,
-      flight: outcome.flight,
-      ...(outcome.slot ? { slot: outcome.slot } : {}),
-      ...(outcome.detail ? { detail: outcome.detail } : {}),
       ...(outcome.error ? { error: outcome.error } : {}),
     }),
   },
@@ -475,7 +491,7 @@ async function runTickDispatcher<K extends keyof DispatcherOutcomes>(
   try {
     ctx.outcomes[dispatcher.key] = await withTimeout(
       pending,
-      Math.max(1, Math.min(timeouts[dispatcher.timeoutKey], remainingMs)),
+      Math.max(1, Math.min(timeouts[dispatcher.timeoutKey], dispatcher.capMs ?? Number.POSITIVE_INFINITY, remainingMs)),
       dispatcher.name,
     );
   } catch (error) {

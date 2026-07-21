@@ -910,3 +910,39 @@ test("canary round 3: the shared dispatch pool bounds the registry — stages ca
     );
   });
 });
+
+test("canary round 4: a slow usage sampler starves itself, never the flight stage", async () => {
+  await withTempStore(async () => {
+    const record = bee({ lastPromptAt: "2026-06-03T09:59:00.000Z" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const ran: string[] = [];
+    const deps: TickDeps = {
+      ...buildDeps({
+        records: [record],
+        liveTargets: new Set([record.tmuxTarget]),
+        panes: new Map([[record.tmuxTarget, "done\n\n› next task"]]),
+        capture,
+      }),
+      now: () => Date.now(),
+      timeouts: { dispatchMs: 10_000, dispatchTotalMs: 150 },
+    };
+    deps.sweepFlights = async () => {
+      ran.push("sweepFlights");
+      return [];
+    };
+    // Would previously run BEFORE flights and drain the whole pool.
+    deps.sampleUsage = () => new Promise((resolve) => setTimeout(() => resolve([]), 400)) as never;
+    deps.dispatchAutoTitle = async () => {
+      ran.push("dispatchAutoTitle");
+      return [];
+    };
+
+    const result = await tick(deps, new Map(), { firstTick: false });
+
+    // The safety-critical flight stage ran; the sampler consumed the pool and
+    // was bounded; whatever followed it was starved instead of the flights.
+    assert.deepEqual(ran.filter((name) => name === "sweepFlights"), ["sweepFlights"]);
+    assert.ok(result.stageMs.sweepFlights !== undefined, "flight stage executed and was timed");
+    assert.ok(result.errors.some((e) => /sampleUsage timed out/.test(e.message)));
+  });
+});
