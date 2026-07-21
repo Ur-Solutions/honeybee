@@ -69,6 +69,8 @@ export type RunDaemonOptions = {
    * and embedders opt in; the `hive daemon run` CLI path enables it.
    */
   sentinel?: boolean;
+  /** Injectable crash-adoption reap (testing); defaults to reapDeadHosts. */
+  bootReap?: () => Promise<string[]>;
 };
 
 export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
@@ -167,19 +169,19 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     await appendDaemonLog({ level: "warn", msg: "hsr.control.start.failed", error: error instanceof Error ? error.message : String(error) });
   }
 
-  // Crash adoption v1: a daemon restart reconciles any HSR bee whose meta still
-  // says "running" but whose host pid is dead (the host owns the harness pipes,
-  // so a dead host is an unrecoverable session). DETACHED (2026-07-21 canary
-  // breach): this scans every HSR run dir — 62 seconds at ~1000 dirs — and it
-  // used to run BEFORE the sentinel/watchdog/loop started, so a large registry
-  // delayed every defense while the daemon sat unprotected. Adoption is not
-  // urgent (the tick's observation reaches the same verdict per bee); let it
-  // finish in the background.
-  void reapDeadHosts()
-    .then((reaped) =>
-      reaped.length > 0 ? appendDaemonLog({ level: "info", msg: "hsr.reaped", bees: reaped }).catch(() => undefined) : undefined,
-    )
-    .catch(() => undefined);
+  // Crash adoption v1 (reapDeadHosts): reconcile HSR bees whose meta says
+  // "running" but whose host pid is dead. DEFERRED until after the FIRST
+  // SUCCESSFUL tick (2026-07-21 canary, round 2): merely detaching it was not
+  // enough — the scan is ~1000 run-dir reads plus main-thread JSON parsing in
+  // THIS process, and launched at boot it raced the cold first tick for the
+  // event loop and fs pool, starving it past the 120s budget into the breach
+  // cycle the detach was meant to fix (two post-patch pids breached exactly
+  // this way; verified via process sampling). Adoption is not urgent — the
+  // tick's per-bee observation reaches the same verdict — so it now waits for
+  // the loop to prove one healthy tick first. The kick lives in the loop body
+  // below; nothing runs here.
+  const bootReap = options.bootReap ?? reapDeadHosts;
+  let bootReapKicked = false;
 
   if (options.shutdownSignal) {
     if (options.shutdownSignal.aborted) {
@@ -294,7 +296,9 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
           await safeLog({ level: "info", msg: "tick.abandoned.settled", adoptedObserved: abandonedTick.result !== null });
           abandonedTick = null;
         }
-        const tickPromise = tickFn(deps, observed);
+        // firstTick until one tick has COUNTED: cold-cache samplers sit out
+        // (skipFirstTick) so the boot tick proves loop health in seconds.
+        const tickPromise = tickFn(deps, observed, { firstTick: state.tickCount === 0 });
         try {
           result = await withTimeout(tickPromise, config.tickBudgetMs, "tick");
         } catch (error) {
@@ -320,6 +324,17 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         state.lastSuccessfulTickAt = state.lastTickAt;
         state.lastTickStageMs = result.stageMs;
         state.lastTickDurationMs = result.durationMs;
+        // Crash-adoption reap: kicked exactly once, only after the loop has
+        // PROVEN one healthy tick — never racing the cold boot tick for the
+        // event loop (2026-07-21 canary round 2).
+        if (!bootReapKicked) {
+          bootReapKicked = true;
+          void bootReap()
+            .then((reaped) =>
+              reaped.length > 0 ? appendDaemonLog({ level: "info", msg: "hsr.reaped", bees: reaped }).catch(() => undefined) : undefined,
+            )
+            .catch(() => undefined);
+        }
         // Record every partial-tick error into recentErrors, then flush the
         // tick's log fan-out (partials, transitions, dispatcher outcomes) in a
         // fixed order — see logTickResult().
