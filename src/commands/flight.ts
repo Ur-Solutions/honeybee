@@ -13,6 +13,8 @@ import { resolveSpawningBeeId } from "../spawnParent.js";
 import { appendLedger, listSessions, loadSession, type SessionRecord } from "../store.js";
 import type { BeeState } from "../state.js";
 import { createFlightSweeper } from "../daemon/flightSweep.js";
+import { paneActivitySignal, type BeeActivitySignal } from "../flight/controller.js";
+import { substrateFor } from "../substrates/index.js";
 import {
   allocateFlightId,
   enqueueTask,
@@ -313,7 +315,9 @@ async function flightStatus(parsed: Parsed): Promise<void> {
 async function flightSweep(parsed: Parsed): Promise<void> {
   const ref = parsed.args[1];
   const sessions = await listSessions();
+  const sessionsByName = new Map(sessions.map((record) => [record.name, record]));
   const observed = new Map<string, BeeState>();
+  const activity = new Map<string, BeeActivitySignal>();
   for (const record of sessions) {
     if (record.lastObservedState) observed.set(record.name, record.lastObservedState as BeeState);
   }
@@ -336,10 +340,26 @@ async function flightSweep(parsed: Parsed): Promise<void> {
       if (!observation) continue;
       if (observation.state) observed.set(bee, observation.state);
       else if (!observation.live) observed.set(bee, "dead");
+      if (observation.activity) {
+        activity.set(bee, { at: new Date(observation.activity.at).toISOString(), fingerprint: observation.activity.fingerprint });
+      }
     }
   }
-  const sweeper = createFlightSweeper({ listFlights: async () => flights });
-  const outcomes = await sweeper(sessions, observed);
+  const sweepNow = Date.now();
+  await Promise.all(slotBees.map(async (bee) => {
+    if (activity.has(bee)) return;
+    const record = sessionsByName.get(bee);
+    if (!record || record.substrate === "hsr") return;
+    let pane = "";
+    try {
+      pane = await substrateFor(record).capture(record.tmuxTarget, 80, record.agentPaneId);
+    } catch {
+      pane = "";
+    }
+    if (pane) activity.set(bee, paneActivitySignal(record, pane, sweepNow));
+  }));
+  const sweeper = createFlightSweeper({ listFlights: async () => flights, now: () => sweepNow });
+  const outcomes = await sweeper(sessions, observed, activity);
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(outcomes, null, 2));
     return;
@@ -522,6 +542,9 @@ async function flightSetStatus(parsed: Parsed, status: "draining" | "closed"): P
   if (flight.status === status) {
     console.log(isPretty() ? note(`${flight.id} already ${status}`) : `noop\t${flight.id}\t${status}`);
     return;
+  }
+  if (flight.status === "closed") {
+    throw new Error(`flight ${flight.id} is closed; closed flights cannot transition to ${status}`);
   }
   await saveFlight({ ...flight, status, updatedAt: new Date().toISOString() });
   await appendLedger({ type: `flight.${status}`, flight: flight.id, name: flight.name });

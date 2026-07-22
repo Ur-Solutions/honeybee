@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { connectRpcClient } from "../src/hsr/rpc.js";
 import { runHsrHost } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
-import { hsrObservations, isAuthNeededMessage, structuredStateFromEvents } from "../src/hsr/observe.js";
+import { hsrActivityFromEvents, hsrObservations, isAuthNeededMessage, structuredStateFromEvents } from "../src/hsr/observe.js";
 import { ensureHsrRunDir, hsrRingPath, hsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { deriveState, type BeeState, type StateContext } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
@@ -188,6 +188,94 @@ test("structuredStateFromEvents recognizes Claude's /login error as auth-needed"
     ]),
     "auth-needed",
   );
+});
+
+test("hsrActivityFromEvents derives genuine progress from runner event boundaries", () => {
+  const cases: Array<{ name: string; events: RunnerEvent[]; at: number; eventType: RunnerEvent["type"] }> = [
+    {
+      name: "unterminated turn_start",
+      events: [{ type: "turn_start", ts: 10 }],
+      at: 10,
+      eventType: "turn_start",
+    },
+    {
+      name: "tool_use after turn_end",
+      events: [
+        { type: "turn_start", ts: 20 },
+        { type: "turn_end", ts: 21 },
+        { type: "tool_use", ts: 22, tool: "Bash" },
+      ],
+      at: 22,
+      eventType: "tool_use",
+    },
+    {
+      name: "text and usage progress",
+      events: [
+        { type: "turn_start", ts: 30 },
+        { type: "text", ts: 31, text: "working" },
+        { type: "usage", ts: 32, inputTokens: 7, outputTokens: 3 },
+      ],
+      at: 32,
+      eventType: "usage",
+    },
+    {
+      name: "needs_input boundary",
+      events: [
+        { type: "turn_start", ts: 40 },
+        { type: "needs_input", ts: 41, kind: "question", question: "continue?" },
+      ],
+      at: 41,
+      eventType: "needs_input",
+    },
+    {
+      name: "turn_end after needs_input",
+      events: [
+        { type: "turn_start", ts: 50 },
+        { type: "needs_input", ts: 51, kind: "question", question: "continue?" },
+        { type: "turn_end", ts: 52 },
+      ],
+      at: 52,
+      eventType: "turn_end",
+    },
+  ];
+
+  for (const entry of cases) {
+    const activity = hsrActivityFromEvents(entry.events);
+    assert.equal(activity?.at, entry.at, entry.name);
+    assert.equal(activity?.eventType, entry.eventType, entry.name);
+    assert.match(activity?.fingerprint ?? "", new RegExp(`:${entry.eventType}:${entry.at}:`), entry.name);
+  }
+});
+
+test("hsrActivityFromEvents scopes lifecycle boundaries to the root thread", () => {
+  const activity = hsrActivityFromEvents(
+    [
+      { type: "turn_start", ts: 1, threadId: "root-thread" },
+      { type: "turn_end", ts: 2, threadId: "nested-thread" },
+    ],
+    { rootThreadId: "root-thread" },
+  );
+
+  assert.equal(activity?.at, 1);
+  assert.equal(activity?.eventType, "turn_start");
+});
+
+test("hsrActivityFromEvents fingerprints are stable for unchanged tails and advance on same-timestamp events", () => {
+  const unchanged: RunnerEvent[] = [
+    { type: "turn_start", ts: 100 },
+    { type: "text", ts: 101, text: "step" },
+  ];
+  const first = hsrActivityFromEvents(unchanged);
+  const second = hsrActivityFromEvents([...unchanged]);
+  assert.equal(first?.fingerprint, second?.fingerprint);
+
+  const advanced = hsrActivityFromEvents([
+    ...unchanged,
+    { type: "usage", ts: 101, inputTokens: 1, outputTokens: 1 },
+  ]);
+  assert.equal(advanced?.at, 101);
+  assert.equal(advanced?.eventType, "usage");
+  assert.notEqual(advanced?.fingerprint, first?.fingerprint);
 });
 
 test("structuredStateFromEvents does not confuse daemon-recoverable auth_expired with auth-needed", () => {

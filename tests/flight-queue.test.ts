@@ -245,8 +245,9 @@ test("lane-keeper: enqueueing onto a drained lane revives it next sweep", async 
   h.setNow(T0 + 2 * 60_000);
   await sweepFlights(h.deps, [bee(worker)], new Map<string, BeeState>([[worker, "sealed"]]));
   assert.equal(h.slots.get("s1")!.state, "drained");
-  // Flight closed on queue exhaustion — reopen to simulate a new work wave on
-  // an active flight (enqueue requires active).
+  // Production has no reopen/status-active API. This in-memory mutation keeps
+  // the record active only to exercise the supported drained-lane invariant:
+  // an already-active queue-backed flight revives a lane when work appears.
   h.flights.set(f.id, { ...h.flights.get(f.id)!, status: "active" });
 
   h.queue.buckets.pending!.push(packet("t9"));

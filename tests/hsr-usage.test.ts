@@ -132,6 +132,7 @@ test("HSR sampler uses the per-tick event snapshot when provided", async () => {
       eventSnapshot: {
         events: [],
         tailEvents: [],
+        activity: null,
         usage: {
           totals: { inputTokens: 33, outputTokens: 7 },
           latestExhausted: { ts: 10, resetHint: "soon" },

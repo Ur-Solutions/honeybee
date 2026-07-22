@@ -5,6 +5,7 @@
 // prepare (write attempt+key) → execute (spawn) → confirm (write bee), so a
 // crash mid-replacement never double-spawns an attempt. All effects are
 // injected: the daemon wires real spawn/nudge/ledger; tests wire fakes.
+import { createHash } from "node:crypto";
 import type { BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
 import { planSlot, type SlotEvidence } from "./machine.js";
@@ -74,6 +75,16 @@ export type FlightSweepDeps = {
   now: () => number;
 };
 
+export type BeeActivitySignal = {
+  at: string;
+  fingerprint?: string;
+};
+
+export function paneActivitySignal(record: Pick<SessionRecord, "name">, pane: string, atMs: number): BeeActivitySignal {
+  const digest = createHash("sha256").update(pane).digest("hex").slice(0, 16);
+  return { at: new Date(atMs).toISOString(), fingerprint: `pane:${record.name}:${digest}` };
+}
+
 export type FlightSweepOutcome = {
   flight: string;
   slot?: string;
@@ -92,6 +103,7 @@ export async function sweepFlights(
   deps: FlightSweepDeps,
   records: readonly SessionRecord[],
   observed: ReadonlyMap<string, BeeState>,
+  activity: ReadonlyMap<string, BeeActivitySignal> = new Map(),
 ): Promise<FlightSweepOutcome[]> {
   const outcomes: FlightSweepOutcome[] = [];
   const flights = await deps.listFlights();
@@ -100,7 +112,7 @@ export async function sweepFlights(
   for (const flight of flights) {
     if (flight.status === "closed") continue;
     try {
-      const sweep = () => sweepOneFlight(deps, flight, recordsByName, observed);
+      const sweep = () => sweepOneFlight(deps, flight, recordsByName, observed, activity);
       outcomes.push(...(deps.withFlightLock ? await deps.withFlightLock(flight.id, sweep) : await sweep()));
     } catch (error) {
       outcomes.push({ flight: flight.id, action: "error", error: error instanceof Error ? error.message : String(error) });
@@ -114,6 +126,7 @@ async function sweepOneFlight(
   flight: FlightRecord,
   recordsByName: ReadonlyMap<string, SessionRecord>,
   observed: ReadonlyMap<string, BeeState>,
+  activityByName: ReadonlyMap<string, BeeActivitySignal>,
 ): Promise<FlightSweepOutcome[]> {
   const outcomes: FlightSweepOutcome[] = [];
   const nowMs = deps.now();
@@ -183,9 +196,11 @@ async function sweepOneFlight(
     }
     const adjusted = adopted || revived;
     const record = subject.beeName ? recordsByName.get(subject.beeName) : undefined;
+    const activity = subject.beeName ? activityByName.get(subject.beeName) : undefined;
     const evidence: SlotEvidence = {
       ...(record ? { beeStatus: record.status } : {}),
       ...(subject.beeName && observed.get(subject.beeName) ? { beeState: observed.get(subject.beeName)! } : {}),
+      ...(activity ? { beeActivityAt: activity.at, ...(activity.fingerprint ? { beeActivityFingerprint: activity.fingerprint } : {}) } : {}),
       seal: subject.beeName ? await deps.latestSeal(subject.beeName) : null,
     };
     const plan = planSlot(flight, subject, evidence, nowMs);
@@ -236,12 +251,14 @@ async function sweepOneFlight(
 
     if (plan.changed || adjusted || planned !== plan.slot) {
       await deps.saveSlot(planned);
-      outcomes.push({
-        flight: flight.id,
-        slot: slot.slotId,
-        action: "transition",
-        detail: `${slot.state}→${planned.state}${adopted ? " (adopted)" : ""}${revived ? " (revived)" : ""}${planned !== plan.slot ? " (recycled)" : ""}`,
-      });
+      if (slot.state !== planned.state || adjusted || planned !== plan.slot) {
+        outcomes.push({
+          flight: flight.id,
+          slot: slot.slotId,
+          action: "transition",
+          detail: `${slot.state}→${planned.state}${adopted ? " (adopted)" : ""}${revived ? " (revived)" : ""}${planned !== plan.slot ? " (recycled)" : ""}`,
+        });
+      }
     }
     for (const event of plan.events) {
       await deps.appendLedger({ type: event.type, flight: flight.id, ...(event.data ?? {}) });

@@ -22,6 +22,10 @@ export type SlotEvidence = {
   beeStatus?: "running" | "dead" | "kill_failed" | "archived";
   /** This tick's derived state for the bee (authoritative, structured). */
   beeState?: BeeState;
+  /** Genuine runner-event progress, when the observer can provide it. */
+  beeActivityAt?: string;
+  /** Stable identity for the runner event behind beeActivityAt. */
+  beeActivityFingerprint?: string;
   /** The bee's LATEST seal (any attempt; the machine does the scoping). */
   seal?: SlotSealObservation | null;
 };
@@ -126,6 +130,48 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
   if (evidence.beeState === "node_unreachable") return finish();
 
   const sealVerdict = flight.contract.completion === "seal" ? judgeSeal(slot, evidence.seal) : "none";
+  const attemptStartMs = Date.parse(next.attemptStartedAt ?? next.since);
+
+  const parseActivityMs = () => {
+    if (!evidence.beeActivityAt) return NaN;
+    const parsed = Date.parse(evidence.beeActivityAt);
+    if (!Number.isFinite(parsed)) return NaN;
+    if (Number.isFinite(attemptStartMs) && parsed < attemptStartMs) return NaN;
+    return parsed;
+  };
+
+  const activityIsNewer = (activityMs: number): boolean => {
+    const lastActivityMs = Date.parse(next.evidence.lastActivityAt ?? "");
+    if (!Number.isFinite(lastActivityMs)) return true;
+    if (evidence.beeActivityFingerprint !== undefined && evidence.beeActivityFingerprint === next.evidence.lastActivityFingerprint) return false;
+    if (activityMs > lastActivityMs) return true;
+    return activityMs === lastActivityMs &&
+      evidence.beeActivityFingerprint !== undefined &&
+      evidence.beeActivityFingerprint !== next.evidence.lastActivityFingerprint;
+  };
+
+  const recordActivity = (): boolean => {
+    const activityMs = parseActivityMs();
+    if (Number.isFinite(activityMs)) {
+      const shouldRecord = !next.evidence.firstEvidenceAt || activityIsNewer(activityMs);
+      if (!shouldRecord) return false;
+      const activityIso = new Date(activityMs).toISOString();
+      if (!next.evidence.firstEvidenceAt) next.evidence.firstEvidenceAt = activityIso;
+      next.evidence.lastActivityAt = activityIso;
+      if (evidence.beeActivityFingerprint) next.evidence.lastActivityFingerprint = evidence.beeActivityFingerprint;
+      else delete next.evidence.lastActivityFingerprint;
+      delete next.nudgedAt;
+      return true;
+    }
+    if (evidence.beeState === "active" && !next.evidence.firstEvidenceAt) {
+      next.evidence.firstEvidenceAt = nowIso;
+      next.evidence.lastActivityAt = nowIso;
+      delete next.evidence.lastActivityFingerprint;
+      delete next.nudgedAt;
+      return true;
+    }
+    return false;
+  };
 
   // 1) Completion evidence beats everything else.
   if (sealVerdict === "match") {
@@ -155,8 +201,6 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
     transition("escalated", { seal: seal.filename, reason: "seal-mismatch", sealTaskId: seal.taskId ?? null, sealAttempt: seal.attempt ?? null });
     return finish();
   }
-
-  const attemptStartMs = Date.parse(next.attemptStartedAt ?? next.since);
 
   // 2a) A MISSING session record for a freshly claimed slot is ambiguity, not
   // death: the spawn may still be executing (in another process — the CLI
@@ -208,14 +252,14 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
   }
 
   const beeState = evidence.beeState;
+  const activityRecorded = recordActivity();
 
   // 3) Activity evidence.
   if (beeState === "active") {
-    if (!next.evidence.firstEvidenceAt) next.evidence.firstEvidenceAt = nowIso;
-    next.evidence.lastActivityAt = nowIso;
-    delete next.nudgedAt;
-    transition("working");
-    return finish();
+    if (activityRecorded) {
+      transition("working");
+      return finish();
+    }
   }
 
   // 4) Blocked: structured needs-input. The daemon's needs-input router owns

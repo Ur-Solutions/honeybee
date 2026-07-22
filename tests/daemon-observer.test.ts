@@ -68,6 +68,7 @@ test("isolated observer: decodes a large chunked response and restores the singl
         snapshot: "large",
         eventSnapshot: {
           events: [event],
+          activity: { at: 1, fingerprint: "text-1", eventType: "text" },
           usage: { totals: null },
           pendingNeedsInput: null,
         },
