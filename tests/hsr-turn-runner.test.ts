@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -27,6 +27,26 @@ process.stdin.on("end", () => {
   line({ type: "system", subtype: "init", session_id: "chat-1" });
   line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "echo:" + prompt + "|args:" + args.join(",") }] }, session_id: "chat-1" });
   line({ type: "result", subtype: "success", is_error: false, result: "ok", session_id: "chat-1" });
+});
+`;
+
+const BACKGROUND_TOOL_SCRIPT = `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const pidFile = process.argv[1];
+const line = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  line({ type: "tool" });
+  setTimeout(() => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    child.unref();
+    writeFileSync(pidFile, String(child.pid));
+    setTimeout(() => {
+      line({ type: "result" });
+      setTimeout(() => {}, 2_500);
+    }, 250);
+  }, 50);
 });
 `;
 
@@ -86,6 +106,24 @@ async function collectTurns(session: RunnerSession, count: number, timeoutMs = 1
     if (next.value.type === "turn_end") turnEnds += 1;
   }
   return events;
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitFor(check: () => boolean | Promise<boolean>, label: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${label}`);
 }
 
 test("turn runner: learns the session id on turn 1 and resumes it on turn 2", async () => {
@@ -170,6 +208,50 @@ test("turn runner: a crashing turn surfaces an error and still closes the turn b
       assert.equal(events.at(-1)?.type, "turn_end", "the bracket closes even without a result line");
     } finally {
       await session.stop();
+    }
+  });
+});
+
+test("turn runner: detached tool process survives its turn and dies with the session", async () => {
+  await withTempStore(async (dir) => {
+    const pidFile = join(dir, "background.pid");
+    const config: TurnRunnerConfig = {
+      ...stubConfig(),
+      baseArgs: ["-e", BACKGROUND_TOOL_SCRIPT, pidFile, "--"],
+      parseLine: (line) => {
+        const parsed = JSON.parse(line) as { type?: string };
+        if (parsed.type === "tool") return [{ type: "tool_use", ts: Date.now(), tool: "exec" }];
+        if (parsed.type === "result") return [{ type: "turn_end", ts: Date.now() }];
+        return [];
+      },
+    };
+    const opts: RunnerOpts = {
+      bee: "turn-bee-background",
+      cwd: dir,
+      env: { ...process.env } as Record<string, string>,
+      runDir: "unused",
+    };
+    const session = await startTurnRunner(config, opts);
+    let backgroundPid: number | undefined;
+    try {
+      await session.send("start preview");
+      await collectTurns(session, 1);
+      backgroundPid = Number(await readFile(pidFile, "utf8"));
+      // Let the per-turn child exit after its result; its background group must
+      // remain alive for later turns until the session itself is stopped.
+      await new Promise((resolve) => setTimeout(resolve, 2_700));
+      assert.equal(isPidAlive(backgroundPid), true, "background process survives the per-turn child");
+      await session.stop();
+      await waitFor(() => !isPidAlive(backgroundPid!), "background process to stop with session");
+    } finally {
+      await session.stop().catch(() => undefined);
+      if (backgroundPid && isPidAlive(backgroundPid)) {
+        try {
+          process.kill(-backgroundPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
     }
   });
 });

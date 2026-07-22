@@ -24,7 +24,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import type { RunnerEvent, RunnerInterruptResult, RunnerOpts, RunnerSession } from "./types.js";
-import { createSessionPlumbing, spawnSessionChild, stopChildGroup } from "./sessionBase.js";
+import { createSessionPlumbing, noteChildProcessEvent, spawnSessionChild, stopChildGroup } from "./sessionBase.js";
 import { makeLineReader } from "./lineReader.js";
 
 export type TurnRunnerConfig = {
@@ -65,10 +65,9 @@ export async function startTurnRunner(config: TurnRunnerConfig, opts: RunnerOpts
   // sessions learn their id from the first turn's init line instead.
   let knownSessionId: string | undefined = opts.resume === true && opts.sessionId ? opts.sessionId : undefined;
   let currentChild: ChildProcess | null = null;
-  let currentExited: () => boolean = () => true;
-  let currentExitedPromise: Promise<void> = Promise.resolve();
   let stopped = false;
   const turnQueue: string[] = [];
+  const turnChildren: Array<{ child: ChildProcess; exited: () => boolean; exitedPromise: Promise<void> }> = [];
   let draining = false;
 
   const session: RunnerSession = {
@@ -106,6 +105,7 @@ export async function startTurnRunner(config: TurnRunnerConfig, opts: RunnerOpts
     }
     for (const ev of produced) {
       if (ev.type === "turn_end") onTurnEnd();
+      if (currentChild) noteChildProcessEvent(currentChild, ev);
       core.ingestEvent(ev);
     }
   };
@@ -140,9 +140,16 @@ export async function startTurnRunner(config: TurnRunnerConfig, opts: RunnerOpts
       });
     });
     currentChild = child;
-    currentExited = () => exited;
-    currentExitedPromise = exitedPromise;
+    turnChildren.push({ child, exited: () => exited, exitedPromise });
     session.pid = child.pid as number;
+    // stop() may have run while spawnSessionChild awaited the OS spawn event.
+    // The session-level snapshot could not include this child yet, so close
+    // the race here before installing protocol listeners or delivering stdin.
+    if (stopped) {
+      await stopChildGroup(child, () => exited, exitedPromise).catch(() => undefined);
+      if (currentChild === child) currentChild = null;
+      return;
+    }
 
     let sawTurnEnd = false;
     child.stdout?.on("data", makeLineReader(handleStdoutLine(() => (sawTurnEnd = true))));
@@ -214,10 +221,14 @@ export async function startTurnRunner(config: TurnRunnerConfig, opts: RunnerOpts
     if (stopped) return;
     stopped = true;
     turnQueue.length = 0;
-    const child = currentChild;
-    if (child) {
-      await stopChildGroup(child, currentExited, currentExitedPromise).catch(() => undefined);
-    }
+    // Per-turn children may intentionally leave previews/dev servers running
+    // for later turns. Retain every ownership scope until the SESSION stops,
+    // then reap current and completed turns together.
+    await Promise.all(
+      turnChildren.map(({ child, exited, exitedPromise }) =>
+        stopChildGroup(child, exited, exitedPromise).catch(() => undefined),
+      ),
+    );
     core.ingestEvent({ type: "exit", ts: Date.now(), code: null });
     core.flushRing();
     core.endStream();
