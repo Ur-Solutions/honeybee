@@ -20,7 +20,7 @@ import { hsrRunDir } from "../hsr/runDir.js";
 import { loadLatestSeal, sealsRoot } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "../sessionMetadata.js";
-import { deriveState, formatStateCell, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
+import { deriveState, formatStateCell, isArchivedState, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
 import { listSessions, loadSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { effectiveTags, normalizeTagArg } from "../tags.js";
@@ -82,10 +82,11 @@ export async function cmdList(parsed: Parsed) {
   }
   const probe = await liveTargetsAcrossNodes(nodes, nodeFilter);
   let records = allRecords;
-  // Filed (archived) bees are hidden from the default list — re-include them
-  // with --archived, and auto-include when the user targets them explicitly
-  // with `--state archived` so that query is never empty.
-  const showArchived = truthy(flag(parsed, "archived")) || stateFilter === "archived";
+  // Filed and sealed bees share the archived visibility class: both stay out
+  // of the everyday list, while --archived (or an explicit archived state
+  // query) restores them. Persisted archived records can be removed before the
+  // state pass; sealed is derived from seal evidence and is removed below.
+  const showArchived = truthy(flag(parsed, "archived")) || stateFilter === "archived" || stateFilter === "sealed";
   if (!showArchived) records = records.filter((r) => r.status !== "archived");
   if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
   if (swarmFilter) records = records.filter((r) => r.swarmId === swarmFilter);
@@ -110,6 +111,8 @@ export async function cmdList(parsed: Parsed) {
 
   const context = await buildStateContext(records, probe);
   const states = new Map(records.map((record) => [record.name, deriveState(record, context)] as const));
+
+  if (!showArchived) records = records.filter((record) => !isArchivedState(states.get(record.name)!.state));
 
   // Live @hive_state (set by hive itself and by agent hooks) wins over the
   // store-derived state — the tmux server is the source of truth for live bees.

@@ -733,8 +733,10 @@ three. The facets:
 - positional `[selector]`: a bee / `@swarm` / `colony:<name>` / `#tag` /
   `tag:<...>` selector applied as a filter alongside the flags (an unknown
   colony/swarm errors, consistent with other commands).
-- `--archived`: include **filed** (`status:"archived"`) bees. They are **hidden
-  by default**; `--archived` (or an explicit `--state archived`) re-includes them.
+- `--archived`: include the archived visibility class: **sealed** bees and
+  **filed** (`status:"archived"`) bees. Both are **hidden by default**;
+  `--archived` re-includes them. An explicit `--state sealed` or `--state
+  archived` also reveals and filters to that state.
 
 **`--json`** emits a machine array regardless of TTY, after all filters are
 applied. Each element has the shape:

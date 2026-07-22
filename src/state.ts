@@ -411,6 +411,11 @@ export function isTerminalState(state: BeeState): boolean {
   return state === "dead" || state === "crashed" || state === "sealed" || state === "archived" || state === "error" || state === "kill_failed";
 }
 
+/** States hidden from the default hive listing and restored by --archived. */
+export function isArchivedState(state: BeeState): boolean {
+  return state === "sealed" || state === "archived";
+}
+
 function heldStateForUnknownPane(record: SessionRecord, context: StateContext): DerivedState | null {
   const previous = context.previousStates?.get(record.name) ?? parseBeeState(record.lastObservedState);
   if (!previous || !isHoldableUnknownPaneState(previous)) return null;

@@ -21,6 +21,7 @@ type SeedRecord = {
   cwd: string;
   colony?: string;
   swarmId?: string;
+  status?: "running" | "dead" | "archived";
 };
 
 async function seed(dir: string, record: SeedRecord): Promise<void> {
@@ -36,11 +37,15 @@ async function seed(dir: string, record: SeedRecord): Promise<void> {
     id: record.name,
     createdAt: now,
     updatedAt: now,
-    status: "dead" as const,
+    status: record.status ?? "dead",
     ...(record.colony ? { colony: record.colony } : {}),
     ...(record.swarmId ? { swarmId: record.swarmId } : {}),
   };
   await writeFile(join(sessionsDir, `${record.name}.json`), `${JSON.stringify(full, null, 2)}\n`);
+}
+
+async function seedSeal(dir: string, name: string): Promise<void> {
+  await mkdir(join(dir, "seals", name), { recursive: true });
 }
 
 async function withFixture(fn: (ctx: { store: string; repoA: string; repoB: string; plain: string }) => Promise<void>): Promise<void> {
@@ -165,5 +170,36 @@ test("hive list --state dead matches dead bees with no live tmux", async () => {
     const rows = JSON.parse(stdout) as Array<{ name: string; beeState: string }>;
     assert.equal(rows.length, 2);
     assert.ok(rows.every((r) => r.beeState === "dead"));
+  });
+});
+
+test("hive ls hides sealed and filed bees unless archived visibility is requested", async () => {
+  await withFixture(async ({ store, repoA, repoB, plain }) => {
+    await seed(store, { name: "ordinary", agent: "claude", cwd: repoA });
+    await seed(store, { name: "sealed", agent: "codex", cwd: repoB });
+    await seed(store, { name: "filed", agent: "claude", cwd: plain, status: "archived" });
+    await seedSeal(store, "sealed");
+
+    const defaultRows = JSON.parse((await hive(store, "ls", "--json")).stdout) as Array<{ name: string }>;
+    assert.deepEqual(defaultRows.map((row) => row.name), ["ordinary"]);
+
+    const archivedRows = JSON.parse((await hive(store, "ls", "--archived", "--json")).stdout) as Array<{ name: string; beeState: string }>;
+    assert.deepEqual(new Set(archivedRows.map((row) => row.name)), new Set(["ordinary", "sealed", "filed"]));
+    assert.equal(archivedRows.find((row) => row.name === "sealed")?.beeState, "sealed");
+    assert.equal(archivedRows.find((row) => row.name === "filed")?.beeState, "archived");
+  });
+});
+
+test("hive list explicit archived state filters reveal their hidden class", async () => {
+  await withFixture(async ({ store, repoA, repoB }) => {
+    await seed(store, { name: "sealed", agent: "codex", cwd: repoA });
+    await seed(store, { name: "filed", agent: "claude", cwd: repoB, status: "archived" });
+    await seedSeal(store, "sealed");
+
+    const sealedRows = JSON.parse((await hive(store, "list", "--state", "sealed", "--json")).stdout) as Array<{ name: string }>;
+    assert.deepEqual(sealedRows.map((row) => row.name), ["sealed"]);
+
+    const archivedRows = JSON.parse((await hive(store, "list", "--state", "archived", "--json")).stdout) as Array<{ name: string }>;
+    assert.deepEqual(archivedRows.map((row) => row.name), ["filed"]);
   });
 });

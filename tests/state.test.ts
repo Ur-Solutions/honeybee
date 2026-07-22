@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { stripAnsi } from "../src/format.js";
-import { type BeeState, cleanStatePriority, deriveState, formatStateCell, isTerminalState, liveTargetKey, STATE_PRESENTATION, stateLabel } from "../src/state.js";
+import { type BeeState, cleanStatePriority, deriveState, formatStateCell, isArchivedState, isTerminalState, liveTargetKey, STATE_PRESENTATION, stateLabel } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
 function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
@@ -276,6 +276,13 @@ test("isTerminalState recognizes end states", () => {
   assert.equal(isTerminalState("queued"), false);
   // node_unreachable is transient: the node may come back online.
   assert.equal(isTerminalState("node_unreachable"), false);
+});
+
+test("isArchivedState groups sealed and filed bees", () => {
+  assert.equal(isArchivedState("sealed"), true);
+  assert.equal(isArchivedState("archived"), true);
+  assert.equal(isArchivedState("dead"), false);
+  assert.equal(isArchivedState("active"), false);
 });
 
 test("archived: a filed bee is archived, NOT dead, even with its tmux target gone", () => {

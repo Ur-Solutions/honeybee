@@ -9,6 +9,7 @@ export const BOOLEAN_FLAGS = new Set([
   "accept-trust",
   "against-recommended",
   "all",
+  "archived",
   "auto",
   "autoswap",
   "background",

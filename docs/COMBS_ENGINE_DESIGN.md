@@ -1,13 +1,13 @@
 # Combs engine design
 
-**Status:** canonical composed implementation contract for Combs phase 1; repair round 1
+**Status:** canonical composed implementation contract for Combs phase 1; E1/E2 rulings resolved
 **Owner:** Honeybee  
 **Concept contract:** `apiary/docs/orchestration-graphs-concept.md`, concept v2 (2026-07-21)  
 **Replaces:** Honeybee flow v1 as the reusable graph and durable-run engine
 
 This document is the canonical home of the composed phase-1 contracts: Honeybee's registry, snapshots, runs, claims, reconciler, executors, checkout integration, and CLI, plus the exact Pollinate, Forum, and Apiary seams those components consume. Pollinate remains the trigger and external-observation owner; Forum remains the packet and verdict owner; Apiary remains a read-model/UI consumer. If another phase-1 design disagrees on argv, JSON shape, exit code, ordering, idempotency, or teardown, this document wins and that design must align.
 
-Concept v2 remains the product authority. Two contradictions discovered in review require a human concept decision and are deliberately not papered over: `PENDING-E1` (typed-output predicates) and `PENDING-E2` (packet-per-node wording under subject supersession). Both safe implementation variants are recorded below; no implementation may guess a resolution.
+Concept v2 remains the product authority. Its 2026-07-21 E1/E2 rulings are incorporated here: the fixed predicate vocabulary includes one deterministic output-equality predicate, and a human node owns one logical thread whose physical successor packet chain spans subject revisions.
 
 The design deliberately evolves existing Honeybee patterns:
 
@@ -164,6 +164,7 @@ export type PredicateSpec =
   | { kind: "seal-present"; nodeId: NodeId; statuses?: Array<"done" | "blocked" | "needs_input" | "failed">; sealType?: string }
   | { kind: "verdict"; nodeId: NodeId; equals: "approve" | "request_changes" }
   | { kind: "ci-status"; check?: string; equals: "success" | "failure" | "pending" | "error" }
+  | { kind: "output-equals"; nodeId: NodeId; path: JsonPointer; equals: JsonValue }
   | { kind: "clock"; afterMs: number; from: "activation-start" | "blocking-since" };
 
 export type ChildCombSource =
@@ -255,6 +256,7 @@ Validation rules are part of the format:
 - Human nodes have fixed output contract `{ verdict: "approve" | "request_changes", comment: string | null, destination: ReviewFeedbackDestination }` and may not override it. Authored `fromNodeId` is resolved at packet creation to the current activation's exact `{type:"bee",sessionId}`; missing/multiple current bees block packet creation rather than emitting a node ID across the Forum seam.
 - Engine predicate and action nodes are `strict`. Child-run nodes are `strict`; expansion judgment lives in the upstream open agent node.
 - An edge may carry at most one `when` predicate. More complicated logic is represented as predicate nodes plus joins; there is no expression or Boolean AST.
+- `output-equals` may reference only a node with a `json-schema` output contract. It reads that node's schema-validated current-lineage output for the same item/cohort, resolves `path` as RFC 6901, and compares to the literal `equals` value using canonical JSON deep equality with no coercion. Before the referenced output is terminal it is waiting; a missing path after terminal validation is false. Fan-out branches must first produce a declared aggregate node output rather than adding selectors to the predicate.
 - `on: "waiting"` is legal only on `kind="waiting"` with a `clock` predicate. It fires once per source activation without completing the waiting source, allowing timeout notification/escalation to run in parallel.
 - `items`, `ValueSource`, and `ObjectMapping` only select/copy values. They cannot call functions or evaluate code.
 - Cycles are legal only through explicit `kind="retry"` edges. Traversing one creates a new attempt cohort. This makes the forward condensation acyclic and validation/entry derivation deterministic.
@@ -265,7 +267,7 @@ Validation rules are part of the format:
 
 Brief templates reuse the deliberately small substitution pattern in `src/flow/json.ts`: `{{input.foo}}`, `{{item.foo}}`, and `{{nodes.<nodeId>.output.foo}}`. A node placeholder always means the current lineage and same item; aggregate/index selection requires an explicit `ValueSource` mapping rather than template syntax. Missing values remain verbatim and cause activation validation to fail before an effect is prepared. No arbitrary JS or expression syntax is evaluated.
 
-`PENDING-E1` — the phase-1 `PredicateSpec` above remains the concept-v2 fixed vocabulary until a human decides otherwise. Variant A adds one deterministic predicate `{kind:"output-equals", nodeId, pointer, value}` over current-lineage typed output; that makes conditional examples such as weekly metrics authorable. Variant B keeps the type unchanged and removes output-conditional examples from phase-1 conformance. Under both variants arbitrary expressions, JavaScript, and Boolean ASTs remain forbidden. Until E1 is decided, `hive comb lint/define` rejects any graph that requires output-dependent branching with `pending_human_decision` and `details.decision="E1"`; implementations must not invent a predicate.
+The predicate vocabulary is closed for phase 1: `seal-present`, `verdict`, `ci-status`, `clock`, and `output-equals`. `output-equals` is sufficient for output-conditional examples such as weekly metrics while remaining data-only. Arbitrary expressions, JavaScript, user-defined predicates, comparison operators other than equality, and Boolean ASTs remain forbidden.
 
 ### 2.3 Registry versions and TS authoring
 
@@ -710,6 +712,8 @@ export type ActionObservationWatch = {
 
 export type HumanPacketRef = {
   packetId: string;
+  predecessorPacketId?: string;
+  successorPacketId?: string;
   snapshotRevision: number;
   definitionDigest: string;
   actionBindingDigest: string;
@@ -720,11 +724,11 @@ export type HumanPacketRef = {
 };
 
 export type HumanPacketThread = {
-  key: string; // `${nodeId}#${itemIndex}`
+  key: string; // one logical thread: `${nodeId}#${itemIndex}`
   nodeId: NodeId;
   itemIndex: number;
   packetCount: number;
-  packetTail: HumanPacketRef[]; // newest 64; full chain is recoverable from events/Forum
+  packetTail: HumanPacketRef[]; // newest 64 members of the successor chain
   currentPacketId: string;
   subject: ResolvedSubject;
   createdAt: string;
@@ -742,7 +746,7 @@ For `coalesce-latest`, a higher-order event with a new subject revision supersed
 
 Every Forum packet is pinned to the snapshot revision, definition digest, action-binding digest, and subject revision in `HumanPacketRef`. Normal review iteration may rerequest the current packet only while all four pins remain equal. A verdict with stale pins is logged as `comb.evidence.stale_verdict` and ignored, not treated as a violation. Comments become the human activation's `output.comment` and are available to downstream brief templates. For `origin=comb`, Honeybee is the sole downstream feedback router; Forum/Apiary records the verdict and destination but suppresses legacy queue/spawn/comment side effects.
 
-`PENDING-E2` — safety behavior is not pending: a changed subject revision always supersedes the old packet and creates a digest/revision-pinned successor. Variant A retains concept-v2's literal “one packet per human node” only for stable-revision rerequests and exposes successor packet IDs separately. Variant B amends the promise to “one logical thread per human node,” with Forum/Apiary rendering the successor chain as one thread. Until a human decides E2, storage preserves both the stable logical `thread.key` and every physical packet, and UI copy must not promise either interpretation.
+Each `(nodeId,itemIndex)` owns one logical `HumanPacketThread`. A changed subject revision supersedes the current digest/revision-pinned packet and creates a successor linked in both directions; the packet chain is the thread. Stable-revision attempts may rerequest the current physical packet. Forum persists the chain, Honeybee preserves the stable `thread.key` and current packet, and the review desk renders the chain as one thread rather than separate review items.
 
 Intent requests are cut from phase 1. Eligible engine action nodes execute only when graph preconditions hold; an agent cannot accelerate or authorize one with a request. `hive comb request` and `IntentRequestRecord` are reserved for a later design with explicit node mapping and TTL semantics and must not be implemented from concept prose alone.
 
@@ -1201,6 +1205,7 @@ Predicate execution has no external effect:
 - `seal-present` examines only a referenced current activation's matching seal evidence.
 - `verdict` examines only a referenced human activation's current output.
 - `ci-status` examines only a Pollinate observation matching subject key/revision and optional check name.
+- `output-equals` examines only the referenced current-lineage, same-item output after its JSON schema validated, resolves the RFC 6901 path, and performs canonical JSON equality against the snapshotted literal.
 - `clock` is derived from `activation-start` or Forum `blocking_since`; the engine writes one clock evidence envelope when the threshold is reached.
 
 Absent evidence leaves the activation `waiting-event`. A mismatch is a violation.
@@ -1369,7 +1374,7 @@ Completion still comes from a matching typed seal, never from `report`.
 
 ### 5.2 JSON envelopes
 
-Every `hive comb ... --json` invocation writes exactly one envelope plus one trailing newline to stdout. Human diagnostics go to stderr. Commands never mix JSONL with this envelope; `comb events` returns an array inside it. Exit codes are canonical: `0` valid success/acknowledgement (including `accepted:false`), `2` invalid argument/schema or `pending_human_decision`, `3` not found, `4` version/claim/idempotency conflict, `5` ambiguous activation or approval required, `6` unresolved effect ambiguity, `7` external dependency/transient transport failure, and `70` internal/corrupt-state failure. Pollinate retries only exit `7`/transport failure; it never infers acceptance from exit 0 alone.
+Every `hive comb ... --json` invocation writes exactly one envelope plus one trailing newline to stdout. Human diagnostics go to stderr. Commands never mix JSONL with this envelope; `comb events` returns an array inside it. Exit codes are canonical: `0` valid success/acknowledgement (including `accepted:false`), `2` invalid argument/schema, `3` not found, `4` version/claim/idempotency conflict, `5` ambiguous activation or approval required, `6` unresolved effect ambiguity, `7` external dependency/transient transport failure, and `70` internal/corrupt-state failure. Pollinate retries only exit `7`/transport failure; it never infers acceptance from exit 0 alone.
 
 ```ts
 export type CombCliSuccess<T> = {
@@ -1384,7 +1389,6 @@ export type CombCliFailure = {
   error: {
     code:
       | "invalid_argument"
-      | "pending_human_decision"
       | "not_found"
       | "version_conflict"
       | "claim_conflict"
@@ -1691,7 +1695,7 @@ Each slice is independently mergeable, testable, and disabled from effects until
 3. **Pure reconciler.** Implement activation evidence matching, attempts, edge firing, waiting clock edges, joins, aggregate output, retries, terminal derivation, event projection, and property tests. Add daemon dispatcher with fake/no-op effect executors.
 4. **Agent and attached-track execution.** Add deterministic cold spawn/adoption, completion contracts, seal `output`, SessionRecord activation bindings, fail-closed `spawn --comb`, `comb run --bee`, `report`, retry re-brief, and cancellation retirement. Enable agent-only combs.
 5. **Checkout and flight capacity.** Extend pool claim ownership/renewal/release; wire per-node checkout needs. Integrate the flight capacity-provider interface when available. Cold spawn remains the supported fallback only when the definition explicitly asked for spawn; a failed flight lease is not silently converted.
-6. **Engine predicates and action bindings.** Add fixed predicates, deterministic/agentic binding executors, preflight/postflight attribution records, verifiers, strict external-state violation detection, cancellation ambiguity, and manual effect resolution. Enable trusted registry combs with actions. Intent requests remain out of phase 1.
+6. **Engine predicates and action bindings.** Add the five fixed predicates (including deterministic `output-equals`), deterministic/agentic binding executors, preflight/postflight attribution records, verifiers, strict external-state violation detection, cancellation ambiguity, and manual effect resolution. Enable trusted registry combs with actions. Intent requests remain out of phase 1.
 7. **Forum human nodes and strict-graph approvals.** Land the Forum/review-desk prerequisites, add packet lifecycle adapter, human output/context, stale successor behavior, approval packets, and gate-removal enforcement.
 8. **Amendments and child runs.** Add JSON patch CAS/quiesce, one child primitive, fan-out/item activations, depth/cancellation inheritance, and promote-from-live-run.
 9. **Pollinate observations/subscriptions.** Add `comb observe`, coalesce/queue behavior, CI evidence, subject supersession, Pollinate run targets, and router cancellation handling.
@@ -1705,16 +1709,16 @@ The repository's existing `node:test` style and dependency injection are retaine
 
 ### 8.1 Unit tests
 
-- Comb grammar: IDs, endpoints, joins, cycles, guided expectations, engine strictness, waiting clock edges, child sources, input/output schemas, and function rejection in TS exports.
+- Comb grammar: IDs, endpoints, joins, cycles, guided expectations, engine strictness, all five fixed predicates, waiting clock edges, child sources, input/output schemas, and function rejection in TS exports.
 - Canonicalization/digests: object-order independence, array-order significance, duplicate define no-op, registry CAS, immutable prior versions, source provenance.
-- Value mapping/templates: every source root, JSON Pointer escaping, current-lineage retry selection, same/index/aggregate item selection, deterministic multi-terminal run output, missing values, and no expression evaluation.
+- Value mapping/templates: every source root, JSON Pointer escaping, current-lineage retry selection, same/index/aggregate item selection, deterministic multi-terminal run output, `output-equals` scalar/object/array/null equality, no coercion, missing-path false, pre-output waiting, and no expression evaluation.
 - Product resolution/bindings: pro cwd match, explicit product fallback, missing intent, stable binding digest, snapshot isolation from config edits.
 - Activation rule: reuse every case in `tests/activation.test.ts`, then add subject-key/revision mismatch, item-index key uniqueness, and stale downstream invalidation.
 - Machine: forward-condensation entry activation, explicit retry cohorts, waiting-only non-entry targets, every activation status, invalid seal output, retry/backoff, timeout edges, fail edges, skipped branches, all/any/quorum/tolerance joins, aggregate counts, and terminal output. The human-last track is a required fixture.
 - Property tests modelled on `tests/flight-machine.test.ts`: across generated evidence/edge sequences, no activation reaches done without matching evidence; no effect is planned twice; cancelled runs plan no new effects; attempts never overwrite history.
 - Claims: canonical value hashing, refuse/join-existing, prepared-claim repair, terminal release, simultaneous allocator races under the actual file lock.
 - Subscriptions: register/coverage ordering, at-least-once dedupe, 1,024-ID bound, queue order, lower-after-higher source order, same-sequence conflict, coalesce cleanup, bee retirement, inert invalidated evidence, subject revision supersession, and cancelled terminal acknowledgement.
-- Amendments: patch grammar, done-node rejection, active quiesce deadline, packet supersession before apply, stale-digest verdict ignore, CAS race, approval policy, human-gate bypass detection, new-intent binding resolution, and both PENDING-E2 storage variants.
+- Amendments: patch grammar, done-node rejection, active quiesce deadline, packet supersession before apply, stale-digest verdict ignore, successor linkage within one stable thread, CAS race, approval policy, human-gate bypass detection, and new-intent binding resolution.
 - Effect identity: planner reordering, insertion, restart, and fan-out never change a semantic key; same key/different request digest halts.
 - Retention: evidence content addressing, stable session evidence IDs, event-tail rollover, attempt compaction/hydration, dirty-check no-op tick, and board payload budget.
 - Guided conformance: each evidence heuristic, self-reported deviation, deviated-then-done representation.
@@ -1748,7 +1752,7 @@ Use a temporary `HIVE_STORE_ROOT`, injected clock, fake session/seal/Forum/Polli
 
 ### 8.4 Repository gates and manual verification
 
-Each slice runs targeted tests, `npm run check`, `npm test`, and `npm run build`. Complex cross-application UI is not automated in Honeybee. Manually verify in Apiary after its implementation: Flightboard live graph, attempt history, child drill-in, deviation feed, attached-track bee affiliation, review-desk graph diff for amendment/approval, stale packet replacement, and violation alarm visibility.
+Each slice runs targeted tests, `npm run check`, `npm test`, and `npm run build`. Complex cross-application UI is not automated in Honeybee. Manually verify in Apiary after its implementation: Flightboard live graph, attempt history, child drill-in, deviation feed, attached-track bee affiliation, review-desk graph diff for amendment/approval, successor packets rendered as one thread, and violation alarm visibility.
 
 ## 9. Canonical cross-system contracts
 
@@ -1786,7 +1790,7 @@ These are normative composed contracts, not assumptions. Current code gaps are r
 
 5. **Forum feedback destination.** The canonical union is `{type:"bee",sessionId:string}|{type:"new-agent"}|{type:"pr-comment"}`. Forum owns the deterministic mapping from legacy `routability`/`session_id` and returns only this union to new consumers. `bee` must identify a Honeybee session, not a comb node ID; Honeybee maps that session to the new attempt binding.
 
-6. **Forum packet interaction with amendments/supersession.** Stable source dedupe and successor links are required. Before applying an amendment, Honeybee supersedes every affected active packet and waits for confirmation; after apply, old-digest verdicts are logged/ignored. Subject-revision movement also creates a successor and follows `PENDING-E2` storage/presentation rules in §2.7.
+6. **Forum packet interaction with amendments/supersession.** Stable source dedupe and bidirectional successor links are required. Before applying an amendment, Honeybee supersedes every affected active packet and waits for confirmation; after apply, old-digest verdicts are logged/ignored. Subject-revision movement creates a successor in the same `HumanPacketThread`, and Forum/Apiary renders that chain as one review thread per §2.7.
 
 7. **Pollinate comb action.** Pollinate adds `{kind:"honeybee",run:"comb",comb:string,version:number,input:JsonValue,collision?:"refuse"|"join-existing"}`. `comb` is literal and `version` required. It uses the exact §5.4 JSON-stdin/provenance argv, validates the envelope, and reads `result.run.id`; `run:"flow"` remains unchanged during re-authoring. Composer commits define an immutable version before saving the version-pinned trigger, so a partial save cannot retarget old triggers.
 
@@ -1863,17 +1867,17 @@ These are normative composed contracts, not assumptions. Current code gaps are r
 | S8 | Honeybee sole feedback router for `origin=comb`: §§2.7, 9.3. |
 | S9 | Semantic effect keys independent of planner order: §2.8. |
 | S10 | Exit-0 `{accepted:false,reason:"terminal"}` and field-driven GC: §5.2. |
-| E1 | `PENDING-E1`; fixed-vocabulary and minimal-output-predicate variants recorded without choosing: §2.2. |
-| E2 | `PENDING-E2`; physical successor safety fixed, packet/thread wording variants pending: §2.7. |
+| E1 | Resolved: fifth fixed predicate `output-equals` compares an RFC 6901 field path on schema-validated current-lineage output with a literal; no expression language: §§2.2, 3.4. |
+| E2 | Resolved: one logical thread per human node/item; revision supersession creates a linked successor packet and the desk renders the chain as one thread: §§2.7, 9.6. |
 
 ## 11. Seal summary
 
 Implementation target: `docs/COMBS_ENGINE_DESIGN.md`.
 
-This repair resolves the engine-owned review clusters and makes the document canonical for composed CLI, JSON, delivery, registration, ordering, attribution, packet, projection, persistence, and teardown contracts. It replaces flow v1 with immutable comb versions and daemon-reconciled, snapshot-isolated runs; reuses the flight activation/idempotency rule; and specifies agent, human, engine, child, claim, cancellation, checkout, amendment, and enforcement behavior down to persisted field and CLI-envelope shapes.
+This repair resolves the engine-owned review clusters and makes the document canonical for composed CLI, JSON, delivery, registration, ordering, attribution, packet, projection, persistence, and teardown contracts. The E1/E2 rulings are final here: `output-equals` is the sole output predicate, and successor packet chains are one logical human-node thread. The design replaces flow v1 with immutable comb versions and daemon-reconciled, snapshot-isolated runs; reuses the flight activation/idempotency rule; and specifies agent, human, engine, child, claim, cancellation, checkout, amendment, and enforcement behavior down to persisted field and CLI-envelope shapes.
 
 Top three open risks:
 
-1. `PENDING-E1`: humans must choose whether phase 1 gains a minimal deterministic typed-output predicate or drops output-conditional examples from conformance.
-2. `PENDING-E2`: humans must choose packet-per-node versus logical-thread wording; safety already requires a new physical packet for every changed subject revision.
-3. The canonical seams require code that does not exist yet across Pollinate/Forum/flight: durable at-least-once outbox and revision/causation observations, idempotent registration/coverage and packet supersession, digest-pinned verdicts, and the flight capacity lease API. Executors remain gated until shared golden fixtures prove those contracts.
+1. Pollinate must implement and prove the durable at-least-once outbox plus revision-, ordering-, and causation-bearing observations before event-only or strict-action combs are enabled.
+2. Forum/review-desk must implement idempotent successor/supersession, digest-pinned verdicts, and one-thread rendering across packet chains before human/amendment executors are enabled.
+3. The in-progress flight controller still needs the atomic capacity lease/adoption interface before flight-backed agent nodes are enabled.

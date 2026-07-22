@@ -28,6 +28,10 @@ test("parse leaves positional args after boolean flags", () => {
   const long = parse(["tail", "--follow", "CO.6e2"]);
   assert.equal(flag(long, "follow"), true);
   assert.deepEqual(long.args, ["CO.6e2"]);
+
+  const archived = parse(["list", "--archived", "colony:frontend"]);
+  assert.equal(flag(archived, "archived"), true);
+  assert.deepEqual(archived.args, ["colony:frontend"]);
 });
 
 test("BOOLEAN_FLAGS is exported so completion can skip value-less flags", () => {
