@@ -36,6 +36,7 @@ export type FlightQueueOps = {
 
 export type FlightSweepDeps = {
   listFlights: () => Promise<FlightRecord[]>;
+  loadFlight: (flightId: string) => Promise<FlightRecord | null>;
   listSlots: (flightId: string) => Promise<SlotRecord[]>;
   saveSlot: (slot: SlotRecord) => Promise<void>;
   saveFlight: (flight: FlightRecord) => Promise<void>;
@@ -80,6 +81,25 @@ export type BeeActivitySignal = {
   fingerprint?: string;
 };
 
+const DATE_MIN_MS = -8_640_000_000_000_000;
+const DATE_MAX_MS = 8_640_000_000_000_000;
+
+function validDateMs(value: number): boolean {
+  return Number.isFinite(value) && value >= DATE_MIN_MS && value <= DATE_MAX_MS && !Number.isNaN(new Date(value).getTime());
+}
+
+export function hsrActivitySignal(
+  activity: { at: number; fingerprint?: string },
+  observedAtMs: number,
+): BeeActivitySignal | null {
+  if (!validDateMs(activity.at) || !validDateMs(observedAtMs)) return null;
+  const at = Math.min(activity.at, observedAtMs);
+  return {
+    at: new Date(at).toISOString(),
+    ...(activity.fingerprint ? { fingerprint: activity.fingerprint } : {}),
+  };
+}
+
 export function paneActivitySignal(record: Pick<SessionRecord, "name">, pane: string, atMs: number): BeeActivitySignal {
   const digest = createHash("sha256").update(pane).digest("hex").slice(0, 16);
   return { at: new Date(atMs).toISOString(), fingerprint: `pane:${record.name}:${digest}` };
@@ -106,16 +126,19 @@ export async function sweepFlights(
   activity: ReadonlyMap<string, BeeActivitySignal> = new Map(),
 ): Promise<FlightSweepOutcome[]> {
   const outcomes: FlightSweepOutcome[] = [];
-  const flights = await deps.listFlights();
+  const snapshots = await deps.listFlights();
   const recordsByName = new Map(records.map((record) => [record.name, record]));
 
-  for (const flight of flights) {
-    if (flight.status === "closed") continue;
+  for (const snapshot of snapshots) {
     try {
-      const sweep = () => sweepOneFlight(deps, flight, recordsByName, observed, activity);
-      outcomes.push(...(deps.withFlightLock ? await deps.withFlightLock(flight.id, sweep) : await sweep()));
+      const sweep = async () => {
+        const flight = await deps.loadFlight(snapshot.id);
+        if (!flight || flight.status === "closed") return [];
+        return sweepOneFlight(deps, flight, recordsByName, observed, activity);
+      };
+      outcomes.push(...(deps.withFlightLock ? await deps.withFlightLock(snapshot.id, sweep) : await sweep()));
     } catch (error) {
-      outcomes.push({ flight: flight.id, action: "error", error: error instanceof Error ? error.message : String(error) });
+      outcomes.push({ flight: snapshot.id, action: "error", error: error instanceof Error ? error.message : String(error) });
     }
   }
   return outcomes;

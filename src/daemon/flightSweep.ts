@@ -12,7 +12,7 @@ import { resolveAccountFlag } from "../commands/spawn.js";
 import { transactionalRetire } from "../kill.js";
 import { withFileLock } from "../lock.js";
 import { sweepFlights, stallNudgeText, type BeeActivitySignal, type FlightSweepDeps, type FlightSweepOutcome } from "../flight/controller.js";
-import { claimNextTask, finishTask, flightDir, leasedTaskForSlot, listFlights, listSlots, saveFlight, saveSlot, taskCounts } from "../flight/store.js";
+import { claimNextTask, finishTask, flightDir, leasedTaskForSlot, listFlights, listSlots, loadFlight, saveFlight, saveSlot, taskCounts } from "../flight/store.js";
 import { slotBeeName, slotContractTaskId, type SlotSealObservation } from "../flight/types.js";
 import type { BeeState } from "../state.js";
 import { appendLedger, loadSession, type SessionRecord } from "../store.js";
@@ -40,6 +40,7 @@ export async function latestSealForCurrentIncarnation(beeName: string): Promise<
 export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): FlightSweeper {
   const deps: FlightSweepDeps = {
     listFlights,
+    loadFlight,
     listSlots,
     saveSlot,
     saveFlight,

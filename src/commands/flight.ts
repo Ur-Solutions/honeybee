@@ -13,13 +13,16 @@ import { resolveSpawningBeeId } from "../spawnParent.js";
 import { appendLedger, listSessions, loadSession, type SessionRecord } from "../store.js";
 import type { BeeState } from "../state.js";
 import { createFlightSweeper } from "../daemon/flightSweep.js";
-import { paneActivitySignal, type BeeActivitySignal } from "../flight/controller.js";
+import { hsrActivitySignal, paneActivitySignal, type BeeActivitySignal } from "../flight/controller.js";
 import { substrateFor } from "../substrates/index.js";
+import { withFileLock } from "../lock.js";
+import type { HsrObservation } from "../hsr/observe.js";
 import {
   allocateFlightId,
   enqueueTask,
   finishTask,
   requeueTask,
+  flightDir,
   listFlights,
   listSlots,
   listTasks,
@@ -100,6 +103,33 @@ function numberFlagOr(parsed: Parsed, name: string, fallback: number): number {
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) throw new Error(`--${name} must be a positive number (got: ${raw})`);
   return value;
+}
+
+function withFlightSweepLock<T>(flightId: string, fn: () => Promise<T>): Promise<T> {
+  return withFileLock(join(flightDir(flightId), ".sweep.lock"), fn, { timeoutMs: 5_000, staleMs: 10 * 60_000 });
+}
+
+function applyTrustedHsrObservation(
+  record: SessionRecord,
+  observation: HsrObservation,
+  observed: Map<string, BeeState>,
+  activity: Map<string, BeeActivitySignal>,
+  observedAtMs: number,
+): void {
+  const trustedLocalHsr = record.substrate === "hsr" && !observation.mirrorOf;
+  if (trustedLocalHsr) {
+    if (observation.state) observed.set(record.name, observation.state);
+    else if (!observation.live) observed.set(record.name, "dead");
+  } else {
+    const trustedRemoteMirror = record.substrate !== "hsr" && record.node !== undefined && observation.live && observation.mirrorOf === record.node;
+    if (!trustedRemoteMirror) return;
+    if (observation.state) observed.set(record.name, observation.state);
+  }
+
+  if (observation.activity) {
+    const signal = hsrActivitySignal(observation.activity, observedAtMs);
+    if (signal) activity.set(record.name, signal);
+  }
 }
 
 async function flightStart(parsed: Parsed): Promise<void> {
@@ -318,6 +348,7 @@ async function flightSweep(parsed: Parsed): Promise<void> {
   const sessionsByName = new Map(sessions.map((record) => [record.name, record]));
   const observed = new Map<string, BeeState>();
   const activity = new Map<string, BeeActivitySignal>();
+  const sweepNow = Date.now();
   for (const record of sessions) {
     if (record.lastObservedState) observed.set(record.name, record.lastObservedState as BeeState);
   }
@@ -336,16 +367,12 @@ async function flightSweep(parsed: Parsed): Promise<void> {
     const { hsrObservations } = await import("../hsr/observe.js");
     const live = await hsrObservations({ includeEvents: true, bees: slotBees });
     for (const bee of slotBees) {
+      const record = sessionsByName.get(bee);
       const observation = live.get(bee);
-      if (!observation) continue;
-      if (observation.state) observed.set(bee, observation.state);
-      else if (!observation.live) observed.set(bee, "dead");
-      if (observation.activity) {
-        activity.set(bee, { at: new Date(observation.activity.at).toISOString(), fingerprint: observation.activity.fingerprint });
-      }
+      if (!record || !observation) continue;
+      applyTrustedHsrObservation(record, observation, observed, activity, sweepNow);
     }
   }
-  const sweepNow = Date.now();
   await Promise.all(slotBees.map(async (bee) => {
     if (activity.has(bee)) return;
     const record = sessionsByName.get(bee);
@@ -538,18 +565,22 @@ async function flightRequeue(parsed: Parsed): Promise<void> {
 }
 
 async function flightSetStatus(parsed: Parsed, status: "draining" | "closed"): Promise<void> {
-  const flight = await resolveFlight(parsed.args[1]);
-  if (flight.status === status) {
-    console.log(isPretty() ? note(`${flight.id} already ${status}`) : `noop\t${flight.id}\t${status}`);
-    return;
-  }
-  if (flight.status === "closed") {
-    throw new Error(`flight ${flight.id} is closed; closed flights cannot transition to ${status}`);
-  }
-  await saveFlight({ ...flight, status, updatedAt: new Date().toISOString() });
-  await appendLedger({ type: `flight.${status}`, flight: flight.id, name: flight.name });
-  if (isPretty()) console.log(actionLine("ok", "flight", [bold(flight.id), status]));
-  else console.log(`${status}\t${flight.id}`);
+  const resolved = await resolveFlight(parsed.args[1]);
+  await withFlightSweepLock(resolved.id, async () => {
+    const flight = await loadFlight(resolved.id);
+    if (!flight) throw new Error(`flight ${resolved.id} disappeared`);
+    if (flight.status === status) {
+      console.log(isPretty() ? note(`${flight.id} already ${status}`) : `noop\t${flight.id}\t${status}`);
+      return;
+    }
+    if (flight.status === "closed") {
+      throw new Error(`flight ${flight.id} is closed; closed flights cannot transition to ${status}`);
+    }
+    await saveFlight({ ...flight, status, updatedAt: new Date().toISOString() });
+    await appendLedger({ type: `flight.${status}`, flight: flight.id, name: flight.name });
+    if (isPretty()) console.log(actionLine("ok", "flight", [bold(flight.id), status]));
+    else console.log(`${status}\t${flight.id}`);
+  });
 }
 
 export function flightUsageHint(): string {

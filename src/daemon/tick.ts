@@ -11,7 +11,7 @@ import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./node
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
 import type { FlightSweeper } from "./flightSweep.js";
-import { paneActivitySignal, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
+import { hsrActivitySignal, paneActivitySignal, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
 import type { UsageSampler, UsageTickOutcome } from "./usageSampler.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { LogInput } from "./log.js";
@@ -675,16 +675,22 @@ export async function tick(
   const hsrSnapshots = new Map<string, string>();
   const activitySignals = new Map<string, BeeActivitySignal>();
   const hsrMirrors = new Set<string>();
+  const recordsByName = new Map(records.map((record) => [record.name, record]));
+  const nowMs = deps.now();
   for (const [bee, observation] of hsrObs) {
+    const record = recordsByName.get(bee);
+    const trustedLocalHsr = record?.substrate === "hsr" && !observation.mirrorOf;
+    const trustedRemoteMirror = record?.substrate !== "hsr" && record?.node !== undefined && observation.live && observation.mirrorOf === record.node;
+    if (!trustedLocalHsr && !trustedRemoteMirror) continue;
     if (observation.live) hsrLive.add(bee);
     if (observation.state) hsrStates.set(bee, observation.state);
     hsrSnapshots.set(bee, observation.snapshot);
     if (observation.activity) {
-      activitySignals.set(bee, { at: new Date(observation.activity.at).toISOString(), fingerprint: observation.activity.fingerprint });
+      const signal = hsrActivitySignal(observation.activity, nowMs);
+      if (signal) activitySignals.set(bee, signal);
     }
-    if (observation.mirrorOf) hsrMirrors.add(bee);
+    if (trustedRemoteMirror) hsrMirrors.add(bee);
   }
-  const nowMs = deps.now();
   for (const record of records) {
     if (activitySignals.has(record.name)) continue;
     const paneKey = record.agentPaneId ?? record.tmuxTarget;

@@ -421,6 +421,49 @@ test("tick: passes HSR, remote-HSR, and tmux-pane activity signals to flight swe
   });
 });
 
+test("tick: clamps future remote-HSR activity and drops invalid timestamps", async () => {
+  await withTempStore(async () => {
+    const NOW = Date.parse("2026-06-03T10:00:00.000Z");
+    const future = bee({ name: "remote-future", tmuxTarget: "remote-future", node: "runner01" });
+    const invalid = bee({ name: "remote-invalid", tmuxTarget: "remote-invalid", node: "runner01" });
+    const wrongMirror = bee({ name: "remote-wrong-mirror", tmuxTarget: "remote-wrong-mirror", node: "runner01" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const remoteNode: NodeRecord = {
+      name: "runner01",
+      kind: "remote-hsr",
+      endpoint: "me@runner01",
+      capabilities: ["*"],
+      status: "unknown",
+      createdAt: "2026-06-03T09:00:00.000Z",
+      updatedAt: "2026-06-03T09:00:00.000Z",
+    };
+    const deps = buildDeps({
+      records: [future, invalid, wrongMirror],
+      nodes: [remoteNode],
+      liveTargets: new Set(),
+      now: NOW,
+      capture,
+    });
+    deps.hsrObservations = async () => new Map([
+      [future.name, { live: true, state: "active" as BeeState, snapshot: "", mirrorOf: "runner01", activity: { at: NOW + 60 * 60_000, fingerprint: "future-fp", eventType: "text" } }],
+      [invalid.name, { live: true, state: "active" as BeeState, snapshot: "", mirrorOf: "runner01", activity: { at: 1e20, fingerprint: "invalid-fp", eventType: "text" } }],
+      [wrongMirror.name, { live: true, state: "active" as BeeState, snapshot: "", mirrorOf: "other-node", activity: { at: NOW - 1_000, fingerprint: "wrong-fp", eventType: "text" } }],
+    ]);
+    let seenActivity: ReadonlyMap<string, { at: string; fingerprint?: string }> | undefined;
+    deps.sweepFlights = async (_records, _observed, activity) => {
+      seenActivity = activity;
+      return [];
+    };
+
+    await tick(deps, new Map());
+
+    assert.equal(seenActivity?.get(future.name)?.at, new Date(NOW).toISOString());
+    assert.equal(seenActivity?.get(future.name)?.fingerprint, "future-fp");
+    assert.equal(seenActivity?.has(invalid.name), false);
+    assert.equal(seenActivity?.has(wrongMirror.name), false);
+  });
+});
+
 test("tick: liveness keys qualified by node do not leak across nodes", async () => {
   await withTempStore(async () => {
     const NOW = Date.parse("2026-06-03T10:00:00.000Z");

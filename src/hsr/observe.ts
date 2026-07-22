@@ -366,9 +366,9 @@ function isActivityEvent(event: RunnerEvent, rootThreadId: string | undefined): 
   }
 }
 
-function activityFingerprint(event: RunnerEvent, index: number): string {
+function activityFingerprint(event: RunnerEvent): string {
   const digest = createHash("sha256").update(JSON.stringify(event)).digest("hex").slice(0, 16);
-  return `${index}:${event.type}:${event.ts}:${digest}`;
+  return `${event.type}:${event.ts}:${digest}`;
 }
 
 export function hsrActivityFromEvents(
@@ -376,17 +376,17 @@ export function hsrActivityFromEvents(
   options: HsrEventDerivationOptions = {},
 ): HsrActivityObservation | null {
   const rootThreadId = options.rootThreadId;
-  let latest: { event: RunnerEvent; index: number } | null = null;
+  let latest: RunnerEvent | null = null;
   for (let i = 0; i < events.length; i += 1) {
     const event = events[i]!;
     if (!Number.isFinite(event.ts) || !isActivityEvent(event, rootThreadId)) continue;
-    latest = { event, index: i };
+    latest = event;
   }
   if (!latest) return null;
   return {
-    at: latest.event.ts,
-    fingerprint: activityFingerprint(latest.event, latest.index),
-    eventType: latest.event.type,
+    at: latest.ts,
+    fingerprint: activityFingerprint(latest),
+    eventType: latest.type,
   };
 }
 
