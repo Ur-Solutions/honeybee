@@ -146,6 +146,10 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
   }
 
   const methods: Record<string, RpcMethodHandler> = {
+    // Feature handshake for clients that must not guess across daemon versions.
+    // spawnEnv:1 advertises the optional env object accepted by spawn.
+    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1 })),
+
     liveness: guarded(async () => {
       const out: Record<string, boolean> = {};
       for (const [bee, observation] of await hsrObservations()) out[bee] = observation.live;
