@@ -34,6 +34,7 @@ import { cmdSpend } from "./commands/spend.js";
 import { cmdSwarm } from "./commands/swarm.js";
 import { sealHelpText } from "./seal.js";
 import { closeAllSubstrates } from "./substrates/index.js";
+import { waitHelpText } from "./wait.js";
 
 // Re-exports consumed by the unit tests (tests/*.test.ts import these from
 // "../src/cli.js"). The HIVE-15 decomposition moved the handlers into
@@ -274,6 +275,7 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       break;
     case "help":
       if (parsed.args[0] === "seal") console.log(sealHelpText());
+      else if (parsed.args[0] === "wait") console.log(waitHelpText());
       else printHelp();
       break;
     case "--help":
@@ -455,5 +457,8 @@ main(process.argv.slice(2)).catch((error) => {
   const [first, ...rest] = message.split("\n");
   console.error(`${errorPrefix()} ${first}`);
   for (const line of rest) console.error(dim(line));
-  process.exitCode = 1;
+  const exitCode = typeof (error as { exitCode?: unknown })?.exitCode === "number"
+    ? (error as { exitCode: number }).exitCode
+    : 1;
+  process.exitCode = exitCode;
 });

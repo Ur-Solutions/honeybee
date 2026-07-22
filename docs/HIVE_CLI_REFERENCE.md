@@ -687,6 +687,19 @@ If the outcome is blocked on an approval/permission prompt, exit code is
 nonzero. This prevents shell chains such as `hive wait ... && hive kill ...`
 from killing a bee that still needs human approval.
 
+Exit codes:
+
+| Code | Outcome |
+| ---: | --- |
+| `0` | The requested idle output or a new seal was printed. |
+| `1` | The bee became blocked or reached a terminal/hopeless state (`crashed`, killed, archived, deleted, or a missing runtime/pinned tmux pane). |
+| `2` | The timeout elapsed before success. |
+
+Every wait mode refreshes the session record and checks runtime liveness on
+each poll. Terminal failures return within one poll interval and print a
+one-line diagnosis naming the state; a transport probe failure is treated as
+unknown liveness rather than false death and can still end in timeout code `2`.
+
 ## Listing, Attaching, Killing, Cleaning
 
 ### `hive list` / `hive ls` / `hive ps`
