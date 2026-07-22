@@ -26,6 +26,21 @@ export type AgentSpec = {
   requestedKind: string;
 };
 
+export type BeeIdentityEnv = {
+  name: string;
+  id: string;
+  comb?: string;
+  parent?: string;
+};
+
+/** Stamp honeybee-owned identity after every other env source is merged. */
+export function stampBeeIdentityEnv(env: Record<string, string>, identity: BeeIdentityEnv): void {
+  env.HIVE_BEE = identity.name;
+  env.HIVE_BEE_ID = identity.id;
+  if (identity.comb) env.HIVE_COMB = identity.comb;
+  if (identity.parent) env.HIVE_PARENT = identity.parent;
+}
+
 const DROID_YOLO_SETTINGS_PATH = resolve(homedir(), ".factory/hive-droid-yolo-settings.json");
 const DROID_YOLO_SETTINGS = {
   autonomyMode: "auto-high",
@@ -443,6 +458,8 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   }
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(opts.name ?? identity.id);
+  const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
+  stampBeeIdentityEnv(spec.env, { name, id: identity.id, comb: name, ...(spawnedById ? { parent: spawnedById } : {}) });
   const tmuxTarget = safeTmuxTargetForFlow(name);
   const nodeName = opts.node?.name ?? LOCAL_NODE_NAME;
   const substrate = opts.node ? substrateForRecord(opts.node) : localSubstrate();
@@ -453,7 +470,6 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   const command = shellCommand(spec);
 
   const now = new Date().toISOString();
-  const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
   const record: SessionRecord = {
     name,
     agent: spec.kind,

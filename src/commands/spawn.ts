@@ -2,7 +2,7 @@
 // account/profile resolution, homogeneous swarms, and frame-driven cohorts.
 // Extracted from cli.ts (HIVE-15).
 import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAccountIntoHome, autoAccountTool, defaultHomeForAccount, findAccount, listAccounts, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord, type SpawnAgentSpec } from "../accounts.js";
-import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
+import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand, stampBeeIdentityEnv } from "../agents.js";
 import { syncBeesSidebarLayout } from "../beesSidebar.js";
 import { beeConfig } from "../config.js";
 import { parseContractFlag, withContractPostscript, type BeeContract } from "../contract.js";
@@ -305,6 +305,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   timer.mark("allocate");
   const name = safeName(opts.name ?? identity.id);
+  stampBeeIdentityEnv(spec.env, { name, id: identity.id, comb: name, ...(spawnedById ? { parent: spawnedById } : {}) });
 
   // Pane-less spawns (HSR / remote-hsr) have no tmux hasSession guard, so a
   // duplicate name would silently OVERWRITE the existing session record and

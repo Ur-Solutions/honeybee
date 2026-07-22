@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { adoptInheritedHome, agentDefaultsToYolo, forcedSessionIdArgs, hasSessionIdArg, resolveAgent, spawnBeeForFlow, splitShellWords, type AgentSpec } from "../src/agents.js";
+import { adoptInheritedHome, agentDefaultsToYolo, forcedSessionIdArgs, hasSessionIdArg, resolveAgent, spawnBeeForFlow, splitShellWords, stampBeeIdentityEnv, type AgentSpec } from "../src/agents.js";
 import { resetConfigCache } from "../src/config.js";
 import { assertExecutableAvailable } from "../src/execCheck.js";
 import { setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
@@ -68,6 +68,24 @@ test("adoptInheritedHome: stamps the env-inherited home onto spec.homePath and s
   } finally {
     if (cleanPrev !== undefined) process.env.CLAUDE_CONFIG_DIR = cleanPrev;
   }
+});
+
+test("stampBeeIdentityEnv is stable-id aware and last-write", () => {
+  const env = {
+    KEEP: "yes",
+    HIVE_BEE: "spoofed-name",
+    HIVE_BEE_ID: "spoofed-id",
+    HIVE_COMB: "spoofed-comb",
+    HIVE_PARENT: "spoofed-parent",
+  };
+  stampBeeIdentityEnv(env, { name: "worker", id: "CL.stable", comb: "worker", parent: "CL.parent" });
+  assert.deepEqual(env, {
+    KEEP: "yes",
+    HIVE_BEE: "worker",
+    HIVE_BEE_ID: "CL.stable",
+    HIVE_COMB: "worker",
+    HIVE_PARENT: "CL.parent",
+  });
 });
 
 test("forcedSessionIdArgs: claude pins a fresh session id; other providers do not", () => {
@@ -285,12 +303,14 @@ test("spawnBeeForFlow stamps tmux hive identity options for spawned bees", { tim
   delete process.env.TMUX;
   setTmuxSocket(socket);
   try {
+    const envPath = join(dir, "child.env");
     const record = await spawnBeeForFlow({
       agent: "sh",
-      extraArgs: ["-c", "sleep 30"],
+      extraArgs: ["-c", `env > ${envPath}; sleep 30`],
       cwd: "/tmp",
       yolo: false,
       name: `flow-stamp-${process.pid}-${Date.now()}`,
+      spawnedById: "CL.parent",
     });
     const line = (await tmux([
       "display-message",
@@ -304,6 +324,19 @@ test("spawnBeeForFlow stamps tmux hive identity options for spawned bees", { tim
     assert.equal(pane, record.agentPaneId);
     assert.equal(state, "working");
     assert.equal(windowName, record.id);
+    let childEnv = "";
+    for (let attempt = 0; attempt < 100 && !childEnv; attempt += 1) {
+      childEnv = await readFile(envPath, "utf8").catch(() => "");
+      if (!childEnv) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const env = Object.fromEntries(childEnv.trim().split("\n").map((line) => {
+      const separator = line.indexOf("=");
+      return [line.slice(0, separator), line.slice(separator + 1)];
+    }));
+    assert.equal(env.HIVE_BEE, record.name);
+    assert.equal(env.HIVE_BEE_ID, record.id);
+    assert.equal(env.HIVE_COMB, record.name);
+    assert.equal(env.HIVE_PARENT, "CL.parent");
   } finally {
     await tmux(["kill-server"], { reject: false });
     setTmuxSocket(undefined);
