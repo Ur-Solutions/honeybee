@@ -16,7 +16,9 @@ import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { liveBeesFromSessions, poolsForProject, poolStatus, projectRepresentatives, type PoolStatus } from "../pool.js";
 import { listProRepoEntries, resolveProSlotForCwd, type ProRepoEntry, type ProSlotKind } from "../proProjects.js";
 import { repoTagFor } from "../repoTag.js";
-import { hsrRunDir } from "../hsr/runDir.js";
+import { transcriptRowsFromEvents } from "../hsr/eventTranscript.js";
+import { readEventTail } from "../hsr/observe.js";
+import { hsrEventsPath, hsrRunDir } from "../hsr/runDir.js";
 import { loadLatestSeal, sealsRoot } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "../sessionMetadata.js";
@@ -452,11 +454,22 @@ export async function cmdTranscript(parsed: Parsed) {
   if (!target) throw new Error("Usage: hive transcript <session> [-n rows] [--json]");
   let record = await resolveSession(target);
   const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record));
-  if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
-  record = await persistSessionTranscriptMetadata(record, tx);
   const limitRaw = flag(parsed, "n") ?? flag(parsed, "limit");
   const limit = limitRaw ? Number(limitRaw) : undefined;
   const json = truthy(flag(parsed, "json"));
+  if (!tx) {
+    // No provider transcript on THIS machine. Remote-hsr bees mirrored by the
+    // daemon (APIA-94) — and local HSR bees whose provider writes no file —
+    // still have a run-dir events.jsonl; render that instead of failing.
+    const rows = transcriptRowsFromEvents(await readEventTail(record.name));
+    if (rows.length > 0) {
+      console.error(transcriptBanner("hsr events", hsrEventsPath(record.name)));
+      console.log(renderTranscript(rows, { limit: Number.isFinite(limit) ? limit : undefined, json }));
+      return;
+    }
+    throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
+  }
+  record = await persistSessionTranscriptMetadata(record, tx);
   console.error(transcriptBanner(tx.provider, tx.path));
   console.log(renderTranscript(tx.rows, { limit: Number.isFinite(limit) ? limit : undefined, json }));
 }
@@ -481,7 +494,17 @@ export async function cmdLast(parsed: Parsed) {
     console.log(await substrateFor(record).capture(record.tmuxTarget, numberFlag(parsed, ["n", "lines"], 120), record.agentPaneId));
     return;
   }
-  if (!tx) throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
+  if (!tx) {
+    // Same events.jsonl fallback as cmdTranscript (mirrored remote-hsr bees).
+    const rows = transcriptRowsFromEvents(await readEventTail(record.name));
+    const eventText = lastAssistantText(rows);
+    if (eventText) {
+      console.error(transcriptBanner("hsr events", hsrEventsPath(record.name)));
+      console.log(eventText);
+      return;
+    }
+    throw new Error(`No transcript provider/file found for ${record.agent} session ${record.name}`);
+  }
   record = await persistSessionTranscriptMetadata(record, tx);
   const text = lastAssistantText(tx.rows);
   if (!text) throw new Error(`No assistant text found in transcript: ${tx.path}`);
