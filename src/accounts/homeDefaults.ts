@@ -87,7 +87,7 @@ function mergeCodexConfigDefaults(input: string): string {
   return `${lines.join("\n")}\n`;
 }
 
-function tomlLines(input: string): string[] {
+export function tomlLines(input: string): string[] {
   const trimmed = input.replace(/\s+$/u, "");
   return trimmed.length === 0 ? [] : trimmed.split(/\r?\n/u);
 }

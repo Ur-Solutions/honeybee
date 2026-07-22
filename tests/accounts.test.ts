@@ -159,6 +159,33 @@ test("activate seeds creds into a home; codex keeps a legacy .codex auth mirror"
   });
 });
 
+test("account activation seeds live gateway MCP config and records the home stamp", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "gateway@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(join(accountDir(account), "auth.json"), `{"id":"codex-token"}`);
+    await mkdir(join(dir, "gateways"), { recursive: true });
+    await writeFile(join(dir, "gateways", "apiary.json"), `${JSON.stringify({
+      name: "apiary",
+      protocol: "mcp",
+      socketPath: "/tmp/apiary.sock",
+      shim: { command: "/opt/apiary-mcp", args: [] },
+      env: { APIARY_GATEWAY: "/tmp/apiary.json" },
+      pid: process.pid,
+      startedAt: "2026-07-22T09:00:00.000Z",
+      gatewayRev: 1,
+    }, null, 2)}\n`);
+
+    const home = join(dir, "homes", account.id);
+    const written = await activateAccountIntoHome(account, home);
+    assert.ok(written.includes("config.toml"));
+    assert.ok(written.includes(".hive-gateways.json"));
+    assert.match(await readFile(join(home, "config.toml"), "utf8"), /\[mcp_servers\.apiary\]/);
+    const stamp = JSON.parse(await readFile(join(home, ".hive-gateways.json"), "utf8"));
+    assert.deepEqual(stamp.files["config.toml"].apiary, { command: "/opt/apiary-mcp", args: [] });
+  });
+});
+
 test("codex activation preserves vaulted config and fills missing standard defaults", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("codex", "codex-config@a.b");

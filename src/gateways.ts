@@ -56,10 +56,10 @@ function parseGatewayRecord(raw: string): GatewayRecord | null {
   const shim = record.shim;
   if (!shim || typeof shim !== "object" || Array.isArray(shim)) return null;
   const shimRecord = shim as Record<string, unknown>;
-  if (typeof record.name !== "string" || record.name.length === 0) return null;
+  if (typeof record.name !== "string" || record.name.length === 0 || /[\u0000-\u001f]/u.test(record.name)) return null;
   if (record.protocol !== "mcp" || record.gatewayRev !== 1) return null;
-  if (typeof record.socketPath !== "string" || !isAbsolute(record.socketPath)) return null;
-  if (typeof shimRecord.command !== "string" || !isAbsolute(shimRecord.command)) return null;
+  if (typeof record.socketPath !== "string" || record.socketPath.includes("\0") || !isAbsolute(record.socketPath)) return null;
+  if (typeof shimRecord.command !== "string" || shimRecord.command.includes("\0") || !isAbsolute(shimRecord.command)) return null;
   if (!Array.isArray(shimRecord.args) || !shimRecord.args.every((arg) => typeof arg === "string" && !arg.includes("\0"))) return null;
   if (!isStringRecord(record.env)) return null;
   if (!Number.isSafeInteger(record.pid) || Number(record.pid) <= 0) return null;
