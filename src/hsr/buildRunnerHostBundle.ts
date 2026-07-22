@@ -79,7 +79,12 @@ export async function ensureRunnerHostBundle(opts?: { force?: boolean }): Promis
   // Dynamic import keeps esbuild a build-time-only devDep — importing at module
   // top-level would make every `hive` invocation fail where esbuild is absent.
   const esbuild = (await import("esbuild")) as typeof import("esbuild");
-  const entry = fileURLToPath(new URL("./remoteHost.ts", import.meta.url));
+  // Under tsx/tests this module runs from src/ and the .ts sibling exists; from
+  // the compiled dist/ it does not — bundle the compiled .js graph instead.
+  const tsEntry = fileURLToPath(new URL("./remoteHost.ts", import.meta.url));
+  const entry = (await fileExists(tsEntry))
+    ? tsEntry
+    : fileURLToPath(new URL("./remoteHost.js", import.meta.url));
 
   await esbuild.build({
     entryPoints: [entry],
