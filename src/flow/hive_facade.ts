@@ -130,6 +130,7 @@ export class HiveFacade {
       extraArgs: [],
       cwd,
       yolo: agentDefaultsToYolo(resolved.agent),
+      ...(spec.env !== undefined ? { env: spec.env } : {}),
       ...(spec.name !== undefined ? { name: spec.name } : {}),
       ...(spec.colony !== undefined ? { colony: spec.colony } : {}),
       swarmId,

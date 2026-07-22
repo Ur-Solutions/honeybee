@@ -6,11 +6,13 @@ import { activateAccountIntoHome, assertCursorHomeAuthFresh, assertGrokHomeAuthF
 import { beeConfig } from "./config.js";
 import { driverDefaultsToYolo, forcedSessionIdArgsForAgent, homeEnvForAgent, identityEnvForAgent, modelArgsForAgent, secretEnvKeysForAgent, sessionPinnedInArgs } from "./drivers.js";
 import { assertExecutableAvailable } from "./execCheck.js";
+import { liveGatewayEnv } from "./gateways.js";
 import { writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity } from "./ids.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
 import { safeName, saveSession, type SessionRecord } from "./store.js";
 import { resolveSpawningBeeId } from "./spawnParent.js";
+import { mergeCallerEnv } from "./spawnEnv.js";
 import { localSubstrate, substrateForRecord } from "./substrates/index.js";
 import type { TmuxWindowOptions } from "./substrates/index.js";
 
@@ -21,10 +23,27 @@ export type AgentSpec = {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Env whose values came from external callers/gateways; redact in records. */
+  redactedEnvKeys?: Set<string>;
   tmuxOptions?: TmuxWindowOptions;
   homePath?: string;
   requestedKind: string;
 };
+
+export type BeeIdentityEnv = {
+  name: string;
+  id: string;
+  comb?: string;
+  parent?: string;
+};
+
+/** Stamp honeybee-owned identity after every other env source is merged. */
+export function stampBeeIdentityEnv(env: Record<string, string>, identity: BeeIdentityEnv): void {
+  env.HIVE_BEE = identity.name;
+  env.HIVE_BEE_ID = identity.id;
+  if (identity.comb) env.HIVE_COMB = identity.comb;
+  if (identity.parent) env.HIVE_PARENT = identity.parent;
+}
 
 const DROID_YOLO_SETTINGS_PATH = resolve(homedir(), ".factory/hive-droid-yolo-settings.json");
 const DROID_YOLO_SETTINGS = {
@@ -106,6 +125,8 @@ export type ResolveAgentOptions = {
    * `--model <provider>/<model>`; single-provider CLIs ignore it.
    */
   provider?: string;
+  /** Caller-supplied spawn env, validated against honeybee-owned keys. */
+  env?: Record<string, string>;
 };
 
 export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options: ResolveAgentOptions = {}): AgentSpec {
@@ -143,6 +164,12 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   if (options.identity && profile.homePath) {
     Object.assign(env, identityEnvForAgent(profile.kind, profile.homePath));
   }
+  const redactedEnvKeys = new Set<string>();
+  const gatewayEnv = liveGatewayEnv();
+  Object.assign(env, gatewayEnv);
+  for (const key of Object.keys(gatewayEnv)) redactedEnvKeys.add(key);
+  mergeCallerEnv(env, options.env);
+  for (const key of Object.keys(options.env ?? {})) redactedEnvKeys.add(key);
   // The account's model selector is appended ONLY when the base command came
   // from the driver default — never when a config/env `command` override is in
   // play, since such a command may already embed `--model …` and appending
@@ -155,6 +182,7 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
     command: parts[0]!,
     args: [...parts.slice(1), ...modelArgs, ...extraArgs],
     env,
+    ...(redactedEnvKeys.size > 0 ? { redactedEnvKeys } : {}),
     ...(tmuxOptions ? { tmuxOptions } : {}),
     homePath: profile.homePath,
     requestedKind: kind,
@@ -170,7 +198,9 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
  * to the user to run (`hive open --window/--print`).
  */
 export function shellCommand(spec: AgentSpec, options: { forExec?: boolean } = {}): string {
-  const secrets = options.forExec ? new Set<string>() : new Set(secretEnvKeysForAgent(spec.kind));
+  const secrets = options.forExec
+    ? new Set<string>()
+    : new Set([...secretEnvKeysForAgent(spec.kind), ...(spec.redactedEnvKeys ?? [])]);
   const env = Object.entries(spec.env).map(([key, value]) => `${key}=${secrets.has(key) ? "<redacted>" : shellQuoteIfNeeded(value)}`);
   return [...env, ...[spec.command, ...spec.args].map(shellQuoteIfNeeded)].join(" ");
 }
@@ -183,9 +213,14 @@ export function shellCommand(spec: AgentSpec, options: { forExec?: boolean } = {
  * has stamped it. Idempotent, and a no-op for static-env recipes or spawns
  * without a home.
  */
-export function refreshIdentityEnv(spec: AgentSpec): void {
+export function refreshIdentityEnv(spec: AgentSpec, callerEnv?: Record<string, string>): void {
   if (!spec.homePath) return;
   Object.assign(spec.env, identityEnvForAgent(spec.kind, spec.homePath));
+  const gatewayEnv = liveGatewayEnv();
+  Object.assign(spec.env, gatewayEnv);
+  for (const key of Object.keys(gatewayEnv)) (spec.redactedEnvKeys ??= new Set()).add(key);
+  mergeCallerEnv(spec.env, callerEnv);
+  for (const key of Object.keys(callerEnv ?? {})) (spec.redactedEnvKeys ??= new Set()).add(key);
 }
 
 /**
@@ -359,6 +394,7 @@ export type SpawnBeeOptions = {
   cwd: string;
   yolo: boolean;
   home?: string | true | string[];
+  env?: Record<string, string>;
   /**
    * Pre-resolved account to bind (creds activated into a dedicated home, the
    * account's default model + provider applied). When omitted, `agent` is
@@ -413,6 +449,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     home,
     yolo: opts.yolo,
     identity: Boolean(account),
+    env: opts.env,
     ...(account?.model ? { model: account.model } : {}),
     ...(account?.provider ? { provider: account.provider } : {}),
   });
@@ -420,7 +457,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     if (opts.node && opts.node.kind !== "local-tmux") throw new Error("account-bound flow spawns are local-only (the vault never leaves this machine)");
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
     await activateAccountIntoHome(account, spec.homePath);
-    refreshIdentityEnv(spec);
+    refreshIdentityEnv(spec, opts.env);
   }
   // Keep the original resolved argv independent from Hive's generated provider
   // session pin so revive can resume (or start fresh) without rebuilding flags.
@@ -446,6 +483,8 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   }
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(opts.name ?? identity.id);
+  const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
+  stampBeeIdentityEnv(spec.env, { name, id: identity.id, comb: name, ...(spawnedById ? { parent: spawnedById } : {}) });
   const tmuxTarget = safeTmuxTargetForFlow(name);
   const nodeName = opts.node?.name ?? LOCAL_NODE_NAME;
   const substrate = opts.node ? substrateForRecord(opts.node) : localSubstrate();
@@ -456,7 +495,6 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   const command = shellCommand(spec);
 
   const now = new Date().toISOString();
-  const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
   const record: SessionRecord = {
     name,
     agent: spec.kind,

@@ -28,6 +28,7 @@ import {
 } from "./cursorAuth.js";
 import { grokAuthUnavailableReason, readGrokAuthFile, syncGrokAuthToVaultLocked } from "./grokAuth.js";
 import { syncGenericCredentialsToVaultLocked } from "./genericSync.js";
+import { seedGatewayMcp } from "./gatewayMcp.js";
 import { seedClaudeHomeAcceptance, seedClaudeHomeDefaults, seedCodexHomeDefaults } from "./homeDefaults.js";
 
 /**
@@ -404,6 +405,10 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     // capability sync, and this is a no-op without a kit binary.
     const kitStamp = await readKitHomeStamp(homePath);
     await kitMaterializeHome(homePath, account.tool, { warn, profile: kitStamp.kitProfile });
+    const gatewaySeed = await seedGatewayMcp(homePath, account.tool);
+    for (const relative of gatewaySeed.written) {
+      if (!written.includes(relative)) written.push(relative);
+    }
     await appendLedger({ type: "account.activate", account: account.id, tool: account.tool, home: homePath, files: written });
     return written;
   });

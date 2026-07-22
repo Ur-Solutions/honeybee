@@ -74,21 +74,32 @@ test("hasSession treats a 'no server running' stderr as session-gone even on odd
   assert.equal(await s.hasSession("alpha"), false);
 });
 
-test("newSession sends an env-prefixed argv with every word quoted for the remote shell", async () => {
+test("newSession streams env-bearing launches over stdin so values never enter the ssh argv", async () => {
   const cap = captureExec();
   cap.respondWith(() => ({ exitCode: 0 }));
   const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
   await s.newSession("alpha", "/remote/path", { command: "codex", args: ["--cwd", "/work/space"], env: { FOO: "bar baz" } });
-  const argv = cap.calls[0]!.argv;
-  // env vars must NOT ride on a `K=v cmd` single string: tmux >= 3.0 exec()s a
-  // multi-word command directly and would execvp a binary named "K=v".
-  assert.deepEqual(argv, [
-    "ssh", ...MUX, "trmd@mini01",
-    // -P -F '#{pane_id}' prints the new pane id; the format is shell-quoted for
-    // the remote shell (the bare '#' would otherwise be a comment).
-    "tmux", "new-session", "-d", "-P", "-F", "'#{pane_id}'", "-s", "alpha", "-c", "/remote/path",
-    "env", "'FOO=bar baz'", "codex", "--cwd", "/work/space",
-  ]);
+  const call = cap.calls[0]!;
+  assert.deepEqual(call.argv, ["ssh", ...MUX, "trmd@mini01", "sh", "-s"]);
+  assert.ok(!call.argv.join(" ").includes("bar baz"), "env value is absent from the process argv");
+  assert.equal(
+    call.input,
+    "exec tmux new-session -d -P -F '#{pane_id}' -s alpha -c /remote/path env 'FOO=bar baz' codex --cwd /work/space\n",
+  );
+});
+
+test("newSession keeps token values out of the ssh command line while delivering them", async () => {
+  const cap = captureExec();
+  cap.respondWith(() => ({ exitCode: 0 }));
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  await s.newSession("alpha", "/remote/path", {
+    command: "codex",
+    args: [],
+    env: { APIARY_AGENT_TOKEN: "secret-token-value" },
+  });
+  const call = cap.calls[0]!;
+  assert.ok(!call.argv.join(" ").includes("secret-token-value"));
+  assert.match(call.input ?? "", /APIARY_AGENT_TOKEN=secret-token-value/);
 });
 
 test("newSession omits the env prefix when the spec has no env", async () => {

@@ -30,6 +30,7 @@ import {
 } from "../hsr/rpc.js";
 import { hsrObservations, pendingNeedsInput } from "../hsr/observe.js";
 import { readHsrMeta } from "../hsr/runDir.js";
+import { assertCallerEnvAllowed } from "../spawnEnv.js";
 import { daemonRoot } from "./log.js";
 
 export type HsrControlServer = {
@@ -44,6 +45,19 @@ export type HsrControlServer = {
  */
 export function hsrControlSocketPath(): string {
   return join(daemonRoot(), "hsr-control.sock");
+}
+
+/** Validate a spawn RPC env object and render it as repeated --env argv. */
+export function hsrSpawnEnvArgv(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("spawn env must be an object of string values");
+  const env: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string") throw new Error(`spawn env value for ${key} must be a string`);
+    env[key] = item;
+  }
+  assertCallerEnvAllowed(env);
+  return Object.entries(env).flatMap(([key, item]) => ["--env", `${key}=${item}`]);
 }
 
 function messageOf(error: unknown): string {
@@ -104,9 +118,11 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
 
   const methods: Record<string, RpcMethodHandler> = {
     // Feature handshake for clients that must not guess across daemon versions:
-    // spawn:2 = in-process spawnSingleBee with prompt/flags/rest support. An
-    // older daemon rejects this method outright, which reads as "CLI fallback".
-    capabilities: guarded(async () => ({ ok: true, spawn: 2 })),
+    // spawn:2 = in-process spawnSingleBee with prompt/flags/rest support;
+    // spawnEnv:1 = the optional env object accepted by spawn (validated, then
+    // forwarded as repeated --env). An older daemon rejects this method
+    // outright, which reads as "CLI fallback".
+    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1 })),
 
     liveness: guarded(async () => {
       const out: Record<string, boolean> = {};
@@ -232,6 +248,7 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
         prompt?: unknown;
         flags?: unknown;
         rest?: unknown;
+        env?: unknown;
       };
       const kind = String(p.kind ?? "");
       if (!kind) return { ok: false, error: "kind required" };
@@ -256,6 +273,11 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
       if (name) flags.set("name", name);
       if (cwd) flags.set("cwd", cwd);
       if (yolo) flags.set("yolo", true);
+      // H2 caller env: validate daemon-side (clear refusal), then ride the same
+      // repeated --env flag the CLI accepts; spawn-side merge order re-applies
+      // the denylist and identity stamps last.
+      const envPairs = hsrSpawnEnvArgv(p.env).filter((word) => word !== "--env");
+      if (envPairs.length > 0) flags.set("env", envPairs);
       const rest = Array.isArray(p.rest) && (p.rest as unknown[]).every((item) => typeof item === "string")
         ? [...(p.rest as string[])]
         : [];

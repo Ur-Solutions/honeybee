@@ -56,6 +56,9 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
     client.on("hsr.event", (p) => relayed.push(p as { bee: string; event: RunnerEvent }));
 
     try {
+      const capabilities = (await client.call("capabilities")) as Record<string, unknown>;
+      assert.deepEqual(capabilities, { ok: true, spawn: 2, spawnEnv: 1 });
+
       // liveness() includes the live bee.
       const liveness = (await client.call("liveness")) as Record<string, boolean>;
       assert.equal(liveness[bee], true, "liveness should show the bee alive");

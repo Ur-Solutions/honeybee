@@ -3,7 +3,7 @@ import { SEAL_STATUSES } from "../seal.js";
 
 export const COMMANDS = [
   "spawn", "new", "launch", "send", "tail", "cat", "transcript", "tx", "last", "wait",
-  "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "next",
+  "list", "ls", "ps", "bees", "gateways", "kill", "clean", "run", "x", "xa", "attach", "next",
   "colony", "pool", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",
@@ -65,7 +65,7 @@ export const SHELL_FIRST_ARG = new Set(["completion"]);
 export const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 export const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--contract", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
+  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--contract", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
   pool: ["--json", "--all", "--ttl", "--count", "--no-keep", "--here", "--yolo", "--name", "--account"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
@@ -86,7 +86,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   sync: ["--json"],
   node: ["--kind", "--endpoint", "--capabilities", "--description", "--ssh-command", "--ssh-args"],
   run: [
-    "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl",
+    "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env",
     "--wait", "--last", "--transcript",
     "--rm", "--cleanup", "--keep",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
@@ -97,7 +97,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--include-paused", "--yes",
   ],
   x: [
-    "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--name", "--colony",
+    "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--name", "--colony",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
     "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate", "--here", "--include-paused", "--yes",
   ],

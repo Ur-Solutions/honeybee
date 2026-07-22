@@ -29,6 +29,7 @@ test("completes commands when no command typed", () => {
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("completion"));
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("cat"));
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("tx"));
+  assert.ok(getCompletionsFromState(["hive", ""], empty).includes("gateways"));
 });
 
 test("completes commands with no args at all", () => {
@@ -76,6 +77,7 @@ test("lists x in top-level commands and completes its flags", () => {
   assert.ok(flags.includes("--prompt"));
   assert.ok(flags.includes("--force-send"));
   assert.ok(flags.includes("--cwd"));
+  assert.ok(flags.includes("--env"));
 });
 
 test("completes shells as first arg of completion", () => {
@@ -126,6 +128,7 @@ test("completes flags when current word starts with dash", () => {
   assert.ok(candidates.includes("--name"));
   assert.ok(candidates.includes("--cwd"));
   assert.ok(candidates.includes("--yolo"));
+  assert.ok(candidates.includes("--env"));
 
   const cleanFlags = getCompletionsFromState(["hive", "clean", "--"], empty);
   assert.ok(cleanFlags.includes("--dead"));

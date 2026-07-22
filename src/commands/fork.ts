@@ -2,7 +2,7 @@
 // seeded from its state, with account-safety resolution.
 // Extracted from cli.ts (HIVE-15).
 import { activateAccountIntoHome, defaultHomeForAccount, type AccountRecord } from "../accounts.js";
-import { adoptInheritedHome, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
+import { adoptInheritedHome, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand, stampBeeIdentityEnv } from "../agents.js";
 import { agentKinds, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { modelArgsFor, pickForkSeed, type ForkSeedInput, type SeedMode } from "../fork.js";
@@ -232,6 +232,12 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
 
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(stringFlag(parsed, ["name"]) ?? identity.id);
+  stampBeeIdentityEnv(spec.env, {
+    name,
+    id: identity.id,
+    comb: name,
+    parent: source.id ?? source.name,
+  });
   const now = new Date().toISOString();
 
   // 8. Launch the fork on the chosen substrate and build the record with fork

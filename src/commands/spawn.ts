@@ -2,7 +2,7 @@
 // account/profile resolution, homogeneous swarms, and frame-driven cohorts.
 // Extracted from cli.ts (HIVE-15).
 import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAccountIntoHome, autoAccountTool, defaultHomeForAccount, findAccount, listAccounts, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord, type SpawnAgentSpec } from "../accounts.js";
-import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
+import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand, stampBeeIdentityEnv } from "../agents.js";
 import { syncBeesSidebarLayout } from "../beesSidebar.js";
 import { beeConfig } from "../config.js";
 import { parseContractFlag, withContractPostscript, type BeeContract } from "../contract.js";
@@ -21,6 +21,7 @@ import { chooseLaunch, type LaunchTemplate } from "../launchTui.js";
 import { cachedAccountLimits, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
 import { LOCAL_NODE_NAME, authPolicyOf, type NodeRecord } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
+import { parseEnvAssignments } from "../spawnEnv.js";
 import { allocatePoolMembers, bindPoolClaim, releasePoolClaim, resolvePoolRef, type PoolAllocation, type ResolvedPool } from "../pool.js";
 import { createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, toProSlug } from "../proProjects.js";
 import { pickRoundRobinAccount } from "../limits/autoPick.js";
@@ -114,12 +115,21 @@ export function resolveKitProfileFlag(parsed: Parsed): string | undefined {
   return value;
 }
 
+export function resolveSpawnEnvFlag(parsed: Parsed): Record<string, string> | undefined {
+  const value = flag(parsed, "env");
+  if (value === undefined) return undefined;
+  const assignments = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  if (assignments.length === 0) throw new Error("--env requires KEY=VALUE (repeat --env for multiple values)");
+  return parseEnvAssignments(assignments);
+}
+
 export type SpawnOptions = {
   agent: string;
   extraArgs: string[];
   cwd: string;
   yolo: boolean;
   home?: string | true | string[];
+  env?: Record<string, string>;
   name?: string;
   colony?: string;
   swarmId?: string;
@@ -219,6 +229,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     home,
     yolo: opts.yolo,
     identity: Boolean(opts.account),
+    env: opts.env,
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.provider ? { provider: opts.provider } : {}),
   });
@@ -258,7 +269,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     } else {
       if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${opts.account.id}`);
       await activateAccountIntoHome(opts.account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
-      refreshIdentityEnv(spec);
+      refreshIdentityEnv(spec, opts.env);
     }
   }
   // trmdy/kit: an explicit capability profile re-materializes the home before
@@ -318,6 +329,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   timer.mark("allocate");
   const name = safeName(opts.name ?? identity.id);
+  stampBeeIdentityEnv(spec.env, { name, id: identity.id, comb: name, ...(spawnedById ? { parent: spawnedById } : {}) });
 
   // Pane-less spawns (HSR / remote-hsr) have no tmux hasSession guard, so a
   // duplicate name would silently OVERWRITE the existing session record and
@@ -792,7 +804,7 @@ export async function bindPoolAllocationToBee(plan: PoolSpawnPlan, allocation: P
 
 export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
+  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
   const timer = startSpawnTimer(requested);
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
@@ -810,8 +822,9 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   let cwd = poolRef ? "" : await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
+  const env = resolveSpawnEnvFlag(parsed);
   const colony = await resolveSpawnColony(parsed);
-  const spec = resolveAgent(agent, extraArgs, { home, yolo });
+  const spec = resolveAgent(agent, extraArgs, { home, yolo, env });
   // HSR is a substrate, not a node: `--substrate hsr` skips node resolution and
   // runs the bee pane-lessly on the local runner host (HSR_EXPLORATION.md §7).
   // Origin-based default (agents → HSR, humans → local-tmux) with explicit
@@ -851,7 +864,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, name, colony, brief: briefText, ...(contract ? { contract } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.
@@ -1227,8 +1240,9 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
   const cwd = poolRef ? "" : await resolveSpawnCwd(parsed, profile?.cwd);
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
+  const env = resolveSpawnEnvFlag(parsed);
   const colony = await resolveSpawnColony(parsed);
-  const spec = resolveAgent(agent, extraArgs, { home, yolo });
+  const spec = resolveAgent(agent, extraArgs, { home, yolo, env });
   const node = await resolveSpawnNode(parsed, spec.kind);
   const swarmId = resolveSwarmIdHint(parsed, agent);
   // Pool fan-out (§6.4): claim ALL N members in one lock acquisition,
@@ -1250,7 +1264,7 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
     const beeCwd = allocation ? allocation.path : cwd;
     let record: SessionRecord;
     try {
-      record = await spawnBee({ agent, extraArgs, cwd: beeCwd, yolo, home, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider, ...(kitProfile ? { kitProfile } : {}), ...(poolPlan && allocation ? { poolKey: poolPlan.pool.key, poolMember: allocation.member } : {}) });
+      record = await spawnBee({ agent, extraArgs, cwd: beeCwd, yolo, home, env, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider, ...(kitProfile ? { kitProfile } : {}), ...(poolPlan && allocation ? { poolKey: poolPlan.pool.key, poolMember: allocation.member } : {}) });
     } catch (error) {
       // Keep the bees already spawned; roll back only the unconsumed claims
       // (this member and everything after it).
@@ -1300,6 +1314,7 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
 
   const briefed = truthy(flag(parsed, "briefed"));
   const flagHome = flag(parsed, "home") ?? flag(parsed, "profile");
+  const env = resolveSpawnEnvFlag(parsed);
   const kitProfile = resolveKitProfileFlag(parsed);
   const records: SessionRecord[] = [];
   // deliverBrief already waits for readiness, so just-briefed bees are excluded
@@ -1319,7 +1334,7 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
     await confirmPausedAccount(account, parsed);
     const yolo = dangerousMode(parsed, agent, caste.bee, profile?.yolo);
     const home = caste.home ?? flagHome;
-    const casteSpec = resolveAgent(agent, extraArgs, { home, yolo });
+    const casteSpec = resolveAgent(agent, extraArgs, { home, yolo, env });
     const casteNode = await resolveSpawnNode(parsed, casteSpec.kind);
     for (let i = 0; i < caste.count; i += 1) {
       // A composer message (if non-blank) overrides this bee's caste brief.
@@ -1339,6 +1354,7 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
         cwd,
         yolo,
         ...(home !== undefined ? { home } : {}),
+        ...(env ? { env } : {}),
         colony,
         swarmId,
         caste: caste.name,
