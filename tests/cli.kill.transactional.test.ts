@@ -218,6 +218,30 @@ test("transactionalKill: session already gone (hasSession false from the start) 
   });
 });
 
+test("transactionalKill: remote-hsr calls substrate.kill even when the session is already gone (remote cred shred / run-dir cleanup)", async () => {
+  await withTempStore(async (dir) => {
+    const record = seed({ name: "remote-ghost", tmuxTarget: "remote-ghost", node: "metal" });
+    await saveSession(record);
+
+    let killCalls = 0;
+    const substrate = makeSubstrate({
+      kind: "remote-hsr",
+      hasSession: async () => false,
+      kill: async () => {
+        killCalls += 1;
+        return killOk();
+      },
+    });
+
+    const outcome = await transactionalKill(record, { substrate, pollIntervalMs: 0 });
+
+    assert.equal(outcome.ok, true);
+    assert.equal(killCalls, 1, "remote-hsr kill RPC must fire for an exited bee so delivered creds are shredded");
+    const gone = await readFile(join(dir, "sessions", "remote-ghost.json"), "utf8").catch(() => null);
+    assert.equal(gone, null, "session record should be deleted");
+  });
+});
+
 test("transactionalKill: session gone still signals a recorded launcher process group", async () => {
   await withTempStore(async () => {
     const record = seed({ name: "alpha", tmuxTarget: "alpha", launcherPgid: 1234 });

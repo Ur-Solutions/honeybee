@@ -73,7 +73,12 @@ async function teardownSession(
     // Probe failures are non-fatal here; proceed to attempt kill.
   }
 
-  if (!alreadyGone || record.launcherPgid) {
+  // remote-hsr's kill RPC is also the remote cleanup hook: it shreds delivered
+  // ephemeral credentials (APIA-93) and removes the remote run dir. A bee that
+  // exited on its own still needs that, so the already-gone fast-path must not
+  // skip the RPC there (it is idempotent on the remote).
+  const needsRemoteCleanup = substrate.kind === "remote-hsr";
+  if (!alreadyGone || record.launcherPgid || needsRemoteCleanup) {
     attempts += 1;
     try {
       const killResult = await substrate.kill(record.tmuxTarget, { launcherPgid: record.launcherPgid });
