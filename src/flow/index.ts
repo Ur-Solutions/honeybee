@@ -79,6 +79,7 @@ export type FlowHive = {
 
 export type FlowSpawnInput = {
   bee: string;
+  env?: Record<string, string>;
   name?: string;
   cwd?: string;
   home?: string;

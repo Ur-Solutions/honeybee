@@ -32,6 +32,7 @@ import {
 } from "../hsr/rpc.js";
 import { hsrObservations, pendingNeedsInput } from "../hsr/observe.js";
 import { readHsrMeta } from "../hsr/runDir.js";
+import { assertCallerEnvAllowed } from "../spawnEnv.js";
 import { daemonRoot } from "./log.js";
 
 export type HsrControlServer = {
@@ -78,6 +79,18 @@ function parseBeeFromPorcelain(stdout: string): string | null {
     if (bee) return bee;
   }
   return null;
+}
+
+export function hsrSpawnEnvArgv(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("spawn env must be an object of string values");
+  const env: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string") throw new Error(`spawn env value for ${key} must be a string`);
+    env[key] = item;
+  }
+  assertCallerEnvAllowed(env);
+  return Object.entries(env).flatMap(([key, item]) => ["--env", `${key}=${item}`]);
 }
 
 export async function startHsrControlServer(opts?: { socketPath?: string }): Promise<HsrControlServer> {
@@ -243,7 +256,7 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
     // spawn is a thin shell to `hive spawn` — it needs resolveAgent/account
     // activation the CLI owns, so we shell the CLI rather than reimplement it.
     spawn: guarded(async (params) => {
-      const p = (params ?? {}) as { kind?: unknown; cwd?: unknown; model?: unknown; name?: unknown; yolo?: unknown };
+      const p = (params ?? {}) as { kind?: unknown; cwd?: unknown; model?: unknown; name?: unknown; yolo?: unknown; env?: unknown };
       const kind = String(p.kind ?? "");
       if (!kind) return { ok: false, error: "kind required" };
       const cwd = typeof p.cwd === "string" ? p.cwd : undefined;
@@ -261,6 +274,7 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
         ...(name ? ["--name", name] : []),
         ...(cwd ? ["--cwd", cwd] : []),
         ...(yolo ? ["--yolo"] : []),
+        ...hsrSpawnEnvArgv(p.env),
         ...(model ? ["--", "--model", model] : []),
       ];
       return await new Promise<{ ok: boolean; bee?: string; error?: string }>((resolve) => {

@@ -311,6 +311,7 @@ test("spawnBeeForFlow stamps tmux hive identity options for spawned bees", { tim
       yolo: false,
       name: `flow-stamp-${process.pid}-${Date.now()}`,
       spawnedById: "CL.parent",
+      env: { CALLER_VALUE: "through-flow" },
     });
     const line = (await tmux([
       "display-message",
@@ -337,6 +338,7 @@ test("spawnBeeForFlow stamps tmux hive identity options for spawned bees", { tim
     assert.equal(env.HIVE_BEE_ID, record.id);
     assert.equal(env.HIVE_COMB, record.name);
     assert.equal(env.HIVE_PARENT, "CL.parent");
+    assert.equal(env.CALLER_VALUE, "through-flow");
   } finally {
     await tmux(["kill-server"], { reject: false });
     setTmuxSocket(undefined);

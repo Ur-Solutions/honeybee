@@ -90,7 +90,7 @@ export async function deliverPromptToBee(record: SessionRecord, prompt: string):
 export async function cmdRun(parsed: Parsed) {
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
-  if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--account <name|auto>] [--yolo] [--wait] [--last] [--rm|--cleanup] [-- <bee-args...>]");
+  if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--yolo] [--wait] [--last] [--rm|--cleanup] [-- <bee-args...>]");
   if (truthy(flag(parsed, "keep")) && cleanupAfterRun(parsed)) throw new Error("--keep cannot be combined with --rm/--cleanup");
   assertSingleBeeInvocation(parsed, "hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
   const waited = truthy(flag(parsed, "wait"));
@@ -176,7 +176,7 @@ export async function cleanupRunSession(record: SessionRecord): Promise<void> {
 export async function cmdX(parsed: Parsed) {
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
-  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--name <id>] [--yolo] [-- <bee-args...>]");
+  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--env KEY=VALUE] [--name <id>] [--yolo] [-- <bee-args...>]");
   assertSingleBeeInvocation(parsed, "hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
 
   // The waitForPromptReady below is authoritative; skip spawn's own readiness

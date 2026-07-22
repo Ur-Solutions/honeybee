@@ -11,6 +11,7 @@ import { allocateBeeIdentity } from "./ids.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
 import { safeName, saveSession, type SessionRecord } from "./store.js";
 import { resolveSpawningBeeId } from "./spawnParent.js";
+import { mergeCallerEnv } from "./spawnEnv.js";
 import { localSubstrate, substrateForRecord } from "./substrates/index.js";
 import type { TmuxWindowOptions } from "./substrates/index.js";
 
@@ -121,6 +122,8 @@ export type ResolveAgentOptions = {
    * `--model <provider>/<model>`; single-provider CLIs ignore it.
    */
   provider?: string;
+  /** Caller-supplied spawn env, validated against honeybee-owned keys. */
+  env?: Record<string, string>;
 };
 
 export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options: ResolveAgentOptions = {}): AgentSpec {
@@ -158,6 +161,7 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   if (options.identity && profile.homePath) {
     Object.assign(env, identityEnvForAgent(profile.kind, profile.homePath));
   }
+  mergeCallerEnv(env, options.env);
   // The account's model selector is appended ONLY when the base command came
   // from the driver default — never when a config/env `command` override is in
   // play, since such a command may already embed `--model …` and appending
@@ -198,9 +202,10 @@ export function shellCommand(spec: AgentSpec, options: { forExec?: boolean } = {
  * has stamped it. Idempotent, and a no-op for static-env recipes or spawns
  * without a home.
  */
-export function refreshIdentityEnv(spec: AgentSpec): void {
+export function refreshIdentityEnv(spec: AgentSpec, callerEnv?: Record<string, string>): void {
   if (!spec.homePath) return;
   Object.assign(spec.env, identityEnvForAgent(spec.kind, spec.homePath));
+  mergeCallerEnv(spec.env, callerEnv);
 }
 
 /**
@@ -374,6 +379,7 @@ export type SpawnBeeOptions = {
   cwd: string;
   yolo: boolean;
   home?: string | true | string[];
+  env?: Record<string, string>;
   /**
    * Pre-resolved account to bind (creds activated into a dedicated home, the
    * account's default model + provider applied). When omitted, `agent` is
@@ -428,6 +434,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     home,
     yolo: opts.yolo,
     identity: Boolean(account),
+    env: opts.env,
     ...(account?.model ? { model: account.model } : {}),
     ...(account?.provider ? { provider: account.provider } : {}),
   });
@@ -435,7 +442,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     if (opts.node && opts.node.kind !== "local-tmux") throw new Error("account-bound flow spawns are local-only (the vault never leaves this machine)");
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
     await activateAccountIntoHome(account, spec.homePath);
-    refreshIdentityEnv(spec);
+    refreshIdentityEnv(spec, opts.env);
   }
   // Pin the bee to its own provider session id from birth (see forcedSessionIdArgs):
   // flow runs spawn many siblings in one cwd, the exact case the cwd-blind claude
