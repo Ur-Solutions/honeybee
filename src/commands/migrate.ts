@@ -2,7 +2,7 @@
 // interactive tmux pane and a pane-less HSR runner (resume), and revive dead bees.
 // Extracted from cli.ts (HIVE-15).
 import { accountEmail, activateAccountIntoHome, captureAccountFromHome, findAccount, homeClaudeEmail, listAccounts, type AccountRecord } from "../accounts.js";
-import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, shellQuoteIfNeeded, splitShellWords, type AgentSpec } from "../agents.js";
+import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, shellQuoteIfNeeded, splitShellWords, type AgentSpec, stampBeeIdentityEnv } from "../agents.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeSpawnOptions } from "../hiveState.js";
@@ -315,11 +315,22 @@ export async function buildResumeSpec(
   // relaunched agent's home is deterministic and persistable (callers stamp
   // spec.homePath back onto the record).
   adoptInheritedHome(resolved);
+  // A relaunch is still the same bee: re-stamp honeybee identity so revived
+  // bees keep their gateway-adoption anchors (H1 applies to every launch).
+  const stampIdentity = (spec: AgentSpec): AgentSpec => {
+    stampBeeIdentityEnv(spec.env, {
+      name: record.name,
+      id: record.id ?? record.name,
+      comb: record.name,
+      ...(record.spawnedById ? { parent: record.spawnedById } : {}),
+    });
+    return spec;
+  };
   if (!options.replayLaunch) {
     await assertExecutableAvailable(resolved.command);
-    return resolved;
+    return stampIdentity(resolved);
   }
-  return assertReplayExecutable(replayRecordedLaunch(record, tool, resolved, extraArgs), resolved);
+  return stampIdentity(await assertReplayExecutable(replayRecordedLaunch(record, tool, resolved, extraArgs), resolved));
 }
 
 
@@ -961,6 +972,13 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
   });
   const replay = replayRecordedLaunch(record, tool, resolved, lifecycleArgs);
   let spec = replay.spec;
+  // Same-bee relaunch: re-stamp honeybee identity (H1 covers revives too).
+  stampBeeIdentityEnv(spec.env, {
+    name: record.name,
+    id: record.id ?? record.name,
+    comb: record.name,
+    ...(record.spawnedById ? { parent: record.spawnedById } : {}),
+  });
   // Refresh the bee's HOME credentials from the vault before relaunch. A bee
   // whose home token expired while it was dead otherwise boots logged-out: the
   // daemon's chain sync only pulls home→vault (keeping the vault fresh, which

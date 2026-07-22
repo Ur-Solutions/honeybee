@@ -5,6 +5,10 @@ import { test } from "node:test";
 import { resolveAgent, resolveHome } from "../src/agents.js";
 import { identityEnvForAgent, identityRecipeForAgent } from "../src/drivers.js";
 
+// resolveAgent merges live operator-gateway env (H3); a real gateway registered
+// on the dev machine must not leak into these unit assertions.
+process.env.HIVE_GATEWAYS_DISABLE = "1";
+
 test("plain spawns never rewrite HOME", () => {
   const spec = resolveAgent("codex", [], { home: "/tmp/slot", yolo: false });
   assert.equal(spec.env.CODEX_HOME, "/tmp/slot");

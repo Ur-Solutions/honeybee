@@ -209,7 +209,7 @@ test("string-only legacy commands replay defensively and remain immutable", { sk
     const record = await readBee(store, bee);
     assert.equal(record.command, command);
     assert.equal(record.launchArgv, undefined);
-    assert.match(String(record.lastReviveCommand), /HIVE_LEGACY=kept sh -c 'sleep 120' -- --legacy 'two words' resume sess-legacy/);
+    assert.match(String(record.lastReviveCommand), /HIVE_LEGACY=kept (?:HIVE_[A-Z_]+=\S+ )*sh -c 'sleep 120' -- --legacy 'two words' resume sess-legacy/);
     assert.doesNotMatch(String(record.lastReviveCommand), /stale-provider-id/);
     assert.match(result.stdout, /--legacy 'two words' resume sess-legacy/);
   });
