@@ -149,5 +149,15 @@ taskId/attempt).
 - Brief gate (project-supplied route-packet validator command).
 - Manager-bee watching (manager down → `flight.manager.down` + packet).
 - Collection validation of `evidence.artifacts` before `collected`.
-- Flightboard TUI / Apiary pane; session-store index; Comb convergence
-  (phase 3).
+- Session-store index (now PRIMARY: at ~1100 sessions, listSessions and the
+  per-record touch loop dominate tick time and drive the remaining breach
+  exposure).
+- Flight visualization: deliberately NOT flight-specific — designed as part
+  of the Comb read-model work (COMBS_ENGINE_DESIGN.md; Apiary consumes run/
+  activation state). A flight maps onto it as a degenerate one-fan-out-node
+  run: lane = node activation stream, task packet = activation input, slot
+  events = activation lifecycle. Interim: `flight status/queue --json` +
+  `hive events --json` are the read surfaces. Known wart for any consumer:
+  the status headline counts DONE SLOTS (always 0 for lane-keepers) — read
+  task-bucket counts instead.
+- Comb convergence (phase 3).
