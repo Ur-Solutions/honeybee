@@ -7,8 +7,9 @@ import { tomlLines } from "./homeDefaults.js";
 
 const STAMP_FILE = ".hive-gateways.json";
 const STAMP_SCHEMA = 1;
+const CODEX_GATEWAY_IDENTITY_ENV_VARS = ["HIVE_BEE", "HIVE_BEE_ID"] as const;
 
-type McpEntry = { command: string; args: string[] };
+type McpEntry = { command: string; args: string[]; envVars?: string[] };
 
 export type GatewayMcpStamp = {
   schema: 1;
@@ -38,17 +39,24 @@ function targetFileForHarness(harness: string): string | undefined {
   return undefined;
 }
 
-function desiredEntries(gateways: GatewayRecord[]): Record<string, McpEntry> {
+function desiredEntries(gateways: GatewayRecord[], harness: string): Record<string, McpEntry> {
   return Object.fromEntries(gateways.map((gateway) => [gateway.name, {
     command: gateway.shim.command,
     args: [...gateway.shim.args],
+    ...(harness === "codex"
+      ? { envVars: [...new Set([...Object.keys(gateway.env).sort(), ...CODEX_GATEWAY_IDENTITY_ENV_VARS])] }
+      : {}),
   }]));
 }
 
 function isMcpEntry(value: unknown): value is McpEntry {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const entry = value as Record<string, unknown>;
-  return typeof entry.command === "string" && Array.isArray(entry.args) && entry.args.every((arg) => typeof arg === "string");
+  return typeof entry.command === "string"
+    && Array.isArray(entry.args)
+    && entry.args.every((arg) => typeof arg === "string")
+    && (entry.envVars === undefined
+      || (Array.isArray(entry.envVars) && entry.envVars.every((name) => typeof name === "string")));
 }
 
 async function readStamp(homePath: string): Promise<StampRead> {
@@ -74,7 +82,11 @@ async function readStamp(homePath: string): Promise<StampRead> {
       const parsedEntries: Record<string, McpEntry> = {};
       for (const [name, entry] of Object.entries(entries)) {
         if (!isMcpEntry(entry)) return { status: "invalid" };
-        parsedEntries[name] = { command: entry.command, args: [...entry.args] };
+        parsedEntries[name] = {
+          command: entry.command,
+          args: [...entry.args],
+          ...(entry.envVars ? { envVars: [...entry.envVars] } : {}),
+        };
       }
       files[file] = parsedEntries;
     }
@@ -121,7 +133,12 @@ async function kitClaimsTarget(homePath: string, targetFile: string): Promise<"c
 }
 
 function sameEntry(left: unknown, right: McpEntry): boolean {
-  return isMcpEntry(left) && left.command === right.command && left.args.length === right.args.length && left.args.every((arg, index) => arg === right.args[index]);
+  if (!isMcpEntry(left) || left.command !== right.command) return false;
+  if (left.args.length !== right.args.length || !left.args.every((arg, index) => arg === right.args[index])) return false;
+  const leftEnvVars = left.envVars ?? [];
+  const rightEnvVars = right.envVars ?? [];
+  return leftEnvVars.length === rightEnvVars.length
+    && leftEnvVars.every((name, index) => name === rightEnvVars[index]);
 }
 
 type TopLevelJsonLayout = {
@@ -294,6 +311,9 @@ function renderCodexEntry(name: string, entry: McpEntry): string {
     `[mcp_servers.${tomlKey(name)}]`,
     `command = ${JSON.stringify(entry.command)}`,
     `args = [${entry.args.map((arg) => JSON.stringify(arg)).join(", ")}]`,
+    ...(entry.envVars
+      ? [`env_vars = [${entry.envVars.map((envVar) => JSON.stringify(envVar)).join(", ")}]`]
+      : []),
   ].join("\n");
 }
 
@@ -464,7 +484,7 @@ async function reconcileLocked(
     gatewayMcpDebug(`skipping ${homePath}: ${reason}`);
     return { status: "skipped", reason, written: [] };
   }
-  const desired = desiredEntries(gateways);
+  const desired = desiredEntries(gateways, harness);
   const owned = initialStamp.files[targetFile] ?? {};
   const reconciled = harness === "claude"
     ? reconcileClaude(target.text, desired, owned)

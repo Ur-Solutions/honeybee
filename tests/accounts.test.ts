@@ -180,9 +180,15 @@ test("account activation seeds live gateway MCP config and records the home stam
     const written = await activateAccountIntoHome(account, home);
     assert.ok(written.includes("config.toml"));
     assert.ok(written.includes(".hive-gateways.json"));
-    assert.match(await readFile(join(home, "config.toml"), "utf8"), /\[mcp_servers\.apiary\]/);
+    const config = await readFile(join(home, "config.toml"), "utf8");
+    assert.match(config, /\[mcp_servers\.apiary\]/);
+    assert.match(config, /env_vars = \["APIARY_GATEWAY", "HIVE_BEE", "HIVE_BEE_ID"\]/);
     const stamp = JSON.parse(await readFile(join(home, ".hive-gateways.json"), "utf8"));
-    assert.deepEqual(stamp.files["config.toml"].apiary, { command: "/opt/apiary-mcp", args: [] });
+    assert.deepEqual(stamp.files["config.toml"].apiary, {
+      command: "/opt/apiary-mcp",
+      args: [],
+      envVars: ["APIARY_GATEWAY", "HIVE_BEE", "HIVE_BEE_ID"],
+    });
   });
 });
 

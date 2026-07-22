@@ -5,7 +5,7 @@
  * stdio, BIDIRECTIONALLY (the server also sends us requests, for approvals). It
  * does NOT use the stream runner — the transport is a request/response + inbound
  * server-request peer (codexRpc.ts), not a line→event stream. This file owns:
- *   - the codex protocol flow (initialize → thread/start → turn/start → notifications)
+ *   - the codex protocol flow (initialize → initialized → thread/start → turn/start → notifications)
  *   - PURE mappers (exported for hermetic tests): notification→events,
  *     user-input encode, server-request→needs_input.
  *

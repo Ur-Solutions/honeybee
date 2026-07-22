@@ -133,13 +133,54 @@ test("codex seeder merges named TOML tables and removes only stamped tables", as
     let config = await readFile(configPath, "utf8");
     assert.match(config, /model = "gpt-5\.5"/);
     assert.match(config, /\[mcp_servers\.user\]/);
-    assert.match(config, /\[mcp_servers\.apiary\]\ncommand = "\/opt\/apiary-mcp"\nargs = \[\]/);
+    assert.match(
+      config,
+      /\[mcp_servers\.apiary\]\ncommand = "\/opt\/apiary-mcp"\nargs = \[\]\nenv_vars = \["APIARY_GATEWAY", "HIVE_BEE", "HIVE_BEE_ID"\]/,
+    );
+    const stamp = await json(join(home, ".hive-gateways.json")) as GatewayMcpStamp;
+    assert.deepEqual(stamp.files["config.toml"]?.apiary, {
+      command: "/opt/apiary-mcp",
+      args: [],
+      envVars: ["APIARY_GATEWAY", "HIVE_BEE", "HIVE_BEE_ID"],
+    });
     assert.deepEqual((await seedGatewayMcp(home, "codex", { gateways: [gateway()] })).written, []);
 
     await seedGatewayMcp(home, "codex", { gateways: [] });
     config = await readFile(configPath, "utf8");
     assert.doesNotMatch(config, /mcp_servers\.apiary/);
     assert.match(config, /mcp_servers\.user/);
+  });
+});
+
+test("codex seeder upgrades an existing owned gateway entry with MCP env forwarding", async () => {
+  await withHome(async (home) => {
+    await writeFile(join(home, "config.toml"), [
+      "[mcp_servers.apiary]",
+      'command = "/opt/apiary-mcp"',
+      "args = []",
+      "",
+    ].join("\n"));
+    await writeFile(join(home, ".hive-gateways.json"), `${JSON.stringify({
+      schema: 1,
+      files: {
+        "config.toml": {
+          apiary: { command: "/opt/apiary-mcp", args: [] },
+        },
+      },
+    }, null, 2)}\n`);
+
+    const result = await seedGatewayMcp(home, "codex", { gateways: [gateway()] });
+    assert.deepEqual(result.written.sort(), [".hive-gateways.json", "config.toml"]);
+    assert.match(
+      await readFile(join(home, "config.toml"), "utf8"),
+      /env_vars = \["APIARY_GATEWAY", "HIVE_BEE", "HIVE_BEE_ID"\]/,
+    );
+    const stamp = await json(join(home, ".hive-gateways.json")) as GatewayMcpStamp;
+    assert.deepEqual(stamp.files["config.toml"]?.apiary.envVars, [
+      "APIARY_GATEWAY",
+      "HIVE_BEE",
+      "HIVE_BEE_ID",
+    ]);
   });
 });
 

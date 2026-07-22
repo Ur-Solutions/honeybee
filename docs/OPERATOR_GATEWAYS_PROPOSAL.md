@@ -238,7 +238,7 @@ Per-harness dialects, keyed off the driver registry (`drivers.ts:160-303`):
 | Harness | File in home | Entry |
 |---|---|---|
 | claude | `.claude.json` `mcpServers` (**empirically verified 2026-07-22 on claude 2.1.217: `settings.json` `mcpServers` is ignored**; `.claude.json` is a mixed credential/state file — merge byte-preserving) | `"<name>": { command, args }` |
-| codex | `config.toml` `[mcp_servers.<name>]` | `command`, `args` (TOML merge helpers exist, `homeDefaults.ts:90-137`) |
+| codex | `config.toml` `[mcp_servers.<name>]` | `command`, `args`, `env_vars` for the gateway advertisement env plus `HIVE_BEE`/`HIVE_BEE_ID` (Codex does not otherwise forward those variables to STDIO MCP children) |
 | opencode | `opencode.json` `mcp` | per opencode schema |
 | grok / kimi / cursor / pi / droid | per driver, as each grows MCP support | absent entry = skipped, logged at debug |
 
