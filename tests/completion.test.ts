@@ -29,6 +29,7 @@ test("completes commands when no command typed", () => {
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("completion"));
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("cat"));
   assert.ok(getCompletionsFromState(["hive", ""], empty).includes("tx"));
+  assert.ok(getCompletionsFromState(["hive", ""], empty).includes("gateways"));
 });
 
 test("completes commands with no args at all", () => {

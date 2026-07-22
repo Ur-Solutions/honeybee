@@ -6,6 +6,7 @@ import { activateAccountIntoHome, assertCursorHomeAuthFresh, assertGrokHomeAuthF
 import { beeConfig } from "./config.js";
 import { driverDefaultsToYolo, forcedSessionIdArgsForAgent, homeEnvForAgent, identityEnvForAgent, modelArgsForAgent, secretEnvKeysForAgent, sessionPinnedInArgs } from "./drivers.js";
 import { assertExecutableAvailable } from "./execCheck.js";
+import { liveGatewayEnv } from "./gateways.js";
 import { writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity } from "./ids.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
@@ -161,6 +162,7 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   if (options.identity && profile.homePath) {
     Object.assign(env, identityEnvForAgent(profile.kind, profile.homePath));
   }
+  Object.assign(env, liveGatewayEnv());
   mergeCallerEnv(env, options.env);
   // The account's model selector is appended ONLY when the base command came
   // from the driver default — never when a config/env `command` override is in
@@ -205,6 +207,7 @@ export function shellCommand(spec: AgentSpec, options: { forExec?: boolean } = {
 export function refreshIdentityEnv(spec: AgentSpec, callerEnv?: Record<string, string>): void {
   if (!spec.homePath) return;
   Object.assign(spec.env, identityEnvForAgent(spec.kind, spec.homePath));
+  Object.assign(spec.env, liveGatewayEnv());
   mergeCallerEnv(spec.env, callerEnv);
 }
 

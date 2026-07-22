@@ -3,7 +3,7 @@ import { SEAL_STATUSES } from "../seal.js";
 
 export const COMMANDS = [
   "spawn", "new", "launch", "send", "tail", "cat", "transcript", "tx", "last", "wait",
-  "list", "ls", "ps", "bees", "kill", "clean", "run", "x", "xa", "attach", "next",
+  "list", "ls", "ps", "bees", "gateways", "kill", "clean", "run", "x", "xa", "attach", "next",
   "colony", "pool", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "daemon",

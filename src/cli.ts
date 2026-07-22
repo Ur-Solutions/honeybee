@@ -18,6 +18,7 @@ import { cmdFlight } from "./commands/flight.js";
 import { cmdFlow, runFlowExec } from "./commands/flow.js";
 import { cmdFork, cmdForkLaunch, cmdSplit } from "./commands/fork.js";
 import { cmdFrame } from "./commands/frame.js";
+import { cmdGateways } from "./commands/gateways.js";
 import { cmdHere, cmdSpawnPicker } from "./commands/here.js";
 import { cmdKeys } from "./commands/keys.js";
 import { cmdLoop } from "./commands/loop.js";
@@ -102,6 +103,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       break;
     case "fleet":
       await cmdFleet(parsed);
+      break;
+    case "gateways":
+      cmdGateways();
       break;
     case "transcript":
     case "tx":
@@ -331,6 +335,7 @@ function printHelp() {
         ["list", "", "show all known sessions with state (alias: ps)"],
         ["bees", "", "grouped fuzzy fleet TUI (^g cycles colony/pro/folder/type grouping, tab previews; --sidebar)"],
         ["fleet", "[<bee>|--all]", "orchestrator fleet trees with live state + seals (no arg: self inside a bee, else all fleets; --all forces all; --json)"],
+        ["gateways", "", "list operator gateway advertisements and liveness"],
         ["tail", "<session>", "capture or follow pane content"],
         ["transcript", "<session>", "render structured transcript rows"],
         ["last", "<session>", "print the bee's most recent assistant message or seal"],
