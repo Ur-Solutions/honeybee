@@ -328,6 +328,22 @@ export function homeEnvForAgent(kind: string): string | undefined {
   return agentDriver(kind)?.homeEnv;
 }
 
+/**
+ * Env keys whose ownership follows a driver home/account identity. Callers and
+ * operator gateways must never override these: doing so can relocate a
+ * credential file or replace a per-account token while the SessionRecord still
+ * claims the original account/home.
+ */
+export function driverIdentityEnvKeys(): string[] {
+  const keys = new Set<string>();
+  for (const driver of Object.values(AGENT_DRIVERS)) {
+    if (driver.homeEnv) keys.add(driver.homeEnv);
+    for (const key of Object.keys(driver.identity?.extraEnv ?? {})) keys.add(key);
+    for (const key of driver.identity?.secretEnvKeys ?? []) keys.add(key);
+  }
+  return [...keys].sort();
+}
+
 export function hasTranscriptProvider(kind: string): boolean {
   return agentDriver(kind)?.hasTranscriptProvider === true;
 }

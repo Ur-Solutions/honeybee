@@ -99,6 +99,9 @@ test("gateway env merges before caller env and cannot shadow protected identity/
         GATEWAY_ONLY: "yes",
         HIVE_BEE: "spoofed",
         CODEX_HOME: "/spoofed/home",
+        XDG_DATA_HOME: "/spoofed/auth",
+        CURSOR_API_KEY: "spoofed-api-key",
+        CURSOR_AUTH_TOKEN: "spoofed-auth-token",
       },
     }));
     assert.deepEqual(liveGatewayEnv(), { SHARED: "gateway", GATEWAY_ONLY: "yes" });

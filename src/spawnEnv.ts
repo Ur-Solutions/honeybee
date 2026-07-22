@@ -1,14 +1,11 @@
+import { driverIdentityEnvKeys } from "./drivers.js";
+
 export const PROTECTED_SPAWN_ENV_KEYS = new Set([
   "HIVE_BEE",
   "HIVE_BEE_ID",
   "HIVE_PARENT",
   "HIVE_COMB",
-  "CLAUDE_CONFIG_DIR",
-  "CODEX_HOME",
-  "OPENCODE_CONFIG_DIR",
-  "GROK_HOME",
-  "KIMI_CODE_HOME",
-  "CURSOR_CONFIG_DIR",
+  ...driverIdentityEnvKeys(),
 ]);
 
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/u;
