@@ -85,6 +85,7 @@ function harness(flightRecord: FlightRecord, initialSlots: SlotRecord[], nowMs: 
     },
     deps: {
       listFlights: async () => [...flights.values()],
+      loadFlight: async (flightId) => flights.get(flightId) ?? null,
       listSlots: async () => [...slots.values()].sort((a, b) => a.slotId.localeCompare(b.slotId, undefined, { numeric: true })),
       saveSlot: async (slot) => {
         saved.push(slot);
@@ -420,4 +421,47 @@ test("CR-1: sweeps run under the flight lock when provided", async () => {
   };
   await sweepFlights(h.deps, [], new Map());
   assert.deepEqual(lockLog, [`lock:${f.id}`, `unlock:${f.id}`]);
+});
+
+test("status race: sweep reloads draining under the lock and does not spawn from an active snapshot", async () => {
+  const f = flight({ target: { slots: 2, mix: [{ key: "fable", agent: "claude", count: 2 }] } });
+  const worker = slotBeeName(f.id, "s2", 0, 1);
+  const working: SlotRecord = {
+    ...vacantSlot("s2"),
+    attempt: 1,
+    state: "working",
+    beeName: worker,
+    attemptStartedAt: iso(T0),
+    evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0) },
+  };
+  const h = harness(f, [vacantSlot("s1"), working], T0 + 1_000);
+  h.deps.withFlightLock = async (flightId, fn) => {
+    const current = h.flights.get(flightId)!;
+    h.flights.set(flightId, { ...current, status: "draining", updatedAt: iso(T0 + 500) });
+    return fn();
+  };
+
+  const outcomes = await sweepFlights(h.deps, [bee(worker)], new Map([[worker, "idle_with_output" as BeeState]]));
+
+  assert.equal(h.spawned.length, 0);
+  assert.equal(h.slots.get("s1")!.state, "vacant");
+  assert.equal(h.flights.get(f.id)!.status, "draining");
+  assert.equal(outcomes.some((outcome) => outcome.action === "spawn"), false);
+});
+
+test("status race: sweep reloads closed under the lock and skips the stale active snapshot", async () => {
+  const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+  const h = harness(f, [vacantSlot("s1")], T0);
+  h.deps.withFlightLock = async (flightId, fn) => {
+    const current = h.flights.get(flightId)!;
+    h.flights.set(flightId, { ...current, status: "closed", updatedAt: iso(T0 + 500) });
+    return fn();
+  };
+
+  const outcomes = await sweepFlights(h.deps, [], new Map());
+
+  assert.deepEqual(outcomes, []);
+  assert.equal(h.spawned.length, 0);
+  assert.equal(h.saved.length, 0);
+  assert.equal(h.flights.get(f.id)!.status, "closed");
 });

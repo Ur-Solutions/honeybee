@@ -141,6 +141,7 @@ function harness(flightRecord: FlightRecord, initialSlots: SlotRecord[], pending
     },
     deps: {
       listFlights: async () => [...flights.values()],
+      loadFlight: async (flightId) => flights.get(flightId) ?? null,
       listSlots: async () => [...slots.values()].sort((a, b) => a.slotId.localeCompare(b.slotId, undefined, { numeric: true })),
       saveSlot: async (slot) => {
         slots.set(slot.slotId, slot);

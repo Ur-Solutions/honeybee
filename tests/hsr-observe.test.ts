@@ -243,7 +243,7 @@ test("hsrActivityFromEvents derives genuine progress from runner event boundarie
     const activity = hsrActivityFromEvents(entry.events);
     assert.equal(activity?.at, entry.at, entry.name);
     assert.equal(activity?.eventType, entry.eventType, entry.name);
-    assert.match(activity?.fingerprint ?? "", new RegExp(`:${entry.eventType}:${entry.at}:`), entry.name);
+    assert.match(activity?.fingerprint ?? "", new RegExp(`^${entry.eventType}:${entry.at}:`), entry.name);
   }
 });
 
@@ -276,6 +276,18 @@ test("hsrActivityFromEvents fingerprints are stable for unchanged tails and adva
   assert.equal(advanced?.at, 101);
   assert.equal(advanced?.eventType, "usage");
   assert.notEqual(advanced?.fingerprint, first?.fingerprint);
+});
+
+test("hsrActivityFromEvents fingerprints survive event-log compaction reindexing", () => {
+  const latest: RunnerEvent = { type: "usage", ts: 101, inputTokens: 1, outputTokens: 1 };
+  const beforeCompaction = hsrActivityFromEvents([
+    { type: "turn_start", ts: 100 },
+    { type: "text", ts: 100, text: "working" },
+    latest,
+  ]);
+  const afterCompaction = hsrActivityFromEvents([latest]);
+
+  assert.equal(beforeCompaction?.fingerprint, afterCompaction?.fingerprint);
 });
 
 test("structuredStateFromEvents does not confuse daemon-recoverable auth_expired with auth-needed", () => {

@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { cmdFlight, parseMixFlag } from "../src/commands/flight.js";
 import { parse } from "../src/parse.js";
-import { ledgerPath } from "../src/store.js";
+import { ledgerPath, saveSession, type SessionRecord } from "../src/store.js";
+import { withFileLock } from "../src/lock.js";
+import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import {
   allocateFlightId,
   deleteFlight,
@@ -16,7 +18,7 @@ import {
   saveFlight,
   saveSlot,
 } from "../src/flight/store.js";
-import { FLIGHT_CONTRACT_DEFAULTS, FLIGHT_REPLACEMENT_DEFAULTS, type FlightRecord, type SlotRecord } from "../src/flight/types.js";
+import { FLIGHT_CONTRACT_DEFAULTS, FLIGHT_REPLACEMENT_DEFAULTS, slotBeeName, type FlightRecord, type SlotRecord } from "../src/flight/types.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-flight-"));
@@ -45,6 +47,55 @@ function flight(id: string): FlightRecord {
     createdAt: now,
     updatedAt: now,
   };
+}
+
+function workerFlight(id: string): FlightRecord {
+  return {
+    ...flight(id),
+    target: { slots: 1, mix: [{ key: "missing", agent: "definitely-missing-hive-agent", count: 1 }] },
+    contract: { ...FLIGHT_CONTRACT_DEFAULTS, stallMs: 24 * 60 * 60 * 1_000 },
+  };
+}
+
+function session(name: string, overrides: Partial<SessionRecord> = {}): SessionRecord {
+  const now = new Date().toISOString();
+  return {
+    name,
+    agent: "claude",
+    cwd: "/tmp/repo",
+    command: "claude",
+    tmuxTarget: name,
+    createdAt: now,
+    updatedAt: now,
+    status: "running",
+    lastObservedState: "active",
+    ...overrides,
+  };
+}
+
+async function runQuietly(fn: () => Promise<void>): Promise<void> {
+  const originalLog = console.log;
+  console.log = () => undefined;
+  try {
+    await fn();
+  } finally {
+    console.log = originalLog;
+  }
+}
+
+async function writeStaleExitedHsrMeta(bee: string, mirrorOfNode?: string): Promise<void> {
+  await ensureHsrRunDir(bee);
+  await writeHsrMeta(bee, {
+    bee,
+    harness: "stub",
+    tier: "server",
+    hostPid: 0,
+    startedAt: "2026-07-20T09:00:00.000Z",
+    controlSocket: "/tmp/stale.sock",
+    status: "exited",
+    endedAt: "2026-07-20T09:05:00.000Z",
+    ...(mirrorOfNode ? { mirrorOfNode } : {}),
+  });
 }
 
 test("flight store: flight + slot round-trip preserves every field", async () => {
@@ -132,5 +183,89 @@ test("flight status API drains and closes monotonically without a flight.active 
     assert.match(ledger, /"type":"flight\.closed"/);
     assert.doesNotMatch(ledger, /"type":"flight\.active"/);
     assert.ok(logs.length >= 2);
+  });
+});
+
+test("flight status API waits on the sweep lock before mutating status", async () => {
+  await withTempStore(async () => {
+    const id = allocateFlightId();
+    await saveFlight(flight(id));
+    let pending: Promise<void> | undefined;
+    await runQuietly(async () => {
+      await withFileLock(join(flightDir(id), ".sweep.lock"), async () => {
+        pending = cmdFlight(parse(["flight", "drain", id]));
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        assert.equal((await loadFlight(id))?.status, "active");
+      }, { timeoutMs: 1_000, staleMs: 10_000 });
+      await pending;
+    });
+
+    assert.equal((await loadFlight(id))?.status, "draining");
+  });
+});
+
+test("flight sweep ignores stale local HSR death for a revived tmux slot bee", async () => {
+  await withTempStore(async () => {
+    const id = allocateFlightId();
+    const f = workerFlight(id);
+    const beeName = slotBeeName(id, "s1", 0, 1);
+    const now = new Date().toISOString();
+    await saveFlight(f);
+    await saveSlot({
+      flightId: id,
+      slotId: "s1",
+      mixKey: "missing",
+      generation: 0,
+      attempt: 1,
+      beeName,
+      state: "working",
+      since: now,
+      attemptStartedAt: now,
+      evidence: { firstEvidenceAt: now, lastActivityAt: now },
+      history: [],
+    });
+    await saveSession(session(beeName, { substrate: "local-tmux" }));
+    await writeStaleExitedHsrMeta(beeName);
+
+    await runQuietly(() => cmdFlight(parse(["flight", "sweep", id, "--json"])));
+
+    const [slot] = await listSlots(id);
+    assert.equal(slot?.state, "working");
+    assert.equal(slot?.beeName, beeName);
+    const ledger = await readFile(ledgerPath(), "utf8").catch(() => "");
+    assert.doesNotMatch(ledger, /flight\.slot\.crashed|flight\.slot\.spawn_failed|flight\.vacancy/);
+  });
+});
+
+test("flight sweep ignores stale local HSR mirror death for a remote-HSR slot bee", async () => {
+  await withTempStore(async () => {
+    const id = allocateFlightId();
+    const f = workerFlight(id);
+    const beeName = slotBeeName(id, "s1", 0, 1);
+    const now = new Date().toISOString();
+    await saveFlight(f);
+    await saveSlot({
+      flightId: id,
+      slotId: "s1",
+      mixKey: "missing",
+      generation: 0,
+      attempt: 1,
+      beeName,
+      state: "working",
+      since: now,
+      attemptStartedAt: now,
+      evidence: { firstEvidenceAt: now, lastActivityAt: now },
+      history: [],
+    });
+    await saveSession(session(beeName, { node: "runner01" }));
+    await writeStaleExitedHsrMeta(beeName, "runner01");
+
+    await runQuietly(() => cmdFlight(parse(["flight", "sweep", id, "--json"])));
+
+    const [slot] = await listSlots(id);
+    assert.equal(slot?.state, "working");
+    assert.equal(slot?.beeName, beeName);
+    const ledger = await readFile(ledgerPath(), "utf8").catch(() => "");
+    assert.doesNotMatch(ledger, /flight\.slot\.crashed|flight\.slot\.spawn_failed|flight\.vacancy/);
   });
 });

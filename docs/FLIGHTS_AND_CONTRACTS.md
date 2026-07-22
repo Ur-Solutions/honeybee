@@ -131,11 +131,17 @@ underpopulation goal from the original parity incident. Mechanics:
   tool events, usage, needs-input/error/auth boundaries, and `turn_end`), not
   by re-observing `beeState=active` on each sweep. The daemon also carries a
   stable fingerprint for the latest activity event, so unchanged tails are
-  no-ops and same-timestamp new events still advance evidence. Adopted or
-  legacy non-HSR slot bees are outside that spawn invariant; when their
-  terminal/snapshot surface can be captured, Honeybee uses a content
-  fingerprint fallback: visible output changes refresh activity; unchanged
-  active output remains eligible for stall handling.
+  no-ops and same-timestamp new events still advance evidence. Event timestamps
+  are validated before conversion; future-skewed runner timestamps are clamped
+  to the local observation time, with the fingerprint preventing unchanged
+  future tails from refreshing every sweep. Adopted or legacy non-HSR slot bees
+  are outside that spawn invariant; when their terminal/snapshot surface can be
+  captured, Honeybee uses a content fingerprint fallback: visible output
+  changes refresh activity; unchanged active output remains eligible for stall
+  handling. Manual `hive flight sweep` only trusts local HSR run-dir death for
+  current `substrate:"hsr"` records; remote mirrors contribute live
+  state/activity only when their `mirrorOf` node matches the current
+  `SessionRecord`.
 - Capacity reconciliation: missing/corrupt slot files are re-created as
   vacant each sweep; completion requires the FULL declared slot set
   (`target.slots`) terminal. Under `draining`, vacancies count as terminal so
