@@ -118,3 +118,12 @@ export {
   activateAccountIntoHome,
   accountHasCredentials,
 } from "./accounts/activation.js";
+
+export {
+  ACCOUNT_BOOT_FAILURE_COOLDOWN_MS,
+  type AccountBootFailure,
+  accountBootHealthPath,
+  recentAccountBootFailures,
+  recordAccountBootFailure,
+  clearAccountBootFailure,
+} from "./accounts/bootHealth.js";

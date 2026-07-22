@@ -142,6 +142,8 @@ export type RunnerOpts = {
   authKind?: "subscription" | "api-key";
   /** Model selector for server-tier adapters that pass it out-of-band (codex thread/start). */
   model?: string;
+  /** Vault account whose credentials were activated into this runner's home. */
+  accountId?: string;
   /** Internal boot-probe hint: this CODEX_HOME was contended before admission. */
   codexBootContended?: boolean;
 };

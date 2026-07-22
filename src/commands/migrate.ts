@@ -199,6 +199,7 @@ export async function reviveHsrRunner(record: SessionRecord, tool: string, opts:
     ...(providerSessionId ? { sessionId: providerSessionId } : {}),
     ...(fresh ? {} : { resume: true }),
     authKind: "subscription",
+    ...(record.accountId ? { accountId: record.accountId } : {}),
     ...(record.model ? { model: record.model } : {}),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
@@ -418,6 +419,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
     sessionId: record.providerSessionId,
     resume: true,
     authKind: "subscription",
+    ...(record.accountId ? { accountId: record.accountId } : {}),
     ...(record.model ? { model: record.model } : {}),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });

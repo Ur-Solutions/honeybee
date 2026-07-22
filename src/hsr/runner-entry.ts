@@ -19,6 +19,7 @@ export type HsrRunPayload = {
   cwd: string;
   sessionId?: string;
   authKind?: "subscription" | "api-key";
+  accountId?: string;
   model?: string;
   /** Resume an existing provider session instead of starting fresh. */
   resume?: boolean;
@@ -69,6 +70,7 @@ export async function runHsrHostFromPayload(payloadPath: string | undefined): Pr
     env: childEnv,
     ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
     ...(payload.authKind ? { authKind: payload.authKind } : {}),
+    ...(payload.accountId ? { accountId: payload.accountId } : {}),
     ...(payload.model ? { model: payload.model } : {}),
     ...(payload.resume ? { resume: true } : {}),
     command: payload.spec.command,

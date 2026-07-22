@@ -15,6 +15,7 @@
  * Node builtins only. No cli.ts / daemon / SubstrateHsr coupling.
  */
 
+import { clearAccountBootFailure, recordAccountBootFailure } from "../accounts/bootHealth.js";
 import { codexHomeFromEnv, withCodexHomeBootLock } from "../codexBoot.js";
 import type { RunnerAdapter, RunnerInputAnswer, RunnerOpts } from "./types.js";
 import { startRpcServer, type RpcMethodHandler } from "./rpc.js";
@@ -112,7 +113,13 @@ export async function runHsrHost(params: {
       ? await withCodexHomeBootLock(codexHomeFromEnv(opts.env), ({ waited }) =>
           startWithAdmission(waited ? { ...opts, codexBootContended: true } : opts))
       : await startWithAdmission(opts);
+    if (bootsCodexAppServer && opts.accountId) {
+      await clearAccountBootFailure(opts.accountId).catch(() => undefined);
+    }
   } catch (error) {
+    if (bootsCodexAppServer && opts.accountId) {
+      await recordAccountBootFailure(opts.accountId).catch(() => undefined);
+    }
     if (startupMeta) {
       await writeHsrMeta(bee, {
         ...startupMeta,

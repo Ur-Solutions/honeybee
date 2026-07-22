@@ -17,7 +17,7 @@
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { type AccountRecord, accountHasCredentials, listAccounts } from "../accounts.js";
+import { type AccountRecord, accountHasCredentials, listAccounts, recentAccountBootFailures } from "../accounts.js";
 import { canonicalAgentKind } from "../agents.js";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
@@ -233,14 +233,28 @@ export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps
   if (candidates.length === 0) {
     throw new Error(`No ${kind} account has vaulted credentials; capture some with: hive login <account>`);
   }
+  const now = (deps.now ?? Date.now)();
+  const bootFailures = await recentAccountBootFailures(now);
+  const healthy = candidates.filter((account) => !bootFailures.has(account.id));
+  const skipped = healthy.length > 0 ? candidates.filter((account) => bootFailures.has(account.id)) : [];
+  const eligible = healthy.length > 0 ? healthy : candidates;
+  const bootHealthReason = skipped.length > 0
+    ? `; skipped ${skipped.map((account) => account.id).join(", ")} for recent boot failure`
+    : healthy.length === 0 && bootFailures.size > 0
+      ? "; every credentialed account has a recent boot failure; using last resort"
+      : "";
   // A single candidate wins regardless of usage — skip the limits round-trips
   // and the pick bookkeeping (there is no herd to steer with one account).
-  if (candidates.length === 1) {
-    return { account: candidates[0]!, reason: `only ${kind} account with credentials`, nearTieIds: [candidates[0]!.id] };
+  if (eligible.length === 1) {
+    return {
+      account: eligible[0]!,
+      reason: `only ${skipped.length > 0 ? "healthy " : ""}${kind} account with credentials${bootHealthReason}`,
+      nearTieIds: [eligible[0]!.id],
+    };
   }
   const ttlMs = deps.ttlMs ?? AUTO_ACCOUNT_TTL_MS;
   let staleServed: string[] = [];
-  const results = await cachedAccountLimits(candidates, {
+  const results = await cachedAccountLimits(eligible, {
     ...deps,
     ttlMs,
     ...(ttlMs > 0
@@ -252,23 +266,23 @@ export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps
     if (schedule) void schedule();
   }
   const byId = new Map(results.map((result) => [result.account, result]));
-  const now = (deps.now ?? Date.now)();
   const [commitments, debits] = await Promise.all([accountCommitments(kind, deps.sessions), pendingPickDebits(now)]);
   const choice = selectLeastLoadedAccount(
-    candidates.map((account) => ({
+    eligible.map((account) => ({
       account,
       limits: byId.get(account.id),
       commitment: (commitments.get(account.id) ?? 0) + (debits.get(account.id) ?? 0),
     })),
     now,
   )!;
-  const rotated = choice.nearTieIds.length > 1 ? await rotateNearTie(kind, choice, candidates, byId) : choice;
+  const rotated = choice.nearTieIds.length > 1 ? await rotateNearTie(kind, choice, eligible, byId) : choice;
+  const healthyChoice = bootHealthReason ? { ...rotated, reason: `${rotated.reason}${bootHealthReason}` } : rotated;
   // Pick bookkeeping (HIVE-80): debit the winner so the next concurrent pick
   // sees this one, and age its cache entry so the picker re-reads live once
   // the provider's numbers can actually reflect the newly placed load.
-  await recordAutoPick(rotated.account.id, now).catch(() => undefined);
-  if (ttlMs > 0) await agePickedLimitsCacheEntry(rotated.account.id, { now, ttlMs }).catch(() => undefined);
-  return rotated;
+  await recordAutoPick(healthyChoice.account.id, now).catch(() => undefined);
+  if (ttlMs > 0) await agePickedLimitsCacheEntry(healthyChoice.account.id, { now, ttlMs }).catch(() => undefined);
+  return healthyChoice;
 }
 
 /**

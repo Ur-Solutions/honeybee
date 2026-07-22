@@ -264,6 +264,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       cwd,
       ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
       authKind: "subscription",
+      ...(account ? { accountId: account.id } : {}),
       ...(model ? { model } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });

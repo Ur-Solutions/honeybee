@@ -444,6 +444,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       cwd: opts.cwd,
       ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
       authKind: "subscription",
+      ...(opts.account ? { accountId: opts.account.id } : {}),
       ...(opts.model ? { model: opts.model } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import { addAccount, accountDir, setAccountPaused } from "../src/accounts.js";
+import { addAccount, accountDir, clearAccountBootFailure, recordAccountBootFailure, setAccountPaused } from "../src/accounts.js";
 import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -936,6 +936,61 @@ test("pickLeastLoadedAccount excludes paused accounts unless includePaused", asy
     // Everything paused: a dedicated error, distinct from the no-creds one.
     await setAccountPaused(one.id, true);
     await assert.rejects(() => pickLeastLoadedAccount("claude"), /Every claude account is paused/);
+  });
+});
+
+test("pickLeastLoadedAccount skips recent boot failures before fetching limits", async () => {
+  await withTempStore(async () => {
+    const failed = await addAccount("codex", "failed@a.b");
+    const busy = await addAccount("codex", "busy@a.b");
+    const quiet = await addAccount("codex", "quiet@a.b");
+    const now = Date.parse("2026-07-22T06:00:00Z");
+    await recordAccountBootFailure(failed.id, now);
+    let fetched: string[] = [];
+
+    const choice = await pickLeastLoadedAccount("codex", {
+      hasCredentials: async () => true,
+      now: () => now + 60_000,
+      fetchLimits: async (accounts) => {
+        fetched = accounts.map((account) => account.id);
+        return accounts.map((account) =>
+          okLimits(account.id, account.id === quiet.id ? 10 : 50, 10, "2026-07-29T06:00:00Z"));
+      },
+    });
+
+    assert.equal(choice.account.id, quiet.id);
+    assert.deepEqual(fetched, [busy.id, quiet.id]);
+    assert.match(choice.reason, new RegExp(`skipped ${failed.id} for recent boot failure`));
+
+    await clearAccountBootFailure(failed.id);
+    const afterClear = await pickLeastLoadedAccount("codex", {
+      hasCredentials: async () => true,
+      now: () => now + 60_000,
+      fetchLimits: async (accounts) => accounts.map((account) =>
+        okLimits(account.id, account.id === failed.id ? 0 : 80, 10, "2026-07-29T06:00:00Z")),
+      ttlMs: 0,
+    });
+    assert.equal(afterClear.account.id, failed.id, "successful-boot clear returns the account to auto selection");
+    assert.doesNotMatch(afterClear.reason, /boot failure/);
+  });
+});
+
+test("pickLeastLoadedAccount uses a failed account as the last credentialed resort", async () => {
+  await withTempStore(async () => {
+    const only = await addAccount("codex", "only@a.b");
+    const now = Date.parse("2026-07-22T06:00:00Z");
+    await recordAccountBootFailure(only.id, now);
+
+    const choice = await pickLeastLoadedAccount("codex", {
+      hasCredentials: async () => true,
+      now: () => now + 60_000,
+      fetchLimits: async () => {
+        throw new Error("a lone last-resort account should not need a limits read");
+      },
+    });
+
+    assert.equal(choice.account.id, only.id);
+    assert.match(choice.reason, /every credentialed account has a recent boot failure; using last resort/);
   });
 });
 

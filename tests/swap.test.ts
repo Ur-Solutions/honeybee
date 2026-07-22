@@ -226,6 +226,7 @@ test("swapAccount relaunches an HSR bee through the runner host", async () => {
     assert.equal(payload?.bee, "CO.test");
     assert.equal(payload?.sessionId, "thread-123");
     assert.equal(payload?.resume, true);
+    assert.equal(payload?.accountId, "codex-new");
     assert.equal(payload?.spec.env.CODEX_HOME, "/tmp/home-c");
     assert.equal(payload?.spec.args.includes("resume"), false);
     assert.equal(updated.runnerPid, 4321);

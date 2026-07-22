@@ -145,6 +145,7 @@ export async function swapAccount(
           sessionId: current.providerSessionId!,
           resume: true,
           authKind: "subscription",
+          accountId: account.id,
           ...(model ? { model } : {}),
           spec: { command: spec.command, args: spec.args, env: spec.env },
         });
