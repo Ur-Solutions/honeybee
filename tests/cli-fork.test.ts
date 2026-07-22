@@ -124,6 +124,14 @@ function forkRecordOf(records: Record<string, unknown>[], parentName: string): R
   return fork!;
 }
 
+function assertForkIdentity(record: Record<string, unknown>, parentName: string): void {
+  const command = String(record.command);
+  assert.match(command, new RegExp(`(?:^| )HIVE_BEE=${String(record.name)}(?: |$)`));
+  assert.match(command, new RegExp(`(?:^| )HIVE_BEE_ID=${String(record.id)}(?: |$)`));
+  assert.match(command, new RegExp(`(?:^| )HIVE_COMB=${String(record.name)}(?: |$)`));
+  assert.match(command, new RegExp(`(?:^| )HIVE_PARENT=${parentName}(?: |$)`));
+}
+
 // ---- C1: same-harness resume ---------------------------------------------
 
 test("C1: same-harness fork with a known providerSessionId bakes native resume args", { timeout: 40_000 }, async () => {
@@ -146,10 +154,53 @@ test("C1: same-harness fork with a known providerSessionId bakes native resume a
     assert.equal(forkRec.providerSessionId, undefined, "fork does NOT inherit the parent's providerSessionId");
     assert.ok(typeof forkRec.lastPromptAt === "string", "anti-cross-match lastPromptAt set");
     assert.equal(forkRec.combId, forkRec.tmuxTarget, "fork is its own comb");
+    assert.equal(forkRec.substrate, undefined, "human-origin fork uses the tmux path");
+    assertForkIdentity(forkRec, parentName);
   } finally {
     await runCli(["kill", parentName, "--comb"], env).catch(() => undefined);
     const recs = await listRecords(storeRoot);
     for (const r of recs) await tmux(["kill-session", "-t", `=${r.tmuxTarget}`], { reject: false });
+    await rm(storeRoot, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("H1: pane-less HSR forks carry the same complete identity env as tmux forks", { timeout: 40_000 }, async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "hive-fork-hsr-identity-"));
+  const cwd = await mkdtemp(join(tmpdir(), "hive-fork-cwd-"));
+  const env = {
+    ...AGENT_CMD_ENV,
+    HIVE_STUB_CMD: process.execPath,
+    HIVE_STORE_ROOT: storeRoot,
+    TMUX_TMPDIR: process.env.TMUX_TMPDIR!,
+  };
+  const parentName = `forkp-hsr-identity-${process.pid}`;
+  let forkName: string | undefined;
+  try {
+    await seedParent(storeRoot, parentName, cwd, {
+      agent: "stub",
+      requestedAgent: "stub",
+      command: process.execPath,
+    });
+    const fork = await runCli([
+      "fork",
+      parentName,
+      "--agent",
+      "stub",
+      "--seed",
+      "none",
+      "--substrate",
+      "hsr",
+      "--no-wait",
+    ], env);
+    assert.equal(fork.code, 0, fork.stderr);
+
+    const forkRec = forkRecordOf(await listRecords(storeRoot), parentName);
+    forkName = String(forkRec.name);
+    assert.equal(forkRec.substrate, "hsr");
+    assertForkIdentity(forkRec, parentName);
+  } finally {
+    if (forkName) await runCli(["kill", forkName, "--yes"], env).catch(() => undefined);
     await rm(storeRoot, { recursive: true, force: true });
     await rm(cwd, { recursive: true, force: true });
   }
