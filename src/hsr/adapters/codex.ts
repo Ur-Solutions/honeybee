@@ -25,6 +25,7 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+import { CodexBootProbeError, type CodexBootFailureCause } from "../../codexBoot.js";
 import type { RunnerAdapter, RunnerEvent, RunnerInputAnswer, RunnerInputQuestion, RunnerInterruptResult, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
 import { harnessAllowance } from "../harness.js";
 import { attachSessionPlumbing, spawnSessionChild, stopChildGroup } from "../sessionBase.js";
@@ -34,6 +35,8 @@ import {
   CodexRpcRequestTimeoutError,
   type CodexRpcPeer,
 } from "./codexRpc.js";
+
+export { CodexBootProbeError, type CodexBootFailureCause };
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -387,18 +390,6 @@ export type CodexThreadHandshakeAttempt<T> = {
   discard(): Promise<void>;
 };
 
-export type CodexBootFailureCause = "process-died" | "alive-but-unresponsive";
-
-export class CodexBootProbeError extends Error {
-  readonly classification: CodexBootFailureCause;
-
-  constructor(classification: CodexBootFailureCause, error: unknown) {
-    super(error instanceof Error ? error.message : String(error));
-    this.name = "CodexBootProbeError";
-    this.classification = classification;
-  }
-}
-
 /**
  * Retry a Codex thread handshake on a fresh app-server after a bounded timeout.
  * Exported so the restart (rather than same-peer retry) contract is hermetically
@@ -424,9 +415,11 @@ export async function retryCodexThreadHandshake<T>(
       const result = await attempt.run(delaysMs[index] as number, timeoutMs);
       return { attempt, result };
     } catch (error) {
-      const classification: CodexBootFailureCause = attempt.isAlive()
-        ? "alive-but-unresponsive"
-        : "process-died";
+      const classification: CodexBootFailureCause = !attempt.isAlive()
+        ? "process-died"
+        : error instanceof CodexRpcRequestTimeoutError
+          ? "alive-but-unresponsive"
+          : "rpc-error";
       // Always discard a failed child. codex-cli 0.144.0 leaves the connection
       // wedged after a premature thread request, including for later requests.
       await attempt.discard().catch(() => undefined);
@@ -648,6 +641,8 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   } catch (error) {
     if (error instanceof CodexBootProbeError) {
       process.stderr.write(`hive: codex boot probe failed: ${error.classification} (${method})\n`);
+    } else {
+      process.stderr.write(`hive: codex boot probe failed: process-died (${method}; app-server spawn failed)\n`);
     }
     throw error;
   }

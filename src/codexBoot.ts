@@ -12,6 +12,19 @@ export type CodexBootLockState = {
   waited: boolean;
 };
 
+export type CodexBootFailureCause = "process-died" | "alive-but-unresponsive" | "rpc-error";
+
+/** A thread probe ran against a Codex home but did not produce a usable session. */
+export class CodexBootProbeError extends Error {
+  readonly classification: CodexBootFailureCause;
+
+  constructor(classification: CodexBootFailureCause, error: unknown) {
+    super(error instanceof Error ? error.message : String(error), { cause: error });
+    this.name = "CodexBootProbeError";
+    this.classification = classification;
+  }
+}
+
 /** Resolve the credential home used by `codex app-server`. */
 export function codexHomeFromEnv(env: Record<string, string | undefined>): string {
   return env.CODEX_HOME || join(env.HOME || homedir(), ".codex");

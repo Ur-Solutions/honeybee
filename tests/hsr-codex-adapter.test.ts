@@ -25,6 +25,7 @@ import {
   encodeCodexApprovalResponse,
   encodeCodexUserInput,
   retryCodexThreadHandshake,
+  startCodexRunner,
 } from "../src/hsr/adapters/codex.js";
 import { CodexRpcRequestTimeoutError } from "../src/hsr/adapters/codexRpc.js";
 import { adapterFor } from "../src/hsr/adapters/index.js";
@@ -343,6 +344,7 @@ test("thread handshake timeout discards the wedged child and retries on a fresh 
 test("thread handshake does not hide non-timeout protocol failures", async () => {
   let created = 0;
   let discarded = 0;
+  const protocolError = new Error("authentication rejected");
   await assert.rejects(
     retryCodexThreadHandshake(
       async () => {
@@ -350,7 +352,7 @@ test("thread handshake does not hide non-timeout protocol failures", async () =>
         return {
           isAlive: () => true,
           async run(): Promise<never> {
-            throw new Error("authentication rejected");
+            throw protocolError;
           },
           async discard(): Promise<void> {
             discarded++;
@@ -359,7 +361,12 @@ test("thread handshake does not hide non-timeout protocol failures", async () =>
       },
       { delaysMs: [0, 1, 2], requestTimeoutMs: 1 },
     ),
-    /authentication rejected/,
+    (error: unknown) => {
+      assert.ok(error instanceof CodexBootProbeError);
+      assert.equal(error.classification, "rpc-error");
+      assert.equal(error.cause, protocolError);
+      return true;
+    },
   );
   assert.equal(created, 1);
   assert.equal(discarded, 1);
@@ -408,5 +415,32 @@ test("thread handshake final failure classifies process death separately from an
   assert.equal(
     (await fail(true, new CodexRpcRequestTimeoutError("thread/start", 1))).classification,
     "alive-but-unresponsive",
+  );
+});
+
+test("codex spawn failures emit a one-line process classification and preserve the original error", async () => {
+  const stderr: string[] = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await assert.rejects(
+      startCodexRunner({
+        bee: "missing-codex",
+        command: "/definitely/missing/honeybee-codex-binary",
+        cwd: process.cwd(),
+        env: {},
+        runDir: "/tmp/missing-codex",
+      }),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT",
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+  assert.match(
+    stderr.join(""),
+    /hive: codex boot probe failed: process-died \(thread\/start; app-server spawn failed\)/,
   );
 });

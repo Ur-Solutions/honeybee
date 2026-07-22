@@ -8,6 +8,7 @@ import {
   recentAccountBootFailures,
   recordAccountBootFailure,
 } from "../src/accounts.js";
+import { CodexBootProbeError } from "../src/codexBoot.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { runHsrHost, type HsrHostHandle } from "../src/hsr/host.js";
 import type { RunnerAdapter, RunnerOpts } from "../src/hsr/types.js";
@@ -42,7 +43,7 @@ test("codex HSR boot failure records the breaker and a later success clears it",
       harness: "codex",
       tier: () => "server",
       async start(): Promise<never> {
-        throw new Error("fake app-server boot failure");
+        throw new CodexBootProbeError("alive-but-unresponsive", new Error("fake app-server boot failure"));
       },
     };
     await assert.rejects(
@@ -63,6 +64,25 @@ test("codex HSR boot failure records the breaker and a later success clears it",
     } finally {
       await handle?.stop().catch(() => undefined);
     }
+  });
+});
+
+test("codex HSR does not record non-probe startup failures in the account breaker", async () => {
+  await withTempStore(async (root) => {
+    const accountId = "codex-non-probe-failure";
+    const failingAdapter: RunnerAdapter = {
+      harness: "codex",
+      tier: () => "server",
+      async start(): Promise<never> {
+        throw new Error("startup admission or lock failure");
+      },
+    };
+
+    await assert.rejects(
+      runHsrHost({ bee: "non-probe-failure", adapter: failingAdapter, opts: opts(root, "non-probe-failure", accountId) }),
+      /startup admission or lock failure/,
+    );
+    assert.equal((await recentAccountBootFailures()).has(accountId), false);
   });
 });
 

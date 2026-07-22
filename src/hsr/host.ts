@@ -16,7 +16,7 @@
  */
 
 import { clearAccountBootFailure, recordAccountBootFailure } from "../accounts/bootHealth.js";
-import { codexHomeFromEnv, withCodexHomeBootLock } from "../codexBoot.js";
+import { CodexBootProbeError, codexHomeFromEnv, withCodexHomeBootLock } from "../codexBoot.js";
 import type { RunnerAdapter, RunnerInputAnswer, RunnerOpts } from "./types.js";
 import { startRpcServer, type RpcMethodHandler } from "./rpc.js";
 import {
@@ -117,7 +117,7 @@ export async function runHsrHost(params: {
       await clearAccountBootFailure(opts.accountId).catch(() => undefined);
     }
   } catch (error) {
-    if (bootsCodexAppServer && opts.accountId) {
+    if (bootsCodexAppServer && opts.accountId && error instanceof CodexBootProbeError) {
       await recordAccountBootFailure(opts.accountId).catch(() => undefined);
     }
     if (startupMeta) {
