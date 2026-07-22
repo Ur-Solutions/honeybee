@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { resolveAgent, stampBeeIdentityEnv } from "../src/agents.js";
+import { resolveAgent, shellCommand, stampBeeIdentityEnv } from "../src/agents.js";
 import {
   gatewayPidIsLive,
   gatewaysWithLiveness,
@@ -112,6 +112,14 @@ test("gateway env merges before caller env and cannot shadow protected identity/
     assert.equal(spec.env.SHARED, "caller");
     assert.equal(spec.env.CALLER_ONLY, "yes");
     assert.equal(spec.env.HIVE_BEE, "worker");
+    const stored = shellCommand(spec);
+    assert.match(stored, /GATEWAY_ONLY=<redacted>/);
+    assert.match(stored, /SHARED=<redacted>/);
+    assert.match(stored, /CALLER_ONLY=<redacted>/);
+    assert.doesNotMatch(stored, /gateway|caller/);
+    const executable = shellCommand(spec, { forExec: true });
+    assert.match(executable, /GATEWAY_ONLY=yes/);
+    assert.match(executable, /SHARED=caller/);
   });
 });
 

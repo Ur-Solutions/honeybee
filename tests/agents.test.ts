@@ -339,6 +339,8 @@ test("spawnBeeForFlow stamps tmux hive identity options for spawned bees", { tim
     assert.equal(env.HIVE_COMB, record.name);
     assert.equal(env.HIVE_PARENT, "CL.parent");
     assert.equal(env.CALLER_VALUE, "through-flow");
+    assert.match(record.command, /CALLER_VALUE=<redacted>/);
+    assert.doesNotMatch(record.command, /through-flow/);
   } finally {
     await tmux(["kill-server"], { reject: false });
     setTmuxSocket(undefined);

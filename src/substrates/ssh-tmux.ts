@@ -109,8 +109,14 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
       ...spec.args,
     ];
     // -P -F prints the new pane id so spawn can pin the bee to it.
-    const argv = buildSshTmuxArgv(["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", target, "-c", cwd, ...commandWords]);
-    const result = await exec(argv);
+    const tmuxArgs = ["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", target, "-c", cwd, ...commandWords];
+    // An env-bearing launch may contain caller-minted tokens. Never put those
+    // values in the local ssh argv (visible via ps); stream the fully quoted
+    // remote command over stdin to `sh -s`. The SSH command line then carries
+    // only `sh -s`, while tmux still launches the child with the real env.
+    const result = envEntries.length > 0
+      ? await runSsh(["sh", "-s"], { input: `exec ${["tmux", ...tmuxArgs].map(shellQuote).join(" ")}\n` })
+      : await runTmux(tmuxArgs);
     if (result.exitCode !== 0) throw new Error(`Remote tmux new-session failed: ${result.stderr.trim() || result.stdout.trim()}`);
     const paneId = result.stdout.trim();
     await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);

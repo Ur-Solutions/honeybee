@@ -23,6 +23,8 @@ export type AgentSpec = {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Env whose values came from external callers/gateways; redact in records. */
+  redactedEnvKeys?: Set<string>;
   tmuxOptions?: TmuxWindowOptions;
   homePath?: string;
   requestedKind: string;
@@ -162,8 +164,12 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   if (options.identity && profile.homePath) {
     Object.assign(env, identityEnvForAgent(profile.kind, profile.homePath));
   }
-  Object.assign(env, liveGatewayEnv());
+  const redactedEnvKeys = new Set<string>();
+  const gatewayEnv = liveGatewayEnv();
+  Object.assign(env, gatewayEnv);
+  for (const key of Object.keys(gatewayEnv)) redactedEnvKeys.add(key);
   mergeCallerEnv(env, options.env);
+  for (const key of Object.keys(options.env ?? {})) redactedEnvKeys.add(key);
   // The account's model selector is appended ONLY when the base command came
   // from the driver default — never when a config/env `command` override is in
   // play, since such a command may already embed `--model …` and appending
@@ -176,6 +182,7 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
     command: parts[0]!,
     args: [...parts.slice(1), ...modelArgs, ...extraArgs],
     env,
+    ...(redactedEnvKeys.size > 0 ? { redactedEnvKeys } : {}),
     ...(tmuxOptions ? { tmuxOptions } : {}),
     homePath: profile.homePath,
     requestedKind: kind,
@@ -191,7 +198,9 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
  * to the user to run (`hive open --window/--print`).
  */
 export function shellCommand(spec: AgentSpec, options: { forExec?: boolean } = {}): string {
-  const secrets = options.forExec ? new Set<string>() : new Set(secretEnvKeysForAgent(spec.kind));
+  const secrets = options.forExec
+    ? new Set<string>()
+    : new Set([...secretEnvKeysForAgent(spec.kind), ...(spec.redactedEnvKeys ?? [])]);
   const env = Object.entries(spec.env).map(([key, value]) => `${key}=${secrets.has(key) ? "<redacted>" : shellQuoteIfNeeded(value)}`);
   return [...env, ...[spec.command, ...spec.args].map(shellQuoteIfNeeded)].join(" ");
 }
@@ -207,8 +216,11 @@ export function shellCommand(spec: AgentSpec, options: { forExec?: boolean } = {
 export function refreshIdentityEnv(spec: AgentSpec, callerEnv?: Record<string, string>): void {
   if (!spec.homePath) return;
   Object.assign(spec.env, identityEnvForAgent(spec.kind, spec.homePath));
-  Object.assign(spec.env, liveGatewayEnv());
+  const gatewayEnv = liveGatewayEnv();
+  Object.assign(spec.env, gatewayEnv);
+  for (const key of Object.keys(gatewayEnv)) (spec.redactedEnvKeys ??= new Set()).add(key);
   mergeCallerEnv(spec.env, callerEnv);
+  for (const key of Object.keys(callerEnv ?? {})) (spec.redactedEnvKeys ??= new Set()).add(key);
 }
 
 /**
