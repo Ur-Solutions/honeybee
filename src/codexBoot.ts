@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { withFileLock } from "./lock.js";
+import { type LockOptions, withFileLock } from "./lock.js";
 import { spawnTimingEnabled } from "./spawnTiming.js";
 
 const CODEX_BOOT_LOCK_FILENAME = ".hive-app-server-boot.lock";
@@ -27,18 +27,22 @@ export function codexHomeFromEnv(env: Record<string, string | undefined>): strin
 export async function withCodexHomeBootLock<T>(
   home: string,
   fn: (state: CodexBootLockState) => Promise<T>,
+  options: LockOptions = {},
 ): Promise<T> {
   let waited = false;
+  const callerOnWait = options.onWait;
   return withFileLock(join(home, CODEX_BOOT_LOCK_FILENAME), () => fn({ waited }), {
-    timeoutMs: CODEX_BOOT_LOCK_TIMEOUT_MS,
+    ...options,
+    timeoutMs: options.timeoutMs ?? CODEX_BOOT_LOCK_TIMEOUT_MS,
     // Heartbeats keep a legitimately slow boot fresh; a hard-crashed holder is
     // reclaimable well before the waiter's overall patience expires.
-    staleMs: CODEX_BOOT_LOCK_STALE_MS,
+    staleMs: options.staleMs ?? CODEX_BOOT_LOCK_STALE_MS,
     onWait: () => {
       waited = true;
       if (spawnTimingEnabled()) {
         process.stderr.write(`hive: debug: waiting for codex boot lock (${home})\n`);
       }
+      callerOnWait?.();
     },
   });
 }

@@ -106,13 +106,13 @@ export async function runHsrHost(params: {
       }
       return adapter.start(startOpts);
     };
-    const startWithAdmission = (startOpts: RunnerOpts) => queueCodexStartup
-      ? withCodexStartupSlot(bee, () => startAdapter(startOpts))
-      : startAdapter(startOpts);
-    session = bootsCodexAppServer
-      ? await withCodexHomeBootLock(codexHomeFromEnv(opts.env), ({ waited }) =>
-          startWithAdmission(waited ? { ...opts, codexBootContended: true } : opts))
-      : await startWithAdmission(opts);
+    const startWithHomeLock = () => bootsCodexAppServer
+      ? withCodexHomeBootLock(codexHomeFromEnv(opts.env), ({ waited }) =>
+          startAdapter(waited ? { ...opts, codexBootContended: true } : opts))
+      : startAdapter(opts);
+    session = queueCodexStartup
+      ? await withCodexStartupSlot(bee, startWithHomeLock)
+      : await startWithHomeLock();
     if (bootsCodexAppServer && opts.accountId) {
       await clearAccountBootFailure(opts.accountId).catch(() => undefined);
     }

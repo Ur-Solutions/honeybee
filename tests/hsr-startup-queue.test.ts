@@ -31,11 +31,11 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
   return { promise, resolve };
 }
 
-function optsFor(bee: string): RunnerOpts {
+function optsFor(root: string, bee: string): RunnerOpts {
   return {
     bee,
     cwd: process.cwd(),
-    env: process.env as Record<string, string>,
+    env: { ...process.env, CODEX_HOME: join(root, "codex-home") } as Record<string, string>,
     runDir: hsrRunDir(bee),
   };
 }
@@ -68,7 +68,7 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
     const first = runHsrHost({
       bee: "queued-one",
       adapter: adapter(() => releaseFirstStart.promise, () => { firstStarts += 1; }),
-      opts: optsFor("queued-one"),
+      opts: optsFor(root, "queued-one"),
       queueStartup: true,
     });
     await waitFor(
@@ -84,7 +84,7 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
         () => { secondStarts += 1; },
         (opts) => { secondContended = opts.codexBootContended === true; },
       ),
-      opts: optsFor("queued-two"),
+      opts: optsFor(root, "queued-two"),
       queueStartup: true,
     });
     await waitFor(async () => (await readHsrMeta("queued-two"))?.status === "queued", "second queued meta");
@@ -104,7 +104,7 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
     releaseFirstStart.resolve();
     firstHandle = await first;
     await waitFor(() => secondStarts === 1, "second admitted after first startup");
-    assert.equal(secondContended, true, "the home-lock waiter reaches the slower first boot probe");
+    assert.equal(secondContended, false, "admission waiting does not consume the home boot lock");
     secondHandle = await second;
     assert.equal((await readHsrMeta("queued-one"))?.status, "running");
     assert.equal((await readHsrMeta("queued-two"))?.status, "running");
@@ -113,6 +113,73 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
       "queued prompt drained after admission",
     );
   } finally {
+    await secondHandle?.stop().catch(() => undefined);
+    await firstHandle?.stop().catch(() => undefined);
+    if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousRoot;
+    if (previousConcurrency === undefined) delete process.env.HIVE_CODEX_START_CONCURRENCY;
+    else process.env.HIVE_CODEX_START_CONCURRENCY = previousConcurrency;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("same-home Codex starts serialize inside separate admission slots", async () => {
+  const previousRoot = process.env.HIVE_STORE_ROOT;
+  const previousConcurrency = process.env.HIVE_CODEX_START_CONCURRENCY;
+  const root = await mkdtemp(join(tmpdir(), "honeybee-hsr-home-lock-"));
+  process.env.HIVE_STORE_ROOT = root;
+  process.env.HIVE_CODEX_START_CONCURRENCY = "2";
+
+  const firstEntered = deferred();
+  const releaseFirst = deferred();
+  let secondStarts = 0;
+  let secondContended = false;
+  const firstAdapter: RunnerAdapter = {
+    harness: "codex",
+    tier: () => "server",
+    async start(opts) {
+      firstEntered.resolve();
+      await releaseFirst.promise;
+      return stubAdapter.start(opts);
+    },
+  };
+  const secondAdapter: RunnerAdapter = {
+    harness: "codex",
+    tier: () => "server",
+    async start(opts) {
+      secondStarts += 1;
+      secondContended = opts.codexBootContended === true;
+      return stubAdapter.start(opts);
+    },
+  };
+
+  let firstHandle: HsrHostHandle | undefined;
+  let secondHandle: HsrHostHandle | undefined;
+  try {
+    const first = runHsrHost({
+      bee: "home-lock-one",
+      adapter: firstAdapter,
+      opts: optsFor(root, "home-lock-one"),
+      queueStartup: true,
+    });
+    await firstEntered.promise;
+
+    const second = runHsrHost({
+      bee: "home-lock-two",
+      adapter: secondAdapter,
+      opts: optsFor(root, "home-lock-two"),
+      queueStartup: true,
+    });
+    await sleep(150);
+    assert.equal(secondStarts, 0, "same-home start entered while the first boot held the lock");
+
+    releaseFirst.resolve();
+    firstHandle = await first;
+    secondHandle = await second;
+    assert.equal(secondStarts, 1);
+    assert.equal(secondContended, true, "the admitted home-lock waiter gets the slower first probe");
+  } finally {
+    releaseFirst.resolve();
     await secondHandle?.stop().catch(() => undefined);
     await firstHandle?.stop().catch(() => undefined);
     if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
@@ -143,7 +210,7 @@ test("every detached HSR harness publishes booting and accepts a durable first t
     starting = runHsrHost({
       bee: "starting-claude",
       adapter,
-      opts: optsFor("starting-claude"),
+      opts: optsFor(root, "starting-claude"),
       queueStartup: true,
     });
     await waitFor(

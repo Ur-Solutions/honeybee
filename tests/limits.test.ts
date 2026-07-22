@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { addAccount, accountDir, clearAccountBootFailure, recordAccountBootFailure, setAccountPaused } from "../src/accounts.js";
+import { withCodexHomeBootLock } from "../src/codexBoot.js";
 import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -22,6 +23,14 @@ async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
     else process.env.HIVE_NO_KEYCHAIN = oldKeychain;
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 function fakeJwt(payload: Record<string, unknown>): string {
@@ -665,6 +674,48 @@ test("codex prefers live app-server limits and falls back to disk snapshots", as
     assert.equal(fallback!.ok, false);
     assert.equal(fallback!.source, "session-snapshot");
     assert.match(fallback!.error ?? "", /no rate-limit snapshot/);
+  });
+});
+
+test("codex live limits bound home-lock contention and fall back to the rollout snapshot", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("codex", "locked@a.b");
+    const home = join(dir, "homes", account.id);
+    const sessions = join(home, "sessions", "2026", "07", "22");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(
+      join(sessions, "rollout-locked.jsonl"),
+      `${JSON.stringify({
+        timestamp: "2026-07-22T07:00:00Z",
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          rate_limits: {
+            primary: { used_percent: 42, window_minutes: 300, resets_at: 1784707200 },
+            plan_type: "pro",
+          },
+        },
+      })}\n`,
+    );
+
+    const lockEntered = deferred();
+    const releaseLock = deferred();
+    const holder = withCodexHomeBootLock(home, async () => {
+      lockEntered.resolve();
+      await releaseLock.promise;
+    });
+    await lockEntered.promise;
+    try {
+      const started = Date.now();
+      const [result] = await accountLimits([account]);
+      assert.ok(Date.now() - started < 5_000, "limits waited too long for a booting home");
+      assert.equal(result!.ok, true);
+      assert.equal(result!.source, "session-snapshot");
+      assert.equal(result!.fiveHour?.usedPercent, 42);
+    } finally {
+      releaseLock.resolve();
+      await holder;
+    }
   });
 });
 

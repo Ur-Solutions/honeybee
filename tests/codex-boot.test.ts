@@ -72,6 +72,34 @@ test("codex boot locks for different homes do not serialize", async () => {
   }
 });
 
+test("codex boot lock callers can bound their contention wait", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-codex-boot-"));
+  const home = join(root, "bounded-home");
+  const firstEntered = deferred();
+  const releaseFirst = deferred();
+
+  try {
+    const first = withCodexHomeBootLock(home, async () => {
+      firstEntered.resolve();
+      await releaseFirst.promise;
+    });
+    await firstEntered.promise;
+
+    const started = Date.now();
+    await assert.rejects(
+      withCodexHomeBootLock(home, async () => undefined, { timeoutMs: 40, pollMs: 5 }),
+      /Timed out waiting for lock/,
+    );
+    assert.ok(Date.now() - started < 500, "timeout override did not bound the lock wait");
+
+    releaseFirst.resolve();
+    await first;
+  } finally {
+    releaseFirst.resolve();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("codex boot lock reclaims a hard-crashed holder before the wait timeout", async () => {
   const root = await mkdtemp(join(tmpdir(), "honeybee-codex-boot-"));
   const home = join(root, "crashed-home");

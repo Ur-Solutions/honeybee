@@ -143,6 +143,7 @@ function snapshotWindow(window: NonNullable<CodexRateLimits["primary"]>): Window
 }
 
 const CODEX_RPC_TIMEOUT_MS = 15_000;
+const CODEX_LIMITS_BOOT_LOCK_TIMEOUT_MS = 3_000;
 
 /**
  * Query `codex app-server` (JSON-RPC over stdio) for the account's live rate
@@ -206,7 +207,7 @@ async function fetchCodexLiveRateLimits(homePath: string): Promise<CodexLiveRate
     child.stdin?.write(
       `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "hive", title: "hive", version: "0.0.1" } } })}\n`,
     );
-  })).catch(() => null);
+  }), { timeoutMs: CODEX_LIMITS_BOOT_LOCK_TIMEOUT_MS }).catch(() => null);
 }
 
 // How many recent rollout files to inspect — a fresh session may not have
