@@ -5,7 +5,7 @@
  * stdio, BIDIRECTIONALLY (the server also sends us requests, for approvals). It
  * does NOT use the stream runner — the transport is a request/response + inbound
  * server-request peer (codexRpc.ts), not a line→event stream. This file owns:
- *   - the codex protocol flow (initialize → thread/start → turn/start → notifications)
+ *   - the codex protocol flow (initialize → initialized → thread/start → turn/start → notifications)
  *   - PURE mappers (exported for hermetic tests): notification→events,
  *     user-input encode, server-request→needs_input.
  *
@@ -605,6 +605,11 @@ async function createLiveCodexHandshakeAttempt(params: {
         clientInfo: { name: "hive-hsr", title: null, version: "0" },
         capabilities: null,
       });
+      // App-server's documented connection handshake is initialize REQUEST
+      // followed by the initialized NOTIFICATION. Codex 0.144.6 tolerates a
+      // missing acknowledgement, but relying on that keeps Hive outside the
+      // protocol contract and fails against a strict peer.
+      peer.notify("initialized", {});
       if (preRequestDelayMs > 0) await sleep(preRequestDelayMs);
       return peer.request(params.method, params.requestParams, { timeoutMs: requestTimeoutMs });
     },
