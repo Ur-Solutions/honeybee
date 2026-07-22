@@ -83,6 +83,11 @@ test("isAutoTitleCandidate: any existing title (or source) is done", () => {
   assert.equal(isAutoTitleCandidate(bee({ titleSource: "user", title: "x" }), NOW), false);
 });
 
+test("isAutoTitleCandidate: historical records are never rescanned", () => {
+  assert.equal(isAutoTitleCandidate(bee({ status: "archived" }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({ status: "dead" }), NOW), false);
+});
+
 test("isAutoTitleCandidate: respects the attempt cap", () => {
   assert.equal(isAutoTitleCandidate(bee({ autoTitleAttempts: MAX_AUTO_TITLE_ATTEMPTS - 1, autoTitleAt: new Date(NOW - AUTO_TITLE_RETRY_BACKOFF_MS).toISOString() }), NOW), true);
   assert.equal(isAutoTitleCandidate(bee({ autoTitleAttempts: MAX_AUTO_TITLE_ATTEMPTS }), NOW), false);

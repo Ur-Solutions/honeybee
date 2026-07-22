@@ -12,11 +12,29 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
-import { hsrObservations, type HsrObservation } from "../hsr/observe.js";
+import { StringDecoder } from "node:string_decoder";
+import { hsrObservations, type HsrEventSnapshot, type HsrObservation } from "../hsr/observe.js";
 import { envMs } from "./timeouts.js";
 
 type ObserveRequest = { id: number; bees: readonly string[] };
-type ObserveResponse = { id: number; ok: boolean; observations?: Array<[string, HsrObservation]>; error?: string };
+type WireEventSnapshot = Omit<HsrEventSnapshot, "tailEvents">;
+type WireObservation = Omit<HsrObservation, "eventSnapshot"> & { eventSnapshot?: WireEventSnapshot };
+type ObserveResponse = { id: number; ok: boolean; observations?: Array<[string, WireObservation]>; error?: string };
+
+function observationToWire(observation: HsrObservation): WireObservation {
+  const { eventSnapshot, ...rest } = observation;
+  if (!eventSnapshot) return rest;
+  // hsrEventSnapshot() aliases tailEvents to events. Sending both duplicated
+  // every event in the observer's already-large JSON response.
+  const { tailEvents: _tailEvents, ...snapshot } = eventSnapshot;
+  return { ...rest, eventSnapshot: snapshot };
+}
+
+function observationFromWire(observation: WireObservation): HsrObservation {
+  const { eventSnapshot, ...rest } = observation;
+  if (!eventSnapshot) return rest;
+  return { ...rest, eventSnapshot: { ...eventSnapshot, tailEvents: eventSnapshot.events } };
+}
 
 /** The child side: serve observation requests over stdin/stdout JSONL. */
 export async function runHsrObserveWorker(input: Readable = process.stdin, output: Writable = process.stdout): Promise<void> {
@@ -35,7 +53,11 @@ export async function runHsrObserveWorker(input: Readable = process.stdin, outpu
     let response: ObserveResponse;
     try {
       const observations = await hsrObservations({ includeEvents: true, bees: request.bees });
-      response = { id: request.id, ok: true, observations: [...observations] };
+      response = {
+        id: request.id,
+        ok: true,
+        observations: [...observations].map(([bee, observation]) => [bee, observationToWire(observation)]),
+      };
     } catch (error) {
       response = { id: request.id, ok: false, error: error instanceof Error ? error.message : String(error) };
     }
@@ -88,13 +110,47 @@ export function createIsolatedHsrObservations(options: IsolatedObserverOptions =
   let child: ObserverChild | null = null;
   let nextId = 1;
   let buffer = "";
+  let scanOffset = 0;
+  let decoder = new StringDecoder("utf8");
   const pending = new Map<number, { resolve: (value: ObserveResponse) => void; reject: (error: Error) => void }>();
 
   const teardown = (reason: string) => {
     for (const [, waiter] of pending) waiter.reject(new Error(reason));
     pending.clear();
     buffer = "";
+    scanOffset = 0;
+    decoder = new StringDecoder("utf8");
     child = null;
+  };
+
+  const ingestResponseText = (text: string): void => {
+    if (!text) return;
+    buffer += text;
+    let newline = buffer.indexOf("\n", scanOffset);
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      scanOffset = 0;
+      let response: ObserveResponse | null = null;
+      try {
+        response = JSON.parse(line) as ObserveResponse;
+      } catch {
+        newline = buffer.indexOf("\n");
+        continue;
+      }
+      if (response && typeof response.id === "number") {
+        const waiter = pending.get(response.id);
+        if (waiter) {
+          pending.delete(response.id);
+          waiter.resolve(response);
+        }
+      }
+      newline = buffer.indexOf("\n");
+    }
+    // No newline can appear in the already-scanned prefix. Resume at the old
+    // end on the next chunk instead of splitting/rescanning the entire growing
+    // multi-megabyte JSON response once per ~64 KiB stdout chunk.
+    scanOffset = buffer.length;
   };
 
   const ensureChild = (): ObserverChild => {
@@ -118,22 +174,7 @@ export function createIsolatedHsrObservations(options: IsolatedObserverOptions =
       if (child === spawned) teardown("hsr observer child stdout error");
     });
     spawned.stdout.on("data", (chunk: Buffer | string) => {
-      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        let response: ObserveResponse | null = null;
-        try {
-          response = JSON.parse(line) as ObserveResponse;
-        } catch {
-          continue;
-        }
-        if (!response || typeof response.id !== "number") continue;
-        const waiter = pending.get(response.id);
-        if (!waiter) continue;
-        pending.delete(response.id);
-        waiter.resolve(response);
-      }
+      ingestResponseText(typeof chunk === "string" ? chunk : decoder.write(chunk));
     });
     child = spawned;
     return spawned;
@@ -181,7 +222,7 @@ export function createIsolatedHsrObservations(options: IsolatedObserverOptions =
       }
     });
     if (!response.ok) throw new Error(response.error ?? "hsr observer failed");
-    return new Map(response.observations ?? []);
+    return new Map((response.observations ?? []).map(([bee, observation]) => [bee, observationFromWire(observation)]));
   };
 
   const close = async (): Promise<void> => {

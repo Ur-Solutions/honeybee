@@ -151,6 +151,70 @@ test("HSR sampler uses the per-tick event snapshot when provided", async () => {
   });
 });
 
+test("HSR sampler skips historical records and never reopens their logs or transcripts", async () => {
+  let reads = 0;
+  const sampler = createUsageSampler({
+    readHsrUsage: async () => {
+      reads += 1;
+      return { totals: null };
+    },
+    readTranscriptRows: async () => {
+      reads += 1;
+      return null;
+    },
+    sampleIntervalMs: 0,
+  });
+
+  const outcomes = await sampler([
+    record({ name: "CL.archived", status: "archived" }),
+    record({ name: "CL.dead", status: "dead" }),
+  ], new Map(), 1_000);
+
+  assert.deepEqual(outcomes, []);
+  assert.equal(reads, 0);
+});
+
+test("HSR sampler trusts absence from a supplied observation batch instead of rescanning", async () => {
+  let reads = 0;
+  const sampler = createUsageSampler({
+    readHsrUsage: async () => {
+      reads += 1;
+      return { totals: null };
+    },
+    readTranscriptRows: async () => {
+      reads += 1;
+      return null;
+    },
+    sampleIntervalMs: 0,
+  });
+
+  assert.deepEqual(await sampler([record()], new Map(), 1_000, new Map()), []);
+  assert.equal(reads, 0);
+});
+
+test("HSR sampler coalesces a later tick while an abandoned sample is still running", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let reads = 0;
+  const sampler = createUsageSampler({
+    readHsrUsage: async () => {
+      reads += 1;
+      await gate;
+      return { totals: null };
+    },
+    sampleIntervalMs: 0,
+  });
+
+  const first = sampler([record()], new Map(), 1_000);
+  const second = sampler([record()], new Map(), 2_000);
+  assert.equal(second, first);
+  assert.equal(reads, 1);
+  release();
+  await first;
+});
+
 test("claude parseLine maps rate_limit_event: [] when allowed, exhausted when rejected", () => {
   const { config } = buildClaudeStreamConfig(optsFor());
 

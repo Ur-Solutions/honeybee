@@ -12,6 +12,7 @@ import type { HsrObservation } from "../src/hsr/observe.js";
 function fakeChild(serve: (request: { id: number; bees: string[] }) => Record<string, unknown> | null): ObserverChild & {
   killed: NodeJS.Signals[];
   emitter: EventEmitter;
+  stdout: PassThrough;
 } {
   const emitter = new EventEmitter();
   const stdin = new PassThrough();
@@ -52,6 +53,39 @@ test("isolated observer: round-trips observations through the child protocol", a
   assert.deepEqual(result.get("alpha"), OBS);
   await observe.close();
   assert.deepEqual(child.killed, ["SIGTERM"]);
+});
+
+test("isolated observer: decodes a large chunked response and restores the single event array alias", async () => {
+  let child: ReturnType<typeof fakeChild>;
+  child = fakeChild((request) => {
+    const event = { type: "text", ts: 1, text: `${"x".repeat(1_000_000)}🐝` };
+    const response = Buffer.from(`${JSON.stringify({
+      id: request.id,
+      ok: true,
+      observations: [["alpha", {
+        live: true,
+        state: "active",
+        snapshot: "large",
+        eventSnapshot: {
+          events: [event],
+          usage: { totals: null },
+          pendingNeedsInput: null,
+        },
+      }]],
+    })}\n`);
+    for (let offset = 0; offset < response.length; offset += 2_047) {
+      child.stdout.write(response.subarray(offset, offset + 2_047));
+    }
+    return null;
+  });
+  const observe = createIsolatedHsrObservations({ timeoutMs: 5_000, spawnChild: () => child });
+
+  const result = await observe(["alpha"]);
+  const snapshot = result.get("alpha")?.eventSnapshot;
+  assert.equal(snapshot?.events[0]?.type, "text");
+  assert.equal((snapshot?.events[0] as { text?: string }).text?.endsWith("🐝"), true);
+  assert.equal(snapshot?.tailEvents, snapshot?.events, "wire response carries events once and restores the alias locally");
+  await observe.close();
 });
 
 test("isolated observer: child error responses reject the request", async () => {

@@ -54,6 +54,9 @@ export const AUTO_TITLE_WATCHDOG_MS = 2 * 60_000;
  * prior attempt was made, past the backoff window.
  */
 export function isAutoTitleCandidate(record: SessionRecord, now: number, backoffMs = AUTO_TITLE_RETRY_BACKOFF_MS): boolean {
+  // Archived/dead history is immutable and cannot acquire a new exchange.
+  // Scanning it on every cold daemon start only reopens old transcripts.
+  if (record.status !== "running") return false;
   if (record.title || record.titleSource) return false;
   if ((record.autoTitleAttempts ?? 0) >= MAX_AUTO_TITLE_ATTEMPTS) return false;
   if (!record.autoTitleAt) return true;
