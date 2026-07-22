@@ -4,6 +4,7 @@ import { resumeArgsForAgent } from "./drivers.js";
 import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
+import { nextRuntimeIncarnationPatch } from "./seal.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // swap-account: the req-1 MECHANISM. Stop the bee's process, activate the
@@ -105,6 +106,7 @@ export async function swapAccount(
     let paneId: string | undefined;
     let launcherPgid: number | undefined;
     let runnerPid: number | undefined;
+    const incarnation = await nextRuntimeIncarnationPatch(current);
     try {
       await activate(account, record.homePath!);
 
@@ -185,6 +187,7 @@ export async function swapAccount(
     //    non-reentrant session lock we already hold.
     const updated: SessionRecord = {
       ...current,
+      ...incarnation,
       accountId: account.id,
       command: shellCommand(spec),
       ...(paneId ? { agentPaneId: paneId } : {}),

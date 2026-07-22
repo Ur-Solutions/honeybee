@@ -406,6 +406,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
       }
     }
     if (hsrControl) await hsrControl.close().catch(() => undefined);
+    await deps.listSessions.close?.().catch(() => undefined);
     await deps.mirrorRemoteEvents?.close?.().catch(() => undefined);
     await deps.hsrObservations?.close?.().catch(() => undefined);
     if (lock) {

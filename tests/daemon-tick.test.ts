@@ -15,6 +15,7 @@ import {
 } from "../src/daemon/run.js";
 import type { BeeState, PaneCaptureMap } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
+import { nextRuntimeIncarnationPatch } from "../src/seal.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-daemon-tick-"));
@@ -207,6 +208,32 @@ test("tick: a terminal record without transcript metadata is not rediscovered af
     await tick(deps, new Map());
 
     assert.deepEqual(refreshed, []);
+  });
+});
+
+test("tick: a revived runtime clears the old terminal discovery claim and gets one new terminal pass", async () => {
+  await withTempStore(async () => {
+    const retired = bee({
+      name: "revived-terminal",
+      tmuxTarget: "revived-terminal",
+      status: "archived",
+      terminalTranscriptDiscoveryAt: "2026-06-03T09:58:00.000Z",
+      lastObservedState: "sealed",
+    });
+    const incarnation = await nextRuntimeIncarnationPatch(retired);
+    const diedAgain = { ...retired, ...incarnation, status: "dead" as const };
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records: [diedAgain], liveTargets: new Set(), capture });
+    const refreshed: string[] = [];
+    deps.refreshTranscriptMetadata = async (candidate) => {
+      refreshed.push(candidate.name);
+      return candidate;
+    };
+
+    await tick(deps, new Map());
+
+    assert.deepEqual(refreshed, [diedAgain.name]);
+    assert.ok(capture.touches.some((touch) => typeof touch.fields.terminalTranscriptDiscoveryAt === "string"));
   });
 });
 

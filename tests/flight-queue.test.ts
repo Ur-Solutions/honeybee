@@ -24,6 +24,9 @@ import {
 } from "../src/flight/types.js";
 import type { BeeState } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
+import { saveSession } from "../src/store.js";
+import { nextRuntimeIncarnationPatch, recordSeal, validateSealArtifact } from "../src/seal.js";
+import { latestSealForCurrentIncarnation } from "../src/daemon/flightSweep.js";
 
 const T0 = Date.parse("2026-07-21T10:00:00.000Z");
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -294,6 +297,32 @@ test("queue store: enqueue → claim → finish round-trip on disk with duplicat
     const remaining = await listTasks(id, "pending");
     assert.deepEqual(remaining.map((task) => task.taskId), ["t2"]);
     assert.equal(remaining[0]!.cwd, "/tmp/wt");
+  });
+});
+
+test("default flight seal reader ignores a prior runtime's matching seal after revive", async () => {
+  await withTempStore(async () => {
+    const record = bee("CO.reused-flight-worker");
+    await recordSeal(record.name, validateSealArtifact({
+      status: "done",
+      summary: "old attempt",
+      type: "implementation",
+      taskId: "task-1",
+      attempt: 1,
+    }));
+    const revived = { ...record, ...(await nextRuntimeIncarnationPatch(record)) };
+    await saveSession(revived);
+    assert.equal(await latestSealForCurrentIncarnation(record.name), null);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await recordSeal(record.name, validateSealArtifact({
+      status: "done",
+      summary: "new attempt",
+      type: "implementation",
+      taskId: "task-1",
+      attempt: 1,
+    }));
+    assert.equal((await latestSealForCurrentIncarnation(record.name))?.status, "done");
   });
 });
 

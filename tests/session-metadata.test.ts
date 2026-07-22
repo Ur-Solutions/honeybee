@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { persistSessionTranscriptMetadata, refreshSessionTranscriptMetadata } from "../src/sessionMetadata.js";
-import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { TranscriptFile } from "../src/transcripts.js";
+import { withFileLock } from "../src/lock.js";
 
 async function withTempStore(fn: (root: string) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "hive-session-metadata-"));
@@ -205,6 +206,65 @@ test("concurrent bootstrap refreshes serialize only on the shared transcript ide
 
     assert.equal(owners.length, 1, "one durable identity claim prevents sibling double-adoption");
     assert.equal(owners[0]?.transcriptPath, transcript.path);
+  });
+});
+
+test("a stale durable claim does not block reuse when its owner no longer carries the identity", async () => {
+  await withTempStore(async () => {
+    const original = bee("CL.original", { lastPrompt: "same prompt", lastPromptAt: "2026-07-18T12:00:00.000Z" });
+    const replacement = bee("CL.replacement", { lastPrompt: "same prompt", lastPromptAt: "2026-07-18T12:00:00.000Z" });
+    await saveSession(original);
+    await saveSession(replacement);
+    const transcript: TranscriptFile = {
+      provider: "claude",
+      path: "/tmp/reusable.jsonl",
+      sessionId: "reusable-session",
+      mtimeMs: 1,
+      rows: [],
+      score: 500,
+      matchedBy: ["mtime", "prompt"],
+      title: "Reusable owner",
+    };
+
+    await persistSessionTranscriptMetadata(original, transcript);
+    await updateSession(original.name, { providerSessionId: undefined, transcriptPath: undefined });
+    await persistSessionTranscriptMetadata(replacement, transcript);
+
+    assert.equal((await loadSession(replacement.name))?.providerSessionId, transcript.sessionId);
+  });
+});
+
+test("new identity claims serialize behind the legacy ownership lock during mixed-version rollout", async () => {
+  await withTempStore(async (root) => {
+    const target = bee("CL.transition", { lastPrompt: "transition prompt", lastPromptAt: "2026-07-18T12:00:00.000Z" });
+    await saveSession(target);
+    const transcript: TranscriptFile = {
+      provider: "claude",
+      path: "/tmp/transition.jsonl",
+      sessionId: "transition-session",
+      mtimeMs: 1,
+      rows: [],
+      score: 500,
+      matchedBy: ["mtime", "prompt"],
+    };
+    let release!: () => void;
+    let entered!: () => void;
+    const enteredLock = new Promise<void>((resolve) => { entered = resolve; });
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const legacy = withFileLock(join(root, "sessions", ".transcript-ownership.lock"), async () => {
+      entered();
+      await hold;
+    });
+    await enteredLock;
+
+    let settled = false;
+    const modern = persistSessionTranscriptMetadata(target, transcript).finally(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(settled, false, "modern claim waits for a mixed-version legacy claimant");
+    release();
+    await legacy;
+    await modern;
+    assert.equal((await loadSession(target.name))?.providerSessionId, transcript.sessionId);
   });
 });
 

@@ -42,14 +42,18 @@ export async function persistSessionTranscriptMetadata(
   const anchored = isAnchoredTranscriptMatch(tx, lookup);
   const needsOwnershipClaim = anchored && !record.transcriptPath && !record.providerSessionId;
 
-  // Snapshot legacy ownership before entering the narrow identity lock. The
-  // former GLOBAL lock called listSessions() while held, so one 1,200-record
-  // scan serialized every daemon/CLI transcript refresh behind it. New claims
-  // use a durable lock/file scoped to one provider identity; listSessions is
-  // single-flight, and no registry walk happens in the critical section.
-  const legacyOwner = needsOwnershipClaim ? await findClaimingSibling(record, tx) : null;
+  // TRANSITION LOCK: old Honeybee processes know only this global lock, while
+  // new ones additionally persist per-identity claims. Keep the legacy lock
+  // around the migration read+claim so a still-running old daemon/CLI cannot
+  // double-adopt in the rollout window. The formerly expensive critical
+  // section is now bounded: listSessions is 32-way + single-flight and terminal
+  // records no longer repeat discovery. This lock can be removed only after
+  // unsupported mixed-version processes are no longer allowed.
   const persisted = needsOwnershipClaim
-    ? await claimTranscriptIdentity(record, tx, legacyOwner, options)
+    ? await withFileLock(join(storeRoot(), "sessions", ".transcript-ownership.lock"), async () => {
+        const legacyOwner = await findClaimingSibling(record, tx);
+        return claimTranscriptIdentity(record, tx, legacyOwner, options);
+      })
     : await persistFields(record, tx, options, anchored);
 
   // Only when the title actually changed this call — this path runs on every
@@ -113,7 +117,10 @@ async function claimTranscriptIdentity(
       // A claim whose owner record was deliberately deleted may be reused.
       // Process state is irrelevant: sealed/archived owners retain history.
       const owner = await loadSession(durable.owner);
-      if (owner) return persistFields(record, tx, options, false);
+      // A pre-commit crash can leave a claim file whose owner never acquired
+      // the identity. Do not strand it forever merely because that unrelated
+      // session record still exists.
+      if (owner && ownsTranscriptIdentity(owner, tx)) return persistFields(record, tx, options, false);
     }
 
     if (!durable && legacyOwner && legacyOwner.name !== record.name) {
@@ -129,6 +136,10 @@ async function claimTranscriptIdentity(
     }
     return persistFields(record, tx, options, true);
   });
+}
+
+function ownsTranscriptIdentity(record: SessionRecord, tx: TranscriptFile): boolean {
+  return record.providerSessionId === tx.sessionId || Boolean(record.transcriptPath && samePath(record.transcriptPath, tx.path));
 }
 
 function transcriptIdentity(agent: string, tx: TranscriptFile): string {

@@ -27,7 +27,7 @@ export type ProbeResult = {
 };
 
 export type TickDeps = {
-  listSessions: () => Promise<SessionRecord[]>;
+  listSessions: (() => Promise<SessionRecord[]>) & { close?: () => Promise<void> };
   listNodes: () => Promise<NodeRecord[]>;
   /** Live target enumeration + node reachability — substrate-routable. */
   probeNodes: (nodes: NodeRecord[]) => Promise<ProbeResult>;
@@ -56,7 +56,7 @@ export type TickDeps = {
    * already read a freshly-created mirror meta.
    */
   mirrorRemoteEvents?: ((records: SessionRecord[]) => Promise<void>) & { close?: () => Promise<void> };
-  sealedBeeNames: () => Promise<Set<string>>;
+  sealedBeeNames: (records: readonly SessionRecord[]) => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
   /**
@@ -622,7 +622,7 @@ export async function tick(
       new Map(),
     ));
   const seals: Set<string> = await timeStage("sealedBeeNames", () =>
-    guard(withTimeout(deps.sealedBeeNames(), timeouts.fsMs, "sealedBeeNames"), errors, new Set()));
+    guard(withTimeout(deps.sealedBeeNames(records), timeouts.fsMs, "sealedBeeNames"), errors, new Set()));
   const livePanes: Set<string> = deps.livePanes
     ? await timeStage("livePanes", () =>
         guard(withTimeout(deps.livePanes!(), timeouts.substrateMs, "livePanes"), errors, new Set<string>()))

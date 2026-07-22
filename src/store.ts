@@ -113,6 +113,10 @@ export type SessionRecord = {
    * forever on every daemon tick/restart.
    */
   terminalTranscriptDiscoveryAt?: string;
+  /** Latest seal filename predating the current runtime incarnation. */
+  sealHighWaterFilename?: string;
+  /** Monotonic relaunch counter; initial spawn is generation zero. */
+  runtimeGeneration?: number;
   title?: string;
   /** Who set `title`: user beats auto beats provider (see naming.ts). */
   titleSource?: "user" | "auto" | "provider";
@@ -461,7 +465,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
@@ -473,6 +477,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "poolMember",
   "titleSource",
   "autoTitleAttempts",
+  "runtimeGeneration",
   "buzAccept",
   "tags",
   "contract",
@@ -531,6 +536,9 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
 
   if (typeof object.autoTitleAttempts === "number" && Number.isFinite(object.autoTitleAttempts)) {
     record.autoTitleAttempts = object.autoTitleAttempts;
+  }
+  if (typeof object.runtimeGeneration === "number" && Number.isSafeInteger(object.runtimeGeneration) && object.runtimeGeneration >= 0) {
+    record.runtimeGeneration = object.runtimeGeneration;
   }
   if (typeof object.launcherPgid === "number" && Number.isSafeInteger(object.launcherPgid) && object.launcherPgid > 0) {
     record.launcherPgid = object.launcherPgid;

@@ -19,24 +19,27 @@ import { appendLedger, loadSession, type SessionRecord } from "../store.js";
 
 export type FlightSweeper = (records: SessionRecord[], observed: Map<string, BeeState>) => Promise<FlightSweepOutcome[]>;
 
+export async function latestSealForCurrentIncarnation(beeName: string): Promise<SlotSealObservation | null> {
+  const record = await loadSession(beeName);
+  const scan = await scanLatestSeal(beeName, { afterFilename: record?.sealHighWaterFilename });
+  if (!scan.seal || !scan.filename) return null;
+  return {
+    filename: scan.filename,
+    sealedAt: scan.seal.sealedAt,
+    status: scan.seal.status,
+    ...(scan.seal.type !== undefined ? { type: scan.seal.type } : {}),
+    ...(scan.seal.taskId !== undefined ? { taskId: scan.seal.taskId } : {}),
+    ...(scan.seal.attempt !== undefined ? { attempt: scan.seal.attempt } : {}),
+  };
+}
+
 export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): FlightSweeper {
   const deps: FlightSweepDeps = {
     listFlights,
     listSlots,
     saveSlot,
     saveFlight,
-    latestSeal: async (beeName): Promise<SlotSealObservation | null> => {
-      const scan = await scanLatestSeal(beeName);
-      if (!scan.seal || !scan.filename) return null;
-      return {
-        filename: scan.filename,
-        sealedAt: scan.seal.sealedAt,
-        status: scan.seal.status,
-        ...(scan.seal.type !== undefined ? { type: scan.seal.type } : {}),
-        ...(scan.seal.taskId !== undefined ? { taskId: scan.seal.taskId } : {}),
-        ...(scan.seal.attempt !== undefined ? { attempt: scan.seal.attempt } : {}),
-      };
-    },
+    latestSeal: latestSealForCurrentIncarnation,
     spawnSlot: async (flight, slot, mix, task) => {
       const account = mix.account ? await resolveAccountFlag(mix.account, mix.agent, undefined) : undefined;
       // A queue task's packet overrides the flight defaults: its brief IS the

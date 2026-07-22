@@ -3,7 +3,8 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { copyBeeSeals, listSeals, loadLatestSeal, recordSeal, scanLatestSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
+import { copyBeeSeals, listSeals, loadLatestSeal, nextRuntimeIncarnationPatch, recordSeal, scanLatestSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
+import type { SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-seal-"));
@@ -204,6 +205,38 @@ test("sealedBeeNames returns every bee with at least one seal", async () => {
     await recordSeal("CL.bbb", validateSealArtifact({ status: "blocked", summary: "b" }));
     const names = await sealedBeeNames();
     assert.deepEqual([...names].sort(), ["CL.bbb", "CO.aaa"]);
+  });
+});
+
+test("seal high-water hides historical seals across revive and exposes the next generation's seal", async () => {
+  await withTempStore(async () => {
+    const record: SessionRecord = {
+      name: "CO.revived",
+      agent: "codex",
+      cwd: "/tmp",
+      command: "codex",
+      tmuxTarget: "CO.revived",
+      createdAt: "2026-07-22T00:00:00.000Z",
+      updatedAt: "2026-07-22T00:00:00.000Z",
+      status: "archived",
+      lastObservedState: "sealed",
+      lastObservedStateAt: "2026-07-22T00:01:00.000Z",
+      terminalTranscriptDiscoveryAt: "2026-07-22T00:01:00.000Z",
+    };
+    await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "generation zero" }));
+    assert.equal((await sealedBeeNames([record])).has(record.name), true);
+
+    const patch = await nextRuntimeIncarnationPatch(record);
+    const revived = { ...record, ...patch, status: "running" as const };
+    assert.equal(revived.runtimeGeneration, 1);
+    assert.equal(revived.lastObservedState, undefined);
+    assert.equal(revived.lastObservedStateAt, undefined);
+    assert.equal(revived.terminalTranscriptDiscoveryAt, undefined);
+    assert.equal((await sealedBeeNames([revived])).has(record.name), false, "old seal is below the new incarnation high-water");
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "generation one" }));
+    assert.equal((await sealedBeeNames([revived])).has(record.name), true, "new seal is above the high-water");
   });
 });
 

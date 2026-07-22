@@ -41,6 +41,12 @@ export async function cmdDaemon(parsed: Parsed) {
       const { runHsrObserveWorker } = await import("../daemon/observerProcess.js");
       return runHsrObserveWorker();
     }
+    // Internal: cancellable session-registry snapshot worker. Kept separate
+    // from the daemon so a never-settling fs call dies on its request timeout.
+    case "session-list-worker": {
+      const { runSessionListWorker } = await import("../daemon/sessionListProcess.js");
+      return runSessionListWorker();
+    }
     default:
       throw new Error(
         `Unknown daemon subcommand: ${sub}\nUsage: hive daemon <install|uninstall|start|stop|restart|status|logs|run>`,
