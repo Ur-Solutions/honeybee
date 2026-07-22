@@ -350,6 +350,7 @@ function normalizeSlot(value: unknown): SlotRecord | null {
     evidence: {
       ...(typeof evidenceRaw.firstEvidenceAt === "string" ? { firstEvidenceAt: evidenceRaw.firstEvidenceAt } : {}),
       ...(typeof evidenceRaw.lastActivityAt === "string" ? { lastActivityAt: evidenceRaw.lastActivityAt } : {}),
+      ...(typeof evidenceRaw.lastActivityFingerprint === "string" ? { lastActivityFingerprint: evidenceRaw.lastActivityFingerprint } : {}),
       ...(typeof evidenceRaw.sealFilename === "string" ? { sealFilename: evidenceRaw.sealFilename } : {}),
     },
     ...(typeof object.idempotencyKey === "string" ? { idempotencyKey: object.idempotencyKey } : {}),

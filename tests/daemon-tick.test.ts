@@ -15,6 +15,7 @@ import {
 } from "../src/daemon/run.js";
 import type { BeeState, PaneCaptureMap } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
+import type { NodeRecord } from "../src/node.js";
 import { nextRuntimeIncarnationPatch } from "../src/seal.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -56,6 +57,7 @@ function buildDeps(args: {
   panes?: PaneCaptureMap;
   seals?: Set<string>;
   unreachableNodes?: Set<string>;
+  nodes?: NodeRecord[];
   now?: number;
   capture: Capture;
   failTouchFor?: Set<string>;
@@ -70,7 +72,7 @@ function buildDeps(args: {
   const nowFixed = args.now ?? Date.parse("2026-06-03T10:00:00.000Z");
   return {
     listSessions: async () => args.records,
-    listNodes: async () => [],
+    listNodes: async () => args.nodes ?? [],
     probeNodes: async () => probe,
     capturePanes: async () => panes,
     sealedBeeNames: async () => seals,
@@ -366,6 +368,56 @@ test("tick: failed HSR observation holds trusted state and never persists a cras
     assert.equal(result.transitions.some((transition) => transition.name === activeHsr.name || transition.name === idleHsr.name), false);
     assert.deepEqual(capture.touches.map((touch) => touch.name), [tmux.name], "unrelated tmux state still persists");
     assert.equal(capture.touches.some((touch) => touch.fields.lastObservedState === "crashed"), false);
+  });
+});
+
+test("tick: passes HSR, remote-HSR, and tmux-pane activity signals to flight sweeps", async () => {
+  await withTempStore(async () => {
+    const NOW = Date.parse("2026-06-03T10:00:00.000Z");
+    const localHsr = bee({ name: "local-hsr", tmuxTarget: "local-hsr", substrate: "hsr" });
+    const remoteHsr = bee({ name: "remote-hsr", tmuxTarget: "remote-hsr", node: "runner01" });
+    const tmuxBee = bee({ name: "tmux-bee", tmuxTarget: "hive:tmux-bee", lastPromptAt: new Date(NOW - 1_000).toISOString() });
+    const capture: Capture = { ledger: [], touches: [] };
+    const remoteNode: NodeRecord = {
+      name: "runner01",
+      kind: "remote-hsr",
+      endpoint: "me@runner01",
+      capabilities: ["*"],
+      status: "unknown",
+      createdAt: "2026-06-03T09:00:00.000Z",
+      updatedAt: "2026-06-03T09:00:00.000Z",
+    };
+    const deps = buildDeps({
+      records: [localHsr, remoteHsr, tmuxBee],
+      nodes: [remoteNode],
+      liveTargets: new Set([tmuxBee.tmuxTarget]),
+      panes: new Map([[tmuxBee.tmuxTarget, "Working... esc to interrupt\nstep 1"]]),
+      now: NOW,
+      capture,
+    });
+    deps.hsrObservations = async (beeNames) => {
+      assert.deepEqual(beeNames, [localHsr.name, remoteHsr.name]);
+      return new Map([
+        [localHsr.name, { live: true, state: "active" as BeeState, snapshot: "", activity: { at: NOW - 2_000, fingerprint: "hsr-local-fp", eventType: "text" } }],
+        [remoteHsr.name, { live: true, state: "active" as BeeState, snapshot: "", mirrorOf: "runner01", activity: { at: NOW - 1_000, fingerprint: "hsr-remote-fp", eventType: "tool_use" } }],
+      ]);
+    };
+    let seenActivity: ReadonlyMap<string, { at: string; fingerprint?: string }> | undefined;
+    deps.sweepFlights = async (_records, _observed, activity) => {
+      seenActivity = activity;
+      return [];
+    };
+
+    const result = await tick(deps, new Map());
+    const { logTickResult } = await import("../src/daemon/tick.js");
+
+    assert.equal(seenActivity?.get(localHsr.name)?.at, new Date(NOW - 2_000).toISOString());
+    assert.equal(seenActivity?.get(localHsr.name)?.fingerprint, "hsr-local-fp");
+    assert.equal(seenActivity?.get(remoteHsr.name)?.at, new Date(NOW - 1_000).toISOString());
+    assert.equal(seenActivity?.get(remoteHsr.name)?.fingerprint, "hsr-remote-fp");
+    assert.equal(seenActivity?.get(tmuxBee.name)?.at, new Date(NOW).toISOString());
+    assert.match(seenActivity?.get(tmuxBee.name)?.fingerprint ?? "", /^pane:tmux-bee:/);
+    assert.equal(logTickResult(result).some((entry) => entry.msg === "flight.transition"), false);
   });
 });
 

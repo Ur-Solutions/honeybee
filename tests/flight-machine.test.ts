@@ -95,6 +95,43 @@ test("idle-without-seal is NEVER done: within stall budget it stays working", ()
   assert.equal(plan.slot.state, "working");
 });
 
+test("unchanged active observations do not rewrite activity evidence", () => {
+  const current = slot({ evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0 + 1_000), lastActivityFingerprint: "fp-1" } });
+  const plan = planSlot(
+    flight(),
+    current,
+    { ...RUNNING, beeState: "active", beeActivityAt: iso(T0 + 2_000), beeActivityFingerprint: "fp-1", seal: null },
+    T0 + 2_000,
+  );
+
+  assert.equal(plan.changed, false);
+  assert.equal(plan.events.length, 0);
+  assert.equal(plan.slot.evidence.lastActivityAt, iso(T0 + 1_000));
+});
+
+test("newer active event evidence refreshes activity and records same-ms fingerprints", () => {
+  const current = slot({ evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0 + 1_000), lastActivityFingerprint: "fp-1" } });
+  const newer = planSlot(
+    flight(),
+    current,
+    { ...RUNNING, beeState: "active", beeActivityAt: iso(T0 + 2_000), beeActivityFingerprint: "fp-2", seal: null },
+    T0 + 3_000,
+  );
+  assert.equal(newer.changed, true);
+  assert.equal(newer.slot.evidence.lastActivityAt, iso(T0 + 2_000));
+  assert.equal(newer.slot.evidence.lastActivityFingerprint, "fp-2");
+
+  const sameTimestampNewEvent = planSlot(
+    flight(),
+    newer.slot,
+    { ...RUNNING, beeState: "active", beeActivityAt: iso(T0 + 2_000), beeActivityFingerprint: "fp-3", seal: null },
+    T0 + 4_000,
+  );
+  assert.equal(sameTimestampNewEvent.changed, true);
+  assert.equal(sameTimestampNewEvent.slot.evidence.lastActivityAt, iso(T0 + 2_000));
+  assert.equal(sameTimestampNewEvent.slot.evidence.lastActivityFingerprint, "fp-3");
+});
+
 test("idle-without-seal past the stall deadline → stalled + delivery-confirmed nudge → escalated after unanswered nudge", () => {
   const f = flight();
   const start = slot();
@@ -128,9 +165,44 @@ test("idle-without-seal past the stall deadline → stalled + delivery-confirmed
 test("activity resets the stall clock and recovers a stalled slot to working", () => {
   const f = flight();
   const stalled = planSlot(f, slot(), { ...RUNNING, beeState: "idle_with_output", seal: null }, T0 + f.contract.stallMs + 1_000).slot;
-  const recovered = planSlot(f, stalled, { ...RUNNING, beeState: "active", seal: null }, T0 + f.contract.stallMs + 60_000);
+  const recovered = planSlot(
+    f,
+    stalled,
+    { ...RUNNING, beeState: "active", beeActivityAt: iso(T0 + f.contract.stallMs + 30_000), beeActivityFingerprint: "new-work", seal: null },
+    T0 + f.contract.stallMs + 60_000,
+  );
   assert.equal(recovered.slot.state, "working");
   assert.equal(recovered.slot.nudgedAt, undefined);
+});
+
+test("active-but-silent slots still stall and nudge when activity does not advance", () => {
+  const f = flight();
+  const current = slot({ evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0), lastActivityFingerprint: "fp-1" } });
+  const plan = planSlot(
+    f,
+    current,
+    { ...RUNNING, beeState: "active", beeActivityAt: iso(T0), beeActivityFingerprint: "fp-1", seal: null },
+    T0 + f.contract.stallMs + 1_000,
+  );
+
+  assert.equal(plan.slot.state, "stalled");
+  assert.equal(plan.wantsNudge, true);
+  assert.equal(plan.slot.evidence.lastActivityAt, iso(T0));
+});
+
+test("active observations without an activity signal do not refresh established evidence", () => {
+  const f = flight();
+  const current = slot({ evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0) } });
+  const plan = planSlot(
+    f,
+    current,
+    { ...RUNNING, beeState: "active", seal: null },
+    T0 + f.contract.stallMs + 1_000,
+  );
+
+  assert.equal(plan.slot.state, "stalled");
+  assert.equal(plan.wantsNudge, true);
+  assert.equal(plan.slot.evidence.lastActivityAt, iso(T0));
 });
 
 test("booting past the readiness deadline → wedged → vacancy with the attempt burned", () => {

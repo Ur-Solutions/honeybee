@@ -124,7 +124,7 @@ function authExpiredObs(ts: number): HsrObservation {
   return {
     live: true,
     snapshot: "",
-    eventSnapshot: { events, tailEvents: events, usage: { totals: null }, pendingNeedsInput: null },
+    eventSnapshot: { events, tailEvents: events, activity: { at: ts, fingerprint: `auth-expired-${ts}`, eventType: "auth_expired" }, usage: { totals: null }, pendingNeedsInput: null },
   };
 }
 

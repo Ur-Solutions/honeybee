@@ -16,6 +16,7 @@
  * Node builtins only.
  */
 
+import { createHash } from "node:crypto";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import type { BeeState } from "../state.js";
 import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
@@ -183,6 +184,8 @@ export type HsrObservation = {
   live: boolean;
   state?: BeeState;
   snapshot: string;
+  /** Latest genuine runner-event progress observed in events.jsonl. */
+  activity?: HsrActivityObservation;
   /**
    * Set to the remote node name when this bee is a LOCAL MIRROR of a remote-hsr
    * bee (APIA-94). The daemon uses it to route the (node-carrying, non-`hsr`)
@@ -200,8 +203,17 @@ export type HsrObservation = {
 export type HsrEventSnapshot = {
   events: RunnerEvent[];
   tailEvents: RunnerEvent[];
+  activity: HsrActivityObservation | null;
   usage: HsrUsageObservation;
   pendingNeedsInput: PendingNeedsInput | null;
+};
+
+export type HsrActivityObservation = {
+  /** Runner event timestamp (epoch ms). */
+  at: number;
+  /** Compact identity of the activity event, stable across unchanged sweeps. */
+  fingerprint: string;
+  eventType: RunnerEvent["type"];
 };
 
 export type HsrObservationOptions = {
@@ -325,6 +337,59 @@ export function structuredStateFromEvents(
   return "booting";
 }
 
+function eventText(event: RunnerEvent): string | undefined {
+  return "text" in event && typeof event.text === "string" ? event.text : undefined;
+}
+
+function isActivityEvent(event: RunnerEvent, rootThreadId: string | undefined): boolean {
+  switch (event.type) {
+    case "turn_start":
+    case "turn_end":
+      return lifecycleAppliesToRoot(event, rootThreadId);
+    case "text":
+    case "thought":
+    case "reasoning":
+      return (eventText(event)?.length ?? 0) > 0;
+    case "tool_use":
+    case "tool_update":
+    case "usage":
+    case "exhausted":
+    case "auth_expired":
+    case "auth_resume":
+    case "needs_input":
+    case "error":
+      return true;
+    case "exit":
+      return false;
+    default:
+      return false;
+  }
+}
+
+function activityFingerprint(event: RunnerEvent, index: number): string {
+  const digest = createHash("sha256").update(JSON.stringify(event)).digest("hex").slice(0, 16);
+  return `${index}:${event.type}:${event.ts}:${digest}`;
+}
+
+export function hsrActivityFromEvents(
+  events: RunnerEvent[],
+  options: HsrEventDerivationOptions = {},
+): HsrActivityObservation | null {
+  const rootThreadId = options.rootThreadId;
+  let latest: { event: RunnerEvent; index: number } | null = null;
+  for (let i = 0; i < events.length; i += 1) {
+    const event = events[i]!;
+    if (!Number.isFinite(event.ts) || !isActivityEvent(event, rootThreadId)) continue;
+    latest = { event, index: i };
+  }
+  if (!latest) return null;
+  return {
+    at: latest.event.ts,
+    fingerprint: activityFingerprint(latest.event, latest.index),
+    eventType: latest.event.type,
+  };
+}
+
 export function isAuthNeededMessage(message: string): boolean {
   const m = message.toLowerCase();
   if (m.includes("not logged in") && m.includes("/login")) return true;
@@ -371,6 +436,7 @@ async function readEventSnapshot(bee: string, rootThreadId?: string): Promise<Hs
   return {
     events,
     tailEvents: events,
+    activity: hsrActivityFromEvents(events, { rootThreadId }),
     usage: hsrUsageObservationFromEvents(events),
     pendingNeedsInput: pendingNeedsInputFromEvents(events, { rootThreadId }),
   };
@@ -419,6 +485,7 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
           live: true,
           snapshot,
           state,
+          ...(eventSnapshot.activity ? { activity: eventSnapshot.activity } : {}),
           ...(mirrorOf ? { mirrorOf } : {}),
           eventSnapshot,
         }] as const;
@@ -431,10 +498,12 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
       const state = meta.status === "queued"
         ? meta.startupPhase === "harness" ? "booting" : "queued"
         : structuredStateFromEvents(events, { rootThreadId });
+      const activity = hsrActivityFromEvents(events, { rootThreadId });
       return [bee, {
         live,
         snapshot,
         state,
+        ...(activity ? { activity } : {}),
         ...(mirrorOf ? { mirrorOf } : {}),
       }] as const;
     } catch {

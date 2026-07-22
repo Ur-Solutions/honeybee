@@ -137,8 +137,10 @@ export type SlotRecord = {
   evidence: {
     /** First observed activity (an in-flight turn) for the CURRENT attempt. */
     firstEvidenceAt?: string;
-    /** Last observed activity/state change for the current attempt. */
+    /** Last genuine activity event for the current attempt. */
     lastActivityAt?: string;
+    /** Fingerprint of the last activity event; disambiguates same-ms progress. */
+    lastActivityFingerprint?: string;
     /** Seal filename that satisfied (or mismatched) the contract. */
     sealFilename?: string;
   };

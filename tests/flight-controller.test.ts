@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { sweepFlights, type FlightSweepDeps } from "../src/flight/controller.js";
+import { paneActivitySignal, sweepFlights, type FlightSweepDeps } from "../src/flight/controller.js";
 import {
   FLIGHT_CONTRACT_DEFAULTS,
   FLIGHT_REPLACEMENT_DEFAULTS,
@@ -55,6 +55,7 @@ type Harness = {
   slots: Map<string, SlotRecord>;
   flights: Map<string, FlightRecord>;
   ledger: Array<Record<string, unknown>>;
+  saved: SlotRecord[];
   spawned: string[];
   nudged: string[];
   seals: Map<string, SlotSealObservation>;
@@ -65,6 +66,7 @@ function harness(flightRecord: FlightRecord, initialSlots: SlotRecord[], nowMs: 
   const slots = new Map(initialSlots.map((slot) => [slot.slotId, slot]));
   const flights = new Map([[flightRecord.id, flightRecord]]);
   const ledger: Array<Record<string, unknown>> = [];
+  const saved: SlotRecord[] = [];
   const spawned: string[] = [];
   const nudged: string[] = [];
   const seals = new Map<string, SlotSealObservation>();
@@ -72,6 +74,7 @@ function harness(flightRecord: FlightRecord, initialSlots: SlotRecord[], nowMs: 
     slots,
     flights,
     ledger,
+    saved,
     spawned,
     nudged,
     seals,
@@ -84,6 +87,7 @@ function harness(flightRecord: FlightRecord, initialSlots: SlotRecord[], nowMs: 
       listFlights: async () => [...flights.values()],
       listSlots: async () => [...slots.values()].sort((a, b) => a.slotId.localeCompare(b.slotId, undefined, { numeric: true })),
       saveSlot: async (slot) => {
+        saved.push(slot);
         slots.set(slot.slotId, slot);
       },
       saveFlight: async (f) => {
@@ -223,6 +227,92 @@ test("stalled slots get exactly one deterministic nudge", async () => {
   // Second sweep shortly after: no repeat nudge.
   await sweepFlights(h.deps, [bee(name)], new Map([[name, "idle_with_output" as BeeState]]));
   assert.equal(h.nudged.length, 1);
+});
+
+test("active slots with unchanged activity do not save or emit working-to-working outcomes", async () => {
+  const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+  const name = slotBeeName(f.id, "s1", 0, 1);
+  const working: SlotRecord = {
+    ...vacantSlot("s1"),
+    attempt: 1,
+    state: "working",
+    beeName: name,
+    attemptStartedAt: iso(T0),
+    evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0 + 1_000), lastActivityFingerprint: "fp-1" },
+  };
+  const h = harness(f, [working], T0 + 5_000);
+  const outcomes = await sweepFlights(
+    h.deps,
+    [bee(name)],
+    new Map([[name, "active" as BeeState]]),
+    new Map([[name, { at: iso(T0 + 5_000), fingerprint: "fp-1" }]]),
+  );
+
+  assert.equal(h.saved.length, 0);
+  assert.deepEqual(outcomes, []);
+});
+
+test("newer active activity saves evidence without a no-op transition outcome", async () => {
+  const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+  const name = slotBeeName(f.id, "s1", 0, 1);
+  const working: SlotRecord = {
+    ...vacantSlot("s1"),
+    attempt: 1,
+    state: "working",
+    beeName: name,
+    attemptStartedAt: iso(T0),
+    evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0), lastActivityFingerprint: "fp-1" },
+  };
+  const h = harness(f, [working], T0 + 5_000);
+  const outcomes = await sweepFlights(
+    h.deps,
+    [bee(name)],
+    new Map([[name, "active" as BeeState]]),
+    new Map([[name, { at: iso(T0 + 2_000), fingerprint: "fp-2" }]]),
+  );
+
+  assert.equal(h.saved.length, 1);
+  assert.equal(h.slots.get("s1")!.evidence.lastActivityAt, iso(T0 + 2_000));
+  assert.equal(h.slots.get("s1")!.evidence.lastActivityFingerprint, "fp-2");
+  assert.equal(outcomes.some((o) => o.action === "transition" && o.detail === "working→working"), false);
+});
+
+test("shared activity timestamps across two slots persist once, then stop churning", async () => {
+  const f = flight({ target: { slots: 2, mix: [{ key: "fable", agent: "claude", count: 2 }] } });
+  const names = ["s1", "s2"].map((slotId) => slotBeeName(f.id, slotId, 0, 1));
+  const slots = (["s1", "s2"] as const).map((slotId, index): SlotRecord => ({
+    ...vacantSlot(slotId),
+    attempt: 1,
+    state: "working",
+    beeName: names[index]!,
+    attemptStartedAt: iso(T0),
+    evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0), lastActivityFingerprint: `old-${slotId}` },
+  }));
+  const h = harness(f, slots, T0 + 60_000);
+  const observed = new Map<string, BeeState>(names.map((name) => [name, "active" as BeeState]));
+  const activity = new Map(names.map((name, index) => [name, { at: iso(T0 + 10_000), fingerprint: `same-ts-${index}` }]));
+
+  const first = await sweepFlights(h.deps, names.map((name) => bee(name)), observed, activity);
+  assert.equal(h.saved.length, 2);
+  assert.equal(h.slots.get("s1")!.evidence.lastActivityAt, iso(T0 + 10_000));
+  assert.equal(h.slots.get("s2")!.evidence.lastActivityAt, iso(T0 + 10_000));
+  assert.equal(first.some((o) => o.detail === "working→working"), false);
+
+  h.saved.length = 0;
+  const second = await sweepFlights(h.deps, names.map((name) => bee(name)), observed, activity);
+  assert.equal(h.saved.length, 0);
+  assert.deepEqual(second, []);
+});
+
+test("pane fallback fingerprints are stable for unchanged tmux output and change with new output", () => {
+  const record = bee("legacy-tmux");
+  const first = paneActivitySignal(record, "working\nstep 1", T0);
+  const unchanged = paneActivitySignal(record, "working\nstep 1", T0 + 60_000);
+  const changed = paneActivitySignal(record, "working\nstep 2", T0 + 60_000);
+
+  assert.equal(first.fingerprint, unchanged.fingerprint);
+  assert.notEqual(first.at, unchanged.at);
+  assert.notEqual(first.fingerprint, changed.fingerprint);
 });
 
 test("closed flights are left alone entirely", async () => {

@@ -11,13 +11,17 @@ import { deliverPromptText } from "../cli/shared.js";
 import { resolveAccountFlag } from "../commands/spawn.js";
 import { transactionalRetire } from "../kill.js";
 import { withFileLock } from "../lock.js";
-import { sweepFlights, stallNudgeText, type FlightSweepDeps, type FlightSweepOutcome } from "../flight/controller.js";
+import { sweepFlights, stallNudgeText, type BeeActivitySignal, type FlightSweepDeps, type FlightSweepOutcome } from "../flight/controller.js";
 import { claimNextTask, finishTask, flightDir, leasedTaskForSlot, listFlights, listSlots, saveFlight, saveSlot, taskCounts } from "../flight/store.js";
 import { slotBeeName, slotContractTaskId, type SlotSealObservation } from "../flight/types.js";
 import type { BeeState } from "../state.js";
 import { appendLedger, loadSession, type SessionRecord } from "../store.js";
 
-export type FlightSweeper = (records: SessionRecord[], observed: Map<string, BeeState>) => Promise<FlightSweepOutcome[]>;
+export type FlightSweeper = (
+  records: SessionRecord[],
+  observed: Map<string, BeeState>,
+  activity?: ReadonlyMap<string, BeeActivitySignal>,
+) => Promise<FlightSweepOutcome[]>;
 
 export async function latestSealForCurrentIncarnation(beeName: string): Promise<SlotSealObservation | null> {
   const record = await loadSession(beeName);
@@ -136,7 +140,7 @@ export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): F
   let inFlight = false;
   let startedAtMs = 0;
   let pendingOutcomes: FlightSweepOutcome[] = [];
-  return async (records, observed) => {
+  return async (records, observed, activity) => {
     // Surface what the last completed sweep did (once).
     const report = pendingOutcomes;
     pendingOutcomes = [];
@@ -147,7 +151,7 @@ export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): F
     }
     inFlight = true;
     startedAtMs = Date.now();
-    void sweepFlights(deps, records, observed)
+    void sweepFlights(deps, records, observed, activity)
       .then((outcomes) => {
         pendingOutcomes = outcomes;
       })

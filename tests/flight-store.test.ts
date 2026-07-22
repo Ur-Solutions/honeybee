@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { parseMixFlag } from "../src/commands/flight.js";
+import { cmdFlight, parseMixFlag } from "../src/commands/flight.js";
+import { parse } from "../src/parse.js";
+import { ledgerPath } from "../src/store.js";
 import {
   allocateFlightId,
   deleteFlight,
@@ -104,4 +106,31 @@ test("parseMixFlag: key=agent[/model][@account]:count forms", () => {
   assert.throws(() => parseMixFlag("fable=claude"), /--mix expects/);
   assert.throws(() => parseMixFlag("fable:5"), /--mix expects/);
   assert.throws(() => parseMixFlag("fable=claude:0"), /--mix expects|positive integer/);
+});
+
+test("flight status API drains and closes monotonically without a flight.active path", async () => {
+  await withTempStore(async () => {
+    const id = allocateFlightId();
+    await saveFlight(flight(id));
+    const logs: unknown[][] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(args);
+    };
+    try {
+      await cmdFlight(parse(["flight", "drain", id]));
+      assert.equal((await loadFlight(id))?.status, "draining");
+      await cmdFlight(parse(["flight", "close", id]));
+      assert.equal((await loadFlight(id))?.status, "closed");
+      await assert.rejects(() => cmdFlight(parse(["flight", "drain", id])), /closed flights cannot transition to draining/);
+    } finally {
+      console.log = originalLog;
+    }
+
+    const ledger = await readFile(ledgerPath(), "utf8");
+    assert.match(ledger, /"type":"flight\.draining"/);
+    assert.match(ledger, /"type":"flight\.closed"/);
+    assert.doesNotMatch(ledger, /"type":"flight\.active"/);
+    assert.ok(logs.length >= 2);
+  });
 });

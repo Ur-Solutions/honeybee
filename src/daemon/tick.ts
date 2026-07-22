@@ -11,7 +11,7 @@ import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./node
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
 import type { FlightSweeper } from "./flightSweep.js";
-import type { FlightSweepOutcome } from "../flight/controller.js";
+import { paneActivitySignal, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
 import type { UsageSampler, UsageTickOutcome } from "./usageSampler.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { LogInput } from "./log.js";
@@ -232,6 +232,7 @@ export type DispatchContext = {
   probe: ProbeResult;
   panes: PaneCaptureMap;
   hsrObs: Map<string, HsrObservation>;
+  activitySignals: Map<string, BeeActivitySignal>;
   transitions: TickTransition[];
   /** This tick's freshly derived state per bee (authoritative current state). */
   observed: Map<string, BeeState>;
@@ -365,8 +366,8 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
     name: "sweepFlights",
     timeoutKey: "dispatchMs",
     // NEVER against an untrusted snapshot: absence must not read as death.
-    run: ({ deps, records, observed, sessionsSnapshotTrusted }) =>
-      sessionsSnapshotTrusted ? deps.sweepFlights?.(records, observed) : undefined,
+    run: ({ deps, records, observed, activitySignals, sessionsSnapshotTrusted }) =>
+      sessionsSnapshotTrusted ? deps.sweepFlights?.(records, observed, activitySignals) : undefined,
     log: (outcome) => ({
       level: outcome.action === "error" ? "warn" : "info",
       msg: `flight.${outcome.action}`,
@@ -672,15 +673,26 @@ export async function tick(
   const hsrLive = new Set<string>();
   const hsrStates = new Map<string, BeeState>();
   const hsrSnapshots = new Map<string, string>();
+  const activitySignals = new Map<string, BeeActivitySignal>();
   const hsrMirrors = new Set<string>();
   for (const [bee, observation] of hsrObs) {
     if (observation.live) hsrLive.add(bee);
     if (observation.state) hsrStates.set(bee, observation.state);
     hsrSnapshots.set(bee, observation.snapshot);
+    if (observation.activity) {
+      activitySignals.set(bee, { at: new Date(observation.activity.at).toISOString(), fingerprint: observation.activity.fingerprint });
+    }
     if (observation.mirrorOf) hsrMirrors.add(bee);
   }
-
   const nowMs = deps.now();
+  for (const record of records) {
+    if (activitySignals.has(record.name)) continue;
+    const paneKey = record.agentPaneId ?? record.tmuxTarget;
+    if (!panes.has(paneKey)) continue;
+    const pane = panes.get(paneKey);
+    if (!pane) continue;
+    activitySignals.set(record.name, paneActivitySignal(record, pane, nowMs));
+  }
   const context: StateContext = {
     liveTargets: probe.liveTargets,
     livePanes,
@@ -828,6 +840,7 @@ export async function tick(
     probe,
     panes,
     hsrObs,
+    activitySignals,
     transitions,
     observed,
     firstTick: options.firstTick === true,

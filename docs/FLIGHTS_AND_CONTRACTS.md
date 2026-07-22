@@ -126,12 +126,28 @@ underpopulation goal from the original parity incident. Mechanics:
   "unanswered"). Attempt exhaustion → `abandoned` + `flight.mix.violation`
   (never silent substitution). Escalated slots are resolved by the operator
   via `hive flight resolve` — the controller never judges.
+- Activity: controller-spawned flight workers run on HSR, so slot freshness is
+  driven by `events.jsonl` progress (`turn_start`, text/thought/reasoning,
+  tool events, usage, needs-input/error/auth boundaries, and `turn_end`), not
+  by re-observing `beeState=active` on each sweep. The daemon also carries a
+  stable fingerprint for the latest activity event, so unchanged tails are
+  no-ops and same-timestamp new events still advance evidence. Adopted or
+  legacy non-HSR slot bees are outside that spawn invariant; when their
+  terminal/snapshot surface can be captured, Honeybee uses a content
+  fingerprint fallback: visible output changes refresh activity; unchanged
+  active output remains eligible for stall handling.
 - Capacity reconciliation: missing/corrupt slot files are re-created as
   vacant each sweep; completion requires the FULL declared slot set
   (`target.slots`) terminal. Under `draining`, vacancies count as terminal so
   a drained flight can complete.
 - `node_unreachable` holds every clock (mirror staleness must not fire stall
   deadlines).
+- Flight status transitions are API-owned: `hive flight drain` moves
+  active → draining, `hive flight close` moves active/draining → closed, and
+  closed flights do not reopen through the status API. There is intentionally
+  no `flight.active` ledger event or broad reopen behavior in v1.1; raw edits
+  to `flights/<id>/flight.json` are outside the state API, are not ledgered,
+  and are only repair/debug surgery.
 - Daemon: the reconciler runs as a tick dispatcher stage (`sweepFlights`),
   consuming the tick's already-derived records/states.
 

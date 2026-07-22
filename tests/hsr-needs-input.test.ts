@@ -192,6 +192,7 @@ test("needs-input dispatcher consumes the per-tick event snapshot when provided"
       eventSnapshot: {
         events: [],
         tailEvents: [],
+        activity: null,
         usage: { totals: null },
         pendingNeedsInput: {
           requestId: "snap-1",
