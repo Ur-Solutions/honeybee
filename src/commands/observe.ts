@@ -17,7 +17,7 @@ import { liveBeesFromSessions, poolsForProject, poolStatus, projectRepresentativ
 import { listProRepoEntries, resolveProSlotForCwd, type ProRepoEntry, type ProSlotKind } from "../proProjects.js";
 import { repoTagFor } from "../repoTag.js";
 import { hsrRunDir } from "../hsr/runDir.js";
-import { listSeals, loadLatestSeal, sealsRoot } from "../seal.js";
+import { loadLatestSeal, sealsRoot } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "../sessionMetadata.js";
 import { deriveState, formatStateCell, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
@@ -27,7 +27,7 @@ import { effectiveTags, normalizeTagArg } from "../tags.js";
 import { appendedPaneText, parseTailOptions } from "../tail.js";
 import { formatShellCommand } from "../tmux.js";
 import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "../transcripts.js";
-import { waitForIdle } from "../wait.js";
+import { waitForIdle, waitForSeal, waitHelpText } from "../wait.js";
 import { resolve } from "node:path";
 import { arrayFlag, assertLocalFleetReadable, buildStateContext, currentTmuxSession, ensureLive, formatHiveStateCell, liveTargetsAcrossNodes, resolveBeeInCurrentPane, resolveSession, sleep, stringFlag, transcriptBanner } from "../cli/shared.js";
 import { openBeePreviewPopup } from "../commands/clean.js";
@@ -488,15 +488,22 @@ export async function cmdLast(parsed: Parsed) {
 
 
 export async function cmdWait(parsed: Parsed) {
+  if (truthy(flag(parsed, "help")) || truthy(flag(parsed, "h"))) {
+    console.log(waitHelpText());
+    return;
+  }
   const target = parsed.args[0];
-  if (!target) throw new Error("Usage: hive wait <session> [--idle-ms 3000] [--timeout-ms 600000] [--last|--transcript|--seal]");
+  if (!target) throw new Error(waitHelpText());
   const record = await resolveSession(target);
 
   if (truthy(flag(parsed, "seal"))) {
-    return waitForSeal(record, parsed);
+    return waitForSeal({
+      record,
+      timeoutMs: numberFlag(parsed, ["timeout-ms", "timeout"], 600_000),
+      pollMs: numberFlag(parsed, ["poll-ms", "poll"], 1_000),
+    });
   }
 
-  await ensureLive(record);
   const outcome = await waitForIdle({
     record,
     idleMs: numberFlag(parsed, ["idle-ms", "idle"], 3_000),
@@ -509,23 +516,6 @@ export async function cmdWait(parsed: Parsed) {
   // A blocked bee did not finish its turn; exit non-zero so `hive wait && hive kill`
   // chains do not kill a bee that is stalled on an approval prompt.
   if (outcome.state === "blocked") process.exitCode = 1;
-}
-
-
-export async function waitForSeal(record: SessionRecord, parsed: Parsed): Promise<void> {
-  const timeoutMs = numberFlag(parsed, ["timeout-ms", "timeout"], 600_000);
-  const pollMs = numberFlag(parsed, ["poll-ms", "poll"], 1_000);
-  const baseline = (await listSeals(record.name))[0]?.sealedAt;
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const latest = await loadLatestSeal(record.name);
-    if (latest && latest.sealedAt !== baseline) {
-      console.log(JSON.stringify(latest, null, 2));
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, Math.max(100, pollMs)));
-  }
-  throw new Error(`Timed out waiting for seal on ${record.name} after ${timeoutMs}ms`);
 }
 
 

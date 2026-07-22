@@ -3,10 +3,35 @@ import { hasTranscriptProvider } from "./drivers.js";
 import { cyan, dim, isPretty, tildify } from "./format.js";
 import { writeHiveState } from "./hiveState.js";
 import { isPermissionPromptPane } from "./readiness.js";
+import { listSeals, loadLatestSeal, type SealRecord } from "./seal.js";
+import { sessionLivenessFailure } from "./sessionLiveness.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
-import { appendLedger, type SessionRecord } from "./store.js";
+import { appendLedger, loadSession, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 import { lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
+
+export const WAIT_EXIT_CODES = {
+  success: 0,
+  terminal: 1,
+  timeout: 2,
+} as const;
+
+export type WaitFailureKind = Exclude<keyof typeof WAIT_EXIT_CODES, "success">;
+
+export class WaitError extends Error {
+  readonly exitCode: number;
+
+  constructor(readonly kind: WaitFailureKind, message: string) {
+    super(message);
+    this.name = "WaitError";
+    this.exitCode = WAIT_EXIT_CODES[kind];
+  }
+}
+
+type WaitSessionDeps = {
+  load?: (name: string) => Promise<SessionRecord | null>;
+  livenessFailure?: (record: SessionRecord) => Promise<string | null>;
+};
 
 export type WaitForIdleOptions = {
   record: SessionRecord;
@@ -18,6 +43,7 @@ export type WaitForIdleOptions = {
   json: boolean;
   /** Substrate override (used by tests); defaults to substrateFor(record). */
   substrate?: Pick<Substrate, "capture" | "hasSession">;
+  sessionDeps?: WaitSessionDeps;
 };
 
 export type WaitForIdleResult = {
@@ -41,18 +67,18 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
   let lastTxPath: string | undefined;
 
   const substrate = options.substrate ?? substrateFor(record);
+  const sessionDeps: WaitSessionDeps = {
+    ...options.sessionDeps,
+    livenessFailure: options.sessionDeps?.livenessFailure ?? ((candidate) => sessionLivenessFailure(candidate, { substrate })),
+  };
   while (Date.now() - started < timeoutMs) {
-    const captured = await substrate.capture(record.tmuxTarget, 200, record.agentPaneId).catch(() => null);
-    if (captured === null || captured === "") {
-      // A failed/empty capture is indistinguishable from a dead session: an
-      // empty pane plus an unchanged transcript would read as "stable" and
-      // the wait would succeed with empty output. Verify the session lives.
-      // hasSession throwing means transport trouble (e.g. ssh exit 255), not
-      // a dead session — keep waiting in that case; only a clean "false"
-      // (tmux answered: no such session) is proof of death.
-      const alive = await substrate.hasSession(record.tmuxTarget).catch(() => null);
-      if (alive === false) throw new Error(`Session died while waiting for idle: ${record.name}`);
+    const refreshed = await refreshWaitSession(record, sessionDeps);
+    if (!refreshed) {
+      await sleep(Math.max(100, pollMs));
+      continue;
     }
+    record = refreshed;
+    const captured = await substrate.capture(record.tmuxTarget, 200, record.agentPaneId).catch(() => null);
     const pane = captured ?? "";
     const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record)).catch(() => null);
     const assistant = tx ? lastAssistantText(tx.rows) : "";
@@ -95,7 +121,96 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
     await sleep(Math.max(100, pollMs));
   }
 
-  throw new Error(`Timed out waiting for idle session after ${timeoutMs}ms: ${record.name}`);
+  throw waitTimeout(`Timed out waiting for idle session after ${timeoutMs}ms: ${record.name}`);
+}
+
+export type WaitForSealOptions = {
+  record: SessionRecord;
+  timeoutMs: number;
+  pollMs: number;
+  sessionDeps?: WaitSessionDeps;
+  list?: (session: string) => Promise<SealRecord[]>;
+  latest?: (session: string) => Promise<SealRecord | null>;
+};
+
+export async function waitForSeal(options: WaitForSealOptions): Promise<void> {
+  let { record } = options;
+  const { timeoutMs, pollMs } = options;
+  const list = options.list ?? listSeals;
+  const latestSeal = options.latest ?? loadLatestSeal;
+  const baseline = (await list(record.name))[0]?.sealedAt;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const latest = await latestSeal(record.name);
+    if (latest && latest.sealedAt !== baseline) {
+      console.log(JSON.stringify(latest, null, 2));
+      return;
+    }
+    const refreshed = await refreshWaitSession(record, options.sessionDeps);
+    if (refreshed) record = refreshed;
+    await sleep(Math.max(100, pollMs));
+  }
+  throw waitTimeout(`Timed out waiting for seal on ${record.name} after ${timeoutMs}ms`);
+}
+
+export function waitHelpText(): string {
+  return `Usage
+  hive wait <session> [--idle-ms 3000] [--timeout-ms 600000] [--poll-ms 750]
+    [--last|--transcript|--seal] [--json] [-n <rows-or-lines>]
+
+  --poll-ms defaults to 1000 with --seal.
+
+Exit codes
+  0  Success: requested idle output or a new seal was printed
+  1  Terminal/hopeless session state (also used for a blocked permission prompt)
+  2  Timeout elapsed before success`;
+}
+
+async function refreshWaitSession(record: SessionRecord, deps: WaitSessionDeps = {}): Promise<SessionRecord | null> {
+  const fresh = await (deps.load ?? loadSession)(record.name);
+  if (!fresh) throw waitTerminal(record.name, "deleted");
+
+  const terminal = recordedWaitTerminalState(fresh);
+  if (terminal) throw waitTerminal(record.name, terminal);
+
+  let failure: string | null;
+  try {
+    failure = await (deps.livenessFailure ?? sessionLivenessFailure)(fresh);
+  } catch {
+    // Transport failure is not proof that a remote runtime died. Do not let an
+    // unknown probe produce false idle; retry until liveness returns or timeout.
+    return null;
+  }
+  if (failure) throw waitTerminal(record.name, "crashed", failure);
+  return fresh;
+}
+
+function recordedWaitTerminalState(record: SessionRecord): string | null {
+  if (record.status === "archived") return "archived";
+  if (record.status === "dead") return "killed";
+  if (record.status === "kill_failed") return "kill_failed";
+  switch (record.lastObservedState) {
+    case "crashed":
+    case "error":
+    case "kill_failed":
+      return record.lastObservedState;
+    case "dead":
+    case "killed":
+      return "killed";
+    case "archived":
+    case "retired":
+      return "archived";
+    default:
+      return null;
+  }
+}
+
+function waitTerminal(session: string, state: string, detail?: string): WaitError {
+  return new WaitError("terminal", `Wait failed for ${session}: terminal state ${state}${detail ? ` (${detail})` : ""}`);
+}
+
+function waitTimeout(message: string): WaitError {
+  return new WaitError("timeout", message);
 }
 
 function isWaitingForRequestedTranscript(

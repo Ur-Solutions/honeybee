@@ -21,6 +21,7 @@ import { LOCAL_NODE_NAME, loadNode, loadNodeSync, supportsCapability, type NodeR
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
 import { sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
+import { ensureSessionLive } from "../sessionLiveness.js";
 import { liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { appendLedger, listSessions, loadSession, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
@@ -739,17 +740,7 @@ export async function resolveSession(name: string): Promise<SessionRecord> {
 
 
 export async function ensureLive(record: SessionRecord) {
-  const substrate = substrateFor(record);
-  if (!(await substrate.hasSession(record.tmuxTarget))) {
-    throw new Error(`tmux session is not running: ${record.tmuxTarget}`);
-  }
-  const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
-  if (isLocal && record.agentPaneId) {
-    const panes = await localSubstrate().listPanes();
-    if (!panes.has(record.agentPaneId)) {
-      throw new Error(`tmux pane is not running for ${record.name}: ${record.agentPaneId}`);
-    }
-  }
+  await ensureSessionLive(record);
 }
 
 
