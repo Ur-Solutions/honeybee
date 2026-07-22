@@ -56,6 +56,7 @@ import {
   writeHsrRing,
   type HsrMeta,
 } from "./runDir.js";
+import { readEventTail } from "./observe.js";
 import type { RunnerEvent } from "./types.js";
 
 /** Debounce ring.txt writes so a chatty remote bee does not thrash the disk. */
@@ -80,6 +81,12 @@ type MirrorEntry = {
   off: () => void;
   ring: string;
   ringTimer: NodeJS.Timeout | null;
+  /**
+   * While the post-attach backfill runs, live events are buffered here instead
+   * of appended, so the backfilled tail and the live stream can be merged
+   * without duplicates. `null` once armed (backfill done) — the steady state.
+   */
+  pending: RunnerEvent[] | null;
 };
 
 type SubstrateEntry = {
@@ -149,14 +156,65 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
     }, RING_DEBOUNCE_MS);
   }
 
-  function onEvent(bee: string, entry: MirrorEntry, raw: unknown): void {
-    if (!isRunnerEvent(raw)) return;
+  function appendMirrored(bee: string, entry: MirrorEntry, event: RunnerEvent): void {
     // The runner is the single writer locally too — appendHsrEvent serializes
     // per bee, so mirrored events land in production order.
-    void appendHsrEvent(bee, raw).catch(() => undefined);
-    if (raw.type === "text" && typeof raw.text === "string" && raw.text.length > 0) {
-      entry.ring = appendRingText(entry.ring, raw.text);
+    void appendHsrEvent(bee, event).catch(() => undefined);
+    if (event.type === "text" && typeof event.text === "string" && event.text.length > 0) {
+      entry.ring = appendRingText(entry.ring, event.text);
       scheduleRingWrite(bee, entry);
+    }
+  }
+
+  function onEvent(bee: string, entry: MirrorEntry, raw: unknown): void {
+    if (!isRunnerEvent(raw)) return;
+    // Backfill in flight: hold the live event until the remote tail is merged,
+    // so an event present in both never lands twice.
+    if (entry.pending !== null) {
+      entry.pending.push(raw);
+      return;
+    }
+    appendMirrored(bee, entry, raw);
+  }
+
+  /**
+   * Merge the remote events.jsonl tail into the local mirror file. Events
+   * emitted between spawn and the first mirror tick predate the observe
+   * subscription and would otherwise be lost locally (they exist only on the
+   * remote). Boundary discipline: only events with ts strictly greater than the
+   * newest local ts are appended, and live events buffered during the backfill
+   * are flushed through the same boundary — dedupe is by timestamp, which the
+   * runner stamps monotonically enough per bee (same-ms boundary collisions are
+   * the accepted residual, versus losing the whole pre-attach tail today).
+   */
+  async function backfill(bee: string, entry: MirrorEntry, substrate: RemoteHsrSubstrate): Promise<void> {
+    let boundary = 0;
+    try {
+      // A daemon restart re-arms mirrors for bees whose local file already has
+      // history — resume after the newest local event instead of re-fetching.
+      const local = await readEventTail(bee);
+      for (const event of local) {
+        if (typeof event.ts === "number" && event.ts > boundary) boundary = event.ts;
+      }
+      const missed = await substrate.eventsTail(bee, boundary > 0 ? boundary : undefined);
+      for (const event of missed) {
+        if (!isRunnerEvent(event)) continue;
+        if (typeof event.ts === "number") {
+          if (event.ts <= boundary) continue;
+          boundary = event.ts;
+        }
+        appendMirrored(bee, entry, event);
+      }
+    } catch {
+      // Transient tunnel failure or an older runner-host without the events
+      // RPC: live events still flow; only the pre-attach tail stays remote.
+    } finally {
+      const buffered = entry.pending ?? [];
+      entry.pending = null; // armed — onEvent appends directly from here on.
+      for (const event of buffered) {
+        if (typeof event.ts === "number" && event.ts <= boundary) continue;
+        appendMirrored(bee, entry, event);
+      }
     }
   }
 
@@ -182,7 +240,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
     if (mirrors.has(bee)) return; // already mirrored — dedupe.
     // Reserve the slot BEFORE the async observe so a re-entrant call this tick
     // can't double-subscribe.
-    const entry: MirrorEntry = { node: node.name, off: () => undefined, ring: "", ringTimer: null };
+    const entry: MirrorEntry = { node: node.name, off: () => undefined, ring: "", ringTimer: null, pending: [] };
     mirrors.set(bee, entry);
     // Seed a `running` mirror meta so the local readers see the bee at once,
     // even before the first event arrives.
@@ -194,7 +252,10 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
       // so a later tick retries. The `running` meta stays — it flips to exited
       // once the bee genuinely leaves the remote list.
       mirrors.delete(bee);
+      return;
     }
+    // Recover the pre-attach tail (spawn → first mirror tick) before going live.
+    await backfill(bee, entry, substrate).catch(() => undefined);
   }
 
   async function teardown(bee: string, entry: MirrorEntry, options: { markExited: boolean }): Promise<void> {

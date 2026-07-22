@@ -182,6 +182,7 @@ function fakeRemoteSubstrate(node: NodeRecord, liveSessions: Set<string>, lifecy
     refreshCredsRemote: async () => ({ ok: true }),
     provisionRemote: async (params) => ({ path: "/tmp/remote-checkout", repo: params.repo, branch: params.branch, reused: false }),
     listCheckouts: async () => [],
+    eventsTail: async () => [],
     observe: async () => {
       lifecycle.observeCalls += 1;
       return () => {
@@ -234,6 +235,97 @@ test("remote event mirror close releases subscriptions and substrates without ma
     assert.equal(lifecycle.offCalls, 1, "dispatcher close unsubscribes once");
     assert.equal(lifecycle.closeCalls, 1, "dispatcher close closes the substrate once");
     assert.equal((await readHsrMeta(beeRecord().name))?.status, "running", "shutdown close must not fake a remote exit");
+  });
+});
+
+test("remote event mirror: backfills events emitted before the observe subscription attached (no duplicates)", async () => {
+  await withTempStore(async (localDir) => {
+    const remoteStore = await mkdtemp("/tmp/hb-rmtb-");
+    const remoteSock = join(localDir, "rc.sock");
+    const serveProc: ChildProcess = spawn(
+      process.execPath,
+      ["--import", "tsx", "src/hsr/remoteHost.ts", "serve", "--socket", remoteSock],
+      { cwd: process.cwd(), env: { ...process.env, HIVE_STORE_ROOT: remoteStore }, stdio: "ignore" },
+    );
+
+    const node = makeNode();
+    const tunnel = makeRelayTunnel();
+    const transport: ConnectRemoteOptions = {
+      execHook: serveUpExecHook,
+      spawnTunnel: tunnel.hook,
+      remoteSocket: remoteSock,
+      forward: { waitAttempts: 200, waitIntervalMs: 10 },
+    };
+    const driverNode = makeNode({ name: "loopdrv" });
+    const driver = createRemoteHsrSubstrate(driverNode, { transport });
+
+    const mirrorSubs: Array<{ close: () => Promise<void> }> = [];
+    const mirror = createRemoteEventMirror({
+      loadNode: async (name) => (name === "loopunit" ? node : null),
+      createSubstrate: (n) => {
+        const sub = createRemoteHsrSubstrate(n, { transport });
+        mirrorSubs.push(sub);
+        return sub;
+      },
+    });
+
+    const record = beeRecord();
+    try {
+      await waitFor(() => existsSync(remoteSock), "remote serve socket appears");
+
+      const bee = record.name;
+      await driver.spawnRemote({
+        bee,
+        kind: "stub",
+        cwd: process.cwd(),
+        sessionId: "pinned-remote-backfill",
+        spec: { command: process.execPath, args: [], env: {} },
+      });
+      await waitFor(async () => await driver.hasSession(bee), "remote bee live");
+
+      // Steer a turn BEFORE the mirror ever ticks: these events exist only on
+      // the remote — exactly the spawn→first-tick gap the backfill recovers.
+      await driver.sendText(bee, "before mirror");
+      await waitFor(async () => {
+        const tail = await driver.eventsTail(bee);
+        return tail.some((e) => e.type === "text");
+      }, "remote events.jsonl has the pre-mirror turn (via the events RPC)");
+
+      // First mirror tick: subscribe + backfill the pre-attach tail.
+      await mirror([record]);
+      await waitFor(async () => {
+        const raw = await readFile(hsrEventsPath(bee), "utf8").catch(() => "");
+        return raw.includes("echo:before mirror");
+      }, "backfill lands the pre-attach text event locally");
+
+      // A live turn after attach must append exactly once alongside the backfill.
+      await driver.sendText(bee, "after mirror");
+      await waitFor(async () => {
+        const raw = await readFile(hsrEventsPath(bee), "utf8").catch(() => "");
+        return raw.includes("echo:after mirror");
+      }, "live events still flow after backfill");
+
+      const lines = (await readFile(hsrEventsPath(bee), "utf8")).trim().split("\n");
+      const beforeCount = lines.filter((l) => l.includes("echo:before mirror")).length;
+      const afterCount = lines.filter((l) => l.includes("echo:after mirror")).length;
+      assert.equal(beforeCount, 1, "backfilled event appears exactly once");
+      assert.equal(afterCount, 1, "live event appears exactly once");
+
+      // A second tick must not re-backfill (dedupe by mirrors map).
+      await mirror([record]);
+      const lines2 = (await readFile(hsrEventsPath(bee), "utf8")).trim().split("\n");
+      assert.equal(lines2.filter((l) => l.includes("echo:before mirror")).length, 1, "no duplicate after a second tick");
+    } finally {
+      await driver.close().catch(() => undefined);
+      for (const sub of mirrorSubs) await sub.close().catch(() => undefined);
+      tunnel.killAll();
+      try {
+        serveProc.kill("SIGTERM");
+      } catch {
+        // already gone
+      }
+      await rm(remoteStore, { recursive: true, force: true }).catch(() => undefined);
+    }
   });
 });
 

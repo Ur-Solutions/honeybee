@@ -426,7 +426,7 @@ function parseRunnerEvents(raw: string): RunnerEvent[] {
   return events;
 }
 
-async function readEventTail(bee: string): Promise<RunnerEvent[]> {
+export async function readEventTail(bee: string): Promise<RunnerEvent[]> {
   const raw = await readTailText(hsrEventsPath(bee), EVENT_TAIL_MAX_BYTES);
   return raw === null ? [] : parseRunnerEvents(raw);
 }

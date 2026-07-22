@@ -36,7 +36,7 @@ import {
   type RpcMethodHandler,
   type RpcServer,
 } from "./rpc.js";
-import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, reapDeadHosts } from "./observe.js";
+import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, readEventTail, reapDeadHosts } from "./observe.js";
 import { readHsrMeta, hsrRunDir, readHsrRestart, writeHsrRestart } from "./runDir.js";
 import {
   recordDeliveredCredentials,
@@ -512,6 +512,23 @@ export function buildController(): RunnerHostController {
       const p = (params ?? {}) as { bee?: unknown; lines?: unknown };
       const args = typeof p.lines === "number" ? { lines: p.lines } : {};
       return await proxyCall(String(p.bee ?? ""), "snapshot", args);
+    }),
+
+    // The bounded events.jsonl tail for a bee, optionally only events strictly
+    // newer than `afterTs` (epoch ms). Read straight off this node's run dir —
+    // no live control socket needed, so it also serves exited bees. The local
+    // event mirror (APIA-94) uses it to backfill events emitted before its
+    // observe subscription attached.
+    events: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; afterTs?: unknown };
+      const bee = String(p.bee ?? "");
+      if (!bee) return { ok: false, error: "bee required" };
+      const afterTs = typeof p.afterTs === "number" && Number.isFinite(p.afterTs) ? p.afterTs : undefined;
+      const events = await readEventTail(bee);
+      return {
+        ok: true,
+        events: afterTs === undefined ? events : events.filter((event) => typeof event.ts === "number" && event.ts > afterTs),
+      };
     }),
 
     // Establish (or ref-count into) a relay of the bee's live event stream. Each

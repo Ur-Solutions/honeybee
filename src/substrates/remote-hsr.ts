@@ -26,6 +26,7 @@
 import type { NodeRecord } from "../node.js";
 import type { BeeState } from "../state.js";
 import type { DeliveredCredentials } from "../hsr/remoteCreds.js";
+import type { RunnerEvent } from "../hsr/types.js";
 import {
   connectRemoteRunnerHost,
   type ConnectRemoteOptions,
@@ -152,6 +153,13 @@ export type RemoteHsrSubstrate = Substrate & {
   listCheckouts(): Promise<RemoteCheckoutRow[]>;
   /** Subscribe to a bee's relayed event stream. Returns an unsubscribe fn. */
   observe(bee: string, onEvent: (event: unknown) => void): Promise<() => void>;
+  /**
+   * The bounded events.jsonl tail for a bee on the node — optionally only events
+   * strictly newer than `afterTs` (epoch ms). The daemon's event mirror uses it
+   * to backfill events emitted before its observe subscription attached. Never
+   * throws — a down tunnel or an older runner-host (no `events` RPC) resolves [].
+   */
+  eventsTail(bee: string, afterTs?: number): Promise<RunnerEvent[]>;
   /** Tear down the cached transport client (tests / shutdown). */
   close(): Promise<void>;
 };
@@ -297,6 +305,19 @@ export function createRemoteHsrSubstrate(
       return "";
     } catch {
       return "";
+    }
+  }
+
+  async function eventsTail(bee: string, afterTs?: number): Promise<RunnerEvent[]> {
+    try {
+      const c = await client();
+      const res = (await c.call("events", afterTs === undefined ? { bee } : { bee, afterTs })) as
+        | { ok?: boolean; events?: unknown }
+        | null;
+      if (res?.ok && Array.isArray(res.events)) return res.events as RunnerEvent[];
+      return [];
+    } catch {
+      return [];
     }
   }
 
@@ -499,6 +520,7 @@ export function createRemoteHsrSubstrate(
     provisionRemote,
     listCheckouts,
     observe,
+    eventsTail,
     async close(): Promise<void> {
       const releasing = [...observed];
       observed.clear();
