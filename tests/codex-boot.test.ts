@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -68,6 +68,26 @@ test("codex boot locks for different homes do not serialize", async () => {
     await Promise.all(boots);
   } finally {
     releaseBoth.resolve();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("codex boot lock reclaims a hard-crashed holder before the wait timeout", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-codex-boot-"));
+  const home = join(root, "crashed-home");
+  try {
+    await mkdir(home, { recursive: true });
+    const lockPath = join(home, ".hive-app-server-boot.lock");
+    await writeFile(lockPath, JSON.stringify({ pid: 999_999, token: "dead" }));
+    const stale = new Date(Date.now() - 3 * 60_000);
+    await utimes(lockPath, stale, stale);
+
+    let waited = false;
+    await withCodexHomeBootLock(home, async (state) => {
+      waited = state.waited;
+    });
+    assert.equal(waited, true);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

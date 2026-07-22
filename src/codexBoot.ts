@@ -5,6 +5,7 @@ import { spawnTimingEnabled } from "./spawnTiming.js";
 
 const CODEX_BOOT_LOCK_FILENAME = ".hive-app-server-boot.lock";
 const CODEX_BOOT_LOCK_TIMEOUT_MS = 10 * 60_000;
+const CODEX_BOOT_LOCK_STALE_MS = 2 * 60_000;
 
 export type CodexBootLockState = {
   /** True when another boot held this home's lock before this caller acquired it. */
@@ -30,7 +31,9 @@ export async function withCodexHomeBootLock<T>(
   let waited = false;
   return withFileLock(join(home, CODEX_BOOT_LOCK_FILENAME), () => fn({ waited }), {
     timeoutMs: CODEX_BOOT_LOCK_TIMEOUT_MS,
-    staleMs: CODEX_BOOT_LOCK_TIMEOUT_MS,
+    // Heartbeats keep a legitimately slow boot fresh; a hard-crashed holder is
+    // reclaimable well before the waiter's overall patience expires.
+    staleMs: CODEX_BOOT_LOCK_STALE_MS,
     onWait: () => {
       waited = true;
       if (spawnTimingEnabled()) {

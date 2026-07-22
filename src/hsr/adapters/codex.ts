@@ -372,7 +372,7 @@ const CODEX_APP_SERVER_ARGS = ["app-server"];
 const CODEX_THREAD_REQUEST_TIMEOUT_MS = 5_000;
 // A caller that waited on its home lock gets more time on the first request
 // because the preceding boot may still be completing an auth refresh. The
-// fixed ladder remains bounded to 72s (37s delays + 15s + four 5s RPCs).
+// thread-request portion stays bounded to 72s (37s delays + 15s + four 5s RPCs).
 const CODEX_CONTENDED_FIRST_REQUEST_TIMEOUT_MS = 15_000;
 const CODEX_THREAD_HANDSHAKE_DELAYS_MS = [0, 2_000, 5_000, 10_000, 20_000] as const;
 const CODEX_STDERR_LOG_LIMIT_BYTES = 1024 * 1024;
