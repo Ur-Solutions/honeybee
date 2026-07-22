@@ -77,13 +77,21 @@ export async function resolveRemoteCwd(
 ): Promise<RemoteCwdResolution | null> {
   const exec = deps.exec ?? defaultExec;
 
+  // Operator switch (Apiary settings / shell): HIVE_REMOTE_SYNC=origin skips
+  // the pro layer entirely; =off skips BOTH layers (remote derives its per-bee
+  // cwd). Unset/auto = pro-first, the default.
+  const mode = (process.env.HIVE_REMOTE_SYNC ?? "auto").toLowerCase();
+  if (mode === "off") return null;
+
   // ── Layer 1: pro sync into the node's canonical checkout ──────────────────
   // `pro sync HOST` prints the remote repo dir as its final stdout line.
   // NOTE: resolve the USER's pro off PATH — on Ubuntu nodes /usr/bin/pro is
   // Canonical's Ubuntu Pro client, but this exec runs LOCALLY where PATH order
   // puts ~/.local/bin first; a wrong-pro invocation fails as not-applicable.
   const endpoint = node.endpoint ?? node.name;
-  const sync = await exec("pro", ["sync", endpoint], { cwd: localCwd, timeoutMs: 180_000 });
+  const sync = mode === "origin"
+    ? ({ ok: false, stdout: "", stderr: "", code: "ENOENT" } as ExecResult)
+    : await exec("pro", ["sync", endpoint], { cwd: localCwd, timeoutMs: 180_000 });
   if (sync.ok) {
     const lines = sync.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
     const remotePath = lines[lines.length - 1];

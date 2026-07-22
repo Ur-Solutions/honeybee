@@ -115,6 +115,27 @@ test("wrong pro (Ubuntu Pro prints help, exits 0) → treated as not applicable,
   assert.equal(res?.via, "provisioned");
 });
 
+test("HIVE_REMOTE_SYNC=origin skips pro; =off skips both layers", async (t) => {
+  const prov = provisioner();
+  const { exec, calls } = scripted(({ command, args }) => {
+    if (command === "pro") throw new Error("pro must not run under =origin/=off");
+    if (command === "git" && args.includes("get-url")) return ok("git@github.com:trmdy/apiary.git\n");
+    if (command === "git" && args.includes("symbolic-ref")) return ok("main\n");
+    if (command === "git" && args.includes("ls-remote")) return ok("abc\trefs/heads/main\n");
+    throw new Error(`unexpected: ${command}`);
+  });
+  t.after(() => delete process.env.HIVE_REMOTE_SYNC);
+
+  process.env.HIVE_REMOTE_SYNC = "origin";
+  const viaOrigin = await resolveRemoteCwd("/Users/me/repo", node(), prov, { exec });
+  assert.equal(viaOrigin?.via, "provisioned");
+
+  process.env.HIVE_REMOTE_SYNC = "off";
+  const off = await resolveRemoteCwd("/Users/me/repo", node(), prov, { exec });
+  assert.equal(off, null);
+  assert.equal(calls.filter((c) => c.command === "pro").length, 0);
+});
+
 test("neither layer applies (no origin) → null (remote derives its per-bee cwd)", async () => {
   const prov = provisioner();
   const { exec } = scripted(({ command, args }) => {
