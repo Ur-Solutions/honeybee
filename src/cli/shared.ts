@@ -425,8 +425,8 @@ export async function capturePanesFor(records: SessionRecord[], liveTargets: Set
 }
 
 
-export async function listSealedBeeNames(): Promise<Set<string>> {
-  return sealedBeeNamesImpl().catch(() => new Set<string>());
+export async function listSealedBeeNames(records?: readonly SessionRecord[]): Promise<Set<string>> {
+  return sealedBeeNamesImpl(records).catch(() => new Set<string>());
 }
 
 
@@ -465,7 +465,7 @@ export async function buildStateContext(
   options: { unreachableNodes?: Set<string> } = {},
 ): Promise<StateContext & { hsrLive: Set<string>; now: number }> {
   const panes = await capturePanesFor(records, probe.liveTargets);
-  const seals = await listSealedBeeNames();
+  const seals = await listSealedBeeNames(records);
   const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
   const { hsrLive, hsrStates, hsrSnapshots } = await observeHsrLiveness();
   return {

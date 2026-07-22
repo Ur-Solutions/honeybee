@@ -1,9 +1,11 @@
-import { join } from "node:path";
-import { storeRoot } from "./fsx.js";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { writeHiveTitle } from "./hiveState.js";
 import { withFileLock } from "./lock.js";
 import { canWriteTitle } from "./naming.js";
-import { listSessions, touchSession, type SessionRecord } from "./store.js";
+import { listSessions, loadSession, touchSession, type SessionRecord } from "./store.js";
 import { isAnchoredTranscriptMatch, latestTranscript, type TranscriptFile, type TranscriptLookupOptions } from "./transcripts.js";
 import { samePath } from "./transcripts/util.js";
 
@@ -40,13 +42,17 @@ export async function persistSessionTranscriptMetadata(
   const anchored = isAnchoredTranscriptMatch(tx, lookup);
   const needsOwnershipClaim = anchored && !record.transcriptPath && !record.providerSessionId;
 
-  // Bootstrap claims serialize across daemon/CLI processes. Without this, two
-  // prompt-identical siblings refreshing concurrently can both observe the
-  // transcript as unclaimed and persist the same provider identity.
+  // TRANSITION LOCK: old Honeybee processes know only this global lock, while
+  // new ones additionally persist per-identity claims. Keep the legacy lock
+  // around the migration read+claim so a still-running old daemon/CLI cannot
+  // double-adopt in the rollout window. The formerly expensive critical
+  // section is now bounded: listSessions is 32-way + single-flight and terminal
+  // records no longer repeat discovery. This lock can be removed only after
+  // unsupported mixed-version processes are no longer allowed.
   const persisted = needsOwnershipClaim
     ? await withFileLock(join(storeRoot(), "sessions", ".transcript-ownership.lock"), async () => {
-        const claimed = await isClaimedBySibling(record, tx);
-        return persistFields(record, tx, options, anchored && !claimed);
+        const legacyOwner = await findClaimingSibling(record, tx);
+        return claimTranscriptIdentity(record, tx, legacyOwner, options);
       })
     : await persistFields(record, tx, options, anchored);
 
@@ -88,14 +94,84 @@ async function persistFields(
   };
 }
 
-async function isClaimedBySibling(record: SessionRecord, tx: TranscriptFile): Promise<boolean> {
+type TranscriptOwnershipClaim = {
+  owner: string;
+  agent: string;
+  identity: string;
+  claimedAt: string;
+};
+
+async function claimTranscriptIdentity(
+  record: SessionRecord,
+  tx: TranscriptFile,
+  legacyOwner: SessionRecord | null,
+  options: PersistTranscriptMetadataOptions,
+): ReturnType<typeof persistFields> {
+  const identity = transcriptIdentity(record.agent, tx);
+  const digest = createHash("sha256").update(identity).digest("hex");
+  const claimPath = join(storeRoot(), "transcript-ownership", `${digest}.json`);
+
+  return withFileLock(`${claimPath}.lock`, async () => {
+    const durable = await readTranscriptOwnershipClaim(claimPath);
+    if (durable && durable.owner !== record.name) {
+      // A claim whose owner record was deliberately deleted may be reused.
+      // Process state is irrelevant: sealed/archived owners retain history.
+      const owner = await loadSession(durable.owner);
+      // A pre-commit crash can leave a claim file whose owner never acquired
+      // the identity. Do not strand it forever merely because that unrelated
+      // session record still exists.
+      if (owner && ownsTranscriptIdentity(owner, tx)) return persistFields(record, tx, options, false);
+    }
+
+    if (!durable && legacyOwner && legacyOwner.name !== record.name) {
+      await writeTranscriptOwnershipClaim(claimPath, legacyOwner.name, record.agent, identity);
+      return persistFields(record, tx, options, false);
+    }
+
+    // Reserve BEFORE persisting session fields. If this process crashes in the
+    // tiny gap, only this same record can resume the claim; a sibling can never
+    // double-adopt the transcript.
+    if (!durable || durable.owner !== record.name) {
+      await writeTranscriptOwnershipClaim(claimPath, record.name, record.agent, identity);
+    }
+    return persistFields(record, tx, options, true);
+  });
+}
+
+function ownsTranscriptIdentity(record: SessionRecord, tx: TranscriptFile): boolean {
+  return record.providerSessionId === tx.sessionId || Boolean(record.transcriptPath && samePath(record.transcriptPath, tx.path));
+}
+
+function transcriptIdentity(agent: string, tx: TranscriptFile): string {
+  const providerIdentity = tx.sessionId.trim();
+  return `${agent}\0${providerIdentity ? `session:${providerIdentity}` : `path:${resolve(tx.path)}`}`;
+}
+
+async function readTranscriptOwnershipClaim(path: string): Promise<TranscriptOwnershipClaim | null> {
+  try {
+    const value = JSON.parse(await readFile(path, "utf8")) as Partial<TranscriptOwnershipClaim>;
+    return typeof value.owner === "string" && typeof value.agent === "string" && typeof value.identity === "string" &&
+      typeof value.claimedAt === "string"
+      ? value as TranscriptOwnershipClaim
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeTranscriptOwnershipClaim(path: string, owner: string, agent: string, identity: string): Promise<void> {
+  const value: TranscriptOwnershipClaim = { owner, agent, identity, claimedAt: new Date().toISOString() };
+  await atomicWriteFile(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+}
+
+async function findClaimingSibling(record: SessionRecord, tx: TranscriptFile): Promise<SessionRecord | null> {
   const records = await listSessions();
-  return records.some((candidate) => {
+  return records.find((candidate) => {
     if (candidate.name === record.name || candidate.agent !== record.agent) return false;
     // Ownership outlives process state: dead/sealed/archived records still own
     // their history. A deliberate resume is preserved because the new record's
     // explicit stored id/path takes the confirmed-identity path above and never
     // enters this heuristic bootstrap claim.
     return candidate.providerSessionId === tx.sessionId || Boolean(candidate.transcriptPath && samePath(candidate.transcriptPath, tx.path));
-  });
+  }) ?? null;
 }

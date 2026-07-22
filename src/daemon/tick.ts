@@ -27,7 +27,7 @@ export type ProbeResult = {
 };
 
 export type TickDeps = {
-  listSessions: () => Promise<SessionRecord[]>;
+  listSessions: (() => Promise<SessionRecord[]>) & { close?: () => Promise<void> };
   listNodes: () => Promise<NodeRecord[]>;
   /** Live target enumeration + node reachability — substrate-routable. */
   probeNodes: (nodes: NodeRecord[]) => Promise<ProbeResult>;
@@ -56,7 +56,7 @@ export type TickDeps = {
    * already read a freshly-created mirror meta.
    */
   mirrorRemoteEvents?: ((records: SessionRecord[]) => Promise<void>) & { close?: () => Promise<void> };
-  sealedBeeNames: () => Promise<Set<string>>;
+  sealedBeeNames: (records: readonly SessionRecord[]) => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
   touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
   /**
@@ -622,7 +622,7 @@ export async function tick(
       new Map(),
     ));
   const seals: Set<string> = await timeStage("sealedBeeNames", () =>
-    guard(withTimeout(deps.sealedBeeNames(), timeouts.fsMs, "sealedBeeNames"), errors, new Set()));
+    guard(withTimeout(deps.sealedBeeNames(records), timeouts.fsMs, "sealedBeeNames"), errors, new Set()));
   const livePanes: Set<string> = deps.livePanes
     ? await timeStage("livePanes", () =>
         guard(withTimeout(deps.livePanes!(), timeouts.substrateMs, "livePanes"), errors, new Set<string>()))
@@ -645,7 +645,7 @@ export async function tick(
   // can no longer affect state.
   const remoteHsrNodes = new Set(nodes.filter((node) => node.kind === "remote-hsr").map((node) => node.name));
   const hsrBeeNames = records
-    .filter((record) => record.status === "running" && (
+    .filter((record) => record.status === "running" && record.lastObservedState !== "sealed" && !seals.has(record.name) && (
       record.substrate === "hsr" || (record.node !== undefined && remoteHsrNodes.has(record.node))
     ))
     .map((record) => record.name);
@@ -717,13 +717,19 @@ export async function tick(
     }
     const terminal = isTerminalState(derived.state);
     const archived = derived.state === "archived";
+    // A seal is already a durable task artifact: it does not justify one last
+    // provider-wide transcript scan. Other fast terminal exits get one claimed
+    // best-effort pass in case they died between spawn and the first tick.
+    const claimTerminalTranscriptDiscovery = terminal && derived.state !== "sealed" &&
+      !record.transcriptPath && !record.terminalTranscriptDiscoveryAt;
     return {
       record,
       state: derived.state,
       persistObservation: observationTrusted,
       mirrorHiveState: observationTrusted && (transitioned || staleHiveState) && !uncertainBooting,
       refreshTranscriptMetadata:
-        observationTrusted && !archived && (!terminal || !record.transcriptPath) && deps.refreshTranscriptMetadata !== undefined,
+        observationTrusted && !archived && (!terminal || claimTerminalTranscriptDiscovery) && deps.refreshTranscriptMetadata !== undefined,
+      claimTerminalTranscriptDiscovery,
     };
   });
 
@@ -758,11 +764,25 @@ export async function tick(
         }
       }
 
-      // Archived bees are immutable, and dead/sealed bees no longer produce transcript updates — skip the
-      // refresh once transcript metadata has been captured. A bee that exited
-      // before its first refresh (fast finish between ticks) still gets one
-      // pass so list/search/tail metadata is not permanently missing.
+      // Archived bees are immutable, and dead/sealed bees no longer produce
+      // transcript updates. A fast-finishing bee still gets one discovery
+      // pass, but claim it durably BEFORE scanning: terminal records with no
+      // matching transcript must not repeat a full provider scan every tick or
+      // after every daemon restart.
       if (plan.refreshTranscriptMetadata && deps.refreshTranscriptMetadata) {
+        if (plan.claimTerminalTranscriptDiscovery) {
+          try {
+            const claimed = await withTimeout(
+              deps.touchSession(record.name, { terminalTranscriptDiscoveryAt: observedAtIso }),
+              timeouts.fsMs,
+              `claimTerminalTranscriptDiscovery(${record.name})`,
+            );
+            if (!claimed) return;
+          } catch (error) {
+            errors.push(toError(error));
+            return;
+          }
+        }
         try {
           await withTimeout(deps.refreshTranscriptMetadata(record), timeouts.transcriptMs, `refreshTranscriptMetadata(${record.name})`);
         } catch (error) {

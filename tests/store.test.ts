@@ -298,6 +298,34 @@ test("listSessions skips malformed session files", async () => {
   }
 });
 
+test("listSessions reads 1,200 records with bounded fan-out and coalesces concurrent snapshots", async () => {
+  await withTempStore(async (dir) => {
+    const sessions = join(dir, "sessions");
+    await mkdir(sessions, { recursive: true });
+    for (let offset = 0; offset < 1_200; offset += 100) {
+      await Promise.all(Array.from({ length: 100 }, (_, inner) => {
+        const index = offset + inner;
+        const record = makeRecord(dir, {
+          name: `CO.${String(index).padStart(4, "0")}`,
+          tmuxTarget: `CO-${index}`,
+          updatedAt: new Date(Date.parse("2026-05-28T00:00:00.000Z") + index).toISOString(),
+        });
+        return writeFile(join(sessions, `${record.name}.json`), JSON.stringify(record));
+      }));
+    }
+
+    const first = listSessions();
+    const second = listSessions();
+    assert.equal(second, first, "concurrent callers share one in-flight registry walk");
+    const records = await first;
+
+    assert.equal(records.length, 1_200);
+    assert.equal(new Set(records.map((record) => record.name)).size, 1_200);
+    assert.equal(records[0]?.name, "CO.1199");
+    assert.equal(records.at(-1)?.name, "CO.0000");
+  });
+});
+
 test("a status:archived record round-trips (not downgraded to dead)", async () => {
   await withTempStore(async (dir) => {
     const record = makeRecord(dir, { status: "archived" });

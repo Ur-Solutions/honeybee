@@ -14,7 +14,7 @@ import { hsrSubstrate } from "../hsr/substrate.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { waitForAgentReady } from "../readiness.js";
-import { loadLatestSeal } from "../seal.js";
+import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
 import { appendLedger, listSessions, storeRoot, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
@@ -334,6 +334,7 @@ export async function reviveHsrRunner(record: SessionRecord, tool: string, opts:
   const fresh = opts.fresh === true;
   const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
   const spec = await buildResumeSpec(record, tool, [], { replayLaunch: opts.replayLaunch });
+  const incarnation = await nextRuntimeIncarnationPatch(record);
   const hostPid = await spawnHsrHost({
     bee: record.name,
     comb: record.combId ?? record.name,
@@ -356,6 +357,7 @@ export async function reviveHsrRunner(record: SessionRecord, tool: string, opts:
   // (HIVE-49).
   const renderedCommand = shellCommand(spec);
   const patch: Partial<SessionRecord> = {
+    ...incarnation,
     ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
     substrate: "hsr",
     runnerPid: hostPid,
@@ -398,6 +400,7 @@ export async function hsrChildSurvives(bee: string, windowMs: number): Promise<b
  */
 export async function reviveTmuxPane(record: SessionRecord, tool: string, opts: { fresh?: boolean } = {}): Promise<void> {
   const spec = await buildResumeSpec(record, tool, opts.fresh ? [] : resumeArgs(tool, record.providerSessionId));
+  const incarnation = await nextRuntimeIncarnationPatch(record);
   const tmuxTarget = safeTmuxTarget(record.name);
   const substrate = localSubstrate();
   const launch = await substrate.newSession(tmuxTarget, record.cwd, {
@@ -410,6 +413,7 @@ export async function reviveTmuxPane(record: SessionRecord, tool: string, opts: 
   // loaded survive; explicit undefined deletes the HSR fields; null = record
   // deleted concurrently, nothing to persist (HIVE-49).
   const restored = await updateSession(record.name, {
+    ...incarnation,
     command: shellCommand(spec),
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
@@ -466,6 +470,7 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
   // 3. Build the interactive resume spec: claude `--resume <id>`, codex
   //    `resume <id>`.
   const spec = await buildResumeSpec(record, tool, resumeArgs(tool, record.providerSessionId));
+  const incarnation = await nextRuntimeIncarnationPatch(record);
 
   // 4. Launch the interactive tmux session (resuming the same provider session).
   const tmuxTarget = safeTmuxTarget(record.name);
@@ -500,6 +505,7 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
   //    kill) — don't resurrect it.
   const command = shellCommand(spec);
   const promoted = await updateSession(record.name, {
+    ...incarnation,
     command,
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
@@ -555,6 +561,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
   // 3. Build the headless spec (the adapter appends the resume + stream flags)
   //    and fork the runner host with resume:true against the same session id.
   const spec = await buildResumeSpec(record, tool, []);
+  const incarnation = await nextRuntimeIncarnationPatch(record);
   const runnerTier = adapter.tier();
   const hostPid = await spawnHsrHost({
     bee: record.name,
@@ -596,6 +603,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
   //    mid-demote (concurrent kill) — don't resurrect it.
   const command = shellCommand(spec);
   const demoted = await updateSession(record.name, {
+    ...incarnation,
     command,
     substrate: "hsr",
     runnerPid: hostPid,
@@ -982,6 +990,7 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
     }
   }
 
+  const incarnation = await nextRuntimeIncarnationPatch(record);
   const launch = await substrate.newSession(record.tmuxTarget, record.cwd, {
     command: spec.command,
     args: spec.args,
@@ -991,6 +1000,7 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
 
   const updated =
     (await updateSession(record.name, {
+      ...incarnation,
       status: "running",
       lastReviveCommand: shellCommand(spec),
       combId: record.combId ?? record.tmuxTarget,

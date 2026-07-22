@@ -335,7 +335,7 @@ export async function poolLiveBees(records?: SessionRecord[]): Promise<LiveBee[]
   const [states, livePanes, seals, hsr] = await Promise.all([
     localSubstrate().listSessionStates().catch(() => new Map<string, string>()),
     localSubstrate().listPanes().catch(() => new Set<string>()),
-    listSealedBeeNames(),
+    listSealedBeeNames(sessions),
     observeHsrLiveness(),
   ]);
   const liveTargets = new Set<string>();

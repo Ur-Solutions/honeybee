@@ -116,6 +116,17 @@ export type SessionRecord = {
   lastPromptAt?: string;
   transcriptPath?: string;
   providerSessionId?: string;
+  /**
+   * A non-sealed terminal bee gets at most one best-effort transcript discovery
+   * pass (sealed bees are skipped outright). Persisting the claim before
+   * discovery prevents dead records with no transcript from being rescanned
+   * forever on every daemon tick/restart.
+   */
+  terminalTranscriptDiscoveryAt?: string;
+  /** Latest seal filename predating the current runtime incarnation. */
+  sealHighWaterFilename?: string;
+  /** Monotonic relaunch counter; initial spawn is generation zero. */
+  runtimeGeneration?: number;
   title?: string;
   /** Who set `title`: user beats auto beats provider (see naming.ts). */
   titleSource?: "user" | "auto" | "provider";
@@ -332,20 +343,55 @@ export async function deleteSession(name: string) {
   await appendLedger({ type: "session.delete", name, ts: new Date().toISOString() });
 }
 
-export async function listSessions(): Promise<SessionRecord[]> {
-  await ensureStore();
-  const [files, legacyFiles] = await Promise.all([readdir(sessionsDir()), readdir(legacySessionsDir()).catch(() => [])]);
-  const seen = new Set<string>();
-  const records: SessionRecord[] = [];
+const DEFAULT_LIST_SESSION_CONCURRENCY = 32;
+const listSessionsInFlight = new Map<string, Promise<SessionRecord[]>>();
 
-  for (const [dir, dirFiles] of [[sessionsDir(), files], [legacySessionsDir(), legacyFiles]] as const) {
+/**
+ * Enumerate one store snapshot with bounded read fan-out. The old sequential
+ * loop took several seconds at 1,200+ records; callers timing it out then
+ * started another full walk on the next daemon tick. The exported wrapper is
+ * single-flight per store root, so even a slow/timed-out consumer can never
+ * accumulate overlapping scans in this process.
+ */
+export function listSessions(): Promise<SessionRecord[]> {
+  const root = storeRoot();
+  const current = listSessionsInFlight.get(root);
+  if (current) return current;
+
+  // Capture both paths now: tests and embedders can swap HIVE_STORE_ROOT while
+  // an asynchronous snapshot is still draining.
+  const pending = listSessionsSnapshot(sessionsDir(), legacySessionsDir()).finally(() => {
+    if (listSessionsInFlight.get(root) === pending) listSessionsInFlight.delete(root);
+  });
+  listSessionsInFlight.set(root, pending);
+  return pending;
+}
+
+async function listSessionsSnapshot(currentDir: string, legacyDir: string): Promise<SessionRecord[]> {
+  await mkdir(currentDir, { recursive: true });
+  const [files, legacyFiles] = await Promise.all([readdir(currentDir), readdir(legacyDir).catch(() => [])]);
+  const seen = new Set<string>();
+  const candidates: Array<{ dir: string; file: string }> = [];
+
+  for (const [dir, dirFiles] of [[currentDir, files], [legacyDir, legacyFiles]] as const) {
     for (const file of dirFiles.filter((name) => name.endsWith(".json"))) {
       if (seen.has(file)) continue;
       seen.add(file);
-      const record = await readSessionRecord(join(dir, file)).catch(() => null);
-      if (record) records.push(record);
+      candidates.push({ dir, file });
     }
   }
+
+  const records: SessionRecord[] = [];
+  let cursor = 0;
+  const workerCount = Math.min(DEFAULT_LIST_SESSION_CONCURRENCY, candidates.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < candidates.length) {
+      const candidate = candidates[cursor++];
+      if (!candidate) continue;
+      const record = await readSessionRecord(join(candidate.dir, candidate.file)).catch(() => null);
+      if (record) records.push(record);
+    }
+  }));
 
   return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
@@ -429,7 +475,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
@@ -442,6 +488,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "poolMember",
   "titleSource",
   "autoTitleAttempts",
+  "runtimeGeneration",
   "buzAccept",
   "tags",
   "contract",
@@ -506,6 +553,9 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
 
   if (typeof object.autoTitleAttempts === "number" && Number.isFinite(object.autoTitleAttempts)) {
     record.autoTitleAttempts = object.autoTitleAttempts;
+  }
+  if (typeof object.runtimeGeneration === "number" && Number.isSafeInteger(object.runtimeGeneration) && object.runtimeGeneration >= 0) {
+    record.runtimeGeneration = object.runtimeGeneration;
   }
   if (typeof object.launcherPgid === "number" && Number.isSafeInteger(object.launcherPgid) && object.launcherPgid > 0) {
     record.launcherPgid = object.launcherPgid;

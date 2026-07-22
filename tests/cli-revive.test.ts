@@ -8,6 +8,8 @@ import { promisify } from "node:util";
 import { readHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
+import { recordSeal, sealedBeeNames, validateSealArtifact } from "../src/seal.js";
+import type { SessionRecord } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -259,7 +261,11 @@ test("revive routes local HSR records through the runner host", async () => {
       substrate: "hsr",
       runnerPid: 2 ** 31 - 1,
       providerSessionId: "sess-hsr",
+      lastObservedState: "sealed",
+      lastObservedStateAt: "2026-06-25T00:01:00.000Z",
+      terminalTranscriptDiscoveryAt: "2026-06-25T00:01:00.000Z",
     });
+    await withStoreEnv(store, () => recordSeal(bee, validateSealArtifact({ status: "done", summary: "old runtime" })));
 
     try {
       const result = await hive(store, socket, ["revive", bee]);
@@ -272,8 +278,16 @@ test("revive routes local HSR records through the runner host", async () => {
       assert.equal(typeof record.runnerPid, "number");
       assert.equal(record.command, "stub", "HSR revive leaves the original command untouched");
       assert.match(String(record.lastReviveCommand), /--recorded-hsr-flag/);
+      assert.equal(record.runtimeGeneration, 1);
+      assert.equal(typeof record.sealHighWaterFilename, "string");
+      assert.equal(record.lastObservedState, undefined);
+      assert.equal(record.lastObservedStateAt, undefined);
+      assert.equal(record.terminalTranscriptDiscoveryAt, undefined);
 
       await withStoreEnv(store, async () => {
+        assert.equal((await sealedBeeNames([record as unknown as SessionRecord])).has(bee), false);
+        await recordSeal(bee, validateSealArtifact({ status: "done", summary: "new runtime" }));
+        assert.equal((await sealedBeeNames([record as unknown as SessionRecord])).has(bee), true);
         const meta = await readHsrMeta(bee);
         assert.ok(meta?.status === "running" || meta?.status === "queued", `expected live/queued HSR host, got ${meta?.status}`);
         assert.equal(meta?.harness, "stub");

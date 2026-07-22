@@ -15,6 +15,7 @@ import {
 } from "../src/daemon/run.js";
 import type { BeeState, PaneCaptureMap } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
+import { nextRuntimeIncarnationPatch } from "../src/seal.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-daemon-tick-"));
@@ -174,7 +175,114 @@ test("tick: skips transcript metadata refresh for archived and captured terminal
 
     await tick(deps, new Map());
 
-    assert.deepEqual(refreshed, ["fast-exit-bee", "live-bee"]);
+    assert.deepEqual(refreshed.sort(), ["fast-exit-bee", "live-bee"]);
+    assert.ok(
+      capture.touches.some((touch) =>
+        touch.name === fastExit.name && typeof touch.fields.terminalTranscriptDiscoveryAt === "string"),
+      "the one terminal discovery pass is durably claimed before scanning",
+    );
+  });
+});
+
+test("tick: a terminal record without transcript metadata is not rediscovered after its durable attempt", async () => {
+  await withTempStore(async () => {
+    const record = bee({
+      name: "dead-without-transcript",
+      tmuxTarget: "dead-without-transcript",
+      substrate: "hsr",
+      status: "dead",
+      terminalTranscriptDiscoveryAt: "2026-06-03T09:58:00.000Z",
+    });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({
+      records: [record],
+      liveTargets: new Set(),
+      capture,
+    });
+    const refreshed: string[] = [];
+    deps.refreshTranscriptMetadata = async (candidate) => {
+      refreshed.push(candidate.name);
+      return candidate;
+    };
+
+    await tick(deps, new Map());
+
+    assert.deepEqual(refreshed, []);
+  });
+});
+
+test("tick: a revived runtime clears the old terminal discovery claim and gets one new terminal pass", async () => {
+  await withTempStore(async () => {
+    const retired = bee({
+      name: "revived-terminal",
+      tmuxTarget: "revived-terminal",
+      status: "archived",
+      terminalTranscriptDiscoveryAt: "2026-06-03T09:58:00.000Z",
+      lastObservedState: "sealed",
+    });
+    const incarnation = await nextRuntimeIncarnationPatch(retired);
+    const diedAgain = { ...retired, ...incarnation, status: "dead" as const };
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records: [diedAgain], liveTargets: new Set(), capture });
+    const refreshed: string[] = [];
+    deps.refreshTranscriptMetadata = async (candidate) => {
+      refreshed.push(candidate.name);
+      return candidate;
+    };
+
+    await tick(deps, new Map());
+
+    assert.deepEqual(refreshed, [diedAgain.name]);
+    assert.ok(capture.touches.some((touch) => typeof touch.fields.terminalTranscriptDiscoveryAt === "string"));
+  });
+});
+
+test("tick: a sealed HSR record without transcript metadata is neither observed nor rediscovered", async () => {
+  await withTempStore(async () => {
+    const record = bee({ name: "sealed-hsr", tmuxTarget: "sealed-hsr", substrate: "hsr" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records: [record], liveTargets: new Set(), seals: new Set([record.name]), capture });
+    const observedBatches: string[][] = [];
+    const refreshed: string[] = [];
+    deps.hsrObservations = async (beeNames) => {
+      observedBatches.push([...beeNames]);
+      return new Map();
+    };
+    deps.refreshTranscriptMetadata = async (candidate) => {
+      refreshed.push(candidate.name);
+      return candidate;
+    };
+
+    await tick(deps, new Map());
+
+    assert.deepEqual(observedBatches, []);
+    assert.deepEqual(refreshed, []);
+  });
+});
+
+test("tick: 1,200-record HSR fleet excludes sealed bees from the observer batch", async () => {
+  await withTempStore(async () => {
+    const records = Array.from({ length: 1_200 }, (_, index) => bee({
+      name: `hsr-${String(index).padStart(4, "0")}`,
+      tmuxTarget: `hsr-${String(index).padStart(4, "0")}`,
+      substrate: "hsr",
+      terminalTranscriptDiscoveryAt: "2026-06-03T09:58:00.000Z",
+    }));
+    const live = records.at(-1)!;
+    const sealed = new Set(records.slice(0, -1).map((record) => record.name));
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records, liveTargets: new Set(), seals: sealed, capture });
+    const batches: string[][] = [];
+    deps.hsrObservations = async (beeNames) => {
+      batches.push([...beeNames]);
+      return new Map([[live.name, { live: true, state: "active", snapshot: "working" }]]);
+    };
+
+    const result = await tick(deps, new Map());
+
+    assert.deepEqual(batches, [[live.name]]);
+    assert.equal(result.observed.size, records.length);
+    assert.equal(result.observed.get(live.name), "active");
   });
 });
 

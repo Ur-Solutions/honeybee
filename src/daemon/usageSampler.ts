@@ -77,6 +77,7 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
   const lastHsrExhaustedTs = new Map<string, number>();
   const lastSampleAt = new Map<string, number>();
   const lastTotals = new Map<string, TokenTotals>();
+  let inFlight: Promise<UsageTickOutcome[]> | undefined;
 
   // Append a fresh token sample for `record` if `totals` moved since the last
   // one (shared by the tmux + HSR paths). Mutates outcome.sampled.
@@ -152,12 +153,26 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
     return outcome;
   }
 
-  return async (records, panes, nowMs, hsrObservations) => {
+  const sample = async (
+    records: SessionRecord[],
+    panes: PaneCaptureMap,
+    nowMs: number,
+    hsrObservations?: ReadonlyMap<string, HsrObservation>,
+  ): Promise<UsageTickOutcome[]> => {
     const outcomes: UsageTickOutcome[] = [];
 
     for (const record of records) {
-      if (!record.accountId) continue;
+      // Historical records cannot produce new usage or exhaustion edges. A
+      // cold daemon previously re-read hundreds of archived HSR logs (and, on
+      // a cache miss, their full transcripts) before its first useful sample.
+      if (!record.accountId || record.status !== "running") continue;
       const hsrObservation = hsrObservations?.get(record.name);
+
+      // When the tick supplied its coherent HSR observation batch, absence is
+      // deliberate or unknown (sealed record filtered out, failed run-dir
+      // read). Do not defeat that bounded batch by launching a second direct
+      // events/transcript scan from the dispatcher.
+      if (record.substrate === "hsr" && hsrObservations !== undefined && !hsrObservation) continue;
 
       // HSR bees are pane-less — feed the sampler from their events.jsonl. A
       // remote-hsr bee with a LOCAL mirror (APIA-94) has the same event log
@@ -201,6 +216,18 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
     }
 
     return outcomes;
+  };
+
+  return (records, panes, nowMs, hsrObservations) => {
+    // withTimeout cannot cancel work it abandons. Share the still-running
+    // sample with later ticks so a slow registry never accumulates overlapping
+    // transcript scans in the same daemon process.
+    if (inFlight) return inFlight;
+    const current = sample(records, panes, nowMs, hsrObservations).finally(() => {
+      if (inFlight === current) inFlight = undefined;
+    });
+    inFlight = current;
+    return current;
   };
 }
 

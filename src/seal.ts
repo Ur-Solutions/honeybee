@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
-import { appendLedger } from "./store.js";
+import { appendLedger, type SessionRecord } from "./store.js";
 
 export const SEAL_STATUSES = ["done", "blocked", "needs_input", "failed"] as const;
 export const SEAL_TYPES = ["implementation", "review", "risk", "test", "witness"] as const;
@@ -350,14 +350,47 @@ export async function copyBeeSeals(beeName: string, destDir: string): Promise<nu
   return copied;
 }
 
-export async function sealedBeeNames(): Promise<Set<string>> {
+/**
+ * Names carrying a seal in their CURRENT runtime incarnation. Without a
+ * record snapshot this preserves the historical index behavior used by seal
+ * search. State derivation passes records, whose high-water filenames hide
+ * seals from earlier incarnations until a newer seal lands.
+ */
+export async function sealedBeeNames(records?: readonly SessionRecord[]): Promise<Set<string>> {
   const root = sealsRoot();
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const directories = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+  if (!records) return directories;
+
   const names = new Set<string>();
-  for (const entry of entries) {
-    if (entry.isDirectory()) names.add(entry.name);
+  const candidates = records.filter((record) => directories.has(record.name));
+  for (let offset = 0; offset < candidates.length; offset += 32) {
+    await Promise.all(candidates.slice(offset, offset + 32).map(async (record) => {
+      if (!record.sealHighWaterFilename) {
+        names.add(record.name);
+        return;
+      }
+      const newer = await scanLatestSeal(record.name, { afterFilename: record.sealHighWaterFilename });
+      if (newer.seal) names.add(record.name);
+    }));
   }
   return names;
+}
+
+/**
+ * Snapshot lifecycle cursors before launching a replacement runtime. Apply the
+ * returned patch only after the launch succeeds; the seal high-water was still
+ * captured before spawn, so a very fast new seal remains visible.
+ */
+export async function nextRuntimeIncarnationPatch(record: SessionRecord): Promise<Partial<SessionRecord>> {
+  const seal = await scanLatestSeal(record.name);
+  return {
+    sealHighWaterFilename: seal.highWaterFilename ?? undefined,
+    runtimeGeneration: (record.runtimeGeneration ?? 0) + 1,
+    terminalTranscriptDiscoveryAt: undefined,
+    lastObservedState: undefined,
+    lastObservedStateAt: undefined,
+  };
 }
 
 async function readSeal(path: string): Promise<SealRecord> {

@@ -6,8 +6,9 @@ import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { hsrObservations } from "../hsr/observe.js";
 import { createIsolatedHsrObservations } from "./observerProcess.js";
+import { createIsolatedSessionLister } from "./sessionListProcess.js";
 import { createRemoteEventMirror } from "../hsr/remoteEventMirror.js";
-import { appendLedger, listSessions, type SessionRecord, touchSession } from "../store.js";
+import { appendLedger, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
 import { createAutoTitleDispatcher } from "./autoTitle.js";
 import { dispatchAutoswaps } from "./autoswap.js";
@@ -100,8 +101,9 @@ async function defaultTranscriptFileStat(path: string): Promise<TranscriptFileSt
 
 export function buildDefaultDeps(): TickDeps {
   const refreshTranscriptMetadata = createThrottledTranscriptMetadataRefresh();
+  const isolatedListSessions = createIsolatedSessionLister();
   return {
-    listSessions,
+    listSessions: isolatedListSessions,
     listNodes,
     probeNodes: defaultProbeNodes,
     capturePanes: defaultCapturePanes,
@@ -140,7 +142,7 @@ export function buildDefaultDeps(): TickDeps {
       // records know them. Provider sync still verifies the home's identity
       // before trusting its credentials.
       const accounts = new Map((await listAccounts()).map((account) => [account.id, account]));
-      for (const record of await listSessions()) {
+      for (const record of await isolatedListSessions()) {
         if (!record.accountId || !record.homePath) continue;
         const account = accounts.get(record.accountId);
         if (!account) continue;
