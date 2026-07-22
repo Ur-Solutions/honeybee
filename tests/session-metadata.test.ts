@@ -181,6 +181,33 @@ test("terminal sibling records retain transcript ownership against heuristic ado
   });
 });
 
+test("concurrent bootstrap refreshes serialize only on the shared transcript identity", async () => {
+  await withTempStore(async () => {
+    const candidates = Array.from({ length: 24 }, (_, index) => bee(`CL.candidate-${index}`, {
+      lastPrompt: "same prompt",
+      lastPromptAt: "2026-07-18T12:00:00.000Z",
+    }));
+    await Promise.all(candidates.map((candidate) => saveSession(candidate)));
+    const transcript: TranscriptFile = {
+      provider: "claude",
+      path: "/tmp/concurrent-owned.jsonl",
+      sessionId: "concurrent-owned-session",
+      mtimeMs: 1,
+      rows: [],
+      score: 500,
+      matchedBy: ["mtime", "prompt"],
+      title: "Exactly one owner",
+    };
+
+    await Promise.all(candidates.map((candidate) => persistSessionTranscriptMetadata(candidate, transcript)));
+    const stored = await Promise.all(candidates.map((candidate) => loadSession(candidate.name)));
+    const owners = stored.filter((candidate) => candidate?.providerSessionId === transcript.sessionId);
+
+    assert.equal(owners.length, 1, "one durable identity claim prevents sibling double-adoption");
+    assert.equal(owners[0]?.transcriptPath, transcript.path);
+  });
+});
+
 test("an explicit stored session id still permits legitimate resume metadata", async () => {
   await withTempStore(async () => {
     const resumed = bee("CL.resumed", { providerSessionId: "resume-session" });
