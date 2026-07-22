@@ -27,6 +27,7 @@ async function seedBee(store: string, name: string, overrides: Record<string, un
     agent: "codex",
     requestedAgent: "codex",
     cwd: store,
+    launchArgv: ["sh", "-c", "sleep 120", "--"],
     command: "CODEX_HOME=/tmp/hive-codex-home codex --dangerously-bypass-approvals-and-sandbox",
     tmuxTarget: name.replaceAll(".", "-"),
     homePath: "/tmp/hive-codex-home",
@@ -247,7 +248,7 @@ test("set-model on a downed HSR bee records the selection and revive applies it"
       assert.equal(record.substrate, "hsr", "the bee stays pane-less")
       assert.equal(record.providerSessionId, "sess-hsr-switch")
       assert.match(
-        String(record.command),
+        String(record.lastReviveCommand),
         /-c model_reasoning_effort=high/,
         "reviveHsrRunner's rebuilt spec must carry the persisted extra flags",
       )
@@ -270,7 +271,7 @@ test("revive applies the recorded model extra flags on the tmux path", { skip: !
     await hive(store, socket, ["revive", bee, "--no-wait"]);
     const record = await readBee(store, bee);
     assert.equal(record.status, "running");
-    assert.match(String(record.command), /-c model_reasoning_effort=high/, "reviveRecord must re-apply modelExtraArgs");
-    assert.match(String(record.command), /resume sess-extras/);
+    assert.match(String(record.lastReviveCommand), /-c model_reasoning_effort=high/, "reviveRecord must re-apply modelExtraArgs");
+    assert.match(String(record.lastReviveCommand), /resume sess-extras/);
   });
 });

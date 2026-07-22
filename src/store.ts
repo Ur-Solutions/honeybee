@@ -20,6 +20,8 @@ export type SessionRecord = {
    */
   launchArgv?: string[];
   command: string;
+  /** Rendered command used by the most recent revive; `command` stays original. */
+  lastReviveCommand?: string;
   tmuxTarget: string;
   /**
    * The tmux pane id (e.g. "%7") this bee's agent actually runs in. Pins all
@@ -427,7 +429,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   return normalizeSessionRecord(parsed, path);
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",

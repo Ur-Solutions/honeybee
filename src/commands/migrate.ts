@@ -39,6 +39,142 @@ import { resolve } from "node:path";
 // "claude" here the day a claude release unifies the two stores.
 export const RESUME_GATED_HARNESSES = new Set(["codex", "grok", "opencode", "kimi"]);
 
+type LaunchReplaySource = "structured" | "legacy-command" | "resolved-fallback";
+
+type LaunchReplay = {
+  spec: AgentSpec;
+  source: LaunchReplaySource;
+};
+
+/** True when `needle` occurs contiguously in `haystack`. */
+function containsArgv(haystack: readonly string[], needle: readonly string[]): boolean {
+  if (needle.length === 0) return true;
+  for (let i = 0; i <= haystack.length - needle.length; i += 1) {
+    if (needle.every((part, offset) => haystack[i + offset] === part)) return true;
+  }
+  return false;
+}
+
+function withoutTrailingArgs(args: readonly string[], suffixes: readonly string[][]): string[] {
+  for (const suffix of [...suffixes].sort((a, b) => b.length - a.length)) {
+    if (suffix.length === 0 || suffix.length > args.length) continue;
+    const offset = args.length - suffix.length;
+    if (suffix.every((part, index) => args[offset + index] === part)) return args.slice(0, offset);
+  }
+  return [...args];
+}
+
+function withoutLegacyResumeArgs(args: readonly string[], tool: string, providerSessionId?: string): string[] {
+  const stripped = withoutTrailingArgs(args, [resumeArgs(tool, providerSessionId), resumeArgs(tool, undefined)]);
+  if (stripped.length !== args.length) return stripped;
+
+  // The id can be missing from a damaged/partially rewritten old record even
+  // though its rendered command still ends in a concrete resume invocation.
+  // Match the driver's id-bearing shape with only the id word wildcarded.
+  const marker = "__hive_recorded_session_id__";
+  const template = resumeArgs(tool, marker);
+  const markerIndex = template.indexOf(marker);
+  if (markerIndex < 0 || template.length > args.length) return [...args];
+  const offset = args.length - template.length;
+  const matches = template.every((part, index) => index === markerIndex || args[offset + index] === part);
+  return matches ? args.slice(0, offset) : [...args];
+}
+
+/**
+ * Recover argv + non-secret env from an old rendered command. shellCommand()
+ * emits env assignments first and shell-quotes every word, so splitShellWords
+ * can reverse its own format. A redacted secret is never copied back into the
+ * child environment; the freshly resolved identity env remains authoritative.
+ */
+function parseLegacyLaunch(command: string): { argv: string[]; env: Record<string, string> } | undefined {
+  let words: string[];
+  try {
+    words = splitShellWords(command);
+  } catch {
+    return undefined;
+  }
+  const env: Record<string, string> = {};
+  let firstArgv = 0;
+  for (; firstArgv < words.length; firstArgv += 1) {
+    const match = words[firstArgv]!.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s);
+    if (!match) break;
+    if (match[2] !== "<redacted>") env[match[1]!] = match[2]!;
+  }
+  const argv = words.slice(firstArgv);
+  return argv.length > 0 && argv[0]!.length > 0 ? { argv, env } : undefined;
+}
+
+/**
+ * Overlay the immutable recorded launch onto a freshly resolved spec. The
+ * resolver still supplies current home/identity env and tmux policy; executable
+ * and argv come from spawn. Legacy rendered commands have a previous revive's
+ * trailing resume suffix removed before the current lifecycle args are added.
+ */
+export function replayRecordedLaunch(
+  record: SessionRecord,
+  tool: string,
+  resolved: AgentSpec,
+  lifecycleArgs: string[],
+): LaunchReplay {
+  let argv: string[] | undefined;
+  let env = resolved.env;
+  let source: LaunchReplaySource = "resolved-fallback";
+
+  if (record.launchArgv?.length) {
+    argv = [...record.launchArgv];
+    source = "structured";
+  } else {
+    const legacy = parseLegacyLaunch(record.command);
+    if (legacy) {
+      argv = legacy.argv;
+      env = { ...resolved.env, ...legacy.env };
+      source = "legacy-command";
+    }
+  }
+
+  if (!argv) return { spec: resolved, source };
+  const command = argv[0]!;
+  let args = argv.slice(1);
+  if (source === "legacy-command") {
+    args = withoutLegacyResumeArgs(args, tool, record.providerSessionId);
+  }
+
+  // `hive set-model` is an explicit post-spawn override. Preserve it alongside
+  // the recorded launch without duplicating selections already present there.
+  const resolvedModelArgs = record.model ? modelArgsForAgent(tool, record.model) : [];
+  const modelArgs = containsArgv(resolved.args, resolvedModelArgs) ? resolvedModelArgs : [];
+  const modelExtras = modelExtraArgsFor(record);
+  for (const selection of [modelArgs, modelExtras]) {
+    if (selection.length > 0 && !containsArgv(args, selection)) args.push(...selection);
+  }
+
+  return {
+    source,
+    spec: {
+      ...resolved,
+      command,
+      args: [...args, ...lifecycleArgs],
+      env,
+    },
+  };
+}
+
+/**
+ * Structured records fail closed when their recorded executable disappeared.
+ * String-only records predate exact argv capture, so an unavailable parsed
+ * executable falls back to today's resolver behavior (no worse than pre-fix).
+ */
+async function assertReplayExecutable(replay: LaunchReplay, resolved: AgentSpec): Promise<AgentSpec> {
+  try {
+    await assertExecutableAvailable(replay.spec.command);
+    return replay.spec;
+  } catch (error) {
+    if (replay.source !== "legacy-command") throw error;
+    await assertExecutableAvailable(resolved.command);
+    return resolved;
+  }
+}
+
 
 /**
  * Gate a promote/demote: the harness must have a verified resume path and the
@@ -155,27 +291,35 @@ export async function tmuxSessionSurvives(
  * adapter appends its own resume flags), interactive callers pass
  * resumeArgs(tool, id).
  */
-export async function buildResumeSpec(record: SessionRecord, tool: string, extraArgs: string[]): Promise<AgentSpec> {
-  const spec = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtraArgsFor(record), ...extraArgs], {
+export async function buildResumeSpec(
+  record: SessionRecord,
+  tool: string,
+  extraArgs: string[],
+  options: { replayLaunch?: boolean } = {},
+): Promise<AgentSpec> {
+  const resolved = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtraArgsFor(record), ...extraArgs], {
     home: record.homePath,
     yolo: agentDefaultsToYolo(tool),
     identity: Boolean(record.accountId),
     ...(record.model ? { model: record.model } : {}),
   });
-  if (record.accountId && spec.homePath) {
+  if (record.accountId && resolved.homePath) {
     const account = await findAccount(record.accountId, tool).catch(() => undefined);
     if (account) {
-      await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
-      refreshIdentityEnv(spec);
+      await activateAccountIntoHome(account, resolved.homePath, { onWarn: (message) => console.error(note(message)) });
+      refreshIdentityEnv(resolved);
     }
   }
   // Legacy records without homePath: a relaunch from inside another bee's
   // session would silently inherit its home env var — make it explicit so the
   // relaunched agent's home is deterministic and persistable (callers stamp
   // spec.homePath back onto the record).
-  adoptInheritedHome(spec);
-  await assertExecutableAvailable(spec.command);
-  return spec;
+  adoptInheritedHome(resolved);
+  if (!options.replayLaunch) {
+    await assertExecutableAvailable(resolved.command);
+    return resolved;
+  }
+  return assertReplayExecutable(replayRecordedLaunch(record, tool, resolved, extraArgs), resolved);
 }
 
 
@@ -185,11 +329,11 @@ export async function buildResumeSpec(record: SessionRecord, tool: string, extra
  * to rejoin the SAME provider session headlessly; revive can pass `fresh` to
  * start a new HSR session while preserving the record identity.
  */
-export async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fresh?: boolean; sessionOverride?: string } = {}): Promise<SessionRecord> {
+export async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fresh?: boolean; sessionOverride?: string; replayLaunch?: boolean } = {}): Promise<SessionRecord> {
   const adapter = adapterFor(tool);
   const fresh = opts.fresh === true;
   const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
-  const spec = await buildResumeSpec(record, tool, []);
+  const spec = await buildResumeSpec(record, tool, [], { replayLaunch: opts.replayLaunch });
   const hostPid = await spawnHsrHost({
     bee: record.name,
     comb: record.combId ?? record.name,
@@ -210,12 +354,14 @@ export async function reviveHsrRunner(record: SessionRecord, tool: string, opts:
   // Field-merge, not a full-record save, so daemon writes since `record`
   // loaded survive; null = record deleted concurrently, nothing to persist
   // (HIVE-49).
+  const renderedCommand = shellCommand(spec);
   const patch: Partial<SessionRecord> = {
-    command: shellCommand(spec),
+    ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
     substrate: "hsr",
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
     ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
+    ...(fresh ? { providerSessionId: undefined } : {}),
     ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
     updatedAt: new Date().toISOString(),
     status: "running",
@@ -782,7 +928,7 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
     );
   }
   if (record.substrate === "hsr") {
-    const updated = await reviveHsrRunner(record, tool, { fresh, sessionOverride });
+    const updated = await reviveHsrRunner(record, tool, { fresh, sessionOverride, replayLaunch: true });
     await appendLedger({
       type: "bee.revive",
       session: record.name,
@@ -798,12 +944,15 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
   // The first-class model + its persisted extra flags ride along — without
   // them a revived bee silently falls back to the harness default model
   // (the HSR path via buildResumeSpec always applied them; this path must too).
-  const spec = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtraArgsFor(record), ...(fresh ? [] : resumeArgs(tool, providerSessionId))], {
+  const lifecycleArgs = fresh ? [] : resumeArgs(tool, providerSessionId);
+  const resolved = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtraArgsFor(record), ...lifecycleArgs], {
     home: record.homePath,
     yolo: sniffYolo(record.command),
     identity: true,
     ...(record.model ? { model: record.model } : {}),
   });
+  const replay = replayRecordedLaunch(record, tool, resolved, lifecycleArgs);
+  let spec = replay.spec;
   // Refresh the bee's HOME credentials from the vault before relaunch. A bee
   // whose home token expired while it was dead otherwise boots logged-out: the
   // daemon's chain sync only pulls home→vault (keeping the vault fresh, which
@@ -819,7 +968,7 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
   // grok/cursor keep their existing assert path.)
   let ownerId: string | undefined;
   if (!record.node) {
-    await assertExecutableAvailable(spec.command);
+    spec = await assertReplayExecutable(replay, resolved);
     if (tool === "claude" && record.homePath) {
       const owner = await claudeAccountOwningHome(record.homePath);
       if (owner) {
@@ -843,7 +992,7 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
   const updated =
     (await updateSession(record.name, {
       status: "running",
-      command: shellCommand(spec),
+      lastReviveCommand: shellCommand(spec),
       combId: record.combId ?? record.tmuxTarget,
       ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
       ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
@@ -906,8 +1055,13 @@ export async function reviveOne(record: SessionRecord, parsed: Parsed, opts: { s
   const updated = await reviveRecord(record, { fresh, sessionOverride });
 
   const how = providerSessionId ? `resumed ${providerSessionId}` : "fresh session";
-  if (isPretty()) console.log(actionLine("ok", "revive", [bold(record.name), record.agent, dim(how)]));
-  else console.log(`revived\t${record.name}\t${record.agent}\t${how}`);
+  const relaunchedCommand = updated.lastReviveCommand ?? updated.command;
+  if (isPretty()) {
+    console.log(actionLine("ok", "revive", [bold(record.name), record.agent, dim(how)]));
+    console.error(note(relaunchedCommand));
+  } else {
+    console.log(`revived\t${record.name}\t${record.agent}\t${how}\t${relaunchedCommand}`);
+  }
   if (!opts.skipReadyWait) await waitForRevivedReady([updated], parsed);
   return updated;
 }
