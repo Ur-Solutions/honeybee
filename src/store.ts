@@ -11,6 +11,14 @@ export type SessionRecord = {
   name: string;
   agent: string;
   cwd: string;
+  /**
+   * Immutable executable + argv resolved for the original launch. Hive-owned
+   * provider-session pinning is deliberately excluded: revive may need to
+   * replace that lifecycle routing with `resume` args or omit it for --fresh,
+   * while every operator/config/model/yolo argument remains byte-for-byte.
+   * Absent on legacy records, which fall back to the rendered `command`.
+   */
+  launchArgv?: string[];
   command: string;
   tmuxTarget: string;
   /**
@@ -424,6 +432,7 @@ const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requeste
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
   ...OPTIONAL_STRING_SESSION_KEYS,
+  "launchArgv",
   "substrate",
   "runnerPid",
   "remoteTokenExpiresAt",
@@ -459,6 +468,12 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
 
   for (const key of OPTIONAL_STRING_SESSION_KEYS) {
     if (typeof object[key] === "string") record[key] = object[key];
+  }
+
+  // Structured original launch. Invalid/empty arrays are ignored so a newer
+  // or hand-edited record degrades to the legacy rendered-command fallback.
+  if (Array.isArray(object.launchArgv) && object.launchArgv.length > 0 && object.launchArgv.every((part) => typeof part === "string")) {
+    record.launchArgv = [...object.launchArgv] as string[];
   }
 
   if (object.autoswap === true) record.autoswap = true;

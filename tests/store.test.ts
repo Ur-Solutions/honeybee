@@ -62,6 +62,7 @@ test("store root is read at call time and session files are private", async () =
       name: "CO.abc",
       agent: "codex",
       cwd: dir,
+      launchArgv: ["codex", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.6-sol"],
       command: "codex",
       tmuxTarget: "CO-abc",
       createdAt: "2026-05-28T00:00:00.000Z",

@@ -226,6 +226,9 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     await assertExecutableAvailable(spec.command);
     await assertAgentAuthFreshForSpawn(spec, account?.id);
   }
+  // Freeze the resolved fork launch before the HSR branch adds Hive's own
+  // provider-session pin. Revive owns provider lifecycle args independently.
+  const launchArgv = [spec.command, ...spec.args];
 
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(stringFlag(parsed, ["name"]) ?? identity.id);
@@ -273,6 +276,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       name,
       agent: spec.kind,
       cwd,
+      launchArgv,
       command,
       tmuxTarget: name, // logical id — HSR has no tmux target
       substrate: "hsr",
@@ -321,6 +325,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       name,
       agent: spec.kind,
       cwd,
+      launchArgv,
       command,
       tmuxTarget,
       ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),

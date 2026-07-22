@@ -422,6 +422,9 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     await activateAccountIntoHome(account, spec.homePath);
     refreshIdentityEnv(spec);
   }
+  // Keep the original resolved argv independent from Hive's generated provider
+  // session pin so revive can resume (or start fresh) without rebuilding flags.
+  const launchArgv = [spec.command, ...spec.args];
   // Pin the bee to its own provider session id from birth (see forcedSessionIdArgs):
   // flow runs spawn many siblings in one cwd, the exact case the cwd-blind claude
   // transcript matcher would otherwise cross-match by mtime.
@@ -458,6 +461,7 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     name,
     agent: spec.kind,
     cwd: opts.cwd,
+    launchArgv,
     command,
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),

@@ -280,6 +280,10 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // "activate" folds in resolveAgent + account activation (the OAuth-refresh
   // network call and accounts-lock wait live here); near-zero without --account.
   timer.mark("activate");
+  // Freeze the operator/config-resolved launch before Hive appends its own
+  // provider-session pin. Revive reuses this exact argv and supplies lifecycle
+  // routing separately (`resume <id>` or nothing for --fresh).
+  const launchArgv = [spec.command, ...spec.args];
   // Pin the bee to its own provider session id from birth so the transcript
   // matcher anchors on it (+1000) instead of cross-matching a sibling's file by
   // mtime — the auto-titler and resume/swap all key off providerSessionId. Skip
@@ -391,6 +395,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       name,
       agent: spec.kind,
       cwd: recordCwd,
+      launchArgv,
       command,
       tmuxTarget: name, // logical id — remote HSR has no tmux target
       node: opts.node.name,
@@ -472,6 +477,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       name,
       agent: spec.kind,
       cwd: opts.cwd,
+      launchArgv,
       command,
       tmuxTarget: name, // logical id — HSR has no tmux target
       substrate: "hsr",
@@ -533,6 +539,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     name,
     agent: spec.kind,
     cwd: opts.cwd,
+    launchArgv,
     command,
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
