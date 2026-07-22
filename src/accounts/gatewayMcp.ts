@@ -33,7 +33,7 @@ function gatewayMcpDebug(message: string): void {
 }
 
 function targetFileForHarness(harness: string): string | undefined {
-  if (harness === "claude") return "settings.json";
+  if (harness === "claude") return ".claude.json";
   if (harness === "codex") return "config.toml";
   return undefined;
 }
@@ -124,6 +124,116 @@ function sameEntry(left: unknown, right: McpEntry): boolean {
   return isMcpEntry(left) && left.command === right.command && left.args.length === right.args.length && left.args.every((arg, index) => arg === right.args[index]);
 }
 
+type TopLevelJsonLayout = {
+  openBrace: number;
+  closeBrace: number;
+  propertyCount: number;
+  lastValueEnd: number;
+  target?: { start: number; end: number };
+};
+
+function skipJsonWhitespace(input: string, start: number): number {
+  let index = start;
+  while (/\s/u.test(input[index] ?? "")) index += 1;
+  return index;
+}
+
+function jsonStringEnd(input: string, start: number): number | null {
+  if (input[start] !== '"') return null;
+  for (let index = start + 1; index < input.length; index += 1) {
+    if (input[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (input[index] === '"') return index + 1;
+  }
+  return null;
+}
+
+function jsonValueEnd(input: string, start: number): number | null {
+  if (input[start] === '"') return jsonStringEnd(input, start);
+  if (input[start] === "{" || input[start] === "[") {
+    const stack = [input[start] === "{" ? "}" : "]"];
+    for (let index = start + 1; index < input.length; index += 1) {
+      if (input[index] === '"') {
+        const end = jsonStringEnd(input, index);
+        if (end === null) return null;
+        index = end - 1;
+        continue;
+      }
+      if (input[index] === "{") stack.push("}");
+      else if (input[index] === "[") stack.push("]");
+      else if (input[index] === stack[stack.length - 1]) {
+        stack.pop();
+        if (stack.length === 0) return index + 1;
+      }
+    }
+    return null;
+  }
+  let end = start;
+  while (end < input.length && !/[\s,}\]]/u.test(input[end]!)) end += 1;
+  return end > start ? end : null;
+}
+
+function topLevelJsonLayout(input: string, targetKey: string): TopLevelJsonLayout | null {
+  let index = skipJsonWhitespace(input, 0);
+  if (input[index] !== "{") return null;
+  const openBrace = index;
+  index += 1;
+  let propertyCount = 0;
+  let lastValueEnd = index;
+  let target: { start: number; end: number } | undefined;
+  while (true) {
+    index = skipJsonWhitespace(input, index);
+    if (input[index] === "}") {
+      const closeBrace = index;
+      if (skipJsonWhitespace(input, closeBrace + 1) !== input.length) return null;
+      return { openBrace, closeBrace, propertyCount, lastValueEnd, ...(target ? { target } : {}) };
+    }
+    const keyEnd = jsonStringEnd(input, index);
+    if (keyEnd === null) return null;
+    let key: unknown;
+    try {
+      key = JSON.parse(input.slice(index, keyEnd));
+    } catch {
+      return null;
+    }
+    index = skipJsonWhitespace(input, keyEnd);
+    if (input[index] !== ":") return null;
+    index = skipJsonWhitespace(input, index + 1);
+    const valueStart = index;
+    const valueEnd = jsonValueEnd(input, valueStart);
+    if (valueEnd === null) return null;
+    propertyCount += 1;
+    lastValueEnd = valueEnd;
+    if (key === targetKey) {
+      if (target) return null;
+      target = { start: valueStart, end: valueEnd };
+    }
+    index = skipJsonWhitespace(input, valueEnd);
+    if (input[index] === ",") {
+      index += 1;
+      continue;
+    }
+    if (input[index] !== "}") return null;
+  }
+}
+
+function rewriteTopLevelJsonProperty(input: string, key: string, value: unknown): string | null {
+  const layout = topLevelJsonLayout(input, key);
+  if (!layout) return null;
+  if (layout.target) {
+    const lineStart = input.lastIndexOf("\n", layout.target.start - 1) + 1;
+    const padding = " ".repeat(layout.target.start - lineStart);
+    const rendered = JSON.stringify(value, null, 2).replaceAll("\n", `\n${padding}`);
+    return `${input.slice(0, layout.target.start)}${rendered}${input.slice(layout.target.end)}`;
+  }
+  const rendered = `${JSON.stringify(key)}:${JSON.stringify(value)}`;
+  const insertAt = layout.propertyCount === 0 ? layout.openBrace + 1 : layout.lastValueEnd;
+  const prefix = layout.propertyCount === 0 ? "" : ",";
+  return `${input.slice(0, insertAt)}${prefix}${rendered}${input.slice(insertAt)}`;
+}
+
 function reconcileClaude(
   input: string,
   desired: Record<string, McpEntry>,
@@ -169,8 +279,10 @@ function reconcileClaude(
     changed = true;
   }
 
-  if (Object.keys(servers).length > 0 || rawServers !== undefined || Object.keys(desired).length > 0) config.mcpServers = servers;
-  return { text: changed ? `${JSON.stringify(config, null, 2)}\n` : input, owned: nextOwned };
+  if (!changed) return { text: input, owned: nextOwned };
+  if (!input.trim()) return { text: `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`, owned: nextOwned };
+  const rewritten = rewriteTopLevelJsonProperty(input, "mcpServers", servers);
+  return rewritten === null ? null : { text: rewritten, owned: nextOwned };
 }
 
 function tomlKey(name: string): string {

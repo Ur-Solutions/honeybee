@@ -35,63 +35,81 @@ async function json(path: string): Promise<Record<string, unknown>> {
 
 test("claude seeder merges, updates, stays idempotent, and reconciles dead gateways", async () => {
   await withHome(async (home) => {
-    const settingsPath = join(home, "settings.json");
-    await writeFile(settingsPath, JSON.stringify({
-      theme: "dark",
+    const statePath = join(home, ".claude.json");
+    await writeFile(statePath, JSON.stringify({
+      oauthAccount: { emailAddress: "operator@example.com" },
       mcpServers: { user: { command: "/usr/bin/user-mcp", args: ["--safe"] } },
     }));
 
     const first = await seedGatewayMcp(home, "claude", { gateways: [gateway()] });
-    assert.deepEqual(first.written, ["settings.json", ".hive-gateways.json"]);
-    let settings = await json(settingsPath) as { theme?: string; mcpServers?: Record<string, unknown> };
-    assert.equal(settings.theme, "dark");
-    assert.deepEqual(settings.mcpServers?.user, { command: "/usr/bin/user-mcp", args: ["--safe"] });
-    assert.deepEqual(settings.mcpServers?.apiary, { command: "/opt/apiary-mcp", args: [] });
+    assert.deepEqual(first.written, [".claude.json", ".hive-gateways.json"]);
+    let state = await json(statePath) as { oauthAccount?: unknown; mcpServers?: Record<string, unknown> };
+    assert.deepEqual(state.oauthAccount, { emailAddress: "operator@example.com" });
+    assert.deepEqual(state.mcpServers?.user, { command: "/usr/bin/user-mcp", args: ["--safe"] });
+    assert.deepEqual(state.mcpServers?.apiary, { command: "/opt/apiary-mcp", args: [] });
 
     const stamp = await json(join(home, ".hive-gateways.json")) as GatewayMcpStamp;
-    assert.deepEqual(stamp.files["settings.json"]?.apiary, { command: "/opt/apiary-mcp", args: [] });
+    assert.deepEqual(stamp.files[".claude.json"]?.apiary, { command: "/opt/apiary-mcp", args: [] });
     assert.deepEqual((await seedGatewayMcp(home, "claude", { gateways: [gateway()] })).written, []);
 
     await seedGatewayMcp(home, "claude", { gateways: [gateway({ shim: { command: "/opt/apiary-mcp-v2", args: ["serve"] } })] });
-    settings = await json(settingsPath) as { theme?: string; mcpServers?: Record<string, unknown> };
-    assert.deepEqual(settings.mcpServers?.apiary, { command: "/opt/apiary-mcp-v2", args: ["serve"] });
+    state = await json(statePath) as { oauthAccount?: unknown; mcpServers?: Record<string, unknown> };
+    assert.deepEqual(state.mcpServers?.apiary, { command: "/opt/apiary-mcp-v2", args: ["serve"] });
 
     await seedGatewayMcp(home, "claude", { gateways: [] });
-    settings = await json(settingsPath) as { theme?: string; mcpServers?: Record<string, unknown> };
-    assert.equal(settings.mcpServers?.apiary, undefined);
-    assert.deepEqual(settings.mcpServers?.user, { command: "/usr/bin/user-mcp", args: ["--safe"] });
+    state = await json(statePath) as { oauthAccount?: unknown; mcpServers?: Record<string, unknown> };
+    assert.equal(state.mcpServers?.apiary, undefined);
+    assert.deepEqual(state.mcpServers?.user, { command: "/usr/bin/user-mcp", args: ["--safe"] });
     const reconciledStamp = await json(join(home, ".hive-gateways.json")) as GatewayMcpStamp;
-    assert.deepEqual(reconciledStamp.files["settings.json"], {});
+    assert.deepEqual(reconciledStamp.files[".claude.json"], {});
+  });
+});
+
+test("claude seeder changes only mcpServers bytes in the mixed state file", async () => {
+  await withHome(async (home) => {
+    const statePath = join(home, ".claude.json");
+    const prefix = '{\n\t"oauthAccount" : {"emailAddress":"operator@example.com"},\n\t"mcpServers" : ';
+    const suffix = ',\n  "projects" : {"/tmp/work":{"hasTrustDialogAccepted":true}}\n}\n';
+    await writeFile(statePath, `${prefix}{"user":{"command":"/usr/bin/user-mcp","args":[]}}${suffix}`);
+
+    await seedGatewayMcp(home, "claude", { gateways: [gateway()] });
+
+    const written = await readFile(statePath, "utf8");
+    assert.ok(written.startsWith(prefix));
+    assert.ok(written.endsWith(suffix));
+    const state = JSON.parse(written) as { mcpServers: Record<string, unknown> };
+    assert.deepEqual(state.mcpServers.user, { command: "/usr/bin/user-mcp", args: [] });
+    assert.deepEqual(state.mcpServers.apiary, { command: "/opt/apiary-mcp", args: [] });
   });
 });
 
 test("reconcile preserves a stamped entry that someone changed and relinquishes ownership", async () => {
   await withHome(async (home) => {
     await seedGatewayMcp(home, "claude", { gateways: [gateway()] });
-    const settingsPath = join(home, "settings.json");
-    const settings = await json(settingsPath) as { mcpServers: Record<string, unknown> };
-    settings.mcpServers.apiary = { command: "/user/replacement", args: [] };
-    await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+    const statePath = join(home, ".claude.json");
+    const state = await json(statePath) as { mcpServers: Record<string, unknown> };
+    state.mcpServers.apiary = { command: "/user/replacement", args: [] };
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
 
     await seedGatewayMcp(home, "claude", { gateways: [] });
-    const after = await json(settingsPath) as { mcpServers: Record<string, unknown> };
+    const after = await json(statePath) as { mcpServers: Record<string, unknown> };
     assert.deepEqual(after.mcpServers.apiary, { command: "/user/replacement", args: [] });
     const stamp = await json(join(home, ".hive-gateways.json")) as GatewayMcpStamp;
-    assert.deepEqual(stamp.files["settings.json"], {});
+    assert.deepEqual(stamp.files[".claude.json"], {});
   });
 });
 
 test("a live gateway upserts a colliding unowned entry, then stamps the write", async () => {
   await withHome(async (home) => {
-    const settingsPath = join(home, "settings.json");
-    await writeFile(settingsPath, JSON.stringify({
+    const statePath = join(home, ".claude.json");
+    await writeFile(statePath, JSON.stringify({
       mcpServers: { apiary: { command: "/old/unowned", args: ["legacy"] } },
     }));
     await seedGatewayMcp(home, "claude", { gateways: [gateway()] });
-    const settings = await json(settingsPath) as { mcpServers: Record<string, unknown> };
-    assert.deepEqual(settings.mcpServers.apiary, { command: "/opt/apiary-mcp", args: [] });
+    const state = await json(statePath) as { mcpServers: Record<string, unknown> };
+    assert.deepEqual(state.mcpServers.apiary, { command: "/opt/apiary-mcp", args: [] });
     const stamp = await json(join(home, ".hive-gateways.json")) as GatewayMcpStamp;
-    assert.deepEqual(stamp.files["settings.json"]?.apiary, { command: "/opt/apiary-mcp", args: [] });
+    assert.deepEqual(stamp.files[".claude.json"]?.apiary, { command: "/opt/apiary-mcp", args: [] });
   });
 });
 
@@ -127,11 +145,11 @@ test("codex seeder merges named TOML tables and removes only stamped tables", as
 
 test("malformed target configs and stamps are untouched", async () => {
   await withHome(async (home) => {
-    const settingsPath = join(home, "settings.json");
-    await writeFile(settingsPath, "{broken json\n");
+    const statePath = join(home, ".claude.json");
+    await writeFile(statePath, "{broken json\n");
     const result = await seedGatewayMcp(home, "claude", { gateways: [gateway()] });
     assert.equal(result.status, "skipped");
-    assert.equal(await readFile(settingsPath, "utf8"), "{broken json\n");
+    assert.equal(await readFile(statePath, "utf8"), "{broken json\n");
     assert.equal(await stat(join(home, ".hive-gateways.json")).catch(() => null), null);
   });
 
@@ -149,12 +167,12 @@ test("malformed target configs and stamps are untouched", async () => {
     const result = await seedGatewayMcp(home, "claude", { gateways: [gateway()] });
     assert.equal(result.status, "skipped");
     assert.equal(await readFile(stampPath, "utf8"), "{broken stamp\n");
-    assert.equal(await stat(join(home, "settings.json")).catch(() => null), null);
+    assert.equal(await stat(join(home, ".claude.json")).catch(() => null), null);
   });
 });
 
 test("kit ownership manifest makes honeybee defer the whole target file", async () => {
-  for (const [harness, target] of [["claude", "settings.json"], ["codex", "config.toml"]] as const) {
+  for (const [harness, target] of [["claude", ".claude.json"], ["codex", "config.toml"]] as const) {
     await withHome(async (home) => {
       const targetPath = join(home, target);
       const original = harness === "claude" ? '{"theme":"dark"}\n' : 'model = "gpt-5.5"\n';
