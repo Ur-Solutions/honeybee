@@ -12,7 +12,11 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   buildCodexSpawn,
   buildCodexThreadRequestParams,
@@ -29,7 +33,17 @@ import {
 } from "../src/hsr/adapters/codex.js";
 import { CodexRpcRequestTimeoutError } from "../src/hsr/adapters/codexRpc.js";
 import { adapterFor } from "../src/hsr/adapters/index.js";
+import { ensureHsrRunDir } from "../src/hsr/runDir.js";
 import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
+
+const appServerFixture = fileURLToPath(new URL("./fixtures/codex-app-server-stub.mjs", import.meta.url));
+
+function stringEnv(extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string")),
+    ...extra,
+  };
+}
 
 /** Strip the ts field so event shapes assert deterministically. */
 function stripTs(events: RunnerEvent[]): unknown[] {
@@ -297,6 +311,44 @@ test("buildCodexThreadRequestParams passes the argv model out-of-band to codex a
     approvalPolicy: "never",
     sandbox: "danger-full-access",
   });
+});
+
+test("codex app-server handshake acknowledges initialize before thread/start", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-hsr-codex-rpc-"));
+  const previousStore = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = root;
+  const bee = "CO.codex-rpc-stub";
+  const logPath = join(root, "rpc.jsonl");
+  await ensureHsrRunDir(bee);
+
+  let session: Awaited<ReturnType<typeof startCodexRunner>> | undefined;
+  try {
+    session = await startCodexRunner({
+      bee,
+      cwd: root,
+      env: stringEnv({ CODEX_APP_SERVER_STUB_LOG: logPath }),
+      runDir: join(root, "hsr", bee),
+      command: appServerFixture,
+    });
+    assert.equal(session.sessionId, "thread-stub");
+
+    const messages = (await readFile(logPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { id?: number; method?: string; params?: unknown });
+    assert.deepEqual(messages.slice(0, 3).map((message) => message.method), [
+      "initialize",
+      "initialized",
+      "thread/start",
+    ]);
+    assert.equal(messages[1]?.id, undefined, "initialized is a notification, not a request");
+    assert.deepEqual(messages[1]?.params, {});
+  } finally {
+    await session?.stop().catch(() => undefined);
+    if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousStore;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("thread handshake timeout discards the wedged child and retries on a fresh attempt with backoff", async () => {

@@ -605,6 +605,11 @@ async function createLiveCodexHandshakeAttempt(params: {
         clientInfo: { name: "hive-hsr", title: null, version: "0" },
         capabilities: null,
       });
+      // App-server's documented connection handshake is initialize REQUEST
+      // followed by the initialized NOTIFICATION. Codex 0.144.6 tolerates a
+      // missing acknowledgement, but relying on that keeps Hive outside the
+      // protocol contract and fails against a strict peer.
+      peer.notify("initialized", {});
       if (preRequestDelayMs > 0) await sleep(preRequestDelayMs);
       return peer.request(params.method, params.requestParams, { timeoutMs: requestTimeoutMs });
     },
