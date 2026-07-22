@@ -50,11 +50,12 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
   const releaseFirstStart = deferred();
   let firstStarts = 0;
   let secondStarts = 0;
-  const adapter = (onStart: () => Promise<void>, count: () => void): RunnerAdapter => ({
+  const adapter = (onStart: () => Promise<void>, count: () => void, inspect?: (opts: RunnerOpts) => void): RunnerAdapter => ({
     harness: "codex",
     tier: () => "server",
     async start(opts) {
       count();
+      inspect?.(opts);
       await onStart();
       return stubAdapter.start(opts);
     },
@@ -62,6 +63,7 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
 
   let firstHandle: HsrHostHandle | undefined;
   let secondHandle: HsrHostHandle | undefined;
+  let secondContended = false;
   try {
     const first = runHsrHost({
       bee: "queued-one",
@@ -77,7 +79,11 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
 
     const second = runHsrHost({
       bee: "queued-two",
-      adapter: adapter(async () => undefined, () => { secondStarts += 1; }),
+      adapter: adapter(
+        async () => undefined,
+        () => { secondStarts += 1; },
+        (opts) => { secondContended = opts.codexBootContended === true; },
+      ),
       opts: optsFor("queued-two"),
       queueStartup: true,
     });
@@ -98,6 +104,7 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
     releaseFirstStart.resolve();
     firstHandle = await first;
     await waitFor(() => secondStarts === 1, "second admitted after first startup");
+    assert.equal(secondContended, true, "the home-lock waiter reaches the slower first boot probe");
     secondHandle = await second;
     assert.equal((await readHsrMeta("queued-one"))?.status, "running");
     assert.equal((await readHsrMeta("queued-two"))?.status, "running");

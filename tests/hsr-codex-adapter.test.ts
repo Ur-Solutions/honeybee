@@ -16,6 +16,7 @@ import { test } from "node:test";
 import {
   buildCodexSpawn,
   buildCodexThreadRequestParams,
+  CodexBootProbeError,
   codexAdapter,
   codexModelFromArgs,
   codexNotificationToEvents,
@@ -307,6 +308,7 @@ test("thread handshake timeout discards the wedged child and retries on a fresh 
     async () => {
       const attempt = ++created;
       return {
+        isAlive: () => true,
         async run(delayMs: number, timeoutMs: number): Promise<string> {
           runs.push({ attempt, delayMs, timeoutMs });
           if (attempt < 3) throw new CodexRpcRequestTimeoutError("thread/start", timeoutMs);
@@ -346,6 +348,7 @@ test("thread handshake does not hide non-timeout protocol failures", async () =>
       async () => {
         created++;
         return {
+          isAlive: () => true,
           async run(): Promise<never> {
             throw new Error("authentication rejected");
           },
@@ -360,4 +363,50 @@ test("thread handshake does not hide non-timeout protocol failures", async () =>
   );
   assert.equal(created, 1);
   assert.equal(discarded, 1);
+});
+
+test("contended thread handshake spends the larger budget only on its first probe", async () => {
+  const timeouts: number[] = [];
+  let attempts = 0;
+  await retryCodexThreadHandshake(
+    async () => ({
+      isAlive: () => true,
+      async run(_delayMs: number, timeoutMs: number): Promise<string> {
+        timeouts.push(timeoutMs);
+        attempts += 1;
+        if (attempts === 1) throw new CodexRpcRequestTimeoutError("thread/start", timeoutMs);
+        return "thread-ok";
+      },
+      async discard(): Promise<void> {},
+    }),
+    { delaysMs: [0, 0], requestTimeoutMs: 5, firstRequestTimeoutMs: 15 },
+  );
+  assert.deepEqual(timeouts, [15, 5]);
+});
+
+test("thread handshake final failure classifies process death separately from an unresponsive live process", async () => {
+  const fail = async (alive: boolean, error: Error): Promise<CodexBootProbeError> => {
+    try {
+      await retryCodexThreadHandshake(
+        async () => ({
+          isAlive: () => alive,
+          async run(): Promise<never> {
+            throw error;
+          },
+          async discard(): Promise<void> {},
+        }),
+        { delaysMs: [0], requestTimeoutMs: 1 },
+      );
+      assert.fail("expected the boot probe to fail");
+    } catch (caught) {
+      assert.ok(caught instanceof CodexBootProbeError);
+      return caught;
+    }
+  };
+
+  assert.equal((await fail(false, new Error("exited"))).classification, "process-died");
+  assert.equal(
+    (await fail(true, new CodexRpcRequestTimeoutError("thread/start", 1))).classification,
+    "alive-but-unresponsive",
+  );
 });

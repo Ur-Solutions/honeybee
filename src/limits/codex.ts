@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { type AccountRecord, codexHomesForAccount } from "../accounts.js";
+import { withCodexHomeBootLock } from "../codexBoot.js";
 import { launchEnv } from "../env.js";
 import type { AccountLimits, CodexLiveRateLimits, CodexLiveWindow, LimitsDeps, WindowUsage } from "./types.js";
 
@@ -150,7 +151,7 @@ const CODEX_RPC_TIMEOUT_MS = 15_000;
  * to the on-disk snapshot.
  */
 async function fetchCodexLiveRateLimits(homePath: string): Promise<CodexLiveRateLimits | null> {
-  return new Promise((resolve) => {
+  return withCodexHomeBootLock(homePath, () => new Promise<CodexLiveRateLimits | null>((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn("codex", ["app-server"], {
@@ -205,7 +206,7 @@ async function fetchCodexLiveRateLimits(homePath: string): Promise<CodexLiveRate
     child.stdin?.write(
       `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "hive", title: "hive", version: "0.0.1" } } })}\n`,
     );
-  });
+  })).catch(() => null);
 }
 
 // How many recent rollout files to inspect — a fresh session may not have

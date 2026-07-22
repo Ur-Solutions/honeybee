@@ -15,6 +15,7 @@
  * Node builtins only. No cli.ts / daemon / SubstrateHsr coupling.
  */
 
+import { codexHomeFromEnv, withCodexHomeBootLock } from "../codexBoot.js";
 import type { RunnerAdapter, RunnerInputAnswer, RunnerOpts } from "./types.js";
 import { startRpcServer, type RpcMethodHandler } from "./rpc.js";
 import {
@@ -72,6 +73,7 @@ export async function runHsrHost(params: {
     adapter.harness === "codex" &&
     tier === "server" &&
     codexStartupConcurrency() > 0;
+  const bootsCodexAppServer = adapter.harness === "codex" && tier === "server";
 
   let startupMeta: HsrMeta | undefined;
   if (publishStartup) {
@@ -96,16 +98,20 @@ export async function runHsrHost(params: {
 
   let session: Awaited<ReturnType<RunnerAdapter["start"]>>;
   try {
-    const startAdapter = async () => {
+    const startAdapter = async (startOpts: RunnerOpts = opts) => {
       if (startupMeta?.startupPhase === "admission") {
         startupMeta = { ...startupMeta, startupPhase: "harness" };
         await writeHsrMeta(bee, startupMeta);
       }
-      return adapter.start(opts);
+      return adapter.start(startOpts);
     };
-    session = queueCodexStartup
-      ? await withCodexStartupSlot(bee, startAdapter)
-      : await startAdapter();
+    const startWithAdmission = (startOpts: RunnerOpts) => queueCodexStartup
+      ? withCodexStartupSlot(bee, () => startAdapter(startOpts))
+      : startAdapter(startOpts);
+    session = bootsCodexAppServer
+      ? await withCodexHomeBootLock(codexHomeFromEnv(opts.env), ({ waited }) =>
+          startWithAdmission(waited ? { ...opts, codexBootContended: true } : opts))
+      : await startWithAdmission(opts);
   } catch (error) {
     if (startupMeta) {
       await writeHsrMeta(bee, {

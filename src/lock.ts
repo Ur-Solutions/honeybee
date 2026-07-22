@@ -2,10 +2,12 @@ import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
 import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 
-type LockOptions = {
+export type LockOptions = {
   timeoutMs?: number;
   staleMs?: number;
   pollMs?: number;
+  /** Called once when acquisition first observes another holder. */
+  onWait?: () => void;
 };
 
 type LockHandle = {
@@ -30,6 +32,7 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
   const started = Date.now();
+  let reportedWait = false;
 
   await mkdir(dirname(path), { recursive: true });
 
@@ -74,6 +77,10 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw error;
+      if (!reportedWait) {
+        reportedWait = true;
+        options.onWait?.();
+      }
 
       const info = await stat(path).catch(() => null);
       if (info && Date.now() - info.mtimeMs > staleMs) {

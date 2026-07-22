@@ -1,0 +1,41 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { withFileLock } from "./lock.js";
+import { spawnTimingEnabled } from "./spawnTiming.js";
+
+const CODEX_BOOT_LOCK_FILENAME = ".hive-app-server-boot.lock";
+const CODEX_BOOT_LOCK_TIMEOUT_MS = 10 * 60_000;
+
+export type CodexBootLockState = {
+  /** True when another boot held this home's lock before this caller acquired it. */
+  waited: boolean;
+};
+
+/** Resolve the credential home used by `codex app-server`. */
+export function codexHomeFromEnv(env: Record<string, string | undefined>): string {
+  return env.CODEX_HOME || join(env.HOME || homedir(), ".codex");
+}
+
+/**
+ * Serialize only the app-server boot window for one CODEX_HOME.
+ *
+ * The lock lives inside the home, so independent homes never share a lock. The
+ * caller releases it as soon as the startup RPC succeeds or fails; the running
+ * app-server remains outside the critical section.
+ */
+export async function withCodexHomeBootLock<T>(
+  home: string,
+  fn: (state: CodexBootLockState) => Promise<T>,
+): Promise<T> {
+  let waited = false;
+  return withFileLock(join(home, CODEX_BOOT_LOCK_FILENAME), () => fn({ waited }), {
+    timeoutMs: CODEX_BOOT_LOCK_TIMEOUT_MS,
+    staleMs: CODEX_BOOT_LOCK_TIMEOUT_MS,
+    onWait: () => {
+      waited = true;
+      if (spawnTimingEnabled()) {
+        process.stderr.write(`hive: debug: waiting for codex boot lock (${home})\n`);
+      }
+    },
+  });
+}

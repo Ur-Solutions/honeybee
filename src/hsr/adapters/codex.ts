@@ -370,6 +370,10 @@ const CODEX_APP_SERVER_ARGS = ["app-server"];
 // is no protocol-level ready notification, so failed attempts must be killed and
 // respawned; retrying on the same peer cannot recover it.
 const CODEX_THREAD_REQUEST_TIMEOUT_MS = 5_000;
+// A caller that waited on its home lock gets more time on the first request
+// because the preceding boot may still be completing an auth refresh. The
+// fixed ladder remains bounded to 72s (37s delays + 15s + four 5s RPCs).
+const CODEX_CONTENDED_FIRST_REQUEST_TIMEOUT_MS = 15_000;
 const CODEX_THREAD_HANDSHAKE_DELAYS_MS = [0, 2_000, 5_000, 10_000, 20_000] as const;
 const CODEX_STDERR_LOG_LIMIT_BYTES = 1024 * 1024;
 
@@ -377,9 +381,23 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 export type CodexThreadHandshakeAttempt<T> = {
   run(preRequestDelayMs: number, requestTimeoutMs: number): Promise<T>;
+  /** Process liveness is independent from whether the RPC peer answers. */
+  isAlive(): boolean;
   /** Kill and fully discard this attempt; a timed-out connection is unrecoverable. */
   discard(): Promise<void>;
 };
+
+export type CodexBootFailureCause = "process-died" | "alive-but-unresponsive";
+
+export class CodexBootProbeError extends Error {
+  readonly classification: CodexBootFailureCause;
+
+  constructor(classification: CodexBootFailureCause, error: unknown) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "CodexBootProbeError";
+    this.classification = classification;
+  }
+}
 
 /**
  * Retry a Codex thread handshake on a fresh app-server after a bounded timeout.
@@ -391,6 +409,7 @@ export async function retryCodexThreadHandshake<T>(
   opts: {
     delaysMs?: readonly number[];
     requestTimeoutMs?: number;
+    firstRequestTimeoutMs?: number;
     onRetry?: (info: { attempt: number; maxAttempts: number; nextDelayMs: number; error: CodexRpcRequestTimeoutError }) => void;
   } = {},
 ): Promise<{ attempt: CodexThreadHandshakeAttempt<T>; result: T }> {
@@ -401,9 +420,13 @@ export async function retryCodexThreadHandshake<T>(
   for (let index = 0; index < delaysMs.length; index++) {
     const attempt = await createAttempt();
     try {
-      const result = await attempt.run(delaysMs[index] as number, requestTimeoutMs);
+      const timeoutMs = index === 0 ? (opts.firstRequestTimeoutMs ?? requestTimeoutMs) : requestTimeoutMs;
+      const result = await attempt.run(delaysMs[index] as number, timeoutMs);
       return { attempt, result };
     } catch (error) {
+      const classification: CodexBootFailureCause = attempt.isAlive()
+        ? "alive-but-unresponsive"
+        : "process-died";
       // Always discard a failed child. codex-cli 0.144.0 leaves the connection
       // wedged after a premature thread request, including for later requests.
       await attempt.discard().catch(() => undefined);
@@ -411,7 +434,7 @@ export async function retryCodexThreadHandshake<T>(
         error instanceof CodexRpcRequestTimeoutError &&
         (error.method === "thread/start" || error.method === "thread/resume");
       const hasNext = index + 1 < delaysMs.length;
-      if (!retryable || !hasNext) throw error;
+      if (!retryable || !hasNext) throw new CodexBootProbeError(classification, error);
       opts.onRetry?.({
         attempt: index + 1,
         maxAttempts: delaysMs.length,
@@ -583,6 +606,7 @@ async function createLiveCodexHandshakeAttempt(params: {
   return {
     child,
     peer,
+    isAlive: () => !exited && child.exitCode === null && child.signalCode === null,
     async run(preRequestDelayMs: number, requestTimeoutMs: number): Promise<unknown> {
       await peer.request("initialize", {
         clientInfo: { name: "hive-hsr", title: null, version: "0" },
@@ -607,17 +631,26 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   const method = opts.resume && opts.sessionId ? "thread/resume" : "thread/start";
   const requestParams = buildCodexThreadRequestParams(opts, method);
 
-  const handshake = await retryCodexThreadHandshake(
-    () => createLiveCodexHandshakeAttempt({ command, args, env, opts, method, requestParams }),
-    {
-      onRetry: ({ attempt, maxAttempts, nextDelayMs, error }) => {
-        process.stderr.write(
-          `hive: ${error.message}; restarting codex app-server ` +
-          `(attempt ${attempt + 1}/${maxAttempts}, waiting ${nextDelayMs}ms before ${method})\n`,
-        );
+  let handshake: Awaited<ReturnType<typeof retryCodexThreadHandshake<unknown>>>;
+  try {
+    handshake = await retryCodexThreadHandshake(
+      () => createLiveCodexHandshakeAttempt({ command, args, env, opts, method, requestParams }),
+      {
+        ...(opts.codexBootContended ? { firstRequestTimeoutMs: CODEX_CONTENDED_FIRST_REQUEST_TIMEOUT_MS } : {}),
+        onRetry: ({ attempt, maxAttempts, nextDelayMs, error }) => {
+          process.stderr.write(
+            `hive: ${error.message}; restarting codex app-server ` +
+            `(attempt ${attempt + 1}/${maxAttempts}, waiting ${nextDelayMs}ms before ${method})\n`,
+          );
+        },
       },
-    },
-  );
+    );
+  } catch (error) {
+    if (error instanceof CodexBootProbeError) {
+      process.stderr.write(`hive: codex boot probe failed: ${error.classification} (${method})\n`);
+    }
+    throw error;
+  }
   const liveAttempt = handshake.attempt as LiveCodexHandshakeAttempt;
   const { child, peer } = liveAttempt;
 
