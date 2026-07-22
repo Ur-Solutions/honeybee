@@ -27,7 +27,7 @@ type CachedGatewayFile = {
 let cachedRoot = "";
 let cachedFiles = new Map<string, CachedGatewayFile>();
 
-function gatewaysDisabled(): boolean {
+export function gatewaysAreDisabled(): boolean {
   return process.env.HIVE_GATEWAYS_DISABLE === "1";
 }
 
@@ -120,13 +120,13 @@ export function gatewayPidIsLive(pid: number, kill: (pid: number, signal: 0) => 
   try {
     kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
 export function gatewaysWithLiveness(): GatewayStatus[] {
-  if (gatewaysDisabled()) return [];
+  if (gatewaysAreDisabled()) return [];
   try {
     return cachedGatewayRecords().map(({ record, registryPath }) => ({
       ...record,

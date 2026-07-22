@@ -200,3 +200,25 @@ test("empty registry is a no-op and unsupported harnesses skip", async () => {
     assert.match(unsupported.reason ?? "", /no MCP config dialect/);
   });
 });
+
+test("the gateway disable switch freezes existing seeded state", async () => {
+  await withHome(async (home) => {
+    await seedGatewayMcp(home, "claude", { gateways: [gateway()] });
+    const statePath = join(home, ".claude.json");
+    const stampPath = join(home, ".hive-gateways.json");
+    const beforeState = await readFile(statePath, "utf8");
+    const beforeStamp = await readFile(stampPath, "utf8");
+    const previous = process.env.HIVE_GATEWAYS_DISABLE;
+    process.env.HIVE_GATEWAYS_DISABLE = "1";
+    try {
+      const result = await seedGatewayMcp(home, "claude");
+      assert.equal(result.status, "skipped");
+      assert.match(result.reason ?? "", /left untouched/);
+      assert.equal(await readFile(statePath, "utf8"), beforeState);
+      assert.equal(await readFile(stampPath, "utf8"), beforeStamp);
+    } finally {
+      if (previous === undefined) delete process.env.HIVE_GATEWAYS_DISABLE;
+      else process.env.HIVE_GATEWAYS_DISABLE = previous;
+    }
+  });
+});

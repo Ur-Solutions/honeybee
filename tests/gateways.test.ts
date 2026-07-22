@@ -72,9 +72,10 @@ test("gateway registry tolerates malformed files and reports pid liveness", asyn
   });
 });
 
-test("gateway liveness is exactly kill(pid, 0)", () => {
+test("gateway liveness uses kill(pid, 0) and treats EPERM as live", () => {
   const calls: Array<[number, number]> = [];
   assert.equal(gatewayPidIsLive(42, (pid, signal) => { calls.push([pid, signal]); }), true);
+  assert.equal(gatewayPidIsLive(44, () => { throw Object.assign(new Error("not permitted"), { code: "EPERM" }); }), true);
   assert.equal(gatewayPidIsLive(43, () => { throw new Error("ESRCH"); }), false);
   assert.deepEqual(calls, [[42, 0]]);
 });

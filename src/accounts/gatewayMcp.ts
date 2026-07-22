@@ -1,7 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { atomicWriteFile } from "../fsx.js";
-import { liveGateways, type GatewayRecord } from "../gateways.js";
+import { gatewaysAreDisabled, liveGateways, type GatewayRecord } from "../gateways.js";
 import { withFileLock } from "../lock.js";
 import { tomlLines } from "./homeDefaults.js";
 
@@ -502,6 +502,11 @@ export async function seedGatewayMcp(
   const targetFile = targetFileForHarness(harness);
   if (!targetFile) {
     const reason = `no MCP config dialect for ${harness}`;
+    gatewayMcpDebug(`skipping ${homePath}: ${reason}`);
+    return { status: "skipped", reason, written: [] };
+  }
+  if (options.gateways === undefined && gatewaysAreDisabled()) {
+    const reason = "gateway discovery is disabled; existing MCP seed state left untouched";
     gatewayMcpDebug(`skipping ${homePath}: ${reason}`);
     return { status: "skipped", reason, written: [] };
   }
