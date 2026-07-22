@@ -23,6 +23,10 @@ export type FlightSweeper = (
   activity?: ReadonlyMap<string, BeeActivitySignal>,
 ) => Promise<FlightSweepOutcome[]>;
 
+export type FlightSweeperOptions = {
+  detached?: boolean;
+};
+
 export async function latestSealForCurrentIncarnation(beeName: string): Promise<SlotSealObservation | null> {
   const record = await loadSession(beeName);
   const scan = await scanLatestSeal(beeName, { afterFilename: record?.sealHighWaterFilename });
@@ -37,7 +41,7 @@ export async function latestSealForCurrentIncarnation(beeName: string): Promise<
   };
 }
 
-export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): FlightSweeper {
+export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}, options: FlightSweeperOptions = {}): FlightSweeper {
   const deps: FlightSweepDeps = {
     listFlights,
     loadFlight,
@@ -127,6 +131,9 @@ export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}): F
     now: () => Date.now(),
     ...overrides,
   };
+  if (options.detached === false) {
+    return (records, observed, activity) => sweepFlights(deps, records, observed, activity);
+  }
   // DETACHED execution (2026-07-21 canary breach): a sweep's side effects —
   // account auto-pick (live limits fetch), credential activation
   // (keychain/OAuth), HSR spawn, brief delivery with its ~90s boot-retry

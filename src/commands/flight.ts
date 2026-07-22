@@ -13,9 +13,10 @@ import { resolveSpawningBeeId } from "../spawnParent.js";
 import { appendLedger, listSessions, loadSession, type SessionRecord } from "../store.js";
 import type { BeeState } from "../state.js";
 import { createFlightSweeper } from "../daemon/flightSweep.js";
-import { hsrActivitySignal, paneActivitySignal, type BeeActivitySignal } from "../flight/controller.js";
+import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal } from "../flight/controller.js";
 import { substrateFor } from "../substrates/index.js";
 import { withFileLock } from "../lock.js";
+import { listNodes } from "../node.js";
 import type { HsrObservation } from "../hsr/observe.js";
 import {
   allocateFlightId,
@@ -115,15 +116,16 @@ function applyTrustedHsrObservation(
   observed: Map<string, BeeState>,
   activity: Map<string, BeeActivitySignal>,
   observedAtMs: number,
+  remoteHsrNodes: ReadonlySet<string>,
 ): void {
-  const trustedLocalHsr = record.substrate === "hsr" && !observation.mirrorOf;
-  if (trustedLocalHsr) {
+  const source = trustedHsrObservationSource(record, observation, remoteHsrNodes);
+  if (source === "local-hsr") {
     if (observation.state) observed.set(record.name, observation.state);
     else if (!observation.live) observed.set(record.name, "dead");
-  } else {
-    const trustedRemoteMirror = record.substrate !== "hsr" && record.node !== undefined && observation.live && observation.mirrorOf === record.node;
-    if (!trustedRemoteMirror) return;
+  } else if (source === "remote-hsr-mirror") {
     if (observation.state) observed.set(record.name, observation.state);
+  } else {
+    return;
   }
 
   if (observation.activity) {
@@ -364,13 +366,14 @@ async function flightSweep(parsed: Parsed): Promise<void> {
     }
   }
   if (slotBees.length > 0) {
+    const remoteHsrNodes = new Set((await listNodes()).filter((node) => node.kind === "remote-hsr").map((node) => node.name));
     const { hsrObservations } = await import("../hsr/observe.js");
     const live = await hsrObservations({ includeEvents: true, bees: slotBees });
     for (const bee of slotBees) {
       const record = sessionsByName.get(bee);
       const observation = live.get(bee);
       if (!record || !observation) continue;
-      applyTrustedHsrObservation(record, observation, observed, activity, sweepNow);
+      applyTrustedHsrObservation(record, observation, observed, activity, sweepNow, remoteHsrNodes);
     }
   }
   await Promise.all(slotBees.map(async (bee) => {
@@ -385,7 +388,7 @@ async function flightSweep(parsed: Parsed): Promise<void> {
     }
     if (pane) activity.set(bee, paneActivitySignal(record, pane, sweepNow));
   }));
-  const sweeper = createFlightSweeper({ listFlights: async () => flights, now: () => sweepNow });
+  const sweeper = createFlightSweeper({ listFlights: async () => flights, now: () => sweepNow }, { detached: false });
   const outcomes = await sweeper(sessions, observed, activity);
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(outcomes, null, 2));

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { paneActivitySignal, sweepFlights, type FlightSweepDeps } from "../src/flight/controller.js";
+import { hsrActivitySignal, paneActivitySignal, sweepFlights, type FlightSweepDeps } from "../src/flight/controller.js";
 import {
   FLIGHT_CONTRACT_DEFAULTS,
   FLIGHT_REPLACEMENT_DEFAULTS,
@@ -314,6 +314,45 @@ test("pane fallback fingerprints are stable for unchanged tmux output and change
   assert.equal(first.fingerprint, unchanged.fingerprint);
   assert.notEqual(first.at, unchanged.at);
   assert.notEqual(first.fingerprint, changed.fingerprint);
+});
+
+test("HSR activity timestamps reject invalid values and clamp future observations", () => {
+  assert.equal(hsrActivitySignal({ at: 1e20, fingerprint: "bad-event" }, T0), null);
+  assert.equal(hsrActivitySignal({ at: T0, fingerprint: "good-event" }, 1e20), null);
+
+  const signal = hsrActivitySignal({ at: T0 + 60_000, fingerprint: "future-event" }, T0 + 5_000);
+  assert.deepEqual(signal, { at: iso(T0 + 5_000), fingerprint: "future-event" });
+});
+
+test("unchanged future HSR activity cannot refresh every sweep tick", async () => {
+  const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+  const name = slotBeeName(f.id, "s1", 0, 1);
+  const working: SlotRecord = {
+    ...vacantSlot("s1"),
+    attempt: 1,
+    state: "working",
+    beeName: name,
+    attemptStartedAt: iso(T0),
+    evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0), lastActivityFingerprint: "old-fp" },
+  };
+  let nowMs = T0 + 5_000;
+  const h = harness(f, [working], nowMs);
+  h.deps.now = () => nowMs;
+  const observed = new Map([[name, "active" as BeeState]]);
+  const records = [bee(name)];
+  const futureEvent = { at: T0 + 60_000, fingerprint: "future-fp" };
+
+  await sweepFlights(h.deps, records, observed, new Map([[name, hsrActivitySignal(futureEvent, nowMs)!]]));
+  assert.equal(h.saved.length, 1);
+  assert.equal(h.slots.get("s1")!.evidence.lastActivityAt, iso(T0 + 5_000));
+  assert.equal(h.slots.get("s1")!.evidence.lastActivityFingerprint, "future-fp");
+
+  h.saved.length = 0;
+  nowMs = T0 + 10_000;
+  const second = await sweepFlights(h.deps, records, observed, new Map([[name, hsrActivitySignal(futureEvent, nowMs)!]]));
+  assert.equal(h.saved.length, 0);
+  assert.deepEqual(second, []);
+  assert.equal(h.slots.get("s1")!.evidence.lastActivityAt, iso(T0 + 5_000));
 });
 
 test("closed flights are left alone entirely", async () => {

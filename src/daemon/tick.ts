@@ -11,7 +11,7 @@ import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./node
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
 import type { FlightSweeper } from "./flightSweep.js";
-import { hsrActivitySignal, paneActivitySignal, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
+import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
 import type { UsageSampler, UsageTickOutcome } from "./usageSampler.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { LogInput } from "./log.js";
@@ -679,9 +679,9 @@ export async function tick(
   const nowMs = deps.now();
   for (const [bee, observation] of hsrObs) {
     const record = recordsByName.get(bee);
-    const trustedLocalHsr = record?.substrate === "hsr" && !observation.mirrorOf;
-    const trustedRemoteMirror = record?.substrate !== "hsr" && record?.node !== undefined && observation.live && observation.mirrorOf === record.node;
-    if (!trustedLocalHsr && !trustedRemoteMirror) continue;
+    if (!record) continue;
+    const trustSource = trustedHsrObservationSource(record, observation, remoteHsrNodes);
+    if (!trustSource) continue;
     if (observation.live) hsrLive.add(bee);
     if (observation.state) hsrStates.set(bee, observation.state);
     hsrSnapshots.set(bee, observation.snapshot);
@@ -689,7 +689,7 @@ export async function tick(
       const signal = hsrActivitySignal(observation.activity, nowMs);
       if (signal) activitySignals.set(bee, signal);
     }
-    if (trustedRemoteMirror) hsrMirrors.add(bee);
+    if (trustSource === "remote-hsr-mirror") hsrMirrors.add(bee);
   }
   for (const record of records) {
     if (activitySignals.has(record.name)) continue;
