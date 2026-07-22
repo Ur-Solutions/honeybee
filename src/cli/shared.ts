@@ -268,6 +268,13 @@ export async function confirmSpawnReady(parsed: Parsed, record: SessionRecord): 
     await writeHiveState(record, "waiting");
     return;
   }
+  // Remote-HSR bees likewise have no pane: the spawn RPC already confirmed the
+  // remote runner-host forked the bee, so the pane readiness poll below would
+  // always time out and emit a spurious "warn spawn <bee> timeout".
+  if (record.node && record.node !== LOCAL_NODE_NAME && loadNodeSync(record.node)?.kind === "remote-hsr") {
+    await writeHiveState(record, "waiting");
+    return;
+  }
   try {
     await waitForAgentReady(record, {
       timeoutMs: numberFlag(parsed, ["boot-ms"], bootMsForAgent(record.agent)),
