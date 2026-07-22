@@ -29,6 +29,7 @@ import { startSpawnTimer, type SpawnTimer } from "../spawnTiming.js";
 import { chooseNewBee, type SpawnTuiAccount } from "../spawnTui.js";
 import { loadSession, safeName, saveSession, type SessionRecord } from "../store.js";
 import { resolveSpawningBeeId } from "../spawnParent.js";
+import { resolveRemoteCwd } from "../hsr/remoteWorkingCopy.js";
 import { localSubstrate, remoteHsrSubstrateForNode, substrateForRecord } from "../substrates/index.js";
 import { createSwarm } from "../swarm.js";
 import { tmux } from "../tmux.js";
@@ -378,6 +379,18 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
         throw new Error(`no checkout named "${opts.checkout}" on ${opts.node.name}; provision one with --repo <url>`);
       }
       spawnCwd = match.path;
+    } else if (opts.cwd) {
+      // DWIM: no explicit --repo/--checkout, but the spawn HAS a local cwd —
+      // resolve it to a remote working copy. Layer 1: pro sync into the node's
+      // canonical checkout (unpushed commits travel via git bundle). Layer 2:
+      // provision from the repo's origin into ~/.hive/worktrees (reused by
+      // name). Not a git repo at all → remote derives its empty per-bee cwd,
+      // exactly the prior behavior.
+      const resolved = await resolveRemoteCwd(opts.cwd, opts.node, substrate);
+      if (resolved) {
+        spawnCwd = resolved.cwd;
+        if (isPretty()) console.error(note(resolved.note));
+      }
     }
     const spawnResult = await substrate.spawnRemote({
       bee: name,
