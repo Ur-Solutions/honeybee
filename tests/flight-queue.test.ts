@@ -30,6 +30,16 @@ import { latestSealForCurrentIncarnation } from "../src/daemon/flightSweep.js";
 
 const T0 = Date.parse("2026-07-21T10:00:00.000Z");
 const iso = (ms: number) => new Date(ms).toISOString();
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForCondition(cond: () => boolean | Promise<boolean>, label: string, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await cond()) return;
+    await sleep(20);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-flight-queue-"));
@@ -361,15 +371,18 @@ test("canary regression: the daemon sweep stage never awaits spawn-shaped work",
     assert.deepEqual(first, []);
 
     // While the sweep is in flight, subsequent ticks report it and skip.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForCondition(() => spawnCalls.length === 1, "detached sweep to reach spawn");
     assert.deepEqual(spawnCalls, ["s1"], "the detached sweep really ran");
     const second = await sweeper([], new Map());
     assert.ok(second.some((o) => o.action === "skipped" && /still running/.test(o.detail ?? "")));
 
     // Release the spawn; the completed sweep's outcomes surface on a later tick.
     releaseSpawn();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const third = await sweeper([], new Map());
+    let third: Awaited<ReturnType<typeof sweeper>> = [];
+    await waitForCondition(async () => {
+      third = await sweeper([], new Map());
+      return third.some((o) => o.action === "spawn" && o.detail === "slow-bee");
+    }, "completed detached sweep");
     assert.ok(third.some((o) => o.action === "spawn" && o.detail === "slow-bee"), JSON.stringify(third));
   });
 });

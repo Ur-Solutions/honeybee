@@ -7,7 +7,8 @@ import { cmdFlight, parseMixFlag } from "../src/commands/flight.js";
 import { parse } from "../src/parse.js";
 import { ledgerPath, saveSession, type SessionRecord } from "../src/store.js";
 import { withFileLock } from "../src/lock.js";
-import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
+import { appendHsrEvent, ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
+import { registerNode } from "../src/node.js";
 import {
   allocateFlightId,
   deleteFlight,
@@ -95,6 +96,30 @@ async function writeStaleExitedHsrMeta(bee: string, mirrorOfNode?: string): Prom
     status: "exited",
     endedAt: "2026-07-20T09:05:00.000Z",
     ...(mirrorOfNode ? { mirrorOfNode } : {}),
+  });
+}
+
+async function writeLiveHsrMirror(bee: string, mirrorOfNode: string, eventTs: number, fingerprintSeed = "foreign-progress"): Promise<void> {
+  await ensureHsrRunDir(bee);
+  await writeHsrMeta(bee, {
+    bee,
+    harness: "stub",
+    tier: "server",
+    hostPid: 0,
+    startedAt: "2026-07-20T09:00:00.000Z",
+    controlSocket: "/tmp/mirror.sock",
+    status: "running",
+    mirrorOfNode,
+  });
+  await appendHsrEvent(bee, { type: "tool_use", ts: eventTs, tool: fingerprintSeed });
+}
+
+async function registerRemoteHsrNode(name: string): Promise<void> {
+  await registerNode({
+    name,
+    kind: "remote-hsr",
+    endpoint: `test@${name}`,
+    runnerHostVersion: "test",
   });
 }
 
@@ -243,6 +268,7 @@ test("flight sweep ignores stale local HSR mirror death for a remote-HSR slot be
     const f = workerFlight(id);
     const beeName = slotBeeName(id, "s1", 0, 1);
     const now = new Date().toISOString();
+    await registerRemoteHsrNode("runner01");
     await saveFlight(f);
     await saveSlot({
       flightId: id,
@@ -267,5 +293,43 @@ test("flight sweep ignores stale local HSR mirror death for a remote-HSR slot be
     assert.equal(slot?.beeName, beeName);
     const ledger = await readFile(ledgerPath(), "utf8").catch(() => "");
     assert.doesNotMatch(ledger, /flight\.slot\.crashed|flight\.slot\.spawn_failed|flight\.vacancy/);
+  });
+});
+
+test("flight sweep ignores a live local HSR mirror whose node does not match the remote record", async () => {
+  await withTempStore(async () => {
+    const id = allocateFlightId();
+    const f = workerFlight(id);
+    const beeName = slotBeeName(id, "s1", 0, 1);
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    await registerRemoteHsrNode("runner01");
+    await registerRemoteHsrNode("runner02");
+    await saveFlight(f);
+    await saveSlot({
+      flightId: id,
+      slotId: "s1",
+      mixKey: "missing",
+      generation: 0,
+      attempt: 1,
+      beeName,
+      state: "working",
+      since: now,
+      attemptStartedAt: now,
+      evidence: { firstEvidenceAt: now, lastActivityAt: now, lastActivityFingerprint: "old-fp" },
+      history: [],
+    });
+    await saveSession(session(beeName, { node: "runner02" }));
+    await writeLiveHsrMirror(beeName, "runner01", nowMs + 60_000);
+
+    await runQuietly(() => cmdFlight(parse(["flight", "sweep", id, "--json"])));
+
+    const [slot] = await listSlots(id);
+    assert.equal(slot?.state, "working");
+    assert.equal(slot?.beeName, beeName);
+    assert.equal(slot?.evidence.lastActivityAt, now);
+    assert.equal(slot?.evidence.lastActivityFingerprint, "old-fp");
+    const ledger = await readFile(ledgerPath(), "utf8").catch(() => "");
+    assert.doesNotMatch(ledger, /flight\.slot\.stalled|flight\.slot\.crashed|flight\.vacancy/);
   });
 });

@@ -81,6 +81,8 @@ export type BeeActivitySignal = {
   fingerprint?: string;
 };
 
+export type HsrObservationTrustSource = "local-hsr" | "remote-hsr-mirror";
+
 const DATE_MIN_MS = -8_640_000_000_000_000;
 const DATE_MAX_MS = 8_640_000_000_000_000;
 
@@ -98,6 +100,19 @@ export function hsrActivitySignal(
     at: new Date(at).toISOString(),
     ...(activity.fingerprint ? { fingerprint: activity.fingerprint } : {}),
   };
+}
+
+export function trustedHsrObservationSource(
+  record: Pick<SessionRecord, "node" | "substrate">,
+  observation: { live: boolean; mirrorOf?: string },
+  remoteHsrNodes: ReadonlySet<string>,
+): HsrObservationTrustSource | null {
+  if (record.substrate === "hsr") {
+    return observation.mirrorOf ? null : "local-hsr";
+  }
+  if (!record.node || !remoteHsrNodes.has(record.node)) return null;
+  if (!observation.live || observation.mirrorOf !== record.node) return null;
+  return "remote-hsr-mirror";
 }
 
 export function paneActivitySignal(record: Pick<SessionRecord, "name">, pane: string, atMs: number): BeeActivitySignal {
