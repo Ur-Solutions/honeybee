@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AgentReadinessError, isAgentReadyPane, isBypassPermissionsPane, isMcpWarningPane, isPermissionPromptPane, isStartupConfirmationPane, isTrustPromptPane, shouldRaiseDroidAutonomy, waitForAgentReady } from "../src/readiness.js";
+import { AgentReadinessError, isAgentActivePane, isAgentReadyPane, isBypassPermissionsPane, isMcpWarningPane, isPermissionPromptPane, isStartupConfirmationPane, isTrustPromptPane, shouldRaiseDroidAutonomy, waitForAgentReady } from "../src/readiness.js";
 import type { SessionRecord } from "../src/store.js";
 
 function record(agent: string): SessionRecord {
@@ -242,4 +242,46 @@ test("resume-time dialogs count as startup confirmations (not ready)", () => {
   assert.equal(isStartupConfirmationPane(tour), true);
   assert.equal(isAgentReadyPane("claude", resume), false);
   assert.equal(isAgentReadyPane("claude", tour), false);
+});
+
+// Real captures from Claude Code v2.1.219 (2026-07-24). The composer stays
+// drawn for the whole turn, so isReady is true in BOTH panes — only the footer
+// distinguishes a working bee from an idle one.
+const CLAUDE_WORKING_PANE = [
+  "  than by design, and features like vertical splits that existed only in",
+  "  patches or in long-unreleased development versions.",
+  "────────────────────────────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ← for agents · ↓ to …",
+].join("\n");
+
+const CLAUDE_IDLE_PANE = [
+  "⏺ Done — counted from 1 to 40 with a 4-second pause between each number.",
+  "✻ Churned for 2m 58s",
+  "────────────────────────────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+].join("\n");
+
+test("a working claude pane reads active even though its composer is ready", () => {
+  assert.equal(isAgentActivePane("claude", CLAUDE_WORKING_PANE), true);
+  assert.equal(isAgentReadyPane("claude", CLAUDE_WORKING_PANE), true, "composer is drawn mid-turn");
+});
+
+test("a finished claude pane is not active — the randomized gerund is not a busy marker", () => {
+  assert.equal(isAgentActivePane("claude", CLAUDE_IDLE_PANE), false);
+  assert.equal(isAgentReadyPane("claude", CLAUDE_IDLE_PANE), true);
+});
+
+test("claude activity is tail-scoped so an interrupt hint in scrollback goes stale", () => {
+  const stale = `  ⏵⏵ bypass permissions on · esc to interrupt\n${"filler\n".repeat(20)}❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)`;
+  assert.equal(isAgentActivePane("claude", stale), false);
+});
+
+test("a claude permission prompt outranks the interrupt hint", () => {
+  const prompt = `${CLAUDE_WORKING_PANE}\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently`;
+  assert.equal(isPermissionPromptPane(prompt), true);
+  assert.equal(isAgentActivePane("claude", prompt), false);
 });
