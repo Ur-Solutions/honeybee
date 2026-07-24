@@ -137,6 +137,19 @@ export type AgentDriver = {
    * and the pin keeps anchoring the bee's own transcript.
    */
   sessionPinWithResumeArgs?: string[];
+  /**
+   * Thread-preserving fork support (session-fork-and-handoff epic):
+   *   nativeTip   — the provider forks its own thread at the tip
+   *                 (claude: `--resume <old> --fork-session --session-id <new>`).
+   *   threadCopy  — honeybee can copy the provider transcript file (optionally
+   *                 truncated at a turn anchor) under a fresh session id and
+   *                 plain-resume the copy. Verified for claude 2026-07-24:
+   *                 resume is purely file-based, so the copy carries full
+   *                 history across cwds, homes/accounts, and the
+   *                 interactive↔headless store split. Harnesses without either
+   *                 capability degrade loudly to seal/summary/log seeding.
+   */
+  forkCapability?: { nativeTip?: boolean; threadCopy?: boolean };
   /** HSR runner adapter (and thus runner tier) when the harness is HSR-capable. */
   hsrAdapter?: RunnerAdapter;
   /**
@@ -163,6 +176,16 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     homeEnv: "CLAUDE_CONFIG_DIR",
     hasTranscriptProvider: true,
     isReady: (pane) => /(?:^|\n)❯\s/.test(pane) || /Try "fix lint errors"|Try "create a util/i.test(pane),
+    // Claude Code keeps its composer (`❯ `) drawn for the WHOLE turn, so
+    // isReady stays true while the bee works — activity has to be read off the
+    // footer instead. The only stable busy marker there is the interrupt hint
+    // ("· esc to interrupt ·"); the spinner above it uses randomized gerunds
+    // (Churned / Brewed / Cooked / Percolating …) that no word list can track,
+    // which is exactly why genericActiveCheck's Working|Thinking|Running
+    // |Processing prefix never matched (v2.1.x). Without this every claude bee
+    // read `idle_with_output` ~30s into any turn, the daemon mirrored that into
+    // @hive_state=done, and Apiary showed working bees as idle.
+    isActive: (pane) => /esc to interrupt/i.test(pane),
     identity: {
       // With CLAUDE_CONFIG_DIR set, all three live inside the config dir.
       credentialFiles: [".credentials.json", ".claude.json", "settings.json"],
@@ -174,6 +197,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     sessionIdFlag: "--session-id",
     resumeDetectFlags: ["--resume", "--continue"],
     sessionPinWithResumeArgs: ["--fork-session"],
+    forkCapability: { nativeTip: true, threadCopy: true },
     hsrAdapter: claudeAdapter,
   },
   codex: {
@@ -195,6 +219,10 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     bootMs: 30_000,
     autoAliasForcesYolo: true,
     resumeArgs: (sid) => (sid ? ["resume", sid] : ["resume", "--last"]),
+    // Rollout files copy under a fresh uuid and `codex resume` is purely
+    // file-based (verified 2026-07-24). Anchoring is turn-grained: codex user
+    // rows carry no ids (assistant `msg_…` ids anchor turn ends).
+    forkCapability: { threadCopy: true },
     hsrAdapter: codexAdapter,
   },
   opencode: {
@@ -241,6 +269,11 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     modelArgs: (model) => (model ? ["--model", model] : []),
     bootMs: 10_000,
     resumeArgs: (sid) => (sid ? ["--resume", sid] : ["--continue"]),
+    // Session dirs copy under a fresh id and resume (verified 2026-07-24);
+    // grok also has native `--fork-session` + `--session-id`, unused by the
+    // HSR path (its adapter is ACP-driven). Tip-only: per-turn truncation of
+    // chat_history + sidecars is unverified.
+    forkCapability: { threadCopy: true },
     hsrAdapter: grokAdapter,
     soleCredentialedAccountDefault: true,
   },
@@ -259,6 +292,10 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     modelArgs: (model) => (model ? ["--model", normalizeKimiModel(model)] : []),
     bootMs: 15_000,
     resumeArgs: (sid) => (sid ? ["--session", sid] : ["--continue"]),
+    // Session dirs copy under a fresh `session_<uuid>` id and resume once the
+    // home-root session_index.jsonl gains an entry (verified 2026-07-24;
+    // resume is index-gated). Tip-only: wire.jsonl truncation is unverified.
+    forkCapability: { threadCopy: true },
     hsrAdapter: kimiAdapter,
   },
   cursor: {
@@ -288,6 +325,11 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     bootMs: 15_000,
     resumeArgs: (sid) => (sid ? ["--resume", sid] : ["--continue"]),
     resumeDetectFlags: ["--resume", "--continue"],
+    // Chat dirs (~/.cursor/chats — machine-global, ignores account homes) copy
+    // verbatim under a fresh uuid and resume by directory name (verified
+    // 2026-07-24; the id appears nowhere inside, store.db untouched).
+    // Tip-only: store.db is SQLite, no truncation.
+    forkCapability: { threadCopy: true },
     hsrAdapter: cursorAdapter,
   },
   pi: {
@@ -426,6 +468,12 @@ export function exhaustionForAgent(kind: string, pane: string): ExhaustionHit | 
  */
 export function modelArgsForAgent(kind: string, model?: string, provider?: string): string[] {
   return agentDriver(kind)?.modelArgs?.(model, provider) ?? [];
+}
+
+/** Thread-preserving fork capability for a kind (both false when undeclared). */
+export function forkCapabilityForAgent(kind: string): { nativeTip: boolean; threadCopy: boolean } {
+  const capability = agentDriver(kind)?.forkCapability;
+  return { nativeTip: capability?.nativeTip === true, threadCopy: capability?.threadCopy === true };
 }
 
 /** Boot-ready timeout (ms) for spawn/brief waits; undeclared kinds get DEFAULT_BOOT_MS. */
