@@ -101,7 +101,7 @@ async function startRig(input: {
   } catch (error) {
     if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = previousStore;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
     throw error;
   }
   const url = (JSON.parse(await readFile(urlFile, "utf8")) as { url: string }).url;
@@ -145,7 +145,7 @@ async function startRig(input: {
       await collector;
       if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
       else process.env.HIVE_STORE_ROOT = previousStore;
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
     },
   };
 }
@@ -537,7 +537,7 @@ test("resume validates cwd/ownership, claims an unowned session, and aborts thro
     await waitFor(() => rig.events.some((event) => event.type === "turn_end"), "abort idle event");
   } finally {
     await rig.cleanup();
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   }
 });
 
@@ -578,7 +578,7 @@ test("resume refuses a session owned by another bee and startup rejects bad Basi
   } finally {
     if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = previousStore;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   }
 });
 
