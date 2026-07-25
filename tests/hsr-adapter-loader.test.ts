@@ -45,6 +45,11 @@ test("a fresh Codex child graph does not load sibling adapters or CLI dispatch",
     }
   `;
   const loaderUrl = `data:text/javascript,${encodeURIComponent(loaderSource)}`;
+  const registerSource = `
+    import { register } from "node:module";
+    register(${JSON.stringify(loaderUrl)}, import.meta.url);
+  `;
+  const registerUrl = `data:text/javascript,${encodeURIComponent(registerSource)}`;
   const runnerEntryUrl = pathToFileURL(`${process.cwd()}/src/hsr/runner-entry.ts`).href;
   const adapterLoaderUrl = pathToFileURL(`${process.cwd()}/src/hsr/adapter-loader.ts`).href;
   const script = `
@@ -54,7 +59,7 @@ test("a fresh Codex child graph does not load sibling adapters or CLI dispatch",
   `;
   const { stderr } = await execFileAsync(
     process.execPath,
-    ["--experimental-loader", loaderUrl, "--import", "tsx", "--input-type=module", "--eval", script],
+    ["--import", registerUrl, "--import", "tsx", "--input-type=module", "--eval", script],
     {
       cwd: process.cwd(),
       env: {
