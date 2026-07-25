@@ -17,6 +17,7 @@ import { cmdEvents } from "./commands/events.js";
 import { cmdFlight } from "./commands/flight.js";
 import { cmdFlow, runFlowExec } from "./commands/flow.js";
 import { cmdFork, cmdForkLaunch, cmdSplit } from "./commands/fork.js";
+import { cmdHandoff } from "./commands/handoff.js";
 import { cmdFrame } from "./commands/frame.js";
 import { cmdGateways } from "./commands/gateways.js";
 import { cmdHere, cmdSpawnPicker } from "./commands/here.js";
@@ -33,6 +34,7 @@ import { cmdSeals, cmdSearch } from "./commands/search.js";
 import { cmdLaunch, cmdNew, cmdSpawn } from "./commands/spawn.js";
 import { cmdSpend } from "./commands/spend.js";
 import { cmdSwarm } from "./commands/swarm.js";
+import { cmdTask } from "./commands/tasks.js";
 import { sealHelpText } from "./seal.js";
 import { closeAllSubstrates } from "./substrates/index.js";
 import { waitHelpText } from "./wait.js";
@@ -153,6 +155,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       if (parsed.args[0] === "launch") await cmdForkLaunch(parsed);
       else await cmdFork(parsed);
       break;
+    case "handoff":
+      await cmdHandoff(parsed);
+      break;
     case "revive":
       await cmdRevive(parsed);
       break;
@@ -230,6 +235,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       break;
     case "buz":
       await cmdBuz(parsed);
+      break;
+    case "task":
+      await cmdTask(parsed);
       break;
     case "daemon":
       await cmdDaemon(parsed);
@@ -326,6 +334,7 @@ function printHelp() {
         ["answer", "<bee> [text]", "answer a blocked HSR bee's needs-input (default: yes)"],
         ["brief", "<selector> <text>", "send a one-time context brief"],
         ["buz", "<send|inbox|read|…>", "addressed messaging: three-tier delivery + per-bee policy"],
+        ["task", "<add|ls|done|…>", "shared micro-task lists with gated auto-supply (task supply <bee> --on)"],
         ["rename", "<selector> <title>", "set a bee's display title (--here for current bee, --auto to derive one, --clear)"],
         ["tag", "<selector> <tag>...", "add/remove user tags on bees (--remove, --list)"],
         ["seal", "<selector> --from <p>", "record a typed handoff artifact"],
@@ -353,7 +362,8 @@ function printHelp() {
       rows: [
         ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
         ["next", "", "jump to the next bee needing you (waiting/done/failed; --prev, --state)"],
-        ["fork", "<bee> [checkpoint]", "branch a bee into a fresh comb, seeded from its state"],
+        ["fork", "<bee> [checkpoint]", "branch a bee's thread into a fresh bee (--at <turn>, --list-anchors)"],
+        ["handoff", "<bee> [-p <instr>]", "compact via self-seal and start a fresh bee from the summary (--from-seal)"],
         ["here", "", "resolve the bee owning the current pane (--id, --json)"],
         ["spawn-picker", "[--frame|--flow]", "print frame/flow names for a display-popup spawn chord"],
         ["urls", "[<bee>]", "list URLs printed in a bee's pane (--lines, --open, --json)"],

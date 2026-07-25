@@ -14,11 +14,11 @@ function ruleFor(pattern: string): RateRule {
 }
 
 test("seed prices a known Claude model with distinct 5m vs 1h cache-write rates", () => {
-  const opus = ruleFor("claude-opus-4-8");
+  const opus = ruleFor("claude-opus-5");
   assert.equal(opus.todo, undefined);
   assert.ok(opus.versions.length > 0);
   const version = opus.versions.at(-1)!;
-  // Opus 4.8 list rate: $5 input / $25 output per MTok.
+  // Opus 5 list rate: $5 input / $25 output per MTok.
   assert.equal(version.inputPerMTok, 5);
   assert.equal(version.outputPerMTok, 25);
   // Cache reads are cheap; 1h writes are strictly pricier than 5m writes.

@@ -99,7 +99,8 @@ function todoRule(modelPattern: string, provider: string, note: string): RateRul
  */
 export function seedRateTable(): RateTable {
   const rules: RateRule[] = [
-    // ── Claude Opus, current $5 / $25 tier (4.5 → 4.8) ──────────────────────
+    // ── Claude Opus, current $5 / $25 tier (4.5 → 5) ────────────────────────
+    anthropicRule("claude-opus-5", "2026-07-24", 5, 25),
     anthropicRule("claude-opus-4-8", "2026-05-19", 5, 25),
     anthropicRule("claude-opus-4-7", "2026-02-24", 5, 25),
     anthropicRule("claude-opus-4-6", "2025-12-15", 5, 25),

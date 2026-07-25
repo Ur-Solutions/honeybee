@@ -24,6 +24,7 @@ import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
 import { sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
 import { ensureSessionLive } from "../sessionLiveness.js";
 import { liveTargetKey, type BeeState, type StateContext } from "../state.js";
+import { consumePreambleForDelivery } from "../spawnPreamble.js";
 import { appendLedger, listSessions, loadSession, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
 import { generateSwarmId, validSwarmId } from "../swarm.js";
@@ -196,7 +197,13 @@ export async function retryWhileHsrHostBoots<T>(
 }
 
 /** Send a prompt, tolerating a detached HSR host's bounded startup window. */
-export async function deliverPromptText(record: SessionRecord, prompt: string): Promise<void> {
+export async function deliverPromptText(record: SessionRecord, promptText: string): Promise<void> {
+  // The one choke point every "hand this bee some text" path funnels through
+  // (brief, `hive x`/`run`, the HSR spawn prompt, the flight sweep). A
+  // message-channel preamble is prepended HERE, exactly once, so callers keep
+  // persisting the operator's own text in brief/lastPrompt and no path can
+  // forget to inject. No-op for claude/grok, whose preamble rode argv.
+  const prompt = await consumePreambleForDelivery(record, promptText);
   const substrate = substrateFor(record);
   const attempt = () => substrate.sendText(record.tmuxTarget, prompt, record.agentPaneId);
   if (substrate.kind !== "hsr" && substrate.kind !== "remote-hsr") {

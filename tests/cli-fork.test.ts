@@ -46,7 +46,9 @@ async function runCli(
   try {
     const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
       cwd: process.cwd(),
-      env: { ...process.env, ...env, NO_COLOR: "1" },
+      // Fork seeding asserts on the exact brief a fork receives; the session
+      // preamble is covered end-to-end in tests/preamble-cli.test.ts instead.
+      env: { HIVE_PREAMBLE_DISABLE: "1", ...process.env, ...env, NO_COLOR: "1" },
       timeout: 30_000,
       maxBuffer: 1024 * 1024,
     });
@@ -291,36 +293,41 @@ test("C3: account-bound parent refuses a fork without --account, and with --acco
   }
 });
 
-test("C3b: fork onto the parent's OWN account is refused (per-account OAuth-rotation guard)", { timeout: 40_000 }, async () => {
+test("C3b: fork onto the parent's OWN account joins its home, skipping re-activation (same-account relaxation)", { timeout: 40_000 }, async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "hive-fork-same-"));
   const cwd = await mkdtemp(join(tmpdir(), "hive-fork-cwd-"));
   const env = { ...AGENT_CMD_ENV, HIVE_STORE_ROOT: storeRoot, TMUX_TMPDIR: process.env.TMUX_TMPDIR! };
   const parentName = `forkp-same-${process.pid}`;
   try {
     // Register the account, then seed the parent bound to it at its DEDICATED
-    // default home (storeRoot/homes/<id>) — the production layout the C3 test
-    // above never reaches (it uses a custom homePath that can't equal it, which
-    // is exactly what masked the original blocker).
+    // default home (storeRoot/homes/<id>) — the production layout.
     const add = await runCli(["account", "add", "codex", "fork-same@a.b"], env);
     assert.equal(add.code, 0, add.stderr);
     const acctId = "codex-fork-same-a.b";
+    const parentHome = join(storeRoot, "homes", acctId);
     await seedParent(storeRoot, parentName, cwd, {
       agent: "codex",
       requestedAgent: "codex",
       accountId: acctId,
-      homePath: join(storeRoot, "homes", acctId),
+      homePath: parentHome,
     });
     await seedSeal(storeRoot, parentName, "Codex parent state");
 
-    // Fork onto the SAME account → must refuse BEFORE any activation, so the
-    // parent's live OAuth chain is never rotated by a second bee on one account.
-    const refused = await runCli(
-      ["fork", parentName, "--agent", "codex", "--account", acctId, "--no-wait", "--boot-ms", "500"],
+    // Fork onto the SAME account → joins the parent's account home (the
+    // auto-stacking risk profile: one home per account, shared credential
+    // file). Credential re-activation is skipped — the empty vault would
+    // otherwise clobber (or fail on) the home — so a success here also proves
+    // the skip. Relaxed 2026-07-24 (session-fork-and-handoff epic).
+    const forked = await runCli(
+      ["fork", parentName, "--agent", "codex", "--account", acctId, "--no-wait", "--force-send", "--boot-ms", "500", "--no-wait-footer"],
       env,
     );
-    assert.notEqual(refused.code, 0, "fork onto the parent's own account is refused");
-    assert.match(refused.stderr, /own account|log each other out|§7\.1/, refused.stderr);
-    assert.equal((await listRecords(storeRoot)).length, 1, "no fork record written on refusal");
+    assert.equal(forked.code, 0, forked.stderr);
+
+    const forkRec = forkRecordOf(await listRecords(storeRoot), parentName);
+    assert.equal(forkRec.accountId, acctId, "fork is bound to the parent's account");
+    assert.equal(forkRec.homePath, parentHome, "fork joins the parent's account home");
+    assert.equal((await listRecords(storeRoot)).length, 2, "parent + fork records exist");
   } finally {
     const recs = await listRecords(storeRoot);
     for (const r of recs) await tmux(["kill-session", "-t", `=${r.tmuxTarget}`], { reject: false });

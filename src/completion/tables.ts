@@ -1,11 +1,13 @@
 import { BUZ_TIERS as CANONICAL_BUZ_TIERS } from "../buz_tiers.js";
 import { SEAL_STATUSES } from "../seal.js";
+import { TASK_STATUSES } from "../tasks.js";
 
 export const COMMANDS = [
   "spawn", "new", "launch", "send", "tail", "cat", "transcript", "tx", "last", "wait",
   "list", "ls", "ps", "bees", "gateways", "kill", "clean", "run", "x", "xa", "attach", "next",
   "colony", "pool", "frame", "swarm", "node", "substrate", "flow", "loop",
   "buz",
+  "task",
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
   "search", "seals", "events", "flight",
@@ -23,6 +25,7 @@ export const SEALS_SUBCOMMANDS = ["find"];
 export const FLOW_SUBCOMMANDS = ["list", "ls", "define", "inspect", "remove", "run", "runs", "logs", "status", "cancel"];
 export const LOOP_SUBCOMMANDS = ["launch", "template", "start", "status", "logs", "stop", "list", "ls"];
 export const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "cancel", "purge", "config"];
+export const TASK_SUBCOMMANDS = ["add", "ls", "show", "start", "done", "block", "cancel", "claim", "mv", "edit", "supply", "lists"];
 export const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
 export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "pause", "resume", "remove"];
 export const KEYS_SUBCOMMANDS = ["print", "path", "check"];
@@ -34,6 +37,7 @@ export const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 export const SEAL_STATUS_VALUES = [...SEAL_STATUSES];
 export const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
 export const BUZ_TIERS: readonly string[] = CANONICAL_BUZ_TIERS;
+export const TASK_STATUS_VALUES: readonly string[] = TASK_STATUSES;
 export const BUZ_ACCEPT_VALUES = buzAcceptValues();
 
 // Every contiguous tier run, shortest-suffix first — derived from the shared
@@ -65,7 +69,7 @@ export const SHELL_FIRST_ARG = new Set(["completion"]);
 export const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 export const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--contract", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
+  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--contract", "--preamble", "--no-preamble", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
   pool: ["--json", "--all", "--ttl", "--count", "--no-keep", "--here", "--yolo", "--name", "--account"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
@@ -134,6 +138,11 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--unread", "--limit", "--from", "--consume", "--read", "--older-than", "--all",
     "--accept",
   ],
+  task: [
+    "--prompt", "-p", "--body", "--auto", "--no-auto", "--context-json", "--quest",
+    "--sender", "--sender-human", "--status", "--before", "--after",
+    "--on", "--off", "--limit", "--json",
+  ],
   daemon: ["--tick-ms", "--json", "--label", "--force", "--follow", "--lines", "-n"],
   events: ["--follow", "-f", "--json", "--type", "--session", "--since", "--lines", "-n"],
   flight: [
@@ -152,7 +161,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ],
 };
 
-export type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
+export type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "task-status" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
 
 export const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 export const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -187,6 +196,10 @@ export const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagVal
     "--tier": "buz-tier",
     "--accept": "buz-accept",
   },
+  task: {
+    "--status": "task-status",
+    "--sender": "bee",
+  },
   loop: {
     "--bee": "bee",
     "--context": "loop-context",
@@ -212,6 +225,7 @@ export const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   flow: FLOW_SUBCOMMANDS,
   loop: LOOP_SUBCOMMANDS,
   buz: BUZ_SUBCOMMANDS,
+  task: TASK_SUBCOMMANDS,
   daemon: DAEMON_SUBCOMMANDS,
   flight: FLIGHT_SUBCOMMANDS,
   account: ACCOUNT_SUBCOMMANDS,
@@ -229,6 +243,13 @@ export const NOUN_SUB_ARG: Record<string, Record<string, NounSubArgKind>> = {
   node: { inspect: "node", update: "node", unregister: "node" },
   flow: { inspect: "flow", remove: "flow", run: "flow", logs: "run", status: "run", cancel: "run" },
   account: { capture: "account", sync: "account", pause: "account", resume: "account", remove: "account", rm: "account" },
+  // task supply/claim/add/ls point at a bee (bare name = bee:<name> list).
+  task: {
+    supply: "session-any",
+    claim: "session-any",
+    add: "session-any",
+    ls: "session-any",
+  },
   // buz subcommands all take a selector as their first positional. We
   // accept any session (live or dead) since reading inbox/outbox/queue
   // is meaningful even for a sealed bee.

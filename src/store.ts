@@ -5,7 +5,23 @@ import { isBuzTier, type BuzTier } from "./buz_tiers.js";
 import { normalizeContract, type BeeContract } from "./contract.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
+import type { PreambleChannel } from "./preamble.js";
 import { dedupeTags, isValidSessionTag, MAX_TAGS_PER_BEE } from "./tags.js";
+
+/**
+ * Per-bee task auto-supply config (see tasks/supplyConfig.ts for semantics
+ * and defaults). Stored on the session record like buzAccept so the daemon's
+ * records snapshot carries it for free.
+ */
+export type TaskSupplyConfig = {
+  on: boolean;
+  /** Breaker: max consecutive auto-feeds without a human interaction. */
+  limit?: number;
+  /** Consecutive-feed counter (daemon-incremented; reset on human sends). */
+  feeds?: number;
+  /** Breaker tripped; cleared only by `hive task supply <bee> --on`. */
+  paused?: boolean;
+};
 
 export type SessionRecord = {
   name: string;
@@ -147,6 +163,12 @@ export type SessionRecord = {
   /** HSR: resolved runner tier for this bee ("server"|"stream"|"turn"|"pty"). */
   runnerTier?: string;
   buzAccept?: BuzTier[];
+  /**
+   * Task auto-supply configuration (tasks/supplyConfig.ts): whether the
+   * daemon's supply loop feeds this bee's task backlog one task per idle
+   * tick, plus the consecutive-feed breaker state. Absent = supply off.
+   */
+  taskSupply?: TaskSupplyConfig;
   lastObservedState?: string;
   lastObservedStateAt?: string;
   runId?: string;
@@ -180,6 +202,24 @@ export type SessionRecord = {
    * idle-without-seal on a seal contract as a stall, never as done.
    */
   contract?: BeeContract;
+  /**
+   * Session preamble actually injected at spawn (src/preamble.ts). Persisted
+   * so the transcript UI can show what the bee was told, `hive fork` can tell a
+   * re-render from a copy, and the `message` channel can guarantee once-only
+   * delivery. `channel: "system-prompt"` text also lives in launchArgv.
+   */
+  preamble?: SessionPreamble;
+};
+
+/** What was injected, how, and (for the message channel) whether it landed. */
+export type SessionPreamble = {
+  text: string;
+  channel: PreambleChannel;
+  /**
+   * Message channel only: the preamble has already been folded into a
+   * delivered brief/prompt, so the next delivery must not prepend it again.
+   */
+  delivered?: boolean;
 };
 
 export { storeRoot } from "./fsx.js";
@@ -490,8 +530,10 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "autoTitleAttempts",
   "runtimeGeneration",
   "buzAccept",
+  "taskSupply",
   "tags",
   "contract",
+  "preamble",
 ]);
 
 function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
@@ -526,6 +568,22 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
 
   if (object.autoswap === true) record.autoswap = true;
+
+  // Session preamble: forward-compatible like contract — a malformed block is
+  // dropped on load rather than throwing. An unknown channel degrades to
+  // "message", the conservative reading (a system-prompt preamble already rode
+  // argv, so mis-reading it as a message only risks one redundant prefix,
+  // whereas the reverse would silently drop it).
+  if (object.preamble && typeof object.preamble === "object" && !Array.isArray(object.preamble)) {
+    const raw = object.preamble as Record<string, unknown>;
+    if (typeof raw.text === "string" && raw.text.length > 0) {
+      record.preamble = {
+        text: raw.text,
+        channel: raw.channel === "system-prompt" ? "system-prompt" : "message",
+        ...(raw.delivered === true ? { delivered: true } : {}),
+      };
+    }
+  }
 
   // Completion contract: forward-compatible like buzAccept — an invalid or
   // unknown-shaped contract is dropped on load, never thrown.
@@ -573,6 +631,20 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
       (value): value is BuzTier => isBuzTier(value),
     );
     if (tiers.length > 0) record.buzAccept = tiers;
+  }
+
+  // taskSupply is the per-bee auto-supply config. Forward-compatible like
+  // buzAccept: an invalid shape is dropped on load, never thrown; invalid
+  // sub-fields are dropped individually (resolveTaskSupply re-defaults them).
+  if (typeof object.taskSupply === "object" && object.taskSupply !== null && !Array.isArray(object.taskSupply)) {
+    const raw = object.taskSupply as Record<string, unknown>;
+    if (typeof raw.on === "boolean") {
+      const config: TaskSupplyConfig = { on: raw.on };
+      if (typeof raw.limit === "number" && Number.isSafeInteger(raw.limit) && raw.limit > 0) config.limit = raw.limit;
+      if (typeof raw.feeds === "number" && Number.isSafeInteger(raw.feeds) && raw.feeds >= 0) config.feeds = raw.feeds;
+      if (raw.paused === true) config.paused = true;
+      record.taskSupply = config;
+    }
   }
 
   // tags is the array of free-form user labels (bare or power-user namespaced,

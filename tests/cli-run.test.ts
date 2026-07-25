@@ -163,7 +163,9 @@ async function runCli(args: string[], env: Record<string, string>): Promise<{ co
   try {
     const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
       cwd: process.cwd(),
-      env: { ...process.env, ...env, NO_COLOR: "1" },
+      // These assert on the EXACT text a bee receives; the session preamble is
+      // covered end-to-end in tests/preamble-cli.test.ts instead.
+      env: { HIVE_PREAMBLE_DISABLE: "1", ...process.env, ...env, NO_COLOR: "1" },
       timeout: 10_000,
       maxBuffer: 1024 * 1024,
     });

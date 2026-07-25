@@ -179,4 +179,6 @@ export {
 
 export { sendBuzMessage } from "./buz/send.js";
 
+export { cancelQueuedBuzMessage } from "./buz/cancel.js";
+
 export { processQueueForBee } from "./buz/drain.js";

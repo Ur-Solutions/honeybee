@@ -21,6 +21,7 @@ import { chooseLaunch, type LaunchTemplate } from "../launchTui.js";
 import { cachedAccountLimits, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
 import { LOCAL_NODE_NAME, authPolicyOf, type NodeRecord } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
+import { planSpawnPreamble } from "../spawnPreamble.js";
 import { parseEnvAssignments } from "../spawnEnv.js";
 import { allocatePoolMembers, bindPoolClaim, releasePoolClaim, resolvePoolRef, type PoolAllocation, type ResolvedPool } from "../pool.js";
 import { createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarmProRepos, resolveProEntryForCwd, toProSlug } from "../proProjects.js";
@@ -200,6 +201,14 @@ export type SpawnOptions = {
    */
   kitProfile?: string;
   /**
+   * Session preamble host layer (`--preamble`) — opaque text from the spawning
+   * environment (Apiary's "you are in Apiary, here are your sidecars" block),
+   * layered after honeybee's own identity layer. See src/preamble.ts.
+   */
+  preamble?: string;
+  /** `--no-preamble`: inject no preamble at all for this spawn. */
+  noPreamble?: boolean;
+  /**
    * Local HSR only (`--wait-host`): block until the detached runner host
    * publishes its first meta.json (≤5s) before returning. Off by default — the
    * record is durable before the fork and the first prompt rides the pending-
@@ -332,6 +341,28 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const name = safeName(opts.name ?? identity.id);
   stampBeeIdentityEnv(spec.env, { name, id: identity.id, comb: name, ...(spawnedById ? { parent: spawnedById } : {}) });
 
+  // Session preamble. Applied HERE because it quotes the bee identity, which
+  // only exists after allocateBeeIdentity above. The system-prompt channel
+  // extends both spec.args (this launch) and launchArgv (so revive re-applies
+  // it — launchArgv was frozen before the provider-session pin precisely so
+  // lifecycle routing stays out of it, but the preamble is part of the
+  // operator-resolved launch and must ride along).
+  const preamblePlan = planSpawnPreamble({
+    kind: spec.kind,
+    identity: { name, id: identity.id, comb: name, ...(spawnedById ? { parent: spawnedById } : {}) },
+    ...(opts.preamble ? { host: opts.preamble } : {}),
+    ...(opts.noPreamble ? { disabled: true } : {}),
+    warn: (message) => console.error(note(message)),
+  });
+  if (preamblePlan?.args.length) {
+    spec.args = [...spec.args, ...preamblePlan.args];
+    launchArgv.push(...preamblePlan.args);
+  }
+  // The `message` channel is NOT folded into the record here: it rides the
+  // bee's first delivered text (deliverPromptText), so `brief`/`lastPrompt`
+  // keep recording what was actually ASKED, and transcript matching keeps
+  // working (rowsContainPrompt is a substring test, so a prefixed row matches).
+
   // Pane-less spawns (HSR / remote-hsr) have no tmux hasSession guard, so a
   // duplicate name would silently OVERWRITE the existing session record and
   // orphan its live runner host (two hosts, one run dir — review CR-1). Refuse
@@ -440,6 +471,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.caste ? { caste: opts.caste } : {}),
       ...(brief ? { brief } : {}),
       ...(opts.contract ? { contract: opts.contract } : {}),
+      ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(spawnedById ? { spawnedById } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
       // UNIT 2: persist the delivered access token's expiry (unix seconds) so the
@@ -523,6 +555,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.caste ? { caste: opts.caste } : {}),
       ...(brief ? { brief } : {}),
       ...(opts.contract ? { contract: opts.contract } : {}),
+      ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(spawnedById ? { spawnedById } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
       ...(opts.autoswap ? { autoswap: true } : {}),
@@ -585,6 +618,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.caste ? { caste: opts.caste } : {}),
     ...(brief ? { brief } : {}),
     ...(opts.contract ? { contract: opts.contract } : {}),
+    ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
     ...(spawnedById ? { spawnedById } : {}),
     ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
     ...(opts.account ? { accountId: opts.account.id } : {}),
@@ -815,9 +849,21 @@ export async function bindPoolAllocationToBee(plan: PoolSpawnPlan, allocation: P
 }
 
 
+/**
+ * `--preamble <text>` / `--no-preamble` (session-preamble epic). `--preamble`
+ * carries the spawning environment's host layer verbatim; `--no-preamble` wins
+ * over it, so a caller can hard-disable without unsetting whatever produced
+ * the text.
+ */
+export function resolvePreambleFlags(parsed: Parsed): { preamble?: string; noPreamble?: boolean } {
+  if (truthy(flag(parsed, "no-preamble"))) return { noPreamble: true };
+  const text = stringFlag(parsed, ["preamble"]);
+  return text ? { preamble: text } : {};
+}
+
 export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
+  if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
   const timer = startSpawnTimer(requested);
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
@@ -847,6 +893,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const briefText = typeof flag(parsed, "brief") === "string" ? String(flag(parsed, "brief")) : undefined;
   const contractRaw = stringFlag(parsed, ["contract"]);
   const contract = contractRaw !== undefined ? parseContractFlag(contractRaw) : undefined;
+  const { preamble, noPreamble } = resolvePreambleFlags(parsed);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
   // Account binding precedence: explicit --account flag > profile account >
   // <tool>-<account> shorthand / account-id resolution.
@@ -877,7 +924,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.
@@ -1258,6 +1305,9 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
   const spec = resolveAgent(agent, extraArgs, { home, yolo, env });
   const node = await resolveSpawnNode(parsed, spec.kind);
   const swarmId = resolveSwarmIdHint(parsed, agent);
+  // Every bee in the swarm gets the same host layer; the identity layer is
+  // re-rendered per bee inside spawnBee, so each carries its OWN id.
+  const { preamble, noPreamble } = resolvePreambleFlags(parsed);
   // Pool fan-out (§6.4): claim ALL N members in one lock acquisition,
   // auto-extending as needed, then hand each bee its own member as cwd.
   const poolPlan = poolRef ? await allocatePoolForSpawn(parsed, poolRef, count, node) : undefined;
@@ -1277,7 +1327,7 @@ export async function spawnHomogeneousSwarm(parsed: Parsed, count: number): Prom
     const beeCwd = allocation ? allocation.path : cwd;
     let record: SessionRecord;
     try {
-      record = await spawnBee({ agent, extraArgs, cwd: beeCwd, yolo, home, env, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider, ...(kitProfile ? { kitProfile } : {}), ...(poolPlan && allocation ? { poolKey: poolPlan.pool.key, poolMember: allocation.member } : {}) });
+      record = await spawnBee({ agent, extraArgs, cwd: beeCwd, yolo, home, env, colony, swarmId, node, account: beeAccount, model: beeModel, provider: beeProvider, ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(kitProfile ? { kitProfile } : {}), ...(poolPlan && allocation ? { poolKey: poolPlan.pool.key, poolMember: allocation.member } : {}) });
     } catch (error) {
       // Keep the bees already spawned; roll back only the unconsumed claims
       // (this member and everything after it).
@@ -1329,6 +1379,8 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
   const flagHome = flag(parsed, "home") ?? flag(parsed, "profile");
   const env = resolveSpawnEnvFlag(parsed);
   const kitProfile = resolveKitProfileFlag(parsed);
+  // One host layer for the whole frame; identity is re-rendered per bee.
+  const framePreamble = resolvePreambleFlags(parsed);
   const records: SessionRecord[] = [];
   // deliverBrief already waits for readiness, so just-briefed bees are excluded
   // from the post-spawn confirmation (mirrors spawnSingleBee's exclusivity).
@@ -1376,6 +1428,8 @@ export async function spawnFromFrame(parsed: Parsed, frameName: string, perBeeMe
         model: beeModel,
         provider: beeProvider,
         ...(kitProfile ? { kitProfile } : {}),
+        ...(framePreamble.preamble ? { preamble: framePreamble.preamble } : {}),
+        ...(framePreamble.noPreamble ? { noPreamble: framePreamble.noPreamble } : {}),
         ...(recordBrief ? { brief: recordBrief } : {}),
       });
       if (toDeliver) {

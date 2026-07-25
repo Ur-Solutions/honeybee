@@ -105,6 +105,19 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
     }
   }
 
+  /** Sanitize a caller-supplied flags object into a Parsed flags map. */
+  function rpcFlags(value: unknown): Map<string, string | true | string[]> {
+    const flags = new Map<string, string | true | string[]>();
+    if (value && typeof value === "object") {
+      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        if (entry === true) flags.set(key, true);
+        else if (typeof entry === "string") flags.set(key, entry);
+        else if (Array.isArray(entry) && entry.every((item) => typeof item === "string")) flags.set(key, entry as string[]);
+      }
+    }
+    return flags;
+  }
+
   /** Wrap a handler so it can never throw out to the transport. */
   function guarded(fn: (params: unknown) => Promise<unknown>): RpcMethodHandler {
     return async (params) => {
@@ -120,9 +133,10 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
     // Feature handshake for clients that must not guess across daemon versions:
     // spawn:2 = in-process spawnSingleBee with prompt/flags/rest support;
     // spawnEnv:1 = the optional env object accepted by spawn (validated, then
-    // forwarded as repeated --env). An older daemon rejects this method
-    // outright, which reads as "CLI fallback".
-    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1 })),
+    // forwarded as repeated --env). fork:1/handoff:1 = in-process
+    // cmdFork/cmdHandoff (session-fork-and-handoff epic). An older daemon
+    // rejects unknown methods outright, which reads as "CLI fallback".
+    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1, fork: 1, handoff: 1 })),
 
     liveness: guarded(async () => {
       const out: Record<string, boolean> = {};
@@ -290,6 +304,27 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
         flags,
         rest,
       });
+      return { ok: true, bee: record.name, ...(record.id ? { id: record.id } : {}) };
+    }),
+
+    // fork/handoff run IN-PROCESS like spawn: cmdFork/cmdHandoff are the exact
+    // code paths the CLI runs, so anchors, thread copy, account policy, and the
+    // ledger behave identically. String flags pass through verbatim.
+    fork: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; flags?: unknown };
+      const bee = String(p.bee ?? "");
+      if (!bee) return { ok: false, error: "bee required" };
+      const { cmdFork } = await import("../commands/fork.js");
+      const record = await cmdFork({ command: "fork", args: [bee], flags: rpcFlags(p.flags), rest: [] });
+      return { ok: true, bee: record.name, ...(record.id ? { id: record.id } : {}) };
+    }),
+
+    handoff: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; flags?: unknown };
+      const bee = String(p.bee ?? "");
+      if (!bee) return { ok: false, error: "bee required" };
+      const { cmdHandoff } = await import("../commands/handoff.js");
+      const record = await cmdHandoff({ command: "handoff", args: [bee], flags: rpcFlags(p.flags), rest: [] });
       return { ok: true, bee: record.name, ...(record.id ? { id: record.id } : {}) };
     }),
   };

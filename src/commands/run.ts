@@ -176,7 +176,7 @@ export async function cleanupRunSession(record: SessionRecord): Promise<void> {
 export async function cmdX(parsed: Parsed) {
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
-  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--env KEY=VALUE] [--name <id>] [--yolo] [-- <bee-args...>]");
+  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--env KEY=VALUE] [--name <id>] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]");
   assertSingleBeeInvocation(parsed, "hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
 
   // The waitForPromptReady below is authoritative; skip spawn's own readiness
@@ -249,7 +249,7 @@ export const OPEN_OWN_FLAGS = new Set([
 export const OPEN_SPAWN_CONTROL_FLAGS = new Set([
   "name", "colony", "swarm", "swarm-id", "count", "frame", "node", "substrate",
   "brief", "briefed", "autoswap", "boot-ms", "no-wait", "force-send", "here",
-  "pool", "no-keep", "kit-profile",
+  "pool", "no-keep", "kit-profile", "preamble", "no-preamble",
 ]);
 
 

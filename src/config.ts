@@ -62,11 +62,28 @@ export type SpawnConfig = {
   };
 };
 
+/**
+ * Session preamble (src/preamble.ts) — the "where am I" block every spawn
+ * injects. Central here so non-Apiary hive bees (terminal, flows, cron) get
+ * the same treatment; Apiary layers its own host text on top per spawn.
+ */
+export type PreambleConfig = {
+  /** Master switch. Default true. */
+  enabled?: boolean;
+  /** Include honeybee's identity layer (id/name/comb/parent + buz). Default true. */
+  identity?: boolean;
+  /** Operator's custom layer, appended last. */
+  text?: string;
+  /** Soft budget override; renderPreamble reports over-budget, never truncates. */
+  maxChars?: number;
+};
+
 export type HiveConfig = {
   bees?: Record<string, BeeConfig>;
   briefFooter?: string;
   naming?: NamingConfig;
   spawn?: SpawnConfig;
+  preamble?: PreambleConfig;
 };
 
 /** Origin defaults when config is absent: agents run pane-less HSR, humans keep local tmux. */
@@ -94,7 +111,8 @@ export function briefFooter(): string {
 
 let cached: HiveConfig | undefined;
 
-const TOP_LEVEL_CONFIG_KEYS = new Set(["bees", "briefFooter", "naming", "spawn"]);
+const TOP_LEVEL_CONFIG_KEYS = new Set(["bees", "briefFooter", "naming", "spawn", "preamble"]);
+const PREAMBLE_CONFIG_KEYS = new Set(["enabled", "identity", "text", "maxChars"]);
 const NAMING_CONFIG_KEYS = new Set(["auto", "tool", "model", "command", "effort"]);
 const SPAWN_CONFIG_KEYS = new Set(["defaultSubstrate"]);
 const SPAWN_DEFAULT_SUBSTRATE_KEYS = new Set(["agent", "user"]);
@@ -144,6 +162,24 @@ export type ResolvedNamingConfig = {
   effort: NamingEffort;
 };
 
+export type ResolvedPreambleConfig = {
+  enabled: boolean;
+  identity: boolean;
+  text?: string;
+  maxChars?: number;
+};
+
+/** Preamble settings with defaults applied (on + identity layer, no custom text). */
+export function preambleConfig(): ResolvedPreambleConfig {
+  const preamble = loadConfig().preamble ?? {};
+  return {
+    enabled: preamble.enabled !== false,
+    identity: preamble.identity !== false,
+    ...(preamble.text ? { text: preamble.text } : {}),
+    ...(preamble.maxChars !== undefined ? { maxChars: preamble.maxChars } : {}),
+  };
+}
+
 export function namingConfig(): ResolvedNamingConfig {
   const naming = loadConfig().naming ?? {};
   const tool = naming.tool ?? "claude";
@@ -190,6 +226,18 @@ function normalizeConfig(value: unknown): { config: HiveConfig; unknownKeys: str
       if (defaults.agent !== undefined || defaults.user !== undefined) spawn.defaultSubstrate = defaults;
     }
     if (spawn.defaultSubstrate !== undefined) config.spawn = spawn;
+  }
+  if (object.preamble && typeof object.preamble === "object" && !Array.isArray(object.preamble)) {
+    const r = object.preamble as Record<string, unknown>;
+    collectUnknownKeys(r, PREAMBLE_CONFIG_KEYS, "preamble", unknownKeys);
+    const preamble: PreambleConfig = {};
+    if (typeof r.enabled === "boolean") preamble.enabled = r.enabled;
+    if (typeof r.identity === "boolean") preamble.identity = r.identity;
+    if (typeof r.text === "string") preamble.text = r.text;
+    // A non-positive/NaN budget would make every preamble read over-budget and
+    // spam the spawn path with warnings; drop it and keep the default.
+    if (typeof r.maxChars === "number" && Number.isFinite(r.maxChars) && r.maxChars > 0) preamble.maxChars = r.maxChars;
+    config.preamble = preamble;
   }
   if (object.bees && typeof object.bees === "object" && !Array.isArray(object.bees)) {
     const bees: Record<string, BeeConfig> = {};

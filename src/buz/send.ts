@@ -4,6 +4,7 @@
 
 import { withFileLock } from "../lock.js";
 import { appendLedger } from "../store.js";
+import { resetTaskSupplyFeedsForHumanInteraction, TASK_SUPPLY_SENDER_NAME } from "../tasks/supplyConfig.js";
 import { generateMessageId } from "./ids.js";
 import { downgradeTier, resolveBuzAccept } from "./policy.js";
 import {
@@ -11,6 +12,7 @@ import {
   deliveryLockPath,
   recipientWriteLockPath,
   senderDisplay,
+  senderToken,
   writeMailbox,
   writeOutbox,
 } from "./storage.js";
@@ -127,6 +129,14 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
     ...(downgrade.downgraded ? { downgraded: true, reason: result.reason } : {}),
     ...(input.node ? { node: input.node } : {}),
   });
+
+  // A human-sender send to this bee is the task-supply breaker's "human
+  // interaction": reset the consecutive-feed counter (tasks/supplyConfig.ts).
+  // The supply loop's own sends are excluded by sender name; best-effort and
+  // never fails the send.
+  if (input.sender.kind === "human" && senderToken(input.sender) !== TASK_SUPPLY_SENDER_NAME) {
+    await resetTaskSupplyFeedsForHumanInteraction(input.recipient);
+  }
 
   return result;
 }

@@ -34,6 +34,7 @@ import {
   SESSION_LIVE_ONLY,
   SHELL_FIRST_ARG,
   SHELLS,
+  TASK_STATUS_VALUES,
   TOP_LEVEL_FLAGS,
   type FlagValueKind,
 } from "./tables.js";
@@ -174,6 +175,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return [...BUZ_TIERS];
     case "buz-accept":
       return BUZ_ACCEPT_VALUES;
+    case "task-status":
+      return [...TASK_STATUS_VALUES];
     case "run":
       return (state.runs ?? []).map((r) => r.runId);
     case "loop-context":

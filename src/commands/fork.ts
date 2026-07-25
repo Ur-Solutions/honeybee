@@ -1,11 +1,12 @@
 // `hive fork`/split — branch a bee into a fresh comb (or an adjacent pane),
 // seeded from its state, with account-safety resolution.
 // Extracted from cli.ts (HIVE-15).
-import { activateAccountIntoHome, defaultHomeForAccount, type AccountRecord } from "../accounts.js";
+import { activateAccountIntoHome, defaultHomeForAccount, listAccounts, type AccountRecord } from "../accounts.js";
 import { adoptInheritedHome, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand, stampBeeIdentityEnv } from "../agents.js";
-import { agentKinds, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
+import { agentKinds, forkCapabilityForAgent, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
-import { modelArgsFor, pickForkSeed, type ForkSeedInput, type SeedMode } from "../fork.js";
+import { modelArgsFor, pickForkSeed, type ForkSeedDecision, type ForkSeedInput, type SeedMode } from "../fork.js";
+import { copyThreadForFork, listTurnAnchors, locateThreadFile, parseAnchorFlag } from "../threadCopy.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "../forkTui.js";
 import { actionLine, bold, dim, isPretty, note, tildify } from "../format.js";
 import { writeSpawnOptions } from "../hiveState.js";
@@ -17,14 +18,15 @@ import { flag, truthy, type Parsed } from "../parse.js";
 import { acquireProSlot, deleteProSlot, listProRepoEntries, resolveProEntryForCwd, toProSlug, type ProSlotKind } from "../proProjects.js";
 import { listSeals, loadLatestSeal } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
+import { planSpawnPreamble } from "../spawnPreamble.js";
 import { appendLedger, listSessions, safeName, saveSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateForRecord, type Substrate } from "../substrates/index.js";
 import { formatShellCommand } from "../tmux.js";
 import { randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { confirmPausedAccount, confirmSpawnReady, dangerousMode, deliverBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnCwd, resolveSpawnSubstrate, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { cmdSend } from "../commands/messaging.js";
-import { maybeLinkHere, newBeeAccountRows, resolveAccountFlag } from "../commands/spawn.js";
+import { maybeLinkHere, newBeeAccountRows, resolveAccountFlag, resolvePreambleFlags } from "../commands/spawn.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 
 /**
@@ -47,66 +49,63 @@ export const FORK_SEED_MODES = new Set<SeedMode>(["resume", "seal", "summary", "
 
 
 /**
- * Account-safety gate for `hive fork` (fork-and-pane §7.1, the crux). Two live
- * processes must never share one account: Anthropic rotates OAuth refresh
- * tokens per-account, so two live bees on one account (even in separate homes)
- * log each other out. Returns the account (if any) the fork should use — for an
- * account-bound parent the fork's account is NEVER === source.accountId (which
- * also guarantees its defaultHomeForAccount home differs from the parent's).
+ * Account gate for `hive fork` (session-fork-and-handoff epic, relaxing
+ * fork-and-pane §7.1). Ground truth: there is ONE home per account
+ * (defaultHomeForAccount), and `--account auto` stacks multiple bees on the
+ * least-loaded account's single home every day — a shared credential file is
+ * the fleet's normal, safe configuration (rotations propagate through the
+ * file). The dangerous configuration is one account's credentials COPIED into
+ * two different homes, where rotation strands the stale copy; that only
+ * happens via re-activation, which the caller therefore SKIPS for a fork that
+ * joins the parent's account home (`joinsParentHome`).
  */
 export async function resolveForkAccountSafety(
   parsed: Parsed,
   source: SessionRecord,
-  context: { targetTool: string; requestedSeed?: SeedMode },
-): Promise<{ account?: AccountRecord }> {
+  context: { targetTool: string; requestedSeed?: SeedMode; threadCopy?: boolean },
+): Promise<{ account?: AccountRecord; joinsParentHome: boolean }> {
   const accountQuery = stringFlag(parsed, ["account"]);
   const wantsResume = context.requestedSeed === "resume";
 
   if (accountQuery) {
     const account = await resolveAccountFlag(accountQuery, context.targetTool, ttlFlagMs(parsed), includePausedFlag(parsed));
-    // The fork's account must DIFFER from a live account-bound parent's. The
-    // OAuth refresh token rotates per-ACCOUNT (not per-home), so two live bees
-    // on one account log each other out even in separate homes — and when the
-    // account's home IS the parent's (the common `defaultHomeForAccount`
-    // layout), this also reuses the parent's exact live home. `--account auto`
-    // can silently land on the parent's own account, so this guard covers it too.
     if (source.accountId && account.id === source.accountId) {
-      throw new Error(
-        `fork would run on ${source.name}'s own account (${account.id}); two live bees on one ` +
-          `account rotate the shared OAuth chain and log each other out. Pass a different ` +
-          `--account (fork-and-pane §7.1).`,
-      );
+      // Same account → the fork JOINS the parent's account home (same shared
+      // credential file — the auto-stacking risk profile). No re-activation.
+      await confirmPausedAccount(account, parsed);
+      return { account, joinsParentHome: true };
     }
-    // The (different) account brings its own dedicated home
-    // (defaultHomeForAccount), so the fork never touches the parent's home.
-    // Native resume needs the parent's provider session, which lives in the
-    // parent's home — a different account/home can't see it.
-    if (wantsResume) {
+    // A different account brings its own dedicated home. Native resume can't
+    // see the parent's provider session there — but a thread-copy harness
+    // copies the session INTO the destination home, so only copy-incapable
+    // harnesses must refuse.
+    if (wantsResume && !context.threadCopy) {
       throw new Error(
         `--seed resume needs ${source.name}'s home to see its provider session; ` +
-          `account ${account.id} has its own home — fork with a seal instead`,
+          `account ${account.id} has its own home and ${context.targetTool} cannot copy threads — fork with a seal instead`,
       );
     }
-    // Last gate, after the hard guards: no point confirming a paused account
-    // the same-account/resume checks would refuse anyway.
     await confirmPausedAccount(account, parsed);
-    return { account };
+    return { account, joinsParentHome: false };
   }
 
   if (source.accountId) {
-    // Account-bound parent with no --account: refuse. A fork must get its own
-    // account/home; sharing the parent's live home rotates the OAuth chain and
-    // logs both bees out.
-    throw new Error(
-      `${source.name} is account-bound (${source.accountId}); a fork must get its own account — ` +
-        `pass --account <a> (or --account auto). Sharing a live home rotates the OAuth chain and ` +
-        `logs both bees out (fork-and-pane §7.1).`,
-    );
+    // Account-bound parent with no --account: inherit the parent's account and
+    // join its home (relaxed 2026-07-24; previously refused). Same risk profile
+    // as `--account auto` stacking a second bee on that account.
+    const account = (await listAccounts()).find((candidate) => candidate.id === source.accountId);
+    if (!account) {
+      throw new Error(
+        `${source.name} is bound to account ${source.accountId}, which is not in the vault — pass --account <a> (or --account auto)`,
+      );
+    }
+    console.error(note(`fork inherits ${source.name}'s account (${account.id}); pass --account to use a different one`));
+    return { account, joinsParentHome: true };
   }
 
   // Default-home parent (no accountId): allow a plain spawn (own fresh tmux
   // session in the default home — same risk profile as a second default bee).
-  if (wantsResume) {
+  if (wantsResume && !context.threadCopy) {
     console.error(
       note(
         `warn: --seed resume reuses ${source.name}'s provider session in a shared home; ` +
@@ -114,7 +113,7 @@ export async function resolveForkAccountSafety(
       ),
     );
   }
-  return {};
+  return { joinsParentHome: false };
 }
 
 
@@ -133,8 +132,8 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
   const selector = parsed.args[0];
   if (!selector) {
     throw new Error(
-      "Usage: hive fork <bee> [checkpoint] [--agent <kind>] [--model <m>] [--node <n>] " +
-        "[--cwd <dir>] [--seed resume|seal|summary|log|none] [--read-log] [--name <n>] [--account <a>] [--here] [--print]",
+      "Usage: hive fork <bee> [checkpoint] [--at <event-id|turn:N>] [--list-anchors] [--agent <kind>] [--model <m>] [--node <n>] " +
+        "[--cwd <dir>] [--seed resume|seal|summary|log|none] [--read-log] [--name <n>] [--account <a>] [--here] [--print] [--json]",
     );
   }
 
@@ -175,11 +174,41 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
   const requestedSeed = seedFlag as SeedMode | undefined;
   const readLog = truthy(flag(parsed, "read-log"));
 
-  // 5. Account safety (the crux). Yields the account whose dedicated home the
-  //    fork will use; for a default-home parent it returns no account.
-  const { account } = await resolveForkAccountSafety(parsed, source, { targetTool, requestedSeed });
+  // 4b. Turn anchor + anchor enumeration (session-fork-and-handoff epic).
+  const capability = forkCapabilityForAgent(targetTool);
+  const anchor = parseAnchorFlag(stringFlag(parsed, ["at"]));
+  if (hasFlag(parsed, "list-anchors")) {
+    await printForkAnchors(parsed, source, sourceTool);
+    return source;
+  }
+  if (anchor.kind === "turn") {
+    if (targetTool !== sourceTool) {
+      throw new Error(`hive fork: --at is same-harness only (${sourceTool}→${targetTool} cannot carry the thread) — use hive handoff`);
+    }
+    if (!capability.threadCopy) {
+      throw new Error(`hive fork: --at needs thread-copy support and ${targetTool} has none — use hive handoff`);
+    }
+    if (requestedSeed !== undefined && requestedSeed !== "resume") {
+      throw new Error(`hive fork: --at is a thread-preserving fork; it conflicts with --seed ${requestedSeed}`);
+    }
+    if (!source.providerSessionId) {
+      throw new Error(`hive fork: ${source.name} has no recorded provider session id to copy from`);
+    }
+  }
 
-  // 6. Pick the seed mode (pure decision).
+  // 5. Account gate. Yields the account (if any) the fork will use, and
+  //    whether it joins the parent's live account home (same account → no
+  //    re-activation; see resolveForkAccountSafety).
+  const { account, joinsParentHome } = await resolveForkAccountSafety(parsed, source, {
+    targetTool,
+    requestedSeed,
+    threadCopy: capability.threadCopy,
+  });
+
+  // 6. Pick the seed mode (pure decision). `hive handoff` rides this same
+  //    pipeline with --seed summary plus a marker flag and the instruction.
+  const isHandoff = hasFlag(parsed, "handoff");
+  const handoffInstruction = stringFlag(parsed, ["handoff-instruction"]);
   const seedInput: ForkSeedInput = {
     source,
     seal,
@@ -188,8 +217,9 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     targetTool,
     sourceTool,
     forkName: source.name,
+    ...(handoffInstruction !== undefined ? { handoffInstruction } : {}),
   };
-  const decision = pickForkSeed(seedInput);
+  let decision: ForkSeedDecision = pickForkSeed(seedInput);
   if (decision.mode === "refuse") throw new Error(`hive fork: ${decision.reason}`);
   // Tell the operator when a bare `hive fork` fell back to a cold boot because the
   // source had nothing to seed from (vs an explicit `--seed none`).
@@ -197,30 +227,83 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     console.error(note(`${source.name} had no session/seal/transcript to seed from — forking cold`));
   }
 
-  // 7. Build the spawn spec and create the new comb. Resume args are baked into
-  //    the spawn command (§7.1); seal/log/none seed via a brief after spawn.
-  const modelArgs = modelArgsFor(targetTool, model);
-  const resumeArgsList = decision.mode === "resume" ? decision.resumeArgs : [];
-  const extraArgs = [...resumeArgsList, ...modelArgs, ...parsed.rest];
-
   const yolo = dangerousMode(parsed, targetTool, requestedAgent);
-  // Substrate policy (APIA-85): a fork from inside a bee lands on HSR by default,
-  // exactly like spawn (resolveSpawnSubstrate) — combs are retired, so the fork
-  // is a pane-less runner-host bee unless `--substrate tmux`/`--node` forces a
-  // tmux bee. `node` is undefined in the HSR case.
+  // Substrate policy (APIA-85 + session-fork-and-handoff): a fork is a sibling
+  // of its source, so an HSR source forks pane-lessly even from a user shell —
+  // which is also the only substrate where the thread copy is verified. An
+  // explicit `--substrate`/`--node` still wins; otherwise spawn's origin
+  // policy applies (agent-context → HSR).
+  if (!hasFlag(parsed, "substrate") && !hasFlag(parsed, "node") && source.substrate === "hsr") {
+    parsed.flags.set("substrate", "hsr");
+  }
   const { useHsr, node } = await resolveSpawnSubstrate(parsed, targetTool);
   const isRemote = node?.kind === "ssh-tmux";
   if (account && isRemote) throw new Error("--account forks are local-only (the vault never leaves this machine)");
 
   // The account brings its own dedicated home; otherwise the fork boots in the
-  // default home (never the parent's exact home for an account-bound parent —
-  // resolveForkAccountSafety already enforced that).
+  // default home. A same-account fork's home IS the parent's account home
+  // (joinsParentHome — resolveForkAccountSafety allowed it).
   const home = account ? defaultHomeForAccount(account) : undefined;
+
+  // 6b. Thread copy. A thread-preserving fork of a copy-capable harness
+  //     (claude, codex) never resumes the parent's session id directly: the
+  //     provider transcript is copied — truncated at the anchor when one is
+  //     given — under a FRESH session id in the DESTINATION store, and the
+  //     fork resumes the copy (delivered via the HSR payload's resume opts,
+  //     which both adapters speak). This carries full history across cwds,
+  //     accounts, and claude's interactive↔headless store split (both
+  //     verified live 2026-07-24), and doubles as anti-cross-match (the fork
+  //     owns its id from birth). Interactive (tmux/remote) resume of a copied
+  //     file is unverified, so the copy path is HSR-local only; tmux forks
+  //     keep the old native-resume args.
+  let copiedSessionId: string | undefined;
+  if (decision.mode === "resume" && capability.threadCopy && source.providerSessionId) {
+    if (useHsr && !isRemote) {
+      const newSessionId = randomUUID();
+      const copied = await copyThreadForFork({
+        kind: targetTool,
+        source: {
+          cwd: source.cwd,
+          providerSessionId: source.providerSessionId,
+          ...(source.homePath ? { homePath: source.homePath } : {}),
+        },
+        destCwd: cwd,
+        ...(home ? { destHome: home } : {}),
+        newSessionId,
+        anchor,
+      });
+      // The provider-facing id may differ from the minted uuid (kimi prefixes).
+      copiedSessionId = copied.newProviderSessionId ?? newSessionId;
+      decision = {
+        mode: "resume",
+        // The resume rides the HSR payload (sessionId + resume), not CLI args.
+        resumeArgs: [],
+        checkpoint: anchor.kind === "turn" ? `turn:${copied.boundaryOrdinal ?? "?"}:${copiedSessionId}` : `copy:${copiedSessionId}`,
+      };
+    } else if (anchor.kind === "turn") {
+      throw new Error("hive fork: --at forks are HSR-local only for now (interactive resume of a copied thread is unverified)");
+    }
+  } else if (anchor.kind === "turn") {
+    throw new Error(`hive fork: --at needs a thread-preserving fork of ${source.name} (no resumable session found)`);
+  }
+
+  // 7. Build the spawn spec and create the new comb. Resume args are baked into
+  //    the spawn command (§7.1); seal/summary/log seed via a brief after spawn.
+  const modelArgs = modelArgsFor(targetTool, model);
+  const resumeArgsList = decision.mode === "resume" ? decision.resumeArgs : [];
+  const extraArgs = [...resumeArgsList, ...modelArgs, ...parsed.rest];
+
   const spec = resolveAgent(requestedAgent, extraArgs, { home, yolo, identity: Boolean(account) });
   if (account) {
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
-    await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
-    refreshIdentityEnv(spec);
+    if (joinsParentHome) {
+      // Joining the parent's live account home: credentials are already active
+      // there, and a vault→home re-activation could overwrite freshly rotated
+      // credentials with a stale vault snapshot — skip it.
+    } else {
+      await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+      refreshIdentityEnv(spec);
+    }
   }
   if (!isRemote) {
     await assertExecutableAvailable(spec.command);
@@ -238,6 +321,20 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     comb: name,
     parent: source.id ?? source.name,
   });
+  // Session preamble: RE-rendered for the fork, never inherited. A fork is a
+  // new bee with a new id, so copying the source's preamble would tell it it is
+  // its own parent. The host layer (`--preamble`) can be re-supplied by the
+  // forking caller; absent one, the fork keeps only identity + config layers.
+  const preamblePlan = planSpawnPreamble({
+    kind: spec.kind,
+    identity: { name, id: identity.id, comb: name, parent: source.id ?? source.name },
+    ...resolvePreambleFlags(parsed),
+    warn: (message) => console.error(note(message)),
+  });
+  if (preamblePlan?.args.length) {
+    spec.args = [...spec.args, ...preamblePlan.args];
+    launchArgv.push(...preamblePlan.args);
+  }
   const now = new Date().toISOString();
 
   // 8. Launch the fork on the chosen substrate and build the record with fork
@@ -271,7 +368,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       comb: name, // fork is its own comb (a fresh lineage root)
       kind: spec.kind,
       cwd,
-      ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
+      ...(copiedSessionId ? { sessionId: copiedSessionId, resume: true } : pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
       authKind: "subscription",
       ...(account ? { accountId: account.id } : {}),
       ...(model ? { model } : {}),
@@ -303,8 +400,9 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       uuid: identity.uuid,
       requestedAgent: spec.requestedKind,
       homePath: spec.homePath,
-      ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
+      ...(copiedSessionId ? { providerSessionId: copiedSessionId } : pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
       ...(account ? { accountId: account.id } : {}),
+      ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(source.colony ? { colony: source.colony } : {}),
     };
     substrate = hsrSubstrate();
@@ -353,6 +451,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       homePath: spec.homePath,
       ...(account ? { accountId: account.id } : {}),
       ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+      ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(source.colony ? { colony: source.colony } : {}),
     };
     await saveSession(record);
@@ -361,7 +460,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
 
   // 9. Ledger.
   await appendLedger({
-    type: "fork.create",
+    type: isHandoff ? "handoff.create" : "fork.create",
     name,
     forkedFromId: record.forkedFromId,
     seedMode: record.seedMode,
@@ -373,19 +472,33 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
 
   // Print the success line. The trailing `command` field on the tab form makes
   // the resume-args / model-args assertion trivial in the non-TTY test harness.
+  const verb = isHandoff ? "handoff" : "fork";
   if (isPretty()) {
-    console.log(actionLine("ok", "fork", [bold(name), spec.kind, dim(`from ${source.name}`), dim(decision.mode)]));
+    console.log(actionLine("ok", verb, [bold(name), spec.kind, dim(`from ${source.name}`), dim(decision.mode)]));
   } else {
-    console.log(`fork\t${name}\t${spec.kind}\t${source.name}\t${decision.mode}\t${record.command}`);
+    console.log(`${verb}\t${name}\t${spec.kind}\t${source.name}\t${decision.mode}\t${record.command}`);
   }
 
   // 10. Seed: resume/none carry the seed in the spawn command (or boot cold);
-  //     seal/log deliver a brief once ready.
+  //     seal/summary/log deliver a brief once ready.
   let finalRecord = record;
-  if (decision.mode === "seal" || decision.mode === "log") {
+  if (decision.mode === "seal" || decision.mode === "summary" || decision.mode === "log") {
     finalRecord = await deliverBrief(parsed, record, decision.brief);
   } else {
     await confirmSpawnReady(parsed, record);
+  }
+
+  // Machine-readable success (Apiary parses the last JSON stdout line).
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify({
+      name: finalRecord.name,
+      ...(finalRecord.id ? { id: finalRecord.id } : {}),
+      agent: finalRecord.agent,
+      forkedFrom: source.name,
+      seedMode: record.seedMode,
+      ...(record.forkCheckpoint ? { checkpoint: record.forkCheckpoint } : {}),
+      ...(copiedSessionId ? { providerSessionId: copiedSessionId } : {}),
+    }));
   }
 
   // 11. --print / --here behave like spawn's interactive affordances. An HSR bee
@@ -400,6 +513,35 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
   }
   await maybeLinkHere(parsed, [finalRecord]);
   return finalRecord;
+}
+
+
+/**
+ * `hive fork --list-anchors <bee>` — enumerate the source's turn boundaries so
+ * external callers (Apiary's per-turn actions) can anchor a fork/handoff
+ * without parsing provider transcripts. Tab form: ordinal, completed, user
+ * event id, timestamp, preview; `--json` emits the TurnAnchor array.
+ */
+async function printForkAnchors(parsed: Parsed, source: SessionRecord, sourceTool: string): Promise<void> {
+  const capability = forkCapabilityForAgent(sourceTool);
+  if (!capability.threadCopy) throw new Error(`hive fork --list-anchors: ${sourceTool} has no thread-copy support; anchors are unavailable`);
+  if (!source.providerSessionId) throw new Error(`hive fork --list-anchors: ${source.name} has no recorded provider session id`);
+  const path = await locateThreadFile(sourceTool, {
+    cwd: source.cwd,
+    providerSessionId: source.providerSessionId,
+    ...(source.homePath ? { homePath: source.homePath } : {}),
+  });
+  const raw = await readFile(path, "utf8").catch(() => {
+    throw new Error(`hive fork --list-anchors: no provider session file at ${path}`);
+  });
+  const anchors = listTurnAnchors(sourceTool, raw.split("\n").filter((line) => line.trim().length > 0));
+  if (truthy(flag(parsed, "json"))) {
+    console.log(JSON.stringify(anchors));
+    return;
+  }
+  for (const entry of anchors) {
+    console.log(`turn:${entry.ordinal}\t${entry.completed ? "done" : "open"}\t${entry.userEventId ?? entry.endEventId ?? ""}\t${entry.ts ?? ""}\t${entry.preview}`);
+  }
 }
 
 
@@ -463,16 +605,16 @@ export async function cmdForkLaunch(parsed: Parsed): Promise<void> {
     }
   })();
 
-  // Account options. An account-bound source MUST fork onto a DIFFERENT account
-  // (a shared OAuth chain rotates and logs both bees out), so its own account is
-  // excluded and the "inherit" row withheld; a default-home source may inherit.
-  const accountRequired = Boolean(source.accountId);
+  // Account options. An account-bound source now INHERITS its account by
+  // default (relaxed 2026-07-24): the fork joins the parent's account home —
+  // the same shared-credential-file configuration `--account auto` stacking
+  // produces every day. Other accounts remain selectable to spread quota.
+  const accountRequired = false;
   const accounts = await newBeeAccountRows(sourceKind).catch(() => []);
   const accountOptions: ForkAccountOption[] = [];
-  if (!accountRequired) accountOptions.push({ value: "", label: "inherit (no account binding)" });
+  accountOptions.push({ value: "", label: source.accountId ? `inherit (${source.accountId})` : "inherit (no account binding)" });
   accountOptions.push({ value: "auto", label: "auto", detail: "least-loaded account" });
   for (const acct of accounts) {
-    if (accountRequired && acct.id === source.accountId) continue;
     accountOptions.push({ value: acct.id, label: acct.label, ...(acct.usage ? { detail: acct.usage } : {}) });
   }
 

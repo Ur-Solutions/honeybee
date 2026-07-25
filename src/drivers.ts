@@ -7,6 +7,7 @@ import { cursorAdapter } from "./hsr/adapters/cursor.js";
 import { grokAdapter } from "./hsr/adapters/grok.js";
 import { kimiAdapter, normalizeKimiModel } from "./hsr/adapters/kimi.js";
 import { openCodeAdapter } from "./hsr/adapters/opencode.js";
+import type { PreambleChannel } from "./preamble.js";
 
 /**
  * IdentityRecipe describes how a provider's login materializes on disk so the
@@ -157,6 +158,20 @@ export type AgentDriver = {
    * sole credentialed account for the tool, when exactly one exists.
    */
   soleCredentialedAccountDefault?: boolean;
+  /**
+   * CLI args that APPEND text to the harness's system prompt — the session
+   * preamble's preferred delivery channel (see src/preamble.ts). Riding argv
+   * means the text is re-applied on every resume/revive (the runner rebuilds
+   * argv from the persisted spec) and survives compaction, which a first-
+   * message injection does not.
+   *
+   * MUST be append-style, never an override: the harness's own system prompt
+   * is what makes it work. Verified 2026-07-25 — claude
+   * `--append-system-prompt`, grok `--rules`. Undefined for the rest (codex
+   * has only AGENTS.md/experimental_instructions_file; opencode/kimi/cursor/
+   * pi/droid unverified), which degrades to the `message` channel.
+   */
+  systemPromptArgs?: (text: string) => string[];
 };
 
 /** Boot-ready timeout for kinds without a declared `bootMs`. */
@@ -199,6 +214,7 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     sessionPinWithResumeArgs: ["--fork-session"],
     forkCapability: { nativeTip: true, threadCopy: true },
     hsrAdapter: claudeAdapter,
+    systemPromptArgs: (text) => ["--append-system-prompt", text],
   },
   codex: {
     kind: "codex",
@@ -276,6 +292,9 @@ const AGENT_DRIVERS: Record<string, AgentDriver> = {
     forkCapability: { threadCopy: true },
     hsrAdapter: grokAdapter,
     soleCredentialedAccountDefault: true,
+    // grok's own help: "--rules <RULES>  Extra rules to append to the system
+    // prompt". NOT --system-prompt-override, which would replace it.
+    systemPromptArgs: (text) => ["--rules", text],
   },
   kimi: {
     kind: "kimi",
@@ -468,6 +487,21 @@ export function exhaustionForAgent(kind: string, pane: string): ExhaustionHit | 
  */
 export function modelArgsForAgent(kind: string, model?: string, provider?: string): string[] {
   return agentDriver(kind)?.modelArgs?.(model, provider) ?? [];
+}
+
+/**
+ * Args that append `text` to the harness's system prompt, or null when the
+ * harness has no such flag. Null is the caller's signal to fall back to the
+ * preamble's `message` channel — see preambleChannelForAgent.
+ */
+export function systemPromptArgsForAgent(kind: string, text: string): string[] | null {
+  if (!text) return null;
+  return agentDriver(kind)?.systemPromptArgs?.(text) ?? null;
+}
+
+/** Which preamble channel a harness supports (see src/preamble.ts). */
+export function preambleChannelForAgent(kind: string): PreambleChannel {
+  return agentDriver(kind)?.systemPromptArgs ? "system-prompt" : "message";
 }
 
 /** Thread-preserving fork capability for a kind (both false when undeclared). */

@@ -29,6 +29,19 @@ const COMMAND_NOISE_RE =
   /<(local-command-caveat|command-name|command-message|command-args|command-contents|local-command-stdout|system-reminder)\b[^>]*>[\s\S]*?<\/\1>/gi;
 
 /**
+ * Hive's own session preamble (src/preamble.ts), when it rode the `message`
+ * channel because the harness has no append-to-system-prompt flag. It is
+ * PREPENDED to the bee's first real text, so it must be stripped rather than
+ * used to skip the row — skipping would discard the operator's prompt with it,
+ * and leaving it in would title every codex bee "You are a Honeybee bee: …".
+ */
+const SESSION_PREAMBLE_RE = /<hive-session>[\s\S]*?<\/hive-session>\s*/gi;
+
+export function stripSessionPreamble(text: string): string {
+  return text.replace(SESSION_PREAMBLE_RE, "");
+}
+
+/**
  * User-role rows that are injected by a harness before the human's prompt.
  * Keep this guard in the shared fallback as well as provider adapters: a new
  * Codex carrier shape must not be able to turn bootstrap context into a bee
@@ -45,7 +58,7 @@ export function isInjectedUserContext(text: string): boolean {
 }
 
 export function stripCommandNoise(text: string): string {
-  return text.replace(COMMAND_NOISE_RE, "").replace(/\n{3,}/g, "\n\n").trim();
+  return stripSessionPreamble(text).replace(COMMAND_NOISE_RE, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export function firstUserText(rows: TranscriptRow[]): string {
@@ -91,7 +104,7 @@ export function firstUserPromptTitle(rows: TranscriptRow[]): string | undefined 
   for (const row of rows) {
     const role = row.message?.role ?? row.type;
     if (role !== "user") continue;
-    const content = textFromContent(row.message?.content ?? row.content);
+    const content = stripSessionPreamble(textFromContent(row.message?.content ?? row.content));
     if (isInjectedUserContext(content)) continue;
     const title = normalizeTitleCandidate(content);
     if (title) return title;

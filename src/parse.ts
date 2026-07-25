@@ -67,6 +67,8 @@ export const BOOLEAN_FLAGS = new Set([
   "wezterm",
   "wide",
   "yolo",
+  "off",
+  "on",
   "no-yolo",
   "no-accept-trust",
   "no-auto",

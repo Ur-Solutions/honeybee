@@ -7,6 +7,7 @@ import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AutoswapOutcome } from "./autoswap.js";
 import type { BuzDispatchOutcome } from "./buzDispatcher.js";
 import type { NeedsInputOutcome } from "./needsInput.js";
+import type { TaskSupplyOutcome } from "./taskSupplyDispatcher.js";
 import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./nodeReachability.js";
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
@@ -79,6 +80,19 @@ export type TickDeps = {
    * tick and goes stale when its touchSession write failed).
    */
   dispatchBuzDrain?: (records: SessionRecord[], transitions: TickTransition[], currentStates: Map<string, BeeState>) => Promise<BuzDispatchOutcome[]>;
+  /**
+   * Optional task auto-supply dispatcher (agent task lists epic): on the same
+   * idle_with_output observation that drains buz queues, feeds the top
+   * eligible task from the bee's task list through the six-condition gate —
+   * strictly after the buz stage (it consumes its outcomes: a tick that
+   * delivered a queued message never also feeds a task). Stateful across
+   * ticks (stall grace counting) — build once per daemon run.
+   */
+  dispatchTaskSupply?: (
+    records: SessionRecord[],
+    currentStates: Map<string, BeeState>,
+    buzDrains: BuzDispatchOutcome[],
+  ) => Promise<TaskSupplyOutcome[]>;
   /**
    * Optional HSR needs-input router (APIA-79): for each blocked HSR bee with a
    * structured needs_input, routes the request as an interrupt-tier buz to the
@@ -175,6 +189,12 @@ export type DispatcherOutcomes = {
    * was not wired.
    */
   buzDrains: BuzDispatchOutcome[];
+  /**
+   * Task auto-supply outcomes: tasks fed to idle bees through the six-
+   * condition gate, fed tasks flagged stalled, per-bee errors. Empty when no
+   * idle bee had supply on + an eligible task / not wired.
+   */
+  taskSupplies: TaskSupplyOutcome[];
   /**
    * HSR needs-input routing outcomes: each blocked HSR bee's request routed to
    * its parent (routedTo) or escalated to the user (escalated). Empty when no
@@ -328,6 +348,25 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
             errors: outcome.result.errors.length,
           }
         : null,
+  },
+  // Task auto-supply: feed the top eligible task to each idle bee whose gate
+  // opens. MUST follow the buz drain stage — it consumes its outcomes (a tick
+  // whose drain delivered a message never also feeds a task).
+  {
+    key: "taskSupplies",
+    name: "dispatchTaskSupply",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed, outcomes }) => deps.dispatchTaskSupply?.(records, observed, outcomes.buzDrains),
+    log: (outcome) => ({
+      level: outcome.action === "error" ? "warn" : "info",
+      msg: `task.supply.${outcome.action}`,
+      session: outcome.bee,
+      ...(outcome.taskId ? { taskId: outcome.taskId } : {}),
+      ...(outcome.buzMessageId ? { buzMessageId: outcome.buzMessageId } : {}),
+      ...(outcome.feeds !== undefined ? { feeds: outcome.feeds } : {}),
+      ...(outcome.breakerTripped ? { breakerTripped: true } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
   },
   // HSR needs-input router: route each blocked HSR bee's structured request to
   // its living parent (buz) or mark it escalated.
@@ -483,7 +522,7 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
 ];
 
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
-  return { buzDrains: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [], flightSweeps: [], poolSweeps: [] };
+  return { buzDrains: [], taskSupplies: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [], flightSweeps: [], poolSweeps: [] };
 }
 
 /**

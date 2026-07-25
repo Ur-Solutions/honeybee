@@ -1,8 +1,6 @@
 // `hive buz` — addressed bee-to-bee messaging (three-tier delivery + policy).
 // Extracted from cli.ts (HIVE-15).
-import { BUZ_TIERS, DELIVERY_LOCK_TIMEOUT_MS, consumeMessage, deliveryLockPath, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, recipientWriteLockPath, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
-import { withFileLock } from "../lock.js";
-import { rm } from "node:fs/promises";
+import { BUZ_TIERS, cancelQueuedBuzMessage, consumeMessage, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
 import { parseAge } from "../clean.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
@@ -220,7 +218,8 @@ export async function findBuzMessage(candidates: SessionRecord[], id: string): P
  * Cancel a queued (not-yet-delivered) message: remove it from the recipient's
  * queue/ under the write lock so a concurrent daemon drain either delivers it
  * fully or never sees it. Only queue/ messages are cancellable — anything in
- * inbox/read/quarantine has already settled.
+ * inbox/read/quarantine has already settled. Locking + ledger live in the
+ * shared primitive (buz/cancel.ts), reused by the task store.
  */
 export async function buzCancel(parsed: Parsed) {
   const target = parsed.args[1];
@@ -228,17 +227,7 @@ export async function buzCancel(parsed: Parsed) {
   if (!target || !id) throw new Error("Usage: hive buz cancel <bee> <message-id>");
 
   const record = await resolveSession(target);
-  // Lock order matches the drain (delivery -> write): holding the delivery
-  // lock means an in-flight drain has either fully delivered this message
-  // (rename to inbox done) or not read it yet — never pasted-but-still-queued.
-  const cancelled = await withFileLock(deliveryLockPath(record.name), () =>
-    withFileLock(recipientWriteLockPath(record.name), async () => {
-      const found = await readMessageById(record.name, id);
-      if (!found || found.mailbox !== "queue") return false;
-      await rm(found.path, { force: true });
-      await rm(`${found.path}.retries`, { force: true }).catch(() => undefined);
-      return true;
-    }), { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS });
+  const cancelled = await cancelQueuedBuzMessage(record.name, id);
 
   if (!cancelled) {
     const found = await readMessageById(record.name, id);
@@ -246,7 +235,6 @@ export async function buzCancel(parsed: Parsed) {
     throw new Error(`No queued buz message with id ${id} for ${record.name}`);
   }
 
-  await appendLedger({ type: "buz.cancel", bee: record.name, messageId: id });
   if (isPretty()) console.log(actionLine("ok", "buz", [bold(record.name), `cancelled:${id}`]));
   else console.log(`buz.cancel\t${record.name}\t${id}`);
 }

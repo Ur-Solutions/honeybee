@@ -42,7 +42,7 @@ function provisioner(path = "/home/trmd/.hive/worktrees/apiary") {
   };
 }
 
-test("layer 1: pro sync succeeds → remote canonical checkout path, no provisioning", async () => {
+test("layer 1: pro sync ships the dirty tree → remote canonical checkout, no provisioning", async () => {
   const prov = provisioner();
   const { exec, calls } = scripted(({ command }) => {
     if (command === "pro") return ok("/home/trmd/Projects/trmd/apiary/repos/apiary\n");
@@ -54,22 +54,66 @@ test("layer 1: pro sync succeeds → remote canonical checkout path, no provisio
   assert.equal(prov.provisionCalls.length, 0);
   assert.deepEqual(calls[0], {
     command: "pro",
-    args: ["sync", "trmd@metal"],
+    args: ["sync", "--dirty", "trmd@metal"],
     cwd: "/Users/me/Projects/trmd/apiary/repos/apiary",
   });
 });
 
-test("layer 1: pro REFUSES (dirty tree) → spawn fails loudly, never falls back", async () => {
+test("layer 1: pro too old for --dirty → retried clean, spawn survives, note says so", async () => {
+  const prov = provisioner();
+  const { exec, calls } = scripted(({ command, args }) => {
+    if (command === "pro" && args.includes("--dirty")) return fail("pro: unknown sync flag: --dirty");
+    if (command === "pro") return ok("/home/trmd/Projects/trmd/apiary/repos/apiary\n");
+    throw new Error("must not fall through to layer 2");
+  });
+  const res = await resolveRemoteCwd("/Users/me/repo", node(), prov, { exec });
+  assert.equal(res?.via, "pro-sync");
+  assert.match(res!.note, /committed only/);
+  assert.deepEqual(calls.map((c) => c.args), [["sync", "--dirty", "trmd@metal"], ["sync", "trmd@metal"]]);
+  assert.equal(prov.provisionCalls.length, 0);
+});
+
+test("layer 1: foreign dirt on the node → fails loudly with the force remedy, never falls back", async () => {
   const prov = provisioner();
   const { exec } = scripted(({ command }) => {
-    if (command === "pro") return fail("pro: refusing to sync dirty working tree: /Users/me/repo");
+    if (command === "pro") return fail("pro: refusing to sync into dirty remote tree: /home/trmd/Projects/x (use --force to overwrite it)");
     throw new Error("must not fall through");
   });
   await assert.rejects(
     resolveRemoteCwd("/Users/me/repo", node(), prov, { exec }),
-    /refusing to sync dirty working tree/,
+    /dirty remote tree.*HIVE_REMOTE_SYNC=force/s,
   );
   assert.equal(prov.provisionCalls.length, 0);
+});
+
+test("layer 1: node is ahead → fails with the pull remedy", async () => {
+  const prov = provisioner();
+  const { exec } = scripted(({ command }) => {
+    if (command === "pro") return fail("pro: remote branch 'main' is not an ancestor of local 'main'");
+    throw new Error("must not fall through");
+  });
+  await assert.rejects(
+    resolveRemoteCwd("/Users/me/repo", node(), prov, { exec }),
+    /pro pull trmd@metal` first/,
+  );
+});
+
+test("HIVE_REMOTE_SYNC=force adds --force; =clean drops --dirty", async (t) => {
+  const prov = provisioner();
+  const { exec, calls } = scripted(({ command }) => {
+    if (command === "pro") return ok("/home/trmd/Projects/trmd/apiary/repos/apiary\n");
+    throw new Error("nothing else should run");
+  });
+  t.after(() => delete process.env.HIVE_REMOTE_SYNC);
+
+  process.env.HIVE_REMOTE_SYNC = "force";
+  await resolveRemoteCwd("/Users/me/repo", node(), prov, { exec });
+  assert.deepEqual(calls[0]!.args, ["sync", "--dirty", "--force", "trmd@metal"]);
+
+  process.env.HIVE_REMOTE_SYNC = "clean";
+  const clean = await resolveRemoteCwd("/Users/me/repo", node(), prov, { exec });
+  assert.deepEqual(calls[1]!.args, ["sync", "trmd@metal"]);
+  assert.equal(clean?.via, "pro-sync");
 });
 
 test("layer 2: not pro-managed → provisions from origin with the pushed local branch", async () => {
