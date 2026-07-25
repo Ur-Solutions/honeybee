@@ -89,5 +89,11 @@ export type LimitsDeps = {
    * real network in tests. The provider fetchers read this off deps.
    */
   httpGetJson?: (url: string, headers: Record<string, string>) => Promise<unknown>;
+  /**
+   * Injectable JSON POST, same contract as httpGetJson: cursor's ConnectRPC
+   * dashboard calls and the kimi-code token refresh. `body` is pre-encoded
+   * (JSON or form) — the matching Content-Type rides in `headers`.
+   */
+  httpPostJson?: (url: string, headers: Record<string, string>, body: string) => Promise<unknown>;
   now?: () => number;
 };

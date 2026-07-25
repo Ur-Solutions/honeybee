@@ -34,10 +34,18 @@ test("providerAdapter / hasProviderAdapter reject unknown and undefined ids", ()
   assert.equal(providerAdapter(undefined), undefined);
 });
 
-test("S3 wires fetchLimits for zai/minimax only; isExhausted/login stay unwired", () => {
-  // S3: the two opencode-hosted providers with documented quota endpoints get
-  // a fetchLimits; everyone else stays unsupported (degrades gracefully).
-  const FETCH_PROVIDERS = new Set<ProviderId>(["zai-coding-plan", "minimax-coding-plan"]);
+test("fetchLimits wired for every quota-bearing provider; isExhausted/login stay unwired", () => {
+  // anthropic/openai route through the dedicated claude/codex paths in
+  // limits/ (an explicit dispatch check, not a registry adapter); every other
+  // provider with a reachable quota endpoint carries its own fetchLimits.
+  const FETCH_PROVIDERS = new Set<ProviderId>([
+    "zai-coding-plan",
+    "minimax-coding-plan",
+    "xai",
+    "moonshot",
+    "cursor",
+    "kimi-for-coding",
+  ]);
   for (const id of ALL_IDS) {
     const adapter = providerAdapter(id)!;
     if (FETCH_PROVIDERS.has(id)) {
