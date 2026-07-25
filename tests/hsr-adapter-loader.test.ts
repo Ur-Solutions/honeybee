@@ -55,7 +55,18 @@ test("a fresh Codex child graph does not load sibling adapters or CLI dispatch",
   const { stderr } = await execFileAsync(
     process.execPath,
     ["--experimental-loader", loaderUrl, "--import", "tsx", "--input-type=module", "--eval", script],
-    { cwd: process.cwd(), env: { ...process.env, NODE_NO_WARNINGS: "1" }, maxBuffer: 1_000_000 },
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        NODE_NO_WARNINGS: "1",
+        // This test observes module evaluation through a custom loader. Node's
+        // cross-process compile cache can bypass that loader after an earlier
+        // suite run has warmed the same TypeScript module.
+        NODE_DISABLE_COMPILE_CACHE: "1",
+      },
+      maxBuffer: 1_000_000,
+    },
   );
 
   assert.match(stderr, /LOAD .*\/hsr\/runner-entry\.ts/);
