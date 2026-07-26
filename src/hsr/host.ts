@@ -17,6 +17,7 @@
 
 import { clearAccountBootFailure, recordAccountBootFailure } from "../accounts/bootHealth.js";
 import { CodexBootProbeError, codexHomeFromEnv, withCodexHomeBootLock } from "../codexBoot.js";
+import { reclaimCodexHomeLogs } from "../codexHomeMaintenance.js";
 import type { RunnerAdapter, RunnerInputAnswer, RunnerOpts } from "./types.js";
 import { startRpcServer, type RpcMethodHandler } from "./rpc.js";
 import {
@@ -107,8 +108,20 @@ export async function runHsrHost(params: {
       return adapter.start(startOpts);
     };
     const startWithHomeLock = () => bootsCodexAppServer
-      ? withCodexHomeBootLock(codexHomeFromEnv(opts.env), ({ waited }) =>
-          startAdapter(waited ? { ...opts, codexBootContended: true } : opts))
+      ? withCodexHomeBootLock(codexHomeFromEnv(opts.env), async ({ waited }) => {
+          // Reclaim the home's log DBs before codex opens them. Holding the boot
+          // lock with no app-server spawned yet is the one moment hive knows the
+          // home may be quiet, and codex's own PASSIVE checkpoint never gets it.
+          // A home left to grow eventually stalls this very handshake, and then
+          // codex can no longer run the retention that would have shrunk it.
+          const reclaimed = await reclaimCodexHomeLogs(codexHomeFromEnv(opts.env)).catch(() => null);
+          if (reclaimed && reclaimed.reclaimedBytes > 0) {
+            process.stderr.write(
+              `hive: reclaimed ${(reclaimed.reclaimedBytes / 1048576).toFixed(0)}MB from codex home logs\n`,
+            );
+          }
+          return startAdapter(waited ? { ...opts, codexBootContended: true } : opts);
+        })
       : startAdapter(opts);
     session = queueCodexStartup
       ? await withCodexStartupSlot(bee, startWithHomeLock)
