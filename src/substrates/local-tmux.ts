@@ -114,7 +114,7 @@ export async function newSession(name: string, cwd: string, spec: LaunchSpec): P
   const launcher = await createLauncher(spec);
   try {
     // -P -F prints the new pane's id so spawn can pin the bee to it.
-    const result = await tmux(["new-session", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
+    const result = await tmux(["new-session", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
     const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
     await applyTmuxWindowOptions(paneId || `=${name}:`, spec.tmuxOptions);
     return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
@@ -134,7 +134,7 @@ export async function newPane(target: string, cwd: string, spec: LaunchSpec, opt
   try {
     if (opts?.dir === "window") {
       // A fresh window in the same session. -P -F prints the new pane id.
-      const result = await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", `=${target}:`, "-c", cwd, command]);
+      const result = await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-t", `=${target}:`, "-c", cwd, command]);
       const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
       await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
       return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
@@ -143,7 +143,7 @@ export async function newPane(target: string, cwd: string, spec: LaunchSpec, opt
     // (no -h) is vertical (stacked). -P -F prints the new pane's id so the
     // sub-bee can be pinned to it.
     const direction = opts?.dir === "h" ? ["-h"] : [];
-    const result = await tmux(["split-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", `=${target}:`, "-c", cwd, ...direction, command]);
+    const result = await tmux(["split-window", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-t", `=${target}:`, "-c", cwd, ...direction, command]);
     const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
     await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
     return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
@@ -213,7 +213,14 @@ export async function killPane(paneId: string, options: { launcherPgid?: number 
 }
 
 function parseLaunchResult(stdout: string): NewSessionResult {
-  const [paneId = "", pidRaw = ""] = stdout.trim().split("\t");
+  // Separator is ":" for the same reason as listSessionStates: tmux sanitizes
+  // control characters (including \t) to "_" when the server has no UTF-8
+  // locale (launchd-started servers), which used to fuse "%7\t5908" into a
+  // single "%7_5908" token that could never match a live pane id. Also accept
+  // the legacy "\t" and sanitized "_" joins so old output still parses.
+  const raw = stdout.trim();
+  const legacy = raw.match(/^(%\d+)[\t_](\d+)$/);
+  const [paneId = "", pidRaw = ""] = legacy ? [legacy[1], legacy[2]] : raw.split(":");
   const launcherPgid = parsePositiveInt(pidRaw);
   return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
 }
