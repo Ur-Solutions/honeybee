@@ -377,13 +377,21 @@ const CODEX_THREAD_REQUEST_TIMEOUT_MS = 5_000;
 // because the preceding boot may still be completing an auth refresh. The
 // thread-request portion stays bounded to 72s (37s delays + 15s + four 5s RPCs).
 const CODEX_CONTENDED_FIRST_REQUEST_TIMEOUT_MS = 15_000;
+// initialize is the cheap half of the handshake — the app-server acks it before
+// the model refresh above even starts — so a slow one means a wedged boot, not
+// real work in progress. It still gets more room than the thread request because
+// a loaded host (many concurrent app-servers over multi-GB codex home DBs) can
+// stall the ack for seconds. Bounding it here rather than inheriting the 30s
+// default request timeout keeps the whole probe finite: worst case is 127s
+// (37s delays + a contended 15s+15s first attempt + four 10s+5s attempts).
+const CODEX_INITIALIZE_REQUEST_TIMEOUT_MS = 10_000;
 const CODEX_THREAD_HANDSHAKE_DELAYS_MS = [0, 2_000, 5_000, 10_000, 20_000] as const;
 const CODEX_STDERR_LOG_LIMIT_BYTES = 1024 * 1024;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export type CodexThreadHandshakeAttempt<T> = {
-  run(preRequestDelayMs: number, requestTimeoutMs: number): Promise<T>;
+  run(preRequestDelayMs: number, requestTimeoutMs: number, initializeTimeoutMs: number): Promise<T>;
   /** Process liveness is independent from whether the RPC peer answers. */
   isAlive(): boolean;
   /** Kill and fully discard this attempt; a timed-out connection is unrecoverable. */
@@ -401,18 +409,22 @@ export async function retryCodexThreadHandshake<T>(
     delaysMs?: readonly number[];
     requestTimeoutMs?: number;
     firstRequestTimeoutMs?: number;
+    initializeTimeoutMs?: number;
     onRetry?: (info: { attempt: number; maxAttempts: number; nextDelayMs: number; error: CodexRpcRequestTimeoutError }) => void;
   } = {},
 ): Promise<{ attempt: CodexThreadHandshakeAttempt<T>; result: T }> {
   const delaysMs = opts.delaysMs ?? CODEX_THREAD_HANDSHAKE_DELAYS_MS;
   const requestTimeoutMs = opts.requestTimeoutMs ?? CODEX_THREAD_REQUEST_TIMEOUT_MS;
+  const initializeTimeoutMs = opts.initializeTimeoutMs ?? CODEX_INITIALIZE_REQUEST_TIMEOUT_MS;
   if (delaysMs.length === 0) throw new Error("codex thread handshake requires at least one attempt");
 
   for (let index = 0; index < delaysMs.length; index++) {
     const attempt = await createAttempt();
     try {
       const timeoutMs = index === 0 ? (opts.firstRequestTimeoutMs ?? requestTimeoutMs) : requestTimeoutMs;
-      const result = await attempt.run(delaysMs[index] as number, timeoutMs);
+      // A contended first probe extends both halves of the handshake: the auth
+      // refresh it is waiting behind delays the initialize ack, not just the thread request.
+      const result = await attempt.run(delaysMs[index] as number, timeoutMs, Math.max(timeoutMs, initializeTimeoutMs));
       return { attempt, result };
     } catch (error) {
       const classification: CodexBootFailureCause = !attempt.isAlive()
@@ -423,9 +435,13 @@ export async function retryCodexThreadHandshake<T>(
       // Always discard a failed child. codex-cli 0.144.0 leaves the connection
       // wedged after a premature thread request, including for later requests.
       await attempt.discard().catch(() => undefined);
-      const retryable =
-        error instanceof CodexRpcRequestTimeoutError &&
-        (error.method === "thread/start" || error.method === "thread/resume");
+      // Every handshake timeout is retryable, including initialize. The remedy is
+      // identical for all of them — the peer is wedged, so discard it and probe a
+      // fresh app-server — and an initialize that never answers is the same
+      // transient host contention as a dropped thread/start, not a distinct fault.
+      // Excluding it made a slow ack a single-shot boot failure that killed the bee
+      // outright while an equally slow thread/start recovered on retry.
+      const retryable = error instanceof CodexRpcRequestTimeoutError;
       const hasNext = index + 1 < delaysMs.length;
       if (!retryable || !hasNext) throw new CodexBootProbeError(classification, error);
       opts.onRetry?.({
@@ -600,11 +616,11 @@ async function createLiveCodexHandshakeAttempt(params: {
     child,
     peer,
     isAlive: () => !exited && child.exitCode === null && child.signalCode === null,
-    async run(preRequestDelayMs: number, requestTimeoutMs: number): Promise<unknown> {
+    async run(preRequestDelayMs: number, requestTimeoutMs: number, initializeTimeoutMs: number): Promise<unknown> {
       await peer.request("initialize", {
         clientInfo: { name: "hive-hsr", title: null, version: "0" },
         capabilities: null,
-      });
+      }, { timeoutMs: initializeTimeoutMs });
       // App-server's documented connection handshake is initialize REQUEST
       // followed by the initialized NOTIFICATION. Codex 0.144.6 tolerates a
       // missing acknowledgement, but relying on that keeps Hive outside the
@@ -645,7 +661,11 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
     );
   } catch (error) {
     if (error instanceof CodexBootProbeError) {
-      process.stderr.write(`hive: codex boot probe failed: ${error.classification} (${method})\n`);
+      // Name the request that actually timed out, not the thread method this boot
+      // was aiming for — reporting "(thread/start)" for a stalled initialize sends
+      // whoever reads the host log looking at the wrong half of the handshake.
+      const failedAt = error.cause instanceof CodexRpcRequestTimeoutError ? error.cause.method : method;
+      process.stderr.write(`hive: codex boot probe failed: ${error.classification} (${failedAt})\n`);
     } else {
       process.stderr.write(`hive: codex boot probe failed: process-died (${method}; app-server spawn failed)\n`);
     }

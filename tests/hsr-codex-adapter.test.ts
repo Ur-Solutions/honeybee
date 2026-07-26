@@ -424,6 +424,75 @@ test("thread handshake does not hide non-timeout protocol failures", async () =>
   assert.equal(discarded, 1);
 });
 
+test("a stalled initialize restarts the app-server instead of failing the boot outright", async () => {
+  // CO.66ad0 died here: initialize timed out once under host contention and the
+  // bee crashed without a second probe, while an equally slow thread/start would
+  // have recovered. Both halves of the handshake wedge the same peer.
+  const methods: string[] = [];
+  let attempts = 0;
+  const { result } = await retryCodexThreadHandshake(
+    async () => ({
+      isAlive: () => true,
+      async run(_delayMs: number, timeoutMs: number): Promise<string> {
+        attempts += 1;
+        if (attempts === 1) {
+          methods.push("initialize");
+          throw new CodexRpcRequestTimeoutError("initialize", timeoutMs);
+        }
+        methods.push("thread/start");
+        return "thread-ok";
+      },
+      async discard(): Promise<void> {},
+    }),
+    { delaysMs: [0, 0], requestTimeoutMs: 1 },
+  );
+  assert.equal(result, "thread-ok");
+  assert.deepEqual(methods, ["initialize", "thread/start"]);
+});
+
+test("initialize gets its own bounded budget, raised to the thread budget when contended", async () => {
+  const seen: Array<{ request: number; initialize: number }> = [];
+  await retryCodexThreadHandshake(
+    async () => ({
+      isAlive: () => true,
+      async run(_delayMs: number, requestTimeoutMs: number, initializeTimeoutMs: number): Promise<string> {
+        seen.push({ request: requestTimeoutMs, initialize: initializeTimeoutMs });
+        if (seen.length === 1) throw new CodexRpcRequestTimeoutError("initialize", initializeTimeoutMs);
+        return "thread-ok";
+      },
+      async discard(): Promise<void> {},
+    }),
+    { delaysMs: [0, 0], requestTimeoutMs: 5, firstRequestTimeoutMs: 30, initializeTimeoutMs: 10 },
+  );
+  // The contended first probe waited behind an auth refresh that delays the ack
+  // too, so initialize takes the larger of the two budgets rather than its own.
+  assert.deepEqual(seen, [
+    { request: 30, initialize: 30 },
+    { request: 5, initialize: 10 },
+  ]);
+});
+
+test("a handshake timeout that exhausts every attempt still reports the failed request", async () => {
+  await assert.rejects(
+    retryCodexThreadHandshake(
+      async () => ({
+        isAlive: () => true,
+        async run(): Promise<never> {
+          throw new CodexRpcRequestTimeoutError("initialize", 1);
+        },
+        async discard(): Promise<void> {},
+      }),
+      { delaysMs: [0, 0], requestTimeoutMs: 1 },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof CodexBootProbeError);
+      assert.equal(error.classification, "alive-but-unresponsive");
+      assert.equal((error.cause as CodexRpcRequestTimeoutError).method, "initialize");
+      return true;
+    },
+  );
+});
+
 test("contended thread handshake spends the larger budget only on its first probe", async () => {
   const timeouts: number[] = [];
   let attempts = 0;
