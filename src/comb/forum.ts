@@ -330,7 +330,27 @@ function unwrapResult(envelope: ForumEnvelope): Record<string, unknown> {
 
 function packetFromEnvelope(envelope: ForumEnvelope, command: string): ForumPacket {
   const packet = unwrapResult(envelope).packet;
-  return parseForumPacket(packet, command);
+  return parseForumPacketReference(packet, command);
+}
+
+function parseForumPacketReference(value: unknown, label: string): ForumPacket {
+  if (!isRecord(value)) throw invalidEnvelope(label, "packet is missing");
+  requireNonEmptyString(value.id, label, "id");
+  if (
+    typeof value.status !== "string" ||
+    ![
+      "needs_review",
+      "in_review",
+      "changes_requested",
+      "approved",
+      "resolved",
+      "superseded",
+      "archived",
+    ].includes(value.status)
+  ) {
+    throw invalidEnvelope(label, "packet status is invalid");
+  }
+  return value as unknown as ForumPacket;
 }
 
 function parseForumPacket(value: unknown, label: string): ForumPacket {

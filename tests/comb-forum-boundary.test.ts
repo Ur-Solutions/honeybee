@@ -3,7 +3,11 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { listForumPackets } from "../src/comb/forum.js";
+import {
+  executeForumPacketEffect,
+  listForumPackets,
+  type ForumPacketEffectRequest,
+} from "../src/comb/forum.js";
 
 async function withFakeForum(
   body: string,
@@ -94,5 +98,57 @@ test("Forum packet polling has a bounded configurable timeout", async () => {
     const started = Date.now();
     await assert.rejects(listForumPackets(), /timed out|failed/i);
     assert.ok(Date.now() - started < 700, "poll should be killed well before the fixture exits");
+  });
+});
+
+test("Forum mutation effects accept sparse packet reference envelopes", async () => {
+  const response = JSON.stringify({
+    ok: true,
+    result: {
+      packet: {
+        id: "PKT.sparse",
+        status: "needs_review",
+      },
+    },
+  });
+  await withFakeForum(`printf '%s' '${response}'`, async () => {
+    const request: ForumPacketEffectRequest = {
+      operation: "create",
+      idempotencyKey: "corpus:sparse",
+      runId: "RUN.sparse",
+      nodeId: "verify",
+      itemIndex: 0,
+      snapshotRevision: 0,
+      definitionDigest: "sha256:def",
+      actionBindingDigest: "sha256:actions",
+      subject: { kind: "run-input", key: "RUN.sparse", revision: "sha256:subject" },
+      combName: "sparse-envelope",
+      cwd: "/tmp",
+      definition: {
+        formatVersion: 2,
+        name: "sparse-envelope",
+        input: { kind: "informal", description: "none" },
+        nodes: [{
+          id: "verify",
+          executor: "human",
+          binding: "strict",
+          human: {
+            title: "Verify",
+            packetKind: "code",
+            feedbackDestination: { type: "new-agent" },
+          },
+        }],
+        edges: [],
+      },
+      human: {
+        title: "Verify",
+        packetKind: "code",
+        feedbackDestination: { type: "new-agent" },
+      },
+      destination: { type: "new-agent" },
+    };
+    const packet = await executeForumPacketEffect(request);
+    assert.equal(packet.id, "PKT.sparse");
+    assert.equal(packet.status, "needs_review");
   });
 });
