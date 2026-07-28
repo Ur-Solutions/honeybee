@@ -19,6 +19,7 @@ import {
   BUZ_ACCEPT_VALUES,
   BUZ_TIERS,
   COMMANDS,
+  DISPLAY_STATE_VALUES,
   FLAG_VALUE_KINDS,
   FLAGS_BY_COMMAND,
   FORK_SEED_VALUES,
@@ -169,6 +170,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return SEAL_STATUS_VALUES;
     case "hive-state":
       return HIVE_STATE_VALUES;
+    case "display-state":
+      return DISPLAY_STATE_VALUES;
     case "flow":
       return (state.flows ?? []).map((f) => f.name);
     case "buz-tier":

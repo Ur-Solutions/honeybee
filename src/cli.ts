@@ -33,6 +33,7 @@ import { cmdOpen, cmdRun, cmdX, cmdXa } from "./commands/run.js";
 import { cmdSeals, cmdSearch } from "./commands/search.js";
 import { cmdLaunch, cmdNew, cmdSpawn } from "./commands/spawn.js";
 import { cmdSpend } from "./commands/spend.js";
+import { cmdState } from "./commands/state.js";
 import { cmdSwarm } from "./commands/swarm.js";
 import { cmdTask } from "./commands/tasks.js";
 import { sealHelpText } from "./seal.js";
@@ -285,6 +286,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "spend":
       await cmdSpend(parsed);
       break;
+    case "state":
+      await cmdState(parsed);
+      break;
     case "help":
       if (parsed.args[0] === "seal") console.log(sealHelpText());
       else if (parsed.args[0] === "wait") console.log(waitHelpText());
@@ -344,6 +348,7 @@ function printHelp() {
       title: "Observe",
       rows: [
         ["list", "", "show all known sessions with state (alias: ps)"],
+        ["state", "<ls|explain>", "BeeView read model: display state, requests, results, freshness (--json)"],
         ["bees", "", "grouped fuzzy fleet TUI (^g cycles colony/pro/folder/type grouping, tab previews; --sidebar)"],
         ["fleet", "[<bee>|--all]", "orchestrator fleet trees with live state + seals (no arg: self inside a bee, else all fleets; --all forces all; --json)"],
         ["gateways", "", "list operator gateway advertisements and liveness"],

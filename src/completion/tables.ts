@@ -10,7 +10,7 @@ export const COMMANDS = [
   "task",
   "daemon",
   "account", "activate", "login", "swap-account", "usage", "limits", "sessions", "sync", "open",
-  "search", "seals", "events", "flight",
+  "search", "seals", "events", "flight", "state",
   "brief", "rename", "seal", "config", "completion", "help", "tag", "own", "move",
   "fork", "here", "spawn-picker", "urls", "keys", "revive", "auth-resume", "retire", "archive", "set-model",
 ];
@@ -32,10 +32,16 @@ export const KEYS_SUBCOMMANDS = ["print", "path", "check"];
 export const SESSIONS_SUBCOMMANDS = ["reconcile"];
 export const SYNC_SUBCOMMANDS = ["manifest"];
 export const FLIGHT_SUBCOMMANDS = ["start", "ls", "list", "status", "sweep", "enqueue", "queue", "resolve", "requeue", "drain", "close"];
+export const STATE_SUBCOMMANDS = ["ls", "list", "explain"];
 
 export const SEARCH_TYPE_VALUES = ["seals", "ledger", "sessions"];
 export const SEAL_STATUS_VALUES = [...SEAL_STATUSES];
 export const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
+// BeeView display states (view/types.ts BeeDisplayState), for `hive state ls --state`.
+export const DISPLAY_STATE_VALUES = [
+  "retired", "needs-auth", "needs-reply", "needs-action", "stop-failed",
+  "crashed", "unreachable", "starting", "working", "ready", "offline",
+];
 export const BUZ_TIERS: readonly string[] = CANONICAL_BUZ_TIERS;
 export const TASK_STATUS_VALUES: readonly string[] = TASK_STATUSES;
 export const BUZ_ACCEPT_VALUES = buzAcceptValues();
@@ -144,6 +150,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--on", "--off", "--limit", "--json",
   ],
   daemon: ["--tick-ms", "--json", "--label", "--force", "--follow", "--lines", "-n"],
+  state: ["--state", "--colony", "--node", "--done", "--json"],
   events: ["--follow", "-f", "--json", "--type", "--session", "--since", "--lines", "-n"],
   flight: [
     "--name", "--cwd", "--mix", "--agent", "--slots", "--model", "--account",
@@ -161,7 +168,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ],
 };
 
-export type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "flow" | "buz-tier" | "buz-accept" | "task-status" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
+export type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "display-state" | "flow" | "buz-tier" | "buz-accept" | "task-status" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
 
 export const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 export const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -209,6 +216,9 @@ export const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagVal
   next: {
     "--state": "hive-state",
   },
+  state: {
+    "--state": "display-state",
+  },
   fork: {
     "--seed": "fork-seed",
   },
@@ -228,6 +238,7 @@ export const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   task: TASK_SUBCOMMANDS,
   daemon: DAEMON_SUBCOMMANDS,
   flight: FLIGHT_SUBCOMMANDS,
+  state: STATE_SUBCOMMANDS,
   account: ACCOUNT_SUBCOMMANDS,
   sessions: SESSIONS_SUBCOMMANDS,
   sync: SYNC_SUBCOMMANDS,
@@ -250,6 +261,9 @@ export const NOUN_SUB_ARG: Record<string, Record<string, NounSubArgKind>> = {
     add: "session-any",
     ls: "session-any",
   },
+  // state explain points at a single bee; any session (live, dead, or
+  // retired) is explainable.
+  state: { explain: "session-any" },
   // buz subcommands all take a selector as their first positional. We
   // accept any session (live or dead) since reading inbox/outbox/queue
   // is meaningful even for a sealed bee.

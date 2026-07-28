@@ -193,6 +193,7 @@ hive transcript ...
 hive last ...
 hive wait ...
 hive list ...
+hive state ...
 hive kill ...
 hive clean ...
 hive attach ...
@@ -774,6 +775,62 @@ machine shape:
 
 ```text
 <state>\t<ref>\t<display-name>\t<agent>\t<cwd>\t<command>
+```
+
+### `hive state`
+
+The CLI mirror of the **BeeView V1 read model** (see
+`docs/BEEVIEW_READ_API.md`): structured facts — display state, open
+intervention requests, latest turn/contract results, observation freshness —
+instead of one composite label. Read-only and daemon-free; `--json` emits the
+library's `BeeViewV1` / `BeeViewListV1` shapes verbatim, so scripts and the
+`honeybee` library entry can never disagree.
+
+```sh
+hive state ls [selector] [--state <display>] [--colony <c>] [--node <n>] [--done] [--json]
+hive state explain <bee> [--json]
+```
+
+**`hive state ls`** lists every bee with its derived *display state* — the
+ADR 001 precedence recomposed from facts, not a rename of the fine-grained
+`BeeState`:
+
+```text
+retired needs-auth needs-reply needs-action stop-failed crashed
+unreachable starting working ready offline
+```
+
+Columns: `STATE` (display state, glyph-colored) · `REF` · `NAME` · `REQS`
+(open requests: `1 reply` / `auth` / `action`, `-` when none) · `RESULT`
+(latest result: `seal ok` / `responded 3m` / `settled 5m`, `-` when none) ·
+`FRESH` (worst observation-source status: `live` / `stale 2d` / `held` /
+`unreachable`) · `DETAIL` (the legacy BeeState detail).
+
+Notable divergences from `hive list`'s states, by design:
+
+- a **sealed but live** bee shows `ready` with its seal in the RESULT column —
+  completion never changes display state;
+- **idle with output** shows `ready` with a `responded`/`settled` turn result;
+- `wedged`/`error` show `needs-action` (a synthesized manual-action request);
+- `kill_failed` shows `stop-failed`; an unreachable node shows `unreachable`.
+
+Filters compose conjunctively like `hive list`: a positional selector (bee /
+`@swarm` / `colony:x` / `#tag`), `--state <display>`, `--colony`, `--node`.
+Retired (filed) bees are hidden by default; `--done` (or `--state retired`)
+reveals them. `--json` prints the filtered `BeeViewListV1`.
+
+**`hive state explain <bee>`** prints one bee's full projection: an identity
+header, the `display:` line naming the exact precedence rule that fired
+(e.g. `needs-reply — open permission request (structured, id=req_abc)`), then
+Runtime / Turn result / Requests / Contract / Freshness / Compat sections with
+every fact annotated by its evidence grade —
+`[structured|hook|observer|legacy: <source>]`. `--json` prints the single
+`BeeViewV1` verbatim.
+
+Non-pretty `state ls` output is TSV-like and stable:
+
+```text
+<display-state>\t<ref>\t<name>\t<reqs>\t<result>\t<fresh>\t<detail>
 ```
 
 ### `hive attach`
