@@ -50,6 +50,13 @@ export type SealArtifact = {
   taskId?: string;
   /** Which lease attempt produced this seal (flight slots; 1-based). */
   attempt?: number;
+  /**
+   * Structured output payload (COMBS_ENGINE_DESIGN §9 contract 15): any JSON
+   * value the consumer's output contract wants (a comb node's typed result).
+   * Additive — seals without output remain valid everywhere, but cannot
+   * complete a comb node whose output contract requires data.
+   */
+  output?: unknown;
   evidence?: SealEvidence;
   filesChanged?: string[];
   testsRun?: TestRun[];
@@ -116,6 +123,8 @@ Artifact contract
                           from your brief's contract postscript when present
   attempt       optional  positive integer — the lease attempt that produced
                           this seal (from the contract postscript)
+  output        optional  any JSON value — structured result payload for
+                          consumers with an output contract (comb nodes)
   evidence      optional  object with machine-checkable claims:
     filesChanged  optional  string[]
     testsRun      optional  object[] (same shape as top-level testsRun)
@@ -177,6 +186,17 @@ export function validateSealArtifact(value: unknown): SealArtifact {
       throw new Error("Invalid seal: attempt must be a positive integer");
     }
     artifact.attempt = object.attempt;
+  }
+
+  if (object.output !== undefined) {
+    // Any JSON value is legal output; a file-based seal already round-tripped
+    // through JSON.parse. Only reject values JSON cannot represent.
+    try {
+      JSON.stringify(object.output);
+    } catch {
+      throw new Error("Invalid seal: output must be a JSON-serializable value");
+    }
+    artifact.output = object.output;
   }
 
   if (object.evidence !== undefined) {

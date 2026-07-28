@@ -291,3 +291,22 @@ test("recordSeal round-trips Seal v2 fields through listSeals", async () => {
     assert.equal(seals[0]!.evidence?.artifacts?.[0]?.ref, "worktrees/s3.diff");
   });
 });
+
+test("Seal v2 output (COMBS contract 15): any JSON value round-trips; absence stays valid", async () => {
+  const artifact = validateSealArtifact({
+    ...VALID,
+    output: { parityScore: 0.98, routes: ["a", "b"], nested: { ok: true } },
+  });
+  assert.deepEqual(artifact.output, { parityScore: 0.98, routes: ["a", "b"], nested: { ok: true } });
+  // primitives and arrays are legal output too
+  assert.equal(validateSealArtifact({ ...VALID, output: 42 }).output, 42);
+  assert.deepEqual(validateSealArtifact({ ...VALID, output: [1, 2] }).output, [1, 2]);
+  // absence unchanged
+  assert.equal(validateSealArtifact(VALID).output, undefined);
+
+  await withTempStore(async () => {
+    await recordSeal("output-bee", { status: "done", summary: "with output", output: { done: true } });
+    const seals = await listSeals("output-bee");
+    assert.deepEqual(seals[0]!.output, { done: true });
+  });
+});
