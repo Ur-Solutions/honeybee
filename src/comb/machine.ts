@@ -196,7 +196,9 @@ function reconcileForwardJoins(run: RunRecord, now: string): boolean {
     if (incoming.length === 0) continue;
     for (const cohortId of cohorts) {
       const itemIndex = cohortItemIndex(cohortId);
-      if (currentActivations(run).some((activation) => activation.address.nodeId === node.id && activation.cohortId === cohortId)) continue;
+      if (Object.values(run.activations).some(
+        (activation) => activation.address.nodeId === node.id && activation.cohortId === cohortId,
+      )) continue;
       const sources = incoming.map((edge) => ({
         edge,
         activation: currentActivations(run).find(
@@ -209,7 +211,9 @@ function reconcileForwardJoins(run: RunRecord, now: string): boolean {
         if (!activation || !isTerminalActivation(activation) || !edgeMatchesStatus(source.edge, activation.status)) return false;
         return run.edgeFiringTail.some((firing) => firing.id === edgeFiringId(source.edge, activation));
       });
-      const failures = terminal.filter((source) => !successful.includes(source));
+      const failures = terminal.filter(
+        (source) => source.activation?.status !== "skipped" && !successful.includes(source),
+      );
       const unresolved = sources.length - terminal.length;
       const policy = node.join ?? { mode: "all" as const, tolerateFailures: 0 };
       const tolerance = policy.tolerateFailures ?? 0;
@@ -226,16 +230,34 @@ function reconcileForwardJoins(run: RunRecord, now: string): boolean {
         impossible = failures.length > tolerance || successful.length + unresolved < quorum;
       }
       if (!ready && !impossible) continue;
+      const consumerSkipped = new Set<string>();
       if (ready && (policy.mode === "any" || policy.mode === "quorum")) {
         for (const source of sources) {
           if (source.activation && !isTerminalActivation(source.activation)) {
-            source.activation.status = "skipped";
-            source.activation.endedAt = now;
-            recordRunEvent(run, "comb.activation.skipped", source.activation.address);
+            consumerSkipped.add(source.activation.id);
+            const shared = definition.edges.some(
+              (edge) =>
+                edge.kind === "forward" &&
+                edge.from === source.activation?.address.nodeId &&
+                edge.to !== node.id,
+            );
+            if (!shared) {
+              source.activation.status = "skipped";
+              source.activation.endedAt = now;
+              recordRunEvent(run, "comb.activation.skipped", source.activation.address);
+            } else {
+              recordRunEvent(run, "comb.join.path_skipped", source.activation.address, {
+                edgeId: source.edge.id,
+                joinNodeId: node.id,
+              });
+            }
           }
         }
       }
-      const aggregate = aggregateFromSources(sources.flatMap((source) => source.activation ? [source.activation] : []));
+      const aggregate = aggregateFromSources(
+        sources.flatMap((source) => source.activation ? [source.activation] : []),
+        consumerSkipped,
+      );
       const activation = createActivation(run, node, {
         attempt: nextAttempt(run, node.id, itemIndex),
         itemIndex,
@@ -270,6 +292,10 @@ function createRetryAttempt(run: RunRecord, edge: CombEdge, source: ActivationRe
     return true;
   }
   const downstream = forwardReachableNodes(run, destination.id);
+  const supportRoots = retrySupportRoots(run, destination.id);
+  for (const root of supportRoots) {
+    for (const reachable of forwardReachableNodes(run, root)) downstream.add(reachable);
+  }
   for (const activation of currentActivations(run)) {
     if (activation.address.itemIndex !== itemIndex || !downstream.has(activation.address.nodeId)) continue;
     activation.invalidatedAt = now;
@@ -277,19 +303,25 @@ function createRetryAttempt(run: RunRecord, edge: CombEdge, source: ActivationRe
   }
   const generation = run.nextCohortGeneration;
   run.nextCohortGeneration += 1;
-  const created = createActivation(run, destination, {
-    attempt,
-    itemIndex,
-    cohortId: `${run.id}:g${generation}:i${itemIndex}`,
-    subject: source.subject,
-    incomingEdgeFiringIds: [firingId],
-    now,
-  });
-  const backoff = Math.min(
-    limits.retryBackoffMs * (2 ** Math.max(0, attempt - 2)),
-    limits.retryBackoffMaxMs,
-  );
-  created.nextEligibleAt = new Date(Date.parse(now) + backoff).toISOString();
+  const cohortId = `${run.id}:g${generation}:i${itemIndex}`;
+  for (const rootId of [destination.id, ...supportRoots]) {
+    const root = nodeFor(run, rootId);
+    const rootAttempt = rootId === destination.id ? attempt : nextAttempt(run, rootId, itemIndex);
+    const rootLimits = { ...run.policies, ...run.policies.nodeOverrides?.[rootId] };
+    const created = createActivation(run, root, {
+      attempt: rootAttempt,
+      itemIndex,
+      cohortId,
+      subject: source.subject,
+      incomingEdgeFiringIds: rootId === destination.id ? [firingId] : [],
+      now,
+    });
+    const backoff = Math.min(
+      rootLimits.retryBackoffMs * (2 ** Math.max(0, rootAttempt - 2)),
+      rootLimits.retryBackoffMaxMs,
+    );
+    created.nextEligibleAt = new Date(Date.parse(now) + backoff).toISOString();
+  }
   return true;
 }
 
@@ -340,6 +372,7 @@ function deriveTerminalRun(run: RunRecord, now: string): boolean {
   if (current.some((activation) => activation.status === "pending" || activation.status === "active" || activation.status === "waiting-event" || activation.status === "waiting-human")) {
     return false;
   }
+  if (hasUnmaterializedForwardFiring(run)) return false;
   const unhandledFailure = current.find((activation) => activation.status === "failed" && !failureHandled(run, activation));
   if (unhandledFailure) {
     run.status = "failed";
@@ -407,7 +440,9 @@ function failureHandled(run: RunRecord, activation: ActivationRecord): boolean {
   return currentActivations(run).some(
     (candidate) =>
       candidate.cohortId === activation.cohortId &&
-      candidate.aggregate?.items.some((item) => sameAddress(item.activation, activation.address)),
+      candidate.aggregate?.items.some(
+        (item) => item.status !== "skipped" && sameAddress(item.activation, activation.address),
+      ),
   );
 }
 
@@ -448,10 +483,17 @@ function edgeFiringId(edge: CombEdge, activation: ActivationRecord): string {
   return `${edge.id}:${activation.id}:${activation.cohortId}`;
 }
 
-function aggregateFromSources(activations: ActivationRecord[]): JoinAggregateOutput {
+function aggregateFromSources(
+  activations: ActivationRecord[],
+  consumerSkipped = new Set<string>(),
+): JoinAggregateOutput {
   const items = activations.map((activation) => ({
     activation: activation.address,
-    status: activation.status === "done" ? "done" as const : activation.status === "skipped" ? "skipped" as const : "failed" as const,
+    status: consumerSkipped.has(activation.id) || activation.status === "skipped"
+      ? "skipped" as const
+      : activation.status === "done"
+        ? "done" as const
+        : "failed" as const,
     ...(activation.output !== undefined ? { output: activation.output } : {}),
   }));
   return {
@@ -474,6 +516,74 @@ function forwardReachableNodes(run: RunRecord, start: string): Set<string> {
     }
   }
   return reachable;
+}
+
+function retrySupportRoots(run: RunRecord, destinationId: string): string[] {
+  const definition = run.currentSnapshot.definition;
+  const roots = new Set<string>();
+  let reachable = forwardReachableNodes(run, destinationId);
+  while (true) {
+    let changed = false;
+    for (const nodeId of reachable) {
+      if (nodeId === destinationId) continue;
+      const incoming = definition.edges.filter((edge) => edge.kind === "forward" && edge.to === nodeId);
+      if (incoming.length < 2) continue;
+      for (const edge of incoming) {
+        if (reachable.has(edge.from)) continue;
+        for (const root of forwardEntryAncestors(run, edge.from)) {
+          if (roots.has(root)) continue;
+          roots.add(root);
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break;
+    reachable = new Set([destinationId]);
+    for (const root of roots) {
+      for (const nodeId of forwardReachableNodes(run, root)) reachable.add(nodeId);
+    }
+    for (const nodeId of forwardReachableNodes(run, destinationId)) reachable.add(nodeId);
+  }
+  return [...roots].sort();
+}
+
+function forwardEntryAncestors(run: RunRecord, start: string): Set<string> {
+  const roots = new Set<string>();
+  const seen = new Set<string>();
+  const queue = [start];
+  while (queue.length) {
+    const nodeId = queue.shift()!;
+    if (seen.has(nodeId)) continue;
+    seen.add(nodeId);
+    const incoming = run.currentSnapshot.definition.edges.filter(
+      (edge) => edge.kind === "forward" && edge.to === nodeId,
+    );
+    if (incoming.length === 0) {
+      roots.add(nodeId);
+      continue;
+    }
+    queue.push(...incoming.map((edge) => edge.from));
+  }
+  return roots;
+}
+
+function hasUnmaterializedForwardFiring(run: RunRecord): boolean {
+  return run.edgeFiringTail.some((firing) => {
+    const source = Object.values(run.activations).find(
+      (activation) => sameAddress(activation.address, firing.from) && !activation.invalidatedAt,
+    );
+    if (!source) return false;
+    const edge = run.currentSnapshot.definition.edges.find(
+      (candidate) => candidate.id === firing.edgeId && candidate.kind === "forward",
+    );
+    if (!edge) return false;
+    return !Object.values(run.activations).some(
+      (activation) =>
+        activation.address.nodeId === edge.to &&
+        activation.address.itemIndex === source.address.itemIndex &&
+        activation.cohortId === firing.cohortId,
+    );
+  });
 }
 
 function terminalNode(run: RunRecord, nodeId: string): boolean {
