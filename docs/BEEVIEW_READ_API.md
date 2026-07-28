@@ -146,22 +146,25 @@ export type BeeViewTurn = {
 };
 
 /**
- * ADR "InterventionRequest", projected from CURRENT evidence only. The
- * durable request store is a later slice; this shape lets it slot in
- * without breaking consumers:
- *   - `id` is already the durable idempotency key the store will adopt
+ * ADR "InterventionRequest". Structured-grade requests come from the durable
+ * request store (src/requests/store.ts, docs/INTERVENTION_REQUESTS.md —
+ * authoritative when a record exists); live derivation remains the
+ * daemon-down fallback under the SAME ids (src/requests/keys.ts), and
+ * observer-grade requests stay live-derived only:
+ *   - `id` is the durable idempotency key shared with the store
  *     (structured requestId, or scope+kind+fingerprint for observer grade)
- *   - `status` is "open"-only today; resolved/cancelled arrive with the store
+ *   - `status`: openRequests carries "open" only; resolved/cancelled appear
+ *     in recentClosedRequests (additive within schemaVersion 1)
  *   - `turnId` stays absent until Turn ids exist.
  */
 export type BeeViewRequest = {
   id: string;
   kind: "question" | "permission" | "auth" | "manual-action";
-  status: "open";
+  status: "open" | "resolved" | "cancelled";
   scope: "turn" | "runtime-generation" | "bee";
   grade: "structured" | "observer";
-  /** ISO — event ts for structured; observer-grade may omit it (first
-   *  projection time is not persisted in v1). */
+  /** ISO — always present on store-backed requests; observer-grade live
+   *  derivation may omit it (projection time is not persisted). */
   openedAt?: string;
   question?: string;
   tool?: string;
@@ -172,6 +175,10 @@ export type BeeViewRequest = {
   questions?: unknown;
   multiSelect?: boolean;
   input?: unknown;
+  /** Store-backed resolved requests: "hive-answer[:caller]" | "auth-resume" | "stop-succeeded". */
+  resolvedBy?: string;
+  /** Store-backed cancelled requests. */
+  cancelReason?: "scope-closed" | "superseded";
   turnId?: string;             // absent until Turn ids land
   evidence: BeeViewEvidence;
 };
@@ -271,6 +278,8 @@ export type BeeViewV1 = {
   latestRuntime: BeeViewRuntime;
   currentTurn?: BeeViewTurn;                    // always undefined in v1
   openRequests: BeeViewRequest[];
+  /** Newest-first resolved/cancelled requests from the durable store (cap 5). */
+  recentClosedRequests?: BeeViewRequest[];
   latestTurnResult?: BeeViewTurnResult;
   latestContractResult?: BeeViewContractResult;
   inboxSummary: BeeViewInboxSummary;
@@ -305,19 +314,28 @@ export type BeeViewListV1 = {
   manual-action request (id `manual:<bee>:<gen>:wedged`); `kill_failed` →
   `stop-failed`; `node_unreachable` → `unreachable` (with the caveat that
   today's node probe is not a heartbeat contract — graded observer).
-- `openRequests` v1 sources:
+- `openRequests` sources, STORE-FIRST (docs/INTERVENTION_REQUESTS.md):
+  0. durable request-store records with status `open` and the CURRENT
+     generation project verbatim (authoritative). An
+     answered-but-events-trailing `needs_input` has a RESOLVED record, so it
+     is NOT open even while the tail still shows `pendingNeedsInput`;
   1. unresolved structured `needs_input` (`pendingNeedsInput` / event
      snapshot) → `question`/`permission`, grade structured, id = requestId
-     (or `ni:<bee>:<ts>` when the adapter sent none);
+     (or `ni:<bee>:<ts>` when the adapter sent none) — LIVE FALLBACK only,
+     applied when no store record exists under that id (daemon down);
   2. pane-detected permission/trust/MCP prompts (`readiness.ts` predicates)
      → `permission`, grade observer, id =
-     `obs:<bee>:<gen>:permission:<fingerprint(pane block)>`;
-  3. auth: `auth-needed` from events (bounded by `auth_resume`) → structured,
-     or from held/pane state → observer; scope `runtime-generation`.
-- Scope closure is inherent in v1: requests are re-derived per projection, so
-  a `turn_end` after a `needs_input`, or a dead runtime, naturally closes
-  them. The durable store later replaces re-derivation with explicit
-  resolved/cancelled records under the **same ids**.
+     `obs:<bee>:<gen>:permission:<fingerprint(pane block)>` — suppressed by a
+     same-id store record or an open store-backed needs-reply request;
+  3. auth: `auth-needed` from events (bounded by `auth_resume`) → structured
+     (store record wins under the same id), or from held/pane state →
+     observer; scope `runtime-generation`.
+- Scope closure: explicit resolved/cancelled records in the durable store
+  (hive answer / auth-resume / retire / kill / revive / daemon reconciler),
+  with live re-derivation still closing fallback-derived requests naturally
+  (a `turn_end` after a `needs_input`, a dead runtime). Ids are byte-shared
+  via `src/requests/keys.ts`. `recentClosedRequests` exposes the last 5
+  closed records, newest first.
 - Library calls never write: no `touchSession`, no `@hive_state` mirroring,
   no ledger appends. The daemon remains the only observer that persists.
 

@@ -266,6 +266,16 @@ async function stateExplain(parsed: Parsed): Promise<void> {
   } else {
     lines.push(`${em("Requests")}    ${soft("none open")}`);
   }
+  if (view.recentClosedRequests && view.recentClosedRequests.length > 0) {
+    lines.push(`  ${soft("Recent history")}`);
+    for (const request of view.recentClosedRequests) {
+      const how = request.status === "resolved"
+        ? `resolved${request.resolvedBy ? ` by ${request.resolvedBy}` : ""}`
+        : `cancelled${request.cancelReason ? ` (${request.cancelReason})` : ""}`;
+      const question = request.question ? ` ${JSON.stringify(truncate(request.question, 40))}` : "";
+      lines.push(soft(`    ${request.kind}${question} id=${request.id} — ${how}`));
+    }
+  }
 
   if (view.latestContractResult) {
     const contract = view.latestContractResult;

@@ -96,22 +96,24 @@ export type BeeViewTurn = {
 };
 
 /**
- * ADR "InterventionRequest", projected from CURRENT evidence only. The
- * durable request store is a later slice; this shape lets it slot in
- * without breaking consumers:
- *   - `id` is already the durable idempotency key the store will adopt
+ * ADR "InterventionRequest". Structured-grade requests come from the durable
+ * request store (src/requests/store.ts — authoritative when a record exists);
+ * live derivation remains the daemon-down fallback under the SAME ids
+ * (src/requests/keys.ts), and observer-grade requests stay live-derived only:
+ *   - `id` is the durable idempotency key shared with the store
  *     (structured requestId, or scope+kind+fingerprint for observer grade)
- *   - `status` is "open"-only today; resolved/cancelled arrive with the store
+ *   - `status`: openRequests carries "open" only; resolved/cancelled appear
+ *     in recentClosedRequests (additive within schemaVersion 1)
  *   - `turnId` stays absent until Turn ids exist.
  */
 export type BeeViewRequest = {
   id: string;
   kind: "question" | "permission" | "auth" | "manual-action";
-  status: "open";
+  status: "open" | "resolved" | "cancelled";
   scope: "turn" | "runtime-generation" | "bee";
   grade: "structured" | "observer";
-  /** ISO — event ts for structured; observer-grade may omit it (first
-   *  projection time is not persisted in v1). */
+  /** ISO — always present on store-backed requests; observer-grade live
+   *  derivation may omit it (projection time is not persisted). */
   openedAt?: string;
   question?: string;
   tool?: string;
@@ -122,6 +124,10 @@ export type BeeViewRequest = {
   questions?: unknown;
   multiSelect?: boolean;
   input?: unknown;
+  /** Store-backed resolved requests: "hive-answer[:caller]" | "auth-resume" | "stop-succeeded". */
+  resolvedBy?: string;
+  /** Store-backed cancelled requests. */
+  cancelReason?: "scope-closed" | "superseded";
   turnId?: string;             // absent until Turn ids land
   evidence: BeeViewEvidence;
 };
@@ -221,6 +227,12 @@ export type BeeViewV1 = {
   latestRuntime: BeeViewRuntime;
   currentTurn?: BeeViewTurn;                    // always undefined in v1
   openRequests: BeeViewRequest[];
+  /**
+   * Newest-first resolved/cancelled requests from the durable store (capped
+   * at 5). Absent when the bee has no stored request history. Additive
+   * within schemaVersion 1.
+   */
+  recentClosedRequests?: BeeViewRequest[];
   latestTurnResult?: BeeViewTurnResult;
   latestContractResult?: BeeViewContractResult;
   inboxSummary: BeeViewInboxSummary;

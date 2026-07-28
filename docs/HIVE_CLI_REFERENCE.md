@@ -814,6 +814,15 @@ Notable divergences from `hive list`'s states, by design:
 - `wedged`/`error` show `needs-action` (a synthesized manual-action request);
 - `kill_failed` shows `stop-failed`; an unreachable node shows `unreachable`.
 
+Structured requests are read from the durable request store
+(`~/.hive/requests/`, docs/INTERVENTION_REQUESTS.md): an answered
+needs_input flips out of `needs-reply` the moment `hive answer` resolves its
+record, even while the events tail still trails. With no store record (e.g.
+the daemon never observed the request), the live derivation remains the
+fallback under identical ids. Closed history retention is tunable via
+`HIVE_REQUESTS_KEEP_CLOSED` (default 50 closed records per bee, plus
+anything closed within 24h; opens are never pruned).
+
 Filters compose conjunctively like `hive list`: a positional selector (bee /
 `@swarm` / `colony:x` / `#tag`), `--state <display>`, `--colony`, `--node`.
 Retired (filed) bees are hidden by default; `--done` (or `--state retired`)
@@ -824,8 +833,12 @@ header, the `display:` line naming the exact precedence rule that fired
 (e.g. `needs-reply — open permission request (structured, id=req_abc)`), then
 Runtime / Turn result / Requests / Contract / Freshness / Compat sections with
 every fact annotated by its evidence grade —
-`[structured|hook|observer|legacy: <source>]`. `--json` prints the single
-`BeeViewV1` verbatim.
+`[structured|hook|observer|legacy: <source>]`. The Requests section also
+shows a `Recent history` block — the last resolved/cancelled requests from
+the durable store (capped at 5, newest first), e.g.
+`permission "Run it?" id=req_abc — resolved by hive-answer`. `--json` prints
+the single `BeeViewV1` verbatim (closed history under
+`recentClosedRequests`).
 
 Non-pretty `state ls` output is TSV-like and stable:
 

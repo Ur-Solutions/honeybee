@@ -21,10 +21,11 @@ import { effectiveHiveState } from "../hiveState.js";
 import { structuredStateFromEvents, type HsrEventSnapshot } from "../hsr/observe.js";
 import type { RunnerEvent } from "../hsr/types.js";
 import { LOCAL_NODE_NAME } from "../node.js";
+import type { InterventionRequestRecord } from "../requests/store.js";
 import type { SealRecord } from "../seal.js";
 import { deriveState, liveTargetKey, parseBeeState, type BeeState, type DerivedState, type StateContext } from "../state.js";
 import type { SessionRecord } from "../store.js";
-import { deriveOpenRequests } from "./requests.js";
+import { deriveOpenRequests, storedRequestView } from "./requests.js";
 import {
   BEE_VIEW_SCHEMA_VERSION,
   type BeeDisplayState,
@@ -54,6 +55,13 @@ export type BeeViewProjectionSources = {
   hiveStateOption?: string;
   /** Provider root thread id (HSR meta.sessionId) scoping turn lifecycle events. */
   rootThreadId?: string;
+  /**
+   * Durable request records for this bee (src/requests/store.ts), when its
+   * store file was read this pass. Store-open records are authoritative for
+   * openRequests; closed ones feed recentClosedRequests. view/* only READS
+   * the store — the daemon and CLI verbs own every mutation.
+   */
+  storedRequests?: InterventionRequestRecord[];
   now?: number;
 };
 
@@ -82,8 +90,16 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
         derived,
         generation,
         ...(sources.eventSnapshot ? { eventSnapshot: sources.eventSnapshot } : {}),
+        ...(sources.storedRequests ? { storedRequests: sources.storedRequests } : {}),
         now: nowMs,
       });
+  // Closed history (resolved/cancelled), newest first, capped at 5 — shown
+  // for retired bees too (retire keeps the request file on purpose).
+  const recentClosedRequests = (sources.storedRequests ?? [])
+    .filter((request) => request.status !== "open")
+    .sort((a, b) => closedRequestAt(b) - closedRequestAt(a))
+    .slice(0, 5)
+    .map(storedRequestView);
   const latestTurnResult = projectTurnResult(sources, derived, latestRuntime, hiveStateOption, nowMs);
   const latestContractResult = projectContractResult(sources);
   const { displayState, displayStateReason } = chooseDisplayState({
@@ -114,6 +130,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
     latestRuntime,
     // currentTurn stays absent until Turn ids land (schemaVersion 1, reserved).
     openRequests,
+    ...(recentClosedRequests.length > 0 ? { recentClosedRequests } : {}),
     ...(latestTurnResult ? { latestTurnResult } : {}),
     ...(latestContractResult ? { latestContractResult } : {}),
     inboxSummary,
@@ -247,6 +264,12 @@ function projectRuntime(
 
 function isoFromEpochMs(ts: number): string | undefined {
   return Number.isFinite(ts) && ts > 0 ? new Date(ts).toISOString() : undefined;
+}
+
+/** When a stored request closed (for newest-first history ordering). */
+function closedRequestAt(record: InterventionRequestRecord): number {
+  const parsed = Date.parse(record.resolvedAt ?? record.cancelledAt ?? record.updatedAt);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 /** Last lifecycle event of `type`, honoring the root-thread scoping rule. */

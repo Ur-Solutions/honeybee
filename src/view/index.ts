@@ -16,16 +16,17 @@
 import { liveTargetsAcrossNodes, resolveSession, type MultiNodeLiveProbe } from "../cli/shared.js";
 import { mapWithConcurrency } from "../concurrency.js";
 import { listNodes, LOCAL_NODE_NAME } from "../node.js";
+import { listBeesWithRequests, readBeeRequests } from "../requests/store.js";
 import { scanLatestSeal } from "../seal.js";
 import { liveTargetKey } from "../state.js";
-import { listSessions, type SessionRecord } from "../store.js";
+import { listSessions, safeName, type SessionRecord } from "../store.js";
 import { assembleStateContext, type AssembledStateContext } from "./context.js";
 import { projectBeeView, type BeeViewProjectionSources } from "./project.js";
 import { BEE_VIEW_SCHEMA_VERSION, type BeeViewListV1, type BeeViewV1 } from "./types.js";
 
 export * from "./types.js";
 export { projectBeeView, type BeeViewProjectionSources } from "./project.js";
-export { deriveOpenRequests, paneFingerprint, type OpenRequestSources } from "./requests.js";
+export { deriveOpenRequests, paneFingerprint, storedRequestView, type OpenRequestSources } from "./requests.js";
 export {
   assembleStateContext,
   capturePanesForRecords,
@@ -49,6 +50,7 @@ async function projectRecord(
   record: SessionRecord,
   context: AssembledStateContext,
   probe: MultiNodeLiveProbe,
+  options: { hasStoredRequests?: boolean } = {},
 ): Promise<BeeViewV1> {
   // Only names the current-incarnation seal index flagged get a scan; the
   // high-water gate keeps earlier incarnations' seals out of the result.
@@ -57,12 +59,16 @@ async function projectRecord(
     : null;
   const hiveStateOption = probe.states.get(liveTargetKey(record.node, record.tmuxTarget)) ?? probe.states.get(record.tmuxTarget);
   const observation = context.hsrObservations.get(record.name);
+  // Durable request records: reads only (view/* never writes the store). The
+  // list path gates the per-bee read behind one requests-dir readdir.
+  const storedRequests = options.hasStoredRequests === false ? [] : await readBeeRequests(record.name).catch(() => []);
   const sources: BeeViewProjectionSources = {
     record,
     context,
     ...(scan?.seal ? { latestSeal: scan.seal, latestSealFilename: scan.filename } : {}),
     ...(observation?.eventSnapshot ? { eventSnapshot: observation.eventSnapshot } : {}),
     ...(hiveStateOption !== undefined && hiveStateOption.length > 0 ? { hiveStateOption } : {}),
+    ...(storedRequests.length > 0 ? { storedRequests } : {}),
     now: context.now,
   };
   return projectBeeView(sources);
@@ -73,10 +79,12 @@ async function projectRecord(
  * included — hiding them is a presentation choice), projected as BeeViewV1.
  */
 export async function listBeeViews(): Promise<BeeViewListV1> {
-  const [records, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const [records, nodes, requestStems] = await Promise.all([listSessions(), listNodes(), listBeesWithRequests().catch(() => [] as string[])]);
   const probe = await liveTargetsAcrossNodes(nodes);
   const context = await assembleStateContext(records, probe, { includeEvents: true });
-  const bees = await mapWithConcurrency(records, SEAL_SCAN_CONCURRENCY, (record) => projectRecord(record, context, probe));
+  const stems = new Set(requestStems);
+  const bees = await mapWithConcurrency(records, SEAL_SCAN_CONCURRENCY, (record) =>
+    projectRecord(record, context, probe, { hasStoredRequests: stems.has(safeName(record.name)) }));
   return {
     schemaVersion: BEE_VIEW_SCHEMA_VERSION,
     generatedAt: new Date(context.now).toISOString(),

@@ -1,32 +1,35 @@
 /**
- * Open InterventionRequest derivation (docs/BEEVIEW_READ_API.md §1, ADR 001).
+ * Open InterventionRequest derivation (docs/BEEVIEW_READ_API.md §1, ADR 001,
+ * docs/INTERVENTION_REQUESTS.md) — STORE-FIRST:
  *
- * Requests are projected from CURRENT evidence only and re-derived per
- * projection pass, so scope closure is inherent: a turn_end after a
- * needs_input, an auth_resume after a login failure, or a dead runtime
- * naturally closes them — no store, no cancellation records yet. Ids are the
- * durable idempotency keys of the request store (src/requests/keys.ts is the
- * single id source shared with it):
+ *   1. durable store records with status open and the CURRENT generation
+ *      project verbatim (authoritative). This is the improvement over pure
+ *      re-derivation: an answered-but-events-trailing needs_input has a
+ *      RESOLVED record, so it is NOT open even while the tail still shows
+ *      pendingNeedsInput;
+ *   2. live structured derivation (unresolved needs_input, unbounded auth)
+ *      applies only when NO store record exists under that id — the
+ *      daemon-down fallback, byte-identical ids via src/requests/keys.ts;
+ *   3. observer-grade derivation is unchanged (never persisted — observer
+ *      ids legitimately recur within a generation), suppressed by a same-id
+ *      store record or when structured evidence already covers the bee.
  *
- *   1. unresolved structured needs_input → question/permission, grade
- *      structured, id = the adapter's requestId (or `ni:<bee>:<ts>` when the
- *      adapter sent none), full payload passed through for `hive answer` UIs;
- *   2. pane-detected permission/trust/MCP prompts (readiness.ts predicates) →
- *      permission, grade observer,
- *      id = `obs:<bee>:<gen>:permission:<fingerprint(pane block)>`;
- *   3. auth: the structured login-required failure from events, bounded by
- *      the auth_resume marker, or observer-grade from pane/held state; scope
- *      runtime-generation;
- *   4. wedged/error → a synthesized observer-grade manual-action request
- *      (id `manual:<bee>:<gen>:wedged`) — a recovery condition, not a
- *      lifecycle (design decision 2).
+ * Live-only sources re-derived per pass:
+ *   - pane-detected permission/trust/MCP prompts (readiness.ts predicates) →
+ *     permission, grade observer,
+ *     id = `obs:<bee>:<gen>:permission:<fingerprint(pane block)>`;
+ *   - auth without structured evidence → observer-grade from pane/held state;
+ *   - wedged/error → a synthesized observer-grade manual-action request
+ *     (id `manual:<bee>:<gen>:wedged`) — a recovery condition, not a
+ *     lifecycle (design decision 2).
  *
- * Read-only and pure over its sources.
+ * Read-only and pure over its sources — view/* NEVER writes the store.
  */
 
 import { createHash } from "node:crypto";
 import { isAuthNeededMessage, type HsrEventSnapshot } from "../hsr/observe.js";
 import { authRequestId, needsInputRequestId } from "../requests/keys.js";
+import type { InterventionRequestRecord } from "../requests/store.js";
 import type { RunnerEvent } from "../hsr/types.js";
 import { isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "../readiness.js";
 import type { DerivedState, StateContext } from "../state.js";
@@ -42,8 +45,32 @@ export type OpenRequestSources = {
   generation: number;
   /** Structured HSR event snapshot, when the run dir was read this pass. */
   eventSnapshot?: HsrEventSnapshot;
+  /** Durable request records for this bee, when its store file was read. */
+  storedRequests?: InterventionRequestRecord[];
   now: number;
 };
+
+/** Map a durable store record verbatim onto the BeeView request shape. */
+export function storedRequestView(record: InterventionRequestRecord): BeeViewRequest {
+  return {
+    id: record.id,
+    kind: record.kind,
+    status: record.status,
+    scope: record.scope,
+    grade: record.grade,
+    openedAt: record.openedAt,
+    ...(record.question !== undefined ? { question: record.question } : {}),
+    ...(record.tool !== undefined ? { tool: record.tool } : {}),
+    ...(record.options !== undefined ? { options: record.options } : {}),
+    ...(record.optionDetails !== undefined ? { optionDetails: record.optionDetails } : {}),
+    ...(record.questions !== undefined ? { questions: record.questions } : {}),
+    ...(record.multiSelect !== undefined ? { multiSelect: record.multiSelect } : {}),
+    ...(record.input !== undefined ? { input: record.input } : {}),
+    ...(record.resolvedBy !== undefined ? { resolvedBy: record.resolvedBy } : {}),
+    ...(record.cancelReason !== undefined ? { cancelReason: record.cancelReason } : {}),
+    evidence: record.evidence,
+  };
+}
 
 /** Stable fingerprint of a pane block, so identical captures share request ids. */
 export function paneFingerprint(pane: string): string {
@@ -79,12 +106,24 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
   const { record, context, derived, generation, eventSnapshot, now } = sources;
   const requests: BeeViewRequest[] = [];
 
+  // 0. Store records first (authoritative): open + current generation project
+  //    verbatim. A record under an id — in ANY status — also suppresses the
+  //    live structured derivation of that id below: an answered-but-events-
+  //    trailing needs_input is resolved, hence NOT open.
+  const stored = sources.storedRequests ?? [];
+  const storedIds = new Set(stored.map((request) => request.id));
+  const openStored = stored.filter((request) => request.status === "open" && request.generation === generation);
+  for (const request of openStored) requests.push(storedRequestView(request));
+  const storedNeedsReplyOpen = openStored.some((request) => request.kind === "question" || request.kind === "permission");
+  const storedAuthOpen = openStored.some((request) => request.kind === "auth");
+
   // 1. Unresolved structured needs_input → question/permission, grade
   //    structured, payload passed through so answer UIs need no second read.
   //    The snapshot's pendingNeedsInput is null once a later turn_end resolved
-  //    it, so closure is inherent in re-derivation.
+  //    it, so closure is inherent in re-derivation. Live fallback only: a
+  //    store record under the same id (any status) wins.
   const pending = eventSnapshot?.pendingNeedsInput ?? null;
-  if (pending) {
+  if (pending && !storedIds.has(needsInputRequestId(record.name, pending))) {
     const openedAt = isoFromEpochMs(pending.ts);
     requests.push({
       id: needsInputRequestId(record.name, pending),
@@ -105,32 +144,38 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
   }
 
   // 2. Pane-detected permission/trust/MCP prompts (observer grade, stable
-  //    fingerprint ids), only when no structured request already covers it.
-  if (derived.state === "blocked" && !pending) {
+  //    fingerprint ids), only when no structured request already covers it
+  //    (a live pending OR an open store-backed needs-reply record).
+  if (derived.state === "blocked" && !pending && !storedNeedsReplyOpen) {
     const paneKey = record.agentPaneId ?? record.tmuxTarget;
     const pane = context.panes?.get(paneKey);
-    if (pane && (isPermissionPromptPane(pane) || isTrustPromptPane(pane) || isMcpWarningPane(pane))) {
-      requests.push({
-        id: `obs:${record.name}:${generation}:permission:${paneFingerprint(pane)}`,
-        kind: "permission",
-        status: "open",
-        scope: "turn",
-        grade: "observer",
-        question: derived.detail,
-        evidence: { grade: "observer", source: "pane-capture", observedAt: new Date(now).toISOString(), detail: derived.detail },
-      });
-    } else {
-      // Blocked without a readable pane this pass (held state, or an HSR
-      // structured "blocked" whose needs_input payload was not snapshot).
-      requests.push({
-        id: `obs:${record.name}:${generation}:permission:held`,
-        kind: "permission",
-        status: "open",
-        scope: "turn",
-        grade: "observer",
-        question: derived.detail,
-        evidence: { grade: "observer", source: "session-record", detail: `blocked without pane evidence this pass (${derived.detail})` },
-      });
+    const observerId = pane && (isPermissionPromptPane(pane) || isTrustPromptPane(pane) || isMcpWarningPane(pane))
+      ? `obs:${record.name}:${generation}:permission:${paneFingerprint(pane)}`
+      : `obs:${record.name}:${generation}:permission:held`;
+    if (!storedIds.has(observerId)) {
+      if (pane && (isPermissionPromptPane(pane) || isTrustPromptPane(pane) || isMcpWarningPane(pane))) {
+        requests.push({
+          id: observerId,
+          kind: "permission",
+          status: "open",
+          scope: "turn",
+          grade: "observer",
+          question: derived.detail,
+          evidence: { grade: "observer", source: "pane-capture", observedAt: new Date(now).toISOString(), detail: derived.detail },
+        });
+      } else {
+        // Blocked without a readable pane this pass (held state, or an HSR
+        // structured "blocked" whose needs_input payload was not snapshot).
+        requests.push({
+          id: observerId,
+          kind: "permission",
+          status: "open",
+          scope: "turn",
+          grade: "observer",
+          question: derived.detail,
+          evidence: { grade: "observer", source: "session-record", detail: `blocked without pane evidence this pass (${derived.detail})` },
+        });
+      }
     }
   }
 
@@ -139,7 +184,7 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
   //    pane/held state otherwise. Scope: the generation needs re-credentialing.
   if (derived.state === "auth-needed") {
     const authEvent = lastAuthNeededEvent(eventSnapshot?.events ?? []);
-    if (authEvent) {
+    if (authEvent && !storedIds.has(authRequestId(record.name, authEvent.ts))) {
       const openedAt = isoFromEpochMs(authEvent.ts);
       requests.push({
         id: authRequestId(record.name, authEvent.ts),
@@ -151,7 +196,7 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
         question: derived.detail,
         evidence: { grade: "structured", source: "hsr-events", ...(openedAt !== undefined ? { observedAt: openedAt } : {}), detail: authEvent.type },
       });
-    } else {
+    } else if (!authEvent && !storedAuthOpen && !storedIds.has(`obs:${record.name}:${generation}:auth:held`)) {
       requests.push({
         id: `obs:${record.name}:${generation}:auth:held`,
         kind: "auth",
@@ -166,7 +211,7 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
 
   // 4. wedged/error: a recovery condition, not a lifecycle — synthesize an
   //    observer-grade manual-action request (design decision 2).
-  if (derived.state === "wedged" || derived.state === "error") {
+  if ((derived.state === "wedged" || derived.state === "error") && !storedIds.has(`manual:${record.name}:${generation}:wedged`)) {
     requests.push({
       id: `manual:${record.name}:${generation}:wedged`,
       kind: "manual-action",
