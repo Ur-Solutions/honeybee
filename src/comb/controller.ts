@@ -144,7 +144,7 @@ async function sweepOneRun(
       reconcileDeadOrStalledAgents(run, records, observed, now);
       reconcileMachine(run, now);
       prepared.push(...planAgentEffects(run, records, now));
-      preparedHuman.push(...planHumanEffects(run, records, now));
+      preparedHuman.push(...planHumanEffects(run, records, packets, now));
     }
   });
   if (first.changed) outcomes.push({ run: runId, action: "reconciled" });
@@ -542,6 +542,7 @@ function resolveAgentAdoptTarget(
 function planHumanEffects(
   run: RunRecord,
   records: ReadonlyMap<string, SessionRecord>,
+  packets: ReadonlyMap<string, ForumPacket>,
   now: string,
 ): PreparedHumanEffect[] {
   if (run.cancellation || run.status !== "active") return [];
@@ -560,9 +561,14 @@ function planHumanEffects(
         candidate.packetId === thread.currentPacketId &&
         candidate.status === "current",
     );
+    const currentPacket = current ? packets.get(current.packetId) : undefined;
+    if (current && !currentPacket) continue;
     const samePins = current ? packetPinsMatch(run, activation, current) : false;
+    const reusableStatus = currentPacket?.status === "changes_requested" ||
+      currentPacket?.status === "needs_review" ||
+      currentPacket?.status === "in_review";
     const operation: ForumPacketEffectRequest["operation"] =
-      !current ? "create" : samePins ? "rerequest" : "successor";
+      !current ? "create" : samePins && reusableStatus ? "rerequest" : "successor";
     let destination: ReviewFeedbackDestination;
     try {
       destination = resolveHumanDestination(run, activation, node, records);

@@ -476,6 +476,139 @@ test("Forum create can crash after the external write and confirm idempotently o
   });
 });
 
+test("a retried approved human node creates a successor packet instead of rerequesting a terminal packet", async () => {
+  await withTempStore(async (dir) => {
+    const definition: CombSpec = {
+      formatVersion: 2,
+      name: "two-human-retry",
+      input: { kind: "informal", description: "none" },
+      nodes: [
+        agentNode("work"),
+        humanNode("review"),
+        humanNode("verification"),
+      ],
+      edges: [
+        { id: "work-review", from: "work", to: "review", kind: "forward", on: "done" },
+        { id: "review-verification", from: "review", to: "verification", kind: "forward", on: "done" },
+        { id: "verification-work", from: "verification", to: "work", kind: "retry", on: "failed" },
+      ],
+    };
+    const created = await createRun({
+      definition,
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: {
+        retryBackoffMs: 0,
+        retireAgentsOnTerminal: false,
+      },
+    });
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    const packets = new Map<string, ForumPacket>();
+    const operations: Array<{ nodeId: string; operation: ForumPacketEffectRequest["operation"] }> = [];
+    const latestSeals = new Map<string, SealRecord>();
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async (name) => {
+        const found = latestSeals.get(name);
+        return found ? { filename: `${name}-${found.attempt}.json`, seal: found } : null;
+      },
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [...packets.values()],
+      executeHumanEffect: async (request) => {
+        operations.push({ nodeId: request.nodeId, operation: request.operation });
+        if (request.operation === "create") {
+          const packet = packetFor(
+            request,
+            `PKT.${request.nodeId}.1`,
+            new Date(now).toISOString(),
+          );
+          packets.set(packet.id, packet);
+          return packet;
+        }
+        const predecessor = packets.get(request.predecessorPacketId!);
+        assert.ok(predecessor);
+        if (request.operation === "rerequest") {
+          if (predecessor.status === "approved" || predecessor.status === "resolved") {
+            throw new Error(`cannot rerequest terminal packet ${predecessor.id}`);
+          }
+          predecessor.status = "needs_review";
+          predecessor.blocking_since = new Date(now).toISOString();
+          return predecessor;
+        }
+        predecessor.status = "superseded";
+        const successor = packetFor(
+          request,
+          `PKT.${request.nodeId}.2`,
+          new Date(now).toISOString(),
+        );
+        packets.set(successor.id, successor);
+        return successor;
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [], new Map());
+    let run = (await loadRun(created.id))!;
+    const work1 = current(run, "work");
+    const work1Bee = work1.beeHandles[0]!.name;
+    latestSeals.set(work1Bee, seal(work1, work1Bee, "2026-07-28T12:00:02.000Z"));
+    now = Date.parse("2026-07-28T12:00:03.000Z");
+    await sweepCombs(deps, [], new Map());
+
+    const review1Packet = packets.get("PKT.review.1")!;
+    review1Packet.status = "approved";
+    review1Packet.verdict = verdict(
+      review1Packet,
+      "approve",
+      "review approved",
+      "2026-07-28T12:00:04.000Z",
+    );
+    now = Date.parse("2026-07-28T12:00:05.000Z");
+    await sweepCombs(deps, [], new Map());
+
+    const verificationPacket = packets.get("PKT.verification.1")!;
+    verificationPacket.status = "changes_requested";
+    verificationPacket.verdict = verdict(
+      verificationPacket,
+      "request_changes",
+      "redo the work",
+      "2026-07-28T12:00:06.000Z",
+    );
+    now = Date.parse("2026-07-28T12:00:07.000Z");
+    await sweepCombs(deps, [], new Map());
+
+    run = (await loadRun(created.id))!;
+    const work2 = current(run, "work");
+    assert.equal(work2.address.attempt, 2);
+    const work2Bee = work2.beeHandles[0]!.name;
+    latestSeals.set(work2Bee, seal(work2, work2Bee, "2026-07-28T12:00:08.000Z"));
+    now = Date.parse("2026-07-28T12:00:09.000Z");
+    await sweepCombs(deps, [], new Map());
+
+    run = (await loadRun(created.id))!;
+    const review2 = current(run, "review");
+    assert.equal(review2.address.attempt, 2);
+    assert.equal(review2.status, "waiting-human");
+    assert.equal(review2.packetId, "PKT.review.2");
+    assert.deepEqual(
+      operations.filter((entry) => entry.nodeId === "review"),
+      [
+        { nodeId: "review", operation: "create" },
+        { nodeId: "review", operation: "successor" },
+      ],
+    );
+    const reviewThread = run.packetThreads.find((thread) => thread.nodeId === "review")!;
+    assert.equal(reviewThread.packetCount, 2);
+    assert.equal(reviewThread.currentPacketId, "PKT.review.2");
+    assert.equal(reviewThread.packetTail[0]?.status, "superseded");
+  });
+});
+
 test("subject revision movement creates a successor in the same human packet thread", async () => {
   await withTempStore(async (dir) => {
     const definition: CombSpec = {
