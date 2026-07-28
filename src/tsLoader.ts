@@ -1,8 +1,33 @@
+import { copyFile, rm } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export async function loadTsModule(path: string, options: { kind?: string } = {}): Promise<unknown> {
+let cacheBustCounter = 0;
+
+export async function loadTsModule(
+  path: string,
+  options: { kind?: string; cacheBust?: boolean } = {},
+): Promise<unknown> {
+  let transientPath: string | undefined;
   try {
-    const module = (await import(pathToFileURL(path).href)) as { default?: unknown };
+    let url = pathToFileURL(path);
+    if (options.cacheBust) {
+      // The tsx loader currently canonicalizes away URL query strings before
+      // consulting its module cache. Import a uniquely named adjacent copy so
+      // updates really reload while relative imports still resolve from the
+      // source directory. Fall back to a query for runtimes that prohibit the
+      // short-lived adjacent file.
+      const suffix = `${process.pid}-${++cacheBustCounter}`;
+      transientPath = join(dirname(path), `.${basename(path, ".ts")}.hive-load-${suffix}.ts`);
+      try {
+        await copyFile(path, transientPath);
+        url = pathToFileURL(transientPath);
+      } catch {
+        transientPath = undefined;
+        url.searchParams.set("hive-load", suffix);
+      }
+    }
+    const module = (await import(url.href)) as { default?: unknown };
     if (module.default === undefined) {
       throw new Error(`TS ${options.kind ?? "module"} at ${path} has no default export`);
     }
@@ -15,6 +40,8 @@ export async function loadTsModule(path: string, options: { kind?: string } = {}
       );
     }
     throw error;
+  } finally {
+    if (transientPath) await rm(transientPath, { force: true }).catch(() => undefined);
   }
 }
 
