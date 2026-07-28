@@ -3,6 +3,12 @@ export type Parsed = {
   args: string[];
   flags: Map<string, string | true | string[]>;
   rest: string[];
+  /**
+   * Number of positionals already seen when --template was parsed. Template
+   * forms use this to distinguish extra input after the flag from a
+   * conflicting legacy `<bee>` token before it.
+   */
+  argsBeforeTemplate?: number;
 };
 
 export const BOOLEAN_FLAGS = new Set([
@@ -11,6 +17,7 @@ export const BOOLEAN_FLAGS = new Set([
   "all",
   // Legacy alias for --done (archived → done rename).
   "archived",
+  "attach",
   "auto",
   "autoswap",
   "background",
@@ -85,6 +92,7 @@ export function parse(argv: string[]): Parsed {
   const flags = new Map<string, string | true | string[]>();
   const args: string[] = [];
   let rest: string[] = [];
+  let argsBeforeTemplate: number | undefined;
 
   for (let i = 0; i < tail.length; i += 1) {
     const item = tail[i]!;
@@ -97,6 +105,7 @@ export function parse(argv: string[]): Parsed {
       const key = item.slice(2, eq > -1 ? eq : undefined);
       const value = eq > -1 ? item.slice(eq + 1) : BOOLEAN_FLAGS.has(key) ? true : i + 1 < tail.length && !tail[i + 1]!.startsWith("-") ? tail[++i]! : true;
       setFlag(flags, key, value);
+      if (key === "template" && argsBeforeTemplate === undefined) argsBeforeTemplate = args.length;
       continue;
     }
     if (item.startsWith("-") && item.length > 1) {
@@ -108,7 +117,7 @@ export function parse(argv: string[]): Parsed {
     args.push(item);
   }
 
-  return { command, args, flags, rest };
+  return { command, args, flags, rest, ...(argsBeforeTemplate !== undefined ? { argsBeforeTemplate } : {}) };
 }
 
 export function setFlag(flags: Map<string, string | true | string[]>, key: string, value: string | true) {

@@ -44,6 +44,10 @@ import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 import { hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../hsr/runDir.js";
 
 export async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
+  if (flag(parsed, "template") !== undefined) {
+    const { runTemplateFlag } = await import("./template.js");
+    return runTemplateFlag(parsed, "spawn");
+  }
   const frameName = typeof flag(parsed, "frame") === "string" ? String(flag(parsed, "frame")) : undefined;
   const count = resolveSpawnCount(parsed);
   let records: SessionRecord[];

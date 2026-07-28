@@ -36,6 +36,7 @@ import { cmdSpend } from "./commands/spend.js";
 import { cmdState } from "./commands/state.js";
 import { cmdSwarm } from "./commands/swarm.js";
 import { cmdTask } from "./commands/tasks.js";
+import { cmdTemplate } from "./commands/template.js";
 import { sealHelpText } from "./seal.js";
 import { closeAllSubstrates } from "./substrates/index.js";
 import { waitHelpText } from "./wait.js";
@@ -198,6 +199,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "frame":
       await cmdFrame(parsed);
       break;
+    case "template":
+      await cmdTemplate(parsed);
+      break;
     case "swarm":
       await cmdSwarm(parsed);
       break;
@@ -324,6 +328,7 @@ function printHelp() {
       title: "Spawn & run",
       rows: [
         ["spawn", "<bee>", "start bees in detached tmux sessions (--frame to spawn a swarm)"],
+        ["template", "<list|run|define|…>", "manage and run reusable single-bee spawn presets"],
         ["new", "", "interactive picker: choose type, account, config & folder, then spawn"],
         ["run", "<bee> -p <prompt>", "spawn, send a prompt, optionally wait and clean up"],
         ["x", "<bee> <prompt>", "spawn a bee and hand it a prompt, then return (fire-and-forget)"],

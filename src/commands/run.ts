@@ -88,6 +88,10 @@ export async function deliverPromptToBee(record: SessionRecord, prompt: string):
 
 
 export async function cmdRun(parsed: Parsed) {
+  if (flag(parsed, "template") !== undefined) {
+    const { runTemplateFlag } = await import("./template.js");
+    return runTemplateFlag(parsed, "run");
+  }
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
   if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--yolo] [--wait] [--last] [--rm|--cleanup] [-- <bee-args...>]");
@@ -174,6 +178,10 @@ export async function cleanupRunSession(record: SessionRecord): Promise<void> {
 // for the prompt to be ready, deliver it — without `run`'s blocking wait/capture/cleanup.
 // Inspect later with `hive tail|attach|wait`.
 export async function cmdX(parsed: Parsed) {
+  if (flag(parsed, "template") !== undefined) {
+    const { runTemplateFlag } = await import("./template.js");
+    return runTemplateFlag(parsed, "x");
+  }
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
   if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--env KEY=VALUE] [--name <id>] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]");
@@ -195,6 +203,10 @@ export async function cmdX(parsed: Parsed) {
 // agent prompt (confirmSpawnReady) so attach lands on a ready pane; detaching
 // leaves the bee running like any tmux session.
 export async function cmdXa(parsed: Parsed) {
+  if (flag(parsed, "template") !== undefined) {
+    const { runTemplateFlag } = await import("./template.js");
+    return runTemplateFlag(parsed, "xa");
+  }
   const agent = parsed.args[0];
   if (!agent) throw new Error("Usage: hive xa <bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--name <id>] [--print]");
   assertSingleBeeInvocation(parsed, "hive xa attaches to a single bee; spawn cohorts with hive spawn --count/--frame");
@@ -247,7 +259,7 @@ export const OPEN_OWN_FLAGS = new Set([
 // In the registered (non-raw) modes these are spawn-pipeline controls, not
 // agent flags — they ride the delegated spawn instead of the passthrough.
 export const OPEN_SPAWN_CONTROL_FLAGS = new Set([
-  "name", "colony", "swarm", "swarm-id", "count", "frame", "node", "substrate",
+  "name", "colony", "swarm", "swarm-id", "count", "frame", "template", "node", "substrate",
   "brief", "briefed", "autoswap", "boot-ms", "no-wait", "force-send", "here",
   "pool", "no-keep", "kit-profile", "preamble", "no-preamble",
 ]);
@@ -280,6 +292,13 @@ export function openPassthroughArgs(parsed: Parsed, exclude: Set<string> = OPEN_
 // session, no SessionRecord (list/tail/kill/daemon do not apply). --window/
 // --app imply --raw: they target external terminal apps by nature.
 export async function cmdOpen(parsed: Parsed) {
+  if (flag(parsed, "template") !== undefined) {
+    if (truthy(flag(parsed, "raw")) || truthy(flag(parsed, "window")) || flag(parsed, "app") !== undefined) {
+      throw new Error("--template is only supported by registered open; remove --raw/--window/--app");
+    }
+    const { runTemplateFlag } = await import("./template.js");
+    return runTemplateFlag(parsed, "open");
+  }
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive open <bee> [--raw] [--window] [--app <terminal>] [--cwd <dir>] [--account <a|auto>] [--print] [<bee-flags...>]");
 
