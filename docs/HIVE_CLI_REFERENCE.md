@@ -1573,10 +1573,18 @@ queue,passive
 
 Interrupts require explicit opt-in per bee.
 
+When `--sender`/`--sender-human` are omitted, the sender defaults to the bee
+owning the current session (`$HIVE_BEE`, else the current tmux pane). Bee-sent
+messages are delivered to the recipient wrapped in a sender-attribution
+envelope — a stable marker line plus one JSON metadata line
+(`{version, from, tier, id, sentAt, subject?}`) ahead of the body — so the
+recipient (and Apiary's transcript UI) can see who sent it. Human sends are
+delivered verbatim.
+
 ### `hive buz`
 
 ```sh
-hive buz send <selector> --sender <bee>|--sender-human <name>
+hive buz send <selector> [--sender <bee>|--sender-human <name>]
   [--tier <interrupt|queue|passive>] [-p <body>] [--subject "..."]
 hive buz inbox <selector> [--limit N] [--from <ref>]
 hive buz outbox <selector> [--limit N] [--from <ref>]

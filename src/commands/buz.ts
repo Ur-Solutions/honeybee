@@ -7,7 +7,7 @@ import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { resolveSelector } from "../selectors.js";
 import { appendLedger, listSessions, updateSession, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
-import { resolveSession, stringFlag } from "../cli/shared.js";
+import { resolveBeeInCurrentPane, resolveSession, stringFlag } from "../cli/shared.js";
 
 export async function cmdBuz(parsed: Parsed) {
   const sub = parsed.args[0];
@@ -40,7 +40,13 @@ export async function resolveBuzSender(parsed: Parsed): Promise<BuzSender> {
   const hasBee = typeof beeFlag === "string" && beeFlag.length > 0;
   const hasHuman = typeof humanFlag === "string" && humanFlag.length > 0;
   if (hasBee && hasHuman) throw new Error("buz: --sender and --sender-human are mutually exclusive");
-  if (!hasBee && !hasHuman) throw new Error("buz: exactly one of --sender <bee> or --sender-human <name> is required");
+  if (!hasBee && !hasHuman) {
+    // Same fallback as `hive task` (commands/tasks.ts): a bee calling from its
+    // own session ($HIVE_BEE / current tmux pane) is its own sender.
+    const self = await resolveBeeInCurrentPane();
+    if (self) return { kind: "bee", id: self.id ?? self.name };
+    throw new Error("buz: exactly one of --sender <bee> or --sender-human <name> is required (no bee identity found in this environment)");
+  }
   if (hasBee) {
     // Must resolve to a registered bee.
     const record = await resolveSession(String(beeFlag));
@@ -63,7 +69,7 @@ export function parseBuzTier(value: unknown): BuzTier {
 
 export async function buzSend(parsed: Parsed) {
   const target = parsed.args[1];
-  if (!target) throw new Error("Usage: hive buz send <selector> --sender <bee>|--sender-human <name> --tier <interrupt|queue|passive> -p <body>");
+  if (!target) throw new Error("Usage: hive buz send <selector> [--sender <bee>|--sender-human <name>] --tier <interrupt|queue|passive> -p <body> (sender defaults to the bee owning the current session)");
   const tier = parseBuzTier(flag(parsed, "tier") ?? "queue");
   const body = stringFlag(parsed, ["prompt", "p"]) ?? "";
   if (body.length === 0) throw new Error("buz: --prompt|-p body is required");
