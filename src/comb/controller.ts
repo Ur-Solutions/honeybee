@@ -40,6 +40,7 @@ export type CombSweepDeps = {
   lookupAgent: (name: string) => Promise<SessionRecord | null>;
   retireAgent: (name: string) => Promise<void>;
   releaseClaim?: (claimId: string, runId: string) => Promise<void>;
+  withRunSweepLock?: <T>(runId: string, fn: () => Promise<T>) => Promise<T>;
   now: () => number;
 };
 
@@ -60,7 +61,8 @@ export async function sweepCombs(
   const recordsByName = new Map(records.map((record) => [record.name, record]));
   for (const listed of runs) {
     try {
-      outcomes.push(...await sweepOneRun(deps, listed.id, recordsByName, observed));
+      const sweep = () => sweepOneRun(deps, listed.id, recordsByName, observed);
+      outcomes.push(...await (deps.withRunSweepLock ? deps.withRunSweepLock(listed.id, sweep) : sweep()));
     } catch (error) {
       outcomes.push({ run: listed.id, action: "error", error: error instanceof Error ? error.message : String(error) });
     }
@@ -246,6 +248,18 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
   let spawned: { name: string; id?: string };
   if (recover) {
     const existing = await deps.lookupAgent(plan.request.name);
+    if (!existing) {
+      const effect = start.run.effects[plan.effectKey];
+      const executeStartedAt = effect?.executeStartedAt;
+      if (!executeStartedAt || deps.now() - Date.parse(executeStartedAt) < start.run.policies.firstEvidenceMs) {
+        return {
+          run: plan.runId,
+          action: "noop",
+          activation: plan.activationId,
+          detail: "executing spawn is still within its adoption window",
+        };
+      }
+    }
     if (!existing || existing.contract?.taskId !== plan.request.taskId || existing.contract?.attempt !== plan.request.attempt) {
       await mutateRun(plan.runId, (run) => {
         const effect = run.effects[plan.effectKey];
@@ -286,6 +300,7 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
     const effect = run.effects[plan.effectKey];
     const activation = run.activations[plan.activationId];
     if (!effect || !activation) return "missing";
+    if (effect.status !== "executing") return `ignored-${effect.status}`;
     const now = new Date(deps.now()).toISOString();
     if ((run.cancellation?.epoch ?? 0) !== effect.fenceEpoch) {
       effect.status = "ambiguous";

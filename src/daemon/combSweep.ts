@@ -1,6 +1,8 @@
+import { join } from "node:path";
 import { deliverPromptText } from "../cli/shared.js";
 import { pickAutoAccount, resolveAccountFlag, spawnBee } from "../commands/spawn.js";
 import { releaseClaim } from "../comb/claims.js";
+import { combRunDir } from "../comb/store.js";
 import {
   sweepCombs,
   type AgentSpawnRequest,
@@ -9,6 +11,7 @@ import {
 } from "../comb/controller.js";
 import { listSweepableRuns } from "../comb/store.js";
 import { transactionalRetire } from "../kill.js";
+import { withFileLock } from "../lock.js";
 import { scanLatestSeal } from "../seal.js";
 import type { BeeState } from "../state.js";
 import { loadSession, touchSession, type SessionRecord } from "../store.js";
@@ -40,6 +43,8 @@ export function createCombSweeper(
       await transactionalRetire(record);
     },
     releaseClaim,
+    withRunSweepLock: (runId, fn) =>
+      withFileLock(join(combRunDir(runId), ".sweep.lock"), fn, { timeoutMs: 5_000, staleMs: 10 * 60_000 }),
     now: () => Date.now(),
     ...overrides,
   };

@@ -3,12 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { cancelRun, createRun, listSweepableRuns, loadRun } from "../src/comb/store.js";
+import { cancelRun, combRunDir, createRun, listSweepableRuns, loadRun } from "../src/comb/store.js";
 import { applySealCompletion, activateAgent, effectBaseKey, evaluatePredicate, reconcileMachine } from "../src/comb/machine.js";
 import { sweepCombs, type CombSweepDeps } from "../src/comb/controller.js";
 import { judgeCombEvidence } from "../src/comb/evidence.js";
 import type { ActivationRecord, CombSpec, JsonValue, RunRecord } from "../src/comb/types.js";
 import type { SealRecord } from "../src/seal.js";
+import { withFileLock } from "../src/lock.js";
 
 async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-comb-machine-"));
@@ -265,6 +266,46 @@ test("controller persists prepare/executing before spawn and never duplicates a 
     const stored = (await loadRun(run.id))!;
     assert.equal(Object.values(stored.effects)[0]?.status, "confirmed");
     assert.equal(stored.activations["work@1#0"]?.beeHandles[0]?.id, "bee-id");
+  });
+});
+
+test("cross-controller run sweep lock prevents duplicate irreversible spawns", async () => {
+  await withTempStore(async (dir) => {
+    const definition: CombSpec = {
+      formatVersion: 2,
+      name: "concurrent-agent",
+      input: { kind: "informal", description: "none" },
+      nodes: [reviewerNode("work")],
+      edges: [],
+    };
+    await createRun({
+      definition,
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: { retireAgentsOnTerminal: false },
+    });
+    let spawns = 0;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => {
+        spawns += 1;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return { name: request.name };
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      withRunSweepLock: (runId, fn) =>
+        withFileLock(join(combRunDir(runId), ".sweep.lock"), fn, { timeoutMs: 2_000 }),
+      now: () => Date.now(),
+    };
+    await Promise.all([
+      sweepCombs(deps, [], new Map()),
+      sweepCombs(deps, [], new Map()),
+    ]);
+    assert.equal(spawns, 1);
   });
 });
 
