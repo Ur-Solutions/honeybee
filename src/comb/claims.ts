@@ -112,9 +112,6 @@ export async function withPreparedClaim<T>(
         existing = released;
       }
       if (existing.status !== "released") {
-        if (collision === "join-existing" && holder) {
-          return { value: holder as unknown as T, run: holder, joinedExisting: true };
-        }
         throw new CombError("claim_conflict", `claim conflict: held by ${existing.runId}`, {
           claimId: existing.id,
           holdingRunId: existing.runId,

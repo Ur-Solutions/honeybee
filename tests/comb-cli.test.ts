@@ -116,7 +116,7 @@ test("CLI emits exactly one success envelope for define/run/read/cancel lifecycl
     assert.equal(runResult.created, true);
     assert.equal(runResult.joinedExisting, false);
     assert.equal(runResult.replayedDelivery, false);
-    assert.equal(runResult.intakeReady, true);
+    assert.equal(runResult.intakeReady, false);
     assert.equal(runResult.run.status, "active");
     const runId = runResult.run.id;
 

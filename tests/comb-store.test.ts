@@ -75,7 +75,7 @@ test("run storage embeds revision-zero truth, writes bounded board/events, and d
   });
 });
 
-test("subject claims refuse or join the exact holder and remain held across cancellation", async () => {
+test("subject claims refuse the exact holder and remain held across cancellation", async () => {
   await withTempStore(async (dir) => {
     const definition = claimedComb();
     const input = { repo: "honeybee", ref: "main" } as const;
@@ -113,11 +113,12 @@ test("subject claims refuse or join the exact holder and remain held across canc
         return true;
       },
     );
-    const joined = await withPreparedClaim<RunRecord>(competitor, "join-existing", async () => {
-      throw new Error("must not create");
-    });
-    assert.equal(joined.joinedExisting, true);
-    assert.equal(joined.run.id, runId);
+    await assert.rejects(
+      withPreparedClaim<RunRecord>(competitor, "join-existing", async () => {
+        throw new Error("must not create");
+      }),
+      (error: unknown) => (error as { code?: string }).code === "claim_conflict",
+    );
 
     await cancelRun(runId);
     assert.equal((await loadClaim(claim.id))?.status, "held");

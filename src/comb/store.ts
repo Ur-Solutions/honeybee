@@ -152,7 +152,7 @@ export async function createRun(options: {
     effects: {},
     effectTail: [],
     cleanup: emptyCleanup("not-required"),
-    intakeReady: true,
+    intakeReady: false,
     ...(options.subjectClaimId ? { subjectClaimId: options.subjectClaimId } : {}),
     eventTail: [],
     eventsRetainedFrom: 1,

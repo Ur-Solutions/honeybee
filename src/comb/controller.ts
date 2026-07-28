@@ -155,7 +155,7 @@ function reconcileDeadOrStalledAgents(
 }
 
 function planAgentEffects(run: RunRecord, now: string): PreparedAgentEffect[] {
-  if (run.cancellation || run.status !== "active" || !run.intakeReady) return [];
+  if (run.cancellation || run.status !== "active") return [];
   const activeCount = currentActivations(run).filter((activation) => activation.status === "active").length;
   let available = Math.max(0, run.policies.maxConcurrentActivations - activeCount);
   const plans: PreparedAgentEffect[] = [];

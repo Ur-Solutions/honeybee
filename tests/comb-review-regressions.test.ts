@@ -14,6 +14,7 @@ import { sweepCombs, type CombSweepDeps } from "../src/comb/controller.js";
 import { atomicWriteFile } from "../src/fsx.js";
 import { instantiateRun } from "../src/comb/instantiate.js";
 import { applySealCompletion, activateAgent, reconcileMachine } from "../src/comb/machine.js";
+import { lintComb } from "../src/comb/schema.js";
 import {
   cancelRun,
   createRun,
@@ -598,4 +599,213 @@ test("review critical B9: evidence mismatch enters the same terminal cleanup and
     assert.equal(retired.length, 1);
     assert.equal((await listSweepableRuns()).some((candidate) => candidate.id === terminal.id), false);
   });
+});
+
+test("review repro C1: lint rejects every slice-2-only authored shape", () => {
+  const base = {
+    formatVersion: 2,
+    name: "future-shape",
+    input: { kind: "informal", description: "x" },
+    nodes: [agentNode("work")],
+    edges: [],
+  };
+  const fixtures: Array<{ label: string; definition: unknown }> = [
+    {
+      label: "subscriptions",
+      definition: {
+        ...base,
+        subscriptions: [{
+          nodeId: "work",
+          triggerId: "trigger",
+          subject: { source: "run-input", pointer: "" },
+          eventKinds: ["push"],
+          delivery: "queue",
+        }],
+      },
+    },
+    {
+      label: "human executor",
+      definition: {
+        ...base,
+        nodes: [{
+          id: "review",
+          executor: "human",
+          binding: "strict",
+          human: {
+            title: "Review",
+            packetKind: "web",
+            feedbackDestination: { type: "new-agent" },
+          },
+        }],
+      },
+    },
+    {
+      label: "engine action",
+      definition: {
+        ...base,
+        nodes: [{
+          id: "land",
+          executor: "engine",
+          binding: "strict",
+          engine: { kind: "action", intent: "land" },
+        }],
+      },
+    },
+    {
+      label: "child run",
+      definition: {
+        ...base,
+        nodes: [{
+          id: "child",
+          executor: "engine",
+          binding: "strict",
+          engine: {
+            kind: "child-run",
+            comb: { kind: "registry", name: "child", version: 1 },
+            input: {},
+          },
+        }],
+      },
+    },
+    {
+      label: "ci status",
+      definition: {
+        ...base,
+        nodes: [{
+          id: "gate",
+          executor: "engine",
+          binding: "strict",
+          engine: { kind: "predicate", predicate: { kind: "ci-status", equals: "success" } },
+        }],
+      },
+    },
+    {
+      label: "waiting edge",
+      definition: {
+        ...base,
+        nodes: [agentNode("work"), agentNode("timeout")],
+        edges: [{
+          id: "wait",
+          from: "work",
+          to: "timeout",
+          kind: "waiting",
+          on: "waiting",
+          when: { kind: "clock", afterMs: 1_000, from: "activation-start" },
+        }],
+      },
+    },
+    {
+      label: "checkout",
+      definition: {
+        ...base,
+        nodes: [{ ...agentNode("work"), checkout: { pool: "review", mode: "exclusive" } }],
+      },
+    },
+    {
+      label: "blocking-since clock",
+      definition: {
+        ...base,
+        nodes: [{
+          id: "clock",
+          executor: "engine",
+          binding: "strict",
+          engine: {
+            kind: "predicate",
+            predicate: { kind: "clock", afterMs: 1_000, from: "blocking-since" },
+          },
+        }],
+      },
+    },
+    {
+      label: "flight capacity",
+      definition: {
+        ...base,
+        nodes: [{
+          id: "work",
+          executor: "agent",
+          binding: "strict",
+          agent: { capacity: { kind: "flight", flightId: "reviewers" }, brief: "work" },
+        }],
+      },
+    },
+  ];
+  for (const fixture of fixtures) {
+    assert.throws(
+      () => lintComb(fixture.definition),
+      /not supported in strict-spine slice 1/,
+      fixture.label,
+    );
+  }
+});
+
+test("review contract C2: no-subscription runs report intakeReady false but still execute agents", async () => {
+  await withTempStore(async (dir) => {
+    const run = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "no-intake",
+        input: { kind: "informal", description: "x" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+    });
+    assert.equal(run.intakeReady, false);
+    let spawns = 0;
+    await sweepCombs(sweepDeps({
+      spawnAgent: async (request) => {
+        spawns += 1;
+        return { name: request.name };
+      },
+    }), [], new Map());
+    assert.equal(spawns, 1);
+  });
+});
+
+test("review contract C3: join-existing honestly refuses without subscription matching", async () => {
+  await withTempStore(async () => {
+    const definition: CombSpec = {
+      ...claimedDefinition("join-refusal"),
+      claim: { scope: "product-comb", inputPointer: "/pr", collision: "join-existing" },
+    };
+    const first = await instantiateRun({
+      definition,
+      input: { pr: 88 },
+      cwd: "/tmp",
+      productKey: "prod",
+      origin: { kind: "manual", actor: "first" },
+    });
+    await assert.rejects(
+      instantiateRun({
+        definition,
+        input: { pr: 88 },
+        cwd: "/tmp",
+        productKey: "prod",
+        origin: { kind: "trigger", triggerId: "other", deliveryId: "delivery" },
+        collision: "join-existing",
+      }),
+      (error: unknown) => {
+        assert.equal((error as { code?: string }).code, "claim_conflict");
+        assert.equal((error as { details?: { holdingRunId?: string } }).details?.holdingRunId, first.run.id);
+        return true;
+      },
+    );
+  });
+});
+
+test("review minor C4: claim declarations are structurally validated during lint", () => {
+  assert.throws(
+    () => lintComb({
+      formatVersion: 2,
+      name: "bad-claim",
+      input: { kind: "informal", description: "x" },
+      claim: { scope: "banana", inputPointer: 5, collision: "refuse" },
+      nodes: [agentNode("work")],
+      edges: [],
+    }),
+    /\$\.claim/,
+  );
 });

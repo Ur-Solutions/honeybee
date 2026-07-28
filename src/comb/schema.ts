@@ -45,14 +45,19 @@ export function normalizeComb(value: unknown, expectedName?: string): CombSpec {
   const edges = arrayAt(root.edges, "$.edges").map((entry, index) => {
     const edge = objectAt(entry, `$.edges[${index}]`);
     const kind = enumAt(edge.kind, `$.edges[${index}].kind`, ["forward", "retry", "waiting"] as const);
+    if (kind === "waiting") unsupported(`$.edges[${index}].kind`, "waiting edges");
     const on = enumAt(edge.on, `$.edges[${index}].on`, ["done", "failed", "waiting"] as const);
+    const when = edge.when !== undefined
+      ? normalizePredicate(edge.when, `$.edges[${index}].when`)
+      : undefined;
+    if (when) assertSlice1Predicate(when, `$.edges[${index}].when`);
     return {
       id: stringAt(edge.id, `$.edges[${index}].id`),
       from: stringAt(edge.from, `$.edges[${index}].from`),
       to: stringAt(edge.to, `$.edges[${index}].to`),
       kind,
       on,
-      ...(edge.when !== undefined ? { when: normalizePredicate(edge.when, `$.edges[${index}].when`) } : {}),
+      ...(when ? { when } : {}),
     };
   });
 
@@ -72,8 +77,8 @@ export function normalizeComb(value: unknown, expectedName?: string): CombSpec {
       value: normalizeValueSource(output.value, "$.output.value"),
     };
   }
-  if (root.claim !== undefined) normalized.claim = root.claim as CombSpec["claim"];
-  if (root.subscriptions !== undefined) normalized.subscriptions = root.subscriptions as CombSpec["subscriptions"];
+  if (root.claim !== undefined) normalized.claim = normalizeClaim(root.claim, "$.claim");
+  if (root.subscriptions !== undefined) unsupported("$.subscriptions", "subscriptions");
 
   validateNormalizedComb(normalized);
   return normalized;
@@ -167,6 +172,7 @@ function normalizeNode(value: unknown, path: string): CombNode {
   const id = stringAt(node.id, `${path}.id`);
   const binding = enumAt(node.binding, `${path}.binding`, ["strict", "guided", "open"] as const);
   const executor = enumAt(node.executor, `${path}.executor`, ["agent", "human", "engine"] as const);
+  if (node.checkout !== undefined) unsupported(`${path}.checkout`, "checkout requirements");
   const base = {
     id,
     binding,
@@ -174,12 +180,12 @@ function normalizeNode(value: unknown, path: string): CombNode {
     ...(node.subject !== undefined ? { subject: normalizeSubject(node.subject, `${path}.subject`) } : {}),
     ...(node.output !== undefined ? { output: normalizeContract(node.output, `${path}.output`) } : {}),
     ...(node.join !== undefined ? { join: normalizeJoin(node.join, `${path}.join`) } : {}),
-    ...(node.checkout !== undefined ? { checkout: normalizeCheckout(node.checkout, `${path}.checkout`) } : {}),
   };
   if (executor === "agent") {
     const agent = objectAt(node.agent, `${path}.agent`);
     const capacity = objectAt(agent.capacity, `${path}.agent.capacity`);
     const capacityKind = enumAt(capacity.kind, `${path}.agent.capacity.kind`, ["spawn", "flight"] as const);
+    if (capacityKind === "flight") unsupported(`${path}.agent.capacity.kind`, "flight capacity");
     return {
       ...base,
       executor,
@@ -206,40 +212,19 @@ function normalizeNode(value: unknown, path: string): CombNode {
     };
   }
   if (executor === "human") {
-    const human = objectAt(node.human, `${path}.human`);
-    const destination = objectAt(human.feedbackDestination, `${path}.human.feedbackDestination`);
-    const destinationType = enumAt(destination.type, `${path}.human.feedbackDestination.type`, ["bee", "new-agent", "pr-comment"] as const);
-    return {
-      ...base,
-      executor,
-      human: {
-        title: stringAt(human.title, `${path}.human.title`),
-        packetKind: enumAt(human.packetKind, `${path}.human.packetKind`, ["web", "desktop", "cli", "code"] as const),
-        ...(typeof human.summary === "string" ? { summary: human.summary } : {}),
-        ...(human.checklist !== undefined ? { checklist: human.checklist as Array<{ text: string; done: boolean }> } : {}),
-        feedbackDestination: destinationType === "bee"
-          ? { type: "bee", fromNodeId: stringAt(destination.fromNodeId, `${path}.human.feedbackDestination.fromNodeId`) }
-          : { type: destinationType },
-      },
-    };
+    unsupported(`${path}.executor`, "human executors");
   }
   const engine = objectAt(node.engine, `${path}.engine`);
   const kind = enumAt(engine.kind, `${path}.engine.kind`, ["predicate", "action", "child-run"] as const);
   if (kind === "predicate") {
-    return { ...base, executor, engine: { kind, predicate: normalizePredicate(engine.predicate, `${path}.engine.predicate`) } };
+    const predicate = normalizePredicate(engine.predicate, `${path}.engine.predicate`);
+    assertSlice1Predicate(predicate, `${path}.engine.predicate`);
+    return { ...base, executor, engine: { kind, predicate } };
   }
   if (kind === "action") {
-    return {
-      ...base,
-      executor,
-      engine: {
-        kind,
-        intent: enumAt(engine.intent, `${path}.engine.intent`, ["land", "run"] as const),
-        ...(engine.input !== undefined ? { input: engine.input as Record<string, ValueSource> } : {}),
-      },
-    };
+    unsupported(`${path}.engine.kind`, "engine actions");
   }
-  return { ...base, executor, engine: engine as unknown as Extract<CombNode, { executor: "engine" }>["engine"] };
+  unsupported(`${path}.engine.kind`, "child runs");
 }
 
 function normalizeContract(value: unknown, path: string): DataContract {
@@ -313,12 +298,20 @@ function normalizePredicate(value: unknown, path: string): PredicateSpec {
   return { kind, afterMs, from: enumAt(predicate.from, `${path}.from`, ["activation-start", "blocking-since"] as const) };
 }
 
-function normalizeCheckout(value: unknown, path: string) {
-  const checkout = objectAt(value, path);
+function normalizeClaim(value: unknown, path: string): NonNullable<CombSpec["claim"]> {
+  const claim = objectAt(value, path);
   return {
-    pool: stringAt(checkout.pool, `${path}.pool`),
-    mode: enumAt(checkout.mode, `${path}.mode`, ["exclusive", "shared"] as const),
+    scope: enumAt(claim.scope, `${path}.scope`, ["product-comb", "product"] as const),
+    inputPointer: pointerAt(claim.inputPointer, `${path}.inputPointer`),
+    collision: enumAt(claim.collision, `${path}.collision`, ["refuse", "join-existing"] as const),
   };
+}
+
+function assertSlice1Predicate(predicate: PredicateSpec, path: string): void {
+  if (predicate.kind === "ci-status") unsupported(`${path}.kind`, "ci-status predicates");
+  if (predicate.kind === "clock" && predicate.from === "blocking-since") {
+    unsupported(`${path}.from`, "blocking-since clocks");
+  }
 }
 
 function normalizeExpectations(value: unknown, path: string) {
@@ -571,4 +564,8 @@ function enumAt<const T extends readonly string[]>(value: unknown, path: string,
 
 function fail(path: string, message: string): never {
   throw new Error(`${path}: ${message}`);
+}
+
+function unsupported(path: string, feature: string): never {
+  fail(path, `${feature} are not supported in strict-spine slice 1`);
 }

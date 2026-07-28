@@ -144,6 +144,12 @@ async function combRun(parsed: Parsed) {
   }
   const eventJson = stringFlag(parsed, "event-json");
   if (eventJson && !triggerId) throw new CombError("invalid_argument", "--event-json requires trigger provenance");
+  if (eventJson) {
+    throw new CombError(
+      "invalid_argument",
+      "--event-json is not supported in strict-spine slice 1 because subscriptions are disabled",
+    );
+  }
   const event = eventJson ? objectValue(parseJson(eventJson, "origin event"), "origin event") : undefined;
   if (event && (event.triggerId !== triggerId || event.deliveryId !== deliveryId)) {
     throw new CombError("invalid_argument", "origin event triggerId/deliveryId must equal provenance flags");
