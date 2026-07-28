@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "description": "Public Honeybee Combs CLI envelope corpus. $type/$enum/$optional are matcher directives; every stdout value is one JSON object plus LF.",
+  "exitCodes": {
+    "success_or_durable_ack": 0,
+    "invalid_argument_or_schema": 2,
+    "not_found": 3,
+    "version_claim_or_idempotency_conflict": 4,
+    "ambiguous_activation_or_approval_required": 5,
+    "unresolved_effect_ambiguity": 6,
+    "external_dependency": 7,
+    "internal_or_corrupt_state": 70
+  },
+  "cases": [
+    {
+      "id": "comb-list-success",
+      "argv": ["comb", "list", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.list",
+        "result": {
+          "combs": {
+            "$type": "array"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-lint-success",
+      "argv": ["comb", "lint", "contracts/deep-review.strict.comb.json", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.lint",
+        "result": {
+          "valid": true,
+          "definitionDigest": {
+            "$pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "normalized": {
+            "$type": "object"
+          },
+          "warnings": {
+            "$type": "array"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-define-success",
+      "argv": ["comb", "define", "contracts/deep-review.strict.comb.json", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.define",
+        "result": {
+          "comb": {
+            "$type": "object",
+            "$required": ["schemaVersion", "name", "version", "digest", "definition", "provenance", "createdAt", "createdBy"]
+          },
+          "created": {
+            "$type": "boolean"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-inspect-success",
+      "argv": ["comb", "inspect", "deep-review-strict", "--version", "1", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.inspect",
+        "result": {
+          "comb": {
+            "$type": "object"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-run-success",
+      "argv": ["comb", "run", "deep-review-strict", "--version", "1", "--input", "-", "--cwd", "/repo", "--product", "honeybee", "--json"],
+      "stdin": {
+        "ref": "HEAD",
+        "effort": "low"
+      },
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": {
+            "$type": "object",
+            "$required": ["id", "status", "origin", "productKey", "activations", "definitionDigest", "cleanupStatus"]
+          },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": true
+        }
+      }
+    },
+    {
+      "id": "comb-runs-success",
+      "argv": ["comb", "runs", "--board", "--last", "200", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.runs",
+        "result": {
+          "runs": {
+            "$type": "array"
+          },
+          "nextSince": {
+            "$optional": true,
+            "$type": "string"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-status-success",
+      "argv": ["comb", "status", "$runId", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.status",
+        "result": {
+          "run": {
+            "$type": "object"
+          },
+          "hydratedActivation": {
+            "$optional": true,
+            "$type": "object"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-cancel-success",
+      "argv": ["comb", "cancel", "$runId", "--reason", "fixture", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.cancel",
+        "result": {
+          "runId": {
+            "$type": "string"
+          },
+          "status": "cancelled",
+          "fence": {
+            "$type": "object",
+            "$required": ["epoch", "requestedAt", "requestedBy"]
+          },
+          "cleanup": {
+            "$type": "object"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-events-success",
+      "argv": ["comb", "events", "$runId", "--after", "0", "--limit", "256", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.events",
+        "result": {
+          "runId": {
+            "$type": "string"
+          },
+          "after": 0,
+          "events": {
+            "$type": "array"
+          },
+          "nextAfter": {
+            "$type": "integer"
+          },
+          "hasMore": {
+            "$type": "boolean"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-not-found-failure",
+      "argv": ["comb", "status", "missing", "--json"],
+      "exitCode": 3,
+      "stdout": {
+        "ok": false,
+        "command": "comb.status",
+        "error": {
+          "code": "not_found",
+          "message": {
+            "$type": "string"
+          },
+          "details": {
+            "$optional": true
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-invalid-argument-failure",
+      "argv": ["comb", "run", "deep-review-strict", "--version", "nope", "--input", "-", "--json"],
+      "stdin": {},
+      "exitCode": 2,
+      "stdout": {
+        "ok": false,
+        "command": "comb.run",
+        "error": {
+          "code": "invalid_argument",
+          "message": {
+            "$type": "string"
+          },
+          "details": {
+            "$optional": true
+          }
+        }
+      }
+    }
+  ]
+}
