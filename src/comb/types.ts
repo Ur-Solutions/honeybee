@@ -312,6 +312,17 @@ export type BeeHandleRef = {
   flightLeaseId?: string;
 };
 
+export type CombActivationBinding = {
+  runId: string;
+  nodeId: NodeId;
+  attempt: number;
+  itemIndex: number;
+  taskId: string;
+  status: "current" | "historical";
+  attachedAt: string;
+  endedAt?: string;
+};
+
 export type EvidenceProducer = {
   kind: "bee" | "forum" | "pollinate" | "engine" | "operator";
   id: string;
@@ -471,6 +482,24 @@ export type RunEvent = {
   data?: JsonObject;
 };
 
+export type SubjectClaimRecord = {
+  schemaVersion: 1;
+  id: string;
+  scope: "product-comb" | "product";
+  productKey: string;
+  combName: string;
+  combVersion?: number;
+  definitionDigest: string;
+  declarationPointer: JsonPointer;
+  value: JsonValue;
+  valueDigest: string;
+  runId: string;
+  status: "prepared" | "held" | "released";
+  preparedAt: string;
+  heldAt?: string;
+  releasedAt?: string;
+};
+
 export type RunRecord = {
   schemaVersion: 1;
   id: string;
@@ -495,6 +524,7 @@ export type RunRecord = {
   cancellation?: CancellationFence;
   cleanup: RunCleanupRecord;
   intakeReady: boolean;
+  subjectClaimId?: string;
   output?: JsonValue;
   eventTail: RunEvent[];
   eventsRetainedFrom: number;

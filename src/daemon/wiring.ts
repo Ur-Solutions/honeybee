@@ -18,6 +18,7 @@ import { createTaskSupplyDispatcher } from "./taskSupplyDispatcher.js";
 import { createNodeReachabilityTracker } from "./nodeReachability.js";
 import { createPoolSweeper } from "./poolSweep.js";
 import { createFlightSweeper } from "./flightSweep.js";
+import { createCombSweeper } from "./combSweep.js";
 import { createUsageSampler } from "./usageSampler.js";
 import { createTokenRefresher } from "./tokenRefresh.js";
 import { defaultCapturePanes, defaultProbeNodes } from "./probe.js";
@@ -134,6 +135,7 @@ export function buildDefaultDeps(): TickDeps {
     dispatchAutoTitle: createAutoTitleDispatcher(),
     refreshRemoteTokens: createTokenRefresher(),
     sweepPools: createPoolSweeper(),
+    sweepCombs: createCombSweeper(),
     sweepFlights: createFlightSweeper(),
     // Pacing lives in runDaemon's dedicated chain-sync loop (every few minutes,
     // never inside the tick path): each call here is a real sweep.
