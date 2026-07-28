@@ -108,6 +108,9 @@ export function validateNormalizedComb(spec: CombSpec): void {
     if (node.executor === "human" && node.binding !== "strict") {
       fail(`$.nodes[${index}].binding`, "human nodes must be strict");
     }
+    if (node.executor === "human" && node.output !== undefined) {
+      fail(`$.nodes[${index}].output`, "human nodes use the fixed verdict/comment/destination contract and may not override it");
+    }
     if (node.executor === "engine" && node.binding !== "strict") {
       fail(`$.nodes[${index}].binding`, "engine nodes must be strict");
     }
@@ -171,7 +174,7 @@ function normalizeNode(value: unknown, path: string): CombNode {
     ...(node.subject !== undefined ? { subject: normalizeSubject(node.subject, `${path}.subject`) } : {}),
     ...(node.output !== undefined ? { output: normalizeContract(node.output, `${path}.output`) } : {}),
     ...(node.join !== undefined ? { join: normalizeJoin(node.join, `${path}.join`) } : {}),
-    ...(node.checkout !== undefined ? { checkout: node.checkout as CombNode["checkout"] } : {}),
+    ...(node.checkout !== undefined ? { checkout: normalizeCheckout(node.checkout, `${path}.checkout`) } : {}),
   };
   if (executor === "agent") {
     const agent = objectAt(node.agent, `${path}.agent`);
@@ -198,12 +201,27 @@ function normalizeNode(value: unknown, path: string): CombNode {
                 ...(typeof capacity.mixKey === "string" ? { mixKey: capacity.mixKey } : {}),
               },
         brief: stringAt(agent.brief, `${path}.agent.brief`),
-        ...(agent.expectations !== undefined ? { expectations: agent.expectations as NonNullable<CombNode & { executor: "agent" }>["agent"]["expectations"] } : {}),
+        ...(agent.expectations !== undefined ? { expectations: normalizeExpectations(agent.expectations, `${path}.agent.expectations`) } : {}),
       },
     };
   }
   if (executor === "human") {
-    return { ...base, executor, human: objectAt(node.human, `${path}.human`) as unknown as Extract<CombNode, { executor: "human" }>["human"] };
+    const human = objectAt(node.human, `${path}.human`);
+    const destination = objectAt(human.feedbackDestination, `${path}.human.feedbackDestination`);
+    const destinationType = enumAt(destination.type, `${path}.human.feedbackDestination.type`, ["bee", "new-agent", "pr-comment"] as const);
+    return {
+      ...base,
+      executor,
+      human: {
+        title: stringAt(human.title, `${path}.human.title`),
+        packetKind: enumAt(human.packetKind, `${path}.human.packetKind`, ["web", "desktop", "cli", "code"] as const),
+        ...(typeof human.summary === "string" ? { summary: human.summary } : {}),
+        ...(human.checklist !== undefined ? { checklist: human.checklist as Array<{ text: string; done: boolean }> } : {}),
+        feedbackDestination: destinationType === "bee"
+          ? { type: "bee", fromNodeId: stringAt(destination.fromNodeId, `${path}.human.feedbackDestination.fromNodeId`) }
+          : { type: destinationType },
+      },
+    };
   }
   const engine = objectAt(node.engine, `${path}.engine`);
   const kind = enumAt(engine.kind, `${path}.engine.kind`, ["predicate", "action", "child-run"] as const);
@@ -257,10 +275,17 @@ function normalizePredicate(value: unknown, path: string): PredicateSpec {
   const predicate = objectAt(value, path);
   const kind = enumAt(predicate.kind, `${path}.kind`, ["seal-present", "verdict", "ci-status", "output-equals", "clock"] as const);
   if (kind === "seal-present") {
+    let statuses: Extract<PredicateSpec, { kind: "seal-present" }>["statuses"];
+    if (predicate.statuses !== undefined) {
+      statuses = arrayAt(predicate.statuses, `${path}.statuses`).map((status, index) =>
+        enumAt(status, `${path}.statuses[${index}]`, ["done", "blocked", "needs_input", "failed"] as const),
+      );
+      if (statuses.length === 0) fail(`${path}.statuses`, "must not be empty");
+    }
     return {
       kind,
       nodeId: stringAt(predicate.nodeId, `${path}.nodeId`),
-      ...(predicate.statuses !== undefined ? { statuses: predicate.statuses as Extract<PredicateSpec, { kind: "seal-present" }>["statuses"] } : {}),
+      ...(statuses ? { statuses } : {}),
       ...(typeof predicate.sealType === "string" ? { sealType: predicate.sealType } : {}),
     };
   }
@@ -286,6 +311,37 @@ function normalizePredicate(value: unknown, path: string): PredicateSpec {
   const afterMs = numberAt(predicate.afterMs, `${path}.afterMs`);
   if (!Number.isSafeInteger(afterMs) || afterMs < 0) fail(`${path}.afterMs`, "must be a non-negative integer");
   return { kind, afterMs, from: enumAt(predicate.from, `${path}.from`, ["activation-start", "blocking-since"] as const) };
+}
+
+function normalizeCheckout(value: unknown, path: string) {
+  const checkout = objectAt(value, path);
+  return {
+    pool: stringAt(checkout.pool, `${path}.pool`),
+    mode: enumAt(checkout.mode, `${path}.mode`, ["exclusive", "shared"] as const),
+  };
+}
+
+function normalizeExpectations(value: unknown, path: string) {
+  return arrayAt(value, path).map((entry, index) => {
+    const expectation = objectAt(entry, `${path}[${index}]`);
+    const evidence = objectAt(expectation.evidence, `${path}[${index}].evidence`);
+    const kind = enumAt(evidence.kind, `${path}[${index}].evidence.kind`, ["agent-report", "seal-test", "seal-artifact", "seal-file"] as const);
+    return {
+      id: stringAt(expectation.id, `${path}[${index}].id`),
+      description: stringAt(expectation.description, `${path}[${index}].description`),
+      evidence:
+        kind === "agent-report"
+          ? { kind }
+          : kind === "seal-test"
+            ? { kind, ...(typeof evidence.commandIncludes === "string" ? { commandIncludes: evidence.commandIncludes } : {}) }
+            : kind === "seal-artifact"
+              ? {
+                  kind,
+                  artifactKind: enumAt(evidence.artifactKind, `${path}[${index}].evidence.artifactKind`, ["branch", "diff", "url", "fixture"] as const),
+                }
+              : { kind, glob: stringAt(evidence.glob, `${path}[${index}].evidence.glob`) },
+    };
+  });
 }
 
 export function normalizeValueSource(value: unknown, path = "$"): ValueSource {

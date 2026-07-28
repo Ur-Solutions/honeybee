@@ -277,7 +277,7 @@ function createRetryAttempt(run: RunRecord, edge: CombEdge, source: ActivationRe
   }
   const generation = run.nextCohortGeneration;
   run.nextCohortGeneration += 1;
-  createActivation(run, destination, {
+  const created = createActivation(run, destination, {
     attempt,
     itemIndex,
     cohortId: `${run.id}:g${generation}:i${itemIndex}`,
@@ -285,6 +285,11 @@ function createRetryAttempt(run: RunRecord, edge: CombEdge, source: ActivationRe
     incomingEdgeFiringIds: [firingId],
     now,
   });
+  const backoff = Math.min(
+    limits.retryBackoffMs * (2 ** Math.max(0, attempt - 2)),
+    limits.retryBackoffMaxMs,
+  );
+  created.nextEligibleAt = new Date(Date.parse(now) + backoff).toISOString();
   return true;
 }
 

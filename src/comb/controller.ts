@@ -101,8 +101,8 @@ async function sweepOneRun(
 }
 
 async function ingestAgentEvidence(deps: CombSweepDeps, run: RunRecord, now: string): Promise<void> {
-  for (const activation of currentActivations(run)) {
-    if (activation.beeHandles.length === 0 || isTerminal(activation)) continue;
+  for (const activation of Object.values(run.activations)) {
+    if (activation.beeHandles.length === 0 || (isTerminal(activation) && !activation.invalidatedAt)) continue;
     for (const handle of activation.beeHandles) {
       const latest = await deps.latestSeal(handle.name);
       if (!latest) continue;

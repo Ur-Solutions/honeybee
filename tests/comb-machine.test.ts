@@ -320,3 +320,44 @@ test("cancellation is a fence before effects and crossing it during execute beco
     assert.equal(crossed.cleanup.status, "blocked-ambiguous");
   });
 });
+
+test("state-machine safety properties hold across generated evidence/order traces", async () => {
+  await withTempStore(async (dir) => {
+    for (let seed = 1; seed <= 40; seed += 1) {
+      const definition: CombSpec = {
+        formatVersion: 2,
+        name: `property-${seed}`,
+        input: { kind: "informal", description: "none" },
+        nodes: [reviewerNode("work")],
+        edges: [{ id: "retry", from: "work", to: "work", kind: "retry", on: "failed" }],
+      };
+      const run = await createRun({
+        definition,
+        input: null,
+        cwd: dir,
+        productKey: "test",
+        origin: { kind: "manual", actor: "property" },
+        policies: { maxAttemptsPerActivation: 3, retryBackoffMs: 0, retireAgentsOnTerminal: false },
+      });
+      let state = seed;
+      for (let step = 0; step < 8 && run.status === "active"; step += 1) {
+        state = (state * 1103515245 + 12345) & 0x7fffffff;
+        const current = Object.values(run.activations)
+          .filter((activation) => !activation.invalidatedAt)
+          .sort((a, b) => b.address.attempt - a.address.attempt)[0]!;
+        if (current.status === "pending") activateAgent(run, current, `2026-07-28T12:00:0${step}.000Z`);
+        if (state % 3 === 0) {
+          applySealCompletion(run, current, sealFor(current, { ok: true, finding: `seed-${seed}` }), `2026-07-28T12:00:0${step}.500Z`);
+        } else if (state % 3 === 1) {
+          applySealCompletion(run, current, sealFor(current, { invalid: true }), `2026-07-28T12:00:0${step}.500Z`);
+        }
+        reconcileMachine(run, `2026-07-28T12:00:0${step}.900Z`);
+        for (const activation of Object.values(run.activations)) {
+          if (activation.status === "done") assert.notEqual(activation.output, undefined, "done requires schema-valid output");
+        }
+        const identities = Object.values(run.activations).map((activation) => activation.id);
+        assert.equal(new Set(identities).size, identities.length, "attempts never overwrite history");
+      }
+    }
+  });
+});
