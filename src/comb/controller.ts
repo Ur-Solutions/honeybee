@@ -286,16 +286,15 @@ async function ingestAgentEvidence(deps: CombSweepDeps, run: RunRecord, now: str
       ({ activation }) => latest.seal.taskId === activation.taskId,
     );
     if (!selected) {
-      const adopted = liveCandidates.find(({ source }) => source === "adopted");
-      if (adopted) {
-        await ingestSealEvidence(
-          run,
-          adopted.activation,
-          latest.filename,
-          latest.seal,
-          { mismatchDisposition: "inert" },
-        );
-      }
+      const fallback = liveCandidates[0];
+      if (!fallback) continue;
+      await ingestSealEvidence(
+        run,
+        fallback.activation,
+        latest.filename,
+        latest.seal,
+        fallback.source === "adopted" ? { mismatchDisposition: "inert" } : {},
+      );
       continue;
     }
     const priorReboundAttempt = !exact &&
