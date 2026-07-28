@@ -29,6 +29,7 @@ import { effectiveTags, normalizeTagArg } from "../tags.js";
 import { appendedPaneText, parseTailOptions } from "../tail.js";
 import { formatShellCommand } from "../tmux.js";
 import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "../transcripts.js";
+import { listBeeViews } from "../view/index.js";
 import { waitForIdle, waitForSeal, waitHelpText } from "../wait.js";
 import { resolve } from "node:path";
 import { arrayFlag, assertLocalFleetReadable, buildStateContext, currentTmuxSession, ensureLive, formatHiveStateCell, liveTargetsAcrossNodes, resolveBeeInCurrentPane, resolveSession, sleep, stringFlag, transcriptBanner } from "../cli/shared.js";
@@ -727,13 +728,17 @@ export async function applyBeeWindowOptions(record: SessionRecord): Promise<void
 
 
 /**
- * Jump the attached client to the next bee that needs attention — `waiting`,
- * `done`, or `failed` by default (override with --state). Reads live @hive_state
- * straight off the local tmux server (no store), so it stays O(1) at any fleet
- * size. Repeated presses cycle through the attention set; --prev walks back.
+ * Jump the attached client to the next bee that needs attention. The queue is
+ * driven by the BeeView displayState (one observation pass, same cost as
+ * `hive ls` — BEEVIEW_READ_API.md decision 4, an operator-approved change from
+ * the old @hive_state read): by default needs-auth, needs-reply, and
+ * needs-action rank above stop-failed and ready, so bees with an open human
+ * request are visited first. Override the set/order with --state; repeated
+ * presses cycle through the attention set; --prev walks back.
  *
- * Local-only by design: switch-client cannot cross to a remote tmux server, so
- * remote bees are out of scope (use `hive attach <bee>` for those).
+ * Local-only by design: switch-client cannot cross to a remote tmux server
+ * (use `hive attach <bee>` for those), and pane-less HSR bees have no session
+ * to switch to.
  */
 export async function cmdNext(parsed: Parsed) {
   const stateFlag = stringFlag(parsed, ["state"]);
@@ -741,8 +746,14 @@ export async function cmdNext(parsed: Parsed) {
   const prev = truthy(flag(parsed, "prev"));
 
   const substrate = localSubstrate();
-  const stateMap = await substrate.listSessionStates();
-  const sessions: BeeStateEntry[] = [...stateMap].map(([name, state]) => ({ name, state }));
+  const list = await listBeeViews();
+  const sessions: BeeStateEntry[] = list.bees
+    .filter((view) =>
+      view.bee.node === LOCAL_NODE_NAME &&
+      view.latestRuntime.substrate === "local-tmux" &&
+      (view.latestRuntime.state === "online" || view.latestRuntime.state === "starting"))
+    .map((view) => ({ name: view.latestRuntime.tmuxTarget ?? view.bee.name, state: view.displayState }));
+  const stateMap = new Map(sessions.map((session) => [session.name, session.state]));
 
   const current = process.env.TMUX ? await currentTmuxSession() : undefined;
   const target = pickNextBee(sessions, current, { states, prev });

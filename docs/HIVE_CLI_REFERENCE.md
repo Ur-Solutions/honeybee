@@ -871,25 +871,30 @@ hive next [--state <comma-list>] [--prev] [--print]
 
 The attention set:
 
-- It is the LOCAL bees whose live `@hive_state` is one of the attention states.
-  The default attention states are `waiting,done,failed` — everything tracked
-  that is NOT actively `working`.
-- `@hive_state` is read straight from the local tmux server (one
-  `tmux list-sessions` over the option — no per-bee store read). hive writes it
-  on its own spawn/brief/send/seal transitions, and the daemon and agent
-  Stop/Notification hooks keep it current; a bee with no `@hive_state` set (or
-  one that is `working`) is never in the set.
-- `--state waiting` (or a comma list like `--state waiting,blocked`) overrides
-  the default set. The order you list states in is the order they are visited.
+- It is the LOCAL, tmux-attached bees whose **BeeView display state** (see
+  `hive state`) is one of the attention states. The default attention states
+  are `needs-auth,needs-reply,needs-action,stop-failed,ready` — every state
+  naming an open human request ranks above `ready` (a settled bee whose
+  output or result awaits review); `working`/`starting` bees are autonomous
+  and never in the default set.
+- The queue is derived from one BeeView observation pass (same cost as
+  `hive ls`), so hook facts, structured needs-input requests, and pane
+  evidence all feed it pre-arbitrated — this replaced the old coarse
+  `@hive_state` read (operator-approved behavior change).
+- `--state needs-reply` (or a comma list like `--state needs-reply,ready`)
+  overrides the default set. The order you list states in is the order they
+  are visited.
 - Remote bees are never in the queue — the attention queue is the local tmux
   server (a remote bee lives on a different server and cannot be
-  `switch-client`'ed to).
+  `switch-client`'ed to) — and pane-less HSR bees have no session to switch
+  to.
 
 Ordering and cycling:
 
 - Bees are grouped by attention-state priority (the order given to `--state`;
-  default `waiting` → `done` → `failed`), and within each group oldest-first
-  (longest in that state), using each bee's last observed state time.
+  default `needs-auth` → `needs-reply` → `needs-action` → `stop-failed` →
+  `ready`), and within each group ordered by name, so repeated presses cycle
+  stably.
 - `hive next` finds your current session in the ordered queue and jumps to the
   NEXT entry, wrapping around at the end; `--prev` jumps to the previous one. If
   your current pane is not itself a bee in the set, `next` enters at the front
@@ -910,11 +915,11 @@ Switching (nesting-safe):
 Examples:
 
 ```sh
-hive next                       # → the oldest waiting bee, then cycle on repeat
-hive next --prev                # step backward through the queue
-hive next --state waiting       # only bees waiting on input
-hive next --state waiting,done  # waiting first, then done
-hive next --print               # emit the switch-client command, don't switch
+hive next                             # → the first bee with an open request, then cycle
+hive next --prev                      # step backward through the queue
+hive next --state needs-reply         # only bees with an open question/permission
+hive next --state needs-reply,ready   # requests first, then settled bees
+hive next --print                     # emit the switch-client command, don't switch
 ```
 
 ### Retired: `hive view` / `hive workspace` / `hive quest`

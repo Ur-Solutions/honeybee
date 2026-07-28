@@ -366,7 +366,7 @@ function printHelp() {
       title: "Manage bees",
       rows: [
         ["attach", "<session>", "attach to the tmux session (nesting-safe inside tmux)"],
-        ["next", "", "jump to the next bee needing you (waiting/done/failed; --prev, --state)"],
+        ["next", "", "jump to the next bee needing you (needs-auth/needs-reply/needs-action/stop-failed/ready; --prev, --state)"],
         ["fork", "<bee> [checkpoint]", "branch a bee's thread into a fresh bee (--at <turn>, --list-anchors)"],
         ["handoff", "<bee> [-p <instr>]", "compact via self-seal and start a fresh bee from the summary (--from-seal)"],
         ["here", "", "resolve the bee owning the current pane (--id, --json)"],

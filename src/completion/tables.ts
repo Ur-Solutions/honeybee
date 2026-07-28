@@ -214,7 +214,7 @@ export const PER_COMMAND_FLAG_VALUE_KINDS: Record<string, Record<string, FlagVal
     "--stop-on-seal": "seal-status",
   },
   next: {
-    "--state": "hive-state",
+    "--state": "display-state",
   },
   state: {
     "--state": "display-state",
