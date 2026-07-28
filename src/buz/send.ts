@@ -6,6 +6,7 @@ import { withFileLock } from "../lock.js";
 import { appendLedger } from "../store.js";
 import { resetTaskSupplyFeedsForHumanInteraction, TASK_SUPPLY_SENDER_NAME } from "../tasks/supplyConfig.js";
 import { generateMessageId } from "./ids.js";
+import { formatBuzInjection } from "./inject.js";
 import { downgradeTier, resolveBuzAccept } from "./policy.js";
 import {
   DELIVERY_LOCK_TIMEOUT_MS,
@@ -163,7 +164,7 @@ async function deliverInterruptTier(context: BuzDeliveryContext): Promise<BuzDel
   try {
     await withFileLock(
       deliveryLockPath(input.recipient.name),
-      () => transport.substrate.sendText(transport.tmuxTarget, input.body, transport.agentPaneId),
+      () => transport.substrate.sendText(transport.tmuxTarget, formatBuzInjection(message), transport.agentPaneId),
       { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS },
     );
     message.deliveredAt = new Date().toISOString();
@@ -202,7 +203,7 @@ async function deliverNextToolTier(context: BuzDeliveryContext): Promise<BuzDeli
   try {
     await withFileLock(
       deliveryLockPath(input.recipient.name),
-      () => transport.substrate.sendText(transport.tmuxTarget, input.body, transport.agentPaneId, { mode: "next-tool" }),
+      () => transport.substrate.sendText(transport.tmuxTarget, formatBuzInjection(message), transport.agentPaneId, { mode: "next-tool" }),
       { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS },
     );
     // deliveredAt marks the hand-off to the runner host; the host flushes at

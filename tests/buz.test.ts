@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  BUZ_INJECTION_MARKER,
   BUZ_TIERS,
   beeMailboxDir,
   buzRoot,
@@ -11,6 +12,7 @@ import {
   DEFAULT_BUZ_ACCEPT,
   downgradeTier,
   externalOutboxDir,
+  formatBuzInjection,
   generateMessageId,
   inboxFilename,
   listMessages,
@@ -296,7 +298,10 @@ test("sendBuzMessage tier=interrupt with transport delivers and copies to inbox/
       transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
     });
     assert.equal(result.message.deliveredAs, "interrupt");
-    assert.equal(pasted, "INTR");
+    // Bee sends are pasted with the sender-attribution envelope, not verbatim.
+    assert.equal(pasted, formatBuzInjection(result.message));
+    assert.ok(pasted.startsWith(BUZ_INJECTION_MARKER));
+    assert.ok(pasted.endsWith("\n\nINTR"));
     const inbox = await readdir(beeMailboxDir("CO.aaa", "inbox"));
     assert.equal(inbox.length, 1);
   });
@@ -417,7 +422,7 @@ test("broadcast: per-bee policy applied independently", async () => {
       transport: { substrate: sub, tmuxTarget: b.tmuxTarget },
     });
     assert.equal(ra.message.deliveredAs, "interrupt");
-    assert.equal(aPasted, "BCAST");
+    assert.equal(aPasted, formatBuzInjection(ra.message));
     assert.equal(rb.message.deliveredAs, "queue");
     assert.equal((await readdir(beeMailboxDir("CO.bbb", "queue"))).length, 1);
   });
@@ -561,7 +566,7 @@ test("processQueueForBee drains queue/ in mtime order and moves to inbox/", asyn
     const sub = fakeSubstrate({ sendText: async (_t, text) => { calls.push(text); } });
     const result = await processQueueForBee(recipient, { transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget } });
 
-    assert.deepEqual(calls, ["first", "second"]);
+    assert.deepEqual(calls, [formatBuzInjection(a.message), formatBuzInjection(b.message)]);
     assert.deepEqual(result.delivered, [a.message.id, b.message.id]);
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 0);
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "inbox"))).length, 2);
@@ -862,13 +867,70 @@ test("processQueueForBee deliverLimit=1 delivers exactly one message per drain",
 
     const first = await processQueueForBee(recipient, { transport, deliverLimit: 1 });
     assert.deepEqual(first.delivered, [a.message.id]);
-    assert.deepEqual(calls, ["first"]);
+    assert.deepEqual(calls, [formatBuzInjection(a.message)]);
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
 
     // The NEXT idle observation delivers the next message.
     const second = await processQueueForBee(recipient, { transport, deliverLimit: 1 });
     assert.deepEqual(second.delivered, [b.message.id]);
-    assert.deepEqual(calls, ["first", "second"]);
+    assert.deepEqual(calls, [formatBuzInjection(a.message), formatBuzInjection(b.message)]);
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 0);
   });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Injection envelope (buz/inject.ts).
+// ──────────────────────────────────────────────────────────────────────────
+
+test("formatBuzInjection wraps a bee send in marker + one JSON metadata line + body", () => {
+  const message: BuzMessage = {
+    id: "msg123",
+    from: { kind: "bee", id: "CL.cc9" },
+    to: "CO.aaa",
+    tier: "queue",
+    deliveredAs: "queue",
+    sentAt: "2026-05-28T00:00:00.000Z",
+    subject: "hello",
+    body: "line one\nline two",
+  };
+  const text = formatBuzInjection(message);
+  const [marker, metaLine, blank, ...rest] = text.split("\n");
+  assert.equal(marker, BUZ_INJECTION_MARKER);
+  assert.deepEqual(JSON.parse(metaLine!), {
+    version: 1,
+    from: "CL.cc9",
+    tier: "queue",
+    id: "msg123",
+    sentAt: "2026-05-28T00:00:00.000Z",
+    subject: "hello",
+  });
+  assert.equal(blank, "");
+  assert.equal(rest.join("\n"), "line one\nline two");
+});
+
+test("formatBuzInjection leaves human sends verbatim (no envelope)", () => {
+  const message: BuzMessage = {
+    id: "msg123",
+    from: { kind: "human", name: "tormod" },
+    to: "CO.aaa",
+    tier: "interrupt",
+    deliveredAs: "interrupt",
+    sentAt: "2026-05-28T00:00:00.000Z",
+    body: "NOW",
+  };
+  assert.equal(formatBuzInjection(message), "NOW");
+});
+
+test("formatBuzInjection omits subject from metadata when absent", () => {
+  const message: BuzMessage = {
+    id: "msg123",
+    from: { kind: "bee", id: "CL.cc9" },
+    to: "CO.aaa",
+    tier: "queue",
+    deliveredAs: "queue",
+    sentAt: "2026-05-28T00:00:00.000Z",
+    body: "x",
+  };
+  const metaLine = formatBuzInjection(message).split("\n")[1]!;
+  assert.equal("subject" in JSON.parse(metaLine), false);
 });

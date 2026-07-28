@@ -14,6 +14,7 @@ import {
   recipientWriteLockPath,
   serializeBuzMessage,
 } from "./storage.js";
+import { formatBuzInjection } from "./inject.js";
 import { type BuzMessage, type DaemonDrainContext, type DrainResult } from "../buz.js";
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -81,7 +82,7 @@ export async function processQueueForBee(
       }
 
       try {
-        await context.transport.substrate.sendText(context.transport.tmuxTarget, message.body, context.transport.agentPaneId);
+        await context.transport.substrate.sendText(context.transport.tmuxTarget, formatBuzInjection(message), context.transport.agentPaneId);
       } catch (error) {
         const retriesPath = `${entry.path}.retries`;
         const prev = Number((await readFile(retriesPath, "utf8").catch(() => "0")).trim()) || 0;

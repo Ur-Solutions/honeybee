@@ -154,6 +154,8 @@ export type DrainResult = {
 
 export { generateMessageId } from "./buz/ids.js";
 
+export { BUZ_INJECTION_MARKER, formatBuzInjection, type BuzInjectionMeta } from "./buz/inject.js";
+
 export { downgradeTier, parseAcceptFlag, resolveBuzAccept, validateAcceptList } from "./buz/policy.js";
 
 export {

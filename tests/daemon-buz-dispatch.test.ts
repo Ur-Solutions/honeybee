@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   beeMailboxDir,
+  formatBuzInjection,
   parseBuzMessage,
   sendBuzMessage,
   type BuzSender,
@@ -193,7 +194,7 @@ test("dispatchBuzDrains drains queue on active->idle_with_output and moves to in
     // delivery starts a new turn, so "second" waits for the NEXT idle tick.
     assert.equal(outcomes.length, 1);
     assert.deepEqual(outcomes[0]!.result.delivered, [a.message.id]);
-    assert.deepEqual(calls, ["first"]);
+    assert.deepEqual(calls, [formatBuzInjection(a.message)]);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).length, 1);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 1);
 
@@ -203,7 +204,7 @@ test("dispatchBuzDrains drains queue on active->idle_with_output and moves to in
       { resolveSubstrate: () => substrate },
     );
     assert.deepEqual(next[0]!.result.delivered, [b.message.id]);
-    assert.deepEqual(calls, ["first", "second"]);
+    assert.deepEqual(calls, [formatBuzInjection(a.message), formatBuzInjection(b.message)]);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).length, 0);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 2);
   });
@@ -222,7 +223,7 @@ test("dispatchBuzDrains drains a bee that is ALREADY idle when a message lands i
 
     assert.equal(outcomes.length, 1);
     assert.deepEqual(outcomes[0]!.result.delivered, [sent.message.id]);
-    assert.deepEqual(calls, ["while-idle"]);
+    assert.deepEqual(calls, [formatBuzInjection(sent.message)]);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).filter((f) => f.endsWith(".md")).length, 0);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 1);
   });
@@ -285,10 +286,10 @@ test("dispatchBuzDrains does NOT drain when transition target is not idle_with_o
 test("dispatchBuzDrains delivers queued messages in id order across two senders, one per tick", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa");
-    const sent: { id: string; body: string }[] = [];
+    const sent: { id: string; injected: string }[] = [];
     for (const body of ["m1", "m2", "m3"]) {
       const r = await sendBuzMessage({ recipient, sender, tier: "queue", body });
-      sent.push({ id: r.message.id, body });
+      sent.push({ id: r.message.id, injected: formatBuzInjection(r.message) });
       await new Promise((r) => setTimeout(r, 5));
     }
 
@@ -305,7 +306,7 @@ test("dispatchBuzDrains delivers queued messages in id order across two senders,
       delivered.push(...outcomes[0]!.result.delivered);
     }
 
-    assert.deepEqual(calls, sent.map((s) => s.body));
+    assert.deepEqual(calls, sent.map((s) => s.injected));
     assert.deepEqual(delivered, sent.map((s) => s.id));
   });
 });
