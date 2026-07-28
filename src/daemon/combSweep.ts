@@ -15,8 +15,9 @@ import {
   type AgentSpawnRequest,
   type CombSweepDeps,
   type CombSweepOutcome,
+  type HumanPacketQuarantineNotice,
 } from "../comb/controller.js";
-import { listSweepableRuns } from "../comb/store.js";
+import { listSweepableRuns, loadRun } from "../comb/store.js";
 import { transactionalRetire } from "../kill.js";
 import { withFileLock } from "../lock.js";
 import { scanLatestSeal } from "../seal.js";
@@ -70,6 +71,7 @@ export function createCombSweeper(
         body: notice.message,
       });
     },
+    notifyPacketQuarantine: notifyPacketQuarantine,
     releaseClaim,
     withRunSweepLock: (runId, fn) =>
       withFileLock(join(combRunDir(runId), ".sweep.lock"), fn, { timeoutMs: 5_000, staleMs: 10 * 60_000 }),
@@ -103,6 +105,27 @@ export function createCombSweeper(
       });
     return report;
   };
+}
+
+async function notifyPacketQuarantine(notice: HumanPacketQuarantineNotice): Promise<void> {
+  const run = notice.runId ? await loadRun(notice.runId) : null;
+  const recipientName = run?.origin.kind === "attached"
+    ? run.origin.beeName
+    : process.env.HIVE_COMB_OPERATOR_BEE;
+  if (!recipientName) {
+    throw new Error(
+      "malformed Forum packet was quarantined but no operator bee could be resolved; set HIVE_COMB_OPERATOR_BEE",
+    );
+  }
+  const recipient = await loadSession(recipientName);
+  if (!recipient) throw new Error(`operator bee is not registered: ${recipientName}`);
+  await sendBuzMessage({
+    recipient,
+    sender: { kind: "bee", id: notice.runId ? `comb:${notice.runId}` : "comb:forum" },
+    tier: "queue",
+    subject: `comb Forum packet quarantined${notice.packetId ? ` ${notice.packetId}` : ""}`,
+    body: notice.message,
+  });
 }
 
 async function spawnCombAgent(request: AgentSpawnRequest): Promise<{ name: string; id?: string }> {

@@ -25,7 +25,11 @@ import type {
   ReviewFeedbackDestination,
   RunRecord,
 } from "./types.js";
-import type { ForumPacketEffectRequest } from "./forum.js";
+import type {
+  ForumPacketEffectRequest,
+  ForumPacketListResult,
+  ForumPacketQuarantine,
+} from "./forum.js";
 
 export type LatestCombSeal = { filename: string; seal: SealRecord } | null;
 
@@ -63,10 +67,11 @@ export type CombSweepDeps = {
   adoptAgent?: (request: AgentAdoptRequest) => Promise<{ name: string; id?: string }>;
   lookupAgent: (name: string) => Promise<SessionRecord | null>;
   retireAgent: (name: string) => Promise<void>;
-  listHumanPackets?: () => Promise<ForumPacket[]>;
+  listHumanPackets?: () => Promise<ForumPacket[] | ForumPacketListResult>;
   executeHumanEffect?: (request: ForumPacketEffectRequest) => Promise<ForumPacket>;
   packetDigest?: (packet: ForumPacket) => string;
   notifyOperator?: (notice: HumanStallNotice) => Promise<void>;
+  notifyPacketQuarantine?: (notice: HumanPacketQuarantineNotice) => Promise<void>;
   releaseClaim?: (claimId: string, runId: string) => Promise<void>;
   withRunSweepLock?: <T>(runId: string, fn: () => Promise<T>) => Promise<T>;
   now: () => number;
@@ -97,6 +102,10 @@ export type HumanStallNotice = {
   message: string;
 };
 
+export type HumanPacketQuarantineNotice = ForumPacketQuarantine & {
+  message: string;
+};
+
 export async function sweepCombs(
   deps: CombSweepDeps,
   records: readonly SessionRecord[],
@@ -107,9 +116,50 @@ export async function sweepCombs(
   const hasHumanNodes = runs.some((run) =>
     run.currentSnapshot.definition.nodes.some((node) => node.executor === "human")
   );
-  const packets = hasHumanNodes && deps.listHumanPackets
-    ? await deps.listHumanPackets()
-    : [];
+  let packets: ForumPacket[] = [];
+  let quarantined: ForumPacketQuarantine[] = [];
+  if (hasHumanNodes && deps.listHumanPackets) {
+    try {
+      const polled = await deps.listHumanPackets();
+      if (Array.isArray(polled)) {
+        packets = polled;
+      } else {
+        packets = polled.packets;
+        quarantined = polled.quarantined;
+      }
+    } catch (error) {
+      outcomes.push({
+        run: "*",
+        action: "error",
+        error: `Forum packet poll degraded: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+  for (const packet of quarantined) {
+    outcomes.push({
+      run: packet.runId ?? "*",
+      action: "error",
+      detail: `quarantined Forum packet${packet.packetId ? ` ${packet.packetId}` : ""}`,
+      error: packet.error,
+    });
+    if (!deps.notifyPacketQuarantine) continue;
+    try {
+      await deps.notifyPacketQuarantine({
+        ...packet,
+        message:
+          `Comb quarantined malformed Forum packet${packet.packetId ? ` ${packet.packetId}` : ""} ` +
+          `at list index ${packet.index}: ${packet.error}`,
+      });
+    } catch (error) {
+      outcomes.push({
+        run: packet.runId ?? "*",
+        action: "error",
+        error: `Forum quarantine notification failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      });
+    }
+  }
   const packetsById = new Map(packets.map((packet) => [packet.id, packet]));
   const recordsByName = new Map(records.map((record) => [record.name, record]));
   for (const listed of runs) {

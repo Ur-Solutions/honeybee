@@ -38,12 +38,45 @@ type ForumEnvelope = {
   error?: { code?: string; message?: string };
 };
 
-export async function listForumPackets(): Promise<ForumPacket[]> {
-  const envelope = await callForum(["packet", "list", "--json"]);
+export type ForumPacketQuarantine = {
+  index: number;
+  packetId?: string;
+  runId?: string;
+  error: string;
+};
+
+export type ForumPacketListResult = {
+  packets: ForumPacket[];
+  quarantined: ForumPacketQuarantine[];
+};
+
+export async function listForumPackets(): Promise<ForumPacketListResult> {
+  const envelope = await callForum(
+    ["packet", "list", "--json"],
+    {
+      timeoutMs: forumPollTimeoutMs(),
+      maxBuffer: 2 * 1024 * 1024,
+    },
+  );
   const result = unwrapResult(envelope);
   const packets = result.packets;
   if (!Array.isArray(packets)) throw invalidEnvelope("packet.list", "result.packets is not an array");
-  return packets.map((packet, index) => parseForumPacket(packet, `packet.list[${index}]`));
+  const valid: ForumPacket[] = [];
+  const quarantined: ForumPacketQuarantine[] = [];
+  for (const [index, packet] of packets.entries()) {
+    try {
+      valid.push(parseForumPacket(packet, `packet.list[${index}]`));
+    } catch (error) {
+      const partial = isRecord(packet) ? packet : {};
+      quarantined.push({
+        index,
+        ...(typeof partial.id === "string" ? { packetId: partial.id } : {}),
+        ...(typeof partial.run_id === "string" ? { runId: partial.run_id } : {}),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return { packets: valid, quarantined };
 }
 
 export async function executeForumPacketEffect(request: ForumPacketEffectRequest): Promise<ForumPacket> {
@@ -230,12 +263,15 @@ function destinationRoutability(destination: ReviewFeedbackDestination): string 
   return "human_only";
 }
 
-async function callForum(args: string[]): Promise<ForumEnvelope> {
+async function callForum(
+  args: string[],
+  options: { timeoutMs?: number; maxBuffer?: number } = {},
+): Promise<ForumEnvelope> {
   const executable = process.env.HIVE_FORUM_BIN ?? "forum";
   try {
     const { stdout } = await execFileAsync(executable, args, {
-      timeout: 15_000,
-      maxBuffer: 16 * 1024 * 1024,
+      timeout: options.timeoutMs ?? 15_000,
+      maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024,
       env: process.env,
     });
     return parseEnvelope(stdout, args.join(" "));
@@ -253,6 +289,12 @@ async function callForum(args: string[]): Promise<ForumEnvelope> {
       `forum command failed: ${failure.stderr?.trim() || failure.message}`,
     );
   }
+}
+
+function forumPollTimeoutMs(): number {
+  const authored = Number(process.env.HIVE_FORUM_POLL_TIMEOUT_MS);
+  if (!Number.isFinite(authored)) return 3_000;
+  return Math.max(50, Math.min(10_000, Math.trunc(authored)));
 }
 
 function parseEnvelope(stdout: string, command: string): ForumEnvelope {
@@ -292,14 +334,100 @@ function packetFromEnvelope(envelope: ForumEnvelope, command: string): ForumPack
 }
 
 function parseForumPacket(value: unknown, label: string): ForumPacket {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
+  if (!isRecord(value)) {
     throw invalidEnvelope(label, "packet is missing");
   }
-  const packet = value as Record<string, unknown>;
-  if (typeof packet.id !== "string" || typeof packet.status !== "string") {
-    throw invalidEnvelope(label, "packet id/status is invalid");
+  const packet = value;
+  requireNonEmptyString(packet.id, label, "id");
+  requireNonEmptyString(packet.title, label, "title");
+  if (
+    typeof packet.status !== "string" ||
+    ![
+      "needs_review",
+      "in_review",
+      "changes_requested",
+      "approved",
+      "resolved",
+      "superseded",
+      "archived",
+    ].includes(packet.status)
+  ) {
+    throw invalidEnvelope(label, "packet status is invalid");
   }
-  return packet as ForumPacket;
+  requireNonEmptyString(packet.kind, label, "kind");
+  requireNonEmptyString(packet.origin, label, "origin");
+  requireNullableString(packet.cwd, label, "cwd");
+  requireNullableString(packet.summary, label, "summary");
+  if (packet.checklist !== null && !Array.isArray(packet.checklist)) {
+    throw invalidEnvelope(label, "packet checklist is not an array");
+  }
+  requireNullableString(packet.native_session_id, label, "native_session_id");
+  requireNullableString(packet.blocking_since, label, "blocking_since");
+  requireNullableString(packet.run_id, label, "run_id");
+  requireNullableString(packet.comb_name, label, "comb_name");
+  requireNullableNumber(packet.base_rev, label, "base_rev");
+  requireNullableNumber(packet.proposed_rev, label, "proposed_rev");
+  requireNullableString(packet.graph_base, label, "graph_base");
+  requireNullableString(packet.graph_proposed, label, "graph_proposed");
+  requireNullableString(packet.definition_digest, label, "definition_digest");
+  requireNullableString(packet.action_binding_digest, label, "action_binding_digest");
+  requireNullableString(packet.subject_revision, label, "subject_revision");
+  if (packet.verdict !== null) parseForumVerdict(packet.verdict, label);
+  return {
+    ...packet,
+    checklist: packet.checklist ?? [],
+  } as unknown as ForumPacket;
+}
+
+function parseForumVerdict(value: unknown, label: string): void {
+  if (!isRecord(value)) throw invalidEnvelope(label, "packet verdict is invalid");
+  requireNonEmptyString(value.packet_id, label, "verdict.packet_id");
+  if (value.verdict !== "approve" && value.verdict !== "request_changes") {
+    throw invalidEnvelope(label, "packet verdict choice is invalid");
+  }
+  requireNullableString(value.comment, label, "verdict.comment");
+  if (!isRecord(value.destination)) {
+    throw invalidEnvelope(label, "packet verdict destination is invalid");
+  }
+  if (value.destination.type === "bee") {
+    requireNonEmptyString(value.destination.sessionId, label, "verdict.destination.sessionId");
+  } else if (
+    value.destination.type !== "new-agent" &&
+    value.destination.type !== "pr-comment"
+  ) {
+    throw invalidEnvelope(label, "packet verdict destination type is invalid");
+  }
+  requireNonEmptyString(value.actor, label, "verdict.actor");
+  requireNullableString(value.definition_digest, label, "verdict.definition_digest");
+  requireNullableString(value.action_binding_digest, label, "verdict.action_binding_digest");
+  requireNullableString(value.subject_revision, label, "verdict.subject_revision");
+  requireNonEmptyString(value.recorded_at, label, "verdict.recorded_at");
+}
+
+function requireNonEmptyString(
+  value: unknown,
+  label: string,
+  field: string,
+): asserts value is string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw invalidEnvelope(label, `packet ${field} is invalid`);
+  }
+}
+
+function requireNullableString(value: unknown, label: string, field: string): void {
+  if (value !== null && typeof value !== "string") {
+    throw invalidEnvelope(label, `packet ${field} is invalid`);
+  }
+}
+
+function requireNullableNumber(value: unknown, label: string, field: string): void {
+  if (value !== null && (typeof value !== "number" || !Number.isFinite(value))) {
+    throw invalidEnvelope(label, `packet ${field} is invalid`);
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function invalidEnvelope(command: string, detail: string): CombError {

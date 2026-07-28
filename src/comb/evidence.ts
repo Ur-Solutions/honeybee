@@ -198,7 +198,7 @@ function forumVerdictPinsMatch(
   expected: HumanPacketRef,
 ): boolean {
   const verdict = packet.verdict;
-  if (!verdict || !verdict.actor.trim()) return false;
+  if (!verdict || typeof verdict.actor !== "string" || !verdict.actor.trim()) return false;
   if (packet.id !== expected.packetId || verdict.packet_id !== packet.id) return false;
   if (packet.run_id !== null && packet.run_id !== run.id) return false;
   if (packet.comb_name !== null && packet.comb_name !== run.currentSnapshot.definition.name) return false;

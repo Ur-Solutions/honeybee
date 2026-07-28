@@ -1052,6 +1052,132 @@ test("blocking_since produces clock evidence, fires the timeout edge, and notifi
   });
 });
 
+test("a failed Forum poll does not prevent an agent-only run from sweeping", async () => {
+  await withTempStore(async (dir) => {
+    await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "locked-forum-human",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const agentRun = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "locked-forum-agent",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const spawned: string[] = [];
+    const outcomes = await sweepCombs({
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => {
+        spawned.push(request.name);
+        return { name: request.name };
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => {
+        throw new Error("database is locked");
+      },
+      now: () => Date.parse("2026-07-28T12:00:01.000Z"),
+    }, [], new Map());
+
+    assert.equal(spawned.length, 1);
+    assert.equal(current((await loadRun(agentRun.id))!, "work").status, "active");
+    assert.ok(outcomes.some((outcome) => outcome.run === "*" && outcome.action === "error"));
+  });
+});
+
+test("a quarantined malformed packet does not block another human run's valid verdict", async () => {
+  await withTempStore(async (dir) => {
+    const first = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "valid-packet-run",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const second = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "malformed-packet-run",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const packets = new Map<string, ForumPacket>();
+    const notices: string[] = [];
+    let quarantined = false;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => quarantined
+        ? {
+            packets: [packets.get(`PKT.${first.id}`)!],
+            quarantined: [{
+              index: 1,
+              packetId: `PKT.${second.id}`,
+              runId: second.id,
+              error: "packet verdict is invalid",
+            }],
+          }
+        : [...packets.values()],
+      executeHumanEffect: async (request) => {
+        const packet = packetFor(
+          request,
+          `PKT.${request.runId}`,
+          "2026-07-28T12:00:00.000Z",
+        );
+        packets.set(packet.id, packet);
+        return packet;
+      },
+      notifyPacketQuarantine: async (notice) => {
+        notices.push(notice.packetId ?? "unknown");
+      },
+      now: () => Date.parse("2026-07-28T12:00:01.000Z"),
+    };
+
+    await sweepCombs(deps, [], new Map());
+    const valid = packets.get(`PKT.${first.id}`)!;
+    valid.status = "approved";
+    valid.verdict = verdict(valid, "approve", "valid", "2026-07-28T12:00:02.000Z");
+    quarantined = true;
+    await sweepCombs(deps, [], new Map());
+
+    assert.equal((await loadRun(first.id))?.status, "done");
+    assert.equal((await loadRun(second.id))?.status, "active");
+    assert.deepEqual(notices, [`PKT.${second.id}`]);
+  });
+});
+
 test("comb run attachment durably adopts the bee before evidence can count", async () => {
   await withTempStore(async (dir) => {
     const bee = session(dir);
