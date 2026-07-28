@@ -5,7 +5,8 @@
  * projection pass, so scope closure is inherent: a turn_end after a
  * needs_input, an auth_resume after a login failure, or a dead runtime
  * naturally closes them — no store, no cancellation records yet. Ids are the
- * durable idempotency keys the later request store adopts under the SAME ids:
+ * durable idempotency keys of the request store (src/requests/keys.ts is the
+ * single id source shared with it):
  *
  *   1. unresolved structured needs_input → question/permission, grade
  *      structured, id = the adapter's requestId (or `ni:<bee>:<ts>` when the
@@ -25,6 +26,7 @@
 
 import { createHash } from "node:crypto";
 import { isAuthNeededMessage, type HsrEventSnapshot } from "../hsr/observe.js";
+import { authRequestId, needsInputRequestId } from "../requests/keys.js";
 import type { RunnerEvent } from "../hsr/types.js";
 import { isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "../readiness.js";
 import type { DerivedState, StateContext } from "../state.js";
@@ -85,7 +87,7 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
   if (pending) {
     const openedAt = isoFromEpochMs(pending.ts);
     requests.push({
-      id: pending.requestId && pending.requestId !== "pending" ? pending.requestId : `ni:${record.name}:${pending.ts}`,
+      id: needsInputRequestId(record.name, pending),
       kind: pending.kind,
       status: "open",
       scope: "turn",
@@ -140,7 +142,7 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
     if (authEvent) {
       const openedAt = isoFromEpochMs(authEvent.ts);
       requests.push({
-        id: `auth:${record.name}:${authEvent.ts}`,
+        id: authRequestId(record.name, authEvent.ts),
         kind: "auth",
         status: "open",
         scope: "runtime-generation",
