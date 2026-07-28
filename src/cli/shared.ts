@@ -24,6 +24,7 @@ import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
 import { sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
 import { ensureSessionLive } from "../sessionLiveness.js";
 import { liveTargetKey, type BeeState, type StateContext } from "../state.js";
+import { assembleStateContext } from "../view/context.js";
 import { consumePreambleForDelivery } from "../spawnPreamble.js";
 import { appendLedger, listSessions, loadSession, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
@@ -467,33 +468,23 @@ export async function observeHsrLiveness(): Promise<{ hsrLive: Set<string>; hsrS
 
 /**
  * Assemble the full StateContext for deriveState from one node-probe pass.
- * Every liveness input — captured panes, seal markers, local pane ids, and the
- * pane-less HSR run-dir observations — is gathered here and ONLY here, so
- * list/TUI/clean can never drift on which inputs feed deriveState (the clean
- * path once omitted the HSR observations and reaped live HSR bees — HIVE-1).
- * `unreachableNodes` overrides the probe's set for callers that widen it
- * (clean treats unregistered nodes as unreachable, never dead).
+ * Delegates to view/context.ts — the single honest assembler shared with the
+ * BeeView surface — so list/TUI/clean can never drift on which inputs feed
+ * deriveState (the clean path once omitted the HSR observations and reaped
+ * live HSR bees — HIVE-1), and the CLI now threads the same mirror
+ * (`hsrMirrors`), batch-failure (`hsrUnavailable`), and legacy
+ * `previousStates` evidence the daemon does. `unreachableNodes` overrides the
+ * probe's set for callers that widen it (clean treats unregistered nodes as
+ * unreachable, never dead).
  */
 export async function buildStateContext(
   records: SessionRecord[],
   probe: MultiNodeLiveProbe,
   options: { unreachableNodes?: Set<string> } = {},
 ): Promise<StateContext & { hsrLive: Set<string>; now: number }> {
-  const panes = await capturePanesFor(records, probe.liveTargets);
-  const seals = await listSealedBeeNames(records);
-  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
-  const { hsrLive, hsrStates, hsrSnapshots } = await observeHsrLiveness();
-  return {
-    liveTargets: probe.liveTargets,
-    livePanes,
-    panes,
-    seals,
-    unreachableNodes: options.unreachableNodes ?? probe.unreachableNodes,
-    hsrLive,
-    hsrStates,
-    hsrSnapshots,
-    now: Date.now(),
-  };
+  return assembleStateContext(records, probe, {
+    ...(options.unreachableNodes ? { unreachableNodes: options.unreachableNodes } : {}),
+  });
 }
 
 

@@ -12,3 +12,12 @@
 
 export * from "./types.js";
 export { paneFingerprint, projectBeeView, type BeeViewProjectionSources } from "./project.js";
+export {
+  assembleStateContext,
+  capturePanesForRecords,
+  PANE_CAPTURE_CONCURRENCY,
+  type AssembledStateContext,
+  type AssembleStateContextOptions,
+  type LiveNodeProbe,
+  type StateContextAssemblyDeps,
+} from "./context.js";
