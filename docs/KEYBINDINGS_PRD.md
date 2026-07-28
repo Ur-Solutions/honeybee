@@ -18,7 +18,7 @@ This PRD is that single home. It owns three things end-to-end:
    verifies the recommended binding set without seizing ownership of the
    operator's hand-curated config (`hive keys print | path | check | doctor`).
 2. **The display-popup picker subcommands** — a thin, stdout-only verb
-   (`hive spawn-picker --frame|--flow`) whose output feeds `fzf` inside a
+   (`hive spawn-picker --frame|--flow|--template`) whose output feeds `fzf` inside a
    `display-popup -E`, plus the picker↔fzf↔action contract.
 3. **The standalone minor features** — `hive here` (the pane→bee reverse-lookup
    bridge), rename-current-bee, and the `hive urls` URL grabber.
@@ -212,7 +212,7 @@ append-machinery is replaced by print + verify.
    operator's conf, or (b) referenced via `source-file <path>` from his own conf
    so updates flow without re-paste.
 2. **The picker / affordance verbs** — `hive here`, `hive spawn-picker
-   --frame|--flow`, `hive urls`, `hive rename --here` (§8, §9) — the targets the
+   --frame|--flow|--template`, `hive urls`, `hive rename --here` (§8, §9) — the targets the
    bindings call.
 
 `hive keys print` reads from the **same canonical string** that backs
@@ -329,13 +329,14 @@ Candidate loaders are already parallel-friendly (the `Promise.all` in
 `getCompletions`, `src/completion.ts:411-421`): `listFrames()`, `listFlows()`,
 `listSwarms()`, `listColonies()`, `listSessions()` (§12).
 
-### 8.2 `hive spawn-picker [--frame | --flow] [--here]`
+### 8.2 `hive spawn-picker [--frame | --flow | --template] [--here]`
 
 Lists spawn candidates for a `display-popup` "spawn something here" chord.
 
 - `--frame` (default): emits one frame name per line from `listFrames()` (the
   `frameList()` pattern, `src/cli.ts:2051-2081`).
 - `--flow`: emits one flow name per line from `listFlows()`.
+- `--template`: emits one agent-template name per line from `listTemplates()`.
 - `--here`: a passthrough hint echoed back so the binding can append `--here` to
   the spawn action unconditionally; the spawned bee then links into the current
   pane/session via the existing `--here` / `maybeLinkHere` path
@@ -352,12 +353,16 @@ display-popup -E "hive spawn-picker --frame | fzf --prompt='frame> ' \
 # spawn swarm from flow (start verb owned by WORKSPACES §8.2):
 display-popup -E "hive spawn-picker --flow | fzf --prompt='flow> ' \
   | xargs -r -I{} hive quest start --flow {}"
+
+# run one saved agent template, linked here:
+display-popup -E "hive spawn-picker --template | fzf --prompt='template> ' \
+  | xargs -r -I{} hive open --template {}"
 ```
 
 This **fully specifies** what `fork-and-pane.md` §7.5 named only as
 `hive spawn-picker --here`: the flag surface, the stdout format, and the
 picker/fzf/action split. There is a **single** picker verb — `hive spawn-picker`
-with `--frame` / `--flow` selecting the candidate source. The two spawn chords
+with `--frame` / `--flow` / `--template` selecting the candidate source. The spawn chords
 (`M-b` spawn-from-frame, `M-F` spawn-swarm-from-flow) differ only in which flag
 the binding supplies; there is no separate `hive frame-picker` / `hive
 flow-picker` verb. The flow→swarm spawn **semantics** are owned upstream
@@ -610,7 +615,7 @@ not hard-blocked on them.
 
 ```
 hive here [--id] [--json]
-hive spawn-picker [--frame | --flow] [--here]
+hive spawn-picker [--frame | --flow | --template] [--here]
 hive urls [<bee>] [--lines <n>] [--open] [--json]
 hive rename --here <new-title>            # argv-reshaping wrapper over existing `hive rename`
 hive keys print  [--tmux | --wezterm]
@@ -800,7 +805,7 @@ Implement / pin the CLI surface (`--id` / `--json` / `--workspace`). Acceptance:
 `--here` affordances.
 
 **Phase 1 — pickers + `hive keys` group + standalone affordances.** Ship the
-single `hive spawn-picker --frame|--flow` verb, `hive urls`, `hive rename --here`,
+single `hive spawn-picker --frame|--flow|--template` verb, `hive urls`, `hive rename --here`,
 the `hive keys print | path | check` group (with `check` carrying the static
 PATH / substrate / `fzf` / opener probes), and `docs/honeybee.tmux.conf`. These
 are independent of each other and of pane-pinning (except the `--here` paths,

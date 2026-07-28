@@ -11,6 +11,7 @@ import { listNodes, type NodeRecord } from "../node.js";
 import { BOOLEAN_FLAGS } from "../parse.js";
 import { listSessions, type SessionRecord } from "../store.js";
 import { listSwarms, type SwarmRecord } from "../swarm.js";
+import { listTemplates, type AgentTemplate } from "../template.js";
 import { listTmuxSessions } from "../tmux.js";
 import {
   ACCOUNT_FIRST_ARG,
@@ -46,6 +47,7 @@ export type CompletionState = {
   colonies?: ColonyRecord[];
   swarms?: SwarmRecord[];
   frames?: Frame[];
+  templates?: AgentTemplate[];
   flows?: Flow[];
   nodes?: NodeRecord[];
   runs?: { runId: string; flowName: string }[];
@@ -105,12 +107,13 @@ export function getCompletionsFromState(words: string[], state: CompletionState)
 
 export async function getCompletions(words: string[]): Promise<string[]> {
   try {
-    const [records, live, colonies, swarms, frames, nodes, flows, runs, accounts] = await Promise.all([
+    const [records, live, colonies, swarms, frames, templates, nodes, flows, runs, accounts] = await Promise.all([
       listSessions(),
       listTmuxSessions(),
       listColonies().catch(() => []),
       listSwarms().catch(() => []),
       listFrames().catch(() => []),
+      listTemplates().catch(() => []),
       listNodes().catch(() => []),
       listFlows().catch(() => []),
       listRuns().catch(() => []),
@@ -122,6 +125,7 @@ export async function getCompletions(words: string[]): Promise<string[]> {
       colonies,
       swarms,
       frames,
+      templates,
       nodes,
       flows,
       runs: runs.map((r) => ({ runId: r.runId, flowName: r.flowName })),
@@ -152,6 +156,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return (state.swarms ?? []).filter((s) => !s.destroyed).map((s) => s.id);
     case "frame":
       return (state.frames ?? []).map((f) => f.name);
+    case "template":
+      return (state.templates ?? []).map((template) => template.name);
     case "shell":
       return SHELLS;
     case "node":
@@ -203,6 +209,9 @@ function nounCommandCandidates(command: string, args: string[], state: Completio
   if (positionalIndex === 0) return subs;
   if (positionalIndex === 1) {
     if (command === "frame" && sub === "define") {
+      return fileCandidates(currentArg, [".json", ".ts"], state.cwd ?? process.cwd());
+    }
+    if (command === "template" && sub === "define") {
       return fileCandidates(currentArg, [".json", ".ts"], state.cwd ?? process.cwd());
     }
     if (command === "flow" && sub === "define") {

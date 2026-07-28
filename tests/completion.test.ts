@@ -45,7 +45,7 @@ test("registers the Phase-1 keybinding verbs and their flags/subs", () => {
   // keys subcommands.
   assert.deepEqual(getCompletionsFromState(["hive", "keys", ""], empty), ["print", "path", "check"]);
   // spawn-picker flags.
-  assert.deepEqual(getCompletionsFromState(["hive", "spawn-picker", "--"], empty), ["--frame", "--flow", "--here"]);
+  assert.deepEqual(getCompletionsFromState(["hive", "spawn-picker", "--"], empty), ["--frame", "--flow", "--template", "--here"]);
   // urls flags.
   assert.deepEqual(getCompletionsFromState(["hive", "urls", "--"], empty), ["--lines", "--open", "--json"]);
   // rename gains --here alongside --auto/--clear.
@@ -231,6 +231,39 @@ test("completes frame names after --frame", () => {
   assert.deepEqual(
     getCompletionsFromState(["hive", "spawn", "--frame", ""], state).sort(),
     ["deep-review", "frontend-redesign"],
+  );
+});
+
+test("completes agent template names after --template and in template subcommands", () => {
+  const state = {
+    records: [],
+    liveTargets: new Set<string>(),
+    templates: [
+      {
+        name: "commit",
+        bee: "codex-auto",
+        prompt: "Commit.",
+        cwd: "caller",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        name: "review",
+        bee: "claude-auto",
+        prompt: "Review.",
+        cwd: "caller",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
+  };
+  assert.deepEqual(
+    getCompletionsFromState(["hive", "x", "--template", ""], state),
+    ["commit", "review"],
+  );
+  assert.deepEqual(
+    getCompletionsFromState(["hive", "template", "inspect", ""], state),
+    ["commit", "review"],
   );
 });
 

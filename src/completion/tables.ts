@@ -5,7 +5,7 @@ import { TASK_STATUSES } from "../tasks.js";
 export const COMMANDS = [
   "spawn", "new", "launch", "send", "tail", "cat", "transcript", "tx", "last", "wait",
   "list", "ls", "ps", "bees", "gateways", "kill", "clean", "run", "x", "xa", "attach", "next",
-  "colony", "pool", "frame", "swarm", "node", "substrate", "flow", "loop",
+  "colony", "pool", "frame", "template", "swarm", "node", "substrate", "flow", "loop",
   "buz",
   "task",
   "daemon",
@@ -18,6 +18,7 @@ export const COMMANDS = [
 export const COLONY_SUBCOMMANDS = ["list", "ls", "create", "inspect", "archive", "update", "rename"];
 export const POOL_SUBCOMMANDS = ["list", "ls", "status", "spawn", "launch", "extend", "sync", "claim", "release", "park", "unpark"];
 export const FRAME_SUBCOMMANDS = ["list", "ls", "define", "update", "reload", "edit", "inspect", "remove"];
+export const TEMPLATE_SUBCOMMANDS = ["list", "ls", "define", "update", "edit", "inspect", "remove", "rm", "run"];
 export const SWARM_SUBCOMMANDS = ["list", "ls", "inspect", "destroy"];
 export const NODE_SUBCOMMANDS = ["list", "ls", "register", "inspect", "update", "unregister"];
 export const SUBSTRATE_SUBCOMMANDS = ["list", "ls"];
@@ -75,7 +76,8 @@ export const SHELL_FIRST_ARG = new Set(["completion"]);
 export const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 export const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--autoswap", "--colony", "--count", "--frame", "--swarm-id", "--brief", "--briefed", "--contract", "--preamble", "--no-preamble", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
+  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--autoswap", "--colony", "--count", "--frame", "--template", "--swarm-id", "--brief", "--briefed", "--contract", "--preamble", "--no-preamble", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
+  template: ["--json", "--wait", "--attach", "--cwd", "--account", "--env", "--name", "--preamble", "--no-preamble", "--yolo", "--no-yolo", "--last", "--transcript", "--idle-ms", "--timeout-ms", "--poll-ms", "-n", "--limit"],
   pool: ["--json", "--all", "--ttl", "--count", "--no-keep", "--here", "--yolo", "--name", "--account"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
   activate: ["--home"],
@@ -83,11 +85,11 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   revive: ["--all", "--crashed", "--fresh", "--session", "--no-wait"],
   "set-model": ["--clear", "--fresh", "--now"],
   xa: [
-    "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony", "--print",
+    "--template", "--cwd", "--home", "--profile", "--account", "--ttl", "--name", "--colony", "--print",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust",
     "--yolo", "--no-yolo", "--dangerous", "--boot-ms", "--here", "--include-paused", "--yes",
   ],
-  open: ["--raw", "--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--include-paused", "--yes"],
+  open: ["--template", "--raw", "--window", "--app", "--cwd", "--home", "--profile", "--account", "--ttl", "--print", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--include-paused", "--yes"],
   view: ["--name", "--new-client", "--close", "--print"],
   ws: ["--root", "--new-client", "--print", "--colony", "--archived", "--cmd", "--name", "--resume"],
   usage: ["--samples", "--json", "--ttl"],
@@ -96,7 +98,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   sync: ["--json"],
   node: ["--kind", "--endpoint", "--capabilities", "--description", "--ssh-command", "--ssh-args"],
   run: [
-    "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env",
+    "--template", "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env",
     "--wait", "--last", "--transcript",
     "--rm", "--cleanup", "--keep",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
@@ -107,14 +109,14 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--include-paused", "--yes",
   ],
   x: [
-    "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--name", "--colony",
+    "--template", "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--name", "--colony",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
     "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate", "--here", "--include-paused", "--yes",
   ],
   send: ["--prompt", "-p"],
   kill: ["--comb", "--yes", "--force"],
   here: ["--id", "--json"],
-  "spawn-picker": ["--frame", "--flow", "--here"],
+  "spawn-picker": ["--frame", "--flow", "--template", "--here"],
   urls: ["--lines", "--open", "--json"],
   keys: ["--tmux", "--wezterm", "--against-recommended"],
   split: ["--brief", "--dir", "--cwd", "--home", "--profile", "--account", "--ttl", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--briefed"],
@@ -168,7 +170,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   ],
 };
 
-export type FlagValueKind = "colony" | "swarm" | "frame" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "display-state" | "flow" | "buz-tier" | "buz-accept" | "task-status" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
+export type FlagValueKind = "colony" | "swarm" | "frame" | "template" | "shell" | "node" | "node-kind" | "bee" | "agent" | "search-type" | "seal-status" | "hive-state" | "display-state" | "flow" | "buz-tier" | "buz-accept" | "task-status" | "run" | "loop-context" | "loop-summarizer" | "account" | "account-or-meta" | "fork-seed";
 
 export const LOOP_CONTEXT_VALUES = ["persistent", "ralph", "rolling"];
 export const LOOP_SUMMARIZER_VALUES = ["self", "bee"];
@@ -181,6 +183,7 @@ export const FLAG_VALUE_KINDS: Record<string, FlagValueKind> = {
   "--swarm": "swarm",
   "--swarm-id": "swarm",
   "--frame": "frame",
+  "--template": "template",
   "--node": "node",
   "--kind": "node-kind",
   "--bee": "bee",
@@ -228,6 +231,7 @@ export const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   colony: COLONY_SUBCOMMANDS,
   pool: POOL_SUBCOMMANDS,
   frame: FRAME_SUBCOMMANDS,
+  template: TEMPLATE_SUBCOMMANDS,
   swarm: SWARM_SUBCOMMANDS,
   node: NODE_SUBCOMMANDS,
   substrate: SUBSTRATE_SUBCOMMANDS,
@@ -245,11 +249,12 @@ export const NOUN_COMMAND_SUBS: Record<string, string[]> = {
   keys: KEYS_SUBCOMMANDS,
 };
 
-export type NounSubArgKind = "colony" | "swarm" | "frame" | "node" | "flow" | "session-any" | "run" | "account";
+export type NounSubArgKind = "colony" | "swarm" | "frame" | "template" | "node" | "flow" | "session-any" | "run" | "account";
 
 export const NOUN_SUB_ARG: Record<string, Record<string, NounSubArgKind>> = {
   colony: { inspect: "colony", archive: "colony", update: "colony", rename: "colony" },
   frame: { inspect: "frame", remove: "frame", edit: "frame", update: "frame", reload: "frame" },
+  template: { inspect: "template", remove: "template", rm: "template", edit: "template", update: "template", run: "template" },
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },
   flow: { inspect: "flow", remove: "flow", run: "flow", logs: "run", status: "run", cancel: "run" },

@@ -1191,7 +1191,7 @@ Important behavior:
   `--dry-run`, or `--older-than`.
 - Bees on unreachable or unregistered nodes are not treated as dead.
 
-## Colonies, Frames, and Swarms
+## Colonies, Templates, Frames, and Swarms
 
 ### `hive colony`
 
@@ -1274,6 +1274,79 @@ Spawn a frame:
 hive frame define ./review-team.json
 hive spawn --frame review-team --colony frontend --briefed
 ```
+
+### `hive template`
+
+Manage reusable single-bee spawn presets. Templates are user-facing job
+presets: unlike machine-local `config.bees` profiles, they include the prompt
+and live in the synced hive store.
+
+```sh
+hive template list
+hive template list --json
+hive template define <path-to-template.json|.ts> [<name>]
+hive template update <name>
+hive template edit <name>
+hive template inspect <name>
+hive template remove <name>
+hive template run <name> [extra input] [--wait|--attach] [spawn flags…] [-- <bee-args…>]
+```
+
+Template JSON shape:
+
+```json
+{
+  "name": "commit",
+  "description": "Atomic commit of the current working tree",
+  "bee": "codex-auto",
+  "prompt": "Commit the current changes. Extra guidance: {{input}}",
+  "cwd": "caller",
+  "account": "codex-work",
+  "env": {
+    "CI": "1"
+  },
+  "args": ["-m", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"medium\""],
+  "yolo": false,
+  "preamble": false
+}
+```
+
+Rules:
+
+- Names match `[A-Za-z0-9][A-Za-z0-9_-]*` (dots and path separators are not
+  accepted).
+- `bee` and `prompt` are required. The bee token is resolved at run time, so
+  aliases such as `codex-auto` choose an account per invocation.
+- `cwd` is `"caller"` (the default) or an absolute path.
+- If the prompt contains `{{input}}`, extra invocation text replaces every
+  occurrence. With no placeholder, non-empty input is appended as a new
+  paragraph.
+- Harness `args` stay an argv array and are never shell-tokenized.
+- `.json` and default-export `.ts` sources are supported. `template update`
+  re-imports the remembered source; `template edit` is JSON-backed only.
+- Spawn precedence is `FLAG > TEMPLATE > PROFILE > ACCOUNT`. Harness argv is
+  ordered explicit `-- …` args, template args, then profile args.
+- `template list --json` returns summary fields only: `name`, `description`
+  (`null` when unset), `bee`, and `updatedAt`. Use `template inspect` for the
+  full canonical record, including the prompt.
+
+Run modes and spawn-family shortcuts:
+
+```sh
+hive template run commit                         # fire-and-forget
+hive template run commit "mention the changelog"
+hive template run commit --wait
+hive template run commit --attach
+
+hive spawn --template commit
+hive x --template commit "mention the changelog"
+hive run --template commit --wait
+hive xa --template commit
+hive open --template commit
+```
+
+`--template` cannot be combined with `--frame`, `--pool`, or a positional bee
+token.
 
 ### `hive swarm`
 

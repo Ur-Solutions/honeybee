@@ -1,5 +1,5 @@
 // Integration coverage for the Phase-1 keybinding layer (KEYBINDINGS_PRD):
-//   - spawn-picker --frame / --flow: one-name-per-line; empty when no frames.
+//   - spawn-picker --frame / --flow / --template: one-name-per-line.
 //   - keys print --tmux: byte-identical to docs/honeybee.tmux.conf.
 //   - keys check: runs against a PRIVATE tmux socket and reports present/absent/
 //     collision without throwing on a clean server.
@@ -62,6 +62,23 @@ async function seedFrame(store: string, name: string): Promise<void> {
     castes: [{ name: "worker", bee: "claude", count: 1 }],
   };
   await writeFile(join(dir, `${name}.json`), `${JSON.stringify(frame, null, 2)}\n`);
+}
+
+async function seedTemplate(store: string, name: string): Promise<void> {
+  const dir = join(store, "templates");
+  await mkdir(dir, { recursive: true });
+  const timestamp = "2026-07-28T00:00:00.000Z";
+  await writeFile(
+    join(dir, `${name}.json`),
+    `${JSON.stringify({
+      name,
+      bee: "codex",
+      prompt: `run ${name}`,
+      cwd: "caller",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }, null, 2)}\n`,
+  );
 }
 
 async function seedBee(store: string, name: string, overrides: Record<string, unknown> = {}): Promise<void> {
@@ -143,6 +160,17 @@ test("spawn-picker --flow lists one flow name per line (built-in loop flow)", as
     assert.ok(names.includes("loop"), `--flow lists the built-in loop flow (got ${JSON.stringify(names)})`);
     // Every line is a bare name (the machine token), no spaces.
     for (const name of names) assert.ok(!/\s/.test(name), `flow name has no spaces: ${name}`);
+  });
+});
+
+test("spawn-picker --template lists one agent template name per line", async () => {
+  await withStore(async (store) => {
+    await seedTemplate(store, "commit");
+    await seedTemplate(store, "review");
+    const out = await hive(store, ["spawn-picker", "--template"]);
+    assert.equal(out.code, 0);
+    const names = out.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+    assert.deepEqual(names, ["commit", "review"]);
   });
 });
 
