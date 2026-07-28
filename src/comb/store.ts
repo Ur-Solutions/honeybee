@@ -150,6 +150,7 @@ export async function createRun(options: {
     activations,
     nextCohortGeneration: 1,
     edgeFiringTail: [],
+    packetThreads: [],
     effects: {},
     effectTail: [],
     cleanup: emptyCleanup("not-required"),
@@ -355,6 +356,9 @@ export function boardView(run: RunRecord): RunBoardView {
       status: activation.status,
       subject: activation.subject,
       beeHandles: activation.beeHandles,
+      ...(activation.packetId ? { packetId: activation.packetId } : {}),
+      ...(activation.packetDigest ? { packetDigest: activation.packetDigest } : {}),
+      ...(activation.threadId ? { threadId: activation.threadId } : {}),
       deviationCount: activation.deviationCount,
       evidence: activation.evidenceTail.slice(-3).map(({ id, kind, producer, recordedAt, summary }) => ({
         id,
@@ -419,15 +423,28 @@ export function initializeRunCleanup(run: RunRecord, now: string): void {
   run.cleanup.pendingEffectKeys = Object.values(run.effects)
     .filter((effect) => effect.status === "prepared" || effect.status === "executing" || effect.status === "ambiguous")
     .map((effect) => effect.key);
-  run.cleanup.pendingBeeNames = [...new Set(
-    Object.values(run.activations).flatMap(
-      (activation) => activation.beeHandles.map((handle) => handle.name),
-    ),
-  )];
+  run.cleanup.pendingPacketIds = run.cancellation
+    ? [...new Set(
+        (run.packetThreads ?? []).flatMap((thread) =>
+          thread.packetTail
+            .filter((packet) => packet.status === "current")
+            .map((packet) => packet.packetId)
+        ),
+      )]
+    : [];
+  run.cleanup.pendingBeeNames = run.policies.retireAgentsOnTerminal
+    ? [...new Set(
+        Object.values(run.activations).flatMap(
+          (activation) => activation.beeHandles
+            .filter((handle) => handle.source === "spawn")
+            .map((handle) => handle.name),
+        ),
+      )]
+    : [];
   run.endedAt = now;
 }
 
-function entryNodeIds(definition: CombSpec): string[] {
+export function entryNodeIds(definition: CombSpec): string[] {
   const hasIncomingForward = new Set(definition.edges.filter((edge) => edge.kind === "forward").map((edge) => edge.to));
   const waitingTargets = new Set(definition.edges.filter((edge) => edge.kind === "waiting").map((edge) => edge.to));
   return definition.nodes
@@ -449,14 +466,33 @@ function resolveActivationSubject(
 }
 
 function evidenceSummary(envelope: EvidenceEnvelope): JsonObject | undefined {
-  if (envelope.kind !== "seal") return undefined;
-  const payload = envelope.payload as { filename: string; seal: { status: string; type?: string; summary: string } };
-  return {
-    filename: payload.filename,
-    status: payload.seal.status,
-    ...(payload.seal.type ? { type: payload.seal.type } : {}),
-    summary: payload.seal.summary.slice(0, 500),
-  };
+  if (envelope.kind === "seal") {
+    const payload = envelope.payload as { filename: string; seal: { status: string; type?: string; summary: string } };
+    return {
+      filename: payload.filename,
+      status: payload.seal.status,
+      ...(payload.seal.type ? { type: payload.seal.type } : {}),
+      summary: payload.seal.summary.slice(0, 500),
+    };
+  }
+  if (envelope.kind === "forum-verdict") {
+    const payload = envelope.payload as JsonObject;
+    return {
+      packetId: payload.packetId ?? null,
+      status: payload.status ?? null,
+      verdict: payload.verdict ?? null,
+      actor: payload.actor ?? null,
+    };
+  }
+  if (envelope.kind === "clock") {
+    const payload = envelope.payload as JsonObject;
+    return {
+      basis: payload.basis ?? null,
+      thresholdMs: payload.thresholdMs ?? null,
+      dueAt: payload.dueAt ?? null,
+    };
+  }
+  return undefined;
 }
 
 async function persistRun(run: RunRecord): Promise<void> {

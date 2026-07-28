@@ -122,7 +122,7 @@ test("lint rejects functions, cycles, forward cycles, and malformed waiting edge
       ...simpleComb(),
       edges: [{ id: "timeout", from: "review", to: "passed", kind: "waiting", on: "waiting" }],
     }),
-    /waiting edges are not supported in strict-spine slice 1/,
+    /waiting edges require on="waiting" and a clock predicate/,
   );
 });
 

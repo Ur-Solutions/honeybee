@@ -1,15 +1,22 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
-import { ingestSealEvidence } from "../src/comb/evidence.js";
-import { reconcileMachine } from "../src/comb/machine.js";
-import { mutateRun, readEvidence } from "../src/comb/store.js";
+import { promisify } from "node:util";
+import { canonicalDigest } from "../src/comb/canonical.js";
+import { attachBeeToRun } from "../src/comb/attachment.js";
+import { ingestForumVerdictEvidence, ingestSealEvidence } from "../src/comb/evidence.js";
+import { applyHumanVerdict, reconcileMachine } from "../src/comb/machine.js";
+import { mutateRun, readEvidence, recordRunEvent } from "../src/comb/store.js";
 import { cmdComb } from "../src/commands/comb.js";
 import { parse } from "../src/parse.js";
-import type { JsonValue } from "../src/comb/types.js";
+import { saveSession, type SessionRecord } from "../src/store.js";
+import type { ForumPacket, JsonValue } from "../src/comb/types.js";
 import type { SealRecord } from "../src/seal.js";
+
+const execFileAsync = promisify(execFile);
 
 type Envelope = {
   ok: boolean;
@@ -64,7 +71,38 @@ async function invoke(
 
 type GoldenArrangement =
   | { kind: "write-store-file"; path: string; contents: string }
+  | { kind: "save-session"; session: SessionRecord }
+  | { kind: "attach-bee"; runId: string; beeName: string; entryNodeId: string; now: string }
   | { kind: "reconcile-machine"; runId: string; now: string }
+  | {
+      kind: "link-human-packet";
+      runId: string;
+      activationId: string;
+      packetId: string;
+      now: string;
+      capturePacketDigest: string;
+    }
+  | {
+      kind: "ingest-forum-verdict";
+      runId: string;
+      activationId: string;
+      packetId: string;
+      now: string;
+      actor: string;
+      comment: string;
+      captureEvidenceId: string;
+      expectedResult?: "match" | "stale";
+      verdictDefinitionDigest?: string;
+    }
+  | {
+      kind: "ingest-late-seal";
+      runId: string;
+      activationId: string;
+      filename: string;
+      invalidatedAt: string;
+      seal: SealRecord;
+      captureEvidenceId: string;
+    }
   | {
       kind: "ingest-seal";
       runId: string;
@@ -82,7 +120,8 @@ type GoldenCase = {
   arrange?: GoldenArrangement[];
   capture?: Record<string, string>;
   exitCode: number;
-  stdout: { command: string } & Record<string, unknown>;
+  stdout?: { command: string } & Record<string, unknown>;
+  stderr?: unknown;
 };
 
 type GoldenCorpus = {
@@ -110,7 +149,9 @@ test("versioned public corpus executes every argv, arrangement, projection, enve
     external_dependency: 7,
     internal_or_corrupt_state: 70,
   });
-  const commands = new Set(corpus.cases.map((fixture) => fixture.stdout.command));
+  const commands = new Set(corpus.cases.flatMap((fixture) =>
+    fixture.stdout ? [fixture.stdout.command] : []
+  ));
   assert.deepEqual(commands, new Set([
     "comb.list",
     "comb.lint",
@@ -122,6 +163,20 @@ test("versioned public corpus executes every argv, arrangement, projection, enve
     "comb.cancel",
     "comb.events",
   ]));
+  const caseIds = new Set(corpus.cases.map((fixture) => fixture.id));
+  for (const required of [
+    "comb-run-attached-adoption",
+    "comb-status-human-thread",
+    "comb-runs-human-packet-board",
+    "comb-events-human-packet-lifecycle",
+    "comb-events-stale-human-verdict",
+    "comb-events-late-invalidated-seal",
+    "comb-status-human-verdict-done",
+    "spawn-comb-argv-surface",
+    "x-comb-argv-surface",
+  ]) {
+    assert.ok(caseIds.has(required), `public corpus is missing ${required}`);
+  }
 
   await withTempStore(async (dir) => {
     const variables = new Map<string, unknown>([
@@ -145,9 +200,124 @@ test("versioned public corpus executes every argv, arrangement, projection, enve
           await writeFile(path, arranged.contents);
           continue;
         }
+        if (arranged.kind === "save-session") {
+          await saveSession(arranged.session);
+          continue;
+        }
+        if (arranged.kind === "attach-bee") {
+          await attachBeeToRun({
+            runId: arranged.runId,
+            beeName: arranged.beeName,
+            entryNodeId: arranged.entryNodeId,
+            deliver: false,
+            now: () => Date.parse(arranged.now),
+          });
+          continue;
+        }
         if (arranged.kind === "reconcile-machine") {
           await mutateRun(arranged.runId, (run) => {
             reconcileMachine(run, arranged.now);
+          });
+          continue;
+        }
+        if (arranged.kind === "link-human-packet") {
+          await mutateRun(arranged.runId, (run) => {
+            const activation = run.activations[arranged.activationId];
+            assert.ok(activation, `${fixture.id}: missing arranged activation ${arranged.activationId}`);
+            const packet = corpusHumanPacket(run, activation, arranged.packetId, "needs_review", null, arranged.now);
+            const digest = canonicalDigest(packet as unknown as JsonValue);
+            activation.status = "waiting-human";
+            activation.startedAt = arranged.now;
+            activation.claim.attemptStartedAt = arranged.now;
+            activation.packetId = packet.id;
+            activation.packetDigest = digest;
+            activation.threadId = `${activation.address.nodeId}#${activation.address.itemIndex}`;
+            activation.blockingSince = arranged.now;
+            run.packetThreads.push({
+              key: activation.threadId,
+              nodeId: activation.address.nodeId,
+              itemIndex: activation.address.itemIndex,
+              packetCount: 1,
+              packetTail: [{
+                packetId: packet.id,
+                snapshotRevision: activation.nodeSnapshotRevision,
+                definitionDigest: run.currentSnapshot.definitionDigest,
+                actionBindingDigest: run.currentSnapshot.actionBindingDigest,
+                subject: activation.subject,
+                status: "current",
+                createdAt: arranged.now,
+              }],
+              currentPacketId: packet.id,
+              subject: activation.subject,
+              createdAt: arranged.now,
+              updatedAt: arranged.now,
+            });
+            recordRunEvent(run, "comb.activation.waiting_human", activation.address, {
+              packetId: packet.id,
+              packetDigest: digest,
+              threadId: activation.threadId,
+            });
+            variables.set(arranged.capturePacketDigest, digest);
+          });
+          continue;
+        }
+        if (arranged.kind === "ingest-forum-verdict") {
+          await mutateRun(arranged.runId, async (run) => {
+            const activation = run.activations[arranged.activationId];
+            assert.ok(activation, `${fixture.id}: missing arranged activation ${arranged.activationId}`);
+            const expected = run.packetThreads
+              .find((thread) => thread.key === activation.threadId)
+              ?.packetTail.find((packet) => packet.packetId === arranged.packetId);
+            assert.ok(expected, `${fixture.id}: missing arranged packet ref ${arranged.packetId}`);
+            const packet = corpusHumanPacket(
+              run,
+              activation,
+              arranged.packetId,
+              "approved",
+              {
+                packet_id: arranged.packetId,
+                verdict: "approve",
+                comment: arranged.comment,
+                destination: { type: "new-agent" },
+                actor: arranged.actor,
+                definition_digest: arranged.verdictDefinitionDigest ?? expected.definitionDigest,
+                action_binding_digest: expected.actionBindingDigest,
+                subject_revision: expected.subject.revision,
+                recorded_at: arranged.now,
+              },
+              activation.blockingSince ?? arranged.now,
+            );
+            const ingested = await ingestForumVerdictEvidence(run, activation, packet, expected);
+            assert.equal(
+              ingested.result,
+              arranged.expectedResult ?? "match",
+              `${fixture.id}: verdict arrangement result`,
+            );
+            variables.set(arranged.captureEvidenceId, activation.evidenceTail.at(-1)!.id);
+            if (ingested.result !== "match") return;
+            assert.ok(ingested.verdict);
+            applyHumanVerdict(run, activation, {
+              verdict: ingested.verdict.verdict,
+              comment: ingested.verdict.comment,
+              destination: ingested.verdict.destination,
+            }, arranged.now);
+            reconcileMachine(run, arranged.now);
+          });
+          continue;
+        }
+        if (arranged.kind === "ingest-late-seal") {
+          await mutateRun(arranged.runId, async (run) => {
+            const activation = run.activations[arranged.activationId];
+            assert.ok(activation, `${fixture.id}: missing arranged activation ${arranged.activationId}`);
+            activation.invalidatedAt = arranged.invalidatedAt;
+            const result = await ingestSealEvidence(
+              run,
+              activation,
+              arranged.filename,
+              arranged.seal,
+            );
+            assert.equal(result, "late-invalidated", `${fixture.id}: late seal must be inert`);
+            variables.set(arranged.captureEvidenceId, activation.evidenceTail.at(-1)!.id);
           });
           continue;
         }
@@ -175,7 +345,13 @@ test("versioned public corpus executes every argv, arrangement, projection, enve
 
       assert.ok(fixture.argv, `${fixture.id}: missing executable argv`);
       const argv = resolveGoldenValue(fixture.argv, variables) as string[];
-      assert.equal(argv[0], "comb", `${fixture.id}: argv must pin the public comb command`);
+      if (argv[0] !== "comb") {
+        const actual = await invokeFullCli(argv);
+        assert.equal(actual.exitCode, fixture.exitCode, `${fixture.id}: exit code`);
+        assertGoldenMatch(actual.stderr.trim(), resolveGoldenValue(fixture.stderr, variables), `${fixture.id}.stderr`);
+        continue;
+      }
+      assert.ok(fixture.stdout, `${fixture.id}: comb command must declare stdout`);
       const actual = await invoke(argv.slice(1), fixture.fault);
 
       for (const [name, pointer] of Object.entries(fixture.capture ?? {})) {
@@ -190,6 +366,63 @@ test("versioned public corpus executes every argv, arrangement, projection, enve
     }
   });
 });
+
+async function invokeFullCli(
+  argv: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  try {
+    const result = await execFileAsync(
+      process.execPath,
+      ["--import", "tsx", "src/cli.ts", ...argv],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, HIVE_BEE: "", NO_COLOR: "1" },
+        timeout: 20_000,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    return { exitCode: 0, stdout: result.stdout, stderr: result.stderr };
+  } catch (error) {
+    const failure = error as Error & { code?: number; stdout?: string; stderr?: string };
+    return {
+      exitCode: typeof failure.code === "number" ? failure.code : 1,
+      stdout: failure.stdout ?? "",
+      stderr: failure.stderr ?? failure.message,
+    };
+  }
+}
+
+function corpusHumanPacket(
+  run: Parameters<typeof reconcileMachine>[0],
+  activation: Parameters<typeof applyHumanVerdict>[1],
+  packetId: string,
+  status: ForumPacket["status"],
+  verdict: ForumPacket["verdict"],
+  blockingSince: string,
+): ForumPacket {
+  return {
+    id: packetId,
+    title: "Corpus human verification",
+    status,
+    kind: "code",
+    origin: "comb",
+    cwd: run.cwd,
+    summary: "Public seam corpus packet",
+    checklist: [{ text: "Work is correct", done: false }],
+    native_session_id: null,
+    blocking_since: blockingSince,
+    run_id: run.id,
+    comb_name: run.currentSnapshot.definition.name,
+    base_rev: null,
+    proposed_rev: activation.nodeSnapshotRevision,
+    graph_base: null,
+    graph_proposed: null,
+    definition_digest: run.currentSnapshot.definitionDigest,
+    action_binding_digest: run.currentSnapshot.actionBindingDigest,
+    subject_revision: activation.subject.revision,
+    verdict,
+  };
+}
 
 function resolvePointer(value: unknown, pointer: string, fixtureId: string): unknown {
   assert.match(pointer, /^($|\/)/, `${fixtureId}: capture pointer must be RFC 6901`);
