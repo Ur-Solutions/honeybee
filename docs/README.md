@@ -4,11 +4,6 @@
 
 It creates bee sessions on demand, sends prompts into them, captures panes, and keeps a tiny local ledger. It is inspired by Shannon's practical tmux/transcript idea, but starts broader: Claude, Codex, OpenCode, Grok, Pi, Droid, or any configured command.
 
-## Current architecture work
-
-- [ADR 001: Separate Bee Lifecycle, Runtime, Turn, Human Request, and Review State](./adr/001-bee-runtime-turn-state-model.md)
-- [State Model V2 Migration Specification](./STATE_MODEL_MIGRATION_SPEC.md)
-
 ## v0 scope
 
 - On-demand session creation
@@ -257,3 +252,10 @@ discovered, and add rate rules in `src/spend/rates.ts`.
 ## Naming notes
 
 The project is now **honeybee**, its CLI is **hive**, and interactive workers are **bees**. New session metadata is written under `~/.hive`; old `~/.agentpit` sessions are still visible for migration safety. The old `ap` binary name remains as a compatibility alias for the same CLI.
+
+## State model documents
+
+- [`adr/001-bee-runtime-turn-state-model.md`](./adr/001-bee-runtime-turn-state-model.md) — accepted domain semantics for Bee/Runtime/Turn/request/review state
+- [`adr/002-event-journal-daemon-authority.md`](./adr/002-event-journal-daemon-authority.md) — event journal / daemon authority; experimental, not accepted
+- [`STATE_MODEL_MIGRATION_SPEC.md`](./STATE_MODEL_MIGRATION_SPEC.md) — full storage cutover plan; deferred, not the implementation plan
+- [`STATE_MODEL_V2_ASSESSMENT.md`](./STATE_MODEL_V2_ASSESSMENT.md) — takeover assessment, forward-only plan, and decision record

@@ -5,6 +5,23 @@ Date: 2026-07-28
 Author: CL.df15 (taking over from CO.e8c0)
 Reviews: [ADR 001](./adr/001-bee-runtime-turn-state-model.md), [Migration spec](./STATE_MODEL_MIGRATION_SPEC.md)
 
+## Decisions (2026-07-28)
+
+The operator answered the §6 questions on 2026-07-28. This section is the
+decision record; §6 keeps the questions with each answer appended inline.
+
+1. **Forward-only approved.** ADR 001's domain semantics are accepted; the
+   storage/daemon material is frozen as
+   [ADR 002](./adr/002-event-journal-daemon-authority.md), status
+   Experimental — not accepted. The migration spec is deferred as a possible
+   later convergence plan.
+2. **BeeView is a library with a CLI mirror** (`hive state explain`) for
+   debugging; Apiary links the library directly.
+3. **The operator commits the dirty trees himself.** Implementation work
+   happens in custom worktrees via subagents, on both repos.
+4. **`hive next` is nearly unused** — it is free to change its behavior; no
+   byte-compatibility requirement.
+
 ## 1. Where this stands
 
 Timeline of the CO.e8c0 session (2026-07-27):
@@ -224,14 +241,23 @@ lands in this repo.
 
 ## 6. Open questions for the operator
 
+All answered 2026-07-28; see the Decisions section at the top. The questions
+stay for the record with each answer appended.
+
 1. Agree to freeze ADR 002 (storage/daemon) as Experimental and proceed
    forward-only? (Recommendation: yes.)
+   **Answered: yes.** ADR 002 is frozen as Experimental — not accepted; the
+   path is forward-only.
 2. Should the BeeView read API be a library import for Apiary (fast, same
    machine) or a `hive` CLI/JSON boundary? (Recommendation: library with a
    CLI mirror for debugging — Apiary already links adapter code.)
+   **Answered: library with a CLI mirror** (`hive state explain`).
 3. Who commits the two dirty trees, and in what cluster order? The honeybee
    `done`-collapse looks ready; the apiary tree needs per-cluster commits by
    their owning bees or one sweep by a single bee.
+   **Answered: the operator commits the dirty trees himself.** Implementation
+   work happens in custom worktrees via subagents on both repos.
 4. Is `hive next` allowed to change behavior now (read fine state /
    open-request facts instead of `@hive_state`), or must it stay
    byte-compatible until BeeView lands?
+   **Answered: free to change now** — `hive next` is nearly unused.

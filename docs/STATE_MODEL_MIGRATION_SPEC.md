@@ -1,10 +1,17 @@
 # State Model V2 Migration Specification
 
-Status: Draft  
+Status: Deferred — possible later convergence plan. Not the implementation plan.  
 Date: 2026-07-27  
 Architecture decision: [ADR 001](./adr/001-bee-runtime-turn-state-model.md)  
 Primary goal: migrate Honeybee and Apiary to the V2 state model without losing
 data, live runtimes, operator workflow, or UI behavior.
+
+> **Deferred (operator decision, 2026-07-28).** This spec was written for a
+> full storage cutover that is on hold. The active path is the forward-only
+> plan in [STATE_MODEL_V2_ASSESSMENT.md §4](./STATE_MODEL_V2_ASSESSMENT.md):
+> no history import, no SQLite, no daemon mutation authority. The legacy-state
+> interpretation table (§8), the invariants, and the UI gate checklist (§11.4)
+> remain useful references regardless of storage.
 
 ## 1. Purpose
 

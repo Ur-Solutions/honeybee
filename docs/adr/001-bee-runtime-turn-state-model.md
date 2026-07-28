@@ -1,9 +1,11 @@
 # ADR 001: Separate Bee Lifecycle, Runtime, Turn, Human Request, and Review State
 
-Status: Proposed  
+Status: Accepted (domain semantics). Storage and writer topology moved to ADR 002 (experimental).  
 Date: 2026-07-27  
 Decision owners: Honeybee maintainers  
-Related specification: [State Model V2 Migration Specification](../STATE_MODEL_MIGRATION_SPEC.md)
+Related specification: [State Model V2 Migration Specification](../STATE_MODEL_MIGRATION_SPEC.md) (deferred)  
+Related documents: [ADR 002](./002-event-journal-daemon-authority.md) (experimental),
+[State Model V2 Assessment](../STATE_MODEL_V2_ASSESSMENT.md) (active plan)
 
 ## Context
 
@@ -300,104 +302,13 @@ its latest result is in the Inbox.
 Unreachable requires a source-specific heartbeat contract. Silence from a
 source that does not promise heartbeats is not evidence of unreachability.
 
-## Event journal and writer topology
+## Storage and writer topology
 
-The canonical domain journal is an append-only SQLite event table owned by one
-supervised daemon per Hive home.
-
-The daemon:
-
-- is the single transition authority
-- is autostarted and watchdogged
-- holds no state required for restart
-- validates commands and appends events plus projections transactionally
-- ingests source events idempotently
-- can be killed at any instruction boundary and recover from SQLite plus origin
-  spools
-
-Commands such as spawn, send, answer, stop, retire, and snooze use versioned
-daemon RPC and fail closed with a clear error.
-
-Event emitters such as hooks, harness adapters, observers, and remote hosts are
-spool-first and fail open. They durably append to a per-origin spool before
-attempting ingestion. Short-lived hooks never depend on a live RPC round trip.
-
-The journal deduplicates on:
-
-```text
-(originId, originSeq)
-```
-
-Every event carries:
-
-```text
-position       local canonical ingest order
-originId       durable emitter identity
-originSeq      emitter-owned monotonic sequence
-beeId
-generationId? 
-turnId?
-type
-payload
-occurredAt     origin clock
-ingestedAt     controlling-node clock
-source
-grade
-```
-
-Ordering is guaranteed only within an origin stream. Cross-origin order is
-projection order, not a claim about wall-clock causality.
-
-The token/text/thought/tool/usage firehose remains in generation spools.
-Domain events may carry checkpoint references into those files. Raw spools are
-evidence archives and transport outboxes, not competing domain truth.
-
-Reads do not require a healthy daemon. Honeybee opens SQLite read-only and
-surfaces `lastProjectedAt` and source freshness. Consumers use a stable
-Honeybee read API rather than depending on table layout.
-
-Each Bee has exactly one controlling node in v1. Remote nodes emit facts to
-that authority and do not maintain a competing canonical projection.
-Cross-node authority transfer is a later decision.
-
-## Minimum event vocabulary
-
-```text
-bee.created
-bee.retired
-
-generation.starting
-generation.online
-generation.observed
-generation.stop_requested
-generation.stop_failed
-generation.exited
-
-turn.accepted
-turn.delivered
-turn.input
-turn.end_evidence
-turn.cancelled
-
-request.opened
-request.resolved
-request.cancelled
-
-contract.result
-
-inbox.read
-inbox.dismissed
-inbox.snoozed
-```
-
-When `generation.exited` is ingested, the daemon appends deterministic
-daemon-origin consequence events in the same transaction:
-
-- `turn.end_evidence(interrupted)` for bound running Turns
-- `request.cancelled(scope-closed)` for affected open requests
-
-Reducers must not silently create projection facts that are absent from the
-event journal.
+The event journal, single-daemon writer topology, and minimum event vocabulary
+that originally accompanied this decision were split into
+[ADR 002](./002-event-journal-daemon-authority.md) on 2026-07-28. ADR 002 is
+experimental and not accepted. The domain semantics in this ADR do not depend
+on that storage architecture.
 
 ## Consumer contract
 
@@ -445,13 +356,17 @@ supports old read contracts.
 4. A generation exit transactionally interrupts bound running Turns and
    cancels scoped requests through logged consequence events.
 5. `exitClass=stopped` requires prior stop intent for that generation.
-6. Event ingestion is idempotent on `(originId, originSeq)`.
-7. Events are immutable; projections are rebuildable.
-8. End-evidence supersession is compatible with the projected outcome.
-9. Hooks and adapters emit facts; only the daemon validates transitions.
-10. Completion and review never alter Bee lifecycle or runtime state.
-11. Retrying work creates a new Turn; history is never rebound or rewritten.
-12. Reads expose staleness and remain available without the daemon.
+6. End-evidence supersession is compatible with the projected outcome.
+7. Completion and review never alter Bee lifecycle or runtime state.
+8. Retrying work creates a new Turn; history is never rebound or rewritten.
+9. Reads expose staleness.
+
+The remaining original invariants — event ingestion idempotent on
+`(originId, originSeq)`; events immutable and projections rebuildable; hooks
+and adapters emit facts while only the daemon validates transitions; reads
+that remain available without the daemon — only make sense with an event
+journal. If an event journal is adopted, see
+[ADR 002](./002-event-journal-daemon-authority.md).
 
 ## Consequences
 
@@ -461,18 +376,17 @@ Positive consequences:
 - A completed response no longer makes a live Bee appear retired.
 - Pane idleness no longer masquerades as task success.
 - Apiary can remove duplicated attention and completion heuristics.
-- Daemon restarts cannot duplicate needs-input routing or resurrect dismissed
-  Inbox items.
-- Remote replay is idempotent.
 - State history becomes explainable from immutable evidence.
 
 Costs and risks:
 
-- The daemon becomes a required mutation authority.
-- SQLite, RPC versioning, origin spools, and rebuild tooling add infrastructure.
 - Existing files and Apiary's local Inbox ledger require a staged migration.
 - Pane-based observers remain heuristic and must retain their evidence grade.
-- Event and spool retention needs a separate archival policy.
+
+Storage-specific consequences (daemon as required mutation authority; SQLite,
+RPC versioning, origin spools, and rebuild tooling; idempotent remote replay;
+restart-safe needs-input routing; event and spool retention) moved to
+[ADR 002](./002-event-journal-daemon-authority.md).
 
 ## Alternatives rejected
 
@@ -492,12 +406,6 @@ the same query power with explicit ownership.
 Rejected because it duplicates an open InterventionRequest. It remains a
 derived presentation only.
 
-### Treat JSONL as the canonical multi-writer journal
-
-Rejected for the clean target because every process would need locking,
-deduplication, validation, and corruption recovery. JSONL remains appropriate
-for origin spools, raw harness evidence, export, and debugging.
-
 ### Treat idle as success
 
 Rejected because unstructured tmux agents can prove only that output settled.
@@ -506,6 +414,27 @@ Semantic success requires contract evidence.
 ### Put observer uncertainty in RuntimeGeneration state
 
 Rejected because uncertainty describes knowledge, not the process.
+
+The storage-specific alternative (treat JSONL as the canonical multi-writer
+journal) moved to [ADR 002](./002-event-journal-daemon-authority.md).
+
+## Implementation strategy
+
+Adoption is forward-only, per the operator decision of 2026-07-28:
+
+- A `BeeView` read model — a library with a CLI mirror
+  (`hive state explain`) — projects the current stores into this ADR's
+  consumer contract first. No new writes, no SQLite, no daemon requirement.
+- An InterventionRequest vertical slice follows: durable request records with
+  the idempotency-key and scope-closure invariants above, from which
+  `needs-reply` derives solely.
+- Turn ids are stamped for new work only. Historical state is not migrated;
+  legacy records stay readable as legacy evidence.
+- The full storage cutover in the
+  [migration specification](../STATE_MODEL_MIGRATION_SPEC.md) is deferred.
+
+See the [State Model V2 Assessment](../STATE_MODEL_V2_ASSESSMENT.md) §4 for
+the ordered, independently shippable steps.
 
 ## Deferred decisions
 
