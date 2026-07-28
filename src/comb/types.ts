@@ -320,6 +320,8 @@ export type CombActivationBinding = {
   taskId: string;
   status: "current" | "historical";
   attachedAt: string;
+  trackDigest?: string;
+  deliveredAt?: string;
   endedAt?: string;
 };
 
@@ -339,7 +341,7 @@ export type EvidenceEnvelopeBase = {
 };
 
 export type EvidenceEnvelope = EvidenceEnvelopeBase & {
-  kind: "seal" | "session-state" | "clock" | "engine-result" | "agent-report";
+  kind: "seal" | "session-state" | "forum-verdict" | "clock" | "engine-result" | "agent-report";
   payload: JsonValue | { filename: string; seal: SealRecord };
 };
 
@@ -391,6 +393,16 @@ export type ActivationRecord = {
   activeChildRunIds: string[];
   childRunTail: string[];
   effectKeys: string[];
+  packetId?: string;
+  packetDigest?: string;
+  threadId?: string;
+  blockingSince?: string;
+  stallNotifiedAt?: string;
+  retryContext?: {
+    from: ActivationAddress;
+    verdict?: "approve" | "request_changes";
+    comment?: string | null;
+  };
   invalidatedAt?: string;
   invalidatedBy?: ActivationAddress;
   failure?: { code: string; message: string; retryable: boolean };
@@ -406,7 +418,7 @@ export type EdgeFiring = {
   firedAt: string;
 };
 
-export type EffectKind = "agent-spawn" | "agent-adopt";
+export type EffectKind = "agent-spawn" | "agent-adopt" | "forum-create" | "forum-rerequest" | "forum-successor";
 export type EffectStatus = "prepared" | "executing" | "confirmed" | "not-executed" | "failed" | "ambiguous";
 export type EffectScope = { kind: "activation"; activation: ActivationAddress } | { kind: "run"; runId: string };
 
@@ -462,6 +474,72 @@ export type RunOrigin =
   | { kind: "trigger"; triggerId: string; deliveryId: string; eventId?: string }
   | { kind: "attached"; beeName: string; entryNodeId: NodeId }
   | { kind: "ad-hoc"; actor: string };
+
+export type ReviewFeedbackDestination =
+  | { type: "bee"; sessionId: string }
+  | { type: "new-agent" }
+  | { type: "pr-comment" };
+
+export type ForumPacketVerdict = {
+  packet_id: string;
+  verdict: "approve" | "request_changes";
+  comment: string | null;
+  destination: ReviewFeedbackDestination;
+  actor: string;
+  definition_digest: string | null;
+  action_binding_digest: string | null;
+  subject_revision: string | null;
+  recorded_at: string;
+};
+
+export type ForumPacket = {
+  id: string;
+  title: string;
+  status: "needs_review" | "in_review" | "changes_requested" | "approved" | "resolved" | "superseded" | "archived";
+  kind: string;
+  origin: string;
+  cwd: string | null;
+  summary: string | null;
+  checklist: JsonValue[];
+  native_session_id: string | null;
+  blocking_since: string | null;
+  run_id: string | null;
+  comb_name: string | null;
+  base_rev: number | null;
+  proposed_rev: number | null;
+  graph_base: string | null;
+  graph_proposed: string | null;
+  definition_digest: string | null;
+  action_binding_digest: string | null;
+  subject_revision: string | null;
+  verdict: ForumPacketVerdict | null;
+  [key: string]: JsonValue | ForumPacketVerdict | undefined;
+};
+
+export type HumanPacketRef = {
+  packetId: string;
+  predecessorPacketId?: string;
+  successorPacketId?: string;
+  snapshotRevision: number;
+  definitionDigest: string;
+  actionBindingDigest: string;
+  subject: ResolvedSubject;
+  status: "current" | "superseded" | "withdrawn";
+  createdAt: string;
+  supersededAt?: string;
+};
+
+export type HumanPacketThread = {
+  key: string;
+  nodeId: NodeId;
+  itemIndex: number;
+  packetCount: number;
+  packetTail: HumanPacketRef[];
+  currentPacketId: string;
+  subject: ResolvedSubject;
+  createdAt: string;
+  updatedAt: string;
+};
 
 export type TriggerAssociation = {
   triggerId: string;
@@ -519,6 +597,7 @@ export type RunRecord = {
   activations: Record<ActivationId, ActivationRecord>;
   nextCohortGeneration: number;
   edgeFiringTail: EdgeFiring[];
+  packetThreads: HumanPacketThread[];
   effects: Record<string, EffectRecord>;
   effectTail: EffectRef[];
   cancellation?: CancellationFence;
@@ -548,6 +627,9 @@ export type RunBoardActivation = {
   status: ActivationStatus;
   subject: ResolvedSubject;
   beeHandles: BeeHandleRef[];
+  packetId?: string;
+  packetDigest?: string;
+  threadId?: string;
   deviationCount: number;
   evidence: Array<Pick<EvidenceRef, "id" | "kind" | "producer" | "recordedAt" | "summary">>;
   startedAt?: string;

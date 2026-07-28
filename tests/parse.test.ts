@@ -34,6 +34,17 @@ test("parse leaves positional args after boolean flags", () => {
   assert.deepEqual(archived.args, ["colony:frontend"]);
 });
 
+test("--comb consumes a registry name for comb filters and attached spawn/x commands", () => {
+  for (const argv of [
+    ["comb", "runs", "--comb", "human-last"],
+    ["spawn", "codex", "--comb", "human-last"],
+    ["x", "codex", "do work", "--comb", "human-last"],
+  ]) {
+    const parsed = parse(argv);
+    assert.equal(flag(parsed, "comb"), "human-last");
+  }
+});
+
 test("BOOLEAN_FLAGS is exported so completion can skip value-less flags", () => {
   assert.ok(BOOLEAN_FLAGS.has("json"));
   assert.ok(BOOLEAN_FLAGS.has("yolo"));

@@ -95,7 +95,9 @@ export function parse(argv: string[]): Parsed {
     if (item.startsWith("--")) {
       const eq = item.indexOf("=");
       const key = item.slice(2, eq > -1 ? eq : undefined);
-      const booleanFlag = BOOLEAN_FLAGS.has(key) && !(command === "comb" && (key === "version" || key === "last"));
+      const booleanFlag = BOOLEAN_FLAGS.has(key) &&
+        !(command === "comb" && (key === "version" || key === "last" || key === "comb")) &&
+        !((command === "spawn" || command === "x" || command === "run") && key === "comb");
       const nextIsValue = i + 1 < tail.length && (!tail[i + 1]!.startsWith("-") || tail[i + 1] === "-");
       const value = eq > -1 ? item.slice(eq + 1) : booleanFlag ? true : nextIsValue ? tail[++i]! : true;
       setFlag(flags, key, value);
@@ -103,7 +105,9 @@ export function parse(argv: string[]): Parsed {
     }
     if (item.startsWith("-") && item.length > 1) {
       const key = item.slice(1);
-      const booleanFlag = BOOLEAN_FLAGS.has(key) && !(command === "comb" && (key === "version" || key === "last"));
+      const booleanFlag = BOOLEAN_FLAGS.has(key) &&
+        !(command === "comb" && (key === "version" || key === "last" || key === "comb")) &&
+        !((command === "spawn" || command === "x" || command === "run") && key === "comb");
       const nextIsValue = i + 1 < tail.length && (!tail[i + 1]!.startsWith("-") || tail[i + 1] === "-");
       const value = booleanFlag ? true : nextIsValue ? tail[++i]! : true;
       setFlag(flags, key, value);

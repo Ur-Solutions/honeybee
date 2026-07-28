@@ -36,16 +36,26 @@ import { createSwarm } from "../swarm.js";
 import { tmux } from "../tmux.js";
 import { linkHere } from "../spawnLink.js";
 import { randomUUID } from "node:crypto";
-import { readdir, realpath, stat } from "node:fs/promises";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { flowRun } from "../commands/flow.js";
+import { attachBeeToRun } from "../comb/attachment.js";
+import { cancelRunWithDisposition, entryNodeIds } from "../comb/store.js";
+import { instantiateRun } from "../comb/instantiate.js";
+import { loadCombVersion } from "../comb/registry.js";
+import { validateContract } from "../comb/schema.js";
+import type { JsonValue, StoredCombVersion } from "../comb/types.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 import { hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../hsr/runDir.js";
+import { transactionalRetire } from "../kill.js";
 
 export async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
   const frameName = typeof flag(parsed, "frame") === "string" ? String(flag(parsed, "frame")) : undefined;
   const count = resolveSpawnCount(parsed);
+  if (flag(parsed, "comb") !== undefined && (frameName || count > 1)) {
+    throw new Error("hive spawn --comb attaches exactly one bee; --frame and --count > 1 are not supported");
+  }
   let records: SessionRecord[];
   if (frameName) {
     records = await spawnFromFrame(parsed, frameName);
@@ -864,6 +874,7 @@ export function resolvePreambleFlags(parsed: Parsed): { preamble?: string; noPre
 export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
+  const combAttachment = await prepareSpawnCombAttachment(parsed);
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
   const timer = startSpawnTimer(requested);
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
@@ -932,6 +943,57 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
     throw error;
   }
   if (poolPlan && poolAllocation) await bindPoolAllocationToBee(poolPlan, poolAllocation, record.name);
+  let attachedToComb = false;
+  if (combAttachment) {
+    let runId: string | undefined;
+    try {
+      const input = combAttachment.input ?? {
+        bee: {
+          name: record.name,
+          id: record.id ?? null,
+          cwd: record.cwd,
+        },
+      };
+      const entryNodeId = resolveSpawnCombEntry(combAttachment.comb, combAttachment.entryNodeId);
+      const instantiated = await instantiateRun({
+        storedComb: combAttachment.comb,
+        input,
+        cwd: record.cwd,
+        productKey: combAttachment.productKey ?? `bee:${record.id ?? record.name}`,
+        origin: {
+          kind: "attached",
+          beeName: record.name,
+          entryNodeId,
+        },
+      });
+      runId = instantiated.run.id;
+      await attachBeeToRun({
+        runId,
+        beeName: record.name,
+        entryNodeId,
+        ...(record.brief ?? briefText ? { brief: record.brief ?? briefText } : {}),
+      });
+      record = await loadSession(record.name) ?? record;
+      attachedToComb = true;
+    } catch (error) {
+      if (runId) {
+        await cancelRunWithDisposition(runId, {
+          reason: `spawn-time attachment failed: ${error instanceof Error ? error.message : String(error)}`,
+        }).catch(() => undefined);
+      }
+      const retired = await transactionalRetire(record).catch((retireError: unknown) => ({
+        ok: false as const,
+        alreadyGone: false,
+        lastError: retireError instanceof Error ? retireError.message : String(retireError),
+      }));
+      if (!retired.ok) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; attachment failed closed but bee quarantine/retirement also failed: ${retired.lastError}`,
+        );
+      }
+      throw error;
+    }
+  }
   const nodeSuffix = useHsr ? [dim("substrate:hsr")] : node && node.name !== LOCAL_NODE_NAME ? [dim(`node:${node.name}`)] : [];
   if (isPretty()) console.log(actionLine("ok", "spawn", [bold(record.name), record.agent, dim(tildify(cwd)), ...nodeSuffix]));
   else console.log(`${record.name}\t${agent}\t${cwd}\t${useHsr ? "hsr" : node?.name ?? LOCAL_NODE_NAME}`);
@@ -947,7 +1009,9 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const argvPrompt = spawnArgvPrompt(parsed);
   // Deliver the record's brief (which carries the contract postscript when a
   // seal contract was demanded), not the raw --brief text.
-  if (truthy(flag(parsed, "briefed")) && (record.brief ?? briefText)) {
+  if (attachedToComb) {
+    timer.mark("brief");
+  } else if (truthy(flag(parsed, "briefed")) && (record.brief ?? briefText)) {
     const delivered = await deliverSpawnBrief(parsed, record, record.brief ?? briefText!);
     record = delivered.record;
     timer.mark(delivered.sent ? "brief" : "ready");
@@ -971,6 +1035,89 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   }
   timer.report(record.name);
   return record;
+}
+
+type PreparedSpawnCombAttachment = {
+  comb: StoredCombVersion;
+  input?: JsonValue;
+  entryNodeId?: string;
+  productKey?: string;
+};
+
+async function prepareSpawnCombAttachment(parsed: Parsed): Promise<PreparedSpawnCombAttachment | undefined> {
+  const rawName = flag(parsed, "comb");
+  if (rawName === undefined) return undefined;
+  if (typeof rawName !== "string" || rawName.trim().length === 0) {
+    throw new Error("--comb requires a registry comb name");
+  }
+  const rawVersion = flag(parsed, "comb-version");
+  const version = rawVersion === undefined
+    ? undefined
+    : typeof rawVersion === "string" && Number.isSafeInteger(Number(rawVersion)) && Number(rawVersion) >= 1
+      ? Number(rawVersion)
+      : (() => { throw new Error("--comb-version must be an integer >= 1"); })();
+  const comb = await loadCombVersion(rawName, version);
+  if (!comb) {
+    throw new Error(version ? `comb not found: ${rawName}@${version}` : `comb not found: ${rawName}`);
+  }
+  const inputSource = flag(parsed, "comb-input");
+  let input: JsonValue | undefined;
+  if (inputSource !== undefined) {
+    if (typeof inputSource !== "string" || inputSource.length === 0) {
+      throw new Error("--comb-input requires a JSON file or -");
+    }
+    const raw = inputSource === "-"
+      ? await readStdinForSpawnComb()
+      : await readFile(resolve(inputSource), "utf8");
+    try {
+      input = JSON.parse(raw) as JsonValue;
+    } catch (error) {
+      throw new Error(`comb input is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const rawEntry = flag(parsed, "comb-entry") ?? flag(parsed, "entry");
+  const entryNodeId = typeof rawEntry === "string" ? rawEntry : undefined;
+  const resolvedEntryNodeId = resolveSpawnCombEntry(comb, entryNodeId);
+  if (input !== undefined) {
+    const validation = validateContract(comb.definition.input, input);
+    if (!validation.valid) {
+      throw new Error(`comb input does not match the input contract: ${validation.errors.join("; ")}`);
+    }
+  }
+  const rawProduct = flag(parsed, "comb-product") ?? flag(parsed, "product");
+  const productKey = typeof rawProduct === "string" ? rawProduct : undefined;
+  return {
+    comb,
+    ...(input !== undefined ? { input } : {}),
+    entryNodeId: resolvedEntryNodeId,
+    ...(productKey ? { productKey } : {}),
+  };
+}
+
+function resolveSpawnCombEntry(comb: StoredCombVersion, requested: string | undefined): string {
+  const entries = entryNodeIds(comb.definition);
+  if (requested) {
+    if (!entries.includes(requested)) throw new Error(`node ${requested} is not an entry node`);
+    return requested;
+  }
+  if (entries.length !== 1) {
+    throw new Error(`comb ${comb.name} has ${entries.length} entry nodes; pass --comb-entry`);
+  }
+  return entries[0]!;
+}
+
+let spawnCombStdin: Promise<string> | undefined;
+function readStdinForSpawnComb(): Promise<string> {
+  spawnCombStdin ??= new Promise((resolveInput, reject) => {
+    const chunks: Buffer[] = [];
+    process.stdin.on("data", (chunk: Buffer | string) =>
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    );
+    process.stdin.on("end", () => resolveInput(Buffer.concat(chunks).toString("utf8")));
+    process.stdin.on("error", reject);
+    process.stdin.resume();
+  });
+  return spawnCombStdin;
 }
 
 

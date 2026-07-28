@@ -613,7 +613,7 @@ test("review critical B9: evidence mismatch enters the same terminal cleanup and
   });
 });
 
-test("review repro C1: lint rejects every slice-2-only authored shape", () => {
+test("review repro C1: lint rejects authored shapes that remain outside the implemented slices", () => {
   const base = {
     formatVersion: 2,
     name: "future-shape",
@@ -632,22 +632,6 @@ test("review repro C1: lint rejects every slice-2-only authored shape", () => {
           subject: { source: "run-input", pointer: "" },
           eventKinds: ["push"],
           delivery: "queue",
-        }],
-      },
-    },
-    {
-      label: "human executor",
-      definition: {
-        ...base,
-        nodes: [{
-          id: "review",
-          executor: "human",
-          binding: "strict",
-          human: {
-            title: "Review",
-            packetKind: "web",
-            feedbackDestination: { type: "new-agent" },
-          },
         }],
       },
     },
@@ -692,40 +676,10 @@ test("review repro C1: lint rejects every slice-2-only authored shape", () => {
       },
     },
     {
-      label: "waiting edge",
-      definition: {
-        ...base,
-        nodes: [agentNode("work"), agentNode("timeout")],
-        edges: [{
-          id: "wait",
-          from: "work",
-          to: "timeout",
-          kind: "waiting",
-          on: "waiting",
-          when: { kind: "clock", afterMs: 1_000, from: "activation-start" },
-        }],
-      },
-    },
-    {
       label: "checkout",
       definition: {
         ...base,
         nodes: [{ ...agentNode("work"), checkout: { pool: "review", mode: "exclusive" } }],
-      },
-    },
-    {
-      label: "blocking-since clock",
-      definition: {
-        ...base,
-        nodes: [{
-          id: "clock",
-          executor: "engine",
-          binding: "strict",
-          engine: {
-            kind: "predicate",
-            predicate: { kind: "clock", afterMs: 1_000, from: "blocking-since" },
-          },
-        }],
       },
     },
     {

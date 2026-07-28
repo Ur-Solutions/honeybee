@@ -10,6 +10,7 @@ import type {
   JsonValue,
   JoinAggregateOutput,
   PredicateSpec,
+  ReviewFeedbackDestination,
   RunRecord,
 } from "./types.js";
 
@@ -56,6 +57,7 @@ export function reconcileMachine(run: RunRecord, now = new Date().toISOString())
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
     let iterationChanged = false;
     iterationChanged = reconcileEnginePredicates(run, now) || iterationChanged;
+    iterationChanged = fireWaitingEdges(run, now) || iterationChanged;
     iterationChanged = fireEligibleEdges(run, now) || iterationChanged;
     iterationChanged = reconcileForwardJoins(run, now) || iterationChanged;
     changed = changed || iterationChanged;
@@ -71,7 +73,9 @@ export function evaluatePredicate(
   context: { itemIndex: number; now: string; activation?: ActivationRecord },
 ): PredicateResult {
   if (predicate.kind === "clock") {
-    const basis = context.activation?.startedAt;
+    const basis = predicate.from === "blocking-since"
+      ? context.activation?.blockingSince
+      : context.activation?.startedAt;
     if (!basis) return { state: "waiting" };
     return Date.parse(context.now) >= Date.parse(basis) + predicate.afterMs
       ? { state: "true" }
@@ -117,6 +121,48 @@ export function activateAgent(run: RunRecord, activation: ActivationRecord, now 
   activation.startedAt = now;
   activation.claim.attemptStartedAt = now;
   recordRunEvent(run, "comb.activation.active", activation.address);
+}
+
+export function applyHumanVerdict(
+  run: RunRecord,
+  activation: ActivationRecord,
+  verdict: {
+    verdict: "approve" | "request_changes";
+    comment: string | null;
+    destination: ReviewFeedbackDestination;
+  },
+  now = new Date().toISOString(),
+): void {
+  if (
+    run.cancellation ||
+    activation.invalidatedAt ||
+    activation.status === "done" ||
+    activation.status === "failed" ||
+    activation.status === "skipped"
+  ) return;
+  const node = nodeFor(run, activation.address.nodeId);
+  if (node.executor !== "human") return;
+  activation.output = {
+    verdict: verdict.verdict,
+    comment: verdict.comment,
+    destination: verdict.destination,
+  };
+  activation.endedAt = now;
+  if (verdict.verdict === "approve") {
+    activation.status = "done";
+    recordRunEvent(run, "comb.activation.done", activation.address, { verdict: verdict.verdict });
+    return;
+  }
+  activation.status = "failed";
+  activation.failure = {
+    code: "human-request-changes",
+    message: verdict.comment ?? "human reviewer requested changes",
+    retryable: true,
+  };
+  recordRunEvent(run, "comb.activation.failed", activation.address, {
+    code: "human-request-changes",
+    retryable: true,
+  });
 }
 
 export function terminalizeRun(
@@ -204,6 +250,67 @@ function fireEligibleEdges(run: RunRecord, now: string): boolean {
       if (edge.kind === "retry") {
         changed = createRetryAttempt(run, edge, activation, firing.id, now) || changed;
       }
+    }
+  }
+  return changed;
+}
+
+function fireWaitingEdges(run: RunRecord, now: string): boolean {
+  let changed = false;
+  const definition = run.currentSnapshot.definition;
+  for (const activation of currentActivations(run)) {
+    if (
+      activation.status !== "active" &&
+      activation.status !== "waiting-human" &&
+      activation.status !== "waiting-event"
+    ) continue;
+    for (const edge of definition.edges.filter(
+      (candidate) =>
+        candidate.kind === "waiting" &&
+        candidate.on === "waiting" &&
+        candidate.from === activation.address.nodeId,
+    )) {
+      const firingId = edgeFiringId(edge, activation);
+      if (run.edgeFiringTail.some((firing) => firing.id === firingId)) continue;
+      const result = evaluatePredicate(run, edge.when!, {
+        itemIndex: activation.address.itemIndex,
+        now,
+        activation,
+      });
+      if (result.state !== "true") continue;
+      run.edgeFiringTail.push({
+        id: firingId,
+        edgeId: edge.id,
+        from: activation.address,
+        toNodeId: edge.to,
+        cohortId: activation.cohortId,
+        subject: activation.subject,
+        firedAt: now,
+      });
+      if (run.edgeFiringTail.length > 256) {
+        run.edgeFiringTail.splice(0, run.edgeFiringTail.length - 256);
+      }
+      recordRunEvent(run, "comb.edge.fired", activation.address, {
+        edgeId: edge.id,
+        toNodeId: edge.to,
+        waiting: true,
+      });
+      if (!currentActivations(run).some(
+        (candidate) =>
+          candidate.address.nodeId === edge.to &&
+          candidate.address.itemIndex === activation.address.itemIndex &&
+          candidate.cohortId === activation.cohortId,
+      )) {
+        createActivation(run, nodeFor(run, edge.to), {
+          attempt: nextAttempt(run, edge.to, activation.address.itemIndex),
+          itemIndex: activation.address.itemIndex,
+          cohortId: activation.cohortId,
+          subject: activation.subject,
+          incomingEdgeFiringIds: [firingId],
+          now,
+        });
+      }
+      changed = true;
     }
   }
   return changed;
@@ -325,6 +432,7 @@ function createRetryAttempt(run: RunRecord, edge: CombEdge, source: ActivationRe
   const generation = run.nextCohortGeneration;
   run.nextCohortGeneration += 1;
   const cohortId = `${run.id}:g${generation}:i${itemIndex}`;
+  const retryContext = humanRetryContext(source);
   for (const rootId of [destination.id, ...supportRoots]) {
     const root = nodeFor(run, rootId);
     const rootAttempt = rootId === destination.id ? attempt : nextAttempt(run, rootId, itemIndex);
@@ -336,6 +444,7 @@ function createRetryAttempt(run: RunRecord, edge: CombEdge, source: ActivationRe
       subject: source.subject,
       incomingEdgeFiringIds: rootId === destination.id ? [firingId] : [],
       now,
+      ...(rootId === destination.id && retryContext ? { retryContext } : {}),
     });
     const backoff = Math.min(
       rootLimits.retryBackoffMs * (2 ** Math.max(0, rootAttempt - 2)),
@@ -357,6 +466,7 @@ function createActivation(
     incomingEdgeFiringIds: string[];
     now: string;
     aggregate?: JoinAggregateOutput;
+    retryContext?: ActivationRecord["retryContext"];
   },
 ): ActivationRecord {
   const id = activationId(node.id, options.attempt, options.itemIndex);
@@ -381,10 +491,22 @@ function createActivation(
     childRunTail: [],
     effectKeys: [],
     ...(options.aggregate ? { aggregate: options.aggregate } : {}),
+    ...(options.retryContext ? { retryContext: options.retryContext } : {}),
   };
   run.activations[id] = activation;
   recordRunEvent(run, "comb.activation.pending", activation.address);
   return activation;
+}
+
+function humanRetryContext(source: ActivationRecord): ActivationRecord["retryContext"] | undefined {
+  if (!source.output || typeof source.output !== "object" || Array.isArray(source.output)) return undefined;
+  if (source.output.verdict !== "request_changes") return undefined;
+  const comment = source.output.comment;
+  return {
+    from: source.address,
+    verdict: "request_changes",
+    ...(comment === null || typeof comment === "string" ? { comment } : {}),
+  };
 }
 
 function deriveTerminalRun(run: RunRecord, now: string): boolean {

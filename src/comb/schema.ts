@@ -45,7 +45,6 @@ export function normalizeComb(value: unknown, expectedName?: string): CombSpec {
   const edges = arrayAt(root.edges, "$.edges").map((entry, index) => {
     const edge = objectAt(entry, `$.edges[${index}]`);
     const kind = enumAt(edge.kind, `$.edges[${index}].kind`, ["forward", "retry", "waiting"] as const);
-    if (kind === "waiting") unsupported(`$.edges[${index}].kind`, "waiting edges");
     const on = enumAt(edge.on, `$.edges[${index}].on`, ["done", "failed", "waiting"] as const);
     const when = edge.when !== undefined
       ? normalizePredicate(edge.when, `$.edges[${index}].when`)
@@ -115,6 +114,14 @@ export function validateNormalizedComb(spec: CombSpec): void {
     }
     if (node.executor === "human" && node.output !== undefined) {
       fail(`$.nodes[${index}].output`, "human nodes use the fixed verdict/comment/destination contract and may not override it");
+    }
+    if (node.executor === "human" && node.human.feedbackDestination.type === "bee") {
+      const fromNodeId = node.human.feedbackDestination.fromNodeId;
+      const source = spec.nodes.find((candidate) => candidate.id === fromNodeId);
+      if (!source) fail(`$.nodes[${index}].human.feedbackDestination.fromNodeId`, "must reference an existing node");
+      if (source.executor !== "agent") {
+        fail(`$.nodes[${index}].human.feedbackDestination.fromNodeId`, "must reference an agent node");
+      }
     }
     if (node.executor === "engine" && node.binding !== "strict") {
       fail(`$.nodes[${index}].binding`, "engine nodes must be strict");
@@ -212,7 +219,41 @@ function normalizeNode(value: unknown, path: string): CombNode {
     };
   }
   if (executor === "human") {
-    unsupported(`${path}.executor`, "human executors");
+    const human = objectAt(node.human, `${path}.human`);
+    const destination = objectAt(human.feedbackDestination, `${path}.human.feedbackDestination`);
+    const destinationType = enumAt(
+      destination.type,
+      `${path}.human.feedbackDestination.type`,
+      ["bee", "new-agent", "pr-comment"] as const,
+    );
+    const feedbackDestination = destinationType === "bee"
+      ? {
+          type: destinationType,
+          fromNodeId: stringAt(destination.fromNodeId, `${path}.human.feedbackDestination.fromNodeId`),
+        }
+      : { type: destinationType };
+    let checklist: Array<{ text: string; done: boolean }> | undefined;
+    if (human.checklist !== undefined) {
+      checklist = arrayAt(human.checklist, `${path}.human.checklist`).map((entry, index) => {
+        const item = objectAt(entry, `${path}.human.checklist[${index}]`);
+        if (typeof item.done !== "boolean") fail(`${path}.human.checklist[${index}].done`, "must be a boolean");
+        return {
+          text: stringAt(item.text, `${path}.human.checklist[${index}].text`),
+          done: item.done,
+        };
+      });
+    }
+    return {
+      ...base,
+      executor,
+      human: {
+        title: stringAt(human.title, `${path}.human.title`),
+        packetKind: enumAt(human.packetKind, `${path}.human.packetKind`, ["web", "desktop", "cli", "code"] as const),
+        ...(typeof human.summary === "string" ? { summary: human.summary } : {}),
+        ...(checklist ? { checklist } : {}),
+        feedbackDestination,
+      },
+    };
   }
   const engine = objectAt(node.engine, `${path}.engine`);
   const kind = enumAt(engine.kind, `${path}.engine.kind`, ["predicate", "action", "child-run"] as const);
@@ -309,9 +350,6 @@ function normalizeClaim(value: unknown, path: string): NonNullable<CombSpec["cla
 
 function assertSlice1Predicate(predicate: PredicateSpec, path: string): void {
   if (predicate.kind === "ci-status") unsupported(`${path}.kind`, "ci-status predicates");
-  if (predicate.kind === "clock" && predicate.from === "blocking-since") {
-    unsupported(`${path}.from`, "blocking-since clocks");
-  }
 }
 
 function normalizeExpectations(value: unknown, path: string) {
@@ -499,7 +537,15 @@ function mustResolvePointer(value: JsonValue, pointer: JsonPointer): JsonValue {
 export function renderBrief(template: string, input: JsonValue, item: JsonValue | undefined, nodes: Iterable<ActivationRecord>): string {
   const nodeMap = new Map<string, ActivationRecord>();
   for (const activation of nodes) {
-    if (activation.invalidatedAt || activation.status !== "done") continue;
+    const retryFeedback =
+      activation.status === "failed" &&
+      activation.output !== undefined &&
+      activation.output !== null &&
+      typeof activation.output === "object" &&
+      !Array.isArray(activation.output) &&
+      activation.output.verdict === "request_changes";
+    if (activation.status !== "done" && !retryFeedback) continue;
+    if (activation.invalidatedAt && !retryFeedback) continue;
     const existing = nodeMap.get(activation.address.nodeId);
     if (!existing || activation.address.attempt > existing.address.attempt) nodeMap.set(activation.address.nodeId, activation);
   }

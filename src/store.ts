@@ -621,6 +621,8 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
         taskId: raw.taskId,
         status: raw.status,
         attachedAt: raw.attachedAt,
+        ...(typeof raw.trackDigest === "string" ? { trackDigest: raw.trackDigest } : {}),
+        ...(typeof raw.deliveredAt === "string" ? { deliveredAt: raw.deliveredAt } : {}),
         ...(typeof raw.endedAt === "string" ? { endedAt: raw.endedAt } : {}),
       });
     }

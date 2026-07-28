@@ -178,13 +178,21 @@ export async function cmdX(parsed: Parsed) {
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
   if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--env KEY=VALUE] [--name <id>] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]");
   assertSingleBeeInvocation(parsed, "hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
+  const attachedComb = typeof flag(parsed, "comb") === "string";
 
   // The waitForPromptReady below is authoritative; skip spawn's own readiness
   // confirmation so a slow boot is only waited for once.
-  const record = await spawnDelegated(parsed, agent, { mutateFlags: (flags) => flags.set("no-wait", true) });
+  const record = await spawnDelegated(parsed, agent, {
+    mutateFlags: (flags) => {
+      flags.set("no-wait", true);
+      if (attachedComb) flags.set("brief", prompt);
+    },
+  });
 
-  await waitForPromptReady(record, parsed);
-  await deliverPromptToBee(record, prompt);
+  if (!attachedComb) {
+    await waitForPromptReady(record, parsed);
+    await deliverPromptToBee(record, prompt);
+  }
   if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
   else console.log(`sent\t${record.name}\t${prompt.length} chars`);
 }

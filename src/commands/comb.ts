@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { loadSession } from "../store.js";
+import { attachBeeToRun } from "../comb/attachment.js";
 import { loadTsModule } from "../tsLoader.js";
 import { flag, truthy, type Parsed } from "../parse.js";
-import { boardView, cancelRunWithDisposition, listRuns, readRunEvents, requireRun } from "../comb/store.js";
+import { boardView, cancelRunWithDisposition, entryNodeIds, listRuns, readRunEvents, requireRun } from "../comb/store.js";
 import { defineCombFromFile, defineCombVersion, listCombVersions, loadCombVersion } from "../comb/registry.js";
 import { asCombError, CombError } from "../comb/errors.js";
 import { instantiateRun } from "../comb/instantiate.js";
@@ -18,7 +19,7 @@ Usage
   hive comb lint <file.json|file.ts|-> [--json]
   hive comb define <file.json|file.ts|-> [name] [--base-version <n>] [--json]
   hive comb inspect <name> [--version <n>] [--json]
-  hive comb run <name> [--version <n>] --input <file|-> --product <key> [--cwd <path>] [--json]
+  hive comb run <name> [--version <n>] --input <file|-> --product <key> [--cwd <path>] [--bee <session>] [--entry <node>] [--json]
   hive comb run --graph <file|-> --input <file|-> --product <key> [--cwd <path>] [--json]
   hive comb runs [--comb <name>] [--status active|failed|cancelled|done] [--active] [--last <1..1000>] [--json]
   hive comb status <run-id> [--activation <activation-id>] [--json]
@@ -128,10 +129,11 @@ async function combInspect(parsed: Parsed) {
 }
 
 async function combRun(parsed: Parsed) {
-  if (flag(parsed, "bee") !== undefined) {
-    throw new CombError("invalid_argument", "attached --bee runs are not enabled in strict-spine slice 1");
-  }
+  const attachedBee = stringFlag(parsed, "bee");
   const graphSource = stringFlag(parsed, "graph");
+  if (graphSource && attachedBee) {
+    throw new CombError("invalid_argument", "ad-hoc --graph runs cannot adopt --bee in phase 1");
+  }
   const name = graphSource ? undefined : parsed.args[1];
   if (!graphSource && !name) throw new CombError("invalid_argument", "Usage: hive comb run <name> --input <file|-> [--json]");
   const inputSource = requiredStringFlag(parsed, "input");
@@ -165,7 +167,16 @@ async function combRun(parsed: Parsed) {
   if (event && (event.triggerId !== triggerId || event.deliveryId !== deliveryId)) {
     throw new CombError("invalid_argument", "origin event triggerId/deliveryId must equal provenance flags");
   }
-  const origin = triggerId && deliveryId
+  if (attachedBee && triggerId) {
+    throw new CombError("invalid_argument", "attached --bee runs cannot also use trigger provenance");
+  }
+  const attachedRecord = attachedBee ? await loadSession(attachedBee) : null;
+  if (attachedBee && !attachedRecord) throw new CombError("not_found", `bee not found: ${attachedBee}`);
+  if (attachedRecord && attachedRecord.status !== "running") {
+    throw new CombError("invalid_argument", `bee ${attachedRecord.name} is terminal (${attachedRecord.status})`);
+  }
+  const entryNodeId = stringFlag(parsed, "entry");
+  const baseOrigin = triggerId && deliveryId
     ? { kind: "trigger" as const, triggerId, deliveryId, ...(typeof event?.eventId === "string" ? { eventId: event.eventId } : {}) }
     : { kind: graphSource ? "ad-hoc" as const : "manual" as const, actor: process.env.HIVE_BEE ?? process.env.USER ?? "operator" };
   if (graphSource) {
@@ -175,7 +186,7 @@ async function combRun(parsed: Parsed) {
       input,
       cwd,
       productKey,
-      origin,
+      origin: baseOrigin,
       ...(collision ? { collision } : {}),
     });
   }
@@ -185,7 +196,26 @@ async function combRun(parsed: Parsed) {
   }
   const comb = await loadCombVersion(name!, version);
   if (!comb) throw new CombError("not_found", version ? `comb not found: ${name}@${version}` : `comb not found: ${name}`);
-  return instantiateRun({
+  const entries = entryNodeIds(comb.definition);
+  const resolvedEntry = attachedRecord
+    ? entryNodeId
+      ? entries.includes(entryNodeId)
+        ? entryNodeId
+        : (() => { throw new CombError("invalid_argument", `node ${entryNodeId} is not an entry node`); })()
+      : entries.length === 1
+        ? entries[0]!
+        : (() => {
+            throw new CombError(
+              "ambiguous_activation",
+              `comb ${comb.name} has ${entries.length} entry nodes; pass --entry`,
+              entries as unknown as JsonValue,
+            );
+          })()
+    : undefined;
+  const origin = attachedRecord
+    ? { kind: "attached" as const, beeName: attachedRecord.name, entryNodeId: resolvedEntry! }
+    : baseOrigin;
+  const instantiated = await instantiateRun({
     storedComb: comb,
     input,
     cwd,
@@ -193,6 +223,27 @@ async function combRun(parsed: Parsed) {
     origin,
     ...(collision ? { collision } : {}),
   });
+  if (!attachedRecord) return instantiated;
+  try {
+    const attachment = await attachBeeToRun({
+      runId: instantiated.run.id,
+      beeName: attachedRecord.name,
+      entryNodeId: resolvedEntry,
+    });
+    return {
+      ...instantiated,
+      run: attachment.run,
+      attachment: {
+        bee: attachment.bee,
+        activationId: attachment.activationId,
+      },
+    };
+  } catch (error) {
+    await cancelRunWithDisposition(instantiated.run.id, {
+      reason: `attached run setup failed: ${error instanceof Error ? error.message : String(error)}`,
+    }).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function combRuns(parsed: Parsed) {
