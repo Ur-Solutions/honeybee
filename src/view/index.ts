@@ -11,7 +11,8 @@
  */
 
 export * from "./types.js";
-export { paneFingerprint, projectBeeView, type BeeViewProjectionSources } from "./project.js";
+export { projectBeeView, type BeeViewProjectionSources } from "./project.js";
+export { deriveOpenRequests, paneFingerprint, type OpenRequestSources } from "./requests.js";
 export {
   assembleStateContext,
   capturePanesForRecords,

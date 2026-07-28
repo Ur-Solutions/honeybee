@@ -17,15 +17,14 @@
  *     contract).
  */
 
-import { createHash } from "node:crypto";
 import { effectiveHiveState } from "../hiveState.js";
-import { isAuthNeededMessage, structuredStateFromEvents, type HsrEventSnapshot } from "../hsr/observe.js";
+import { structuredStateFromEvents, type HsrEventSnapshot } from "../hsr/observe.js";
 import type { RunnerEvent } from "../hsr/types.js";
 import { LOCAL_NODE_NAME } from "../node.js";
-import { isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "../readiness.js";
 import type { SealRecord } from "../seal.js";
 import { deriveState, liveTargetKey, parseBeeState, type BeeState, type DerivedState, type StateContext } from "../state.js";
 import type { SessionRecord } from "../store.js";
+import { deriveOpenRequests } from "./requests.js";
 import {
   BEE_VIEW_SCHEMA_VERSION,
   type BeeDisplayState,
@@ -73,9 +72,18 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
 
   const bee = projectBee(record, nodeName);
   const latestRuntime = projectRuntime(record, context, derived, { generation, unreachable, held });
+  // Scope closure is inherent: a retired bee or an exited runtime has no open
+  // requests — re-derivation from current evidence closes them naturally.
   const openRequests = bee.lifecycle === "retired" || latestRuntime.state === "exited"
     ? []
-    : deriveOpenRequests(sources, derived, generation, nowMs);
+    : deriveOpenRequests({
+        record,
+        context,
+        derived,
+        generation,
+        ...(sources.eventSnapshot ? { eventSnapshot: sources.eventSnapshot } : {}),
+        now: nowMs,
+      });
   const latestTurnResult = projectTurnResult(sources, derived, latestRuntime, hiveStateOption, nowMs);
   const latestContractResult = projectContractResult(sources);
   const { displayState, displayStateReason } = chooseDisplayState({
@@ -385,147 +393,6 @@ function projectContractResult(sources: BeeViewProjectionSources): BeeViewContra
       ...(sources.latestSealFilename ? { detail: sources.latestSealFilename } : {}),
     },
   };
-}
-
-/** Stable fingerprint of a pane block, so identical captures share request ids. */
-export function paneFingerprint(pane: string): string {
-  const block = pane.trimEnd().split("\n").slice(-15).join("\n").trim();
-  return createHash("sha256").update(block).digest("hex").slice(0, 12);
-}
-
-/**
- * Open InterventionRequests from CURRENT evidence only (re-derived every
- * projection, so scope closure is inherent: a turn_end after a needs_input, or
- * a dead runtime, naturally closes them). Ids are the durable idempotency keys
- * the later request store adopts.
- */
-function deriveOpenRequests(
-  sources: BeeViewProjectionSources,
-  derived: DerivedState,
-  generation: number,
-  nowMs: number,
-): BeeViewRequest[] {
-  const { record, context, eventSnapshot } = sources;
-  const requests: BeeViewRequest[] = [];
-
-  // 1. Unresolved structured needs_input → question/permission, grade
-  //    structured, payload passed through so answer UIs need no second read.
-  const pending = eventSnapshot?.pendingNeedsInput ?? null;
-  if (pending) {
-    const openedAt = isoFromEpochMs(pending.ts);
-    requests.push({
-      id: pending.requestId && pending.requestId !== "pending" ? pending.requestId : `ni:${record.name}:${pending.ts}`,
-      kind: pending.kind,
-      status: "open",
-      scope: "turn",
-      grade: "structured",
-      ...(openedAt !== undefined ? { openedAt } : {}),
-      question: pending.question,
-      ...(pending.tool !== undefined ? { tool: pending.tool } : {}),
-      ...(pending.options !== undefined ? { options: pending.options } : {}),
-      ...(pending.optionDetails !== undefined ? { optionDetails: pending.optionDetails } : {}),
-      ...(pending.questions !== undefined ? { questions: pending.questions } : {}),
-      ...(pending.multiSelect !== undefined ? { multiSelect: pending.multiSelect } : {}),
-      ...(pending.input !== undefined ? { input: pending.input } : {}),
-      evidence: { grade: "structured", source: "hsr-events", ...(openedAt !== undefined ? { observedAt: openedAt } : {}), detail: "needs_input" },
-    });
-  }
-
-  // 2. Pane-detected permission/trust/MCP prompts (observer grade, stable
-  //    fingerprint ids), only when no structured request already covers it.
-  if (derived.state === "blocked" && !pending) {
-    const paneKey = record.agentPaneId ?? record.tmuxTarget;
-    const pane = context.panes?.get(paneKey);
-    if (pane && (isPermissionPromptPane(pane) || isTrustPromptPane(pane) || isMcpWarningPane(pane))) {
-      requests.push({
-        id: `obs:${record.name}:${generation}:permission:${paneFingerprint(pane)}`,
-        kind: "permission",
-        status: "open",
-        scope: "turn",
-        grade: "observer",
-        question: derived.detail,
-        evidence: { grade: "observer", source: "pane-capture", observedAt: new Date(nowMs).toISOString(), detail: derived.detail },
-      });
-    } else {
-      // Blocked without a readable pane this pass (held state, or an HSR
-      // structured "blocked" whose needs_input payload was not snapshot).
-      requests.push({
-        id: `obs:${record.name}:${generation}:permission:held`,
-        kind: "permission",
-        status: "open",
-        scope: "turn",
-        grade: "observer",
-        question: derived.detail,
-        evidence: { grade: "observer", source: "session-record", detail: `blocked without pane evidence this pass (${derived.detail})` },
-      });
-    }
-  }
-
-  // 3. Auth: structured when the events tail carries the login-required
-  //    failure (bounded by auth_resume — structuredStateFromEvents applies the
-  //    boundary), observer-grade from pane/held state otherwise.
-  if (derived.state === "auth-needed") {
-    const authEvent = lastAuthNeededEvent(eventSnapshot?.events ?? []);
-    if (authEvent) {
-      const openedAt = isoFromEpochMs(authEvent.ts);
-      requests.push({
-        id: `auth:${record.name}:${authEvent.ts}`,
-        kind: "auth",
-        status: "open",
-        scope: "runtime-generation",
-        grade: "structured",
-        ...(openedAt !== undefined ? { openedAt } : {}),
-        question: derived.detail,
-        evidence: { grade: "structured", source: "hsr-events", ...(openedAt !== undefined ? { observedAt: openedAt } : {}), detail: authEvent.type },
-      });
-    } else {
-      requests.push({
-        id: `obs:${record.name}:${generation}:auth:held`,
-        kind: "auth",
-        status: "open",
-        scope: "runtime-generation",
-        grade: "observer",
-        question: derived.detail,
-        evidence: { grade: "observer", source: "session-record", detail: "auth-needed from pane/held state" },
-      });
-    }
-  }
-
-  // 4. wedged/error: a recovery condition, not a lifecycle — synthesize an
-  //    observer-grade manual-action request (design decision 2).
-  if (derived.state === "wedged" || derived.state === "error") {
-    requests.push({
-      id: `manual:${record.name}:${generation}:wedged`,
-      kind: "manual-action",
-      status: "open",
-      scope: "runtime-generation",
-      grade: "observer",
-      question: derived.detail,
-      evidence: { grade: "observer", source: "session-record", detail: derived.detail },
-    });
-  }
-
-  return requests;
-}
-
-/** Last auth-needed signal (error/auth_expired) not yet bounded by auth_resume. */
-function lastAuthNeededEvent(events: RunnerEvent[]): RunnerEvent | undefined {
-  let lastAuth: RunnerEvent | undefined;
-  let lastAuthIdx = -1;
-  let lastResumeIdx = -1;
-  for (let i = 0; i < events.length; i += 1) {
-    const event = events[i]!;
-    if (event.type === "auth_resume") lastResumeIdx = i;
-    if (event.type === "auth_expired" && event.requiresLogin) {
-      lastAuth = event;
-      lastAuthIdx = i;
-    }
-    if (event.type === "error" && isAuthNeededMessage(event.message)) {
-      lastAuth = event;
-      lastAuthIdx = i;
-    }
-  }
-  return lastAuthIdx > lastResumeIdx ? lastAuth : undefined;
 }
 
 function chooseDisplayState(facts: {

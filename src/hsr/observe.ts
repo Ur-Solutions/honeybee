@@ -536,7 +536,7 @@ export type PendingNeedsInput = {
   input?: unknown;
 };
 
-function pendingNeedsInputFromEvents(
+export function pendingNeedsInputFromEvents(
   events: RunnerEvent[],
   options: HsrEventDerivationOptions = {},
 ): PendingNeedsInput | null {
