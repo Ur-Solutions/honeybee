@@ -14,7 +14,7 @@ import type {
 const execFileAsync = promisify(execFile);
 
 export type ForumPacketEffectRequest = {
-  operation: "create" | "rerequest" | "successor";
+  operation: "create" | "rerequest" | "successor" | "withdraw";
   idempotencyKey: string;
   runId: string;
   nodeId: string;
@@ -49,6 +49,7 @@ export async function listForumPackets(): Promise<ForumPacket[]> {
 export async function executeForumPacketEffect(request: ForumPacketEffectRequest): Promise<ForumPacket> {
   if (request.operation === "create") return createPacket(request);
   if (request.operation === "rerequest") return rerequestPacket(request);
+  if (request.operation === "withdraw") return withdrawPacket(request);
   return createSuccessor(request);
 }
 
@@ -126,6 +127,31 @@ async function createSuccessor(request: ForumPacketEffectRequest): Promise<Forum
     "packet.successor",
   );
   return reconcileDestinationAndFields(packet, request, `${request.idempotencyKey}:fields`);
+}
+
+async function withdrawPacket(request: ForumPacketEffectRequest): Promise<ForumPacket> {
+  if (!request.predecessorPacketId) {
+    throw new CombError("corrupt_state", "forum withdrawal effect is missing its packet ID");
+  }
+  const current = packetFromEnvelope(
+    await callForum(["packet", "show", request.predecessorPacketId, "--json"]),
+    "packet.show",
+  );
+  if (current.status === "superseded" || current.status === "archived") return current;
+  return packetFromEnvelope(
+    await callForum([
+      "packet",
+      "status",
+      current.id,
+      "superseded",
+      "--message",
+      `comb terminal withdrawal ${request.idempotencyKey}`,
+      "--actor",
+      "hive-comb",
+      "--json",
+    ]),
+    "packet.status",
+  );
 }
 
 async function reconcileDestinationAndFields(

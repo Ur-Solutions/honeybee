@@ -11,6 +11,7 @@ import {
 } from "../src/comb/controller.js";
 import type { ForumPacketEffectRequest } from "../src/comb/forum.js";
 import {
+  cancelRun,
   createRun,
   listSweepableRuns,
   loadRun,
@@ -606,6 +607,218 @@ test("a retried approved human node creates a successor packet instead of rerequ
     assert.equal(reviewThread.packetCount, 2);
     assert.equal(reviewThread.currentPacketId, "PKT.review.2");
     assert.equal(reviewThread.packetTail[0]?.status, "superseded");
+  });
+});
+
+test("cancelling a waiting human node withdraws its packet and keeps a later verdict as inert evidence", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "cancel-human",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retireAgentsOnTerminal: false },
+    });
+    const packets = new Map<string, ForumPacket>();
+    const operations: string[] = [];
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [...packets.values()],
+      executeHumanEffect: async (request) => {
+        operations.push(String(request.operation));
+        if (String(request.operation) === "withdraw") {
+          const packet = packets.get(request.predecessorPacketId!);
+          assert.ok(packet);
+          packet.status = "superseded";
+          return packet;
+        }
+        const packet = packetFor(request, "PKT.cancelled", new Date(now).toISOString());
+        packets.set(packet.id, packet);
+        return packet;
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [], new Map());
+    let run = (await loadRun(created.id))!;
+    assert.equal(current(run, "verify").status, "waiting-human");
+
+    await cancelRun(created.id, {
+      reason: "operator cancelled",
+      requestedBy: "test",
+      now: "2026-07-28T12:00:02.000Z",
+    });
+    const packet = packets.get("PKT.cancelled")!;
+    packet.status = "approved";
+    packet.verdict = verdict(
+      packet,
+      "approve",
+      "arrived after cancellation",
+      "2026-07-28T12:00:03.000Z",
+    );
+    now = Date.parse("2026-07-28T12:00:04.000Z");
+    await sweepCombs(deps, [], new Map());
+    await sweepCombs(deps, [], new Map());
+
+    run = (await loadRun(created.id))!;
+    assert.equal(run.status, "cancelled");
+    assert.equal(run.cleanup.status, "complete");
+    assert.deepEqual(operations, ["create", "withdraw"]);
+    assert.equal(run.packetThreads[0]?.packetTail[0]?.status, "withdrawn");
+    assert.equal(current(run, "verify").status, "waiting-human");
+    assert.ok(
+      (await readRunEvents(run.id, { after: 0, limit: 1_000 })).events
+        .some((event) => event.type === "comb.evidence.late_cancelled"),
+    );
+  });
+});
+
+test("a packet confirmed after the cancellation fence is never activated and is withdrawn", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "cancel-create-race",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retireAgentsOnTerminal: false },
+    });
+    const packets = new Map<string, ForumPacket>();
+    const operations: string[] = [];
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [...packets.values()],
+      executeHumanEffect: async (request) => {
+        operations.push(String(request.operation));
+        if (String(request.operation) === "withdraw") {
+          const packet = packets.get(request.predecessorPacketId!);
+          assert.ok(packet);
+          packet.status = "superseded";
+          return packet;
+        }
+        await cancelRun(created.id, {
+          reason: "raced packet creation",
+          requestedBy: "test",
+          now: "2026-07-28T12:00:02.000Z",
+        });
+        const packet = packetFor(request, "PKT.raced", "2026-07-28T12:00:02.000Z");
+        packets.set(packet.id, packet);
+        return packet;
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [], new Map());
+    let run = (await loadRun(created.id))!;
+    assert.equal(run.status, "cancelled");
+    assert.notEqual(current(run, "verify").status, "waiting-human");
+    assert.deepEqual(operations, ["create", "withdraw"]);
+    assert.equal(run.cleanup.status, "complete");
+    assert.deepEqual(run.cleanup.pendingPacketIds, []);
+    assert.equal(run.packetThreads[0]?.packetTail[0]?.status, "withdrawn");
+
+    now = Date.parse("2026-07-28T12:00:03.000Z");
+    await sweepCombs(deps, [], new Map());
+    run = (await loadRun(created.id))!;
+    assert.deepEqual(operations, ["create", "withdraw"]);
+    assert.equal(run.cleanup.status, "complete");
+    assert.deepEqual(run.cleanup.pendingPacketIds, []);
+    assert.equal(run.packetThreads[0]?.packetTail[0]?.status, "withdrawn");
+  });
+});
+
+test("terminal cleanup recovers an ambiguous Forum create without treating its packet as an agent", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "cancel-ambiguous-create",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retireAgentsOnTerminal: false },
+    });
+    const packets = new Map<string, ForumPacket>();
+    const operations: string[] = [];
+    const agentLookups: string[] = [];
+    let createCalls = 0;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async (name) => {
+        agentLookups.push(name);
+        return null;
+      },
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [...packets.values()],
+      executeHumanEffect: async (request) => {
+        operations.push(String(request.operation));
+        if (String(request.operation) === "withdraw") {
+          const packet = packets.get(request.predecessorPacketId!);
+          assert.ok(packet);
+          packet.status = "superseded";
+          return packet;
+        }
+        createCalls += 1;
+        let packet = packets.get("PKT.ambiguous");
+        if (!packet) {
+          packet = packetFor(request, "PKT.ambiguous", "2026-07-28T12:00:01.000Z");
+          packets.set(packet.id, packet);
+        }
+        if (createCalls === 1) throw new Error("lost confirmation after Forum committed");
+        return packet;
+      },
+      now: () => Date.parse("2026-07-28T12:00:03.000Z"),
+    };
+
+    await sweepCombs(deps, [], new Map());
+    let run = (await loadRun(created.id))!;
+    assert.equal(Object.values(run.effects)[0]?.status, "executing");
+    await cancelRun(created.id, {
+      reason: "cancel during ambiguous create",
+      requestedBy: "test",
+      now: "2026-07-28T12:00:02.000Z",
+    });
+
+    await sweepCombs(deps, [], new Map());
+    run = (await loadRun(created.id))!;
+    assert.deepEqual(operations, ["create", "create", "withdraw"]);
+    assert.deepEqual(agentLookups, []);
+    assert.equal(run.status, "cancelled");
+    assert.equal(run.cleanup.status, "complete");
+    assert.equal(run.packetThreads[0]?.packetTail[0]?.status, "withdrawn");
   });
 });
 

@@ -418,7 +418,13 @@ export type EdgeFiring = {
   firedAt: string;
 };
 
-export type EffectKind = "agent-spawn" | "agent-adopt" | "forum-create" | "forum-rerequest" | "forum-successor";
+export type EffectKind =
+  | "agent-spawn"
+  | "agent-adopt"
+  | "forum-create"
+  | "forum-rerequest"
+  | "forum-successor"
+  | "forum-withdraw";
 export type EffectStatus = "prepared" | "executing" | "confirmed" | "not-executed" | "failed" | "ambiguous";
 export type EffectScope = { kind: "activation"; activation: ActivationAddress } | { kind: "run"; runId: string };
 
@@ -435,6 +441,7 @@ export type EffectRecord = {
   confirmedAt?: string;
   externalRef?: string;
   requestDigest: string;
+  request?: JsonValue;
   result?: JsonValue;
   error?: string;
   verificationEvidenceIds: string[];

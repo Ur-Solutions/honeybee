@@ -178,6 +178,15 @@ async function sweepOneRun(
   await mutateRun(runId, (run) => {
     if (run.status === "active") reconcileMachine(run, new Date(deps.now()).toISOString());
   });
+  outcomes.push(...await recoverTerminalHumanEffects(deps, runId));
+  const withdrawals = await mutateRun(runId, async (run) => {
+    if (run.status === "active") return [] as PreparedHumanEffect[];
+    if (run.cancellation) await ingestCancelledHumanEvidence(deps, run, packets);
+    return planPacketWithdrawals(run, packets, new Date(deps.now()).toISOString());
+  });
+  for (const plan of withdrawals.result) {
+    outcomes.push(await executeHumanEffect(deps, plan));
+  }
   outcomes.push(...await reconcileTerminalEffects(deps, runId));
   outcomes.push(...await driveCleanup(deps, runId));
   if (outcomes.length === 0) outcomes.push({ run: runId, action: "noop" });
@@ -237,6 +246,28 @@ async function ingestHumanEvidence(
       },
       now,
     );
+  }
+}
+
+async function ingestCancelledHumanEvidence(
+  deps: CombSweepDeps,
+  run: RunRecord,
+  packets: ReadonlyMap<string, ForumPacket>,
+): Promise<void> {
+  for (const activation of currentActivations(run)) {
+    if (!activation.packetId) continue;
+    const packet = packets.get(activation.packetId);
+    if (!packet?.verdict) continue;
+    activation.packetDigest = deps.packetDigest
+      ? deps.packetDigest(packet)
+      : canonicalDigest(packet as unknown as JsonValue);
+    const thread = (run.packetThreads ?? []).find((candidate) => candidate.key === activation.threadId);
+    const expected = thread?.packetTail.find(
+      (candidate) =>
+        candidate.packetId === activation.packetId &&
+        candidate.status === "current",
+    );
+    if (expected) await ingestForumVerdictEvidence(run, activation, packet, expected);
   }
 }
 
@@ -642,6 +673,7 @@ function planHumanEffects(
       preparedAt: now,
       ...(current ? { externalRef: current.packetId } : {}),
       requestDigest,
+      request: request as unknown as JsonValue,
       verificationEvidenceIds: [],
     };
     run.effects[key] = effect;
@@ -655,15 +687,158 @@ function planHumanEffects(
   return plans;
 }
 
+function planPacketWithdrawals(
+  run: RunRecord,
+  packets: ReadonlyMap<string, ForumPacket>,
+  now: string,
+): PreparedHumanEffect[] {
+  const plans: PreparedHumanEffect[] = [];
+  for (const packetId of [...run.cleanup.pendingPacketIds]) {
+    const observed = packets.get(packetId);
+    if (observed?.status === "superseded" || observed?.status === "archived") {
+      markPacketWithdrawn(run, packetId, now);
+      continue;
+    }
+    const activation = Object.values(run.activations).find(
+      (candidate) => candidate.packetId === packetId,
+    );
+    if (!activation) {
+      recordRunEvent(run, "comb.violation", undefined, {
+        code: "packet-withdrawal-activation-missing",
+        packetId,
+      });
+      continue;
+    }
+    const node = run.currentSnapshot.definition.nodes.find(
+      (candidate) =>
+        candidate.id === activation.address.nodeId &&
+        candidate.executor === "human",
+    );
+    if (!node || node.executor !== "human") {
+      recordRunEvent(run, "comb.violation", activation.address, {
+        code: "packet-withdrawal-node-missing",
+        packetId,
+      });
+      continue;
+    }
+    const semanticId = `packet:${packetId}:cancellation:${run.cancellation?.epoch ?? 0}`;
+    const semanticDigest = canonicalDigest(semanticId);
+    const key = `run:${run.id}:forum-withdraw:${semanticDigest.slice("sha256:".length)}`;
+    const request: ForumPacketEffectRequest = {
+      operation: "withdraw",
+      idempotencyKey: key,
+      runId: run.id,
+      nodeId: activation.address.nodeId,
+      itemIndex: activation.address.itemIndex,
+      snapshotRevision: activation.nodeSnapshotRevision,
+      definitionDigest: run.currentSnapshot.definitionDigest,
+      actionBindingDigest: run.currentSnapshot.actionBindingDigest,
+      subject: activation.subject,
+      combName: run.currentSnapshot.definition.name,
+      cwd: run.cwd,
+      definition: run.currentSnapshot.definition,
+      human: node.human,
+      destination: { type: "new-agent" },
+      predecessorPacketId: packetId,
+    };
+    const requestDigest = canonicalDigest(request as unknown as JsonValue);
+    const existing = run.effects[key];
+    if (existing) {
+      if (
+        existing.status === "prepared" ||
+        existing.status === "executing" ||
+        existing.status === "ambiguous"
+      ) {
+        plans.push({
+          runId: run.id,
+          activationId: activation.id,
+          effectKey: key,
+          request,
+        });
+      }
+      continue;
+    }
+    const effect: EffectRecord = {
+      key,
+      scope: { kind: "activation", activation: activation.address },
+      kind: "forum-withdraw",
+      semanticId,
+      semanticDigest,
+      fenceEpoch: run.cancellation?.epoch ?? 0,
+      status: "prepared",
+      preparedAt: now,
+      externalRef: packetId,
+      requestDigest,
+      request: request as unknown as JsonValue,
+      verificationEvidenceIds: [],
+    };
+    run.effects[key] = effect;
+    activation.effectKeys.push(key);
+    run.cleanup.pendingEffectKeys = [...new Set([...run.cleanup.pendingEffectKeys, key])];
+    recordRunEvent(run, "comb.effect.prepared", activation.address, {
+      effectKey: key,
+      kind: effect.kind,
+    });
+    plans.push({
+      runId: run.id,
+      activationId: activation.id,
+      effectKey: key,
+      request,
+    });
+  }
+  return plans;
+}
+
+async function recoverTerminalHumanEffects(
+  deps: CombSweepDeps,
+  runId: string,
+): Promise<CombSweepOutcome[]> {
+  const recoverable = await mutateRun(runId, (run) => {
+    if (run.status === "active") return [] as PreparedHumanEffect[];
+    const plans: PreparedHumanEffect[] = [];
+    for (const effect of Object.values(run.effects)) {
+      if (
+        effect.kind === "forum-withdraw" ||
+        (effect.kind !== "forum-create" &&
+          effect.kind !== "forum-rerequest" &&
+          effect.kind !== "forum-successor") ||
+        (effect.status !== "executing" && effect.status !== "ambiguous") ||
+        effect.scope.kind !== "activation" ||
+        !effect.request
+      ) continue;
+      const activationId =
+        `${effect.scope.activation.nodeId}@${effect.scope.activation.attempt}#${effect.scope.activation.itemIndex}`;
+      plans.push({
+        runId,
+        activationId,
+        effectKey: effect.key,
+        request: effect.request as unknown as ForumPacketEffectRequest,
+      });
+    }
+    return plans;
+  });
+  const outcomes: CombSweepOutcome[] = [];
+  for (const plan of recoverable.result) {
+    outcomes.push(await executeHumanEffect(deps, plan, true));
+  }
+  return outcomes;
+}
+
 async function executeHumanEffect(
   deps: CombSweepDeps,
   plan: PreparedHumanEffect,
+  allowTerminalRecovery = false,
 ): Promise<CombSweepOutcome> {
   const start = await mutateRun(plan.runId, (run) => {
     const effect = run.effects[plan.effectKey];
     const activation = run.activations[plan.activationId];
     if (!effect || !activation) return false;
-    if (run.cancellation || run.status !== "active") {
+    const withdrawal = plan.request.operation === "withdraw";
+    if (
+      !withdrawal &&
+      !allowTerminalRecovery &&
+      (run.cancellation || run.status !== "active")
+    ) {
       if (effect.status === "prepared") {
         effect.status = "not-executed";
         effect.confirmedAt = new Date(deps.now()).toISOString();
@@ -674,14 +849,20 @@ async function executeHumanEffect(
       }
       return false;
     }
-    if (effect.status !== "prepared" && effect.status !== "executing") return false;
+    if (
+      effect.status !== "prepared" &&
+      effect.status !== "executing" &&
+      effect.status !== "ambiguous"
+    ) return false;
     if (effect.status === "prepared") {
       effect.status = "executing";
       effect.executeStartedAt = new Date(deps.now()).toISOString();
-      activation.status = "active";
-      activation.startedAt ??= effect.executeStartedAt;
-      activation.claim.attemptStartedAt ??= effect.executeStartedAt;
-      recordRunEvent(run, "comb.activation.active", activation.address);
+      if (!withdrawal) {
+        activation.status = "active";
+        activation.startedAt ??= effect.executeStartedAt;
+        activation.claim.attemptStartedAt ??= effect.executeStartedAt;
+        recordRunEvent(run, "comb.activation.active", activation.address);
+      }
     }
     return true;
   });
@@ -697,7 +878,11 @@ async function executeHumanEffect(
     await mutateRun(plan.runId, (run) => {
       const effect = run.effects[plan.effectKey];
       const activation = run.activations[plan.activationId];
-      if (!effect || !activation || effect.status !== "executing") return;
+      if (
+        !effect ||
+        !activation ||
+        (effect.status !== "executing" && effect.status !== "ambiguous")
+      ) return;
       effect.error = message;
       recordRunEvent(run, "comb.effect.failed", activation.address, {
         effectKey: effect.key,
@@ -716,23 +901,37 @@ async function executeHumanEffect(
   const confirmed = await mutateRun(plan.runId, (run) => {
     const effect = run.effects[plan.effectKey];
     const activation = run.activations[plan.activationId];
-    if (!effect || !activation || effect.status !== "executing") return "ignored";
+    if (
+      !effect ||
+      !activation ||
+      (effect.status !== "executing" && effect.status !== "ambiguous")
+    ) return "ignored";
     const now = new Date(deps.now()).toISOString();
     effect.status = "confirmed";
     effect.confirmedAt = now;
     effect.externalRef = packet.id;
     effect.result = packet as unknown as JsonValue;
-    linkHumanPacket(
-      run,
-      activation,
-      packet,
-      plan.request,
-      deps.packetDigest ? deps.packetDigest(packet) : canonicalDigest(packet as unknown as JsonValue),
-      now,
-    );
+    if (plan.request.operation === "withdraw") {
+      markPacketWithdrawn(run, packet.id, now);
+    } else {
+      const fenceCrossed =
+        run.status !== "active" ||
+        (run.cancellation?.epoch ?? 0) !== effect.fenceEpoch;
+      linkHumanPacket(
+        run,
+        activation,
+        packet,
+        plan.request,
+        deps.packetDigest ? deps.packetDigest(packet) : canonicalDigest(packet as unknown as JsonValue),
+        now,
+        !fenceCrossed,
+      );
+      if (fenceCrossed) reopenCleanupForPacket(run, packet.id, now);
+    }
     recordRunEvent(run, "comb.effect.confirmed", activation.address, {
       effectKey: effect.key,
       externalRef: packet.id,
+      ...(run.cancellation ? { cancellationFenceCrossed: true } : {}),
     });
     return "confirmed";
   });
@@ -785,6 +984,7 @@ function linkHumanPacket(
   request: ForumPacketEffectRequest,
   digest: string,
   now: string,
+  activate = true,
 ): void {
   run.packetThreads ??= [];
   const key = humanThreadId(activation);
@@ -830,12 +1030,40 @@ function linkHumanPacket(
   activation.packetDigest = digest;
   activation.threadId = key;
   activation.blockingSince = packet.blocking_since ?? now;
+  if (!activate) return;
   activation.status = "waiting-human";
   recordRunEvent(run, "comb.activation.waiting_human", activation.address, {
     packetId: packet.id,
     packetDigest: digest,
     threadId: key,
   });
+}
+
+function markPacketWithdrawn(run: RunRecord, packetId: string, now: string): void {
+  let changed = false;
+  for (const thread of run.packetThreads ?? []) {
+    const ref = thread.packetTail.find((candidate) => candidate.packetId === packetId);
+    if (!ref || ref.status === "withdrawn") continue;
+    ref.status = "withdrawn";
+    ref.supersededAt = now;
+    thread.updatedAt = now;
+    changed = true;
+  }
+  run.cleanup.pendingPacketIds = run.cleanup.pendingPacketIds.filter(
+    (candidate) => candidate !== packetId,
+  );
+  if (changed) recordRunEvent(run, "comb.packet.withdrawn", undefined, { packetId });
+}
+
+function reopenCleanupForPacket(run: RunRecord, packetId: string, now: string): void {
+  if (run.cleanup.status === "complete" || run.cleanup.status === "not-required") {
+    run.cleanup.status = "pending";
+    run.cleanup.startedAt ??= now;
+    delete run.cleanup.completedAt;
+  } else if (run.cleanup.status === "blocked-ambiguous") {
+    run.cleanup.status = "pending";
+  }
+  run.cleanup.pendingPacketIds = [...new Set([...run.cleanup.pendingPacketIds, packetId])];
 }
 
 function packetRef(
@@ -1083,6 +1311,21 @@ async function reconcileTerminalEffects(
       if (effect.scope.kind !== "activation") continue;
       const effectActivation = effect.scope.activation;
       const activationId = `${effectActivation.nodeId}@${effectActivation.attempt}#${effectActivation.itemIndex}`;
+      const forumEffect = effect.kind === "forum-create" ||
+        effect.kind === "forum-rerequest" ||
+        effect.kind === "forum-successor" ||
+        effect.kind === "forum-withdraw";
+      if (forumEffect) {
+        if (effect.status === "prepared" && effect.kind !== "forum-withdraw") {
+          effect.status = "not-executed";
+          effect.confirmedAt = now;
+          recordRunEvent(run, "comb.effect.failed", effectActivation, {
+            effectKey: effect.key,
+            outcome: "not-executed",
+          });
+        }
+        continue;
+      }
       if (effect.status === "prepared") {
         effect.status = "not-executed";
         effect.confirmedAt = now;
@@ -1188,7 +1431,7 @@ async function driveCleanup(deps: CombSweepDeps, runId: string): Promise<CombSwe
     run.cleanup.pendingBeeNames = remaining;
     const unresolved = Object.values(run.effects).filter((effect) => effect.status === "prepared" || effect.status === "executing" || effect.status === "ambiguous");
     run.cleanup.pendingEffectKeys = unresolved.map((effect) => effect.key);
-    if (remaining.length || unresolved.length) {
+    if (remaining.length || run.cleanup.pendingPacketIds.length || unresolved.length) {
       run.cleanup.status = unresolved.some((effect) => effect.status === "ambiguous")
         ? "blocked-ambiguous"
         : "pending";
