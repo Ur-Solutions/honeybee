@@ -992,9 +992,9 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
         activation.beeHandles.push({
           name: spawned.name,
           ...(spawned.id ? { id: spawned.id } : {}),
-          source: plan.mode === "adopt" || recover ? "adopted" : "spawn",
+          source: plan.mode === "adopt" ? "adopted" : "spawn",
         });
-        reopenCleanupForBee(run, spawned.name, now);
+        reopenCleanupForBee(run, spawned.name, now, plan.mode === "spawn");
         recordRunEvent(run, "comb.effect.confirmed", activation.address, {
           effectKey: effect.key,
           externalRef: spawned.name,
@@ -1009,9 +1009,9 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
       effect.confirmedAt = now;
       effect.externalRef = spawned.name;
       if (!activation.beeHandles.some((handle) => handle.name === spawned.name)) {
-        activation.beeHandles.push({ name: spawned.name, ...(spawned.id ? { id: spawned.id } : {}), source: plan.mode === "adopt" || recover ? "adopted" : "spawn" });
+        activation.beeHandles.push({ name: spawned.name, ...(spawned.id ? { id: spawned.id } : {}), source: plan.mode === "adopt" ? "adopted" : "spawn" });
       }
-      reopenCleanupForBee(run, spawned.name, now);
+      reopenCleanupForBee(run, spawned.name, now, plan.mode === "spawn");
       recordRunEvent(run, "comb.effect.confirmed", activation.address, {
         effectKey: effect.key,
         externalRef: spawned.name,
@@ -1023,7 +1023,7 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
     effect.confirmedAt = now;
     effect.externalRef = spawned.name;
     if (!activation.beeHandles.some((handle) => handle.name === spawned.name)) {
-      activation.beeHandles.push({ name: spawned.name, ...(spawned.id ? { id: spawned.id } : {}), source: plan.mode === "adopt" || recover ? "adopted" : "spawn" });
+      activation.beeHandles.push({ name: spawned.name, ...(spawned.id ? { id: spawned.id } : {}), source: plan.mode === "adopt" ? "adopted" : "spawn" });
     }
     recordRunEvent(run, "comb.effect.confirmed", activation.address, { effectKey: effect.key, externalRef: spawned.name });
     return "confirmed";
@@ -1111,10 +1111,10 @@ async function reconcileTerminalEffects(
           activation.beeHandles.push({
             name: existing.name,
             ...(existing.id ? { id: existing.id } : {}),
-            source: "adopted",
+            source: effect.kind === "agent-spawn" ? "spawn" : "adopted",
           });
         }
-        reopenCleanupForBee(run, existing.name, now);
+        reopenCleanupForBee(run, existing.name, now, effect.kind === "agent-spawn");
         recordRunEvent(run, "comb.effect.confirmed", activation.address, {
           effectKey: effect.key,
           externalRef: existing.name,
@@ -1208,7 +1208,13 @@ async function driveCleanup(deps: CombSweepDeps, runId: string): Promise<CombSwe
   return outcomes;
 }
 
-function reopenCleanupForBee(run: RunRecord, beeName: string, now: string): void {
+function reopenCleanupForBee(
+  run: RunRecord,
+  beeName: string,
+  now: string,
+  owned: boolean,
+): void {
+  if (!owned || !run.policies.retireAgentsOnTerminal) return;
   if (run.cleanup.status === "complete" || run.cleanup.status === "not-required") {
     run.cleanup.status = "pending";
     run.cleanup.startedAt ??= now;

@@ -423,11 +423,15 @@ export function initializeRunCleanup(run: RunRecord, now: string): void {
   run.cleanup.pendingEffectKeys = Object.values(run.effects)
     .filter((effect) => effect.status === "prepared" || effect.status === "executing" || effect.status === "ambiguous")
     .map((effect) => effect.key);
-  run.cleanup.pendingBeeNames = [...new Set(
-    Object.values(run.activations).flatMap(
-      (activation) => activation.beeHandles.map((handle) => handle.name),
-    ),
-  )];
+  run.cleanup.pendingBeeNames = run.policies.retireAgentsOnTerminal
+    ? [...new Set(
+        Object.values(run.activations).flatMap(
+          (activation) => activation.beeHandles
+            .filter((handle) => handle.source === "spawn")
+            .map((handle) => handle.name),
+        ),
+      )]
+    : [];
   run.endedAt = now;
 }
 

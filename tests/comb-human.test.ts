@@ -173,6 +173,116 @@ function current(run: RunRecord, nodeId: string): ActivationRecord {
   return activation;
 }
 
+test("terminal approval leaves an adopted operator bee alive because the run never owned it", async () => {
+  await withTempStore(async (dir) => {
+    const bee = session(dir);
+    const created = await createRun({
+      definition: humanLastDefinition(),
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "attached", beeName: bee.name, entryNodeId: "work" },
+      now: "2026-07-28T12:00:00.000Z",
+    });
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    const packets = new Map<string, ForumPacket>();
+    const latestSeals = new Map<string, SealRecord>();
+    const retired: string[] = [];
+    let operatorAlive = true;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async (name) => {
+        const found = latestSeals.get(name);
+        return found ? { filename: `${name}-${found.attempt}.json`, seal: found } : null;
+      },
+      spawnAgent: async (request) => ({ name: request.name }),
+      adoptAgent: async () => ({ name: bee.name, id: bee.id }),
+      lookupAgent: async () => operatorAlive ? bee : null,
+      retireAgent: async (name) => {
+        retired.push(name);
+        if (name === bee.name) operatorAlive = false;
+      },
+      listHumanPackets: async () => [...packets.values()],
+      executeHumanEffect: async (request) => {
+        const packet = packetFor(request, "PKT.operator-survives", new Date(now).toISOString());
+        packets.set(packet.id, packet);
+        return packet;
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [bee], new Map());
+    let run = (await loadRun(created.id))!;
+    const work = current(run, "work");
+    assert.equal(work.beeHandles[0]?.source, "adopted");
+    latestSeals.set(bee.name, seal(work, bee.name, "2026-07-28T12:00:02.000Z"));
+    now = Date.parse("2026-07-28T12:00:03.000Z");
+    await sweepCombs(deps, [bee], new Map());
+
+    const packet = packets.get("PKT.operator-survives")!;
+    packet.status = "approved";
+    packet.verdict = verdict(packet, "approve", "approved", "2026-07-28T12:00:04.000Z");
+    now = Date.parse("2026-07-28T12:00:05.000Z");
+    await sweepCombs(deps, [bee], new Map());
+    run = (await loadRun(created.id))!;
+
+    assert.equal(run.status, "done");
+    assert.equal(run.cleanup.status, "complete");
+    assert.equal(operatorAlive, true, "the attached operator bee must remain live after approval");
+    assert.deepEqual(retired, [], "cleanup must retire only engine-owned spawned bees");
+  });
+});
+
+test("retireAgentsOnTerminal=false keeps engine-spawned bees alive while completing cleanup", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "keep-owned-bee",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: { retireAgentsOnTerminal: false },
+      now: "2026-07-28T12:00:00.000Z",
+    });
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    let spawnedName = "";
+    let latestSeal: SealRecord | undefined;
+    const retired: string[] = [];
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => latestSeal
+        ? { filename: "owned.json", seal: latestSeal }
+        : null,
+      spawnAgent: async (request) => {
+        spawnedName = request.name;
+        return { name: request.name };
+      },
+      lookupAgent: async () => null,
+      retireAgent: async (name) => {
+        retired.push(name);
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [], new Map());
+    const active = current((await loadRun(created.id))!, "work");
+    latestSeal = seal(active, spawnedName, "2026-07-28T12:00:02.000Z");
+    now = Date.parse("2026-07-28T12:00:03.000Z");
+    await sweepCombs(deps, [], new Map());
+    const run = (await loadRun(created.id))!;
+
+    assert.equal(run.status, "done");
+    assert.equal(run.cleanup.status, "complete");
+    assert.deepEqual(retired, []);
+  });
+});
+
 test("human verification keeps one thread, rerequests after comment-driven retry, ignores stale pins, and approves", async () => {
   await withTempStore(async (dir) => {
     const bee = session(dir);
