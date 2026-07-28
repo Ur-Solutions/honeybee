@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./comb": {
+      "types": "./dist/comb/sdk.d.ts",
+      "default": "./dist/comb/sdk.js"
     }
   },
   "bin": {
@@ -31,5 +35,8 @@
     "@types/node": "25.7.0",
     "tsx": "4.21.0",
     "typescript": "6.0.3"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1"
   }
 }
