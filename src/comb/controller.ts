@@ -572,10 +572,15 @@ function planAgentEffects(
     const requestDigest = canonicalDigest(request as unknown as JsonValue);
     const existing = run.effects[key];
     if (existing) {
+      const executionRequest =
+        existing.kind === "agent-adopt" && existing.request
+          ? existing.request as unknown as AgentAdoptRequest
+          : request;
+      const executionRequestDigest = canonicalDigest(executionRequest as unknown as JsonValue);
       if (existing.status === "confirmed") {
         continue;
       }
-      if (existing.requestDigest !== requestDigest) {
+      if (existing.requestDigest !== executionRequestDigest) {
         terminalizeRun(run, "failed", {
           code: "effect-key-collision",
           message: `effect ${key} was replanned with a different request`,
@@ -583,7 +588,13 @@ function planAgentEffects(
         }, now, activation.address);
         recordRunEvent(run, "comb.violation", activation.address, { code: "effect-key-collision", effectKey: key });
       } else if (existing.status === "prepared" || existing.status === "executing") {
-        plans.push({ runId: run.id, activationId: activation.id, effectKey: key, request, mode });
+        plans.push({
+          runId: run.id,
+          activationId: activation.id,
+          effectKey: key,
+          request: executionRequest,
+          mode,
+        });
         if (activation.status === "pending") available -= 1;
       }
       continue;
@@ -726,7 +737,7 @@ function planHumanEffects(
       destination,
       ...(current ? { predecessorPacketId: current.packetId } : {}),
     };
-    const requestDigest = canonicalDigest(request as unknown as JsonValue);
+    const requestDigest = humanEffectRequestDigest(request);
     const existing = run.effects[key];
     if (existing) {
       if (existing.requestDigest !== requestDigest) {
@@ -740,7 +751,14 @@ function planHumanEffects(
           effectKey: key,
         });
       } else if (existing.status === "prepared" || existing.status === "executing") {
-        plans.push({ runId: run.id, activationId: activation.id, effectKey: key, request });
+        plans.push({
+          runId: run.id,
+          activationId: activation.id,
+          effectKey: key,
+          request: existing.request
+            ? existing.request as unknown as ForumPacketEffectRequest
+            : request,
+        });
       }
       continue;
     }
@@ -768,6 +786,11 @@ function planHumanEffects(
     plans.push({ runId: run.id, activationId: activation.id, effectKey: key, request });
   }
   return plans;
+}
+
+function humanEffectRequestDigest(request: ForumPacketEffectRequest): string {
+  const { destination: _volatileDestination, ...stableRequest } = request;
+  return canonicalDigest(stableRequest as unknown as JsonValue);
 }
 
 function planPacketWithdrawals(

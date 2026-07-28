@@ -580,6 +580,66 @@ test("Forum create can crash after the external write and confirm idempotently o
   });
 });
 
+test("Forum effect recovery keeps its original resolved destination when session identity availability changes", async () => {
+  await withTempStore(async (dir) => {
+    const definition = humanLastDefinition();
+    const created = await createRun({
+      definition,
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: { retireAgentsOnTerminal: false },
+    });
+    let spawnedName = "";
+    let latest: SealRecord | undefined;
+    let forumCalls = 0;
+    let createdPacket: ForumPacket | undefined;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => latest
+        ? { filename: "work-done.json", seal: latest }
+        : null,
+      spawnAgent: async (request) => {
+        spawnedName = request.name;
+        return { name: request.name };
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => createdPacket ? [createdPacket] : [],
+      executeHumanEffect: async (request) => {
+        forumCalls += 1;
+        createdPacket ??= packetFor(request, "PKT.stable-destination", "2026-07-28T12:00:02.000Z");
+        if (forumCalls === 1) throw new Error("lost Forum confirmation");
+        return createdPacket;
+      },
+      now: () => Date.parse("2026-07-28T12:00:03.000Z"),
+    };
+
+    await sweepCombs(deps, [], new Map());
+    let run = (await loadRun(created.id))!;
+    const work = current(run, "work");
+    latest = seal(work, spawnedName, "2026-07-28T12:00:04.000Z");
+    const resolved = {
+      ...session(dir),
+      name: spawnedName,
+      id: "stable-session-id",
+      tmuxTarget: spawnedName,
+    };
+    await sweepCombs(deps, [resolved], new Map());
+    run = (await loadRun(created.id))!;
+    assert.equal(current(run, "verify").status, "active");
+    assert.equal(Object.values(run.effects).find((effect) => effect.kind === "forum-create")?.status, "executing");
+
+    await sweepCombs(deps, [{ ...resolved, id: spawnedName }], new Map());
+    run = (await loadRun(created.id))!;
+    assert.equal(run.status, "active");
+    assert.equal(current(run, "verify").status, "waiting-human");
+    assert.equal(createdPacket?.native_session_id, "stable-session-id");
+    assert.equal(forumCalls, 2);
+  });
+});
+
 test("a retried approved human node creates a successor packet instead of rerequesting a terminal packet", async () => {
   await withTempStore(async (dir) => {
     const definition: CombSpec = {
@@ -1211,10 +1271,39 @@ test("comb run attachment durably adopts the bee before evidence can count", asy
     assert.equal(activation.claim.attemptStartedAt, "2026-07-28T12:00:05.000Z");
     assert.equal(activation.beeHandles[0]?.source, "adopted");
     assert.equal(Object.values(run.effects)[0]?.kind, "agent-adopt");
+    assert.equal(Object.values(run.effects)[0]?.semanticId, `bee:${bee.name}`);
     assert.equal(Object.values(run.effects)[0]?.status, "confirmed");
     const storedBee = await loadSession(bee.name);
     assert.equal(storedBee?.combActivations?.[0]?.runId, run.id);
     assert.equal(storedBee?.combActivations?.[0]?.attachedAt, "2026-07-28T12:00:05.000Z");
     assert.match(storedBee?.brief ?? "", new RegExp(run.id));
+
+    await mutateRun(run.id, (record) => {
+      const recovering = Object.values(record.effects)[0]!;
+      recovering.status = "executing";
+      delete recovering.confirmedAt;
+      delete recovering.result;
+      const currentActivation = current(record, "work");
+      currentActivation.beeHandles = [];
+      currentActivation.status = "active";
+    });
+    let recoveries = 0;
+    await sweepCombs({
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      adoptAgent: async () => {
+        recoveries += 1;
+        return { name: bee.name, id: bee.id };
+      },
+      lookupAgent: async () => bee,
+      retireAgent: async () => undefined,
+      now: () => Date.parse("2026-07-28T12:00:06.000Z"),
+    }, [bee], new Map());
+    const recovered = (await loadRun(run.id))!;
+    assert.equal(recovered.status, "active");
+    assert.equal(Object.values(recovered.effects)[0]?.status, "confirmed");
+    assert.equal(current(recovered, "work").beeHandles[0]?.name, bee.name);
+    assert.equal(recoveries, 1);
   });
 });

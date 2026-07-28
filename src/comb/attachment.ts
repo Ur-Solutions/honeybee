@@ -45,6 +45,12 @@ export async function attachBeeToRun(options: {
   if (node?.executor !== "agent") {
     throw new CombError("invalid_argument", `attached entry ${entryId} must be an agent node`);
   }
+  if (node.agent.capacity.kind !== "spawn") {
+    throw new CombError(
+      "invalid_argument",
+      `attached entry ${entryId} must use spawn capacity in strict-spine slice 1`,
+    );
+  }
   const trackPostscript = combTrackPostscript(run, activation, node);
   const contract = {
     completion: "seal" as const,
@@ -60,15 +66,24 @@ export async function attachBeeToRun(options: {
   const briefWithContract = withContractPostscript(renderedBrief, contract);
   const fullBrief = `${briefWithContract ? `${briefWithContract}\n\n` : ""}${trackPostscript}`;
   const trackDigest = canonicalDigest(fullBrief);
-  const semanticId = `bee:${session.id ?? session.name}`;
+  const semanticId = `bee:${session.name}`;
   const semanticDigest = canonicalDigest(semanticId);
   const effectKey = `${effectBaseKey(activation)}:agent-adopt:${semanticDigest.slice("sha256:".length)}`;
-  const requestDigest = canonicalDigest({
+  const adoptionRequest = {
     runId: run.id,
     activation: activation.address,
-    bee: { name: session.name, id: session.id ?? null },
+    name: session.name,
+    agent: node.agent.capacity.bee,
+    ...(node.agent.capacity.account ? { account: node.agent.capacity.account } : {}),
+    ...(node.agent.capacity.model ? { model: node.agent.capacity.model } : {}),
+    substrate: node.agent.capacity.substrate ?? "hsr",
+    cwd: run.cwd,
+    brief: fullBrief,
+    taskId: activation.taskId,
+    attempt: activation.address.attempt,
     trackDigest,
-  });
+  };
+  const requestDigest = canonicalDigest(adoptionRequest as unknown as JsonValue);
   const startedAt = new Date(nowFn()).toISOString();
 
   await mutateRun(run.id, (record) => {
@@ -90,6 +105,7 @@ export async function attachBeeToRun(options: {
         preparedAt: startedAt,
         externalRef: session.name,
         requestDigest,
+        request: adoptionRequest as unknown as JsonValue,
         verificationEvidenceIds: [],
       };
       record.effects[effectKey] = effect;

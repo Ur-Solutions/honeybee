@@ -138,6 +138,26 @@
         }
       }
     },
+    "humanComb": {
+      "formatVersion": 2,
+      "name": "corpus-human",
+      "input": { "kind": "informal", "description": "fixture input" },
+      "nodes": [
+        {
+          "id": "verify",
+          "executor": "human",
+          "binding": "strict",
+          "human": {
+            "title": "Corpus human verification",
+            "packetKind": "code",
+            "summary": "Public seam corpus packet",
+            "checklist": [{ "text": "Work is correct", "done": false }],
+            "feedbackDestination": { "type": "new-agent" }
+          }
+        }
+      ],
+      "edges": []
+    },
     "inputHead": { "ref": "HEAD" },
     "inputOther": { "ref": "OTHER" }
   },
@@ -936,6 +956,471 @@
           "details": { "errno": "EIO" }
         }
       }
+    },
+    {
+      "id": "comb-run-adoption-base",
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputOther", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "capture": {
+        "adoptionRunId": "/result/run/id"
+      },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": {
+            "id": { "$type": "string" },
+            "status": "active",
+            "activations": [
+              {
+                "id": "work@1#0",
+                "status": "pending",
+                "beeHandles": []
+              }
+            ]
+          },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-run-attached-adoption",
+      "arrange": [
+        {
+          "kind": "save-session",
+          "session": {
+            "name": "corpus-operator",
+            "id": "corpus-operator-id",
+            "agent": "codex",
+            "cwd": "$fixtureCwd",
+            "command": "codex",
+            "tmuxTarget": "corpus-operator",
+            "substrate": "hsr",
+            "createdAt": "2099-01-01T00:00:00.000Z",
+            "updatedAt": "2099-01-01T00:00:00.000Z",
+            "status": "running"
+          }
+        },
+        {
+          "kind": "attach-bee",
+          "runId": "$adoptionRunId",
+          "beeName": "corpus-operator",
+          "entryNodeId": "work",
+          "now": "2099-01-01T00:00:01.000Z"
+        }
+      ],
+      "argv": ["comb", "status", "$adoptionRunId", "--activation", "work@1#0", "--json"],
+      "exitCode": 0,
+      "capture": {
+        "adoptionTaskId": "/result/hydratedActivation/taskId"
+      },
+      "stdout": {
+        "ok": true,
+        "command": "comb.status",
+        "result": {
+          "run": {
+            "id": "$adoptionRunId",
+            "status": "active",
+            "activations": {
+              "work@1#0": {
+                "id": "work@1#0",
+                "status": "active",
+                "beeHandles": [
+                  {
+                    "name": "corpus-operator",
+                    "id": "corpus-operator-id",
+                    "source": "adopted"
+                  }
+                ]
+              }
+            }
+          },
+          "hydratedActivation": {
+            "id": "work@1#0",
+            "status": "active",
+            "beeHandles": [
+              {
+                "name": "corpus-operator",
+                "id": "corpus-operator-id",
+                "source": "adopted"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-events-late-invalidated-seal",
+      "arrange": [
+        {
+          "kind": "ingest-late-seal",
+          "runId": "$adoptionRunId",
+          "activationId": "work@1#0",
+          "filename": "corpus-late-adopted.json",
+          "invalidatedAt": "2099-01-01T00:00:02.000Z",
+          "seal": {
+            "beeName": "corpus-operator",
+            "sealedAt": "2099-01-01T00:00:03.000Z",
+            "status": "done",
+            "summary": "late adopted seal",
+            "taskId": "$adoptionTaskId",
+            "attempt": 1
+          },
+          "captureEvidenceId": "lateInvalidatedEvidenceId"
+        }
+      ],
+      "argv": ["comb", "events", "$adoptionRunId", "--after", "0", "--limit", "256", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.events",
+        "result": {
+          "runId": "$adoptionRunId",
+          "events": {
+            "$contains": [
+              {
+                "sequence": 6,
+                "type": "comb.evidence.late_invalidated",
+                "activation": {
+                  "runId": "$adoptionRunId",
+                  "nodeId": "work",
+                  "attempt": 1,
+                  "itemIndex": 0
+                },
+                "data": {
+                  "evidenceId": "$lateInvalidatedEvidenceId",
+                  "kind": "seal"
+                }
+              }
+            ]
+          },
+          "nextAfter": 6,
+          "hasMore": false
+        }
+      }
+    },
+    {
+      "id": "comb-run-bee-entry-argv-surface",
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--bee", "missing-corpus-bee", "--entry", "work", "--json"],
+      "exitCode": 3,
+      "stdout": {
+        "ok": false,
+        "command": "comb.run",
+        "error": {
+          "code": "not_found",
+          "message": "bee not found: missing-corpus-bee"
+        }
+      }
+    },
+    {
+      "id": "comb-define-human",
+      "argv": ["comb", "define", "$humanComb", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.define",
+        "result": {
+          "comb": {
+            "name": "corpus-human",
+            "version": 1,
+            "definition": {
+              "nodes": {
+                "$contains": [
+                  {
+                    "id": "verify",
+                    "executor": "human",
+                    "human": {
+                      "packetKind": "code",
+                      "feedbackDestination": { "type": "new-agent" }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-run-human",
+      "argv": ["comb", "run", "corpus-human", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "capture": {
+        "humanRunId": "/result/run/id",
+        "humanSubjectRevision": "/result/run/activations/0/subject/revision"
+      },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": {
+            "id": { "$type": "string" },
+            "status": "active",
+            "activations": [
+              {
+                "id": "verify@1#0",
+                "nodeId": "verify",
+                "status": "pending",
+                "subject": {
+                  "kind": "run-input",
+                  "key": "$humanRunId",
+                  "revision": "$humanSubjectRevision"
+                }
+              }
+            ]
+          },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-status-human-thread",
+      "arrange": [
+        {
+          "kind": "link-human-packet",
+          "runId": "$humanRunId",
+          "activationId": "verify@1#0",
+          "packetId": "PKT.corpus-human",
+          "now": "2099-01-01T00:00:10.000Z",
+          "capturePacketDigest": "humanPacketDigest"
+        }
+      ],
+      "argv": ["comb", "status", "$humanRunId", "--activation", "verify@1#0", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.status",
+        "result": {
+          "run": {
+            "id": "$humanRunId",
+            "activations": {
+              "verify@1#0": {
+                "status": "waiting-human",
+                "packetId": "PKT.corpus-human",
+                "packetDigest": "$humanPacketDigest",
+                "threadId": "verify#0"
+              }
+            },
+            "packetThreads": [
+              {
+                "key": "verify#0",
+                "nodeId": "verify",
+                "itemIndex": 0,
+                "packetCount": 1,
+                "currentPacketId": "PKT.corpus-human",
+                "packetTail": [
+                  {
+                    "packetId": "PKT.corpus-human",
+                    "status": "current",
+                    "snapshotRevision": 0,
+                    "subject": {
+                      "kind": "run-input",
+                      "key": "$humanRunId",
+                      "revision": "$humanSubjectRevision"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "hydratedActivation": {
+            "id": "verify@1#0",
+            "status": "waiting-human",
+            "packetId": "PKT.corpus-human",
+            "packetDigest": "$humanPacketDigest",
+            "threadId": "verify#0"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-runs-human-packet-board",
+      "argv": ["comb", "runs", "--comb", "corpus-human", "--board", "--last", "1", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.runs",
+        "result": {
+          "runs": [
+            {
+              "id": "$humanRunId",
+              "status": "active",
+              "activations": [
+                {
+                  "id": "verify@1#0",
+                  "status": "waiting-human",
+                  "packetId": "PKT.corpus-human",
+                  "packetDigest": "$humanPacketDigest",
+                  "threadId": "verify#0"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "comb-events-human-packet-lifecycle",
+      "argv": ["comb", "events", "$humanRunId", "--after", "0", "--limit", "256", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.events",
+        "result": {
+          "runId": "$humanRunId",
+          "events": {
+            "$contains": [
+              {
+                "sequence": 3,
+                "type": "comb.activation.waiting_human",
+                "activation": {
+                  "runId": "$humanRunId",
+                  "nodeId": "verify",
+                  "attempt": 1,
+                  "itemIndex": 0
+                },
+                "data": {
+                  "packetId": "PKT.corpus-human",
+                  "packetDigest": "$humanPacketDigest",
+                  "threadId": "verify#0"
+                }
+              }
+            ]
+          },
+          "nextAfter": 3,
+          "hasMore": false
+        }
+      }
+    },
+    {
+      "id": "comb-events-stale-human-verdict",
+      "arrange": [
+        {
+          "kind": "ingest-forum-verdict",
+          "runId": "$humanRunId",
+          "activationId": "verify@1#0",
+          "packetId": "PKT.corpus-human",
+          "now": "2099-01-01T00:00:15.000Z",
+          "actor": "corpus-reviewer",
+          "comment": "stale verdict",
+          "captureEvidenceId": "staleHumanVerdictEvidenceId",
+          "expectedResult": "stale",
+          "verdictDefinitionDigest": "sha256:stale-corpus-definition"
+        }
+      ],
+      "argv": ["comb", "events", "$humanRunId", "--after", "3", "--limit", "256", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.events",
+        "result": {
+          "runId": "$humanRunId",
+          "after": 3,
+          "events": [
+            {
+              "id": "$humanRunId:4",
+              "sequence": 4,
+              "type": "comb.evidence.stale_verdict",
+              "at": { "$type": "string" },
+              "activation": {
+                "runId": "$humanRunId",
+                "nodeId": "verify",
+                "attempt": 1,
+                "itemIndex": 0
+              },
+              "data": {
+                "evidenceId": "$staleHumanVerdictEvidenceId",
+                "packetId": "PKT.corpus-human"
+              }
+            }
+          ],
+          "nextAfter": 4,
+          "hasMore": false
+        }
+      }
+    },
+    {
+      "id": "comb-status-human-verdict-done",
+      "arrange": [
+        {
+          "kind": "ingest-forum-verdict",
+          "runId": "$humanRunId",
+          "activationId": "verify@1#0",
+          "packetId": "PKT.corpus-human",
+          "now": "2099-01-01T00:00:20.000Z",
+          "actor": "corpus-reviewer",
+          "comment": "approved by corpus",
+          "captureEvidenceId": "humanVerdictEvidenceId"
+        }
+      ],
+      "argv": ["comb", "status", "$humanRunId", "--activation", "verify@1#0", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.status",
+        "result": {
+          "run": {
+            "id": "$humanRunId",
+            "status": "done",
+            "activations": {
+              "verify@1#0": {
+                "status": "done",
+                "packetId": "PKT.corpus-human",
+                "packetDigest": "$humanPacketDigest",
+                "threadId": "verify#0",
+                "output": {
+                  "verdict": "approve",
+                  "comment": "approved by corpus",
+                  "destination": { "type": "new-agent" }
+                },
+                "evidenceTail": {
+                  "$contains": [
+                    {
+                      "id": "$humanVerdictEvidenceId",
+                      "kind": "forum-verdict",
+                      "producer": {
+                        "kind": "forum",
+                        "id": "PKT.corpus-human"
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "packetThreads": [
+              {
+                "key": "verify#0",
+                "packetCount": 1,
+                "currentPacketId": "PKT.corpus-human",
+                "packetTail": [
+                  {
+                    "packetId": "PKT.corpus-human",
+                    "status": "current"
+                  }
+                ]
+              }
+            ]
+          },
+          "hydratedActivation": {
+            "status": "done",
+            "packetId": "PKT.corpus-human",
+            "threadId": "verify#0"
+          }
+        }
+      }
+    },
+    {
+      "id": "spawn-comb-argv-surface",
+      "argv": ["spawn", "codex", "--comb", "corpus-human", "--comb-version", "0", "--comb-input", "$inputHead", "--json"],
+      "exitCode": 1,
+      "stderr": "hive: --comb-version must be an integer >= 1"
+    },
+    {
+      "id": "x-comb-argv-surface",
+      "argv": ["x", "codex", "corpus prompt", "--comb", "corpus-human", "--comb-version", "0", "--comb-input", "$inputHead", "--json"],
+      "exitCode": 1,
+      "stderr": "hive: --comb-version must be an integer >= 1"
     }
   ]
 }
