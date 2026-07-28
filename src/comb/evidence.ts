@@ -13,7 +13,14 @@ import type {
   RunRecord,
 } from "./types.js";
 
-export type EvidenceIngestResult = "match" | "stale" | "duplicate" | "late-cancelled" | "late-invalidated" | "mismatch";
+export type EvidenceIngestResult =
+  | "match"
+  | "stale"
+  | "duplicate"
+  | "late-cancelled"
+  | "late-terminal"
+  | "late-invalidated"
+  | "mismatch";
 
 export function judgeCombEvidence(
   activation: ActivationRecord,
@@ -159,6 +166,10 @@ export async function ingestForumVerdictEvidence(
   if (run.cancellation) {
     recordRunEvent(run, "comb.evidence.late_cancelled", activation.address, evidenceEventData(ref.id, ref.kind));
     return { result: "late-cancelled" };
+  }
+  if (run.status !== "active") {
+    recordRunEvent(run, "comb.evidence.late_terminal", activation.address, evidenceEventData(ref.id, ref.kind));
+    return { result: "late-terminal" };
   }
   if (activation.invalidatedAt) {
     recordRunEvent(run, "comb.evidence.late_invalidated", activation.address, evidenceEventData(ref.id, ref.kind));

@@ -18,6 +18,7 @@ import {
   mutateRun,
   readRunEvents,
 } from "../src/comb/store.js";
+import { terminalizeRun } from "../src/comb/machine.js";
 import type {
   ActivationRecord,
   CombSpec,
@@ -525,6 +526,64 @@ test("an attempt-one seal arriving ten seconds after an adopted feedback rebind 
   });
 });
 
+test("an adopted bee sealing an unrelated task before any rebind is inert", async () => {
+  await withTempStore(async (dir) => {
+    const bee = session(dir);
+    await saveSession(bee);
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "attached-unrelated-seal",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "attached", beeName: bee.name, entryNodeId: "work" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retireAgentsOnTerminal: false },
+    });
+    await attachBeeToRun({
+      runId: created.id,
+      beeName: bee.name,
+      deliver: false,
+      now: () => Date.parse("2026-07-28T12:00:01.000Z"),
+    });
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => ({
+        filename: "unrelated.json",
+        seal: {
+          beeName: bee.name,
+          sealedAt: "2026-07-28T12:00:02.000Z",
+          status: "done",
+          summary: "unrelated operator task",
+          taskId: "operator:unrelated",
+          attempt: 1,
+        },
+      }),
+      spawnAgent: async (request) => ({ name: request.name }),
+      adoptAgent: async () => ({ name: bee.name, id: bee.id }),
+      lookupAgent: async () => bee,
+      retireAgent: async () => undefined,
+      now: () => Date.parse("2026-07-28T12:00:03.000Z"),
+    };
+
+    await sweepCombs(deps, [bee], new Map());
+    const run = (await loadRun(created.id))!;
+    const events = (await readRunEvents(run.id, { after: 0, limit: 1_000 })).events;
+    assert.equal(run.status, "active");
+    assert.equal(current(run, "work").status, "active");
+    assert.equal(current(run, "work").failure, undefined);
+    assert.ok(events.some((event) => event.type === "comb.evidence.unattributed_seal"));
+    assert.ok(!events.some(
+      (event) => event.type === "comb.violation" && event.data?.code === "evidence-mismatch",
+    ));
+  });
+});
+
 test("Forum create can crash after the external write and confirm idempotently on the next sweep", async () => {
   await withTempStore(async (dir) => {
     const definition: CombSpec = {
@@ -846,6 +905,76 @@ test("cancelling a waiting human node withdraws its packet and keeps a later ver
       (await readRunEvents(run.id, { after: 0, limit: 1_000 })).events
         .some((event) => event.type === "comb.evidence.late_cancelled"),
     );
+  });
+});
+
+test("a failed run withdraws an outstanding human packet and records a late verdict inertly", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "failed-human",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retireAgentsOnTerminal: false },
+    });
+    const packets = new Map<string, ForumPacket>();
+    const operations: string[] = [];
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [...packets.values()],
+      executeHumanEffect: async (request) => {
+        operations.push(request.operation);
+        if (request.operation === "withdraw") {
+          const packet = packets.get(request.predecessorPacketId!);
+          assert.ok(packet);
+          packet.status = "superseded";
+          return packet;
+        }
+        const packet = packetFor(request, "PKT.failed", new Date(now).toISOString());
+        packets.set(packet.id, packet);
+        return packet;
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [], new Map());
+    await mutateRun(created.id, (run) => {
+      terminalizeRun(run, "failed", {
+        code: "sibling-failed",
+        message: "a sibling activation exhausted its attempts",
+      }, "2026-07-28T12:00:02.000Z");
+    });
+    const packet = packets.get("PKT.failed")!;
+    packet.verdict = verdict(
+      packet,
+      "approve",
+      "arrived after failure",
+      "2026-07-28T12:00:03.000Z",
+    );
+    now = Date.parse("2026-07-28T12:00:04.000Z");
+    await sweepCombs(deps, [], new Map());
+
+    const run = (await loadRun(created.id))!;
+    const events = (await readRunEvents(run.id, { after: 0, limit: 1_000 })).events;
+    assert.equal(run.status, "failed");
+    assert.equal(run.cleanup.status, "complete");
+    assert.deepEqual(run.cleanup.pendingPacketIds, []);
+    assert.equal(run.packetThreads[0]?.packetTail[0]?.status, "withdrawn");
+    assert.deepEqual(operations, ["create", "withdraw"]);
+    assert.ok(events.some((event) => event.type === "comb.evidence.late_terminal"));
   });
 });
 

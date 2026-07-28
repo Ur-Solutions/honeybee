@@ -231,7 +231,7 @@ async function sweepOneRun(
   outcomes.push(...await recoverTerminalHumanEffects(deps, runId));
   const withdrawals = await mutateRun(runId, async (run) => {
     if (run.status === "active") return [] as PreparedHumanEffect[];
-    if (run.cancellation) await ingestCancelledHumanEvidence(deps, run, packets);
+    await ingestTerminalHumanEvidence(deps, run, packets);
     return planPacketWithdrawals(run, packets, new Date(deps.now()).toISOString());
   });
   for (const plan of withdrawals.result) {
@@ -263,10 +263,25 @@ async function ingestAgentEvidence(deps: CombSweepDeps, run: RunRecord, now: str
       latest.seal.taskId === activation.taskId &&
       latest.seal.attempt === activation.address.attempt
     );
-    const selected = exact ?? candidates
+    const liveCandidates = candidates
       .filter(({ activation }) => !activation.invalidatedAt && !isTerminal(activation))
-      .sort((left, right) => right.activation.address.attempt - left.activation.address.attempt)[0];
-    if (!selected) continue;
+      .sort((left, right) => right.activation.address.attempt - left.activation.address.attempt);
+    const selected = exact ?? liveCandidates.find(
+      ({ activation }) => latest.seal.taskId === activation.taskId,
+    );
+    if (!selected) {
+      const adopted = liveCandidates.find(({ source }) => source === "adopted");
+      if (adopted) {
+        await ingestSealEvidence(
+          run,
+          adopted.activation,
+          latest.filename,
+          latest.seal,
+          { mismatchDisposition: "inert" },
+        );
+      }
+      continue;
+    }
     const priorReboundAttempt = !exact &&
       selected.source === "adopted" &&
       candidates.some(({ activation }) =>
@@ -332,7 +347,7 @@ async function ingestHumanEvidence(
   }
 }
 
-async function ingestCancelledHumanEvidence(
+async function ingestTerminalHumanEvidence(
   deps: CombSweepDeps,
   run: RunRecord,
   packets: ReadonlyMap<string, ForumPacket>,
@@ -801,7 +816,12 @@ function planPacketWithdrawals(
   const plans: PreparedHumanEffect[] = [];
   for (const packetId of [...run.cleanup.pendingPacketIds]) {
     const observed = packets.get(packetId);
-    if (observed?.status === "superseded" || observed?.status === "archived") {
+    if (
+      observed?.status === "approved" ||
+      observed?.status === "resolved" ||
+      observed?.status === "superseded" ||
+      observed?.status === "archived"
+    ) {
       markPacketWithdrawn(run, packetId, now);
       continue;
     }
