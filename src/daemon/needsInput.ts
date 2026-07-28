@@ -13,14 +13,23 @@
 //     `hive bees`; we just record the escalation outcome (the caller logs it).
 //     Desktop notifications / Apiary "Needs-me" are a later UI concern.
 //
-// Stateful across ticks within a daemon run: an internal Set de-dupes on
-// "<bee>:<requestId>:<event-ts>" so each needs_input is routed ONCE, not
-// re-buzzed every tick while the bee stays blocked. The event timestamp keeps
-// id-less adapter requests distinct after the bee unblocks and blocks again.
-// Never throws — per-bee errors are captured into the outcome.
+// Routing state lives in the durable request store (docs/
+// INTERVENTION_REQUESTS.md), not in memory: per candidate the dispatcher
+// looks the request up under its shared id (requests/keys.ts), skips it
+// unless it is OPEN and not yet routed/escalated, routes, then persists
+// routedTo/routedAt (or escalated) via markRequestRouted. A relaunched daemon
+// therefore reads routedAt from disk — no duplicate routing — and a request
+// resolved while the daemon was down is never routed at all. The reconciler
+// stage runs immediately before this one and normally owns the open; when the
+// record is missing (ordering is a fast path, not correctness) the dispatcher
+// opens it itself. `ni:<bee>:<ts>` ids keep unblock-then-reblock requests
+// distinct, exactly as the old in-memory "<bee>:<requestId>:<event-ts>" key
+// did. Never throws — per-bee errors are captured into the outcome.
 
 import { sendBuzMessage, type BuzSender } from "../buz.js";
 import { pendingNeedsInput, type HsrObservation, type PendingNeedsInput } from "../hsr/observe.js";
+import { needsInputRequestId } from "../requests/keys.js";
+import { markRequestRouted, openRequest, readBeeRequests, type OpenRequestInput } from "../requests/store.js";
 import { isTerminalState, type BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
 
@@ -57,23 +66,38 @@ function formatBody(bee: string, pending: PendingNeedsInput): string {
   return lines.join("\n");
 }
 
-function dedupeKey(bee: string, pending: PendingNeedsInput): string {
-  return `${bee}:${pending.requestId}:${pending.ts}`;
+/** Self-heal open input when the reconciler has not landed the record yet. */
+function openInputFor(record: SessionRecord, pending: PendingNeedsInput): OpenRequestInput {
+  const openedAt = Number.isFinite(pending.ts) && pending.ts > 0 ? new Date(pending.ts).toISOString() : undefined;
+  return {
+    id: needsInputRequestId(record.name, pending),
+    kind: pending.kind,
+    scope: "turn",
+    grade: "structured",
+    generation: record.runtimeGeneration ?? 0,
+    ...(openedAt !== undefined ? { openedAt } : {}),
+    question: pending.question,
+    ...(pending.tool !== undefined ? { tool: pending.tool } : {}),
+    ...(pending.options !== undefined ? { options: pending.options } : {}),
+    ...(pending.optionDetails !== undefined ? { optionDetails: pending.optionDetails } : {}),
+    ...(pending.questions !== undefined ? { questions: pending.questions } : {}),
+    ...(pending.multiSelect !== undefined ? { multiSelect: pending.multiSelect } : {}),
+    ...(pending.input !== undefined ? { input: pending.input } : {}),
+    evidence: { grade: "structured", source: "hsr-events", ...(openedAt !== undefined ? { observedAt: openedAt } : {}), detail: "needs_input" },
+  };
 }
 
 /**
- * Build the stateful per-tick needs-input dispatcher. Call the returned function
- * once per tick with the tick's records and its freshly-derived state map.
+ * Build the needs-input dispatcher. Call the returned function once per tick
+ * with the tick's records and its freshly-derived state map. Stateless in
+ * memory — routing exactly-once is carried by the request store's
+ * routedAt/escalated marks, which survive daemon restarts.
  */
 export function createNeedsInputDispatcher(): (
   records: SessionRecord[],
   currentStates: Map<string, BeeState>,
   hsrObservations?: ReadonlyMap<string, HsrObservation>,
 ) => Promise<NeedsInputOutcome[]> {
-  // Persists across ticks for the life of the daemon run so each needs_input is
-  // routed exactly once.
-  const handled = new Set<string>();
-
   return async (records, currentStates, hsrObservations) => {
     const outcomes: NeedsInputOutcome[] = [];
     for (const record of records) {
@@ -85,8 +109,20 @@ export function createNeedsInputDispatcher(): (
           ? observed.eventSnapshot.pendingNeedsInput
           : await pendingNeedsInput(record.name);
         if (!pending) continue;
-        const key = dedupeKey(record.name, pending);
-        if (handled.has(key)) continue;
+
+        // Durable routing state under the shared id. The reconciler ran just
+        // before this stage; when the record is absent the dispatcher opens
+        // it itself (fast path, not correctness).
+        const requestId = needsInputRequestId(record.name, pending);
+        let request = (await readBeeRequests(record.name)).find((candidate) => candidate.id === requestId);
+        if (!request) {
+          request = (await openRequest(record.name, openInputFor(record, pending))).record;
+        }
+        // A request resolved while the daemon was down (hive answer) or
+        // cancelled by scope closure is NEVER routed; one already routed or
+        // escalated (possibly by a previous daemon run) is not routed again.
+        if (request.status !== "open") continue;
+        if (request.routedAt !== undefined || request.escalated === true) continue;
 
         // parentId is a bee id; tolerate a name for older/loose records.
         const parent = record.parentId
@@ -102,11 +138,11 @@ export function createNeedsInputDispatcher(): (
             subject: "needs input",
             body: formatBody(record.name, pending),
           });
-          handled.add(key);
+          await markRequestRouted(record.name, requestId, { routedTo: parent.name });
           outcomes.push({ bee: record.name, requestId: pending.requestId, routedTo: parent.name });
         } else {
           // Parentless or the parent is dead/terminal → escalate to the user.
-          handled.add(key);
+          await markRequestRouted(record.name, requestId, { escalated: true });
           outcomes.push({ bee: record.name, requestId: pending.requestId, escalated: true });
         }
       } catch (error) {
