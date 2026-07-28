@@ -94,7 +94,7 @@ export async function cmdRun(parsed: Parsed) {
   }
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
-  if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--yolo] [--wait] [--last] [--rm|--cleanup] [-- <bee-args...>]");
+  if (!agent || !prompt) throw new Error("Usage: hive run <bee> -p <prompt> [--template <name>] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--yolo] [--wait] [--last] [--rm|--cleanup] [-- <bee-args...>]");
   if (truthy(flag(parsed, "keep")) && cleanupAfterRun(parsed)) throw new Error("--keep cannot be combined with --rm/--cleanup");
   assertSingleBeeInvocation(parsed, "hive run spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
   const waited = truthy(flag(parsed, "wait"));
@@ -184,7 +184,7 @@ export async function cmdX(parsed: Parsed) {
   }
   const agent = parsed.args[0];
   const prompt = stringFlag(parsed, ["prompt", "p"]) ?? parsed.args.slice(1).join(" ");
-  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--cwd <dir>] [--account <name|auto>] [--env KEY=VALUE] [--name <id>] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]");
+  if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--template <name>] [--cwd <dir>] [--account <name|auto>] [--env KEY=VALUE] [--name <id>] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]");
   assertSingleBeeInvocation(parsed, "hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
 
   // The waitForPromptReady below is authoritative; skip spawn's own readiness
@@ -208,7 +208,7 @@ export async function cmdXa(parsed: Parsed) {
     return runTemplateFlag(parsed, "xa");
   }
   const agent = parsed.args[0];
-  if (!agent) throw new Error("Usage: hive xa <bee> [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--name <id>] [--print]");
+  if (!agent) throw new Error("Usage: hive xa <bee> [--template <name>] [--cwd <dir>] [--home <1|2|3|path>] [--account <a|auto>] [--name <id>] [--print]");
   assertSingleBeeInvocation(parsed, "hive xa attaches to a single bee; spawn cohorts with hive spawn --count/--frame");
 
   // `xa` = spawn + attach to a terminal. HSR bees are pane-less and have no
@@ -300,7 +300,7 @@ export async function cmdOpen(parsed: Parsed) {
     return runTemplateFlag(parsed, "open");
   }
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive open <bee> [--raw] [--window] [--app <terminal>] [--cwd <dir>] [--account <a|auto>] [--print] [<bee-flags...>]");
+  if (!requested) throw new Error("Usage: hive open <bee> [--template <name>] [--raw] [--window] [--app <terminal>] [--cwd <dir>] [--account <a|auto>] [--print] [<bee-flags...>]");
 
   const rawAppFlag = typeof flag(parsed, "app") === "string" ? String(flag(parsed, "app")) : undefined;
   const raw = truthy(flag(parsed, "raw")) || truthy(flag(parsed, "window")) || rawAppFlag !== undefined;

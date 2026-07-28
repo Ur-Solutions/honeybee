@@ -13,6 +13,7 @@ test("hive-x with no args reports the same usage as hive x", async () => {
   assert.equal(fast.stdout, full.stdout);
   assert.equal(fast.stderr, full.stderr);
   assert.match(fast.stderr, /Usage: hive x <bee> <prompt>/);
+  assert.match(fast.stderr, /--template <name>/);
 });
 
 test("hive-x preserves cmdX validation errors", async () => {
