@@ -82,13 +82,36 @@ export async function withPreparedClaim<T>(
   }
   await mkdir(combClaimsRoot(), { recursive: true });
   return withFileLock(claimLockPath(claim.id), async () => {
-    const existing = await loadClaim(claim.id);
+    let existing = await loadClaim(claim.id);
     if (existing && existing.status !== "released") {
       const holder = await loadRun(existing.runId);
       if (existing.status === "prepared" && !holder) {
-        const released = { ...existing, status: "released" as const, releasedAt: new Date().toISOString() };
+        const released: SubjectClaimRecord = {
+          ...existing,
+          status: "released",
+          releasedAt: new Date().toISOString(),
+        };
         await atomicWriteFile(claimPath(claim.id), `${JSON.stringify(released, null, 2)}\n`, { mode: 0o600 });
-      } else {
+        existing = released;
+      } else if (existing.status === "prepared" && holder) {
+        const held: SubjectClaimRecord = {
+          ...existing,
+          status: "held",
+          heldAt: new Date().toISOString(),
+        };
+        await atomicWriteFile(claimPath(claim.id), `${JSON.stringify(held, null, 2)}\n`, { mode: 0o600 });
+        existing = held;
+      }
+      if (holder && holder.cleanup.status === "complete") {
+        const released: SubjectClaimRecord = {
+          ...existing,
+          status: "released",
+          releasedAt: new Date().toISOString(),
+        };
+        await atomicWriteFile(claimPath(claim.id), `${JSON.stringify(released, null, 2)}\n`, { mode: 0o600 });
+        existing = released;
+      }
+      if (existing.status !== "released") {
         if (collision === "join-existing" && holder) {
           return { value: holder as unknown as T, run: holder, joinedExisting: true };
         }
@@ -107,8 +130,18 @@ export async function withPreparedClaim<T>(
       await atomicWriteFile(claimPath(claim.id), `${JSON.stringify(held, null, 2)}\n`, { mode: 0o600 });
       return { ...created, joinedExisting: false };
     } catch (error) {
-      const released: SubjectClaimRecord = { ...claim, status: "released", releasedAt: new Date().toISOString() };
-      await atomicWriteFile(claimPath(claim.id), `${JSON.stringify(released, null, 2)}\n`, { mode: 0o600 });
+      const holder = await loadRun(claim.runId);
+      if (holder?.subjectClaimId === claim.id) {
+        const held: SubjectClaimRecord = {
+          ...claim,
+          status: "held",
+          heldAt: new Date().toISOString(),
+        };
+        await atomicWriteFile(claimPath(claim.id), `${JSON.stringify(held, null, 2)}\n`, { mode: 0o600 });
+      } else {
+        const released: SubjectClaimRecord = { ...claim, status: "released", releasedAt: new Date().toISOString() };
+        await atomicWriteFile(claimPath(claim.id), `${JSON.stringify(released, null, 2)}\n`, { mode: 0o600 });
+      }
       throw error;
     }
   });

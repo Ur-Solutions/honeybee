@@ -228,12 +228,17 @@ export async function listRuns(): Promise<RunRecord[]> {
 }
 
 export async function listSweepableRuns(): Promise<RunRecord[]> {
-  return (await listRuns()).filter((run) => run.status === "active" || run.cleanup.status !== "complete");
+  return (await listRuns()).filter(
+    (run) =>
+      run.status === "active" ||
+      run.cleanup.status !== "complete" ||
+      Boolean(run.subjectClaimId && !run.subjectClaimReleasedAt),
+  );
 }
 
 export async function cancelRun(runId: string, options: { reason?: string; requestedBy?: string; now?: string } = {}): Promise<RunRecord> {
   const { run } = await mutateRun(runId, (record) => {
-    if (record.cancellation) return;
+    if (record.status !== "active" || record.cancellation) return;
     const requestedAt = options.now ?? new Date().toISOString();
     record.cancellation = {
       epoch: 1,
@@ -242,14 +247,7 @@ export async function cancelRun(runId: string, options: { reason?: string; reque
       ...(options.reason ? { reason: options.reason } : {}),
     };
     record.status = "cancelled";
-    record.cleanup = emptyCleanup("pending");
-    record.cleanup.startedAt = requestedAt;
-    record.cleanup.pendingEffectKeys = Object.values(record.effects)
-      .filter((effect) => effect.status === "prepared" || effect.status === "executing")
-      .map((effect) => effect.key);
-    record.cleanup.pendingBeeNames = Object.values(record.activations)
-      .flatMap((activation) => activation.beeHandles.map((handle) => handle.name));
-    record.cleanup.pendingBeeNames = [...new Set(record.cleanup.pendingBeeNames)];
+    initializeRunCleanup(record, requestedAt);
     recordRunEvent(record, "comb.run.cancelled", undefined, {
       requestedBy: record.cancellation.requestedBy,
       ...(record.cancellation.reason ? { reason: record.cancellation.reason } : {}),
@@ -390,6 +388,20 @@ export function emptyCleanup(status: RunRecord["cleanup"]["status"]): RunRecord[
     pendingBeeNames: [],
     pendingChildRunIds: [],
   };
+}
+
+export function initializeRunCleanup(run: RunRecord, now: string): void {
+  run.cleanup = emptyCleanup("pending");
+  run.cleanup.startedAt = now;
+  run.cleanup.pendingEffectKeys = Object.values(run.effects)
+    .filter((effect) => effect.status === "prepared" || effect.status === "executing" || effect.status === "ambiguous")
+    .map((effect) => effect.key);
+  run.cleanup.pendingBeeNames = [...new Set(
+    Object.values(run.activations).flatMap(
+      (activation) => activation.beeHandles.map((handle) => handle.name),
+    ),
+  )];
+  run.endedAt = now;
 }
 
 function entryNodeIds(definition: CombSpec): string[] {

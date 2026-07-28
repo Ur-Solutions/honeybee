@@ -309,7 +309,7 @@ test("cross-controller run sweep lock prevents duplicate irreversible spawns", a
   });
 });
 
-test("crash recovery waits for adoption evidence before failing an unconfirmed spawn", async () => {
+test("crash recovery fails after the adoption window but owns and cleans up a late spawn", async () => {
   await withTempStore(async (dir) => {
     const definition: CombSpec = {
       formatVersion: 2,
@@ -361,12 +361,13 @@ test("crash recovery waits for adoption evidence before failing an unconfirmed s
     assert.equal(spawns, 1);
     assert.equal(stored.activations["work@1#0"]?.status, "failed");
     assert.equal(stored.activations["work@1#0"]?.failure?.code, "spawn-adoption-missing");
-    assert.equal(Object.values(stored.effects)[0]?.status, "failed");
-    assert.deepEqual(stored.activations["work@1#0"]?.beeHandles, []);
+    assert.equal(Object.values(stored.effects)[0]?.status, "confirmed");
+    assert.equal(stored.activations["work@1#0"]?.beeHandles[0]?.name, `late-${run.id}`);
+    assert.equal(stored.cleanup.status, "complete");
   });
 });
 
-test("cancellation is a fence before effects and crossing it during execute becomes ambiguous", async () => {
+test("cancellation fences effects before execute and confirms a known spawn before cleanup", async () => {
   await withTempStore(async (dir) => {
     const definition: CombSpec = {
       formatVersion: 2,
@@ -414,8 +415,8 @@ test("cancellation is a fence before effects and crossing it during execute beco
     };
     await sweepCombs(deps, [], new Map());
     const crossed = (await loadRun(during.id))!;
-    assert.equal(Object.values(crossed.effects)[0]?.status, "ambiguous");
-    assert.equal(crossed.cleanup.status, "blocked-ambiguous");
+    assert.equal(Object.values(crossed.effects)[0]?.status, "confirmed");
+    assert.equal(crossed.cleanup.status, "complete");
   });
 });
 

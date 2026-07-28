@@ -3,9 +3,9 @@ import type { BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
 import { canonicalDigest } from "./canonical.js";
 import { ingestSealEvidence } from "./evidence.js";
-import { applySealCompletion, activateAgent, effectBaseKey, reconcileMachine } from "./machine.js";
+import { applySealCompletion, activateAgent, effectBaseKey, reconcileMachine, terminalizeRun } from "./machine.js";
 import { renderBrief } from "./schema.js";
-import { emptyCleanup, mutateRun, recordRunEvent, type listSweepableRuns } from "./store.js";
+import { initializeRunCleanup, mutateRun, recordRunEvent, type listSweepableRuns } from "./store.js";
 import type { ActivationRecord, EffectRecord, JsonValue, RunRecord } from "./types.js";
 
 export type LatestCombSeal = { filename: string; seal: SealRecord } | null;
@@ -97,6 +97,7 @@ async function sweepOneRun(
   await mutateRun(runId, (run) => {
     if (run.status === "active") reconcileMachine(run, new Date(deps.now()).toISOString());
   });
+  outcomes.push(...await reconcileTerminalEffects(deps, runId));
   outcomes.push(...await driveCleanup(deps, runId));
   if (outcomes.length === 0) outcomes.push({ run: runId, action: "noop" });
   return outcomes;
@@ -190,8 +191,11 @@ function planAgentEffects(run: RunRecord, now: string): PreparedAgentEffect[] {
     const existing = run.effects[key];
     if (existing) {
       if (existing.requestDigest !== requestDigest) {
-        run.status = "failed";
-        run.failure = { code: "effect-key-collision", message: `effect ${key} was replanned with a different request`, activation: activation.address };
+        terminalizeRun(run, "failed", {
+          code: "effect-key-collision",
+          message: `effect ${key} was replanned with a different request`,
+          activation: activation.address,
+        }, now, activation.address);
         recordRunEvent(run, "comb.violation", activation.address, { code: "effect-key-collision", effectKey: key });
       } else if (existing.status === "prepared" || existing.status === "executing") {
         plans.push({ runId: run.id, activationId: activation.id, effectKey: key, request });
@@ -303,19 +307,45 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
     const effect = run.effects[plan.effectKey];
     const activation = run.activations[plan.activationId];
     if (!effect || !activation) return "missing";
-    if (effect.status !== "executing") return `ignored-${effect.status}`;
     const now = new Date(deps.now()).toISOString();
+    if (effect.status !== "executing") {
+      if (
+        run.status !== "active" &&
+        effect.status !== "confirmed" &&
+        !activation.beeHandles.some((handle) => handle.name === spawned.name)
+      ) {
+        effect.status = "confirmed";
+        effect.confirmedAt = now;
+        effect.externalRef = spawned.name;
+        activation.beeHandles.push({
+          name: spawned.name,
+          ...(spawned.id ? { id: spawned.id } : {}),
+          source: recover ? "adopted" : "spawn",
+        });
+        reopenCleanupForBee(run, spawned.name, now);
+        recordRunEvent(run, "comb.effect.confirmed", activation.address, {
+          effectKey: effect.key,
+          externalRef: spawned.name,
+          late: true,
+        });
+        return "late-confirmed";
+      }
+      return `ignored-${effect.status}`;
+    }
     if ((run.cancellation?.epoch ?? 0) !== effect.fenceEpoch) {
-      effect.status = "ambiguous";
-      effect.error = "cancellation fence advanced during spawn";
+      effect.status = "confirmed";
+      effect.confirmedAt = now;
+      effect.externalRef = spawned.name;
       if (!activation.beeHandles.some((handle) => handle.name === spawned.name)) {
         activation.beeHandles.push({ name: spawned.name, ...(spawned.id ? { id: spawned.id } : {}), source: recover ? "adopted" : "spawn" });
       }
-      run.cleanup.status = "blocked-ambiguous";
-      run.cleanup.pendingBeeNames = [...new Set([...run.cleanup.pendingBeeNames, spawned.name])];
-      run.cleanup.pendingEffectKeys = [...new Set([...run.cleanup.pendingEffectKeys, effect.key])];
-      recordRunEvent(run, "comb.effect.ambiguous", activation.address, { effectKey: effect.key });
-      return "ambiguous";
+      reopenCleanupForBee(run, spawned.name, now);
+      recordRunEvent(run, "comb.effect.confirmed", activation.address, {
+        effectKey: effect.key,
+        externalRef: spawned.name,
+        cancellationFenceCrossed: true,
+      });
+      return "confirmed-after-cancel";
     }
     effect.status = "confirmed";
     effect.confirmedAt = now;
@@ -335,13 +365,107 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
   };
 }
 
+async function reconcileTerminalEffects(
+  deps: CombSweepDeps,
+  runId: string,
+): Promise<CombSweepOutcome[]> {
+  const prepared = await mutateRun(runId, (run) => {
+    if (run.status === "active") return [] as Array<{ key: string; activationId: string; name?: string }>;
+    const now = new Date(deps.now()).toISOString();
+    if (run.cleanup.status === "not-required") initializeRunCleanup(run, now);
+    const candidates: Array<{ key: string; activationId: string; name?: string }> = [];
+    for (const effect of Object.values(run.effects)) {
+      if (effect.scope.kind !== "activation") continue;
+      const effectActivation = effect.scope.activation;
+      const activationId = `${effectActivation.nodeId}@${effectActivation.attempt}#${effectActivation.itemIndex}`;
+      if (effect.status === "prepared") {
+        effect.status = "not-executed";
+        effect.confirmedAt = now;
+        recordRunEvent(run, "comb.effect.failed", effectActivation, {
+          effectKey: effect.key,
+          outcome: "not-executed",
+        });
+      } else if (effect.status === "executing" || effect.status === "ambiguous") {
+        candidates.push({ key: effect.key, activationId, ...(effect.externalRef ? { name: effect.externalRef } : {}) });
+      }
+    }
+    if (run.cleanup.status === "blocked-ambiguous") run.cleanup.status = "pending";
+    return candidates;
+  });
+  const outcomes: CombSweepOutcome[] = [];
+  for (const candidate of prepared.result) {
+    const existing = candidate.name ? await deps.lookupAgent(candidate.name) : null;
+    const classified = await mutateRun(runId, (run) => {
+      const effect = run.effects[candidate.key];
+      const activation = run.activations[candidate.activationId];
+      if (!effect || !activation || (effect.status !== "executing" && effect.status !== "ambiguous")) return "unchanged";
+      const now = new Date(deps.now()).toISOString();
+      if (
+        existing &&
+        existing.contract?.taskId === activation.taskId &&
+        existing.contract?.attempt === activation.address.attempt
+      ) {
+        effect.status = "confirmed";
+        effect.confirmedAt = now;
+        effect.externalRef = existing.name;
+        if (!activation.beeHandles.some((handle) => handle.name === existing.name)) {
+          activation.beeHandles.push({
+            name: existing.name,
+            ...(existing.id ? { id: existing.id } : {}),
+            source: "adopted",
+          });
+        }
+        reopenCleanupForBee(run, existing.name, now);
+        recordRunEvent(run, "comb.effect.confirmed", activation.address, {
+          effectKey: effect.key,
+          externalRef: existing.name,
+          recoveredDuringCleanup: true,
+        });
+        return "confirmed";
+      }
+      effect.status = "failed";
+      effect.confirmedAt = now;
+      effect.error = existing
+        ? `cleanup adoption contract mismatch for ${existing.name}`
+        : "cleanup found no spawned session";
+      if (existing) {
+        recordRunEvent(run, "comb.violation", activation.address, {
+          code: "spawn-adoption-mismatch",
+          effectKey: effect.key,
+          externalRef: existing.name,
+        });
+      }
+      recordRunEvent(run, "comb.effect.failed", activation.address, {
+        effectKey: effect.key,
+        outcome: "failed",
+      });
+      return "failed";
+    });
+    outcomes.push({
+      run: runId,
+      action: "cleanup",
+      activation: candidate.activationId,
+      ...(candidate.name ? { bee: candidate.name } : {}),
+      detail: `effect-${classified.result}`,
+    });
+  }
+  return outcomes;
+}
+
 async function driveCleanup(deps: CombSweepDeps, runId: string): Promise<CombSweepOutcome[]> {
-  const before = await mutateRun(runId, (run) => ({
-    status: run.cleanup.status,
-    bees: [...run.cleanup.pendingBeeNames],
-    claimId: run.subjectClaimId,
-  }));
-  if (before.result.status === "not-required" || before.result.status === "complete" || before.result.status === "blocked-ambiguous") return [];
+  const before = await mutateRun(runId, (run) => {
+    if (run.status !== "active" && run.cleanup.status === "not-required") {
+      initializeRunCleanup(run, new Date(deps.now()).toISOString());
+    }
+    return {
+      runStatus: run.status,
+      status: run.cleanup.status,
+      bees: [...run.cleanup.pendingBeeNames],
+      claimId: run.subjectClaimId,
+      claimReleasedAt: run.subjectClaimReleasedAt,
+    };
+  });
+  if (before.result.runStatus === "active" || before.result.status === "not-required") return [];
   const outcomes: CombSweepOutcome[] = [];
   const remaining: string[] = [];
   for (const bee of before.result.bees) {
@@ -354,22 +478,46 @@ async function driveCleanup(deps: CombSweepDeps, runId: string): Promise<CombSwe
     }
   }
   const completed = await mutateRun(runId, (run) => {
-    if (run.cleanup.status !== "pending") return false;
+    if (run.cleanup.status === "complete") return true;
+    if (run.cleanup.status !== "pending" && run.cleanup.status !== "blocked-ambiguous") return false;
     run.cleanup.pendingBeeNames = remaining;
     const unresolved = Object.values(run.effects).filter((effect) => effect.status === "prepared" || effect.status === "executing" || effect.status === "ambiguous");
     run.cleanup.pendingEffectKeys = unresolved.map((effect) => effect.key);
-    if (remaining.length || unresolved.length) return false;
+    if (remaining.length || unresolved.length) {
+      run.cleanup.status = unresolved.some((effect) => effect.status === "ambiguous")
+        ? "blocked-ambiguous"
+        : "pending";
+      return false;
+    }
     const now = new Date(deps.now()).toISOString();
     run.cleanup.status = "complete";
     run.cleanup.completedAt = now;
-    run.endedAt = now;
+    run.endedAt ??= now;
     recordRunEvent(run, "comb.run.cleanup_complete");
     return true;
   });
-  if (completed.result && before.result.claimId && deps.releaseClaim) {
+  if (completed.result && before.result.claimId && !before.result.claimReleasedAt && deps.releaseClaim) {
     await deps.releaseClaim(before.result.claimId, runId);
+    const releasedAt = new Date(deps.now()).toISOString();
+    await mutateRun(runId, (run) => {
+      if (run.subjectClaimReleasedAt) return;
+      run.subjectClaimReleasedAt = releasedAt;
+      recordRunEvent(run, "comb.claim.released", undefined, { claimId: before.result.claimId! });
+    });
+    outcomes.push({ run: runId, action: "cleanup", detail: "claim-released" });
   }
   return outcomes;
+}
+
+function reopenCleanupForBee(run: RunRecord, beeName: string, now: string): void {
+  if (run.cleanup.status === "complete" || run.cleanup.status === "not-required") {
+    run.cleanup.status = "pending";
+    run.cleanup.startedAt ??= now;
+    delete run.cleanup.completedAt;
+  } else if (run.cleanup.status === "blocked-ambiguous") {
+    run.cleanup.status = "pending";
+  }
+  run.cleanup.pendingBeeNames = [...new Set([...run.cleanup.pendingBeeNames, beeName])];
 }
 
 function renderAgentBrief(run: RunRecord, activation: ActivationRecord, node: Extract<RunRecord["currentSnapshot"]["definition"]["nodes"][number], { executor: "agent" }>): string {

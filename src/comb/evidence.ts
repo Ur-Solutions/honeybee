@@ -1,6 +1,7 @@
 import { judgeActivationEvidence } from "../activation.js";
 import type { SealRecord } from "../seal.js";
 import { canonicalDigest } from "./canonical.js";
+import { terminalizeRun } from "./machine.js";
 import { saveEvidence, recordRunEvent } from "./store.js";
 import type { ActivationRecord, EvidenceEnvelope, JsonObject, JsonValue, RunRecord } from "./types.js";
 
@@ -69,19 +70,19 @@ export async function ingestSealEvidence(
     { requireKeys: true },
   );
   if (verdict === "mismatch") {
+    const failedAt = new Date().toISOString();
     activation.status = "failed";
-    activation.endedAt = new Date().toISOString();
+    activation.endedAt = failedAt;
     activation.failure = {
       code: "evidence-mismatch",
       message: `seal ${filename} does not match ${activation.taskId} attempt ${activation.address.attempt}`,
       retryable: false,
     };
-    run.status = "failed";
-    run.failure = {
+    terminalizeRun(run, "failed", {
       code: "evidence-mismatch",
       message: activation.failure.message,
       activation: activation.address,
-    };
+    }, failedAt, activation.address);
     recordRunEvent(run, "comb.violation", activation.address, {
       code: "evidence-mismatch",
       evidenceId: ref.id,

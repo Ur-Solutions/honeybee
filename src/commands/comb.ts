@@ -212,7 +212,22 @@ async function combStatus(parsed: Parsed) {
 async function combCancel(parsed: Parsed) {
   const runId = requiredArg(parsed, 1, "Usage: hive comb cancel <run-id> [--reason <text>] [--json]");
   const run = await cancelRun(runId, { ...(stringFlag(parsed, "reason") ? { reason: stringFlag(parsed, "reason")! } : {}) });
-  return { runId, status: "cancelled" as const, fence: run.cancellation!, cleanup: run.cleanup };
+  if (run.status !== "cancelled" || !run.cancellation) {
+    return {
+      runId,
+      status: run.status,
+      accepted: false,
+      reason: "terminal" as const,
+      cleanup: run.cleanup,
+    };
+  }
+  return {
+    runId,
+    status: "cancelled" as const,
+    accepted: true,
+    fence: run.cancellation,
+    cleanup: run.cleanup,
+  };
 }
 
 async function combEvents(parsed: Parsed) {

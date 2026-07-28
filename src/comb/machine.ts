@@ -1,7 +1,7 @@
 import type { SealRecord } from "../seal.js";
 import { activationKey } from "../activation.js";
 import { canonicalDeepEqual, resolveJsonPointer, resolveValueSource, validateContract } from "./schema.js";
-import { activationId, emptyCleanup, recordRunEvent } from "./store.js";
+import { activationId, initializeRunCleanup, recordRunEvent } from "./store.js";
 import type {
   ActivationRecord,
   CombEdge,
@@ -115,6 +115,26 @@ export function activateAgent(run: RunRecord, activation: ActivationRecord, now 
   activation.startedAt = now;
   activation.claim.attemptStartedAt = now;
   recordRunEvent(run, "comb.activation.active", activation.address);
+}
+
+export function terminalizeRun(
+  run: RunRecord,
+  status: Exclude<RunRecord["status"], "active">,
+  failure: RunRecord["failure"] | undefined,
+  now: string,
+  activation?: ActivationRecord["address"],
+): boolean {
+  if (run.status !== "active") return false;
+  run.status = status;
+  if (failure) run.failure = failure;
+  initializeRunCleanup(run, now);
+  recordRunEvent(
+    run,
+    status === "done" ? "comb.run.done" : status === "cancelled" ? "comb.run.cancelled" : "comb.run.failed",
+    activation,
+    failure ? { code: failure.code } : run.output === undefined ? undefined : { output: run.output },
+  );
+  return true;
 }
 
 function reconcileEnginePredicates(run: RunRecord, now: string): boolean {
@@ -282,13 +302,12 @@ function createRetryAttempt(run: RunRecord, edge: CombEdge, source: ActivationRe
   const attempt = nextAttempt(run, destination.id, itemIndex);
   const limits = { ...run.policies, ...run.policies.nodeOverrides?.[destination.id] };
   if (attempt > limits.maxAttemptsPerActivation) {
-    run.status = "failed";
-    run.failure = {
+    const failure = {
       code: "attempts-exhausted",
       message: `node ${destination.id} exceeded ${limits.maxAttemptsPerActivation} attempts`,
       activation: source.address,
     };
-    recordRunEvent(run, "comb.run.failed", source.address, { code: "attempts-exhausted", nodeId: destination.id });
+    terminalizeRun(run, "failed", failure, now, source.address);
     return true;
   }
   const downstream = forwardReachableNodes(run, destination.id);
@@ -375,14 +394,11 @@ function deriveTerminalRun(run: RunRecord, now: string): boolean {
   if (hasUnmaterializedForwardFiring(run)) return false;
   const unhandledFailure = current.find((activation) => activation.status === "failed" && !failureHandled(run, activation));
   if (unhandledFailure) {
-    run.status = "failed";
-    run.failure = {
+    terminalizeRun(run, "failed", {
       code: unhandledFailure.failure?.code ?? "activation-failed",
       message: unhandledFailure.failure?.message ?? `activation ${unhandledFailure.id} failed`,
       activation: unhandledFailure.address,
-    };
-    startTerminalCleanup(run, now);
-    recordRunEvent(run, "comb.run.failed", unhandledFailure.address, { code: run.failure.code });
+    }, now, unhandledFailure.address);
     return true;
   }
   const outputDeclaration = run.currentSnapshot.definition.output;
@@ -397,39 +413,23 @@ function deriveTerminalRun(run: RunRecord, now: string): boolean {
       });
       const validation = validateContract(outputDeclaration.contract, output);
       if (!validation.valid) {
-        run.status = "failed";
-        run.failure = { code: "invalid-output", message: `comb output is invalid: ${validation.errors.join("; ")}` };
-        startTerminalCleanup(run, now);
-        recordRunEvent(run, "comb.run.failed", undefined, { code: "invalid-output" });
+        terminalizeRun(run, "failed", {
+          code: "invalid-output",
+          message: `comb output is invalid: ${validation.errors.join("; ")}`,
+        }, now);
         return true;
       }
       run.output = output;
     } catch (error) {
-      run.status = "failed";
-      run.failure = { code: "invalid-output", message: error instanceof Error ? error.message : String(error) };
-      startTerminalCleanup(run, now);
-      recordRunEvent(run, "comb.run.failed", undefined, { code: "invalid-output" });
+      terminalizeRun(run, "failed", {
+        code: "invalid-output",
+        message: error instanceof Error ? error.message : String(error),
+      }, now);
       return true;
     }
   }
-  run.status = "done";
-  startTerminalCleanup(run, now);
-  recordRunEvent(run, "comb.run.done", undefined, run.output === undefined ? undefined : { output: run.output });
+  terminalizeRun(run, "done", undefined, now);
   return true;
-}
-
-function startTerminalCleanup(run: RunRecord, now: string): void {
-  const bees = currentActivations(run).flatMap((activation) => activation.beeHandles.map((handle) => handle.name));
-  if (run.policies.retireAgentsOnTerminal && bees.length) {
-    run.cleanup = emptyCleanup("pending");
-    run.cleanup.startedAt = now;
-    run.cleanup.pendingBeeNames = [...new Set(bees)];
-  } else {
-    run.cleanup = emptyCleanup("complete");
-    run.cleanup.startedAt = now;
-    run.cleanup.completedAt = now;
-    run.endedAt = now;
-  }
 }
 
 function failureHandled(run: RunRecord, activation: ActivationRecord): boolean {

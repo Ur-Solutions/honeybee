@@ -1,10 +1,28 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import {
+  claimPath,
+  deriveSubjectClaim,
+  loadClaim,
+  releaseClaim,
+  withPreparedClaim,
+} from "../src/comb/claims.js";
+import { sweepCombs, type CombSweepDeps } from "../src/comb/controller.js";
+import { atomicWriteFile } from "../src/fsx.js";
+import { instantiateRun } from "../src/comb/instantiate.js";
 import { applySealCompletion, activateAgent, reconcileMachine } from "../src/comb/machine.js";
-import { createRun } from "../src/comb/store.js";
+import {
+  cancelRun,
+  createRun,
+  emptyCleanup,
+  listRuns,
+  listSweepableRuns,
+  loadRun,
+  mutateRun,
+} from "../src/comb/store.js";
 import type { ActivationRecord, CombSpec, RunRecord } from "../src/comb/types.js";
 import type { SealRecord } from "../src/seal.js";
 
@@ -54,6 +72,37 @@ function finish(run: RunRecord, nodeId: string, status: SealRecord["status"] = "
   activateAgent(run, activation, "2026-07-28T12:00:00.000Z");
   applySealCompletion(run, activation, sealFor(activation, status), "2026-07-28T12:00:01.000Z");
   return activation;
+}
+
+function sweepDeps(overrides: Partial<CombSweepDeps> = {}): CombSweepDeps {
+  return {
+    listRuns: listSweepableRuns,
+    latestSeal: async () => null,
+    spawnAgent: async (request) => ({ name: request.name }),
+    lookupAgent: async () => null,
+    retireAgent: async () => undefined,
+    releaseClaim,
+    now: () => Date.now(),
+    ...overrides,
+  };
+}
+
+function claimedDefinition(name = "claim-comb"): CombSpec {
+  return {
+    formatVersion: 2,
+    name,
+    input: {
+      kind: "json-schema",
+      schema: {
+        type: "object",
+        properties: { pr: { type: "integer" } },
+        required: ["pr"],
+      },
+    },
+    claim: { scope: "product-comb", inputPointer: "/pr", collision: "refuse" },
+    nodes: [agentNode("work")],
+    edges: [],
+  };
 }
 
 test("review repro A1: partial-branch retry re-derives every all-join member in the new cohort", async () => {
@@ -196,5 +245,357 @@ test("review repro A3: self-retrying a join never creates a second live activati
     assert.equal(current.length, 1);
     assert.equal(current[0]?.id, "c@2#0");
     assert.equal(Object.values(run.activations).some((activation) => activation.id === "c@3#0"), false);
+  });
+});
+
+test("review repro B1: cancelling a done run is an idempotent terminal acknowledgement", async () => {
+  await withTempStore(async (dir) => {
+    const run = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "done-cancel",
+        input: { kind: "informal", description: "x" },
+        nodes: [agentNode("solo")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: { retireAgentsOnTerminal: false },
+    });
+    finish(run, "solo");
+    reconcileMachine(run, "2026-07-28T12:00:02.000Z");
+    await mutateRun(run.id, (record) => {
+      Object.assign(record, run);
+    });
+    const before = (await loadRun(run.id))!;
+
+    const after = await cancelRun(run.id, { reason: "late duplicate" });
+    assert.equal(after.status, "done");
+    assert.equal(after.cleanup.status, before.cleanup.status);
+    assert.equal(after.endedAt, before.endedAt);
+    assert.equal(after.cancellation, undefined);
+    assert.equal(after.nextEventSequence, before.nextEventSequence);
+  });
+});
+
+test("review repro B2: instant terminal cleanup releases the claim and leaves the sweep set", async () => {
+  await withTempStore(async () => {
+    const definition = claimedDefinition();
+    const first = await instantiateRun({
+      definition,
+      input: { pr: 42 },
+      cwd: "/tmp",
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const deps = sweepDeps({
+      spawnAgent: async () => {
+        throw new Error("spawn binary missing");
+      },
+    });
+    for (let index = 0; index < 4; index += 1) await sweepCombs(deps, [], new Map());
+
+    const terminal = (await loadRun(first.run.id))!;
+    assert.equal(terminal.status, "failed");
+    assert.equal(terminal.cleanup.status, "complete");
+    assert.ok(terminal.endedAt);
+    assert.ok(terminal.subjectClaimReleasedAt);
+    assert.equal((await loadClaim(terminal.subjectClaimId!))?.status, "released");
+    assert.equal((await listSweepableRuns()).some((run) => run.id === terminal.id), false);
+
+    const second = await instantiateRun({
+      definition,
+      input: { pr: 42 },
+      cwd: "/tmp",
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+    });
+    assert.notEqual(second.run.id, first.run.id);
+    assert.equal(second.created, true);
+  });
+});
+
+test("review repro B3: cancellation classifies a crash-orphaned prepared effect", async () => {
+  await withTempStore(async () => {
+    const created = await instantiateRun({
+      definition: claimedDefinition(),
+      input: { pr: 7 },
+      cwd: "/tmp",
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const runId = created.run.id;
+    await sweepCombs(sweepDeps({
+      spawnAgent: async () => {
+        throw new Error("SIMULATED-DAEMON-CRASH");
+      },
+    }), [], new Map());
+    await mutateRun(runId, (run) => {
+      for (const effect of Object.values(run.effects)) {
+        effect.status = "prepared";
+        delete effect.executeStartedAt;
+        delete effect.error;
+      }
+      for (const activation of Object.values(run.activations)) {
+        activation.status = "pending";
+        delete activation.endedAt;
+        delete activation.failure;
+      }
+      run.status = "active";
+      delete run.failure;
+      delete run.endedAt;
+      run.cleanup = emptyCleanup("not-required");
+    });
+
+    await cancelRun(runId, { reason: "cancel while daemon is down" });
+    const deps = sweepDeps();
+    for (let index = 0; index < 3; index += 1) await sweepCombs(deps, [], new Map());
+
+    const terminal = (await loadRun(runId))!;
+    assert.equal(terminal.status, "cancelled");
+    assert.equal(terminal.cleanup.status, "complete");
+    assert.deepEqual(Object.values(terminal.effects).map((effect) => effect.status), ["not-executed"]);
+    assert.equal((await loadClaim(terminal.subjectClaimId!))?.status, "released");
+    assert.equal((await listSweepableRuns()).some((run) => run.id === runId), false);
+  });
+});
+
+test("review repro B4: attempts exhaustion performs full cleanup, retirement, and claim release", async () => {
+  await withTempStore(async () => {
+    const definition: CombSpec = {
+      ...claimedDefinition("exhaust"),
+      claim: { scope: "product-comb", inputPointer: "", collision: "refuse" },
+      input: { kind: "json-schema", schema: { type: "object" } },
+      edges: [{ id: "retry", from: "work", to: "work", kind: "retry", on: "failed" }],
+    };
+    const created = await instantiateRun({
+      definition,
+      input: {},
+      cwd: "/tmp",
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+      policies: { maxAttemptsPerActivation: 1, retryBackoffMs: 0 },
+    });
+    const seals = new Map<string, SealRecord>();
+    const retired: string[] = [];
+    const deps = sweepDeps({
+      spawnAgent: async (request) => {
+        seals.set(request.name, {
+          beeName: request.name,
+          sealedAt: new Date(Date.now() + 1_000).toISOString(),
+          status: "failed",
+          summary: "gave up",
+          taskId: request.taskId,
+          attempt: request.attempt,
+        });
+        return { name: request.name };
+      },
+      latestSeal: async (name) => {
+        const seal = seals.get(name);
+        return seal ? { filename: `${name}.json`, seal } : null;
+      },
+      retireAgent: async (name) => {
+        retired.push(name);
+      },
+    });
+    for (let index = 0; index < 5; index += 1) await sweepCombs(deps, [], new Map());
+
+    const terminal = (await loadRun(created.run.id))!;
+    assert.equal(terminal.status, "failed");
+    assert.equal(terminal.failure?.code, "attempts-exhausted");
+    assert.equal(terminal.cleanup.status, "complete");
+    assert.ok(terminal.endedAt);
+    assert.deepEqual(retired, [Object.values(terminal.activations)[0]?.beeHandles[0]?.name]);
+    assert.equal((await loadClaim(terminal.subjectClaimId!))?.status, "released");
+    assert.equal((await listSweepableRuns()).some((run) => run.id === terminal.id), false);
+  });
+});
+
+test("review repro B5: a spawn that crosses cancellation is confirmed, retired, and never wedges ambiguous", async () => {
+  await withTempStore(async (dir) => {
+    const run = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "cancel-crossing",
+        input: { kind: "informal", description: "x" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const retired: string[] = [];
+    const deps = sweepDeps({
+      listRuns: async () => {
+        const current = await loadRun(run.id);
+        return current ? [current] : [];
+      },
+      spawnAgent: async (request) => {
+        await cancelRun(run.id, { reason: "cross fence" });
+        return { name: request.name };
+      },
+      retireAgent: async (name) => {
+        retired.push(name);
+      },
+    });
+
+    await sweepCombs(deps, [], new Map());
+    const terminal = (await loadRun(run.id))!;
+    assert.equal(terminal.status, "cancelled");
+    assert.equal(terminal.cleanup.status, "complete");
+    assert.deepEqual(Object.values(terminal.effects).map((effect) => effect.status), ["confirmed"]);
+    assert.equal(retired.length, 1);
+  });
+});
+
+test("review contract B6: a prepared claim with its durable matching run repairs to held", async () => {
+  await withTempStore(async (dir) => {
+    const definition = claimedDefinition("prepared-repair");
+    const input = { pr: 91 };
+    const runId = "0000000000001-cafe";
+    const claim = deriveSubjectClaim({
+      definition,
+      productKey: "prod",
+      input,
+      runId,
+      now: "2026-07-28T12:00:00.000Z",
+    })!;
+    await mkdir(dirname(claimPath(claim.id)), { recursive: true });
+    await atomicWriteFile(claimPath(claim.id), `${JSON.stringify(claim, null, 2)}\n`, { mode: 0o600 });
+    await createRun({
+      definition,
+      input,
+      cwd: dir,
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+      runId,
+      subjectClaimId: claim.id,
+    });
+
+    const competitor = deriveSubjectClaim({
+      definition,
+      productKey: "prod",
+      input,
+      runId: "0000000000002-cafe",
+    })!;
+    await assert.rejects(
+      withPreparedClaim(competitor, "refuse", async () => {
+        throw new Error("must not create");
+      }),
+      (error: unknown) => (error as { code?: string }).code === "claim_conflict",
+    );
+    assert.equal((await loadClaim(claim.id))?.status, "held");
+    assert.equal((await loadClaim(claim.id))?.runId, runId);
+  });
+});
+
+test("review contract B7: simultaneous allocators produce one run and one structured refusal", async () => {
+  await withTempStore(async () => {
+    const definition = claimedDefinition("allocator-race");
+    const options = {
+      definition,
+      input: { pr: 123 },
+      cwd: "/tmp",
+      productKey: "prod",
+      origin: { kind: "manual" as const, actor: "test" },
+    };
+    const outcomes = await Promise.allSettled([
+      instantiateRun(options),
+      instantiateRun(options),
+    ]);
+    assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+    const refusal = outcomes.find((outcome) => outcome.status === "rejected");
+    assert.ok(refusal && refusal.status === "rejected");
+    assert.equal((refusal.reason as { code?: string }).code, "claim_conflict");
+    assert.equal((await listRuns()).length, 1);
+    const onlyRun = (await listRuns())[0]!;
+    assert.equal((await loadClaim(onlyRun.subjectClaimId!))?.status, "held");
+  });
+});
+
+test("review major B8: persisted blocked-ambiguous spawn cleanup is automatically resolvable", async () => {
+  await withTempStore(async (dir) => {
+    const run = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "legacy-ambiguous",
+        input: { kind: "informal", description: "x" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const retired: string[] = [];
+    const deps = sweepDeps({
+      spawnAgent: async (request) => ({ name: request.name }),
+      retireAgent: async (name) => {
+        retired.push(name);
+      },
+    });
+    await sweepCombs(deps, [], new Map());
+    await cancelRun(run.id, { reason: "legacy state fixture" });
+    await mutateRun(run.id, (record) => {
+      const effect = Object.values(record.effects)[0]!;
+      effect.status = "ambiguous";
+      record.cleanup.status = "blocked-ambiguous";
+      record.cleanup.pendingEffectKeys = [effect.key];
+    });
+
+    await sweepCombs(deps, [], new Map());
+    const resolved = (await loadRun(run.id))!;
+    assert.equal(Object.values(resolved.effects)[0]?.status, "failed");
+    assert.equal(resolved.cleanup.status, "complete");
+    assert.equal(retired.length, 1);
+    assert.equal((await listSweepableRuns()).some((candidate) => candidate.id === run.id), false);
+  });
+});
+
+test("review critical B9: evidence mismatch enters the same terminal cleanup and claim-release path", async () => {
+  await withTempStore(async () => {
+    const created = await instantiateRun({
+      definition: claimedDefinition("mismatch-cleanup"),
+      input: { pr: 55 },
+      cwd: "/tmp",
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const seals = new Map<string, SealRecord>();
+    const retired: string[] = [];
+    const deps = sweepDeps({
+      spawnAgent: async (request) => {
+        seals.set(request.name, {
+          beeName: request.name,
+          sealedAt: new Date(Date.now() + 1_000).toISOString(),
+          status: "done",
+          summary: "wrong activation",
+          taskId: `${request.taskId}-wrong`,
+          attempt: request.attempt,
+        });
+        return { name: request.name };
+      },
+      latestSeal: async (name) => {
+        const seal = seals.get(name);
+        return seal ? { filename: `${name}.json`, seal } : null;
+      },
+      retireAgent: async (name) => {
+        retired.push(name);
+      },
+    });
+    for (let index = 0; index < 3; index += 1) await sweepCombs(deps, [], new Map());
+
+    const terminal = (await loadRun(created.run.id))!;
+    assert.equal(terminal.status, "failed");
+    assert.equal(terminal.failure?.code, "evidence-mismatch");
+    assert.equal(terminal.cleanup.status, "complete");
+    assert.equal((await loadClaim(terminal.subjectClaimId!))?.status, "released");
+    assert.equal(retired.length, 1);
+    assert.equal((await listSweepableRuns()).some((candidate) => candidate.id === terminal.id), false);
   });
 });

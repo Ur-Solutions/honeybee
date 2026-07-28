@@ -525,6 +525,7 @@ export type RunRecord = {
   cleanup: RunCleanupRecord;
   intakeReady: boolean;
   subjectClaimId?: string;
+  subjectClaimReleasedAt?: string;
   output?: JsonValue;
   eventTail: RunEvent[];
   eventsRetainedFrom: number;
