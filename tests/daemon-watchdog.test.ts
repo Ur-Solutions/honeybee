@@ -27,6 +27,7 @@ function emptyTickResult(): TickResult {
     errors: [],
     buzDrains: [],
     taskSupplies: [],
+    requestReconciles: [],
     needsInput: [],
     nodeReachability: [],
     poolSweeps: [],

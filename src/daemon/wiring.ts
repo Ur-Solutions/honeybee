@@ -14,6 +14,7 @@ import { createAutoTitleDispatcher } from "./autoTitle.js";
 import { dispatchAutoswaps } from "./autoswap.js";
 import { dispatchBuzDrains } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher } from "./needsInput.js";
+import { createRequestReconciler } from "./requestSweep.js";
 import { createTaskSupplyDispatcher } from "./taskSupplyDispatcher.js";
 import { createNodeReachabilityTracker } from "./nodeReachability.js";
 import { createPoolSweeper } from "./poolSweep.js";
@@ -127,6 +128,7 @@ export function buildDefaultDeps(): TickDeps {
     appendLedger,
     dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),
     dispatchTaskSupply: createTaskSupplyDispatcher(),
+    reconcileRequests: createRequestReconciler(),
     dispatchNeedsInput: createNeedsInputDispatcher(),
     dispatchNodeReachability: createNodeReachabilityTracker(),
     sampleUsage: createUsageSampler(),

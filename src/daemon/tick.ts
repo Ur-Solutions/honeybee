@@ -7,6 +7,7 @@ import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AutoswapOutcome } from "./autoswap.js";
 import type { BuzDispatchOutcome } from "./buzDispatcher.js";
 import type { NeedsInputOutcome } from "./needsInput.js";
+import type { RequestReconcileOutcome, RequestReconciler } from "./requestSweep.js";
 import type { TaskSupplyOutcome } from "./taskSupplyDispatcher.js";
 import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./nodeReachability.js";
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
@@ -93,6 +94,16 @@ export type TickDeps = {
     currentStates: Map<string, BeeState>,
     buzDrains: BuzDispatchOutcome[],
   ) => Promise<TaskSupplyOutcome[]>;
+  /**
+   * Optional durable InterventionRequest reconciler
+   * (docs/INTERVENTION_REQUESTS.md): folds this tick's trusted observations
+   * into the request store (open/resolve/cancel) so dispatchNeedsInput and
+   * BeeView read durable records. Runs IMMEDIATELY BEFORE dispatchNeedsInput,
+   * only against a trusted sessions snapshot; hsrUnavailable bees are skipped
+   * with zero writes. Stateful across ticks (advisory open-record cache) —
+   * build once per daemon run.
+   */
+  reconcileRequests?: RequestReconciler;
   /**
    * Optional HSR needs-input router (APIA-79): for each blocked HSR bee with a
    * structured needs_input, routes the request as an interrupt-tier buz to the
@@ -196,6 +207,11 @@ export type DispatcherOutcomes = {
    */
   taskSupplies: TaskSupplyOutcome[];
   /**
+   * Durable request reconciles this tick: opened/resolved/cancelled records
+   * per bee. Empty when nothing changed / not wired.
+   */
+  requestReconciles: RequestReconcileOutcome[];
+  /**
    * HSR needs-input routing outcomes: each blocked HSR bee's request routed to
    * its parent (routedTo) or escalated to the user (escalated). Empty when no
    * blocked HSR bee had a pending request / not wired.
@@ -268,6 +284,12 @@ export type DispatchContext = {
    * (the flight reconciler) must not run on an untrusted snapshot.
    */
   sessionsSnapshotTrusted: boolean;
+  /**
+   * Bees whose HSR observation batch failed this tick: state is UNKNOWN and
+   * held, never republished. The request reconciler skips them with zero
+   * writes (ADR 001 invariant 2 — missing observation is not a transition).
+   */
+  hsrUnavailable: ReadonlySet<string>;
   nowMs: number;
   /**
    * Outcomes of the stages that already ran this tick, in registry order —
@@ -365,6 +387,27 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
       ...(outcome.buzMessageId ? { buzMessageId: outcome.buzMessageId } : {}),
       ...(outcome.feeds !== undefined ? { feeds: outcome.feeds } : {}),
       ...(outcome.breakerTripped ? { breakerTripped: true } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
+  // Durable InterventionRequest reconciler: fold this tick's trusted
+  // observations into the request store BEFORE the needs-input router reads
+  // it. NEVER against an untrusted snapshot (record absence must not read as
+  // retirement); per-bee hsrUnavailable skips live inside the reconciler.
+  {
+    key: "requestReconciles",
+    name: "reconcileRequests",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed, hsrObs, hsrUnavailable, sessionsSnapshotTrusted }) =>
+      sessionsSnapshotTrusted
+        ? deps.reconcileRequests?.({ records, currentStates: observed, hsrObservations: hsrObs, hsrUnavailable })
+        : undefined,
+    log: (outcome) => ({
+      level: outcome.action === "error" ? "warn" : "info",
+      msg: `request.${outcome.action}`,
+      session: outcome.bee,
+      ...(outcome.id ? { id: outcome.id } : {}),
+      ...(outcome.detail ? { detail: outcome.detail } : {}),
       ...(outcome.error ? { error: outcome.error } : {}),
     }),
   },
@@ -522,7 +565,7 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
 ];
 
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
-  return { buzDrains: [], taskSupplies: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [], flightSweeps: [], poolSweeps: [] };
+  return { buzDrains: [], taskSupplies: [], requestReconciles: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [], flightSweeps: [], poolSweeps: [] };
 }
 
 /**
@@ -893,6 +936,7 @@ export async function tick(
     observed,
     firstTick: options.firstTick === true,
     sessionsSnapshotTrusted,
+    hsrUnavailable,
     nowMs,
     outcomes: emptyDispatcherOutcomes(),
   };
