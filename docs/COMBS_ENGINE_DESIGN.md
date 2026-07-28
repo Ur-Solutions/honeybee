@@ -798,6 +798,8 @@ export type EffectRecord = {
   requestDigest: string;
   result?: JsonValue;
   error?: string;
+  retryCount?: number;
+  nextEligibleAt?: string;
   verificationEvidenceIds: string[];
   resolution?: {
     outcome: "confirmed" | "not-executed" | "failed";

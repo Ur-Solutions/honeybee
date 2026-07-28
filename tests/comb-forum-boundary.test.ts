@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   executeForumPacketEffect,
+  ForumCommandError,
   listForumPackets,
   type ForumPacketEffectRequest,
 } from "../src/comb/forum.js";
@@ -98,6 +99,32 @@ test("Forum packet polling has a bounded configurable timeout", async () => {
     const started = Date.now();
     await assert.rejects(listForumPackets(), /timed out|failed/i);
     assert.ok(Date.now() - started < 700, "poll should be killed well before the fixture exits");
+  });
+});
+
+test("Forum exit 7 is transient while exit 4 is terminal", async () => {
+  const response = JSON.stringify({
+    ok: false,
+    error: { code: "dependency_failure", message: "database is locked" },
+  });
+  await withFakeForum(`printf '%s' '${response}'; exit 7`, async () => {
+    await assert.rejects(listForumPackets(), (error: unknown) => {
+      assert.ok(error instanceof ForumCommandError);
+      assert.equal(error.commandExitCode, 7);
+      assert.equal(error.retryable, true);
+      assert.equal(error.ambiguous, true);
+      return true;
+    });
+  });
+
+  await withFakeForum(`printf '%s' '${response}'; exit 4`, async () => {
+    await assert.rejects(listForumPackets(), (error: unknown) => {
+      assert.ok(error instanceof ForumCommandError);
+      assert.equal(error.commandExitCode, 4);
+      assert.equal(error.retryable, false);
+      assert.equal(error.ambiguous, false);
+      return true;
+    });
   });
 });
 

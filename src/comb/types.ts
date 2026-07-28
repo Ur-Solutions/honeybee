@@ -444,6 +444,8 @@ export type EffectRecord = {
   request?: JsonValue;
   result?: JsonValue;
   error?: string;
+  retryCount?: number;
+  nextEligibleAt?: string;
   verificationEvidenceIds: string[];
 };
 

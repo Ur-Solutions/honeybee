@@ -30,6 +30,7 @@ import type {
   ForumPacketListResult,
   ForumPacketQuarantine,
 } from "./forum.js";
+import { classifyForumCommandError } from "./forum.js";
 
 export type LatestCombSeal = { filename: string; seal: SealRecord } | null;
 
@@ -106,6 +107,8 @@ export type HumanPacketQuarantineNotice = ForumPacketQuarantine & {
   message: string;
 };
 
+const notifiedQuarantineEpisodes = new WeakMap<CombSweepDeps, Set<string>>();
+
 export async function sweepCombs(
   deps: CombSweepDeps,
   records: readonly SessionRecord[],
@@ -118,9 +121,11 @@ export async function sweepCombs(
   );
   let packets: ForumPacket[] = [];
   let quarantined: ForumPacketQuarantine[] = [];
+  let forumPollSucceeded = false;
   if (hasHumanNodes && deps.listHumanPackets) {
     try {
       const polled = await deps.listHumanPackets();
+      forumPollSucceeded = true;
       if (Array.isArray(polled)) {
         packets = polled;
       } else {
@@ -135,6 +140,8 @@ export async function sweepCombs(
       });
     }
   }
+  const notifiedQuarantines = notifiedQuarantineEpisodes.get(deps) ?? new Set<string>();
+  const currentQuarantines = new Set(quarantined.map(quarantineEpisodeKey));
   for (const packet of quarantined) {
     outcomes.push({
       run: packet.runId ?? "*",
@@ -143,6 +150,8 @@ export async function sweepCombs(
       error: packet.error,
     });
     if (!deps.notifyPacketQuarantine) continue;
+    const episodeKey = quarantineEpisodeKey(packet);
+    if (notifiedQuarantines.has(episodeKey)) continue;
     try {
       await deps.notifyPacketQuarantine({
         ...packet,
@@ -150,6 +159,7 @@ export async function sweepCombs(
           `Comb quarantined malformed Forum packet${packet.packetId ? ` ${packet.packetId}` : ""} ` +
           `at list index ${packet.index}: ${packet.error}`,
       });
+      notifiedQuarantines.add(episodeKey);
     } catch (error) {
       outcomes.push({
         run: packet.runId ?? "*",
@@ -159,6 +169,12 @@ export async function sweepCombs(
         }`,
       });
     }
+  }
+  if (forumPollSucceeded) {
+    for (const episodeKey of notifiedQuarantines) {
+      if (!currentQuarantines.has(episodeKey)) notifiedQuarantines.delete(episodeKey);
+    }
+    notifiedQuarantineEpisodes.set(deps, notifiedQuarantines);
   }
   const packetsById = new Map(packets.map((packet) => [packet.id, packet]));
   const recordsByName = new Map(records.map((record) => [record.name, record]));
@@ -776,7 +792,12 @@ function planHumanEffects(
           code: "effect-key-collision",
           effectKey: key,
         });
-      } else if (existing.status === "prepared" || existing.status === "executing") {
+      } else if (
+        (existing.status === "prepared" ||
+          existing.status === "executing" ||
+          existing.status === "ambiguous") &&
+        (!existing.nextEligibleAt || existing.nextEligibleAt <= now)
+      ) {
         existing.requestDigest = executionRequestDigest;
         existing.request ??= executionRequest as unknown as JsonValue;
         plans.push({
@@ -828,10 +849,12 @@ function planPacketWithdrawals(
   for (const packetId of [...run.cleanup.pendingPacketIds]) {
     const observed = packets.get(packetId);
     if (
-      observed?.status === "approved" ||
-      observed?.status === "resolved" ||
       observed?.status === "superseded" ||
-      observed?.status === "archived"
+      observed?.status === "archived" ||
+      (
+        !run.cancellation &&
+        (observed?.status === "approved" || observed?.status === "resolved")
+      )
     ) {
       markPacketWithdrawn(run, packetId, now);
       continue;
@@ -886,6 +909,7 @@ function planPacketWithdrawals(
         existing.status === "executing" ||
         existing.status === "ambiguous"
       ) {
+        if (existing.nextEligibleAt && existing.nextEligibleAt > now) continue;
         plans.push({
           runId: run.id,
           activationId: activation.id,
@@ -941,7 +965,9 @@ async function recoverTerminalHumanEffects(
           effect.kind !== "forum-successor") ||
         (effect.status !== "executing" && effect.status !== "ambiguous") ||
         effect.scope.kind !== "activation" ||
-        !effect.request
+        !effect.request ||
+        (effect.nextEligibleAt &&
+          effect.nextEligibleAt > new Date(deps.now()).toISOString())
       ) continue;
       const activationId =
         `${effect.scope.activation.nodeId}@${effect.scope.activation.attempt}#${effect.scope.activation.itemIndex}`;
@@ -970,6 +996,8 @@ async function executeHumanEffect(
     const effect = run.effects[plan.effectKey];
     const activation = run.activations[plan.activationId];
     if (!effect || !activation) return false;
+    const now = new Date(deps.now()).toISOString();
+    if (effect.nextEligibleAt && effect.nextEligibleAt > now) return false;
     const withdrawal = plan.request.operation === "withdraw";
     if (
       !withdrawal &&
@@ -1012,27 +1040,40 @@ async function executeHumanEffect(
     packet = await deps.executeHumanEffect(plan.request);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await mutateRun(plan.runId, (run) => {
+    const classification = classifyForumCommandError(error);
+    if (!classification.retryable) {
+      return failHumanEffect(deps, plan, error, false);
+    }
+    const retry = await mutateRun(plan.runId, (run) => {
       const effect = run.effects[plan.effectKey];
       const activation = run.activations[plan.activationId];
       if (
         !effect ||
         !activation ||
         (effect.status !== "executing" && effect.status !== "ambiguous")
-      ) return;
+      ) return undefined;
+      effect.status = "ambiguous";
       effect.error = message;
+      effect.retryCount = (effect.retryCount ?? 0) + 1;
+      const retryDelay = forumRetryBackoffMs(run, effect.retryCount);
+      effect.nextEligibleAt = new Date(deps.now() + retryDelay).toISOString();
       recordRunEvent(run, "comb.effect.failed", activation.address, {
         effectKey: effect.key,
-        ambiguous: true,
+        ambiguous: classification.ambiguous,
         retryable: true,
+        retryCount: effect.retryCount,
+        nextEligibleAt: effect.nextEligibleAt,
       });
+      return effect.nextEligibleAt;
     });
     return {
       run: plan.runId,
       action: "error",
       activation: plan.activationId,
       error: message,
-      detail: "Forum command outcome is ambiguous; idempotent execution will resume on the next sweep",
+      detail:
+        `Forum command failed transiently; idempotent execution is eligible after ` +
+        `${retry.result ?? "the configured backoff"}`,
     };
   }
   const confirmed = await mutateRun(plan.runId, (run) => {
@@ -1046,6 +1087,8 @@ async function executeHumanEffect(
     const now = new Date(deps.now()).toISOString();
     effect.status = "confirmed";
     effect.confirmedAt = now;
+    delete effect.nextEligibleAt;
+    delete effect.error;
     effect.externalRef = packet.id;
     effect.result = packet as unknown as JsonValue;
     if (plan.request.operation === "withdraw") {
@@ -1084,6 +1127,7 @@ async function failHumanEffect(
   deps: CombSweepDeps,
   plan: PreparedHumanEffect,
   error: unknown,
+  retryable = false,
 ): Promise<CombSweepOutcome> {
   const message = error instanceof Error ? error.message : String(error);
   await mutateRun(plan.runId, (run) => {
@@ -1095,15 +1139,15 @@ async function failHumanEffect(
     activation.status = "failed";
     activation.endedAt = new Date(deps.now()).toISOString();
     activation.failure = {
-      code: "forum-effect-failed",
+      code: retryable ? "forum-effect-failed" : "forum-effect-terminal",
       message,
-      retryable: true,
+      retryable,
     };
     recordRunEvent(run, "comb.effect.failed", activation.address, {
       effectKey: effect.key,
     });
     recordRunEvent(run, "comb.activation.failed", activation.address, {
-      code: "forum-effect-failed",
+      code: retryable ? "forum-effect-failed" : "forum-effect-terminal",
     });
   });
   return {
@@ -1112,6 +1156,19 @@ async function failHumanEffect(
     activation: plan.activationId,
     error: message,
   };
+}
+
+function forumRetryBackoffMs(run: RunRecord, retryCount: number): number {
+  const exponent = Math.min(30, Math.max(0, retryCount - 1));
+  return Math.min(
+    run.policies.retryBackoffMs * (2 ** exponent),
+    run.policies.retryBackoffMaxMs,
+  );
+}
+
+function quarantineEpisodeKey(packet: ForumPacketQuarantine): string {
+  if (packet.packetId) return `packet:${packet.packetId}`;
+  return `unknown:${packet.runId ?? "*"}:${packet.index}`;
 }
 
 function linkHumanPacket(

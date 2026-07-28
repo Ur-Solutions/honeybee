@@ -10,7 +10,10 @@ import {
   type AgentAdoptRequest,
   type CombSweepDeps,
 } from "../src/comb/controller.js";
-import type { ForumPacketEffectRequest } from "../src/comb/forum.js";
+import {
+  ForumCommandError,
+  type ForumPacketEffectRequest,
+} from "../src/comb/forum.js";
 import {
   cancelRun,
   createRun,
@@ -600,7 +603,7 @@ test("Forum create can crash after the external write and confirm idempotently o
       cwd: dir,
       productKey: "test",
       origin: { kind: "manual", actor: "test" },
-      policies: { retireAgentsOnTerminal: false },
+      policies: { retryBackoffMs: 0, retireAgentsOnTerminal: false },
     });
     const packets = new Map<string, ForumPacket>();
     let calls = 0;
@@ -627,7 +630,7 @@ test("Forum create can crash after the external write and confirm idempotently o
     await sweepCombs(deps, [], new Map());
     let run = (await loadRun(created.id))!;
     assert.equal(current(run, "verify").status, "active");
-    assert.equal(Object.values(run.effects)[0]?.status, "executing");
+    assert.equal(Object.values(run.effects)[0]?.status, "ambiguous");
     assert.equal(packets.size, 1);
 
     await sweepCombs(deps, [], new Map());
@@ -649,7 +652,7 @@ test("Forum effect recovery keeps its original resolved destination when session
       cwd: dir,
       productKey: "test",
       origin: { kind: "manual", actor: "test" },
-      policies: { retireAgentsOnTerminal: false },
+      policies: { retryBackoffMs: 0, retireAgentsOnTerminal: false },
     });
     let spawnedName = "";
     let latest: SealRecord | undefined;
@@ -689,7 +692,7 @@ test("Forum effect recovery keeps its original resolved destination when session
     await sweepCombs(deps, [resolved], new Map());
     run = (await loadRun(created.id))!;
     assert.equal(current(run, "verify").status, "active");
-    assert.equal(Object.values(run.effects).find((effect) => effect.kind === "forum-create")?.status, "executing");
+    assert.equal(Object.values(run.effects).find((effect) => effect.kind === "forum-create")?.status, "ambiguous");
 
     await sweepCombs(deps, [{ ...resolved, id: spawnedName }], new Map());
     run = (await loadRun(created.id))!;
@@ -714,7 +717,7 @@ test("a pre-fix in-flight Forum effect migrates its legacy full-request digest",
       cwd: dir,
       productKey: "test",
       origin: { kind: "manual", actor: "test" },
-      policies: { retireAgentsOnTerminal: false },
+      policies: { retryBackoffMs: 0, retireAgentsOnTerminal: false },
     });
     let persistedRequest: ForumPacketEffectRequest | undefined;
     let forumCalls = 0;
@@ -1124,7 +1127,7 @@ test("terminal cleanup recovers an ambiguous Forum create without treating its p
       productKey: "test",
       origin: { kind: "manual", actor: "test" },
       now: "2026-07-28T12:00:00.000Z",
-      policies: { retireAgentsOnTerminal: false },
+      policies: { retryBackoffMs: 0, retireAgentsOnTerminal: false },
     });
     const packets = new Map<string, ForumPacket>();
     const operations: string[] = [];
@@ -1162,7 +1165,7 @@ test("terminal cleanup recovers an ambiguous Forum create without treating its p
 
     await sweepCombs(deps, [], new Map());
     let run = (await loadRun(created.id))!;
-    assert.equal(Object.values(run.effects)[0]?.status, "executing");
+    assert.equal(Object.values(run.effects)[0]?.status, "ambiguous");
     await cancelRun(created.id, {
       reason: "cancel during ambiguous create",
       requestedBy: "test",
@@ -1356,6 +1359,144 @@ test("a failed Forum poll does not prevent an agent-only run from sweeping", asy
   });
 });
 
+test("a transient Forum mutation observes bounded run-policy backoff before retrying", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "forum-transient-backoff",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: {
+        retryBackoffMs: 100,
+        retryBackoffMaxMs: 200,
+        retireAgentsOnTerminal: false,
+      },
+    });
+    let now = Date.parse("2026-07-28T12:00:00.000Z");
+    let forumCalls = 0;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [],
+      executeHumanEffect: async (request) => {
+        forumCalls += 1;
+        if (forumCalls <= 3) {
+          throw new ForumCommandError("forum dependency failure", {
+            retryable: true,
+            ambiguous: true,
+            commandExitCode: 7,
+          });
+        }
+        return packetFor(request, "PKT.backoff", new Date(now).toISOString());
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [], new Map());
+    let run = (await loadRun(created.id))!;
+    let effect = Object.values(run.effects).find(
+      (candidate) => candidate.kind === "forum-create",
+    );
+    assert.equal(forumCalls, 1);
+    assert.equal(effect?.status, "ambiguous");
+    assert.equal(effect?.retryCount, 1);
+    assert.equal(effect?.nextEligibleAt, "2026-07-28T12:00:00.100Z");
+
+    await sweepCombs(deps, [], new Map());
+    assert.equal(forumCalls, 1);
+
+    now += 100;
+    await sweepCombs(deps, [], new Map());
+    run = (await loadRun(created.id))!;
+    effect = Object.values(run.effects).find(
+      (candidate) => candidate.kind === "forum-create",
+    );
+    assert.equal(forumCalls, 2);
+    assert.equal(effect?.retryCount, 2);
+    assert.equal(effect?.nextEligibleAt, "2026-07-28T12:00:00.300Z");
+
+    now += 200;
+    await sweepCombs(deps, [], new Map());
+    run = (await loadRun(created.id))!;
+    effect = Object.values(run.effects).find(
+      (candidate) => candidate.kind === "forum-create",
+    );
+    assert.equal(forumCalls, 3);
+    assert.equal(effect?.retryCount, 3);
+    assert.equal(effect?.nextEligibleAt, "2026-07-28T12:00:00.500Z");
+
+    now += 199;
+    await sweepCombs(deps, [], new Map());
+    assert.equal(forumCalls, 3);
+
+    now += 1;
+    await sweepCombs(deps, [], new Map());
+    run = (await loadRun(created.id))!;
+    effect = Object.values(run.effects).find(
+      (candidate) => candidate.kind === "forum-create",
+    );
+    assert.equal(forumCalls, 4);
+    assert.equal(effect?.status, "confirmed");
+    assert.equal(effect?.nextEligibleAt, undefined);
+    assert.equal(current(run, "verify").status, "waiting-human");
+  });
+});
+
+test("a terminal Forum mutation error fails once without retrying", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "forum-terminal-error",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: { retireAgentsOnTerminal: false },
+    });
+    let forumCalls = 0;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [],
+      executeHumanEffect: async () => {
+        forumCalls += 1;
+        throw new ForumCommandError("forum revision conflict", {
+          retryable: false,
+          ambiguous: false,
+          commandExitCode: 4,
+        });
+      },
+      now: () => Date.parse("2026-07-28T12:00:00.000Z"),
+    };
+
+    await sweepCombs(deps, [], new Map());
+    await sweepCombs(deps, [], new Map());
+    const run = (await loadRun(created.id))!;
+    assert.equal(forumCalls, 1);
+    assert.equal(run.status, "failed");
+    assert.equal(current(run, "verify").failure?.code, "forum-effect-terminal");
+    assert.equal(current(run, "verify").failure?.retryable, false);
+  });
+});
+
 test("a quarantined malformed packet does not block another human run's valid verdict", async () => {
   await withTempStore(async (dir) => {
     const first = await createRun({
@@ -1425,10 +1566,17 @@ test("a quarantined malformed packet does not block another human run's valid ve
     valid.verdict = verdict(valid, "approve", "valid", "2026-07-28T12:00:02.000Z");
     quarantined = true;
     await sweepCombs(deps, [], new Map());
+    await sweepCombs(deps, [], new Map());
+
+    assert.deepEqual(notices, [`PKT.${second.id}`]);
+    quarantined = false;
+    await sweepCombs(deps, [], new Map());
+    quarantined = true;
+    await sweepCombs(deps, [], new Map());
 
     assert.equal((await loadRun(first.id))?.status, "done");
     assert.equal((await loadRun(second.id))?.status, "active");
-    assert.deepEqual(notices, [`PKT.${second.id}`]);
+    assert.deepEqual(notices, [`PKT.${second.id}`, `PKT.${second.id}`]);
   });
 });
 

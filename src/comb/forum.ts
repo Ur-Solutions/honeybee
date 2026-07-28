@@ -50,6 +50,50 @@ export type ForumPacketListResult = {
   quarantined: ForumPacketQuarantine[];
 };
 
+export class ForumCommandError extends CombError {
+  readonly retryable: boolean;
+  readonly ambiguous: boolean;
+  readonly commandExitCode?: number;
+
+  constructor(
+    message: string,
+    options: {
+      retryable: boolean;
+      ambiguous: boolean;
+      commandExitCode?: number;
+    },
+  ) {
+    super("external_dependency", message, {
+      retryable: options.retryable,
+      ambiguous: options.ambiguous,
+      ...(options.commandExitCode === undefined
+        ? {}
+        : { commandExitCode: options.commandExitCode }),
+    });
+    this.name = "ForumCommandError";
+    this.retryable = options.retryable;
+    this.ambiguous = options.ambiguous;
+    this.commandExitCode = options.commandExitCode;
+  }
+}
+
+export function classifyForumCommandError(error: unknown): {
+  retryable: boolean;
+  ambiguous: boolean;
+  commandExitCode?: number;
+} {
+  if (error instanceof ForumCommandError) {
+    return {
+      retryable: error.retryable,
+      ambiguous: error.ambiguous,
+      ...(error.commandExitCode === undefined
+        ? {}
+        : { commandExitCode: error.commandExitCode }),
+    };
+  }
+  return { retryable: true, ambiguous: true };
+}
+
 export async function listForumPackets(): Promise<ForumPacketListResult> {
   const envelope = await callForum(
     ["packet", "list", "--json"],
@@ -276,18 +320,59 @@ async function callForum(
     });
     return parseEnvelope(stdout, args.join(" "));
   } catch (error) {
-    const failure = error as Error & { stdout?: string; stderr?: string };
-    if (failure.stdout) {
-      const envelope = parseEnvelope(failure.stdout, args.join(" "));
-      throw new CombError(
-        "external_dependency",
-        `forum ${envelope.error?.code ?? "error"}: ${envelope.error?.message ?? "command failed"}`,
-      );
-    }
-    throw new CombError(
-      "external_dependency",
-      `forum command failed: ${failure.stderr?.trim() || failure.message}`,
+    if (error instanceof ForumCommandError) throw error;
+    const failure = error as Error & {
+      code?: number | string;
+      killed?: boolean;
+      signal?: NodeJS.Signals;
+      stdout?: string;
+      stderr?: string;
+    };
+    const commandExitCode = typeof failure.code === "number" ? failure.code : undefined;
+    const systemCode = typeof failure.code === "string" ? failure.code : undefined;
+    const retryable =
+      commandExitCode === 7 ||
+      Boolean(failure.killed || failure.signal) ||
+      Boolean(systemCode && TRANSIENT_FORUM_SYSTEM_CODES.has(systemCode));
+    const detail = forumFailureDetail(failure.stdout) ??
+      failure.stderr?.trim() ??
+      failure.message;
+    throw new ForumCommandError(
+      `forum command failed: ${detail}`,
+      {
+        retryable,
+        ambiguous: retryable,
+        ...(commandExitCode === undefined ? {} : { commandExitCode }),
+      },
     );
+  }
+}
+
+const TRANSIENT_FORUM_SYSTEM_CODES = new Set([
+  "EBUSY",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EIO",
+  "EMFILE",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "ENFILE",
+  "ENOSPC",
+  "ETIMEDOUT",
+]);
+
+function forumFailureDetail(stdout: string | undefined): string | undefined {
+  if (!stdout) return undefined;
+  try {
+    const envelope = JSON.parse(stdout) as unknown;
+    if (!isRecord(envelope) || !isRecord(envelope.error)) return undefined;
+    const code = typeof envelope.error.code === "string" ? envelope.error.code : "error";
+    const message = typeof envelope.error.message === "string"
+      ? envelope.error.message
+      : "command failed";
+    return `${code}: ${message}`;
+  } catch {
+    return undefined;
   }
 }
 
@@ -309,9 +394,9 @@ function parseEnvelope(stdout: string, command: string): ForumEnvelope {
   }
   const envelope = value as ForumEnvelope;
   if (envelope.ok !== true) {
-    throw new CombError(
-      "external_dependency",
+    throw new ForumCommandError(
       `forum ${envelope.error?.code ?? "error"}: ${envelope.error?.message ?? "command failed"}`,
+      { retryable: false, ambiguous: false, commandExitCode: 0 },
     );
   }
   return envelope;
@@ -451,5 +536,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function invalidEnvelope(command: string, detail: string): CombError {
-  return new CombError("external_dependency", `forum ${command} returned an invalid JSON envelope: ${detail}`);
+  return new ForumCommandError(
+    `forum ${command} returned an invalid JSON envelope: ${detail}`,
+    { retryable: false, ambiguous: false, commandExitCode: 0 },
+  );
 }
