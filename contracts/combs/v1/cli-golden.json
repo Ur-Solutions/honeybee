@@ -83,6 +83,61 @@
       ],
       "edges": []
     },
+    "terminalDoneComb": {
+      "formatVersion": 2,
+      "name": "corpus-terminal-done",
+      "input": { "kind": "informal", "description": "fixture input" },
+      "nodes": [
+        {
+          "id": "finish",
+          "executor": "engine",
+          "binding": "strict",
+          "engine": {
+            "kind": "predicate",
+            "predicate": {
+              "kind": "clock",
+              "afterMs": 0,
+              "from": "activation-start"
+            }
+          }
+        }
+      ],
+      "edges": []
+    },
+    "terminalFailedComb": {
+      "formatVersion": 2,
+      "name": "corpus-terminal-failed",
+      "input": { "kind": "informal", "description": "fixture input" },
+      "nodes": [
+        {
+          "id": "finish",
+          "executor": "engine",
+          "binding": "strict",
+          "engine": {
+            "kind": "predicate",
+            "predicate": {
+              "kind": "clock",
+              "afterMs": 0,
+              "from": "activation-start"
+            }
+          }
+        }
+      ],
+      "edges": [],
+      "output": {
+        "contract": {
+          "kind": "json-schema",
+          "schema": { "type": "string" }
+        },
+        "value": {
+          "source": "node-output",
+          "nodeId": "finish",
+          "pointer": "",
+          "lineage": "current",
+          "item": "same"
+        }
+      }
+    },
     "inputHead": { "ref": "HEAD" },
     "inputOther": { "ref": "OTHER" }
   },
@@ -573,6 +628,130 @@
       }
     },
     {
+      "id": "comb-define-terminal-done",
+      "argv": ["comb", "define", "$terminalDoneComb", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.define",
+        "result": {
+          "comb": { "name": "corpus-terminal-done", "version": 1 },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-run-terminal-done",
+      "argv": ["comb", "run", "corpus-terminal-done", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "capture": { "doneRunId": "/result/run/id" },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": { "id": { "$type": "string" }, "status": "active" },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-cancel-done-terminal-ack",
+      "arrange": [
+        {
+          "kind": "reconcile-machine",
+          "runId": "$doneRunId",
+          "now": "2099-01-01T00:00:00.000Z"
+        }
+      ],
+      "argv": ["comb", "cancel", "$doneRunId", "--reason", "must-not-rewrite", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.cancel",
+        "result": {
+          "runId": "$doneRunId",
+          "status": "done",
+          "accepted": false,
+          "reason": "terminal",
+          "cleanup": {
+            "status": "pending",
+            "pendingEffectKeys": [],
+            "pendingSubscriptionIds": [],
+            "pendingObservationWatchIds": [],
+            "pendingPacketIds": [],
+            "pendingBeeNames": [],
+            "pendingChildRunIds": [],
+            "startedAt": "2099-01-01T00:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-define-terminal-failed",
+      "argv": ["comb", "define", "$terminalFailedComb", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.define",
+        "result": {
+          "comb": { "name": "corpus-terminal-failed", "version": 1 },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-run-terminal-failed",
+      "argv": ["comb", "run", "corpus-terminal-failed", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "capture": { "failedRunId": "/result/run/id" },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": { "id": { "$type": "string" }, "status": "active" },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-cancel-failed-terminal-ack",
+      "arrange": [
+        {
+          "kind": "reconcile-machine",
+          "runId": "$failedRunId",
+          "now": "2099-01-01T00:00:01.000Z"
+        }
+      ],
+      "argv": ["comb", "cancel", "$failedRunId", "--reason", "must-not-rewrite", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.cancel",
+        "result": {
+          "runId": "$failedRunId",
+          "status": "failed",
+          "accepted": false,
+          "reason": "terminal",
+          "cleanup": {
+            "status": "pending",
+            "pendingEffectKeys": [],
+            "pendingSubscriptionIds": [],
+            "pendingObservationWatchIds": [],
+            "pendingPacketIds": [],
+            "pendingBeeNames": [],
+            "pendingChildRunIds": [],
+            "startedAt": "2099-01-01T00:00:01.000Z"
+          }
+        }
+      }
+    },
+    {
       "id": "comb-run-trigger-create",
       "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputOther", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--origin-trigger", "trigger-corpus", "--origin-delivery", "delivery-corpus", "--json"],
       "exitCode": 0,
@@ -745,11 +924,8 @@
     },
     {
       "id": "comb-transient-io-classification",
-      "operation": {
-        "kind": "classify-error",
-        "error": { "code": "EIO", "message": "fixture I/O interruption" },
-        "command": "comb.run"
-      },
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "fault": { "code": "EIO", "message": "fixture I/O interruption" },
       "exitCode": 7,
       "stdout": {
         "ok": false,

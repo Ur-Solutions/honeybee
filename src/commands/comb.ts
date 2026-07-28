@@ -25,10 +25,15 @@ Usage
   hive comb cancel <run-id> [--reason <text>] [--json]
   hive comb events <run-id> [--after <sequence>] [--limit <1..1000>] [--json]`;
 
-export async function cmdComb(parsed: Parsed): Promise<void> {
+export type CombCommandDeps = {
+  beforeExecute?: (command: string) => Promise<void> | void;
+};
+
+export async function cmdComb(parsed: Parsed, deps: CombCommandDeps = {}): Promise<void> {
   const subcommand = parsed.args[0];
   const command = `comb.${subcommand ?? "help"}`;
   try {
+    await deps.beforeExecute?.(command);
     let result: unknown;
     switch (subcommand) {
       case undefined:

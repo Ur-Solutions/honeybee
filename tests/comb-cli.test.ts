@@ -3,12 +3,12 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
-import { asCombError } from "../src/comb/errors.js";
 import { ingestSealEvidence } from "../src/comb/evidence.js";
+import { reconcileMachine } from "../src/comb/machine.js";
 import { mutateRun, readEvidence } from "../src/comb/store.js";
 import { cmdComb } from "../src/commands/comb.js";
 import { parse } from "../src/parse.js";
-import type { ActivationRecord, EvidenceRef, JsonValue } from "../src/comb/types.js";
+import type { JsonValue } from "../src/comb/types.js";
 import type { SealRecord } from "../src/seal.js";
 
 type Envelope = {
@@ -32,7 +32,10 @@ async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> 
   }
 }
 
-async function invoke(args: string[]): Promise<{ envelope: Envelope; exitCode: number }> {
+async function invoke(
+  args: string[],
+  fault?: { code: string; message: string },
+): Promise<{ envelope: Envelope; exitCode: number }> {
   const stdout: string[] = [];
   const stderr: string[] = [];
   const originalLog = console.log;
@@ -41,7 +44,15 @@ async function invoke(args: string[]): Promise<{ envelope: Envelope; exitCode: n
   console.log = (...values: unknown[]) => stdout.push(values.map(String).join(" "));
   console.error = (...values: unknown[]) => stderr.push(values.map(String).join(" "));
   try {
-    await cmdComb(parse(["comb", ...args]));
+    await cmdComb(parse(["comb", ...args]), {
+      ...(fault
+        ? {
+            beforeExecute: () => {
+              throw Object.assign(new Error(fault.message), { code: fault.code });
+            },
+          }
+        : {}),
+    });
   } finally {
     console.log = originalLog;
     console.error = originalError;
@@ -53,6 +64,7 @@ async function invoke(args: string[]): Promise<{ envelope: Envelope; exitCode: n
 
 type GoldenArrangement =
   | { kind: "write-store-file"; path: string; contents: string }
+  | { kind: "reconcile-machine"; runId: string; now: string }
   | {
       kind: "ingest-seal";
       runId: string;
@@ -66,11 +78,7 @@ type GoldenArrangement =
 type GoldenCase = {
   id: string;
   argv?: string[];
-  operation?: {
-    kind: "classify-error";
-    error: { code: string; message: string };
-    command: string;
-  };
+  fault?: { code: string; message: string };
   arrange?: GoldenArrangement[];
   capture?: Record<string, string>;
   exitCode: number;
@@ -137,6 +145,12 @@ test("versioned public corpus executes every argv, arrangement, projection, enve
           await writeFile(path, arranged.contents);
           continue;
         }
+        if (arranged.kind === "reconcile-machine") {
+          await mutateRun(arranged.runId, (run) => {
+            reconcileMachine(run, arranged.now);
+          });
+          continue;
+        }
         await mutateRun(arranged.runId, async (run) => {
           const activation = run.activations[arranged.activationId];
           assert.ok(activation, `${fixture.id}: missing arranged activation ${arranged.activationId}`);
@@ -159,31 +173,10 @@ test("versioned public corpus executes every argv, arrangement, projection, enve
         });
       }
 
-      let actual: { envelope: Envelope; exitCode: number };
-      if (fixture.argv) {
-        const argv = resolveGoldenValue(fixture.argv, variables) as string[];
-        assert.equal(argv[0], "comb", `${fixture.id}: argv must pin the public comb command`);
-        actual = await invoke(argv.slice(1));
-      } else {
-        assert.equal(fixture.operation?.kind, "classify-error", `${fixture.id}: missing executable action`);
-        const source = Object.assign(
-          new Error(fixture.operation!.error.message),
-          { code: fixture.operation!.error.code },
-        );
-        const error = asCombError(source);
-        actual = {
-          exitCode: error.exitCode,
-          envelope: {
-            ok: false,
-            command: fixture.operation!.command,
-            error: {
-              code: error.code,
-              message: error.message,
-              ...(error.details !== undefined ? { details: error.details } : {}),
-            },
-          },
-        };
-      }
+      assert.ok(fixture.argv, `${fixture.id}: missing executable argv`);
+      const argv = resolveGoldenValue(fixture.argv, variables) as string[];
+      assert.equal(argv[0], "comb", `${fixture.id}: argv must pin the public comb command`);
+      const actual = await invoke(argv.slice(1), fixture.fault);
 
       for (const [name, pointer] of Object.entries(fixture.capture ?? {})) {
         variables.set(name, resolvePointer(actual.envelope, pointer, fixture.id));
