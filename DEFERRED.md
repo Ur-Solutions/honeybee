@@ -7,6 +7,7 @@
 ## Delta-review additions (2026-07-28, non-blocking, queued for slice 1.1)
 - SEM-13 PARTIAL: subject compare still self-referential.
 - SEM-17 PARTIAL: active-run late spawn success leaves bee unowned.
+- **DELTA-5 — persisted agent-adoption replans:** recovery intentionally replays the persisted adoption request, so its digest check proves stored-request integrity but cannot detect a newly rendered custom brief that diverges under the same semantic key. Fixing this requires separating stable semantic fields from replay-only transport fields, like the broader SEM-13 migration, rather than discarding the request that closes the attach/adopt crash window.
 - NEW: stale-claim `releaseClaim` corrupt_state sweep-loop after crash-window repair.
 - NEW: support-root recreation bypasses per-node attempt caps.
 
