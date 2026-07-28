@@ -56,6 +56,7 @@ export async function createRun(options: {
   origin: RunOrigin;
   policies?: Partial<RunPolicies>;
   subjectClaimId?: string;
+  originDeliveryRequestDigest?: string;
   runId?: string;
   now?: string;
 }): Promise<RunRecord> {
@@ -154,6 +155,9 @@ export async function createRun(options: {
     cleanup: emptyCleanup("not-required"),
     intakeReady: false,
     ...(options.subjectClaimId ? { subjectClaimId: options.subjectClaimId } : {}),
+    ...(options.originDeliveryRequestDigest
+      ? { originDeliveryRequestDigest: options.originDeliveryRequestDigest }
+      : {}),
     eventTail: [],
     eventsRetainedFrom: 1,
     nextEventSequence: 1,

@@ -526,6 +526,7 @@ export type RunRecord = {
   intakeReady: boolean;
   subjectClaimId?: string;
   subjectClaimReleasedAt?: string;
+  originDeliveryRequestDigest?: string;
   output?: JsonValue;
   eventTail: RunEvent[];
   eventsRetainedFrom: number;

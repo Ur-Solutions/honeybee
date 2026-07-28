@@ -6,8 +6,16 @@ import { withFileLock } from "../lock.js";
 import { canonicalDigest } from "./canonical.js";
 import { deriveSubjectClaim, withPreparedClaim } from "./claims.js";
 import { CombError } from "./errors.js";
-import { createRun, boardView, loadRun } from "./store.js";
-import type { CombSpec, JsonValue, RunBoardView, RunOrigin, RunPolicies, StoredCombVersion } from "./types.js";
+import { createRun, boardView, listRuns, loadRun } from "./store.js";
+import type {
+  CombSpec,
+  JsonValue,
+  RunBoardView,
+  RunOrigin,
+  RunPolicies,
+  RunRecord,
+  StoredCombVersion,
+} from "./types.js";
 
 type DeliveryRecord = {
   schemaVersion: 1;
@@ -40,23 +48,44 @@ export async function instantiateRun(options: {
   const definition = options.storedComb?.definition ?? options.definition;
   if (!definition) throw new CombError("invalid_argument", "run requires a registry comb or ad-hoc graph");
   if (options.origin.kind === "trigger") {
-    const digest = canonicalDigest({
-      comb: options.storedComb
-        ? { name: options.storedComb.name, version: options.storedComb.version, digest: options.storedComb.digest }
-        : { digest: canonicalDigest(definition as unknown as JsonValue) },
-      input: options.input,
-      cwd: options.cwd,
-      productKey: options.productKey,
-      origin: options.origin,
-      collision: options.collision ?? definition.claim?.collision ?? "refuse",
-    });
-    return withDelivery(options.origin.deliveryId, digest, () => instantiateFresh({ ...options, definition }));
+    const digest = deliveryRequestDigest({ ...options, definition });
+    return withDelivery(
+      options.origin.deliveryId,
+      digest,
+      () => instantiateFresh({ ...options, definition, originDeliveryRequestDigest: digest }),
+    );
   }
   return instantiateFresh({ ...options, definition });
 }
 
+export function deliveryRequestDigest(options: {
+  storedComb?: StoredCombVersion;
+  definition?: CombSpec;
+  input: JsonValue;
+  cwd: string;
+  productKey: string;
+  origin: RunOrigin;
+  collision?: "refuse" | "join-existing";
+}): string {
+  const definition = options.storedComb?.definition ?? options.definition;
+  if (!definition) throw new CombError("invalid_argument", "delivery digest requires a registry comb or ad-hoc graph");
+  return canonicalDigest({
+    comb: options.storedComb
+      ? { name: options.storedComb.name, version: options.storedComb.version, digest: options.storedComb.digest }
+      : { digest: canonicalDigest(definition as unknown as JsonValue) },
+    input: options.input,
+    cwd: options.cwd,
+    productKey: options.productKey,
+    origin: options.origin,
+    collision: options.collision ?? definition.claim?.collision ?? "refuse",
+  });
+}
+
 async function instantiateFresh(
-  options: Parameters<typeof instantiateRun>[0] & { definition: CombSpec },
+  options: Parameters<typeof instantiateRun>[0] & {
+    definition: CombSpec;
+    originDeliveryRequestDigest?: string;
+  },
 ): Promise<InstantiateResult> {
   const runId = generateRunId();
   const declaredCollision = options.definition.claim?.collision ?? "refuse";
@@ -84,6 +113,9 @@ async function instantiateFresh(
         ...(options.policies ? { policies: options.policies } : {}),
         runId,
         ...(subjectClaimId ? { subjectClaimId } : {}),
+        ...(options.originDeliveryRequestDigest
+          ? { originDeliveryRequestDigest: options.originDeliveryRequestDigest }
+          : {}),
       });
       return { value: run, run };
     },
@@ -122,6 +154,26 @@ async function withDelivery(
         intakeReady: run.intakeReady,
       };
     }
+    const recovered = await recoverDeliveryRun(deliveryId, requestDigest);
+    if (recovered) {
+      const record: DeliveryRecord = {
+        schemaVersion: 1,
+        deliveryId,
+        requestDigest,
+        runId: recovered.id,
+        created: true,
+        joinedExisting: false,
+        createdAt: recovered.createdAt,
+      };
+      await atomicWriteFile(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+      return {
+        run: boardView(recovered),
+        created: true,
+        joinedExisting: false,
+        replayedDelivery: true,
+        intakeReady: recovered.intakeReady,
+      };
+    }
     const result = await create();
     const record: DeliveryRecord = {
       schemaVersion: 1,
@@ -135,6 +187,27 @@ async function withDelivery(
     await atomicWriteFile(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
     return result;
   });
+}
+
+async function recoverDeliveryRun(
+  deliveryId: string,
+  requestDigest: string,
+): Promise<RunRecord | null> {
+  const matches = (await listRuns()).filter(
+    (run) => run.origin.kind === "trigger" && run.origin.deliveryId === deliveryId,
+  );
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    throw new CombError("corrupt_state", `origin delivery ${deliveryId} has multiple durable runs`);
+  }
+  const run = matches[0]!;
+  if (!run.originDeliveryRequestDigest) {
+    throw new CombError("corrupt_state", `run ${run.id} is missing its delivery request digest`);
+  }
+  if (run.originDeliveryRequestDigest !== requestDigest) {
+    throw new CombError("version_conflict", `origin delivery ${deliveryId} was already used with a different request`);
+  }
+  return run;
 }
 
 async function readDelivery(path: string): Promise<DeliveryRecord | null> {

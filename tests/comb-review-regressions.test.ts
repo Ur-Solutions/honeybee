@@ -12,7 +12,7 @@ import {
 } from "../src/comb/claims.js";
 import { sweepCombs, type CombSweepDeps } from "../src/comb/controller.js";
 import { atomicWriteFile } from "../src/fsx.js";
-import { instantiateRun } from "../src/comb/instantiate.js";
+import { deliveryRequestDigest, instantiateRun } from "../src/comb/instantiate.js";
 import { applySealCompletion, activateAgent, reconcileMachine } from "../src/comb/machine.js";
 import { lintComb } from "../src/comb/schema.js";
 import {
@@ -808,4 +808,80 @@ test("review minor C4: claim declarations are structurally validated during lint
     }),
     /\$\.claim/,
   );
+});
+
+test("review critical D1: replay recovers a claimless run persisted before its delivery index", async () => {
+  await withTempStore(async (dir) => {
+    const definition: CombSpec = {
+      formatVersion: 2,
+      name: "delivery-repair",
+      input: { kind: "informal", description: "x" },
+      nodes: [agentNode("work")],
+      edges: [],
+    };
+    const origin = {
+      kind: "trigger" as const,
+      triggerId: "trigger-1",
+      deliveryId: "delivery-crash-1",
+    };
+    const options = {
+      definition,
+      input: null,
+      cwd: dir,
+      productKey: "prod",
+      origin,
+    };
+    const requestDigest = deliveryRequestDigest(options);
+    const orphaned = await createRun({
+      ...options,
+      originDeliveryRequestDigest: requestDigest,
+    });
+
+    const replay = await instantiateRun(options);
+    assert.equal(replay.run.id, orphaned.id);
+    assert.equal(replay.replayedDelivery, true);
+    assert.equal(replay.created, true);
+    assert.equal((await listRuns()).length, 1);
+  });
+});
+
+test("review critical D2: replay adopts a claimed run instead of returning permanent claim conflict", async () => {
+  await withTempStore(async (dir) => {
+    const definition = claimedDefinition("claimed-delivery-repair");
+    const origin = {
+      kind: "trigger" as const,
+      triggerId: "trigger-2",
+      deliveryId: "delivery-crash-2",
+    };
+    const options = {
+      definition,
+      input: { pr: 77 },
+      cwd: dir,
+      productKey: "prod",
+      origin,
+    };
+    const requestDigest = deliveryRequestDigest(options);
+    const runId = "0000000000003-cafe";
+    const claim = deriveSubjectClaim({
+      definition,
+      productKey: options.productKey,
+      input: options.input,
+      runId,
+    })!;
+    const orphaned = await withPreparedClaim(claim, "refuse", async (claimId) => {
+      const run = await createRun({
+        ...options,
+        runId,
+        subjectClaimId: claimId,
+        originDeliveryRequestDigest: requestDigest,
+      });
+      return { value: run, run };
+    });
+
+    const replay = await instantiateRun(options);
+    assert.equal(replay.run.id, orphaned.run.id);
+    assert.equal(replay.replayedDelivery, true);
+    assert.equal((await listRuns()).length, 1);
+    assert.equal((await loadClaim(claim.id))?.status, "held");
+  });
 });
