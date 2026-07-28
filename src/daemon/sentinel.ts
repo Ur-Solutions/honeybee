@@ -15,7 +15,8 @@
 // (launchd KeepAlive) then starts a fresh daemon. The sentinel exits when the
 // parent is gone, so daemon restarts never accumulate sentinels.
 
-import { appendFileSync, statSync } from "node:fs";
+import { appendFileSync, readFileSync, statSync } from "node:fs";
+import type { ActiveTickDiagnostic } from "./index.js";
 
 export type SentinelOptions = {
   parentPid: number;
@@ -73,6 +74,7 @@ export async function runSentinel(options: SentinelOptions, deps: SentinelDeps =
 
 function logKill(options: SentinelOptions): void {
   if (!options.logPath) return;
+  const activeTick = readActiveTickDiagnostic(options.statePath);
   try {
     appendFileSync(
       options.logPath,
@@ -82,10 +84,35 @@ function logKill(options: SentinelOptions): void {
         msg: "daemon.sentinel.kill",
         parentPid: options.parentPid,
         staleMs: options.staleMs,
+        exitIntent: "unplanned",
+        activeTick,
       })}\n`,
     );
   } catch {
     // best effort — the kill matters, the log line doesn't
+  }
+}
+
+function readActiveTickDiagnostic(statePath: string): ActiveTickDiagnostic | null {
+  try {
+    const parsed = JSON.parse(readFileSync(statePath, "utf8")) as {
+      activeTick?: Partial<ActiveTickDiagnostic>;
+    };
+    const active = parsed.activeTick;
+    if (
+      typeof active?.startedAt !== "string" ||
+      typeof active.stage !== "string" ||
+      typeof active.stageStartedAt !== "string"
+    ) {
+      return null;
+    }
+    return {
+      startedAt: active.startedAt,
+      stage: active.stage,
+      stageStartedAt: active.stageStartedAt,
+    };
+  } catch {
+    return null;
   }
 }
 

@@ -17,12 +17,14 @@ test("renderPlist produces a stable XML structure matching the golden shape", ()
     stdErrPath: "/Users/test/.hive/daemon/log.err.txt",
     keepAlive: true,
     runAtLoad: true,
+    throttleInterval: 30,
     environmentVariables: { HIVE_STORE_ROOT: "/Users/test/.hive" },
   });
   assert.ok(xml.startsWith(`<?xml version="1.0" encoding="UTF-8"?>`));
   assert.match(xml, /<key>Label<\/key>\s+<string>dev\.honeybee\.hive<\/string>/);
   assert.match(xml, /<key>KeepAlive<\/key>\s+<true\/>/);
   assert.match(xml, /<key>RunAtLoad<\/key>\s+<true\/>/);
+  assert.match(xml, /<key>ThrottleInterval<\/key>\s+<integer>30<\/integer>/);
   assert.match(xml, /<key>StandardOutPath<\/key>\s+<string>\/Users\/test\/\.hive\/daemon\/log\.txt<\/string>/);
   assert.match(xml, /<key>StandardErrorPath<\/key>\s+<string>\/Users\/test\/\.hive\/daemon\/log\.err\.txt<\/string>/);
   assert.match(xml, /<key>ProgramArguments<\/key>\s+<array>/);
@@ -57,6 +59,17 @@ test("renderPlist renders KeepAlive SuccessfulExit dict", () => {
     keepAlive: { successfulExit: false },
   });
   assert.match(xml, /<key>KeepAlive<\/key>\s+<dict>\s+<key>SuccessfulExit<\/key>\s+<false\/>\s+<\/dict>/);
+});
+
+test("renderPlist rejects an invalid throttle interval", () => {
+  const base = {
+    label: "dev.honeybee.hive",
+    programArguments: ["/usr/bin/node", "/abs/cli.js", "daemon", "run"],
+    stdOutPath: "/tmp/out",
+    stdErrPath: "/tmp/err",
+  };
+  assert.throws(() => renderPlist({ ...base, throttleInterval: 0 }), /positive integer/);
+  assert.throws(() => renderPlist({ ...base, throttleInterval: 1.5 }), /positive integer/);
 });
 
 test("renderPlist emits no blank lines when workingDirectory and env are omitted", () => {

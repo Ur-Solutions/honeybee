@@ -21,6 +21,11 @@ export type RenderPlistOptions = {
    */
   keepAlive?: boolean | { successfulExit: boolean };
   runAtLoad?: boolean;
+  /**
+   * Minimum launchd restart interval in seconds. KeepAlive jobs that fail
+   * repeatedly are delayed by this interval, preventing a hot crash loop.
+   */
+  throttleInterval?: number;
   /** Optional EnvironmentVariables dictionary (e.g. HIVE_STORE_ROOT). */
   environmentVariables?: Record<string, string>;
 };
@@ -57,6 +62,12 @@ export function renderPlist(options: RenderPlistOptions): string {
   if (options.workingDirectory !== undefined && !isAbsolute(options.workingDirectory)) {
     throw new Error(`renderPlist: workingDirectory must be absolute (got ${options.workingDirectory})`);
   }
+  if (
+    options.throttleInterval !== undefined &&
+    (!Number.isInteger(options.throttleInterval) || options.throttleInterval <= 0)
+  ) {
+    throw new Error("renderPlist: throttleInterval must be a positive integer");
+  }
 
   const runAtLoad = options.runAtLoad !== false;
 
@@ -88,6 +99,12 @@ export function renderPlist(options: RenderPlistOptions): string {
       `    <key>SuccessfulExit</key>`,
       `    <${keepAlive.successfulExit ? "true" : "false"}/>`,
       `  </dict>`,
+    );
+  }
+  if (options.throttleInterval !== undefined) {
+    lines.push(
+      `  <key>ThrottleInterval</key>`,
+      `  <integer>${options.throttleInterval}</integer>`,
     );
   }
   lines.push(

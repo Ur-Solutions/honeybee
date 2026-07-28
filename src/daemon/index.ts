@@ -47,6 +47,28 @@ export type RecentError = {
   msg: string;
 };
 
+export type ActiveTickDiagnostic = {
+  startedAt: string;
+  stage: string;
+  stageStartedAt: string;
+};
+
+export type FatalDiagnostic = {
+  ts: string;
+  reason: string;
+  /** Captured stack or stringified rejection value. */
+  error: string;
+  exitIntent: "unplanned";
+  activeTick?: ActiveTickDiagnostic;
+};
+
+export type StaleBuzQueueDiagnostic = {
+  recipient: string;
+  count: number;
+  oldestSentAt: string;
+  ageMs: number;
+};
+
 export type DaemonState = {
   startedAt: string;
   /**
@@ -71,12 +93,29 @@ export type DaemonState = {
   lastTickStageMs?: Record<string, number>;
   /** Total duration of the last completed tick. */
   lastTickDurationMs?: number;
+  /**
+   * Live diagnostic for the currently executing (possibly abandoned) tick.
+   * It is not domain state: it exists only to identify the awaited stage when
+   * supervision terminates the daemon.
+   */
+  activeTick?: ActiveTickDiagnostic;
+  /** Most recent in-process fatal diagnostic, persisted before termination. */
+  lastFatal?: FatalDiagnostic;
+  /** Current operator diagnostics for old queued mail addressed to live bees. */
+  staleBuzQueues?: StaleBuzQueueDiagnostic[];
 };
 
 export type DaemonStaleReason = "loop-stale" | "tick-progress-stale" | "recent-errors-saturated" | "missing-state";
 
 export type DaemonStatusReport = {
   running: boolean;
+  /**
+   * launchd has spawned the service but it has not acquired its daemon lock
+   * yet. This is a short healthy boot phase, not a down daemon.
+   */
+  starting: boolean;
+  /** launchd's child pid during starting/running, when available. */
+  supervisorPid: number | null;
   lock: LockMeta | null;
   /**
    * True when a lock exists but was written by a different host (shared or
@@ -185,6 +224,9 @@ export async function readDaemonState(): Promise<DaemonState | null> {
         : undefined;
     const lastTickDurationMs =
       typeof obj.lastTickDurationMs === "number" && Number.isFinite(obj.lastTickDurationMs) ? obj.lastTickDurationMs : undefined;
+    const activeTick = parseActiveTickDiagnostic(obj.activeTick);
+    const lastFatal = parseFatalDiagnostic(obj.lastFatal);
+    const staleBuzQueues = parseStaleBuzQueueDiagnostics(obj.staleBuzQueues);
     return {
       startedAt: obj.startedAt,
       lastTickAt,
@@ -195,10 +237,77 @@ export async function readDaemonState(): Promise<DaemonState | null> {
       ...(lastSuccessfulTickAt !== undefined ? { lastSuccessfulTickAt } : {}),
       ...(lastTickStageMs !== undefined ? { lastTickStageMs } : {}),
       ...(lastTickDurationMs !== undefined ? { lastTickDurationMs } : {}),
+      ...(activeTick ? { activeTick } : {}),
+      ...(lastFatal ? { lastFatal } : {}),
+      ...(staleBuzQueues ? { staleBuzQueues } : {}),
     };
   } catch {
     return null;
   }
+}
+
+function parseStaleBuzQueueDiagnostics(
+  value: unknown,
+): StaleBuzQueueDiagnostic[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.flatMap((entry): StaleBuzQueueDiagnostic[] => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const obj = entry as Record<string, unknown>;
+    if (
+      typeof obj.recipient !== "string" ||
+      typeof obj.count !== "number" ||
+      !Number.isFinite(obj.count) ||
+      typeof obj.oldestSentAt !== "string" ||
+      typeof obj.ageMs !== "number" ||
+      !Number.isFinite(obj.ageMs)
+    ) {
+      return [];
+    }
+    return [{
+      recipient: obj.recipient,
+      count: obj.count,
+      oldestSentAt: obj.oldestSentAt,
+      ageMs: obj.ageMs,
+    }];
+  });
+}
+
+function parseActiveTickDiagnostic(value: unknown): ActiveTickDiagnostic | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  if (
+    typeof obj.startedAt !== "string" ||
+    typeof obj.stage !== "string" ||
+    typeof obj.stageStartedAt !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    startedAt: obj.startedAt,
+    stage: obj.stage,
+    stageStartedAt: obj.stageStartedAt,
+  };
+}
+
+function parseFatalDiagnostic(value: unknown): FatalDiagnostic | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  if (
+    typeof obj.ts !== "string" ||
+    typeof obj.reason !== "string" ||
+    typeof obj.error !== "string" ||
+    obj.exitIntent !== "unplanned"
+  ) {
+    return undefined;
+  }
+  const activeTick = parseActiveTickDiagnostic(obj.activeTick);
+  return {
+    ts: obj.ts,
+    reason: obj.reason,
+    error: obj.error,
+    exitIntent: "unplanned",
+    ...(activeTick ? { activeTick } : {}),
+  };
 }
 
 export type ReadDaemonStatusOptions = {
@@ -275,6 +384,7 @@ export async function readDaemonStatus(
   // lock-steal refusal in fsx.acquireLongLivedLock).
   const lockHeldByOtherHost = !!lock && !lockOwnedByThisMachine(lock);
   const running = !!lock && !lockHeldByOtherHost && isPidLikelyAlive(lock.pid);
+  const starting = !running && install.serviceState === "running";
   const staleAfterMs = options.staleAfterMs ?? defaultStaleAfterMs();
   // Staleness only applies to a running daemon. A down daemon is already
   // reported as down; a live daemon with no readable state is unhealthy.
@@ -289,6 +399,8 @@ export async function readDaemonStatus(
   if (recentErrorsSaturated) staleReasons.push("recent-errors-saturated");
   return {
     running,
+    starting,
+    supervisorPid: install.servicePid,
     lock,
     lockHeldByOtherHost,
     state,
@@ -303,15 +415,35 @@ export async function readDaemonStatus(
   };
 }
 
-async function readInstallStatus(label?: string): Promise<{ plistExists: boolean; plistPath: string }> {
+async function readInstallStatus(
+  label?: string,
+): Promise<{
+  plistExists: boolean;
+  plistPath: string;
+  serviceState: string | null;
+  servicePid: number | null;
+}> {
   try {
     // Dynamic import keeps this module importable on platforms where the
     // install module's launchctl dependency is undesirable to load eagerly.
     const mod = await import("./install.js");
-    const status = await mod.getAgentInstallStatus(label);
-    return { plistExists: status.plistExists, plistPath: status.plistPath };
+    const [status, runtime] = await Promise.all([
+      mod.getAgentInstallStatus(label),
+      mod.getAgentRuntimeStatus(label),
+    ]);
+    return {
+      plistExists: status.plistExists,
+      plistPath: status.plistPath,
+      serviceState: runtime.state,
+      servicePid: runtime.pid,
+    };
   } catch {
-    return { plistExists: false, plistPath: "" };
+    return {
+      plistExists: false,
+      plistPath: "",
+      serviceState: null,
+      servicePid: null,
+    };
   }
 }
 

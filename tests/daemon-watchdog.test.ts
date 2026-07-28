@@ -67,6 +67,10 @@ test("runDaemon: a budget-abandoned tick never overlaps the next — the loop sk
       observedArgs.push(new Map(previousObserved));
       try {
         if (calls === 1) {
+          // Arm the release only once the first tick actually starts. Doing
+          // this before runDaemon boot made the gate expire during a slow,
+          // contended test startup and stopped exercising abandonment.
+          setTimeout(release, 150);
           await gate; // wedges well past the budget (the production failure shape), then settles
           return lateResult;
         }
@@ -75,7 +79,6 @@ test("runDaemon: a budget-abandoned tick never overlaps the next — the loop sk
         active -= 1;
       }
     };
-    setTimeout(release, 150);
 
     await runDaemon({
       config: { tickMs: 20, tickBudgetMs: 50, watchdogMs: 60_000, maxConsecutiveFailures: 1_000, maxTicks: 2 },
@@ -111,8 +114,9 @@ test("runDaemon: a never-settling abandoned tick escalates via maxConsecutiveFai
 
     const done = runDaemon({
       config: { tickMs: 5, tickBudgetMs: 30, watchdogMs: 60_000, maxConsecutiveFailures: 3 },
-      tickImpl: () => {
+      tickImpl: (_deps, _observed, options) => {
         calls += 1;
+        options?.onStageChange?.("records");
         return never<TickResult>();
       },
       shutdownSignal: controller.signal,
@@ -132,6 +136,11 @@ test("runDaemon: a never-settling abandoned tick escalates via maxConsecutiveFai
       state!.recentErrors.some((e) => /tick skipped: previous tick still running/.test(e.msg)),
       `recentErrors records the skips (got: ${JSON.stringify(state!.recentErrors)})`,
     );
+    assert.equal(state!.activeTick?.stage, "records", "fatal state identifies the stage that never settled");
+    assert.equal(state!.lastFatal?.reason, "supervisor-breach");
+    assert.equal(state!.lastFatal?.exitIntent, "unplanned");
+    assert.match(state!.lastFatal?.error ?? "", /consecutive failed loop iterations/);
+    assert.equal(state!.lastFatal?.activeTick?.stage, "records");
   });
 });
 

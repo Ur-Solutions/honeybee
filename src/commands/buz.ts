@@ -167,9 +167,27 @@ export async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "que
 
 export async function buzRead(parsed: Parsed) {
   const id = parsed.args[1];
-  if (!id) throw new Error("Usage: hive buz read <message-id> [--consume] [--bee <ref>]");
+  const all = truthy(flag(parsed, "all"));
   const consume = truthy(flag(parsed, "consume"));
   const beeRef = typeof flag(parsed, "bee") === "string" ? String(flag(parsed, "bee")) : undefined;
+  if (all) {
+    if (id) throw new Error("buz read: a message id and --all are mutually exclusive");
+    if (consume) throw new Error("buz read: --all already consumes every inbox message; omit --consume");
+    if (!beeRef) throw new Error("Usage: hive buz read --all --bee <ref>");
+    const record = await resolveSession(beeRef);
+    const listing = await listMessages(record.name, "inbox");
+    const consumedIds: string[] = [];
+    for (const { message } of listing) {
+      if (await consumeMessage(record.name, message.id)) consumedIds.push(message.id);
+    }
+    console.log(JSON.stringify({
+      bee: record.name,
+      consumed: consumedIds.length,
+      ids: consumedIds,
+    }, null, 2));
+    return;
+  }
+  if (!id) throw new Error("Usage: hive buz read <message-id> [--consume] [--bee <ref>] | hive buz read --all --bee <ref>");
   const candidates = beeRef ? [await resolveSession(beeRef)] : await listSessions();
   const found = await findBuzMessage(candidates, id);
   if (!found) throw new Error(`No buz message found with id: ${id}`);

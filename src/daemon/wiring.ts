@@ -12,7 +12,7 @@ import { appendLedger, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
 import { createAutoTitleDispatcher } from "./autoTitle.js";
 import { dispatchAutoswaps } from "./autoswap.js";
-import { dispatchBuzDrains } from "./buzDispatcher.js";
+import { createBuzDrainDispatcher } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher } from "./needsInput.js";
 import { createRequestReconciler } from "./requestSweep.js";
 import { createTaskSupplyDispatcher } from "./taskSupplyDispatcher.js";
@@ -104,6 +104,7 @@ async function defaultTranscriptFileStat(path: string): Promise<TranscriptFileSt
 export function buildDefaultDeps(): TickDeps {
   const refreshTranscriptMetadata = createThrottledTranscriptMetadataRefresh();
   const isolatedListSessions = createIsolatedSessionLister();
+  const dispatchBuzDrain = createBuzDrainDispatcher();
   return {
     listSessions: isolatedListSessions,
     listNodes,
@@ -126,7 +127,7 @@ export function buildDefaultDeps(): TickDeps {
     },
     refreshTranscriptMetadata,
     appendLedger,
-    dispatchBuzDrain: (records, transitions, currentStates) => dispatchBuzDrains(records, transitions, { currentStates }),
+    dispatchBuzDrain,
     dispatchTaskSupply: createTaskSupplyDispatcher(),
     reconcileRequests: createRequestReconciler(),
     dispatchNeedsInput: createNeedsInputDispatcher(),

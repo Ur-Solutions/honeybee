@@ -41,6 +41,28 @@ test("writeDaemonState/readDaemonState round-trip preserves shape", async () => 
       version: "1",
       pid: 12345,
       recentErrors: [{ ts: "2026-06-03T10:00:02.000Z", msg: "boom" }],
+      activeTick: {
+        startedAt: "2026-06-03T10:00:03.000Z",
+        stage: "records",
+        stageStartedAt: "2026-06-03T10:00:04.000Z",
+      },
+      lastFatal: {
+        ts: "2026-06-03T10:00:05.000Z",
+        reason: "supervisor-breach",
+        error: "Error: tick timed out",
+        exitIntent: "unplanned",
+        activeTick: {
+          startedAt: "2026-06-03T10:00:03.000Z",
+          stage: "records",
+          stageStartedAt: "2026-06-03T10:00:04.000Z",
+        },
+      },
+      staleBuzQueues: [{
+        recipient: "CL.stalled",
+        count: 2,
+        oldestSentAt: "2026-06-03T09:30:00.000Z",
+        ageMs: 30 * 60_000,
+      }],
     };
     await writeDaemonState(state);
     const loaded = await readDaemonState();

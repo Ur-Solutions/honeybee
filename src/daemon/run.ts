@@ -17,7 +17,12 @@ import {
 import { logTickResult, tick, type TickResult } from "./tick.js";
 import { defaultTickTimeouts, envMs, toError, withTimeout } from "./timeouts.js";
 import { buildDefaultDeps } from "./wiring.js";
-import { createSupervisor, pushRecentError, spawnSentinel } from "./supervision.js";
+import {
+  createSupervisor,
+  pushRecentError,
+  recordFatalDiagnosticSync,
+  spawnSentinel,
+} from "./supervision.js";
 
 // The daemon's tick machinery, default wiring, and timeout primitives moved to
 // dedicated modules (tick/probe/wiring/supervision/timeouts) in the HIVE-18
@@ -101,6 +106,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     version: DAEMON_VERSION,
     pid: process.pid,
     recentErrors: [],
+    staleBuzQueues: [],
   };
 
   let observed = new Map<string, BeeState>();
@@ -128,12 +134,18 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   process.on("SIGINT", onSignal);
 
   const uncaughtErrors: unknown[] = [];
-  const onUncaught = (error: unknown) => {
+  const onUncaughtException = (error: unknown) => {
     uncaughtErrors.push(error);
+    recordFatalDiagnosticSync(state, "uncaught-exception", error);
     requestShutdown("uncaught-exception", 1);
   };
-  process.on("uncaughtException", onUncaught);
-  process.on("unhandledRejection", onUncaught);
+  const onUnhandledRejection = (error: unknown) => {
+    uncaughtErrors.push(error);
+    recordFatalDiagnosticSync(state, "unhandled-rejection", error);
+    requestShutdown("unhandled-rejection", 1);
+  };
+  process.on("uncaughtException", onUncaughtException);
+  process.on("unhandledRejection", onUnhandledRejection);
 
   // Best-effort synchronous safety net: if Node terminates without our async cleanup
   // completing (eg fatal C error, signal arriving during an unrelated sync op), still
@@ -267,6 +279,25 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   // tick instead of starting another.
   let consecutiveFailures = 0;
   let lastHealthyIterationMs = Date.now();
+  const beginActiveTick = () => {
+    const now = new Date().toISOString();
+    state.activeTick = {
+      startedAt: now,
+      stage: "starting",
+      stageStartedAt: now,
+    };
+  };
+  const updateActiveTickStage = (stage: string | null) => {
+    if (!state.activeTick) return;
+    state.activeTick = {
+      ...state.activeTick,
+      stage: stage ?? "between-stages",
+      stageStartedAt: new Date().toISOString(),
+    };
+  };
+  const clearActiveTick = () => {
+    delete state.activeTick;
+  };
   // The most recent budget-abandoned tick, until it settles. `result` carries
   // its late resolution so the next tick can adopt the observed map.
   let abandonedTick: { settled: boolean; result: TickResult | null } | null = null;
@@ -293,12 +324,17 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
           // next tick doesn't re-detect — and re-dispatch — the same
           // transitions. It still doesn't count toward tickCount.
           if (abandonedTick.result) observed = abandonedTick.result.observed;
+          clearActiveTick();
           await safeLog({ level: "info", msg: "tick.abandoned.settled", adoptedObserved: abandonedTick.result !== null });
           abandonedTick = null;
         }
         // firstTick until one tick has COUNTED: cold-cache samplers sit out
         // (skipFirstTick) so the boot tick proves loop health in seconds.
-        const tickPromise = tickFn(deps, observed, { firstTick: state.tickCount === 0 });
+        beginActiveTick();
+        const tickPromise = tickFn(deps, observed, {
+          firstTick: state.tickCount === 0,
+          onStageChange: updateActiveTickStage,
+        });
         try {
           result = await withTimeout(tickPromise, config.tickBudgetMs, "tick");
         } catch (error) {
@@ -318,12 +354,22 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
       }
       supervisor.beat();
       if (result) {
+        clearActiveTick();
         observed = result.observed;
         state.tickCount += 1;
         state.lastTickAt = new Date().toISOString();
         state.lastSuccessfulTickAt = state.lastTickAt;
         state.lastTickStageMs = result.stageMs;
         state.lastTickDurationMs = result.durationMs;
+        state.staleBuzQueues = result.buzDrains.flatMap((outcome) =>
+          outcome.staleQueue
+            ? [{
+                recipient: outcome.staleQueue.recipient,
+                count: outcome.staleQueue.count,
+                oldestSentAt: outcome.staleQueue.oldestSentAt,
+                ageMs: outcome.staleQueue.ageMs,
+              }]
+            : []);
         // Crash-adoption reap: kicked exactly once, only after the loop has
         // PROVEN one healthy tick — never racing the cold boot tick for the
         // event loop (2026-07-21 canary round 2).
@@ -418,8 +464,8 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);
-    process.off("uncaughtException", onUncaught);
-    process.off("unhandledRejection", onUncaught);
+    process.off("uncaughtException", onUncaughtException);
+    process.off("unhandledRejection", onUnhandledRejection);
     process.off("exit", safetyNetRelease);
   }
 

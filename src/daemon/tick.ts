@@ -339,6 +339,16 @@ export type TickDispatcher<K extends keyof DispatcherOutcomes> = {
 
 type AnyTickDispatcher = { [K in keyof DispatcherOutcomes]: TickDispatcher<K> }[keyof DispatcherOutcomes];
 
+export type TickOptions = {
+  firstTick?: boolean;
+  /**
+   * Ephemeral observability hook. The daemon records this in state.json so a
+   * whole-tick timeout or watchdog kill identifies the exact awaited stage.
+   * null means the tick is between named stages, not that it has settled.
+   */
+  onStageChange?: (stage: string | null) => void;
+};
+
 /**
  * The dispatcher registry: state-derived work that runs at the end of every
  * tick, strictly in this order. SAFETY-CRITICAL, cheap stages come FIRST
@@ -360,7 +370,22 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
     timeoutKey: "dispatchMs",
     run: ({ deps, records, transitions, observed }) => deps.dispatchBuzDrain?.(records, transitions, observed),
     log: (outcome) =>
-      outcome.result.delivered.length > 0 || outcome.result.quarantined.length > 0 || outcome.result.errors.length > 0
+      outcome.diagnosticError
+        ? {
+            level: "warn",
+            msg: "buz.queue.scan.failed",
+            error: outcome.diagnosticError,
+          }
+        : outcome.staleQueue?.newlyStale
+        ? {
+            level: "warn",
+            msg: "buz.queue.stale",
+            recipient: outcome.recipient,
+            queued: outcome.staleQueue.count,
+            oldestSentAt: outcome.staleQueue.oldestSentAt,
+            ageMs: outcome.staleQueue.ageMs,
+          }
+        : outcome.result.delivered.length > 0 || outcome.result.quarantined.length > 0 || outcome.result.errors.length > 0
         ? {
             level: outcome.result.errors.length > 0 ? "warn" : "info",
             msg: "buz.drain",
@@ -583,13 +608,18 @@ async function runTickDispatcher<K extends keyof DispatcherOutcomes>(
   truncated: string[],
   /** Remaining shared dispatcher pool (ms); the effective timeout is the min. */
   remainingMs: number,
+  onStageChange?: (stage: string | null) => void,
 ): Promise<void> {
   if (dispatcher.skipFirstTick && ctx.firstTick) return;
-  const pending = dispatcher.run(ctx);
-  if (!pending) return;
+  onStageChange?.(dispatcher.name);
   const start = ctx.deps.now();
-  const budgetMs = Math.max(1, Math.min(timeouts[dispatcher.timeoutKey], dispatcher.capMs ?? Number.POSITIVE_INFINITY, remainingMs));
+  const budgetMs = Math.max(
+    1,
+    Math.min(timeouts[dispatcher.timeoutKey], dispatcher.capMs ?? Number.POSITIVE_INFINITY, remainingMs),
+  );
   try {
+    const pending = dispatcher.run(ctx);
+    if (!pending) return;
     ctx.outcomes[dispatcher.key] = await withTimeout(pending, budgetMs, dispatcher.name);
   } catch (error) {
     // A budget timeout is POLICY (bounded best-effort; the stage retries next
@@ -604,6 +634,7 @@ async function runTickDispatcher<K extends keyof DispatcherOutcomes>(
     }
   } finally {
     stageMs[dispatcher.name] = Math.max(0, ctx.deps.now() - start);
+    onStageChange?.(null);
   }
 }
 
@@ -666,7 +697,7 @@ export function logTickResult(result: TickResult): LogInput[] {
 export async function tick(
   deps: TickDeps,
   previousObserved: Map<string, BeeState>,
-  options: { firstTick?: boolean } = {},
+  options: TickOptions = {},
 ): Promise<TickResult> {
   const start = deps.now();
   const errors: Error[] = [];
@@ -674,11 +705,13 @@ export async function tick(
   const stageMs: Record<string, number> = {};
   const truncated: string[] = [];
   const timeStage = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
+    options.onStageChange?.(name);
     const stageStart = deps.now();
     try {
       return await run();
     } finally {
       stageMs[name] = Math.max(0, deps.now() - stageStart);
+      options.onStageChange?.(null);
     }
   };
 
@@ -957,7 +990,16 @@ export async function tick(
       }
       continue;
     }
-    await runTickDispatcher(dispatcher, dispatchContext, timeouts, errors, stageMs, truncated, remainingMs);
+    await runTickDispatcher(
+      dispatcher,
+      dispatchContext,
+      timeouts,
+      errors,
+      stageMs,
+      truncated,
+      remainingMs,
+      options.onStageChange,
+    );
   }
 
   // Chain sync deliberately does NOT run here: runDaemon drives deps.syncChains

@@ -171,6 +171,24 @@ test("hive buz read --consume moves the message from inbox/ to read/", async () 
   }
 });
 
+test("hive buz read --all bulk-consumes the recipient inbox", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    await hive(dir, "buz", "send", "CO.aaa", "--sender-human", "tormod", "--tier", "passive", "-p", "one");
+    await hive(dir, "buz", "send", "CO.aaa", "--sender-human", "tormod", "--tier", "passive", "-p", "two");
+    const { stdout } = await hive(dir, "buz", "read", "--all", "--bee", "CO.aaa");
+    const parsed = JSON.parse(stdout);
+    assert.equal(parsed.bee, "CO.aaa");
+    assert.equal(parsed.consumed, 2);
+    assert.equal(parsed.ids.length, 2);
+    assert.deepEqual(await readdir(join(dir, "buz", "CO.aaa", "inbox")), []);
+    assert.equal((await readdir(join(dir, "buz", "CO.aaa", "read"))).length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hive buz read finds a message without --bee", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
   try {

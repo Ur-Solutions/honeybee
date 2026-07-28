@@ -1738,6 +1738,7 @@ hive buz inbox <selector> [--limit N] [--from <ref>]
 hive buz outbox <selector> [--limit N] [--from <ref>]
 hive buz queue <selector> [--limit N] [--from <ref>]
 hive buz read <message-id> [--consume] [--bee <ref>]
+hive buz read --all --bee <ref>
 hive buz purge <selector> [--read|--older-than <age>|--all]
 hive buz config <bee> [--accept interrupt,queue,passive]
 ```
@@ -1750,6 +1751,7 @@ hive buz send CO.a3f --sender-human trmd --tier queue -p "Please post status."
 hive buz send @review --sender CO.a3f --tier passive --subject "FYI" -p "Shared note"
 hive buz inbox CO.a3f --limit 10
 hive buz read 000000ABCDE-123abc --consume --bee CO.a3f
+hive buz read --all --bee CO.a3f
 hive buz purge CO.a3f --read
 hive buz purge CO.a3f --older-than 7d
 ```

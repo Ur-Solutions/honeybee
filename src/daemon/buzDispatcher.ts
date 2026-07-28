@@ -22,14 +22,23 @@
 // safely without blocking concurrent senders' mailbox writes.
 
 import { readdir } from "node:fs/promises";
-import { beeMailboxDir, processQueueForBee, type DrainResult } from "../buz.js";
+import {
+  beeMailboxDir,
+  listMessages,
+  processQueueForBee,
+  type DrainResult,
+} from "../buz.js";
+import type { BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
 import { substrateFor, type Substrate } from "../substrates/index.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { TickTransition } from "./tick.js";
+import { envMs } from "./timeouts.js";
 
 const DEFAULT_BUZ_MAILBOX_CONCURRENCY = 16;
 const DEFAULT_BUZ_DRAIN_CONCURRENCY = 8;
+const DEFAULT_BUZ_STALE_AFTER_MS = 10 * 60_000;
+const DEFAULT_BUZ_STALE_SCAN_INTERVAL_MS = 60_000;
 
 export type BuzDispatchTrigger = {
   record: SessionRecord;
@@ -40,6 +49,17 @@ export type BuzDispatchTrigger = {
 export type BuzDispatchOutcome = {
   recipient: string;
   result: DrainResult;
+  /** Operator diagnostic; deliberately separate from bee/task state. */
+  staleQueue?: StaleBuzQueue & { newlyStale: boolean };
+  /** A best-effort staleness scan failure must never fail normal delivery. */
+  diagnosticError?: string;
+};
+
+export type StaleBuzQueue = {
+  recipient: string;
+  count: number;
+  oldestSentAt: string;
+  ageMs: number;
 };
 
 export type BuzDispatchDeps = {
@@ -72,6 +92,152 @@ export type BuzDispatchDeps = {
   /** Maximum concurrent per-bee drain attempts. Per-bee locks still serialize same-bee drains. */
   drainConcurrency?: number;
 };
+
+export type BuzStalenessDeps = {
+  now?: () => number;
+  staleAfterMs?: number;
+  scanIntervalMs?: number;
+  mailboxConcurrency?: number;
+  listQueue?: (record: SessionRecord) => ReturnType<typeof listMessages>;
+};
+
+/**
+ * Stateful daemon-facing dispatcher: normal queue draining plus a throttled
+ * scan for old queued mail addressed to a currently live recipient. Warnings
+ * remain in every TickResult (so daemon status can surface them), while
+ * `newlyStale` only fires on an edge/change to avoid log spam.
+ */
+export function createBuzDrainDispatcher(
+  deps: BuzDispatchDeps & BuzStalenessDeps = {},
+): (
+  records: SessionRecord[],
+  transitions: TickTransition[],
+  currentStates: Map<string, BeeState>,
+) => Promise<BuzDispatchOutcome[]> {
+  const now = deps.now ?? (() => Date.now());
+  const staleAfterMs =
+    deps.staleAfterMs ??
+    envMs("HIVE_BUZ_STALE_AFTER_MS", DEFAULT_BUZ_STALE_AFTER_MS);
+  const scanIntervalMs =
+    deps.scanIntervalMs ??
+    envMs("HIVE_BUZ_STALE_SCAN_INTERVAL_MS", DEFAULT_BUZ_STALE_SCAN_INTERVAL_MS);
+  let lastScanAt = Number.NEGATIVE_INFINITY;
+  let warnings: StaleBuzQueue[] = [];
+  let previousKeys = new Map<string, string>();
+
+  return async (records, transitions, currentStates) => {
+    const drained = await dispatchBuzDrains(records, transitions, {
+      ...deps,
+      currentStates,
+    });
+    const nowMs = now();
+    let newlyStale = new Set<string>();
+    if (nowMs - lastScanAt >= scanIntervalMs) {
+      lastScanAt = nowMs;
+      try {
+        warnings = await findStaleBuzQueues(records, currentStates, {
+          now: () => nowMs,
+          staleAfterMs,
+          mailboxConcurrency: deps.mailboxConcurrency,
+          listQueue: deps.listQueue,
+        });
+        const nextKeys = new Map<string, string>();
+        newlyStale = new Set(
+          warnings
+            .filter((warning) => {
+              const key = `${warning.count}:${warning.oldestSentAt}`;
+              nextKeys.set(warning.recipient, key);
+              return previousKeys.get(warning.recipient) !== key;
+            })
+            .map((warning) => warning.recipient),
+        );
+        previousKeys = nextKeys;
+      } catch (error) {
+        return [
+          ...drained,
+          ...warnings.map((warning) => ({
+            recipient: warning.recipient,
+            result: { delivered: [], quarantined: [], errors: [] },
+            staleQueue: { ...warning, newlyStale: false },
+          })),
+          {
+            recipient: "<staleness-scan>",
+            result: { delivered: [], quarantined: [], errors: [] },
+            diagnosticError: error instanceof Error ? error.message : String(error),
+          },
+        ];
+      }
+    }
+
+    return [
+      ...drained,
+      ...warnings.map((warning) => ({
+        recipient: warning.recipient,
+        result: { delivered: [], quarantined: [], errors: [] },
+        staleQueue: {
+          ...warning,
+          newlyStale: newlyStale.has(warning.recipient),
+        },
+      })),
+    ];
+  };
+}
+
+export async function findStaleBuzQueues(
+  records: SessionRecord[],
+  currentStates: ReadonlyMap<string, BeeState>,
+  deps: Pick<
+    BuzStalenessDeps,
+    "now" | "staleAfterMs" | "mailboxConcurrency" | "listQueue"
+  > = {},
+): Promise<StaleBuzQueue[]> {
+  const nowMs = (deps.now ?? (() => Date.now()))();
+  const staleAfterMs = deps.staleAfterMs ?? DEFAULT_BUZ_STALE_AFTER_MS;
+  const listQueue =
+    deps.listQueue ??
+    ((record: SessionRecord) => listMessages(record.name, "queue"));
+  const candidates = records.filter((record) =>
+    buzRecipientIsLive(currentStates.get(record.name) ?? record.lastObservedState));
+  const scanned = await mapWithConcurrency(
+    candidates,
+    deps.mailboxConcurrency ??
+      envConcurrency("HIVE_BUZ_MAILBOX_CONCURRENCY", DEFAULT_BUZ_MAILBOX_CONCURRENCY),
+    async (record): Promise<StaleBuzQueue | null> => {
+      const queued = await listQueue(record);
+      if (queued.length === 0) return null;
+      const oldestSentAt = queued.at(-1)!.message.sentAt;
+      const oldestMs = Date.parse(oldestSentAt);
+      if (!Number.isFinite(oldestMs)) return null;
+      const ageMs = Math.max(0, nowMs - oldestMs);
+      if (ageMs < staleAfterMs) return null;
+      return {
+        recipient: record.name,
+        count: queued.length,
+        oldestSentAt,
+        ageMs,
+      };
+    },
+  );
+  return scanned
+    .filter((warning): warning is StaleBuzQueue => warning !== null)
+    .sort((a, b) => b.ageMs - a.ageMs || a.recipient.localeCompare(b.recipient));
+}
+
+function buzRecipientIsLive(state: string | undefined): boolean {
+  switch (state) {
+    case "auth-needed":
+    case "blocked":
+    case "ready":
+    case "active":
+    case "idle_with_output":
+    case "queued":
+    case "booting":
+    case "wedged":
+      return true;
+    default:
+      return false;
+  }
+}
 
 /**
  * Select the bees whose queue/ should be drained this tick: every record

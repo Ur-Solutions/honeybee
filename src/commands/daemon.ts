@@ -223,14 +223,21 @@ export async function daemonStatus(parsed: Parsed) {
   const status = await readDaemonStatus(undefined, { label, ...(staleAfter > 0 ? { staleAfterMs: staleAfter } : {}) });
   // Exit codes: 0 healthy, 3 down, 4 unhealthy/stale (process alive but not progressing).
   // Anything polling this command must treat nonzero as an outage.
-  const exitCode = status.running ? (status.stale ? 4 : 0) : 3;
+  const exitCode = status.starting ? 0 : status.running ? (status.stale ? 4 : 0) : 3;
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(status, null, 2));
   } else {
     const installedTag = status.installed ? "installed" : "not-installed";
     if (!isPretty()) {
-      const dot = status.running ? (status.stale ? "STALE" : "running") : "down";
+      const dot = status.starting
+        ? "starting"
+        : status.running
+          ? (status.stale ? "STALE" : "running")
+          : "down";
       console.log(`${dot}\t${installedTag}\t${status.lock?.pid ?? ""}\t${status.state?.startedAt ?? ""}\t${status.state?.lastTickAt ?? ""}\t${status.state?.tickCount ?? 0}`);
+    } else if (status.starting) {
+      console.log(`${green("◌")} ${bold("hive daemon")} ${dim("starting")} ${dim(`(${installedTag})`)}`);
+      if (status.supervisorPid) console.log(dim(`  launchd pid ${status.supervisorPid}; waiting for daemon lock`));
     } else if (!status.running) {
       console.log(`${red("○")} ${bold("hive daemon")} ${dim("down")} ${dim(`(${installedTag})`)}`);
       if (status.installed && status.plistPath) {
@@ -242,6 +249,7 @@ export async function daemonStatus(parsed: Parsed) {
       if (status.state) {
         console.log(dim(`  last state.json: pid ${status.state.pid} startedAt ${status.state.startedAt}`));
         console.log(dim(`  last tick: ${status.state.lastTickAt ?? "(none)"} ticks=${status.state.tickCount}`));
+        printDaemonDiagnostics(status.state);
       }
     } else if (status.stale) {
       const reasonLabels: Record<string, string> = {
@@ -262,6 +270,7 @@ export async function daemonStatus(parsed: Parsed) {
           console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
           for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
         }
+        printDaemonDiagnostics(status.state);
       }
       console.log(dim(`  hint: hive daemon restart`));
     } else {
@@ -281,10 +290,35 @@ export async function daemonStatus(parsed: Parsed) {
           console.log(dim(`  recent errors (${status.state.recentErrors.length}):`));
           for (const e of status.state.recentErrors.slice(-3)) console.log(dim(`    ${e.ts} ${e.msg}`));
         }
+        printDaemonDiagnostics(status.state);
       }
     }
   }
   process.exit(exitCode);
+}
+
+function printDaemonDiagnostics(state: DaemonState): void {
+  if (state.activeTick) {
+    console.log(dim(
+      `  active tick: ${state.activeTick.stage} since ${state.activeTick.stageStartedAt}`,
+    ));
+  }
+  if (state.staleBuzQueues && state.staleBuzQueues.length > 0) {
+    console.log(note(
+      `  stale buz queues (${state.staleBuzQueues.length} live recipient${state.staleBuzQueues.length === 1 ? "" : "s"}):`,
+    ));
+    for (const warning of state.staleBuzQueues.slice(0, 5)) {
+      console.log(note(
+        `    ${warning.recipient}: ${warning.count} queued, oldest ${warning.oldestSentAt}`,
+      ));
+    }
+  }
+  if (state.lastFatal) {
+    const headline = state.lastFatal.error.split("\n", 1)[0] ?? state.lastFatal.reason;
+    console.log(dim(
+      `  last fatal: ${state.lastFatal.ts} ${state.lastFatal.reason} (${headline})`,
+    ));
+  }
 }
 
 

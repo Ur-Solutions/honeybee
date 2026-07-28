@@ -9,7 +9,10 @@ import {
   getAgentInstallStatus,
   installAgent,
   isAgentInstalled,
+  parseAgentRuntimeStatus,
   setLaunchctlRunner,
+  startAgent,
+  stopAgent,
   uninstallAgent,
   type LaunchctlResult,
 } from "../src/daemon/install.js";
@@ -70,8 +73,9 @@ test("installAgent writes the plist to ~/Library/LaunchAgents/ and bootstraps vi
       assert.match(plistText, /<key>StandardOutPath<\/key>\s+<string>[^<]*launchd\.out\.txt<\/string>/);
       assert.match(plistText, /<key>StandardErrorPath<\/key>\s+<string>[^<]*launchd\.err\.txt<\/string>/);
       assert.doesNotMatch(plistText, /<string>[^<]*daemon\/log\.txt<\/string>/);
-      // Relaunch only after unsuccessful exits — no crash loop on clean stop.
-      assert.match(plistText, /<key>KeepAlive<\/key>\s+<dict>\s+<key>SuccessfulExit<\/key>\s+<false\/>\s+<\/dict>/);
+      // Watchdog SIGKILL must always relaunch. Planned stops unload the job.
+      assert.match(plistText, /<key>KeepAlive<\/key>\s+<true\/>/);
+      assert.match(plistText, /<key>ThrottleInterval<\/key>\s+<integer>30<\/integer>/);
       // We only need to assert that the bootstrap call shape is correct on macOS.
       if (process.platform === "darwin") {
         assert.equal(calls.length, 1);
@@ -293,9 +297,97 @@ test("readDaemonStatus surfaces installed=false when no plist exists", async () 
   });
 });
 
+test("parseAgentRuntimeStatus extracts launchd state and pid", () => {
+  const parsed = parseAgentRuntimeStatus(`
+gui/501/dev.honeybee.hive = {
+  state = running
+  pid = 53271
+}
+`);
+  assert.deepEqual(parsed, { loaded: true, state: "running", pid: 53271 });
+});
+
+test("readDaemonStatus reports launchd's pre-lock boot window as starting", async () => {
+  await withTempHome(async () => {
+    const dispose = setLaunchctlRunner(async (args) => {
+      if (args[0] === "print") {
+        return {
+          ok: true,
+          stdout: "state = running\npid = 54321\n",
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    });
+    try {
+      await installAgent({
+        cliEntry: "/abs/cli.js",
+        nodeBinary: "/usr/bin/node",
+        skipBootstrap: true,
+      });
+      const status = await readDaemonStatus();
+      assert.equal(status.running, false);
+      assert.equal(status.starting, true);
+      assert.equal(status.supervisorPid, 54321);
+    } finally {
+      dispose();
+    }
+  });
+});
+
 test("plistPathForLabel resolves under the active HOME", async () => {
   await withTempHome(async () => {
     const expected = join(process.env.HOME!, "Library", "LaunchAgents", "dev.honeybee.hive.plist");
     assert.equal(plistPathForLabel("dev.honeybee.hive"), expected);
+  });
+});
+
+test("startAgent bootstraps an intentionally unloaded service", async () => {
+  await withTempHome(async () => {
+    const { calls, dispose } = captureRunner();
+    try {
+      const result = await startAgent("dev.honeybee.hive");
+      assert.equal(result.ok, true);
+      assert.deepEqual(calls.map((call) => call.args[0]), ["bootstrap"]);
+      assert.equal(calls[0]!.args[2], plistPathForLabel("dev.honeybee.hive"));
+    } finally {
+      dispose();
+    }
+  });
+});
+
+test("startAgent falls back to kickstart when the service is already loaded", async () => {
+  await withTempHome(async () => {
+    const calls: RunnerCall[] = [];
+    const dispose = setLaunchctlRunner(async (args) => {
+      calls.push({ args });
+      if (args[0] === "bootstrap") {
+        return { ok: false, stdout: "", stderr: "service already loaded", exitCode: 5 };
+      }
+      return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    });
+    try {
+      const result = await startAgent("dev.honeybee.hive");
+      assert.equal(result.ok, true);
+      assert.deepEqual(calls.map((call) => call.args[0]), ["bootstrap", "kickstart"]);
+      assert.deepEqual(calls[1]!.args.slice(0, 2), ["kickstart", "-k"]);
+    } finally {
+      dispose();
+    }
+  });
+});
+
+test("stopAgent records planned stop intent by unloading the service", async () => {
+  await withTempHome(async () => {
+    const { calls, dispose } = captureRunner();
+    try {
+      const result = await stopAgent("dev.honeybee.hive");
+      assert.equal(result.ok, true);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0]!.args, ["bootout", `gui/${process.getuid?.() ?? 0}/dev.honeybee.hive`]);
+    } finally {
+      dispose();
+    }
   });
 });

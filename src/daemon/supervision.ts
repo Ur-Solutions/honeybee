@@ -6,12 +6,20 @@
  * deadlocks joining the threadpool (2026-07-02 incident: ~9h stuck inside
  * process.exit). The only escapes are a synchronous syscall (sync fs bypasses
  * the threadpool) and SIGKILL (needs no cooperation from the wedged runtime);
- * launchd KeepAlive (SuccessfulExit=false) restarts the daemon.
+ * launchd KeepAlive restarts the daemon after an unplanned hard exit. Planned
+ * operator stops unload the service with launchctl bootout.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
 import { daemonLogPath } from "./log.js";
-import { daemonStatePath, maxRecentErrors, type DaemonConfig, type DaemonState, type RecentError } from "./index.js";
+import {
+  daemonStatePath,
+  maxRecentErrors,
+  type DaemonConfig,
+  type DaemonState,
+  type FatalDiagnostic,
+  type RecentError,
+} from "./index.js";
 
 export type BreachInfo = { stalledMs: number; reason: string };
 
@@ -56,7 +64,9 @@ export type CreateSupervisorOptions = {
  */
 export function createSupervisor(options: CreateSupervisorOptions): Supervisor {
   const { config, state, safetyNetRelease, isStopping } = options;
-  const onBreach = options.onWatchdogBreach ?? ((info: BreachInfo) => hardKill(info, safetyNetRelease));
+  const onBreach =
+    options.onWatchdogBreach ??
+    ((info: BreachInfo) => hardKill(info, state, safetyNetRelease));
   let breachFired = false;
   let lastLoopBeatMs = Date.now();
   let watchdog: ReturnType<typeof setInterval> | null = null;
@@ -65,14 +75,11 @@ export function createSupervisor(options: CreateSupervisorOptions): Supervisor {
     if (breachFired) return;
     breachFired = true;
     pushRecentError(state, new Error(`${info.reason}; hard-killing for supervised restart (stalled ${info.stalledMs}ms)`));
-    // Persist the breach record synchronously BEFORE the breach action: the
-    // action is normally SIGKILL, after which nothing runs, and async writes
-    // are exactly what a poisoned threadpool can no longer deliver.
-    try {
-      writeFileSync(daemonStatePath(), `${JSON.stringify({ ...state, recentErrors: [...state.recentErrors] }, null, 2)}\n`, { mode: 0o600 });
-    } catch {
-      // best effort
-    }
+    recordFatalDiagnosticSync(
+      state,
+      "supervisor-breach",
+      new Error(`${info.reason} (stalled ${info.stalledMs}ms)`),
+    );
     onBreach(info);
   };
 
@@ -105,17 +112,75 @@ export function createSupervisor(options: CreateSupervisorOptions): Supervisor {
  * syscall on this thread and SIGKILL needs no cooperation from the wedged
  * runtime; launchd KeepAlive restarts us.
  */
-function hardKill(info: BreachInfo, safetyNetRelease: () => void): void {
+function hardKill(info: BreachInfo, state: DaemonState, safetyNetRelease: () => void): void {
   try {
     appendFileSync(
       daemonLogPath(),
-      `${JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: "daemon.breach", reason: info.reason, stalledMs: info.stalledMs })}\n`,
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "error",
+        msg: "daemon.breach",
+        reason: info.reason,
+        stalledMs: info.stalledMs,
+        exitIntent: "unplanned",
+        activeTick: state.activeTick ?? null,
+        stack: state.lastFatal?.error ?? null,
+      })}\n`,
     );
   } catch {
     // best effort
   }
   safetyNetRelease();
   process.kill(process.pid, "SIGKILL");
+}
+
+/**
+ * Synchronously persist and log an unplanned fatal exit. This deliberately
+ * avoids libuv: the daemon's fatal paths include a poisoned async fs pool,
+ * and SIGKILL leaves no later cleanup opportunity.
+ */
+export function recordFatalDiagnosticSync(
+  state: DaemonState,
+  reason: string,
+  error: unknown,
+): FatalDiagnostic {
+  const rendered = error instanceof Error
+    ? error.stack ?? error.message
+    : String(error);
+  const fatal: FatalDiagnostic = {
+    ts: new Date().toISOString(),
+    reason,
+    error: rendered,
+    exitIntent: "unplanned",
+    ...(state.activeTick ? { activeTick: { ...state.activeTick } } : {}),
+  };
+  state.lastFatal = fatal;
+  try {
+    writeFileSync(
+      daemonStatePath(),
+      `${JSON.stringify({ ...state, recentErrors: [...state.recentErrors] }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // best effort
+  }
+  try {
+    appendFileSync(
+      daemonLogPath(),
+      `${JSON.stringify({
+        ts: fatal.ts,
+        level: "error",
+        msg: "daemon.fatal",
+        reason: fatal.reason,
+        exitIntent: fatal.exitIntent,
+        activeTick: fatal.activeTick ?? null,
+        error: fatal.error,
+      })}\n`,
+    );
+  } catch {
+    // best effort
+  }
+  return fatal;
 }
 
 /**

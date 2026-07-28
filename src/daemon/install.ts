@@ -20,6 +20,7 @@ const execFileAsync = promisify(execFile);
  * /usr/bin:/bin:/usr/sbin:/sbin, where tmux is typically absent.
  */
 const DEFAULT_LAUNCHD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+export const DEFAULT_DAEMON_THROTTLE_SECONDS = 30;
 
 export type InstallOptions = {
   label?: string;
@@ -196,9 +197,14 @@ export async function renderCandidatePlist(options: InstallOptions = {}): Promis
     // would follow our rotation rename and stdout would land in the rotated file.
     stdOutPath: daemonLaunchdOutPath(),
     stdErrPath: daemonLaunchdErrPath(),
-    // Relaunch only after unsuccessful exits so a clean deliberate exit
-    // (e.g. `hive daemon stop`) does not loop forever.
-    keepAlive: { successfulExit: false },
+    // Keep the daemon alive unconditionally. macOS launchd reports a
+    // self-SIGKILL as EXITED code=0, so SuccessfulExit=false does NOT assert
+    // after the watchdog's hard-kill path. Planned stops use launchctl
+    // bootout instead of relying on the child's exit status.
+    keepAlive: true,
+    // launchd already defaults to 10s; use a more conservative explicit
+    // interval so a persistent boot failure cannot become a hot crash loop.
+    throttleInterval: DEFAULT_DAEMON_THROTTLE_SECONDS,
     runAtLoad: true,
     environmentVariables: env,
   });
@@ -324,16 +330,30 @@ export async function uninstallAgent(options: UninstallOptions = {}): Promise<Un
  * Kickstart the LaunchAgent (start if stopped). Requires it to be installed.
  */
 export async function startAgent(label: string = DEFAULT_LAUNCH_LABEL): Promise<LaunchctlResult> {
-  return currentRunner(["kickstart", "-k", userServiceTarget(label)]);
+  // `hive daemon stop` unloads the service to express deliberate stop intent,
+  // so start must first try to load the on-disk plist again. If the job is
+  // already loaded (legacy stopped state or a repeated start), kickstart is
+  // the compatible fallback.
+  const bootstrap = await currentRunner(["bootstrap", userDomain(), plistPathForLabel(label)]);
+  if (bootstrap.ok) return bootstrap;
+  const kickstart = await currentRunner(["kickstart", "-k", userServiceTarget(label)]);
+  if (kickstart.ok) return kickstart;
+  return {
+    ok: false,
+    stdout: [bootstrap.stdout, kickstart.stdout].filter(Boolean).join("\n"),
+    stderr: [bootstrap.stderr, kickstart.stderr].filter(Boolean).join("\n"),
+    exitCode: kickstart.exitCode,
+  };
 }
 
 /**
- * Stop the LaunchAgent via SIGTERM. The daemon handles SIGTERM and exits 0,
- * and KeepAlive.SuccessfulExit=false only relaunches after unsuccessful
- * exits — so this is a real stop until the next start/kickstart or login.
+ * Deliberately stop and unload the LaunchAgent. With unconditional KeepAlive,
+ * merely signaling the child would immediately relaunch it; bootout is the
+ * service-manager-level stop intent. The plist stays installed so `start`
+ * can bootstrap it later.
  */
 export async function stopAgent(label: string = DEFAULT_LAUNCH_LABEL): Promise<LaunchctlResult> {
-  return currentRunner(["kill", "SIGTERM", userServiceTarget(label)]);
+  return currentRunner(["bootout", userServiceTarget(label)]);
 }
 
 /**
@@ -351,6 +371,31 @@ export async function restartAgent(label: string = DEFAULT_LAUNCH_LABEL): Promis
 export async function printAgentStatus(label: string = DEFAULT_LAUNCH_LABEL): Promise<LaunchctlResult | null> {
   if (!isLaunchctlSupported()) return null;
   return currentRunner(["print", userServiceTarget(label)]);
+}
+
+export type AgentRuntimeStatus = {
+  loaded: boolean;
+  state: string | null;
+  pid: number | null;
+};
+
+export function parseAgentRuntimeStatus(output: string): AgentRuntimeStatus {
+  const state = output.match(/^\s*state = (.+?)\s*$/m)?.[1] ?? null;
+  const pidRaw = output.match(/^\s*pid = (\d+)\s*$/m)?.[1];
+  const pid = pidRaw ? Number(pidRaw) : null;
+  return {
+    loaded: true,
+    state,
+    pid: Number.isInteger(pid) && pid! > 0 ? pid : null,
+  };
+}
+
+export async function getAgentRuntimeStatus(
+  label: string = DEFAULT_LAUNCH_LABEL,
+): Promise<AgentRuntimeStatus> {
+  const result = await printAgentStatus(label);
+  if (!result?.ok) return { loaded: false, state: null, pid: null };
+  return parseAgentRuntimeStatus(result.stdout);
 }
 
 /**

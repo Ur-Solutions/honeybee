@@ -10,7 +10,12 @@ import {
   sendBuzMessage,
   type BuzSender,
 } from "../src/buz.js";
-import { dispatchBuzDrains, selectBuzDispatchTriggers } from "../src/daemon/buzDispatcher.js";
+import {
+  createBuzDrainDispatcher,
+  dispatchBuzDrains,
+  findStaleBuzQueues,
+  selectBuzDispatchTriggers,
+} from "../src/daemon/buzDispatcher.js";
 import { tick, type ProbeResult, type TickDeps, type TickTransition } from "../src/daemon/run.js";
 import type { BeeState } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
@@ -171,6 +176,101 @@ test("selectBuzDispatchTriggers ignores transitions for unknown records", async 
   ];
   const triggers = await selectBuzDispatchTriggers([], transitions, queueNonEmpty);
   assert.equal(triggers.length, 0);
+});
+
+test("findStaleBuzQueues reports old mail only for currently live recipients", async () => {
+  const now = Date.parse("2026-07-28T12:00:00.000Z");
+  const oldMessage = {
+    id: "old",
+    from: sender,
+    to: "alpha",
+    tier: "queue" as const,
+    deliveredAs: "queue" as const,
+    sentAt: "2026-07-28T11:30:00.000Z",
+    body: "stalled",
+  };
+  const records = [makeRecord("alpha"), makeRecord("done"), makeRecord("fresh")];
+  const states = new Map<string, BeeState>([
+    ["alpha", "active"],
+    ["done", "done"],
+    ["fresh", "ready"],
+  ]);
+  const warnings = await findStaleBuzQueues(records, states, {
+    now: () => now,
+    staleAfterMs: 10 * 60_000,
+    listQueue: async (record) => {
+      if (record.name === "fresh") {
+        return [{
+          message: { ...oldMessage, id: "fresh", to: "fresh", sentAt: "2026-07-28T11:55:00.000Z" },
+          path: "/tmp/fresh",
+        }];
+      }
+      return [{ message: { ...oldMessage, to: record.name }, path: `/tmp/${record.name}` }];
+    },
+  });
+  assert.deepEqual(warnings, [{
+    recipient: "alpha",
+    count: 1,
+    oldestSentAt: oldMessage.sentAt,
+    ageMs: 30 * 60_000,
+  }]);
+});
+
+test("createBuzDrainDispatcher keeps stale diagnostics current but logs only their edge", async () => {
+  let now = Date.parse("2026-07-28T12:00:00.000Z");
+  let queued = true;
+  const recipient = makeRecord("alpha");
+  const states = new Map<string, BeeState>([["alpha", "active"]]);
+  const dispatcher = createBuzDrainDispatcher({
+    now: () => now,
+    staleAfterMs: 10 * 60_000,
+    scanIntervalMs: 1,
+    hasQueuedMessages: async () => false,
+    listQueue: async () => queued
+      ? [{
+          message: {
+            id: "old",
+            from: sender,
+            to: recipient.name,
+            tier: "queue",
+            deliveredAs: "queue",
+            sentAt: "2026-07-28T11:30:00.000Z",
+            body: "stalled",
+          },
+          path: "/tmp/old",
+        }]
+      : [],
+  });
+
+  const first = await dispatcher([recipient], [], states);
+  assert.equal(first[0]!.staleQueue?.newlyStale, true);
+  now += 2;
+  const unchanged = await dispatcher([recipient], [], states);
+  assert.equal(unchanged[0]!.staleQueue?.newlyStale, false);
+  queued = false;
+  now += 2;
+  assert.deepEqual(await dispatcher([recipient], [], states), []);
+});
+
+test("createBuzDrainDispatcher reports scan failures without rejecting delivery", async () => {
+  const recipient = makeRecord("alpha");
+  const dispatcher = createBuzDrainDispatcher({
+    now: () => Date.parse("2026-07-28T12:00:00.000Z"),
+    scanIntervalMs: 1,
+    hasQueuedMessages: async () => true,
+    drain: async () => ({ delivered: ["delivered"], quarantined: [], errors: [] }),
+    listQueue: async () => {
+      throw new Error("mailbox unavailable");
+    },
+  });
+
+  const outcomes = await dispatcher(
+    [recipient],
+    [],
+    new Map<string, BeeState>([["alpha", "idle_with_output"]]),
+  );
+  assert.deepEqual(outcomes[0]!.result.delivered, ["delivered"]);
+  assert.equal(outcomes[1]!.diagnosticError, "mailbox unavailable");
 });
 
 // ─── dispatchBuzDrains end-to-end ────────────────────────────────────────
