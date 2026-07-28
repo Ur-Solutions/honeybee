@@ -165,7 +165,7 @@ export async function cleanupRunSession(record: SessionRecord): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  console.error(note(`${outcome.alreadyGone ? "archived stale" : "retired"} ${record.name} (--rm/--cleanup)`));
+  console.error(note(`${outcome.alreadyGone ? "filed stale" : "retired"} ${record.name} (--rm/--cleanup)`));
 }
 
 

@@ -198,7 +198,7 @@ test("simultaneous batch completion: all slots seal in one sweep → all done + 
     });
   }
   const records = names.map((name) => bee(name));
-  const observed = new Map<string, BeeState>(names.map((name) => [name, "sealed" as BeeState]));
+  const observed = new Map<string, BeeState>(names.map((name) => [name, "done" as BeeState]));
   const outcomes = await sweepFlights(h.deps, records, observed);
 
   for (const slotId of ["s1", "s2", "s3"]) assert.equal(h.slots.get(slotId)!.state, "done");

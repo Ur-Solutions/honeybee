@@ -186,7 +186,7 @@ async function refreshWaitSession(record: SessionRecord, deps: WaitSessionDeps =
 }
 
 function recordedWaitTerminalState(record: SessionRecord): string | null {
-  if (record.status === "archived") return "archived";
+  if (record.status === "done") return "done";
   if (record.status === "dead") return "killed";
   if (record.status === "kill_failed") return "kill_failed";
   switch (record.lastObservedState) {
@@ -197,9 +197,13 @@ function recordedWaitTerminalState(record: SessionRecord): string | null {
     case "dead":
     case "killed":
       return "killed";
+    // A lastObservedState of "done" (or legacy "sealed") on a still-running
+    // record means SEALED, which satisfies the wait via the seal path — only
+    // legacy filed markers are terminal here; new filed records are caught by
+    // the status check above.
     case "archived":
     case "retired":
-      return "archived";
+      return "done";
     default:
       return null;
   }

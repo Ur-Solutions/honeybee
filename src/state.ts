@@ -7,8 +7,7 @@ import type { SessionRecord } from "./store.js";
 export type BeeState =
   | "dead"
   | "crashed"
-  | "sealed"
-  | "archived"
+  | "done"
   | "auth-needed"
   | "blocked"
   | "ready"
@@ -127,15 +126,16 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
     return { state: "kill_failed", detail: record.lastError ?? "previous kill failed" };
   }
 
-  // An archived bee is a settled terminal fact (filed on `quest done`): its tmux
-  // target is gone, but it is FILED, not dead, and must never flip to "offline"
-  // on an unreachable node. Short-circuit BEFORE the liveness/node probe so the
-  // archived status always wins — even over a stray live target of the same name.
-  if (record.status === "archived") {
-    return { state: "archived", detail: "filed on quest done" };
+  // A filed bee is a settled terminal fact (filed on `quest done` / retire): its
+  // tmux target is gone, but it is FILED, not dead, and must never flip to
+  // "offline" on an unreachable node. Short-circuit BEFORE the liveness/node
+  // probe so the filed status always wins — even over a stray live target of
+  // the same name.
+  if (record.status === "done") {
+    return { state: "done", detail: "filed" };
   }
 
-  // node_unreachable takes precedence over dead/sealed because we cannot trust the
+  // node_unreachable takes precedence over dead/done because we cannot trust the
   // liveTargets set when the bee's node failed to respond — we don't actually know
   // whether the session is alive.
   const nodeName = record.node && record.node.length > 0 ? record.node : LOCAL_NODE_NAME;
@@ -144,7 +144,7 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   }
 
   if (context.hsrUnavailable?.has(record.name)) {
-    if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
+    if (context.seals?.has(record.name)) return { state: "done", detail: "sealed before exit" };
     return heldHsrStateForUnavailableObservation(record, context);
   }
 
@@ -174,12 +174,12 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
     ? context.livePanes.has(record.agentPaneId)
     : context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.liveTargets.has(record.tmuxTarget);
   if (!live) {
-    if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
+    if (context.seals?.has(record.name)) return { state: "done", detail: "sealed before exit" };
     return deadOrCrashed(record, context);
   }
 
   if (context.seals?.has(record.name)) {
-    return { state: "sealed", detail: "seal recorded" };
+    return { state: "done", detail: "seal recorded" };
   }
 
   // Content is keyed by the bee's own pane (agentPaneId) so sub-bees sharing a
@@ -259,11 +259,11 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
   const now = context.now ?? Date.now();
   const live = context.hsrLive?.has(record.name) ?? false;
   if (!live) {
-    if (context.seals?.has(record.name)) return { state: "sealed", detail: "sealed before exit" };
+    if (context.seals?.has(record.name)) return { state: "done", detail: "sealed before exit" };
     return deadOrCrashed(record, context);
   }
   if (context.seals?.has(record.name)) {
-    return { state: "sealed", detail: "seal recorded" };
+    return { state: "done", detail: "seal recorded" };
   }
 
   const structured = context.hsrStates?.get(record.name);
@@ -286,10 +286,8 @@ function deriveHsrState(record: SessionRecord, context: StateContext): DerivedSt
       case "dead":
       case "crashed":
         return deadOrCrashed(record, context);
-      case "sealed":
-        return { state: "sealed", detail: "seal recorded" };
-      case "archived":
-        return { state: "archived", detail: "filed on quest done" };
+      case "done":
+        return { state: "done", detail: context.seals?.has(record.name) ? "seal recorded" : "filed" };
       case "error":
         return { state: "error", detail: record.lastError ?? "runner error" };
       case "kill_failed":
@@ -382,8 +380,7 @@ export const STATE_PRESENTATION: Record<BeeState, StatePresentation> = {
   "auth-needed": { label: "auth-needed", glyph: "!", color: yellow, labelColor: yellow, cleanPriority: 6 },
   blocked: { label: "blocked", glyph: "●", color: yellow, labelColor: yellow, cleanPriority: 5 },
   idle_with_output: { label: "idle", glyph: "●", color: dim, labelColor: plain, cleanPriority: 0 },
-  sealed: { label: "sealed", glyph: "●", color: magenta, labelColor: magenta, cleanPriority: 2 },
-  archived: { label: "archived", glyph: "○", color: gray, labelColor: gray, cleanPriority: 1 },
+  done: { label: "done", glyph: "●", color: magenta, labelColor: magenta, cleanPriority: 2 },
   error: { label: "error", glyph: "●", color: red, labelColor: red, cleanPriority: 6 },
   kill_failed: { label: "kill_failed", glyph: "●", color: red, labelColor: red, cleanPriority: 3 },
   dead: { label: "dead", glyph: "○", color: gray, labelColor: gray, cleanPriority: 1 },
@@ -408,12 +405,12 @@ export function cleanStatePriority(state: BeeState): number {
 
 export function isTerminalState(state: BeeState): boolean {
   // node_unreachable is transient — the node may come back online — and not terminal.
-  return state === "dead" || state === "crashed" || state === "sealed" || state === "archived" || state === "error" || state === "kill_failed";
+  return state === "dead" || state === "crashed" || state === "done" || state === "error" || state === "kill_failed";
 }
 
-/** States hidden from the default hive listing and restored by --archived. */
-export function isArchivedState(state: BeeState): boolean {
-  return state === "sealed" || state === "archived";
+/** States hidden from the default hive listing and restored by --done (alias --archived). */
+export function isDoneState(state: BeeState): boolean {
+  return state === "done";
 }
 
 function heldStateForUnknownPane(record: SessionRecord, context: StateContext): DerivedState | null {
@@ -435,11 +432,15 @@ function parseBeeState(value: string | undefined): BeeState | undefined {
     case "error":
     case "dead":
     case "crashed":
-    case "sealed":
-    case "archived":
+    case "done":
     case "kill_failed":
     case "node_unreachable":
       return value;
+    // Legacy observed-state strings persisted before the archived/sealed →
+    // done rename; old records and remote event streams still carry them.
+    case "sealed":
+    case "archived":
+      return "done";
     default:
       return undefined;
   }

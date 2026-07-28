@@ -167,7 +167,7 @@ test("HSR sampler skips historical records and never reopens their logs or trans
   });
 
   const outcomes = await sampler([
-    record({ name: "CL.archived", status: "archived" }),
+    record({ name: "CL.archived", status: "done" }),
     record({ name: "CL.dead", status: "dead" }),
   ], new Map(), 1_000);
 

@@ -22,7 +22,7 @@ import { hsrEventsPath, hsrRunDir } from "../hsr/runDir.js";
 import { loadLatestSeal, sealsRoot } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "../sessionMetadata.js";
-import { deriveState, formatStateCell, isArchivedState, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
+import { deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
 import { listSessions, loadSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { effectiveTags, normalizeTagArg } from "../tags.js";
@@ -72,7 +72,9 @@ export async function cmdList(parsed: Parsed) {
   const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
   const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")).replace(/^@/, "") : undefined;
   const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
-  const stateFilter = stringFlag(parsed, ["state"]);
+  const rawStateFilter = stringFlag(parsed, ["state"]);
+  // Legacy state names from before the archived/sealed → done rename.
+  const stateFilter = rawStateFilter === "archived" || rawStateFilter === "sealed" ? "done" : rawStateFilter;
   const agentFilter = stringFlag(parsed, ["agent"]);
   const repoFilter = stringFlag(parsed, ["repo"]);
   const tagFilters = arrayFlag(parsed, "tag");
@@ -84,12 +86,12 @@ export async function cmdList(parsed: Parsed) {
   }
   const probe = await liveTargetsAcrossNodes(nodes, nodeFilter);
   let records = allRecords;
-  // Filed and sealed bees share the archived visibility class: both stay out
-  // of the everyday list, while --archived (or an explicit archived state
-  // query) restores them. Persisted archived records can be removed before the
-  // state pass; sealed is derived from seal evidence and is removed below.
-  const showArchived = truthy(flag(parsed, "archived")) || stateFilter === "archived" || stateFilter === "sealed";
-  if (!showArchived) records = records.filter((r) => r.status !== "archived");
+  // Done bees (filed or sealed) stay out of the everyday list; --done (legacy
+  // alias --archived) or an explicit done-state query restores them. Persisted
+  // filed records can be removed before the state pass; a sealed bee's done
+  // state is derived from seal evidence and is removed below.
+  const showDone = truthy(flag(parsed, "done")) || truthy(flag(parsed, "archived")) || stateFilter === "done";
+  if (!showDone) records = records.filter((r) => r.status !== "done");
   if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
   if (swarmFilter) records = records.filter((r) => r.swarmId === swarmFilter);
   if (nodeFilter) records = records.filter((r) => (r.node ?? LOCAL_NODE_NAME) === nodeFilter);
@@ -114,7 +116,7 @@ export async function cmdList(parsed: Parsed) {
   const context = await buildStateContext(records, probe);
   const states = new Map(records.map((record) => [record.name, deriveState(record, context)] as const));
 
-  if (!showArchived) records = records.filter((record) => !isArchivedState(states.get(record.name)!.state));
+  if (!showDone) records = records.filter((record) => !isDoneState(states.get(record.name)!.state));
 
   // Live @hive_state (set by hive itself and by agent hooks) wins over the
   // store-derived state — the tmux server is the source of truth for live bees.
@@ -372,7 +374,7 @@ export async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTui
   const now = Date.now();
   const items = records.map((record) => {
     const derived = deriveState(record, context);
-    const live = derived.state !== "dead" && derived.state !== "sealed" && derived.state !== "node_unreachable";
+    const live = derived.state !== "dead" && derived.state !== "done" && derived.state !== "node_unreachable";
     const liveHive = effectiveHiveState(probe.states.get(liveTargetKey(record.node, record.tmuxTarget)), derived.state);
     const stateHeadline = liveHive ? liveHive : stateLabel(derived.state);
     const displayName = sessionDisplayName(record);
@@ -572,7 +574,7 @@ export async function cmdRetire(parsed: Parsed) {
       continue;
     }
     if (isPretty()) {
-      console.log(actionLine("ok", "retire", [bold(record.name), dim(outcome.alreadyGone ? "already stopped — archived" : "stopped and archived")]));
+      console.log(actionLine("ok", "retire", [bold(record.name), dim(outcome.alreadyGone ? "already stopped — filed as done" : "stopped and filed as done")]));
     } else {
       console.log(`retired\t${record.name}`);
     }

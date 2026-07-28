@@ -108,7 +108,7 @@ test("followLedgerEvents: streams appended lines and survives rotation", async (
     });
 
     // Backlog before follow start is not replayed (position starts at EOF).
-    await appendFile(path, line({ ts: "2026-07-20T10:01:00.000Z", type: "state.transition", session: "a", to: "sealed" }));
+    await appendFile(path, line({ ts: "2026-07-20T10:01:00.000Z", type: "state.transition", session: "a", to: "done" }));
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.deepEqual(seen.map((e) => e.session), ["a"]);
 

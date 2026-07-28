@@ -19,7 +19,7 @@ import {
 
 export type SlotEvidence = {
   /** Session-record status when the slot bee's record still exists. */
-  beeStatus?: "running" | "dead" | "kill_failed" | "archived";
+  beeStatus?: "running" | "dead" | "kill_failed" | "done";
   /** This tick's derived state for the bee (authoritative, structured). */
   beeState?: BeeState;
   /** Genuine runner-event progress, when the observer can provide it. */
@@ -230,7 +230,7 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
   const beeDead =
     evidence.beeStatus === "dead" ||
     evidence.beeStatus === "kill_failed" ||
-    evidence.beeStatus === "archived" ||
+    evidence.beeStatus === "done" ||
     (evidence.beeState !== undefined && DEAD_BEE_STATES.has(evidence.beeState));
   if (beeDead) {
     // Exit contracts: only a CLEAN exit is completion. Crash-flavored

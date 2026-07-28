@@ -218,8 +218,8 @@ test("seal high-water hides historical seals across revive and exposes the next 
       tmuxTarget: "CO.revived",
       createdAt: "2026-07-22T00:00:00.000Z",
       updatedAt: "2026-07-22T00:00:00.000Z",
-      status: "archived",
-      lastObservedState: "sealed",
+      status: "done",
+      lastObservedState: "done",
       lastObservedStateAt: "2026-07-22T00:01:00.000Z",
       terminalTranscriptDiscoveryAt: "2026-07-22T00:01:00.000Z",
     };

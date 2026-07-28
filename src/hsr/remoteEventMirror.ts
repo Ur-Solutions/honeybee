@@ -28,7 +28,7 @@
  *               local stream runner.
  *   teardown  — when the bee leaves the node's live list (or its record/node is
  *               gone) the subscription is torn down and the mirror meta flips to
- *               "exited" so deriveState settles it dead/sealed.
+ *               "exited" so deriveState settles it dead/done.
  *   dedupe    — one subscription per bee; a repeated tick never double-subscribes.
  *   reconnect — the transport re-adopts the local hsr.event bridge across tunnel
  *               drops (remoteTransport.ts) and the substrate re-issues the
@@ -271,7 +271,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
     }
     mirrors.delete(bee);
     if (options.markExited) {
-      // Flip the mirror meta to exited so deriveState settles it dead/sealed.
+      // Flip the mirror meta to exited so deriveState settles it dead/done.
       await writeMirrorMeta(bee, entry.node, "exited").catch(() => undefined);
     }
   }

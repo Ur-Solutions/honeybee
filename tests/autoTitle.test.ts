@@ -84,7 +84,7 @@ test("isAutoTitleCandidate: any existing title (or source) is done", () => {
 });
 
 test("isAutoTitleCandidate: historical records are never rescanned", () => {
-  assert.equal(isAutoTitleCandidate(bee({ status: "archived" }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({ status: "done" }), NOW), false);
   assert.equal(isAutoTitleCandidate(bee({ status: "dead" }), NOW), false);
 });
 

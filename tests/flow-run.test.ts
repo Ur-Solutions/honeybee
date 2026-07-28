@@ -268,7 +268,7 @@ test("cleanup=kill-on-end calls killAll() on flow-spawned bees at end", async ()
     // alreadyGone and the record is ARCHIVED (kept, revivable) — not deleted.
     const { loadSession } = await import("../src/store.js");
     const kept = await loadSession("kill-bee");
-    assert.equal(kept?.status, "archived", "cleanup=kill-on-end should archive the spawned record");
+    assert.equal(kept?.status, "done", "cleanup=kill-on-end should file the spawned record as done");
   });
 });
 
@@ -329,7 +329,7 @@ test("cleanupOverride absent: kill-on-end still kills (regression guard)", async
     assert.equal(outcome.status, "ok");
     const { loadSession } = await import("../src/store.js");
     const kept = await loadSession("noovr-bee");
-    assert.equal(kept?.status, "archived", "without an override, kill-on-end still archives the record");
+    assert.equal(kept?.status, "done", "without an override, kill-on-end still files the record as done");
   });
 });
 

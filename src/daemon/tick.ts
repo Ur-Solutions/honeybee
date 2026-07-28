@@ -595,7 +595,7 @@ export function logTickResult(result: TickResult): LogInput[] {
   for (const transition of result.transitions) {
     // First observations (daemon restart: EVERY session "transitions" from
     // undefined) are not events — on a large registry they flooded the log
-    // with hundreds of `from:null → archived` rows written sequentially
+    // with hundreds of `from:null → done` rows written sequentially
     // inside the loop body (2026-07-21 canary). Same rule as the ledger.
     if (transition.from === undefined) continue;
     entries.push({
@@ -685,7 +685,7 @@ export async function tick(
   // can no longer affect state.
   const remoteHsrNodes = new Set(nodes.filter((node) => node.kind === "remote-hsr").map((node) => node.name));
   const hsrBeeNames = records
-    .filter((record) => record.status === "running" && record.lastObservedState !== "sealed" && !seals.has(record.name) && (
+    .filter((record) => record.status === "running" && record.lastObservedState !== "done" && record.lastObservedState !== "sealed" && !seals.has(record.name) && (
       record.substrate === "hsr" || (record.node !== undefined && remoteHsrNodes.has(record.node))
     ))
     .map((record) => record.name);
@@ -767,17 +767,20 @@ export async function tick(
     const observationUnavailable = hsrUnavailable.has(record.name);
     // A seal or offline node is independently trustworthy even when the local
     // HSR run-dir batch failed. Every other HSR state is held, not republished.
-    const observationTrusted = !observationUnavailable || derived.state === "sealed" || derived.state === "node_unreachable";
+    const observationTrusted = !observationUnavailable || derived.state === "done" || derived.state === "node_unreachable";
     const transitioned = observationTrusted && prev !== derived.state;
     if (transitioned) {
       transitions.push({ name: record.name, from: prev, to: derived.state });
     }
     const terminal = isTerminalState(derived.state);
-    const archived = derived.state === "archived";
+    // "done" covers both filed and sealed bees; the persisted status tells
+    // them apart (a filed record carries status "done", a sealed one doesn't).
+    const filed = record.status === "done";
+    const sealedNow = derived.state === "done" && !filed;
     // A seal is already a durable task artifact: it does not justify one last
     // provider-wide transcript scan. Other fast terminal exits get one claimed
     // best-effort pass in case they died between spawn and the first tick.
-    const claimTerminalTranscriptDiscovery = terminal && derived.state !== "sealed" &&
+    const claimTerminalTranscriptDiscovery = terminal && !sealedNow &&
       !record.transcriptPath && !record.terminalTranscriptDiscoveryAt;
     return {
       record,
@@ -785,7 +788,7 @@ export async function tick(
       persistObservation: observationTrusted,
       mirrorHiveState: observationTrusted && (transitioned || staleHiveState) && !uncertainBooting,
       refreshTranscriptMetadata:
-        observationTrusted && !archived && (!terminal || claimTerminalTranscriptDiscovery) && deps.refreshTranscriptMetadata !== undefined,
+        observationTrusted && !filed && (!terminal || claimTerminalTranscriptDiscovery) && deps.refreshTranscriptMetadata !== undefined,
       claimTerminalTranscriptDiscovery,
     };
   });

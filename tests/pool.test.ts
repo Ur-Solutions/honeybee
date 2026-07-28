@@ -327,7 +327,7 @@ test("liveBeesFromSessions keeps non-terminal local bees and drops dead/sealed/r
       session("sealed-bee"),
       session("remote-bee", { node: "mini01" }),
       session("hsr-alive", { substrate: "hsr" }),
-      session("archived-bee", { status: "archived" }),
+      session("archived-bee", { status: "done" }),
     ];
     const context: StateContext = {
       liveTargets: new Set([liveTargetKey(undefined, "alive"), liveTargetKey(undefined, "sealed-bee"), liveTargetKey("mini01", "remote-bee")]),

@@ -115,7 +115,7 @@ async function claimTranscriptIdentity(
     const durable = await readTranscriptOwnershipClaim(claimPath);
     if (durable && durable.owner !== record.name) {
       // A claim whose owner record was deliberately deleted may be reused.
-      // Process state is irrelevant: sealed/archived owners retain history.
+      // Process state is irrelevant: done (sealed/filed) owners retain history.
       const owner = await loadSession(durable.owner);
       // A pre-commit crash can leave a claim file whose owner never acquired
       // the identity. Do not strand it forever merely because that unrelated
@@ -168,7 +168,7 @@ async function findClaimingSibling(record: SessionRecord, tx: TranscriptFile): P
   const records = await listSessions();
   return records.find((candidate) => {
     if (candidate.name === record.name || candidate.agent !== record.agent) return false;
-    // Ownership outlives process state: dead/sealed/archived records still own
+    // Ownership outlives process state: dead/done records still own
     // their history. A deliberate resume is preserved because the new record's
     // explicit stored id/path takes the confirmed-identity path above and never
     // enters this heuristic bootstrap claim.

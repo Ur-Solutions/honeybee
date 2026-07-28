@@ -156,7 +156,7 @@ test("tick: skips transcript metadata refresh for archived and captured terminal
     const sealed = bee({ name: "sealed-bee", tmuxTarget: "hive:sealed", transcriptPath: "/tmp/sealed.jsonl" });
     // Archived records are immutable and must never be revisited, even when an
     // older record has no transcript path.
-    const archived = bee({ name: "archived-bee", tmuxTarget: "hive:archived", status: "archived" });
+    const archived = bee({ name: "archived-bee", tmuxTarget: "hive:archived", status: "done" });
     // A bee that exited before its first refresh (fast finish between ticks)
     // still gets one pass so list/search metadata is not permanently missing.
     const fastExit = bee({ name: "fast-exit-bee", tmuxTarget: "hive:fast" });
@@ -218,9 +218,9 @@ test("tick: a revived runtime clears the old terminal discovery claim and gets o
     const retired = bee({
       name: "revived-terminal",
       tmuxTarget: "revived-terminal",
-      status: "archived",
+      status: "done",
       terminalTranscriptDiscoveryAt: "2026-06-03T09:58:00.000Z",
-      lastObservedState: "sealed",
+      lastObservedState: "done",
     });
     const incarnation = await nextRuntimeIncarnationPatch(retired);
     const diedAgain = { ...retired, ...incarnation, status: "dead" as const };
@@ -1008,7 +1008,7 @@ test("tick: a large archived registry's first observation floods neither the led
   await withTempStore(async () => {
     const { logTickResult } = await import("../src/daemon/tick.js");
     // 400 archived sessions + one live bee, fresh daemon (empty previousObserved).
-    const records = Array.from({ length: 400 }, (_, i) => bee({ name: `old-${i}`, tmuxTarget: `hive:old-${i}`, status: "archived" }));
+    const records = Array.from({ length: 400 }, (_, i) => bee({ name: `old-${i}`, tmuxTarget: `hive:old-${i}`, status: "done" }));
     records.push(bee({ name: "live-1", tmuxTarget: "hive:live-1" }));
     const capture: Capture = { ledger: [], touches: [] };
     const deps = buildDeps({ records, liveTargets: new Set(["hive:live-1"]), capture });

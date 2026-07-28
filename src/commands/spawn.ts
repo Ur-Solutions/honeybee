@@ -366,7 +366,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   // Pane-less spawns (HSR / remote-hsr) have no tmux hasSession guard, so a
   // duplicate name would silently OVERWRITE the existing session record and
   // orphan its live runner host (two hosts, one run dir — review CR-1). Refuse
-  // while a running record holds the name; a dead/archived record may be
+  // while a running record holds the name; a dead or done (filed) record may be
   // reused (the overwrite is then deliberate re-creation).
   if (opts.substrate === "hsr" || opts.node?.kind === "remote-hsr") {
     const existing = await loadSession(name);

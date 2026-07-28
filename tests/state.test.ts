@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { stripAnsi } from "../src/format.js";
-import { type BeeState, cleanStatePriority, deriveState, formatStateCell, isArchivedState, isTerminalState, liveTargetKey, STATE_PRESENTATION, stateLabel } from "../src/state.js";
+import { type BeeState, cleanStatePriority, deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, STATE_PRESENTATION, stateLabel } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
 function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
@@ -30,14 +30,16 @@ test("dead: tmux target is not live and the record is explicitly marked dead", (
   assert.equal(result.state, "dead");
 });
 
-test("sealed (after exit): tmux gone but seal exists", () => {
+test("done (sealed after exit): tmux gone but seal exists", () => {
   const result = deriveState(bee(), { liveTargets: new Set(), seals: new Set(["alpha"]), now: NOW });
-  assert.equal(result.state, "sealed");
+  assert.equal(result.state, "done");
+  assert.match(result.detail, /sealed/);
 });
 
-test("sealed (while alive): tmux live and seal exists", () => {
+test("done (sealed while alive): tmux live and seal exists", () => {
   const result = deriveState(bee(), { liveTargets: new Set(["alpha-target"]), seals: new Set(["alpha"]), now: NOW });
-  assert.equal(result.state, "sealed");
+  assert.equal(result.state, "done");
+  assert.match(result.detail, /seal/);
 });
 
 test("kill_failed: record explicitly marked", () => {
@@ -202,7 +204,7 @@ test("stateLabel returns human-readable forms", () => {
   assert.equal(stateLabel("idle_with_output"), "idle");
   assert.equal(stateLabel("kill_failed"), "kill_failed");
   assert.equal(stateLabel("node_unreachable"), "offline");
-  assert.equal(stateLabel("archived"), "archived");
+  assert.equal(stateLabel("done"), "done");
   assert.equal(stateLabel("auth-needed"), "auth-needed");
 });
 
@@ -211,8 +213,7 @@ test("stateLabel returns human-readable forms", () => {
 const ALL_STATES: BeeState[] = [
   "dead",
   "crashed",
-  "sealed",
-  "archived",
+  "done",
   "auth-needed",
   "blocked",
   "ready",
@@ -243,8 +244,7 @@ test("cleanStatePriority preserves the original ordering", () => {
   assert.equal(cleanStatePriority("idle_with_output"), 0);
   assert.equal(cleanStatePriority("dead"), 1);
   assert.equal(cleanStatePriority("crashed"), 1);
-  assert.equal(cleanStatePriority("archived"), 1);
-  assert.equal(cleanStatePriority("sealed"), 2);
+  assert.equal(cleanStatePriority("done"), 2);
   assert.equal(cleanStatePriority("kill_failed"), 3);
   assert.equal(cleanStatePriority("ready"), 4);
   assert.equal(cleanStatePriority("blocked"), 5);
@@ -261,16 +261,15 @@ test("formatStateCell renders the table's glyph and label", () => {
   assert.equal(stripAnsi(formatStateCell("ready")), "● ready");
   assert.equal(stripAnsi(formatStateCell("queued")), "◌ queued");
   assert.equal(stripAnsi(formatStateCell("idle_with_output")), "● idle");
-  assert.equal(stripAnsi(formatStateCell("archived")), "○ archived");
+  assert.equal(stripAnsi(formatStateCell("done")), "● done");
   assert.equal(stripAnsi(formatStateCell("dead")), "○ dead");
   assert.equal(stripAnsi(formatStateCell("node_unreachable")), "? offline");
 });
 
 test("isTerminalState recognizes end states", () => {
   assert.equal(isTerminalState("dead"), true);
-  assert.equal(isTerminalState("sealed"), true);
+  assert.equal(isTerminalState("done"), true);
   assert.equal(isTerminalState("kill_failed"), true);
-  assert.equal(isTerminalState("archived"), true);
   assert.equal(isTerminalState("active"), false);
   assert.equal(isTerminalState("ready"), false);
   assert.equal(isTerminalState("queued"), false);
@@ -278,31 +277,30 @@ test("isTerminalState recognizes end states", () => {
   assert.equal(isTerminalState("node_unreachable"), false);
 });
 
-test("isArchivedState groups sealed and filed bees", () => {
-  assert.equal(isArchivedState("sealed"), true);
-  assert.equal(isArchivedState("archived"), true);
-  assert.equal(isArchivedState("dead"), false);
-  assert.equal(isArchivedState("active"), false);
+test("isDoneState covers sealed and filed bees (both derive to done)", () => {
+  assert.equal(isDoneState("done"), true);
+  assert.equal(isDoneState("dead"), false);
+  assert.equal(isDoneState("active"), false);
 });
 
-test("archived: a filed bee is archived, NOT dead, even with its tmux target gone", () => {
-  const result = deriveState(bee({ status: "archived" }), { liveTargets: new Set(), now: NOW });
-  assert.equal(result.state, "archived", "filed, not dead");
+test("done: a filed bee is done, NOT dead, even with its tmux target gone", () => {
+  const result = deriveState(bee({ status: "done" }), { liveTargets: new Set(), now: NOW });
+  assert.equal(result.state, "done", "filed, not dead");
   assert.match(result.detail, /filed/);
 });
 
-test("archived wins over a stray live target (status is the settled fact)", () => {
-  const result = deriveState(bee({ status: "archived" }), { liveTargets: new Set(["alpha-target"]), now: NOW });
-  assert.equal(result.state, "archived");
+test("filed done wins over a stray live target (status is the settled fact)", () => {
+  const result = deriveState(bee({ status: "done" }), { liveTargets: new Set(["alpha-target"]), now: NOW });
+  assert.equal(result.state, "done");
 });
 
-test("archived precedes the node_unreachable check (a filed bee never flips to offline)", () => {
-  const result = deriveState(bee({ status: "archived", node: "remote" }), {
+test("filed done precedes the node_unreachable check (a filed bee never flips to offline)", () => {
+  const result = deriveState(bee({ status: "done", node: "remote" }), {
     liveTargets: new Set(),
     unreachableNodes: new Set(["remote"]),
     now: NOW,
   });
-  assert.equal(result.state, "archived", "archived guard precedes the node check");
+  assert.equal(result.state, "done", "filed guard precedes the node check");
 });
 
 test("node_unreachable: bee's node is in unreachableNodes", () => {
@@ -315,14 +313,14 @@ test("node_unreachable: bee's node is in unreachableNodes", () => {
   assert.match(result.detail, /mini01 offline/);
 });
 
-test("node_unreachable takes precedence over sealed and dead", () => {
+test("node_unreachable takes precedence over done and dead", () => {
   const result = deriveState(bee({ node: "mini01" }), {
     liveTargets: new Set(),
     seals: new Set(["alpha"]),
     unreachableNodes: new Set(["mini01"]),
     now: NOW,
   });
-  // We must not lie and call this 'sealed' when we don't know — the node is offline.
+  // We must not lie and call this 'done' when we don't know — the node is offline.
   assert.equal(result.state, "node_unreachable");
 });
 

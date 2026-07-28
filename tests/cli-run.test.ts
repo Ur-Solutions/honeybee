@@ -77,7 +77,7 @@ test("run --rm cleans up when known driver readiness fails", async () => {
     assert.equal(files.length, 1, "retired record should remain on disk");
     const { readFile } = await import("node:fs/promises");
     const raw = await readFile(join(storeRoot, "sessions", files[0]!), "utf8");
-    assert.equal((JSON.parse(raw) as { status: string }).status, "archived");
+    assert.equal((JSON.parse(raw) as { status: string }).status, "done");
   } finally {
     await kill(name);
     await rm(storeRoot, { recursive: true, force: true });

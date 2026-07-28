@@ -177,7 +177,7 @@ async function readTailText(path: string, maxBytes: number): Promise<string | nu
  *   live     — host-pid liveness (see file docs).
  *   state    — a STRUCTURED BeeState derived from the events.jsonl tail, or
  *              undefined when the bee is not live (deriveState resolves
- *              dead/sealed) or no structured signal exists yet.
+ *              dead/done) or no structured signal exists yet.
  *   snapshot — the rendered ring text tail (used as an output fallback).
  */
 export type HsrObservation = {

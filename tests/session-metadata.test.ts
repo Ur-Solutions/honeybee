@@ -155,7 +155,7 @@ test("terminal sibling records retain transcript ownership against heuristic ado
   await withTempStore(async () => {
     const target = bee("CL.target", { lastPrompt: "same prompt", lastPromptAt: "2026-07-18T12:00:00.000Z" });
     const historical = bee("CL.historical", {
-      status: "archived",
+      status: "done",
       providerSessionId: "historical-session",
       transcriptPath: "/tmp/historical.jsonl",
       lastObservedState: "crashed",

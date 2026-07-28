@@ -177,7 +177,7 @@ test("waitForIdle diagnoses killed and archived records by terminal state", asyn
   try {
     await withStoreRoot(dir, async () => {
       const substrate = { capture: async () => "working", hasSession: async () => true };
-      for (const [status, expected] of [["dead", "killed"], ["archived", "archived"]] as const) {
+      for (const [status, expected] of [["dead", "killed"], ["done", "done"]] as const) {
         const saved = { ...record(dir), status };
         await saveSession(saved);
         await assert.rejects(

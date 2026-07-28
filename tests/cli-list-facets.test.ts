@@ -21,7 +21,7 @@ type SeedRecord = {
   cwd: string;
   colony?: string;
   swarmId?: string;
-  status?: "running" | "dead" | "archived";
+  status?: "running" | "dead" | "done";
 };
 
 async function seed(dir: string, record: SeedRecord): Promise<void> {
@@ -173,33 +173,40 @@ test("hive list --state dead matches dead bees with no live tmux", async () => {
   });
 });
 
-test("hive ls hides sealed and filed bees unless archived visibility is requested", async () => {
+test("hive ls hides done (sealed and filed) bees unless done visibility is requested", async () => {
   await withFixture(async ({ store, repoA, repoB, plain }) => {
     await seed(store, { name: "ordinary", agent: "claude", cwd: repoA });
     await seed(store, { name: "sealed", agent: "codex", cwd: repoB });
-    await seed(store, { name: "filed", agent: "claude", cwd: plain, status: "archived" });
+    await seed(store, { name: "filed", agent: "claude", cwd: plain, status: "done" });
     await seedSeal(store, "sealed");
 
     const defaultRows = JSON.parse((await hive(store, "ls", "--json")).stdout) as Array<{ name: string }>;
     assert.deepEqual(defaultRows.map((row) => row.name), ["ordinary"]);
 
-    const archivedRows = JSON.parse((await hive(store, "ls", "--archived", "--json")).stdout) as Array<{ name: string; beeState: string }>;
-    assert.deepEqual(new Set(archivedRows.map((row) => row.name)), new Set(["ordinary", "sealed", "filed"]));
-    assert.equal(archivedRows.find((row) => row.name === "sealed")?.beeState, "sealed");
-    assert.equal(archivedRows.find((row) => row.name === "filed")?.beeState, "archived");
+    const doneRows = JSON.parse((await hive(store, "ls", "--done", "--json")).stdout) as Array<{ name: string; beeState: string }>;
+    assert.deepEqual(new Set(doneRows.map((row) => row.name)), new Set(["ordinary", "sealed", "filed"]));
+    assert.equal(doneRows.find((row) => row.name === "sealed")?.beeState, "done");
+    assert.equal(doneRows.find((row) => row.name === "filed")?.beeState, "done");
+
+    // Legacy alias from before the archived → done rename.
+    const legacyRows = JSON.parse((await hive(store, "ls", "--archived", "--json")).stdout) as Array<{ name: string }>;
+    assert.deepEqual(new Set(legacyRows.map((row) => row.name)), new Set(["ordinary", "sealed", "filed"]));
   });
 });
 
-test("hive list explicit archived state filters reveal their hidden class", async () => {
+test("hive list explicit done state filter (and legacy aliases) reveals the hidden class", async () => {
   await withFixture(async ({ store, repoA, repoB }) => {
     await seed(store, { name: "sealed", agent: "codex", cwd: repoA });
-    await seed(store, { name: "filed", agent: "claude", cwd: repoB, status: "archived" });
+    await seed(store, { name: "filed", agent: "claude", cwd: repoB, status: "done" });
     await seedSeal(store, "sealed");
 
-    const sealedRows = JSON.parse((await hive(store, "list", "--state", "sealed", "--json")).stdout) as Array<{ name: string }>;
-    assert.deepEqual(sealedRows.map((row) => row.name), ["sealed"]);
+    const doneRows = JSON.parse((await hive(store, "list", "--state", "done", "--json")).stdout) as Array<{ name: string }>;
+    assert.deepEqual(new Set(doneRows.map((row) => row.name)), new Set(["sealed", "filed"]));
 
-    const archivedRows = JSON.parse((await hive(store, "list", "--state", "archived", "--json")).stdout) as Array<{ name: string }>;
-    assert.deepEqual(archivedRows.map((row) => row.name), ["filed"]);
+    // Legacy state names normalize to done and reveal the whole done class.
+    for (const legacy of ["sealed", "archived"]) {
+      const rows = JSON.parse((await hive(store, "list", "--state", legacy, "--json")).stdout) as Array<{ name: string }>;
+      assert.deepEqual(new Set(rows.map((row) => row.name)), new Set(["sealed", "filed"]), `--state ${legacy}`);
+    }
   });
 });

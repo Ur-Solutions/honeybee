@@ -217,9 +217,9 @@ export function formatSelector(selector: Selector): string {
 
 export async function resolveSelector(query: string): Promise<ResolvedTarget> {
   const selector = parseSelector(query);
-  // Filed (archived) bees are excluded from DEFAULT selector resolution
-  // (send/kill/list <sel>): an archived bee is no longer a live send/kill target.
-  const records = (await listSessions()).filter((r) => r.status !== "archived");
+  // Filed (done) bees are excluded from DEFAULT selector resolution
+  // (send/kill/list <sel>): a filed bee is no longer a live send/kill target.
+  const records = (await listSessions()).filter((r) => r.status !== "done");
   const state: SelectorState = { records };
 
   // The tag kind reuses colony:/swarm: existence sets for its unknown-value

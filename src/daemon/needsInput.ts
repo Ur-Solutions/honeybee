@@ -35,7 +35,7 @@ export type NeedsInputOutcome = {
 
 /**
  * A parent is "alive" when its freshly-observed state exists and is not
- * terminal (dead/sealed/archived/error/kill_failed). An unknown state (parent
+ * terminal (dead/done/error/kill_failed). An unknown state (parent
  * not in this tick's observed map) is treated as not-alive → escalate, so a
  * request is never routed into a void.
  */

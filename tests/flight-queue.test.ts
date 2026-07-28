@@ -191,7 +191,7 @@ test("lane-keeper: a done task recycles the lane onto the next packet until the 
   // Worker seals t1 (contract taskId = queue task id, attempt-scoped).
   h.seals.set(g0Bee, { filename: "seal-t1.json", sealedAt: iso(T0 + 60_000), status: "done", taskId: "t1", attempt: 1 });
   h.setNow(T0 + 2 * 60_000);
-  await sweepFlights(h.deps, [bee(g0Bee)], new Map<string, BeeState>([[g0Bee, "sealed"]]));
+  await sweepFlights(h.deps, [bee(g0Bee)], new Map<string, BeeState>([[g0Bee, "done"]]));
 
   // t1 filed as done; lane recycled to generation 1 and claimed t2 with its cwd.
   assert.equal(h.queue.buckets.done!.length, 1);
@@ -212,7 +212,7 @@ test("lane-keeper: a done task recycles the lane onto the next packet until the 
   const g1Bee = h.spawned[1]!.name;
   h.seals.set(g1Bee, { filename: "seal-t2.json", sealedAt: iso(T0 + 3 * 60_000), status: "done", taskId: "t2", attempt: 1 });
   h.setNow(T0 + 4 * 60_000);
-  const outcomes = await sweepFlights(h.deps, [bee(g1Bee)], new Map<string, BeeState>([[g1Bee, "sealed"]]));
+  const outcomes = await sweepFlights(h.deps, [bee(g1Bee)], new Map<string, BeeState>([[g1Bee, "done"]]));
   assert.equal(h.queue.buckets.done!.length, 2);
   assert.equal(h.slots.get("s1")!.state, "drained");
   assert.ok(h.ledger.some((e) => e.type === "flight.slot.drained"));
@@ -254,7 +254,7 @@ test("lane-keeper: enqueueing onto a drained lane revives it next sweep", async 
   const worker = h.spawned[0]!.name;
   h.seals.set(worker, { filename: "s.json", sealedAt: iso(T0 + 60_000), status: "done", taskId: "t1", attempt: 1 });
   h.setNow(T0 + 2 * 60_000);
-  await sweepFlights(h.deps, [bee(worker)], new Map<string, BeeState>([[worker, "sealed"]]));
+  await sweepFlights(h.deps, [bee(worker)], new Map<string, BeeState>([[worker, "done"]]));
   assert.equal(h.slots.get("s1")!.state, "drained");
   // Production has no reopen/status-active API. This in-memory mutation keeps
   // the record active only to exercise the supported drained-lane invariant:
@@ -263,7 +263,7 @@ test("lane-keeper: enqueueing onto a drained lane revives it next sweep", async 
 
   h.queue.buckets.pending!.push(packet("t9"));
   h.setNow(T0 + 3 * 60_000);
-  await sweepFlights(h.deps, [bee(worker)], new Map<string, BeeState>([[worker, "sealed"]]));
+  await sweepFlights(h.deps, [bee(worker)], new Map<string, BeeState>([[worker, "done"]]));
   const s1 = h.slots.get("s1")!;
   assert.equal(s1.state, "booting");
   assert.equal(s1.taskId, "t9");

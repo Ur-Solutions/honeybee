@@ -34,7 +34,9 @@ export function hiveStateFor(state: BeeState): HiveTmuxState | undefined {
     case "auth-needed":
       return "waiting";
     case "idle_with_output":
-    case "sealed":
+    case "done":
+      // A filed bee's session is already gone — the write is a best-effort
+      // no-op there, so "done" needs no special-casing.
       return "done";
     case "wedged":
     case "error":
@@ -42,9 +44,8 @@ export function hiveStateFor(state: BeeState): HiveTmuxState | undefined {
       return "failed";
     case "dead":
     case "crashed":
-    case "archived":
     case "node_unreachable":
-      // Session gone (or filed), or unknowable — nothing to write to.
+      // Session gone, or unknowable — nothing to write to.
       return undefined;
   }
 }

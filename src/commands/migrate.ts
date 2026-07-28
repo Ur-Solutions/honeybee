@@ -661,9 +661,9 @@ export async function cmdRevive(parsed: Parsed): Promise<void> {
     const which = bulkCrashed ? "--crashed" : "--all";
     if (stringFlag(parsed, ["session"])) throw new Error(`hive revive ${which} cannot take --session (one id can't apply to many bees)`);
     const records = await listSessions();
-    // Retired (archived) bees are settled on purpose — bulk revive must never
+    // Retired (done) bees are settled on purpose — bulk revive must never
     // resurrect them. Reviving a retired bee stays possible one at a time.
-    const local = records.filter((r) => (!r.node || r.node === LOCAL_NODE_NAME) && r.status !== "archived");
+    const local = records.filter((r) => (!r.node || r.node === LOCAL_NODE_NAME) && r.status !== "done");
     let revived = 0;
     let alive = 0;
     const skipped: string[] = [];
@@ -679,7 +679,7 @@ export async function cmdRevive(parsed: Parsed): Promise<void> {
         // whose session is gone was never retired/killed, so something under it
         // failed (tmux server crash, external kill, harness exit). A bee with a
         // seal finished its work before exiting — deriveState reports it
-        // "sealed", not "crashed" — so --crashed must not resurrect it.
+        // "done" (sealed), not "crashed" — so --crashed must not resurrect it.
         if (bulkCrashed && record.status !== "running") {
           continue;
         }

@@ -187,7 +187,7 @@ export async function transactionalKill(
 /**
  * Transactional retire: the everyday way to end a bee. Tears down the runtime
  * exactly like transactionalKill (substrate.kill -> poll hasSession), then
- * ARCHIVES the record (status='archived') instead of deleting it — the bee
+ * FILES the record (status='done') instead of deleting it — the bee
  * leaves the active list but its record, seals, ledger history, and provider
  * session stay intact, so `hive revive` can bring it back and `hive seals` /
  * `hive spend` keep working. Distinguishes deliberate retirement from a crash:
@@ -223,7 +223,7 @@ export async function transactionalRetire(
   }
 
   await updateSession(record.name, {
-    status: "archived",
+    status: "done",
     updatedAt: new Date().toISOString(),
     // A retired bee must not keep reporting a stale error from an earlier
     // failed kill; explicit undefined deletes the field.

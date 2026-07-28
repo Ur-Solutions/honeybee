@@ -9,6 +9,7 @@ export const BOOLEAN_FLAGS = new Set([
   "accept-trust",
   "against-recommended",
   "all",
+  // Legacy alias for --done (archived → done rename).
   "archived",
   "auto",
   "autoswap",
@@ -23,6 +24,7 @@ export const BOOLEAN_FLAGS = new Set([
   "dangerous",
   "dashboard",
   "dead",
+  "done",
   "dry-run",
   "example",
   "f",

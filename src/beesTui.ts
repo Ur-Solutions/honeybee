@@ -250,7 +250,6 @@ const STATE_RANK: Record<string, number> = {
   working: 3,
   done: 4,
   idle_with_output: 4,
-  sealed: 5,
   queued: 6,
   booting: 7,
   wedged: 8,

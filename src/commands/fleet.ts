@@ -2,7 +2,7 @@
 // `hive fleet [<ref>]` — the durable fleet-state surface. Given an orchestrator
 // bee (default: self, via HIVE_BEE / the current pane), it walks the persisted
 // spawnedById edges into the descendant tree and enriches each node with the
-// same live state `hive ps` derives (running/blocked/sealed/dead), last
+// same live state `hive ps` derives (running/blocked/done/dead), last
 // activity, and last seal. An orchestrator re-reads this (--json) every cycle to
 // reconcile its children from ground truth instead of holding the roster in
 // context, which compaction drops.

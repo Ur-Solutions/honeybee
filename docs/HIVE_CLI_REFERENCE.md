@@ -692,7 +692,7 @@ Exit codes:
 | Code | Outcome |
 | ---: | --- |
 | `0` | The requested idle output or a new seal was printed. |
-| `1` | The bee became blocked or reached a terminal/hopeless state (`crashed`, killed, archived, deleted, or a missing runtime/pinned tmux pane). |
+| `1` | The bee became blocked or reached a terminal/hopeless state (`crashed`, killed, retired to `done`, deleted, or a missing runtime/pinned tmux pane). |
 | `2` | The timeout elapsed before success. |
 
 Every wait mode refreshes the session record and checks runtime liveness on
@@ -709,7 +709,7 @@ Show known sessions with derived state.
 ```sh
 hive list [selector] [--colony <name>] [--swarm <id>] [--node <name>]
           [--state <s>] [--agent <a>] [--repo <name>] [--tag <ns:val>]...
-          [--archived] [--json] [--wide]
+          [--done] [--json] [--wide]
 hive ps --wide
 ```
 
@@ -733,10 +733,12 @@ three. The facets:
 - positional `[selector]`: a bee / `@swarm` / `colony:<name>` / `#tag` /
   `tag:<...>` selector applied as a filter alongside the flags (an unknown
   colony/swarm errors, consistent with other commands).
-- `--archived`: include the archived visibility class: **sealed** bees and
-  **filed** (`status:"archived"`) bees. Both are **hidden by default**;
-  `--archived` re-includes them. An explicit `--state sealed` or `--state
-  archived` also reveals and filters to that state.
+- `--done`: include the done visibility class: **sealed** bees and **filed**
+  (`status:"done"`) bees. Both derive to the `done` state and are **hidden by
+  default**; `--done` re-includes them. An explicit `--state done` also
+  reveals and filters to that state. Legacy spellings are still accepted:
+  `--archived` as a flag alias, and `--state sealed` / `--state archived` as
+  state aliases for `done`.
 
 **`--json`** emits a machine array regardless of TTY, after all filters are
 applied. Each element has the shape:
@@ -761,7 +763,8 @@ States:
 - `active`: recently prompted or still active.
 - `idle`: live with output after a completed turn.
 - `blocked`: permission, trust, or MCP warning prompt.
-- `sealed`: latest state has a seal recorded.
+- `done`: settled — a seal is recorded, or the record was filed by
+  `hive retire` / `quest done`. (Pre-rename spellings: `sealed`, `archived`.)
 - `dead`: tmux session is gone.
 - `kill_failed`: previous transactional kill failed.
 - `offline`: node unreachable, so liveness is unknown.

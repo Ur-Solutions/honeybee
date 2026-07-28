@@ -42,10 +42,10 @@ export async function cmdClean(parsed: Parsed) {
 
 export async function cmdCleanDead(parsed: Parsed) {
   const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
-  // A filed (archived) bee is filed, not dead — `clean` must never reap it (PRD
+  // A filed (done) bee is filed, not dead — `clean` must never reap it (PRD
   // §13); only an explicit `hive kill` deletes a filed bee. Exclude it at the
   // source so neither the dead-sweep nor the pane-dead loop below can touch it.
-  const records = allRecords.filter((r) => r.status !== "archived");
+  const records = allRecords.filter((r) => r.status !== "done");
   const probe = await liveTargetsAcrossNodes(nodes);
   // Records on an unreachable node are NOT dead — we genuinely don't know their state.
   // Treat them as live so we don't sweep their metadata while their node is down.
@@ -315,10 +315,10 @@ export type CleanCandidate = CleanTuiItem & {
 
 export async function collectCleanCandidates(): Promise<{ records: SessionRecord[]; candidates: CleanCandidate[] }> {
   const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
-  // A filed (archived) bee derives to the "archived" terminal state but must NOT
+  // A filed (done) bee derives to the "done" terminal state but must NOT
   // be offered as an idle/dead clean candidate (PRD §13) — exclude it up front so
   // `clean --idle`/interactive never lists it.
-  const records = allRecords.filter((r) => r.status !== "archived");
+  const records = allRecords.filter((r) => r.status !== "done");
   const probe = await liveTargetsAcrossNodes(nodes);
   // A record whose node is no longer registered was never probed; treat it as
   // unreachable (not dead) so clean paths refuse to sweep a possibly-live bee.

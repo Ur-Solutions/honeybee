@@ -65,7 +65,7 @@ test("transactionalRetire archives the record instead of deleting it", async () 
 
     const stored = await loadSession("retire-me");
     assert.ok(stored, "record must survive retire");
-    assert.equal(stored!.status, "archived");
+    assert.equal(stored!.status, "done");
     assert.equal(stored!.lastError, undefined, "stale lastError is cleared on retire");
   });
 });
@@ -99,9 +99,9 @@ test("a running record with no live session derives crashed; an explicit dead re
 });
 
 test("an archived (retired) record derives archived even without a live session", () => {
-  const retired = seed({ name: "filed", tmuxTarget: "filed", status: "archived" });
+  const retired = seed({ name: "filed", tmuxTarget: "filed", status: "done" });
   const derived = deriveState(retired, { liveTargets: new Set<string>() });
-  assert.equal(derived.state, "archived");
+  assert.equal(derived.state, "done");
 });
 
 test("an hsr record that is not live derives crashed when still marked running", () => {

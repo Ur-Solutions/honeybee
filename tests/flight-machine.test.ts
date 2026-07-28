@@ -59,7 +59,7 @@ function seal(overrides: Partial<SlotSealObservation> = {}): SlotSealObservation
 const RUNNING: SlotEvidence = { beeStatus: "running" };
 
 test("done requires a current-attempt matching seal — a matching done seal completes", () => {
-  const plan = planSlot(flight(), slot(), { ...RUNNING, beeState: "sealed", seal: seal() }, T0 + 31 * 60_000);
+  const plan = planSlot(flight(), slot(), { ...RUNNING, beeState: "done", seal: seal() }, T0 + 31 * 60_000);
   assert.equal(plan.slot.state, "done");
   assert.ok(plan.events.some((e) => e.type === "flight.slot.done"));
   assert.equal(plan.slot.evidence.sealFilename, seal().filename);

@@ -326,12 +326,21 @@ test("listSessions reads 1,200 records with bounded fan-out and coalesces concur
   });
 });
 
-test("a status:archived record round-trips (not downgraded to dead)", async () => {
+test("a status:done record round-trips (not downgraded to dead)", async () => {
   await withTempStore(async (dir) => {
-    const record = makeRecord(dir, { status: "archived" });
+    const record = makeRecord(dir, { status: "done" });
     await saveSession(record);
     const loaded = await loadSession(record.name);
-    assert.equal(loaded?.status, "archived", "archived survives a round-trip (validation allow-list)");
+    assert.equal(loaded?.status, "done", "done survives a round-trip (validation allow-list)");
+  });
+});
+
+test("a legacy status:archived record loads as done (pre-rename records)", async () => {
+  await withTempStore(async (dir) => {
+    const record = makeRecord(dir, { status: "archived" as unknown as "done" });
+    await saveSession(record);
+    const loaded = await loadSession(record.name);
+    assert.equal(loaded?.status, "done", "legacy archived normalizes to done on read");
   });
 });
 

@@ -120,7 +120,7 @@ export type SessionRecord = {
   kitProfile?: string;
   createdAt: string;
   updatedAt: string;
-  status: "running" | "dead" | "kill_failed" | "archived";
+  status: "running" | "dead" | "kill_failed" | "done";
   lastError?: string;
   notes?: string;
   id?: string;
@@ -552,9 +552,12 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
     createdAt: object.createdAt as string,
     updatedAt: object.updatedAt as string,
     status:
-      object.status === "running" || object.status === "dead" || object.status === "kill_failed" || object.status === "archived"
+      object.status === "running" || object.status === "dead" || object.status === "kill_failed" || object.status === "done"
         ? object.status
-        : "dead",
+        : // Legacy filed records predate the archived → done rename.
+          object.status === "archived"
+          ? "done"
+          : "dead",
   };
 
   for (const key of OPTIONAL_STRING_SESSION_KEYS) {
