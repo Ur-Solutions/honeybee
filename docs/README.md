@@ -4,6 +4,11 @@
 
 It creates bee sessions on demand, sends prompts into them, captures panes, and keeps a tiny local ledger. It is inspired by Shannon's practical tmux/transcript idea, but starts broader: Claude, Codex, OpenCode, Grok, Pi, Droid, or any configured command.
 
+## Current architecture work
+
+- [ADR 001: Separate Bee Lifecycle, Runtime, Turn, Human Request, and Review State](./adr/001-bee-runtime-turn-state-model.md)
+- [State Model V2 Migration Specification](./STATE_MODEL_MIGRATION_SPEC.md)
+
 ## v0 scope
 
 - On-demand session creation
