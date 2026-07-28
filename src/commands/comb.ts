@@ -4,7 +4,7 @@ import { extname, resolve } from "node:path";
 import { loadSession } from "../store.js";
 import { loadTsModule } from "../tsLoader.js";
 import { flag, truthy, type Parsed } from "../parse.js";
-import { cancelRun, boardView, listRuns, readRunEvents, requireRun } from "../comb/store.js";
+import { boardView, cancelRunWithDisposition, listRuns, readRunEvents, requireRun } from "../comb/store.js";
 import { defineCombFromFile, defineCombVersion, listCombVersions, loadCombVersion } from "../comb/registry.js";
 import { asCombError, CombError } from "../comb/errors.js";
 import { instantiateRun } from "../comb/instantiate.js";
@@ -223,8 +223,10 @@ async function combStatus(parsed: Parsed) {
 
 async function combCancel(parsed: Parsed) {
   const runId = requiredArg(parsed, 1, "Usage: hive comb cancel <run-id> [--reason <text>] [--json]");
-  const run = await cancelRun(runId, { ...(stringFlag(parsed, "reason") ? { reason: stringFlag(parsed, "reason")! } : {}) });
-  if (run.status !== "cancelled" || !run.cancellation) {
+  const { run, accepted } = await cancelRunWithDisposition(runId, {
+    ...(stringFlag(parsed, "reason") ? { reason: stringFlag(parsed, "reason")! } : {}),
+  });
+  if (!accepted) {
     return {
       runId,
       status: run.status,

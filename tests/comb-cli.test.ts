@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
+import { asCombError } from "../src/comb/errors.js";
+import { ingestSealEvidence } from "../src/comb/evidence.js";
+import { mutateRun, readEvidence } from "../src/comb/store.js";
 import { cmdComb } from "../src/commands/comb.js";
 import { parse } from "../src/parse.js";
+import type { ActivationRecord, EvidenceRef, JsonValue } from "../src/comb/types.js";
+import type { SealRecord } from "../src/seal.js";
 
 type Envelope = {
   ok: boolean;
@@ -46,13 +51,47 @@ async function invoke(args: string[]): Promise<{ envelope: Envelope; exitCode: n
   return { envelope: JSON.parse(stdout[0]!) as Envelope, exitCode: Number(process.exitCode ?? 0) };
 }
 
-test("versioned public corpus pins every implemented command envelope and canonical exit code", async () => {
-  const corpus = JSON.parse(await readFile(resolve("contracts/combs/v1/cli-golden.json"), "utf8")) as {
-    schemaVersion: number;
-    exitCodes: Record<string, number>;
-    cases: Array<{ id: string; stdout: { command: string } }>;
+type GoldenArrangement =
+  | { kind: "write-store-file"; path: string; contents: string }
+  | {
+      kind: "ingest-seal";
+      runId: string;
+      activationId: string;
+      filename: string;
+      seal: SealRecord;
+      captureEvidenceId: string;
+      assertProjection: string;
+    };
+
+type GoldenCase = {
+  id: string;
+  argv?: string[];
+  operation?: {
+    kind: "classify-error";
+    error: { code: string; message: string };
+    command: string;
   };
+  arrange?: GoldenArrangement[];
+  capture?: Record<string, string>;
+  exitCode: number;
+  stdout: { command: string } & Record<string, unknown>;
+};
+
+type GoldenCorpus = {
+  schemaVersion: number;
+  runnerVersion: number;
+  exitCodes: Record<string, number>;
+  fixtures: Record<string, JsonValue>;
+  projectionFixtures: Record<string, unknown>;
+  cases: GoldenCase[];
+};
+
+test("versioned public corpus executes every argv, arrangement, projection, envelope, and exit code", async () => {
+  const corpus = JSON.parse(
+    await readFile(resolve("contracts/combs/v1/cli-golden.json"), "utf8"),
+  ) as GoldenCorpus;
   assert.equal(corpus.schemaVersion, 1);
+  assert.equal(corpus.runnerVersion, 1);
   assert.deepEqual(corpus.exitCodes, {
     success_or_durable_ack: 0,
     invalid_argument_or_schema: 2,
@@ -75,7 +114,186 @@ test("versioned public corpus pins every implemented command envelope and canoni
     "comb.cancel",
     "comb.events",
   ]));
+
+  await withTempStore(async (dir) => {
+    const variables = new Map<string, unknown>([
+      ["fixtureCwd", dir],
+      ...Object.entries(corpus.projectionFixtures).map(([name, value]) => [`${name}Projection`, value] as const),
+    ]);
+    const fixtureRoot = join(dir, "corpus-fixtures");
+    await mkdir(fixtureRoot, { recursive: true });
+    for (const [name, value] of Object.entries(corpus.fixtures)) {
+      const path = join(fixtureRoot, `${name}.json`);
+      await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
+      variables.set(name, path);
+    }
+
+    for (const fixture of corpus.cases) {
+      for (const arrangement of fixture.arrange ?? []) {
+        const arranged = resolveGoldenValue(arrangement, variables) as GoldenArrangement;
+        if (arranged.kind === "write-store-file") {
+          const path = join(dir, arranged.path);
+          await mkdir(dirname(path), { recursive: true });
+          await writeFile(path, arranged.contents);
+          continue;
+        }
+        await mutateRun(arranged.runId, async (run) => {
+          const activation = run.activations[arranged.activationId];
+          assert.ok(activation, `${fixture.id}: missing arranged activation ${arranged.activationId}`);
+          const result = await ingestSealEvidence(
+            run,
+            activation,
+            arranged.filename,
+            arranged.seal,
+          );
+          assert.equal(result, "match", `${fixture.id}: seal arrangement must match`);
+          const ref = activation.evidenceTail.at(-1);
+          assert.ok(ref, `${fixture.id}: seal arrangement did not retain evidence`);
+          variables.set(arranged.captureEvidenceId, ref.id);
+          const envelope = await readEvidence(run.id, ref);
+          assertGoldenMatch(
+            envelope,
+            resolveGoldenValue(corpus.projectionFixtures[arranged.assertProjection], variables),
+            `${fixture.id}.projection.${arranged.assertProjection}`,
+          );
+        });
+      }
+
+      let actual: { envelope: Envelope; exitCode: number };
+      if (fixture.argv) {
+        const argv = resolveGoldenValue(fixture.argv, variables) as string[];
+        assert.equal(argv[0], "comb", `${fixture.id}: argv must pin the public comb command`);
+        actual = await invoke(argv.slice(1));
+      } else {
+        assert.equal(fixture.operation?.kind, "classify-error", `${fixture.id}: missing executable action`);
+        const source = Object.assign(
+          new Error(fixture.operation!.error.message),
+          { code: fixture.operation!.error.code },
+        );
+        const error = asCombError(source);
+        actual = {
+          exitCode: error.exitCode,
+          envelope: {
+            ok: false,
+            command: fixture.operation!.command,
+            error: {
+              code: error.code,
+              message: error.message,
+              ...(error.details !== undefined ? { details: error.details } : {}),
+            },
+          },
+        };
+      }
+
+      for (const [name, pointer] of Object.entries(fixture.capture ?? {})) {
+        variables.set(name, resolvePointer(actual.envelope, pointer, fixture.id));
+      }
+      assert.equal(actual.exitCode, fixture.exitCode, `${fixture.id}: exit code`);
+      assertGoldenMatch(
+        actual.envelope,
+        resolveGoldenValue(fixture.stdout, variables),
+        `${fixture.id}.stdout`,
+      );
+    }
+  });
 });
+
+function resolvePointer(value: unknown, pointer: string, fixtureId: string): unknown {
+  assert.match(pointer, /^($|\/)/, `${fixtureId}: capture pointer must be RFC 6901`);
+  let current = value;
+  for (const raw of pointer.split("/").slice(1)) {
+    const key = raw.replace(/~1/g, "/").replace(/~0/g, "~");
+    assert.ok(current !== null && typeof current === "object", `${fixtureId}: ${pointer} did not resolve`);
+    current = (current as Record<string, unknown>)[key];
+  }
+  assert.notEqual(current, undefined, `${fixtureId}: ${pointer} did not resolve`);
+  return current;
+}
+
+function resolveGoldenValue(value: unknown, variables: ReadonlyMap<string, unknown>): unknown {
+  if (typeof value === "string") {
+    const exact = /^\$([A-Za-z][A-Za-z0-9]*)$/.exec(value);
+    if (exact && variables.has(exact[1]!)) {
+      return resolveGoldenValue(variables.get(exact[1]!), variables);
+    }
+    return value.replace(/\$([A-Za-z][A-Za-z0-9]*)/g, (whole, name: string) => {
+      const replacement = variables.get(name);
+      return typeof replacement === "string" || typeof replacement === "number"
+        ? String(replacement)
+        : whole;
+    });
+  }
+  if (Array.isArray(value)) return value.map((item) => resolveGoldenValue(item, variables));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, resolveGoldenValue(item, variables)]),
+    );
+  }
+  return value;
+}
+
+function assertGoldenMatch(actual: unknown, expected: unknown, path: string): void {
+  if (expected && typeof expected === "object" && !Array.isArray(expected)) {
+    const matcher = expected as Record<string, unknown>;
+    if ("$type" in matcher) {
+      const type = matcher.$type;
+      const matches = type === "array"
+        ? Array.isArray(actual)
+        : type === "object"
+          ? actual !== null && typeof actual === "object" && !Array.isArray(actual)
+          : type === "integer"
+            ? Number.isInteger(actual)
+            : typeof actual === type;
+      assert.equal(matches, true, `${path}: expected type ${String(type)}, received ${typeof actual}`);
+    }
+    if ("$pattern" in matcher) {
+      assert.equal(typeof actual, "string", `${path}: pattern target must be a string`);
+      assert.match(actual as string, new RegExp(String(matcher.$pattern)), path);
+    }
+    if ("$contains" in matcher) {
+      assert.ok(Array.isArray(actual), `${path}: $contains target must be an array`);
+      for (const [index, wanted] of (matcher.$contains as unknown[]).entries()) {
+        let matched = false;
+        for (const candidate of actual) {
+          try {
+            assertGoldenMatch(candidate, wanted, `${path}.$contains[${index}]`);
+            matched = true;
+            break;
+          } catch {
+            // Try the next candidate; the final assertion reports the missing fixture.
+          }
+        }
+        assert.equal(matched, true, `${path}: no array element matched $contains[${index}]`);
+      }
+    }
+    if (Array.isArray(matcher.$required)) {
+      assert.ok(actual && typeof actual === "object", `${path}: $required target must be an object`);
+      for (const key of matcher.$required as string[]) {
+        assert.ok(key in (actual as Record<string, unknown>), `${path}: missing required key ${key}`);
+      }
+    }
+    const fields = Object.entries(matcher).filter(([key]) => !key.startsWith("$"));
+    if (fields.length > 0) {
+      assert.ok(actual && typeof actual === "object" && !Array.isArray(actual), `${path}: expected object`);
+      for (const [key, child] of fields) {
+        const record = actual as Record<string, unknown>;
+        const optional = child && typeof child === "object" && !Array.isArray(child) &&
+          (child as Record<string, unknown>).$optional === true;
+        if (!(key in record) && optional) continue;
+        assert.ok(key in record, `${path}: missing key ${key}`);
+        assertGoldenMatch(record[key], child, `${path}.${key}`);
+      }
+    }
+    return;
+  }
+  if (Array.isArray(expected)) {
+    assert.ok(Array.isArray(actual), `${path}: expected array`);
+    assert.equal(actual.length, expected.length, `${path}: array length`);
+    expected.forEach((item, index) => assertGoldenMatch(actual[index], item, `${path}[${index}]`));
+    return;
+  }
+  assert.deepEqual(actual, expected, path);
+}
 
 test("CLI emits exactly one success envelope for define/run/read/cancel lifecycle", async () => {
   await withTempStore(async (dir) => {

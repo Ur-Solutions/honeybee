@@ -242,8 +242,15 @@ export async function listSweepableRuns(): Promise<RunRecord[]> {
 }
 
 export async function cancelRun(runId: string, options: { reason?: string; requestedBy?: string; now?: string } = {}): Promise<RunRecord> {
-  const { run } = await mutateRun(runId, (record) => {
-    if (record.status !== "active" || record.cancellation) return;
+  return (await cancelRunWithDisposition(runId, options)).run;
+}
+
+export async function cancelRunWithDisposition(
+  runId: string,
+  options: { reason?: string; requestedBy?: string; now?: string } = {},
+): Promise<{ run: RunRecord; accepted: boolean }> {
+  const { run, result: accepted } = await mutateRun(runId, (record) => {
+    if (record.status !== "active" || record.cancellation) return false;
     const requestedAt = options.now ?? new Date().toISOString();
     record.cancellation = {
       epoch: 1,
@@ -257,8 +264,9 @@ export async function cancelRun(runId: string, options: { reason?: string; reque
       requestedBy: record.cancellation.requestedBy,
       ...(record.cancellation.reason ? { reason: record.cancellation.reason } : {}),
     });
+    return true;
   });
-  return run;
+  return { run, accepted };
 }
 
 export async function saveEvidence(runId: string, envelope: EvidenceEnvelope): Promise<EvidenceRef> {
