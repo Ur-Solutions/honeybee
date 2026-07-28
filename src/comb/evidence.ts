@@ -48,6 +48,7 @@ export async function ingestSealEvidence(
   activation: ActivationRecord,
   filename: string,
   seal: SealRecord,
+  options: { mismatchDisposition?: "fail" | "inert" } = {},
 ): Promise<EvidenceIngestResult> {
   const id = canonicalDigest({ beeName: seal.beeName, filename } as JsonValue);
   if (activation.evidenceTail.some((ref) => ref.id === id)) return "duplicate";
@@ -83,6 +84,15 @@ export async function ingestSealEvidence(
     subject: envelope.subject,
   });
   if (verdict === "mismatch") {
+    if (options.mismatchDisposition === "inert") {
+      recordRunEvent(run, "comb.evidence.unattributed_seal", activation.address, {
+        ...evidenceEventData(ref.id, ref.kind),
+        bee: seal.beeName,
+        taskId: seal.taskId ?? null,
+        attempt: seal.attempt ?? null,
+      });
+      return "stale";
+    }
     const failedAt = new Date().toISOString();
     activation.status = "failed";
     activation.endedAt = failedAt;

@@ -194,13 +194,46 @@ async function sweepOneRun(
 }
 
 async function ingestAgentEvidence(deps: CombSweepDeps, run: RunRecord, now: string): Promise<void> {
+  const routes = new Map<
+    string,
+    Array<{ activation: ActivationRecord; source: ActivationRecord["beeHandles"][number]["source"] }>
+  >();
   for (const activation of Object.values(run.activations)) {
     if (activation.beeHandles.length === 0 || (isTerminal(activation) && !activation.invalidatedAt)) continue;
     for (const handle of activation.beeHandles) {
-      const latest = await deps.latestSeal(handle.name);
-      if (!latest) continue;
-      const result = await ingestSealEvidence(run, activation, latest.filename, latest.seal);
-      if (result === "match") applySealCompletion(run, activation, latest.seal, now);
+      const candidates = routes.get(handle.name) ?? [];
+      candidates.push({ activation, source: handle.source });
+      routes.set(handle.name, candidates);
+    }
+  }
+  for (const [beeName, candidates] of routes) {
+    const latest = await deps.latestSeal(beeName);
+    if (!latest) continue;
+    const exact = candidates.find(({ activation }) =>
+      latest.seal.taskId === activation.taskId &&
+      latest.seal.attempt === activation.address.attempt
+    );
+    const selected = exact ?? candidates
+      .filter(({ activation }) => !activation.invalidatedAt && !isTerminal(activation))
+      .sort((left, right) => right.activation.address.attempt - left.activation.address.attempt)[0];
+    if (!selected) continue;
+    const priorReboundAttempt = !exact &&
+      selected.source === "adopted" &&
+      candidates.some(({ activation }) =>
+        activation.address.nodeId === selected.activation.address.nodeId &&
+        activation.address.itemIndex === selected.activation.address.itemIndex &&
+        activation.address.attempt < selected.activation.address.attempt &&
+        Boolean(activation.invalidatedAt)
+      );
+    const result = await ingestSealEvidence(
+      run,
+      selected.activation,
+      latest.filename,
+      latest.seal,
+      priorReboundAttempt ? { mismatchDisposition: "inert" } : {},
+    );
+    if (result === "match") {
+      applySealCompletion(run, selected.activation, latest.seal, now);
     }
   }
 }

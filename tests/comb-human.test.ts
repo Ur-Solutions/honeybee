@@ -422,6 +422,109 @@ test("human verification keeps one thread, rerequests after comment-driven retry
   });
 });
 
+test("an attempt-one seal arriving ten seconds after an adopted feedback rebind is inert", async () => {
+  await withTempStore(async (dir) => {
+    const bee = session(dir);
+    const created = await createRun({
+      definition: humanLastDefinition(),
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "attached", beeName: bee.name, entryNodeId: "work" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: {
+        retryBackoffMs: 0,
+        retireAgentsOnTerminal: false,
+      },
+    });
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    const packets = new Map<string, ForumPacket>();
+    let latest: { filename: string; seal: SealRecord } | null = null;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => latest,
+      spawnAgent: async (request) => ({ name: request.name }),
+      adoptAgent: async () => ({ name: bee.name, id: bee.id }),
+      lookupAgent: async () => bee,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [...packets.values()],
+      executeHumanEffect: async (request) => {
+        if (request.operation === "create") {
+          const packet = packetFor(request, "PKT.late-seal", new Date(now).toISOString());
+          packets.set(packet.id, packet);
+          return packet;
+        }
+        const packet = packets.get(request.predecessorPacketId!);
+        assert.ok(packet);
+        packet.status = "needs_review";
+        packet.verdict = null;
+        packet.blocking_since = new Date(now).toISOString();
+        return packet;
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [bee], new Map());
+    let run = (await loadRun(created.id))!;
+    const work1 = current(run, "work");
+    latest = {
+      filename: "attempt-1-completion.json",
+      seal: seal(work1, bee.name, "2026-07-28T12:00:02.000Z"),
+    };
+    now = Date.parse("2026-07-28T12:00:03.000Z");
+    await sweepCombs(deps, [bee], new Map());
+
+    const packet = packets.get("PKT.late-seal")!;
+    packet.status = "changes_requested";
+    packet.verdict = verdict(
+      packet,
+      "request_changes",
+      "please revise",
+      "2026-07-28T12:00:04.000Z",
+    );
+    now = Date.parse("2026-07-28T12:00:05.000Z");
+    await sweepCombs(deps, [bee], new Map());
+    run = (await loadRun(created.id))!;
+    const work2 = current(run, "work");
+    assert.equal(work2.address.attempt, 2);
+    assert.equal(work2.beeHandles[0]?.source, "adopted");
+
+    latest = {
+      filename: "attempt-1-late.json",
+      seal: seal(work1, bee.name, "2026-07-28T12:00:15.000Z"),
+    };
+    now = Date.parse("2026-07-28T12:00:16.000Z");
+    await sweepCombs(deps, [bee], new Map());
+
+    run = (await loadRun(created.id))!;
+    assert.equal(run.status, "active");
+    assert.equal(current(run, "work").status, "active");
+    assert.equal(current(run, "work").failure, undefined);
+    let events = (await readRunEvents(run.id, { after: 0, limit: 1_000 })).events;
+    assert.ok(events.some((event) => event.type === "comb.evidence.late_invalidated"));
+    assert.ok(!events.some((event) => event.type === "comb.violation" && event.data?.code === "evidence-mismatch"));
+
+    latest = {
+      filename: "unrelated-interactive-task.json",
+      seal: {
+        beeName: bee.name,
+        sealedAt: "2026-07-28T12:00:17.000Z",
+        status: "done",
+        summary: "unrelated operator task",
+        taskId: "operator:unrelated",
+        attempt: 99,
+      },
+    };
+    now = Date.parse("2026-07-28T12:00:18.000Z");
+    await sweepCombs(deps, [bee], new Map());
+    run = (await loadRun(created.id))!;
+    events = (await readRunEvents(run.id, { after: 0, limit: 1_000 })).events;
+    assert.equal(run.status, "active");
+    assert.equal(current(run, "work").status, "active");
+    assert.ok(events.some((event) => event.type === "comb.evidence.unattributed_seal"));
+  });
+});
+
 test("Forum create can crash after the external write and confirm idempotently on the next sweep", async () => {
   await withTempStore(async (dir) => {
     const definition: CombSpec = {
