@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { basename, extname, resolve } from "node:path";
+import { extname, resolve } from "node:path";
 import { loadSession } from "../store.js";
 import { loadTsModule } from "../tsLoader.js";
 import { flag, truthy, type Parsed } from "../parse.js";
@@ -18,8 +18,8 @@ Usage
   hive comb lint <file.json|file.ts|-> [--json]
   hive comb define <file.json|file.ts|-> [name] [--base-version <n>] [--json]
   hive comb inspect <name> [--version <n>] [--json]
-  hive comb run <name> [--version <n>] --input <file|-> [--cwd <path>] [--product <key>] [--json]
-  hive comb run --graph <file|-> --input <file|-> [--cwd <path>] [--product <key>] [--json]
+  hive comb run <name> [--version <n>] --input <file|-> --product <key> [--cwd <path>] [--json]
+  hive comb run --graph <file|-> --input <file|-> --product <key> [--cwd <path>] [--json]
   hive comb runs [--comb <name>] [--status active|failed|cancelled|done] [--active] [--last <1..1000>] [--json]
   hive comb status <run-id> [--activation <activation-id>] [--json]
   hive comb cancel <run-id> [--reason <text>] [--json]
@@ -135,7 +135,13 @@ async function combRun(parsed: Parsed) {
   }
   const input = await loadJsonValue(inputSource, "run input");
   const cwd = resolve(stringFlag(parsed, "cwd") ?? process.cwd());
-  const productKey = stringFlag(parsed, "product") ?? basename(cwd);
+  const productKey = stringFlag(parsed, "product");
+  if (!productKey) {
+    throw new CombError(
+      "invalid_argument",
+      "--product is required in strict-spine slice 1; product identity is never inferred from cwd",
+    );
+  }
   const collision = optionalEnumFlag(parsed, "collision", ["refuse", "join-existing"] as const);
   const triggerId = stringFlag(parsed, "origin-trigger");
   const deliveryId = stringFlag(parsed, "origin-delivery");

@@ -9,7 +9,10 @@ export type EvidenceIngestResult = "match" | "stale" | "duplicate" | "late-cance
 
 export function judgeCombEvidence(
   activation: ActivationRecord,
-  envelope: Pick<EvidenceEnvelope, "recordedAt" | "taskId" | "activation" | "subject"> & { attempt?: number },
+  envelope: Pick<EvidenceEnvelope, "recordedAt" | "activation" | "subject"> & {
+    taskId?: string;
+    attempt?: number;
+  },
 ): "none" | "match" | "mismatch" {
   const shared = judgeActivationEvidence(
     activation.claim,
@@ -64,11 +67,13 @@ export async function ingestSealEvidence(
     recordRunEvent(run, "comb.evidence.late_invalidated", activation.address, evidenceEventData(ref.id, ref.kind));
     return "late-invalidated";
   }
-  const verdict = judgeActivationEvidence(
-    activation.claim,
-    { recordedAt: seal.sealedAt, taskId: seal.taskId, attempt: seal.attempt },
-    { requireKeys: true },
-  );
+  const verdict = judgeCombEvidence(activation, {
+    recordedAt: seal.sealedAt,
+    taskId: seal.taskId,
+    attempt: seal.attempt,
+    activation: envelope.activation,
+    subject: envelope.subject,
+  });
   if (verdict === "mismatch") {
     const failedAt = new Date().toISOString();
     activation.status = "failed";

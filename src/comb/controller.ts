@@ -171,6 +171,22 @@ function planAgentEffects(run: RunRecord, now: string): PreparedAgentEffect[] {
       recordRunEvent(run, "comb.activation.failed", activation.address, { code: "flight-capacity-unavailable" });
       continue;
     }
+    let brief: string;
+    try {
+      brief = renderAgentBrief(run, activation, node);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      activation.status = "failed";
+      activation.endedAt = now;
+      activation.failure = {
+        code: "invalid-brief",
+        message,
+        retryable: false,
+      };
+      recordRunEvent(run, "comb.activation.failed", activation.address, { code: "invalid-brief" });
+      recordRunEvent(run, "comb.violation", activation.address, { code: "invalid-brief", message });
+      continue;
+    }
     const semanticId = "primary";
     const semanticDigest = canonicalDigest(semanticId);
     const key = `${effectBaseKey(activation)}:agent-spawn:${semanticDigest.slice("sha256:".length)}`;
@@ -183,7 +199,7 @@ function planAgentEffects(run: RunRecord, now: string): PreparedAgentEffect[] {
       ...(node.agent.capacity.model ? { model: node.agent.capacity.model } : {}),
       substrate: node.agent.capacity.substrate ?? "hsr",
       cwd: run.cwd,
-      brief: renderAgentBrief(run, activation, node),
+      brief,
       taskId: activation.taskId,
       attempt: activation.address.attempt,
     };
@@ -529,7 +545,7 @@ function renderAgentBrief(run: RunRecord, activation: ActivationRecord, node: Ex
 }
 
 export function deterministicAgentName(runId: string, activation: ActivationRecord): string {
-  const suffix = runId.slice(-5).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const suffix = canonicalDigest(runId).slice("sha256:".length, "sha256:".length + 12);
   const node = activation.address.nodeId.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").slice(0, 28);
   return `comb-${suffix}-${node}-i${activation.address.itemIndex}-a${activation.address.attempt}`;
 }

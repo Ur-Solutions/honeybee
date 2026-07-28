@@ -101,7 +101,9 @@ export function evaluatePredicate(
       ? { state: "true" }
       : { state: "false", message: `verdict on ${predicate.nodeId} did not equal ${predicate.equals}` };
   }
-  if (referenced.status !== "done" || referenced.output === undefined) return { state: "waiting" };
+  if (referenced.status !== "done" || referenced.output === undefined) {
+    return { state: "false", message: `${predicate.nodeId} completed without schema-validated output` };
+  }
   const selected = resolveJsonPointer(referenced.output, predicate.path);
   if (!selected.found) return { state: "false", message: `output path ${predicate.path} is missing on ${predicate.nodeId}` };
   return canonicalDeepEqual(selected.value, predicate.equals)

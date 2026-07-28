@@ -154,6 +154,32 @@ test("CLI failure envelopes use canonical codes/exits and stdout purity", async 
   });
 });
 
+test("comb run requires an explicit product identity instead of deriving one from cwd", async () => {
+  await withTempStore(async (dir) => {
+    const fixture = resolve("contracts/deep-review.strict.comb.json");
+    const inputPath = join(dir, "input.json");
+    await writeFile(inputPath, JSON.stringify({ ref: "HEAD", effort: "low" }));
+    await invoke(["define", fixture, "--json"]);
+
+    const missingProduct = await invoke([
+      "run",
+      "deep-review-strict",
+      "--version",
+      "1",
+      "--input",
+      inputPath,
+      "--cwd",
+      dir,
+      "--json",
+    ]);
+    assert.equal(missingProduct.exitCode, 2);
+    assert.deepEqual(missingProduct.envelope.error, {
+      code: "invalid_argument",
+      message: "--product is required in strict-spine slice 1; product identity is never inferred from cwd",
+    });
+  });
+});
+
 test("trigger delivery replay is idempotent and a conflicting digest exits 4", async () => {
   await withTempStore(async (dir) => {
     const fixture = resolve("contracts/deep-review.strict.comb.json");

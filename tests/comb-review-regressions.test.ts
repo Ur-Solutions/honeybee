@@ -10,12 +10,23 @@ import {
   releaseClaim,
   withPreparedClaim,
 } from "../src/comb/claims.js";
-import { sweepCombs, type CombSweepDeps } from "../src/comb/controller.js";
+import {
+  deterministicAgentName,
+  sweepCombs,
+  type CombSweepDeps,
+} from "../src/comb/controller.js";
+import { asCombError } from "../src/comb/errors.js";
 import { atomicWriteFile } from "../src/fsx.js";
 import { deliveryRequestDigest, instantiateRun } from "../src/comb/instantiate.js";
-import { applySealCompletion, activateAgent, reconcileMachine } from "../src/comb/machine.js";
+import {
+  applySealCompletion,
+  activateAgent,
+  evaluatePredicate,
+  reconcileMachine,
+} from "../src/comb/machine.js";
 import { lintComb } from "../src/comb/schema.js";
 import {
+  boardView,
   cancelRun,
   createRun,
   emptyCleanup,
@@ -23,6 +34,7 @@ import {
   listSweepableRuns,
   loadRun,
   mutateRun,
+  recordRunEvent,
 } from "../src/comb/store.js";
 import type { ActivationRecord, CombSpec, RunRecord } from "../src/comb/types.js";
 import type { SealRecord } from "../src/seal.js";
@@ -883,5 +895,127 @@ test("review critical D2: replay adopts a claimed run instead of returning perma
     assert.equal(replay.replayedDelivery, true);
     assert.equal((await listRuns()).length, 1);
     assert.equal((await loadClaim(claim.id))?.status, "held");
+  });
+});
+
+test("review contract E1: transient filesystem errors retain a retryable external-dependency class", () => {
+  const error = Object.assign(new Error("temporary storage failure"), { code: "EIO" });
+  const classified = asCombError(error);
+  assert.equal(classified.code, "external_dependency");
+  assert.equal(classified.exitCode, 7);
+});
+
+test("review repro E2: an unresolved brief placeholder fails once instead of wedging every sweep", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "bad-placeholder",
+        input: { kind: "informal", description: "x" },
+        nodes: [{
+          ...agentNode("work"),
+          agent: {
+            capacity: { kind: "spawn", bee: "codex" },
+            brief: "review {{input.missing}}",
+          },
+        }],
+        edges: [],
+      },
+      input: {},
+      cwd: dir,
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+    });
+
+    const first = await sweepCombs(sweepDeps(), [], new Map());
+    assert.equal(first.some((outcome) => outcome.action === "error"), false);
+    const failed = await loadRun(created.id);
+    assert.equal(failed?.status, "failed");
+    assert.equal(failed?.failure?.code, "invalid-brief");
+    assert.equal(failed?.activations["work@1#0"]?.failure?.retryable, false);
+    assert.deepEqual(failed?.effects, {});
+    assert.equal(failed?.cleanup.status, "complete");
+
+    const second = await sweepCombs(sweepDeps(), [], new Map());
+    assert.equal(second.some((outcome) => outcome.action === "error"), false);
+    assert.equal((await listSweepableRuns()).some((run) => run.id === created.id), false);
+  });
+});
+
+test("review major E3: output-equals resolves false when its producer is terminal without output", async () => {
+  await withTempStore(async (dir) => {
+    const run = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "terminal-output-predicate",
+        input: { kind: "informal", description: "x" },
+        nodes: [
+          {
+            ...agentNode("source"),
+            output: { kind: "json-schema", schema: { type: "object" } },
+          },
+        ],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const source = run.activations["source@1#0"]!;
+    source.status = "failed";
+    source.endedAt = "2026-07-28T12:00:01.000Z";
+    assert.deepEqual(
+      evaluatePredicate(
+        run,
+        { kind: "output-equals", nodeId: "source", path: "/verdict", equals: "pass" },
+        { itemIndex: 0, now: "2026-07-28T12:00:02.000Z" },
+      ),
+      { state: "false", message: "source completed without schema-validated output" },
+    );
+  });
+});
+
+test("review minor E4: deterministic bee names distinguish runs with the same visible suffix", async () => {
+  await withTempStore(async (dir) => {
+    const run = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "bee-name-entropy",
+        input: { kind: "informal", description: "x" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+    });
+    const activation = run.activations["work@1#0"]!;
+    assert.notEqual(
+      deterministicAgentName("0000000000001-abcde", activation),
+      deterministicAgentName("9999999999999-abcde", activation),
+    );
+  });
+});
+
+test("review minor E5: board views expose the run's recorded violation count", async () => {
+  await withTempStore(async (dir) => {
+    const run = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "violation-count",
+        input: { kind: "informal", description: "x" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "prod",
+      origin: { kind: "manual", actor: "test" },
+    });
+    recordRunEvent(run, "comb.violation", run.activations["work@1#0"]!.address, { code: "first" });
+    recordRunEvent(run, "comb.violation", run.activations["work@1#0"]!.address, { code: "second" });
+    assert.equal(boardView(run).violationCount, 2);
   });
 });

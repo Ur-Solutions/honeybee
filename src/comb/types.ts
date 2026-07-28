@@ -531,6 +531,7 @@ export type RunRecord = {
   eventTail: RunEvent[];
   eventsRetainedFrom: number;
   nextEventSequence: number;
+  violationCount: number;
   ledgerPublishedThrough: number;
   createdAt: string;
   updatedAt: string;

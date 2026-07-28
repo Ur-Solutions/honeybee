@@ -13,6 +13,20 @@ const EXIT_CODES: Record<CombCliErrorCode, number> = {
   corrupt_state: 70,
 };
 
+const TRANSIENT_EXTERNAL_CODES = new Set([
+  "EACCES",
+  "EBUSY",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EIO",
+  "EMFILE",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "ENFILE",
+  "ENOSPC",
+  "ETIMEDOUT",
+]);
+
 export class CombError extends Error {
   readonly code: CombCliErrorCode;
   readonly exitCode: number;
@@ -29,5 +43,12 @@ export class CombError extends Error {
 
 export function asCombError(error: unknown): CombError {
   if (error instanceof CombError) return error;
+  const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+  if (typeof code === "string" && TRANSIENT_EXTERNAL_CODES.has(code)) {
+    return new CombError("external_dependency", error instanceof Error ? error.message : String(error), { errno: code });
+  }
+  if (error instanceof SyntaxError) {
+    return new CombError("corrupt_state", error.message);
+  }
   return new CombError("invalid_argument", error instanceof Error ? error.message : String(error));
 }

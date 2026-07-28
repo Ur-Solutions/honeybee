@@ -161,6 +161,7 @@ export async function createRun(options: {
     eventTail: [],
     eventsRetainedFrom: 1,
     nextEventSequence: 1,
+    violationCount: 0,
     ledgerPublishedThrough: 0,
     createdAt,
     updatedAt: createdAt,
@@ -283,6 +284,14 @@ export async function readEvidence(runId: string, ref: EvidenceRef): Promise<Evi
 }
 
 export function recordRunEvent(run: RunRecord, type: string, activation?: ActivationRecord["address"], data?: JsonObject): RunEvent {
+  if (type === "comb.violation" || type.startsWith("comb.violation.")) {
+    run.violationCount = (
+      run.violationCount ??
+      run.eventTail.filter((event) =>
+        event.type === "comb.violation" || event.type.startsWith("comb.violation.")
+      ).length
+    ) + 1;
+  }
   const sequence = run.nextEventSequence;
   const event: RunEvent = {
     id: `${run.id}:${sequence}`,
@@ -369,7 +378,9 @@ export function boardView(run: RunRecord): RunBoardView {
     activations,
     activeChildRunIds: [],
     childRunTail: [],
-    violationCount: 0,
+    violationCount: run.violationCount ?? run.eventTail.filter((event) =>
+      event.type === "comb.violation" || event.type.startsWith("comb.violation.")
+    ).length,
     deviationCount: activations.reduce((sum, activation) => sum + activation.deviationCount, 0),
     lastEventSequence: run.nextEventSequence - 1,
     createdAt: run.createdAt,
