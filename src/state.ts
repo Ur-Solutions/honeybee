@@ -419,7 +419,14 @@ function heldStateForUnknownPane(record: SessionRecord, context: StateContext): 
   return { state: previous, detail: detailForHeldState(previous, record, context.now ?? Date.now()) };
 }
 
-function parseBeeState(value: string | undefined): BeeState | undefined {
+/**
+ * Parse a persisted observed-state string into a BeeState. Handles the legacy
+ * `sealed`/`archived` spellings (pre-rename records and remote event streams
+ * still carry them) and returns undefined for anything unrecognized — callers
+ * must treat an unparseable cache as absent, never trust it via an unchecked
+ * cast.
+ */
+export function parseBeeState(value: string | undefined): BeeState | undefined {
   switch (value) {
     case "blocked":
     case "auth-needed":

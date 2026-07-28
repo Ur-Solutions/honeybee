@@ -11,7 +11,7 @@ import { stringFlag } from "../cli/shared.js";
 import { SEAL_TYPES, type SealType } from "../seal.js";
 import { resolveSpawningBeeId } from "../spawnParent.js";
 import { appendLedger, listSessions, loadSession, type SessionRecord } from "../store.js";
-import type { BeeState } from "../state.js";
+import { parseBeeState, type BeeState } from "../state.js";
 import { createFlightSweeper } from "../daemon/flightSweep.js";
 import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal } from "../flight/controller.js";
 import { substrateFor } from "../substrates/index.js";
@@ -352,7 +352,10 @@ async function flightSweep(parsed: Parsed): Promise<void> {
   const activity = new Map<string, BeeActivitySignal>();
   const sweepNow = Date.now();
   for (const record of sessions) {
-    if (record.lastObservedState) observed.set(record.name, record.lastObservedState as BeeState);
+    // Legacy `sealed`/`archived` strings normalize to done; anything
+    // unrecognized is treated as absent rather than trusted via a cast.
+    const cached = parseBeeState(record.lastObservedState);
+    if (cached) observed.set(record.name, cached);
   }
   // Persisted lastObservedState lags whenever the daemon is down — exactly
   // when an inline sweep is most needed. Overlay a LIVE run-dir observation
