@@ -1130,6 +1130,10 @@ test("canary round 4: a slow usage sampler starves itself, never the flight stag
       now: () => Date.now(),
       timeouts: { dispatchMs: 10_000, dispatchTotalMs: 150 },
     };
+    deps.sweepCombs = async () => {
+      ran.push("sweepCombs");
+      return [];
+    };
     deps.sweepFlights = async () => {
       ran.push("sweepFlights");
       return [];
@@ -1145,7 +1149,8 @@ test("canary round 4: a slow usage sampler starves itself, never the flight stag
 
     // The safety-critical flight stage ran; the sampler consumed the pool and
     // was bounded; whatever followed it was starved instead of the flights.
-    assert.deepEqual(ran.filter((name) => name === "sweepFlights"), ["sweepFlights"]);
+    assert.deepEqual(ran.filter((name) => name === "sweepCombs" || name === "sweepFlights"), ["sweepCombs", "sweepFlights"]);
+    assert.ok(result.stageMs.sweepCombs !== undefined, "comb stage executed and was timed");
     assert.ok(result.stageMs.sweepFlights !== undefined, "flight stage executed and was timed");
     assert.ok(result.truncated.some((name) => name.startsWith("sampleUsage@")));
     assert.equal(result.errors.length, 0, "budget enforcement must not manufacture errors");

@@ -1,0 +1,941 @@
+{
+  "schemaVersion": 1,
+  "runnerVersion": 1,
+  "description": "Executable Honeybee Combs strict-spine corpus. Cases run in order against one fresh store. $type, $pattern, $optional, $required, and $contains are matcher directives; $name strings are captures or materialized fixture paths.",
+  "exitCodes": {
+    "success_or_durable_ack": 0,
+    "invalid_argument_or_schema": 2,
+    "not_found": 3,
+    "version_claim_or_idempotency_conflict": 4,
+    "ambiguous_activation_or_approval_required": 5,
+    "unresolved_effect_ambiguity": 6,
+    "external_dependency": 7,
+    "internal_or_corrupt_state": 70
+  },
+  "fixtures": {
+    "simpleComb": {
+      "formatVersion": 2,
+      "name": "corpus-review",
+      "input": {
+        "kind": "json-schema",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "ref": { "type": "string" }
+          },
+          "required": ["ref"],
+          "additionalProperties": false
+        }
+      },
+      "nodes": [
+        {
+          "id": "work",
+          "executor": "agent",
+          "binding": "strict",
+          "agent": {
+            "capacity": { "kind": "spawn", "bee": "codex", "account": "auto" },
+            "brief": "Review {{input.ref}}."
+          },
+          "output": {
+            "kind": "json-schema",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "verdict": { "enum": ["pass", "fail"] }
+              },
+              "required": ["verdict"],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "edges": []
+    },
+    "claimComb": {
+      "formatVersion": 2,
+      "name": "corpus-claim",
+      "input": {
+        "kind": "json-schema",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "ref": { "type": "string" }
+          },
+          "required": ["ref"],
+          "additionalProperties": false
+        }
+      },
+      "claim": {
+        "scope": "product-comb",
+        "inputPointer": "/ref",
+        "collision": "join-existing"
+      },
+      "nodes": [
+        {
+          "id": "work",
+          "executor": "agent",
+          "binding": "strict",
+          "agent": {
+            "capacity": { "kind": "spawn", "bee": "codex", "account": "auto" },
+            "brief": "Review {{input.ref}}."
+          }
+        }
+      ],
+      "edges": []
+    },
+    "terminalDoneComb": {
+      "formatVersion": 2,
+      "name": "corpus-terminal-done",
+      "input": { "kind": "informal", "description": "fixture input" },
+      "nodes": [
+        {
+          "id": "finish",
+          "executor": "engine",
+          "binding": "strict",
+          "engine": {
+            "kind": "predicate",
+            "predicate": {
+              "kind": "clock",
+              "afterMs": 0,
+              "from": "activation-start"
+            }
+          }
+        }
+      ],
+      "edges": []
+    },
+    "terminalFailedComb": {
+      "formatVersion": 2,
+      "name": "corpus-terminal-failed",
+      "input": { "kind": "informal", "description": "fixture input" },
+      "nodes": [
+        {
+          "id": "finish",
+          "executor": "engine",
+          "binding": "strict",
+          "engine": {
+            "kind": "predicate",
+            "predicate": {
+              "kind": "clock",
+              "afterMs": 0,
+              "from": "activation-start"
+            }
+          }
+        }
+      ],
+      "edges": [],
+      "output": {
+        "contract": {
+          "kind": "json-schema",
+          "schema": { "type": "string" }
+        },
+        "value": {
+          "source": "node-output",
+          "nodeId": "finish",
+          "pointer": "",
+          "lineage": "current",
+          "item": "same"
+        }
+      }
+    },
+    "inputHead": { "ref": "HEAD" },
+    "inputOther": { "ref": "OTHER" }
+  },
+  "projectionFixtures": {
+    "activation": {
+      "id": "work@1#0",
+      "address": {
+        "runId": "$runId",
+        "nodeId": "work",
+        "attempt": 1,
+        "itemIndex": 0
+      },
+      "taskId": "$taskId",
+      "cohortId": "$runId:g0:i0",
+      "nodeSnapshotRevision": 0,
+      "status": "pending",
+      "subject": {
+        "kind": "run-input",
+        "key": "$runId",
+        "revision": "$subjectRevision"
+      },
+      "claim": {
+        "taskId": "$taskId",
+        "attempt": 1
+      },
+      "beeHandles": [],
+      "evidenceCount": 1,
+      "evidenceTail": [
+        {
+          "id": "$evidenceId",
+          "kind": "seal",
+          "subject": {
+            "kind": "run-input",
+            "key": "$runId",
+            "revision": "$subjectRevision"
+          },
+          "producer": { "kind": "bee", "id": "corpus-reviewer" },
+          "recordedAt": "2099-01-01T00:00:00.000Z",
+          "payloadDigest": { "$pattern": "^sha256:[0-9a-f]{64}$" },
+          "storageRef": { "$pattern": "^evidence/[0-9a-f]{64}\\.json$" },
+          "summary": {
+            "filename": "corpus-seal.json",
+            "status": "done",
+            "type": "review",
+            "summary": "fixture evidence"
+          }
+        }
+      ],
+      "deviationCount": 0,
+      "deviationTail": [],
+      "incomingEdgeFiringIds": [],
+      "activeChildRunIds": [],
+      "childRunTail": [],
+      "effectKeys": []
+    },
+    "evidence": {
+      "schemaVersion": 1,
+      "id": "$evidenceId",
+      "activation": {
+        "runId": "$runId",
+        "nodeId": "work",
+        "attempt": 1,
+        "itemIndex": 0
+      },
+      "taskId": "$taskId",
+      "subject": {
+        "kind": "run-input",
+        "key": "$runId",
+        "revision": "$subjectRevision"
+      },
+      "producer": { "kind": "bee", "id": "corpus-reviewer" },
+      "recordedAt": "2099-01-01T00:00:00.000Z",
+      "kind": "seal",
+      "payload": {
+        "filename": "corpus-seal.json",
+        "seal": {
+          "beeName": "corpus-reviewer",
+          "sealedAt": "2099-01-01T00:00:00.000Z",
+          "status": "done",
+          "summary": "fixture evidence",
+          "type": "review",
+          "taskId": "$taskId",
+          "attempt": 1,
+          "output": { "verdict": "pass" }
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "comb-list-success",
+      "argv": ["comb", "list", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.list",
+        "result": { "combs": [] }
+      }
+    },
+    {
+      "id": "comb-lint-success",
+      "argv": ["comb", "lint", "$simpleComb", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.lint",
+        "result": {
+          "valid": true,
+          "definitionDigest": { "$pattern": "^sha256:[0-9a-f]{64}$" },
+          "normalized": {
+            "formatVersion": 2,
+            "name": "corpus-review",
+            "nodes": {
+              "$contains": [
+                {
+                  "id": "work",
+                  "executor": "agent",
+                  "binding": "strict"
+                }
+              ]
+            }
+          },
+          "warnings": []
+        }
+      }
+    },
+    {
+      "id": "comb-define-success",
+      "argv": ["comb", "define", "$simpleComb", "--json"],
+      "exitCode": 0,
+      "capture": {
+        "definitionDigest": "/result/comb/digest"
+      },
+      "stdout": {
+        "ok": true,
+        "command": "comb.define",
+        "result": {
+          "comb": {
+            "schemaVersion": 1,
+            "name": "corpus-review",
+            "version": 1,
+            "digest": { "$pattern": "^sha256:[0-9a-f]{64}$" },
+            "definition": { "name": "corpus-review", "formatVersion": 2 },
+            "provenance": { "kind": "file" },
+            "createdAt": { "$type": "string" },
+            "createdBy": { "$type": "string" }
+          },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-inspect-success",
+      "argv": ["comb", "inspect", "corpus-review", "--version", "1", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.inspect",
+        "result": {
+          "comb": {
+            "name": "corpus-review",
+            "version": 1,
+            "digest": "$definitionDigest"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-run-manual",
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "capture": {
+        "runId": "/result/run/id",
+        "subjectRevision": "/result/run/activations/0/subject/revision"
+      },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": {
+            "id": { "$pattern": "^[0-9A-Za-z-]+$" },
+            "comb": {
+              "name": "corpus-review",
+              "version": 1,
+              "digest": "$definitionDigest"
+            },
+            "status": "active",
+            "origin": { "kind": "manual", "actor": { "$type": "string" } },
+            "triggerAssociations": [],
+            "productKey": "corpus-product",
+            "depth": 0,
+            "snapshotRevision": 0,
+            "definitionDigest": "$definitionDigest",
+            "actionBindingDigest": { "$pattern": "^sha256:[0-9a-f]{64}$" },
+            "intakeReady": false,
+            "cleanupStatus": "not-required",
+            "activations": [
+              {
+                "id": "work@1#0",
+                "nodeId": "work",
+                "attempt": 1,
+                "itemIndex": 0,
+                "cohortId": "$runId:g0:i0",
+                "status": "pending",
+                "subject": {
+                  "kind": "run-input",
+                  "key": "$runId",
+                  "revision": "$subjectRevision"
+                },
+                "beeHandles": [],
+                "deviationCount": 0,
+                "evidence": []
+              }
+            ],
+            "activeChildRunIds": [],
+            "childRunTail": [],
+            "violationCount": 0,
+            "deviationCount": 0,
+            "lastEventSequence": 2,
+            "createdAt": { "$type": "string" },
+            "updatedAt": { "$type": "string" }
+          },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-status-hydrated-activation",
+      "argv": ["comb", "status", "$runId", "--activation", "work@1#0", "--json"],
+      "exitCode": 0,
+      "capture": {
+        "taskId": "/result/hydratedActivation/taskId"
+      },
+      "stdout": {
+        "ok": true,
+        "command": "comb.status",
+        "result": {
+          "run": {
+            "id": "$runId",
+            "activations": {
+              "work@1#0": {
+                "id": "work@1#0",
+                "address": {
+                  "runId": "$runId",
+                  "nodeId": "work",
+                  "attempt": 1,
+                  "itemIndex": 0
+                },
+                "status": "pending",
+                "subject": {
+                  "kind": "run-input",
+                  "key": "$runId",
+                  "revision": "$subjectRevision"
+                }
+              }
+            }
+          },
+          "hydratedActivation": {
+            "id": "work@1#0",
+            "address": {
+              "runId": "$runId",
+              "nodeId": "work",
+              "attempt": 1,
+              "itemIndex": 0
+            },
+            "taskId": { "$type": "string" },
+            "status": "pending",
+            "subject": {
+              "kind": "run-input",
+              "key": "$runId",
+              "revision": "$subjectRevision"
+            },
+            "evidenceCount": 0,
+            "evidenceTail": []
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-status-evidence-projection",
+      "arrange": [
+        {
+          "kind": "ingest-seal",
+          "runId": "$runId",
+          "activationId": "work@1#0",
+          "filename": "corpus-seal.json",
+          "seal": {
+            "beeName": "corpus-reviewer",
+            "sealedAt": "2099-01-01T00:00:00.000Z",
+            "status": "done",
+            "summary": "fixture evidence",
+            "type": "review",
+            "taskId": "$taskId",
+            "attempt": 1,
+            "output": { "verdict": "pass" }
+          },
+          "captureEvidenceId": "evidenceId",
+          "assertProjection": "evidence"
+        }
+      ],
+      "argv": ["comb", "status", "$runId", "--activation", "work@1#0", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.status",
+        "result": {
+          "run": {
+            "id": "$runId",
+            "activations": {
+              "work@1#0": {
+                "evidenceCount": 1,
+                "evidenceTail": [
+                  {
+                    "id": "$evidenceId",
+                    "kind": "seal",
+                    "subject": {
+                      "kind": "run-input",
+                      "key": "$runId",
+                      "revision": "$subjectRevision"
+                    },
+                    "producer": { "kind": "bee", "id": "corpus-reviewer" },
+                    "recordedAt": "2099-01-01T00:00:00.000Z",
+                    "payloadDigest": { "$pattern": "^sha256:[0-9a-f]{64}$" },
+                    "storageRef": { "$pattern": "^evidence/[0-9a-f]{64}\\.json$" },
+                    "summary": {
+                      "filename": "corpus-seal.json",
+                      "status": "done",
+                      "type": "review",
+                      "summary": "fixture evidence"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "hydratedActivation": "$activationProjection"
+        }
+      }
+    },
+    {
+      "id": "comb-runs-board-projection",
+      "argv": ["comb", "runs", "--board", "--last", "1", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.runs",
+        "result": {
+          "runs": [
+            {
+              "id": "$runId",
+              "status": "active",
+              "intakeReady": false,
+              "cleanupStatus": "not-required",
+              "activations": [
+                {
+                  "id": "work@1#0",
+                  "nodeId": "work",
+                  "attempt": 1,
+                  "itemIndex": 0,
+                  "cohortId": "$runId:g0:i0",
+                  "status": "pending",
+                  "subject": {
+                    "kind": "run-input",
+                    "key": "$runId",
+                    "revision": "$subjectRevision"
+                  },
+                  "beeHandles": [],
+                  "deviationCount": 0,
+                  "evidence": [
+                    {
+                      "id": "$evidenceId",
+                      "kind": "seal",
+                      "producer": { "kind": "bee", "id": "corpus-reviewer" },
+                      "recordedAt": "2099-01-01T00:00:00.000Z",
+                      "summary": {
+                        "filename": "corpus-seal.json",
+                        "status": "done",
+                        "type": "review",
+                        "summary": "fixture evidence"
+                      }
+                    }
+                  ]
+                }
+              ],
+              "violationCount": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "comb-events-success",
+      "argv": ["comb", "events", "$runId", "--after", "0", "--limit", "256", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.events",
+        "result": {
+          "runId": "$runId",
+          "after": 0,
+          "events": {
+            "$contains": [
+              {
+                "id": "$runId:1",
+                "sequence": 1,
+                "type": "comb.run.started",
+                "at": { "$type": "string" }
+              },
+              {
+                "id": "$runId:2",
+                "sequence": 2,
+                "type": "comb.activation.pending",
+                "activation": {
+                  "runId": "$runId",
+                  "nodeId": "work",
+                  "attempt": 1,
+                  "itemIndex": 0
+                }
+              },
+              {
+                "id": "$runId:3",
+                "sequence": 3,
+                "type": "comb.evidence.recorded"
+              }
+            ]
+          },
+          "nextAfter": 3,
+          "hasMore": false
+        }
+      }
+    },
+    {
+      "id": "comb-cancel-active",
+      "argv": ["comb", "cancel", "$runId", "--reason", "fixture", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.cancel",
+        "result": {
+          "runId": "$runId",
+          "status": "cancelled",
+          "accepted": true,
+          "fence": {
+            "epoch": 1,
+            "requestedAt": { "$type": "string" },
+            "requestedBy": { "$type": "string" },
+            "reason": "fixture"
+          },
+          "cleanup": {
+            "status": "pending",
+            "pendingEffectKeys": [],
+            "pendingSubscriptionIds": [],
+            "pendingObservationWatchIds": [],
+            "pendingPacketIds": [],
+            "pendingBeeNames": [],
+            "pendingChildRunIds": [],
+            "startedAt": { "$type": "string" }
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-cancel-terminal-ack",
+      "argv": ["comb", "cancel", "$runId", "--reason", "must-not-rewrite", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.cancel",
+        "result": {
+          "runId": "$runId",
+          "status": "cancelled",
+          "accepted": false,
+          "reason": "terminal",
+          "cleanup": {
+            "status": "pending",
+            "pendingEffectKeys": [],
+            "pendingSubscriptionIds": [],
+            "pendingObservationWatchIds": [],
+            "pendingPacketIds": [],
+            "pendingBeeNames": [],
+            "pendingChildRunIds": [],
+            "startedAt": { "$type": "string" }
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-define-terminal-done",
+      "argv": ["comb", "define", "$terminalDoneComb", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.define",
+        "result": {
+          "comb": { "name": "corpus-terminal-done", "version": 1 },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-run-terminal-done",
+      "argv": ["comb", "run", "corpus-terminal-done", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "capture": { "doneRunId": "/result/run/id" },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": { "id": { "$type": "string" }, "status": "active" },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-cancel-done-terminal-ack",
+      "arrange": [
+        {
+          "kind": "reconcile-machine",
+          "runId": "$doneRunId",
+          "now": "2099-01-01T00:00:00.000Z"
+        }
+      ],
+      "argv": ["comb", "cancel", "$doneRunId", "--reason", "must-not-rewrite", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.cancel",
+        "result": {
+          "runId": "$doneRunId",
+          "status": "done",
+          "accepted": false,
+          "reason": "terminal",
+          "cleanup": {
+            "status": "pending",
+            "pendingEffectKeys": [],
+            "pendingSubscriptionIds": [],
+            "pendingObservationWatchIds": [],
+            "pendingPacketIds": [],
+            "pendingBeeNames": [],
+            "pendingChildRunIds": [],
+            "startedAt": "2099-01-01T00:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-define-terminal-failed",
+      "argv": ["comb", "define", "$terminalFailedComb", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.define",
+        "result": {
+          "comb": { "name": "corpus-terminal-failed", "version": 1 },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-run-terminal-failed",
+      "argv": ["comb", "run", "corpus-terminal-failed", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "capture": { "failedRunId": "/result/run/id" },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": { "id": { "$type": "string" }, "status": "active" },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-cancel-failed-terminal-ack",
+      "arrange": [
+        {
+          "kind": "reconcile-machine",
+          "runId": "$failedRunId",
+          "now": "2099-01-01T00:00:01.000Z"
+        }
+      ],
+      "argv": ["comb", "cancel", "$failedRunId", "--reason", "must-not-rewrite", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.cancel",
+        "result": {
+          "runId": "$failedRunId",
+          "status": "failed",
+          "accepted": false,
+          "reason": "terminal",
+          "cleanup": {
+            "status": "pending",
+            "pendingEffectKeys": [],
+            "pendingSubscriptionIds": [],
+            "pendingObservationWatchIds": [],
+            "pendingPacketIds": [],
+            "pendingBeeNames": [],
+            "pendingChildRunIds": [],
+            "startedAt": "2099-01-01T00:00:01.000Z"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-run-trigger-create",
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputOther", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--origin-trigger", "trigger-corpus", "--origin-delivery", "delivery-corpus", "--json"],
+      "exitCode": 0,
+      "capture": { "deliveryRunId": "/result/run/id" },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": {
+            "id": { "$type": "string" },
+            "status": "active",
+            "origin": {
+              "kind": "trigger",
+              "triggerId": "trigger-corpus",
+              "deliveryId": "delivery-corpus"
+            },
+            "intakeReady": false
+          },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-run-trigger-replay",
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputOther", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--origin-trigger", "trigger-corpus", "--origin-delivery", "delivery-corpus", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": { "id": "$deliveryRunId" },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": true,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-event-json-honest-refusal",
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputOther", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--origin-trigger", "trigger-corpus", "--origin-delivery", "delivery-event", "--event-json", "{\"triggerId\":\"trigger-corpus\",\"deliveryId\":\"delivery-event\",\"eventId\":\"event-1\"}", "--json"],
+      "exitCode": 2,
+      "stdout": {
+        "ok": false,
+        "command": "comb.run",
+        "error": {
+          "code": "invalid_argument",
+          "message": "--event-json is not supported in strict-spine slice 1 because subscriptions are disabled"
+        }
+      }
+    },
+    {
+      "id": "comb-run-graph",
+      "argv": ["comb", "run", "--graph", "$simpleComb", "--input", "$inputOther", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": {
+            "comb": { "name": "corpus-review" },
+            "origin": { "kind": "ad-hoc", "actor": { "$type": "string" } },
+            "productKey": "corpus-product",
+            "intakeReady": false
+          },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-define-claim",
+      "argv": ["comb", "define", "$claimComb", "--json"],
+      "exitCode": 0,
+      "stdout": {
+        "ok": true,
+        "command": "comb.define",
+        "result": {
+          "comb": { "name": "corpus-claim", "version": 1 },
+          "created": true
+        }
+      }
+    },
+    {
+      "id": "comb-run-claim-holder",
+      "argv": ["comb", "run", "corpus-claim", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "exitCode": 0,
+      "capture": { "holdingRunId": "/result/run/id" },
+      "stdout": {
+        "ok": true,
+        "command": "comb.run",
+        "result": {
+          "run": { "id": { "$type": "string" }, "status": "active" },
+          "created": true,
+          "joinedExisting": false,
+          "replayedDelivery": false,
+          "intakeReady": false
+        }
+      }
+    },
+    {
+      "id": "comb-run-join-refusal",
+      "argv": ["comb", "run", "corpus-claim", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--origin-trigger", "trigger-claim", "--origin-delivery", "delivery-claim", "--collision", "join-existing", "--json"],
+      "exitCode": 4,
+      "stdout": {
+        "ok": false,
+        "command": "comb.run",
+        "error": {
+          "code": "claim_conflict",
+          "message": { "$pattern": "^claim conflict: held by " },
+          "details": {
+            "claimId": { "$pattern": "^[0-9a-f]{64}$" },
+            "holdingRunId": "$holdingRunId",
+            "holdingRunStatus": "active",
+            "cleanupStatus": "not-required"
+          }
+        }
+      }
+    },
+    {
+      "id": "comb-not-found-failure",
+      "argv": ["comb", "status", "missing", "--json"],
+      "exitCode": 3,
+      "stdout": {
+        "ok": false,
+        "command": "comb.status",
+        "error": {
+          "code": "not_found",
+          "message": "comb run not found: missing"
+        }
+      }
+    },
+    {
+      "id": "comb-product-required",
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--json"],
+      "exitCode": 2,
+      "stdout": {
+        "ok": false,
+        "command": "comb.run",
+        "error": {
+          "code": "invalid_argument",
+          "message": "--product is required in strict-spine slice 1; product identity is never inferred from cwd"
+        }
+      }
+    },
+    {
+      "id": "comb-corrupt-state",
+      "arrange": [
+        {
+          "kind": "write-store-file",
+          "path": "combs/definitions/corrupt-comb/index.json",
+          "contents": "{not-json"
+        }
+      ],
+      "argv": ["comb", "inspect", "corrupt-comb", "--json"],
+      "exitCode": 70,
+      "stdout": {
+        "ok": false,
+        "command": "comb.inspect",
+        "error": {
+          "code": "corrupt_state",
+          "message": { "$pattern": "^(Unexpected|Expected)" }
+        }
+      }
+    },
+    {
+      "id": "comb-transient-io-classification",
+      "argv": ["comb", "run", "corpus-review", "--version", "1", "--input", "$inputHead", "--cwd", "$fixtureCwd", "--product", "corpus-product", "--json"],
+      "fault": { "code": "EIO", "message": "fixture I/O interruption" },
+      "exitCode": 7,
+      "stdout": {
+        "ok": false,
+        "command": "comb.run",
+        "error": {
+          "code": "external_dependency",
+          "message": "fixture I/O interruption",
+          "details": { "errno": "EIO" }
+        }
+      }
+    }
+  ]
+}

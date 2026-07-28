@@ -16,6 +16,7 @@ import { cmdDaemon, cmdSessions, cmdSync } from "./commands/daemon.js";
 import { cmdEvents } from "./commands/events.js";
 import { cmdFlight } from "./commands/flight.js";
 import { cmdFlow, runFlowExec } from "./commands/flow.js";
+import { cmdComb, COMB_HELP, runCombSweepExec } from "./commands/comb.js";
 import { cmdFork, cmdForkLaunch, cmdSplit } from "./commands/fork.js";
 import { cmdHandoff } from "./commands/handoff.js";
 import { cmdFrame } from "./commands/frame.js";
@@ -59,6 +60,10 @@ async function main(argv: string[]) {
   }
   if (argv[0] === "__flow-exec") {
     await runFlowExec(argv.slice(1));
+    return;
+  }
+  if (argv[0] === "__comb-sweep") {
+    await runCombSweepExec();
     return;
   }
   if (argv[0] === "__hsr-run") {
@@ -235,6 +240,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "flow":
       await cmdFlow(parsed);
       break;
+    case "comb":
+      await cmdComb(parsed);
+      break;
     case "loop":
       await cmdLoop(parsed);
       break;
@@ -296,6 +304,7 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "help":
       if (parsed.args[0] === "seal") console.log(sealHelpText());
       else if (parsed.args[0] === "wait") console.log(waitHelpText());
+      else if (parsed.args[0] === "comb") console.log(COMB_HELP);
       else printHelp();
       break;
     case "--help":
@@ -398,6 +407,7 @@ function printHelp() {
         ["swarm", "<list|inspect|destroy>", "manage live or destroyed bee cohorts"],
         ["frame", "<list|define|…>", "manage reusable swarm blueprints"],
         ["flow", "<list|run|runs|…>", "manage and run flow definitions"],
+        ["comb", "<define|run|runs|…>", "manage immutable combs and durable graph runs"],
         ["own", "<owner> <bee>...", "set the owned-by/reports-to edge (--clear to unset)"],
         ["move", "<bee> --colony <c>", "reassign a bee's colony (or --owner <o> alias)"],
       ],

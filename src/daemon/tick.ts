@@ -14,6 +14,8 @@ import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
 import type { FlightSweeper } from "./flightSweep.js";
 import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
+import type { CombSweeper } from "./combSweep.js";
+import type { CombSweepOutcome } from "../comb/controller.js";
 import type { UsageSampler, UsageTickOutcome } from "./usageSampler.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { LogInput } from "./log.js";
@@ -169,6 +171,11 @@ export type TickDeps = {
    */
   sweepFlights?: FlightSweeper;
   /**
+   * Optional Combs reconciler: drives durable graph runs before flights/pools
+   * so cancellation fences and owned resources settle first.
+   */
+  sweepCombs?: CombSweeper;
+  /**
    * Optional credential sync: pulls rotated/refreshed auth from the accounts'
    * homes back into the vault. The default wiring throttles itself — most
    * runs are a no-op. NOT called by tick(): runDaemon drives it on its own
@@ -234,6 +241,8 @@ export type DispatcherOutcomes = {
   poolSweeps: PoolSweepOutcome[];
   /** Flight reconciler outcomes (empty when no active flights / not wired). */
   flightSweeps: FlightSweepOutcome[];
+  /** Combs engine outcomes (empty when no sweepable runs / not wired). */
+  combSweeps: CombSweepOutcome[];
 };
 
 export type TickResult = DispatcherOutcomes & {
@@ -469,6 +478,22 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
   // Flight reconciler (CL.701): drive slot leases from this tick's evidence —
   // seal completion, deadlines, idempotent replacement under backpressure.
   {
+    key: "combSweeps",
+    name: "sweepCombs",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed, sessionsSnapshotTrusted }) =>
+      sessionsSnapshotTrusted ? deps.sweepCombs?.(records, observed) : undefined,
+    log: (outcome) => ({
+      level: outcome.action === "error" || outcome.action === "failed" ? "warn" : "info",
+      msg: `comb.${outcome.action}`,
+      run: outcome.run,
+      ...(outcome.activation ? { activation: outcome.activation } : {}),
+      ...(outcome.bee ? { bee: outcome.bee } : {}),
+      ...(outcome.detail ? { detail: outcome.detail } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
+  {
     key: "flightSweeps",
     name: "sweepFlights",
     timeoutKey: "dispatchMs",
@@ -590,7 +615,20 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
 ];
 
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
-  return { buzDrains: [], taskSupplies: [], requestReconciles: [], needsInput: [], nodeReachability: [], usage: [], autoswaps: [], autoTitles: [], tokenRefreshes: [], flightSweeps: [], poolSweeps: [] };
+  return {
+    buzDrains: [],
+    taskSupplies: [],
+    requestReconciles: [],
+    needsInput: [],
+    nodeReachability: [],
+    usage: [],
+    autoswaps: [],
+    autoTitles: [],
+    tokenRefreshes: [],
+    combSweeps: [],
+    flightSweeps: [],
+    poolSweeps: [],
+  };
 }
 
 /**

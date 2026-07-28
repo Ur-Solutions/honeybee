@@ -7,6 +7,7 @@ import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
 import type { PreambleChannel } from "./preamble.js";
 import { dedupeTags, isValidSessionTag, MAX_TAGS_PER_BEE } from "./tags.js";
+import type { CombActivationBinding } from "./comb/types.js";
 
 /**
  * Per-bee task auto-supply config (see tasks/supplyConfig.ts for semantics
@@ -58,6 +59,8 @@ export type SessionRecord = {
    * (was: fork-and-pane Phase B)
    */
   combId?: string;
+  /** Combs engine activation bindings. Legacy combId above is unrelated. */
+  combActivations?: CombActivationBinding[];
   /** The bee this one was split from (intra-comb lineage). (Phase B) */
   parentId?: string;
   /** Operator-set owned-by/reports-to edge → target bee id. (Tags PRD Phase 2) */
@@ -534,6 +537,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "tags",
   "contract",
   "preamble",
+  "combActivations",
 ]);
 
 function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
@@ -593,6 +597,34 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   if (object.contract !== undefined) {
     const contract = normalizeContract(object.contract);
     if (contract) record.contract = contract;
+  }
+
+  if (Array.isArray(object.combActivations)) {
+    const bindings: CombActivationBinding[] = [];
+    for (const value of object.combActivations) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const raw = value as Record<string, unknown>;
+      if (
+        typeof raw.runId !== "string" ||
+        typeof raw.nodeId !== "string" ||
+        !Number.isSafeInteger(raw.attempt) ||
+        !Number.isSafeInteger(raw.itemIndex) ||
+        typeof raw.taskId !== "string" ||
+        (raw.status !== "current" && raw.status !== "historical") ||
+        typeof raw.attachedAt !== "string"
+      ) continue;
+      bindings.push({
+        runId: raw.runId,
+        nodeId: raw.nodeId,
+        attempt: raw.attempt as number,
+        itemIndex: raw.itemIndex as number,
+        taskId: raw.taskId,
+        status: raw.status,
+        attachedAt: raw.attachedAt,
+        ...(typeof raw.endedAt === "string" ? { endedAt: raw.endedAt } : {}),
+      });
+    }
+    if (bindings.length) record.combActivations = bindings;
   }
 
   // HSR fields. `substrate` is a closed union (absent = local-tmux); an

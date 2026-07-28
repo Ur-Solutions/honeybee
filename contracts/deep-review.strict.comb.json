@@ -1,0 +1,271 @@
+{
+  "formatVersion": 2,
+  "name": "deep-review-strict",
+  "description": "All-strict three-way review with a tolerant all-join and aggregate output.",
+  "input": {
+    "kind": "json-schema",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        }
+      },
+      "required": ["ref", "effort"],
+      "additionalProperties": false
+    }
+  },
+  "output": {
+    "contract": {
+      "kind": "json-schema",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "activation": {
+                  "type": "object"
+                },
+                "status": {
+                  "enum": ["done", "failed", "skipped"]
+                },
+                "output": {
+                  "type": "object"
+                }
+              },
+              "required": ["activation", "status"],
+              "additionalProperties": false
+            }
+          },
+          "succeeded": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": ["items", "succeeded", "failed", "skipped"],
+        "additionalProperties": false
+      }
+    },
+    "value": {
+      "source": "node-output",
+      "nodeId": "join",
+      "pointer": "",
+      "lineage": "current",
+      "item": "aggregate"
+    }
+  },
+  "nodes": [
+    {
+      "id": "architecture",
+      "label": "Architecture reviewer",
+      "executor": "agent",
+      "binding": "strict",
+      "output": {
+        "kind": "json-schema",
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "reviewer": {
+              "const": "architecture"
+            },
+            "verdict": {
+              "enum": ["pass", "fail"]
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "severity": {
+                    "enum": ["low", "medium", "high"]
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  }
+                },
+                "required": ["severity", "message"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["reviewer", "verdict", "findings"],
+          "additionalProperties": false
+        }
+      },
+      "agent": {
+        "capacity": {
+          "kind": "spawn",
+          "bee": "codex",
+          "account": "auto",
+          "substrate": "hsr"
+        },
+        "brief": "Cheap focused review of {{input.ref}} in the current Honeybee repo. Inspect architecture boundaries only. Do not edit. Use {{input.effort}} effort. Return at most two concrete findings. Seal done with taskId/attempt from your completion contract and output exactly {\"reviewer\":\"architecture\",\"verdict\":\"pass\"|\"fail\",\"findings\":[{\"severity\":\"low\"|\"medium\"|\"high\",\"message\":\"...\",\"file\":\"optional\"}]}."
+      }
+    },
+    {
+      "id": "correctness",
+      "label": "Correctness reviewer",
+      "executor": "agent",
+      "binding": "strict",
+      "output": {
+        "kind": "json-schema",
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "reviewer": {
+              "const": "correctness"
+            },
+            "verdict": {
+              "enum": ["pass", "fail"]
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "severity": {
+                    "enum": ["low", "medium", "high"]
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  }
+                },
+                "required": ["severity", "message"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["reviewer", "verdict", "findings"],
+          "additionalProperties": false
+        }
+      },
+      "agent": {
+        "capacity": {
+          "kind": "spawn",
+          "bee": "codex",
+          "account": "auto",
+          "substrate": "hsr"
+        },
+        "brief": "Cheap focused review of {{input.ref}} in the current Honeybee repo. Inspect correctness and edge cases only. Do not edit. Use {{input.effort}} effort. Return at most two concrete findings. Seal done with taskId/attempt from your completion contract and output exactly {\"reviewer\":\"correctness\",\"verdict\":\"pass\"|\"fail\",\"findings\":[{\"severity\":\"low\"|\"medium\"|\"high\",\"message\":\"...\",\"file\":\"optional\"}]}."
+      }
+    },
+    {
+      "id": "tests",
+      "label": "Test reviewer",
+      "executor": "agent",
+      "binding": "strict",
+      "output": {
+        "kind": "json-schema",
+        "schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "properties": {
+            "reviewer": {
+              "const": "tests"
+            },
+            "verdict": {
+              "enum": ["pass", "fail"]
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "severity": {
+                    "enum": ["low", "medium", "high"]
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  }
+                },
+                "required": ["severity", "message"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["reviewer", "verdict", "findings"],
+          "additionalProperties": false
+        }
+      },
+      "agent": {
+        "capacity": {
+          "kind": "spawn",
+          "bee": "codex",
+          "account": "auto",
+          "substrate": "hsr"
+        },
+        "brief": "Cheap focused review of {{input.ref}} in the current Honeybee repo. Inspect tests and missing coverage only. Do not edit. Use {{input.effort}} effort. Return at most two concrete findings. Seal done with taskId/attempt from your completion contract and output exactly {\"reviewer\":\"tests\",\"verdict\":\"pass\"|\"fail\",\"findings\":[{\"severity\":\"low\"|\"medium\"|\"high\",\"message\":\"...\",\"file\":\"optional\"}]}."
+      }
+    },
+    {
+      "id": "join",
+      "label": "Aggregate reviewer outputs",
+      "executor": "engine",
+      "binding": "strict",
+      "join": {
+        "mode": "all",
+        "tolerateFailures": 1
+      },
+      "engine": {
+        "kind": "predicate",
+        "predicate": {
+          "kind": "seal-present",
+          "nodeId": "architecture",
+          "statuses": ["done"]
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "architecture-join",
+      "from": "architecture",
+      "to": "join",
+      "kind": "forward",
+      "on": "done"
+    },
+    {
+      "id": "correctness-join",
+      "from": "correctness",
+      "to": "join",
+      "kind": "forward",
+      "on": "done"
+    },
+    {
+      "id": "tests-join",
+      "from": "tests",
+      "to": "join",
+      "kind": "forward",
+      "on": "done"
+    }
+  ]
+}
