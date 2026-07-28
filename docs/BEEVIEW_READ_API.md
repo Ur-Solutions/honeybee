@@ -443,7 +443,9 @@ library return byte-identical JSON.
    test-guarded deletion; old-vs-new parity diffs over recorded fixtures
    before deleting. The `remote/attention.ts` byte-copy table and the four
    is-retired predicates go last.
-8. Later slices (separate): durable InterventionRequest store (fills
-   resolved/cancelled, `openedAt` always present), then Turn ids (fills
-   `currentTurn`, `turnId`, `exitClass: "clean"`, outcome `cancelled`).
-   Additive within schemaVersion 1.
+8. Later slices (separate): the durable InterventionRequest store SHIPPED
+   2026-07-28 (fills resolved/cancelled + `recentClosedRequests`;
+   store-backed `openedAt` always present — see
+   [INTERVENTION_REQUESTS.md](./INTERVENTION_REQUESTS.md)). Turn ids remain
+   (fill `currentTurn`, `turnId`, `exitClass: "clean"`, outcome
+   `cancelled`). Additive within schemaVersion 1.

@@ -191,6 +191,16 @@ Ordered steps, each independently shippable and abortable:
    derives solely from open requests. This kills the worst live ambiguity
    (the original "waiting" complaint) and fixes `hive next`'s conflation
    without touching `@hive_state`.
+   **SHIPPED 2026-07-28** — see
+   [INTERVENTION_REQUESTS.md](./INTERVENTION_REQUESTS.md) (approved design)
+   and `src/requests/` (store + shared id builders), `src/daemon/
+   requestSweep.ts` (reconciler stage), the store-backed needs-input router,
+   and BeeView's store-first `openRequests` + `recentClosedRequests`.
+   Scoping note: the durable store persists STRUCTURED-grade requests plus
+   the stop-failed manual action; purely observer-grade requests stay
+   live-derived (their ids legitimately recur within a generation).
+   Retention: opens never pruned; closed history bounded by
+   `HIVE_REQUESTS_KEEP_CLOSED` (default 50 per bee) plus a 24h floor.
 5. **Turn ids for new work only.** `hive send` stamps a turn id; hooks and
    HSR events attach evidence; seals may correlate. No reconstruction of
    historical turns.

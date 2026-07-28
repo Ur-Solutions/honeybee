@@ -428,6 +428,17 @@ Adoption is forward-only, per the operator decision of 2026-07-28:
 - An InterventionRequest vertical slice follows: durable request records with
   the idempotency-key and scope-closure invariants above, from which
   `needs-reply` derives solely.
+  **Shipped 2026-07-28** (`src/requests/`, design in
+  [INTERVENTION_REQUESTS.md](../INTERVENTION_REQUESTS.md)): structured-grade
+  requests persist per bee under `~/.hive/requests/`; `hive answer` /
+  `auth-resume` / kill / retire / incarnation verbs write closures directly
+  (daemon-down functional); the daemon reconciler stage folds trusted
+  observations idempotently; the needs-input router carries its exactly-once
+  state on the records (restart-safe); BeeView projects store-open records
+  authoritatively with live derivation as the daemon-down fallback under
+  byte-identical ids. Observer-grade requests (pane fingerprints, held,
+  wedged) stay live-derived — their ids legitimately recur within a
+  generation, so a durable closed record would wrongly suppress recurrence.
 - Turn ids are stamped for new work only. Historical state is not migrated;
   legacy records stay readable as legacy evidence.
 - The full storage cutover in the
