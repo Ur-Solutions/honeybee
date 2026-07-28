@@ -755,7 +755,18 @@ function planHumanEffects(
     const requestDigest = humanEffectRequestDigest(request);
     const existing = run.effects[key];
     if (existing) {
-      if (existing.requestDigest !== requestDigest) {
+      const executionRequest = existing.request
+        ? existing.request as unknown as ForumPacketEffectRequest
+        : request;
+      const executionRequestDigest = humanEffectRequestDigest(executionRequest);
+      const legacyExecutionRequestDigest = canonicalDigest(executionRequest as unknown as JsonValue);
+      if (
+        requestDigest !== executionRequestDigest ||
+        (
+          existing.requestDigest !== executionRequestDigest &&
+          existing.requestDigest !== legacyExecutionRequestDigest
+        )
+      ) {
         terminalizeRun(run, "failed", {
           code: "effect-key-collision",
           message: `effect ${key} was replanned with a different request`,
@@ -766,13 +777,13 @@ function planHumanEffects(
           effectKey: key,
         });
       } else if (existing.status === "prepared" || existing.status === "executing") {
+        existing.requestDigest = executionRequestDigest;
+        existing.request ??= executionRequest as unknown as JsonValue;
         plans.push({
           runId: run.id,
           activationId: activation.id,
           effectKey: key,
-          request: existing.request
-            ? existing.request as unknown as ForumPacketEffectRequest
-            : request,
+          request: executionRequest,
         });
       }
       continue;

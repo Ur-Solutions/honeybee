@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { attachBeeToRun } from "../src/comb/attachment.js";
+import { canonicalDigest } from "../src/comb/canonical.js";
 import {
   sweepCombs,
   type AgentAdoptRequest,
@@ -695,6 +696,70 @@ test("Forum effect recovery keeps its original resolved destination when session
     assert.equal(run.status, "active");
     assert.equal(current(run, "verify").status, "waiting-human");
     assert.equal(createdPacket?.native_session_id, "stable-session-id");
+    assert.equal(forumCalls, 2);
+  });
+});
+
+test("a pre-fix in-flight Forum effect migrates its legacy full-request digest", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "legacy-human-effect-digest",
+        input: { kind: "informal", description: "none" },
+        nodes: [humanNode("verify")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: { retireAgentsOnTerminal: false },
+    });
+    let persistedRequest: ForumPacketEffectRequest | undefined;
+    let forumCalls = 0;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => ({ name: request.name }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [],
+      executeHumanEffect: async (request) => {
+        forumCalls += 1;
+        persistedRequest ??= request;
+        if (forumCalls === 1) throw new Error("pre-upgrade process loss");
+        return packetFor(request, "PKT.legacy-digest", "2026-07-28T12:00:01.000Z");
+      },
+      now: () => Date.parse("2026-07-28T12:00:02.000Z"),
+    };
+
+    await sweepCombs(deps, [], new Map());
+    assert.ok(persistedRequest);
+    const legacyDigest = canonicalDigest(persistedRequest as unknown as JsonValue);
+    await mutateRun(created.id, (run) => {
+      const effect = Object.values(run.effects).find(
+        (candidate) => candidate.kind === "forum-create",
+      );
+      assert.ok(effect);
+      effect.requestDigest = legacyDigest;
+      delete effect.request;
+    });
+
+    await sweepCombs(deps, [], new Map());
+    const run = (await loadRun(created.id))!;
+    const effect = Object.values(run.effects).find(
+      (candidate) => candidate.kind === "forum-create",
+    );
+    assert.equal(run.status, "active");
+    assert.equal(current(run, "verify").status, "waiting-human");
+    assert.equal(current(run, "verify").packetId, "PKT.legacy-digest");
+    assert.equal(effect?.status, "confirmed");
+    assert.ok(effect?.request);
+    assert.notEqual(effect?.requestDigest, legacyDigest);
+    assert.ok(!run.eventTail.some(
+      (event) => event.type === "comb.violation" && event.data?.code === "effect-key-collision",
+    ));
     assert.equal(forumCalls, 2);
   });
 });
