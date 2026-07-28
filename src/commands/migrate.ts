@@ -14,6 +14,7 @@ import { hsrSubstrate } from "../hsr/substrate.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { waitForAgentReady } from "../readiness.js";
+import { closeRequestsForNewIncarnation, readBeeRequests, resolveRequest } from "../requests/store.js";
 import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
 import { appendLedger, listSessions, storeRoot, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
@@ -381,7 +382,33 @@ export async function reviveHsrRunner(record: SessionRecord, tool: string, opts:
   };
   const restored = (await updateSession(record.name, patch)) ?? { ...record, ...patch };
   await writeSpawnOptions(restored);
+  await closeSupersededRequests(record, incarnation);
   return restored;
+}
+
+/**
+ * New-incarnation request closure, applied NEXT TO every
+ * nextRuntimeIncarnationPatch application: requests opened against earlier
+ * generations are superseded by the relaunch (the daemon reconciler backstops
+ * a missed call via the same generation comparison). Best-effort — a request-
+ * store hiccup must never fail a revive/promote/demote/swap.
+ */
+async function closeSupersededRequests(record: SessionRecord, incarnation: Partial<SessionRecord>): Promise<void> {
+  const newGeneration = incarnation.runtimeGeneration ?? (record.runtimeGeneration ?? 0) + 1;
+  await closeRequestsForNewIncarnation(record.name, newGeneration).catch(() => undefined);
+}
+
+/**
+ * Resolve every open auth request for the bee by "auth-resume" — the CLI-side
+ * locked write that makes `hive auth-resume` daemon-down functional. Called
+ * right after the auth_resume marker lands in the events tail; the daemon's
+ * reconciler performs the same resolution when it observes the bounded tail.
+ */
+export async function resolveAuthRequestsAfterResume(bee: string): Promise<void> {
+  const openAuth = (await readBeeRequests(bee)).filter((request) => request.status === "open" && request.kind === "auth");
+  for (const request of openAuth) {
+    await resolveRequest(bee, request.id, { by: "auth-resume" });
+  }
 }
 
 
@@ -440,6 +467,7 @@ export async function reviveTmuxPane(record: SessionRecord, tool: string, opts: 
     ...(opts.fresh ? { providerSessionId: undefined } : {}),
   });
   if (restored) await writeSpawnOptions(restored);
+  await closeSupersededRequests(record, incarnation);
 }
 
 
@@ -529,6 +557,7 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
     runnerTier: undefined,
   });
   if (promoted) await writeSpawnOptions(promoted);
+  await closeSupersededRequests(record, incarnation);
   await appendLedger({ type: "session.promote", session: record.name, from: "hsr", to: "local-tmux", providerSessionId: record.providerSessionId });
 
   if (isPretty()) {
@@ -628,6 +657,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
     launcherPgid: undefined,
   });
   if (demoted) await writeSpawnOptions(demoted);
+  await closeSupersededRequests(record, incarnation);
   await appendLedger({ type: "session.demote", session: record.name, from: "local-tmux", to: "hsr", providerSessionId: record.providerSessionId });
 
   if (isPretty()) {
@@ -773,6 +803,10 @@ export async function cmdAuthResume(parsed: Parsed): Promise<void> {
     hsrEventsPath(record.name),
     `${JSON.stringify({ type: "auth_resume", ts: Date.now() })}\n`,
   ).catch(() => {});
+  // The durable counterpart of the marker above: every open auth request for
+  // this bee is now a resolved fact (daemon-down safe; the reconciler would
+  // otherwise land the same resolution when it observes the bounded tail).
+  await resolveAuthRequestsAfterResume(record.name).catch(() => undefined);
   const cleared =
     (await updateSession(record.name, {
       lastObservedState: undefined,
@@ -1036,6 +1070,7 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
       updatedAt: new Date().toISOString(),
     })) ?? record;
   await writeSpawnOptions(updated);
+  await closeSupersededRequests(record, incarnation);
   await appendLedger({
     type: "bee.revive",
     session: record.name,

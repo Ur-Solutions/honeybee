@@ -1,6 +1,8 @@
 import { appendLedger, deleteSession, updateSession, type SessionRecord } from "./store.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { dropPoolClaimsForBee } from "./pool.js";
+import { stopFailedRequestId } from "./requests/keys.js";
+import { cancelOpenRequests, openRequest, removeBeeRequests, resolveRequest } from "./requests/store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 
 export type TransactionalKillOptions = {
@@ -122,6 +124,26 @@ async function teardownSession(
 }
 
 /**
+ * Open the durable stop-failed manual-action request right after writing
+ * status kill_failed (docs/INTERVENTION_REQUESTS.md): the recorded stop
+ * intent is a fact, so the record is structured-grade even though the runtime
+ * itself was only pane/pid-observed. Idempotent per generation; best-effort —
+ * the kill outcome must be reported even when the request store misbehaves.
+ */
+async function openStopFailedRequest(record: SessionRecord, lastError: string): Promise<void> {
+  const generation = record.runtimeGeneration ?? 0;
+  await openRequest(record.name, {
+    id: stopFailedRequestId(record.name, generation),
+    kind: "manual-action",
+    scope: "runtime-generation",
+    grade: "structured",
+    generation,
+    question: `stop failed: ${lastError}`,
+    evidence: { grade: "structured", source: "session-record", detail: "kill_failed" },
+  }).catch(() => undefined);
+}
+
+/**
  * Transactional kill: substrate.kill -> poll substrate.hasSession -> only then
  * deleteSession. On failure (session still exists after polling, or its absence
  * cannot be confirmed), the SessionRecord is updated with status='kill_failed'
@@ -154,6 +176,7 @@ export async function transactionalKill(
       lastError,
       updatedAt: new Date().toISOString(),
     });
+    await openStopFailedRequest(record, lastError);
     if (emitLedger) {
       await appendLedger({
         type: "session.kill",
@@ -168,6 +191,10 @@ export async function transactionalKill(
   }
 
   await deleteSession(record.name);
+  // Kill is PURGE (consistent with seals/run data): the bee's request file —
+  // open and closed history alike — goes with the record. Best-effort, like
+  // the pool-claim cleanup next to it.
+  await removeBeeRequests(record.name).catch(() => undefined);
   // Eager pool-claim cleanup (CHECKOUT_POOLS_PRD §6.2): a killed bee's claim
   // would otherwise count toward its member's occupancy until pendingUntil.
   // Best-effort — claim expiry is the backstop.
@@ -209,6 +236,7 @@ export async function transactionalRetire(
       lastError,
       updatedAt: new Date().toISOString(),
     });
+    await openStopFailedRequest(record, lastError);
     if (emitLedger) {
       await appendLedger({
         type: "session.retire",
@@ -222,6 +250,12 @@ export async function transactionalRetire(
     return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
   }
 
+  // Request closures BEFORE filing (retire keeps the file — revivable
+  // history): a pending stop-failed from an earlier failed kill/retire is now
+  // a fact resolved by this successful stop; everything else open closes with
+  // the bee. Order matters — resolve first so cancel-all can't claim it.
+  await resolveRequest(record.name, stopFailedRequestId(record.name, record.runtimeGeneration ?? 0), { by: "stop-succeeded" }).catch(() => undefined);
+  await cancelOpenRequests(record.name, {}, "scope-closed", "retired").catch(() => undefined);
   await updateSession(record.name, {
     status: "done",
     updatedAt: new Date().toISOString(),

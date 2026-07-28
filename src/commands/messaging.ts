@@ -9,6 +9,8 @@ import { readHsrMeta } from "../hsr/runDir.js";
 import { gatherTitleContext, generateTitle } from "../naming.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
+import { needsInputRequestId } from "../requests/keys.js";
+import { openAndResolveRequest } from "../requests/store.js";
 import { recordSeal, sealArtifactExampleJson, sealHelpText, validateSealArtifact } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { appendLedger, updateSession, type SessionRecord } from "../store.js";
@@ -441,6 +443,36 @@ export async function cmdAnswer(parsed: Parsed) {
   } finally {
     client.close();
   }
+
+  // Durable resolution AFTER the RPC succeeded, under the SAME id the live
+  // view derives (requests/keys.ts). The events tail keeps showing
+  // pendingNeedsInput until turn_end, so this resolved record is what flips
+  // BeeView out of needs-reply immediately — and openRequest's idempotency is
+  // what stops the daemon's next reconcile tick from re-opening it. Daemon
+  // down: no open record exists yet, so this backfills open+resolve in one
+  // locked write. Best-effort: the answer already landed on the runner.
+  const openedAt = Number.isFinite(pending.ts) && pending.ts > 0 ? new Date(pending.ts).toISOString() : undefined;
+  const callerBee = process.env.HIVE_BEE;
+  await openAndResolveRequest(
+    record.name,
+    {
+      id: needsInputRequestId(record.name, pending),
+      kind: pending.kind,
+      scope: "turn",
+      grade: "structured",
+      generation: record.runtimeGeneration ?? 0,
+      ...(openedAt !== undefined ? { openedAt } : {}),
+      question: pending.question,
+      ...(pending.tool !== undefined ? { tool: pending.tool } : {}),
+      ...(pending.options !== undefined ? { options: pending.options } : {}),
+      ...(pending.optionDetails !== undefined ? { optionDetails: pending.optionDetails } : {}),
+      ...(pending.questions !== undefined ? { questions: pending.questions } : {}),
+      ...(pending.multiSelect !== undefined ? { multiSelect: pending.multiSelect } : {}),
+      ...(pending.input !== undefined ? { input: pending.input } : {}),
+      evidence: { grade: "structured", source: "hsr-events", ...(openedAt !== undefined ? { observedAt: openedAt } : {}), detail: "needs_input" },
+    },
+    { by: callerBee ? `hive-answer:${callerBee}` : "hive-answer", resolution: answer },
+  ).catch(() => undefined);
 
   if (isPretty()) console.log(actionLine("ok", "answer", [bold(record.name), dim(pending.requestId)]));
   else console.log(`answered\t${record.name}\t${pending.requestId}`);

@@ -2,6 +2,7 @@ import { activateAccountIntoHome, listAccounts, syncAccountCredentialsToVault, t
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, splitShellWords } from "./agents.js";
 import { resumeArgsForAgent } from "./drivers.js";
 import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
+import { closeRequestsForNewIncarnation } from "./requests/store.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 import { nextRuntimeIncarnationPatch } from "./seal.js";
@@ -198,6 +199,14 @@ export async function swapAccount(
       updatedAt: new Date().toISOString(),
     };
     await saveSessionLocked(updated);
+    // The swap replaced the runtime: requests opened against the previous
+    // generation are superseded (next to the nextRuntimeIncarnationPatch
+    // application, per docs/INTERVENTION_REQUESTS.md; the daemon reconciler
+    // backstops a missed call). Best-effort — never fail the swap over it.
+    await closeRequestsForNewIncarnation(
+      record.name,
+      updated.runtimeGeneration ?? (current.runtimeGeneration ?? 0) + 1,
+    ).catch(() => undefined);
     await appendLedger({
       type: "account.swap",
       session: record.name,
