@@ -309,6 +309,63 @@ test("cross-controller run sweep lock prevents duplicate irreversible spawns", a
   });
 });
 
+test("crash recovery waits for adoption evidence before failing an unconfirmed spawn", async () => {
+  await withTempStore(async (dir) => {
+    const definition: CombSpec = {
+      formatVersion: 2,
+      name: "recover-agent",
+      input: { kind: "informal", description: "none" },
+      nodes: [reviewerNode("work")],
+      edges: [],
+    };
+    const run = await createRun({
+      definition,
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: { firstEvidenceMs: 100, retireAgentsOnTerminal: false },
+    });
+    let now = Date.parse("2026-07-28T12:00:00.000Z");
+    let spawns = 0;
+    let signalSpawn!: () => void;
+    let releaseSpawn!: (result: { name: string; id?: string }) => void;
+    const spawnStarted = new Promise<void>((resolve) => { signalSpawn = resolve; });
+    const spawnResult = new Promise<{ name: string; id?: string }>((resolve) => { releaseSpawn = resolve; });
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async () => {
+        spawns += 1;
+        signalSpawn();
+        return spawnResult;
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      now: () => now,
+    };
+
+    const interruptedSweep = sweepCombs(deps, [], new Map());
+    await spawnStarted;
+    const withinWindow = await sweepCombs(deps, [], new Map());
+    assert.equal(withinWindow.some((outcome) => outcome.detail === "executing spawn is still within its adoption window"), true);
+    assert.equal((await loadRun(run.id))?.activations["work@1#0"]?.status, "active");
+
+    now += 101;
+    const afterWindow = await sweepCombs(deps, [], new Map());
+    assert.equal(afterWindow.some((outcome) => outcome.error === "executing spawn was not adoptable"), true);
+    releaseSpawn({ name: `late-${run.id}` });
+    await interruptedSweep;
+
+    const stored = (await loadRun(run.id))!;
+    assert.equal(spawns, 1);
+    assert.equal(stored.activations["work@1#0"]?.status, "failed");
+    assert.equal(stored.activations["work@1#0"]?.failure?.code, "spawn-adoption-missing");
+    assert.equal(Object.values(stored.effects)[0]?.status, "failed");
+    assert.deepEqual(stored.activations["work@1#0"]?.beeHandles, []);
+  });
+});
+
 test("cancellation is a fence before effects and crossing it during execute becomes ambiguous", async () => {
   await withTempStore(async (dir) => {
     const definition: CombSpec = {

@@ -73,6 +73,16 @@ export async function cmdComb(parsed: Parsed): Promise<void> {
   }
 }
 
+/** Internal one-shot entrypoint used by daemon integration and acceptance tests. */
+export async function runCombSweepExec(): Promise<void> {
+  const [{ createCombSweeper }, { listSessions }] = await Promise.all([
+    import("../daemon/combSweep.js"),
+    import("../store.js"),
+  ]);
+  const sweep = createCombSweeper({}, { detached: false });
+  console.log(JSON.stringify(await sweep(await listSessions(), new Map()), null, 2));
+}
+
 async function combLint(parsed: Parsed) {
   const source = requiredArg(parsed, 1, "Usage: hive comb lint <file.json|file.ts|-> [--json]");
   const value = await loadDefinition(source);

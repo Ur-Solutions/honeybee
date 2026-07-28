@@ -13,11 +13,10 @@ import { cmdClean } from "./commands/clean.js";
 import { cmdColony } from "./commands/colony.js";
 import { cmdCompletion, cmdConfig } from "./commands/config.js";
 import { cmdDaemon, cmdSessions, cmdSync } from "./commands/daemon.js";
-import { createCombSweeper } from "./daemon/combSweep.js";
 import { cmdEvents } from "./commands/events.js";
 import { cmdFlight } from "./commands/flight.js";
 import { cmdFlow, runFlowExec } from "./commands/flow.js";
-import { cmdComb, COMB_HELP } from "./commands/comb.js";
+import { cmdComb, COMB_HELP, runCombSweepExec } from "./commands/comb.js";
 import { cmdFork, cmdForkLaunch, cmdSplit } from "./commands/fork.js";
 import { cmdHandoff } from "./commands/handoff.js";
 import { cmdFrame } from "./commands/frame.js";
@@ -40,7 +39,6 @@ import { cmdSwarm } from "./commands/swarm.js";
 import { cmdTask } from "./commands/tasks.js";
 import { sealHelpText } from "./seal.js";
 import { closeAllSubstrates } from "./substrates/index.js";
-import { listSessions } from "./store.js";
 import { waitHelpText } from "./wait.js";
 
 // Re-exports consumed by the unit tests (tests/*.test.ts import these from
@@ -64,8 +62,7 @@ async function main(argv: string[]) {
     return;
   }
   if (argv[0] === "__comb-sweep") {
-    const sweep = createCombSweeper({}, { detached: false });
-    console.log(JSON.stringify(await sweep(await listSessions(), new Map()), null, 2));
+    await runCombSweepExec();
     return;
   }
   if (argv[0] === "__hsr-run") {

@@ -159,7 +159,8 @@ function planAgentEffects(run: RunRecord, now: string): PreparedAgentEffect[] {
   let available = Math.max(0, run.policies.maxConcurrentActivations - activeCount);
   const plans: PreparedAgentEffect[] = [];
   for (const activation of currentActivations(run)) {
-    if (available <= 0 || activation.status !== "pending" || activation.nextEligibleAt && activation.nextEligibleAt > now) continue;
+    if (activation.status !== "pending" && activation.status !== "active") continue;
+    if (activation.status === "pending" && (available <= 0 || activation.nextEligibleAt && activation.nextEligibleAt > now)) continue;
     const node = run.currentSnapshot.definition.nodes.find((candidate) => candidate.id === activation.address.nodeId);
     if (node?.executor !== "agent") continue;
     if (node.agent.capacity.kind !== "spawn") {
@@ -194,9 +195,11 @@ function planAgentEffects(run: RunRecord, now: string): PreparedAgentEffect[] {
         recordRunEvent(run, "comb.violation", activation.address, { code: "effect-key-collision", effectKey: key });
       } else if (existing.status === "prepared" || existing.status === "executing") {
         plans.push({ runId: run.id, activationId: activation.id, effectKey: key, request });
+        if (activation.status === "pending") available -= 1;
       }
       continue;
     }
+    if (activation.status === "active") continue;
     const effect: EffectRecord = {
       key,
       scope: { kind: "activation", activation: activation.address },
