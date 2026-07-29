@@ -38,6 +38,7 @@ import { cmdState } from "./commands/state.js";
 import { cmdSwarm } from "./commands/swarm.js";
 import { cmdTask } from "./commands/tasks.js";
 import { cmdTemplate } from "./commands/template.js";
+import { cmdTrack } from "./commands/track.js";
 import { sealHelpText } from "./seal.js";
 import { closeAllSubstrates } from "./substrates/index.js";
 import { waitHelpText } from "./wait.js";
@@ -252,6 +253,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "task":
       await cmdTask(parsed);
       break;
+    case "track":
+      await cmdTrack(parsed);
+      break;
     case "daemon":
       await cmdDaemon(parsed);
       break;
@@ -353,6 +357,7 @@ function printHelp() {
         ["brief", "<selector> <text>", "send a one-time context brief"],
         ["buz", "<send|inbox|read|…>", "addressed messaging: three-tier delivery + per-bee policy"],
         ["task", "<add|ls|done|…>", "shared micro-task lists with gated auto-supply (task supply <bee> --on)"],
+        ["track", "<define|attach|status|…>", "expected step sequences attached to one bee"],
         ["rename", "<selector> <title>", "set a bee's display title (--here for current bee, --auto to derive one, --clear)"],
         ["tag", "<selector> <tag>...", "add/remove user tags on bees (--remove, --list)"],
         ["seal", "<selector> --from <p>", "record a typed handoff artifact"],

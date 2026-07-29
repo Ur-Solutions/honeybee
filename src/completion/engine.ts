@@ -12,6 +12,7 @@ import { BOOLEAN_FLAGS } from "../parse.js";
 import { listSessions, type SessionRecord } from "../store.js";
 import { listSwarms, type SwarmRecord } from "../swarm.js";
 import { listTemplates, type AgentTemplate } from "../template.js";
+import { listTracks, type Track } from "../track.js";
 import { listTmuxSessions } from "../tmux.js";
 import {
   ACCOUNT_FIRST_ARG,
@@ -47,6 +48,7 @@ export type CompletionState = {
   colonies?: ColonyRecord[];
   swarms?: SwarmRecord[];
   frames?: Frame[];
+  tracks?: Track[];
   templates?: AgentTemplate[];
   flows?: Flow[];
   nodes?: NodeRecord[];
@@ -107,12 +109,13 @@ export function getCompletionsFromState(words: string[], state: CompletionState)
 
 export async function getCompletions(words: string[]): Promise<string[]> {
   try {
-    const [records, live, colonies, swarms, frames, templates, nodes, flows, runs, accounts] = await Promise.all([
+    const [records, live, colonies, swarms, frames, tracks, templates, nodes, flows, runs, accounts] = await Promise.all([
       listSessions(),
       listTmuxSessions(),
       listColonies().catch(() => []),
       listSwarms().catch(() => []),
       listFrames().catch(() => []),
+      listTracks().catch(() => []),
       listTemplates().catch(() => []),
       listNodes().catch(() => []),
       listFlows().catch(() => []),
@@ -125,6 +128,7 @@ export async function getCompletions(words: string[]): Promise<string[]> {
       colonies,
       swarms,
       frames,
+      tracks,
       templates,
       nodes,
       flows,
@@ -158,6 +162,8 @@ function resolveFlagValueCandidates(kind: FlagValueKind, state: CompletionState)
       return (state.frames ?? []).map((f) => f.name);
     case "template":
       return (state.templates ?? []).map((template) => template.name);
+    case "track":
+      return (state.tracks ?? []).map((track) => track.name);
     case "shell":
       return SHELLS;
     case "node":
@@ -216,6 +222,9 @@ function nounCommandCandidates(command: string, args: string[], state: Completio
     }
     if (command === "flow" && sub === "define") {
       return fileCandidates(currentArg, [".json", ".ts"], state.cwd ?? process.cwd());
+    }
+    if (command === "track" && sub === "define") {
+      return fileCandidates(currentArg, [".json"], state.cwd ?? process.cwd());
     }
     const argKind = sub ? NOUN_SUB_ARG[command]?.[sub] : undefined;
     if (!argKind) return [];
