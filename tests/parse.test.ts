@@ -45,6 +45,18 @@ test("--comb consumes a registry name for comb filters and attached spawn/x comm
   }
 });
 
+test("--track and track --version consume values", () => {
+  for (const argv of [
+    ["spawn", "codex", "--track", "release"],
+    ["x", "codex", "do work", "--track", "release"],
+  ]) {
+    const parsed = parse(argv);
+    assert.equal(flag(parsed, "track"), "release");
+  }
+  const shown = parse(["track", "show", "release", "--version", "2"]);
+  assert.equal(flag(shown, "version"), "2");
+});
+
 test("BOOLEAN_FLAGS is exported so completion can skip value-less flags", () => {
   assert.ok(BOOLEAN_FLAGS.has("json"));
   assert.ok(BOOLEAN_FLAGS.has("yolo"));

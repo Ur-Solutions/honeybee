@@ -105,6 +105,7 @@ export function parse(argv: string[]): Parsed {
       const key = item.slice(2, eq > -1 ? eq : undefined);
       const booleanFlag = BOOLEAN_FLAGS.has(key) &&
         !(command === "comb" && (key === "version" || key === "last" || key === "comb")) &&
+        !(command === "track" && key === "version") &&
         !((command === "spawn" || command === "x" || command === "run") && key === "comb");
       const nextIsValue = i + 1 < tail.length && (!tail[i + 1]!.startsWith("-") || tail[i + 1] === "-");
       const value = eq > -1 ? item.slice(eq + 1) : booleanFlag ? true : nextIsValue ? tail[++i]! : true;
@@ -116,6 +117,7 @@ export function parse(argv: string[]): Parsed {
       const key = item.slice(1);
       const booleanFlag = BOOLEAN_FLAGS.has(key) &&
         !(command === "comb" && (key === "version" || key === "last" || key === "comb")) &&
+        !(command === "track" && key === "version") &&
         !((command === "spawn" || command === "x" || command === "run") && key === "comb");
       const nextIsValue = i + 1 < tail.length && (!tail[i + 1]!.startsWith("-") || tail[i + 1] === "-");
       const value = booleanFlag ? true : nextIsValue ? tail[++i]! : true;

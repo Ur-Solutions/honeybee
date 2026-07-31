@@ -27,7 +27,10 @@ export const FLOW_SUBCOMMANDS = ["list", "ls", "define", "inspect", "remove", "r
 export const LOOP_SUBCOMMANDS = ["launch", "template", "start", "status", "logs", "stop", "list", "ls"];
 export const BUZ_SUBCOMMANDS = ["send", "inbox", "outbox", "queue", "read", "cancel", "purge", "config"];
 export const TASK_SUBCOMMANDS = ["add", "ls", "show", "start", "done", "block", "cancel", "claim", "mv", "edit", "supply", "lists"];
-export const TRACK_SUBCOMMANDS = ["define", "list", "ls", "show", "attach", "status", "detach", "step", "exception"];
+export const TRACK_SUBCOMMANDS = [
+  "define", "list", "ls", "show", "attach", "queue", "queue-list",
+  "status", "detach", "step", "subtask", "exception",
+];
 export const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
 export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "pause", "resume", "remove"];
 export const KEYS_SUBCOMMANDS = ["print", "path", "check"];
@@ -77,7 +80,7 @@ export const SHELL_FIRST_ARG = new Set(["completion"]);
 export const ACCOUNT_FIRST_ARG = new Set(["login", "activate", "usage", "limits"]);
 
 export const FLAGS_BY_COMMAND: Record<string, string[]> = {
-  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--autoswap", "--colony", "--count", "--frame", "--template", "--swarm-id", "--brief", "--briefed", "--contract", "--preamble", "--no-preamble", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
+  spawn: ["--name", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--autoswap", "--colony", "--count", "--frame", "--template", "--swarm-id", "--track", "--track-version", "--brief", "--briefed", "--contract", "--preamble", "--no-preamble", "--node", "--substrate", "--here", "--yolo", "--no-yolo", "--dangerous", "--no-accept-trust", "--no-wait", "--include-paused", "--yes"],
   template: ["--json", "--wait", "--attach", "--cwd", "--account", "--env", "--name", "--preamble", "--no-preamble", "--yolo", "--no-yolo", "--last", "--transcript", "--idle-ms", "--timeout-ms", "--poll-ms", "-n", "--limit"],
   pool: ["--json", "--all", "--ttl", "--count", "--no-keep", "--here", "--yolo", "--name", "--account"],
   account: ["--email", "--home", "--json", "--no-wait", "--timeout-ms"],
@@ -105,14 +108,14 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
     "--yolo", "--dangerous",
     "--idle-ms", "--timeout-ms", "--poll-ms", "--boot-ms", "--wait-ms",
-    "--node", "--substrate",
+    "--node", "--substrate", "--track", "--track-version",
     "-n", "--limit", "--json",
     "--include-paused", "--yes",
   ],
   x: [
     "--template", "--prompt", "-p", "--cwd", "--pool", "--no-keep", "--home", "--profile", "--account", "--ttl", "--env", "--name", "--colony",
     "--accept-trust", "--trust", "--no-accept-trust", "--no-trust", "--force-send",
-    "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate", "--here", "--include-paused", "--yes",
+    "--yolo", "--dangerous", "--boot-ms", "--node", "--substrate", "--track", "--track-version", "--here", "--include-paused", "--yes",
   ],
   send: ["--prompt", "-p"],
   kill: ["--comb", "--yes", "--force"],
@@ -152,7 +155,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
     "--sender", "--sender-human", "--status", "--before", "--after",
     "--on", "--off", "--limit", "--json",
   ],
-  track: ["--json", "--note"],
+  track: ["--json", "--note", "--version", "--start-at", "--queued-by", "--exception", "--step"],
   daemon: ["--tick-ms", "--json", "--label", "--force", "--follow", "--lines", "-n"],
   state: ["--state", "--colony", "--node", "--done", "--json"],
   events: ["--follow", "-f", "--json", "--type", "--session", "--since", "--lines", "-n"],
@@ -186,6 +189,7 @@ export const FLAG_VALUE_KINDS: Record<string, FlagValueKind> = {
   "--swarm-id": "swarm",
   "--frame": "frame",
   "--template": "template",
+  "--track": "track",
   "--node": "node",
   "--kind": "node-kind",
   "--bee": "bee",
@@ -272,6 +276,8 @@ export const NOUN_SUB_ARG: Record<string, Record<string, NounSubArgKind>> = {
   track: {
     show: "track",
     attach: "track",
+    queue: "track",
+    "queue-list": "session-any",
     status: "session-any",
     detach: "session-any",
   },
