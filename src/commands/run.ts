@@ -17,6 +17,7 @@ import { formatShellCommand } from "../tmux.js";
 import { waitForIdle } from "../wait.js";
 import { acceptsTrust, cleanupAfterRun, confirmPausedAccount, dangerousMode, deliverPromptText, formatPaneExcerpt, hasFlag, hsrSubstrateRequested, includePausedFlag, resolveSpawnCwd, sleep, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { cmdSpawn, resolveAccountFlag, resolveProfileOverlay, resolveSpawnAgentWithAuto } from "../commands/spawn.js";
+import { loadTrackAttachment } from "../track.js";
 
 /**
  * run/x/xa spawn exactly one bee — reject cohort flags with a command-specific
@@ -187,17 +188,28 @@ export async function cmdX(parsed: Parsed) {
   if (!agent || !prompt) throw new Error("Usage: hive x <bee> <prompt> [--template <name>] [--cwd <dir>] [--account <name|auto>] [--env KEY=VALUE] [--name <id>] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]");
   assertSingleBeeInvocation(parsed, "hive x spawns a single bee; to prompt a swarm use: hive spawn <bee> --count <n> && hive send <selector> <prompt>");
   const attachedComb = typeof flag(parsed, "comb") === "string";
+  const requestedTrack = typeof flag(parsed, "track") === "string";
 
   // The waitForPromptReady below is authoritative; skip spawn's own readiness
   // confirmation so a slow boot is only waited for once.
   const record = await spawnDelegated(parsed, agent, {
     mutateFlags: (flags) => {
-      flags.set("no-wait", true);
+      // A track's standing postscript is the first turn. Let spawn wait for a
+      // tmux prompt and combine the x prompt with it so the agent receives one
+      // coherent initial turn. HSR does not block on this readiness path.
+      if (!requestedTrack) flags.set("no-wait", true);
       if (attachedComb) flags.set("brief", prompt);
+      if (requestedTrack) {
+        flags.set("brief", prompt);
+        // A comb already owns delivery of the work prompt; in the combined
+        // case the track adds only its standing postscript as a second turn.
+        if (!attachedComb) flags.set("track-prompt", true);
+      }
     },
   });
 
-  if (!attachedComb) {
+  const attachedTrack = requestedTrack && Boolean(await loadTrackAttachment(record.name));
+  if (!attachedComb && !attachedTrack) {
     await waitForPromptReady(record, parsed);
     await deliverPromptToBee(record, prompt);
   }

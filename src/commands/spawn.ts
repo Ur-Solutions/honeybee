@@ -11,7 +11,7 @@ import { assertExecutableAvailable } from "../execCheck.js";
 import { listFlows } from "../flow/index.js";
 import { actionLine, bold, dim, formatRelativeTime, isPretty, note, tildify } from "../format.js";
 import { listFrames, loadFrame, type Frame } from "../frame.js";
-import { writeSpawnOptions } from "../hiveState.js";
+import { writeHiveState, writeSpawnOptions } from "../hiveState.js";
 import { adapterFor } from "../hsr/adapters/index.js";
 import { mintEphemeralCredential, type EphemeralCredential } from "../hsr/remoteCreds.js";
 import { harnessSupportsRemoteHsr } from "../hsr/harness.js";
@@ -28,7 +28,7 @@ import { createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarm
 import { pickRoundRobinAccount } from "../limits/autoPick.js";
 import { startSpawnTimer, type SpawnTimer } from "../spawnTiming.js";
 import { chooseNewBee, type SpawnTuiAccount } from "../spawnTui.js";
-import { loadSession, safeName, saveSession, type SessionRecord } from "../store.js";
+import { appendLedger, loadSession, safeName, saveSession, updateSession, type SessionRecord } from "../store.js";
 import { resolveSpawningBeeId } from "../spawnParent.js";
 import { resolveRemoteCwd } from "../hsr/remoteWorkingCopy.js";
 import { localSubstrate, remoteHsrSubstrateForNode, substrateForRecord } from "../substrates/index.js";
@@ -38,7 +38,7 @@ import { linkHere } from "../spawnLink.js";
 import { randomUUID } from "node:crypto";
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
-import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
+import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverPromptText, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { flowRun } from "../commands/flow.js";
 import { attachBeeToRun } from "../comb/attachment.js";
 import { cancelRunWithDisposition, entryNodeIds } from "../comb/store.js";
@@ -49,6 +49,7 @@ import type { JsonValue, StoredCombVersion } from "../comb/types.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 import { hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../hsr/runDir.js";
 import { transactionalRetire } from "../kill.js";
+import { attachTrack, loadTrack } from "../track.js";
 
 export async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
   if (flag(parsed, "template") !== undefined) {
@@ -59,6 +60,9 @@ export async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
   const count = resolveSpawnCount(parsed);
   if (flag(parsed, "comb") !== undefined && (frameName || count > 1)) {
     throw new Error("hive spawn --comb attaches exactly one bee; --frame and --count > 1 are not supported");
+  }
+  if (flag(parsed, "track") !== undefined && (frameName || count > 1)) {
+    throw new Error("hive spawn --track attaches exactly one bee; --frame and --count > 1 are not supported");
   }
   let records: SessionRecord[];
   if (frameName) {
@@ -879,6 +883,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--template <name>] [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
   const combAttachment = await prepareSpawnCombAttachment(parsed);
+  const trackAttachment = await prepareSpawnTrackAttachment(parsed);
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
   const timer = startSpawnTimer(requested);
   // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
@@ -1037,8 +1042,67 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
     await confirmSpawnReady(parsed, record);
     timer.mark("ready");
   }
+  if (trackAttachment) {
+    try {
+      await attachTrack(trackAttachment.name, {
+        bee: record.name,
+        ...(record.id ? { beeId: record.id } : {}),
+        ...(trackAttachment.version !== undefined ? { version: trackAttachment.version } : {}),
+        deliver: async (postscript) => {
+          const prompt = truthy(flag(parsed, "track-prompt")) && briefText
+            ? `${briefText}\n\n${postscript}`
+            : postscript;
+          await deliverPromptText(record, prompt);
+          const at = new Date().toISOString();
+          record = await updateSession(record.name, {
+            updatedAt: at,
+            status: "running",
+            lastPrompt: prompt,
+            lastPromptAt: at,
+          }) ?? { ...record, updatedAt: at, status: "running", lastPrompt: prompt, lastPromptAt: at };
+          await writeHiveState(record, "working");
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await appendLedger({
+        type: "track.attach_failed",
+        track: trackAttachment.name,
+        ...(trackAttachment.version !== undefined ? { version: trackAttachment.version } : {}),
+        bee: record.name,
+        beeId: record.id,
+        error: message,
+        at: new Date().toISOString(),
+      });
+      const warning = `spawned ${record.name}, but track ${trackAttachment.name} failed to attach: ${message}; bee remains live and untracked`;
+      if (isPretty()) console.error(actionLine("warn", "track", [warning]));
+      else console.error(`warn\ttrack.attach_failed\t${record.name}\t${trackAttachment.name}\t${message}`);
+    }
+  }
   timer.report(record.name);
   return record;
+}
+
+type PreparedSpawnTrackAttachment = {
+  name: string;
+  version?: number;
+};
+
+async function prepareSpawnTrackAttachment(parsed: Parsed): Promise<PreparedSpawnTrackAttachment | undefined> {
+  const rawName = flag(parsed, "track");
+  if (rawName === undefined) return undefined;
+  if (typeof rawName !== "string" || rawName.trim().length === 0) {
+    throw new Error("--track requires a track name");
+  }
+  const rawVersion = flag(parsed, "track-version");
+  const version = rawVersion === undefined
+    ? undefined
+    : typeof rawVersion === "string" && Number.isSafeInteger(Number(rawVersion)) && Number(rawVersion) >= 1
+      ? Number(rawVersion)
+      : (() => { throw new Error("--track-version must be an integer >= 1"); })();
+  const track = await loadTrack(rawName, version);
+  if (!track) throw new Error(version ? `track not found: ${rawName}@${version}` : `track not found: ${rawName}`);
+  return { name: rawName, ...(version !== undefined ? { version } : {}) };
 }
 
 type PreparedSpawnCombAttachment = {
