@@ -812,14 +812,19 @@ test("syncClaudeChainToVault pulls the freshest link from the account's homes", 
     const now = Date.now();
     await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-old", now + 1_000));
     const home = join(dir, "homes", account.id);
+    const loginHome = join(dir, "login-homes", account.id);
     await mkdir(home, { recursive: true });
+    await mkdir(loginHome, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-live", now + 8 * 3_600_000));
+    await writeFile(join(loginHome, ".credentials.json"), chainJson("tok-stale-sibling", now + 2_000));
 
     const deps = { fetchProfileEmail: async () => "sync@a.b" };
     const first = await syncClaudeChainToVault(account, undefined, deps);
     assert.equal(first.vaultUpdated, true);
     const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
     assert.equal(vault.claudeAiOauth.accessToken, "tok-live");
+    const sibling = JSON.parse(await readFile(join(loginHome, ".credentials.json"), "utf8"));
+    assert.equal(sibling.claudeAiOauth.accessToken, "tok-live", "harvested chain propagates to every active account home");
 
     const second = await syncClaudeChainToVault(account, undefined, deps);
     assert.equal(second.vaultUpdated, false);

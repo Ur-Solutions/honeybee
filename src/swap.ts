@@ -1,4 +1,12 @@
-import { activateAccountIntoHome, listAccounts, syncAccountCredentialsToVault, type AccountRecord } from "./accounts.js";
+import { copyFile, mkdir, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  activateAccountIntoHome,
+  defaultHomeForAccount,
+  listAccounts,
+  syncAccountCredentialsToVault,
+  type AccountRecord,
+} from "./accounts.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, splitShellWords } from "./agents.js";
 import { resumeArgsForAgent } from "./drivers.js";
 import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
@@ -9,10 +17,12 @@ import { nextRuntimeIncarnationPatch } from "./seal.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // swap-account: the req-1 MECHANISM. Stop the bee's process, activate the
-// target account's credentials into the bee's home, resume the same provider
-// session in the same home, record the binding. Purely mechanical and fully
-// ledger-logged; the *decision* to swap lives in the autoswap dispatcher (an
-// opt-in deterministic flow) or above honeybee entirely.
+// target account's credentials into that account's dedicated home, resume the
+// same provider session there, and record both the binding and new home. Never
+// re-credential the source home in place: several live bees may share an
+// account home, so overwriting it would silently invalidate all of them. Purely
+// mechanical and fully ledger-logged; the *decision* to swap lives in the
+// autoswap dispatcher (an opt-in deterministic flow) or above honeybee.
 // ──────────────────────────────────────────────────────────────────────────
 
 export type SwapAccountOptions = {
@@ -24,6 +34,8 @@ export type SwapAccountOptions = {
   activate?: typeof activateAccountIntoHome;
   /** Registry reader (tests). Defaults to listAccounts; used for the provider-match guard. */
   listAccounts?: typeof listAccounts;
+  /** Target-account home resolver (tests). Defaults to defaultHomeForAccount. */
+  homeForAccount?: typeof defaultHomeForAccount;
   /** Local HSR runner-host launcher (tests). Defaults to spawnHsrHost. */
   spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
   /** Local HSR runner-host readiness probe (tests). Defaults to waitForHsrHost. */
@@ -32,6 +44,42 @@ export type SwapAccountOptions = {
 
 const DEFAULT_POLL_ATTEMPTS = 8;
 const DEFAULT_POLL_INTERVAL_MS = 500;
+
+/**
+ * Provider resume metadata lives under the identity home for Claude and Codex.
+ * Moving credentials without the recorded transcript makes `--resume <id>`
+ * fail with "No conversation found" even though the provider id is valid.
+ * Copy the known, non-secret transcript to the same relative location in the
+ * target home and return its new path. Records without discovered transcript
+ * metadata keep their existing path and rely on the provider's own resume
+ * mechanism, preserving legacy/non-file-backed harness behavior.
+ */
+async function relocateSessionTranscript(
+  record: SessionRecord,
+  sourceHomePath: string,
+  targetHomePath: string,
+): Promise<string | undefined> {
+  if (!record.transcriptPath || resolve(sourceHomePath) === resolve(targetHomePath)) {
+    return record.transcriptPath;
+  }
+  const sourceTranscript = resolve(record.transcriptPath);
+  const sourceHome = resolve(sourceHomePath);
+  const relativeTranscript = relative(sourceHome, sourceTranscript);
+  if (
+    !relativeTranscript ||
+    relativeTranscript === ".." ||
+    relativeTranscript.startsWith(`..${sep}`) ||
+    isAbsolute(relativeTranscript)
+  ) {
+    return record.transcriptPath;
+  }
+  const info = await stat(sourceTranscript).catch(() => null);
+  if (!info?.isFile()) return record.transcriptPath;
+  const targetTranscript = join(targetHomePath, relativeTranscript);
+  await mkdir(dirname(targetTranscript), { recursive: true });
+  await copyFile(sourceTranscript, targetTranscript);
+  return targetTranscript;
+}
 
 export async function swapAccount(
   record: SessionRecord,
@@ -61,7 +109,8 @@ export async function swapAccount(
         `Swap requires a dedicated home (spawn with --home or --account).`,
     );
   }
-  if (record.accountId === account.id) {
+  const targetHomePath = (options.homeForAccount ?? defaultHomeForAccount)(account);
+  if (record.accountId === account.id && resolve(record.homePath) === resolve(targetHomePath)) {
     throw new Error(`Bee ${record.name} is already on account ${account.id}`);
   }
 
@@ -77,31 +126,44 @@ export async function swapAccount(
     //    the session and resurrect the deleted bee.
     const current = await loadSession(record.name);
     if (!current) throw new Error(`Session ${record.name} no longer exists; aborting swap`);
+    if (!current.homePath) {
+      throw new Error(`Session ${record.name} lost its dedicated home; aborting swap`);
+    }
+    if (current.accountId === account.id && resolve(current.homePath) === resolve(targetHomePath)) {
+      throw new Error(`Bee ${record.name} is already on account ${account.id}`);
+    }
+    const sourceHomePath = current.homePath;
 
     // 1. Ensure the process is stopped. The tmux session must be fully gone
     //    before we relaunch into the same target.
-    if (await substrate.hasSession(record.tmuxTarget)) {
-      const killResult = await substrate.kill(record.tmuxTarget);
+    if (await substrate.hasSession(current.tmuxTarget)) {
+      const killResult = await substrate.kill(current.tmuxTarget);
       if (!killResult.ok) {
         throw new Error(`Could not stop ${record.name} before swap: ${killResult.stderr || killResult.stdout || `exit ${killResult.exitCode}`}`);
       }
     }
     let gone = false;
     for (let i = 0; i < pollAttempts; i += 1) {
-      if (!(await substrate.hasSession(record.tmuxTarget).catch(() => true))) {
+      if (!(await substrate.hasSession(current.tmuxTarget).catch(() => true))) {
         gone = true;
         break;
       }
       if (pollIntervalMs > 0) await sleep(pollIntervalMs);
     }
-    if (!gone) throw new Error(`Session ${record.tmuxTarget} still alive after kill; aborting swap`);
+    if (!gone) throw new Error(`Session ${current.tmuxTarget} still alive after kill; aborting swap`);
 
-    // 2. Rescue the current account's freshest credentials from this home
-    //    before activation overwrites it, then activate the target account.
+    // Resume ids are backed by home-local transcript files for Claude/Codex.
+    // Carry the discovered transcript before launching from the new home.
+    const relocatedTranscriptPath = await relocateSessionTranscript(current, sourceHomePath, targetHomePath);
+
+    // 2. Rescue the current account's freshest credentials from its source
+    //    home, then activate the target in the target account's own home. The
+    //    two paths deliberately differ during a real swap: changing credentials
+    //    in the source home would break every other bee sharing that account.
     const rescueRegistry = current.accountId && accountRegistry.length === 0 ? await (options.listAccounts ?? listAccounts)() : accountRegistry;
     const currentAccount = current.accountId ? rescueRegistry.find((candidate) => candidate.id === current.accountId) : undefined;
     if (currentAccount && currentAccount.tool === tool && currentAccount.id !== account.id) {
-      await syncAccountCredentialsToVault(currentAccount, record.homePath!, { trustExtraHome: true }).catch(() => undefined);
+      await syncAccountCredentialsToVault(currentAccount, sourceHomePath, { trustExtraHome: true }).catch(() => undefined);
     }
     let spec: ReturnType<typeof resolveAgent>;
     let paneId: string | undefined;
@@ -109,10 +171,10 @@ export async function swapAccount(
     let runnerPid: number | undefined;
     const incarnation = await nextRuntimeIncarnationPatch(current);
     try {
-      await activate(account, record.homePath!);
+      await activate(account, targetHomePath);
 
-      // 3. Resume the same provider session in the same provider home, with the
-      //    driver's explicit identity env. The record's own model (a deliberate
+      // 3. Resume the same provider session in the target account's home, with
+      //    the driver's explicit identity env. The record's own model (a deliberate
       //    `hive set-model` choice) wins over the NEW account's default model;
       //    the account still supplies opencode's provider so a swapped bee keeps
       //    its `--model <provider>/<model>` selector (adversarial review fix #4).
@@ -130,7 +192,7 @@ export async function swapAccount(
       const model = current.model ?? account.model;
       const modelExtra = current.modelExtraArgs ? splitShellWords(current.modelExtraArgs) : [];
       spec = resolveAgent(current.requestedAgent ?? current.agent, [...modelExtra, ...(hsr ? [] : resumeArgs(tool, current.providerSessionId))], {
-        home: current.homePath,
+        home: targetHomePath,
         yolo: sniffYolo(current.command),
         identity: true,
         ...(model ? { model } : {}),
@@ -168,12 +230,13 @@ export async function swapAccount(
         launcherPgid = launch.launcherPgid;
       }
     } catch (error) {
-      // Activation happens before relaunch. If anything after it fails, restore
-      // the old account into the home so the persisted binding and on-disk
-      // credentials cannot diverge (the exact failure mode fixed here).
-      if (currentAccount) {
+      // Activation happens before relaunch. A normal swap uses a distinct
+      // target home, so the source was never overwritten and needs no rollback.
+      // Retain the old restoration only for a deliberately custom layout where
+      // both accounts resolve to the same home.
+      if (currentAccount && resolve(sourceHomePath) === resolve(targetHomePath)) {
         try {
-          await activate(currentAccount, record.homePath!);
+          await activate(currentAccount, sourceHomePath);
         } catch (rollbackError) {
           const original = error instanceof Error ? error.message : String(error);
           const rollback = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
@@ -191,6 +254,8 @@ export async function swapAccount(
       ...current,
       ...incarnation,
       accountId: account.id,
+      homePath: targetHomePath,
+      ...(relocatedTranscriptPath ? { transcriptPath: relocatedTranscriptPath } : {}),
       command: shellCommand(spec),
       ...(paneId ? { agentPaneId: paneId } : {}),
       ...(launcherPgid ? { launcherPgid } : {}),
@@ -212,7 +277,8 @@ export async function swapAccount(
       session: record.name,
       from: record.accountId ?? null,
       to: account.id,
-      home: record.homePath,
+      fromHome: sourceHomePath,
+      home: targetHomePath,
       providerSessionId: record.providerSessionId ?? null,
     });
     return updated;

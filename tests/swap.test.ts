@@ -87,11 +87,15 @@ async function seedOpencodeAuth(account: AccountRecord, token: string, root = ac
   }
 }
 
-test("swapAccount stops, re-credentials, resumes the same session, and rebinds", async () => {
-  await withTempStore(async () => {
+test("swapAccount stops, moves to the target account home, resumes the same session, and rebinds", async () => {
+  await withTempStore(async (dir) => {
     const { substrate, calls } = fakeSubstrate(true);
     const activated: string[] = [];
-    const existing = record();
+    const sourceHome = join(dir, "homes", "claude-old");
+    const sourceTranscript = join(sourceHome, "projects", "project-a", "uuid-123.jsonl");
+    await mkdir(join(sourceTranscript, ".."), { recursive: true });
+    await writeFile(sourceTranscript, "{\"type\":\"user\"}\n");
+    const existing = record({ homePath: sourceHome, transcriptPath: sourceTranscript });
     await saveSession(existing);
     const updated = await swapAccount(existing, account, {
       substrate,
@@ -102,19 +106,25 @@ test("swapAccount stops, re-credentials, resumes the same session, and rebinds",
       },
     });
 
-    assert.deepEqual(activated, ["claude-new:/tmp/home-a"]);
+    const targetHome = join(dir, "homes", account.id);
+    assert.deepEqual(activated, [`claude-new:${targetHome}`]);
     assert.equal(calls[0]!.method, "kill");
     const relaunch = calls.find((call) => call.method === "newSession")!;
     assert.equal(relaunch.target, "CL-test");
-    // Same session resumed, same yolo mode, same home, in the same tmux target.
+    // Same session resumed, same yolo mode, target-account home, same tmux target.
     assert.deepEqual(relaunch.spec!.args.slice(-2), ["--resume", "uuid-123"]);
     assert.ok(relaunch.spec!.args.includes("--dangerously-skip-permissions"));
-    assert.equal(relaunch.spec!.env?.CLAUDE_CONFIG_DIR, "/tmp/home-a");
+    assert.equal(relaunch.spec!.env?.CLAUDE_CONFIG_DIR, targetHome);
 
     assert.equal(updated.accountId, "claude-new");
+    assert.equal(updated.homePath, targetHome);
+    const targetTranscript = join(targetHome, "projects", "project-a", "uuid-123.jsonl");
+    assert.equal(updated.transcriptPath, targetTranscript);
+    assert.equal(await readFile(targetTranscript, "utf8"), "{\"type\":\"user\"}\n");
     assert.equal(updated.status, "running");
     const persisted = await loadSession("CL.test");
     assert.equal(persisted?.accountId, "claude-new");
+    assert.equal(persisted?.homePath, targetHome);
   });
 });
 
@@ -128,15 +138,35 @@ test("swapAccount refuses a bee in the default home", async () => {
   });
 });
 
-test("swapAccount refuses tool mismatch and no-op swaps", async () => {
-  await withTempStore(async () => {
+test("swapAccount refuses tool mismatch and a true no-op swap", async () => {
+  await withTempStore(async (dir) => {
     const { substrate } = fakeSubstrate(true);
     const codexAccount: AccountRecord = { ...account, id: "codex-x", tool: "codex" };
     await assert.rejects(() => swapAccount(record(), codexAccount, { substrate, sleep: async () => undefined }), /codex account/);
     await assert.rejects(
-      () => swapAccount(record({ accountId: "claude-new" }), account, { substrate, sleep: async () => undefined }),
+      () => swapAccount(record({ accountId: "claude-new", homePath: join(dir, "homes", account.id) }), account, { substrate, sleep: async () => undefined }),
       /already on account/,
     );
+  });
+});
+
+test("swapAccount repairs a same-account bee stranded in another account's home", async () => {
+  await withTempStore(async (dir) => {
+    const { substrate, calls } = fakeSubstrate(true);
+    const existing = record({ accountId: account.id, homePath: "/tmp/home-wrong" });
+    await saveSession(existing);
+
+    const updated = await swapAccount(existing, account, {
+      substrate,
+      sleep: async () => undefined,
+      activate: async () => ["auth"],
+    });
+
+    const targetHome = join(dir, "homes", account.id);
+    assert.equal(updated.accountId, account.id);
+    assert.equal(updated.homePath, targetHome);
+    const relaunch = calls.find((call) => call.method === "newSession")!;
+    assert.equal(relaunch.spec!.env?.CLAUDE_CONFIG_DIR, targetHome);
   });
 });
 
@@ -176,8 +206,8 @@ test("swapAccount tolerates undefined provider (legacy claude swap still allowed
   });
 });
 
-test("swapAccount relaunches codex with CODEX_HOME but not HOME", async () => {
-  await withTempStore(async () => {
+test("swapAccount relaunches codex in the target account home with CODEX_HOME but not HOME", async () => {
+  await withTempStore(async (dir) => {
     const { substrate, calls } = fakeSubstrate(false);
     const codexAccount: AccountRecord = { id: "codex-new", tool: "codex", label: "c@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
     const existing = record({ agent: "codex", command: "CODEX_HOME=/tmp/home-c codex", homePath: "/tmp/home-c", accountId: "codex-old", providerSessionId: undefined });
@@ -189,13 +219,13 @@ test("swapAccount relaunches codex with CODEX_HOME but not HOME", async () => {
     );
     const relaunch = calls.find((call) => call.method === "newSession")!;
     assert.deepEqual(relaunch.spec!.args.slice(-2), ["resume", "--last"]);
-    assert.equal(relaunch.spec!.env?.CODEX_HOME, "/tmp/home-c");
+    assert.equal(relaunch.spec!.env?.CODEX_HOME, join(dir, "homes", codexAccount.id));
     assert.equal(relaunch.spec!.env?.HOME, undefined);
   });
 });
 
-test("swapAccount relaunches an HSR bee through the runner host", async () => {
-  await withTempStore(async () => {
+test("swapAccount relaunches an HSR bee through the runner host in the target account home", async () => {
+  await withTempStore(async (dir) => {
     const { substrate, calls } = fakeSubstrate(false);
     const codexAccount: AccountRecord = { id: "codex-new", tool: "codex", label: "c@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
     const existing = record({
@@ -227,14 +257,14 @@ test("swapAccount relaunches an HSR bee through the runner host", async () => {
     assert.equal(payload?.sessionId, "thread-123");
     assert.equal(payload?.resume, true);
     assert.equal(payload?.accountId, "codex-new");
-    assert.equal(payload?.spec.env.CODEX_HOME, "/tmp/home-c");
+    assert.equal(payload?.spec.env.CODEX_HOME, join(dir, "homes", codexAccount.id));
     assert.equal(payload?.spec.args.includes("resume"), false);
     assert.equal(updated.runnerPid, 4321);
     assert.equal(updated.accountId, "codex-new");
   });
 });
 
-test("swapAccount restores the old credentials when HSR relaunch fails", async () => {
+test("swapAccount leaves the distinct source home untouched when HSR relaunch fails", async () => {
   await withTempStore(async () => {
     const { substrate } = fakeSubstrate(false);
     const oldAccount: AccountRecord = { id: "codex-old", tool: "codex", label: "old@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
@@ -268,7 +298,7 @@ test("swapAccount restores the old credentials when HSR relaunch fails", async (
       /runner launch failed/,
     );
 
-    assert.deepEqual(activated, ["codex-new", "codex-old"]);
+    assert.deepEqual(activated, ["codex-new"]);
     assert.equal((await loadSession(existing.name))?.accountId, "codex-old");
   });
 });
@@ -342,7 +372,8 @@ test("swapAccount rescues generic file-backed credentials before overwriting the
 
     const rescued = JSON.parse(await readFile(join(accountDir(currentAccount), "xdg-data", "opencode", "auth.json"), "utf8"));
     assert.equal(rescued["zai-coding-plan"].key, "fresh-current");
-    const stamped = JSON.parse(await readFile(join(home, "xdg-data", "opencode", "auth.json"), "utf8"));
+    const targetHome = join(dir, "homes", targetAccount.id);
+    const stamped = JSON.parse(await readFile(join(targetHome, "xdg-data", "opencode", "auth.json"), "utf8"));
     assert.equal(stamped["zai-coding-plan"].key, "target-key");
   });
 });

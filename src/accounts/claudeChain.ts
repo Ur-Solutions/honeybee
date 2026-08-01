@@ -308,7 +308,12 @@ export async function syncClaudeChainToVaultLocked(account: AccountRecord, extra
     best = chain;
   }
   if (!best || best === vault) return { chain: best, vaultUpdated: false };
-  await saveClaudeChainToVaultLocked(account, best.raw);
+  // A rotated link harvested from one home is the only live link in the OAuth
+  // chain. Keeping it in the vault alone strands every other active home on
+  // the now-dead refresh token: their next turn fails even though the account
+  // registry itself looks healthy. Distribute the adopted link just like a
+  // Honeybee-owned refresh so all attributable homes advance atomically.
+  await distributeClaudeChainLocked(account, best.oauth);
   await appendLedger({
     type: "account.chain-sync",
     account: account.id,
@@ -393,7 +398,7 @@ export async function refreshClaudeOauthChain(refreshToken: string): Promise<Ref
  * provider's reuse detection — revoking the chain and logging live sessions
  * out (HIVE-2).
  */
-export async function persistClaudeChainLocked(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
+async function distributeClaudeChainLocked(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
   const sourceRaw = JSON.stringify({ claudeAiOauth: oauth });
   await saveClaudeChainToVaultLocked(account, sourceRaw);
   for (const home of await claudeHomesForAccount(account)) {
@@ -424,6 +429,10 @@ export async function persistClaudeChainLocked(account: AccountRecord, oauth: Re
       await appendLedger({ type: "account.chain-propagation-failed", account: account.id, home, error: message }).catch(() => {});
     }
   }
+}
+
+export async function persistClaudeChainLocked(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
+  await distributeClaudeChainLocked(account, oauth);
   await appendLedger({ type: "account.token-refresh", account: account.id });
 }
 
