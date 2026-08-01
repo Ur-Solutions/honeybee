@@ -9,8 +9,8 @@ export function cmdGateways(): void {
         gateway.live ? "live" : "dead",
         gateway.name,
         gateway.protocol,
-        gateway.pid,
-        gateway.socketPath,
+        gateway.pid ?? (gateway.stateless ? "stateless" : "-"),
+        gateway.socketPath ?? "-",
         gateway.shim.command,
         gateway.startedAt,
       ].join("\t"));
@@ -34,8 +34,8 @@ export function cmdGateways(): void {
       gateway.live ? green("live") : gray("dead"),
       bold(gateway.name),
       gateway.protocol,
-      String(gateway.pid),
-      dim(gateway.socketPath),
+      gateway.pid !== undefined ? String(gateway.pid) : gateway.stateless ? "stateless" : "-",
+      dim(gateway.socketPath ?? "-"),
       dim(gateway.shim.command),
     ]),
   ));

@@ -136,3 +136,46 @@ test("hive gateways lists valid live and stale advertisements", async () => {
     assert.match(stdout, /^live\tlive\tmcp\t/m);
   });
 });
+
+test("stateless gateways parse without socketPath/pid and are live iff the shim is executable", async () => {
+  await withStore(async (root) => {
+    const shimPath = join(root, "foundation-shim");
+    await writeFile(shimPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const statelessBase = {
+      name: "foundation",
+      protocol: "mcp",
+      shim: { command: shimPath, args: ["mcp"] },
+      env: {},
+      startedAt: "2026-08-01T09:00:00.000Z",
+      gatewayRev: 1,
+      stateless: true,
+    };
+    await writeGateway(root, "foundation", statelessBase);
+    await writeGateway(root, "ghost", { ...statelessBase, name: "ghost", shim: { command: join(root, "missing-shim"), args: [] } });
+    // Regression guards: daemon gateways still require pid + socketPath.
+    await writeGateway(root, "daemonless-bad", { ...gateway({ name: "daemonless-bad" }), pid: undefined });
+    await writeGateway(root, "stateless-bad-socket", { ...statelessBase, name: "stateless-bad-socket", socketPath: "relative.sock" });
+
+    const statuses = gatewaysWithLiveness();
+    assert.deepEqual(statuses.map(({ name, live }) => ({ name, live })), [
+      { name: "foundation", live: true },
+      { name: "ghost", live: false },
+    ]);
+    const foundation = statuses.find((entry) => entry.name === "foundation");
+    assert.equal(foundation?.stateless, true);
+    assert.equal(foundation?.pid, undefined);
+    assert.equal(foundation?.socketPath, undefined);
+    // The live stateless gateway is seeding-eligible; the unspawnable one is not.
+    assert.deepEqual(liveGateways().map(({ name }) => name), ["foundation"]);
+  });
+});
+
+test("stateless gateways may still carry socketPath/pid, validated as usual", async () => {
+  await withStore(async (root) => {
+    const shimPath = join(root, "shim");
+    await writeFile(shimPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await writeGateway(root, "hybrid", gateway({ name: "hybrid", shim: { command: shimPath, args: [] }, stateless: true, pid: 2_147_483_647 }));
+    // stateless wins for liveness even when a (dead) pid is present.
+    assert.deepEqual(gatewaysWithLiveness().map(({ name, live }) => ({ name, live })), [{ name: "hybrid", live: true }]);
+  });
+});
