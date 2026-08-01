@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { accessSync, constants, readFileSync, readdirSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { storeRoot } from "./fsx.js";
 import { isValidEnvEntry, PROTECTED_SPAWN_ENV_KEYS } from "./spawnEnv.js";
@@ -6,12 +6,17 @@ import { isValidEnvEntry, PROTECTED_SPAWN_ENV_KEYS } from "./spawnEnv.js";
 export type GatewayRecord = {
   name: string;
   protocol: "mcp";
-  socketPath: string;
+  /** Absent for stateless gateways — the shim is the whole gateway. */
+  socketPath?: string;
   shim: { command: string; args: string[] };
   env: Record<string, string>;
-  pid: number;
+  /** Absent for stateless gateways — there is no daemon process. */
+  pid?: number;
   startedAt: string;
   gatewayRev: 1;
+  /** A stateless gateway has no daemon; its shim is a complete server spawned
+   *  per consumer. Liveness = the shim command is executable, not kill(pid,0). */
+  stateless?: boolean;
 };
 
 export type GatewayStatus = GatewayRecord & {
@@ -58,22 +63,41 @@ function parseGatewayRecord(raw: string): GatewayRecord | null {
   const shimRecord = shim as Record<string, unknown>;
   if (typeof record.name !== "string" || record.name.length === 0 || /[\u0000-\u001f]/u.test(record.name)) return null;
   if (record.protocol !== "mcp" || record.gatewayRev !== 1) return null;
-  if (typeof record.socketPath !== "string" || record.socketPath.includes("\0") || !isAbsolute(record.socketPath)) return null;
+  if (record.stateless !== undefined && typeof record.stateless !== "boolean") return null;
+  const stateless = record.stateless === true;
+  // A stateless gateway has no daemon: socketPath/pid are optional (validated
+  // only when present). A daemon gateway requires both, exactly as before.
+  if (record.socketPath !== undefined || !stateless) {
+    if (typeof record.socketPath !== "string" || record.socketPath.includes("\0") || !isAbsolute(record.socketPath)) return null;
+  }
   if (typeof shimRecord.command !== "string" || shimRecord.command.includes("\0") || !isAbsolute(shimRecord.command)) return null;
   if (!Array.isArray(shimRecord.args) || !shimRecord.args.every((arg) => typeof arg === "string" && !arg.includes("\0"))) return null;
   if (!isStringRecord(record.env)) return null;
-  if (!Number.isSafeInteger(record.pid) || Number(record.pid) <= 0) return null;
+  if (record.pid !== undefined || !stateless) {
+    if (!Number.isSafeInteger(record.pid) || Number(record.pid) <= 0) return null;
+  }
   if (typeof record.startedAt !== "string" || !Number.isFinite(Date.parse(record.startedAt))) return null;
   return {
     name: record.name,
     protocol: "mcp",
-    socketPath: record.socketPath,
+    ...(typeof record.socketPath === "string" ? { socketPath: record.socketPath } : {}),
     shim: { command: shimRecord.command, args: [...shimRecord.args] as string[] },
     env: { ...record.env },
-    pid: Number(record.pid),
+    ...(record.pid !== undefined ? { pid: Number(record.pid) } : {}),
     startedAt: record.startedAt,
     gatewayRev: 1,
+    ...(stateless ? { stateless: true } : {}),
   };
+}
+
+/** Stateless liveness: the shim is spawnable (exists and is executable). */
+function statelessShimIsSpawnable(command: string): boolean {
+  try {
+    accessSync(command, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function cachedGatewayRecords(): Array<{ record: GatewayRecord; registryPath: string }> {
@@ -130,7 +154,9 @@ export function gatewaysWithLiveness(): GatewayStatus[] {
   try {
     return cachedGatewayRecords().map(({ record, registryPath }) => ({
       ...record,
-      live: gatewayPidIsLive(record.pid),
+      live: record.stateless === true
+        ? statelessShimIsSpawnable(record.shim.command)
+        : record.pid !== undefined && gatewayPidIsLive(record.pid),
       registryPath,
     }));
   } catch (error) {
