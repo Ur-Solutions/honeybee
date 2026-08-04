@@ -40,3 +40,24 @@ export async function resolveSpawningBeeId(): Promise<string | undefined> {
   }
   return undefined;
 }
+
+/**
+ * Resolve an explicit parent supplied by a trusted host integration (for
+ * example Apiary after authenticating the gateway principal). Unlike the
+ * ambient resolver above, this does not inspect child environment variables:
+ * the caller must pass an existing bee name or stable id, and Honeybee stores
+ * the canonical id. Keeping this separate lets daemon/CLI host seams forward
+ * lineage without making caller-controlled spawn env an identity channel.
+ */
+export async function resolveExplicitSpawningBeeId(reference: string): Promise<string> {
+  const value = reference.trim();
+  if (!value) throw new Error("spawnedById requires an existing bee name or id");
+
+  const byName = await loadSession(value);
+  if (byName) return byName.id ?? byName.name;
+
+  const records = await listSessions();
+  const byId = records.find((record) => record.id === value);
+  if (byId) return byId.id ?? byId.name;
+  throw new Error(`Unknown spawning bee: ${value}`);
+}

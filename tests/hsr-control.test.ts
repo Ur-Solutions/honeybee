@@ -61,6 +61,7 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
         ok: true,
         spawn: 2,
         spawnEnv: 1,
+        spawnParent: 1,
         fork: 1,
         handoff: 1,
       });
@@ -175,6 +176,18 @@ test("hsr control socket: spawn with an unknown kind returns ok:false", async ()
     try {
       const missing = (await client.call("spawn", {})) as { ok: boolean; error?: string };
       assert.equal(missing.ok, false, "spawn without kind should be ok:false");
+      const spoofedFlag = (await client.call("spawn", {
+        kind: "definitely-not-a-harness",
+        flags: { "spawned-by": "untrusted-parent" },
+      })) as { ok: boolean; error?: string };
+      assert.equal(spoofedFlag.ok, false);
+      assert.doesNotMatch(spoofedFlag.error ?? "", /Unknown spawning bee/, "generic flags cannot enter the trusted parent seam");
+      const unknownParent = (await client.call("spawn", {
+        kind: "definitely-not-a-harness",
+        spawnedById: "missing-parent",
+      })) as { ok: boolean; error?: string };
+      assert.equal(unknownParent.ok, false);
+      assert.match(unknownParent.error ?? "", /Unknown spawning bee/, "top-level parent is validated before spawn");
       const unknown = (await client.call("spawn", { kind: "definitely-not-a-harness" })) as { ok: boolean; error?: string };
       assert.equal(unknown.ok, false, "spawn with an unknown kind should be ok:false");
       assert.ok((unknown.error ?? "").length > 0, "error message expected");

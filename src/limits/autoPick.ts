@@ -4,9 +4,11 @@
 //  - auto: least-loaded account of a tool. Ranks by pace-adjusted weekly load
 //    plus locally-known commitments (live bees + decaying pick debits — see
 //    commitments.ts and HIVE-80), deprioritizing an account whose 5h window
-//    is nearly exhausted, reading limits through the cache with a 1h default
-//    ttl. Near-tie candidates rotate via a persistent cursor so concurrent
-//    bursts spread instead of stacking on the emptiest account.
+//    is nearly exhausted. A model-aware pick also includes the provider's
+//    model-scoped allowance (Fable today); a persistent per-account penalty
+//    applies the operator's placement preference. Limits read through the
+//    cache with a 1h default ttl. Near-tie candidates rotate via a persistent
+//    cursor so concurrent bursts spread instead of stacking on one account.
 //  - rr: the next account in a persistent round-robin order, advancing a
 //    cursor on disk. Explicitly NOT limits-aware — the operator wants the
 //    workload spread evenly regardless of remaining quota.
@@ -35,6 +37,16 @@ import { paceDelta, windowRolledOver } from "./window.js";
  * red zone of the usage bars.
  */
 export const AUTO_FIVE_HOUR_SATURATION_PERCENT = 90;
+
+/**
+ * Fable is deliberately protected earlier than the general weekly allowance:
+ * at/above 75% used, an account with scoped headroom wins even when pace says
+ * the Fable allowance is behind pace and about to reset.
+ */
+export const AUTO_FABLE_WEEKLY_SATURATION_PERCENT = 75;
+
+/** General weekly wall retained for model-aware selection. */
+export const AUTO_GENERAL_WEEKLY_SATURATION_PERCENT = 90;
 
 /**
  * Headroom below which pace stops mattering in the auto pick. An account
@@ -99,15 +111,32 @@ export type AutoAccountChoice = {
   nearTieIds: string[];
 };
 
+export type AutoAccountSelectionOptions = {
+  /** Effective model for the bee being spawned (for model-scoped limits). */
+  model?: string;
+};
+
+/** Claude's provider model ids currently spell the scoped allowance as Fable. */
+export function isFableModel(model: string | undefined): boolean {
+  return typeof model === "string" && /(?:^|[-_/])fable(?:[-_/]|$)/i.test(model);
+}
+
 /**
  * Order: readable limits before unreadable; 5h headroom before 5h-saturated;
- * then least pace-adjusted weekly load (see effectiveWindowLoad — an account
- * whose unused quota expires at an imminent reset scores below one that is
- * burning ahead of pace; a rolled-over window counts as 0; a missing weekly
- * window falls back to the 5h one); raw 5h used% and registration order as
- * the deterministic tie-breaks. Null only for an empty candidate list.
+ * for a model-aware pick, scoped/general weekly headroom before a nearly empty
+ * constraint; then least pace-adjusted weekly load plus the account's operator
+ * penalty (see effectiveWindowLoad —
+ * an account whose unused quota expires at an imminent reset scores below one
+ * that is burning ahead of pace; a rolled-over window counts as 0; a missing
+ * weekly window falls back to the 5h one); raw scoped/5h used% and registration
+ * order as the deterministic tie-breaks. Null only for an empty candidate list.
  */
-export function selectLeastLoadedAccount(candidates: AutoAccountCandidate[], now = Date.now()): AutoAccountChoice | null {
+export function selectLeastLoadedAccount(
+  candidates: AutoAccountCandidate[],
+  now = Date.now(),
+  options: AutoAccountSelectionOptions = {},
+): AutoAccountChoice | null {
+  const fableAware = isFableModel(options.model);
   const rawScore = (window: WindowUsage | undefined): number | null =>
     window ? (windowRolledOver(window, now) ? 0 : window.usedPercent) : null;
   const paceScore = (window: WindowUsage | undefined): number | null =>
@@ -117,24 +146,43 @@ export function selectLeastLoadedAccount(candidates: AutoAccountCandidate[], now
     // Saturation and the tie-break stay on RAW 5h used% — a saturated short
     // window is a wall regardless of how favorable its pace looks.
     const fiveHour = ok ? rawScore(limits?.fiveHour) : null;
-    const weekly = ok ? (paceScore(limits?.weekly) ?? paceScore(limits?.fiveHour)) : null;
+    const generalWeeklyUsed = ok ? rawScore(limits?.weekly) : null;
+    const generalWeekly = ok ? (paceScore(limits?.weekly) ?? paceScore(limits?.fiveHour)) : null;
+    const modelWindow = fableAware && ok ? limits?.fableWeekly : undefined;
+    const modelWeekly = paceScore(modelWindow);
+    // A Fable bee consumes both the general allowance and its scoped included
+    // allowance. Rank by the tighter effective window so improving sensitivity
+    // to Fable never makes the picker ignore an almost-empty general week.
+    const weekly = fableAware && modelWeekly !== null
+      ? Math.max(generalWeekly ?? 0, modelWeekly)
+      : generalWeekly;
+    const modelUsed = rawScore(modelWindow);
+    const accountPenalty = account.autoPickPenalty ?? 0;
     return {
       account,
       limits,
       ok,
       // Commitments apply to unreadable accounts too — live bees are known
       // locally regardless of whether the provider's limits endpoint answers.
-      weekly: (weekly ?? 0) + (commitment ?? 0),
+      weekly: (weekly ?? 0) + (commitment ?? 0) + accountPenalty,
       fiveHour: fiveHour ?? 0,
+      modelUsed: modelUsed ?? 0,
       commitment: commitment ?? 0,
-      saturated: ok && fiveHour !== null && fiveHour >= AUTO_FIVE_HOUR_SATURATION_PERCENT,
+      accountPenalty,
+      fiveHourSaturated: ok && fiveHour !== null && fiveHour >= AUTO_FIVE_HOUR_SATURATION_PERCENT,
+      modelSaturated: ok && fableAware && (
+        (modelUsed !== null && modelUsed >= AUTO_FABLE_WEEKLY_SATURATION_PERCENT) ||
+        (generalWeeklyUsed !== null && generalWeeklyUsed >= AUTO_GENERAL_WEEKLY_SATURATION_PERCENT)
+      ),
     };
   });
   scored.sort(
     (a, b) =>
       Number(!a.ok) - Number(!b.ok) ||
-      Number(a.saturated) - Number(b.saturated) ||
+      Number(a.fiveHourSaturated) - Number(b.fiveHourSaturated) ||
+      Number(a.modelSaturated) - Number(b.modelSaturated) ||
       a.weekly - b.weekly ||
+      a.modelUsed - b.modelUsed ||
       a.fiveHour - b.fiveHour ||
       a.account.addedAt.localeCompare(b.account.addedAt) ||
       a.account.id.localeCompare(b.account.id),
@@ -143,25 +191,41 @@ export function selectLeastLoadedAccount(candidates: AutoAccountCandidate[], now
   if (!best) return null;
   const base = !best.ok
     ? "limits unreadable for every account; oldest registration"
-    : best.saturated
+    : best.fiveHourSaturated
       ? "every account is close to its 5h limit; least effective weekly load"
-      : autoPickWeeklyReason(best.limits, now);
-  const reason = best.commitment > 0 ? `${base}; +${Math.round(best.commitment)} in-flight` : base;
+      : best.modelSaturated
+        ? "every account is close to its Fable or general weekly limit; least effective Fable-aware weekly load"
+        : autoPickWeeklyReason(best.limits, now, fableAware);
+  const reason = [
+    base,
+    ...(best.commitment > 0 ? [`+${Math.round(best.commitment)} in-flight`] : []),
+    ...(best.accountPenalty > 0 ? [`+${best.accountPenalty} account auto penalty`] : []),
+  ].join("; ");
   const nearTieIds = scored
-    .filter((s) => s.ok === best.ok && s.saturated === best.saturated && s.weekly - best.weekly <= AUTO_TIE_EPSILON_PERCENT)
+    .filter((s) =>
+      s.ok === best.ok &&
+      s.fiveHourSaturated === best.fiveHourSaturated &&
+      s.modelSaturated === best.modelSaturated &&
+      s.weekly - best.weekly <= AUTO_TIE_EPSILON_PERCENT
+    )
     .map((s) => s.account.id);
   return { account: best.account, ...(best.ok && best.limits ? { limits: best.limits } : {}), reason, nearTieIds };
 }
 
 /** Why the winner won, pace-aware: names the expiring surplus / overpace when the window boundary is known. */
-function autoPickWeeklyReason(limits: AccountLimits | undefined, now: number): string {
-  const window = limits?.weekly ?? limits?.fiveHour;
+function autoPickWeeklyReason(limits: AccountLimits | undefined, now: number, fableAware: boolean): string {
+  const fableWindow = fableAware ? limits?.fableWeekly : undefined;
+  const generalWindow = limits?.weekly ?? limits?.fiveHour;
+  const fableConstrains = fableWindow !== undefined &&
+    (generalWindow === undefined || effectiveWindowLoad(fableWindow, now) >= effectiveWindowLoad(generalWindow, now));
+  const window = fableConstrains ? fableWindow : generalWindow;
+  const label = fableWindow ? "Fable-aware weekly" : "weekly";
   const pace = window && !windowRolledOver(window, now) ? paceDelta(window, now) : null;
-  if (pace === null) return "least weekly usage";
+  if (pace === null) return `least ${label} usage`;
   const rounded = Math.round(Math.abs(pace));
-  if (pace <= -3) return `least effective weekly load (${rounded}% behind pace — surplus expires at reset)`;
-  if (pace >= 3) return `least effective weekly load (${rounded}% ahead of pace)`;
-  return "least effective weekly load (on pace)";
+  if (pace <= -3) return `least effective ${label} load (${rounded}% behind pace — surplus expires at reset)`;
+  if (pace >= 3) return `least effective ${label} load (${rounded}% ahead of pace)`;
+  return `least effective ${label} load (on pace)`;
 }
 
 /** Default freshness budget for the auto pick: cached limits younger than this are good enough. */
@@ -189,6 +253,8 @@ export type PickAccountDeps = CachedLimitsOptions & {
   sessions?: SessionRecord[];
   /** Consider paused accounts too (they are excluded from the pool by default). */
   includePaused?: boolean;
+  /** Effective model for the new bee, used to rank model-scoped allowances. */
+  model?: string;
   /**
    * Revalidate hook fired when stale snapshots were served. Defaults to the
    * detached `hive limits` sweep — but only for production reads (fetchLimits
@@ -217,9 +283,11 @@ function pickableAccounts(kind: string, registered: AccountRecord[], includePaus
  * Resolve the `auto` account query: among the tool's accounts with vaulted
  * credentials, pick the one with the least pace-adjusted weekly load (an
  * imminent reset with unused quota beats a nominally lower used%), pushing
- * accounts whose 5h window is nearly exhausted to the back. Limits come through the
- * cache with a 1h default ttl, so back-to-back auto spawns do not re-pay the
- * provider round-trips; pass ttlMs (0 = always live) to override.
+ * accounts whose 5h window is nearly exhausted to the back. When `model`
+ * names Fable, its scoped weekly allowance is an additional constraint.
+ * Limits come through the cache with a 1h default ttl, so back-to-back auto
+ * spawns do not re-pay the provider round-trips; pass ttlMs (0 = always live)
+ * to override.
  */
 export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps = {}): Promise<AutoAccountChoice> {
   const kind = canonicalAgentKind(tool).toLowerCase();
@@ -274,6 +342,7 @@ export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps
       commitment: (commitments.get(account.id) ?? 0) + (debits.get(account.id) ?? 0),
     })),
     now,
+    { ...(deps.model ? { model: deps.model } : {}) },
   )!;
   const rotated = choice.nearTieIds.length > 1 ? await rotateNearTie(kind, choice, eligible, byId) : choice;
   const healthyChoice = bootHealthReason ? { ...rotated, reason: `${rotated.reason}${bootHealthReason}` } : rotated;

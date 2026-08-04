@@ -21,14 +21,14 @@ import { readEventTail } from "../hsr/observe.js";
 import { hsrEventsPath, hsrRunDir } from "../hsr/runDir.js";
 import { loadLatestSeal, sealsRoot } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
-import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "../sessionMetadata.js";
+import { persistSessionTranscriptMetadata, resolveSessionTranscript } from "../sessionMetadata.js";
 import { deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
 import { listSessions, loadSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { effectiveTags, normalizeTagArg } from "../tags.js";
 import { appendedPaneText, parseTailOptions } from "../tail.js";
 import { formatShellCommand } from "../tmux.js";
-import { hasTranscriptProvider, lastAssistantText, latestTranscript, renderTranscript } from "../transcripts.js";
+import { hasTranscriptProvider, lastAssistantText, renderTranscript } from "../transcripts.js";
 import { listBeeViews } from "../view/index.js";
 import { waitForIdle, waitForSeal, waitHelpText } from "../wait.js";
 import { resolve } from "node:path";
@@ -456,7 +456,9 @@ export async function cmdTranscript(parsed: Parsed) {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive transcript <session> [-n rows] [--json]");
   let record = await resolveSession(target);
-  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record));
+  const resolved = await resolveSessionTranscript(record);
+  record = resolved.record;
+  const tx = resolved.transcript;
   const limitRaw = flag(parsed, "n") ?? flag(parsed, "limit");
   const limit = limitRaw ? Number(limitRaw) : undefined;
   const json = truthy(flag(parsed, "json"));
@@ -490,7 +492,9 @@ export async function cmdLast(parsed: Parsed) {
     return;
   }
 
-  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record));
+  const resolved = await resolveSessionTranscript(record);
+  record = resolved.record;
+  const tx = resolved.transcript;
   if (!tx && !hasTranscriptProvider(record.agent)) {
     await ensureLive(record);
     console.error(isPretty() ? note(`no transcript provider for ${record.agent}; falling back to pane capture`) : `# no transcript provider for ${record.agent}; falling back to pane capture`);

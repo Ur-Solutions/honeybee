@@ -65,10 +65,12 @@ const BEE_LIST: TaskListId = { kind: "bee", name: "CL.aaa" };
 // Ids + list ids.
 // ──────────────────────────────────────────────────────────────────────────
 
-test("generateTaskId produces task_-prefixed sortable ids", () => {
+test("generateTaskId produces task_-prefixed UUIDv7 ids and accepts legacy ids", () => {
   const id = generateTaskId(1700000000000);
-  assert.match(id, /^task_[0-9A-Z]{13}-[0-9a-f]{6}$/);
+  assert.match(id, /^task_018bcfe5-6800-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.equal(isTaskId(id), true);
+  assert.equal(isTaskId("task_00001KZ5P6CKM-9ad70d"), true);
+  assert.equal(isTaskId("task_018bcfe5-6800-4abc-8def-0123456789ab"), false);
   assert.equal(isTaskId("msg-nope"), false);
 });
 

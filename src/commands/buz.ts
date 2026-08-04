@@ -1,6 +1,6 @@
-// `hive buz` — addressed bee-to-bee messaging (three-tier delivery + policy).
+// `hive buz` — addressed bee-to-bee messaging (four-tier delivery + policy).
 // Extracted from cli.ts (HIVE-15).
-import { BUZ_TIERS, cancelQueuedBuzMessage, consumeMessage, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
+import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
 import { parseAge } from "../clean.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
@@ -69,8 +69,8 @@ export function parseBuzTier(value: unknown): BuzTier {
 
 export async function buzSend(parsed: Parsed) {
   const target = parsed.args[1];
-  if (!target) throw new Error("Usage: hive buz send <selector> [--sender <bee>|--sender-human <name>] --tier <interrupt|queue|passive> -p <body> (sender defaults to the bee owning the current session)");
-  const tier = parseBuzTier(flag(parsed, "tier") ?? "queue");
+  if (!target) throw new Error(`Usage: hive buz send <selector> [--sender <bee>|--sender-human <name>] [--tier <${BUZ_TIERS.join("|")}>] -p <body> (default tier: ${DEFAULT_BUZ_TIER}; sender defaults to the bee owning the current session)`);
+  const tier = parseBuzTier(flag(parsed, "tier") ?? DEFAULT_BUZ_TIER);
   const body = stringFlag(parsed, ["prompt", "p"]) ?? "";
   if (body.length === 0) throw new Error("buz: --prompt|-p body is required");
   const subject = typeof flag(parsed, "subject") === "string" ? String(flag(parsed, "subject")) : undefined;
@@ -294,7 +294,7 @@ export async function buzPurge(parsed: Parsed) {
 
 export async function buzConfig(parsed: Parsed) {
   const ref = parsed.args[1];
-  if (!ref) throw new Error("Usage: hive buz config <bee> [--accept interrupt,queue,passive]");
+  if (!ref) throw new Error(`Usage: hive buz config <bee> [--accept ${BUZ_TIERS.join(",")}]`);
   const record = await resolveSession(ref);
 
   const acceptRaw = flag(parsed, "accept");

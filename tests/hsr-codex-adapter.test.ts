@@ -351,6 +351,52 @@ test("codex app-server handshake acknowledges initialize before thread/start", a
   }
 });
 
+test("next-tool sends use turn/steer for an active Codex turn and await acceptance", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-hsr-codex-steer-"));
+  const previousStore = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = root;
+  const bee = "CO.codex-steer-stub";
+  const logPath = join(root, "rpc.jsonl");
+  await ensureHsrRunDir(bee);
+
+  let session: Awaited<ReturnType<typeof startCodexRunner>> | undefined;
+  try {
+    session = await startCodexRunner({
+      bee,
+      cwd: root,
+      env: stringEnv({ CODEX_APP_SERVER_STUB_LOG: logPath }),
+      runDir: join(root, "hsr", bee),
+      command: appServerFixture,
+    });
+    const events = session.events[Symbol.asyncIterator]();
+
+    // Idle next-tool delivery starts a fresh turn and waits for its app-server
+    // acceptance. Consume turn/started so the adapter's active lifecycle is
+    // definitely visible before the second send.
+    await session.send("start work", { mode: "next-tool" });
+    assert.equal((await events.next()).value?.type, "turn_start");
+    await session.send("focus the failing test", { mode: "next-tool" });
+
+    const messages = (await readFile(logPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+    const methods = messages.map((message) => message.method);
+    assert.equal(methods.filter((method) => method === "turn/start").length, 1);
+    const steer = messages.find((message) => message.method === "turn/steer");
+    assert.deepEqual(steer?.params, {
+      threadId: "thread-stub",
+      input: [encodeCodexUserInput("focus the failing test")],
+      expectedTurnId: "turn-live",
+    });
+  } finally {
+    await session?.stop().catch(() => undefined);
+    if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousStore;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("thread handshake timeout discards the wedged child and retries on a fresh attempt with backoff", async () => {
   const runs: Array<{ attempt: number; delayMs: number; timeoutMs: number }> = [];
   const discarded: number[] = [];

@@ -170,11 +170,11 @@ shapes are preserved.
 - `hive daemon …` — install/start/stop a launchctl-managed dispatcher that
   ticks every ~2s, derives state, and drains the buz queue. Linux ships a
   systemd unit snippet for copy-paste (no auto-install).
-- `hive buz …` — three-tier addressed messaging (`interrupt | queue |
-  passive`) under `~/.hive/buz/<bee>/{inbox,outbox,queue,read,quarantine}/`,
+- `hive buz …` — four-tier addressed messaging (`interrupt | next-tool |
+  queue | passive`) under `~/.hive/buz/<bee>/{inbox,outbox,queue,read,quarantine}/`,
   with strict sender attribution (`--sender <bee>` or `--sender-human <name>`)
-  and a per-bee `buzAccept` policy. Default when unset:
-  `['queue', 'passive']`.
+  and a per-bee `buzAccept` policy. Omitted `--tier` defaults to `next-tool`;
+  the accept policy defaults to `['next-tool', 'queue', 'passive']`.
 - `hive flow …` — TS or JSON flows registered under `~/.hive/flows/<name>.{ts,json}`,
   run foreground or detached with `--background` (independent process trees,
   not daemon-managed). Cancel signals the run's pgid.

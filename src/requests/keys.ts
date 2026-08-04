@@ -24,6 +24,11 @@ export function authRequestId(bee: string, eventTs: number): string {
   return `auth:${bee}:${eventTs}`;
 }
 
+/** Manual action: an auth-failed turn had no exactly recoverable prompt text. */
+export function authPromptLossRequestId(bee: string, generation: number, eventTs: number): string {
+  return `manual:${bee}:${generation}:auth-prompt-loss:${eventTs}`;
+}
+
 /** Manual action: a recorded stop (kill/retire) failed for this generation. */
 export function stopFailedRequestId(bee: string, generation: number): string {
   return `manual:${bee}:${generation}:stop-failed`;

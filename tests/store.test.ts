@@ -11,6 +11,7 @@ import {
   loadSession,
   safeName,
   saveSession,
+  shouldPersistObservationHeartbeat,
   touchSession,
   updateSession,
   type SessionRecord,
@@ -174,6 +175,45 @@ test("touchSession skips the write when only lastObservedStateAt churns within t
     assert.equal(after?.lastObservedState, "idle_with_output");
     assert.equal(after?.lastObservedStateAt, "2026-05-28T00:01:02.000Z");
   });
+});
+
+test("terminal session observations never renew their on-disk heartbeat", async () => {
+  await withTempStore(async (dir) => {
+    const observedAt = "2026-05-28T00:00:00.000Z";
+    const path = join(dir, "sessions", "CO.abc.json");
+
+    for (const status of ["done", "dead"] as const) {
+      await saveSession(makeRecord(dir, {
+        status,
+        lastObservedState: status === "done" ? "done" : "dead",
+        lastObservedStateAt: observedAt,
+      }));
+      const before = await readFile(path, "utf8");
+
+      await touchSession("CO.abc", {
+        lastObservedState: status === "done" ? "done" : "dead",
+        lastObservedStateAt: "2026-05-28T12:00:00.000Z",
+      });
+
+      assert.equal(await readFile(path, "utf8"), before, `${status} heartbeat must stay immutable`);
+      assert.equal((await loadSession("CO.abc"))?.lastObservedStateAt, observedAt);
+    }
+
+    // A real state change still persists immediately; only timestamp-only
+    // churn is suppressed.
+    await touchSession("CO.abc", {
+      lastObservedState: "crashed",
+      lastObservedStateAt: "2026-05-28T12:00:01.000Z",
+    });
+    assert.equal((await loadSession("CO.abc"))?.lastObservedState, "crashed");
+  });
+});
+
+test("only live or uncertain records need observation heartbeat persistence", () => {
+  assert.equal(shouldPersistObservationHeartbeat({ status: "running" }), true);
+  assert.equal(shouldPersistObservationHeartbeat({ status: "kill_failed" }), true);
+  assert.equal(shouldPersistObservationHeartbeat({ status: "dead" }), false);
+  assert.equal(shouldPersistObservationHeartbeat({ status: "done" }), false);
 });
 
 test("touchSession cannot resurrect a deleted session", async () => {

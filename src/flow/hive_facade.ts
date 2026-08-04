@@ -17,6 +17,7 @@ import {
   type BuzMessage,
   type BuzSender,
   type BuzTier,
+  DEFAULT_BUZ_TIER,
   listMessages,
   sendBuzMessage,
 } from "../buz.js";
@@ -291,8 +292,8 @@ export class HiveFacade {
   ): Promise<void> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
-    const tier: BuzTier = options.tier ?? "queue";
-    const transport = tier === "interrupt"
+    const tier: BuzTier = options.tier ?? DEFAULT_BUZ_TIER;
+    const transport = tier === "interrupt" || tier === "next-tool"
       ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId }
       : undefined;
     await sendBuzMessage({

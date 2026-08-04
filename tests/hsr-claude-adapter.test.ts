@@ -188,6 +188,7 @@ test("command/args prepends stream-json flags then preserves caller args, no dup
     }),
   );
   assert.equal(config.command, "claude");
+  assert.equal(config.nativeSteering, true, "Claude owns the safe mid-turn input queue");
   assert.deepEqual(config.args, [
     "-p",
     "--input-format",

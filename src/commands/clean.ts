@@ -7,12 +7,12 @@ import { highlightUniqueSessionReference } from "../ids.js";
 import { transactionalKill } from "../kill.js";
 import { LOCAL_NODE_NAME, listNodes } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
-import { transcriptLookupForSession } from "../sessionMetadata.js";
+import { resolveSessionTranscript } from "../sessionMetadata.js";
 import { cleanStatePriority, deriveState, isTerminalState, liveTargetKey, type BeeState, type DerivedState } from "../state.js";
 import { deleteSession, listSessions, safeName, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { tmux } from "../tmux.js";
-import { latestTranscript, renderTranscript } from "../transcripts.js";
+import { renderTranscript } from "../transcripts.js";
 import { rm, writeFile } from "node:fs/promises";
 import { ageFlag, buildStateContext, hasFlag, liveTargetsAcrossNodes, observeHsrLiveness } from "../cli/shared.js";
 
@@ -231,7 +231,7 @@ export async function cleanPreview(
 ): Promise<string> {
   const transcriptRows = opts.transcriptRows ?? 8;
   const paneLines = opts.paneLines ?? 80;
-  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record)).catch(() => null);
+  const tx = (await resolveSessionTranscript(record).catch(() => null))?.transcript ?? null;
   if (tx) {
     const rendered = renderTranscript(tx.rows, { limit: transcriptRows }).trim();
     if (rendered) return [`transcript ${tx.provider} ${tildify(tx.path)}`, "", rendered].join("\n");

@@ -28,8 +28,8 @@ import {
   type HsrMeta,
 } from "./runDir.js";
 import { codexStartupConcurrency, withCodexStartupSlot } from "./startupQueue.js";
-import { drainPendingHsrTurns, withHsrTurnDeliveryLock } from "./pendingTurns.js";
-import { pendingNeedsInput } from "./observe.js";
+import { drainPendingHsrTurns, removePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
+import { isAuthNeededMessage, pendingNeedsInput } from "./observe.js";
 
 export type HsrHostHandle = {
   bee: string;
@@ -167,11 +167,34 @@ export async function runHsrHost(params: {
     resolveDone = resolve;
   });
 
+  // Normal local-HSR sends arrive with a durable pending-turn filename. Match
+  // those ids to structured turn_start/turn_end frames in FIFO order. A clean
+  // turn_end acks the journal file; a login-required error deliberately leaves
+  // it in place so auth recovery can replay the operator's exact text.
+  const awaitingTurnStart: string[] = [];
+  const openTurns: Array<{ deliveryId?: string; authFailed: boolean }> = [];
+
+  const sendTrackedTurn = async (text: string, mode: unknown, deliveryId: unknown): Promise<void> => {
+    const trackedId = mode !== "next-tool" && typeof deliveryId === "string" ? deliveryId : undefined;
+    if (trackedId) awaitingTurnStart.push(trackedId);
+    try {
+      await session.send(text, mode === "next-tool" ? { mode: "next-tool" } : undefined);
+    } catch (error) {
+      // If no turn_start consumed the id, do not let a later unrelated turn
+      // inherit it. The journal file stays for a future host/recovery drain.
+      if (trackedId) {
+        const pendingIndex = awaitingTurnStart.indexOf(trackedId);
+        if (pendingIndex >= 0) awaitingTurnStart.splice(pendingIndex, 1);
+      }
+      throw error;
+    }
+  };
+
   // --- control socket --------------------------------------------------------
   const methods: Record<string, RpcMethodHandler> = {
     send: (params) => {
-      const p = (params ?? {}) as { text?: unknown; mode?: unknown };
-      return session.send(String(p.text ?? ""), p.mode === "next-tool" ? { mode: "next-tool" } : undefined);
+      const p = (params ?? {}) as { text?: unknown; mode?: unknown; deliveryId?: unknown };
+      return sendTrackedTurn(String(p.text ?? ""), p.mode, p.deliveryId);
     },
     interrupt: () => session.interrupt(),
     answer: (params) => {
@@ -211,7 +234,7 @@ export async function runHsrHost(params: {
       await withHsrTurnDeliveryLock(bee, async () => {
         meta = { ...meta, status: "running", runningAt: new Date().toISOString() };
         await writeHsrMeta(bee, meta);
-        await drainPendingHsrTurns(bee, (text) => session.send(text));
+        await drainPendingHsrTurns(bee, (turn) => sendTrackedTurn(turn.text, undefined, turn.filename));
       });
     } catch (error) {
       await session.stop().catch(() => undefined);
@@ -227,7 +250,9 @@ export async function runHsrHost(params: {
   }
 
   // Learn the provider session id (captured by the runner from the init line,
-  // which carries no RunnerEvent) into meta.json.
+  // which carries no RunnerEvent) into meta.json. The child can take longer
+  // than the first reconciliation delay to emit init under machine load, so
+  // retry with a bounded interval until it arrives instead of sampling once.
   const reconcileSessionId = async (): Promise<void> => {
     if (finalized) return;
     if (session.sessionId && session.sessionId !== meta.sessionId) {
@@ -235,11 +260,22 @@ export async function runHsrHost(params: {
       await writeHsrMeta(bee, meta).catch(() => undefined);
     }
   };
-  setTimeout(() => void reconcileSessionId(), SESSION_ID_RECONCILE_MS);
+  let sessionIdReconcileTimer: NodeJS.Timeout | undefined;
+  const scheduleSessionIdReconcile = (delayMs: number): void => {
+    sessionIdReconcileTimer = setTimeout(() => {
+      void reconcileSessionId().finally(() => {
+        if (!finalized && !meta.sessionId) {
+          scheduleSessionIdReconcile(Math.min(delayMs * 2, 1_000));
+        }
+      });
+    }, delayMs);
+  };
+  if (!meta.sessionId) scheduleSessionIdReconcile(SESSION_ID_RECONCILE_MS);
 
   const finalize = async (exitCode: number | null): Promise<void> => {
     if (finalized) return;
     finalized = true;
+    if (sessionIdReconcileTimer) clearTimeout(sessionIdReconcileTimer);
     meta = {
       ...meta,
       ...(session.sessionId ? { sessionId: session.sessionId } : {}),
@@ -256,6 +292,21 @@ export async function runHsrHost(params: {
   void (async () => {
     try {
       for await (const event of session.events) {
+        if (event.type === "turn_start") {
+          openTurns.push({ deliveryId: awaitingTurnStart.shift(), authFailed: false });
+        } else if (
+          (event.type === "error" && isAuthNeededMessage(event.message)) ||
+          (event.type === "auth_expired" && event.requiresLogin === true)
+        ) {
+          if (openTurns[0]) openTurns[0].authFailed = true;
+        } else if (event.type === "turn_end") {
+          const completed = openTurns.shift();
+          if (completed?.deliveryId && !completed.authFailed) {
+            await removePendingHsrTurn(bee, completed.deliveryId).catch((error) => {
+              process.stderr.write(`hsr host ${bee}: could not ack pending turn: ${String(error)}\n`);
+            });
+          }
+        }
         try {
           server.broadcast("event", event);
         } catch {

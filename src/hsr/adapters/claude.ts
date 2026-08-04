@@ -310,6 +310,11 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
     tier: "stream",
     command,
     args,
+    // Claude Code accepts additional stream-json user messages while a turn is
+    // running and queues them at its own safe model/tool boundary. Let the
+    // harness own that timing instead of waiting for a future tool_use event
+    // that may already have fired for the currently-running tool.
+    nativeSteering: true,
     parseLine,
     encodeUserTurn: encodeClaudeUserTurn,
     encodeInterrupt: encodeClaudeInterrupt,

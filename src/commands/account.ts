@@ -1,6 +1,6 @@
 // `hive account`/activate/login/swap-account/usage/limits — provider account vault.
 // Extracted from cli.ts (HIVE-15).
-import { accountEmail, accountHasCredentials, accountsRegistryPath, activateAccountIntoHome, addAccount, captureAccountFromHome, defaultHomeForAccount, findAccount, listAccounts, removeAccount, setAccountPaused, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault, type AccountChainSyncOutcome, type AccountRecord } from "../accounts.js";
+import { accountEmail, accountHasCredentials, accountsRegistryPath, activateAccountIntoHome, addAccount, captureAccountFromHome, defaultHomeForAccount, findAccount, listAccounts, removeAccount, setAccountAutoPickPenalty, setAccountPaused, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault, type AccountChainSyncOutcome, type AccountRecord } from "../accounts.js";
 import { canonicalAgentKind, resolveAgent, resolveHome } from "../agents.js";
 import { cursorLiveAuthDigest } from "../accounts/cursorAuth.js";
 import { parseAge } from "../clean.js";
@@ -86,6 +86,22 @@ export async function cmdAccount(parsed: Parsed) {
       else console.log(`${paused ? "paused" : "resumed"}\t${account.id}`);
       break;
     }
+    case "auto-penalty":
+    case "downprio": {
+      const query = parsed.args[1];
+      const raw = parsed.args[2] ?? (sub === "downprio" ? "25" : undefined);
+      if (!query || raw === undefined) {
+        throw new Error("Usage: hive account auto-penalty <account> <0..100> (or: hive account downprio <account> [points])");
+      }
+      const penalty = Number(raw);
+      const account = await setAccountAutoPickPenalty(query, penalty);
+      const detail = penalty === 0
+        ? "auto-pick penalty cleared"
+        : `+${penalty} effective-load points in auto selection`;
+      if (isPretty()) console.log(actionLine("ok", "auto-penalty", [bold(account.id), dim(detail)]));
+      else console.log(`auto-penalty\t${account.id}\t${penalty}`);
+      break;
+    }
     case "remove":
     case "rm": {
       const query = parsed.args[1];
@@ -119,7 +135,7 @@ export async function cmdAccount(parsed: Parsed) {
       break;
     }
     default:
-      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|sync|pause|resume|remove`);
+      throw new Error(`Unknown account subcommand: ${sub}. Use: list|add|login|capture|sync|pause|resume|auto-penalty|downprio|remove`);
   }
 }
 
@@ -151,6 +167,7 @@ export async function accountList(parsed: Parsed) {
         account.tool,
         account.provider ?? "-",
         account.label,
+        account.autoPickPenalty ? `+${account.autoPickPenalty}` : "-",
         isPretty() ? state : plain,
         summary.lastExhaustedAt ? formatRelativeTime(summary.lastExhaustedAt) : "-",
         summary.lastResetHint ?? "-",
@@ -167,7 +184,7 @@ export async function accountList(parsed: Parsed) {
     return;
   }
   console.log(formatTable(
-    [{ header: "ACCOUNT" }, { header: "TOOL" }, { header: "PROVIDER" }, { header: "LABEL" }, { header: "STATE" }, { header: "EXHAUSTED" }, { header: "RESET" }],
+    [{ header: "ACCOUNT" }, { header: "TOOL" }, { header: "PROVIDER" }, { header: "LABEL" }, { header: "AUTO" }, { header: "STATE" }, { header: "EXHAUSTED" }, { header: "RESET" }],
     rows,
   ));
 }

@@ -255,7 +255,7 @@ function lifecycleAppliesToRoot(event: RunnerEvent, rootThreadId: string | undef
  *   - a turn in flight (last marker is turn_start) → "active".
  *   - a tool_use AFTER the last turn_end → "active" (see below).
  *   - the last turn finished (turn_end) → "idle_with_output".
- *   - no turn markers yet: any assistant text already → "ready", else "booting".
+ *   - no turn markers yet: any assistant text already → "ready".
  * Returns undefined when the tail carries no usable signal at all (empty log).
  *
  * Why tool_use gates idle: turn_end comes from the harness's own end-of-turn
@@ -315,7 +315,7 @@ export function structuredStateFromEvents(
   // A login-required auth failure is sticky for the turn it happened in. It is
   // intentionally separate from `auth_expired`: remote ephemeral-token bees can
   // recover that automatically, while this one requires a human login. The
-  // `auth_resume` marker (written by `hive auth-resume` after capture+revive)
+  // `auth_resume` marker (written after credential-aware capture/revive)
   // bounds the stickiness: a resumed bee sits idle without starting a new
   // turn, so the stale error must not keep re-deriving auth-needed. An auth
   // error AFTER the marker (the resumed runner failed again) still wins.
@@ -331,10 +331,28 @@ export function structuredStateFromEvents(
   if (lastTool > lastEnd) return "active";
   // A completed turn: the bee produced output and is now waiting.
   if (lastEnd >= 0) return "idle_with_output";
-  // No turn markers yet — still coming up. Any assistant text already means the
-  // session is talking (ready); otherwise it is still booting.
+  // No turn markers yet. Assistant text proves the session is talking; without
+  // it, the event tail has no decisive lifecycle signal. Do not call that
+  // "booting" here: a successfully-started server HSR intentionally emits no
+  // runner event until its first prompt. The run-dir meta owns startup state.
   if (hasText) return "ready";
-  return "booting";
+  return undefined;
+}
+
+/**
+ * Project one live run dir's startup metadata and event tail into BeeState.
+ * `runningAt` is written only after adapter startup and the control socket are
+ * ready, so it is the authoritative readiness signal for a never-prompted HSR.
+ * Before that point, queued admission remains queued and queued harness startup
+ * remains booting, preserving the real boot-wedge detector.
+ */
+function structuredStateFromRunDir(meta: HsrMeta, events: RunnerEvent[]): BeeState {
+  if (meta.status === "queued") {
+    return meta.startupPhase === "harness" ? "booting" : "queued";
+  }
+  const eventState = structuredStateFromEvents(events, { rootThreadId: meta.sessionId });
+  if (eventState) return eventState;
+  return meta.runningAt ? "ready" : "booting";
 }
 
 function eventText(event: RunnerEvent): string | undefined {
@@ -478,9 +496,7 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
           hsrSnapshot(bee),
           readEventSnapshot(bee, rootThreadId),
         ]);
-        const state = meta.status === "queued"
-          ? meta.startupPhase === "harness" ? "booting" : "queued"
-          : structuredStateFromEvents(eventSnapshot.tailEvents, { rootThreadId });
+        const state = structuredStateFromRunDir(meta, eventSnapshot.tailEvents);
         return [bee, {
           live: true,
           snapshot,
@@ -495,9 +511,7 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
         hsrSnapshot(bee),
         readEventTail(bee),
       ]);
-      const state = meta.status === "queued"
-        ? meta.startupPhase === "harness" ? "booting" : "queued"
-        : structuredStateFromEvents(events, { rootThreadId });
+      const state = structuredStateFromRunDir(meta, events);
       const activity = hsrActivityFromEvents(events, { rootThreadId });
       return [bee, {
         live,

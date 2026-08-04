@@ -26,7 +26,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import { CodexBootProbeError, type CodexBootFailureCause } from "../../codexBoot.js";
-import type { RunnerAdapter, RunnerEvent, RunnerInputAnswer, RunnerInputQuestion, RunnerInterruptResult, RunnerOpts, RunnerSession, RunnerTier } from "../types.js";
+import type { RunnerAdapter, RunnerEvent, RunnerInputAnswer, RunnerInputQuestion, RunnerInterruptResult, RunnerOpts, RunnerSendOpts, RunnerSession, RunnerTier } from "../types.js";
 import { harnessAllowance } from "../harness.js";
 import { attachSessionPlumbing, spawnSessionChild, stopChildGroup } from "../sessionBase.js";
 import {
@@ -720,23 +720,69 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   threadId = threadIdFromResponse(handshake.result) ?? (method === "thread/resume" ? opts.sessionId ?? "" : "");
   if (threadId.length > 0) session.sessionId = threadId;
 
-  async function send(text: string): Promise<void> {
+  async function startTurn(text: string, awaitAcceptance: boolean): Promise<void> {
     if (hasExited()) throw new Error("hsr codex: app-server has exited (session ended?)");
     if (!threadId) throw new Error("hsr codex: no thread id (thread/start did not complete)");
-    // Fire the turn; turn_start/turn_end come from turn/started / turn/completed
-    // notifications, so we don't block send() on the turn's completion.
-    void peer
-      .request("turn/start", { threadId, input: [encodeCodexUserInput(text)] })
-      .catch((error: unknown) => {
-        const message = `turn/start failed: ${String(error)}`;
-        // An auth-expiry turn failure (the access token died between boot and this
-        // turn) is classified so the daemon backstop recovers it; else generic error.
-        ingestEvent(
-          isCodexAuthExpiryError(message)
-            ? { type: "auth_expired", ts: Date.now() }
-            : { type: "error", ts: Date.now(), message },
-        );
-      });
+    const request = peer.request("turn/start", { threadId, input: [encodeCodexUserInput(text)] });
+    const reportFailure = (error: unknown): void => {
+      const message = `turn/start failed: ${String(error)}`;
+      // An auth-expiry turn failure (the access token died between boot and this
+      // turn) is classified so the daemon backstop recovers it; else generic error.
+      ingestEvent(
+        isCodexAuthExpiryError(message)
+          ? { type: "auth_expired", ts: Date.now() }
+          : { type: "error", ts: Date.now(), message },
+      );
+    };
+    if (awaitAcceptance) {
+      try {
+        await request;
+      } catch (error) {
+        reportFailure(error);
+        throw error;
+      }
+      return;
+    }
+    // Direct sends preserve the existing fire-and-observe behavior;
+    // turn_start/turn_end arrive as notifications and failures enter the ring.
+    void request.catch(reportFailure);
+  }
+
+  async function send(text: string, sendOpts?: RunnerSendOpts): Promise<void> {
+    if (hasExited()) throw new Error("hsr codex: app-server has exited (session ended?)");
+    if (!threadId) throw new Error("hsr codex: no thread id (thread/start did not complete)");
+
+    if (sendOpts?.mode === "next-tool" && turnLifecycle.active) {
+      const expectedTurnId = turnLifecycle.turnId;
+      if (!expectedTurnId) throw new Error("hsr codex: active turn has no turn id to steer");
+      try {
+        const response = asObject(await peer.request("turn/steer", {
+          threadId,
+          input: [encodeCodexUserInput(text)],
+          expectedTurnId,
+        }));
+        const acceptedTurnId = stringField(response?.turnId);
+        if (acceptedTurnId && acceptedTurnId !== expectedTurnId) {
+          throw new Error(`hsr codex: turn/steer accepted unexpected turn ${acceptedTurnId}`);
+        }
+        return;
+      } catch (error) {
+        // The active turn may finish between our lifecycle snapshot and the
+        // RPC. Once its completion notification has arrived, the same message
+        // is a normal fresh turn. While it remains active (including Codex's
+        // explicit ActiveTurnNotSteerable modes), surface the failure so buz
+        // leaves its durable row queued instead of changing semantics.
+        if (!hasExited() && !turnLifecycle.active) {
+          await startTurn(text, true);
+          return;
+        }
+        throw error;
+      }
+    }
+
+    // next-tool while idle is just a fresh turn, but await the app-server's
+    // acceptance so buz does not retire its durable queue stage prematurely.
+    await startTurn(text, sendOpts?.mode === "next-tool");
   }
 
   async function answer(requestId: string, answerValue: RunnerInputAnswer): Promise<void> {

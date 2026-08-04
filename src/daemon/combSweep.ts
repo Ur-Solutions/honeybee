@@ -130,9 +130,9 @@ async function notifyPacketQuarantine(notice: HumanPacketQuarantineNotice): Prom
 
 async function spawnCombAgent(request: AgentSpawnRequest): Promise<{ name: string; id?: string }> {
   const account = request.account === "auto"
-    ? await pickAutoAccount(request.agent, undefined)
+    ? await pickAutoAccount(request.agent, undefined, false, request.model)
     : request.account
-      ? await resolveAccountFlag(request.account, request.agent, undefined)
+      ? await resolveAccountFlag(request.account, request.agent, undefined, false, request.model)
       : undefined;
   const record = await spawnBee({
     agent: request.agent,

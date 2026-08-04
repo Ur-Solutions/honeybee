@@ -887,6 +887,101 @@ test("selectLeastLoadedAccount pushes 5h-saturated accounts behind ones with hea
   assert.match(allHot?.reason ?? "", /5h limit/);
 });
 
+test("selectLeastLoadedAccount protects an almost-empty Fable allowance for Fable spawns", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  const withFable = (
+    id: string,
+    weekly: number,
+    fable: number,
+    fableResetsAt?: string,
+  ): import("../src/limits.js").AccountLimits => ({
+    account: id,
+    tool: "claude",
+    ok: true,
+    source: "oauth-api",
+    fiveHour: { usedPercent: 10 },
+    weekly: { usedPercent: weekly },
+    fableWeekly: {
+      usedPercent: fable,
+      windowMinutes: 10_080,
+      ...(fableResetsAt ? { resetsAt: fableResetsAt } : {}),
+    },
+  });
+  const candidates = [
+    // Generic auto prefers a. Its Fable allowance, however, has only 5% left
+    // and is behind pace because it resets soon — exactly the unsafe case a
+    // pure pace score would otherwise be tempted to burn.
+    { account: pickAccount("a", "2026-01-01"), limits: withFable("a", 10, 95, "2026-06-10T13:00:00Z") },
+    { account: pickAccount("b", "2026-01-02"), limits: withFable("b", 40, 70) },
+  ];
+
+  assert.equal(selectLeastLoadedAccount(candidates, now)?.account.id, "a", "non-Fable selection remains generic");
+  const fable = selectLeastLoadedAccount(candidates, now, { model: "claude-fable-5" });
+  assert.equal(fable?.account.id, "b");
+  assert.match(fable?.reason ?? "", /Fable-aware/);
+
+  const threshold = [
+    { account: pickAccount("threshold", "2026-01-05"), limits: withFable("threshold", 5, 75) },
+    { account: pickAccount("below", "2026-01-06"), limits: withFable("below", 40, 74) },
+  ];
+  assert.equal(
+    selectLeastLoadedAccount(threshold, now, { model: "claude-fable-5" })?.account.id,
+    "below",
+    "75% Fable usage enters the protected down-priority tier",
+  );
+
+  // The scoped wall is additive, not a replacement for the general week: if
+  // both choices are close to one of their two weekly caps, take the account
+  // with more usable headroom across the pair.
+  const competingWalls = [
+    { account: pickAccount("c", "2026-01-03"), limits: withFable("c", 99, 89) },
+    { account: pickAccount("d", "2026-01-04"), limits: withFable("d", 10, 91) },
+  ];
+  assert.equal(selectLeastLoadedAccount(competingWalls, now, { model: "Fable" })?.account.id, "d");
+});
+
+test("pickLeastLoadedAccount threads the requested Fable model into scoring", async () => {
+  await withTempStore(async () => {
+    const almostEmpty = await addAccount("claude", "almost-empty@a.b");
+    const headroom = await addAccount("claude", "headroom@a.b");
+    const now = Date.parse("2026-06-10T12:00:00Z");
+    const choice = await pickLeastLoadedAccount("claude", {
+      model: "FABLE",
+      hasCredentials: async () => true,
+      fetchLimits: async () => [
+        { ...okLimits(almostEmpty.id, 10, 10), fableWeekly: { usedPercent: 99 } },
+        { ...okLimits(headroom.id, 40, 10), fableWeekly: { usedPercent: 60 } },
+      ],
+      now: () => now,
+    });
+    assert.equal(choice.account.id, headroom.id);
+  });
+});
+
+test("selectLeastLoadedAccount applies a persistent per-account auto penalty", () => {
+  const now = Date.parse("2026-06-10T12:00:00Z");
+  const preferred = pickAccount("gmail", "2026-01-01");
+  const other = pickAccount("work", "2026-01-02");
+  const base = [
+    { account: preferred, limits: okLimits("gmail", 10, 10) },
+    { account: other, limits: okLimits("work", 30, 10) },
+  ];
+  assert.equal(selectLeastLoadedAccount(base, now)?.account.id, "gmail");
+
+  const penalized = [
+    { ...base[0]!, account: { ...preferred, autoPickPenalty: 25 } },
+    base[1]!,
+  ];
+  assert.equal(selectLeastLoadedAccount(penalized, now)?.account.id, "work");
+
+  const stillWins = selectLeastLoadedAccount([
+    penalized[0]!,
+    { account: other, limits: okLimits("work", 80, 10) },
+  ], now);
+  assert.equal(stillWins?.account.id, "gmail");
+  assert.match(stillWins?.reason ?? "", /\+25 account auto penalty/);
+});
+
 test("selectLeastLoadedAccount treats rolled-over windows as fresh and unreadable limits as last resort", () => {
   const now = Date.parse("2026-06-10T12:00:00Z");
   // a's snapshot says 99% but its windows already reset → counts as 0%.

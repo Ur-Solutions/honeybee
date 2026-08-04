@@ -10,6 +10,7 @@ import {
   buzRoot,
   consumeMessage,
   DEFAULT_BUZ_ACCEPT,
+  DEFAULT_BUZ_TIER,
   downgradeTier,
   externalOutboxDir,
   formatBuzInjection,
@@ -87,9 +88,9 @@ function fakeSubstrate(impl: Partial<Substrate> = {}): Substrate {
   return { ...base, ...impl };
 }
 
-test("generateMessageId returns a 13-base32 + 6-hex sortable id", () => {
+test("generateMessageId returns an RFC 9562 UUIDv7 with the supplied timestamp", () => {
   const id = generateMessageId(1700000000000);
-  assert.match(id, /^[0-9A-Z]{13}-[0-9a-f]{6}$/);
+  assert.match(id, /^018bcfe5-6800-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 });
 
 test("generateMessageId does not collide within the same millisecond (broadcasts)", () => {
@@ -108,12 +109,12 @@ test("generateMessageId is collision-free and sortable across 1000 generations",
   }
   const unique = new Set(ids);
   assert.equal(unique.size, ids.length, "ids must be unique");
-  const sorted = [...ids].sort();
-  // Because timestamp prefix is monotonic over millis and the random suffix
-  // resolves intra-millisecond ties, the natural insertion order should match
-  // lexicographic sort within the same millisecond window.
-  // We only check stability across millisecond boundaries here.
-  assert.equal(sorted[0]!.slice(0, 13) <= sorted[sorted.length - 1]!.slice(0, 13), true);
+  assert.deepEqual([...ids].sort(), ids, "canonical UUIDv7 strings sort by timestamp");
+});
+
+test("generateMessageId rejects timestamps outside UUIDv7's 48-bit field", () => {
+  assert.throws(() => generateMessageId(-1), /UUIDv7 timestamp out of range/);
+  assert.throws(() => generateMessageId(0x1000000000000), /UUIDv7 timestamp out of range/);
 });
 
 test("sanitizeHumanName lowercases and replaces non [a-z0-9_-] with underscore", () => {
@@ -150,7 +151,8 @@ test("dot-only bee names stay inside buz root", async () => {
 
 test("resolveBuzAccept returns DEFAULT_BUZ_ACCEPT when undefined", () => {
   assert.deepEqual(resolveBuzAccept({ buzAccept: undefined }), DEFAULT_BUZ_ACCEPT);
-  assert.deepEqual([...DEFAULT_BUZ_ACCEPT], ["queue", "passive"]);
+  assert.deepEqual([...DEFAULT_BUZ_ACCEPT], ["next-tool", "queue", "passive"]);
+  assert.equal(DEFAULT_BUZ_TIER, "next-tool");
 });
 
 test("resolveBuzAccept returns the explicit list when set", () => {
@@ -163,9 +165,9 @@ test("downgradeTier returns requested tier when accepted", () => {
   assert.equal(r.downgraded, false);
 });
 
-test("downgradeTier downgrades interrupt -> queue when only queue+passive allowed", () => {
+test("downgradeTier downgrades interrupt -> next-tool under the default policy", () => {
   const r = downgradeTier("interrupt", DEFAULT_BUZ_ACCEPT);
-  assert.equal(r.effective, "queue");
+  assert.equal(r.effective, "next-tool");
   assert.equal(r.downgraded, true);
   assert.match(r.reason ?? "", /policy disallows interrupt/);
 });
@@ -202,9 +204,9 @@ test("parseAcceptFlag splits comma-separated values", () => {
   assert.deepEqual(parseAcceptFlag("queue, passive"), ["queue", "passive"]);
 });
 
-test("serialize/parse round-trip preserves frontmatter and body bytes", () => {
+test("serialize/parse round-trip preserves legacy ids, frontmatter, and body bytes", () => {
   const m: BuzMessage = {
-    id: "ABCDEFGHIJKLM-1a2b",
+    id: "00001KZ5P6CKM-9ad70d",
     from: { kind: "bee", id: "CL.cc9" },
     to: "CO.aaa",
     tier: "queue",
@@ -307,7 +309,7 @@ test("sendBuzMessage tier=interrupt with transport delivers and copies to inbox/
   });
 });
 
-test("default policy auto-downgrades interrupt -> queue (without explicit opt-in)", async () => {
+test("default policy rejects true interrupt and safely falls back on tmux", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa"); // no buzAccept => DEFAULT
     let pasteCount = 0;
@@ -395,13 +397,17 @@ test("sender-human routes outbox via _external/<sanitized>/", async () => {
     const files = await readdir(dir);
     assert.equal(files.length, 1);
     // Filename uses safe-stamped name: <ts>-to-<recipient>-<id>.md
-    assert.match(files[0]!, /-to-CO\.aaa-[0-9A-Z]{13}-[0-9a-f]{6}\.md$/);
+    assert.match(
+      files[0]!,
+      /-to-CO\.aaa-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$/,
+    );
   });
 });
 
 test("broadcast: per-bee policy applied independently", async () => {
   await withTempStore(async () => {
-    // Recipient A allows interrupt, B uses default => downgrade to queue.
+    // Recipient A allows interrupt. B's default policy chooses next-tool,
+    // which its tmux substrate safely downgrades to queue.
     const a = makeRecord("CO.aaa", { buzAccept: ["interrupt"] });
     const b = makeRecord("CO.bbb"); // default policy
 
@@ -753,11 +759,13 @@ test("tier=next-tool on a supportsNextTool substrate delivers with mode and copi
     const recipient = makeRecord("CO.aaa");
     let pasted = "";
     let mode: string | undefined;
+    let stagedAtHandoff = false;
     const sub = fakeSubstrate({
       supportsNextTool: true,
       sendText: async (_t, text, _p, options) => {
         pasted = text;
         mode = options?.mode;
+        stagedAtHandoff = (await readdir(beeMailboxDir("CO.aaa", "queue"))).length === 1;
       },
     });
     const result = await sendBuzMessage({
@@ -771,9 +779,33 @@ test("tier=next-tool on a supportsNextTool substrate delivers with mode and copi
     assert.equal(result.downgraded, false);
     assert.equal(pasted, "NT");
     assert.equal(mode, "next-tool");
+    assert.equal(stagedAtHandoff, true, "message is durable before provider hand-off");
+    assert.equal(result.queuePath, undefined);
+    assert.ok(result.inboxPath);
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "inbox"))).length, 1);
-    // No queue write for a live delivery (the dir may not even exist yet).
+    // The durable stage moves atomically to inbox after provider acceptance.
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue")).catch(() => [])).length, 0);
+  });
+});
+
+test("default policy accepts next-tool from a bee sender", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    let mode: string | undefined;
+    const sub = fakeSubstrate({
+      supportsNextTool: true,
+      sendText: async (_target, _text, _pane, options) => { mode = options?.mode; },
+    });
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.cc9" },
+      tier: DEFAULT_BUZ_TIER,
+      body: "NT",
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(result.message.deliveredAs, "next-tool");
+    assert.equal(result.downgraded, false);
+    assert.equal(mode, "next-tool");
   });
 });
 
@@ -801,9 +833,15 @@ test("tier=next-tool downgrades to queue when the substrate cannot hold it", asy
 test("tier=next-tool transport failure falls back to queue without losing the message", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa");
+    let stagedMtimeMs = 0;
     const sub = fakeSubstrate({
       supportsNextTool: true,
-      sendText: async () => { throw new Error("socket gone"); },
+      sendText: async () => {
+        const [staged] = await readdir(beeMailboxDir("CO.aaa", "queue"));
+        stagedMtimeMs = (await stat(join(beeMailboxDir("CO.aaa", "queue"), staged!))).mtimeMs;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        throw new Error("socket gone");
+      },
     });
     const result = await sendBuzMessage({
       recipient,
@@ -815,13 +853,30 @@ test("tier=next-tool transport failure falls back to queue without losing the me
     assert.equal(result.message.deliveredAs, "queue");
     assert.equal(result.downgraded, true);
     assert.match(result.reason ?? "", /next-tool transport failed/);
-    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
+    const files = await readdir(beeMailboxDir("CO.aaa", "queue"));
+    assert.equal(files.length, 1);
+    const queuedPath = join(beeMailboxDir("CO.aaa", "queue"), files[0]!);
+    assert.equal(parseBuzMessage(await readFile(queuedPath, "utf8")).deliveredAs, "queue");
+    assert.ok(
+      Math.abs((await stat(queuedPath)).mtimeMs - stagedMtimeMs) < 2,
+      "downgrade metadata rewrite preserves the original FIFO timestamp",
+    );
+    const ledger = (await readFile(join(buzRoot(), "..", "ledger.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const sendEvent = ledger.find((event) =>
+      event.type === "buz.send" && event.messageId === result.message.id
+    );
+    assert.equal(sendEvent?.deliveredAs, "queue");
+    assert.equal(sendEvent?.downgraded, true);
+    assert.match(String(sendEvent?.reason), /next-tool transport failed/);
   });
 });
 
 test("human sender bypasses the accept-list downgrade (interrupt with default policy)", async () => {
   await withTempStore(async () => {
-    const recipient = makeRecord("CO.aaa"); // no buzAccept => DEFAULT (queue+passive)
+    const recipient = makeRecord("CO.aaa"); // no buzAccept => DEFAULT (next-tool+queue+passive)
     let pasted = "";
     const sub = fakeSubstrate({ sendText: async (_t, text) => { pasted = text; } });
     const result = await sendBuzMessage({

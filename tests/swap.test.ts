@@ -8,6 +8,7 @@ import type { HsrRunPayload } from "../src/hsr/runnerHost.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { LaunchSpec, Substrate } from "../src/substrates/types.js";
 import { resumeArgs, swapAccount } from "../src/swap.js";
+import { claudeSessionFilePath } from "../src/threadCopy.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -87,19 +88,21 @@ async function seedOpencodeAuth(account: AccountRecord, token: string, root = ac
   }
 }
 
-test("swapAccount stops, moves to the target account home, resumes the same session, and rebinds", async () => {
+test("swapAccount re-keys a Claude thread when moving it to another account", async () => {
   await withTempStore(async (dir) => {
     const { substrate, calls } = fakeSubstrate(true);
     const activated: string[] = [];
     const sourceHome = join(dir, "homes", "claude-old");
-    const sourceTranscript = join(sourceHome, "projects", "project-a", "uuid-123.jsonl");
+    const cwd = join(dir, "project-a");
+    const sourceTranscript = claudeSessionFilePath({ cwd, providerSessionId: "uuid-123", homePath: sourceHome });
     await mkdir(join(sourceTranscript, ".."), { recursive: true });
-    await writeFile(sourceTranscript, "{\"type\":\"user\"}\n");
-    const existing = record({ homePath: sourceHome, transcriptPath: sourceTranscript });
+    await writeFile(sourceTranscript, "{\"type\":\"user\",\"sessionId\":\"uuid-123\"}\n");
+    const existing = record({ cwd, homePath: sourceHome, transcriptPath: sourceTranscript });
     await saveSession(existing);
     const updated = await swapAccount(existing, account, {
       substrate,
       sleep: async () => undefined,
+      newProviderSessionId: () => "uuid-new",
       activate: async (target, home) => {
         activated.push(`${target.id}:${home}`);
         return ["auth"];
@@ -111,16 +114,17 @@ test("swapAccount stops, moves to the target account home, resumes the same sess
     assert.equal(calls[0]!.method, "kill");
     const relaunch = calls.find((call) => call.method === "newSession")!;
     assert.equal(relaunch.target, "CL-test");
-    // Same session resumed, same yolo mode, target-account home, same tmux target.
-    assert.deepEqual(relaunch.spec!.args.slice(-2), ["--resume", "uuid-123"]);
+    // A re-keyed copy is resumed with the same yolo mode in the target home.
+    assert.deepEqual(relaunch.spec!.args.slice(-2), ["--resume", "uuid-new"]);
     assert.ok(relaunch.spec!.args.includes("--dangerously-skip-permissions"));
     assert.equal(relaunch.spec!.env?.CLAUDE_CONFIG_DIR, targetHome);
 
     assert.equal(updated.accountId, "claude-new");
     assert.equal(updated.homePath, targetHome);
-    const targetTranscript = join(targetHome, "projects", "project-a", "uuid-123.jsonl");
+    assert.equal(updated.providerSessionId, "uuid-new");
+    const targetTranscript = claudeSessionFilePath({ cwd, providerSessionId: "uuid-new", homePath: targetHome });
     assert.equal(updated.transcriptPath, targetTranscript);
-    assert.equal(await readFile(targetTranscript, "utf8"), "{\"type\":\"user\"}\n");
+    assert.equal(await readFile(targetTranscript, "utf8"), "{\"type\":\"user\",\"sessionId\":\"uuid-new\"}\n");
     assert.equal(updated.status, "running");
     const persisted = await loadSession("CL.test");
     assert.equal(persisted?.accountId, "claude-new");
@@ -200,9 +204,53 @@ test("swapAccount tolerates undefined provider (legacy claude swap still allowed
       sleep: async () => undefined,
       activate: async () => ["auth"],
       listAccounts: async () => [legacyCurrent, account],
+      newProviderSessionId: () => "uuid-new",
+      copyThread: async () => ({ path: "/tmp/copied-uuid-new.jsonl", keptRows: 1 }),
     });
     assert.equal(updated.accountId, "claude-new");
     assert.ok(calls.some((call) => call.method === "newSession"));
+  });
+});
+
+test("swapAccount launches an HSR Claude bee on the re-keyed target-account thread", async () => {
+  await withTempStore(async (dir) => {
+    const { substrate, calls } = fakeSubstrate(false);
+    const sourceHome = join(dir, "homes", "claude-old");
+    const cwd = join(dir, "project-hsr");
+    const sourceTranscript = claudeSessionFilePath({ cwd, providerSessionId: "uuid-old", homePath: sourceHome });
+    await mkdir(join(sourceTranscript, ".."), { recursive: true });
+    await writeFile(sourceTranscript, "{\"type\":\"user\",\"sessionId\":\"uuid-old\"}\n");
+    const existing = record({
+      name: "CL.hsr",
+      cwd,
+      tmuxTarget: "CL.hsr",
+      substrate: "hsr",
+      homePath: sourceHome,
+      providerSessionId: "uuid-old",
+      transcriptPath: sourceTranscript,
+    });
+    await saveSession(existing);
+    let payload: HsrRunPayload | undefined;
+
+    const updated = await swapAccount(existing, account, {
+      substrate,
+      sleep: async () => undefined,
+      activate: async () => ["auth"],
+      newProviderSessionId: () => "uuid-new",
+      spawnHsrHost: async (next) => {
+        payload = next;
+        return 4321;
+      },
+      waitForHsrHost: async () => true,
+    });
+
+    assert.equal(calls.some((call) => call.method === "newSession"), false);
+    assert.equal(payload?.sessionId, "uuid-new");
+    assert.equal(payload?.resume, true);
+    assert.equal(payload?.accountId, account.id);
+    assert.equal(updated.providerSessionId, "uuid-new");
+    assert.equal(updated.runnerPid, 4321);
+    assert.equal(updated.transcriptPath, claudeSessionFilePath({ cwd, providerSessionId: "uuid-new", homePath: join(dir, "homes", account.id) }));
   });
 });
 

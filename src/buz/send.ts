@@ -2,6 +2,7 @@
 // copy, dispatch to the effective tier's delivery handler (interrupt paste /
 // queue / passive), and record the ledger entries.
 
+import { stat, utimes } from "node:fs/promises";
 import { withFileLock } from "../lock.js";
 import { appendLedger } from "../store.js";
 import { resetTaskSupplyFeedsForHumanInteraction, TASK_SUPPLY_SENDER_NAME } from "../tasks/supplyConfig.js";
@@ -11,6 +12,7 @@ import { downgradeTier, resolveBuzAccept } from "./policy.js";
 import {
   DELIVERY_LOCK_TIMEOUT_MS,
   deliveryLockPath,
+  finalizeQueuedDelivery,
   recipientWriteLockPath,
   senderDisplay,
   senderToken,
@@ -127,7 +129,9 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
     to: message.to,
     tier: input.tier,
     deliveredAs: message.deliveredAs,
-    ...(downgrade.downgraded ? { downgraded: true, reason: result.reason } : {}),
+    ...(result.downgraded
+      ? { downgraded: true, ...(result.reason ? { reason: result.reason } : {}) }
+      : {}),
     ...(input.node ? { node: input.node } : {}),
   });
 
@@ -185,10 +189,10 @@ async function deliverInterruptTier(context: BuzDeliveryContext): Promise<BuzDel
 async function deliverNextToolTier(context: BuzDeliveryContext): Promise<BuzDeliveryOutcome> {
   const { input, message, result } = context;
 
-  // next-tool needs a substrate that can HOLD the message until the recipient's
-  // next tool boundary (the HSR runner host). Without a transport, or on a
-  // substrate that would just paste immediately (tmux), downgrade to queue so
-  // the semantics stay deterministic rather than silently becoming "now".
+  // next-tool needs a substrate with a non-interrupting steering path. Without
+  // a transport, or on a substrate that would just paste immediately (tmux),
+  // downgrade to queue so the semantics stay deterministic rather than
+  // silently becoming "now".
   if (!input.transport || input.transport.substrate.supportsNextTool !== true) {
     message.deliveredAs = "queue";
     result.downgraded = true;
@@ -200,24 +204,49 @@ async function deliverNextToolTier(context: BuzDeliveryContext): Promise<BuzDeli
   }
 
   const transport = input.transport;
-  try {
-    await withFileLock(
-      deliveryLockPath(input.recipient.name),
-      () => transport.substrate.sendText(transport.tmuxTarget, formatBuzInjection(message), transport.agentPaneId, { mode: "next-tool" }),
-      { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS },
-    );
-    // deliveredAt marks the hand-off to the runner host; the host flushes at
-    // the next tool boundary (or immediately when the bee is idle).
-    message.deliveredAt = new Date().toISOString();
-  } catch (error) {
-    message.deliveredAs = "queue";
-    result.downgraded = true;
-    result.reason = `next-tool transport failed: ${error instanceof Error ? error.message : String(error)}`;
-    await BUZ_DELIVERY_HANDLERS.queue(context);
-    return { liveTierAttempted: "next-tool" };
-  }
+  // Stage the exact message in queue/ BEFORE handing it to the provider. The
+  // delivery lock excludes the daemon drainer while the hand-off is live. On
+  // success, queue -> inbox is one atomic rename; on failure (or a process
+  // crash before that rename), the durable row remains drainable. This is the
+  // same at-least-once choice as the ordinary queue drainer: ambiguity may
+  // duplicate a steer, but it cannot silently lose one.
+  await withFileLock(deliveryLockPath(input.recipient.name), async () => {
+    await writeRecipientMailbox(context, "queue");
+    try {
+      await transport.substrate.sendText(
+        transport.tmuxTarget,
+        formatBuzInjection(message),
+        transport.agentPaneId,
+        { mode: "next-tool" },
+      );
+    } catch (error) {
+      message.deliveredAs = "queue";
+      result.downgraded = true;
+      result.reason = `next-tool transport failed: ${error instanceof Error ? error.message : String(error)}`;
+      // Rewrite the staged file with its final downgrade metadata. It stays in
+      // queue/ for the daemon; do not append a second queue copy. Preserve its
+      // initial mtime so messages queued during the RPC cannot jump ahead of it.
+      const queuePath = result.queuePath;
+      const originalTimes = queuePath ? await stat(queuePath).catch(() => undefined) : undefined;
+      await writeRecipientMailbox(context, "queue");
+      if (queuePath && originalTimes) {
+        await utimes(queuePath, originalTimes.atime, originalTimes.mtime).catch(() => undefined);
+      }
+      return;
+    }
 
-  await writeRecipientMailbox(context, "inbox");
+    // deliveredAt is the provider acceptance receipt. Codex waits for the
+    // turn/steer response; stream harnesses wait for stdin acceptance into the
+    // harness-owned prompt queue.
+    message.deliveredAt = new Date().toISOString();
+    const queuePath = result.queuePath;
+    if (!queuePath) throw new Error("next-tool delivery lost its durable queue stage");
+    await withFileLock(recipientWriteLockPath(input.recipient.name), async () => {
+      result.inboxPath = await finalizeQueuedDelivery(input.recipient.name, queuePath, message);
+      delete result.queuePath;
+    });
+  }, { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS });
+
   return { liveTierAttempted: "next-tool" };
 }
 

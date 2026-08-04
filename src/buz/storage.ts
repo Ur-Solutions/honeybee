@@ -163,6 +163,30 @@ export async function writeMailbox(beeName: string, mailbox: BuzMailbox, message
   return path;
 }
 
+/**
+ * Complete a live delivery that was staged durably in queue/. The caller must
+ * hold the recipient write lock. Rewriting before rename keeps deliveredAt and
+ * deliveredAs exact while the atomic move preserves the original FIFO name.
+ */
+export async function finalizeQueuedDelivery(
+  beeName: string,
+  queuePath: string,
+  message: BuzMessage,
+): Promise<string> {
+  const queueDir = beeMailboxDir(beeName, "queue");
+  const filename = basename(queuePath);
+  if (resolve(queuePath) !== resolve(join(queueDir, filename))) {
+    throw new Error(`buz queued delivery escaped recipient queue: ${queuePath}`);
+  }
+  const inboxDir = beeMailboxDir(beeName, "inbox");
+  await mkdir(inboxDir, { recursive: true });
+  await atomicWriteFile(queuePath, serializeBuzMessage(message), { mode: 0o600 });
+  const inboxPath = join(inboxDir, filename);
+  await rename(queuePath, inboxPath);
+  await rm(`${queuePath}.retries`, { force: true }).catch(() => undefined);
+  return inboxPath;
+}
+
 export async function writeOutbox(message: BuzMessage): Promise<string> {
   let dir: string;
   if (message.from.kind === "bee") {

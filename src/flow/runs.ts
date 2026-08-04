@@ -5,7 +5,7 @@
 //   ~/.hive/flows/<flowName>/runs/<runId>/log.txt
 //   ~/.hive/flows/<flowName>/runs/<runId>/result.json
 //
-// runId format mirrors src/buz.ts: 13-char base32 timestamp + 4-hex random.
+// Flow run ids retain their 13-char base32 timestamp + 4-hex random format.
 // listRuns scans across all flows newest-first.
 
 import { mkdir, readFile, readdir, stat } from "node:fs/promises";
@@ -53,7 +53,7 @@ export type FlowRunResult = {
 const BASE32_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /**
- * Generate a runId: 13-char base32 timestamp + 4-hex random, like buz ids.
+ * Generate a runId: 13-char base32 timestamp + 4-hex random.
  * Sortable lexicographically the same way as the underlying integer.
  */
 export function generateRunId(now: number = Date.now()): string {

@@ -113,6 +113,76 @@ test("hsrObservations: scopes reads to requested bees and skips exited payloads"
   });
 });
 
+test("hsrObservations: confirmed running with no events is ready and never ages into wedged", async () => {
+  await withTempStore(async () => {
+    const bee = "idle-server";
+    const now = Date.now();
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "codex",
+      tier: "server",
+      sessionId: "thread-idle",
+      hostPid: process.pid,
+      startedAt: new Date(now - 20 * 60_000).toISOString(),
+      runningAt: new Date(now - 20 * 60_000 + 500).toISOString(),
+      controlSocket: "/tmp/idle-server.sock",
+      status: "running",
+    });
+
+    assert.equal(structuredStateFromEvents([]), undefined, "an empty event tail has no lifecycle opinion");
+    assert.equal(
+      structuredStateFromEvents([{ type: "usage", ts: now, inputTokens: 1, outputTokens: 0 }]),
+      undefined,
+      "telemetry without a turn boundary is not a boot-state signal",
+    );
+    const observation = (await hsrObservations()).get(bee);
+    assert.equal(observation?.live, true);
+    assert.equal(observation?.state, "ready", "runningAt proves the empty server session is ready");
+
+    const record = {
+      ...hsrRecord(bee),
+      createdAt: new Date(now - 20 * 60_000).toISOString(),
+    };
+    const context = await contextFromObservations();
+    context.now = now;
+    assert.equal(deriveState(record, context).state, "ready", "a healthy idle host never hits the five-minute wedge age");
+  });
+});
+
+test("hsrObservations: pre-handshake startup stays queued/booting and true stale boots still wedge", async () => {
+  await withTempStore(async () => {
+    const admission = "queued-admission";
+    const harness = "queued-harness";
+    const now = Date.now();
+    for (const [bee, startupPhase] of [[admission, "admission"], [harness, "harness"]] as const) {
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, {
+        bee,
+        harness: "codex",
+        tier: "server",
+        hostPid: process.pid,
+        startedAt: new Date(now - 20 * 60_000).toISOString(),
+        startupPhase,
+        controlSocket: `/tmp/${bee}.sock`,
+        status: "queued",
+      });
+    }
+
+    const observations = await hsrObservations();
+    assert.equal(observations.get(admission)?.state, "queued");
+    assert.equal(observations.get(harness)?.state, "booting");
+
+    const context = await contextFromObservations();
+    context.now = now;
+    const staleHarness = {
+      ...hsrRecord(harness),
+      createdAt: new Date(now - 20 * 60_000).toISOString(),
+    };
+    assert.equal(deriveState(staleHarness, context).state, "wedged", "an old pre-handshake host still wedges");
+  });
+});
+
 test("hsrObservations: live structured state feeds deriveState (not dead), dead host → dead", async () => {
   await withTempStore(async () => {
     const bee = "observee";
@@ -129,7 +199,7 @@ test("hsrObservations: live structured state feeds deriveState (not dead), dead 
       await waitFor(async () => (await hsrObservations()).get(bee)?.live === true, "bee live");
       const bootCtx = await contextFromObservations();
       const bootDerived = deriveState(record, bootCtx);
-      assert.notEqual(bootDerived.state, "dead", "live HSR bee must not derive dead");
+      assert.equal(bootDerived.state, "ready", "a started, never-prompted HSR bee is ready");
 
       // 2. Send a turn → the stub emits a text echo + turn_end. The structured
       //    state is idle_with_output (last turn marker is turn_end) and the

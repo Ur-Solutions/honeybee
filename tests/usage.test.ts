@@ -56,6 +56,50 @@ test("usage events append and read back; summary computes window deltas", async 
     assert.equal(summary.lastResetHint, "resets at 7pm");
     assert.equal(isRecentlyExhausted(summary, now), true);
     assert.equal(isRecentlyExhausted(summary, now + 6 * 60 * 60 * 1000), false);
+
+    // One post-exhaustion sample is NOT recovery: the sampler's throttle
+    // routinely flushes pre-limit spend with a post-exhaustion timestamp.
+    await appendUsageEvent(sample("2026-06-10T11:45:00.000Z", 320, 45));
+    const trailing = await usageSummary("acct", now);
+    assert.equal(isRecentlyExhausted(trailing, now), true, "a single trailing sample is not recovery evidence");
+
+    await appendUsageEvent(sample("2026-06-10T11:46:00.000Z", 340, 47));
+    const recovered = await usageSummary("acct", now);
+    assert.equal(isRecentlyExhausted(recovered, now), false, "two growing post-exhaustion samples are recovery evidence");
+  });
+});
+
+test("exhaustion cool-off survives the sampler's trailing flush of pre-limit tokens", async () => {
+  await withTempStore(async () => {
+    let totals = { input_tokens: 100, output_tokens: 10 };
+    const sampler = createUsageSampler({
+      appendLedger: async () => undefined,
+      readTranscriptRows: async () => ({
+        provider: "claude",
+        rows: [{ type: "assistant", message: { role: "assistant", usage: totals } } as never],
+      }),
+    });
+    const t0 = Date.parse("2026-06-10T12:00:00.000Z");
+    const records = [record()];
+    const limitPane = "Claude usage limit reached. Your limit will reset at 7pm.";
+
+    const first = await sampler(records, new Map([["CL-a", "❯ working"]]), t0);
+    assert.equal(first[0]!.sampled, true);
+
+    // The bee keeps spending; the 60s sample throttle holds the next flush.
+    totals = { input_tokens: 200, output_tokens: 30 };
+
+    // 30s later the pane shows the provider limit: exhaustion, no sample yet.
+    const hit = await sampler(records, new Map([["CL-a", limitPane]]), t0 + 30_000);
+    assert.equal(hit[0]!.exhausted, true);
+    assert.equal(hit[0]!.sampled, false);
+
+    // 60s after that the throttle elapses and flushes the PRE-limit spend with
+    // a post-exhaustion timestamp. That must not clear the cool-off.
+    const flush = await sampler(records, new Map([["CL-a", limitPane]]), t0 + 90_000);
+    assert.equal(flush[0]!.sampled, true);
+    const summary = await usageSummary("acct", t0 + 91_000);
+    assert.equal(isRecentlyExhausted(summary, t0 + 91_000), true, "trailing flush must not end the cool-off");
   });
 });
 

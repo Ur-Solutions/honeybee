@@ -32,7 +32,7 @@ export const TRACK_SUBCOMMANDS = [
   "status", "detach", "step", "subtask", "exception",
 ];
 export const DAEMON_SUBCOMMANDS = ["install", "uninstall", "start", "stop", "restart", "status", "logs", "run"];
-export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "pause", "resume", "remove"];
+export const ACCOUNT_SUBCOMMANDS = ["list", "ls", "add", "login", "capture", "sync", "pause", "resume", "auto-penalty", "downprio", "remove"];
 export const KEYS_SUBCOMMANDS = ["print", "path", "check"];
 export const SESSIONS_SUBCOMMANDS = ["reconcile"];
 export const SYNC_SUBCOMMANDS = ["manifest"];
@@ -265,7 +265,16 @@ export const NOUN_SUB_ARG: Record<string, Record<string, NounSubArgKind>> = {
   swarm: { inspect: "swarm", destroy: "swarm" },
   node: { inspect: "node", update: "node", unregister: "node" },
   flow: { inspect: "flow", remove: "flow", run: "flow", logs: "run", status: "run", cancel: "run" },
-  account: { capture: "account", sync: "account", pause: "account", resume: "account", remove: "account", rm: "account" },
+  account: {
+    capture: "account",
+    sync: "account",
+    pause: "account",
+    resume: "account",
+    "auto-penalty": "account",
+    downprio: "account",
+    remove: "account",
+    rm: "account",
+  },
   // task supply/claim/add/ls point at a bee (bare name = bee:<name> list).
   task: {
     supply: "session-any",

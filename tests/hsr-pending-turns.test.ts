@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { runHsrHost } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
-import { enqueueTurnForBootingHsrHost } from "../src/hsr/pendingTurns.js";
+import { enqueueTurnForBootingHsrHost, readPendingHsrTurns } from "../src/hsr/pendingTurns.js";
 import { hsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
 import type { RunnerOpts } from "../src/hsr/types.js";
@@ -133,8 +133,38 @@ test("a turn enqueued before host boot is drained into the harness at queued→r
         async () => (await sub.capture(bee, 50)).includes("echo:hello-from-before-boot"),
         "pre-boot turn echoed by the harness",
       );
-      const files = await readdir(join(hsrRunDir(bee), "pending-turns")).catch(() => [] as string[]);
-      assert.equal(files.filter((name) => name.endsWith(".json")).length, 0);
+      await waitFor(async () => (await readPendingHsrTurns(bee)).length === 0, "successful turn journal ack");
+    } finally {
+      await handle.stop();
+    }
+  });
+});
+
+test("a live HSR send stays journaled through a login-required auth failure", async () => {
+  await withTempStore(async () => {
+    const bee = "auth-journal";
+    const handle = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee), queueStartup: true });
+    try {
+      await hsrSubstrate().sendText(bee, "authfail exact operator prompt");
+      await waitFor(
+        async () => (await readPendingHsrTurns(bee)).length === 1,
+        "auth-failed turn retained",
+      );
+      const pending = await readPendingHsrTurns(bee);
+      assert.equal(pending[0]!.text, "authfail exact operator prompt");
+    } finally {
+      await handle.stop();
+    }
+  });
+});
+
+test("a live HSR send is removed only after a successful turn_end", async () => {
+  await withTempStore(async () => {
+    const bee = "success-journal";
+    const handle = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee), queueStartup: true });
+    try {
+      await hsrSubstrate().sendText(bee, "successful exact operator prompt");
+      await waitFor(async () => (await readPendingHsrTurns(bee)).length === 0, "live turn journal ack");
     } finally {
       await handle.stop();
     }

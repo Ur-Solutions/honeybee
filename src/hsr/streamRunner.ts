@@ -26,6 +26,13 @@ export type StreamRunnerConfig = {
   parseLine(line: string): RunnerEvent[];
   /** Encode a user turn as the bytes to write to child stdin (include trailing newline). */
   encodeUserTurn(text: string): string;
+  /**
+   * The harness owns a safe mid-turn input queue. A next-tool send can be
+   * written immediately and the harness incorporates it at its next model
+   * boundary (after any in-flight tool result), without Honeybee guessing
+   * whether the relevant tool_use event already passed.
+   */
+  nativeSteering?: boolean;
   /** Optional: encode an answer to a needs_input requestId (permission/question). */
   encodeAnswer?(requestId: string, answer: string): string;
   /**
@@ -75,9 +82,9 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     if (id && id.length > 0) session.sessionId = id;
   };
 
-  // next-tool hold (queued-steering spec): texts parked here wait for the
-  // current turn's next tool boundary. `turnActive` brackets between our own
-  // turn_start (send) and the harness's turn_end.
+  // Fallback next-tool hold (queued-steering spec): runners without a native
+  // steering queue park texts here until the current turn's next observed
+  // tool boundary. `turnActive` brackets our send through harness turn_end.
   let turnActive = false;
   const heldForNextTool: string[] = [];
 
@@ -167,6 +174,10 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
 
   async function send(text: string, opts?: RunnerSendOpts): Promise<void> {
     if (opts?.mode === "next-tool" && turnActive) {
+      if (config.nativeSteering) {
+        await writeInterjection(text);
+        return;
+      }
       writableStdin(); // fail the caller NOW if the session is already dead
       heldForNextTool.push(text);
       return;

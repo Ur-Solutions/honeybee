@@ -26,10 +26,10 @@ export type KillResult = {
 /**
  * How a sendText should land relative to the recipient's live turn:
  * - "now": deliver immediately (the default; interjects a running turn).
- * - "next-tool": hold until the recipient's next tool boundary. Only the HSR
- *   substrates can honor this (the runner host sees tool events inline);
- *   substrates that cannot MUST ignore the option, and callers that need
- *   deterministic semantics (buz) gate on `supportsNextTool` first.
+ * - "next-tool": enqueue a non-interrupting steer for the live turn's next
+ *   provider-safe boundary. Only HSR substrates can honor this; substrates
+ *   that cannot MUST ignore the option, and callers that need deterministic
+ *   semantics (buz) gate on `supportsNextTool` first.
  */
 export type SendTextOptions = { mode?: "now" | "next-tool" };
 

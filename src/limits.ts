@@ -58,15 +58,19 @@ export {
 
 export {
   AUTO_FIVE_HOUR_SATURATION_PERCENT,
+  AUTO_FABLE_WEEKLY_SATURATION_PERCENT,
+  AUTO_GENERAL_WEEKLY_SATURATION_PERCENT,
   AUTO_PACE_FULL_WEIGHT_HEADROOM_PERCENT,
   AUTO_ACCOUNT_TTL_MS,
   AUTO_STALE_LIMITS_MAX_MS,
   AUTO_TIE_EPSILON_PERCENT,
   effectiveWindowLoad,
+  isFableModel,
   selectLeastLoadedAccount,
   pickLeastLoadedAccount,
   type AutoAccountCandidate,
   type AutoAccountChoice,
+  type AutoAccountSelectionOptions,
   type PickAccountDeps,
 } from "./limits/autoPick.js";
 

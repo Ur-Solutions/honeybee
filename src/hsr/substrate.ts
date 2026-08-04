@@ -58,7 +58,18 @@ async function sendText(bee: string, text: string, _paneId?: string, options?: S
     }
     const client = await connectRpcClient(meta.controlSocket);
     try {
-      await client.call("send", { text, ...(options?.mode === "next-tool" ? { mode: "next-tool" } : {}) });
+      if (options?.mode === "next-tool") {
+        // Steering joins an already-open provider turn and has no independent
+        // turn_end boundary to ack against, so it keeps its existing native
+        // queue semantics rather than masquerading as a recoverable new turn.
+        await client.call("send", { text, mode: "next-tool" });
+      } else {
+        // Persist BEFORE stdin/RPC acceptance. The host acks this file only on
+        // a completed non-auth turn; a login-required failure leaves the exact
+        // operator text available for restart+replay.
+        const turn = await enqueuePendingHsrTurn(bee, text);
+        await client.call("send", { text, deliveryId: turn.filename });
+      }
     } finally {
       client.close();
     }

@@ -32,5 +32,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       return;
     }
     write({ id: message.id, result: { thread: { id: "thread-stub", turns: [] } } });
+    return;
+  }
+  if (message.method === "turn/start" && message.id !== undefined) {
+    write({ id: message.id, result: { turn: { id: "turn-live", status: "inProgress", items: [] } } });
+    write({ method: "turn/started", params: { threadId: "thread-stub", turn: { id: "turn-live", status: "inProgress" } } });
+    return;
+  }
+  if (message.method === "turn/steer" && message.id !== undefined) {
+    write({ id: message.id, result: { turnId: message.params.expectedTurnId } });
   }
 });

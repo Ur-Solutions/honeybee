@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveSpawningBeeId } from "../src/spawnParent.js";
+import { resolveExplicitSpawningBeeId, resolveSpawningBeeId } from "../src/spawnParent.js";
 
 // Snapshot + restore the env keys the resolver reads.
 function snapshotEnv() {
@@ -50,6 +50,38 @@ test("resolveSpawningBeeId: HIVE_BEE anchors to the bee's id; no anchor → unde
     // No anchor at all (operator/daemon root) → undefined, no store read needed.
     delete process.env.HIVE_BEE;
     assert.equal(await resolveSpawningBeeId(), undefined);
+  } finally {
+    restore();
+    await rm(store, { recursive: true, force: true });
+  }
+});
+
+test("resolveExplicitSpawningBeeId canonicalizes trusted names/ids and rejects unknown parents", async () => {
+  const store = await mkdtemp(join(tmpdir(), "hb-explicit-parent-store-"));
+  const restore = snapshotEnv();
+  try {
+    process.env.HIVE_STORE_ROOT = store;
+    delete process.env.HIVE_BEE;
+    await mkdir(join(store, "sessions"), { recursive: true });
+    await writeFile(
+      join(store, "sessions", "orchestrator.json"),
+      JSON.stringify({
+        name: "orchestrator",
+        agent: "codex",
+        cwd: "/x",
+        command: "codex",
+        tmuxTarget: "orchestrator",
+        createdAt: "2026-07-04T00:00:00Z",
+        updatedAt: "2026-07-04T00:00:00Z",
+        status: "running",
+        id: "CO.stable-parent",
+      }),
+    );
+
+    assert.equal(await resolveExplicitSpawningBeeId("orchestrator"), "CO.stable-parent");
+    assert.equal(await resolveExplicitSpawningBeeId("CO.stable-parent"), "CO.stable-parent");
+    await assert.rejects(resolveExplicitSpawningBeeId("missing-parent"), /Unknown spawning bee/);
+    await assert.rejects(resolveExplicitSpawningBeeId("   "), /requires an existing bee/);
   } finally {
     restore();
     await rm(store, { recursive: true, force: true });

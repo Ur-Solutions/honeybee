@@ -77,6 +77,21 @@ async function seedGrokCredential(dir: string, accountId: string): Promise<void>
   await writeFile(credPath, grokAuthJson("solo@example.com", "2030-01-01T00:00:00.000Z", "solo"));
 }
 
+test("account downprio defaults to +25 auto points and auto-penalty 0 clears it", async () => {
+  await withStore(async (dir) => {
+    await hive(dir, "account", "add", "claude", "gmail@example.com");
+    const down = await hive(dir, "account", "downprio", "claude-gmail-example.com");
+    assert.match(down.stdout, /auto-penalty\tclaude-gmail-example\.com\t25/);
+
+    const listed = JSON.parse((await hive(dir, "account", "list", "--json")).stdout) as Array<Record<string, unknown>>;
+    assert.equal(listed[0]?.autoPickPenalty, 25);
+
+    await hive(dir, "account", "auto-penalty", "claude-gmail-example.com", "0");
+    const cleared = JSON.parse((await hive(dir, "account", "list", "--json")).stdout) as Array<Record<string, unknown>>;
+    assert.equal(cleared[0]?.autoPickPenalty, undefined);
+  });
+});
+
 test("account-first open embeds the opencode --model <provider>/<model> selector", async () => {
   await withStore(async (dir) => {
     await hive(dir, "account", "add", "opencode", "minimax", "--provider", "minimax-coding-plan", "--model", "MiniMax-M3");

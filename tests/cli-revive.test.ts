@@ -174,6 +174,10 @@ test("spawn-record round trip: revive --fresh replays yolo and passthrough argv 
 
     await hive(store, socket, ["spawn", "codex", "--name", bee, "--cwd", store, "--yolo", "--no-wait", "--", ...passthrough], env);
     const spawned = await readBee(store, bee);
+    await writeFile(
+      join(store, "sessions", `${bee}.json`),
+      `${JSON.stringify({ ...spawned, providerSessionId: "stale-provider-id", transcriptPath: "/tmp/stale-provider-id.jsonl" }, null, 2)}\n`,
+    );
     assert.deepEqual(spawned.launchArgv, [fakeCodex, "--dangerously-bypass-approvals-and-sandbox", ...passthrough]);
     const originalCommand = spawned.command;
     const originalArgv = spawned.launchArgv;
@@ -186,6 +190,7 @@ test("spawn-record round trip: revive --fresh replays yolo and passthrough argv 
     assert.equal(revived.command, originalCommand);
     assert.deepEqual(revived.launchArgv, originalArgv);
     assert.equal(revived.providerSessionId, undefined);
+    assert.equal(revived.transcriptPath, undefined);
     assert.equal(revived.lastReviveCommand, originalCommand, "fresh replay is the exact original base launch");
     assert.match(result.stdout, /codex --dangerously-bypass-approvals-and-sandbox -m gpt-5\.6-sol -c/);
 
@@ -293,6 +298,34 @@ test("revive routes local HSR records through the runner host", async () => {
         assert.equal(meta?.harness, "stub");
         assert.equal(meta?.sessionId, "sess-hsr");
       });
+    } finally {
+      await killHsrBee(store, bee);
+    }
+  });
+});
+
+test("revive --fresh clears an HSR bee's stale provider id and transcript anchor", async () => {
+  await withRig(async ({ store, socket }) => {
+    const bee = "HSR.fresh";
+    await seedBee(store, bee, {
+      agent: "stub",
+      requestedAgent: "stub",
+      command: "stub",
+      launchArgv: [process.execPath, "--recorded-fresh-flag"],
+      tmuxTarget: bee,
+      substrate: "hsr",
+      runnerPid: 2 ** 31 - 1,
+      providerSessionId: "stale-provider-id",
+      transcriptPath: "/tmp/stale-provider-id.jsonl",
+    });
+
+    try {
+      const result = await hive(store, socket, ["revive", bee, "--fresh", "--no-wait"]);
+      assert.match(result.stdout, /revived\tHSR\.fresh\tstub\tfresh/);
+      const revived = await readBee(store, bee);
+      assert.equal(revived.status, "running");
+      assert.equal(revived.providerSessionId, undefined);
+      assert.equal(revived.transcriptPath, undefined);
     } finally {
       await killHsrBee(store, bee);
     }

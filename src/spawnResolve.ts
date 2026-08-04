@@ -19,6 +19,8 @@ import { pickRoundRobinAccount } from "./limits/autoPick.js";
 export type ResolveSpawnSpecOptions = {
   /** Max acceptable age (ms) for cached provider limits when auto-picking; 0 = always live. */
   ttlMs?: number;
+  /** Effective model for the bee, used to rank model-scoped allowances. */
+  model?: string;
   /** Sink for the "account auto → <id>" line (stderr in the loop log; silent if omitted). */
   onNote?: (message: string) => void;
 };
@@ -42,7 +44,10 @@ export async function resolveSpawnSpec(token: string, options: ResolveSpawnSpecO
   }
   const autoTool = autoAccountTool(trimmed);
   if (autoTool) {
-    const choice = await pickLeastLoadedAccount(autoTool, options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {});
+    const choice = await pickLeastLoadedAccount(autoTool, {
+      ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
+      ...(options.model ? { model: options.model } : {}),
+    });
     options.onNote?.(`account auto → ${choice.account.id} — ${choice.reason}`);
     return { agent: autoTool, account: choice.account };
   }

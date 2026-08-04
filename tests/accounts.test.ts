@@ -28,6 +28,7 @@ import {
   removeAccount,
   resolveSpawnAgent,
   roundRobinAccountTool,
+  setAccountAutoPickPenalty,
   setAccountPaused,
   syncAccountCredentialsToVault,
   syncClaudeChainToVault,
@@ -93,6 +94,26 @@ test("setAccountPaused pauses and resumes an account in the registry", async () 
     const resumed = await setAccountPaused(account.id, false);
     assert.equal(resumed.pausedAt, undefined);
     assert.equal((await listAccounts()).find((candidate) => candidate.id === account.id)?.pausedAt, undefined, "resume persists");
+  });
+});
+
+test("setAccountAutoPickPenalty persists, updates, and clears an auto-only preference", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "priority@example.com");
+    const penalized = await setAccountAutoPickPenalty(account.id, 25);
+    assert.equal(penalized.autoPickPenalty, 25);
+    assert.equal((await listAccounts()).find((candidate) => candidate.id === account.id)?.autoPickPenalty, 25);
+
+    const updated = await setAccountAutoPickPenalty(account.id, 12.5);
+    assert.equal(updated.autoPickPenalty, 12.5);
+
+    const cleared = await setAccountAutoPickPenalty(account.id, 0);
+    assert.equal(cleared.autoPickPenalty, undefined);
+    assert.equal((await listAccounts()).find((candidate) => candidate.id === account.id)?.autoPickPenalty, undefined);
+
+    await assert.rejects(() => setAccountAutoPickPenalty(account.id, -1), /0 to 100/);
+    await assert.rejects(() => setAccountAutoPickPenalty(account.id, 101), /0 to 100/);
+    await assert.rejects(() => setAccountAutoPickPenalty(account.id, Number.NaN), /0 to 100/);
   });
 });
 
@@ -1186,6 +1207,22 @@ test("normalizeAccountRecord leaves an unknown/future CLI provider-less and unto
   const out = normalizeAccountRecord(rec);
   assert.equal(out.provider, undefined);
   assert.equal(out, rec); // returned by reference (no copy) when there is nothing to backfill
+});
+
+test("normalizeAccountRecord preserves valid auto penalties and ignores invalid hand edits", () => {
+  const valid = normalizeAccountRecord(legacyRecord({
+    id: "claude-priority",
+    tool: "claude",
+    provider: "anthropic",
+    autoPickPenalty: 25,
+  }));
+  assert.equal(valid.autoPickPenalty, 25);
+
+  const invalid = normalizeAccountRecord({
+    ...legacyRecord({ id: "claude-invalid-priority", tool: "claude", provider: "anthropic" }),
+    autoPickPenalty: 250,
+  });
+  assert.equal(invalid.autoPickPenalty, undefined);
 });
 
 test("accountCli reads the on-disk tool field", () => {

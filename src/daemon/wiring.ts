@@ -11,6 +11,7 @@ import { createRemoteEventMirror } from "../hsr/remoteEventMirror.js";
 import { appendLedger, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
 import { createAutoTitleDispatcher } from "./autoTitle.js";
+import { createAuthRecoveryDispatcher } from "./authRecovery.js";
 import { dispatchAutoswaps } from "./autoswap.js";
 import { createBuzDrainDispatcher } from "./buzDispatcher.js";
 import { createNeedsInputDispatcher } from "./needsInput.js";
@@ -131,6 +132,7 @@ export function buildDefaultDeps(): TickDeps {
     dispatchBuzDrain,
     dispatchTaskSupply: createTaskSupplyDispatcher(),
     reconcileRequests: createRequestReconciler(),
+    recoverAuthNeeded: createAuthRecoveryDispatcher(),
     dispatchNeedsInput: createNeedsInputDispatcher(),
     dispatchNodeReachability: createNodeReachabilityTracker(),
     sampleUsage: createUsageSampler(),

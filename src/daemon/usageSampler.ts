@@ -16,10 +16,10 @@ import { exhaustionForAgent } from "../drivers.js";
 import { hsrUsageObservation, type HsrObservation, type HsrUsageObservation } from "../hsr/observe.js";
 import { readHsrMeta } from "../hsr/runDir.js";
 import { LOCAL_NODE_NAME } from "../node.js";
-import { transcriptLookupForSession } from "../sessionMetadata.js";
+import { resolveSessionTranscript } from "../sessionMetadata.js";
 import type { PaneCaptureMap } from "../state.js";
 import { appendLedger, type SessionRecord } from "../store.js";
-import { latestTranscript, readJsonl, type TranscriptRow } from "../transcripts.js";
+import { readJsonl, type TranscriptRow } from "../transcripts.js";
 import { appendUsageEvent, transcriptTokenTotals, type TokenTotals, type UsageEvent } from "../usage.js";
 
 export type UsageTickOutcome = {
@@ -39,6 +39,8 @@ export type UsageSamplerDeps = {
   readTranscriptRows?: (record: SessionRecord) => Promise<{ provider: string; rows: TranscriptRow[] } | null>;
   /** Structured usage/exhaustion from an HSR bee's events.jsonl. Injectable for tests. */
   readHsrUsage?: (bee: string) => Promise<HsrUsageObservation>;
+  /** Stable start of the current HSR runtime, used to reject prior-incarnation events. */
+  readHsrRuntimeStartedAt?: (bee: string) => Promise<number | undefined>;
   /**
    * Whether a (node-carrying, non-`hsr`) remote bee has a LOCAL mirror run dir
    * (APIA-94) — if so it is fed from the mirrored events.jsonl via the HSR path,
@@ -65,6 +67,7 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
   const ledger = deps.appendLedger ?? appendLedger;
   const readRows = deps.readTranscriptRows ?? defaultReadTranscriptRows;
   const readHsrUsage = deps.readHsrUsage ?? hsrUsageObservation;
+  const readHsrRuntimeStartedAt = deps.readHsrRuntimeStartedAt ?? defaultHsrRuntimeStartedAt;
   const isMirroredRemoteBee = deps.isMirroredRemoteBee ?? defaultIsMirroredRemoteBee;
   const sampleIntervalMs = deps.sampleIntervalMs ?? DEFAULT_SAMPLE_INTERVAL_MS;
 
@@ -99,11 +102,11 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
 
   // Emit the account.exhausted edge for `record` (shared usage-log + ledger
   // append). Mutates outcome.exhausted/resetHint.
-  async function emitExhausted(record: SessionRecord, resetHint: string | undefined, nowMs: number, outcome: UsageTickOutcome): Promise<void> {
+  async function emitExhausted(record: SessionRecord, resetHint: string | undefined, observedAtMs: number, outcome: UsageTickOutcome): Promise<void> {
     outcome.exhausted = true;
     if (resetHint) outcome.resetHint = resetHint;
     await appendEvent({
-      ts: new Date(nowMs).toISOString(),
+      ts: new Date(observedAtMs).toISOString(),
       kind: "exhausted",
       account: record.accountId!,
       bee: record.name,
@@ -128,12 +131,20 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
     const outcome: UsageTickOutcome = { bee: record.name, account: record.accountId!, sampled: false, exhausted: false };
     const observation = hsrObservation?.eventSnapshot?.usage ?? await readHsrUsage(record.name).catch(() => null);
 
-    // Exhaustion: rising edge on a strictly-newer `exhausted` event ts.
+    // Exhaustion: rising edge on a strictly-newer event from THIS runtime.
+    // events.jsonl intentionally survives revive --fresh/account handoffs; an
+    // old rate-limit row must never be replayed under the bee's new account.
     if (observation?.latestExhausted) {
       const previous = lastHsrExhaustedTs.get(record.name);
-      if (previous === undefined || observation.latestExhausted.ts > previous) {
-        lastHsrExhaustedTs.set(record.name, observation.latestExhausted.ts);
-        await emitExhausted(record, observation.latestExhausted.resetHint, nowMs, outcome);
+      const eventTs = observation.latestExhausted.ts;
+      const runtimeStartedAt = await readHsrRuntimeStartedAt(record.name).catch(() => undefined);
+      if (previous === undefined || eventTs > previous) {
+        lastHsrExhaustedTs.set(record.name, eventTs);
+        if (runtimeStartedAt === undefined || eventTs >= runtimeStartedAt) {
+          // Preserve the provider event's time. A daemon restart may observe
+          // it again, but must not extend its cool-off window to restart time.
+          await emitExhausted(record, observation.latestExhausted.resetHint, eventTs, outcome);
+        }
       }
     }
 
@@ -242,11 +253,18 @@ async function defaultIsMirroredRemoteBee(record: SessionRecord): Promise<boolea
   return !!meta?.mirrorOfNode;
 }
 
-// Claude transcripts keep usage on the raw rows latestTranscript already
+async function defaultHsrRuntimeStartedAt(bee: string): Promise<number | undefined> {
+  const startedAt = (await readHsrMeta(bee))?.startedAt;
+  if (!startedAt) return undefined;
+  const ts = Date.parse(startedAt);
+  return Number.isFinite(ts) ? ts : undefined;
+}
+
+// Claude transcripts keep usage on the normalized rows transcript resolution
 // returns; codex stores token_count events that its normalizer strips, so we
 // re-read the raw JSONL for codex.
 async function defaultReadTranscriptRows(record: SessionRecord): Promise<{ provider: string; rows: TranscriptRow[] } | null> {
-  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record));
+  const tx = (await resolveSessionTranscript(record)).transcript;
   if (!tx) return null;
   if (tx.provider === "codex") {
     return { provider: tx.provider, rows: await readJsonl(tx.path) };

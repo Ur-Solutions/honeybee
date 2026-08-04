@@ -16,7 +16,7 @@ import { openInNewTerminal, runInCurrentTerminal } from "../terminal.js";
 import { formatShellCommand } from "../tmux.js";
 import { waitForIdle } from "../wait.js";
 import { acceptsTrust, cleanupAfterRun, confirmPausedAccount, dangerousMode, deliverPromptText, formatPaneExcerpt, hasFlag, hsrSubstrateRequested, includePausedFlag, resolveSpawnCwd, sleep, stringFlag, ttlFlagMs } from "../cli/shared.js";
-import { cmdSpawn, resolveAccountFlag, resolveProfileOverlay, resolveSpawnAgentWithAuto } from "../commands/spawn.js";
+import { cmdSpawn, requestedModelFromArgs, resolveAccountFlag, resolveProfileOverlay, resolveSpawnAgentWithAuto } from "../commands/spawn.js";
 import { loadTrackAttachment } from "../track.js";
 
 /**
@@ -74,13 +74,16 @@ export async function waitForPromptReady(record: SessionRecord, parsed: Parsed):
 
 
 /**
- * Deliver a run/x prompt: send it to the agent pane, stamp the record's
- * lastPrompt fields, flip hive-state to working, and ledger the prompt.
+ * Deliver a run/x prompt: capture the send boundary, send it to the agent
+ * pane, stamp the record's lastPrompt fields, flip hive-state to working, and
+ * ledger the prompt. Capturing before delivery matters for very fast HSR turns:
+ * their transcript can complete before sendText resolves, and must still be
+ * newer than waitForIdle's transcript cutoff.
  * Returns the stamp timestamp (cmdRun's waitForIdle needs it).
  */
 export async function deliverPromptToBee(record: SessionRecord, prompt: string): Promise<string> {
-  await deliverPromptText(record, prompt);
   const now = new Date().toISOString();
+  await deliverPromptText(record, prompt);
   await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
   await writeHiveState(record, "working");
   await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
@@ -372,7 +375,10 @@ export async function cmdOpenRaw(parsed: Parsed) {
   const profileArgs = profile?.args ?? [];
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
-  const account = accountQuery ? await resolveAccountFlag(accountQuery, canonicalAgentKind(agent), ttlFlagMs(parsed), includePausedFlag(parsed)) : (profile?.account ?? aliasAccount);
+  const requestedModel = requestedModelFromArgs([...openPassthroughArgs(parsed), ...parsed.rest, ...profileArgs]) ?? profile?.model;
+  const account = accountQuery
+    ? await resolveAccountFlag(accountQuery, canonicalAgentKind(agent), ttlFlagMs(parsed), includePausedFlag(parsed), requestedModel)
+    : (profile?.account ?? aliasAccount);
   // Raw open skips cmdSpawn, so it needs its own paused-account gate.
   await confirmPausedAccount(account, parsed);
   const model = account ? (profile?.model ?? account.model) : undefined;

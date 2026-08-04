@@ -435,9 +435,11 @@ A simple file-backed mailbox under `~/.hive/buz/` is enough. Each bee owns five 
   _external/tormod/outbox/...                                # human-originated sends
 ```
 
-Three delivery tiers, gated by each bee's `buzAccept` policy on the SessionRecord (default when absent: `['queue', 'passive']` — interrupts require explicit opt-in):
+Four delivery tiers, gated by each bee's `buzAccept` policy on the SessionRecord (default when absent: `['next-tool', 'queue', 'passive']` — true interrupts require explicit opt-in):
 
 - `interrupt` — pasted into the recipient's pane immediately via the substrate.
+- `next-tool` — non-interrupting steering of the active turn; unsupported
+  substrates downgrade to `queue`.
 - `queue` — written to `queue/`; the daemon drains to `inbox/` on the next `active → idle_with_output` transition.
 - `passive` — written straight to `inbox/`, no delivery action.
 
@@ -446,14 +448,14 @@ Sender attribution is strict: `--sender <bee>` must resolve to a registered bee 
 Commands (as shipped):
 
 ```bash
-hive buz send <selector> --sender CO.13d --tier queue -p "Review this patch"
+hive buz send <selector> --sender CO.13d -p "Review this patch"
 hive buz send <selector> --sender-human tormod --tier interrupt -p "stop"
 hive buz inbox <selector> [--limit N] [--from <ref>]
 hive buz outbox <selector>
 hive buz queue <selector>
 hive buz read <message-id> [--consume] [--bee <ref>]
 hive buz purge <selector> [--read | --older-than 30d | --all]
-hive buz config <bee> [--accept interrupt,queue,passive]
+hive buz config <bee> [--accept interrupt,next-tool,queue,passive]
 ```
 
 The upper layer decides routing. Honeybee stores and delivers.

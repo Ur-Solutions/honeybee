@@ -84,6 +84,15 @@ test("completes shells as first arg of completion", () => {
   assert.deepEqual(getCompletionsFromState(["hive", "completion", ""], empty), ["bash", "zsh", "fish"]);
 });
 
+test("completes account auto-priority commands and account arguments", () => {
+  const accounts = [{ id: "claude-gmail", tool: "claude", label: "gmail", addedAt: "2026-01-01T00:00:00Z" }];
+  const state = { ...empty, accounts };
+  const subs = getCompletionsFromState(["hive", "account", ""], state);
+  assert.ok(subs.includes("downprio"));
+  assert.ok(subs.includes("auto-penalty"));
+  assert.deepEqual(getCompletionsFromState(["hive", "account", "downprio", ""], state), ["claude-gmail"]);
+});
+
 test("completes only live sessions for send/tail/cat/transcript/tx/wait/attach", () => {
   const records = [
     session("brave-otter", "brave-otter-target", "CO.abc"),

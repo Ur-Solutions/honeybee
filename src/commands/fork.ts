@@ -62,13 +62,13 @@ export const FORK_SEED_MODES = new Set<SeedMode>(["resume", "seal", "summary", "
 export async function resolveForkAccountSafety(
   parsed: Parsed,
   source: SessionRecord,
-  context: { targetTool: string; requestedSeed?: SeedMode; threadCopy?: boolean },
+  context: { targetTool: string; requestedSeed?: SeedMode; threadCopy?: boolean; model?: string },
 ): Promise<{ account?: AccountRecord; joinsParentHome: boolean }> {
   const accountQuery = stringFlag(parsed, ["account"]);
   const wantsResume = context.requestedSeed === "resume";
 
   if (accountQuery) {
-    const account = await resolveAccountFlag(accountQuery, context.targetTool, ttlFlagMs(parsed), includePausedFlag(parsed));
+    const account = await resolveAccountFlag(accountQuery, context.targetTool, ttlFlagMs(parsed), includePausedFlag(parsed), context.model);
     if (source.accountId && account.id === source.accountId) {
       // Same account → the fork JOINS the parent's account home (same shared
       // credential file — the auto-stacking risk profile). No re-activation.
@@ -203,6 +203,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     targetTool,
     requestedSeed,
     threadCopy: capability.threadCopy,
+    ...(model ? { model } : {}),
   });
 
   // 6. Pick the seed mode (pure decision). `hive handoff` rides this same

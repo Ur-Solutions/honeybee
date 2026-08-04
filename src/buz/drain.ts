@@ -59,8 +59,9 @@ export async function processQueueForBee(
   // for the same bee (which would double-paste every queue file both listed).
   // Filesystem mutations take the write lock briefly per message, so
   // concurrent senders' mailbox writes never wait behind substrate I/O
-  // (HIVE-47). Lock order is always delivery -> write; sendBuzMessage never
-  // holds one while acquiring the other, so the pair cannot deadlock.
+  // (HIVE-47). Whenever both are needed, lock order is always delivery ->
+  // write (including next-tool's durable hand-off), so the pair cannot
+  // deadlock.
   await withFileLock(deliveryLockPath(record.name), async () => {
     await mkdir(inboxDir, { recursive: true });
 

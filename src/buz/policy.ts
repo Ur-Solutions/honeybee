@@ -18,8 +18,8 @@ export function resolveBuzAccept(record: Pick<SessionRecord, "buzAccept">): read
 const BUZ_DOWNGRADE_CHAIN: readonly BuzTier[] = BUZ_TIERS;
 const BUZ_DOWNGRADE_FLOOR: BuzTier = BUZ_TIERS.at(-1)!;
 
-// Auto-downgrade chain interrupt -> queue -> passive. If even passive is
-// disallowed by an explicit policy that excludes all three, returns
+// Auto-downgrade chain interrupt -> next-tool -> queue -> passive. If passive
+// is also disallowed by an explicit policy that excludes every tier, returns
 // passive as a hard floor (we never silently drop a message); callers can
 // inspect `downgraded` + `reason` to decide whether to error.
 export function downgradeTier(requested: BuzTier, accepted: readonly BuzTier[]): DowngradeResult {

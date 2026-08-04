@@ -280,6 +280,7 @@ hive spawn codex-work        # <tool>-<account-fragment> shorthand
 hive spawn claude-thto --autoswap
 hive spawn claude-auto       # least-loaded account pick (also: --account auto)
 hive spawn codex-rr          # round-robin: next account in registration order (also: --account rr)
+hive account downprio claude-tormod.haugland-gmail.com 25
 ```
 
 Account-bound spawns activate credentials into a home before launch. Autoswap
@@ -295,9 +296,20 @@ preferred even over accounts with nominally lower used% — e.g. 70% used but
 resetting tomorrow beats 40% used with five days to go. Pace's weight fades as
 headroom drops below 25%, so a 98%-used account an hour from reset never wins
 on pace alone. Accounts ≥90% into their 5h window sort behind ones with
-headroom, and accounts whose limits cannot be read are a last resort (oldest
-registration wins). The pick is printed to stderr, e.g.
+headroom. When the spawned model is Fable, auto also ranks the Fable-scoped
+weekly allowance alongside the general weekly window and pushes accounts at
+≥75% Fable usage behind accounts with scoped headroom, even if the nearly
+empty allowance is behind pace and about to reset. Accounts whose limits
+cannot be read are a last resort (oldest registration wins). The pick is
+printed to stderr, e.g.
 `account auto → claude-thto (weekly 66%, 5h 12%) — least effective weekly load (18% behind pace — surplus expires at reset)`.
+
+An account can carry a persistent auto-only penalty in effective-load points:
+`hive account downprio <account> [points]` defaults to +25, while
+`hive account auto-penalty <account> <0..100>` sets an exact value (0 clears
+it). A +25 account must be roughly 25 usage points emptier to rank equally.
+The preference affects only `auto`; explicit account selection and `rr` are
+unchanged. `hive account list` shows the value in the `AUTO` column.
 
 The pick reads limits through the cache with a default ttl of **1h**, so
 back-to-back auto spawns cost no extra provider round-trips. Override per call
@@ -1705,18 +1717,24 @@ Logs and state live under `~/.hive/loops/<loopId>/` plus the flow run log path.
 
 ## Buz Messaging
 
-Buz is file-backed addressed messaging between bees and humans.
+Buz is file-backed addressed messaging between bees and humans. New messages
+use RFC 9562 UUIDv7 identifiers; existing messages with the former
+base32-timestamp identifiers remain readable.
 
 Tiers:
 
 - `interrupt`: paste into tmux immediately and write inbox.
+- `next-tool`: non-interrupting steering of the active turn; unsupported
+  substrates and transport failures fall back to queue.
 - `queue`: store under queue; the daemon drains it when the recipient is idle.
 - `passive`: write inbox only, no live delivery.
+
+Omitting `--tier` requests `next-tool`.
 
 Default accept policy when unset:
 
 ```text
-queue,passive
+next-tool,queue,passive
 ```
 
 Interrupts require explicit opt-in per bee.
@@ -1733,24 +1751,25 @@ delivered verbatim.
 
 ```sh
 hive buz send <selector> [--sender <bee>|--sender-human <name>]
-  [--tier <interrupt|queue|passive>] [-p <body>] [--subject "..."]
+  [--tier <interrupt|next-tool|queue|passive>] [-p <body>] [--subject "..."]
 hive buz inbox <selector> [--limit N] [--from <ref>]
 hive buz outbox <selector> [--limit N] [--from <ref>]
 hive buz queue <selector> [--limit N] [--from <ref>]
 hive buz read <message-id> [--consume] [--bee <ref>]
 hive buz read --all --bee <ref>
 hive buz purge <selector> [--read|--older-than <age>|--all]
-hive buz config <bee> [--accept interrupt,queue,passive]
+hive buz config <bee> [--accept interrupt,next-tool,queue,passive]
 ```
 
 Examples:
 
 ```sh
-hive buz config CO.a3f --accept interrupt,queue,passive
+hive buz config CO.a3f --accept interrupt,next-tool,queue,passive
+hive buz send CO.a3f --sender-human trmd -p "Steer without interrupting."
 hive buz send CO.a3f --sender-human trmd --tier queue -p "Please post status."
 hive buz send @review --sender CO.a3f --tier passive --subject "FYI" -p "Shared note"
 hive buz inbox CO.a3f --limit 10
-hive buz read 000000ABCDE-123abc --consume --bee CO.a3f
+hive buz read 01987478-346a-7ad4-a774-5e94ef7f30f8 --consume --bee CO.a3f
 hive buz read --all --bee CO.a3f
 hive buz purge CO.a3f --read
 hive buz purge CO.a3f --older-than 7d
@@ -1758,7 +1777,10 @@ hive buz purge CO.a3f --older-than 7d
 
 Policy downgrades:
 
-- If `interrupt` is not accepted, delivery downgrades to `queue` when allowed.
+- If `interrupt` is not accepted, delivery downgrades through `next-tool`, then
+  `queue`, according to the recipient policy.
+- If `next-tool` is not accepted or the substrate cannot steer, delivery
+  downgrades to `queue` when allowed.
 - If `queue` is not accepted, delivery downgrades to `passive` when allowed.
 - If an interrupt transport fails, the message is queued for later delivery.
 
@@ -1826,6 +1848,8 @@ hive account capture <account> --home <1|2|3|path>
 hive account sync [account]
 hive account pause <account>
 hive account resume <account>
+hive account downprio <account> [points]        # defaults to +25 auto points
+hive account auto-penalty <account> <0..100>   # 0 clears
 hive account remove <account>
 ```
 

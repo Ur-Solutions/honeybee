@@ -84,6 +84,13 @@ export type UsageSummary = {
   lastSample?: UsageSample;
   lastExhaustedAt?: string;
   lastResetHint?: string;
+  /**
+   * True when some bee produced two consecutive growing samples after the last
+   * exhaustion — actual token movement. A single post-exhaustion sample is NOT
+   * recovery: sample ts is append time, and the sampler's throttle routinely
+   * flushes pre-limit spend with a timestamp after the exhaustion event.
+   */
+  recoveredAfterExhaustion?: boolean;
   /** Sum of token deltas across samples in the trailing window. */
   windowInputTokens: number;
   windowOutputTokens: number;
@@ -106,6 +113,7 @@ export async function usageSummary(accountId: string, now = Date.now(), windowMs
   for (const event of events) {
     if (event.kind === "exhausted") {
       summary.lastExhaustedAt = event.ts;
+      summary.recoveredAfterExhaustion = false;
       if (event.resetHint) summary.lastResetHint = event.resetHint;
       continue;
     }
@@ -114,6 +122,16 @@ export async function usageSummary(accountId: string, now = Date.now(), windowMs
     const previous = lastByBee.get(event.bee);
     lastByBee.set(event.bee, event);
     const ts = Date.parse(event.ts);
+    if (summary.lastExhaustedAt && previous) {
+      const exhaustedTs = Date.parse(summary.lastExhaustedAt);
+      const previousTs = Date.parse(previous.ts);
+      if (
+        Number.isFinite(exhaustedTs) && previousTs > exhaustedTs && ts > exhaustedTs &&
+        (event.inputTokens > previous.inputTokens || event.outputTokens > previous.outputTokens)
+      ) {
+        summary.recoveredAfterExhaustion = true;
+      }
+    }
     if (!Number.isFinite(ts) || now - ts > windowMs) continue;
     const inputDelta = previous ? Math.max(0, event.inputTokens - previous.inputTokens) : event.inputTokens;
     const outputDelta = previous ? Math.max(0, event.outputTokens - previous.outputTokens) : event.outputTokens;
@@ -132,6 +150,7 @@ export function isRecentlyExhausted(summary: UsageSummary, now = Date.now(), coo
   if (!summary.lastExhaustedAt) return false;
   const ts = Date.parse(summary.lastExhaustedAt);
   if (!Number.isFinite(ts)) return false;
+  if (summary.recoveredAfterExhaustion) return false;
   return now - ts < coolOffMs;
 }
 

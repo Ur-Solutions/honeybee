@@ -94,13 +94,21 @@ export type RunnerEvent =
   // generic `error`). The daemon reacts by minting a fresh token and restarting
   // the runner with resume — mirrors how `exhausted` drives the autoswap edge.
   | { type: "auth_expired"; ts: number; detail?: string; requiresLogin?: boolean }
-  // Human-login recovery marker: appended by `hive auth-resume` after it
-  // captures the fresh login and relaunches the runner. It un-sticks the
+  // Credential recovery marker: appended after `hive auth-resume` or daemon
+  // auto-recovery relaunches the runner. It un-sticks the
   // auth-needed classification — a resumed bee sits idle, so WITHOUT this
   // boundary the stale login-required `error` stays the tail's last turn and
   // the daemon re-derives auth-needed forever (observed on CL.8d7,
   // 2026-07-16). An auth error AFTER the marker (creds still bad) re-wins.
-  | { type: "auth_resume"; ts: number }
+  | {
+      type: "auth_resume";
+      ts: number;
+      /** Recovery provenance for event-tail inspection; absent on legacy markers. */
+      source?: "human-login" | "valid-disk-credentials" | "valid-vault-credentials" | "auto";
+      /** Daemon incident attempt, intentionally metadata-only (never credentials). */
+      attempt?: number;
+      replayedPrompts?: number;
+    }
   | {
       type: "needs_input";
       ts: number;
@@ -150,11 +158,10 @@ export type RunnerOpts = {
 
 /**
  * How a send should land relative to the live turn. "now" (default) delivers
- * immediately; "next-tool" asks the runner to HOLD the text until the next
- * tool boundary (tool_use / turn_end) of the current turn — idle sessions
- * deliver immediately. Stream runners and server adapters with native tool
- * events (OpenCode) implement the hold; turn runners already queue behind the
- * live turn, while other server/pty adapters use harness-native semantics.
+ * immediately; "next-tool" means non-interrupting steering into the current
+ * turn. Provider-native queues (Codex turn/steer, Claude streaming input) own
+ * the exact safe boundary; other structured runners hold until tool_use or
+ * turn_end. Idle sessions deliver immediately as a fresh turn.
  */
 export type RunnerSendOpts = { mode?: "now" | "next-tool" };
 

@@ -43,7 +43,8 @@ test("identityLayer states the facts a bee cannot derive", () => {
   assert.match(text, /spawned by CL\.xyz/);
   // The buz invocation shape is not guessable, so it must be spelled out with
   // this bee's own name already substituted into --sender.
-  assert.match(text, /hive buz send <bee> --sender scout-3 --tier queue/);
+  assert.match(text, /hive buz send <bee> --sender scout-3 -p/);
+  assert.doesNotMatch(text, /--tier/);
 });
 
 test("identityLayer omits the comb line when the comb is the bee's own name", () => {

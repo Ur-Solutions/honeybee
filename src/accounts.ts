@@ -30,6 +30,7 @@ export {
   addAccount,
   removeAccount,
   setAccountPaused,
+  setAccountAutoPickPenalty,
 } from "./accounts/registry.js";
 
 export {

@@ -1,4 +1,4 @@
-// buz — file-backed three-tier addressed messaging between bees.
+// buz — file-backed four-tier addressed messaging between bees.
 //
 // Storage layout (under storeRoot() — e.g. ~/.hive):
 //
@@ -11,14 +11,17 @@
 //
 // Tiers:
 //   interrupt — substrate.sendText immediately + copy in inbox/
+//   next-tool — non-interrupting steer into the live turn on capable HSR
+//               substrates; durably staged in queue/ until provider acceptance
 //   queue     — store in queue/ (drained by the daemon whenever the
 //               recipient is observed idle_with_output)
 //   passive   — store in inbox/ only, no live delivery
 //
 // Per-recipient policy: SessionRecord.buzAccept lists allowed tiers. Missing
-// field defaults to ['queue','passive'] (interrupts require explicit opt-in
-// to close the spoof/DoS vector documented in PHASE2_PLAN.md decision #8).
-// Disallowed tiers auto-downgrade interrupt -> queue -> passive; the
+// field defaults to ['next-tool','queue','passive'] (true interrupts require
+// explicit opt-in to close the spoof/DoS vector documented in PHASE2_PLAN.md
+// decision #8).
+// Disallowed tiers auto-downgrade interrupt -> next-tool -> queue -> passive; the
 // actually-delivered tier is recorded in the message frontmatter as
 // deliveredAs and surfaced in the ledger.
 //
@@ -42,16 +45,16 @@ import type { BuzTier } from "./buz_tiers.js";
 import type { SessionRecord } from "./store.js";
 import type { Substrate } from "./substrates/index.js";
 
-export { BUZ_TIERS, isBuzTier, type BuzTier } from "./buz_tiers.js";
+export { BUZ_TIERS, DEFAULT_BUZ_TIER, isBuzTier, type BuzTier } from "./buz_tiers.js";
 
 export const BUZ_MAILBOXES = ["inbox", "queue", "outbox", "read", "quarantine"] as const;
 export type BuzMailbox = (typeof BUZ_MAILBOXES)[number];
 
 export const EXTERNAL_NAMESPACE = "_external";
 
-// Default policy when SessionRecord.buzAccept is undefined: queue + passive
-// accepted; interrupts require explicit opt-in.
-export const DEFAULT_BUZ_ACCEPT: readonly BuzTier[] = Object.freeze(["queue", "passive"]);
+// Default policy when SessionRecord.buzAccept is undefined: non-interrupting
+// steering, queue, and passive accepted; true interrupts require opt-in.
+export const DEFAULT_BUZ_ACCEPT: readonly BuzTier[] = Object.freeze(["next-tool", "queue", "passive"]);
 
 export type BuzSender =
   | { kind: "bee"; id: string }       // bee id (resolved from a SessionRecord)

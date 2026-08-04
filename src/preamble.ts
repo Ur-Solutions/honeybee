@@ -87,7 +87,7 @@ export function identityLayer(identity: PreambleIdentity): string {
     lines.push(`You were spawned by ${identity.parent}; report back to it when your work is done.`);
   }
   lines.push(
-    `Message another bee: \`hive buz send <bee> --sender ${identity.name} --tier queue -p "<message>"\`. Read yours: \`hive buz inbox ${identity.name}\`.`,
+    `Message another bee: \`hive buz send <bee> --sender ${identity.name} -p "<message>"\`. Read yours: \`hive buz inbox ${identity.name}\`.`,
   );
   return lines.join("\n");
 }

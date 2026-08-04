@@ -25,7 +25,7 @@ export async function spawnSlotBee(
   mix: FlightMixEntry,
   task?: FlightTaskPacket,
 ): Promise<SpawnedSlotBee> {
-  const account = mix.account ? await resolveAccountFlag(mix.account, mix.agent, undefined) : undefined;
+  const account = mix.account ? await resolveAccountFlag(mix.account, mix.agent, undefined, false, mix.model) : undefined;
   const brief = task?.brief ?? flight.brief;
   const record = await spawnBee({
     agent: mix.agent,

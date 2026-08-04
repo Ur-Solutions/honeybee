@@ -20,6 +20,11 @@ export type AccountRecord = {
   model?: string; // NEW: optional default model for spawns
   email?: string;
   /**
+   * Persistent effective-load points added only during `--account auto`
+   * selection. Explicit account use and round-robin are unaffected.
+   */
+  autoPickPenalty?: number;
+  /**
    * Set while the account is paused: excluded from the `auto`/`rr` pools by
    * default, and explicit use (spawn/x/xa) asks for confirmation first.
    * Absent = active.
@@ -58,9 +63,20 @@ export const PROVIDER_BY_CLI: Record<string, string> = {
  * excluded from provider-keyed features until set explicitly.
  */
 export function normalizeAccountRecord(a: AccountRecord): AccountRecord {
-  if (a.provider) return a;
+  const rawPenalty = (a as Record<string, unknown>).autoPickPenalty;
+  const validPenalty = typeof rawPenalty === "number" && Number.isFinite(rawPenalty) && rawPenalty > 0 && rawPenalty <= 100
+    ? rawPenalty
+    : undefined;
+  const penaltyNeedsNormalization = rawPenalty !== undefined && rawPenalty !== validPenalty;
   const inferred = PROVIDER_BY_CLI[a.tool];
-  return inferred ? { ...a, provider: inferred } : a;
+  if (a.provider && !penaltyNeedsNormalization) return a;
+  if (!a.provider && !inferred && !penaltyNeedsNormalization) return a;
+  const { autoPickPenalty: _invalidPenalty, ...rest } = a;
+  return {
+    ...rest,
+    ...(a.provider ?? inferred ? { provider: a.provider ?? inferred } : {}),
+    ...(validPenalty !== undefined ? { autoPickPenalty: validPenalty } : {}),
+  };
 }
 
 export function vaultRoot(): string {
@@ -232,6 +248,33 @@ export async function setAccountPaused(idOrLabel: string, paused: boolean): Prom
     const updated: AccountRecord = paused ? { ...rest, pausedAt: new Date().toISOString() } : rest;
     await writeRegistry(accounts.map((candidate) => (candidate.id === account.id ? updated : candidate)));
     await appendLedger({ type: paused ? "account.pause" : "account.resume", account: account.id, tool: account.tool });
+    return updated;
+  });
+}
+
+/**
+ * Bias `auto` selection away from an account by adding effective-load points.
+ * Zero clears the preference. This never pauses the account and never affects
+ * explicit or round-robin selection.
+ */
+export async function setAccountAutoPickPenalty(idOrLabel: string, penalty: number): Promise<AccountRecord> {
+  if (!Number.isFinite(penalty) || penalty < 0 || penalty > 100) {
+    throw new Error(`Auto-pick penalty must be a number from 0 to 100 (got ${penalty})`);
+  }
+  return withAccountsLock(async () => {
+    const accounts = await listAccounts();
+    const account = matchAccount(accounts, idOrLabel);
+    const normalized = penalty === 0 ? undefined : penalty;
+    if (account.autoPickPenalty === normalized) return account;
+    const { autoPickPenalty: _cleared, ...rest } = account;
+    const updated: AccountRecord = normalized === undefined ? rest : { ...rest, autoPickPenalty: normalized };
+    await writeRegistry(accounts.map((candidate) => (candidate.id === account.id ? updated : candidate)));
+    await appendLedger({
+      type: "account.auto_penalty",
+      account: account.id,
+      tool: account.tool,
+      penalty: normalized ?? 0,
+    });
     return updated;
   });
 }

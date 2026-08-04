@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
@@ -14,11 +15,12 @@ import { closeRequestsForNewIncarnation } from "./requests/store.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 import { nextRuntimeIncarnationPatch } from "./seal.js";
+import { copyThreadForFork } from "./threadCopy.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // swap-account: the req-1 MECHANISM. Stop the bee's process, activate the
-// target account's credentials into that account's dedicated home, resume the
-// same provider session there, and record both the binding and new home. Never
+// target account's credentials into that account's dedicated home, transplant
+// the provider thread safely, and record both the binding and new home. Never
 // re-credential the source home in place: several live bees may share an
 // account home, so overwriting it would silently invalidate all of them. Purely
 // mechanical and fully ledger-logged; the *decision* to swap lives in the
@@ -40,6 +42,10 @@ export type SwapAccountOptions = {
   spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
   /** Local HSR runner-host readiness probe (tests). Defaults to waitForHsrHost. */
   waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
+  /** Thread copier override (tests). Defaults to copyThreadForFork. */
+  copyThread?: typeof copyThreadForFork;
+  /** Fresh provider id factory (tests). Defaults to randomUUID. */
+  newProviderSessionId?: () => string;
 };
 
 const DEFAULT_POLL_ATTEMPTS = 8;
@@ -133,6 +139,14 @@ export async function swapAccount(
       throw new Error(`Bee ${record.name} is already on account ${account.id}`);
     }
     const sourceHomePath = current.homePath;
+    // Claude's OAuth identity is bound into the provider session chain. A
+    // cross-account resume can therefore keep charging the source account even
+    // when every credential file belongs to the target. Re-key a transcript
+    // copy instead; native same-id resume is only safe within one account.
+    const rekeyClaudeThread = tool === "claude" && current.accountId !== account.id;
+    if (rekeyClaudeThread && !current.providerSessionId) {
+      throw new Error(`Bee ${current.name} has no recorded provider session id; refusing to switch Claude accounts without thread continuity`);
+    }
 
     // 1. Ensure the process is stopped. The tmux session must be fully gone
     //    before we relaunch into the same target.
@@ -153,8 +167,29 @@ export async function swapAccount(
     if (!gone) throw new Error(`Session ${current.tmuxTarget} still alive after kill; aborting swap`);
 
     // Resume ids are backed by home-local transcript files for Claude/Codex.
-    // Carry the discovered transcript before launching from the new home.
-    const relocatedTranscriptPath = await relocateSessionTranscript(current, sourceHomePath, targetHomePath);
+    // Claude cross-account moves must additionally mint a fresh id so its
+    // account-bound provider chain cannot route back to the source identity.
+    let launchProviderSessionId = current.providerSessionId;
+    let relocatedTranscriptPath: string | undefined;
+    if (rekeyClaudeThread) {
+      const newSessionId = (options.newProviderSessionId ?? randomUUID)();
+      const copied = await (options.copyThread ?? copyThreadForFork)({
+        kind: tool,
+        source: {
+          cwd: current.cwd,
+          providerSessionId: current.providerSessionId!,
+          homePath: sourceHomePath,
+        },
+        destCwd: current.cwd,
+        destHome: targetHomePath,
+        newSessionId,
+        anchor: { kind: "tip" },
+      });
+      launchProviderSessionId = copied.newProviderSessionId ?? newSessionId;
+      relocatedTranscriptPath = copied.path;
+    } else {
+      relocatedTranscriptPath = await relocateSessionTranscript(current, sourceHomePath, targetHomePath);
+    }
 
     // 2. Rescue the current account's freshest credentials from its source
     //    home, then activate the target in the target account's own home. The
@@ -173,8 +208,8 @@ export async function swapAccount(
     try {
       await activate(account, targetHomePath);
 
-      // 3. Resume the same provider session in the target account's home, with
-      //    the driver's explicit identity env. The record's own model (a deliberate
+      // 3. Resume the safely transplanted provider thread in the target
+      //    account's home, with the driver's explicit identity env. The record's own model (a deliberate
       //    `hive set-model` choice) wins over the NEW account's default model;
       //    the account still supplies opencode's provider so a swapped bee keeps
       //    its `--model <provider>/<model>` selector (adversarial review fix #4).
@@ -186,12 +221,12 @@ export async function swapAccount(
       //    adapter owns the provider-specific resume protocol, so do not append
       //    interactive CLI resume args to its base spec.
       const hsr = current.substrate === "hsr";
-      if (hsr && !current.providerSessionId) {
+      if (hsr && !launchProviderSessionId) {
         throw new Error(`Bee ${current.name} has no recorded provider session id; refusing to switch accounts without session continuity`);
       }
       const model = current.model ?? account.model;
       const modelExtra = current.modelExtraArgs ? splitShellWords(current.modelExtraArgs) : [];
-      spec = resolveAgent(current.requestedAgent ?? current.agent, [...modelExtra, ...(hsr ? [] : resumeArgs(tool, current.providerSessionId))], {
+      spec = resolveAgent(current.requestedAgent ?? current.agent, [...modelExtra, ...(hsr ? [] : resumeArgs(tool, launchProviderSessionId))], {
         home: targetHomePath,
         yolo: sniffYolo(current.command),
         identity: true,
@@ -207,7 +242,7 @@ export async function swapAccount(
           ...(current.parentId ? { parent: current.parentId } : {}),
           kind: tool,
           cwd: current.cwd,
-          sessionId: current.providerSessionId!,
+          sessionId: launchProviderSessionId!,
           resume: true,
           authKind: "subscription",
           accountId: account.id,
@@ -255,6 +290,7 @@ export async function swapAccount(
       ...incarnation,
       accountId: account.id,
       homePath: targetHomePath,
+      providerSessionId: launchProviderSessionId,
       ...(relocatedTranscriptPath ? { transcriptPath: relocatedTranscriptPath } : {}),
       command: shellCommand(spec),
       ...(paneId ? { agentPaneId: paneId } : {}),
@@ -279,7 +315,8 @@ export async function swapAccount(
       to: account.id,
       fromHome: sourceHomePath,
       home: targetHomePath,
-      providerSessionId: record.providerSessionId ?? null,
+      fromProviderSessionId: current.providerSessionId ?? null,
+      providerSessionId: launchProviderSessionId ?? null,
     });
     return updated;
   });

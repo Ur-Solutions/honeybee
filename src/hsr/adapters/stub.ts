@@ -51,6 +51,11 @@ rl.on("line", (raw) => {
     return;
   }
   const text = typeof msg.text === "string" ? msg.text : "";
+  if (text.includes("authfail")) {
+    emit({ t: "error", message: "Not logged in · Please run /login" });
+    emit({ t: "result" });
+    return;
+  }
   if (text.includes("ask")) {
     pendingRequestId = "r1";
     emit({ t: "needs", requestId: "r1", question: "proceed?" });
@@ -120,6 +125,8 @@ const stubConfig: StreamRunnerConfig = {
             outputTokens: Number(msg.outputTokens ?? 0),
           },
         ];
+      case "error":
+        return [{ type: "error", ts: 0, message: String(msg.message ?? "stub error") }];
       case "result":
         return [{ type: "turn_end", ts: 0 }];
       default:

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { enqueuePendingHsrTurn, readPendingHsrTurns } from "../src/hsr/pendingTurns.js";
 import type { SealRecord } from "../src/seal.js";
 import { sessionLivenessFailure } from "../src/sessionLiveness.js";
 import { deleteSession, saveSession, type SessionRecord } from "../src/store.js";
@@ -128,6 +129,51 @@ test("waitForIdle does not report --last success before a prompted transcript ap
           return true;
         },
       );
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("waitForIdle does not report a stable local HSR snapshot while a turn is still journaled", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-wait-hsr-pending-"));
+  try {
+    await withStoreRoot(dir, async () => {
+      const prompted = {
+        ...record(dir),
+        name: "pending-hsr-bee",
+        tmuxTarget: "pending-hsr-bee",
+        agent: "stub",
+        substrate: "hsr" as const,
+        lastPrompt: "queued exact prompt",
+        lastPromptAt: "2026-06-10T00:00:01.000Z",
+      };
+      await saveSession(prompted);
+      await enqueuePendingHsrTurn(prompted.name, prompted.lastPrompt);
+      const substrate = {
+        capture: async () => "runner starting",
+        hasSession: async () => true,
+      };
+
+      await assert.rejects(
+        waitForIdle({
+          record: prompted,
+          idleMs: 50,
+          timeoutMs: 220,
+          pollMs: 50,
+          output: "pane",
+          rows: 0,
+          json: false,
+          substrate,
+          sessionDeps: { livenessFailure: async () => null },
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof WaitError);
+          assert.equal(error.exitCode, WAIT_EXIT_CODES.timeout);
+          return true;
+        },
+      );
+      assert.equal((await readPendingHsrTurns(prompted.name)).length, 1, "waiting must not consume the turn");
     });
   } finally {
     await rm(dir, { recursive: true, force: true });

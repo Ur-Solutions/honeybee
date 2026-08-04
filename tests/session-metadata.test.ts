@@ -3,7 +3,13 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { persistSessionTranscriptMetadata, refreshSessionTranscriptMetadata } from "../src/sessionMetadata.js";
+import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
+import {
+  persistSessionTranscriptMetadata,
+  refreshSessionTranscriptMetadata,
+  resolveSessionTranscript,
+  syncHsrProviderSessionId,
+} from "../src/sessionMetadata.js";
 import { loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { TranscriptFile } from "../src/transcripts.js";
 import { withFileLock } from "../src/lock.js";
@@ -38,6 +44,82 @@ function bee(name: string, overrides: Partial<SessionRecord> = {}): SessionRecor
 function claudeProjectKey(cwd: string): string {
   return resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
 }
+
+async function writeExitedHsrMeta(beeName: string, sessionId: string): Promise<void> {
+  await ensureHsrRunDir(beeName);
+  await writeHsrMeta(beeName, {
+    bee: beeName,
+    harness: "claude",
+    tier: "stream",
+    sessionId,
+    hostPid: process.pid,
+    startedAt: "2026-07-18T12:00:00.000Z",
+    runningAt: "2026-07-18T12:00:01.000Z",
+    controlSocket: `/tmp/${beeName}.sock`,
+    status: "exited",
+    exitCode: 0,
+    endedAt: "2026-07-18T12:10:00.000Z",
+  });
+}
+
+test("retired HSR metadata anchors transcript lookup to its provider session instead of a sibling", async () => {
+  await withTempStore(async (root) => {
+    const cwd = join(root, "workspace");
+    const home = join(root, "claude-home");
+    const transcriptDir = join(home, "projects", claudeProjectKey(cwd));
+    await mkdir(transcriptDir, { recursive: true });
+    const ownPath = join(transcriptDir, "own-provider.jsonl");
+    const siblingPath = join(transcriptDir, "newer-sibling.jsonl");
+    await writeFile(ownPath, [
+      JSON.stringify({ type: "user", timestamp: "2026-07-18T12:00:01.000Z", message: { role: "user", content: "own work" } }),
+      JSON.stringify({ type: "assistant", timestamp: "2026-07-18T12:00:02.000Z", message: { role: "assistant", content: "own answer" } }),
+    ].join("\n") + "\n");
+    await writeFile(siblingPath, [
+      JSON.stringify({ type: "user", timestamp: "2026-07-18T12:00:03.000Z", message: { role: "user", content: "sibling work" } }),
+      JSON.stringify({ type: "assistant", timestamp: "2026-07-18T12:00:04.000Z", message: { role: "assistant", content: "sibling answer" } }),
+    ].join("\n") + "\n");
+    await utimes(ownPath, new Date("2026-07-18T12:01:00.000Z"), new Date("2026-07-18T12:01:00.000Z"));
+    await utimes(siblingPath, new Date("2026-07-18T12:02:00.000Z"), new Date("2026-07-18T12:02:00.000Z"));
+
+    const record = bee("CL.retired", {
+      cwd,
+      homePath: home,
+      substrate: "hsr",
+      status: "done",
+    });
+    await saveSession(record);
+    await writeExitedHsrMeta(record.name, "own-provider");
+
+    const synced = await syncHsrProviderSessionId(record);
+    assert.equal(synced.providerSessionId, "own-provider");
+    assert.equal((await loadSession(record.name))?.providerSessionId, "own-provider", "the learned id is durable");
+
+    const resolved = await resolveSessionTranscript(record);
+    assert.equal(resolved.transcript?.sessionId, "own-provider");
+    assert.equal(resolved.transcript?.path, ownPath, "a newer same-cwd sibling cannot win over HSR identity");
+  });
+});
+
+test("HSR transcript resolution fails closed when its provider transcript is absent", async () => {
+  await withTempStore(async (root) => {
+    const cwd = join(root, "workspace");
+    const home = join(root, "claude-home");
+    const transcriptDir = join(home, "projects", claudeProjectKey(cwd));
+    await mkdir(transcriptDir, { recursive: true });
+    await writeFile(join(transcriptDir, "sibling-only.jsonl"), [
+      JSON.stringify({ type: "user", timestamp: "2026-07-18T12:00:01.000Z", message: { role: "user", content: "not this bee" } }),
+      JSON.stringify({ type: "assistant", timestamp: "2026-07-18T12:00:02.000Z", message: { role: "assistant", content: "sibling output" } }),
+    ].join("\n") + "\n");
+
+    const record = bee("CL.missing-own", { cwd, homePath: home, substrate: "hsr", status: "done" });
+    await saveSession(record);
+    await writeExitedHsrMeta(record.name, "provider-with-no-file");
+
+    const resolved = await resolveSessionTranscript(record);
+    assert.equal(resolved.record.providerSessionId, "provider-with-no-file");
+    assert.equal(resolved.transcript, null, "a cwd/mtime-only sibling is never returned as this bee's transcript");
+  });
+});
 
 test("crashed HSR bee never adopts a live sibling transcript from spawn proximity", async () => {
   await withTempStore(async (root) => {

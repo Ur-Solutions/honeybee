@@ -2,30 +2,36 @@
 // interactive tmux pane and a pane-less HSR runner (resume), and revive dead bees.
 // Extracted from cli.ts (HIVE-15).
 import { accountEmail, activateAccountIntoHome, captureAccountFromHome, findAccount, homeClaudeEmail, listAccounts, type AccountRecord } from "../accounts.js";
+import { planClaudeRecoveryCredentials } from "../accounts/credentialHealth.js";
 import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, shellQuoteIfNeeded, splitShellWords, type AgentSpec, stampBeeIdentityEnv } from "../agents.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeSpawnOptions } from "../hiveState.js";
 import { adapterFor } from "../hsr/adapters/index.js";
-import { hsrObservations, type HsrObservation } from "../hsr/observe.js";
+import { hsrObservations, readEventTail, type HsrObservation } from "../hsr/observe.js";
+import { readPendingHsrTurns } from "../hsr/pendingTurns.js";
 import { connectRpcClient } from "../hsr/rpc.js";
-import { hsrEventsPath, readHsrMeta } from "../hsr/runDir.js";
+import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta } from "../hsr/runDir.js";
 import { hsrSubstrate } from "../hsr/substrate.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { waitForAgentReady } from "../readiness.js";
-import { closeRequestsForNewIncarnation, readBeeRequests, resolveRequest } from "../requests/store.js";
+import { authPromptLossRequestId } from "../requests/keys.js";
+import { closeRequestsForNewIncarnation, openRequest, readBeeRequests, resolveRequest } from "../requests/store.js";
 import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
 import { appendLedger, listSessions, storeRoot, updateSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
 import { formatShellCommand, hasSession } from "../tmux.js";
 import { identityRecipeForAgent, modelArgsForAgent } from "../drivers.js";
-import { resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
+import { deliverPromptText, resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
 import { loginSeatLiveDigest } from "./account.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
-import { appendFile, readFile, stat } from "node:fs/promises";
+import { appendFile, readFile, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { RunnerEvent } from "../hsr/types.js";
+import { lastAuthNeededEvent } from "../view/requests.js";
+import { atomicWriteFile } from "../fsx.js";
 
 // Harnesses whose interactive↔headless resume genuinely carries history — the
 // only ones promote/demote accept. claude is EXCLUDED: its interactive-TUI and
@@ -296,7 +302,7 @@ export async function buildResumeSpec(
   record: SessionRecord,
   tool: string,
   extraArgs: string[],
-  options: { replayLaunch?: boolean } = {},
+  options: { replayLaunch?: boolean; activateCredentials?: boolean } = {},
 ): Promise<AgentSpec> {
   const resolved = resolveAgent(record.requestedAgent ?? record.agent, [...modelExtraArgsFor(record), ...extraArgs], {
     home: record.homePath,
@@ -304,7 +310,7 @@ export async function buildResumeSpec(
     identity: Boolean(record.accountId),
     ...(record.model ? { model: record.model } : {}),
   });
-  if (record.accountId && resolved.homePath) {
+  if (options.activateCredentials !== false && record.accountId && resolved.homePath) {
     const account = await findAccount(record.accountId, tool).catch(() => undefined);
     if (account) {
       await activateAccountIntoHome(account, resolved.homePath, { onWarn: (message) => console.error(note(message)) });
@@ -341,11 +347,24 @@ export async function buildResumeSpec(
  * to rejoin the SAME provider session headlessly; revive can pass `fresh` to
  * start a new HSR session while preserving the record identity.
  */
-export async function reviveHsrRunner(record: SessionRecord, tool: string, opts: { fresh?: boolean; sessionOverride?: string; replayLaunch?: boolean } = {}): Promise<SessionRecord> {
+export async function reviveHsrRunner(
+  record: SessionRecord,
+  tool: string,
+  opts: {
+    fresh?: boolean;
+    sessionOverride?: string;
+    replayLaunch?: boolean;
+    activateCredentials?: boolean;
+    deferRequestClosure?: boolean;
+  } = {},
+): Promise<SessionRecord> {
   const adapter = adapterFor(tool);
   const fresh = opts.fresh === true;
   const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
-  const spec = await buildResumeSpec(record, tool, [], { replayLaunch: opts.replayLaunch });
+  const spec = await buildResumeSpec(record, tool, [], {
+    replayLaunch: opts.replayLaunch,
+    activateCredentials: opts.activateCredentials,
+  });
   const incarnation = await nextRuntimeIncarnationPatch(record);
   const hostPid = await spawnHsrHost({
     bee: record.name,
@@ -375,14 +394,17 @@ export async function reviveHsrRunner(record: SessionRecord, tool: string, opts:
     runnerPid: hostPid,
     ...(runnerTier ? { runnerTier } : {}),
     ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
-    ...(fresh ? { providerSessionId: undefined } : {}),
+    // Clear both halves of the provider-thread anchor. Keeping the old path
+    // lets transcript discovery re-adopt the abandoned session id moments
+    // after a successful --fresh launch.
+    ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
     ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
     updatedAt: new Date().toISOString(),
     status: "running",
   };
   const restored = (await updateSession(record.name, patch)) ?? { ...record, ...patch };
   await writeSpawnOptions(restored);
-  await closeSupersededRequests(record, incarnation);
+  if (!opts.deferRequestClosure) await closeSupersededRequests(record, incarnation);
   return restored;
 }
 
@@ -409,6 +431,208 @@ export async function resolveAuthRequestsAfterResume(bee: string): Promise<void>
   for (const request of openAuth) {
     await resolveRequest(bee, request.id, { by: "auth-resume" });
   }
+}
+
+export type AuthPromptRecovery = {
+  prompts: string[];
+  source: "journal" | "legacy-last-prompt" | "unrecoverable";
+  authEventTs: number;
+};
+
+type StagedAuthReplay = AuthPromptRecovery & { version: 1; stagedAt: string };
+
+function stagedAuthReplayPath(bee: string): string {
+  return resolve(hsrRunDir(bee), "auth-replay.json");
+}
+
+async function readStagedAuthReplay(bee: string): Promise<AuthPromptRecovery | null> {
+  try {
+    const parsed = JSON.parse(await readFile(stagedAuthReplayPath(bee), "utf8")) as Partial<StagedAuthReplay>;
+    if (
+      parsed.version !== 1 ||
+      !Array.isArray(parsed.prompts) ||
+      !parsed.prompts.every((prompt) => typeof prompt === "string") ||
+      !["journal", "legacy-last-prompt", "unrecoverable"].includes(String(parsed.source)) ||
+      typeof parsed.authEventTs !== "number"
+    ) return null;
+    return {
+      prompts: parsed.prompts,
+      source: parsed.source as AuthPromptRecovery["source"],
+      authEventTs: parsed.authEventTs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function stageAuthReplay(bee: string, recovery: AuthPromptRecovery): Promise<void> {
+  const staged: StagedAuthReplay = { version: 1, ...recovery, stagedAt: new Date().toISOString() };
+  await ensureHsrRunDir(bee);
+  await atomicWriteFile(stagedAuthReplayPath(bee), `${JSON.stringify(staged, null, 2)}\n`, { mode: 0o600 });
+}
+
+/**
+ * Prove that the record's legacy lastPrompt belongs to the auth-failed turn.
+ * New sends use the durable pending-turn journal; this is only the migration
+ * bridge for prompts accepted before that journal shipped.
+ */
+export function legacyPromptForAuthFailure(
+  record: Pick<SessionRecord, "lastPrompt" | "lastPromptAt">,
+  events: RunnerEvent[],
+): string | undefined {
+  if (!record.lastPrompt || !record.lastPromptAt) return undefined;
+  const promptAt = Date.parse(record.lastPromptAt);
+  if (!Number.isFinite(promptAt)) return undefined;
+  const authEvent = lastAuthNeededEvent(events);
+  if (!authEvent) return undefined;
+  const authIndex = events.lastIndexOf(authEvent);
+  let startIndex = -1;
+  let endIndex = -1;
+  for (let index = authIndex; index >= 0; index -= 1) {
+    if (events[index]!.type === "turn_start") {
+      startIndex = index;
+      break;
+    }
+  }
+  for (let index = authIndex; index < events.length; index += 1) {
+    if (events[index]!.type === "turn_end") {
+      endIndex = index;
+      break;
+    }
+  }
+  if (startIndex < 0) return undefined;
+  const startedAt = events[startIndex]!.ts;
+  const endedAt = endIndex >= 0 ? events[endIndex]!.ts : authEvent.ts;
+  // send() stamps lastPrompt just after stdin/RPC acceptance. Allow a small
+  // scheduling margin around the structured frame, but never guess across
+  // turns — uncertain text is surfaced as prompt loss instead.
+  if (promptAt < startedAt - 1_000 || promptAt > endedAt + 5_000) return undefined;
+  return record.lastPrompt;
+}
+
+/** Exact prompts to replay after auth resume, preferring the durable journal. */
+export async function collectAuthRecoveryPrompts(
+  record: SessionRecord,
+  events: RunnerEvent[] = [],
+): Promise<AuthPromptRecovery> {
+  const staged = await readStagedAuthReplay(record.name);
+  if (staged) return staged;
+  const effectiveEvents = events.length > 0 ? events : await readEventTail(record.name);
+  const authEvent = lastAuthNeededEvent(effectiveEvents);
+  const journaled = await readPendingHsrTurns(record.name);
+  if (journaled.length > 0) {
+    return {
+      prompts: journaled.map((turn) => turn.text),
+      source: "journal",
+      authEventTs: authEvent?.ts ?? Date.now(),
+    };
+  }
+  const legacy = legacyPromptForAuthFailure(record, effectiveEvents);
+  return {
+    prompts: legacy === undefined ? [] : [legacy],
+    source: legacy === undefined ? "unrecoverable" : "legacy-last-prompt",
+    authEventTs: authEvent?.ts ?? Date.now(),
+  };
+}
+
+export type AuthResumeSource = "human-login" | "valid-disk-credentials" | "valid-vault-credentials" | "auto";
+
+/**
+ * Mechanical stop → same-session revive → auth boundary → exact prompt replay.
+ * The boundary lands BEFORE replay: if the new child rejects the credentials,
+ * its later auth error wins and the daemon sees needs-auth again.
+ */
+export async function recoverAuthNeededBee(
+  record: SessionRecord,
+  account: AccountRecord,
+  options: {
+    source: AuthResumeSource;
+    attempt?: number;
+    events?: RunnerEvent[];
+    activateCredentials?: boolean;
+  },
+): Promise<{ record: SessionRecord; replayedPrompts: number; promptSource: AuthPromptRecovery["source"] }> {
+  if (!record.homePath) throw new Error(`hive auth-resume: ${record.name} has no dedicated home`);
+  const promptRecovery = await collectAuthRecoveryPrompts(record, options.events);
+  // The ordinary HSR stop intentionally clears pending turns. Stage an
+  // owner-only replay bundle first so a failed activation/revive/marker write
+  // cannot destroy the last durable copy. It is removed only after every
+  // replay has itself entered the new host's pending-turn journal.
+  await stageAuthReplay(record.name, promptRecovery);
+  const activateCredentials = options.activateCredentials ?? (
+    options.source === "human-login" || options.source === "valid-vault-credentials"
+  );
+  if (activateCredentials) {
+    await activateAccountIntoHome(account, record.homePath, { onWarn: (message) => console.error(note(message)) });
+  }
+  await stopRuntimeForAuthResume(record);
+  // Credential selection already chose and, when needed, activated the best
+  // persisted chain. Skip revive's generic second activation so the decision
+  // cannot be changed between the stop and the new child boot.
+  const revived = await reviveRecord(record, {
+    fresh: false,
+    skipCredentialActivation: true,
+    deferRequestClosure: true,
+  });
+  const marker = {
+    type: "auth_resume" as const,
+    ts: Date.now(),
+    source: options.source,
+    ...(options.attempt !== undefined ? { attempt: options.attempt } : {}),
+    replayedPrompts: promptRecovery.prompts.length,
+  };
+  if (record.substrate === "hsr") {
+    await appendFile(hsrEventsPath(record.name), `${JSON.stringify(marker)}\n`);
+  } else {
+    await appendFile(hsrEventsPath(record.name), `${JSON.stringify(marker)}\n`).catch(() => undefined);
+  }
+  await resolveAuthRequestsAfterResume(record.name).catch(() => undefined);
+  // Auth is a successful recovery fact, not merely a superseded request. Close
+  // it as auth-resume first; then supersede any unrelated old-generation opens.
+  await closeRequestsForNewIncarnation(
+    record.name,
+    revived.runtimeGeneration ?? (record.runtimeGeneration ?? 0) + 1,
+  ).catch(() => undefined);
+  const cleared =
+    (await updateSession(record.name, {
+      lastObservedState: undefined,
+      lastObservedStateAt: undefined,
+      updatedAt: new Date().toISOString(),
+    })) ?? revived;
+
+  for (const prompt of promptRecovery.prompts) {
+    await deliverPromptText(cleared, prompt);
+  }
+  await rm(stagedAuthReplayPath(record.name), { force: true });
+
+  if (promptRecovery.source === "unrecoverable") {
+    await openRequest(record.name, {
+      id: authPromptLossRequestId(record.name, cleared.runtimeGeneration ?? 0, promptRecovery.authEventTs),
+      kind: "manual-action",
+      scope: "runtime-generation",
+      grade: "structured",
+      generation: cleared.runtimeGeneration ?? 0,
+      question: "Authentication recovery restarted the bee, but the failed operator prompt could not be recovered exactly. Resend that prompt.",
+      evidence: {
+        grade: "structured",
+        source: "hsr-prompt-journal",
+        observedAt: new Date(promptRecovery.authEventTs).toISOString(),
+        detail: "auth-prompt-unrecoverable",
+      },
+    });
+  }
+
+  await appendLedger({
+    type: "bee.auth_resume",
+    session: record.name,
+    account: account.id,
+    providerSessionId: record.providerSessionId,
+    source: options.source,
+    ...(options.attempt !== undefined ? { attempt: options.attempt } : {}),
+    replayedPrompts: promptRecovery.prompts.length,
+    promptSource: promptRecovery.source,
+  });
+  return { record: cleared, replayedPrompts: promptRecovery.prompts.length, promptSource: promptRecovery.source };
 }
 
 
@@ -462,9 +686,9 @@ export async function reviveTmuxPane(record: SessionRecord, tool: string, opts: 
     substrate: undefined,
     runnerPid: undefined,
     runnerTier: undefined,
-    // A fresh relaunch abandons the old provider session — keeping its id
-    // would make the next resume rejoin a conversation this bee left behind.
-    ...(opts.fresh ? { providerSessionId: undefined } : {}),
+    // A fresh relaunch abandons the old provider session. Its transcript path
+    // is an equally strong anchor, so retaining it would re-adopt the old id.
+    ...(opts.fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
   });
   if (restored) await writeSpawnOptions(restored);
   await closeSupersededRequests(record, incarnation);
@@ -757,11 +981,12 @@ export async function cmdRevive(parsed: Parsed): Promise<void> {
 /**
  * hive auth-resume <bee>
  *
- * Human-login recovery for a live-but-stuck `auth-needed` bee:
- *   1. capture fresh credentials from the account's login seat,
- *   2. activate them into the bee's dedicated home,
+ * Credential-aware recovery for a live-but-stuck `auth-needed` bee:
+ *   1. compare Claude's effective home chain with the account vault,
+ *   2. preserve a newer home chain, activate a newer vaulted login, or require
+ *      a fresh login when neither persisted chain is usable,
  *   3. stop the stuck runtime,
- *   4. relaunch the same bee and resume the same provider session.
+ *   4. relaunch the same provider session and replay the failed prompt.
  *
  * Unlike `revive`, this intentionally accepts a LIVE runtime: `auth-needed`
  * runners are alive enough to hold a record but unable to make progress.
@@ -785,45 +1010,46 @@ export async function cmdAuthResume(parsed: Parsed): Promise<void> {
   }
 
   const account = await findAccount(record.accountId, tool);
-  const seatHome = resolve(storeRoot(), "login-homes", account.id);
-  await assertLoginSeatFreshForAuthResume(account, seatHome);
-  const captured = await captureAccountFromHome(account, seatHome).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`hive auth-resume: no fresh login captured for ${account.id} (${message}); run hive login ${account.id} first`);
-  });
+  let source: AuthResumeSource = "human-login";
+  let credentialDetail = "fresh interactive login";
+  const credentialPlan = tool === "claude"
+    ? await planClaudeRecoveryCredentials(account, record.homePath)
+    : { ready: false as const, reason: "unsupported-tool" };
+  let diskIdentityMatches = true;
+  if (credentialPlan.ready && credentialPlan.source === "home") {
+    const expectedEmail = accountEmail(account)?.toLowerCase();
+    const actualEmail = (await homeClaudeEmail(record.homePath).catch(() => null))?.toLowerCase();
+    diskIdentityMatches = !(expectedEmail && actualEmail && expectedEmail !== actualEmail);
+  }
+  if (credentialPlan.ready && credentialPlan.source === "home" && diskIdentityMatches) {
+    source = "valid-disk-credentials";
+    credentialDetail = "current home credentials";
+  } else if (credentialPlan.ready && credentialPlan.source === "vault") {
+    source = "valid-vault-credentials";
+    credentialDetail = credentialPlan.reason === "vault-newer"
+      ? "newer credentials from vault"
+      : "valid credentials from vault";
+  } else {
+    // This is the unchanged real-logout gate: an absent, malformed, expired,
+    // or non-refreshable credential still requires a human to complete login.
+    const seatHome = resolve(storeRoot(), "login-homes", account.id);
+    await assertLoginSeatFreshForAuthResume(account, seatHome);
+    const captured = await captureAccountFromHome(account, seatHome).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`hive auth-resume: no fresh login captured for ${account.id} (${message}); run hive login ${account.id} first`);
+    });
+    credentialDetail = `${captured.length} credential file(s)`;
+  }
 
-  await activateAccountIntoHome(account, record.homePath, { onWarn: (message) => console.error(note(message)) });
-  await stopRuntimeForAuthResume(record);
-  const revived = await reviveRecord(record, { fresh: false });
-  // Bound the auth-needed stickiness in the events tail: a resumed bee sits
-  // idle, so without this marker structuredStateFromEvents keeps re-deriving
-  // auth-needed from the stale login-required error turn (CL.8d7, 2026-07-16).
-  // Best-effort — an HSR-less (tmux) bee has no events log and that's fine.
-  await appendFile(
-    hsrEventsPath(record.name),
-    `${JSON.stringify({ type: "auth_resume", ts: Date.now() })}\n`,
-  ).catch(() => {});
-  // The durable counterpart of the marker above: every open auth request for
-  // this bee is now a resolved fact (daemon-down safe; the reconciler would
-  // otherwise land the same resolution when it observes the bounded tail).
-  await resolveAuthRequestsAfterResume(record.name).catch(() => undefined);
-  const cleared =
-    (await updateSession(record.name, {
-      lastObservedState: undefined,
-      lastObservedStateAt: undefined,
-      updatedAt: new Date().toISOString(),
-    })) ?? revived;
-  await appendLedger({
-    type: "bee.auth_resume",
-    session: record.name,
-    account: account.id,
-    providerSessionId: record.providerSessionId,
-  });
+  const recovered = await recoverAuthNeededBee(record, account, { source });
 
   if (isPretty()) {
-    console.log(actionLine("ok", "auth-resume", [bold(record.name), account.id, dim(`${captured.length} credential file(s)`)]));
+    const promptDetail = recovered.promptSource === "unrecoverable"
+      ? "prompt missing — resend required"
+      : `${recovered.replayedPrompts} prompt(s) replayed`;
+    console.log(actionLine("ok", "auth-resume", [bold(record.name), account.id, dim(credentialDetail), dim(promptDetail)]));
   } else {
-    console.log(`auth-resumed\t${record.name}\t${account.id}\t${cleared.providerSessionId ?? ""}`);
+    console.log(`auth-resumed\t${record.name}\t${account.id}\t${recovered.record.providerSessionId ?? ""}\t${source}\t${recovered.promptSource}`);
   }
 }
 
@@ -967,7 +1193,15 @@ async function waitForRevivedReady(records: SessionRecord[], parsed: Parsed): Pr
  * bound account into the same home. In both cases there is no cross-account
  * OAuth-logout hazard. `reviveOne`/`restore` both rely on this invariant.
  */
-export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean; sessionOverride?: string }): Promise<SessionRecord> {
+export async function reviveRecord(
+  record: SessionRecord,
+  opts: {
+    fresh: boolean;
+    sessionOverride?: string;
+    skipCredentialActivation?: boolean;
+    deferRequestClosure?: boolean;
+  },
+): Promise<SessionRecord> {
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   const fresh = opts.fresh;
   // sessionOverride resumes (and persists) a specific provider session — used to
@@ -981,7 +1215,13 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
     );
   }
   if (record.substrate === "hsr") {
-    const updated = await reviveHsrRunner(record, tool, { fresh, sessionOverride, replayLaunch: true });
+    const updated = await reviveHsrRunner(record, tool, {
+      fresh,
+      sessionOverride,
+      replayLaunch: true,
+      activateCredentials: opts.skipCredentialActivation !== true,
+      deferRequestClosure: opts.deferRequestClosure,
+    });
     await appendLedger({
       type: "bee.revive",
       session: record.name,
@@ -1029,7 +1269,7 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
   let ownerId: string | undefined;
   if (!record.node) {
     spec = await assertReplayExecutable(replay, resolved);
-    if (tool === "claude" && record.homePath) {
+    if (tool === "claude" && record.homePath && opts.skipCredentialActivation !== true) {
       const owner = await claudeAccountOwningHome(record.homePath);
       if (owner) {
         ownerId = owner.id;
@@ -1065,12 +1305,13 @@ export async function reviveRecord(record: SessionRecord, opts: { fresh: boolean
       // A fresh revive abandons the old provider session: keeping its id would
       // make the NEXT revive resume a session that no longer matches this bee
       // (or never existed), dying with "No conversation found". Explicit
-      // undefined deletes the field.
-      ...(fresh ? { providerSessionId: undefined } : {}),
+      // undefined deletes the fields. The old transcript path must go too or
+      // discovery will immediately restore the abandoned provider id.
+      ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
       updatedAt: new Date().toISOString(),
     })) ?? record;
   await writeSpawnOptions(updated);
-  await closeSupersededRequests(record, incarnation);
+  if (!opts.deferRequestClosure) await closeSupersededRequests(record, incarnation);
   await appendLedger({
     type: "bee.revive",
     session: record.name,
@@ -1207,7 +1448,7 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
   const applyFields: Partial<SessionRecord> = {
     model: clear ? undefined : model,
     modelExtraArgs: extraLine,
-    ...(fresh ? { providerSessionId: undefined } : {}),
+    ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
     updatedAt: new Date().toISOString(),
   };
 

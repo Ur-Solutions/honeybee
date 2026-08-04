@@ -1,6 +1,7 @@
 // Durable InterventionRequest reconciler (docs/INTERVENTION_REQUESTS.md).
 //
-// Runs as a registry stage IMMEDIATELY BEFORE dispatchNeedsInput: it folds
+// Runs immediately before credential-aware auth recovery and needs-input
+// routing: it folds
 // this tick's TRUSTED observations into the request store so the dispatcher
 // (and BeeView) read durable records instead of re-deriving. Per tick it:
 //

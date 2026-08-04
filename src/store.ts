@@ -283,10 +283,18 @@ function compactSaveEvent(record: SessionRecord): Record<string, unknown> {
   };
 }
 
-// How often a pure `lastObservedStateAt` heartbeat is allowed to hit disk.
-// The daemon touches every session every ~2s; without this gate each tick
-// rewrites every record file even when nothing observable changed.
+// How often a pure `lastObservedStateAt` heartbeat is allowed to hit disk for
+// live records. Terminal history never needs a freshness lease: its lifecycle
+// status is authoritative, and rewriting thousands of retired records turns a
+// single daemon sweep into an FSEvents storm for every fleet observer.
 const TOUCH_HEARTBEAT_MS = 60_000;
+
+/** Whether a record still benefits from a persisted observation freshness lease. */
+export function shouldPersistObservationHeartbeat(
+  record: Pick<SessionRecord, "status">,
+): boolean {
+  return record.status !== "done" && record.status !== "dead";
+}
 
 /**
  * touchSession atomically merges a subset of fields into a session record without
@@ -340,6 +348,7 @@ async function mergeSessionFields(
     }
     if (options.skipNoopWrites && sessionFingerprint(existing) === sessionFingerprint(merged)) {
       if (existing.lastObservedStateAt === merged.lastObservedStateAt) return merged;
+      if (!shouldPersistObservationHeartbeat(existing)) return merged;
       const previousAt = Date.parse(existing.lastObservedStateAt ?? "");
       const nextAt = Date.parse(merged.lastObservedStateAt ?? "");
       if (Number.isFinite(previousAt) && Number.isFinite(nextAt) && nextAt - previousAt < TOUCH_HEARTBEAT_MS) {

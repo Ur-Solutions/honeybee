@@ -2,8 +2,9 @@ import { hiveStateFor } from "../hiveState.js";
 import type { NodeRecord } from "../node.js";
 import type { HsrObservation } from "../hsr/observe.js";
 import { deriveState, isTerminalState, liveTargetKey, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
-import type { SessionRecord } from "../store.js";
+import { shouldPersistObservationHeartbeat, type SessionRecord } from "../store.js";
 import type { AutoTitleOutcome } from "./autoTitle.js";
+import type { AuthRecoveryOutcome } from "./authRecovery.js";
 import type { AutoswapOutcome } from "./autoswap.js";
 import type { BuzDispatchOutcome } from "./buzDispatcher.js";
 import type { NeedsInputOutcome } from "./needsInput.js";
@@ -100,12 +101,24 @@ export type TickDeps = {
    * Optional durable InterventionRequest reconciler
    * (docs/INTERVENTION_REQUESTS.md): folds this tick's trusted observations
    * into the request store (open/resolve/cancel) so dispatchNeedsInput and
-   * BeeView read durable records. Runs IMMEDIATELY BEFORE dispatchNeedsInput,
+   * BeeView read durable records. Runs immediately before auth recovery and
+   * dispatchNeedsInput,
    * only against a trusted sessions snapshot; hsrUnavailable bees are skipped
    * with zero writes. Stateful across ticks (advisory open-record cache) —
    * build once per daemon run.
    */
   reconcileRequests?: RequestReconciler;
+  /**
+   * Credential-aware local Claude HSR recovery. Runs immediately after auth
+   * requests are persisted, before human needs-input routing. Implementations
+   * must stop closed on ambiguous credentials or exhausted retry guards.
+   */
+  recoverAuthNeeded?: (
+    records: SessionRecord[],
+    currentStates: Map<string, BeeState>,
+    hsrObservations: ReadonlyMap<string, HsrObservation>,
+    nowMs: number,
+  ) => Promise<AuthRecoveryOutcome[]>;
   /**
    * Optional HSR needs-input router (APIA-79): for each blocked HSR bee with a
    * structured needs_input, routes the request as an interrupt-tier buz to the
@@ -218,6 +231,8 @@ export type DispatcherOutcomes = {
    * per bee. Empty when nothing changed / not wired.
    */
   requestReconciles: RequestReconcileOutcome[];
+  /** Automatic auth recovery attempts/results (empty when no eligible bee). */
+  authRecoveries: AuthRecoveryOutcome[];
   /**
    * HSR needs-input routing outcomes: each blocked HSR bee's request routed to
    * its parent (routedTo) or escalated to the user (escalated). Empty when no
@@ -445,6 +460,26 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
       ...(outcome.error ? { error: outcome.error } : {}),
     }),
   },
+  // Credential-aware HSR auth recovery: the request above is durable before
+  // this mechanical restart begins. A hard stop leaves that request visible.
+  {
+    key: "authRecoveries",
+    name: "recoverAuthNeeded",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed, hsrObs, nowMs, sessionsSnapshotTrusted }) =>
+      sessionsSnapshotTrusted ? deps.recoverAuthNeeded?.(records, observed, hsrObs, nowMs) : undefined,
+    log: (outcome) => ({
+      level: outcome.action === "recovered" && outcome.promptSource !== "unrecoverable" ? "info" : "warn",
+      msg: `auth.auto_recovery.${outcome.action}`,
+      session: outcome.bee,
+      generation: outcome.generation,
+      ...(outcome.attempt !== undefined ? { attempt: outcome.attempt } : {}),
+      ...(outcome.replayedPrompts !== undefined ? { replayedPrompts: outcome.replayedPrompts } : {}),
+      ...(outcome.promptSource ? { promptSource: outcome.promptSource } : {}),
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
   // HSR needs-input router: route each blocked HSR bee's structured request to
   // its living parent (buz) or mark it escalated.
   {
@@ -619,6 +654,7 @@ export function emptyDispatcherOutcomes(): DispatcherOutcomes {
     buzDrains: [],
     taskSupplies: [],
     requestReconciles: [],
+    authRecoveries: [],
     needsInput: [],
     nodeReachability: [],
     usage: [],
@@ -899,7 +935,11 @@ export async function tick(
     return {
       record,
       state: derived.state,
-      persistObservation: observationTrusted,
+      // Terminal history is immutable. Its lifecycle status is authoritative,
+      // so do not take a lock/read/write trip for a freshness timestamp that no
+      // consumer should use. Meaningful lifecycle mutations revive the record
+      // before it re-enters this path.
+      persistObservation: observationTrusted && shouldPersistObservationHeartbeat(record),
       mirrorHiveState: observationTrusted && (transitioned || staleHiveState) && !uncertainBooting,
       refreshTranscriptMetadata:
         observationTrusted && !filed && (!terminal || claimTerminalTranscriptDiscovery) && deps.refreshTranscriptMetadata !== undefined,

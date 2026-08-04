@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
+import { readHsrMeta } from "./hsr/runDir.js";
 import { writeHiveTitle } from "./hiveState.js";
 import { withFileLock } from "./lock.js";
 import { canWriteTitle } from "./naming.js";
@@ -26,11 +27,58 @@ export function transcriptLookupForSession(record: SessionRecord): TranscriptLoo
   };
 }
 
+/**
+ * Reconcile the provider identity learned by an HSR host into its durable
+ * SessionRecord. The host can learn the id after `spawn` has already saved the
+ * record (and can finish before the daemon's first transcript scan), leaving
+ * transcript lookup unanchored. A same-name local HSR run dir, or an explicitly
+ * marked remote mirror, is authoritative for that runtime identity. Stale run
+ * dirs from records migrated back to tmux are deliberately ignored.
+ */
+export async function syncHsrProviderSessionId(record: SessionRecord): Promise<SessionRecord> {
+  // Local tmux records cannot own a local HSR meta. Remote records may have a
+  // daemon-maintained mirror, so they take the cheap metadata probe below.
+  if (record.substrate !== "hsr" && !record.node) return record;
+  const meta = await readHsrMeta(record.name).catch(() => null);
+  const belongsToHsrRecord = record.substrate === "hsr" || meta?.mirrorOfNode !== undefined;
+  if (!belongsToHsrRecord || !meta?.sessionId || meta.sessionId === record.providerSessionId) return record;
+  const updated = await touchSession(record.name, {
+    providerSessionId: meta.sessionId,
+    updatedAt: new Date().toISOString(),
+  });
+  return updated ?? record;
+}
+
+export type ResolvedSessionTranscript = {
+  record: SessionRecord;
+  transcript: TranscriptFile | null;
+};
+
+/**
+ * Resolve a transcript only when it is anchored to this record by provider id,
+ * stored path, or prompt evidence. Returning a weak cwd/mtime sibling as if it
+ * belonged to the bee is worse than returning no provider transcript: HSR
+ * callers can then use their own events.jsonl fallback without misattribution.
+ */
+export async function resolveSessionTranscript(record: SessionRecord): Promise<ResolvedSessionTranscript> {
+  const synced = await syncHsrProviderSessionId(record);
+  const lookup = transcriptLookupForSession(synced);
+  const transcript = await latestTranscript(synced.agent, synced.cwd, lookup);
+  return {
+    record: synced,
+    transcript: transcript && isAnchoredTranscriptMatch(transcript, lookup) ? transcript : null,
+  };
+}
+
 export async function refreshSessionTranscriptMetadata(record: SessionRecord): Promise<SessionRecord | null> {
-  if (!record.lastPromptAt && !record.transcriptPath) return record;
-  const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record));
-  if (!tx) return record;
-  return persistSessionTranscriptMetadata(record, tx);
+  const synced = await syncHsrProviderSessionId(record);
+  // Preserve the old no-scan fast path for records with no transcript anchor or
+  // prompt. An HSR meta session id added above intentionally unlocks discovery.
+  if (!synced.lastPromptAt && !synced.transcriptPath && !synced.providerSessionId) return synced;
+  const lookup = transcriptLookupForSession(synced);
+  const tx = await latestTranscript(synced.agent, synced.cwd, lookup);
+  if (!tx || !isAnchoredTranscriptMatch(tx, lookup)) return synced;
+  return persistSessionTranscriptMetadata(synced, tx);
 }
 
 export async function persistSessionTranscriptMetadata(

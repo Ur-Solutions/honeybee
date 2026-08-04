@@ -58,6 +58,22 @@ test("hive buz send --sender CL.cc9 --tier queue stores in queue/", async () => 
   }
 });
 
+test("hive buz send defaults the requested tier to next-tool", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    await seedSession(dir, "CL.cc9");
+    const { stdout } = await hive(dir, "buz", "send", "CO.aaa", "--sender", "CL.cc9", "-p", "hello");
+    // The seeded bee is tmux-backed, so next-tool correctly falls back to the
+    // durable queue; requested and effective tiers remain independently visible.
+    assert.match(stdout, /\tnext-tool\tqueue\tdowngraded/);
+    const queue = await readdir(join(dir, "buz", "CO.aaa", "queue"));
+    assert.equal(queue.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hive buz send --sender and --sender-human are mutually exclusive", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
   try {
@@ -100,6 +116,20 @@ test("hive buz send rejects an unknown tier", async () => {
     await seedSession(dir, "CO.aaa");
     const stderr = await hiveExpectFail(dir, "buz", "send", "CO.aaa", "--sender-human", "t", "--tier", "shout", "-p", "x");
     assert.match(stderr, /unknown tier|--tier must be one of/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz usage advertises the next-tool steering tier", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    const { stdout: globalUsage } = await hive(dir);
+    assert.match(globalUsage, /addressed messaging: four-tier delivery/);
+    const sendUsage = await hiveExpectFail(dir, "buz", "send");
+    assert.match(sendUsage, /interrupt\|next-tool\|queue\|passive/);
+    const configUsage = await hiveExpectFail(dir, "buz", "config");
+    assert.match(configUsage, /interrupt,next-tool,queue,passive/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -302,7 +332,7 @@ test("completion: buz subcommands and --accept values", async () => {
     }
     const accept = await hive(dir, "__complete", "hive", "buz", "config", "CO.aaa", "--accept", "");
     const acceptLines = accept.stdout.trim().split("\n").filter(Boolean);
-    assert.ok(acceptLines.includes("queue,passive"));
+    assert.ok(acceptLines.includes("next-tool,queue,passive"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

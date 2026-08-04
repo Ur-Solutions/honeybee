@@ -8,7 +8,7 @@ import { codexNotificationToEvents } from "../src/hsr/adapters/codex.js";
 import { ensureHsrRunDir, hsrEventsPath } from "../src/hsr/runDir.js";
 import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
 import { createUsageSampler } from "../src/daemon/usageSampler.js";
-import type { HsrObservation } from "../src/hsr/observe.js";
+import type { HsrObservation, HsrUsageObservation } from "../src/hsr/observe.js";
 import type { SessionRecord } from "../src/store.js";
 import { readUsageEvents, type UsageEvent } from "../src/usage.js";
 
@@ -97,6 +97,7 @@ test("HSR sampler fires exhaustion on the rising edge of an exhausted event", as
     assert.equal(first[0]!.resetHint, "2026-07-03T14:00:00.000Z");
     assert.equal(ledger.filter((e) => e.type === "account.exhausted").length, 1);
     assert.equal((await readUsageEvents("acct-hsr")).filter((e) => e.kind === "exhausted").length, 1);
+    assert.equal((await readUsageEvents("acct-hsr")).find((e) => e.kind === "exhausted")?.ts, new Date(5_000).toISOString());
 
     // Same log next tick: the exhausted event persists but is NOT re-fired.
     const second = await sampler([record()], new Map(), 2_000);
@@ -113,6 +114,30 @@ test("HSR sampler fires exhaustion on the rising edge of an exhausted event", as
     assert.equal(third[0]!.resetHint, "2026-07-03T19:00:00.000Z");
     assert.equal(ledger.filter((e) => e.type === "account.exhausted").length, 2);
   });
+});
+
+test("HSR sampler ignores exhaustion events from an earlier runtime incarnation", async () => {
+  let latestExhausted: HsrUsageObservation["latestExhausted"] = { ts: 50, resetHint: "old-account-limit" };
+  const ledger: Record<string, unknown>[] = [];
+  const events: UsageEvent[] = [];
+  const sampler = createUsageSampler({
+    appendUsageEvent: async (event) => void events.push(event),
+    appendLedger: async (event) => void ledger.push(event),
+    readHsrUsage: async () => ({ totals: null, ...(latestExhausted ? { latestExhausted } : {}) }),
+    readHsrRuntimeStartedAt: async () => 100,
+    sampleIntervalMs: 0,
+  });
+
+  const stale = await sampler([record()], new Map(), 1_000);
+  assert.equal(stale[0]!.exhausted, false);
+  assert.equal(events.length, 0);
+  assert.equal(ledger.length, 0);
+
+  latestExhausted = { ts: 150, resetHint: "current-account-limit" };
+  const current = await sampler([record()], new Map(), 2_000);
+  assert.equal(current[0]!.exhausted, true);
+  assert.equal(events.filter((event) => event.kind === "exhausted").length, 1);
+  assert.equal(ledger.filter((event) => event.type === "account.exhausted").length, 1);
 });
 
 test("HSR sampler uses the per-tick event snapshot when provided", async () => {

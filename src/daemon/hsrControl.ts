@@ -31,6 +31,7 @@ import {
 import { hsrObservations, pendingNeedsInput } from "../hsr/observe.js";
 import { readHsrMeta } from "../hsr/runDir.js";
 import { assertCallerEnvAllowed } from "../spawnEnv.js";
+import { resolveExplicitSpawningBeeId } from "../spawnParent.js";
 import { daemonRoot } from "./log.js";
 
 export type HsrControlServer = {
@@ -133,10 +134,12 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
     // Feature handshake for clients that must not guess across daemon versions:
     // spawn:2 = in-process spawnSingleBee with prompt/flags/rest support;
     // spawnEnv:1 = the optional env object accepted by spawn (validated, then
-    // forwarded as repeated --env). fork:1/handoff:1 = in-process
+    // forwarded as repeated --env). spawnParent:1 = authenticated hosts may
+    // pass top-level spawnedById; generic flags/env cannot set lineage.
+    // fork:1/handoff:1 = in-process
     // cmdFork/cmdHandoff (session-fork-and-handoff epic). An older daemon
     // rejects unknown methods outright, which reads as "CLI fallback".
-    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1, fork: 1, handoff: 1 })),
+    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1, spawnParent: 1, fork: 1, handoff: 1 })),
 
     liveness: guarded(async () => {
       const out: Record<string, boolean> = {};
@@ -263,6 +266,7 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
         flags?: unknown;
         rest?: unknown;
         env?: unknown;
+        spawnedById?: unknown;
       };
       const kind = String(p.kind ?? "");
       if (!kind) return { ok: false, error: "kind required" };
@@ -271,6 +275,11 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
       const model = typeof p.model === "string" ? p.model : undefined;
       const prompt = typeof p.prompt === "string" && p.prompt.trim().length > 0 ? p.prompt : undefined;
       const yolo = p.yolo === true;
+      let spawnedById: string | undefined;
+      if (p.spawnedById !== undefined) {
+        if (typeof p.spawnedById !== "string") return { ok: false, error: "spawnedById must be a bee name or id" };
+        spawnedById = await resolveExplicitSpawningBeeId(p.spawnedById);
+      }
       const { spawnSingleBee } = await import("../commands/spawn.js");
       // Generic passthrough for callers (Apiary) that speak full spawn flags —
       // `--account auto`, `--pool`, etc. — plus a harness-flag rest group. The
@@ -296,14 +305,17 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
         ? [...(p.rest as string[])]
         : [];
       if (model) rest.push("--model", model);
-      const record = await spawnSingleBee({
-        command: "spawn",
-        // A positional prompt rides the pending-turn queue (deliverHsrPrompt),
-        // exactly like `hive spawn <kind> "<prompt>" --substrate hsr`.
-        args: prompt ? [kind, prompt] : [kind],
-        flags,
-        rest,
-      });
+      const record = await spawnSingleBee(
+        {
+          command: "spawn",
+          // A positional prompt rides the pending-turn queue (deliverHsrPrompt),
+          // exactly like `hive spawn <kind> "<prompt>" --substrate hsr`.
+          args: prompt ? [kind, prompt] : [kind],
+          flags,
+          rest,
+        },
+        spawnedById ? { spawnedById } : {},
+      );
       return { ok: true, bee: record.name, ...(record.id ? { id: record.id } : {}) };
     }),
 

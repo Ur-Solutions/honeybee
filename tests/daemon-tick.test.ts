@@ -850,6 +850,29 @@ test("dispatcher registry: covers every DispatcherOutcomes key exactly once", ()
   assert.equal(new Set(names).size, names.length, "withTimeout labels must be unique");
 });
 
+test("auth recovery registry stage receives trusted HSR observations and surfaces outcomes", async () => {
+  const dispatcher = dispatcherFor("authRecoveries");
+  const outcome = { bee: "alpha", action: "recovered" as const, generation: 2, attempt: 1 };
+  let called = 0;
+  const ctx = {
+    deps: {
+      recoverAuthNeeded: async () => {
+        called += 1;
+        return [outcome];
+      },
+    },
+    records: [],
+    observed: new Map(),
+    hsrObs: new Map(),
+    nowMs: 123,
+    sessionsSnapshotTrusted: true,
+  } as unknown as Parameters<typeof dispatcher.run>[0];
+  assert.deepEqual(await dispatcher.run(ctx), [outcome]);
+  assert.equal(called, 1);
+  assert.equal(dispatcher.run({ ...ctx, sessionsSnapshotTrusted: false }), undefined);
+  assert.equal(called, 1);
+});
+
 test("tick: usage exhaustion gates dispatchAutoswap through the registry", async () => {
   await withTempStore(async () => {
     const record = bee();

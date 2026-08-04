@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { hasTranscriptProvider } from "./drivers.js";
 import { cyan, dim, isPretty, tildify } from "./format.js";
 import { writeHiveState } from "./hiveState.js";
+import { hasPendingHsrTurns } from "./hsr/pendingTurns.js";
+import { LOCAL_NODE_NAME } from "./node.js";
 import { isPermissionPromptPane } from "./readiness.js";
 import { listSeals, loadLatestSeal, type SealRecord } from "./seal.js";
 import { sessionLivenessFailure } from "./sessionLiveness.js";
-import { persistSessionTranscriptMetadata, transcriptLookupForSession } from "./sessionMetadata.js";
+import { persistSessionTranscriptMetadata, resolveSessionTranscript } from "./sessionMetadata.js";
 import { appendLedger, loadSession, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 import { lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
@@ -80,7 +82,9 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
     record = refreshed;
     const captured = await substrate.capture(record.tmuxTarget, 200, record.agentPaneId).catch(() => null);
     const pane = captured ?? "";
-    const tx = await latestTranscript(record.agent, record.cwd, transcriptLookupForSession(record)).catch(() => null);
+    const resolvedTranscript = await resolveSessionTranscript(record).catch(() => ({ record, transcript: null }));
+    record = resolvedTranscript.record;
+    const tx = resolvedTranscript.transcript;
     const assistant = tx ? lastAssistantText(tx.rows) : "";
     const fingerprint = hashParts([pane, tx?.path ?? "", String(tx?.mtimeMs ?? 0), assistant]);
 
@@ -95,7 +99,7 @@ export async function waitForIdle(options: WaitForIdleOptions): Promise<WaitForI
       // "done" — the bee is blocked waiting for a human. Surface that clearly
       // instead of letting the caller read the stall as a completed turn.
       const blocked = isPermissionPromptPane(lastPane);
-      if (!blocked && isWaitingForRequestedTranscript(record, options, tx, assistant)) {
+      if (!blocked && await isWaitingForRequestedOutput(record, options, tx, assistant)) {
         await sleep(Math.max(100, pollMs));
         continue;
       }
@@ -217,12 +221,20 @@ function waitTimeout(message: string): WaitError {
   return new WaitError("timeout", message);
 }
 
-function isWaitingForRequestedTranscript(
+async function isWaitingForRequestedOutput(
   record: SessionRecord,
   options: WaitForIdleOptions,
   tx: Awaited<ReturnType<typeof latestTranscript>>,
   assistant: string,
-): boolean {
+): Promise<boolean> {
+  // Local HSR prompt delivery is durably journaled until the provider emits a
+  // successful turn boundary. A stable startup snapshot is not completion:
+  // under load the host may still be booting with the operator's turn queued.
+  if (
+    record.substrate === "hsr" &&
+    (!record.node || record.node === LOCAL_NODE_NAME) &&
+    await hasPendingHsrTurns(record.name)
+  ) return true;
   if (options.output === "pane" || !hasTranscriptProvider(record.agent)) return false;
   // Preserve historical pane fallback for unprompted/manual waits that have no
   // transcript anchor. Prompted runs should not report a stable ready screen as

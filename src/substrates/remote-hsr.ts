@@ -473,8 +473,8 @@ export function createRemoteHsrSubstrate(
     kind: "remote-hsr",
     node: node.name,
     endpoint: node.endpoint,
-    // The remote runner host sees tool events inline; the mode forwards over
-    // the send RPC, so a next-tool hold works exactly as it does locally.
+    // The mode forwards over the send RPC, so native/fallback next-tool
+    // steering works exactly as it does on a local runner host.
     supportsNextTool: true,
     probe,
     hasSession,

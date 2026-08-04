@@ -18,7 +18,7 @@ import { harnessSupportsRemoteHsr } from "../hsr/harness.js";
 import { allocateBeeIdentity } from "../ids.js";
 import { kitMaterializeHome, readKitHomeStamp } from "../kit.js";
 import { chooseLaunch, type LaunchTemplate } from "../launchTui.js";
-import { cachedAccountLimits, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
+import { cachedAccountLimits, isFableModel, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
 import { LOCAL_NODE_NAME, authPolicyOf, type NodeRecord } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { planSpawnPreamble } from "../spawnPreamble.js";
@@ -676,12 +676,30 @@ export type SpawnAccountAliasResolver = {
 };
 
 
+/** Last CLI model selector wins, matching the harnesses' argv semantics. */
+export function requestedModelFromArgs(args: string[]): string | undefined {
+  let model: string | undefined;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if ((arg === "--model" || arg === "-m") && args[i + 1]) {
+      model = args[++i];
+    } else if (arg.startsWith("--model=") && arg.length > "--model=".length) {
+      model = arg.slice("--model=".length);
+    } else if (arg.startsWith("-m=") && arg.length > 3) {
+      model = arg.slice(3);
+    }
+  }
+  return model;
+}
+
+
 export function spawnAccountAliasResolver(requested: string, parsed: Parsed): SpawnAccountAliasResolver | undefined {
   const includePaused = includePausedFlag(parsed);
   const rr = roundRobinAccountTool(requested);
   if (rr) return { agent: rr, account: () => pickRoundRobinAccountForCli(rr, includePaused) };
   const tool = autoAccountTool(requested);
-  if (tool) return { agent: tool, account: () => pickAutoAccount(tool, ttlFlagMs(parsed), includePaused) };
+  const model = requestedModelFromArgs(parsed.rest);
+  if (tool) return { agent: tool, account: () => pickAutoAccount(tool, ttlFlagMs(parsed), includePaused, model) };
   return undefined;
 }
 
@@ -708,8 +726,14 @@ export async function defaultSoleCredentialedAccount(requested: string, parsed: 
 
 
 /** `--account <query>` resolution; reserved queries: `auto` (least-loaded) and `rr` (round-robin). */
-export async function resolveAccountFlag(query: string, tool: string, ttlMs: number | undefined, includePaused = false): Promise<AccountRecord> {
-  if (query === AUTO_ACCOUNT_QUERY) return pickAutoAccount(tool, ttlMs, includePaused);
+export async function resolveAccountFlag(
+  query: string,
+  tool: string,
+  ttlMs: number | undefined,
+  includePaused = false,
+  model?: string,
+): Promise<AccountRecord> {
+  if (query === AUTO_ACCOUNT_QUERY) return pickAutoAccount(tool, ttlMs, includePaused, model);
   if (query === RR_ACCOUNT_QUERY) return pickRoundRobinAccountForCli(tool, includePaused);
   return findAccount(query, tool);
 }
@@ -720,9 +744,13 @@ export async function resolveAccountFlag(query: string, tool: string, ttlMs: num
 // hosts multiple providers (minimax + glm + kimi), an auto-pick for `opencode`
 // is provider-blind and may select a different provider than the user meant.
 // Account-first resolution (exact id) sidesteps this; left unchanged in S2.
-export async function pickAutoAccount(tool: string, ttlMs: number | undefined, includePaused = false): Promise<AccountRecord> {
-  const choice = await pickLeastLoadedAccount(tool, { ...(ttlMs !== undefined ? { ttlMs } : {}), ...(includePaused ? { includePaused } : {}) });
-  const usage = autoPickUsage(choice.limits);
+export async function pickAutoAccount(tool: string, ttlMs: number | undefined, includePaused = false, model?: string): Promise<AccountRecord> {
+  const choice = await pickLeastLoadedAccount(tool, {
+    ...(ttlMs !== undefined ? { ttlMs } : {}),
+    ...(includePaused ? { includePaused } : {}),
+    ...(model ? { model } : {}),
+  });
+  const usage = autoPickUsage(choice.limits, model);
   const freshness = choice.limits?.cached && choice.limits.asOf ? `, cached ${formatRelativeTime(choice.limits.asOf)} ago` : "";
   console.error(note(`account auto → ${choice.account.id}${usage ? ` (${usage}${freshness})` : ""} — ${choice.reason}`));
   return choice.account;
@@ -736,12 +764,16 @@ export async function pickRoundRobinAccountForCli(tool: string, includePaused = 
 }
 
 
-export function autoPickUsage(limits: AccountLimits | undefined): string {
+export function autoPickUsage(limits: AccountLimits | undefined, model?: string): string {
   if (!limits?.ok) return "";
   const now = Date.now();
   const cell = (label: string, window?: WindowUsage) =>
     window ? `${label} ${Math.round(windowRolledOver(window, now) ? 0 : window.usedPercent)}%` : null;
-  return [cell("weekly", limits.weekly), cell("5h", limits.fiveHour)].filter(Boolean).join(", ");
+  return [
+    ...(isFableModel(model) ? [cell("Fable", limits.fableWeekly)] : []),
+    cell("weekly", limits.weekly),
+    cell("5h", limits.fiveHour),
+  ].filter(Boolean).join(", ");
 }
 
 
@@ -879,7 +911,10 @@ export function resolvePreambleFlags(parsed: Parsed): { preamble?: string; noPre
   return text ? { preamble: text } : {};
 }
 
-export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
+export async function spawnSingleBee(
+  parsed: Parsed,
+  trustedContext: { spawnedById?: string } = {},
+): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--template <name>] [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
   const combAttachment = await prepareSpawnCombAttachment(parsed);
@@ -902,6 +937,9 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const env = resolveSpawnEnvFlag(parsed);
+  // Only trusted in-process integrations can supply this context. It is not a
+  // Parsed flag and cannot arrive through generic spawn flags or child env.
+  const spawnedById = trustedContext.spawnedById;
   const colony = await resolveSpawnColony(parsed);
   const spec = resolveAgent(agent, extraArgs, { home, yolo, env });
   // HSR is a substrate, not a node: `--substrate hsr` skips node resolution and
@@ -917,7 +955,10 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
   // Account binding precedence: explicit --account flag > profile account >
   // <tool>-<account> shorthand / account-id resolution.
-  const account = accountQuery ? await resolveAccountFlag(accountQuery, spec.kind, ttlFlagMs(parsed), includePausedFlag(parsed)) : (profile?.account ?? aliasAccount);
+  const requestedModel = requestedModelFromArgs(extraArgs) ?? profile?.model;
+  const account = accountQuery
+    ? await resolveAccountFlag(accountQuery, spec.kind, ttlFlagMs(parsed), includePausedFlag(parsed), requestedModel)
+    : (profile?.account ?? aliasAccount);
   // A paused account is only used deliberately: warn + confirm (or --yes),
   // before any home activation or session creation happens.
   await confirmPausedAccount(account, parsed);
@@ -944,7 +985,7 @@ export async function spawnSingleBee(parsed: Parsed): Promise<SessionRecord> {
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(spawnedById ? { spawnedById } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.
