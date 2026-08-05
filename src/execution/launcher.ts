@@ -84,10 +84,16 @@ export async function materializeExplicitPlacement(
   return claimWorkingCopy(explicit.workingCopyId, runId);
 }
 
-export function createHsrRunLauncher(deps: { nodeId: string }): RunLauncher {
+/**
+ * `nodeId` resolves the CANONICAL bound node identity (binding.nodeId) lazily:
+ * the daemon builds the launcher before any binding exists, and runs can only
+ * arrive after run.start validated the lease against that same binding.
+ */
+export function createHsrRunLauncher(deps: { nodeId: () => Promise<string> }): RunLauncher {
   return async (request: RunLaunchRequest): Promise<RunLaunchResult> => {
     const { runId, beeName, intent } = request;
-    const copy = await materializeExplicitPlacement(deps.nodeId, request);
+    const nodeId = await deps.nodeId();
+    const copy = await materializeExplicitPlacement(nodeId, request);
 
     const harness = asObject(intent.harness);
     const driverId = String(harness?.driverId ?? "");
@@ -120,7 +126,7 @@ export function createHsrRunLauncher(deps: { nodeId: string }): RunLauncher {
 
     const workingCopy: JsonObject = {
       workingCopyId: copy.workingCopyId,
-      nodeId: deps.nodeId,
+      nodeId,
       providerId: NATIVE_PROVIDER_ID,
       productId: copy.productId,
       ...(copy.origin ? { origin: copy.origin } : {}),

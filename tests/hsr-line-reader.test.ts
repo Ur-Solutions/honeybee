@@ -70,3 +70,23 @@ test("each reader instance keeps its own buffer", () => {
   assert.deepEqual(outA, ["a-partial"]);
   assert.deepEqual(outB, ["b-partial"]);
 });
+
+test("maxLineLength: an oversized complete line is discarded, framing resumes after it", () => {
+  const out: string[] = [];
+  let overflows = 0;
+  const feed = makeLineReader((l) => out.push(l), { maxLineLength: 8, onOverflow: () => overflows++ });
+  feed(Buffer.from("ok\nway-too-long-line\nafter\n", "utf8"));
+  assert.deepEqual(out, ["ok", "after"]);
+  assert.equal(overflows, 1);
+});
+
+test("maxLineLength: a newline-less flood never buffers beyond the bound", () => {
+  const out: string[] = [];
+  let overflows = 0;
+  const feed = makeLineReader((l) => out.push(l), { maxLineLength: 8, onOverflow: () => overflows++ });
+  feed(Buffer.from("0123456789", "utf8"));
+  feed(Buffer.from("more-and-more", "utf8"));
+  assert.equal(overflows, 1, "one overflow per oversized line");
+  feed(Buffer.from("tail\nok\n", "utf8"));
+  assert.deepEqual(out, ["ok"], "the oversized line's tail is discarded; the next line frames normally");
+});

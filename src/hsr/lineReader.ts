@@ -19,21 +19,52 @@
  * Node builtins only.
  */
 
+export type LineReaderOpts = {
+  /**
+   * Reject any single line longer than this many UTF-16 code units. Once the
+   * partial buffer exceeds the bound, buffered data is dropped, the rest of
+   * that line is discarded, and `onOverflow` fires once for it — the reader
+   * never holds unbounded memory for a peer that stops sending newlines.
+   */
+  maxLineLength?: number;
+  onOverflow?: () => void;
+};
+
 /**
  * Build a `(chunk: Buffer) => void` data handler that splits the stream into
  * lines and invokes `onLine` once per non-blank line. Stateful over partial
  * lines — create one per stream.
  */
-export function makeLineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
+export function makeLineReader(onLine: (line: string) => void, opts: LineReaderOpts = {}): (chunk: Buffer) => void {
+  const maxLineLength = opts.maxLineLength ?? Number.POSITIVE_INFINITY;
   let buffer = "";
+  let discarding = false;
   return (chunk: Buffer): void => {
     buffer += chunk.toString("utf8");
-    let nl = buffer.indexOf("\n");
-    while (nl !== -1) {
+    for (;;) {
+      const nl = buffer.indexOf("\n");
+      if (nl === -1) {
+        if (discarding) {
+          buffer = "";
+        } else if (buffer.length > maxLineLength) {
+          buffer = "";
+          discarding = true;
+          opts.onOverflow?.();
+        }
+        return;
+      }
       const line = buffer.slice(0, nl).replace(/\r$/, "");
       buffer = buffer.slice(nl + 1);
+      if (discarding) {
+        // The tail of the oversized line ends here; resume normal framing.
+        discarding = false;
+        continue;
+      }
+      if (line.length > maxLineLength) {
+        opts.onOverflow?.();
+        continue;
+      }
       if (line.trim().length > 0) onLine(line);
-      nl = buffer.indexOf("\n");
     }
   };
 }

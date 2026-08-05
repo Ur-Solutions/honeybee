@@ -20,6 +20,12 @@ import { saveSession } from "../src/store.js";
 export const OWNER_SCOPE = "oscope-local-1";
 export const WORKSPACE = "wsp-alpha";
 export const SNAPSHOT_DIGEST = "sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
+/**
+ * The CANONICAL Apiary nodeId bound at install time (LocalAuthorityManifest
+ * hostNodeId shape). Deliberately different from the Honeybee-minted internal
+ * identity so tests prove the public protocol speaks the bound id.
+ */
+export const CANONICAL_NODE_ID = "node-0a1b2c3d-apiary-host";
 
 /** Fresh HIVE_STORE_ROOT per test. */
 export async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -46,9 +52,11 @@ export async function installTestAuthority(): Promise<TestAuthority> {
     authorityId: "la-0001",
     authorityEpoch: 1,
     authorityPublicKey: authority.publicKey,
+    nodeId: CANONICAL_NODE_ID,
   });
-  const identity = await loadNodeIdentity();
-  return { authority, binding, nodeId: identity.nodeId };
+  // Minted for signing custody; the PUBLIC node identity is binding.nodeId.
+  await loadNodeIdentity();
+  return { authority, binding, nodeId: binding.nodeId };
 }
 
 export type EnvelopeOverrides = {

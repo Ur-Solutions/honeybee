@@ -93,6 +93,7 @@ test("binding: corrupt record and non-ed25519 install key fail closed", async ()
         authorityId: "la-0002",
         authorityEpoch: 1,
         authorityPublicKey: Buffer.from("junk").toString("base64"),
+        nodeId: "node-apiary-junk",
       }),
       /Ed25519/,
     );

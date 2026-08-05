@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { loadExecutionContract, createExecutionValidator } from "../src/execution/contract.js";
 import { executionError } from "../src/execution/errors.js";
-import { requireExecutionBinding, loadNodeIdentity } from "../src/execution/nodeState.js";
+import { requireExecutionBinding } from "../src/execution/nodeState.js";
 import {
   admitRunStart,
   beeNameForRun,
@@ -50,11 +50,10 @@ function errorCode(response: JsonObject): string | undefined {
 /** Admit a reservation directly (bypassing launch) to stage crash windows. */
 async function stageReservation(ctx: TestAuthority, envelope: JsonObject) {
   const binding = await requireExecutionBinding();
-  const identity = await loadNodeIdentity();
   const validated = validateRunStart(envelope, {
     validator,
     binding,
-    nodeId: identity.nodeId,
+    nodeId: binding.nodeId,
     protocolVersion: "0.1",
   });
   const { reservation } = await admitRunStart({
