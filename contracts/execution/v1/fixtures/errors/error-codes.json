@@ -13,6 +13,7 @@
     { "code": "MATERIALIZATION_FAILED", "message": "fresh working copy allocation failed; canonical checkout untouched", "retryable": false },
     { "code": "HARNESS_UNAVAILABLE", "message": "harness claude is absent on this node", "retryable": false },
     { "code": "RUN_VERSION_CONFLICT", "message": "command precondition ifStateVersion 4 is stale (current 6)", "retryable": false },
+    { "code": "RUN_UNKNOWN", "message": "runId run-9999 names no Run reserved on this node", "retryable": false },
     {
       "code": "CURSOR_EXPIRED",
       "message": "events before seq 120 were compacted; resume from the checkpoint",

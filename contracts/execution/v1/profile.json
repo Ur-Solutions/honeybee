@@ -119,6 +119,7 @@
         "MATERIALIZATION_FAILED",
         "HARNESS_UNAVAILABLE",
         "RUN_VERSION_CONFLICT",
+        "RUN_UNKNOWN",
         "CURSOR_EXPIRED",
         "NODE_LOST",
         "AUTHORITY_UNAVAILABLE"
@@ -164,6 +165,7 @@
     "MATERIALIZATION_FAILED": { "retryable": false, "meaning": "Run Environment preparation failed" },
     "HARNESS_UNAVAILABLE": { "retryable": false, "meaning": "driver or compatible harness is absent/degraded beyond policy" },
     "RUN_VERSION_CONFLICT": { "retryable": false, "meaning": "command precondition is stale" },
+    "RUN_UNKNOWN": { "retryable": false, "meaning": "runId names no Run reserved on this node" },
     "CURSOR_EXPIRED": { "retryable": false, "meaning": "requested event history compacted; checkpoint supplied if available" },
     "NODE_LOST": { "retryable": false, "meaning": "coordinator cannot prove runtime liveness" },
     "AUTHORITY_UNAVAILABLE": { "retryable": true, "meaning": "required validation/renewal cannot complete" },

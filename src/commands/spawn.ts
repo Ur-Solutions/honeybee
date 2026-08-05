@@ -169,6 +169,13 @@ export type SpawnOptions = {
    * its own orchestrator bee).
    */
   spawnedById?: string;
+  /**
+   * Execution-protocol Run identity (contracts/execution/v1). Stamped on the
+   * SessionRecord at creation — atomically with the spawn — so the execution
+   * coordinator's crash recovery can bind the session back to its durable
+   * run.start reservation. Only the in-process protocol launcher sets this.
+   */
+  executionRunId?: string;
   node?: NodeRecord;
   /**
    * Substrate override. HSR ("hsr") runs the bee pane-lessly under a detached
@@ -491,6 +498,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.contract ? { contract: opts.contract } : {}),
       ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(spawnedById ? { spawnedById } : {}),
+      ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
       // UNIT 2: persist the delivered access token's expiry (unix seconds) so the
       // daemon can proactively re-deliver before it dies. Only the ephemeral-token
@@ -575,6 +583,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.contract ? { contract: opts.contract } : {}),
       ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(spawnedById ? { spawnedById } : {}),
+      ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
       ...(opts.autoswap ? { autoswap: true } : {}),
       ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
@@ -638,6 +647,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     ...(opts.contract ? { contract: opts.contract } : {}),
     ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
     ...(spawnedById ? { spawnedById } : {}),
+    ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
     ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
     ...(opts.account ? { accountId: opts.account.id } : {}),
     ...(opts.autoswap ? { autoswap: true } : {}),
@@ -913,7 +923,7 @@ export function resolvePreambleFlags(parsed: Parsed): { preamble?: string; noPre
 
 export async function spawnSingleBee(
   parsed: Parsed,
-  trustedContext: { spawnedById?: string } = {},
+  trustedContext: { spawnedById?: string; executionRunId?: string } = {},
 ): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--template <name>] [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
@@ -985,7 +995,7 @@ export async function spawnSingleBee(
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(spawnedById ? { spawnedById } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(spawnedById ? { spawnedById } : {}), ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.

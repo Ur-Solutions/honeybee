@@ -175,6 +175,14 @@ export type SessionRecord = {
   lastObservedState?: string;
   lastObservedStateAt?: string;
   runId?: string;
+  /**
+   * Execution-protocol Run identity (contracts/execution/v1) this bee is bound
+   * to, stamped atomically at record creation by a protocol `run.start` spawn.
+   * Distinct from the flow `runId` above. Crash recovery uses it to prove a
+   * reservation's launch actually persisted (started-receipt-lost vs
+   * indeterminate) without ever counting processes.
+   */
+  executionRunId?: string;
   flowName?: string;
   /** Vault account bound to this bee's home (Phase 3 identity layer). */
   accountId?: string;

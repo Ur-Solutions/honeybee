@@ -32,6 +32,8 @@ import { hsrObservations, pendingNeedsInput } from "../hsr/observe.js";
 import { readHsrMeta } from "../hsr/runDir.js";
 import { assertCallerEnvAllowed } from "../spawnEnv.js";
 import { resolveExplicitSpawningBeeId } from "../spawnParent.js";
+import { createExecutionRpcMethods } from "../execution/rpcMethods.js";
+import type { ExecutionService } from "../execution/service.js";
 import { daemonRoot } from "./log.js";
 
 export type HsrControlServer = {
@@ -65,7 +67,11 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export async function startHsrControlServer(opts?: { socketPath?: string }): Promise<HsrControlServer> {
+export async function startHsrControlServer(opts?: {
+  socketPath?: string;
+  /** Execution-protocol coordinator override (tests inject fakes). */
+  executionService?: () => ExecutionService | Promise<ExecutionService>;
+}): Promise<HsrControlServer> {
   const socketPath = opts?.socketPath ?? hsrControlSocketPath();
 
   // Live event relays, one cached client per observed bee. Ref-counted across
@@ -139,7 +145,10 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
     // fork:1/handoff:1 = in-process
     // cmdFork/cmdHandoff (session-fork-and-handoff epic). An older daemon
     // rejects unknown methods outright, which reads as "CLI fallback".
-    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1, spawnParent: 1, fork: 1, handoff: 1 })),
+    // execution:1 = the contracts/execution/v1 protocol methods
+    // (protocol.hello, node.describe, run.start/get/events) are registered on
+    // this socket; real capability negotiation is protocol.hello itself.
+    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1, spawnParent: 1, fork: 1, handoff: 1, execution: 1 })),
 
     liveness: guarded(async () => {
       const out: Record<string, boolean> = {};
@@ -341,7 +350,32 @@ export async function startHsrControlServer(opts?: { socketPath?: string }): Pro
     }),
   };
 
-  server = await startRpcServer({ socketPath, methods });
+  // Execution-protocol methods (contracts/execution/v1, slice H1) ride the
+  // same socket behind their own per-connection protocol.hello gate. The
+  // coordinator is built lazily on first protocol call so daemon boot does not
+  // pay the contract/ajv load, and legacy methods are untouched.
+  const execution = createExecutionRpcMethods(
+    opts?.executionService ??
+      (async () => {
+        const [{ createExecutionService, storeSessionEvidenceSource }, { createHsrRunLauncher }, { loadNodeIdentity }] =
+          await Promise.all([
+            import("../execution/service.js"),
+            import("../execution/launcher.js"),
+            import("../execution/nodeState.js"),
+          ]);
+        const identity = await loadNodeIdentity();
+        return createExecutionService({
+          launcher: createHsrRunLauncher({ nodeId: identity.nodeId }),
+          sessions: storeSessionEvidenceSource(),
+        });
+      }),
+  );
+
+  server = await startRpcServer({
+    socketPath,
+    methods: { ...execution.methods, ...methods },
+    onDisconnect: (ctx) => execution.onDisconnect(ctx),
+  });
 
   return {
     path: server.path,
