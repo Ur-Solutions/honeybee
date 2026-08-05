@@ -112,6 +112,14 @@ export type RunReservation = {
   capabilityLeaseId: string;
   /** Full RunIntent as admitted (conflict checks + relaunch use it verbatim). */
   intent: JsonObject;
+  /**
+   * Immutable initiator fact from the admitting envelope's validated
+   * ActorContext (minimal: kind + id). Captured once at admission; an agent
+   * initiator becomes the spawned harness's parent edge (spawnedById) unless
+   * a same-scope parentRunId supplies the actual parent bee. Human/root
+   * initiators carry the fact but never manufacture a parent.
+   */
+  initiator?: { kind: string; id: string };
   /** Deterministic HSR bee name this Run is bound to (derived from runId). */
   beeName: string;
   phase: RunReservationPhase;
@@ -200,7 +208,22 @@ export async function readReservation(runId: string): Promise<RunReservation | n
   if (parsed.runId !== runId) {
     throw executionError("AUTHORITY_UNAVAILABLE", `run reservation directory for ${runId} names a different run (${String(parsed.runId)})`);
   }
+  if (parsed.initiator !== undefined && !isValidInitiator(parsed.initiator)) {
+    // A malformed initiator would silently corrupt parent authorship on
+    // relaunch (a fake or empty parent edge). Fail closed like every other
+    // corrupt reservation fact — never cast it through.
+    throw executionError("AUTHORITY_UNAVAILABLE", `run reservation for ${runId} carries a malformed initiator fact`);
+  }
   return parsed as unknown as RunReservation;
+}
+
+/** ActorContext initiator kinds admitted by the corpus (actor-context.schema.json). */
+const INITIATOR_KINDS = new Set(["user", "agent", "pollinate-activation", "parent-comb"]);
+
+function isValidInitiator(value: unknown): value is { kind: string; id: string } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const { kind, id } = value as Record<string, unknown>;
+  return typeof kind === "string" && INITIATOR_KINDS.has(kind) && typeof id === "string" && id.length > 0;
 }
 
 async function writeReservation(reservation: RunReservation): Promise<void> {
@@ -252,6 +275,7 @@ export type AdmissionInput = {
   leaseExpiresAt: string;
   capabilityLeaseId: string;
   intent: JsonObject;
+  initiator?: { kind: string; id: string };
 };
 
 export type AdmissionOutcome = {
@@ -362,6 +386,7 @@ export async function admitRunStart(input: AdmissionInput): Promise<AdmissionOut
       leaseExpiresAt: input.leaseExpiresAt,
       capabilityLeaseId: input.capabilityLeaseId,
       intent: input.intent,
+      ...(input.initiator ? { initiator: input.initiator } : {}),
       beeName: beeNameForRun(input.runId),
       phase: "reserved",
       createdAt: now,

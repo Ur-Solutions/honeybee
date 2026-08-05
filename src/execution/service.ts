@@ -52,6 +52,13 @@ export type RunLaunchRequest = {
   beeName: string;
   intent: JsonObject;
   lease: JsonObject;
+  /**
+   * Trusted parent bee id for the spawned harness, resolved by the
+   * coordinator from admitted facts only (parent Run's actual bee identity,
+   * else the admitted agent initiator). Absent for human/root initiators —
+   * the spawn must then carry NO parent edge, ambient context included.
+   */
+  spawnedById?: string;
 };
 
 export type RunLaunchResult = {
@@ -143,6 +150,31 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   const driverIdOf = (reservation: RunReservation): string =>
     String((reservation.intent.harness as JsonObject | undefined)?.driverId ?? "");
 
+  /** Minimal immutable initiator fact from a validated authority envelope. */
+  function initiatorOf(authority: JsonObject): { kind: string; id: string } | undefined {
+    const actor = authority.actor;
+    if (actor === null || typeof actor !== "object" || Array.isArray(actor)) return undefined;
+    const raw = (actor as JsonObject).initiator;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const { kind, id } = raw as JsonObject;
+    return typeof kind === "string" && typeof id === "string" ? { kind, id } : undefined;
+  }
+
+  /**
+   * Trusted parent authorship for the harness spawn. A same-scope parentRunId
+   * (validated at admission) contributes its ACTUAL bee identity once known;
+   * otherwise an agent initiator from the admitted ActorContext is the parent.
+   * Human/root initiators get no parent — never an invented one.
+   */
+  async function runSpawnedById(reservation: RunReservation): Promise<string | undefined> {
+    const parentRunId = reservation.intent.parentRunId;
+    if (typeof parentRunId === "string") {
+      const parent = await readReservation(parentRunId);
+      if (parent?.sessionRef) return parent.sessionRef;
+    }
+    return reservation.initiator?.kind === "agent" ? reservation.initiator.id : undefined;
+  }
+
   /** Run the launcher for a reservation this caller owns. Never throws. */
   async function launch(reservation: RunReservation, lease: JsonObject): Promise<void> {
     const runId = reservation.runId;
@@ -162,11 +194,13 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         { onlyIfAbsentTypes: true },
       );
       try {
+        const spawnedById = await runSpawnedById(reservation);
         const result = await options.launcher({
           runId,
           beeName: reservation.beeName,
           intent: reservation.intent,
           lease,
+          ...(spawnedById ? { spawnedById } : {}),
         });
         await mutateReservation(runId, (current) => ({
           ...current,
@@ -534,8 +568,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     protocolVersion,
     schemaDigest,
     now,
-    identity,
-    binding: requireExecutionBinding,
+    binding,
     ...(options.verifySignature ? { verifySignature: options.verifySignature } : {}),
     control,
     sessions: options.sessions,
@@ -583,6 +616,28 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       const identicalRetry =
         peeked !== null && peeked.effectKey === validated.effectKey && peeked.requestDigest === validated.requestDigest;
       if (!identicalRetry) assertLeaseWindow(validated.lease, now());
+      // Trusted parent authorship, admitted once from validated facts only:
+      // the initiator is the authority ActorContext initiator, and a
+      // parentRunId must name a Run reserved on THIS node in the SAME owner
+      // scope + workspace — a parent is never invented for an unknown or
+      // cross-scope reference. Checked for NEW admissions only, so identical
+      // replays stay read-only even after the parent Run is released.
+      const initiator = initiatorOf(validated.authority);
+      if (!identicalRetry) {
+        const parentRunId = (validated.intent as JsonObject).parentRunId;
+        if (parentRunId !== undefined) {
+          const parent = typeof parentRunId === "string" ? await readReservation(parentRunId) : null;
+          if (!parent) {
+            throw executionError("RUN_UNKNOWN", `parentRunId ${String(parentRunId)} names no Run reserved on this node`);
+          }
+          if (
+            parent.ownerScopeId !== String(validated.authority.ownerScopeId) ||
+            parent.workspaceId !== String(validated.authority.workspaceId)
+          ) {
+            throw executionError("LEASE_DENIED", `parentRunId ${parent.runId} belongs to a different owner scope/workspace`);
+          }
+        }
+      }
       const { reservation, created } = await admitRunStart({
         runId: validated.runId,
         effectKey: validated.effectKey,
@@ -596,6 +651,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         leaseExpiresAt: String(validated.lease.expiresAt),
         capabilityLeaseId: String(validated.authority.capabilityLeaseId),
         intent: validated.intent,
+        ...(initiator ? { initiator } : {}),
       });
       if (created) {
         await appendRunEvents(

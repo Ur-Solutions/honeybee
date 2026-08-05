@@ -251,8 +251,10 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   const ownsTimer = !opts.timer;
   // Capture the spawning bee (if this spawn is itself running inside one) so the
   // child carries a durable parent edge the fleet surface can walk. Undefined
-  // for operator/daemon-launched roots.
-  const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
+  // for operator/daemon-launched roots. Execution-protocol spawns
+  // (executionRunId set) derive lineage ONLY from admitted protocol facts:
+  // an absent spawnedById there means "no parent", never ambient discovery.
+  const spawnedById = opts.spawnedById ?? (opts.executionRunId ? undefined : await resolveSpawningBeeId());
   // A seal contract appends its deterministic postscript to the brief so the
   // record AND every delivery path carry the demand (CL.701 §4.1).
   const brief = withContractPostscript(opts.brief, opts.contract);

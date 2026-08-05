@@ -100,6 +100,13 @@ export function createHsrRunLauncher(deps: { nodeId: () => Promise<string> }): R
     const model = typeof harness?.model === "string" ? harness.model : undefined;
     const config = asObject(harness?.config);
     const brief = typeof config?.brief === "string" ? config.brief : undefined;
+    // Account selection comes ONLY from the signed intent's harness config —
+    // never from the daemon's profiles, aliases, or ambient environment.
+    // "auto" rides the existing least-loaded resolution behind --account.
+    const account = config?.account;
+    if (account !== undefined && (typeof account !== "string" || account.length === 0)) {
+      throw executionError("HARNESS_UNAVAILABLE", "harness config.account must be a non-empty account query string");
+    }
 
     const { spawnSingleBee } = await import("../commands/spawn.js");
     const flags = new Map<string, string | true | string[]>();
@@ -108,6 +115,7 @@ export function createHsrRunLauncher(deps: { nodeId: () => Promise<string> }): R
     // The registry locator is the node-private path; it is used here to run
     // the process and never echoed back through the protocol.
     flags.set("cwd", copy.path);
+    if (account) flags.set("account", account);
     let record;
     try {
       record = await spawnSingleBee(
@@ -117,7 +125,9 @@ export function createHsrRunLauncher(deps: { nodeId: () => Promise<string> }): R
           flags,
           rest: model ? ["--model", model] : [],
         },
-        { executionRunId: runId },
+        // executionRunId also pins lineage: the parent edge is exactly the
+        // coordinator-resolved spawnedById (or none) — ambient never applies.
+        { executionRunId: runId, ...(request.spawnedById ? { spawnedById: request.spawnedById } : {}) },
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
