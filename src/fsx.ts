@@ -91,7 +91,7 @@ export type AtomicWriteOptions = {
 // millisecond never collide on the temp file name.
 let atomicWriteCounter = 0;
 
-export async function atomicWriteFile(path: string, data: string, options: AtomicWriteOptions = {}): Promise<void> {
+export async function atomicWriteFile(path: string, data: string | Buffer, options: AtomicWriteOptions = {}): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   atomicWriteCounter += 1;
   const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.${atomicWriteCounter}.tmp`);

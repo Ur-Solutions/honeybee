@@ -38,6 +38,25 @@ export function createExecutionRpcMethods(service: () => ExecutionService | Prom
     }
   };
 
+  /**
+   * Every method with effects shares one shape: the mutation gate refuses an
+   * un-negotiated or incompatible connection with an envelope-shaped typed
+   * error; a gated call otherwise answers with the service's response
+   * envelope (receipt + result, or typed error).
+   */
+  const effectMethod =
+    (select: (svc: ExecutionService) => (request: never) => Promise<unknown>): RpcMethodHandler =>
+    async (params, ctx) => {
+      const svc = await resolveService();
+      try {
+        gate(ctx, true);
+      } catch (error) {
+        const requestId = (params as { requestId?: unknown } | null)?.requestId;
+        return { protocolVersion: svc.protocolVersion, requestId: String(requestId ?? ""), error: toWireError(error) };
+      }
+      return select(svc)(params as never);
+    };
+
   const methods: Record<string, RpcMethodHandler> = {
     "protocol.hello": async (params, ctx) => {
       const svc = await resolveService();
@@ -59,16 +78,12 @@ export function createExecutionRpcMethods(service: () => ExecutionService | Prom
       const outcome = await svc.describe(params as never);
       return "error" in outcome ? outcome : outcome.result;
     },
-    "run.start": async (params, ctx) => {
-      const svc = await resolveService();
-      try {
-        gate(ctx, true);
-      } catch (error) {
-        const requestId = (params as { requestId?: unknown } | null)?.requestId;
-        return { protocolVersion: svc.protocolVersion, requestId: String(requestId ?? ""), error: toWireError(error) };
-      }
-      return svc.runStart(params as never);
-    },
+    "run.start": effectMethod((svc) => svc.runStart),
+    "run.command": effectMethod((svc) => svc.runCommand),
+    "run.cancel": effectMethod((svc) => svc.runCancel),
+    "run.collect": effectMethod((svc) => svc.runCollect),
+    "run.retain": effectMethod((svc) => svc.runRetain),
+    "run.release": effectMethod((svc) => svc.runRelease),
     "run.get": async (params, ctx) => {
       const svc = await resolveService();
       try {

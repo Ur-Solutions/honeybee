@@ -34,10 +34,13 @@ import {
   readRunEvents,
   type LaunchEvidence,
   type RunEnvironmentFacts,
+  type RunEventInput,
   type RunReservation,
   type StoredRunEvent,
 } from "./runStore.js";
 import { assertLeaseWindow, validateRunStart } from "./runStart.js";
+import { hsrHarnessControl, type HarnessControl } from "./harnessControl.js";
+import { createRunOperations, type RunOperations } from "./operations.js";
 import type { SignatureVerifier } from "./signing.js";
 
 /* ---------------------------------------------------------------- */
@@ -76,6 +79,8 @@ export type SessionEvidenceSource = {
 export type ExecutionServiceOptions = {
   launcher: RunLauncher;
   sessions: SessionEvidenceSource;
+  /** Harness steering/stop channel; defaults to the HSR control-socket path. */
+  control?: HarnessControl;
   harnessProbe?: HarnessProbe;
   verifySignature?: SignatureVerifier;
   now?: () => Date;
@@ -98,6 +103,11 @@ export type ExecutionService = {
   runStart(request: JsonValue): Promise<JsonObject>;
   runGet(request: JsonValue): Promise<NonEffectResult>;
   runEvents(request: JsonValue): Promise<NonEffectResult>;
+  runCommand(request: JsonValue): Promise<JsonObject>;
+  runCancel(request: JsonValue): Promise<JsonObject>;
+  runCollect(request: JsonValue): Promise<JsonObject>;
+  runRetain(request: JsonValue): Promise<JsonObject>;
+  runRelease(request: JsonValue): Promise<JsonObject>;
 };
 
 export function createExecutionService(options: ExecutionServiceOptions): ExecutionService {
@@ -106,6 +116,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   const schemaDigest = computeSchemaDigest(contract);
   const protocolVersion = typeof contract.profile.protocolVersion === "string" ? contract.profile.protocolVersion : "0.1";
   const now = options.now ?? (() => new Date());
+  const control = options.control ?? hsrHarnessControl();
   const inFlight = new Map<string, Promise<void>>();
 
   let identityPromise: Promise<ExecutionNodeIdentity> | undefined;
@@ -173,6 +184,52 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           ],
           { onlyIfAbsentTypes: true },
         );
+        // A cancel that landed while this launch was in flight wins: stop the
+        // just-started session so a durably cancelled Run never keeps running.
+        // An UNCONFIRMED stop must not hide behind the cancelled terminal —
+        // record honest liveness doubt so reconciliation stays observable.
+        const post = await readReservation(runId);
+        if (post?.cancel || post?.result?.outcome === "cancelled") {
+          let stopConfirmed = false;
+          let detail = "";
+          try {
+            const stop = await control.stop(reservation.beeName);
+            stopConfirmed = stop.stopped;
+            detail = stop.detail;
+          } catch (error) {
+            detail = error instanceof Error ? error.message : String(error);
+          }
+          if (stopConfirmed) {
+            // The sweep owns terminal resolution for a cancel that landed
+            // pre-running: confirmed stop -> atomically cancelled + event.
+            const resolved = await mutateReservation(runId, (record) => {
+              const { indeterminateAt: _resolved, ...rest } = record;
+              if (rest.result) return rest as RunReservation;
+              return {
+                ...(rest as RunReservation),
+                result: { outcome: "cancelled", cause: record.cancel?.reason ?? "cancel_requested", finishedAt: now().toISOString() },
+              };
+            });
+            if (resolved.result?.outcome === "cancelled") {
+              await appendRunEvents(
+                runId,
+                protocolVersion,
+                [{ type: "run.cancelled", payload: { cause: resolved.result.cause ?? "cancel_requested" }, origin: await origin() }],
+                { onlyIfAbsentTypes: true },
+              );
+            }
+          } else {
+            await mutateReservation(runId, (record) =>
+              record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
+            );
+            await appendRunEvents(
+              runId,
+              protocolVersion,
+              [{ type: "run.lost", payload: { cause: "cancel_stop_unconfirmed", ...(detail ? { detail } : {}) }, origin: await origin() }],
+              { onlyIfAbsentTypes: true },
+            );
+          }
+        }
       } catch (error) {
         const wire = toWireError(error);
         await mutateReservation(runId, (current) => ({
@@ -233,24 +290,119 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         { onlyIfAbsentTypes: true },
       );
     }
+    const leaseExpired = Date.parse(current.leaseExpiresAt) < now().getTime();
+    if (current.phase === "started" && !current.result && (current.cancel !== undefined || leaseExpired)) {
+      // Durable desired-state stop reconciler. Two ways in: execution
+      // authority died with the lease (a still-running harness must not
+      // continue unbounded), or a cancellation intent exists whose stop was
+      // never confirmed. EVERY reconcile pass retries the clean stop until it
+      // is confirmed or the session outcome proves exit — a transient stop
+      // failure never strands a live harness behind a lost marker.
+      if (!current.cancel) {
+        current = await mutateReservation(current.runId, (record) =>
+          record.cancel ? record : { ...record, cancel: { requestedAt: now().toISOString(), reason: "lease_expired" } },
+        );
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "cancel.requested", payload: { reason: "lease_expired" }, origin: await origin() }],
+          { onlyIfAbsentKeys: true },
+        );
+      }
+      const evidence = await options.sessions.evidence(current.beeName);
+      const ours = evidence.sessionExists && (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
+      let stopConfirmed = true;
+      let detail = "no live harness";
+      if (ours) {
+        try {
+          const stop = await control.stop(current.beeName);
+          stopConfirmed = stop.stopped;
+          detail = stop.detail;
+        } catch (error) {
+          stopConfirmed = false;
+          detail = error instanceof Error ? error.message : String(error);
+        }
+      }
+      if (stopConfirmed) {
+        current = await mutateReservation(current.runId, (record) => {
+          const { indeterminateAt: _resolved, ...rest } = record;
+          if (rest.result) return rest as RunReservation;
+          return {
+            ...(rest as RunReservation),
+            result: { outcome: "cancelled", cause: record.cancel?.reason ?? "cancel_requested", finishedAt: now().toISOString() },
+          };
+        });
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "run.cancelled", payload: { cause: current.result?.cause ?? "cancel_requested" }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+      } else {
+        current = await mutateReservation(current.runId, (record) =>
+          record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
+        );
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "run.lost", payload: { cause: "cancel_stop_unconfirmed", detail }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+      }
+    }
+    if (!current.result && current.cancel) {
+      // Durable cancellation intent resolves terminally ONLY on proof: a
+      // reservation that provably never started (no launch in flight, no
+      // session evidence, grace elapsed) can never run, so cancelled is fact,
+      // not hope. Every other case waits for a confirmed stop or exit fold.
+      const cancelClassification = classifyLaunch(current, await options.sessions.evidence(current.beeName), {
+        inFlight: inFlight.has(current.runId),
+        nowMs: now().getTime(),
+        ...(options.launchGraceMs !== undefined ? { graceMs: options.launchGraceMs } : {}),
+      });
+      if (cancelClassification === "reserved-not-started") {
+        current = await mutateReservation(current.runId, (record) => {
+          if (record.result) return record;
+          const { indeterminateAt: _resolved, ...rest } = record;
+          return {
+            ...(rest as RunReservation),
+            result: { outcome: "cancelled", cause: record.cancel?.reason ?? "cancel_requested", finishedAt: now().toISOString() },
+          };
+        });
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "run.cancelled", payload: { cause: current.cancel?.reason ?? "cancel_requested" }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+      }
+    }
     if (current.phase === "started" && !current.result) {
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
         const exitCode = outcome.exitCode ?? undefined;
-        const terminal: "completed" | "failed" = exitCode === 0 ? "completed" : "failed";
-        current = await mutateReservation(current.runId, (record) =>
-          record.result
-            ? record
-            : {
-                ...record,
-                result: {
-                  outcome: terminal,
-                  ...(terminal === "failed" ? { cause: "harness_exited" } : {}),
-                  ...(exitCode !== undefined ? { harnessExitCode: exitCode } : {}),
-                  finishedAt: now().toISOString(),
-                },
-              },
-        );
+        // A run with durable cancellation intent whose harness is now provably
+        // down finished by being cancelled, not by "failing".
+        const terminal: "completed" | "failed" | "cancelled" = current.cancel
+          ? "cancelled"
+          : exitCode === 0
+            ? "completed"
+            : "failed";
+        current = await mutateReservation(current.runId, (record) => {
+          if (record.result) return record;
+          // Proven exit resolves any outstanding liveness doubt.
+          const { indeterminateAt: _resolved, ...rest } = record;
+          return {
+            ...(rest as RunReservation),
+            result: {
+              outcome: terminal,
+              ...(terminal === "failed" ? { cause: "harness_exited" } : {}),
+              ...(terminal === "cancelled" ? { cause: record.cancel?.reason ?? "cancel_requested" } : {}),
+              ...(exitCode !== undefined ? { harnessExitCode: exitCode } : {}),
+              finishedAt: now().toISOString(),
+            },
+          };
+        });
         await appendRunEvents(
           current.runId,
           protocolVersion,
@@ -260,21 +412,68 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
               payload: exitCode !== undefined ? { exitCode } : {},
               origin: await origin({ driverId: driverIdOf(current) }),
             },
-            { type: terminal === "completed" ? "run.completed" : "run.failed", payload: {}, origin: await origin() },
+            {
+              type: terminal === "completed" ? "run.completed" : terminal === "cancelled" ? "run.cancelled" : "run.failed",
+              payload: {},
+              origin: await origin(),
+            },
           ],
           { onlyIfAbsentTypes: true },
         );
       }
     }
+    if (current.result && current.indeterminateAt) {
+      // A terminal fact recorded while a stop was unconfirmable: the doubt
+      // clears only when the session outcome proves the harness exited.
+      const outcome = await options.sessions.outcome(current.beeName);
+      if (outcome && !outcome.live) {
+        current = await mutateReservation(current.runId, (record) => {
+          const { indeterminateAt: _resolved, ...rest } = record;
+          return rest as RunReservation;
+        });
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "harness.exited", payload: {}, origin: await origin({ driverId: driverIdOf(current) }) }],
+          { onlyIfAbsentTypes: true },
+        );
+      }
+    }
+    // Self-heal missing lifecycle events: a crash can land between a durable
+    // state write and its event append, and replays deliberately skip side
+    // effects — so every read re-derives the events its state implies.
+    const repairs: RunEventInput[] = [];
+    if (current.result) {
+      repairs.push({ type: `run.${current.result.outcome}`, payload: {}, origin: await origin() });
+    }
+    if (current.sealedAt && current.environment) {
+      repairs.push({
+        type: "environment.sealed",
+        payload: { environmentId: current.environment.environmentId },
+        origin: await origin({ providerId: current.environment.providerId }),
+      });
+    }
+    if (current.releasedAt && current.environment) {
+      repairs.push({
+        type: "environment.released",
+        payload: { environmentId: current.environment.environmentId },
+        origin: await origin({ providerId: current.environment.providerId }),
+      });
+    }
+    if (repairs.length > 0) await appendRunEvents(current.runId, protocolVersion, repairs, { onlyIfAbsentTypes: true });
     return current;
   }
 
   /** Derive the projection state/health from a reconciled reservation. */
   function deriveState(reservation: RunReservation, launchInFlight: boolean): { state: string; health: "ready" | "degraded" | "lost" } {
+    // Unresolved liveness doubt WINS over a recorded terminal fact: a result
+    // written while a stop was unconfirmable must not project a comfortable
+    // terminal state over a possibly-live harness. Reconciliation clears
+    // indeterminateAt once the session outcome proves exit.
+    if (reservation.indeterminateAt) return { state: "lost", health: "lost" };
     if (reservation.result) {
       return { state: reservation.result.outcome, health: "ready" };
     }
-    if (reservation.indeterminateAt) return { state: "lost", health: "lost" };
     switch (reservation.phase) {
       case "reserved":
         return { state: "accepted", health: "ready" };
@@ -309,12 +508,35 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
               environmentId: reservation.environment.environmentId,
               isolation: reservation.environment.isolation,
               ...(reservation.environment.workingCopy ? { workingCopy: reservation.environment.workingCopy } : {}),
+              ...(reservation.retainUntil && !reservation.releasedAt ? { retainedUntil: reservation.retainUntil } : {}),
             },
           }
         : {}),
       ...(reservation.result ? { result: { ...reservation.result } } : {}),
     };
   }
+
+  /* -------------------------------------------------------------- */
+  /* Per-run operations (run.command/cancel/collect/retain/release)  */
+  /* -------------------------------------------------------------- */
+
+  const ops: RunOperations = createRunOperations({
+    contract,
+    validator,
+    protocolVersion,
+    schemaDigest,
+    now,
+    identity,
+    binding: requireExecutionBinding,
+    ...(options.verifySignature ? { verifySignature: options.verifySignature } : {}),
+    control,
+    sessions: options.sessions,
+    settle: async (reservation) => {
+      const settled = await reconcile(reservation);
+      return { reservation: settled, state: deriveState(settled, inFlight.has(settled.runId)).state };
+    },
+    origin,
+  });
 
   /* -------------------------------------------------------------- */
   /* Methods                                                         */
@@ -365,6 +587,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         jobId: String(validated.intent.jobId),
         leaseId: String(validated.lease.leaseId),
         leaseExpiresAt: String(validated.lease.expiresAt),
+        capabilityLeaseId: String(validated.authority.capabilityLeaseId),
         intent: validated.intent,
       });
       if (created) {
@@ -386,7 +609,9 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         nowMs: now().getTime(),
         ...(options.launchGraceMs !== undefined ? { graceMs: options.launchGraceMs } : {}),
       });
-      if (classification === "reserved-not-started") {
+      // A reservation that already carries a terminal result (e.g. cancelled
+      // before its launch ever started) must never relaunch on replay.
+      if (classification === "reserved-not-started" && !current.result) {
         if (Date.parse(current.leaseExpiresAt) < now().getTime()) {
           const finishedAt = now().toISOString();
           current = await mutateReservation(current.runId, (record) =>
@@ -435,6 +660,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   async function runGet(request: JsonValue): Promise<NonEffectResult> {
     try {
       const reservation = await reconcile(await loadReservationFor(request, "run-get-request"));
+      await ops.reconcileOperations(reservation.runId);
       return { result: await buildProjection(reservation) };
     } catch (error) {
       return { error: toWireError(error) };
@@ -444,6 +670,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   async function runEvents(request: JsonValue): Promise<NonEffectResult> {
     try {
       const reservation = await reconcile(await loadReservationFor(request, "run-events-request"));
+      await ops.reconcileOperations(reservation.runId);
       const doc = request as JsonObject;
       const afterSeq = Number(doc.afterSeq ?? 0);
       const limit = typeof doc.limit === "number" && doc.limit >= 1 ? Math.floor(doc.limit) : Number.POSITIVE_INFINITY;
@@ -507,6 +734,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     runStart,
     runGet,
     runEvents,
+    runCommand: ops.runCommand,
+    runCancel: ops.runCancel,
+    runCollect: ops.runCollect,
+    runRetain: ops.runRetain,
+    runRelease: ops.runRelease,
   };
 }
 

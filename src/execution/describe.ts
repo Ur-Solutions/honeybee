@@ -24,6 +24,9 @@ export const DESCRIPTOR_TTL_MS = 5 * 60_000;
 /** Harness drivers this slice advertises (the Phase 0-1 checkpoint pair). */
 export const ADVERTISED_HARNESSES = ["claude", "codex"] as const;
 
+/** run.command variants the HSR control socket actually delivers (H3). */
+export const SUPPORTED_COMMANDS = ["send", "answer", "interrupt"] as const;
+
 export type HarnessProbe = (kind: string) => Promise<{ status: "ready" | "absent"; command?: string }>;
 
 /** Default probe: the driver's resolved executable is runnable on this node. */
@@ -66,11 +69,12 @@ export async function buildNodeDescriptor(deps: NodeDescriptorDeps): Promise<Jso
       driverId: kind,
       driverVersion: "0.1.0",
       runnerTier: "hsr",
-      // H1 registers no run.command variants yet, so the descriptor promises
-      // none and claims the weakest delivery semantics; H3 advertises the
-      // effect-keyed send/answer/interrupt set when those receipts exist.
-      commands: [],
-      commandDelivery: "indeterminate",
+      // H3: exactly the effect-keyed commands the HSR control socket truly
+      // delivers. checkpoint is NOT advertised (no driver support), and
+      // delivery is honestly at-most-once: crash windows become durable
+      // `indeterminate` command results and are never blindly redelivered.
+      commands: [...SUPPORTED_COMMANDS],
+      commandDelivery: "at-most-once",
       resume: false,
       checkpoint: false,
       accountResidency: "node-resident",
@@ -93,7 +97,9 @@ export async function buildNodeDescriptor(deps: NodeDescriptorDeps): Promise<Jso
         providerId: NATIVE_PROVIDER_ID,
         isolation: nativeIsolationManifest(),
         materializerForms: [GIT_WORKTREE_MATERIALIZER_ID],
-        persistence: { checkpoint: false, retainSupported: false },
+        // H3: run.retain extends the debug-retention window on this provider;
+        // checkpointing still does not exist and is not claimed.
+        persistence: { checkpoint: false, retainSupported: true },
         secretInjection: "env-allowlist",
         status: "ready",
       },
