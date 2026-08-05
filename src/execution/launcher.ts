@@ -127,7 +127,11 @@ export function createHsrRunLauncher(deps: { nodeId: () => Promise<string> }): R
         },
         // executionRunId also pins lineage: the parent edge is exactly the
         // coordinator-resolved spawnedById (or none) — ambient never applies.
-        { executionRunId: runId, ...(request.spawnedById ? { spawnedById: request.spawnedById } : {}) },
+        // protocolLaunch pins the SIGNED harness intent: spawn's local
+        // overlays (thin profiles, account aliases, sole-account defaults,
+        // config yolo) are bypassed so bees.<driver> config cannot change
+        // harness, account, args, or yolo underneath the lease.
+        { executionRunId: runId, protocolLaunch: true, ...(request.spawnedById ? { spawnedById: request.spawnedById } : {}) },
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

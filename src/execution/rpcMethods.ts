@@ -26,7 +26,16 @@ export type ExecutionRpcMethods = {
 export function createExecutionRpcMethods(service: () => ExecutionService | Promise<ExecutionService>): ExecutionRpcMethods {
   const negotiated = new Map<number, ConnectionNegotiation>();
   let servicePromise: Promise<ExecutionService> | undefined;
-  const resolveService = (): Promise<ExecutionService> => (servicePromise ??= Promise.resolve(service()));
+  const resolveService = (): Promise<ExecutionService> => {
+    // Cache only success: a rejected bootstrap (e.g. transient store/binding
+    // failure) must not poison every later call on this daemon — drop the
+    // cached promise so the next call retries the factory.
+    const attempt = (servicePromise ??= Promise.resolve(service()).catch((error: unknown) => {
+      if (servicePromise === attempt) servicePromise = undefined;
+      throw error;
+    }));
+    return attempt;
+  };
 
   const gate = (ctx: RpcConnectionCtx, mutation: boolean): void => {
     const state = negotiated.get(ctx.connectionId);

@@ -24,8 +24,43 @@ export const DESCRIPTOR_TTL_MS = 5 * 60_000;
 /** Harness drivers this slice advertises (the Phase 0-1 checkpoint pair). */
 export const ADVERTISED_HARNESSES = ["claude", "codex"] as const;
 
-/** run.command variants the HSR control socket actually delivers (H3). */
-export const SUPPORTED_COMMANDS = ["send", "answer", "interrupt"] as const;
+/**
+ * run.command variants the HSR control socket actually delivers (H3).
+ * `answer` is NOT here: needs_input.opened is not bridged into the protocol
+ * event stream yet, so an open input request is unobservable from protocol
+ * data and an advertised answer command could never be driven honestly. The
+ * legacy session/UI answer path is unaffected.
+ */
+export const SUPPORTED_COMMANDS = ["send", "interrupt"] as const;
+
+/**
+ * Event families the local-core-v1 runtime durably emits today — the honesty
+ * baseline behind profile.json's REQUIRED eventTypes (everything else in the
+ * schema vocabulary lives in optionalEventTypes until its emitter exists).
+ * Emit sites: run lifecycle + environment + harness in service.ts,
+ * command/cancel/collect lifecycles in operations.ts.
+ */
+export const PRODUCED_EVENT_TYPES = [
+  "run.accepted",
+  "environment.materializing",
+  "environment.ready",
+  "harness.starting",
+  "harness.running",
+  "harness.exited",
+  "command.accepted",
+  "command.dispatching",
+  "command.completed",
+  "command.failed",
+  "command.indeterminate",
+  "collection.completed",
+  "cancel.requested",
+  "run.cancelled",
+  "run.failed",
+  "run.completed",
+  "run.lost",
+  "environment.sealed",
+  "environment.released",
+] as const;
 
 export type HarnessProbe = (kind: string) => Promise<{ status: "ready" | "absent"; command?: string }>;
 
@@ -70,9 +105,10 @@ export async function buildNodeDescriptor(deps: NodeDescriptorDeps): Promise<Jso
       driverVersion: "0.1.0",
       runnerTier: "hsr",
       // H3: exactly the effect-keyed commands the HSR control socket truly
-      // delivers. checkpoint is NOT advertised (no driver support), and
-      // delivery is honestly at-most-once: crash windows become durable
-      // `indeterminate` command results and are never blindly redelivered.
+      // delivers. checkpoint is NOT advertised (no driver support), answer is
+      // NOT advertised (needs_input.opened is not bridged), and delivery is
+      // honestly at-most-once: crash windows become durable `indeterminate`
+      // command results and are never blindly redelivered.
       commands: [...SUPPORTED_COMMANDS],
       commandDelivery: "at-most-once",
       resume: false,

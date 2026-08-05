@@ -317,7 +317,6 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       const { validated, reservation, state } = await prepare(request, "run-command-body", "run.command");
       const command = asObject(validated.body.command) ?? {};
       const kind = String(command.kind ?? "");
-      const stateVersion = await lastEventSeq(validated.runId);
       const { record, created } = await admitOperation({
         runId: validated.runId,
         method: "run.command",
@@ -337,6 +336,17 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           if (kind === "checkpoint") {
             throw executionError("CAPABILITY_MISMATCH", `driver ${driverIdOf(reservation)} does not support checkpoint on this node`);
           }
+          if (kind === "answer") {
+            // needs_input.opened is not bridged into the protocol event
+            // stream, so an open input request is unobservable from protocol
+            // data: answer is not deliverable here (node.describe does not
+            // advertise it). The legacy session/UI answer path is unaffected;
+            // the dispatch machinery below stays for when the bridge lands.
+            throw executionError(
+              "CAPABILITY_MISMATCH",
+              `driver ${driverIdOf(reservation)} does not deliver answer on this node yet (needs_input.opened is not bridged)`,
+            );
+          }
           assertLeaseNotExpired(reservation, now());
           if (TERMINAL_RUN_STATES.has(state) || state === "lost") {
             throw executionError("RUN_VERSION_CONFLICT", `run ${validated.runId} is ${state}; steering commands cannot apply`);
@@ -344,20 +354,27 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           if (state !== "running") {
             throw executionError("HARNESS_UNAVAILABLE", `run ${validated.runId} harness is not running yet (state ${state})`);
           }
-          const expected = validated.body.ifStateVersion;
-          if (expected !== undefined && expected !== stateVersion) {
-            throw executionError("RUN_VERSION_CONFLICT", `ifStateVersion ${String(expected)} is stale (current ${stateVersion})`, {
-              expected: expected as JsonValue,
-              current: stateVersion,
-            });
+          // Preconditions above were settled BEFORE the admission lock; a
+          // concurrent cancel/terminal transition can land in that window.
+          // Re-read the durable reservation UNDER the lock so a run that is
+          // cancelling or already finished can never admit new steering.
+          const fresh = await readReservation(validated.runId);
+          if (!fresh) {
+            throw executionError("RUN_UNKNOWN", `runId ${validated.runId} names no Run reserved on this node`);
           }
-          if (kind === "answer") {
-            const open = await deps.control.pendingInputId(reservation.beeName);
-            if (open === null || open !== String(command.inputRequestId)) {
-              throw executionError(
-                "RUN_VERSION_CONFLICT",
-                `input request ${String(command.inputRequestId)} is not open (already resolved or never opened)`,
-              );
+          if (fresh.cancel || fresh.result) {
+            const why = fresh.result ? `is ${fresh.result.outcome}` : "has a durable cancellation intent";
+            throw executionError("RUN_VERSION_CONFLICT", `run ${validated.runId} ${why}; steering commands cannot apply`);
+          }
+          const expected = validated.body.ifStateVersion;
+          if (expected !== undefined) {
+            // Recomputed under the lock for the same reason.
+            const stateVersion = await lastEventSeq(validated.runId);
+            if (expected !== stateVersion) {
+              throw executionError("RUN_VERSION_CONFLICT", `ifStateVersion ${String(expected)} is stale (current ${stateVersion})`, {
+                expected: expected as JsonValue,
+                current: stateVersion,
+              });
             }
           }
         },

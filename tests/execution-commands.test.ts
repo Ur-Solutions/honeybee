@@ -1,6 +1,7 @@
-// H3 run.command: effect-keyed send/answer/interrupt with durable receipts,
-// honest at-most-once delivery, crash-window indeterminate (never blind
-// redelivery), and the corpus preconditions (RFC acceptance test 12).
+// H3 run.command: effect-keyed send/interrupt with durable receipts, honest
+// at-most-once delivery, crash-window indeterminate (never blind redelivery),
+// the corpus preconditions (RFC acceptance test 12), and the honest refusals
+// (answer until needs_input.opened is bridged, checkpoint, refresh-credential).
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
@@ -109,31 +110,29 @@ test("run.command: effect key reuse with different content conflicts; distinct e
   });
 });
 
-test("run.command answer: resolves an open input request; a resolved/unopened request is a typed precondition failure", async () => {
+test("run.command answer is CAPABILITY_MISMATCH until needs_input.opened is bridged — schema-valid, never dispatched, no durable effect", async () => {
   await withTempStore(async () => {
+    // Even with an open input request on the legacy control socket, the
+    // protocol path must refuse: needs_input.opened never reaches protocol
+    // consumers, so an advertised answer command could not be driven honestly.
     const control = fakeControl({ pendingInput: "inp-0001" });
     const { ctx, service } = await startRunningRun({ control });
 
-    const wrong = (await service.runCommand(
-      buildOperationEnvelope(ctx, `${RUN_ID}/command/answer-0002`, {
-        runId: RUN_ID,
-        command: { kind: "answer", inputRequestId: "inp-9999", answer: { approved: true } },
-      }),
-    )) as JsonObject;
-    assert.equal((wrong.error as JsonObject).code, "RUN_VERSION_CONFLICT");
-    // Refused BEFORE any durable effect: no record, and a later retry may succeed.
-    assert.equal(await readOperation(RUN_ID, `${RUN_ID}/command/answer-0002`), null);
+    const envelope = buildOperationEnvelope(ctx, `${RUN_ID}/command/answer-0001`, {
+      runId: RUN_ID,
+      command: { kind: "answer", inputRequestId: "inp-0001", answer: { approved: true } },
+    });
+    // The vocabulary still validates answer (like checkpoint) — the refusal is
+    // a capability fact, not a schema gap.
+    assert.deepEqual(validator.validate("run-command-body", envelope.body).errors, []);
 
-    const answer = (await service.runCommand(
-      buildOperationEnvelope(ctx, `${RUN_ID}/command/answer-0001`, {
-        runId: RUN_ID,
-        command: { kind: "answer", inputRequestId: "inp-0001", answer: { approved: true } },
-      }),
-    )) as JsonObject;
-    assert.deepEqual(answer.result, { commandState: "completed" });
-    assert.equal(control.calls.filter((call) => call.method === "answer").length, 1);
+    const refused = (await service.runCommand(envelope)) as JsonObject;
+    assert.equal((refused.error as JsonObject).code, "CAPABILITY_MISMATCH");
+    // Refused BEFORE any durable effect or delivery attempt.
+    assert.equal(await readOperation(RUN_ID, `${RUN_ID}/command/answer-0001`), null);
+    assert.equal(control.calls.filter((call) => call.method === "answer").length, 0);
     const events = await readRunEvents(RUN_ID);
-    assert.ok(events.some((event) => event.type === "needs_input.resolved" && (event.payload as JsonObject).inputRequestId === "inp-0001"));
+    assert.ok(!events.some((event) => event.type.startsWith("needs_input.")), "no needs_input events without the bridge");
   });
 });
 
@@ -330,5 +329,42 @@ test("run.command on a terminal run is RUN_VERSION_CONFLICT with no durable effe
     const refused = (await service.runCommand(sendEnvelope(ctx, "after cancel", `${RUN_ID}/command/send-post`))) as JsonObject;
     assert.equal((refused.error as JsonObject).code, "RUN_VERSION_CONFLICT");
     assert.equal(await readOperation(RUN_ID, `${RUN_ID}/command/send-post`), null);
+  });
+});
+
+test("run.command vs concurrent cancel: a cancel landing after the pre-lock settle is refused under the admission lock", async () => {
+  await withTempStore(async () => {
+    const { createRunOperations } = await import("../src/execution/operations.js");
+    const { computeSchemaDigest } = await import("../src/execution/contract.js");
+    const { storeSessionEvidenceSource } = await import("../src/execution/service.js");
+    const control = fakeControl();
+    const { ctx, service } = await startRunningRun({ control });
+
+    // Deterministic interleaving: this operations instance settles the run as
+    // "running" — the exact STALE pre-lock view a concurrent RPC captures
+    // before another caller's cancel lands.
+    const staleOps = createRunOperations({
+      contract,
+      validator,
+      protocolVersion: "0.1",
+      schemaDigest: computeSchemaDigest(contract),
+      now: () => new Date(),
+      binding: async () => ctx.binding,
+      control: control.control,
+      sessions: storeSessionEvidenceSource(),
+      settle: async (reservation) => ({ reservation, state: "running" }),
+      origin: async () => ({ nodeId: ctx.nodeId }),
+    });
+
+    // The cancel completes fully in the window between that stale settle and
+    // the command's admission.
+    await service.runCancel(buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "race" }));
+
+    const refused = (await staleOps.runCommand(sendEnvelope(ctx, "late steer", `${RUN_ID}/command/send-race`))) as JsonObject;
+    assert.equal((refused.error as JsonObject).code, "RUN_VERSION_CONFLICT");
+    // Refused under the lock BEFORE any durable effect or delivery: the
+    // cancelled run never receives steering.
+    assert.equal(await readOperation(RUN_ID, `${RUN_ID}/command/send-race`), null);
+    assert.equal(control.calls.filter((call) => call.method === "send").length, 0);
   });
 });
