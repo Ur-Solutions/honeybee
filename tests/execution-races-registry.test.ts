@@ -101,6 +101,32 @@ test("every local-core-v1 method in the corpus profile is registered on the RPC 
   }
 });
 
+test("rpc lazy service: a rejected bootstrap is retried on the next call, not cached forever", async () => {
+  await withTempStore(async () => {
+    await installTestAuthority();
+    let factoryCalls = 0;
+    const rpc = createExecutionRpcMethods(() => {
+      factoryCalls += 1;
+      if (factoryCalls === 1) return Promise.reject(new Error("transient bootstrap failure"));
+      return makeService();
+    });
+    const ctx = { connectionId: 1, close: () => undefined };
+
+    // First call surfaces the bootstrap failure...
+    await assert.rejects(Promise.resolve(rpc.methods["run.get"]!({ protocolVersion: "0.1", runId: RUN_ID }, ctx)), /transient bootstrap failure/);
+    // ...and the next call retries the factory instead of replaying the
+    // cached rejection: it reaches the negotiated-connection gate, proving a
+    // live service answered.
+    const gated = (await rpc.methods["run.get"]!({ protocolVersion: "0.1", runId: RUN_ID }, ctx)) as JsonObject;
+    assert.equal((gated.error as JsonObject).code, "PROTOCOL_INCOMPATIBLE");
+    assert.equal(factoryCalls, 2);
+
+    // Success IS cached: further calls do not re-run the factory.
+    await rpc.methods["run.get"]!({ protocolVersion: "0.1", runId: RUN_ID }, ctx);
+    assert.equal(factoryCalls, 2);
+  });
+});
+
 // Type-level guard that the registration thunk above matches the factory's
 // expected signature (the throw is intentional).
 void ((): ExecutionService | Promise<ExecutionService> => {

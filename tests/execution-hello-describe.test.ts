@@ -52,8 +52,9 @@ test("node.describe: signed, owner-scoped, honest about absent harnesses and the
     const codex = harnesses.find((entry) => entry.driverId === "codex")!;
     assert.equal(claude.status, "ready");
     // H3: exactly the effect-keyed commands the control socket delivers;
-    // checkpoint is honestly absent, delivery is at-most-once.
-    assert.deepEqual(claude.commands, ["send", "answer", "interrupt"], "H3 advertises the delivered command set");
+    // checkpoint AND answer (needs_input.opened not bridged) are honestly
+    // absent, delivery is at-most-once.
+    assert.deepEqual(claude.commands, ["send", "interrupt"], "H3 advertises the delivered command set");
     assert.equal(claude.commandDelivery, "at-most-once");
     assert.equal(claude.checkpoint, false);
     assert.equal(codex.status, "absent");

@@ -830,6 +830,46 @@ export async function resolveProfileOverlay(requested: string): Promise<ProfileO
 }
 
 
+export type SpawnOverlays = {
+  agent: string;
+  aliasAccount?: AccountRecord;
+  profile?: ProfileOverlay;
+  extraArgs: string[];
+  yolo: boolean;
+};
+
+/**
+ * Resolve the local spawn conveniences layered over a requested bee token:
+ * account aliases (`<tool>-auto`/`-rr`), thin-profile overlays (config
+ * `bees.<name>` referencing an account), the sole-credentialed-account
+ * default, and the yolo decision.
+ *
+ * A trusted protocol launch (execution run.start) carries a SIGNED harness
+ * intent, so every local overlay is bypassed: the agent is the exact signed
+ * driverId, no alias/profile account is offered (the account comes only from
+ * the signed config.account, threaded as --account by the launcher), argv is
+ * exactly the launcher's, and yolo is the driver registry default. A local
+ * `bees.<driver>` config entry can therefore never change harness, account,
+ * args, or yolo underneath the signed intent.
+ */
+export async function resolveSpawnOverlays(requested: string, parsed: Parsed, protocolLaunch: boolean): Promise<SpawnOverlays> {
+  if (protocolLaunch) {
+    return { agent: requested, extraArgs: parsed.rest, yolo: agentDefaultsToYolo(requested) };
+  }
+  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
+  const profile = await resolveProfileOverlay(requested);
+  const agent = profile ? profile.account.tool : resolvedAgent;
+  const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
+  return {
+    agent,
+    ...(aliasAccount ? { aliasAccount } : {}),
+    ...(profile ? { profile } : {}),
+    extraArgs,
+    yolo: dangerousMode(parsed, agent, requested, profile?.yolo),
+  };
+}
+
+
 /**
  * The prompt a spawn invocation carried in argv, or "" when there is none.
  *
@@ -925,7 +965,7 @@ export function resolvePreambleFlags(parsed: Parsed): { preamble?: string; noPre
 
 export async function spawnSingleBee(
   parsed: Parsed,
-  trustedContext: { spawnedById?: string; executionRunId?: string } = {},
+  trustedContext: { spawnedById?: string; executionRunId?: string; protocolLaunch?: boolean } = {},
 ): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--template <name>] [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
@@ -933,20 +973,20 @@ export async function spawnSingleBee(
   const trackAttachment = await prepareSpawnTrackAttachment(parsed);
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
   const timer = startSpawnTimer(requested);
-  // <tool>-<account> spawn shorthand: hive spawn codex-ur / claude-thto / claude-auto.
-  const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
-  // Thin profile: a config bee referencing an account supplies the CLI from the
-  // account, plus model/args/cwd/yolo overrides (precedence FLAG > PROFILE >
-  // ACCOUNT).
-  const profile = await resolveProfileOverlay(requested);
-  const agent = profile ? profile.account.tool : resolvedAgent;
-  const extraArgs = profile ? [...parsed.rest, ...profile.args] : parsed.rest;
+  // Local overlays: <tool>-<account> shorthand, thin profiles (config
+  // bees.<name> with model/args/cwd/yolo overrides, precedence FLAG > PROFILE
+  // > ACCOUNT), sole-account default, and the yolo decision. A trusted
+  // protocolLaunch bypasses ALL of them — the signed intent is exact.
+  const { agent, aliasAccount, profile, extraArgs, yolo } = await resolveSpawnOverlays(
+    requested,
+    parsed,
+    trustedContext.protocolLaunch === true,
+  );
   // A pool spawn defers cwd to the allocated member (validated exclusive with
   // --cwd); allocation itself waits until node/substrate resolution below so a
   // doomed spawn never burns a claim.
   const poolRef = poolFlagRef(parsed);
   let cwd = poolRef ? "" : await resolveSpawnCwd(parsed, profile?.cwd);
-  const yolo = dangerousMode(parsed, agent, requested, profile?.yolo);
   const home = flag(parsed, "home") ?? flag(parsed, "profile");
   const env = resolveSpawnEnvFlag(parsed);
   // Only trusted in-process integrations can supply this context. It is not a
