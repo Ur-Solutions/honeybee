@@ -19,7 +19,7 @@ import { executionError, toWireError } from "./errors.js";
 import { assertLeaseNotExpired, assertRunBinding, validateOperationEnvelope, type ValidatedOperationEnvelope } from "./envelope.js";
 import { collectGitDiffMetadata, putEvidence, readRunLogBytes, readTranscriptBytes } from "./evidence.js";
 import { HarnessDispatchError, type HarnessControl } from "./harnessControl.js";
-import type { ExecutionBindingRecord, ExecutionNodeIdentity } from "./nodeState.js";
+import type { ExecutionBindingRecord } from "./nodeState.js";
 import {
   admitOperation,
   listOperations,
@@ -57,7 +57,6 @@ export type RunOperationsDeps = {
   protocolVersion: string;
   schemaDigest: string;
   now: () => Date;
-  identity: () => Promise<ExecutionNodeIdentity>;
   binding: () => Promise<ExecutionBindingRecord>;
   verifySignature?: SignatureVerifier;
   control: HarnessControl;
@@ -509,7 +508,9 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   };
 
   async function buildEnvironmentManifest(reservation: RunReservation): Promise<JsonObject> {
-    const nodeId = (await deps.identity()).nodeId;
+    // Wire-visible node identity is always the canonical bound Apiary nodeId,
+    // never the Honeybee-minted signing identity (key custody only).
+    const nodeId = (await deps.binding()).nodeId;
     const harness = asObject(reservation.intent.harness);
     // Composed ONLY from admitted protocol facts + static platform identity —
     // never process environment variables, credentials, or machine paths.
@@ -539,7 +540,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   }
 
   async function collectEntries(reservation: RunReservation): Promise<ManifestEntry[]> {
-    const nodeId = (await deps.identity()).nodeId;
+    const nodeId = (await deps.binding()).nodeId;
     const requested = new Set(
       (Array.isArray(asObject(reservation.intent.evidenceContract)?.collect)
         ? (asObject(reservation.intent.evidenceContract)!.collect as JsonValue[])

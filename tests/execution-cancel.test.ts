@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
 import { admitRunStart, readReservation, readRunEvents } from "../src/execution/runStore.js";
 import { validateRunStart } from "../src/execution/runStart.js";
-import { loadNodeIdentity, requireExecutionBinding } from "../src/execution/nodeState.js";
+import { requireExecutionBinding } from "../src/execution/nodeState.js";
 import { loadSession, saveSession } from "../src/store.js";
 import {
   beeNameForRun,
@@ -76,8 +76,7 @@ test("run.cancel of a reserved (never-launched) run cancels it and a run.start r
     const envelope = buildRunStartEnvelope(ctx);
     // Admit the reservation durably WITHOUT launching (crash-before-launch).
     const binding = await requireExecutionBinding();
-    const identity = await loadNodeIdentity();
-    const validated = validateRunStart(envelope, { validator, binding, nodeId: identity.nodeId, protocolVersion: "0.1" });
+    const validated = validateRunStart(envelope, { validator, binding, nodeId: binding.nodeId, protocolVersion: "0.1" });
     await admitRunStart({
       runId: validated.runId,
       effectKey: validated.effectKey,
