@@ -1,0 +1,541 @@
+// Execution coordinator for the H1 slice of local-core-v1: effect-keyed
+// run.start admission -> durable reservation -> injected launcher -> bound
+// session, plus run.get / run.events over the durable per-Run control events.
+//
+// The launcher is an injected seam (RunLauncher): production wires the HSR
+// spawn path (launcher.ts); tests wire fakes and crash injections. The
+// coordinator itself never resolves a cwd and never falls back to a CLI after
+// admission — if the launcher cannot satisfy the leased placement it throws a
+// typed error and the Run fails with that cause.
+import type { JsonValue } from "../comb/types.js";
+import {
+  computeSchemaDigest,
+  createExecutionValidator,
+  loadExecutionContract,
+  type ExecutionContract,
+  type ExecutionValidator,
+  type JsonObject,
+} from "./contract.js";
+import { assertDescribeScope, buildNodeDescriptor, NATIVE_PROVIDER_ID, type HarnessProbe } from "./describe.js";
+import { ExecutionProtocolError, executionError, toWireError, type ExecutionErrorWire } from "./errors.js";
+import { negotiateHello, supportedFeatures, type HelloResult } from "./hello.js";
+import {
+  loadNodeIdentity,
+  requireExecutionBinding,
+  type ExecutionBindingRecord,
+  type ExecutionNodeIdentity,
+} from "./nodeState.js";
+import {
+  admitRunStart,
+  appendRunEvents,
+  classifyLaunch,
+  mutateReservation,
+  readReservation,
+  readRunEvents,
+  type LaunchEvidence,
+  type RunEnvironmentFacts,
+  type RunReservation,
+  type StoredRunEvent,
+} from "./runStore.js";
+import { assertLeaseWindow, validateRunStart } from "./runStart.js";
+import type { SignatureVerifier } from "./signing.js";
+
+/* ---------------------------------------------------------------- */
+/* Injected seams                                                    */
+/* ---------------------------------------------------------------- */
+
+export type RunLaunchRequest = {
+  runId: string;
+  beeName: string;
+  intent: JsonObject;
+  lease: JsonObject;
+};
+
+export type RunLaunchResult = {
+  /** Provider session reference (bee id / provider session id) once known. */
+  sessionRef?: string;
+  environment: RunEnvironmentFacts;
+};
+
+/**
+ * Materialize the leased placement and start the harness for one reserved
+ * Run. Must be path-free at the boundary: placement identity arrives as the
+ * intent's placement/working-copy reference, never as a caller cwd. Throws
+ * ExecutionProtocolError (MATERIALIZATION_FAILED / HARNESS_UNAVAILABLE / ...)
+ * on typed refusals.
+ */
+export type RunLauncher = (request: RunLaunchRequest) => Promise<RunLaunchResult>;
+
+/** Durable evidence about the session a reservation may have started. */
+export type SessionEvidenceSource = {
+  evidence(beeName: string): Promise<LaunchEvidence>;
+  /** Latest liveness/outcome for a bound session; null when nothing exists. */
+  outcome(beeName: string): Promise<{ live: boolean; exitCode?: number | null } | null>;
+};
+
+export type ExecutionServiceOptions = {
+  launcher: RunLauncher;
+  sessions: SessionEvidenceSource;
+  harnessProbe?: HarnessProbe;
+  verifySignature?: SignatureVerifier;
+  now?: () => Date;
+  launchGraceMs?: number;
+};
+
+/* ---------------------------------------------------------------- */
+/* Service                                                           */
+/* ---------------------------------------------------------------- */
+
+export type NonEffectResult = { result: JsonObject } | { error: ExecutionErrorWire };
+
+export type ExecutionService = {
+  contract: ExecutionContract;
+  validator: ExecutionValidator;
+  schemaDigest: string;
+  protocolVersion: string;
+  hello(request: JsonValue): HelloResult;
+  describe(request: JsonValue): Promise<NonEffectResult>;
+  runStart(request: JsonValue): Promise<JsonObject>;
+  runGet(request: JsonValue): Promise<NonEffectResult>;
+  runEvents(request: JsonValue): Promise<NonEffectResult>;
+};
+
+export function createExecutionService(options: ExecutionServiceOptions): ExecutionService {
+  const contract = loadExecutionContract();
+  const validator = createExecutionValidator(contract);
+  const schemaDigest = computeSchemaDigest(contract);
+  const protocolVersion = typeof contract.profile.protocolVersion === "string" ? contract.profile.protocolVersion : "0.1";
+  const now = options.now ?? (() => new Date());
+  const inFlight = new Map<string, Promise<void>>();
+
+  let identityPromise: Promise<ExecutionNodeIdentity> | undefined;
+  const identity = (): Promise<ExecutionNodeIdentity> => (identityPromise ??= loadNodeIdentity());
+
+  const origin = async (extra?: { driverId?: string; providerId?: string }) => ({
+    nodeId: (await identity()).nodeId,
+    ...(extra?.driverId ? { driverId: extra.driverId } : {}),
+    ...(extra?.providerId ? { providerId: extra.providerId } : {}),
+  });
+
+  /* -------------------------------------------------------------- */
+  /* Launch + recovery                                               */
+  /* -------------------------------------------------------------- */
+
+  const driverIdOf = (reservation: RunReservation): string =>
+    String((reservation.intent.harness as JsonObject | undefined)?.driverId ?? "");
+
+  /** Run the launcher for a reservation this caller owns. Never throws. */
+  async function launch(reservation: RunReservation, lease: JsonObject): Promise<void> {
+    const runId = reservation.runId;
+    const attempt = (async () => {
+      await mutateReservation(runId, (current) => ({
+        ...current,
+        phase: "launching",
+        launchAttemptedAt: now().toISOString(),
+      }));
+      await appendRunEvents(
+        runId,
+        protocolVersion,
+        [
+          { type: "environment.materializing", payload: {}, origin: await origin({ providerId: NATIVE_PROVIDER_ID }) },
+          { type: "harness.starting", payload: { operationId: runId }, origin: await origin({ driverId: driverIdOf(reservation) }) },
+        ],
+        { onlyIfAbsentTypes: true },
+      );
+      try {
+        const result = await options.launcher({
+          runId,
+          beeName: reservation.beeName,
+          intent: reservation.intent,
+          lease,
+        });
+        await mutateReservation(runId, (current) => ({
+          ...current,
+          phase: "started",
+          startedAt: now().toISOString(),
+          ...(result.sessionRef ? { sessionRef: result.sessionRef } : {}),
+          environment: result.environment,
+        }));
+        await appendRunEvents(
+          runId,
+          protocolVersion,
+          [
+            {
+              type: "environment.ready",
+              payload: { environmentId: result.environment.environmentId },
+              origin: await origin({ providerId: result.environment.providerId }),
+            },
+            {
+              type: "harness.running",
+              payload: result.sessionRef ? { sessionRef: result.sessionRef } : {},
+              origin: await origin({ driverId: driverIdOf(reservation) }),
+            },
+          ],
+          { onlyIfAbsentTypes: true },
+        );
+      } catch (error) {
+        const wire = toWireError(error);
+        await mutateReservation(runId, (current) => ({
+          ...current,
+          phase: "failed",
+          failedAt: now().toISOString(),
+          failureCause: `${wire.code}: ${wire.message}`,
+          result: { outcome: "failed", cause: `${wire.code}: ${wire.message}`, finishedAt: now().toISOString() },
+        }));
+        await appendRunEvents(
+          runId,
+          protocolVersion,
+          [{ type: "run.failed", payload: { cause: wire.code, message: wire.message }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+      }
+    })();
+    inFlight.set(runId, attempt);
+    try {
+      await attempt;
+    } finally {
+      if (inFlight.get(runId) === attempt) inFlight.delete(runId);
+    }
+  }
+
+  /**
+   * Reconcile a reservation with the durable session evidence: repair the
+   * started-receipt-lost crash window, mark indeterminate outcomes lost, and
+   * fold a finished harness into terminal state + events. Idempotent; called
+   * from run.start replays, run.get, and run.events.
+   */
+  async function reconcile(reservation: RunReservation): Promise<RunReservation> {
+    const classification = classifyLaunch(reservation, await options.sessions.evidence(reservation.beeName), {
+      inFlight: inFlight.has(reservation.runId),
+      nowMs: now().getTime(),
+      ...(options.launchGraceMs !== undefined ? { graceMs: options.launchGraceMs } : {}),
+    });
+    let current = reservation;
+    if (classification === "started-receipt-lost") {
+      // The process started durably but the receipt path crashed: bind it.
+      current = await mutateReservation(current.runId, (record) =>
+        record.phase === "launching" ? { ...record, phase: "started", startedAt: record.startedAt ?? now().toISOString() } : record,
+      );
+      await appendRunEvents(
+        current.runId,
+        protocolVersion,
+        [{ type: "harness.running", payload: {}, origin: await origin({ driverId: driverIdOf(current) }) }],
+        { onlyIfAbsentTypes: true },
+      );
+    } else if (classification === "indeterminate" && !current.indeterminateAt) {
+      current = await mutateReservation(current.runId, (record) =>
+        record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
+      );
+      await appendRunEvents(
+        current.runId,
+        protocolVersion,
+        [{ type: "run.lost", payload: { cause: "start_outcome_indeterminate" }, origin: await origin() }],
+        { onlyIfAbsentTypes: true },
+      );
+    }
+    if (current.phase === "started" && !current.result) {
+      const outcome = await options.sessions.outcome(current.beeName);
+      if (outcome && !outcome.live) {
+        const exitCode = outcome.exitCode ?? undefined;
+        const terminal: "completed" | "failed" = exitCode === 0 ? "completed" : "failed";
+        current = await mutateReservation(current.runId, (record) =>
+          record.result
+            ? record
+            : {
+                ...record,
+                result: {
+                  outcome: terminal,
+                  ...(terminal === "failed" ? { cause: "harness_exited" } : {}),
+                  ...(exitCode !== undefined ? { harnessExitCode: exitCode } : {}),
+                  finishedAt: now().toISOString(),
+                },
+              },
+        );
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [
+            {
+              type: "harness.exited",
+              payload: exitCode !== undefined ? { exitCode } : {},
+              origin: await origin({ driverId: driverIdOf(current) }),
+            },
+            { type: terminal === "completed" ? "run.completed" : "run.failed", payload: {}, origin: await origin() },
+          ],
+          { onlyIfAbsentTypes: true },
+        );
+      }
+    }
+    return current;
+  }
+
+  /** Derive the projection state/health from a reconciled reservation. */
+  function deriveState(reservation: RunReservation, launchInFlight: boolean): { state: string; health: "ready" | "degraded" | "lost" } {
+    if (reservation.result) {
+      return { state: reservation.result.outcome, health: "ready" };
+    }
+    if (reservation.indeterminateAt) return { state: "lost", health: "lost" };
+    switch (reservation.phase) {
+      case "reserved":
+        return { state: "accepted", health: "ready" };
+      case "launching":
+        return { state: "starting", health: launchInFlight ? "ready" : "degraded" };
+      case "started":
+        return { state: "running", health: "ready" };
+      case "failed":
+        return { state: "failed", health: "ready" };
+    }
+  }
+
+  async function buildProjection(reservation: RunReservation): Promise<JsonObject> {
+    const nodeId = (await identity()).nodeId;
+    const events = await readRunEvents(reservation.runId);
+    const lastSeq = events.length > 0 ? events[events.length - 1]!.seq : 0;
+    const { state, health } = deriveState(reservation, inFlight.has(reservation.runId));
+    return {
+      runId: reservation.runId,
+      jobId: reservation.jobId,
+      state,
+      stateVersion: lastSeq,
+      lastEventSeq: lastSeq,
+      health,
+      updatedAt: reservation.updatedAt,
+      ...(reservation.environment
+        ? {
+            environment: {
+              runId: reservation.runId,
+              nodeId,
+              providerId: reservation.environment.providerId,
+              environmentId: reservation.environment.environmentId,
+              isolation: reservation.environment.isolation,
+              ...(reservation.environment.workingCopy ? { workingCopy: reservation.environment.workingCopy } : {}),
+            },
+          }
+        : {}),
+      ...(reservation.result ? { result: { ...reservation.result } } : {}),
+    };
+  }
+
+  /* -------------------------------------------------------------- */
+  /* Methods                                                         */
+  /* -------------------------------------------------------------- */
+
+  function effectResponse(requestId: JsonValue, reservation: RunReservation, outcome: "created" | "replayed", state: string): JsonObject {
+    return {
+      protocolVersion,
+      requestId: String(requestId ?? ""),
+      receipt: { ...reservation.receipt, outcome },
+      result: { runId: reservation.runId, state },
+    };
+  }
+
+  function effectError(requestId: JsonValue, error: unknown): JsonObject {
+    return { protocolVersion, requestId: String(requestId ?? ""), error: toWireError(error) as unknown as JsonValue } as JsonObject;
+  }
+
+  async function runStart(request: JsonValue): Promise<JsonObject> {
+    const requestId = (request as JsonObject | null)?.requestId ?? "";
+    try {
+      const binding = await requireExecutionBinding();
+      const nodeIdentity = await identity();
+      const validated = validateRunStart(request, {
+        validator,
+        binding,
+        nodeId: nodeIdentity.nodeId,
+        protocolVersion,
+        ...(options.verifySignature ? { verifySignature: options.verifySignature } : {}),
+        now,
+        // The validity window is enforced below for NEW admissions and for
+        // relaunches only: an identical retry must still replay its recorded
+        // receipt after the lease expired (replay is read-only).
+        skipTimeWindow: true,
+      });
+      const peeked = await readReservation(validated.runId);
+      const identicalRetry =
+        peeked !== null && peeked.effectKey === validated.effectKey && peeked.requestDigest === validated.requestDigest;
+      if (!identicalRetry) assertLeaseWindow(validated.lease, now());
+      const { reservation, created } = await admitRunStart({
+        runId: validated.runId,
+        effectKey: validated.effectKey,
+        requestDigest: validated.requestDigest,
+        protocolVersion,
+        schemaDigest,
+        ownerScopeId: String(validated.authority.ownerScopeId),
+        workspaceId: String(validated.authority.workspaceId),
+        jobId: String(validated.intent.jobId),
+        leaseId: String(validated.lease.leaseId),
+        leaseExpiresAt: String(validated.lease.expiresAt),
+        intent: validated.intent,
+      });
+      if (created) {
+        await appendRunEvents(
+          reservation.runId,
+          protocolVersion,
+          [{ type: "run.accepted", payload: { effectKey: reservation.effectKey, receiptId: reservation.receipt.receiptId }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+        await launch(reservation, validated.lease);
+        const settled = await reconcile((await readReservation(reservation.runId))!);
+        return effectResponse(requestId, settled, "created", deriveState(settled, inFlight.has(settled.runId)).state);
+      }
+      // Identical retry: replay the original receipt; continue the effect only
+      // when the durable evidence proves the launch never started.
+      let current = await reconcile(reservation);
+      const classification = classifyLaunch(current, await options.sessions.evidence(current.beeName), {
+        inFlight: inFlight.has(current.runId),
+        nowMs: now().getTime(),
+        ...(options.launchGraceMs !== undefined ? { graceMs: options.launchGraceMs } : {}),
+      });
+      if (classification === "reserved-not-started") {
+        if (Date.parse(current.leaseExpiresAt) < now().getTime()) {
+          const finishedAt = now().toISOString();
+          current = await mutateReservation(current.runId, (record) =>
+            record.phase === "started" || record.result
+              ? record
+              : {
+                  ...record,
+                  phase: "failed",
+                  failedAt: finishedAt,
+                  failureCause: "LEASE_DENIED: lease expired before the reserved launch could start",
+                  result: { outcome: "failed", cause: "lease_expired", finishedAt },
+                },
+          );
+          await appendRunEvents(
+            current.runId,
+            protocolVersion,
+            [{ type: "run.failed", payload: { cause: "lease_expired" }, origin: await origin() }],
+            { onlyIfAbsentTypes: true },
+          );
+        } else {
+          await launch(current, validated.lease);
+          current = await reconcile((await readReservation(current.runId))!);
+        }
+      }
+      return effectResponse(requestId, current, "replayed", deriveState(current, inFlight.has(current.runId)).state);
+    } catch (error) {
+      return effectError(requestId, error);
+    }
+  }
+
+  async function loadReservationFor(request: JsonValue, schema: string): Promise<RunReservation> {
+    const check = validator.validate(schema, request);
+    if (!check.valid) {
+      throw executionError("SCHEMA_UNSUPPORTED", `invalid ${schema} request: ${check.errors.join("; ")}`);
+    }
+    const doc = request as JsonObject;
+    if (doc.protocolVersion !== protocolVersion) {
+      throw executionError("PROTOCOL_INCOMPATIBLE", `protocolVersion ${String(doc.protocolVersion)} is not ${protocolVersion}`);
+    }
+    const runId = String(doc.runId);
+    const reservation = await readReservation(runId);
+    if (!reservation) throw executionError("RUN_UNKNOWN", `runId ${runId} names no Run reserved on this node`);
+    return reservation;
+  }
+
+  async function runGet(request: JsonValue): Promise<NonEffectResult> {
+    try {
+      const reservation = await reconcile(await loadReservationFor(request, "run-get-request"));
+      return { result: await buildProjection(reservation) };
+    } catch (error) {
+      return { error: toWireError(error) };
+    }
+  }
+
+  async function runEvents(request: JsonValue): Promise<NonEffectResult> {
+    try {
+      const reservation = await reconcile(await loadReservationFor(request, "run-events-request"));
+      const doc = request as JsonObject;
+      const afterSeq = Number(doc.afterSeq ?? 0);
+      const limit = typeof doc.limit === "number" && doc.limit >= 1 ? Math.floor(doc.limit) : Number.POSITIVE_INFINITY;
+      const all = await readRunEvents(reservation.runId);
+      const events: StoredRunEvent[] = [];
+      for (const event of all) {
+        if (event.seq <= afterSeq) continue;
+        if (events.length >= limit) break;
+        events.push(event);
+      }
+      const nextAfterSeq = events.length > 0 ? events[events.length - 1]!.seq : afterSeq;
+      return {
+        result: {
+          runId: reservation.runId,
+          afterSeq,
+          events: events as unknown as JsonValue[],
+          nextAfterSeq,
+          // H1 keeps the full control log (no compaction), so replay always
+          // starts at seq 1; CURSOR_EXPIRED arrives with compaction in H2.
+          retention: { oldestReplayableSeq: all.length > 0 ? all[0]!.seq : 1 },
+        },
+      };
+    } catch (error) {
+      return { error: toWireError(error) };
+    }
+  }
+
+  async function describe(request: JsonValue): Promise<NonEffectResult> {
+    try {
+      const check = validator.validate("node-describe-request", request);
+      if (!check.valid) {
+        throw executionError("SCHEMA_UNSUPPORTED", `invalid node.describe request: ${check.errors.join("; ")}`);
+      }
+      const doc = request as JsonObject;
+      if (doc.protocolVersion !== protocolVersion) {
+        throw executionError("PROTOCOL_INCOMPATIBLE", `protocolVersion ${String(doc.protocolVersion)} is not ${protocolVersion}`);
+      }
+      const binding = await requireExecutionBinding();
+      assertDescribeScope(doc, binding);
+      const descriptor = await buildNodeDescriptor({
+        identity: await identity(),
+        binding,
+        protocolVersion,
+        features: supportedFeatures(contract),
+        ...(options.harnessProbe ? { harnessProbe: options.harnessProbe } : {}),
+        now,
+      });
+      return { result: descriptor };
+    } catch (error) {
+      return { error: toWireError(error) };
+    }
+  }
+
+  return {
+    contract,
+    validator,
+    schemaDigest,
+    protocolVersion,
+    hello: (request) => negotiateHello(request, contract, validator, schemaDigest),
+    describe,
+    runStart,
+    runGet,
+    runEvents,
+  };
+}
+
+/* ---------------------------------------------------------------- */
+/* Production session-evidence source                                */
+/* ---------------------------------------------------------------- */
+
+/** Durable evidence from the session store + HSR run dir (production wiring). */
+export function storeSessionEvidenceSource(): SessionEvidenceSource {
+  return {
+    async evidence(beeName) {
+      const [{ loadSession }, { readHsrMeta }] = await Promise.all([import("../store.js"), import("../hsr/runDir.js")]);
+      const record = await loadSession(beeName);
+      const meta = await readHsrMeta(beeName);
+      return {
+        sessionExists: record !== null || meta !== null,
+        ...(record?.executionRunId !== undefined ? { stampedRunId: record.executionRunId } : {}),
+      };
+    },
+    async outcome(beeName) {
+      const [{ loadSession }, { readHsrMeta }] = await Promise.all([import("../store.js"), import("../hsr/runDir.js")]);
+      const meta = await readHsrMeta(beeName);
+      if (meta) {
+        if (meta.status === "exited") return { live: false, exitCode: meta.exitCode ?? null };
+        return { live: true };
+      }
+      const record = await loadSession(beeName);
+      if (!record) return null;
+      return record.status === "running" ? { live: true } : { live: false, exitCode: null };
+    },
+  };
+}

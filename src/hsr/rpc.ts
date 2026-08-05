@@ -111,10 +111,12 @@ export async function startRpcServer(opts: {
   methods: Record<string, RpcMethodHandler>;
   /** Optional: called once per new client connection. */
   onConnection?: (ctx: RpcConnectionCtx) => void;
+  /** Optional: called once when a client connection closes (state cleanup). */
+  onDisconnect?: (ctx: RpcConnectionCtx) => void;
   /** Max queued broadcast frames per slow connection before drop-oldest (HIVE-70). */
   maxBroadcastQueue?: number;
 }): Promise<RpcServer> {
-  const { socketPath, methods, onConnection } = opts;
+  const { socketPath, methods, onConnection, onDisconnect } = opts;
   const maxBroadcastQueue = Math.max(1, opts.maxBroadcastQueue ?? DEFAULT_MAX_BROADCAST_QUEUE);
 
   await mkdir(dirname(socketPath), { recursive: true, mode: SOCKET_DIR_MODE });
@@ -209,6 +211,13 @@ export async function startRpcServer(opts: {
     socket.once("close", () => {
       conn.queue.length = 0;
       connections.delete(connectionId);
+      if (onDisconnect) {
+        try {
+          onDisconnect(ctx);
+        } catch {
+          // A misbehaving onDisconnect hook must never take down the server.
+        }
+      }
     });
 
     if (onConnection) {
