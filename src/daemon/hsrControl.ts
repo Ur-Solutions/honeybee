@@ -32,6 +32,7 @@ import { hsrObservations, pendingNeedsInput } from "../hsr/observe.js";
 import { readHsrMeta } from "../hsr/runDir.js";
 import { assertCallerEnvAllowed } from "../spawnEnv.js";
 import { resolveExplicitSpawningBeeId } from "../spawnParent.js";
+import { createExecutionAdminMethods } from "../execution/adminMethods.js";
 import { createExecutionRpcMethods } from "../execution/rpcMethods.js";
 import type { ExecutionService } from "../execution/service.js";
 import { daemonRoot } from "./log.js";
@@ -148,7 +149,20 @@ export async function startHsrControlServer(opts?: {
     // execution:1 = the contracts/execution/v1 protocol methods
     // (protocol.hello, node.describe, run.start/get/events) are registered on
     // this socket; real capability negotiation is protocol.hello itself.
-    capabilities: guarded(async () => ({ ok: true, spawn: 2, spawnEnv: 1, spawnParent: 1, fork: 1, handoff: 1, execution: 1 })),
+    // executionAdmin:1 = the node-local administrative bootstrap methods
+    // (executionAdmin.bindLocalAuthorityHost / .registerWorkingCopy). These
+    // are NOT corpus methods and are never claimed by protocol.hello; see
+    // src/execution/adminMethods.ts for the trust boundary.
+    capabilities: guarded(async () => ({
+      ok: true,
+      spawn: 2,
+      spawnEnv: 1,
+      spawnParent: 1,
+      fork: 1,
+      handoff: 1,
+      execution: 1,
+      executionAdmin: 1,
+    })),
 
     liveness: guarded(async () => {
       const out: Record<string, boolean> = {};
@@ -357,23 +371,29 @@ export async function startHsrControlServer(opts?: {
   const execution = createExecutionRpcMethods(
     opts?.executionService ??
       (async () => {
-        const [{ createExecutionService, storeSessionEvidenceSource }, { createHsrRunLauncher }, { loadNodeIdentity }] =
+        const [{ createExecutionService, storeSessionEvidenceSource }, { createHsrRunLauncher }, { requireExecutionBinding }] =
           await Promise.all([
             import("../execution/service.js"),
             import("../execution/launcher.js"),
             import("../execution/nodeState.js"),
           ]);
-        const identity = await loadNodeIdentity();
         return createExecutionService({
-          launcher: createHsrRunLauncher({ nodeId: identity.nodeId }),
+          // Runs execute as the CANONICAL bound Apiary nodeId; resolved lazily
+          // because runs cannot exist before a binding does.
+          launcher: createHsrRunLauncher({ nodeId: async () => (await requireExecutionBinding()).nodeId }),
           sessions: storeSessionEvidenceSource(),
         });
       }),
   );
 
+  // Node-local admin bootstrap methods (executionAdmin:1). Available without
+  // protocol.hello — a binding must be installable BEFORE any corpus method
+  // can succeed (node.describe fails closed without one).
+  const admin = createExecutionAdminMethods();
+
   server = await startRpcServer({
     socketPath,
-    methods: { ...execution.methods, ...methods },
+    methods: { ...execution.methods, ...admin, ...methods },
     onDisconnect: (ctx) => execution.onDisconnect(ctx),
   });
 

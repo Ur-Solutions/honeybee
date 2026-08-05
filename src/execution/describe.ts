@@ -85,7 +85,9 @@ export async function buildNodeDescriptor(deps: NodeDescriptorDeps): Promise<Jso
     });
   }
   const descriptor: JsonObject = {
-    nodeId: deps.identity.nodeId,
+    // The CANONICAL public node identity is the Apiary nodeId bound at
+    // install time; the Honeybee-minted identity only signs (key custody).
+    nodeId: deps.binding.nodeId,
     ownerScopeId: deps.binding.ownerScopeId,
     binding: deps.binding.binding as unknown as JsonValue,
     observedAt: now.toISOString(),

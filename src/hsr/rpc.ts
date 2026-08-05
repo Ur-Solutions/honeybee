@@ -39,6 +39,11 @@ const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const SOCKET_DIR_MODE = 0o700;
 const SOCKET_MODE = 0o700;
+// Server-side inbound frame bound: one JSON-RPC request per line, so a line
+// larger than this is either a runaway or hostile writer. Generous enough for
+// the biggest legitimate frame (spawn prompts); an offending connection is
+// destroyed rather than buffered without bound.
+const SERVER_MAX_LINE_BYTES = 8 * 1024 * 1024;
 // Per-connection outbound broadcast bound (HIVE-70). Mirrors the local
 // transport's inbound DEFAULT_MAX_QUEUE (remoteTransport.ts): once a client
 // stops draining and this many frames are queued, we DROP-OLDEST rather than
@@ -120,6 +125,12 @@ export async function startRpcServer(opts: {
   const maxBroadcastQueue = Math.max(1, opts.maxBroadcastQueue ?? DEFAULT_MAX_BROADCAST_QUEUE);
 
   await mkdir(dirname(socketPath), { recursive: true, mode: SOCKET_DIR_MODE });
+  // mkdir's mode only applies when it CREATES the directory; re-assert
+  // owner-only on the existing dir so a loosened tree cannot widen who may
+  // connect. Same-user restriction IS the socket's trust boundary (Node has
+  // no portable peer-credential API to check the caller instead), so a server
+  // that cannot assert owner-only permissions must fail closed, not start.
+  await chmod(dirname(socketPath), SOCKET_DIR_MODE);
   await clearStaleSocket(socketPath);
 
   const connections = new Map<number, ServerConnection>();
@@ -205,7 +216,7 @@ export async function startRpcServer(opts: {
       })();
     };
 
-    socket.on("data", makeLineReader(handleLine));
+    socket.on("data", makeLineReader(handleLine, { maxLineLength: SERVER_MAX_LINE_BYTES, onOverflow: () => socket.destroy() }));
     socket.on("drain", () => flushBroadcastQueue(conn));
     socket.on("error", () => socket.destroy());
     socket.once("close", () => {
@@ -238,8 +249,15 @@ export async function startRpcServer(opts: {
     });
   });
 
-  // Tighten permissions: owner-only, matching the 0o700 parent dir.
-  await chmod(socketPath, SOCKET_MODE).catch(() => {});
+  // Tighten permissions: owner-only, matching the 0o700 parent dir. Fail
+  // closed if the socket file cannot be restricted (see dir chmod above).
+  try {
+    await chmod(socketPath, SOCKET_MODE);
+  } catch (error) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await unlink(socketPath).catch(() => {});
+    throw error;
+  }
 
   return {
     path: socketPath,

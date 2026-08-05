@@ -107,6 +107,13 @@ function contentOf(record: Pick<WorkingCopyRecord, "productId" | "path" | "snaps
  * absolute node-local path.
  */
 export async function registerWorkingCopy(input: RegisterWorkingCopyInput): Promise<WorkingCopyRecord> {
+  return (await registerWorkingCopyIdempotent(input)).record;
+}
+
+export type RegisterWorkingCopyOutcome = { record: WorkingCopyRecord; outcome: "created" | "replayed" };
+
+/** registerWorkingCopy, reporting whether this call created the record or replayed an identical one. */
+export async function registerWorkingCopyIdempotent(input: RegisterWorkingCopyInput): Promise<RegisterWorkingCopyOutcome> {
   if (!input.workingCopyId || !input.productId || !input.path) {
     throw new Error("registerWorkingCopy: workingCopyId, productId, and path are required");
   }
@@ -120,7 +127,7 @@ export async function registerWorkingCopy(input: RegisterWorkingCopyInput): Prom
   return mutateRegistry((file) => {
     const existing = file.copies.find((copy) => copy.workingCopyId === normalized.workingCopyId);
     if (existing) {
-      if (contentOf(existing) === contentOf(normalized)) return existing;
+      if (contentOf(existing) === contentOf(normalized)) return { record: existing, outcome: "replayed" as const };
       throw executionError(
         "IDEMPOTENCY_CONFLICT",
         `working copy ${normalized.workingCopyId} is already registered with different content`,
@@ -138,7 +145,7 @@ export async function registerWorkingCopy(input: RegisterWorkingCopyInput): Prom
       registeredAt: new Date().toISOString(),
     };
     file.copies.push(record);
-    return record;
+    return { record, outcome: "created" as const };
   });
 }
 
