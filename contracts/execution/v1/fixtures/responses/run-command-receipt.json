@@ -1,0 +1,21 @@
+{
+  "description": "Golden run.command receipt for the send command.",
+  "schema": "execution-response-envelope",
+  "method": "run.command",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0002",
+    "receipt": {
+      "receiptId": "rcpt-0002",
+      "effectKey": "run-0001/command/send-0001",
+      "requestDigest": "sha256:e48577c233cade41c49caa42dcca92756b54f81174ac98cea4d1c9905f4405ad",
+      "outcome": "created",
+      "resultVersion": 1,
+      "recordedAt": "2026-08-05T10:20:01Z"
+    },
+    "result": {
+      "commandState": "accepted"
+    }
+  }
+}

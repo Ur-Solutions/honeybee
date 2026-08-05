@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-cancel-body.schema.json",
+  "title": "RunCancelBody",
+  "description": "Body of run.cancel. Cancellation is a separate durable command; disconnecting a client never cancels a run. Repeating cancellation returns the same receipt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "reason": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+  }
+}

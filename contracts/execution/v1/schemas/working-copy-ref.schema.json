@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/working-copy-ref.schema.json",
+  "title": "WorkingCopyRef",
+  "description": "One facet of a Run Environment, not the environment's identity. The locator is provider-private and opaque outside the owning node; a different node cannot feed it back as placement identity. Occupancy is claimed durably for the Run and released idempotently.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["workingCopyId", "nodeId", "productId"],
+  "properties": {
+    "workingCopyId": { "$ref": "common.schema.json#/$defs/WorkingCopyId" },
+    "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+    "providerId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "productId": { "$ref": "common.schema.json#/$defs/ProductId" },
+    "origin": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+    "revision": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" },
+    "branch": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+    "occupancy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claimedByRunId", "claimedAt"],
+      "properties": {
+        "claimedByRunId": { "$ref": "common.schema.json#/$defs/RunId" },
+        "claimedAt": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "token"],
+      "properties": {
+        "kind": { "const": "node-private" },
+        "token": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+      }
+    }
+  }
+}

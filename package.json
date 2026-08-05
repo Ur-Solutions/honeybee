@@ -13,6 +13,10 @@
     "./comb": {
       "types": "./dist/comb/sdk.d.ts",
       "default": "./dist/comb/sdk.js"
+    },
+    "./execution/v1": {
+      "types": "./dist/execution/index.d.ts",
+      "default": "./dist/execution/index.js"
     }
   },
   "bin": {
@@ -25,6 +29,7 @@
     "postbuild": "chmod +x dist/cli.js dist/cli-x.js",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
+    "execution:digest": "tsx scripts/update-execution-digest.mjs",
     "dev": "tsx src/cli.ts",
     "hive": "node dist/cli.js"
   },

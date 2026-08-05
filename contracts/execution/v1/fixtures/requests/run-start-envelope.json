@@ -1,0 +1,157 @@
+{
+  "description": "Golden run.start: RunIntent plus ExecutionLease in the common effect envelope. The authority capabilityLeaseId equals lease.parentCapabilityLeaseId; requestDigest is the canonical digest of body.",
+  "schema": "execution-request-envelope",
+  "bodySchema": "run-start-body",
+  "method": "run.start",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0001",
+    "effectKey": "job-0001/run-0001/start",
+    "traceId": "trace-0001",
+    "issuedAt": "2026-08-05T10:00:00Z",
+    "requestDigest": "sha256:b2aa9fd9adf0a707794699c60095aa77cc46d3079054c1532fe4728484c2e588",
+    "authority": {
+      "actor": {
+        "initiator": {
+          "kind": "user",
+          "id": "user-ada",
+          "displayName": "Ada"
+        }
+      },
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "capabilityLeaseId": "cap-lease-0001",
+      "authorityEpoch": 1,
+      "policyEpoch": 1
+    },
+    "body": {
+      "intent": {
+        "jobId": "job-0001",
+        "runId": "run-0001",
+        "attemptOrdinal": 1,
+        "ownerScopeId": "oscope-local-1",
+        "workspaceId": "wsp-alpha",
+        "target": {
+          "productId": "prod-honeycomb-app",
+          "source": {
+            "kind": "git",
+            "normalizedOrigin": "https://git.example.com/acme/honeycomb-app.git",
+            "revision": "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c"
+          },
+          "digest": "sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+        },
+        "placement": "fresh",
+        "harness": {
+          "driverId": "claude",
+          "versionRange": ">=2.0.0",
+          "model": "claude-sonnet-5",
+          "config": {
+            "brief": "Fix the failing parser unit test and run the suite."
+          }
+        },
+        "requiredCapabilities": [
+          {
+            "capability": "harness/claude"
+          },
+          {
+            "capability": "materializer/git-worktree"
+          }
+        ],
+        "trustZone": "local-default",
+        "mutationAuthority": [
+          {
+            "kind": "working-copy-write"
+          }
+        ],
+        "budget": {
+          "maxDurationSeconds": 3600,
+          "maxTokens": 2000000
+        },
+        "evidenceContract": {
+          "collect": [
+            "commands",
+            "tests",
+            "diff",
+            "logs",
+            "environment-manifest"
+          ],
+          "delivery": "local-manifest"
+        }
+      },
+      "lease": {
+        "leaseId": "lease-0001",
+        "parentCapabilityLeaseId": "cap-lease-0001",
+        "runId": "run-0001",
+        "audience": {
+          "nodeId": "node-mac-1",
+          "providerId": "native-host",
+          "binding": {
+            "kind": "local-authority-host",
+            "bindingId": "bind-0001",
+            "authorityId": "la-0001",
+            "keyFingerprint": "sha256:abababababababababababababababababababababababababababababababab",
+            "authorityEpoch": 1
+          }
+        },
+        "ownerScopeId": "oscope-local-1",
+        "workspaceId": "wsp-alpha",
+        "actor": {
+          "initiator": {
+            "kind": "user",
+            "id": "user-ada",
+            "displayName": "Ada"
+          }
+        },
+        "allowedSnapshotDigest": "sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+        "allowedHarness": {
+          "driverId": "claude",
+          "versionRange": ">=2.0.0",
+          "model": "claude-sonnet-5",
+          "config": {
+            "brief": "Fix the failing parser unit test and run the suite."
+          }
+        },
+        "capabilities": [
+          {
+            "capability": "harness/claude"
+          },
+          {
+            "capability": "materializer/git-worktree"
+          }
+        ],
+        "resourceLimits": {
+          "maxCpuCores": 8,
+          "maxMemoryMb": 16384
+        },
+        "networkPolicy": {
+          "mode": "inherit-node"
+        },
+        "mutationAuthority": [
+          {
+            "kind": "working-copy-write"
+          }
+        ],
+        "materializationCredentialLeaseIds": [],
+        "runtimeCredentialLeaseIds": [],
+        "evidenceContract": {
+          "collect": [
+            "commands",
+            "tests",
+            "diff",
+            "logs",
+            "environment-manifest"
+          ],
+          "delivery": "local-manifest"
+        },
+        "issuedAt": "2026-08-05T10:00:00Z",
+        "notBefore": "2026-08-05T10:00:00Z",
+        "expiresAt": "2026-08-05T14:00:00Z",
+        "authorityEpoch": 1,
+        "policyEpoch": 1,
+        "signature": "ed25519:bGVhc2Utc2lnbmF0dXJlLWZpeHR1cmU="
+      }
+    },
+    "signature": "ed25519:ZW52ZWxvcGUtc2lnbmF0dXJlLWZpeHR1cmU="
+  }
+}

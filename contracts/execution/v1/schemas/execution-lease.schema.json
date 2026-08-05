@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/execution-lease.schema.json",
+  "title": "ExecutionLease",
+  "description": "Apiary-minted, audience-bound execution authority for exactly one Run. Honeybee may reject a stale or incompatible target but may not place elsewhere, widen capability, mutate a canonical checkout, or borrow another account. Baseline v1: Apiary mints every child lease; Honeybee cannot sign or widen one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "leaseId",
+    "parentCapabilityLeaseId",
+    "runId",
+    "audience",
+    "ownerScopeId",
+    "workspaceId",
+    "actor",
+    "allowedSnapshotDigest",
+    "allowedHarness",
+    "capabilities",
+    "resourceLimits",
+    "networkPolicy",
+    "mutationAuthority",
+    "materializationCredentialLeaseIds",
+    "runtimeCredentialLeaseIds",
+    "evidenceContract",
+    "issuedAt",
+    "notBefore",
+    "expiresAt",
+    "authorityEpoch",
+    "policyEpoch",
+    "signature"
+  ],
+  "properties": {
+    "leaseId": { "$ref": "common.schema.json#/$defs/ExecutionLeaseId" },
+    "parentCapabilityLeaseId": { "$ref": "common.schema.json#/$defs/CapabilityLeaseId" },
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "audience": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeId", "providerId", "binding"],
+      "properties": {
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+        "providerId": { "$ref": "common.schema.json#/$defs/Identifier" },
+        "binding": { "$ref": "execution-audience-binding-ref.schema.json" }
+      }
+    },
+    "ownerScopeId": { "$ref": "common.schema.json#/$defs/OwnerScopeId" },
+    "workspaceId": { "$ref": "common.schema.json#/$defs/WorkspaceId" },
+    "actor": { "$ref": "actor-context.schema.json" },
+    "allowedSnapshotDigest": { "$ref": "common.schema.json#/$defs/Sha256Digest" },
+    "allowedHarness": { "$ref": "harness-request.schema.json" },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "capability-requirement.schema.json" }
+    },
+    "resourceLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxCpuCores": { "type": "number", "minimum": 0 },
+        "maxMemoryMb": { "type": "number", "minimum": 0 },
+        "maxDiskMb": { "type": "number", "minimum": 0 },
+        "maxProcesses": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "enum": ["inherit-node", "allowlist", "deny-external"] },
+        "allow": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+        }
+      }
+    },
+    "mutationAuthority": {
+      "type": "array",
+      "items": { "$ref": "mutation-grant.schema.json" }
+    },
+    "materializationCredentialLeaseIds": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/CredentialLeaseId" }
+    },
+    "runtimeCredentialLeaseIds": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/CredentialLeaseId" }
+    },
+    "evidenceContract": { "$ref": "evidence-contract.schema.json" },
+    "issuedAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "notBefore": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "expiresAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "authorityEpoch": { "$ref": "common.schema.json#/$defs/Epoch" },
+    "policyEpoch": { "$ref": "common.schema.json#/$defs/Epoch" },
+    "signature": { "$ref": "common.schema.json#/$defs/Signature" }
+  }
+}

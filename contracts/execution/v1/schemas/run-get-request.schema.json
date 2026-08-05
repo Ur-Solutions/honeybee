@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-get-request.schema.json",
+  "title": "RunGetRequest",
+  "description": "Read-only request for the latest durable Run projection.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "runId"],
+  "properties": {
+    "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion" },
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" }
+  }
+}

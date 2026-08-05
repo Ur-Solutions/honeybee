@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/attach-lease.schema.json",
+  "title": "AttachLease",
+  "description": "Name reserved by runtime-target-v1, which this corpus does not activate. The canonical shape (architecture section 9.7: a specialized capability lease with parentCapabilityLeaseId, owner scope/workspace, run/target/generation, actor, audience variants, role, actions, notBefore/expiresAt, authority/access/policy epochs, signature) is adopted only when both repositories accept runtime-target-v1 schemas and fixtures. Fail-closed until then: no value validates against this reservation.",
+  "x-reserved": "runtime-target-v1",
+  "not": {}
+}

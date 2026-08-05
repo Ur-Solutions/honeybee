@@ -1,0 +1,25 @@
+{
+  "description": "Golden terminal cleanup receipt: returned only after all required release steps completed or were classified unrecoverable.",
+  "schema": "execution-response-envelope",
+  "method": "run.release",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0008",
+    "receipt": {
+      "receiptId": "rcpt-0008",
+      "effectKey": "run-0001/release",
+      "requestDigest": "sha256:f742a2447669c9a43369a2928e7e17e1b14bde52afd30e5fab8e3d79c7c2c559",
+      "outcome": "created",
+      "resultVersion": 1,
+      "recordedAt": "2026-08-05T12:00:02Z"
+    },
+    "result": {
+      "environmentState": "released",
+      "steps": {
+        "completed": 4,
+        "unrecoverable": 0
+      }
+    }
+  }
+}

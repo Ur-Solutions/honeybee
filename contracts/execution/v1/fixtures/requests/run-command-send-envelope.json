@@ -1,0 +1,38 @@
+{
+  "description": "Golden run.command send: its own effect key and preconditioned Run version.",
+  "schema": "execution-request-envelope",
+  "bodySchema": "run-command-body",
+  "method": "run.command",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0002",
+    "effectKey": "run-0001/command/send-0001",
+    "traceId": "trace-0002",
+    "issuedAt": "2026-08-05T10:20:00Z",
+    "requestDigest": "sha256:e48577c233cade41c49caa42dcca92756b54f81174ac98cea4d1c9905f4405ad",
+    "authority": {
+      "actor": {
+        "initiator": {
+          "kind": "user",
+          "id": "user-ada",
+          "displayName": "Ada"
+        }
+      },
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "capabilityLeaseId": "cap-lease-0001",
+      "authorityEpoch": 1,
+      "policyEpoch": 1
+    },
+    "body": {
+      "runId": "run-0001",
+      "ifStateVersion": 6,
+      "command": {
+        "kind": "send",
+        "text": "Also add a regression test for the empty-input case."
+      }
+    },
+    "signature": "ed25519:c2VuZC1zaWduYXR1cmUtZml4dHVyZQ=="
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "entity": "run",
+  "description": "Run transitions: allowed must exactly mirror states.json; rejected samples include reversal, terminal escape, and skipped admission.",
+  "allowed": [
+    ["allocating", "offered"],
+    ["offered", "accepted"],
+    ["accepted", "materializing"],
+    ["materializing", "starting"],
+    ["starting", "running"],
+    ["running", "completed"],
+    ["running", "failed"],
+    ["running", "cancelled"],
+    ["materializing", "failed"],
+    ["starting", "failed"],
+    ["accepted", "lost"],
+    ["materializing", "lost"],
+    ["starting", "lost"],
+    ["running", "lost"],
+    ["lost", "recovering"],
+    ["lost", "cancelled"],
+    ["recovering", "running"],
+    ["recovering", "failed"],
+    ["recovering", "cancelled"],
+    ["accepted", "cancelled"],
+    ["materializing", "cancelled"],
+    ["starting", "cancelled"]
+  ],
+  "rejected": [
+    ["allocating", "running"],
+    ["offered", "materializing"],
+    ["allocating", "cancelled"],
+    ["running", "offered"],
+    ["completed", "running"],
+    ["cancelled", "recovering"],
+    ["failed", "running"],
+    ["lost", "running"]
+  ]
+}

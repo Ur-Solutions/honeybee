@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/execution-response-envelope.schema.json",
+  "title": "ExecutionResponseEnvelope",
+  "description": "Response to an effect method: the same requestId, a stable receipt, and exactly one of result or typed error.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "requestId"],
+  "properties": {
+    "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion" },
+    "requestId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "receipt": { "$ref": "effect-receipt.schema.json" },
+    "result": { "$ref": "common.schema.json#/$defs/JsonValue" },
+    "error": { "$ref": "error.schema.json" }
+  },
+  "oneOf": [{ "required": ["result"] }, { "required": ["error"] }]
+}

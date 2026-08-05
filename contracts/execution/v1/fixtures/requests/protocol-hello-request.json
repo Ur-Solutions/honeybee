@@ -1,0 +1,11 @@
+{
+  "description": "Golden protocol.hello request: Apiary requires local-core-v1 and asks optionally about runtime targets.",
+  "schema": "protocol-hello-request",
+  "method": "protocol.hello",
+  "valid": true,
+  "value": {
+    "client": { "product": "apiary", "version": "0.4.0", "protocolRange": "0.1" },
+    "requiredFeatures": ["local-core-v1"],
+    "optionalFeatures": ["runtime-target-v1"]
+  }
+}

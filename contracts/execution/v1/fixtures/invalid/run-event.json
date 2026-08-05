@@ -1,0 +1,28 @@
+{
+  "description": "Must fail: seq below 1; missing origin.",
+  "schema": "run-event",
+  "valid": false,
+  "values": [
+    {
+      "protocolVersion": "0.1",
+      "runId": "run-0001",
+      "seq": 0,
+      "eventId": "evt-bad-1",
+      "type": "run.accepted",
+      "occurredAt": "2026-08-05T10:00:01Z",
+      "ingestedAt": "2026-08-05T10:00:01Z",
+      "origin": { "nodeId": "node-mac-1" },
+      "payload": {}
+    },
+    {
+      "protocolVersion": "0.1",
+      "runId": "run-0001",
+      "seq": 1,
+      "eventId": "evt-bad-2",
+      "type": "run.accepted",
+      "occurredAt": "2026-08-05T10:00:01Z",
+      "ingestedAt": "2026-08-05T10:00:01Z",
+      "payload": {}
+    }
+  ]
+}

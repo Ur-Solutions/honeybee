@@ -1,0 +1,71 @@
+{
+  "description": "Golden owner-scoped node.describe response: native provider, ready Claude driver, honestly absent Codex harness with an install hint, and an unactivated runtime-target feature set (absent from protocol.features).",
+  "schema": "node-descriptor",
+  "method": "node.describe",
+  "valid": true,
+  "value": {
+    "nodeId": "node-mac-1",
+    "ownerScopeId": "oscope-local-1",
+    "binding": {
+      "kind": "local-authority-host",
+      "bindingId": "bind-0001",
+      "authorityId": "la-0001",
+      "keyFingerprint": "sha256:abababababababababababababababababababababababababababababababab",
+      "authorityEpoch": 1
+    },
+    "observedAt": "2026-08-05T09:59:30Z",
+    "expiresAt": "2026-08-05T10:04:30Z",
+    "protocol": { "version": "0.1", "features": ["local-core-v1"] },
+    "platform": { "os": "darwin", "arch": "arm64", "version": "25.0" },
+    "providers": [
+      {
+        "providerId": "native-host",
+        "isolation": {
+          "filesystem": "dedicated",
+          "processes": "shared",
+          "network": "shared",
+          "browserProfile": "none",
+          "deviations": ["native host: process and network isolation are advisory"]
+        },
+        "materializerForms": ["git-worktree"],
+        "persistence": { "checkpoint": false, "retainSupported": true, "maxRetainHours": 168 },
+        "secretInjection": "env-allowlist",
+        "status": "ready"
+      }
+    ],
+    "harnesses": [
+      {
+        "driverId": "claude",
+        "driverVersion": "1.0.0",
+        "harnessVersion": "2.3.1",
+        "runnerTier": "hsr",
+        "commands": ["send", "answer", "interrupt"],
+        "commandDelivery": "deduplicated",
+        "resume": true,
+        "checkpoint": false,
+        "accountResidency": "node-resident",
+        "status": "ready"
+      },
+      {
+        "driverId": "codex",
+        "driverVersion": "1.0.0",
+        "commands": ["send", "interrupt"],
+        "commandDelivery": "at-most-once",
+        "status": "absent",
+        "installHint": "install the codex CLI and re-run node discovery"
+      }
+    ],
+    "materializers": [
+      {
+        "materializerId": "git-worktree",
+        "sourceKinds": ["git"],
+        "placements": ["fresh", "inherit", "explicit"],
+        "status": "ready"
+      }
+    ],
+    "resources": { "cpuCores": 10, "memoryMb": 32768, "diskMb": 512000, "maxConcurrentRuns": 6 },
+    "trustZones": ["local-default"],
+    "health": "ready",
+    "signature": "ed25519:bm9kZS1zbmFwc2hvdC1zaWduYXR1cmU="
+  }
+}

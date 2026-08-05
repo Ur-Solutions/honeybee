@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/runtime-target-ref.schema.json",
+  "title": "RuntimeTargetRef",
+  "description": "Name reserved by runtime-target-v1, which this corpus does not activate. The canonical shape (architecture section 9.7: owner scope, workspace, run, target, kind, bounded generation) is adopted only when both repositories accept runtime-target-v1 schemas and fixtures. Fail-closed until then: no value validates against this reservation.",
+  "x-reserved": "runtime-target-v1",
+  "not": {}
+}

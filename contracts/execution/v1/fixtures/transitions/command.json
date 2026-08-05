@@ -1,0 +1,16 @@
+{
+  "entity": "command",
+  "description": "Command transitions: dispatching is durably recorded before non-deduplicating delivery; unresolved outcomes end indeterminate, never blind redelivery.",
+  "allowed": [
+    ["accepted", "dispatching"],
+    ["dispatching", "completed"],
+    ["dispatching", "failed"],
+    ["dispatching", "indeterminate"]
+  ],
+  "rejected": [
+    ["accepted", "completed"],
+    ["indeterminate", "dispatching"],
+    ["completed", "dispatching"],
+    ["failed", "accepted"]
+  ]
+}

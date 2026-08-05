@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-release-body.schema.json",
+  "title": "RunReleaseBody",
+  "description": "Body of run.release. Release is desired state backed by a durable step ledger; retries continue unfinished cleanup steps. A terminal cleanup receipt is returned only after all required steps complete or are classified unrecoverable.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" }
+  }
+}

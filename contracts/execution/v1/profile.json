@@ -1,0 +1,175 @@
+{
+  "contract": "honeybee-execution",
+  "contractVersion": "0.1.0",
+  "protocolVersion": "0.1",
+  "description": "Named feature profiles for the Apiary <-> Honeybee execution protocol. Phase 0 accepts schemas and fixtures for local-core-v1; Phase 1 activates it. runtime-target-v1 is reserved as schema names only and is default-off; comb-activation-v1 is intentionally absent from this corpus.",
+  "profiles": {
+    "local-core-v1": {
+      "activation": "baseline",
+      "defaultEnabled": true,
+      "features": ["local-core-v1"],
+      "methods": [
+        {
+          "method": "protocol.hello",
+          "effect": false,
+          "requestSchema": "protocol-hello-request",
+          "responseSchema": "protocol-hello-response"
+        },
+        {
+          "method": "node.describe",
+          "effect": false,
+          "requestSchema": "node-describe-request",
+          "responseSchema": "node-descriptor"
+        },
+        {
+          "method": "run.start",
+          "effect": true,
+          "requestSchema": "execution-request-envelope",
+          "bodySchema": "run-start-body",
+          "responseSchema": "execution-response-envelope"
+        },
+        {
+          "method": "run.get",
+          "effect": false,
+          "requestSchema": "run-get-request",
+          "responseSchema": "run-projection"
+        },
+        {
+          "method": "run.events",
+          "effect": false,
+          "requestSchema": "run-events-request",
+          "responseSchema": "run-events-page"
+        },
+        {
+          "method": "run.command",
+          "effect": true,
+          "requestSchema": "execution-request-envelope",
+          "bodySchema": "run-command-body",
+          "responseSchema": "execution-response-envelope"
+        },
+        {
+          "method": "run.cancel",
+          "effect": true,
+          "requestSchema": "execution-request-envelope",
+          "bodySchema": "run-cancel-body",
+          "responseSchema": "execution-response-envelope"
+        },
+        {
+          "method": "run.collect",
+          "effect": true,
+          "requestSchema": "execution-request-envelope",
+          "bodySchema": "run-collect-body",
+          "responseSchema": "execution-response-envelope"
+        },
+        {
+          "method": "run.retain",
+          "effect": true,
+          "requestSchema": "execution-request-envelope",
+          "bodySchema": "run-retain-body",
+          "responseSchema": "execution-response-envelope"
+        },
+        {
+          "method": "run.release",
+          "effect": true,
+          "requestSchema": "execution-request-envelope",
+          "bodySchema": "run-release-body",
+          "responseSchema": "execution-response-envelope"
+        }
+      ],
+      "commands": ["send", "answer", "interrupt", "checkpoint"],
+      "profileGatedCommands": { "refresh-credential": "credential-lease-v1" },
+      "eventTypes": [
+        "run.accepted",
+        "environment.materializing",
+        "environment.ready",
+        "harness.starting",
+        "harness.running",
+        "harness.exited",
+        "turn.started",
+        "turn.completed",
+        "needs_input.opened",
+        "needs_input.resolved",
+        "command.accepted",
+        "command.dispatching",
+        "command.completed",
+        "command.failed",
+        "command.indeterminate",
+        "usage.updated",
+        "artifact.staged",
+        "artifact.finalized",
+        "collection.completed",
+        "cancel.requested",
+        "run.cancelled",
+        "run.failed",
+        "run.completed",
+        "run.lost",
+        "run.recovering",
+        "environment.sealed",
+        "environment.released"
+      ],
+      "optionalEventTypes": ["surface.intent.proposed"],
+      "errorCodes": [
+        "PROTOCOL_INCOMPATIBLE",
+        "SCHEMA_UNSUPPORTED",
+        "BINDING_DENIED",
+        "LEASE_DENIED",
+        "IDEMPOTENCY_CONFLICT",
+        "CAPABILITY_MISMATCH",
+        "SNAPSHOT_UNAVAILABLE",
+        "MATERIALIZATION_FAILED",
+        "HARNESS_UNAVAILABLE",
+        "RUN_VERSION_CONFLICT",
+        "CURSOR_EXPIRED",
+        "NODE_LOST",
+        "AUTHORITY_UNAVAILABLE"
+      ]
+    },
+    "runtime-target-v1": {
+      "activation": "optional",
+      "defaultEnabled": false,
+      "schemasOnly": true,
+      "features": ["runtime-target-v1", "target-viewer-v1", "target-driver-v1"],
+      "schemas": [
+        "runtime-target-ref",
+        "runtime-target-descriptor",
+        "attach-lease",
+        "active-attachment-ref"
+      ],
+      "methods": ["target.list", "target.get", "target.attach", "target.detach"],
+      "driverMethods": ["target.take-control", "target.input", "target.release-control"],
+      "eventTypes": [
+        "target.provisioning",
+        "target.live",
+        "target.sealed",
+        "target.released",
+        "target.failed",
+        "attachment.active",
+        "attachment.expired",
+        "attachment.revoked",
+        "attachment.detached",
+        "attachment.fenced"
+      ],
+      "errorCodes": ["ATTACH_DENIED", "TARGET_GONE", "TARGET_GENERATION_STALE", "DRIVER_FENCED"],
+      "note": "Schema names reserved only; the reserved schema documents are fail-closed (nothing validates against them) until the canonical architecture section 9.7 shapes are accepted with the profile. The profile is not activated by this corpus; absence means honest capability absence, not a legacy sidecar/cast fallback. target-viewer-v1 never implies target-driver-v1."
+    }
+  },
+  "errorCodes": {
+    "PROTOCOL_INCOMPATIBLE": { "retryable": false, "meaning": "no compatible major/features" },
+    "SCHEMA_UNSUPPORTED": { "retryable": false, "meaning": "required field/action unknown" },
+    "BINDING_DENIED": { "retryable": false, "meaning": "local-host, PairGrant, or NodeEnrollment binding is invalid/stale" },
+    "LEASE_DENIED": { "retryable": false, "meaning": "invalid signature, scope, audience, time, or epoch" },
+    "IDEMPOTENCY_CONFLICT": { "retryable": false, "meaning": "effect key or entity ID reused with different content" },
+    "CAPABILITY_MISMATCH": { "retryable": false, "meaning": "node/provider/driver cannot meet the leased requirements" },
+    "SNAPSHOT_UNAVAILABLE": { "retryable": false, "meaning": "product snapshot or patch cannot be verified" },
+    "MATERIALIZATION_FAILED": { "retryable": false, "meaning": "Run Environment preparation failed" },
+    "HARNESS_UNAVAILABLE": { "retryable": false, "meaning": "driver or compatible harness is absent/degraded beyond policy" },
+    "RUN_VERSION_CONFLICT": { "retryable": false, "meaning": "command precondition is stale" },
+    "CURSOR_EXPIRED": { "retryable": false, "meaning": "requested event history compacted; checkpoint supplied if available" },
+    "NODE_LOST": { "retryable": false, "meaning": "coordinator cannot prove runtime liveness" },
+    "AUTHORITY_UNAVAILABLE": { "retryable": true, "meaning": "required validation/renewal cannot complete" },
+    "ATTACH_DENIED": { "retryable": false, "meaning": "attach lease, audience, role, action, policy, or stream disclosure is not authorized" },
+    "TARGET_GONE": { "retryable": false, "meaning": "target is released, failed without recovery, or no longer retained" },
+    "TARGET_GENERATION_STALE": { "retryable": false, "meaning": "reference or attachment names a replaced target generation" },
+    "DRIVER_FENCED": { "retryable": false, "meaning": "input/control operation does not hold the controller's active driver epoch" }
+  }
+}

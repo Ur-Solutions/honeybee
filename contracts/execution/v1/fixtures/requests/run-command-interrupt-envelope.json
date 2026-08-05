@@ -1,0 +1,37 @@
+{
+  "description": "Golden run.command interrupt.",
+  "schema": "execution-request-envelope",
+  "bodySchema": "run-command-body",
+  "method": "run.command",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0004",
+    "effectKey": "run-0001/command/interrupt-0001",
+    "traceId": "trace-0004",
+    "issuedAt": "2026-08-05T10:30:00Z",
+    "requestDigest": "sha256:2f57c98c06e689c2a1bdabf95cd58a8cc30e0cad48b9ec0be443b6d09e5d16c4",
+    "authority": {
+      "actor": {
+        "initiator": {
+          "kind": "user",
+          "id": "user-ada",
+          "displayName": "Ada"
+        }
+      },
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "capabilityLeaseId": "cap-lease-0001",
+      "authorityEpoch": 1,
+      "policyEpoch": 1
+    },
+    "body": {
+      "runId": "run-0001",
+      "command": {
+        "kind": "interrupt",
+        "reason": "operator steering"
+      }
+    },
+    "signature": "ed25519:aW50ZXJydXB0LXNpZ25hdHVyZQ=="
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "description": "Must fail: unsigned envelope; envelope smuggling an ambient cwd field (paths never cross placement); authority claims missing an epoch.",
+  "schema": "execution-request-envelope",
+  "valid": false,
+  "values": [
+    {
+      "protocolVersion": "0.1",
+      "requestId": "req-bad-1",
+      "effectKey": "run-0001/cancel",
+      "traceId": "trace-bad-1",
+      "issuedAt": "2026-08-05T10:40:00Z",
+      "requestDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "authority": {
+        "actor": { "initiator": { "kind": "user", "id": "user-ada" } },
+        "ownerScopeId": "oscope-local-1",
+        "workspaceId": "wsp-alpha",
+        "capabilityLeaseId": "cap-lease-0001",
+        "authorityEpoch": 1,
+        "policyEpoch": 1
+      },
+      "body": { "runId": "run-0001" }
+    },
+    {
+      "protocolVersion": "0.1",
+      "requestId": "req-bad-2",
+      "effectKey": "run-0001/cancel",
+      "traceId": "trace-bad-2",
+      "issuedAt": "2026-08-05T10:40:00Z",
+      "requestDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "cwd": "/Users/dev/checkouts/honeycomb-app",
+      "authority": {
+        "actor": { "initiator": { "kind": "user", "id": "user-ada" } },
+        "ownerScopeId": "oscope-local-1",
+        "workspaceId": "wsp-alpha",
+        "capabilityLeaseId": "cap-lease-0001",
+        "authorityEpoch": 1,
+        "policyEpoch": 1
+      },
+      "body": { "runId": "run-0001" },
+      "signature": "ed25519:YmFkLWZpeHR1cmU="
+    },
+    {
+      "protocolVersion": "0.1",
+      "requestId": "req-bad-3",
+      "effectKey": "run-0001/cancel",
+      "traceId": "trace-bad-3",
+      "issuedAt": "2026-08-05T10:40:00Z",
+      "requestDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "authority": {
+        "actor": { "initiator": { "kind": "user", "id": "user-ada" } },
+        "ownerScopeId": "oscope-local-1",
+        "workspaceId": "wsp-alpha",
+        "capabilityLeaseId": "cap-lease-0001",
+        "authorityEpoch": 1
+      },
+      "body": { "runId": "run-0001" },
+      "signature": "ed25519:YmFkLWZpeHR1cmU="
+    }
+  ]
+}

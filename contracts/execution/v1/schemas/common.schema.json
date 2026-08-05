@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/common.schema.json",
+  "title": "ExecutionContractCommon",
+  "description": "Shared primitives for the Honeybee execution protocol corpus. IDs are opaque identifiers, never filesystem paths.",
+  "$defs": {
+    "NonEmptyString": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "Identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+    },
+    "ProtocolVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+    "FeatureName": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "Timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "Sha256Digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "Signature": { "type": "string", "minLength": 1, "maxLength": 8192 },
+    "Seq": { "type": "integer", "minimum": 0 },
+    "Epoch": { "type": "integer", "minimum": 1 },
+    "JsonValue": true,
+    "CapabilityStatus": { "enum": ["ready", "absent", "incompatible", "degraded"] },
+    "RunId": { "$ref": "#/$defs/Identifier" },
+    "JobId": { "$ref": "#/$defs/Identifier" },
+    "NodeId": { "$ref": "#/$defs/Identifier" },
+    "OwnerScopeId": { "$ref": "#/$defs/Identifier" },
+    "WorkspaceId": { "$ref": "#/$defs/Identifier" },
+    "ProductId": { "$ref": "#/$defs/Identifier" },
+    "ArtifactId": { "$ref": "#/$defs/Identifier" },
+    "EnvironmentId": { "$ref": "#/$defs/Identifier" },
+    "WorkingCopyId": { "$ref": "#/$defs/Identifier" },
+    "ExecutionLeaseId": { "$ref": "#/$defs/Identifier" },
+    "CapabilityLeaseId": { "$ref": "#/$defs/Identifier" },
+    "CredentialLeaseId": { "$ref": "#/$defs/Identifier" },
+    "ExecutionAudienceBindingId": { "$ref": "#/$defs/Identifier" },
+    "LocalAuthorityId": { "$ref": "#/$defs/Identifier" },
+    "PairGrantId": { "$ref": "#/$defs/Identifier" },
+    "NodeEnrollmentId": { "$ref": "#/$defs/Identifier" },
+    "ActivationId": { "$ref": "#/$defs/Identifier" },
+    "TrustZone": { "$ref": "#/$defs/Identifier" }
+  }
+}

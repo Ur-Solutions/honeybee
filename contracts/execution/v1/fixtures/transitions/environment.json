@@ -1,0 +1,20 @@
+{
+  "entity": "environment",
+  "description": "Run Environment transitions: seal before retain or release; release is idempotent desired state.",
+  "allowed": [
+    ["absent", "preparing"],
+    ["preparing", "ready"],
+    ["ready", "sealed"],
+    ["sealed", "retained"],
+    ["sealed", "releasing"],
+    ["retained", "releasing"],
+    ["releasing", "released"]
+  ],
+  "rejected": [
+    ["absent", "ready"],
+    ["ready", "retained"],
+    ["retained", "ready"],
+    ["released", "preparing"],
+    ["sealed", "ready"]
+  ]
+}

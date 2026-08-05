@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-events-page.schema.json",
+  "title": "RunEventsPage",
+  "description": "One page of durable Run events from an exclusive afterSeq cursor. gaps mark separately retained high-volume output spools; the control stream itself must not have silent gaps.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId", "afterSeq", "events", "nextAfterSeq"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "afterSeq": { "$ref": "common.schema.json#/$defs/Seq" },
+    "events": {
+      "type": "array",
+      "items": { "$ref": "run-event.schema.json" }
+    },
+    "nextAfterSeq": { "$ref": "common.schema.json#/$defs/Seq" },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["oldestReplayableSeq"],
+      "properties": {
+        "oldestReplayableSeq": { "$ref": "common.schema.json#/$defs/Seq" }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stream", "fromSeq", "toSeq", "reason"],
+        "properties": {
+          "stream": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+          "fromSeq": { "$ref": "common.schema.json#/$defs/Seq" },
+          "toSeq": { "$ref": "common.schema.json#/$defs/Seq" },
+          "reason": { "enum": ["spool-compacted", "live-broadcast-drop"] }
+        }
+      }
+    }
+  }
+}

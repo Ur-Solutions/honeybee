@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/execution-request-envelope.schema.json",
+  "title": "ExecutionRequestEnvelope",
+  "description": "Common envelope for every method with effects. requestId identifies one transport request; effectKey identifies the logical effect independently of retries. Reusing an effect key with a different requestDigest is IDEMPOTENCY_CONFLICT. requestDigest is the canonical sha256 digest of body; the signature covers the canonical envelope and body.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "requestId",
+    "effectKey",
+    "traceId",
+    "issuedAt",
+    "requestDigest",
+    "authority",
+    "body",
+    "signature"
+  ],
+  "properties": {
+    "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion" },
+    "requestId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "effectKey": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "traceId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "issuedAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "requestDigest": { "$ref": "common.schema.json#/$defs/Sha256Digest" },
+    "authority": { "$ref": "authority-envelope.schema.json" },
+    "body": { "$ref": "common.schema.json#/$defs/JsonValue" },
+    "signature": { "$ref": "common.schema.json#/$defs/Signature" }
+  }
+}

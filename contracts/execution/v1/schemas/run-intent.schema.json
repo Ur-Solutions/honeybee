@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-intent.schema.json",
+  "title": "RunIntent",
+  "description": "One path-free, authorized intent. runId is the sole Run identity; attemptOrdinal is Apiary audit/presentation and never part of a durable key. A retry has a new runId linked by retryOfRunId.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "jobId",
+    "runId",
+    "attemptOrdinal",
+    "ownerScopeId",
+    "workspaceId",
+    "target",
+    "placement",
+    "harness",
+    "requiredCapabilities",
+    "trustZone",
+    "mutationAuthority",
+    "budget",
+    "evidenceContract"
+  ],
+  "properties": {
+    "jobId": { "$ref": "common.schema.json#/$defs/JobId" },
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "retryOfRunId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "attemptOrdinal": { "type": "integer", "minimum": 1 },
+    "ownerScopeId": { "$ref": "common.schema.json#/$defs/OwnerScopeId" },
+    "workspaceId": { "$ref": "common.schema.json#/$defs/WorkspaceId" },
+    "target": { "$ref": "product-snapshot-ref.schema.json" },
+    "placement": {
+      "oneOf": [
+        { "enum": ["fresh", "inherit", "canonical"] },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "workingCopyId", "nodeId"],
+          "properties": {
+            "kind": { "const": "explicit" },
+            "workingCopyId": { "$ref": "common.schema.json#/$defs/WorkingCopyId" },
+            "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" }
+          }
+        }
+      ]
+    },
+    "harness": { "$ref": "harness-request.schema.json" },
+    "requiredCapabilities": {
+      "type": "array",
+      "items": { "$ref": "capability-requirement.schema.json" }
+    },
+    "trustZone": { "$ref": "common.schema.json#/$defs/TrustZone" },
+    "mutationAuthority": {
+      "type": "array",
+      "items": { "$ref": "mutation-grant.schema.json" }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxDurationSeconds": { "type": "number", "minimum": 0 },
+        "maxTokens": { "type": "integer", "minimum": 0 },
+        "maxCostUsd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "evidenceContract": { "$ref": "evidence-contract.schema.json" },
+    "parentRunId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "activationId": { "$ref": "common.schema.json#/$defs/ActivationId" }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "entity": "target",
+  "description": "Runtime target transitions (runtime-target-v1, reserved and not activated by this corpus).",
+  "allowed": [
+    ["absent", "provisioning"],
+    ["provisioning", "live"],
+    ["live", "sealed"],
+    ["sealed", "released"],
+    ["provisioning", "failed"],
+    ["live", "failed"],
+    ["sealed", "failed"],
+    ["failed", "released"]
+  ],
+  "rejected": [
+    ["absent", "live"],
+    ["released", "live"],
+    ["failed", "live"]
+  ]
+}

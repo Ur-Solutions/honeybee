@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/protocol-hello-request.schema.json",
+  "title": "ProtocolHelloRequest",
+  "description": "Negotiates version and features. Required before every other method on a new connection.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["client", "requiredFeatures", "optionalFeatures"],
+  "properties": {
+    "client": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["product", "version", "protocolRange"],
+      "properties": {
+        "product": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "version": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "protocolRange": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+      }
+    },
+    "requiredFeatures": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/FeatureName" }
+    },
+    "optionalFeatures": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/FeatureName" }
+    }
+  }
+}

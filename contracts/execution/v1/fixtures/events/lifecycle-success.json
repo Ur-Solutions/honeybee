@@ -1,0 +1,223 @@
+{
+  "description": "Golden successful lifecycle replay from afterSeq 0: accept, materialize, harness turn with needs-input answered via an effect-keyed command, usage, completion, collection, seal, release. Includes the optional path-free surface.intent.proposed event.",
+  "schema": "run-events-page",
+  "method": "run.events",
+  "valid": true,
+  "value": {
+    "runId": "run-0001",
+    "afterSeq": 0,
+    "nextAfterSeq": 19,
+    "retention": { "oldestReplayableSeq": 1 },
+    "events": [
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 1,
+        "eventId": "evt-run-0001-1",
+        "type": "run.accepted",
+        "occurredAt": "2026-08-05T10:00:01Z",
+        "ingestedAt": "2026-08-05T10:00:01Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "effectKey": "job-0001/run-0001/start", "receiptId": "rcpt-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 2,
+        "eventId": "evt-run-0001-2",
+        "type": "environment.materializing",
+        "occurredAt": "2026-08-05T10:00:02Z",
+        "ingestedAt": "2026-08-05T10:00:02Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 3,
+        "eventId": "evt-run-0001-3",
+        "type": "environment.ready",
+        "occurredAt": "2026-08-05T10:00:06Z",
+        "ingestedAt": "2026-08-05T10:00:06Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0001", "workingCopyId": "wc-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 4,
+        "eventId": "evt-run-0001-4",
+        "type": "harness.starting",
+        "occurredAt": "2026-08-05T10:00:07Z",
+        "ingestedAt": "2026-08-05T10:00:07Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "operationId": "run-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 5,
+        "eventId": "evt-run-0001-5",
+        "type": "harness.running",
+        "occurredAt": "2026-08-05T10:00:12Z",
+        "ingestedAt": "2026-08-05T10:00:12Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "sessionRef": "hsr-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 6,
+        "eventId": "evt-run-0001-6",
+        "type": "turn.started",
+        "occurredAt": "2026-08-05T10:00:13Z",
+        "ingestedAt": "2026-08-05T10:00:13Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "turnId": "turn-1" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 7,
+        "eventId": "evt-run-0001-7",
+        "type": "surface.intent.proposed",
+        "occurredAt": "2026-08-05T10:05:00Z",
+        "ingestedAt": "2026-08-05T10:05:00Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "intentId": "sint-0001", "kind": "terminal" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 8,
+        "eventId": "evt-run-0001-8",
+        "type": "needs_input.opened",
+        "occurredAt": "2026-08-05T10:22:00Z",
+        "ingestedAt": "2026-08-05T10:22:00Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "inputRequestId": "inp-0001", "prompt": "Approve the proposed refactor plan?" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 9,
+        "eventId": "evt-run-0001-9",
+        "type": "command.accepted",
+        "occurredAt": "2026-08-05T10:25:01Z",
+        "ingestedAt": "2026-08-05T10:25:01Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "effectKey": "run-0001/command/answer-0001", "kind": "answer" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 10,
+        "eventId": "evt-run-0001-10",
+        "type": "command.dispatching",
+        "occurredAt": "2026-08-05T10:25:02Z",
+        "ingestedAt": "2026-08-05T10:25:02Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "effectKey": "run-0001/command/answer-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 11,
+        "eventId": "evt-run-0001-11",
+        "type": "command.completed",
+        "occurredAt": "2026-08-05T10:25:03Z",
+        "ingestedAt": "2026-08-05T10:25:03Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "effectKey": "run-0001/command/answer-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 12,
+        "eventId": "evt-run-0001-12",
+        "type": "needs_input.resolved",
+        "occurredAt": "2026-08-05T10:25:03Z",
+        "ingestedAt": "2026-08-05T10:25:03Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "inputRequestId": "inp-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 13,
+        "eventId": "evt-run-0001-13",
+        "type": "usage.updated",
+        "occurredAt": "2026-08-05T10:40:00Z",
+        "ingestedAt": "2026-08-05T10:40:00Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "inputTokens": 48000, "outputTokens": 3200 }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 14,
+        "eventId": "evt-run-0001-14",
+        "type": "turn.completed",
+        "occurredAt": "2026-08-05T10:55:00Z",
+        "ingestedAt": "2026-08-05T10:55:00Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "turnId": "turn-1" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 15,
+        "eventId": "evt-run-0001-15",
+        "type": "harness.exited",
+        "occurredAt": "2026-08-05T10:56:00Z",
+        "ingestedAt": "2026-08-05T10:56:00Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "claude" },
+        "payload": { "exitCode": 0 }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 16,
+        "eventId": "evt-run-0001-16",
+        "type": "run.completed",
+        "occurredAt": "2026-08-05T10:56:01Z",
+        "ingestedAt": "2026-08-05T10:56:01Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "outcome": "completed" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 17,
+        "eventId": "evt-run-0001-17",
+        "type": "collection.completed",
+        "occurredAt": "2026-08-05T11:00:20Z",
+        "ingestedAt": "2026-08-05T11:00:20Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "collectionId": "coll-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 18,
+        "eventId": "evt-run-0001-18",
+        "type": "environment.sealed",
+        "occurredAt": "2026-08-05T11:00:21Z",
+        "ingestedAt": "2026-08-05T11:00:21Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0001",
+        "seq": 19,
+        "eventId": "evt-run-0001-19",
+        "type": "environment.released",
+        "occurredAt": "2026-08-05T12:00:02Z",
+        "ingestedAt": "2026-08-05T12:00:02Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0001" }
+      }
+    ]
+  }
+}

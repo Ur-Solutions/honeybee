@@ -1,0 +1,15 @@
+{
+  "description": "Must fail: outcome outside created|replayed.",
+  "schema": "effect-receipt",
+  "valid": false,
+  "values": [
+    {
+      "receiptId": "rcpt-bad-1",
+      "effectKey": "job-0001/run-0001/start",
+      "requestDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "outcome": "duplicate",
+      "resultVersion": 1,
+      "recordedAt": "2026-08-05T10:00:01Z"
+    }
+  ]
+}

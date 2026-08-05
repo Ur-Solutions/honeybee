@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/node-descriptor.schema.json",
+  "title": "NodeDescriptor",
+  "description": "Signed, short-lived capability snapshot for one owner scope and one applicable authority binding. Snapshots are scheduler inputs, not indefinite promises; run.start revalidates the exact selected requirements. Absence is explicit capability state, never an empty result set.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "nodeId",
+    "ownerScopeId",
+    "binding",
+    "observedAt",
+    "expiresAt",
+    "protocol",
+    "platform",
+    "providers",
+    "harnesses",
+    "materializers",
+    "resources",
+    "trustZones",
+    "health",
+    "signature"
+  ],
+  "properties": {
+    "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+    "ownerScopeId": { "$ref": "common.schema.json#/$defs/OwnerScopeId" },
+    "binding": { "$ref": "execution-audience-binding-ref.schema.json" },
+    "observedAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "expiresAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "features"],
+      "properties": {
+        "version": { "$ref": "common.schema.json#/$defs/ProtocolVersion" },
+        "features": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/FeatureName" }
+        }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch"],
+      "properties": {
+        "os": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "arch": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "version": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+      }
+    },
+    "providers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ProviderCapability" }
+    },
+    "harnesses": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/HarnessCapability" }
+    },
+    "materializers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ProductMaterializerCapability" }
+    },
+    "resources": { "$ref": "#/$defs/ResourceCapacity" },
+    "trustZones": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/TrustZone" }
+    },
+    "health": { "enum": ["ready", "degraded", "draining", "offline"] },
+    "signature": { "$ref": "common.schema.json#/$defs/Signature" }
+  },
+  "$defs": {
+    "ProviderCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providerId", "isolation", "materializerForms", "status"],
+      "properties": {
+        "providerId": { "$ref": "common.schema.json#/$defs/Identifier" },
+        "isolation": { "$ref": "isolation-manifest.schema.json" },
+        "materializerForms": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+        },
+        "features": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+        },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "checkpoint": { "type": "boolean" },
+            "retainSupported": { "type": "boolean" },
+            "maxRetainHours": { "type": "number", "minimum": 0 }
+          }
+        },
+        "secretInjection": { "enum": ["none", "env-allowlist"] },
+        "status": { "$ref": "common.schema.json#/$defs/CapabilityStatus" }
+      }
+    },
+    "HarnessCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["driverId", "driverVersion", "commands", "commandDelivery", "status"],
+      "properties": {
+        "driverId": { "$ref": "common.schema.json#/$defs/Identifier" },
+        "driverVersion": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "harnessVersion": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "runnerTier": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "commands": {
+          "type": "array",
+          "items": { "enum": ["send", "answer", "interrupt", "checkpoint"] }
+        },
+        "commandDelivery": { "enum": ["deduplicated", "at-most-once", "indeterminate"] },
+        "resume": { "type": "boolean" },
+        "checkpoint": { "type": "boolean" },
+        "accountResidency": { "enum": ["node-resident", "leased", "none"] },
+        "status": { "$ref": "common.schema.json#/$defs/CapabilityStatus" },
+        "installHint": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+      }
+    },
+    "ProductMaterializerCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["materializerId", "sourceKinds", "placements", "status"],
+      "properties": {
+        "materializerId": { "$ref": "common.schema.json#/$defs/Identifier" },
+        "sourceKinds": {
+          "type": "array",
+          "items": { "enum": ["git"] }
+        },
+        "placements": {
+          "type": "array",
+          "items": { "enum": ["fresh", "inherit", "canonical", "explicit"] }
+        },
+        "status": { "$ref": "common.schema.json#/$defs/CapabilityStatus" }
+      }
+    },
+    "ResourceCapacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpuCores": { "type": "number", "minimum": 0 },
+        "memoryMb": { "type": "number", "minimum": 0 },
+        "diskMb": { "type": "number", "minimum": 0 },
+        "maxConcurrentRuns": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

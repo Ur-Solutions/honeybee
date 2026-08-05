@@ -1,0 +1,14 @@
+{
+  "entity": "collection",
+  "description": "Collection transitions; collection is orthogonal to the terminal Run result.",
+  "allowed": [
+    ["idle", "collecting"],
+    ["collecting", "complete"],
+    ["collecting", "failed"]
+  ],
+  "rejected": [
+    ["idle", "complete"],
+    ["complete", "collecting"],
+    ["failed", "collecting"]
+  ]
+}

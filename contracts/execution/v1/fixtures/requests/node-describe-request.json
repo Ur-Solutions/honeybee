@@ -1,0 +1,11 @@
+{
+  "description": "Golden owner-scoped node.describe request under a LocalAuthority host binding.",
+  "schema": "node-describe-request",
+  "method": "node.describe",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "ownerScopeId": "oscope-local-1",
+    "bindingId": "bind-0001"
+  }
+}

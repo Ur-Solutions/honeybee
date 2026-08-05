@@ -1,0 +1,33 @@
+{
+  "description": "Golden error envelope per typed code (RFC section 18). retryable mirrors the profile.json classification; CURSOR_EXPIRED carries a checkpoint reference.",
+  "schema": "error",
+  "valid": true,
+  "values": [
+    { "code": "PROTOCOL_INCOMPATIBLE", "message": "no compatible protocol major or feature set", "retryable": false },
+    { "code": "SCHEMA_UNSUPPORTED", "message": "required field or action is unknown to this server", "retryable": false },
+    { "code": "BINDING_DENIED", "message": "local-host binding is stale for authority epoch 2", "retryable": false },
+    { "code": "LEASE_DENIED", "message": "execution lease audience does not match this node", "retryable": false },
+    { "code": "IDEMPOTENCY_CONFLICT", "message": "effect key reused with a different request digest", "retryable": false },
+    { "code": "CAPABILITY_MISMATCH", "message": "driver codex cannot satisfy leased command set", "retryable": false },
+    { "code": "SNAPSHOT_UNAVAILABLE", "message": "product snapshot revision cannot be verified from the normalized origin", "retryable": false },
+    { "code": "MATERIALIZATION_FAILED", "message": "fresh working copy allocation failed; canonical checkout untouched", "retryable": false },
+    { "code": "HARNESS_UNAVAILABLE", "message": "harness claude is absent on this node", "retryable": false },
+    { "code": "RUN_VERSION_CONFLICT", "message": "command precondition ifStateVersion 4 is stale (current 6)", "retryable": false },
+    {
+      "code": "CURSOR_EXPIRED",
+      "message": "events before seq 120 were compacted; resume from the checkpoint",
+      "retryable": false,
+      "checkpoint": {
+        "nextSeq": 120,
+        "checkpointDigest": "sha256:e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "artifactId": "art-checkpoint-0001"
+      }
+    },
+    { "code": "NODE_LOST", "message": "coordinator cannot prove runtime liveness for node-mac-1", "retryable": false },
+    { "code": "AUTHORITY_UNAVAILABLE", "message": "authority validation cannot complete; retry after it is reachable", "retryable": true },
+    { "code": "ATTACH_DENIED", "message": "attach lease role viewer does not authorize the requested stream", "retryable": false },
+    { "code": "TARGET_GONE", "message": "target trg-0001 was released and is no longer retained", "retryable": false },
+    { "code": "TARGET_GENERATION_STALE", "message": "attachment names replaced target generation 1 (current 2)", "retryable": false },
+    { "code": "DRIVER_FENCED", "message": "input operation does not hold active driver epoch 3", "retryable": false }
+  ]
+}

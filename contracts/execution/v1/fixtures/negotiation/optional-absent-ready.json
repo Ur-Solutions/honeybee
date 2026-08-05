@@ -1,0 +1,29 @@
+{
+  "description": "Optional-feature absence: credential-lease-v1 is not offered, the client stays ready and only the corresponding capability is unavailable.",
+  "request": {
+    "client": {
+      "product": "apiary",
+      "version": "0.4.0",
+      "protocolRange": "0.1"
+    },
+    "requiredFeatures": [
+      "local-core-v1"
+    ],
+    "optionalFeatures": [
+      "credential-lease-v1"
+    ]
+  },
+  "response": {
+    "server": {
+      "product": "honeybee",
+      "version": "0.0.1",
+      "protocolVersion": "0.1"
+    },
+    "selectedFeatures": [
+      "local-core-v1"
+    ],
+    "missingRequiredFeatures": [],
+    "compatibility": "ready",
+    "schemaDigest": "sha256:3815cc52d8efe0e76ad9e2dbb582506e525d619cf438870fd31b351f8dc80d05"
+  }
+}

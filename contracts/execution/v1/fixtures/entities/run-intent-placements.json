@@ -1,0 +1,56 @@
+{
+  "description": "Golden RunIntent placement variants: a retry with fresh placement, and a compatibility-only explicit node-local working-copy reference (never a portable path).",
+  "schema": "run-intent",
+  "valid": true,
+  "values": [
+    {
+      "jobId": "job-0001",
+      "runId": "run-0002",
+      "retryOfRunId": "run-0001",
+      "attemptOrdinal": 2,
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "target": {
+        "productId": "prod-honeycomb-app",
+        "source": {
+          "kind": "git",
+          "normalizedOrigin": "https://git.example.com/acme/honeycomb-app.git",
+          "revision": "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c"
+        },
+        "digest": "sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+      },
+      "placement": "fresh",
+      "harness": { "driverId": "claude", "model": "claude-sonnet-5" },
+      "requiredCapabilities": [{ "capability": "harness/claude" }],
+      "trustZone": "local-default",
+      "mutationAuthority": [{ "kind": "working-copy-write" }],
+      "budget": { "maxDurationSeconds": 3600 },
+      "evidenceContract": { "collect": ["logs", "diff"], "delivery": "local-manifest" }
+    },
+    {
+      "jobId": "job-0004",
+      "runId": "run-0005",
+      "attemptOrdinal": 1,
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "target": {
+        "productId": "prod-honeycomb-app",
+        "source": {
+          "kind": "git",
+          "normalizedOrigin": "https://git.example.com/acme/honeycomb-app.git",
+          "revision": "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c"
+        },
+        "dirtyPatchArtifactId": "art-patch-0001",
+        "digest": "sha256:2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e"
+      },
+      "placement": { "kind": "explicit", "workingCopyId": "wc-0001", "nodeId": "node-mac-1" },
+      "harness": { "driverId": "codex" },
+      "requiredCapabilities": [{ "capability": "harness/codex" }],
+      "trustZone": "local-default",
+      "mutationAuthority": [{ "kind": "working-copy-write" }],
+      "budget": {},
+      "evidenceContract": { "collect": ["logs"], "delivery": "local-manifest" },
+      "parentRunId": "run-0001"
+    }
+  ]
+}

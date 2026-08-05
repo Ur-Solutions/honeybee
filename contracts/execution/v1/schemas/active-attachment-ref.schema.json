@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/active-attachment-ref.schema.json",
+  "title": "ActiveAttachmentRef",
+  "description": "Name reserved by runtime-target-v1, which this corpus does not activate. The canonical shape (architecture section 9.7: attachmentId, attachLeaseId, target and bounded generation, role, driverEpoch for active drivers) is adopted only when both repositories accept runtime-target-v1 schemas and fixtures. Fail-closed until then: no value validates against this reservation.",
+  "x-reserved": "runtime-target-v1",
+  "not": {}
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/node-describe-request.schema.json",
+  "title": "NodeDescribeRequest",
+  "description": "Read-only, but scoped: one owner scope cannot enumerate another binding's private capabilities. A local authority-host or PairGrant binding is valid; organization enrollment is not a prerequisite for accountless execution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "ownerScopeId"],
+  "properties": {
+    "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion" },
+    "ownerScopeId": { "$ref": "common.schema.json#/$defs/OwnerScopeId" },
+    "bindingId": { "$ref": "common.schema.json#/$defs/ExecutionAudienceBindingId" }
+  }
+}
