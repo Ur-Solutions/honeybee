@@ -62,7 +62,8 @@ function effectIndexPath(effectKey: string): string {
   return join(executionRoot(), "effects", `${sha256hex(effectKey).slice(0, 32)}.json`);
 }
 
-function admissionLockPath(): string {
+/** Shared admission lock: every effect admission decision serializes on it. */
+export function admissionLockPath(): string {
   return join(executionRoot(), ".admission.lock");
 }
 
@@ -103,6 +104,12 @@ export type RunReservation = {
   jobId: string;
   leaseId: string;
   leaseExpiresAt: string;
+  /**
+   * Parent capability lease from the admitting envelope's authority claims.
+   * REQUIRED: every per-run operation must present the same capabilityLeaseId;
+   * a record without one fails closed on read (no pre-H3 fail-open).
+   */
+  capabilityLeaseId: string;
   /** Full RunIntent as admitted (conflict checks + relaunch use it verbatim). */
   intent: JsonObject;
   /** Deterministic HSR bee name this Run is bound to (derived from runId). */
@@ -120,11 +127,32 @@ export type RunReservation = {
   result?: { outcome: "completed" | "failed" | "cancelled"; cause?: string; harnessExitCode?: number; finishedAt: string };
   /** Set when recovery declared the start outcome unknowable. */
   indeterminateAt?: string;
+  /** Durable cancellation intent (run.cancel is desired state, not an RPC race). */
+  cancel?: { requestedAt: string; reason?: string };
+  /** Debug-retention window (run.retain); extends retention only, never authority. */
+  retainUntil?: string;
+  /** Environment lifecycle stamps written by run.release's step ledger. */
+  sealedAt?: string;
+  releasedAt?: string;
   createdAt: string;
   updatedAt: string;
 };
 
-type EffectIndexEntry = { effectKey: string; requestDigest: string; runId: string };
+export type EffectIndexEntry = {
+  effectKey: string;
+  requestDigest: string;
+  runId: string;
+  /** Owning method; absent on H1 records, which are implicitly run.start. */
+  method?: string;
+  /**
+   * Two-phase admission marker. "pending" is written under the admission lock
+   * BEFORE the durable record, "committed" after it. Only a SAME-FACT retry
+   * may repair a pending entry; a committed entry without its record is a
+   * lost record and fails closed. Entries written before this field existed
+   * are treated as committed.
+   */
+  phase?: "pending" | "committed";
+};
 
 /** Deterministic bee name for a Run: retries re-derive the same binding. */
 export function beeNameForRun(runId: string): string {
@@ -132,8 +160,13 @@ export function beeNameForRun(runId: string): string {
 }
 
 /** Deterministic receipt id: a replayed crash-window admission mints identical bytes. */
-function receiptIdFor(effectKey: string, requestDigest: string): string {
+export function receiptIdFor(effectKey: string, requestDigest: string): string {
   return `rcpt-${sha256hex(`${effectKey}\n${requestDigest}`).slice(0, 16)}`;
+}
+
+/** Stable per-effect key for filenames/ids derived from an effect key. */
+export function effectKeyHash(effectKey: string): string {
+  return sha256hex(effectKey).slice(0, 32);
 }
 
 /**
@@ -155,7 +188,13 @@ export async function readReservation(runId: string): Promise<RunReservation | n
   } catch {
     throw executionError("AUTHORITY_UNAVAILABLE", `run reservation for ${runId} is corrupt; refusing to re-admit the effect`);
   }
-  if (parsed.version !== 1 || typeof parsed.effectKey !== "string" || typeof parsed.requestDigest !== "string" || typeof parsed.phase !== "string") {
+  if (
+    parsed.version !== 1 ||
+    typeof parsed.effectKey !== "string" ||
+    typeof parsed.requestDigest !== "string" ||
+    typeof parsed.phase !== "string" ||
+    typeof parsed.capabilityLeaseId !== "string"
+  ) {
     throw executionError("AUTHORITY_UNAVAILABLE", `run reservation for ${runId} has an unknown version or missing fields`);
   }
   if (parsed.runId !== runId) {
@@ -171,7 +210,7 @@ async function writeReservation(reservation: RunReservation): Promise<void> {
 }
 
 /** Absent (ENOENT) -> null; corrupt fails closed like readReservation. */
-async function readEffectIndex(effectKey: string): Promise<EffectIndexEntry | null> {
+export async function readEffectIndex(effectKey: string): Promise<EffectIndexEntry | null> {
   let raw: string;
   try {
     raw = await readFile(effectIndexPath(effectKey), "utf8");
@@ -191,7 +230,7 @@ async function readEffectIndex(effectKey: string): Promise<EffectIndexEntry | nu
   return parsed as unknown as EffectIndexEntry;
 }
 
-async function writeEffectIndex(entry: EffectIndexEntry): Promise<void> {
+export async function writeEffectIndex(entry: EffectIndexEntry): Promise<void> {
   await mkdir(join(executionRoot(), "effects"), { recursive: true, mode: 0o700 });
   await atomicWriteFile(effectIndexPath(entry.effectKey), `${JSON.stringify(entry, null, 2)}\n`, { mode: 0o600 });
 }
@@ -211,6 +250,7 @@ export type AdmissionInput = {
   jobId: string;
   leaseId: string;
   leaseExpiresAt: string;
+  capabilityLeaseId: string;
   intent: JsonObject;
 };
 
@@ -221,15 +261,19 @@ export type AdmissionOutcome = {
 };
 
 /**
- * Durably reserve (runId, effectKey, requestDigest) BEFORE any launch.
+ * Durably reserve (runId, effectKey, requestDigest) BEFORE any launch, with a
+ * TWO-PHASE global effect index:
+ *
+ *   pending index (under lock) -> reservation record -> committed index
  *
  * - identical retry (same effectKey + digest, any transport requestId) replays
  *   the original reservation and receipt;
  * - the same effectKey with a different digest, or the same runId under a
- *   different effect, is IDEMPOTENCY_CONFLICT with no new effect;
- * - a crash between the reservation write and the effect-index write is
- *   repaired here on the next identical retry (the reservation is the record
- *   of truth; the index only accelerates cross-run conflict checks).
+ *   different effect, is IDEMPOTENCY_CONFLICT with no new effect — including
+ *   against a PENDING entry, so a crash between the phases can never let the
+ *   same effect key be admitted for a different run;
+ * - only a same-fact retry may repair a pending entry; a COMMITTED entry
+ *   whose record is missing is a lost record and fails closed.
  */
 export async function admitRunStart(input: AdmissionInput): Promise<AdmissionOutcome> {
   await ensureExecutionRoot();
@@ -249,7 +293,25 @@ export async function admitRunStart(input: AdmissionInput): Promise<AdmissionOut
         { effectKey: input.effectKey, runId: indexed.runId },
       );
     }
+    if (indexed && (indexed.method ?? "run.start") !== "run.start") {
+      throw executionError(
+        "IDEMPOTENCY_CONFLICT",
+        `effect key ${input.effectKey} is bound to method ${indexed.method}`,
+        { effectKey: input.effectKey },
+      );
+    }
     const existing = await readReservation(input.runId);
+    if (indexed && (indexed.phase ?? "committed") === "committed" && !existing) {
+      // A committed index entry without its reservation cannot arise from any
+      // legitimate crash order — only from a lost/deleted reservation.
+      // Re-admitting would launch a second harness under an effect that may
+      // already have run. Fail closed.
+      throw executionError(
+        "AUTHORITY_UNAVAILABLE",
+        `effect ${input.effectKey} is committed in the index but run ${input.runId} has no reservation; refusing to re-admit a possibly launched effect`,
+        { effectKey: input.effectKey, runId: input.runId },
+      );
+    }
     if (existing) {
       if (existing.effectKey !== input.effectKey || existing.requestDigest !== input.requestDigest) {
         throw executionError(
@@ -258,9 +320,25 @@ export async function admitRunStart(input: AdmissionInput): Promise<AdmissionOut
           { runId: input.runId, effectKey: existing.effectKey },
         );
       }
-      if (!indexed) await writeEffectIndex({ effectKey: input.effectKey, requestDigest: input.requestDigest, runId: input.runId });
+      if (!indexed || indexed.phase === "pending") {
+        await writeEffectIndex({
+          effectKey: input.effectKey,
+          requestDigest: input.requestDigest,
+          runId: input.runId,
+          method: "run.start",
+          phase: "committed",
+        });
+      }
       return { reservation: existing, created: false };
     }
+    // Phase 1: pending intent BEFORE the record (same-fact repair only).
+    await writeEffectIndex({
+      effectKey: input.effectKey,
+      requestDigest: input.requestDigest,
+      runId: input.runId,
+      method: "run.start",
+      phase: "pending",
+    });
     const now = new Date().toISOString();
     const reservation: RunReservation = {
       version: 1,
@@ -282,6 +360,7 @@ export async function admitRunStart(input: AdmissionInput): Promise<AdmissionOut
       jobId: input.jobId,
       leaseId: input.leaseId,
       leaseExpiresAt: input.leaseExpiresAt,
+      capabilityLeaseId: input.capabilityLeaseId,
       intent: input.intent,
       beeName: beeNameForRun(input.runId),
       phase: "reserved",
@@ -289,7 +368,14 @@ export async function admitRunStart(input: AdmissionInput): Promise<AdmissionOut
       updatedAt: now,
     };
     await writeReservation(reservation);
-    await writeEffectIndex({ effectKey: input.effectKey, requestDigest: input.requestDigest, runId: input.runId });
+    // Phase 2: commit the index only after the record durably exists.
+    await writeEffectIndex({
+      effectKey: input.effectKey,
+      requestDigest: input.requestDigest,
+      runId: input.runId,
+      method: "run.start",
+      phase: "committed",
+    });
     return { reservation, created: true };
   });
 }
@@ -322,6 +408,18 @@ export type RunEventInput = {
   origin: { nodeId: string; driverId?: string; providerId?: string };
   occurredAt?: string;
 };
+
+/**
+ * Idempotency key for one member of a repeated event family. Type-only dedup
+ * is wrong for families that legitimately repeat (command.*, needs_input.*,
+ * collection.completed): each member is keyed by its identifying payload
+ * field, so replaying one command's lifecycle never suppresses another's.
+ */
+export function eventFamilyKey(type: string, payload: JsonValue): string {
+  const doc = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? (payload as JsonObject) : {};
+  const member = doc.effectKey ?? doc.collectionId ?? doc.inputRequestId ?? "";
+  return `${type}#${typeof member === "string" ? member : JSON.stringify(member)}`;
+}
 
 export type StoredRunEvent = {
   protocolVersion: string;
@@ -408,15 +506,18 @@ export async function readRunEvents(runId: string): Promise<StoredRunEvent[]> {
  * Append control events with the next monotonic seq, under the per-run lock.
  * `onlyIfAbsentTypes` makes state-changing appends idempotent across restart
  * reconciliation: an event type listed there is skipped when it already
- * exists. A torn trailing record from a crashed append is truncated (still
- * under the lock) before new bytes go in, so partial bytes can never be
- * concatenated into a hybrid record.
+ * exists (singleton lifecycle families only). `onlyIfAbsentKeys` is the
+ * per-member form for REPEATED families: an input is skipped only when an
+ * event with the same eventFamilyKey (type + identifying payload member)
+ * already exists — never type-only. A torn trailing record from a crashed
+ * append is truncated (still under the lock) before new bytes go in, so
+ * partial bytes can never be concatenated into a hybrid record.
  */
 export async function appendRunEvents(
   runId: string,
   protocolVersion: string,
   inputs: RunEventInput[],
-  options: { onlyIfAbsentTypes?: boolean } = {},
+  options: { onlyIfAbsentTypes?: boolean; onlyIfAbsentKeys?: boolean } = {},
 ): Promise<StoredRunEvent[]> {
   await mkdir(runDir(runId), { recursive: true, mode: 0o700 });
   return withFileLock(eventsLockPath(runId), async () => {
@@ -426,11 +527,13 @@ export async function appendRunEvents(
       await atomicWriteFile(eventsPath(runId), valid, { mode: 0o600 });
     }
     const present = new Set(log.events.map((event) => event.type));
+    const presentKeys = new Set(log.events.map((event) => eventFamilyKey(event.type, event.payload)));
     let seq = log.events.length > 0 ? log.events[log.events.length - 1]!.seq : 0;
     const appended: StoredRunEvent[] = [];
     let lines = "";
     for (const input of inputs) {
       if (options.onlyIfAbsentTypes && present.has(input.type)) continue;
+      if (options.onlyIfAbsentKeys && presentKeys.has(eventFamilyKey(input.type, input.payload))) continue;
       seq += 1;
       const now = new Date().toISOString();
       const event: StoredRunEvent = {
@@ -445,6 +548,7 @@ export async function appendRunEvents(
         payload: input.payload,
       };
       present.add(event.type);
+      presentKeys.add(eventFamilyKey(event.type, event.payload));
       appended.push(event);
       lines += `${JSON.stringify(event)}\n`;
     }

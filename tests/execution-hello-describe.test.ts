@@ -37,7 +37,7 @@ test("protocol.hello: incompatible protocol range and malformed requests fail cl
   });
 });
 
-test("node.describe: signed, owner-scoped, honest about absent harnesses and empty command set", async () => {
+test("node.describe: signed, owner-scoped, honest about absent harnesses and the delivered command set", async () => {
   await withTempStore(async () => {
     const { binding } = await installTestAuthority();
     const service = makeService();
@@ -51,8 +51,11 @@ test("node.describe: signed, owner-scoped, honest about absent harnesses and emp
     const claude = harnesses.find((entry) => entry.driverId === "claude")!;
     const codex = harnesses.find((entry) => entry.driverId === "codex")!;
     assert.equal(claude.status, "ready");
-    assert.deepEqual(claude.commands, [], "H1 advertises no run.command variants");
-    assert.equal(claude.commandDelivery, "indeterminate");
+    // H3: exactly the effect-keyed commands the control socket delivers;
+    // checkpoint is honestly absent, delivery is at-most-once.
+    assert.deepEqual(claude.commands, ["send", "answer", "interrupt"], "H3 advertises the delivered command set");
+    assert.equal(claude.commandDelivery, "at-most-once");
+    assert.equal(claude.checkpoint, false);
     assert.equal(codex.status, "absent");
     assert.ok(typeof codex.installHint === "string" && codex.installHint.length > 0, "absent harness carries an install hint");
     const materializers = descriptor.materializers as Array<Record<string, unknown>>;

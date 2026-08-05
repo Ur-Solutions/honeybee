@@ -14,6 +14,7 @@ import {
 } from "../src/execution/nodeState.js";
 import { beeNameForRun, runKey, type RunEnvironmentFacts } from "../src/execution/runStore.js";
 import { createExecutionService, storeSessionEvidenceSource, type ExecutionService, type RunLauncher } from "../src/execution/service.js";
+import { HarnessDispatchError, type HarnessControl, type HarnessStopResult } from "../src/execution/harnessControl.js";
 import { generateExecutionKeyPair, signCanonical, type ExecutionKeyPair } from "../src/execution/signing.js";
 import { saveSession } from "../src/store.js";
 
@@ -91,7 +92,10 @@ export function buildRunStartEnvelope(ctx: TestAuthority, overrides: EnvelopeOve
   };
   const capabilities: JsonValue = [{ capability: "harness/claude" }, { capability: "materializer/git-worktree" }];
   const mutationAuthority: JsonValue = [{ kind: "working-copy-write" }];
-  const evidenceContract: JsonValue = { collect: ["logs", "diff"], delivery: "local-manifest" };
+  const evidenceContract: JsonValue = {
+    collect: ["logs", "diff", "environment-manifest", "transcript"],
+    delivery: "local-manifest",
+  };
 
   const intent: JsonObject = {
     jobId,
@@ -214,6 +218,7 @@ export function countingLauncher(behavior: { failWith?: Error; delayMs?: number;
 
 export type ServiceOptions = {
   launcher?: RunLauncher;
+  control?: HarnessControl;
   now?: () => Date;
   launchGraceMs?: number;
 };
@@ -223,10 +228,99 @@ export function makeService(opts: ServiceOptions = {}): ExecutionService {
   return createExecutionService({
     launcher: opts.launcher ?? countingLauncher().launcher,
     sessions: storeSessionEvidenceSource(),
+    control: opts.control ?? fakeControl().control,
     harnessProbe: async (kind) => (kind === "claude" ? { status: "ready" } : { status: "absent" }),
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.launchGraceMs !== undefined ? { launchGraceMs: opts.launchGraceMs } : {}),
   });
 }
 
-export { beeNameForRun };
+/* ---------------------------------------------------------------- */
+/* Operation envelopes (run.command/cancel/collect/retain/release)   */
+/* ---------------------------------------------------------------- */
+
+export type OperationEnvelopeOverrides = {
+  effectKey?: string;
+  requestId?: string;
+  mutateAuthority?: (authority: JsonObject) => void;
+  mutateSigned?: (envelope: JsonObject) => void;
+};
+
+/** Build a fully signed, corpus-shaped per-run effect envelope. */
+export function buildOperationEnvelope(
+  ctx: TestAuthority,
+  effectKey: string,
+  body: JsonObject,
+  overrides: OperationEnvelopeOverrides = {},
+): JsonObject {
+  const authority: JsonObject = {
+    actor: { initiator: { kind: "user", id: "user-ada", displayName: "Ada" } },
+    ownerScopeId: OWNER_SCOPE,
+    workspaceId: WORKSPACE,
+    capabilityLeaseId: "cap-lease-0001",
+    authorityEpoch: 1,
+    policyEpoch: 1,
+  };
+  overrides.mutateAuthority?.(authority);
+  const envelope: JsonObject = {
+    protocolVersion: "0.1",
+    requestId: overrides.requestId ?? `req-${overrides.effectKey ?? effectKey}`.slice(0, 60),
+    effectKey: overrides.effectKey ?? effectKey,
+    traceId: "trace-op-0001",
+    issuedAt: ISSUED_AT,
+    requestDigest: canonicalDigest(body as JsonValue),
+    authority,
+    body,
+  };
+  envelope.signature = signCanonical(ctx.authority.privateKey, envelope);
+  overrides.mutateSigned?.(envelope);
+  return envelope;
+}
+
+/* ---------------------------------------------------------------- */
+/* Fake harness control                                              */
+/* ---------------------------------------------------------------- */
+
+export type FakeControlBehavior = {
+  /** Thrown by send/answer/interrupt when set. */
+  dispatchError?: Error;
+  /** send/answer/interrupt never resolve (simulates an in-flight window). */
+  hang?: boolean;
+  /** Open needs-input request id answered by pendingInputId. */
+  pendingInput?: string | null;
+  stopResult?: HarnessStopResult;
+};
+
+export type FakeControl = {
+  control: HarnessControl;
+  calls: Array<{ method: string; beeName: string; args: unknown[] }>;
+  behavior: FakeControlBehavior;
+};
+
+export function fakeControl(behavior: FakeControlBehavior = {}): FakeControl {
+  const calls: FakeControl["calls"] = [];
+  const dispatch = async (method: string, beeName: string, ...args: unknown[]): Promise<void> => {
+    calls.push({ method, beeName, args });
+    if (behavior.hang) await new Promise(() => undefined);
+    if (behavior.dispatchError) throw behavior.dispatchError;
+  };
+  return {
+    calls,
+    behavior,
+    control: {
+      send: (beeName, text, deliveryId) => dispatch("send", beeName, text, deliveryId),
+      answer: (beeName, inputRequestId, answer) => dispatch("answer", beeName, inputRequestId, answer),
+      interrupt: (beeName, reason) => dispatch("interrupt", beeName, reason),
+      async pendingInputId(beeName) {
+        calls.push({ method: "pendingInputId", beeName, args: [] });
+        return behavior.pendingInput ?? null;
+      },
+      async stop(beeName) {
+        calls.push({ method: "stop", beeName, args: [] });
+        return behavior.stopResult ?? { stopped: true, detail: "clean stop confirmed" };
+      },
+    },
+  };
+}
+
+export { beeNameForRun, HarnessDispatchError };

@@ -68,6 +68,7 @@ async function stageReservation(ctx: TestAuthority, envelope: JsonObject) {
     jobId: String(validated.intent.jobId),
     leaseId: String(validated.lease.leaseId),
     leaseExpiresAt: String(validated.lease.expiresAt),
+    capabilityLeaseId: String(validated.authority.capabilityLeaseId),
     intent: validated.intent,
   });
   return reservation;
