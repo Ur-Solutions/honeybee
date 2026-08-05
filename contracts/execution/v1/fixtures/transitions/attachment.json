@@ -1,0 +1,16 @@
+{
+  "entity": "attachment",
+  "description": "Attachment transitions (runtime-target-v1, reserved and not activated by this corpus). active carries the viewer|driver role dimension.",
+  "allowed": [
+    ["requested", "active"],
+    ["active", "expired"],
+    ["active", "revoked"],
+    ["active", "detached"],
+    ["active", "fenced"]
+  ],
+  "rejected": [
+    ["requested", "fenced"],
+    ["fenced", "active"],
+    ["detached", "active"]
+  ]
+}

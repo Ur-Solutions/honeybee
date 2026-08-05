@@ -1,0 +1,22 @@
+{
+  "description": "Golden idempotent replay: a new transport requestId carrying the same effect key and digest returns the original receipt with outcome replayed.",
+  "schema": "execution-response-envelope",
+  "method": "run.start",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0009",
+    "receipt": {
+      "receiptId": "rcpt-0001",
+      "effectKey": "job-0001/run-0001/start",
+      "requestDigest": "sha256:b2aa9fd9adf0a707794699c60095aa77cc46d3079054c1532fe4728484c2e588",
+      "outcome": "replayed",
+      "resultVersion": 1,
+      "recordedAt": "2026-08-05T10:00:01Z"
+    },
+    "result": {
+      "runId": "run-0001",
+      "state": "accepted"
+    }
+  }
+}

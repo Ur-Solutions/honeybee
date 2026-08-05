@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-start-body.schema.json",
+  "title": "RunStartBody",
+  "description": "Body of run.start inside the common request envelope. The envelope's authority.capabilityLeaseId must equal lease.parentCapabilityLeaseId; actor, owner-scope, workspace, epoch, and audience claims must match exactly or the request fails before reservation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["intent", "lease"],
+  "properties": {
+    "intent": { "$ref": "run-intent.schema.json" },
+    "lease": { "$ref": "execution-lease.schema.json" }
+  }
+}

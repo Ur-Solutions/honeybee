@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-command-body.schema.json",
+  "title": "RunCommandBody",
+  "description": "Body of run.command. ifStateVersion is the optional preconditioned Run version; a stale precondition fails with RUN_VERSION_CONFLICT.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId", "command"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "command": { "$ref": "run-command.schema.json" },
+    "ifStateVersion": { "$ref": "common.schema.json#/$defs/Seq" }
+  }
+}

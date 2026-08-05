@@ -1,0 +1,234 @@
+{
+  "description": "Golden loss/recovery and cancellation replay: node loss and recovery, an indeterminate command in a non-deduplicating crash window, a failed command, durable cancel, late evidence recorded as artifacts, seal and release.",
+  "schema": "run-events-page",
+  "method": "run.events",
+  "valid": true,
+  "value": {
+    "runId": "run-0003",
+    "afterSeq": 0,
+    "nextAfterSeq": 20,
+    "retention": { "oldestReplayableSeq": 1 },
+    "events": [
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 1,
+        "eventId": "evt-run-0003-1",
+        "type": "run.accepted",
+        "occurredAt": "2026-08-05T13:00:01Z",
+        "ingestedAt": "2026-08-05T13:00:01Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "effectKey": "job-0002/run-0003/start", "receiptId": "rcpt-0031" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 2,
+        "eventId": "evt-run-0003-2",
+        "type": "environment.materializing",
+        "occurredAt": "2026-08-05T13:00:02Z",
+        "ingestedAt": "2026-08-05T13:00:02Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0003" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 3,
+        "eventId": "evt-run-0003-3",
+        "type": "environment.ready",
+        "occurredAt": "2026-08-05T13:00:06Z",
+        "ingestedAt": "2026-08-05T13:00:06Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0003" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 4,
+        "eventId": "evt-run-0003-4",
+        "type": "harness.starting",
+        "occurredAt": "2026-08-05T13:00:07Z",
+        "ingestedAt": "2026-08-05T13:00:07Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "codex" },
+        "payload": { "operationId": "run-0003" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 5,
+        "eventId": "evt-run-0003-5",
+        "type": "harness.running",
+        "occurredAt": "2026-08-05T13:00:12Z",
+        "ingestedAt": "2026-08-05T13:00:12Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "codex" },
+        "payload": { "sessionRef": "hsr-0003" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 6,
+        "eventId": "evt-run-0003-6",
+        "type": "run.lost",
+        "occurredAt": "2026-08-05T13:10:00Z",
+        "ingestedAt": "2026-08-05T13:10:00Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "cause": "coordinator cannot prove runtime liveness" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 7,
+        "eventId": "evt-run-0003-7",
+        "type": "run.recovering",
+        "occurredAt": "2026-08-05T13:11:00Z",
+        "ingestedAt": "2026-08-05T13:11:00Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "verified": ["run-identity", "process-start-identity", "environment-ownership", "lease-state"] }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 8,
+        "eventId": "evt-run-0003-8",
+        "type": "harness.running",
+        "occurredAt": "2026-08-05T13:11:05Z",
+        "ingestedAt": "2026-08-05T13:11:05Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "codex" },
+        "payload": { "sessionRef": "hsr-0003", "recovered": true }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 9,
+        "eventId": "evt-run-0003-9",
+        "type": "command.accepted",
+        "occurredAt": "2026-08-05T13:12:00Z",
+        "ingestedAt": "2026-08-05T13:12:00Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "effectKey": "run-0003/command/send-0001", "kind": "send" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 10,
+        "eventId": "evt-run-0003-10",
+        "type": "command.dispatching",
+        "occurredAt": "2026-08-05T13:12:01Z",
+        "ingestedAt": "2026-08-05T13:12:01Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "codex" },
+        "payload": { "effectKey": "run-0003/command/send-0001" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 11,
+        "eventId": "evt-run-0003-11",
+        "type": "command.indeterminate",
+        "occurredAt": "2026-08-05T13:12:30Z",
+        "ingestedAt": "2026-08-05T13:12:30Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "codex" },
+        "payload": { "effectKey": "run-0003/command/send-0001", "cause": "crash during a non-deduplicating delivery window; not redelivered" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 12,
+        "eventId": "evt-run-0003-12",
+        "type": "command.accepted",
+        "occurredAt": "2026-08-05T13:13:00Z",
+        "ingestedAt": "2026-08-05T13:13:00Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "effectKey": "run-0003/command/send-0002", "kind": "send" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 13,
+        "eventId": "evt-run-0003-13",
+        "type": "command.dispatching",
+        "occurredAt": "2026-08-05T13:13:01Z",
+        "ingestedAt": "2026-08-05T13:13:01Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "codex" },
+        "payload": { "effectKey": "run-0003/command/send-0002" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 14,
+        "eventId": "evt-run-0003-14",
+        "type": "command.failed",
+        "occurredAt": "2026-08-05T13:13:02Z",
+        "ingestedAt": "2026-08-05T13:13:02Z",
+        "origin": { "nodeId": "node-mac-1", "driverId": "codex" },
+        "payload": { "effectKey": "run-0003/command/send-0002", "cause": "harness rejected structured input" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 15,
+        "eventId": "evt-run-0003-15",
+        "type": "cancel.requested",
+        "occurredAt": "2026-08-05T13:14:00Z",
+        "ingestedAt": "2026-08-05T13:14:00Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "effectKey": "run-0003/cancel", "reason": "operator cancel" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 16,
+        "eventId": "evt-run-0003-16",
+        "type": "artifact.staged",
+        "occurredAt": "2026-08-05T13:14:10Z",
+        "ingestedAt": "2026-08-05T13:14:10Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "kind": "log", "digest": "sha256:d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 17,
+        "eventId": "evt-run-0003-17",
+        "type": "artifact.finalized",
+        "occurredAt": "2026-08-05T13:14:11Z",
+        "ingestedAt": "2026-08-05T13:14:11Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "kind": "log", "digest": "sha256:d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 18,
+        "eventId": "evt-run-0003-18",
+        "type": "run.cancelled",
+        "occurredAt": "2026-08-05T13:14:20Z",
+        "ingestedAt": "2026-08-05T13:14:20Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "lateOutputRecorded": true }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 19,
+        "eventId": "evt-run-0003-19",
+        "type": "environment.sealed",
+        "occurredAt": "2026-08-05T13:14:30Z",
+        "ingestedAt": "2026-08-05T13:14:30Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0003" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0003",
+        "seq": 20,
+        "eventId": "evt-run-0003-20",
+        "type": "environment.released",
+        "occurredAt": "2026-08-05T13:20:00Z",
+        "ingestedAt": "2026-08-05T13:20:00Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0003" }
+      }
+    ]
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/collection-manifest.schema.json",
+  "title": "CollectionManifest",
+  "description": "Digest-addressed local collection manifest (local-core-v1). Entry refs are authorized node-local references, opaque outside the owning node; immutable artifact IDs and staged/finalized upload state require evidence-upload-v1. A screenshot or model report alone is not proof of a successful run.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId", "collectionId", "state", "entries", "createdAt"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "collectionId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "state": { "enum": ["collecting", "complete", "failed"] },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "digest", "sizeBytes", "ref"],
+        "properties": {
+          "kind": {
+            "enum": [
+              "command-log",
+              "test-report",
+              "diff",
+              "log",
+              "environment-manifest",
+              "media",
+              "transcript"
+            ]
+          },
+          "digest": { "$ref": "common.schema.json#/$defs/Sha256Digest" },
+          "sizeBytes": { "type": "integer", "minimum": 0 },
+          "mediaType": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+          "ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "nodeId", "token"],
+            "properties": {
+              "kind": { "const": "node-local" },
+              "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+              "token": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+            }
+          }
+        }
+      }
+    },
+    "createdAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "completedAt": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}

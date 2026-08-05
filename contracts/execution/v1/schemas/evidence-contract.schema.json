@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/evidence-contract.schema.json",
+  "title": "EvidenceContract",
+  "description": "Typed results requested from a Run. local-core-v1 delivery is a digest-addressed local collection manifest; artifact upload requires evidence-upload-v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["collect", "delivery"],
+  "properties": {
+    "collect": {
+      "type": "array",
+      "items": {
+        "enum": ["commands", "tests", "diff", "logs", "environment-manifest", "media", "transcript"]
+      }
+    },
+    "delivery": { "enum": ["local-manifest"] }
+  }
+}

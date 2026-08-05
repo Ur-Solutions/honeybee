@@ -1,0 +1,34 @@
+{
+  "description": "Golden run.retain: extends debug retention only, never execution or credential authority.",
+  "schema": "execution-request-envelope",
+  "bodySchema": "run-retain-body",
+  "method": "run.retain",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0007",
+    "effectKey": "run-0001/retain-0001",
+    "traceId": "trace-0007",
+    "issuedAt": "2026-08-05T11:10:00Z",
+    "requestDigest": "sha256:faafd439aceb14b43dd1a99c369f2d979317afff9a30779b31e1f6fdf46d8cab",
+    "authority": {
+      "actor": {
+        "initiator": {
+          "kind": "user",
+          "id": "user-ada",
+          "displayName": "Ada"
+        }
+      },
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "capabilityLeaseId": "cap-lease-0001",
+      "authorityEpoch": 1,
+      "policyEpoch": 1
+    },
+    "body": {
+      "runId": "run-0001",
+      "retainUntil": "2026-08-07T11:10:00Z"
+    },
+    "signature": "ed25519:cmV0YWluLXNpZ25hdHVyZQ=="
+  }
+}

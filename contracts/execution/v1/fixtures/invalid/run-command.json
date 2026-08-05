@@ -1,0 +1,9 @@
+{
+  "description": "Must fail: unknown command kind (unsupported actions fail explicitly); send without text.",
+  "schema": "run-command",
+  "valid": false,
+  "values": [
+    { "kind": "steer", "text": "turn left" },
+    { "kind": "send" }
+  ]
+}

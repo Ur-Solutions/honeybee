@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/harness-request.schema.json",
+  "title": "HarnessRequest",
+  "description": "Capability-addressed harness selection. Apiary never branches on harness internals; config is driver-normalized opaque launch configuration and must not contain paths, credentials, or ambient environment.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["driverId"],
+  "properties": {
+    "driverId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "versionRange": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+    "model": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+    "config": { "$ref": "common.schema.json#/$defs/JsonValue" }
+  }
+}

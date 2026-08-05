@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-environment-ref.schema.json",
+  "title": "RunEnvironmentRef",
+  "description": "Provider-neutral reference to the one isolated Run Environment of a Run. environmentId and any provider locator are opaque outside the owning node.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId", "nodeId", "providerId", "environmentId", "isolation"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+    "providerId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "environmentId": { "$ref": "common.schema.json#/$defs/EnvironmentId" },
+    "isolation": { "$ref": "isolation-manifest.schema.json" },
+    "workingCopy": { "$ref": "working-copy-ref.schema.json" },
+    "retainedUntil": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}

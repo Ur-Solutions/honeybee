@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/product-snapshot-ref.schema.json",
+  "title": "ProductSnapshotRef",
+  "description": "Path-free, immutable product snapshot identity. normalizedOrigin is a normalized remote origin, never a machine path. Dirty client state arrives as a digest-verified patch artifact.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["productId", "source", "digest"],
+  "properties": {
+    "productId": { "$ref": "common.schema.json#/$defs/ProductId" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "normalizedOrigin", "revision"],
+      "properties": {
+        "kind": { "const": "git" },
+        "normalizedOrigin": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" }
+      }
+    },
+    "dirtyPatchArtifactId": { "$ref": "common.schema.json#/$defs/ArtifactId" },
+    "submodules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["origin", "revision"],
+        "properties": {
+          "origin": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+          "revision": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" }
+        }
+      }
+    },
+    "digest": { "$ref": "common.schema.json#/$defs/Sha256Digest" }
+  }
+}

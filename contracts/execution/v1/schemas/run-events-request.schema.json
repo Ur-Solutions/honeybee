@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-events-request.schema.json",
+  "title": "RunEventsRequest",
+  "description": "Fetch or subscribe from an exclusive afterSeq cursor. Historical fetch and live tail use the same event representation. Expired history returns CURSOR_EXPIRED with a checkpoint reference when available.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "runId", "afterSeq"],
+  "properties": {
+    "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion" },
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "afterSeq": { "$ref": "common.schema.json#/$defs/Seq" },
+    "limit": { "type": "integer", "minimum": 1 },
+    "tail": { "type": "boolean" }
+  }
+}

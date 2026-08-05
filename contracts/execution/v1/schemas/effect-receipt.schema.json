@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/effect-receipt.schema.json",
+  "title": "EffectReceipt",
+  "description": "Durable record of one accepted logical effect. A new request ID carrying the same effect key and digest returns the previously recorded receipt with outcome replayed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["receiptId", "effectKey", "requestDigest", "outcome", "resultVersion", "recordedAt"],
+  "properties": {
+    "receiptId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "effectKey": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "requestDigest": { "$ref": "common.schema.json#/$defs/Sha256Digest" },
+    "outcome": { "enum": ["created", "replayed"] },
+    "resultVersion": { "type": "integer", "minimum": 1 },
+    "recordedAt": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "description": "Golden run.command answer resolving an open input request.",
+  "schema": "execution-request-envelope",
+  "bodySchema": "run-command-body",
+  "method": "run.command",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0003",
+    "effectKey": "run-0001/command/answer-0001",
+    "traceId": "trace-0003",
+    "issuedAt": "2026-08-05T10:25:00Z",
+    "requestDigest": "sha256:a372ce55d88c12913f195f3ed44f075686f6cf3cc0bb0bb6c19c1ccaf633a40a",
+    "authority": {
+      "actor": {
+        "initiator": {
+          "kind": "user",
+          "id": "user-ada",
+          "displayName": "Ada"
+        }
+      },
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "capabilityLeaseId": "cap-lease-0001",
+      "authorityEpoch": 1,
+      "policyEpoch": 1
+    },
+    "body": {
+      "runId": "run-0001",
+      "command": {
+        "kind": "answer",
+        "inputRequestId": "inp-0001",
+        "answer": {
+          "approved": true
+        }
+      }
+    },
+    "signature": "ed25519:YW5zd2VyLXNpZ25hdHVyZS1maXh0dXJl"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/execution-audience-binding-ref.schema.json",
+  "title": "ExecutionAudienceBindingRef",
+  "description": "The applicable authority binding for one node. The active authority separately signs and validates the binding reference and epochs; a node cannot self-assert one. Tailnet membership, SSH reachability, localhost, and Unix-socket possession are transport facts, not authorization.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "bindingId", "authorityId", "keyFingerprint", "authorityEpoch"],
+      "properties": {
+        "kind": { "const": "local-authority-host" },
+        "bindingId": { "$ref": "common.schema.json#/$defs/ExecutionAudienceBindingId" },
+        "authorityId": { "$ref": "common.schema.json#/$defs/LocalAuthorityId" },
+        "keyFingerprint": { "$ref": "common.schema.json#/$defs/Sha256Digest" },
+        "authorityEpoch": { "$ref": "common.schema.json#/$defs/Epoch" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "bindingId", "pairGrantId", "keyFingerprint", "grantEpoch"],
+      "properties": {
+        "kind": { "const": "pair-grant" },
+        "bindingId": { "$ref": "common.schema.json#/$defs/ExecutionAudienceBindingId" },
+        "pairGrantId": { "$ref": "common.schema.json#/$defs/PairGrantId" },
+        "keyFingerprint": { "$ref": "common.schema.json#/$defs/Sha256Digest" },
+        "grantEpoch": { "$ref": "common.schema.json#/$defs/Epoch" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "bindingId", "enrollmentId", "keyFingerprint", "enrollmentEpoch"],
+      "properties": {
+        "kind": { "const": "node-enrollment" },
+        "bindingId": { "$ref": "common.schema.json#/$defs/ExecutionAudienceBindingId" },
+        "enrollmentId": { "$ref": "common.schema.json#/$defs/NodeEnrollmentId" },
+        "keyFingerprint": { "$ref": "common.schema.json#/$defs/Sha256Digest" },
+        "enrollmentEpoch": { "$ref": "common.schema.json#/$defs/Epoch" }
+      }
+    }
+  ]
+}

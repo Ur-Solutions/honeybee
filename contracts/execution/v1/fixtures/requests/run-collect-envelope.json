@@ -1,0 +1,33 @@
+{
+  "description": "Golden run.collect requesting the evidence contract's outputs.",
+  "schema": "execution-request-envelope",
+  "bodySchema": "run-collect-body",
+  "method": "run.collect",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0006",
+    "effectKey": "run-0001/collect",
+    "traceId": "trace-0006",
+    "issuedAt": "2026-08-05T11:00:00Z",
+    "requestDigest": "sha256:f742a2447669c9a43369a2928e7e17e1b14bde52afd30e5fab8e3d79c7c2c559",
+    "authority": {
+      "actor": {
+        "initiator": {
+          "kind": "user",
+          "id": "user-ada",
+          "displayName": "Ada"
+        }
+      },
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "capabilityLeaseId": "cap-lease-0001",
+      "authorityEpoch": 1,
+      "policyEpoch": 1
+    },
+    "body": {
+      "runId": "run-0001"
+    },
+    "signature": "ed25519:Y29sbGVjdC1zaWduYXR1cmU="
+  }
+}

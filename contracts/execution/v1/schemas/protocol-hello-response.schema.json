@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/protocol-hello-response.schema.json",
+  "title": "ProtocolHelloResponse",
+  "description": "The server must refuse all mutation methods when compatibility is incompatible. Optional-feature absence may degrade only the corresponding UI; it cannot alter the semantics of a required field.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["server", "selectedFeatures", "missingRequiredFeatures", "compatibility", "schemaDigest"],
+  "properties": {
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["product", "version", "protocolVersion"],
+      "properties": {
+        "product": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "version": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion" }
+      }
+    },
+    "selectedFeatures": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/FeatureName" }
+    },
+    "missingRequiredFeatures": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/FeatureName" }
+    },
+    "compatibility": { "enum": ["ready", "incompatible", "degraded"] },
+    "schemaDigest": { "$ref": "common.schema.json#/$defs/Sha256Digest" }
+  }
+}

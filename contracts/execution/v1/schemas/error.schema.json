@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/error.schema.json",
+  "title": "ExecutionError",
+  "description": "Typed protocol error. Unknown required fields, actions, schema versions, epochs, or capabilities fail closed before side effects. checkpoint accompanies CURSOR_EXPIRED when a compacted history has a checkpoint/artifact reference.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "message", "retryable"],
+  "properties": {
+    "code": {
+      "enum": [
+        "PROTOCOL_INCOMPATIBLE",
+        "SCHEMA_UNSUPPORTED",
+        "BINDING_DENIED",
+        "LEASE_DENIED",
+        "IDEMPOTENCY_CONFLICT",
+        "CAPABILITY_MISMATCH",
+        "SNAPSHOT_UNAVAILABLE",
+        "MATERIALIZATION_FAILED",
+        "HARNESS_UNAVAILABLE",
+        "RUN_VERSION_CONFLICT",
+        "CURSOR_EXPIRED",
+        "NODE_LOST",
+        "AUTHORITY_UNAVAILABLE",
+        "ATTACH_DENIED",
+        "TARGET_GONE",
+        "TARGET_GENERATION_STALE",
+        "DRIVER_FENCED"
+      ]
+    },
+    "message": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+    "retryable": { "type": "boolean" },
+    "details": { "$ref": "common.schema.json#/$defs/JsonValue" },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nextSeq"],
+      "properties": {
+        "nextSeq": { "$ref": "common.schema.json#/$defs/Seq" },
+        "checkpointDigest": { "$ref": "common.schema.json#/$defs/Sha256Digest" },
+        "artifactId": { "$ref": "common.schema.json#/$defs/ArtifactId" }
+      }
+    }
+  }
+}

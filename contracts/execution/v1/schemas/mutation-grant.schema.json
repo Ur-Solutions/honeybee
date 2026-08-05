@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/mutation-grant.schema.json",
+  "title": "MutationGrant",
+  "description": "Explicit mutation authority for a Run. Honeybee does not infer permission from a runnable CLI; anything not granted is denied.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind"],
+  "properties": {
+    "kind": {
+      "enum": ["working-copy-write", "branch-push", "external-integration"]
+    },
+    "resource": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "actions": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "description": "Golden retained RunEnvironmentRef: opaque environment identity, effective isolation with declared deviations, and a working copy facet.",
+  "schema": "run-environment-ref",
+  "valid": true,
+  "value": {
+    "runId": "run-0001",
+    "nodeId": "node-mac-1",
+    "providerId": "native-host",
+    "environmentId": "env-0001",
+    "isolation": {
+      "filesystem": "dedicated",
+      "processes": "shared",
+      "network": "shared",
+      "browserProfile": "none",
+      "deviations": ["native host: process and network isolation are advisory"]
+    },
+    "workingCopy": {
+      "workingCopyId": "wc-0001",
+      "nodeId": "node-mac-1",
+      "providerId": "native-host",
+      "productId": "prod-honeycomb-app",
+      "origin": "https://git.example.com/acme/honeycomb-app.git",
+      "revision": "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c",
+      "branch": "agent/run-0001",
+      "occupancy": { "claimedByRunId": "run-0001", "claimedAt": "2026-08-05T10:00:05Z" },
+      "locator": { "kind": "node-private", "token": "wc-locator-0001" }
+    },
+    "retainedUntil": "2026-08-07T11:10:00Z"
+  }
+}

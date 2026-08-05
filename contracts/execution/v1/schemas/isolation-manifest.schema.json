@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/isolation-manifest.schema.json",
+  "title": "IsolationManifest",
+  "description": "Effective (or declared) isolation per dimension. The provider reports deviations before the harness starts; a required guarantee cannot degrade silently. Native providers may honestly advertise weaker isolation while uniquely supplying other capability.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["filesystem", "processes", "network", "browserProfile"],
+  "properties": {
+    "filesystem": { "enum": ["dedicated", "namespaced", "shared", "none"] },
+    "processes": { "enum": ["dedicated", "namespaced", "shared", "none"] },
+    "network": { "enum": ["dedicated", "namespaced", "shared", "none"] },
+    "browserProfile": { "enum": ["dedicated", "namespaced", "shared", "none"] },
+    "deviations": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+    }
+  }
+}

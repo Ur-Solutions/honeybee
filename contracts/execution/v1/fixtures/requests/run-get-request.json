@@ -1,0 +1,10 @@
+{
+  "description": "Golden run.get request.",
+  "schema": "run-get-request",
+  "method": "run.get",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "runId": "run-0001"
+  }
+}

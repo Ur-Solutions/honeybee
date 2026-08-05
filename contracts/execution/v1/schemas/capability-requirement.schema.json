@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/capability-requirement.schema.json",
+  "title": "CapabilityRequirement",
+  "description": "One required node/provider/driver capability. Unknown required capabilities fail closed with CAPABILITY_MISMATCH before side effects.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["capability"],
+  "properties": {
+    "capability": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "minVersion": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+    "params": { "$ref": "common.schema.json#/$defs/JsonValue" }
+  }
+}

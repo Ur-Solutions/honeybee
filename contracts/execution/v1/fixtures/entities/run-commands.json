@@ -1,0 +1,12 @@
+{
+  "description": "Golden RunCommand variants. checkpoint is advertised per driver; refresh-credential is schema-valid here but usable only under the negotiated credential-lease-v1 profile.",
+  "schema": "run-command",
+  "valid": true,
+  "values": [
+    { "kind": "send", "text": "Run the full test suite and summarize failures." },
+    { "kind": "answer", "inputRequestId": "inp-0001", "answer": { "approved": true } },
+    { "kind": "interrupt", "reason": "operator steering" },
+    { "kind": "checkpoint" },
+    { "kind": "refresh-credential", "credentialLeaseId": "cred-lease-0001" }
+  ]
+}

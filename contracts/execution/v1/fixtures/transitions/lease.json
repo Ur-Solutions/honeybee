@@ -1,0 +1,17 @@
+{
+  "entity": "lease",
+  "description": "Lease transitions per the RFC: offered -> accepted -> active -> expired | revoked | released.",
+  "allowed": [
+    ["offered", "accepted"],
+    ["accepted", "active"],
+    ["active", "expired"],
+    ["active", "revoked"],
+    ["active", "released"]
+  ],
+  "rejected": [
+    ["offered", "active"],
+    ["accepted", "released"],
+    ["expired", "active"],
+    ["released", "accepted"]
+  ]
+}

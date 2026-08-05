@@ -1,0 +1,152 @@
+{
+  "description": "Cross-product state machines from the execution RFC section 11. Transitions are the exhaustive allowed set; anything absent is rejected. Every transition record must carry run, sequence, origin, timestamp, authority epoch, previous state, and cause.",
+  "entities": {
+    "run": {
+      "profile": "local-core-v1",
+      "initial": "allocating",
+      "states": [
+        "allocating",
+        "offered",
+        "accepted",
+        "materializing",
+        "starting",
+        "running",
+        "lost",
+        "recovering",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "terminal": ["completed", "failed", "cancelled"],
+      "transitions": [
+        ["allocating", "offered"],
+        ["offered", "accepted"],
+        ["accepted", "materializing"],
+        ["materializing", "starting"],
+        ["starting", "running"],
+        ["running", "completed"],
+        ["running", "failed"],
+        ["running", "cancelled"],
+        ["materializing", "failed"],
+        ["starting", "failed"],
+        ["accepted", "lost"],
+        ["materializing", "lost"],
+        ["starting", "lost"],
+        ["running", "lost"],
+        ["lost", "recovering"],
+        ["lost", "cancelled"],
+        ["recovering", "running"],
+        ["recovering", "failed"],
+        ["recovering", "cancelled"],
+        ["accepted", "cancelled"],
+        ["materializing", "cancelled"],
+        ["starting", "cancelled"]
+      ],
+      "notes": [
+        "Apiary controls allocating -> offered; Honeybee controls the Run from lease acceptance onward.",
+        "Cancellation may enter any nonterminal state after accepted.",
+        "lost -> recovering -> running is the only non-monotonic path.",
+        "A retry is a new runId linked by retryOfRunId, never a state transition of the old Run."
+      ]
+    },
+    "lease": {
+      "profile": "local-core-v1",
+      "initial": "offered",
+      "states": ["offered", "accepted", "active", "expired", "revoked", "released"],
+      "terminal": ["expired", "revoked", "released"],
+      "transitions": [
+        ["offered", "accepted"],
+        ["accepted", "active"],
+        ["active", "expired"],
+        ["active", "revoked"],
+        ["active", "released"]
+      ],
+      "notes": [
+        "An expired lease may permit evidence collection and cleanup, never new external mutation."
+      ]
+    },
+    "command": {
+      "profile": "local-core-v1",
+      "initial": "accepted",
+      "states": ["accepted", "dispatching", "completed", "failed", "indeterminate"],
+      "terminal": ["completed", "failed", "indeterminate"],
+      "transitions": [
+        ["accepted", "dispatching"],
+        ["dispatching", "completed"],
+        ["dispatching", "failed"],
+        ["dispatching", "indeterminate"]
+      ],
+      "notes": [
+        "The coordinator durably records dispatching before calling a non-deduplicating driver and never blindly redelivers after a crash."
+      ]
+    },
+    "collection": {
+      "profile": "local-core-v1",
+      "initial": "idle",
+      "states": ["idle", "collecting", "complete", "failed"],
+      "terminal": ["complete", "failed"],
+      "transitions": [
+        ["idle", "collecting"],
+        ["collecting", "complete"],
+        ["collecting", "failed"]
+      ],
+      "notes": [
+        "Collection is orthogonal to the terminal Run result and may continue after completion, failure, or cancellation."
+      ]
+    },
+    "environment": {
+      "profile": "local-core-v1",
+      "initial": "absent",
+      "states": ["absent", "preparing", "ready", "sealed", "retained", "releasing", "released"],
+      "terminal": ["released"],
+      "transitions": [
+        ["absent", "preparing"],
+        ["preparing", "ready"],
+        ["ready", "sealed"],
+        ["sealed", "retained"],
+        ["sealed", "releasing"],
+        ["retained", "releasing"],
+        ["releasing", "released"]
+      ],
+      "notes": [
+        "Release is desired state backed by a durable step ledger; retries continue unfinished cleanup steps.",
+        "A retained environment has no valid credential or external-mutation authority after lease expiry.",
+        "Open RFC question: cleanup after a failed preparation is release-ledger internal; preparing -> releasing is deliberately not modelled in 0.x."
+      ]
+    },
+    "target": {
+      "profile": "runtime-target-v1",
+      "initial": "absent",
+      "states": ["absent", "provisioning", "live", "sealed", "released", "failed"],
+      "terminal": ["released"],
+      "transitions": [
+        ["absent", "provisioning"],
+        ["provisioning", "live"],
+        ["live", "sealed"],
+        ["sealed", "released"],
+        ["provisioning", "failed"],
+        ["live", "failed"],
+        ["sealed", "failed"],
+        ["failed", "released"]
+      ],
+      "notes": ["Reserved with runtime-target-v1 schema names; the profile is not activated by this corpus."]
+    },
+    "attachment": {
+      "profile": "runtime-target-v1",
+      "initial": "requested",
+      "states": ["requested", "active", "expired", "revoked", "detached", "fenced"],
+      "terminal": ["expired", "revoked", "detached", "fenced"],
+      "transitions": [
+        ["requested", "active"],
+        ["active", "expired"],
+        ["active", "revoked"],
+        ["active", "detached"],
+        ["active", "fenced"]
+      ],
+      "notes": [
+        "active carries a role dimension (viewer | driver); fencing applies to driver attachments.",
+        "Reserved with runtime-target-v1 schema names; the profile is not activated by this corpus."
+      ]
+    }
+  }
+}

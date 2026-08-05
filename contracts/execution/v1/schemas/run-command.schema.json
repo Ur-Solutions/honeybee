@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-command.schema.json",
+  "title": "RunCommand",
+  "description": "Runtime commands. Each command has its own effect key, capability scope, preconditioned Run version, and receipt. Unsupported harness commands fail explicitly. refresh-credential is available only under the negotiated credential-lease-v1 profile.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text"],
+      "properties": {
+        "kind": { "const": "send" },
+        "text": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "inputRequestId", "answer"],
+      "properties": {
+        "kind": { "const": "answer" },
+        "inputRequestId": { "$ref": "common.schema.json#/$defs/Identifier" },
+        "answer": { "$ref": "common.schema.json#/$defs/JsonValue" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "interrupt" },
+        "reason": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "checkpoint" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "credentialLeaseId"],
+      "properties": {
+        "kind": { "const": "refresh-credential" },
+        "credentialLeaseId": { "$ref": "common.schema.json#/$defs/CredentialLeaseId" }
+      }
+    }
+  ]
+}

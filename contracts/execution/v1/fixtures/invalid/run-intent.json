@@ -1,0 +1,75 @@
+{
+  "description": "Must fail: an absolute machine path as placement (paths are never placement identity); attemptOrdinal below 1; missing runId.",
+  "schema": "run-intent",
+  "valid": false,
+  "values": [
+    {
+      "jobId": "job-0001",
+      "runId": "run-0001",
+      "attemptOrdinal": 1,
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "target": {
+        "productId": "prod-honeycomb-app",
+        "source": {
+          "kind": "git",
+          "normalizedOrigin": "https://git.example.com/acme/honeycomb-app.git",
+          "revision": "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c"
+        },
+        "digest": "sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+      },
+      "placement": "/Users/dev/checkouts/honeycomb-app",
+      "harness": { "driverId": "claude" },
+      "requiredCapabilities": [],
+      "trustZone": "local-default",
+      "mutationAuthority": [],
+      "budget": {},
+      "evidenceContract": { "collect": ["logs"], "delivery": "local-manifest" }
+    },
+    {
+      "jobId": "job-0001",
+      "runId": "run-0001",
+      "attemptOrdinal": 0,
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "target": {
+        "productId": "prod-honeycomb-app",
+        "source": {
+          "kind": "git",
+          "normalizedOrigin": "https://git.example.com/acme/honeycomb-app.git",
+          "revision": "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c"
+        },
+        "digest": "sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+      },
+      "placement": "fresh",
+      "harness": { "driverId": "claude" },
+      "requiredCapabilities": [],
+      "trustZone": "local-default",
+      "mutationAuthority": [],
+      "budget": {},
+      "evidenceContract": { "collect": ["logs"], "delivery": "local-manifest" }
+    },
+    {
+      "jobId": "job-0001",
+      "attemptOrdinal": 1,
+      "ownerScopeId": "oscope-local-1",
+      "workspaceId": "wsp-alpha",
+      "target": {
+        "productId": "prod-honeycomb-app",
+        "source": {
+          "kind": "git",
+          "normalizedOrigin": "https://git.example.com/acme/honeycomb-app.git",
+          "revision": "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c"
+        },
+        "digest": "sha256:1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+      },
+      "placement": "fresh",
+      "harness": { "driverId": "claude" },
+      "requiredCapabilities": [],
+      "trustZone": "local-default",
+      "mutationAuthority": [],
+      "budget": {},
+      "evidenceContract": { "collect": ["logs"], "delivery": "local-manifest" }
+    }
+  ]
+}

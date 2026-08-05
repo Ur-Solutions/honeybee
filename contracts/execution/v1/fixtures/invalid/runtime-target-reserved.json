@@ -1,0 +1,8 @@
+{
+  "description": "Must fail: runtime-target-v1 schema names are fail-closed reservations; nothing validates against them until the profile's canonical shapes are accepted.",
+  "schema": "runtime-target-ref",
+  "valid": false,
+  "values": [
+    { "runId": "run-0001", "targetId": "trg-0001", "kind": "pty", "generation": 1 }
+  ]
+}

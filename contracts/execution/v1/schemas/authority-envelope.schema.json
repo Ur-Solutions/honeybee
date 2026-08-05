@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/authority-envelope.schema.json",
+  "title": "AuthorityEnvelope",
+  "description": "Authorization claims only. It does not duplicate request ID, trace, timestamp, digest, or signature. Effect methods require capabilityLeaseId; for run.start it must equal ExecutionLease.parentCapabilityLeaseId.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["actor", "ownerScopeId", "workspaceId", "authorityEpoch", "policyEpoch"],
+  "properties": {
+    "actor": { "$ref": "actor-context.schema.json" },
+    "ownerScopeId": { "$ref": "common.schema.json#/$defs/OwnerScopeId" },
+    "workspaceId": { "$ref": "common.schema.json#/$defs/WorkspaceId" },
+    "capabilityLeaseId": { "$ref": "common.schema.json#/$defs/CapabilityLeaseId" },
+    "authorityEpoch": { "$ref": "common.schema.json#/$defs/Epoch" },
+    "policyEpoch": { "$ref": "common.schema.json#/$defs/Epoch" }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-collect-body.schema.json",
+  "title": "RunCollectBody",
+  "description": "Body of run.collect. Collection may continue after the harness stops; publishing review-ready metadata remains an Apiary authority action.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" }
+  }
+}

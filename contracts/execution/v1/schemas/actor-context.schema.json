@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/actor-context.schema.json",
+  "title": "ActorContext",
+  "description": "Complete actor context, immutable through relays. Transport hops may be appended, but the initiator can never be replaced.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["initiator"],
+  "properties": {
+    "initiator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "enum": ["user", "agent", "pollinate-activation", "parent-comb"] },
+        "id": { "$ref": "common.schema.json#/$defs/Identifier" },
+        "displayName": { "$ref": "common.schema.json#/$defs/NonEmptyString" }
+      }
+    },
+    "transportHops": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["nodeId", "at"],
+        "properties": {
+          "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+          "at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+        }
+      }
+    }
+  }
+}

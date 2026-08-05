@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-retain-body.schema.json",
+  "title": "RunRetainBody",
+  "description": "Body of run.retain. Extends an authorized debug-retention window without extending execution, credential, network, or external-mutation authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId", "retainUntil"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "retainUntil": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}

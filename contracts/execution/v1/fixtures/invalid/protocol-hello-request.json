@@ -1,0 +1,18 @@
+{
+  "description": "Must fail: missing protocolRange; unknown top-level field (unknown required content fails closed).",
+  "schema": "protocol-hello-request",
+  "valid": false,
+  "values": [
+    {
+      "client": { "product": "apiary", "version": "0.4.0" },
+      "requiredFeatures": ["local-core-v1"],
+      "optionalFeatures": []
+    },
+    {
+      "client": { "product": "apiary", "version": "0.4.0", "protocolRange": "0.1" },
+      "requiredFeatures": ["local-core-v1"],
+      "optionalFeatures": [],
+      "legacyMode": true
+    }
+  ]
+}

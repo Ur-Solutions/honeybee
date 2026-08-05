@@ -1,0 +1,43 @@
+{
+  "description": "Golden digest-addressed local collection manifest (local-core-v1): node-local opaque refs, no artifact upload.",
+  "schema": "collection-manifest",
+  "method": "run.collect",
+  "valid": true,
+  "value": {
+    "runId": "run-0001",
+    "collectionId": "coll-0001",
+    "state": "complete",
+    "entries": [
+      {
+        "kind": "command-log",
+        "digest": "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "sizeBytes": 5120,
+        "mediaType": "text/plain",
+        "ref": { "kind": "node-local", "nodeId": "node-mac-1", "token": "coll-0001/command-log" }
+      },
+      {
+        "kind": "test-report",
+        "digest": "sha256:c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+        "sizeBytes": 20480,
+        "mediaType": "application/json",
+        "ref": { "kind": "node-local", "nodeId": "node-mac-1", "token": "coll-0001/test-report" }
+      },
+      {
+        "kind": "diff",
+        "digest": "sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "sizeBytes": 8192,
+        "mediaType": "text/x-diff",
+        "ref": { "kind": "node-local", "nodeId": "node-mac-1", "token": "coll-0001/diff" }
+      },
+      {
+        "kind": "environment-manifest",
+        "digest": "sha256:c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+        "sizeBytes": 2048,
+        "mediaType": "application/json",
+        "ref": { "kind": "node-local", "nodeId": "node-mac-1", "token": "coll-0001/environment-manifest" }
+      }
+    ],
+    "createdAt": "2026-08-05T11:00:01Z",
+    "completedAt": "2026-08-05T11:00:20Z"
+  }
+}

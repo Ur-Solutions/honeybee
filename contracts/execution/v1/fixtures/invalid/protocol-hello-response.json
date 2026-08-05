@@ -1,0 +1,14 @@
+{
+  "description": "Must fail: compatibility outside the closed enum.",
+  "schema": "protocol-hello-response",
+  "valid": false,
+  "values": [
+    {
+      "server": { "product": "honeybee", "version": "0.0.1", "protocolVersion": "0.1" },
+      "selectedFeatures": [],
+      "missingRequiredFeatures": [],
+      "compatibility": "maybe",
+      "schemaDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

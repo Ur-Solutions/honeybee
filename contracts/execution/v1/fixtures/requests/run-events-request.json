@@ -1,0 +1,12 @@
+{
+  "description": "Golden run.events fetch from an exclusive durable cursor; afterSeq 0 replays from the start.",
+  "schema": "run-events-request",
+  "method": "run.events",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "runId": "run-0001",
+    "afterSeq": 0,
+    "limit": 500
+  }
+}

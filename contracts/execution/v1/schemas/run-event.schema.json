@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-event.schema.json",
+  "title": "RunEvent",
+  "description": "Durable, replayable Run event. Delivery is at-least-once; consumers deduplicate by (runId, seq). Sequence is monotonic within a Run; the protocol does not claim universal wall-clock order across nodes. Secret material never appears in ordinary events.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "runId", "seq", "eventId", "type", "occurredAt", "ingestedAt", "origin", "payload"],
+  "properties": {
+    "protocolVersion": { "$ref": "common.schema.json#/$defs/ProtocolVersion" },
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "seq": { "type": "integer", "minimum": 1 },
+    "eventId": { "$ref": "common.schema.json#/$defs/Identifier" },
+    "type": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$" },
+    "occurredAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "ingestedAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeId"],
+      "properties": {
+        "nodeId": { "$ref": "common.schema.json#/$defs/NodeId" },
+        "driverId": { "$ref": "common.schema.json#/$defs/Identifier" },
+        "providerId": { "$ref": "common.schema.json#/$defs/Identifier" }
+      }
+    },
+    "payload": { "$ref": "common.schema.json#/$defs/JsonValue" }
+  }
+}

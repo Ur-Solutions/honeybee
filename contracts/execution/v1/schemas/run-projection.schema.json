@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://honeybee.dev/contracts/execution/v1/run-projection.schema.json",
+  "title": "RunProjection",
+  "description": "Latest durable Run projection returned by run.get: state, event cursor, health/freshness, Run Environment reference when materialized, and terminal result when present.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runId", "state", "stateVersion", "lastEventSeq", "health", "updatedAt"],
+  "properties": {
+    "runId": { "$ref": "common.schema.json#/$defs/RunId" },
+    "jobId": { "$ref": "common.schema.json#/$defs/JobId" },
+    "state": {
+      "enum": [
+        "allocating",
+        "offered",
+        "accepted",
+        "materializing",
+        "starting",
+        "running",
+        "lost",
+        "recovering",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "stateVersion": { "$ref": "common.schema.json#/$defs/Seq" },
+    "lastEventSeq": { "$ref": "common.schema.json#/$defs/Seq" },
+    "health": { "enum": ["ready", "degraded", "lost"] },
+    "updatedAt": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "environment": { "$ref": "run-environment-ref.schema.json" },
+    "needsInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputRequestId", "openedAtSeq"],
+      "properties": {
+        "inputRequestId": { "$ref": "common.schema.json#/$defs/Identifier" },
+        "openedAtSeq": { "$ref": "common.schema.json#/$defs/Seq" }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "finishedAt"],
+      "properties": {
+        "outcome": { "enum": ["completed", "failed", "cancelled"] },
+        "cause": { "$ref": "common.schema.json#/$defs/NonEmptyString" },
+        "harnessExitCode": { "type": "integer" },
+        "finishedAt": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    }
+  }
+}

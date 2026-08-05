@@ -1,0 +1,47 @@
+{
+  "description": "Golden materialization-failure replay: fresh materialization fails, the Run fails without any canonical-checkout fallback and without starting a harness.",
+  "schema": "run-events-page",
+  "method": "run.events",
+  "valid": true,
+  "value": {
+    "runId": "run-0004",
+    "afterSeq": 0,
+    "nextAfterSeq": 3,
+    "retention": { "oldestReplayableSeq": 1 },
+    "events": [
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0004",
+        "seq": 1,
+        "eventId": "evt-run-0004-1",
+        "type": "run.accepted",
+        "occurredAt": "2026-08-05T14:00:01Z",
+        "ingestedAt": "2026-08-05T14:00:01Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "effectKey": "job-0003/run-0004/start", "receiptId": "rcpt-0041" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0004",
+        "seq": 2,
+        "eventId": "evt-run-0004-2",
+        "type": "environment.materializing",
+        "occurredAt": "2026-08-05T14:00:02Z",
+        "ingestedAt": "2026-08-05T14:00:02Z",
+        "origin": { "nodeId": "node-mac-1", "providerId": "native-host" },
+        "payload": { "environmentId": "env-0004" }
+      },
+      {
+        "protocolVersion": "0.1",
+        "runId": "run-0004",
+        "seq": 3,
+        "eventId": "evt-run-0004-3",
+        "type": "run.failed",
+        "occurredAt": "2026-08-05T14:00:09Z",
+        "ingestedAt": "2026-08-05T14:00:09Z",
+        "origin": { "nodeId": "node-mac-1" },
+        "payload": { "errorCode": "MATERIALIZATION_FAILED", "cause": "fresh worktree allocation failed; canonical checkout untouched; no harness started" }
+      }
+    ]
+  }
+}

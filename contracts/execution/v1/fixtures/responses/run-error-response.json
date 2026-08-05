@@ -1,0 +1,16 @@
+{
+  "description": "Golden effect refusal: response envelope carrying a typed error and no result. IDEMPOTENCY_CONFLICT means an effect key was reused with different content; no new effect occurred.",
+  "schema": "execution-response-envelope",
+  "method": "run.start",
+  "valid": true,
+  "value": {
+    "protocolVersion": "0.1",
+    "requestId": "req-0010",
+    "error": {
+      "code": "IDEMPOTENCY_CONFLICT",
+      "message": "effect key job-0001/run-0001/start is bound to a different request digest",
+      "retryable": false,
+      "details": { "effectKey": "job-0001/run-0001/start" }
+    }
+  }
+}
