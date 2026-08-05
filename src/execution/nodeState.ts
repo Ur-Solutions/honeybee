@@ -131,6 +131,15 @@ export type LocalAuthorityHostBindingRef = {
 export type ExecutionBindingRecord = {
   version: 1;
   ownerScopeId: string;
+  /**
+   * The CANONICAL public node identity this node executes as: the Apiary
+   * LocalAuthorityManifest's intended host fact, bound at install time. Every
+   * protocol surface (node.describe, lease audience, explicit placement,
+   * event origins) speaks this id; the Honeybee-minted identity in
+   * node-identity.json remains signing-key custody only, so L2 never juggles
+   * two public node identities.
+   */
+  nodeId: string;
   binding: LocalAuthorityHostBindingRef;
   /** base64 SPKI DER of the LocalAuthority signing key; leases/envelopes verify against it. */
   authorityPublicKey: string;
@@ -147,17 +156,15 @@ export type InstallBindingInput = {
   authorityId: string;
   authorityEpoch: number;
   authorityPublicKey: string;
+  /** Canonical Apiary nodeId (the authority manifest's hostNodeId). */
+  nodeId: string;
 };
 
-/**
- * Install (or replace, e.g. on authority-epoch bump) the node's accepted
- * LocalAuthority host binding. The keyFingerprint is derived from the supplied
- * authority public key, so a record can never carry a fingerprint that does
- * not match the key it verifies with.
- */
-export async function installLocalAuthorityHostBinding(input: InstallBindingInput): Promise<ExecutionBindingRecord> {
-  if (!input.ownerScopeId || !input.bindingId || !input.authorityId || !input.authorityPublicKey) {
-    throw new Error("installLocalAuthorityHostBinding: ownerScopeId, bindingId, authorityId, authorityPublicKey required");
+function buildBindingRecord(input: InstallBindingInput): ExecutionBindingRecord {
+  if (!input.ownerScopeId || !input.bindingId || !input.authorityId || !input.authorityPublicKey || !input.nodeId) {
+    throw new Error(
+      "installLocalAuthorityHostBinding: ownerScopeId, bindingId, authorityId, authorityPublicKey, nodeId required",
+    );
   }
   if (!Number.isInteger(input.authorityEpoch) || input.authorityEpoch < 1) {
     throw new Error("installLocalAuthorityHostBinding: authorityEpoch must be a positive integer");
@@ -165,9 +172,10 @@ export async function installLocalAuthorityHostBinding(input: InstallBindingInpu
   if (!isEd25519PublicKey(input.authorityPublicKey)) {
     throw new Error("installLocalAuthorityHostBinding: authorityPublicKey must be a base64 SPKI DER Ed25519 key");
   }
-  const record: ExecutionBindingRecord = {
+  return {
     version: 1,
     ownerScopeId: input.ownerScopeId,
+    nodeId: input.nodeId,
     binding: {
       kind: "local-authority-host",
       bindingId: input.bindingId,
@@ -178,9 +186,61 @@ export async function installLocalAuthorityHostBinding(input: InstallBindingInpu
     authorityPublicKey: input.authorityPublicKey,
     installedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Install (or replace, e.g. on authority-epoch bump) the node's accepted
+ * LocalAuthority host binding. The keyFingerprint is derived from the supplied
+ * authority public key, so a record can never carry a fingerprint that does
+ * not match the key it verifies with. Direct-write seam for tests/tooling;
+ * the RPC surface goes through bindLocalAuthorityHostFirstUse, which never
+ * replaces an existing binding.
+ */
+export async function installLocalAuthorityHostBinding(input: InstallBindingInput): Promise<ExecutionBindingRecord> {
+  const record = buildBindingRecord(input);
   await ensureExecutionRoot();
   await atomicWriteFile(bindingPath(), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   return record;
+}
+
+export type FirstUseBindOutcome = { record: ExecutionBindingRecord; outcome: "created" | "replayed" };
+
+/**
+ * Idempotent trust-on-first-use bind. Under the binding lock:
+ *   - truly absent binding  -> install (TOFU is acceptable ONLY because the
+ *     control socket is same-user restricted; see adminMethods.ts);
+ *   - identical facts       -> replay of the original record (no rewrite);
+ *   - any differing fact    -> IDEMPOTENCY_CONFLICT, fail closed. There is no
+ *     replace/handoff path here — epoch bumps and authority moves are an
+ *     explicit future operation, never a bind side effect;
+ *   - corrupt existing record -> BINDING_DENIED (propagated from read).
+ */
+export async function bindLocalAuthorityHostFirstUse(input: InstallBindingInput): Promise<FirstUseBindOutcome> {
+  const candidate = buildBindingRecord(input);
+  await ensureExecutionRoot();
+  return withFileLock(join(executionRoot(), ".binding.lock"), async () => {
+    const existing = await readExecutionBinding();
+    if (!existing) {
+      await atomicWriteFile(bindingPath(), `${JSON.stringify(candidate, null, 2)}\n`, { mode: 0o600 });
+      return { record: candidate, outcome: "created" as const };
+    }
+    const identical =
+      existing.ownerScopeId === candidate.ownerScopeId &&
+      existing.nodeId === candidate.nodeId &&
+      existing.authorityPublicKey === candidate.authorityPublicKey &&
+      existing.binding.bindingId === candidate.binding.bindingId &&
+      existing.binding.authorityId === candidate.binding.authorityId &&
+      existing.binding.keyFingerprint === candidate.binding.keyFingerprint &&
+      existing.binding.authorityEpoch === candidate.binding.authorityEpoch;
+    if (!identical) {
+      throw executionError(
+        "IDEMPOTENCY_CONFLICT",
+        "a different LocalAuthority host binding is already installed on this node; refusing to replace it",
+        { installedBindingId: existing.binding.bindingId, installedAuthorityId: existing.binding.authorityId },
+      );
+    }
+    return { record: existing, outcome: "replayed" as const };
+  });
 }
 
 /**
@@ -207,6 +267,8 @@ export async function readExecutionBinding(): Promise<ExecutionBindingRecord | n
   if (
     parsed.version !== 1 ||
     typeof parsed.ownerScopeId !== "string" ||
+    typeof parsed.nodeId !== "string" ||
+    parsed.nodeId.length === 0 ||
     typeof parsed.authorityPublicKey !== "string" ||
     !binding ||
     binding.kind !== "local-authority-host" ||

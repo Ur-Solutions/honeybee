@@ -122,8 +122,16 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   let identityPromise: Promise<ExecutionNodeIdentity> | undefined;
   const identity = (): Promise<ExecutionNodeIdentity> => (identityPromise ??= loadNodeIdentity());
 
+  // The canonical public node identity is the Apiary nodeId pinned in the
+  // installed binding (nodeState.ts). A binding is immutable once installed
+  // (first-use bind never replaces), so caching the first successful read is
+  // safe; failures are NOT cached so a bind that lands later is picked up.
+  let cachedBinding: ExecutionBindingRecord | undefined;
+  const binding = async (): Promise<ExecutionBindingRecord> => (cachedBinding ??= await requireExecutionBinding());
+  const canonicalNodeId = async (): Promise<string> => (await binding()).nodeId;
+
   const origin = async (extra?: { driverId?: string; providerId?: string }) => ({
-    nodeId: (await identity()).nodeId,
+    nodeId: await canonicalNodeId(),
     ...(extra?.driverId ? { driverId: extra.driverId } : {}),
     ...(extra?.providerId ? { providerId: extra.providerId } : {}),
   });
@@ -487,7 +495,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   }
 
   async function buildProjection(reservation: RunReservation): Promise<JsonObject> {
-    const nodeId = (await identity()).nodeId;
+    const nodeId = await canonicalNodeId();
     const events = await readRunEvents(reservation.runId);
     const lastSeq = events.length > 0 ? events[events.length - 1]!.seq : 0;
     const { state, health } = deriveState(reservation, inFlight.has(reservation.runId));
@@ -558,12 +566,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   async function runStart(request: JsonValue): Promise<JsonObject> {
     const requestId = (request as JsonObject | null)?.requestId ?? "";
     try {
-      const binding = await requireExecutionBinding();
-      const nodeIdentity = await identity();
+      const installed = await binding();
       const validated = validateRunStart(request, {
         validator,
-        binding,
-        nodeId: nodeIdentity.nodeId,
+        binding: installed,
+        nodeId: installed.nodeId,
         protocolVersion,
         ...(options.verifySignature ? { verifySignature: options.verifySignature } : {}),
         now,
@@ -708,11 +715,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       if (doc.protocolVersion !== protocolVersion) {
         throw executionError("PROTOCOL_INCOMPATIBLE", `protocolVersion ${String(doc.protocolVersion)} is not ${protocolVersion}`);
       }
-      const binding = await requireExecutionBinding();
-      assertDescribeScope(doc, binding);
+      const installed = await binding();
+      assertDescribeScope(doc, installed);
       const descriptor = await buildNodeDescriptor({
         identity: await identity(),
-        binding,
+        binding: installed,
         protocolVersion,
         features: supportedFeatures(contract),
         ...(options.harnessProbe ? { harnessProbe: options.harnessProbe } : {}),

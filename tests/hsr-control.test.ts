@@ -65,6 +65,7 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
         fork: 1,
         handoff: 1,
         execution: 1,
+        executionAdmin: 1,
       });
 
       // liveness() includes the live bee.
