@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { copyBeeSeals, listSeals, loadLatestSeal, nextRuntimeIncarnationPatch, recordSeal, scanLatestSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
+import { copyBeeSeals, listSeals, loadLatestSeal, nextRuntimeIncarnationPatch, nextTurnPatch, recordSeal, scanLatestSeal, sealedBeeNames, sealsRoot, validateSealArtifact } from "../src/seal.js";
 import type { SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -237,6 +237,82 @@ test("seal high-water hides historical seals across revive and exposes the next 
     await new Promise((resolve) => setTimeout(resolve, 10));
     await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "generation one" }));
     assert.equal((await sealedBeeNames([revived])).has(record.name), true, "new seal is above the high-water");
+  });
+});
+
+test("a new turn retires the previous seal without advancing the runtime generation", async () => {
+  await withTempStore(async () => {
+    const record: SessionRecord = {
+      name: "CO.follow-up",
+      agent: "codex",
+      cwd: "/tmp",
+      command: "codex",
+      tmuxTarget: "CO.follow-up",
+      createdAt: "2026-08-04T00:00:00.000Z",
+      updatedAt: "2026-08-04T00:01:00.000Z",
+      status: "running",
+      runtimeGeneration: 7,
+      lastObservedState: "done",
+      lastObservedStateAt: "2026-08-04T00:01:00.000Z",
+    };
+    await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "first turn" }));
+    assert.equal((await sealedBeeNames([record])).has(record.name), true);
+
+    const patch = await nextTurnPatch(record);
+    const resumed = { ...record, ...patch };
+    assert.equal(resumed.runtimeGeneration, 7, "another turn reuses the same live runtime");
+    assert.equal(resumed.lastObservedState, undefined);
+    assert.equal(resumed.lastObservedStateAt, undefined);
+    assert.equal((await sealedBeeNames([resumed])).has(record.name), false, "the completed turn's seal is below the boundary");
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "follow-up turn" }));
+    assert.equal((await sealedBeeNames([resumed])).has(record.name), true, "the follow-up turn's seal remains current");
+  });
+});
+
+test("sealedBeeNames repairs a pre-cursor record whose cached done state predates its prompt", async () => {
+  await withTempStore(async () => {
+    const first = await recordSeal(
+      "CO.pre-cursor",
+      validateSealArtifact({ status: "done", summary: "completed before the follow-up" }),
+    );
+    const firstAt = Date.parse(first.sealedAt);
+    const followedUp: SessionRecord = {
+      name: "CO.pre-cursor",
+      agent: "codex",
+      cwd: "/tmp",
+      command: "codex",
+      tmuxTarget: "CO.pre-cursor",
+      createdAt: new Date(firstAt - 2_000).toISOString(),
+      updatedAt: new Date(firstAt + 2_000).toISOString(),
+      status: "running",
+      lastPrompt: "one more thing",
+      lastPromptAt: new Date(firstAt + 2_000).toISOString(),
+      lastObservedState: "done",
+      lastObservedStateAt: new Date(firstAt - 1_000).toISOString(),
+    };
+
+    assert.equal(
+      (await sealedBeeNames([followedUp])).has(followedUp.name),
+      false,
+      "the older seal cannot pin a later prompt to done",
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const completedFollowUp = await recordSeal(
+      followedUp.name,
+      validateSealArtifact({ status: "done", summary: "follow-up complete" }),
+    );
+    const completedRecord = {
+      ...followedUp,
+      lastPromptAt: new Date(Date.parse(completedFollowUp.sealedAt) - 1).toISOString(),
+    };
+    assert.equal(
+      (await sealedBeeNames([completedRecord])).has(followedUp.name),
+      true,
+      "a seal written after the follow-up remains authoritative",
+    );
   });
 });
 

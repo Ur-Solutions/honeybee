@@ -11,7 +11,7 @@ import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { needsInputRequestId } from "../requests/keys.js";
 import { openAndResolveRequest } from "../requests/store.js";
-import { recordSeal, sealArtifactExampleJson, sealHelpText, validateSealArtifact } from "../seal.js";
+import { nextTurnPatch, recordSeal, sealArtifactExampleJson, sealHelpText, validateSealArtifact } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { appendLedger, updateSession, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
@@ -380,9 +380,19 @@ export async function cmdSend(parsed: Parsed) {
       else console.error(`skip\t${record.name}\tdead`);
       continue;
     }
+    // Snapshot before delivery so a very fast seal from the new turn remains
+    // above the boundary. Persist only after sendText succeeds: a failed send
+    // must leave the completed turn's seal authoritative.
+    const turn = await nextTurnPatch(record);
     await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
     const now = new Date().toISOString();
-    await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
+    await updateSession(record.name, {
+      ...turn,
+      updatedAt: now,
+      status: "running",
+      lastPrompt: prompt,
+      lastPromptAt: now,
+    });
     await writeHiveState(record, "working");
     await appendLedger({ type: "prompt.send", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
     if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));

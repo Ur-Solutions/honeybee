@@ -370,11 +370,29 @@ export async function copyBeeSeals(beeName: string, destDir: string): Promise<nu
   return copied;
 }
 
+function cachedSealPredatesPrompt(record: SessionRecord): boolean {
+  if (record.lastObservedState !== "done" && record.lastObservedState !== "sealed") return false;
+  const promptAt = record.lastPromptAt ? Date.parse(record.lastPromptAt) : NaN;
+  const observedAt = record.lastObservedStateAt ? Date.parse(record.lastObservedStateAt) : NaN;
+  return Number.isFinite(promptAt) && Number.isFinite(observedAt) && promptAt > observedAt;
+}
+
+function sealCompletesLatestPrompt(record: SessionRecord, seal: SealRecord): boolean {
+  const promptAt = record.lastPromptAt ? Date.parse(record.lastPromptAt) : NaN;
+  const sealedAt = Date.parse(seal.sealedAt);
+  // Malformed or legacy timestamps fail closed: preserving a seal is safer
+  // than fabricating a running turn from evidence we cannot order.
+  if (!Number.isFinite(promptAt) || !Number.isFinite(sealedAt)) return true;
+  return sealedAt >= promptAt;
+}
+
 /**
  * Names carrying a seal in their CURRENT runtime incarnation. Without a
  * record snapshot this preserves the historical index behavior used by seal
  * search. State derivation passes records, whose high-water filenames hide
- * seals from earlier incarnations until a newer seal lands.
+ * seals from earlier incarnations until a newer seal lands. The timestamp
+ * fallback repairs pre-turn-cursor records: if a prompt is newer than the
+ * cached done observation, only a seal at or after that prompt is current.
  */
 export async function sealedBeeNames(records?: readonly SessionRecord[]): Promise<Set<string>> {
   const root = sealsRoot();
@@ -386,15 +404,40 @@ export async function sealedBeeNames(records?: readonly SessionRecord[]): Promis
   const candidates = records.filter((record) => directories.has(record.name));
   for (let offset = 0; offset < candidates.length; offset += 32) {
     await Promise.all(candidates.slice(offset, offset + 32).map(async (record) => {
-      if (!record.sealHighWaterFilename) {
+      const recoverStaleTurn = cachedSealPredatesPrompt(record);
+      if (!record.sealHighWaterFilename && !recoverStaleTurn) {
         names.add(record.name);
         return;
       }
-      const newer = await scanLatestSeal(record.name, { afterFilename: record.sealHighWaterFilename });
-      if (newer.seal) names.add(record.name);
+      const newer = await scanLatestSeal(record.name, {
+        afterFilename: record.sealHighWaterFilename ?? null,
+      });
+      if (newer.seal && (!recoverStaleTurn || sealCompletesLatestPrompt(record, newer.seal))) {
+        names.add(record.name);
+      }
     }));
   }
   return names;
+}
+
+/**
+ * Snapshot the seal boundary before delivering a new turn to an existing
+ * runtime. Apply this patch only after delivery succeeds: every seal already
+ * present belongs to the turn that just finished, while a seal written after
+ * the snapshot belongs to the new turn and must remain visible.
+ *
+ * A new turn is not a new runtime generation. Keep request ownership and the
+ * transcript binding intact; only retire the previous turn's seal and clear
+ * its cached terminal observation so readers cannot keep projecting `done`
+ * while the warm runtime is working again.
+ */
+export async function nextTurnPatch(record: SessionRecord): Promise<Partial<SessionRecord>> {
+  const seal = await scanLatestSeal(record.name);
+  return {
+    sealHighWaterFilename: seal.highWaterFilename ?? undefined,
+    lastObservedState: undefined,
+    lastObservedStateAt: undefined,
+  };
 }
 
 /**
