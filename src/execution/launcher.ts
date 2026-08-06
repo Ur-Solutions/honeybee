@@ -27,6 +27,57 @@ function asObject(value: JsonValue | undefined): JsonObject | undefined {
   return value as JsonObject;
 }
 
+export type HsrHarnessLaunchConfig = {
+  driverId: string;
+  model?: string;
+  brief?: string;
+  account?: string;
+  preamble?: string;
+};
+
+/**
+ * Read the driver-normalized portion of a signed HarnessRequest. Keep this
+ * strict at the execution boundary: these values become local spawn flags,
+ * so malformed signed input must fail typed instead of being coerced.
+ */
+export function resolveHsrHarnessLaunchConfig(intent: JsonObject): HsrHarnessLaunchConfig {
+  const harness = asObject(intent.harness);
+  const driverId = String(harness?.driverId ?? "");
+  const model = typeof harness?.model === "string" ? harness.model : undefined;
+  const config = asObject(harness?.config);
+  const brief = typeof config?.brief === "string" ? config.brief : undefined;
+  const account = config?.account;
+  if (account !== undefined && (typeof account !== "string" || account.length === 0)) {
+    throw executionError("HARNESS_UNAVAILABLE", "harness config.account must be a non-empty account query string");
+  }
+  const preamble = config?.preamble;
+  if (preamble !== undefined && (typeof preamble !== "string" || preamble.trim().length === 0)) {
+    throw executionError("HARNESS_UNAVAILABLE", "harness config.preamble must be a non-empty string");
+  }
+  return {
+    driverId,
+    ...(model !== undefined ? { model } : {}),
+    ...(brief !== undefined ? { brief } : {}),
+    ...(account !== undefined ? { account } : {}),
+    ...(preamble !== undefined ? { preamble } : {}),
+  };
+}
+
+export function buildHsrSpawnFlags(
+  beeName: string,
+  cwd: string,
+  config: Pick<HsrHarnessLaunchConfig, "account" | "preamble">,
+): Map<string, string | true | string[]> {
+  const flags = new Map<string, string | true | string[]>([
+    ["substrate", "hsr"],
+    ["name", beeName],
+    ["cwd", cwd],
+  ]);
+  if (config.account) flags.set("account", config.account);
+  if (config.preamble) flags.set("preamble", config.preamble);
+  return flags;
+}
+
 /**
  * Resolve and durably claim the explicit placement for a Run, proving that
  * the registered working copy actually materializes the LEASED snapshot:
@@ -95,27 +146,19 @@ export function createHsrRunLauncher(deps: { nodeId: () => Promise<string> }): R
     const nodeId = await deps.nodeId();
     const copy = await materializeExplicitPlacement(nodeId, request);
 
-    const harness = asObject(intent.harness);
-    const driverId = String(harness?.driverId ?? "");
-    const model = typeof harness?.model === "string" ? harness.model : undefined;
-    const config = asObject(harness?.config);
-    const brief = typeof config?.brief === "string" ? config.brief : undefined;
-    // Account selection comes ONLY from the signed intent's harness config —
-    // never from the daemon's profiles, aliases, or ambient environment.
-    // "auto" rides the existing least-loaded resolution behind --account.
-    const account = config?.account;
-    if (account !== undefined && (typeof account !== "string" || account.length === 0)) {
-      throw executionError("HARNESS_UNAVAILABLE", "harness config.account must be a non-empty account query string");
-    }
+    // Account and preamble selection come ONLY from the signed intent's
+    // harness config — never from daemon profiles or ambient configuration.
+    // Keeping the preamble separate from brief lets spawn compose every layer
+    // into one <hive-session> block before delivering the operator's prompt.
+    const { driverId, model, brief, account, preamble } = resolveHsrHarnessLaunchConfig(intent);
 
     const { spawnSingleBee } = await import("../commands/spawn.js");
-    const flags = new Map<string, string | true | string[]>();
-    flags.set("substrate", "hsr");
-    flags.set("name", beeName);
     // The registry locator is the node-private path; it is used here to run
     // the process and never echoed back through the protocol.
-    flags.set("cwd", copy.path);
-    if (account) flags.set("account", account);
+    const flags = buildHsrSpawnFlags(beeName, copy.path, {
+      ...(account ? { account } : {}),
+      ...(preamble ? { preamble } : {}),
+    });
     let record;
     try {
       record = await spawnSingleBee(

@@ -263,6 +263,43 @@ test("HSR launcher: a non-string harness config.account is refused typed, never 
   });
 });
 
+test("HSR launcher config keeps signed preamble separate from the operator brief", async () => {
+  const { buildHsrSpawnFlags, resolveHsrHarnessLaunchConfig } = await import("../src/execution/launcher.js");
+  const resolved = resolveHsrHarnessLaunchConfig({
+    harness: {
+      driverId: "codex",
+      model: "gpt-5.6-sol",
+      config: {
+        brief: "Fix the transcript regression.",
+        preamble: "You are inside Apiary.",
+        account: "auto",
+      },
+    },
+  });
+  assert.deepEqual(resolved, {
+    driverId: "codex",
+    model: "gpt-5.6-sol",
+    brief: "Fix the transcript regression.",
+    preamble: "You are inside Apiary.",
+    account: "auto",
+  });
+  assert.deepEqual([...buildHsrSpawnFlags("run-0001", "/tmp/cell", resolved)], [
+    ["substrate", "hsr"],
+    ["name", "run-0001"],
+    ["cwd", "/tmp/cell"],
+    ["account", "auto"],
+    ["preamble", "You are inside Apiary."],
+  ]);
+});
+
+test("HSR launcher config refuses a non-string signed preamble", async () => {
+  const { resolveHsrHarnessLaunchConfig } = await import("../src/execution/launcher.js");
+  assert.throws(
+    () => resolveHsrHarnessLaunchConfig({ harness: { driverId: "codex", config: { brief: "hi", preamble: 123 } } }),
+    (error: { code?: string }) => error.code === "HARNESS_UNAVAILABLE",
+  );
+});
+
 test("scope sanity: test-kit canonical nodeId differs from the minted identity", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
