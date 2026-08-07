@@ -1,5 +1,4 @@
 import { stat } from "node:fs/promises";
-import { listAccounts, syncAccountCredentialsToVault, syncAllAccountCredentialsToVault } from "../accounts.js";
 import { hiveStateFor, writeHiveState } from "../hiveState.js";
 import { listNodes } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
@@ -7,6 +6,7 @@ import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
 import { hsrObservations } from "../hsr/observe.js";
 import { createIsolatedHsrObservations } from "./observerProcess.js";
 import { createIsolatedSessionLister } from "./sessionListProcess.js";
+import { createIsolatedCredentialSweeper } from "./credentialSweepProcess.js";
 import { createRemoteEventMirror } from "../hsr/remoteEventMirror.js";
 import { appendLedger, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
@@ -106,6 +106,7 @@ async function defaultTranscriptFileStat(path: string): Promise<TranscriptFileSt
 export function buildDefaultDeps(): TickDeps {
   const refreshTranscriptMetadata = createThrottledTranscriptMetadataRefresh();
   const isolatedListSessions = createIsolatedSessionLister();
+  const isolatedCredentialSweep = createIsolatedCredentialSweeper();
   const dispatchBuzDrain = createBuzDrainDispatcher();
   return {
     listSessions: isolatedListSessions,
@@ -142,22 +143,10 @@ export function buildDefaultDeps(): TickDeps {
     sweepPools: createPoolSweeper(),
     sweepCombs: createCombSweeper(),
     sweepFlights: createFlightSweeper(),
-    // Pacing lives in runDaemon's dedicated chain-sync loop (every few minutes,
-    // never inside the tick path): each call here is a real sweep.
-    syncChains: async () => {
-      await syncAllAccountCredentialsToVault();
-      // Account-bound bees may run in homes the sweep cannot find on its own
-      // (arbitrary --home paths outside ~/.claude*/~/.codex*); the session
-      // records know them. Provider sync still verifies the home's identity
-      // before trusting its credentials.
-      const accounts = new Map((await listAccounts()).map((account) => [account.id, account]));
-      for (const record of await isolatedListSessions()) {
-        if (!record.accountId || !record.homePath) continue;
-        const account = accounts.get(record.accountId);
-        if (!account) continue;
-        await syncAccountCredentialsToVault(account, record.homePath, { trustExtraHome: true }).catch(() => undefined);
-      }
-    },
+    // Pacing/single-flight lives in runDaemon. The sweep itself is isolated in
+    // a killable child: a keychain prompt or lost fs completion cannot retain
+    // an account lock or overlap a later interval in the daemon process.
+    syncChains: isolatedCredentialSweep,
     now: () => Date.now(),
   };
 }

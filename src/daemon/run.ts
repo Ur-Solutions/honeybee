@@ -17,6 +17,7 @@ import {
 import { logTickResult, tick, type TickResult } from "./tick.js";
 import { defaultTickTimeouts, envMs, toError, withTimeout } from "./timeouts.js";
 import { buildDefaultDeps } from "./wiring.js";
+import { createCredentialSyncController, type CredentialSyncRunOutcome, type CredentialSyncSettlement } from "./credentialSyncController.js";
 import {
   createSupervisor,
   pushRecentError,
@@ -253,17 +254,44 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   // supervised-restart storm never front-loads keychain sweeps into boot.
   const chainSyncIntervalMs = envMs("HIVE_DAEMON_CHAIN_SYNC_INTERVAL_MS", 5 * 60_000);
   const chainSyncBudgetMs = defaultTickTimeouts().chainSyncMs;
+  const logCredentialSync = async (
+    outcome: CredentialSyncRunOutcome | CredentialSyncSettlement,
+    late = false,
+  ): Promise<void> => {
+    if (outcome.status === "skipped-inflight") {
+      await safeLog({ level: "warn", msg: "chain.sync.skipped", reason: "previous-sweep-in-flight", inFlightMs: outcome.inFlightMs });
+      return;
+    }
+    const counters = outcome.telemetry ? { ...outcome.telemetry } : {};
+    if (outcome.status === "completed") {
+      await safeLog({ level: "info", msg: late ? "chain.sync.late-settled" : "chain.sync.complete", durationMs: outcome.durationMs, ...counters });
+      return;
+    }
+    const error = outcome.error ?? new Error(`credential sync ${outcome.status}`);
+    pushRecentError(state, error);
+    await safeLog({
+      level: "warn",
+      msg: late ? "chain.sync.late-settled" : outcome.status === "timed-out" ? "chain.sync.timeout" : "chain.sync.failed",
+      settlement: outcome.status,
+      durationMs: outcome.durationMs,
+      error: error.message,
+      ...counters,
+    });
+  };
+  const chainSyncController = deps.syncChains
+    ? createCredentialSyncController(deps.syncChains, {
+        budgetMs: chainSyncBudgetMs,
+        onLateSettlement: (settlement) => {
+          void logCredentialSync(settlement, true);
+        },
+      })
+    : null;
   const chainSyncLoop = deps.syncChains
     ? (async () => {
         while (!stopping) {
           await sleep(chainSyncIntervalMs, () => stopping);
           if (stopping) return;
-          try {
-            await withTimeout(deps.syncChains!(), chainSyncBudgetMs, "syncChains");
-          } catch (error) {
-            pushRecentError(state, toError(error));
-            await safeLog({ level: "warn", msg: "chain.sync.failed", error: toError(error).message });
-          }
+          await logCredentialSync(await chainSyncController!.run());
         }
       })()
     : Promise.resolve();
@@ -441,8 +469,10 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   } finally {
     supervisor.stop();
-    // Give the chain-sync loop a beat to notice `stopping`; a sync wedged
-    // mid-flight is bounded by its own withTimeout and must not hold shutdown.
+    // Closing the isolated worker cancels any active credential work. The
+    // single-flight controller retains a non-isolated late promise until it
+    // settles, but shutdown never waits indefinitely for it.
+    await deps.syncChains?.close?.().catch(() => undefined);
     await Promise.race([chainSyncLoop, new Promise((resolve) => setTimeout(resolve, 500))]);
     if (sentinel) {
       try {

@@ -18,6 +18,7 @@ import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, typ
 import type { CombSweeper } from "./combSweep.js";
 import type { CombSweepOutcome } from "../comb/controller.js";
 import type { UsageSampler, UsageTickOutcome } from "./usageSampler.js";
+import type { CredentialSweepTelemetry } from "./credentialSweep.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 import type { LogInput } from "./log.js";
 import { defaultTickTimeouts, guard, toError, withTimeout, type TickTimeouts } from "./timeouts.js";
@@ -196,7 +197,7 @@ export type TickDeps = {
    * starve the observation loop (the recurring listSessions-timeout breach
    * cycle traced back to heavy fs work sharing the tick's sequential path).
    */
-  syncChains?: () => Promise<void>;
+  syncChains?: (() => Promise<CredentialSweepTelemetry | void>) & { close?: () => Promise<void> };
   /** Per-call hard budgets; unset fields fall back to defaultTickTimeouts(). */
   timeouts?: Partial<TickTimeouts>;
   now: () => number;

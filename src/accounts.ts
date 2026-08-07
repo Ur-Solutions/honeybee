@@ -52,6 +52,7 @@ export { seedClaudeHomeAcceptance } from "./accounts/homeDefaults.js";
 export {
   type ClaudeChain,
   type RefreshedClaudeToken,
+  isRawClaudeCredentialPayload,
   parseClaudeChain,
   parseClaudeChainStrict,
   readHomeClaudeChain,
