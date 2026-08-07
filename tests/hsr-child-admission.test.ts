@@ -52,18 +52,26 @@ function opts(bee: string): RunnerOpts {
 test("detached runner publishes an OS-comparable host birth fingerprint", { skip: !detachedRuntimeAvailable() }, async () => {
   await withTempStore(async () => {
     const bee = "cross-process-host-birth";
-    const hostPid = await spawnHsrHost({
-      bee,
-      comb: bee,
-      kind: "stub",
-      cwd: process.cwd(),
-      authKind: "subscription",
-      spec: {
-        command: process.execPath,
-        args: ["-e", "setInterval(() => {}, 1_000)"],
-        env: process.env as Record<string, string>,
+    const hostPid = await spawnHsrHost(
+      {
+        bee,
+        comb: bee,
+        kind: "stub",
+        cwd: process.cwd(),
+        authKind: "subscription",
+        spec: {
+          command: process.execPath,
+          args: ["-e", "setInterval(() => {}, 1_000)"],
+          env: process.env as Record<string, string>,
+        },
       },
-    });
+      {
+        resolveEntry: async () => ({
+          path: join(process.cwd(), "src", "hsr", "runner-entry.ts"),
+          mode: "dedicated",
+        }),
+      },
+    );
     try {
       const meta = await readHsrMetaStrict(bee);
       assert.equal(meta?.hostPid, hostPid);
