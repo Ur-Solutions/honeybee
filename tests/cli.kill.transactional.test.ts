@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { ensureHsrRunDir, hsrEventsPath, hsrRunDir } from "../src/hsr/runDir.js";
 import { transactionalKill } from "../src/kill.js";
+import { recordSeal, sealsRoot, validateSealArtifact } from "../src/seal.js";
 import { saveSession, type SessionRecord } from "../src/store.js";
 import type { KillResult, Substrate } from "../src/substrates/types.js";
 import { hasSession as tmuxHasSession, kill as tmuxKill, newSession as tmuxNewSession } from "../src/tmux.js";
@@ -79,6 +81,9 @@ test("transactionalKill: substrate.kill ok and hasSession=false → ok=true, rec
   await withTempStore(async (dir) => {
     const record = seed({ name: "alpha", tmuxTarget: "alpha" });
     await saveSession(record);
+    await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "purge me" }));
+    await ensureHsrRunDir(record.name);
+    await writeFile(hsrEventsPath(record.name), "historical events\n");
 
     let killCalls = 0;
     let probeCalls = 0;
@@ -102,6 +107,8 @@ test("transactionalKill: substrate.kill ok and hasSession=false → ok=true, rec
     const sessionsDir = join(dir, "sessions");
     const after = await readFile(join(sessionsDir, "alpha.json"), "utf8").catch(() => null);
     assert.equal(after, null, "session record should be deleted");
+    await assert.rejects(readdir(join(sealsRoot(), record.name)), /ENOENT/);
+    await assert.rejects(readdir(hsrRunDir(record.name)), /ENOENT/);
 
     const ledger = await readFile(join(dir, "ledger.jsonl"), "utf8");
     const lines = ledger.trim().split("\n").map((l) => JSON.parse(l));

@@ -1,3 +1,7 @@
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import { hsrRunDir } from "./hsr/runDir.js";
+import { sealsRoot } from "./seal.js";
 import { appendLedger, deleteSession, updateSession, type SessionRecord } from "./store.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { dropPoolClaimsForBee } from "./pool.js";
@@ -46,6 +50,20 @@ type TeardownVerdict = {
   stillRunning: boolean;
   lastError?: string;
 };
+
+/**
+ * Explicit irreversible purge shared by `kill` and every clean mode. Artifact
+ * stores are removed before the SessionRecord, so an interrupted purge keeps
+ * the retry handle instead of leaving unaddressable seals/run data behind.
+ * `deleteSession` remains the intentionally metadata-only low-level primitive.
+ */
+export async function purgeSessionData(record: SessionRecord): Promise<void> {
+  await rm(join(sealsRoot(), record.name), { recursive: true, force: true });
+  await rm(hsrRunDir(record.name), { recursive: true, force: true });
+  await removeBeeRequests(record.name);
+  await deleteSession(record.name);
+  if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
+}
 
 /**
  * Shared teardown core for kill and retire: substrate.kill -> poll
@@ -190,15 +208,7 @@ export async function transactionalKill(
     return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
   }
 
-  await deleteSession(record.name);
-  // Kill is PURGE (consistent with seals/run data): the bee's request file —
-  // open and closed history alike — goes with the record. Best-effort, like
-  // the pool-claim cleanup next to it.
-  await removeBeeRequests(record.name).catch(() => undefined);
-  // Eager pool-claim cleanup (CHECKOUT_POOLS_PRD §6.2): a killed bee's claim
-  // would otherwise count toward its member's occupancy until pendingUntil.
-  // Best-effort — claim expiry is the backstop.
-  if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
+  await purgeSessionData(record);
   if (emitLedger) {
     await appendLedger({
       type: "session.kill",

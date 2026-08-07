@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
+import { ensureHsrRunDir, hsrEventsPath, hsrMetaPath, hsrRingPath } from "../src/hsr/runDir.js";
 import { transactionalRetire } from "../src/kill.js";
+import { recordSeal, sealsRoot, validateSealArtifact } from "../src/seal.js";
 import { deriveState } from "../src/state.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { KillResult, Substrate } from "../src/substrates/types.js";
+
+const execFileAsync = promisify(execFile);
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), "hive-retire-"));
@@ -49,8 +55,11 @@ function fakeSubstrate(overrides: Partial<Substrate>): Substrate {
 
 test("transactionalRetire archives the record instead of deleting it", async () => {
   await withTempStore(async () => {
-    const record = seed({ name: "retire-me", tmuxTarget: "retire-me", lastError: "stale kill error" });
+    const record = { ...seed({ name: "retire-me", tmuxTarget: "retire-me", lastError: "stale kill error" }), substrate: "hsr" as const };
     await saveSession(record);
+    await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "keep me" }));
+    await ensureHsrRunDir(record.name);
+    await writeFile(hsrEventsPath(record.name), '{"type":"text","ts":1,"text":"history"}\n');
     let killed = 0;
     const substrate = fakeSubstrate({
       kill: async () => {
@@ -67,6 +76,41 @@ test("transactionalRetire archives the record instead of deleting it", async () 
     assert.ok(stored, "record must survive retire");
     assert.equal(stored!.status, "done");
     assert.equal(stored!.lastError, undefined, "stale lastError is cleared on retire");
+    assert.match(await readFile(hsrEventsPath(record.name), "utf8"), /history/, "retire keeps HSR history");
+    const [sealFile] = await readdir(join(sealsRoot(), record.name));
+    assert.match(await readFile(join(sealsRoot(), record.name, sealFile!), "utf8"), /keep me/);
+  });
+});
+
+test("hive retire --compact compacts HSR events but preserves metadata, seals, meta, and ring", async () => {
+  await withTempStore(async (dir) => {
+    const record = { ...seed({ name: "compact-me", tmuxTarget: "compact-me" }), substrate: "hsr" as const };
+    await saveSession(record);
+    await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "retained seal" }));
+    await ensureHsrRunDir(record.name);
+    await writeFile(hsrMetaPath(record.name), JSON.stringify({
+      bee: record.name,
+      harness: "codex",
+      tier: "turn",
+      hostPid: 0,
+      startedAt: "2026-08-01T00:00:00.000Z",
+      controlSocket: "/tmp/missing.sock",
+      status: "exited",
+    }));
+    await writeFile(hsrRingPath(record.name), "rendered tail\n");
+    const events = Array.from({ length: 600 }, (_, index) => JSON.stringify({ type: "text", ts: index, text: `line ${index}` })).join("\n") + "\n";
+    await writeFile(hsrEventsPath(record.name), events);
+
+    await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "retire", record.name, "--compact"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+
+    assert.equal((await loadSession(record.name))?.status, "done");
+    assert.match(await readFile(hsrMetaPath(record.name), "utf8"), /compact-me/);
+    assert.equal(await readFile(hsrRingPath(record.name), "utf8"), "rendered tail\n");
+    assert.ok((await readFile(hsrEventsPath(record.name), "utf8")).split("\n").filter(Boolean).length <= 401);
+    assert.ok((await readdir(join(sealsRoot(), record.name))).length > 0);
   });
 });
 

@@ -323,12 +323,18 @@ test("only live or uncertain records need observation heartbeat persistence", ()
 test("touchSession cannot resurrect a deleted session", async () => {
   await withTempStore(async (dir) => {
     await saveSession(makeRecord(dir));
+    await mkdir(join(dir, "seals", "CO.abc"), { recursive: true });
+    await mkdir(join(dir, "hsr", "CO.abc"), { recursive: true });
+    await writeFile(join(dir, "seals", "CO.abc", "seal.json"), "seal history");
+    await writeFile(join(dir, "hsr", "CO.abc", "events.jsonl"), "run history");
     await deleteSession("CO.abc");
 
     assert.equal(await touchSession("CO.abc", { lastObservedState: "working", lastObservedStateAt: new Date().toISOString() }), null);
     assert.equal(await loadSession("CO.abc"), null);
     const files = await readdir(join(dir, "sessions"));
     assert.deepEqual(files.filter((file) => file.endsWith(".json")), []);
+    assert.equal(await readFile(join(dir, "seals", "CO.abc", "seal.json"), "utf8"), "seal history", "deleteSession is metadata-only");
+    assert.equal(await readFile(join(dir, "hsr", "CO.abc", "events.jsonl"), "utf8"), "run history", "deleteSession does not imply purge");
   });
 });
 

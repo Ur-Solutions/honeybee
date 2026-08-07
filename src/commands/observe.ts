@@ -18,8 +18,8 @@ import { listProRepoEntries, resolveProSlotForCwd, type ProRepoEntry, type ProSl
 import { repoTagFor } from "../repoTag.js";
 import { transcriptRowsFromEvents } from "../hsr/eventTranscript.js";
 import { readEventTail } from "../hsr/observe.js";
-import { hsrEventsPath, hsrRunDir } from "../hsr/runDir.js";
-import { loadLatestSeal, sealsRoot } from "../seal.js";
+import { compactHsrEvents, hsrEventsPath } from "../hsr/runDir.js";
+import { loadLatestSeal } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, resolveSessionTranscript } from "../sessionMetadata.js";
 import { deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
@@ -560,7 +560,8 @@ export async function cmdWait(parsed: Parsed) {
  */
 export async function cmdRetire(parsed: Parsed) {
   const target = parsed.args[0];
-  if (!target) throw new Error("Usage: hive retire <bee|@swarm|colony:name>");
+  if (!target) throw new Error("Usage: hive retire <bee|@swarm|colony:name> [--compact]");
+  const compact = truthy(flag(parsed, "compact"));
   const resolved = await resolveSelector(target);
   const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
   if (records.length === 0) throw new Error(`hive retire: no bees match ${target}`);
@@ -578,6 +579,10 @@ export async function cmdRetire(parsed: Parsed) {
       }
       continue;
     }
+    // Optional, non-deleting historical HSR compaction: folds old events into
+    // semantic checkpoints and keeps the bounded tail. Record, seals, run dir,
+    // meta, restart descriptor, and ring all remain available for revive/read.
+    if (compact) await compactHsrEvents(record.name);
     if (isPretty()) {
       console.log(actionLine("ok", "retire", [bold(record.name), dim(outcome.alreadyGone ? "already stopped — filed as done" : "stopped and filed as done")]));
     } else {
@@ -628,20 +633,11 @@ export async function cmdKill(parsed: Parsed) {
     process.exitCode = 1;
     return;
   }
-  await purgeBeeArtifacts(record);
   if (isPretty()) {
     console.log(actionLine(outcome.alreadyGone ? "warn" : "ok", outcome.alreadyGone ? "gone" : "kill", [bold(record.name), dim("record, seals, and run data deleted")]));
   } else {
     console.log(`${outcome.alreadyGone ? "gone" : "killed"}\t${record.name}`);
   }
-}
-
-/** Best-effort removal of the bee's per-bee stores (seals, HSR run dir). */
-async function purgeBeeArtifacts(record: SessionRecord): Promise<void> {
-  const { rm } = await import("node:fs/promises");
-  const { join } = await import("node:path");
-  await rm(join(sealsRoot(), record.name), { recursive: true, force: true }).catch(() => undefined);
-  await rm(hsrRunDir(record.name), { recursive: true, force: true }).catch(() => undefined);
 }
 
 async function promptLine(question: string): Promise<string> {
