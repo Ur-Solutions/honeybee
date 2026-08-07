@@ -1,11 +1,25 @@
 import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { readClaudeKeychain, writeClaudeKeychainEntry } from "../keychain.js";
+import * as keychain from "../keychain.js";
 import { atomicWriteFile } from "../fsx.js";
 import { appendLedger } from "../store.js";
 import { accountDir, withAccountLock, listAccounts, CROSS_ACCOUNT_LOCK_TIMEOUT_MS, type AccountRecord } from "./registry.js";
 import { accountEmail } from "./utils.js";
 import { candidateHomes, dedicatedHomesFor } from "./homes.js";
+
+type RawClaudeKeychainReader = (homePath: string) => Promise<string | null>;
+
+/**
+ * The activation hardening shard adds an explicitly raw reader while keeping
+ * readClaudeKeychain compatibility-decoding for older callers. Prefer the raw
+ * API whenever it is present, while remaining buildable before that shard is
+ * integrated. Chain selection must inspect the representation Claude itself
+ * receives, never a compatibility-decoded view that can hide hex corruption.
+ */
+function defaultRawClaudeKeychainReader(): RawClaudeKeychainReader {
+  const moduleWithRaw = keychain as typeof keychain & { readClaudeKeychainRaw?: RawClaudeKeychainReader };
+  return moduleWithRaw.readClaudeKeychainRaw ?? keychain.readClaudeKeychain;
+}
 
 function decodeClaudeCredentialsRaw(raw: string | null): string | null {
   if (!raw) return null;
@@ -18,6 +32,18 @@ function decodeClaudeCredentialsRaw(raw: string | null): string | null {
     return decoded.trimStart().startsWith("{") ? decoded : raw;
   } catch {
     return raw;
+  }
+}
+
+/** True only for the raw JSON representation Claude itself can consume. */
+export function isRawClaudeCredentialPayload(raw: string | null): boolean {
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: unknown; expiresAt?: unknown } };
+    return typeof parsed?.claudeAiOauth?.accessToken === "string"
+      && typeof parsed.claudeAiOauth.expiresAt === "number";
+  } catch {
+    return false;
   }
 }
 
@@ -101,7 +127,7 @@ function isBetterClaudeChain(candidate: ClaudeChain, current: ClaudeChain | null
 /** The freshest chain link present in a home — its keychain entry or credentials file. */
 export async function readHomeClaudeChain(homePath: string): Promise<ClaudeChain | null> {
   const fromFile = parseClaudeChain(await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null), `${homePath}:file`);
-  const fromKeychain = parseClaudeChain(await readClaudeKeychain(homePath), `${homePath}:keychain`);
+  const fromKeychain = parseClaudeChain(await keychain.readClaudeKeychain(homePath), `${homePath}:keychain`);
   if (fromFile && fromKeychain) return isBetterClaudeChain(fromKeychain, fromFile) ? fromKeychain : fromFile;
   return fromKeychain ?? fromFile;
 }
@@ -234,6 +260,8 @@ export type ChainSyncResult = { chain: ClaudeChain | null; vaultUpdated: boolean
 export type ChainSyncDeps = {
   /** Resolve a fresh token's identity (tests inject; default is the memoized OAuth profile lookup). */
   fetchProfileEmail?: (accessToken: string) => Promise<string | null>;
+  /** Read the exact representation Claude receives from Keychain. */
+  readKeychainRaw?: RawClaudeKeychainReader;
   now?: () => number;
 };
 
@@ -272,7 +300,9 @@ export async function syncClaudeChainToVault(account: AccountRecord, extraHome?:
 
 export async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<ChainSyncResult> {
   const vaultPath = join(accountDir(account), ".credentials.json");
-  const vault = parseClaudeChain(await readFile(vaultPath, "utf8").catch(() => null), "vault");
+  const vaultRaw = await readFile(vaultPath, "utf8").catch(() => null);
+  const vault = isRawClaudeCredentialPayload(vaultRaw) ? parseClaudeChain(vaultRaw, "vault") : null;
+  let refusedNonRaw = vaultRaw === null || isRawClaudeCredentialPayload(vaultRaw) ? 0 : 1;
   const homes = new Map<string, string>();
   for (const home of await claudeHomesForAccount(account)) homes.set(resolve(home), home);
   if (extraHome && !homes.has(resolve(extraHome)) && (await homeBelongsToAccount(extraHome, account))) {
@@ -280,10 +310,30 @@ export async function syncClaudeChainToVaultLocked(account: AccountRecord, extra
   }
   const expected = accountEmail(account);
   const profileOf = deps.fetchProfileEmail ?? claudeProfileEmailCached;
+  const readKeychainRaw = deps.readKeychainRaw ?? defaultRawClaudeKeychainReader();
   const nowMs = (deps.now ?? Date.now)();
   let best = vault;
+  const quarantinedHomes = new Set<string>();
   for (const home of homes.values()) {
-    const chain = await readHomeClaudeChain(home);
+    const [keychainRaw, fileRaw] = await Promise.all([
+      readKeychainRaw(home),
+      readFile(join(home, ".credentials.json"), "utf8").catch(() => null),
+    ]);
+    // Claude treats a present keychain item as authoritative. If that exact
+    // value is not consumable JSON, quarantine the whole home: falling back
+    // to its file can select an older chain and then overwrite a fresher but
+    // malformed keychain link (the 2026-08-07 production incident shape).
+    if (keychainRaw !== null && !isRawClaudeCredentialPayload(keychainRaw)) {
+      refusedNonRaw += 1;
+      quarantinedHomes.add(resolve(home));
+      if (fileRaw !== null && !isRawClaudeCredentialPayload(fileRaw)) refusedNonRaw += 1;
+      continue;
+    }
+    if (fileRaw !== null && !isRawClaudeCredentialPayload(fileRaw)) refusedNonRaw += 1;
+    const fromKeychain = isRawClaudeCredentialPayload(keychainRaw) ? parseClaudeChain(keychainRaw, `${home}:keychain`) : null;
+    // A present, valid keychain entry is equally authoritative: only consult
+    // the file when no keychain item exists at all.
+    const chain = fromKeychain ?? (isRawClaudeCredentialPayload(fileRaw) ? parseClaudeChain(fileRaw, `${home}:file`) : null);
     if (!chain || !isBetterClaudeChain(chain, best)) continue;
     // Adopting a home chain rewrites the vault — the one moment a foreign
     // chain can hijack the account. A dedicated home is the account's by
@@ -307,13 +357,21 @@ export async function syncClaudeChainToVaultLocked(account: AccountRecord, extra
     }
     best = chain;
   }
+  if (refusedNonRaw > 0) {
+    await appendLedger({
+      type: "account.chain-sync-refused",
+      account: account.id,
+      reason: "non-raw-json-credential",
+      refusedSources: refusedNonRaw,
+    }).catch(() => undefined);
+  }
   if (!best || best === vault) return { chain: best, vaultUpdated: false };
   // A rotated link harvested from one home is the only live link in the OAuth
   // chain. Keeping it in the vault alone strands every other active home on
   // the now-dead refresh token: their next turn fails even though the account
   // registry itself looks healthy. Distribute the adopted link just like a
   // Honeybee-owned refresh so all attributable homes advance atomically.
-  await distributeClaudeChainLocked(account, best.oauth);
+  await distributeClaudeChainLocked(account, best.oauth, { quarantinedHomes, readKeychainRaw });
   await appendLedger({
     type: "account.chain-sync",
     account: account.id,
@@ -398,13 +456,43 @@ export async function refreshClaudeOauthChain(refreshToken: string): Promise<Ref
  * provider's reuse detection — revoking the chain and logging live sessions
  * out (HIVE-2).
  */
-async function distributeClaudeChainLocked(account: AccountRecord, oauth: Record<string, unknown>): Promise<void> {
+type ClaudeDistributionOptions = {
+  quarantinedHomes?: ReadonlySet<string>;
+  readKeychainRaw?: RawClaudeKeychainReader;
+};
+
+async function distributeClaudeChainLocked(
+  account: AccountRecord,
+  oauth: Record<string, unknown>,
+  options: ClaudeDistributionOptions = {},
+): Promise<void> {
   const sourceRaw = JSON.stringify({ claudeAiOauth: oauth });
+  if (!isRawClaudeCredentialPayload(sourceRaw)) {
+    await appendLedger({
+      type: "account.chain-distribution-refused",
+      account: account.id,
+      reason: "non-raw-json-credential",
+    }).catch(() => undefined);
+    throw new Error("refusing to distribute a non-JSON Claude credential");
+  }
   await saveClaudeChainToVaultLocked(account, sourceRaw);
+  const readKeychainRaw = options.readKeychainRaw ?? defaultRawClaudeKeychainReader();
   for (const home of await claudeHomesForAccount(account)) {
+    if (options.quarantinedHomes?.has(resolve(home))) continue;
     try {
-      const existingEntry = await readClaudeKeychain(home);
-      const keychainWrite = await writeClaudeKeychainEntry(home, mergeCredentialsJson(existingEntry, sourceRaw));
+      const existingEntry = await readKeychainRaw(home);
+      // Even outside a sweep adoption, do not write through a malformed
+      // authoritative item. The activation writer repair owns recovery.
+      if (existingEntry !== null && !isRawClaudeCredentialPayload(existingEntry)) {
+        await appendLedger({
+          type: "account.chain-propagation-refused",
+          account: account.id,
+          home,
+          reason: "non-raw-json-keychain",
+        }).catch(() => undefined);
+        continue;
+      }
+      const keychainWrite = await keychain.writeClaudeKeychainEntry(home, mergeCredentialsJson(existingEntry, sourceRaw));
       // A failed or degraded keychain write MUST be visible: claude prefers
       // the keychain over .credentials.json, so a home whose file is fresh
       // but whose keychain kept a previous identity silently bills every bee

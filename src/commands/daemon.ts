@@ -47,6 +47,13 @@ export async function cmdDaemon(parsed: Parsed) {
       const { runSessionListWorker } = await import("../daemon/sessionListProcess.js");
       return runSessionListWorker();
     }
+    // Internal: the disposable credential worker. A deadline breach kills the
+    // process, so keychain/fs work and any account lock it owns cannot overlap
+    // later daemon intervals.
+    case "credential-sweep-worker": {
+      const { runCredentialSweepWorker } = await import("../daemon/credentialSweepProcess.js");
+      return runCredentialSweepWorker();
+    }
     default:
       throw new Error(
         `Unknown daemon subcommand: ${sub}\nUsage: hive daemon <install|uninstall|start|stop|restart|status|logs|run>`,

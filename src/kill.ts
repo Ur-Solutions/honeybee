@@ -1,4 +1,5 @@
 import { appendLedger, deleteSession, updateSession, type SessionRecord } from "./store.js";
+import { syncCredentialPairIsolated } from "./daemon/credentialSweepProcess.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { dropPoolClaimsForBee } from "./pool.js";
 import { stopFailedRequestId } from "./requests/keys.js";
@@ -16,6 +17,10 @@ export type TransactionalKillOptions = {
   sleep?: (ms: number) => Promise<void>;
   /** Append a ledger event (default true). */
   emitLedger?: boolean;
+  /** Injectable best-effort final credential harvest after runtime exit. */
+  finalCredentialSync?: (record: SessionRecord) => Promise<void>;
+  /** Hard outer budget for finalCredentialSync (default 10s). */
+  finalCredentialSyncBudgetMs?: number;
 };
 
 export type KillOutcome =
@@ -144,6 +149,45 @@ async function openStopFailedRequest(record: SessionRecord, lastError: string): 
 }
 
 /**
+ * Harvest a runner home's last rotated credential after its process is
+ * confirmed gone, before retire/purge makes the SessionRecord historical or
+ * removes it. The explicit record binding is the trust proof for an arbitrary
+ * home; provider-specific sync still validates identities where possible.
+ */
+export async function syncSessionCredentialsOnExit(record: SessionRecord, timeoutMs?: number): Promise<void> {
+  if (!record.accountId || !record.homePath) return;
+  const outcome = await syncCredentialPairIsolated(record.accountId, record.homePath, { ...(timeoutMs ? { timeoutMs } : {}) });
+  if (outcome.failedPairs > 0 || outcome.timedOutPairs > 0) throw new Error("final credential sync failed");
+}
+
+async function finalCredentialSync(record: SessionRecord, options: TransactionalKillOptions): Promise<void> {
+  if (!record.accountId || !record.homePath) return;
+  const budgetMs = options.finalCredentialSyncBudgetMs ?? 10_000;
+  const sync = options.finalCredentialSync ?? ((candidate: SessionRecord) =>
+    syncSessionCredentialsOnExit(candidate, Math.max(1, budgetMs - 1_000)));
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      sync(record),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`final credential sync timed out after ${budgetMs}ms`)), budgetMs);
+      }),
+    ]);
+    if (options.emitLedger !== false) {
+      await appendLedger({ type: "account.final-sync", session: record.name, account: record.accountId, ok: true });
+    }
+  } catch {
+    // Runtime teardown must remain available during a credential outage. The
+    // daemon's historical-home sweep remains the recovery backstop.
+    if (options.emitLedger !== false) {
+      await appendLedger({ type: "account.final-sync", session: record.name, account: record.accountId, ok: false }).catch(() => undefined);
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * Transactional kill: substrate.kill -> poll substrate.hasSession -> only then
  * deleteSession. On failure (session still exists after polling, or its absence
  * cannot be confirmed), the SessionRecord is updated with status='kill_failed'
@@ -190,6 +234,7 @@ export async function transactionalKill(
     return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
   }
 
+  await finalCredentialSync(record, options);
   await deleteSession(record.name);
   // Kill is PURGE (consistent with seals/run data): the bee's request file —
   // open and closed history alike — goes with the record. Best-effort, like
@@ -250,6 +295,7 @@ export async function transactionalRetire(
     return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
   }
 
+  await finalCredentialSync(record, options);
   // Request closures BEFORE filing (retire keeps the file — revivable
   // history): a pending stop-failed from an earlier failed kill/retire is now
   // a fact resolved by this successful stop; everything else open closes with

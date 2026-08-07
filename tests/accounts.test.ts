@@ -20,6 +20,7 @@ import {
   captureAccountFromHome,
   findAccount,
   listAccounts,
+  isRawClaudeCredentialPayload,
   mergeCredentialsJson,
   claudeCredentialsEquivalent,
   normalizeAccountRecord,
@@ -345,6 +346,57 @@ test("parseClaudeChain decodes hex-encoded keychain payloads", () => {
   assert.equal(chain?.refreshToken, "refresh-hex");
   assert.equal(chain?.expiresAt, 1_797_782_400_000);
   assert.equal(chain?.raw, raw);
+});
+
+test("chain sync refuses to treat hex text as a Claude-consumable distribution source", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "hex-refused@a.b");
+    const raw = chainJson("tok-still-valid", Date.now() + 3_600_000, "refresh-still-valid");
+    const hex = hexPayload(raw);
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(vaultPath, hex);
+    await writeFile(join(home, ".credentials.json"), hex);
+
+    assert.equal(isRawClaudeCredentialPayload(hex), false);
+    const result = await syncClaudeChainToVault(account);
+
+    assert.equal(result.vaultUpdated, false);
+    assert.equal(result.chain, null, "tolerant decoding remains available to readers, but sync cannot redistribute it");
+    assert.equal(await readFile(vaultPath, "utf8"), hex, "the malformed representation is left untouched for the writer repair shard");
+    assert.equal(await readFile(join(home, ".credentials.json"), "utf8"), hex);
+  });
+});
+
+test("chain sync quarantines a home with a malformed authoritative keychain instead of adopting its older file", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "keychain-quarantine@a.b");
+    const now = Date.now();
+    const vaultRaw = chainJson("tok-vault", now + 1_000, "refresh-vault");
+    const fileRaw = chainJson("tok-file-older", now + 2 * 3_600_000, "refresh-file-older");
+    const malformedFresherKeychain = hexPayload(
+      chainJson("tok-keychain-live", now + 8 * 3_600_000, "refresh-keychain-live"),
+    );
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    const home = join(dir, "homes", account.id);
+    const filePath = join(home, ".credentials.json");
+    await mkdir(home, { recursive: true });
+    await writeFile(vaultPath, vaultRaw);
+    await writeFile(filePath, fileRaw);
+
+    const result = await syncClaudeChainToVault(account, undefined, {
+      readKeychainRaw: async (candidate) => candidate === home ? malformedFresherKeychain : null,
+      fetchProfileEmail: async () => {
+        throw new Error("quarantined sources must not reach identity verification");
+      },
+    });
+
+    assert.equal(result.vaultUpdated, false);
+    assert.equal(result.chain?.oauth.accessToken, "tok-vault");
+    assert.equal(await readFile(vaultPath, "utf8"), vaultRaw, "the older file was not adopted into the vault");
+    assert.equal(await readFile(filePath, "utf8"), fileRaw, "no distribution rewrote the quarantined home");
+  });
 });
 
 function fakeJwt(payload: Record<string, unknown>): string {

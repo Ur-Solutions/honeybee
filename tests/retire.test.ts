@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { transactionalRetire } from "../src/kill.js";
+import { transactionalKill, transactionalRetire } from "../src/kill.js";
 import { deriveState } from "../src/state.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { KillResult, Substrate } from "../src/substrates/types.js";
@@ -32,6 +32,8 @@ function seed(record: Partial<SessionRecord> & { name: string; tmuxTarget: strin
     updatedAt: record.updatedAt ?? "2026-05-28T11:00:00.000Z",
     status: record.status ?? "running",
     ...(record.lastError ? { lastError: record.lastError } : {}),
+    ...(record.accountId ? { accountId: record.accountId } : {}),
+    ...(record.homePath ? { homePath: record.homePath } : {}),
   };
 }
 
@@ -82,6 +84,74 @@ test("transactionalRetire marks kill_failed when the session survives", async ()
     const stored = await loadSession("stubborn");
     assert.ok(stored);
     assert.equal(stored!.status, "kill_failed");
+  });
+});
+
+test("retire and purge stay bounded when their post-exit credential harvest never settles", async () => {
+  await withTempStore(async () => {
+    const retireRecord = seed({
+      name: "retire-wedged-sync",
+      tmuxTarget: "retire-wedged-sync",
+      accountId: "codex-a",
+      homePath: "/tmp/codex-a",
+    });
+    const purgeRecord = seed({
+      name: "purge-wedged-sync",
+      tmuxTarget: "purge-wedged-sync",
+      accountId: "codex-a",
+      homePath: "/tmp/codex-a",
+    });
+    await saveSession(retireRecord);
+    await saveSession(purgeRecord);
+    const neverSync = async (): Promise<void> => new Promise<void>(() => undefined);
+    const options = {
+      substrate: fakeSubstrate({}),
+      pollIntervalMs: 0,
+      emitLedger: false,
+      finalCredentialSync: neverSync,
+      finalCredentialSyncBudgetMs: 20,
+    };
+
+    const startedAt = Date.now();
+    assert.equal((await transactionalRetire(retireRecord, options)).ok, true);
+    assert.equal((await transactionalKill(purgeRecord, options)).ok, true);
+    assert.ok(Date.now() - startedAt < 500, "both lifecycle operations honor the short final-sync budget");
+    assert.equal((await loadSession("retire-wedged-sync"))?.status, "done");
+    assert.equal(await loadSession("purge-wedged-sync"), null);
+  });
+});
+
+test("successful retire harvests credentials only after the runtime is confirmed gone", async () => {
+  await withTempStore(async () => {
+    const target = seed({
+      name: "retire-final-harvest",
+      tmuxTarget: "retire-final-harvest",
+      accountId: "codex-a",
+      homePath: "/tmp/codex-a",
+    });
+    await saveSession(target);
+    let live = true;
+    const order: string[] = [];
+    const substrate = fakeSubstrate({
+      kill: async () => {
+        order.push("kill");
+        live = false;
+        return killOk();
+      },
+      hasSession: async () => live,
+    });
+
+    const outcome = await transactionalRetire(target, {
+      substrate,
+      pollIntervalMs: 0,
+      emitLedger: false,
+      finalCredentialSync: async () => {
+        assert.equal(live, false, "credential harvest starts after teardown confirmation");
+        order.push("sync");
+      },
+    });
+    assert.equal(outcome.ok, true);
+    assert.deepEqual(order, ["kill", "sync"]);
   });
 });
 

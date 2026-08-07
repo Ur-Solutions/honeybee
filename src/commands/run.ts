@@ -1,7 +1,7 @@
 // `hive run`/x/xa/open — spawn a bee, hand it a prompt, and optionally wait,
 // attach, or present it where you are.
 // Extracted from cli.ts (HIVE-15).
-import { activateAccountIntoHome, defaultHomeForAccount, seedClaudeHomeAcceptance, syncAccountCredentialsToVault } from "../accounts.js";
+import { activateAccountIntoHome, defaultHomeForAccount, seedClaudeHomeAcceptance } from "../accounts.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { bootMsForAgent } from "../drivers.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
@@ -18,6 +18,7 @@ import { waitForIdle } from "../wait.js";
 import { acceptsTrust, cleanupAfterRun, confirmPausedAccount, dangerousMode, deliverPromptText, formatPaneExcerpt, hasFlag, hsrSubstrateRequested, includePausedFlag, resolveSpawnCwd, sleep, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { cmdSpawn, requestedModelFromArgs, resolveAccountFlag, resolveProfileOverlay, resolveSpawnAgentWithAuto } from "../commands/spawn.js";
 import { loadTrackAttachment } from "../track.js";
+import { syncCredentialPairIsolated } from "../daemon/credentialSweepProcess.js";
 
 /**
  * run/x/xa spawn exactly one bee — reject cohort flags with a command-specific
@@ -435,6 +436,6 @@ export async function cmdOpenRaw(parsed: Parsed) {
   // Pull it back now so the next activation does not stamp an old credential
   // over the live one.
   if (account && spec.homePath) {
-    await syncAccountCredentialsToVault(account, spec.homePath, { trustExtraHome: true }).catch(() => undefined);
+    await syncCredentialPairIsolated(account.id, spec.homePath).catch(() => undefined);
   }
 }
