@@ -469,7 +469,7 @@ async function rebuildActiveSessionIndexLocked(
         "active-index reconciliation attempts; prior projection preserved",
       );
     }
-    if (previous && snapshot.readFailures.length > 0) {
+    if (snapshot.readFailures.length > 0) {
       throw new AggregateError(
         snapshot.readFailures.map((failure) => failure.error),
         "active-index reconciliation could not authoritatively read every canonical record",

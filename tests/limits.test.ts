@@ -1487,6 +1487,27 @@ test("account commitments include an older-writer live record without daemon rec
   });
 });
 
+test("account commitments fail closed when the initial active-index rebuild cannot read every record", async () => {
+  await withTempStore(async (dir) => {
+    const sessionsDir = join(dir, "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    const healthy = liveSession("bootstrap-healthy", "account-a", "working");
+    await writeFile(join(sessionsDir, `${healthy.name}.json`), JSON.stringify(healthy));
+    await writeFile(join(sessionsDir, "bootstrap-torn.json"), '{"name":');
+
+    await assert.rejects(
+      () => accountCommitments("claude"),
+      (error: unknown) => error instanceof AggregateError && /authoritatively read/.test(error.message),
+      "a first rebuild must not commit a partial projection that hides an unreadable live record",
+    );
+    await assert.rejects(
+      () => readFile(activeSessionIndexPath(), "utf8"),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT",
+      "a failed bootstrap must leave the active index absent for a later authoritative retry",
+    );
+  });
+});
+
 test("account commitments reject an ambiguous indexed live record instead of undercounting", async () => {
   await withTempStore(async (dir) => {
     const healthy = liveSession("commitment-healthy", "account-a", "working");
