@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { canonicalAgentKind } from "../agents.js";
 import { hasAgentDriver, identityRecipeForAgent, type IdentityRecipe } from "../drivers.js";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
-import { withFileLock } from "../lock.js";
+import { type LockOptions, withFileLock } from "../lock.js";
 import { appendLedger, safeName } from "../store.js";
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -117,10 +117,10 @@ export function withAccountsLock<T>(fn: () => Promise<T>): Promise<T> {
  * activation past the lock timeout (HIVE-64). Same-account work still
  * serializes, which rotating refresh tokens require (HIVE-2). Not reentrant.
  */
-export function withAccountLock<T>(accountId: string, fn: () => Promise<T>, options: { timeoutMs?: number } = {}): Promise<T> {
+export function withAccountLock<T>(accountId: string, fn: () => Promise<T>, options: LockOptions = {}): Promise<T> {
   // Activation may refresh an OAuth chain over the network (15s cap) while
   // holding the lock; give waiters enough patience to outlive that.
-  return withFileLock(accountLockPath(accountId), fn, { timeoutMs: options.timeoutMs ?? 30_000 });
+  return withFileLock(accountLockPath(accountId), fn, { ...options, timeoutMs: options.timeoutMs ?? 30_000 });
 }
 
 // Cross-account writes (chain evacuation, imposter parking) take the OTHER

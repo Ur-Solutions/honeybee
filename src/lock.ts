@@ -1,16 +1,43 @@
 import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
 import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
+import { hostname } from "node:os";
+import { performance } from "node:perf_hooks";
+
+export type LockOwnerMetadata = {
+  /** Process id advertised by the holder. Never treated as identity by itself. */
+  pid?: number;
+  /** Host that created the lock. Absent on legacy lock files. */
+  hostname?: string;
+  /** Wall-clock diagnostic stamp from the holder. */
+  createdAt?: string;
+};
+
+export type LockWaitInfo = {
+  /** Monotonic duration observed so far. */
+  waitMs: number;
+  /** Secret-free, size-bounded projection of the first holder observed. */
+  owner: LockOwnerMetadata | null;
+};
+
+export type LockAcquiredInfo = LockWaitInfo & {
+  waited: boolean;
+};
 
 export type LockOptions = {
   timeoutMs?: number;
   staleMs?: number;
   pollMs?: number;
   /** Called once when acquisition first observes another holder. */
-  onWait?: () => void;
+  onWait?: (info: LockWaitInfo) => void;
+  /** Called after acquisition, with the full monotonic wait and first owner. */
+  onAcquired?: (info: LockAcquiredInfo) => void;
+  /** Called immediately before a timed-out acquisition rejects. */
+  onTimeout?: (info: LockWaitInfo) => void;
 };
 
 type LockHandle = {
+  acquired: LockAcquiredInfo;
   release: () => Promise<void>;
 };
 
@@ -31,8 +58,15 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
-  const started = Date.now();
+  const started = performance.now();
   let reportedWait = false;
+  let firstOwner: LockOwnerMetadata | null = null;
+
+  const throwTimeout = (): never => {
+    const info = { waitMs: Math.max(0, performance.now() - started), owner: firstOwner };
+    safeCallback(() => options.onTimeout?.(info));
+    throw new Error(`Timed out waiting for lock: ${path}`);
+  };
 
   await mkdir(dirname(path), { recursive: true });
 
@@ -41,7 +75,7 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
       const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
       const handle = await open(path, "wx", 0o600);
       try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), token }));
+        await handle.writeFile(JSON.stringify({ pid: process.pid, hostname: hostname(), createdAt: new Date().toISOString(), token }));
       } finally {
         await handle.close().catch(() => undefined);
       }
@@ -52,7 +86,14 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
         void utimes(path, now, now).catch(() => undefined);
       }, Math.max(50, Math.floor(staleMs / 3)));
       heartbeat.unref?.();
+      const acquired: LockAcquiredInfo = {
+        waited: reportedWait,
+        waitMs: Math.max(0, performance.now() - started),
+        owner: firstOwner,
+      };
+      safeCallback(() => options.onAcquired?.(acquired));
       return {
+        acquired,
         release: async () => {
           clearInterval(heartbeat);
           // Only remove the lock if our token is still in it. If a waiter
@@ -79,19 +120,98 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
       if (code !== "EEXIST") throw error;
       if (!reportedWait) {
         reportedWait = true;
-        options.onWait?.();
+        firstOwner = await readLockOwner(path);
+        const info = { waitMs: Math.max(0, performance.now() - started), owner: firstOwner };
+        // Observability must never be able to break mutual exclusion. In
+        // particular, do not let a telemetry callback throw between EEXIST and
+        // the retry loop and strand an activation.
+        safeCallback(() => options.onWait?.(info));
+      }
+
+      // Current-format local locks advertise their host + pid. A dead owner can
+      // be reclaimed immediately instead of forcing every activation to wait
+      // for the mtime stale window. Legacy/remote-host records retain the
+      // conservative stale timeout because a pid alone is not safe identity.
+      const owner = await readLockOwner(path);
+      if (owner && owner.hostname === hostname() && owner.pid !== undefined && !isPidAlive(owner.pid)) {
+        await stealDeadLock(path, owner);
+        if (performance.now() - started >= timeoutMs) throwTimeout();
+        continue;
       }
 
       const info = await stat(path).catch(() => null);
       if (info && Date.now() - info.mtimeMs > staleMs) {
         await stealStaleLock(path, staleMs);
-        if (Date.now() - started >= timeoutMs) throw new Error(`Timed out waiting for lock: ${path}`);
+        if (performance.now() - started >= timeoutMs) throwTimeout();
         continue;
       }
 
-      if (Date.now() - started >= timeoutMs) throw new Error(`Timed out waiting for lock: ${path}`);
+      if (performance.now() - started >= timeoutMs) throwTimeout();
       await sleep(pollMs);
     }
+  }
+}
+
+function safeCallback(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    // Metrics/debug hooks are deliberately non-authoritative.
+  }
+}
+
+/** Parse only a secret-free, bounded metadata projection from a lock file. */
+async function readLockOwner(path: string): Promise<LockOwnerMetadata | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return null;
+  }
+  if (raw.length > 16 * 1024) return null;
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return {
+      ...(typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0 ? { pid: value.pid } : {}),
+      ...(typeof value.hostname === "string" && value.hostname.length <= 255 ? { hostname: value.hostname } : {}),
+      ...(typeof value.createdAt === "string" && value.createdAt.length <= 64 ? { createdAt: value.createdAt } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Reclaim only if the same advertised dead owner still owns the file. */
+async function stealDeadLock(path: string, expected: LockOwnerMetadata): Promise<void> {
+  const guardPath = `${path}.steal`;
+  let guard;
+  try {
+    guard = await open(guardPath, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    return;
+  }
+  try {
+    const current = await readLockOwner(path);
+    if (!current || current.pid !== expected.pid || current.hostname !== expected.hostname || current.createdAt !== expected.createdAt) return;
+    if (current.pid !== undefined && isPidAlive(current.pid)) return;
+    const stalePath = `${path}.dead.${process.pid}.${Math.random().toString(36).slice(2)}`;
+    await rename(path, stalePath).catch(() => undefined);
+    await rm(stalePath, { force: true }).catch(() => undefined);
+  } finally {
+    await guard.close().catch(() => undefined);
+    await rm(guardPath, { force: true }).catch(() => undefined);
   }
 }
 

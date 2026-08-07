@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { buildAddGenericPasswordCommand, claudeKeychainService, credentialDigest, identityOnlyCredentials, keychainAvailable, readClaudeKeychain, writeClaudeKeychainEntry } from "../src/keychain.js";
+import { buildAddGenericPasswordCommand, claudeKeychainService, credentialDigest, decodeSecurityPasswordOutput, identityOnlyCredentials, keychainAvailable, readClaudeKeychain, writeClaudeKeychainEntry } from "../src/keychain.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,40 +31,46 @@ test("HIVE_NO_KEYCHAIN disables the bridge entirely", async () => {
   }
 });
 
-test("buildAddGenericPasswordCommand hex-encodes the secret and quotes the other tokens", () => {
-  // Hex sidesteps the `security -i` tokenizer entirely: quotes, backslashes,
-  // and the newlines of pretty-printed merged JSON all round-trip.
-  const secret = '{\n  "a": "b\\c \\"d\\""\n}';
-  const hex = Buffer.from(secret, "utf8").toString("hex");
+test("buildAddGenericPasswordCommand stores compact Claude JSON as a plain password", () => {
+  const secret = JSON.stringify({ a: 'b\\c "d"' }, null, 2);
+  const compact = JSON.stringify(JSON.parse(secret));
+  const quoted = `"${compact.replace(/[\\"]/g, "\\$&")}"`;
   assert.equal(
     buildAddGenericPasswordCommand("me", "Claude Code-credentials", secret),
-    `add-generic-password -U -a "me" -s "Claude Code-credentials" -X ${hex}`,
+    `add-generic-password -U -a "me" -s "Claude Code-credentials" -w ${quoted}`,
   );
   // The optional keychain path becomes a trailing quoted token.
   assert.equal(
     buildAddGenericPasswordCommand("me", "svc", "pw", "/tmp/kc db"),
-    `add-generic-password -U -a "me" -s "svc" -X ${Buffer.from("pw").toString("hex")} "/tmp/kc db"`,
+    `add-generic-password -U -a "me" -s "svc" -w "pw" "/tmp/kc db"`,
   );
 });
 
+test("security hex rendering is normalized to JSON at the bridge boundary", () => {
+  const json = JSON.stringify({ claudeAiOauth: { accessToken: "token", expiresAt: 123 } });
+  assert.equal(decodeSecurityPasswordOutput(Buffer.from(json).toString("hex")), json);
+  assert.equal(decodeSecurityPasswordOutput(json), json);
+  assert.equal(decodeSecurityPasswordOutput("deadbeef"), "deadbeef", "non-JSON hex is not guessed into credentials");
+});
+
 test("buildAddGenericPasswordCommand compacts oversize JSON, fails closed when even that overflows", () => {
-  // An array pretty-prints one element per line, so the exact bytes hex to
-  // well over the interpreter's ~4KB line buffer while the compact form
+  // An array pretty-prints one element per line, so the exact form grows
+  // over the interpreter's ~4KB line buffer while the compact form
   // stays well under it. Assert both preconditions so size drift is loud.
   const payload = { claudeAiOauth: { scopes: Array.from({ length: 350 }, () => "ab") } };
   const oversizePretty = JSON.stringify(payload, null, 2);
   const compact = JSON.stringify(payload);
-  assert.ok(oversizePretty.length * 2 > 4100, "precondition: exact form must overflow the line budget");
-  assert.ok(compact.length * 2 < 3900, "precondition: compact form must fit the line budget");
+  assert.ok(oversizePretty.length > 4100, "precondition: exact form must overflow the line budget");
+  assert.ok(compact.length < 3900, "precondition: compact form must fit the line budget");
   const command = buildAddGenericPasswordCommand("me", "svc", oversizePretty);
   assert.notEqual(command, null);
-  const hex = command!.split(" -X ")[1]!;
-  assert.equal(Buffer.from(hex, "hex").toString("utf8"), compact);
+  assert.match(command!, / -w /);
+  assert.doesNotMatch(command!, /[\r\n]/);
   // Too big even compacted → null (fail closed; argv is never a fallback).
-  const huge = JSON.stringify({ claudeAiOauth: { accessToken: "x".repeat(3000) } });
+  const huge = JSON.stringify({ claudeAiOauth: { accessToken: "x".repeat(5000) } });
   assert.equal(buildAddGenericPasswordCommand("me", "svc", huge), null);
   // Oversize and not JSON → cannot compact → null.
-  assert.equal(buildAddGenericPasswordCommand("me", "svc", "z".repeat(3000)), null);
+  assert.equal(buildAddGenericPasswordCommand("me", "svc", "z".repeat(5000)), null);
 });
 
 test("buildAddGenericPasswordCommand rejects account/service values that break the line protocol", () => {
@@ -77,15 +83,21 @@ test("buildAddGenericPasswordCommand rejects account/service values that break t
 // isolated in a throwaway keychain file so the developer's login keychain is
 // never touched. Exercises the same command construction writeClaudeKeychain
 // uses, with the explicit keychain-path argument targeting the fixture.
-test("security -i round-trips a hostile secret byte-for-byte (macOS only)", { skip: process.platform !== "darwin" }, async () => {
+test("security -i writes Claude-format credentials as raw JSON, not hex text (macOS only)", { skip: process.platform !== "darwin" }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hive-keychain-test-"));
   const keychain = join(dir, "test.keychain-db");
   try {
     await execFileAsync("security", ["create-keychain", "-p", "test", keychain]);
-    // Pretty-printed like mergeCredentialsJson output: multi-line, quotes,
-    // backslashes, shell metacharacters, unicode.
+    // Real Claude-shaped, ASCII OAuth JSON. Pretty input is deliberately
+    // compacted: Claude requires a plain password whose `security -w` output
+    // begins with `{`, not a hex representation beginning with `7b`.
     const secret = JSON.stringify({
-      claudeAiOauth: { accessToken: 'sk-ant-oat01-x"y\\z', weird: "q'{}[]$`!* #;|&<>()~^%\téé😀" },
+      claudeAiOauth: {
+        accessToken: "sk-ant-oat01-example",
+        refreshToken: "sk-ant-ort01-example",
+        expiresAt: 1_797_782_400_000,
+        scopes: ["user:inference", "user:profile"],
+      },
     }, null, 2);
     const command = buildAddGenericPasswordCommand("hive-test", "hive-test-svc", secret, keychain);
     assert.notEqual(command, null);
@@ -93,11 +105,10 @@ test("security -i round-trips a hostile secret byte-for-byte (macOS only)", { sk
     pending.child.stdin?.end(`${command}\n`);
     await pending;
     const { stdout } = await execFileAsync("security", ["find-generic-password", "-w", "-s", "hive-test-svc", keychain], { timeout: 60_000 });
-    // find -w hex-encodes non-plain (here: multi-line) data — decode, exactly
-    // as readClaudeKeychain consumers do via decodeClaudeCredentialsRaw.
+    // Claude's required format: find -w returns JSON text, never a hex blob.
     const raw = stdout.trim();
-    const got = /^[0-9a-f]+$/.test(raw) && raw.length % 2 === 0 ? Buffer.from(raw, "hex").toString("utf8") : raw;
-    assert.equal(got, secret);
+    assert.equal(raw.startsWith("{"), true, raw.slice(0, 32));
+    assert.deepEqual(JSON.parse(raw), JSON.parse(secret));
   } finally {
     await execFileAsync("security", ["delete-keychain", keychain]).catch(() => {});
     rmSync(dir, { recursive: true, force: true });
@@ -114,7 +125,7 @@ test("identityOnlyCredentials extracts the claudeAiOauth identity and drops sibl
   const merged = JSON.stringify(
     {
       claudeAiOauth: { accessToken: "sk-ant-oat01-abc", refreshToken: "sk-ant-ort01-def", expiresAt: 1783112557760 },
-      mcpOAuth: { server: { accessToken: "m".repeat(2000) } },
+      mcpOAuth: { server: { accessToken: "m".repeat(4500) } },
     },
     null,
     2,

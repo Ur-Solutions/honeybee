@@ -13,6 +13,7 @@
  */
 
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { acquireLongLivedLock, LockBusyError, storeRoot } from "../fsx.js";
 
 export const DEFAULT_CODEX_STARTUP_CONCURRENCY = 2;
@@ -48,6 +49,17 @@ function slotPath(index: number): string {
   return join(storeRoot(), "locks", "hsr-startup", `codex-${index}.lock`);
 }
 
+export type CodexStartupSlotTiming = {
+  waitMs: number;
+  heldMs: number;
+  slot: number | null;
+  owner: { pid: number; hostname: string; startedAt: string; label?: string } | null;
+};
+
+export type CodexStartupSlotOptions = {
+  onTiming?: (timing: CodexStartupSlotTiming) => void;
+};
+
 /**
  * Run one Codex adapter cold start in a bounded machine-wide slot.
  *
@@ -56,11 +68,20 @@ function slotPath(index: number): string {
  * the startup handshake needs protection. Slot choice is best-effort fair
  * across polling waiters; no agent execution remains behind the gate.
  */
-export async function withCodexStartupSlot<T>(bee: string, fn: () => Promise<T>): Promise<T> {
+export async function withCodexStartupSlot<T>(bee: string, fn: () => Promise<T>, options: CodexStartupSlotOptions = {}): Promise<T> {
   const concurrency = codexStartupConcurrency();
-  if (concurrency === 0) return fn();
+  const started = performance.now();
+  if (concurrency === 0) {
+    const heldAt = performance.now();
+    try {
+      return await fn();
+    } finally {
+      safeTiming(options.onTiming, { waitMs: heldAt - started, heldMs: performance.now() - heldAt, slot: null, owner: null });
+    }
+  }
 
   const deadline = Date.now() + startupQueueTimeoutMs();
+  let firstOwner: CodexStartupSlotTiming["owner"] = null;
   for (;;) {
     for (let index = 0; index < concurrency; index += 1) {
       let lock: Awaited<ReturnType<typeof acquireLongLivedLock>>;
@@ -68,14 +89,28 @@ export async function withCodexStartupSlot<T>(bee: string, fn: () => Promise<T>)
         lock = await acquireLongLivedLock(slotPath(index), { label: `codex startup ${bee}` });
       } catch (error) {
         if (!(error instanceof LockBusyError)) throw error;
+        const existing = error.existing;
+        firstOwner ??= existing ? {
+          pid: existing.pid,
+          hostname: existing.hostname,
+          startedAt: existing.startedAt,
+          ...(existing.label ? { label: existing.label } : {}),
+        } : null;
         continue;
       }
       // Keep fn outside the acquisition catch: an adapter is allowed to throw
       // any Error subtype, including LockBusyError, and must never be mistaken
       // for a busy startup slot and silently retried.
+      const acquiredAt = performance.now();
       try {
         return await fn();
       } finally {
+        safeTiming(options.onTiming, {
+          waitMs: acquiredAt - started,
+          heldMs: performance.now() - acquiredAt,
+          slot: index,
+          owner: firstOwner,
+        });
         await lock.release().catch(() => undefined);
       }
     }
@@ -84,5 +119,13 @@ export async function withCodexStartupSlot<T>(bee: string, fn: () => Promise<T>)
       throw new Error(`Timed out waiting for a Codex startup slot after ${startupQueueTimeoutMs()}ms (${bee})`);
     }
     await sleep(Math.min(POLL_MS, Math.max(1, deadline - Date.now())));
+  }
+}
+
+function safeTiming(callback: CodexStartupSlotOptions["onTiming"], timing: CodexStartupSlotTiming): void {
+  try {
+    callback?.(timing);
+  } catch {
+    // Startup admission remains authoritative; telemetry is best effort.
   }
 }

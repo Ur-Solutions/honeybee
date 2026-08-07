@@ -1,7 +1,11 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
+import { withFileLock } from "./lock.js";
+import { storeRoot } from "./fsx.js";
 
 const execFileP = promisify(execFile);
 
@@ -42,7 +46,20 @@ export interface KitMaterializeOptions {
   freshnessTtlMs?: number;
   /** Clock seam for freshness tests. */
   now?: () => number;
+  /** Always-on, secret-free phase observation. Callback failures are ignored. */
+  onTiming?: (timing: KitMaterializeTiming) => void;
 }
+
+export type KitMaterializeTiming = {
+  totalMs: number;
+  freshnessCheckMs: number;
+  probeMs: number;
+  lockWaitMs: number;
+  lockHeldMs: number;
+  syncMs: number;
+  freshness: "hit" | "miss" | "disabled" | "unavailable";
+  singleFlight: boolean;
+};
 
 export const DEFAULT_KIT_SYNC_TTL_MS = 60_000;
 
@@ -104,6 +121,26 @@ export function kitAvailableVersion(): Promise<string | null> {
 /** Test seam: forget the cached probe (HIVE_KIT_BIN changes between tests). */
 export function resetKitProbeForTests(): void {
   kitProbe = undefined;
+  kitFlights.clear();
+}
+
+const kitFlights = new Map<string, Promise<KitMaterializeTiming>>();
+
+function zeroTiming(freshness: KitMaterializeTiming["freshness"]): KitMaterializeTiming {
+  return { totalMs: 0, freshnessCheckMs: 0, probeMs: 0, lockWaitMs: 0, lockHeldMs: 0, syncMs: 0, freshness, singleFlight: false };
+}
+
+function notifyTiming(callback: KitMaterializeOptions["onTiming"], timing: KitMaterializeTiming): void {
+  try {
+    callback?.(timing);
+  } catch {
+    // Observability is never authoritative for capability convergence.
+  }
+}
+
+function kitHomeLockPath(homePath: string): string {
+  const key = createHash("sha256").update(resolve(homePath)).digest("hex").slice(0, 32);
+  return join(storeRoot(), "locks", "kit-homes", `${key}.lock`);
 }
 
 /**
@@ -118,10 +155,34 @@ export async function kitMaterializeHome(
   harness: string,
   options: KitMaterializeOptions = {},
 ): Promise<void> {
+  const key = JSON.stringify([resolve(homePath), harness, options.profile ?? "", options.strict === true]);
+  const existing = kitFlights.get(key);
+  if (existing) {
+    const shared = await existing;
+    notifyTiming(options.onTiming, { ...shared, singleFlight: true });
+    return;
+  }
+  const flight = runKitMaterializeHome(homePath, harness, options);
+  kitFlights.set(key, flight);
+  try {
+    const timing = await flight;
+    notifyTiming(options.onTiming, timing);
+  } finally {
+    if (kitFlights.get(key) === flight) kitFlights.delete(key);
+  }
+}
+
+async function runKitMaterializeHome(
+  homePath: string,
+  harness: string,
+  options: KitMaterializeOptions,
+): Promise<KitMaterializeTiming> {
   const warn = options.warn ?? (() => undefined);
+  const started = performance.now();
+  const timing = zeroTiming("miss");
   if (kitDisabled()) {
     if (options.strict) throw new Error("kit integration is disabled (HIVE_KIT_DISABLE=1)");
-    return;
+    return { ...timing, totalMs: performance.now() - started, freshness: "disabled" };
   }
   // Apiary fan-outs commonly activate the same account home several times in
   // one second. A successful Kit sync stamps materializedAt in its ownership
@@ -129,20 +190,25 @@ export async function kitMaterializeHome(
   // work is redundant and costs two Node subprocesses (~100ms locally). Keep
   // explicit --kit-profile strict: it is a requested capability transition,
   // not best-effort background convergence.
-  if (
-    !options.strict &&
-    await kitHomeWasMaterializedRecently(
+  const freshnessStarted = performance.now();
+  const fresh = !options.strict && await kitHomeWasMaterializedRecently(
       homePath,
       options.profile,
       kitSyncTtlMs(options.freshnessTtlMs),
       options.now?.() ?? Date.now(),
-    )
-  ) return;
-  if ((await kitAvailableVersion()) === null) {
+    );
+  timing.freshnessCheckMs += performance.now() - freshnessStarted;
+  if (fresh) {
+    return { ...timing, totalMs: performance.now() - started, freshness: "hit" };
+  }
+  const probeStarted = performance.now();
+  const available = await kitAvailableVersion();
+  timing.probeMs = performance.now() - probeStarted;
+  if (available === null) {
     if (options.strict) {
       throw new Error("kit binary not found — install trmdy/kit (npm link) or set HIVE_KIT_BIN");
     }
-    return;
+    return { ...timing, totalMs: performance.now() - started, freshness: "unavailable" };
   }
   const args = [
     "sync",
@@ -153,27 +219,48 @@ export async function kitMaterializeHome(
     ...(options.profile ? ["--profile", options.profile] : []),
     "--json",
   ];
-  try {
-    // Timeout budget: the best-effort activation path runs inside the account
-    // lock, whose waiters give up after 30s (registry.ts). 15s + hard kill
-    // bounds kit's OWN hang so a wedged binary can't hold the lock indefinitely
-    // — but it is additive to the other lock-held work (credential copy + OAuth
-    // refresh), so a slow-but-not-hung kit can still contribute to lock
-    // pressure. kit self-serializes per home (its own .kit/sync lock), so
-    // concurrent syncs to one home don't corrupt regardless of this lock. The
-    // explicit strict --kit-profile path (outside the account lock) gets 120s.
-    await execFileP(kitBin(), args, {
-      timeout: options.strict ? 120_000 : 15_000,
-      killSignal: "SIGKILL",
-      maxBuffer: 4_000_000,
-    });
-  } catch (error) {
-    const detail = describeExecError(error);
-    if (options.strict) {
-      throw new Error(`kit sync --profile ${options.profile ?? "(default)"} failed for ${homePath}: ${detail}`);
+  let lockAcquiredAt = 0;
+  await withFileLock(kitHomeLockPath(homePath), async () => {
+    lockAcquiredAt = performance.now();
+    // Cross-process double-check: a sibling may have completed while this
+    // process waited for the home. This is the important miss->hit fast path
+    // during large Apiary fan-outs.
+    if (!options.strict) {
+      const recheckStarted = performance.now();
+      const nowFresh = await kitHomeWasMaterializedRecently(
+        homePath,
+        options.profile,
+        kitSyncTtlMs(options.freshnessTtlMs),
+        options.now?.() ?? Date.now(),
+      );
+      timing.freshnessCheckMs += performance.now() - recheckStarted;
+      if (nowFresh) {
+        timing.freshness = "hit";
+        return;
+      }
     }
-    warn(`kit sync skipped for ${homePath}: ${detail}`);
-  }
+    const syncStarted = performance.now();
+    try {
+      await execFileP(kitBin(), args, {
+        timeout: options.strict ? 120_000 : 15_000,
+        killSignal: "SIGKILL",
+        maxBuffer: 4_000_000,
+      });
+    } catch (error) {
+      const detail = describeExecError(error);
+      if (options.strict) {
+        throw new Error(`kit sync --profile ${options.profile ?? "(default)"} failed for ${homePath}: ${detail}`);
+      }
+      warn(`kit sync skipped for ${homePath}: ${detail}`);
+    } finally {
+      timing.syncMs = performance.now() - syncStarted;
+    }
+  }, {
+    timeoutMs: options.strict ? 130_000 : 30_000,
+    onAcquired: ({ waitMs }) => { timing.lockWaitMs = waitMs; },
+  });
+  timing.lockHeldMs = lockAcquiredAt > 0 ? performance.now() - lockAcquiredAt : 0;
+  return { ...timing, totalMs: performance.now() - started };
 }
 
 /**

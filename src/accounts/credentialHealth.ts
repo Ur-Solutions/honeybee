@@ -1,8 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { readClaudeKeychain } from "../keychain.js";
-import { parseClaudeChain, readVaultClaudeChain, type ClaudeChain } from "./claudeChain.js";
-import type { AccountRecord } from "./registry.js";
+import { readClaudeKeychainRaw } from "../keychain.js";
+import { parseClaudeChainStrict, type ClaudeChain } from "./claudeChain.js";
+import { accountDir, type AccountRecord } from "./registry.js";
 
 export type ClaudeDiskCredentialHealth =
   | { valid: true; expiresAt: number }
@@ -61,7 +61,7 @@ export async function inspectClaudeDiskCredentials(
 ): Promise<ClaudeDiskCredentialHealth> {
   const raw = await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null);
   if (raw === null) return { valid: false, reason: "missing" };
-  const chain = parseClaudeChain(raw, "home-file");
+  const chain = parseClaudeChainStrict(raw, "home-file");
   return inspectClaudeChain(chain, options);
 }
 
@@ -72,9 +72,11 @@ export async function inspectClaudeDiskCredentials(
  * stale Keychain entry.
  */
 export async function readEffectiveClaudeHomeChain(homePath: string): Promise<ClaudeChain | null> {
-  const keychain = parseClaudeChain(await readClaudeKeychain(homePath), `${homePath}:keychain`);
-  if (keychain) return keychain;
-  return parseClaudeChain(
+  const rawKeychain = await readClaudeKeychainRaw(homePath);
+  // Presence wins even when malformed: Claude will read the broken keychain
+  // item and will not fall back to a healthy file.
+  if (rawKeychain !== null) return parseClaudeChainStrict(rawKeychain, `${homePath}:keychain`);
+  return parseClaudeChainStrict(
     await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null),
     `${homePath}:file`,
   );
@@ -97,7 +99,10 @@ export async function planClaudeRecoveryCredentials(
 ): Promise<ClaudeRecoveryCredentialPlan> {
   const [home, vault] = await Promise.all([
     (options.readHome ?? readEffectiveClaudeHomeChain)(homePath),
-    (options.readVault ?? readVaultClaudeChain)(account),
+    (options.readVault ?? (async (record: AccountRecord) => parseClaudeChainStrict(
+      await readFile(join(accountDir(record), ".credentials.json"), "utf8").catch(() => null),
+      "vault",
+    )))(account),
   ]);
   const healthOptions = { ...(options.now ? { now: options.now } : {}) };
   const homeHealth = inspectClaudeChain(home, healthOptions);

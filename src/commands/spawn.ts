@@ -38,6 +38,7 @@ import { linkHere } from "../spawnLink.js";
 import { randomUUID } from "node:crypto";
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverPromptText, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { flowRun } from "../commands/flow.js";
 import { attachBeeToRun } from "../comb/attachment.js";
@@ -50,6 +51,16 @@ import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 import { hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../hsr/runDir.js";
 import { transactionalRetire } from "../kill.js";
 import { attachTrack, loadTrack } from "../track.js";
+
+async function persistSpawnTiming(timer: SpawnTimer, label: string): Promise<void> {
+  const report = timer.report(label);
+  await appendLedger({
+    type: "spawn.timing",
+    session: label,
+    totalMs: report.totalMs,
+    phases: report.phases,
+  }).catch(() => undefined);
+}
 
 export async function cmdSpawn(parsed: Parsed): Promise<SessionRecord> {
   if (flag(parsed, "template") !== undefined) {
@@ -509,7 +520,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     };
     await saveSession(record);
     timer.mark("persist");
-    if (ownsTimer) timer.report(record.name);
+    if (ownsTimer) await persistSpawnTiming(timer, record.name);
     return record;
   }
 
@@ -604,7 +615,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     if (opts.waitForHost && !(await waitForHsrHost(name, 5000))) {
       console.error(note(`hsr host for ${name} did not report live within 5s; the daemon will reconcile`));
     }
-    if (ownsTimer) timer.report(record.name);
+    if (ownsTimer) await persistSpawnTiming(timer, record.name);
     return record;
   }
 
@@ -663,7 +674,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
   timer.mark("persist");
   // Owned timers (swarm/internal callers) report here; a caller-threaded timer
   // is reported by the caller once the readiness wait has also been measured.
-  if (ownsTimer) timer.report(record.name);
+  if (ownsTimer) await persistSpawnTiming(timer, record.name);
   return record;
 }
 
@@ -758,11 +769,31 @@ export async function resolveAccountFlag(
 // is provider-blind and may select a different provider than the user meant.
 // Account-first resolution (exact id) sidesteps this; left unchanged in S2.
 export async function pickAutoAccount(tool: string, ttlMs: number | undefined, includePaused = false, model?: string): Promise<AccountRecord> {
-  const choice = await pickLeastLoadedAccount(tool, {
-    ...(ttlMs !== undefined ? { ttlMs } : {}),
-    ...(includePaused ? { includePaused } : {}),
-    ...(model ? { model } : {}),
-  });
+  const started = performance.now();
+  let choice: Awaited<ReturnType<typeof pickLeastLoadedAccount>>;
+  try {
+    choice = await pickLeastLoadedAccount(tool, {
+      ...(ttlMs !== undefined ? { ttlMs } : {}),
+      ...(includePaused ? { includePaused } : {}),
+      ...(model ? { model } : {}),
+    });
+  } catch (error) {
+    await appendLedger({
+      type: "account.auto-pick-timing",
+      tool,
+      outcome: "failed",
+      durationMs: Math.max(0, performance.now() - started),
+    }).catch(() => undefined);
+    throw error;
+  }
+  await appendLedger({
+    type: "account.auto-pick-timing",
+    tool,
+    outcome: "selected",
+    account: choice.account.id,
+    durationMs: Math.max(0, performance.now() - started),
+    cacheHit: choice.limits?.cached === true,
+  }).catch(() => undefined);
   const usage = autoPickUsage(choice.limits, model);
   const freshness = choice.limits?.cached && choice.limits.asOf ? `, cached ${formatRelativeTime(choice.limits.asOf)} ago` : "";
   console.error(note(`account auto → ${choice.account.id}${usage ? ` (${usage}${freshness})` : ""} — ${choice.reason}`));
@@ -1174,7 +1205,7 @@ export async function spawnSingleBee(
       else console.error(`warn\ttrack.attach_failed\t${record.name}\t${trackAttachment.name}\t${message}`);
     }
   }
-  timer.report(record.name);
+  await persistSpawnTiming(timer, record.name);
   return record;
 }
 

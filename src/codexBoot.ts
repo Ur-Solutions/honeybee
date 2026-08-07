@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type LockOptions, withFileLock } from "./lock.js";
+import { type LockOptions, type LockOwnerMetadata, withFileLock } from "./lock.js";
 import { spawnTimingEnabled } from "./spawnTiming.js";
 
 const CODEX_BOOT_LOCK_FILENAME = ".hive-app-server-boot.lock";
@@ -10,6 +10,10 @@ const CODEX_BOOT_LOCK_STALE_MS = 2 * 60_000;
 export type CodexBootLockState = {
   /** True when another boot held this home's lock before this caller acquired it. */
   waited: boolean;
+  /** Full monotonic acquisition wait, including filesystem arbitration. */
+  waitMs: number;
+  /** Secret-free metadata for the first holder observed, if contended. */
+  owner: LockOwnerMetadata | null;
 };
 
 export type CodexBootFailureCause = "process-died" | "alive-but-unresponsive" | "rpc-error";
@@ -43,19 +47,27 @@ export async function withCodexHomeBootLock<T>(
   options: LockOptions = {},
 ): Promise<T> {
   let waited = false;
+  let waitMs = 0;
+  let owner: LockOwnerMetadata | null = null;
   const callerOnWait = options.onWait;
-  return withFileLock(join(home, CODEX_BOOT_LOCK_FILENAME), () => fn({ waited }), {
+  const callerOnAcquired = options.onAcquired;
+  return withFileLock(join(home, CODEX_BOOT_LOCK_FILENAME), () => fn({ waited, waitMs, owner }), {
     ...options,
     timeoutMs: options.timeoutMs ?? CODEX_BOOT_LOCK_TIMEOUT_MS,
     // Heartbeats keep a legitimately slow boot fresh; a hard-crashed holder is
     // reclaimable well before the waiter's overall patience expires.
     staleMs: options.staleMs ?? CODEX_BOOT_LOCK_STALE_MS,
-    onWait: () => {
+    onWait: (info) => {
       waited = true;
       if (spawnTimingEnabled()) {
         process.stderr.write(`hive: debug: waiting for codex boot lock (${home})\n`);
       }
-      callerOnWait?.();
+      callerOnWait?.(info);
+    },
+    onAcquired: (info) => {
+      waitMs = info.waitMs;
+      owner = info.owner;
+      callerOnAcquired?.(info);
     },
   });
 }

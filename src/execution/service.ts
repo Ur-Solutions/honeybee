@@ -321,6 +321,24 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         [{ type: "harness.running", payload: {}, origin: await origin({ driverId: driverIdOf(current) }) }],
         { onlyIfAbsentTypes: true },
       );
+    } else if (classification === "booting-receipt-lost") {
+      const outcome = await options.sessions.outcome(current.beeName);
+      if (outcome && !outcome.live) {
+        const finishedAt = now().toISOString();
+        current = await mutateReservation(current.runId, (record) => ({
+          ...record,
+          phase: "failed",
+          failedAt: record.failedAt ?? finishedAt,
+          failureCause: record.failureCause ?? "HARNESS_UNAVAILABLE: harness exited before readiness",
+          result: record.result ?? { outcome: "failed", cause: "HARNESS_UNAVAILABLE: harness exited before readiness", finishedAt },
+        }));
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "run.failed", payload: { cause: "HARNESS_UNAVAILABLE", message: "harness exited before readiness" }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+      }
     } else if (classification === "indeterminate" && !current.indeterminateAt) {
       current = await mutateReservation(current.runId, (record) =>
         record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
@@ -819,13 +837,19 @@ export function storeSessionEvidenceSource(): SessionEvidenceSource {
       return {
         sessionExists: record !== null || meta !== null,
         ...(record?.executionRunId !== undefined ? { stampedRunId: record.executionRunId } : {}),
+        ...(meta !== null ? { ready: meta.status === "running" && typeof meta.runningAt === "string" } : {}),
       };
     },
     async outcome(beeName) {
-      const [{ loadSession }, { readHsrMeta }] = await Promise.all([import("../store.js"), import("../hsr/runDir.js")]);
+      const [{ loadSession }, { readHsrMeta }, { defaultIsPidAlive }] = await Promise.all([
+        import("../store.js"),
+        import("../hsr/runDir.js"),
+        import("../fsx.js"),
+      ]);
       const meta = await readHsrMeta(beeName);
       if (meta) {
         if (meta.status === "exited") return { live: false, exitCode: meta.exitCode ?? null };
+        if (!meta.mirrorOfNode && !defaultIsPidAlive(meta.hostPid)) return { live: false, exitCode: null };
         return { live: true };
       }
       const record = await loadSession(beeName);

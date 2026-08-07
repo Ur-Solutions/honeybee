@@ -598,6 +598,7 @@ export type LaunchClassification =
   | "launch-in-flight"
   | "reserved-not-started"
   | "started-receipt-lost"
+  | "booting-receipt-lost"
   | "indeterminate";
 
 /**
@@ -613,6 +614,8 @@ export type LaunchEvidence = {
   sessionExists: boolean;
   /** The executionRunId stamped on that session record, when present. */
   stampedRunId?: string;
+  /** False when durable HSR evidence exists but has not reached runningAt. */
+  ready?: boolean;
 };
 
 /**
@@ -633,6 +636,7 @@ export function classifyLaunch(
   if (reservation.indeterminateAt) return "indeterminate";
   if (evidence.sessionExists) {
     if (evidence.stampedRunId !== undefined && evidence.stampedRunId !== reservation.runId) return "indeterminate";
+    if (evidence.ready === false) return "booting-receipt-lost";
     return "started-receipt-lost";
   }
   const attempted = Date.parse(reservation.launchAttemptedAt ?? reservation.updatedAt);
