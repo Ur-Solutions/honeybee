@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import type { AccountRecord } from "../src/accounts.js";
 import { accountLockPath, withAccountLock } from "../src/accounts.js";
+import { fileLockMutationGuardPath, readFileLockIdentity } from "../src/lock.js";
 import {
   planCredentialSweep,
   runCredentialSweep,
@@ -15,6 +16,7 @@ import {
 import {
   createIsolatedCredentialSweeper,
   CredentialSweepTimeoutError,
+  reapCredentialWorkerLocks,
   type CredentialSweepChild,
 } from "../src/daemon/credentialSweepProcess.js";
 import { createCredentialSyncController } from "../src/daemon/credentialSyncController.js";
@@ -264,5 +266,91 @@ test("isolated credential sweep kills a never-settling sync, releases its accoun
     assert.deepEqual(await sweep(), recoveredTelemetry);
     assert.equal(spawns, 2);
     await sweep.close();
+  });
+});
+
+test("credential lock reaper leaves a newly reacquired live generation in place", async () => {
+  await withTempStore(async (root) => {
+    const deadPid = 515_151;
+    const accountId = "codex-reacquired";
+    const lockPath = accountLockPath(accountId);
+    await mkdir(join(root, "locks", "accounts"), { recursive: true });
+    await writeFile(lockPath, JSON.stringify({
+      pid: deadPid,
+      createdAt: "2026-08-07T00:00:00.000Z",
+      token: "dead-generation",
+    }));
+
+    let observed!: () => void;
+    const staleOwnerObserved = new Promise<void>((resolve) => { observed = resolve; });
+    let resumeReaper!: () => void;
+    const reaperMayResume = new Promise<void>((resolve) => { resumeReaper = resolve; });
+    const reaping = reapCredentialWorkerLocks(root, deadPid, {
+      beforeRevalidate: async () => {
+        observed();
+        await reaperMayResume;
+      },
+    });
+    await staleOwnerObserved;
+
+    // Model another cleanup/acquisition winning after the reaper's first read.
+    // The new holder is real withFileLock work, so it participates in the same
+    // mutation gate as guarded revalidation.
+    await rm(lockPath, { force: true });
+    let liveEntered!: () => void;
+    const liveWasEntered = new Promise<void>((resolve) => { liveEntered = resolve; });
+    let releaseLive!: () => void;
+    const liveMayRelease = new Promise<void>((resolve) => { releaseLive = resolve; });
+    const liveHolder = withAccountLock(accountId, async () => {
+      liveEntered();
+      await liveMayRelease;
+    });
+    await liveWasEntered;
+
+    resumeReaper();
+    assert.equal(await reaping, 0, "exact owner revalidation rejected the replacement generation");
+    const liveRaw = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown; token?: unknown };
+    assert.equal(liveRaw.pid, process.pid);
+    assert.notEqual(liveRaw.token, "dead-generation");
+
+    let waiterEntered = false;
+    const waiter = withAccountLock(accountId, async () => { waiterEntered = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(waiterEntered, false, "reaper did not create a parallel-acquisition window");
+    releaseLive();
+    await Promise.all([liveHolder, waiter]);
+    assert.equal(waiterEntered, true);
+  });
+});
+
+test("credential lock reaper recovers a worker killed while holding its generation guard", async () => {
+  await withTempStore(async (root) => {
+    const deadPid = 616_161;
+    const accountId = "codex-guard-killed";
+    const lockPath = accountLockPath(accountId);
+    await mkdir(join(root, "locks", "accounts"), { recursive: true });
+    await writeFile(lockPath, JSON.stringify({
+      pid: deadPid,
+      createdAt: "2026-08-07T00:00:00.000Z",
+      token: "dead-lock-generation",
+    }));
+    const identity = await readFileLockIdentity(lockPath);
+    assert.ok(identity);
+    const guardPath = fileLockMutationGuardPath(lockPath, identity!);
+    await writeFile(guardPath, JSON.stringify({
+      pid: deadPid,
+      hostname: hostname(),
+      createdAt: "2026-08-07T00:00:01.000Z",
+      token: "dead-guard-generation",
+      lockFingerprint: identity!.fingerprint,
+    }));
+
+    assert.equal(await reapCredentialWorkerLocks(root, deadPid), 1);
+    await assert.rejects(() => readFile(lockPath, "utf8"), { code: "ENOENT" });
+    await assert.rejects(() => readFile(guardPath, "utf8"), { code: "ENOENT" });
+
+    let acquired = false;
+    await withAccountLock(accountId, async () => { acquired = true; }, { timeoutMs: 200 });
+    assert.equal(acquired, true, "the dead generation guard cannot strand future activations");
   });
 });

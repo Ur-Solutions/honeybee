@@ -9,8 +9,19 @@ const execFileAsync = promisify(execFile);
 // `security` can block indefinitely on a keychain-unlock or consent dialog —
 // fatal for headless callers (the daemon's credential sync wedges its tick).
 // One minute is enough for a human to answer an interactive prompt; after
-// that the call fails closed (read → null, write → false).
+// that the call fails closed (read → unreadable, write → false).
 const SECURITY_EXEC_TIMEOUT_MS = 60_000;
+
+export type ClaudeKeychainReadResult =
+  | { status: "present"; raw: string }
+  | { status: "absent" }
+  | { status: "unavailable" }
+  | { status: "unreadable"; reason: "timeout" | "security-error" };
+
+type KeychainReadDeps = {
+  available?: () => boolean;
+  execSecurity?: (args: string[], options: { timeout: number }) => Promise<{ stdout: string }>;
+};
 
 // ──────────────────────────────────────────────────────────────────────────
 // macOS Keychain bridge for Claude Code credentials.
@@ -40,18 +51,67 @@ export function claudeKeychainService(homePath: string): string {
   return `Claude Code-credentials-${createHash("sha256").update(path).digest("hex").slice(0, 8)}`;
 }
 
-/** Raw `security -w` rendering. Health checks use this to reject hex corruption. */
-export async function readClaudeKeychainRaw(homePath: string): Promise<string | null> {
-  if (!keychainAvailable()) return null;
+function explicitItemNotFound(error: unknown): boolean {
+  const failure = error as { code?: unknown; stderr?: unknown };
+  // `security` exits with errSecItemNotFound (-25300) truncated to 44 on
+  // macOS. Keep the full status and exact diagnostic for test doubles and
+  // potential future wrappers, but do not classify any other failure as
+  // absence: locked keychains, ACL rejection, missing `security`, and timeouts
+  // all mean an authoritative store could exist but could not be inspected.
+  if (failure.code === -25_300) return true;
+  const stderr = typeof failure.stderr === "string" ? failure.stderr : Buffer.isBuffer(failure.stderr) ? failure.stderr.toString("utf8") : "";
+  return /(?:errSecItemNotFound|The specified item could not be found in the keychain)/i.test(stderr);
+}
+
+function keychainReadFailureReason(error: unknown): "timeout" | "security-error" {
+  const failure = error as { code?: unknown; killed?: unknown; signal?: unknown; message?: unknown };
+  if (
+    failure.code === "ETIMEDOUT"
+    || failure.killed === true
+    || failure.signal === "SIGTERM"
+    || (typeof failure.message === "string" && /timed?\s*out/i.test(failure.message))
+  ) return "timeout";
+  return "security-error";
+}
+
+/**
+ * Inspect the exact `security -w` rendering without erasing authority state.
+ * Only an explicit errSecItemNotFound is absence. A successful empty password
+ * is still a present (malformed) item, while locked/ACL/timeout failures are
+ * unreadable and callers must quarantine or fail closed instead of consulting
+ * `.credentials.json`.
+ */
+export async function readClaudeKeychainState(homePath: string, deps: KeychainReadDeps = {}): Promise<ClaudeKeychainReadResult> {
+  const available = deps.available ?? keychainAvailable;
+  if (!available()) return { status: "unavailable" };
+  const execSecurity = deps.execSecurity ?? (async (args, options) => {
+    const { stdout } = await execFileAsync("security", args, options);
+    return { stdout: String(stdout) };
+  });
   try {
     // macOS may show a one-time "security wants to access ..." consent dialog
     // for items created by Claude Code itself; Always Allow makes it stick.
-    const { stdout } = await execFileAsync("security", ["find-generic-password", "-w", "-s", claudeKeychainService(homePath)], { timeout: SECURITY_EXEC_TIMEOUT_MS });
-    const value = stdout.trim();
-    return value.length > 0 ? value : null;
-  } catch {
-    return null;
+    const { stdout } = await execSecurity(["find-generic-password", "-w", "-s", claudeKeychainService(homePath)], { timeout: SECURITY_EXEC_TIMEOUT_MS });
+    return { status: "present", raw: stdout.trim() };
+  } catch (error) {
+    if (explicitItemNotFound(error)) return { status: "absent" };
+    return { status: "unreadable", reason: keychainReadFailureReason(error) };
   }
+}
+
+export class ClaudeKeychainUnreadableError extends Error {
+  constructor(homePath: string, readonly reason: Extract<ClaudeKeychainReadResult, { status: "unreadable" }>["reason"]) {
+    super(`Could not read the authoritative macOS Keychain entry for ${homePath} (${reason})`);
+    this.name = "ClaudeKeychainUnreadableError";
+  }
+}
+
+/** Raw `security -w` rendering. Throws when an authoritative item is unreadable. */
+export async function readClaudeKeychainRaw(homePath: string): Promise<string | null> {
+  const result = await readClaudeKeychainState(homePath);
+  if (result.status === "present") return result.raw;
+  if (result.status === "unreadable") throw new ClaudeKeychainUnreadableError(homePath, result.reason);
+  return null;
 }
 
 /** Read credentials with legacy hex decoding for migration/rescue callers. */

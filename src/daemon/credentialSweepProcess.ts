@@ -6,12 +6,13 @@
  * pid, and starts the next interval with a clean process.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { readdir, readFile, rename, rm } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { storeRoot } from "../fsx.js";
+import { readFileLockIdentity, removeFileLockIfOwner, type FileLockOwnerIdentity } from "../lock.js";
 import { runCredentialPairSync, runCredentialSweep, type CredentialSweepProgress, type CredentialSweepTelemetry } from "./credentialSweep.js";
 import { envMs } from "./timeouts.js";
 
@@ -141,25 +142,30 @@ function emptyTelemetry(): CredentialSweepTelemetry {
  * the holder pid. Renaming before removal keeps deletion recoverable through a
  * narrow, explicit path and avoids broad lock-directory cleanup.
  */
-export async function reapCredentialWorkerLocks(root: string, deadPid: number): Promise<number> {
+export type CredentialWorkerLockReapOptions = {
+  /** Deterministic race barrier for tests/diagnostics; no lock is held here. */
+  beforeRevalidate?: (path: string, observed: FileLockOwnerIdentity) => Promise<void>;
+};
+
+export async function reapCredentialWorkerLocks(
+  root: string,
+  deadPid: number,
+  options: CredentialWorkerLockReapOptions = {},
+): Promise<number> {
   const lockDir = join(root, "locks", "accounts");
   const entries = await readdir(lockDir).catch(() => [] as string[]);
   let reaped = 0;
   for (const entry of entries) {
     if (!entry.endsWith(".lock")) continue;
     const path = join(lockDir, entry);
-    let ownerPid: number | undefined;
-    try {
-      const parsed = JSON.parse(await readFile(path, "utf8")) as { pid?: unknown };
-      ownerPid = typeof parsed.pid === "number" ? parsed.pid : undefined;
-    } catch {
-      continue;
-    }
-    if (ownerPid !== deadPid) continue;
-    const reapedPath = `${path}.reaped.${process.pid}.${Date.now()}`;
-    const moved = await rename(path, reapedPath).then(() => true).catch(() => false);
+    const observed = await readFileLockIdentity(path);
+    if (observed?.owner.pid !== deadPid) continue;
+    await options.beforeRevalidate?.(path, observed);
+    const moved = await removeFileLockIfOwner(path, observed, {
+      suffix: "reaped",
+      validate: (current) => current.owner.pid === deadPid,
+    });
     if (!moved) continue;
-    await rm(reapedPath, { force: true }).catch(() => undefined);
     reaped += 1;
   }
   return reaped;

@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { buildAddGenericPasswordCommand, claudeKeychainService, credentialDigest, decodeSecurityPasswordOutput, identityOnlyCredentials, keychainAvailable, readClaudeKeychain, writeClaudeKeychainEntry } from "../src/keychain.js";
+import { buildAddGenericPasswordCommand, claudeKeychainService, credentialDigest, decodeSecurityPasswordOutput, identityOnlyCredentials, keychainAvailable, readClaudeKeychain, readClaudeKeychainState, writeClaudeKeychainEntry } from "../src/keychain.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -29,6 +29,36 @@ test("HIVE_NO_KEYCHAIN disables the bridge entirely", async () => {
     if (old === undefined) delete process.env.HIVE_NO_KEYCHAIN;
     else process.env.HIVE_NO_KEYCHAIN = old;
   }
+});
+
+test("keychain reads distinguish explicit absence from unreadable and preserve present raw bytes", async () => {
+  const home = "/tmp/keychain-read-state";
+  const read = (execSecurity: (args: string[]) => Promise<{ stdout: string }>) => readClaudeKeychainState(home, {
+    available: () => true,
+    execSecurity,
+  });
+
+  assert.deepEqual(await read(async () => {
+    throw Object.assign(new Error("not found"), {
+      code: 44,
+      stderr: "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.",
+    });
+  }), { status: "absent" });
+  assert.deepEqual(await read(async () => {
+    throw Object.assign(new Error("ambiguous security failure"), { code: 44 });
+  }), { status: "unreadable", reason: "security-error" }, "exit-code truncation alone is not explicit absence");
+  assert.deepEqual(await read(async () => {
+    throw Object.assign(new Error("User interaction is not allowed"), { code: 36 });
+  }), { status: "unreadable", reason: "security-error" });
+  assert.deepEqual(await read(async () => {
+    throw Object.assign(new Error("timed out"), { code: "ETIMEDOUT", killed: true });
+  }), { status: "unreadable", reason: "timeout" });
+
+  // Exit zero means the item exists even when its payload is malformed/empty;
+  // only the explicit item-not-found status above is absence.
+  assert.deepEqual(await read(async () => ({ stdout: "\n" })), { status: "present", raw: "" });
+  const healthy = '{"claudeAiOauth":{"accessToken":"a","expiresAt":1}}';
+  assert.deepEqual(await read(async () => ({ stdout: `${healthy}\n` })), { status: "present", raw: healthy });
 });
 
 test("buildAddGenericPasswordCommand stores compact Claude JSON as a plain password", () => {

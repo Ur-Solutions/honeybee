@@ -1,4 +1,5 @@
 import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { hostname } from "node:os";
@@ -11,6 +12,14 @@ export type LockOwnerMetadata = {
   hostname?: string;
   /** Wall-clock diagnostic stamp from the holder. */
   createdAt?: string;
+};
+
+/** Secret-free exact identity for one concrete lock-file generation. */
+export type FileLockOwnerIdentity = {
+  owner: LockOwnerMetadata;
+  /** SHA-256 of the complete bounded lock record, including its private token. */
+  fingerprint: string;
+  mtimeMs: number;
 };
 
 export type LockWaitInfo = {
@@ -45,6 +54,102 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_STALE_MS = 60_000;
 const DEFAULT_POLL_MS = 25;
 
+type MutationGuard = { release: () => Promise<void> };
+
+export function fileLockMutationGuardPath(path: string, expected: FileLockOwnerIdentity): string {
+  return `${path}.mutate-${expected.fingerprint}`;
+}
+
+async function reclaimDeadMutationGuard(guardPath: string, expected: FileLockOwnerIdentity): Promise<boolean> {
+  let guardOwner: { pid?: unknown; hostname?: unknown; lockFingerprint?: unknown } | null = null;
+  try {
+    const raw = await readFile(guardPath, "utf8");
+    if (raw.length > 16 * 1024) return false;
+    guardOwner = JSON.parse(raw) as { pid?: unknown; hostname?: unknown; lockFingerprint?: unknown };
+  } catch {
+    return false;
+  }
+  if (
+    guardOwner?.lockFingerprint !== expected.fingerprint
+    || guardOwner.hostname !== hostname()
+    || typeof guardOwner.pid !== "number"
+    || !Number.isSafeInteger(guardOwner.pid)
+    || guardOwner.pid <= 0
+    || isPidAlive(guardOwner.pid)
+  ) return false;
+  // The path is generation-scoped. Removing a dead guard for G cannot touch or
+  // block a replacement lock H, whose random lock token yields another SHA-256
+  // guard path. Contenders for G retry open("wx") and exact revalidation.
+  await rm(guardPath, { force: true }).catch(() => undefined);
+  return true;
+}
+
+async function acquireMutationGuard(path: string, expected: FileLockOwnerIdentity, timeoutMs = 250): Promise<MutationGuard | null> {
+  const guardPath = fileLockMutationGuardPath(path, expected);
+  const deadline = performance.now() + Math.max(0, timeoutMs);
+  while (true) {
+    try {
+      const handle = await open(guardPath, "wx", 0o600);
+      const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+      try {
+        await handle.writeFile(JSON.stringify({
+          pid: process.pid,
+          hostname: hostname(),
+          createdAt: new Date().toISOString(),
+          token,
+          lockFingerprint: expected.fingerprint,
+        }));
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        await rm(guardPath, { force: true }).catch(() => undefined);
+        throw error;
+      }
+      return {
+        release: async () => {
+          await handle.close().catch(() => undefined);
+          await rm(guardPath, { force: true }).catch(() => undefined);
+        },
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (await reclaimDeadMutationGuard(guardPath, expected)) continue;
+      if (performance.now() >= deadline) return null;
+      await sleep(5);
+    }
+  }
+}
+
+export type GuardedFileLockOwnerResult<T> =
+  | { matched: true; value: T }
+  | { matched: false };
+
+/** Run one mutation only while the exact observed lock generation owns path. */
+export async function withGuardedFileLockOwner<T>(
+  path: string,
+  expected: FileLockOwnerIdentity,
+  action: (current: FileLockOwnerIdentity) => Promise<T>,
+  guardTimeoutMs = 250,
+): Promise<GuardedFileLockOwnerResult<T>> {
+  const guard = await acquireMutationGuard(path, expected, guardTimeoutMs);
+  if (!guard) return { matched: false };
+  try {
+    const current = await readFileLockIdentity(path);
+    if (!current || current.fingerprint !== expected.fingerprint) return { matched: false };
+    return { matched: true, value: await action(current) };
+  } finally {
+    await guard.release();
+  }
+}
+
+async function refreshFileLockIfOwner(path: string, expected: FileLockOwnerIdentity, timeoutMs: number): Promise<boolean> {
+  const refreshed = await withGuardedFileLockOwner(path, expected, async () => {
+    const now = new Date();
+    await utimes(path, now, now);
+    return true;
+  }, timeoutMs).catch(() => ({ matched: false } as const));
+  return refreshed.matched;
+}
+
 export async function withFileLock<T>(path: string, fn: () => Promise<T>, options: LockOptions = {}): Promise<T> {
   const lock = await acquireFileLock(path, options);
   try {
@@ -73,18 +178,24 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
   while (true) {
     try {
       const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+      const rawIdentity = JSON.stringify({ pid: process.pid, hostname: hostname(), createdAt: new Date().toISOString(), token });
       const handle = await open(path, "wx", 0o600);
       try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, hostname: hostname(), createdAt: new Date().toISOString(), token }));
+        await handle.writeFile(rawIdentity);
       } finally {
         await handle.close().catch(() => undefined);
       }
+      const expected = identityFromRaw(rawIdentity, Date.now())!;
       // Refresh the lock's mtime while held so a critical section longer than
       // staleMs (e.g. a slow ssh drain) is not stolen mid-flight by a waiter.
+      const heartbeatMs = Math.max(50, Math.floor(staleMs / 3));
+      let heartbeatRunning = false;
       const heartbeat = setInterval(() => {
-        const now = new Date();
-        void utimes(path, now, now).catch(() => undefined);
-      }, Math.max(50, Math.floor(staleMs / 3)));
+        if (heartbeatRunning) return;
+        heartbeatRunning = true;
+        void refreshFileLockIfOwner(path, expected, heartbeatMs)
+          .finally(() => { heartbeatRunning = false; });
+      }, heartbeatMs);
       heartbeat.unref?.();
       const acquired: LockAcquiredInfo = {
         waited: reportedWait,
@@ -96,28 +207,11 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
         acquired,
         release: async () => {
           clearInterval(heartbeat);
-          // Only remove the lock if our token is still in it. If a waiter
-          // declared us stale and stole the lock, the file now belongs to the
-          // new holder; deleting it would let a third party acquire in parallel.
-          // The read->rm pair is not atomic (no flock), but a steal landing in
-          // that window requires staleMs of missed heartbeats first — the
-          // holder refreshes mtime every staleMs/3 — so the residual race is
-          // theoretical: it needs a process frozen long enough to be declared
-          // stale that resumes precisely between the read and the rm.
-          const current = await readFile(path, "utf8").catch(() => null);
-          if (current === null) return;
-          try {
-            const parsed = JSON.parse(current) as { token?: unknown };
-            if (parsed?.token !== token) return;
-          } catch {
-            return;
-          }
-          await rm(path, { force: true }).catch(() => undefined);
+          await removeFileLockIfOwner(path, expected, { suffix: "released", guardTimeoutMs: 1_000 }).catch(() => undefined);
         },
       };
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       if (!reportedWait) {
         reportedWait = true;
         firstOwner = await readLockOwner(path);
@@ -132,16 +226,16 @@ async function acquireFileLock(path: string, options: LockOptions): Promise<Lock
       // be reclaimed immediately instead of forcing every activation to wait
       // for the mtime stale window. Legacy/remote-host records retain the
       // conservative stale timeout because a pid alone is not safe identity.
-      const owner = await readLockOwner(path);
-      if (owner && owner.hostname === hostname() && owner.pid !== undefined && !isPidAlive(owner.pid)) {
-        await stealDeadLock(path, owner);
+      const identity = await readFileLockIdentity(path);
+      if (identity && identity.owner.hostname === hostname() && identity.owner.pid !== undefined && !isPidAlive(identity.owner.pid)) {
+        await stealDeadLock(path, identity);
         if (performance.now() - started >= timeoutMs) throwTimeout();
         continue;
       }
 
       const info = await stat(path).catch(() => null);
       if (info && Date.now() - info.mtimeMs > staleMs) {
-        await stealStaleLock(path, staleMs);
+        await stealStaleLock(path, staleMs, identity ?? undefined);
         if (performance.now() - started >= timeoutMs) throwTimeout();
         continue;
       }
@@ -161,18 +255,13 @@ function safeCallback(fn: () => void): void {
 }
 
 /** Parse only a secret-free, bounded metadata projection from a lock file. */
-async function readLockOwner(path: string): Promise<LockOwnerMetadata | null> {
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch {
-    return null;
-  }
+function identityFromRaw(raw: string, mtimeMs: number): FileLockOwnerIdentity | null {
   if (raw.length > 16 * 1024) return null;
+  let owner: LockOwnerMetadata;
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    return {
+    owner = {
       ...(typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0 ? { pid: value.pid } : {}),
       ...(typeof value.hostname === "string" && value.hostname.length <= 255 ? { hostname: value.hostname } : {}),
       ...(typeof value.createdAt === "string" && value.createdAt.length <= 64 ? { createdAt: value.createdAt } : {}),
@@ -180,6 +269,23 @@ async function readLockOwner(path: string): Promise<LockOwnerMetadata | null> {
   } catch {
     return null;
   }
+  return { owner, fingerprint: createHash("sha256").update(raw).digest("hex"), mtimeMs };
+}
+
+/** Read an exact, secret-free identity for guarded lock-owner revalidation. */
+export async function readFileLockIdentity(path: string): Promise<FileLockOwnerIdentity | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return null;
+  }
+  const info = await stat(path).catch(() => null);
+  return info ? identityFromRaw(raw, info.mtimeMs) : null;
+}
+
+async function readLockOwner(path: string): Promise<LockOwnerMetadata | null> {
+  return (await readFileLockIdentity(path))?.owner ?? null;
 }
 
 function isPidAlive(pid: number): boolean {
@@ -193,64 +299,62 @@ function isPidAlive(pid: number): boolean {
 }
 
 /** Reclaim only if the same advertised dead owner still owns the file. */
-async function stealDeadLock(path: string, expected: LockOwnerMetadata): Promise<void> {
-  const guardPath = `${path}.steal`;
-  let guard;
-  try {
-    guard = await open(guardPath, "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    return;
-  }
-  try {
-    const current = await readLockOwner(path);
-    if (!current || current.pid !== expected.pid || current.hostname !== expected.hostname || current.createdAt !== expected.createdAt) return;
-    if (current.pid !== undefined && isPidAlive(current.pid)) return;
-    const stalePath = `${path}.dead.${process.pid}.${Math.random().toString(36).slice(2)}`;
-    await rename(path, stalePath).catch(() => undefined);
-    await rm(stalePath, { force: true }).catch(() => undefined);
-  } finally {
-    await guard.close().catch(() => undefined);
-    await rm(guardPath, { force: true }).catch(() => undefined);
-  }
+async function stealDeadLock(path: string, expected: FileLockOwnerIdentity): Promise<void> {
+  await removeFileLockIfOwner(path, expected, {
+    suffix: "dead",
+    validate: (current) => current.owner.pid === undefined || !isPidAlive(current.owner.pid),
+  });
 }
-
-// A stealer that crashes mid-steal leaves the guard behind; steals themselves
-// take microseconds, so anything older than this is debris.
-const STEAL_GUARD_STALE_MS = 10_000;
 
 /**
  * Remove a stale lock so the caller can retry acquisition. Stealers serialize
- * behind a `.steal` guard (open wx) and re-check staleness while holding it,
+ * behind a generation-scoped mutation guard and re-check staleness while holding it,
  * so two waiters that both observed a stale lock can't take turns deleting
  * each other's freshly recreated locks: only the first one in finds a stale
  * file, the rest re-stat and see either nothing or the winner's fresh lock.
  * The removal itself goes through rename so a racing legacy rm cannot make us
  * delete a file we did not inspect.
  */
-async function stealStaleLock(path: string, staleMs: number): Promise<void> {
-  const guardPath = `${path}.steal`;
-  let guard;
+async function stealStaleLock(path: string, staleMs: number, observed?: FileLockOwnerIdentity): Promise<void> {
+  const expected = observed ?? await readFileLockIdentity(path);
+  if (!expected) return;
+  await removeFileLockIfOwner(path, expected, {
+    suffix: "stale",
+    validate: (current) => Date.now() - current.mtimeMs > staleMs,
+  });
+}
+
+export type RemoveFileLockOptions = {
+  suffix?: string;
+  guardTimeoutMs?: number;
+  validate?: (current: FileLockOwnerIdentity) => boolean;
+};
+
+/**
+ * Rename/remove a lock only after exact owner revalidation under the same
+ * generation gate used by releases, heartbeats, and other reclaimers. A new
+ * direct open("wx") cannot succeed until the guarded rename removes the old
+ * path, and its random token gives the replacement a different guard.
+ */
+export async function removeFileLockIfOwner(
+  path: string,
+  expected: FileLockOwnerIdentity,
+  options: RemoveFileLockOptions = {},
+): Promise<boolean> {
+  let movedPath: string | null = null;
+  const move = async (current: FileLockOwnerIdentity): Promise<boolean> => {
+    if (options.validate && !options.validate(current)) return false;
+    const suffix = options.suffix?.replace(/[^a-z0-9_-]/gi, "") || "removed";
+    movedPath = `${path}.${suffix}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+    const moved = await rename(path, movedPath).then(() => true).catch(() => false);
+    if (!moved) movedPath = null;
+    return moved;
+  };
   try {
-    guard = await open(guardPath, "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    // Another stealer is mid-steal; clear its guard only if it clearly crashed.
-    const guardInfo = await stat(guardPath).catch(() => null);
-    if (guardInfo && Date.now() - guardInfo.mtimeMs > STEAL_GUARD_STALE_MS) {
-      await rm(guardPath, { force: true }).catch(() => undefined);
-    }
-    return;
-  }
-  try {
-    const current = await stat(path).catch(() => null);
-    if (!current || Date.now() - current.mtimeMs <= staleMs) return; // already stolen or refreshed
-    const stalePath = `${path}.stale.${process.pid}.${Math.random().toString(36).slice(2)}`;
-    await rename(path, stalePath).catch(() => undefined);
-    await rm(stalePath, { force: true }).catch(() => undefined);
+    const guarded = await withGuardedFileLockOwner(path, expected, move, options.guardTimeoutMs ?? 250);
+    return guarded.matched && guarded.value;
   } finally {
-    await guard.close().catch(() => undefined);
-    await rm(guardPath, { force: true }).catch(() => undefined);
+    if (movedPath) await rm(movedPath, { force: true }).catch(() => undefined);
   }
 }
 

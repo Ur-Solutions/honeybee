@@ -7,12 +7,12 @@ import { accountDir, withAccountLock, listAccounts, CROSS_ACCOUNT_LOCK_TIMEOUT_M
 import { accountEmail } from "./utils.js";
 import { candidateHomes, dedicatedHomesFor } from "./homes.js";
 
-type RawClaudeKeychainReader = (homePath: string) => Promise<string | null>;
+type RawClaudeKeychainReader = (homePath: string) => Promise<keychain.ClaudeKeychainReadResult>;
 
 function defaultRawClaudeKeychainReader(): RawClaudeKeychainReader {
   // Chain selection must inspect the exact representation Claude receives,
   // never the compatibility-decoded migration view that can hide hex damage.
-  return keychain.readClaudeKeychainRaw;
+  return keychain.readClaudeKeychainState;
 }
 
 function decodeClaudeCredentialsRaw(raw: string | null): string | null {
@@ -130,10 +130,19 @@ function isBetterClaudeChain(candidate: ClaudeChain, current: ClaudeChain | null
 
 /** The freshest chain link present in a home — its keychain entry or credentials file. */
 export async function readHomeClaudeChain(homePath: string): Promise<ClaudeChain | null> {
-  const fromFile = parseClaudeChain(await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null), `${homePath}:file`);
-  const fromKeychain = parseClaudeChain(await keychain.readClaudeKeychain(homePath), `${homePath}:keychain`);
-  if (fromFile && fromKeychain) return isBetterClaudeChain(fromKeychain, fromFile) ? fromKeychain : fromFile;
-  return fromKeychain ?? fromFile;
+  const keychainRead = await keychain.readClaudeKeychainState(homePath);
+  if (keychainRead.status === "unreadable") {
+    throw new keychain.ClaudeKeychainUnreadableError(homePath, keychainRead.reason);
+  }
+  if (keychainRead.status === "present") {
+    // Rescue/migration callers retain tolerant legacy-hex decoding, but a
+    // present malformed item remains authoritative and can never fall through
+    // to a stale on-disk credential.
+    const fromKeychain = parseClaudeChain(keychainRead.raw, `${homePath}:keychain`);
+    if (!fromKeychain) throw new Error(`Unusable authoritative macOS Keychain entry for ${homePath}`);
+    return fromKeychain;
+  }
+  return parseClaudeChain(await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null), `${homePath}:file`);
 }
 
 /** Logged-in email recorded in a home's .claude.json; null when unknown. */
@@ -259,7 +268,17 @@ export async function saveClaudeOauthToVault(account: AccountRecord, oauth: Reco
   });
 }
 
+export type ClaudeChainParkingIntent = {
+  ownerId: string;
+  ownerEmail: string;
+  notAccountId: string;
+  chainRaw: string;
+  chainExpiresAt: number;
+  source: string;
+};
+
 export type ChainSyncResult = { chain: ClaudeChain | null; vaultUpdated: boolean };
+export type LockedChainSyncResult = ChainSyncResult & { parkingIntents: ClaudeChainParkingIntent[] };
 
 export type ChainSyncDeps = {
   /** Resolve a fresh token's identity (tests inject; default is the memoized OAuth profile lookup). */
@@ -299,10 +318,17 @@ export async function claudeProfileEmailCached(accessToken: string): Promise<str
  * a later activation does not stamp a dead link over a live one.
  */
 export async function syncClaudeChainToVault(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<ChainSyncResult> {
-  return withAccountLock(account.id, () => syncClaudeChainToVaultLocked(account, extraHome, deps));
+  const locked = await withAccountLock(account.id, () => syncClaudeChainToVaultLocked(account, extraHome, deps));
+  // Cross-account parking deliberately happens only after the scanned
+  // account's lock is gone. The owner write then takes its own lock and
+  // revalidates both registry ownership and vault freshness.
+  for (const intent of locked.parkingIntents) {
+    await fulfillClaudeChainParkingIntent(intent).catch(() => undefined);
+  }
+  return { chain: locked.chain, vaultUpdated: locked.vaultUpdated };
 }
 
-export async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<ChainSyncResult> {
+export async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<LockedChainSyncResult> {
   const vaultPath = join(accountDir(account), ".credentials.json");
   const vaultRaw = await readFile(vaultPath, "utf8").catch(() => null);
   const vault = isRawClaudeCredentialPayload(vaultRaw) ? parseClaudeChain(vaultRaw, "vault") : null;
@@ -318,11 +344,18 @@ export async function syncClaudeChainToVaultLocked(account: AccountRecord, extra
   const nowMs = (deps.now ?? Date.now)();
   let best = vault;
   const quarantinedHomes = new Set<string>();
+  const parkingIntents = new Map<string, ClaudeChainParkingIntent>();
   for (const home of homes.values()) {
-    const [keychainRaw, fileRaw] = await Promise.all([
+    const [keychainRead, fileRaw] = await Promise.all([
       readKeychainRaw(home),
       readFile(join(home, ".credentials.json"), "utf8").catch(() => null),
     ]);
+    if (keychainRead.status === "unreadable") {
+      refusedNonRaw += 1;
+      quarantinedHomes.add(resolve(home));
+      continue;
+    }
+    const keychainRaw = keychainRead.status === "present" ? keychainRead.raw : null;
     // Claude treats a present keychain item as authoritative. If that exact
     // value is not consumable JSON, quarantine the whole home: falling back
     // to its file can select an older chain and then overwrite a fresher but
@@ -355,7 +388,8 @@ export async function syncClaudeChainToVaultLocked(account: AccountRecord, extra
     if (expected && chain.expiresAt > nowMs) {
       const actual = await profileOf(String(chain.oauth.accessToken)).catch(() => null);
       if (actual && actual !== expected) {
-        await parkClaudeChainWithOwnerLocked(chain, actual, account).catch(() => undefined);
+        const intent = await planClaudeChainParking(chain, actual, account).catch(() => null);
+        if (intent) parkingIntents.set(`${intent.ownerId}\0${intent.chainRaw}`, intent);
         continue;
       }
     }
@@ -369,7 +403,7 @@ export async function syncClaudeChainToVaultLocked(account: AccountRecord, extra
       refusedSources: refusedNonRaw,
     }).catch(() => undefined);
   }
-  if (!best || best === vault) return { chain: best, vaultUpdated: false };
+  if (!best || best === vault) return { chain: best, vaultUpdated: false, parkingIntents: [...parkingIntents.values()] };
   // A rotated link harvested from one home is the only live link in the OAuth
   // chain. Keeping it in the vault alone strands every other active home on
   // the now-dead refresh token: their next turn fails even though the account
@@ -382,24 +416,57 @@ export async function syncClaudeChainToVaultLocked(account: AccountRecord, extra
     from: best.source,
     expiresAt: new Date(best.expiresAt).toISOString(),
   });
-  return { chain: best, vaultUpdated: true };
+  return { chain: best, vaultUpdated: true, parkingIntents: [...parkingIntents.values()] };
 }
 
 /**
- * Freshness-guarded write of a verified foreign chain into its owner's vault —
- * the sync-side twin of evacuateForeignClaudeChainLocked. Turning a would-be
- * hijack into a rescue makes the sweep self-healing: an account whose live
- * link is stranded in another account's home gets it back on the next sync.
+ * Resolve the account for a verified foreign chain without writing its vault.
+ * The returned intent is fulfilled only after the scanned account lock exits.
  */
-async function parkClaudeChainWithOwnerLocked(chain: ClaudeChain, email: string, notAccount: AccountRecord): Promise<void> {
+async function planClaudeChainParking(chain: ClaudeChain, email: string, notAccount: AccountRecord): Promise<ClaudeChainParkingIntent | null> {
   const owner = (await listAccounts()).find(
     (candidate) => candidate.tool === "claude" && candidate.id !== notAccount.id && accountEmail(candidate) === email,
   );
-  if (!owner) return;
-  const vault = parseClaudeChainStrict(await readFile(join(accountDir(owner), ".credentials.json"), "utf8").catch(() => null), "vault");
-  if (vault && vault.expiresAt >= chain.expiresAt) return;
-  await saveClaudeChainToVaultLocked(owner, chain.raw);
-  await appendLedger({ type: "account.chain-evacuate", account: owner.id, home: chain.source });
+  if (!owner) return null;
+  return {
+    ownerId: owner.id,
+    ownerEmail: email,
+    notAccountId: notAccount.id,
+    chainRaw: chain.raw,
+    chainExpiresAt: chain.expiresAt,
+    source: chain.source,
+  };
+}
+
+/** Fulfil a foreign-chain parking intent under only the real owner's lock. */
+export async function fulfillClaudeChainParkingIntent(intent: ClaudeChainParkingIntent): Promise<boolean> {
+  let parked = false;
+  await withAccountLock(intent.ownerId, async () => {
+    // The registry and source payload may have changed while we released the
+    // victim's lock and waited for the owner. Re-read/validate both before the
+    // write, then compare against the owner's current vault inside the same
+    // critical section so an already-fresher rotation always wins.
+    const owner = (await listAccounts()).find(
+      (candidate) => candidate.id === intent.ownerId
+        && candidate.id !== intent.notAccountId
+        && candidate.tool === "claude"
+        && accountEmail(candidate) === intent.ownerEmail,
+    );
+    if (!owner) return;
+    const chain = parseClaudeChainStrict(intent.chainRaw, intent.source);
+    if (!chain || chain.expiresAt !== intent.chainExpiresAt) return;
+    const vault = parseClaudeChainStrict(
+      await readFile(join(accountDir(owner), ".credentials.json"), "utf8").catch(() => null),
+      "vault",
+    );
+    if (!isBetterClaudeChain(chain, vault)) return;
+    await saveClaudeChainToVaultLocked(owner, chain.raw);
+    parked = true;
+  }, { timeoutMs: CROSS_ACCOUNT_LOCK_TIMEOUT_MS });
+  if (parked) {
+    await appendLedger({ type: "account.chain-evacuate", account: intent.ownerId, home: intent.source }).catch(() => undefined);
+  }
+  return parked;
 }
 
 /**
@@ -485,9 +552,19 @@ async function distributeClaudeChainLocked(
     if (options.quarantinedHomes?.has(resolve(home))) continue;
     try {
       const existingEntry = await readKeychainRaw(home);
+      if (existingEntry.status === "unreadable") {
+        await appendLedger({
+          type: "account.chain-propagation-refused",
+          account: account.id,
+          home,
+          reason: "unreadable-authoritative-keychain",
+        }).catch(() => undefined);
+        continue;
+      }
+      const existingRaw = existingEntry.status === "present" ? existingEntry.raw : null;
       // Even outside a sweep adoption, do not write through a malformed
       // authoritative item. The activation writer repair owns recovery.
-      if (existingEntry !== null && !isRawClaudeCredentialPayload(existingEntry)) {
+      if (existingRaw !== null && !isRawClaudeCredentialPayload(existingRaw)) {
         await appendLedger({
           type: "account.chain-propagation-refused",
           account: account.id,
@@ -496,7 +573,7 @@ async function distributeClaudeChainLocked(
         }).catch(() => undefined);
         continue;
       }
-      const keychainWrite = await keychain.writeClaudeKeychainEntry(home, mergeCredentialsJson(existingEntry, sourceRaw));
+      const keychainWrite = await keychain.writeClaudeKeychainEntry(home, mergeCredentialsJson(existingRaw, sourceRaw));
       // A failed or degraded keychain write MUST be visible: claude prefers
       // the keychain over .credentials.json, so a home whose file is fresh
       // but whose keychain kept a previous identity silently bills every bee

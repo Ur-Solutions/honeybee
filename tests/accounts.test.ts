@@ -35,6 +35,7 @@ import {
   syncAccountCredentialsToVault,
   syncClaudeChainToVault,
   syncCodexAuthToVault,
+  withAccountLock,
   type AccountRecord,
 } from "../src/accounts.js";
 import { verifyActivatedClaudeIdentity, type ActivationContext } from "../src/accounts/activation.js";
@@ -409,7 +410,9 @@ test("chain sync quarantines a home with a malformed authoritative keychain inst
     await writeFile(filePath, fileRaw);
 
     const result = await syncClaudeChainToVault(account, undefined, {
-      readKeychainRaw: async (candidate) => candidate === home ? malformedFresherKeychain : null,
+      readKeychainRaw: async (candidate) => candidate === home
+        ? { status: "present", raw: malformedFresherKeychain }
+        : { status: "absent" },
       fetchProfileEmail: async () => {
         throw new Error("quarantined sources must not reach identity verification");
       },
@@ -419,6 +422,42 @@ test("chain sync quarantines a home with a malformed authoritative keychain inst
     assert.equal(result.chain?.oauth.accessToken, "tok-vault");
     assert.equal(await readFile(vaultPath, "utf8"), vaultRaw, "the older file was not adopted into the vault");
     assert.equal(await readFile(filePath, "utf8"), fileRaw, "no distribution rewrote the quarantined home");
+  });
+});
+
+test("chain sync falls back only for an absent keychain and quarantines unreadable authority", async () => {
+  await withTempStore(async (dir) => {
+    const now = Date.now();
+    const exercise = async (
+      label: string,
+      keychainRead: { status: "absent" } | { status: "unreadable"; reason: "security-error" } | { status: "present"; raw: string },
+      expectedToken: string,
+      expectedUpdated: boolean,
+    ) => {
+      const account = await addAccount("claude", `${label}@a.b`);
+      const vaultPath = join(accountDir(account), ".credentials.json");
+      const home = join(dir, "homes", account.id);
+      await mkdir(home, { recursive: true });
+      await writeFile(vaultPath, chainJson(`tok-${label}-vault`, now + 1_000, `refresh-${label}-vault`));
+      await writeFile(join(home, ".credentials.json"), chainJson(`tok-${label}-file`, now + 8 * 3_600_000, `refresh-${label}-file`));
+
+      const result = await syncClaudeChainToVault(account, undefined, {
+        readKeychainRaw: async (candidate) => candidate === home ? keychainRead : { status: "absent" },
+        fetchProfileEmail: async () => `${label}@a.b`,
+      });
+      assert.equal(result.vaultUpdated, expectedUpdated, label);
+      const vault = JSON.parse(await readFile(vaultPath, "utf8"));
+      assert.equal(vault.claudeAiOauth.accessToken, expectedToken, label);
+    };
+
+    await exercise("absent", { status: "absent" }, "tok-absent-file", true);
+    await exercise("unreadable", { status: "unreadable", reason: "security-error" }, "tok-unreadable-vault", false);
+    await exercise(
+      "healthy",
+      { status: "present", raw: chainJson("tok-healthy-keychain", now + 4 * 3_600_000, "refresh-healthy-keychain") },
+      "tok-healthy-keychain",
+      true,
+    );
   });
 });
 
@@ -1008,6 +1047,65 @@ test("syncClaudeChainToVault parks a verified foreign chain with its owner inste
     // ...and the stranded chain was rescued into its real owner's vault.
     const ownerVault = JSON.parse(await readFile(join(accountDir(owner), ".credentials.json"), "utf8"));
     assert.equal(ownerVault.claudeAiOauth.accessToken, "tok-owner-live");
+  });
+});
+
+test("foreign-chain parking releases victim A before locking owner B and rechecks B freshness", async () => {
+  await withTempStore(async (dir) => {
+    const victim = await addAccount("claude", "parking-victim@a.b");
+    const owner = await addAccount("claude", "parking-owner@c.d");
+    const now = Date.now();
+    const victimVaultPath = join(accountDir(victim), ".credentials.json");
+    const ownerVaultPath = join(accountDir(owner), ".credentials.json");
+    await writeFile(victimVaultPath, chainJson("tok-victim", now + 3_600_000, "refresh-victim"));
+    await writeFile(ownerVaultPath, chainJson("tok-owner-old", now + 1_000, "refresh-owner-old"));
+    const home = join(dir, "homes", victim.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), chainJson("tok-owner-stranded", now + 8 * 3_600_000, "refresh-owner-stranded"));
+
+    let ownerLocked!: () => void;
+    const ownerLockEntered = new Promise<void>((resolve) => { ownerLocked = resolve; });
+    let advanceOwner!: () => void;
+    const ownerAdvance = new Promise<void>((resolve) => { advanceOwner = resolve; });
+    const ownerHolder = withAccountLock(owner.id, async () => {
+      ownerLocked();
+      await ownerAdvance;
+      // A concurrent owner rotation lands while the parking intent waits.
+      await writeFile(ownerVaultPath, chainJson("tok-owner-newest", now + 12 * 3_600_000, "refresh-owner-newest"));
+    });
+    await ownerLockEntered;
+
+    let profileReached!: () => void;
+    const profileWasReached = new Promise<void>((resolve) => { profileReached = resolve; });
+    let returnProfile!: () => void;
+    const profileMayReturn = new Promise<void>((resolve) => { returnProfile = resolve; });
+    const syncing = syncClaudeChainToVault(victim, undefined, {
+      fetchProfileEmail: async () => {
+        profileReached();
+        await profileMayReturn;
+        return "parking-owner@c.d";
+      },
+    });
+    await profileWasReached;
+
+    // Queue an A waiter before identity verification returns. Correct parking
+    // releases A and then blocks on B; the old direct write changed B while A
+    // was still held, so B's vault is a deterministic race oracle here.
+    let victimWaiterEntered!: () => void;
+    const victimWaiterWasEntered = new Promise<void>((resolve) => { victimWaiterEntered = resolve; });
+    const victimWaiter = withAccountLock(victim.id, async () => { victimWaiterEntered(); });
+    returnProfile();
+    await victimWaiterWasEntered;
+    const beforeOwnerRelease = JSON.parse(await readFile(ownerVaultPath, "utf8"));
+    assert.equal(beforeOwnerRelease.claudeAiOauth.accessToken, "tok-owner-old", "B was not written while only A's lock was held");
+    await victimWaiter;
+
+    advanceOwner();
+    await ownerHolder;
+    const result = await syncing;
+    assert.equal(result.vaultUpdated, false);
+    const finalOwnerVault = JSON.parse(await readFile(ownerVaultPath, "utf8"));
+    assert.equal(finalOwnerVault.claudeAiOauth.accessToken, "tok-owner-newest", "parking re-read B and preserved its fresher concurrent rotation");
   });
 });
 

@@ -6,8 +6,8 @@ import { identityRecipeForAgent, type IdentityRecipe } from "../drivers.js";
 import {
   decodeSecurityPasswordOutput,
   keychainAvailable,
-  readClaudeKeychain,
   readClaudeKeychainRaw,
+  readClaudeKeychainState,
   writeClaudeKeychainEntry,
 } from "../keychain.js";
 import { kitMaterializeHome, readKitHomeStamp, type KitMaterializeTiming } from "../kit.js";
@@ -18,12 +18,13 @@ import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./re
 import {
   claudeCredentialsEquivalent,
   claudeProfileEmailCached,
-  claudeTokenExpiry,
   evacuateForeignClaudeChain,
+  fulfillClaudeChainParkingIntent,
   mergeCredentialsJson,
   parseClaudeChainStrict,
   refreshVaultClaudeChainIfStaleLocked,
   syncClaudeChainToVaultLocked,
+  type ClaudeChainParkingIntent,
   type RefreshedClaudeToken,
 } from "./claudeChain.js";
 import { accountEmail } from "./utils.js";
@@ -49,7 +50,26 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
   const captured = await withAccountLock(account.id, async () => {
     const captured: string[] = [];
     const capturedCredentials: string[] = [];
+    const primary = recipe.credentialFiles[0]!;
+    let authoritativeClaudeCredential: string | null = null;
+    if (account.tool === "claude" && keychainAvailable()) {
+      const keychainRead = await readClaudeKeychainState(homePath);
+      if (keychainRead.status === "unreadable") {
+        throw new Error(`Cannot capture ${account.id}: the authoritative macOS Keychain entry for ${homePath} is unreadable (${keychainRead.reason})`);
+      }
+      if (keychainRead.status === "present") {
+        const decoded = decodeSecurityPasswordOutput(keychainRead.raw);
+        if (!parseClaudeChainStrict(decoded, `${homePath}:keychain`)) {
+          throw new Error(`Cannot capture ${account.id}: the authoritative macOS Keychain entry for ${homePath} is malformed`);
+        }
+        authoritativeClaudeCredential = decoded;
+      }
+    }
     for (const relative of recipe.credentialFiles) {
+      // A present Keychain item is Claude's authoritative credential. Do not
+      // transiently copy the fallback file into the vault before replacing it:
+      // capture must be fail-closed even if a later write or parse fails.
+      if (account.tool === "claude" && relative === primary && authoritativeClaudeCredential !== null) continue;
       const source = join(homePath, relative);
       const info = await stat(source).catch(() => null);
       if (!info?.isFile()) continue;
@@ -66,7 +86,6 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
     // live store, gated on identity: the home's freshly-written authInfo (who
     // just logged in) must match the account, and the live tokens must not
     // verifiably belong to someone else.
-    const primary = recipe.credentialFiles[0]!;
     if (account.tool === "cursor" && !capturedCredentials.includes(primary)) {
       const live = await readCursorLiveAuth();
       if (!live) {
@@ -94,19 +113,13 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
     }
     // On macOS, claude stores the primary credential in the Keychain rather
     // than .credentials.json — and when both exist, the on-disk file is often
-    // a stale relic of an old login. Vault whichever is fresher.
-    if (account.tool === "claude" && keychainAvailable()) {
-      const keychainRaw = await readClaudeKeychain(homePath);
-      if (keychainRaw) {
-        const fileRaw = await readFile(join(homePath, primary), "utf8").catch(() => null);
-        if (!fileRaw || (claudeTokenExpiry(keychainRaw) ?? 0) > (claudeTokenExpiry(fileRaw) ?? 0)) {
-          const target = join(accountDir(account), primary);
-          await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-          await atomicWriteFile(target, `${keychainRaw}\n`, { mode: 0o600 });
-          if (!captured.includes(primary)) captured.push(primary);
-          if (!capturedCredentials.includes(primary)) capturedCredentials.push(primary);
-        }
-      }
+    // a stale relic of an old login. A present Keychain item is authoritative.
+    if (authoritativeClaudeCredential !== null) {
+      const target = join(accountDir(account), primary);
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      await atomicWriteFile(target, `${authoritativeClaudeCredential}\n`, { mode: 0o600 });
+      if (!captured.includes(primary)) captured.push(primary);
+      if (!capturedCredentials.includes(primary)) capturedCredentials.push(primary);
     }
     for (const relative of recipe.configFiles ?? []) {
       const source = join(homePath, relative);
@@ -182,6 +195,8 @@ export type ActivationContext = {
   written: string[];
   /** Deferred so identity diagnostics never extend the credential lock. */
   deferredLedger?: Array<Record<string, unknown>>;
+  /** Foreign-owner writes run only after the activating account lock is released. */
+  deferredClaudeParking?: ClaudeChainParkingIntent[];
   time?<T>(phase: string, fn: () => Promise<T>): Promise<T>;
 };
 
@@ -207,7 +222,8 @@ async function claudePreActivate(ctx: ActivationContext): Promise<void> {
   await timeActivationStep(ctx, "rescue-foreign", () => evacuateForeignClaudeChain(account, homePath).catch(() => undefined));
   // (2) Pull the account's own freshest link into the vault so we never
   // stamp a dead link over a live one.
-  await timeActivationStep(ctx, "sync-vault", () => syncClaudeChainToVaultLocked(account, homePath).catch(() => undefined));
+  const synced = await timeActivationStep(ctx, "sync-vault", () => syncClaudeChainToVaultLocked(account, homePath).catch(() => undefined));
+  if (synced?.parkingIntents.length) ctx.deferredClaudeParking?.push(...synced.parkingIntents);
   // (3) A stale chain would make claude boot onto an expired access token
   // and replay a possibly-rotated refresh token. Refresh it ourselves and
   // persist the rotation; on failure, refuse to stamp a known-dead chain.
@@ -517,6 +533,7 @@ async function performAccountActivation(
   const hooks = activationHooksFor(account.tool);
   const timing = emptyActivationTiming();
   const deferredLedger: Array<Record<string, unknown>> = [];
+  const deferredClaudeParking: ClaudeChainParkingIntent[] = [];
   const ctx: ActivationContext = {
     account,
     homePath,
@@ -525,6 +542,7 @@ async function performAccountActivation(
     warn,
     written: [],
     deferredLedger,
+    deferredClaudeParking,
     async time<T>(phase: string, fn: () => Promise<T>): Promise<T> {
       const phaseStarted = performance.now();
       try {
@@ -591,6 +609,16 @@ async function performAccountActivation(
           });
         } finally {
           timing.accountLockHeldMs = accountLockAcquiredAt > 0 ? performance.now() - accountLockAcquiredAt : 0;
+        }
+
+        // Parking a verified foreign chain is a cross-account operation. The
+        // scan above only returned intents while A was locked; fulfil them now,
+        // after A is released, under each real owner's lock with a fresh vault
+        // read. This also prevents A→B/B→A lock-order cycles.
+        for (const intent of deferredClaudeParking.splice(0)) {
+          await fulfillClaudeChainParkingIntent(intent).catch((error) => {
+            warn(`could not park a foreign Claude chain with ${intent.ownerId}: ${error instanceof Error ? error.message : String(error)}`);
+          });
         }
 
         // Config/default/capability convergence is home-scoped, not secret-vault
