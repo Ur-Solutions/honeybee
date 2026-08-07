@@ -1,5 +1,4 @@
-// Checkout-pool daemon sweep (CHECKOUT_POOLS_PRD §6.6), piggybacking the tick's
-// dispatcher registry. Three cheap, failure-tolerant duties per pool:
+// Checkout-pool daemon sweep (CHECKOUT_POOLS_PRD §6.6). Three duties per pool:
 //
 //   - claim GC: prune claims past pendingUntil (the allocator prunes under its
 //     own lock too; the sweep is the backstop for pools nobody allocates from).
@@ -12,16 +11,20 @@
 //     floor, clone replacements IN THE BACKGROUND (a clone can outlive the
 //     dispatch budget; the outcome surfaces on a later sweep).
 //
-// The sweep NEVER probes tmux itself: liveness comes from the tick's freshly
-// derived state map. Every per-pool step is try/caught into the outcome — a
-// broken pool (or a pool-less pro) must never break the tick.
+// Occupancy is safety-critical: the sweep takes the same strict durable-record
+// and local-runtime snapshot as allocation. An unreadable observation fails
+// the entire discovered sweep closed before any pool state or checkout is
+// mutated. Every later per-pool step is try/caught into the outcome — a broken
+// pool (or a pool-less pro) must never break the tick.
 
 import { sendBuzMessage } from "../buz.js";
 import {
+  canonicalizePoolMembers,
   claimExpired,
   deriveMemberOccupancy,
   loadPoolRecord,
   poolsForProject,
+  poolLiveBees,
   projectRepresentatives,
   savePoolRecord,
   withPoolLock,
@@ -37,7 +40,6 @@ import {
   type ProCheckoutSyncResult,
   type ProRepoEntry,
 } from "../proProjects.js";
-import { LOCAL_NODE_NAME } from "../node.js";
 import { isTerminalState, type BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
 import { envMs } from "./timeouts.js";
@@ -141,6 +143,10 @@ export type PoolSweeperDeps = {
   extend?: (repoPath: string, pool: string, count: number) => Promise<string[]>;
   sendNudge?: (recipient: SessionRecord, senderBee: SessionRecord, body: string) => Promise<void>;
   appendLedger?: (event: Record<string, unknown>) => Promise<void>;
+  /** Strict positive-runtime occupancy observer; injectable for tests. */
+  observeLiveBees?: (records: SessionRecord[], currentStates: Map<string, BeeState>) => Promise<LiveBee[]>;
+  /** Canonical member identity observer; injectable for tests. */
+  canonicalizeMembers?: typeof canonicalizePoolMembers;
 };
 
 /**
@@ -156,6 +162,8 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
   const discoverPools = deps.discoverPools ?? poolsForProject;
   const sync = deps.sync ?? ((repoPath: string, names: string[]) => syncProCheckouts(repoPath, names, { rebase: true }));
   const extend = deps.extend ?? extendProPool;
+  const observeLiveBees = deps.observeLiveBees ?? (() => poolLiveBees());
+  const canonicalizeMembers = deps.canonicalizeMembers ?? canonicalizePoolMembers;
   const sendNudge =
     deps.sendNudge ??
     (async (recipient: SessionRecord, senderBee: SessionRecord, body: string) => {
@@ -187,16 +195,6 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
     if (nowMs - lastSweepAt < intervalMs) return [];
     lastSweepAt = nowMs;
 
-    // Liveness straight from the tick's derived states — no extra probing.
-    // A record missing from the map is treated as live (conservative: never
-    // fabricate a vacate edge from a partial observation).
-    const liveBees: LiveBee[] = records
-      .filter((record) => !record.node || record.node === LOCAL_NODE_NAME)
-      .filter((record) => {
-        const state = currentStates.get(record.name);
-        return state === undefined || !isTerminalState(state);
-      })
-      .map((record) => ({ name: record.name, cwd: record.cwd }));
     const recordByName = new Map(records.map((record) => [record.name, record]));
 
     const outcomes: PoolSweepOutcome[] = [];
@@ -214,109 +212,126 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
     } catch {
       pools = [];
     }
+    if (pools.length === 0) return [];
+
+    // This barrier is deliberately after discovery but before any per-pool
+    // mutation. A display-terminal state does not release capacity: only the
+    // strict observer's positively absent runtime can create a vacate edge.
+    let liveBees: LiveBee[];
+    try {
+      liveBees = await observeLiveBees(records, currentStates);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return pools.map((pool) => ({ pool: pool.key, error: `occupancy observation failed closed: ${detail}` }));
+    }
 
     for (const pool of pools) {
       const outcome: PoolSweepOutcome = { pool: pool.key };
       try {
-        // (a) claim GC, only locking when there is something to prune.
-        const record = await loadPoolRecord(pool.key);
-        const expiredCount = record?.claims.filter((claim) => claimExpired(claim, nowMs)).length ?? 0;
-        if (expiredCount > 0) {
-          await withPoolLock(pool.key, async () => {
-            const fresh = await loadPoolRecord(pool.key);
-            if (!fresh) return;
-            const keep = fresh.claims.filter((claim) => !claimExpired(claim, nowMs));
-            if (keep.length === fresh.claims.length) return;
-            outcome.gcExpired = fresh.claims.length - keep.length;
-            fresh.claims = keep;
-            await savePoolRecord(fresh);
-          });
-        }
-
-        const occupancy = deriveMemberOccupancy({
-          members: pool.members,
-          config: pool.config,
-          claims: (await loadPoolRecord(pool.key))?.claims ?? [],
-          parked: record?.parked ?? [],
-          liveBees,
-          now: nowMs,
-        });
-        const view = memberSweepView(occupancy, pool.config.branch);
-        const plan = planPoolSweep({
-          members: view,
-          previousOccupied: previousOccupied.get(pool.key),
-          ...(pool.config.minFree !== undefined ? { minFree: pool.config.minFree } : {}),
-        });
-
-        // (b) refresh-on-vacate.
-        if (plan.syncMembers.length > 0) {
-          const names = plan.syncMembers.map((n) => `${pool.repo}:${pool.pool}-${n}`);
-          const result = await sync(pool.repoPath, names);
-          outcome.synced = result.rows.map((row) => ({
-            member: memberNumberFromPath(row.path, pool.pool),
-            status: row.status,
-          }));
-        }
-
-        // Flags: nudge once per (member, reason) until the condition clears.
-        const prevOccupants = previousOccupants.get(pool.key);
-        const flagged: PoolSweepOutcome["flagged"] = [];
-        for (const flag of plan.flags) {
-          const dedupe = `${pool.key}:${flag.member}:${flag.reason}`;
-          if (nudged.has(dedupe)) continue;
-          nudged.add(dedupe);
-          const nudgedParent = await nudgeDepartedBeeParent({
-            pool,
-            member: flag.member,
-            reason: flag.reason,
-            departedNames: (prevOccupants?.get(flag.member) ?? []).filter(
-              (name) => !occupancy.find((m) => m.n === flag.member)?.occupants.includes(name),
-            ),
-            recordByName,
-            currentStates,
-            sendNudge,
-          });
-          flagged.push({ member: flag.member, reason: flag.reason, ...(nudgedParent ? { nudged: nudgedParent } : {}) });
-          await (deps.appendLedger ?? (async () => undefined))({
-            type: "pool.member.flagged",
-            pool: pool.key,
-            member: flag.member,
-            reason: flag.reason,
-          });
-        }
-        if (flagged.length > 0) outcome.flagged = flagged;
-        // Re-arm cleared flags so a future recurrence nudges again.
-        for (const member of view) {
-          if (!member.dirty) nudged.delete(`${pool.key}:${member.n}:dirty`);
-          if (member.onBaseBranch) nudged.delete(`${pool.key}:${member.n}:parked-branch`);
-        }
-
-        // (c) minFree pre-extend — background; report started/finished.
-        const settled = settledExtends.get(pool.key);
-        if (settled) {
-          settledExtends.delete(pool.key);
-          if (settled.error !== undefined) outcome.error = `pre-extend failed: ${settled.error}`;
-          else if (settled.created !== undefined) outcome.extended = settled.created;
-        }
-        if (plan.extendBy > 0 && !inFlightExtends.has(pool.key)) {
-          const newSize = pool.members.length + plan.extendBy;
-          if (newSize > pool.config.maxSize) {
-            outcome.warned = `pool ${pool.pool} pre-extend exceeds maxSize: ${newSize}/${pool.config.maxSize} — consider cleaning or raising maxSize`;
+        // Member canonicalization is another observation barrier: a lexical
+        // symlink spelling can hide an occupant whose SessionRecord.cwd is a
+        // realpath. Resolve it before claim GC or any checkout mutation.
+        const canonicalMembers = await canonicalizeMembers(pool.members);
+        // The decision and every checkout mutation share the allocator's pool
+        // lock. Otherwise a claim/park could land after this occupancy read but
+        // before sync, letting refresh-on-vacate rewrite a newly owned member.
+        await withPoolLock(pool.key, async () => {
+          // (a) claim GC.
+          const record = await loadPoolRecord(pool.key);
+          if (record) {
+            const keep = record.claims.filter((claim) => !claimExpired(claim, nowMs));
+            if (keep.length !== record.claims.length) {
+              outcome.gcExpired = record.claims.length - keep.length;
+              record.claims = keep;
+              await savePoolRecord(record);
+            }
           }
-          const pending = extend(pool.repoPath, pool.pool, plan.extendBy);
-          inFlightExtends.set(pool.key, pending);
-          void pending
-            .then((created) => settledExtends.set(pool.key, { created: created.length }))
-            .catch((error: unknown) => settledExtends.set(pool.key, { error: error instanceof Error ? error.message : String(error) }))
-            .finally(() => inFlightExtends.delete(pool.key));
-          outcome.extendStarted = plan.extendBy;
-        }
 
-        previousOccupied.set(pool.key, plan.occupiedNow);
-        previousOccupants.set(
-          pool.key,
-          new Map(occupancy.map((member) => [member.n, member.occupants])),
-        );
+          const occupancy = deriveMemberOccupancy({
+            members: canonicalMembers,
+            config: pool.config,
+            claims: record?.claims ?? [],
+            parked: record?.parked ?? [],
+            liveBees,
+            now: nowMs,
+          });
+          const view = memberSweepView(occupancy, pool.config.branch);
+          const plan = planPoolSweep({
+            members: view,
+            previousOccupied: previousOccupied.get(pool.key),
+            ...(pool.config.minFree !== undefined ? { minFree: pool.config.minFree } : {}),
+          });
+
+          // (b) refresh-on-vacate.
+          if (plan.syncMembers.length > 0) {
+            const names = plan.syncMembers.map((n) => `${pool.repo}:${pool.pool}-${n}`);
+            const result = await sync(pool.repoPath, names);
+            outcome.synced = result.rows.map((row) => ({
+              member: memberNumberFromPath(row.path, pool.pool),
+              status: row.status,
+            }));
+          }
+
+          // Flags: nudge once per (member, reason) until the condition clears.
+          const prevOccupants = previousOccupants.get(pool.key);
+          const flagged: PoolSweepOutcome["flagged"] = [];
+          for (const flag of plan.flags) {
+            const dedupe = `${pool.key}:${flag.member}:${flag.reason}`;
+            if (nudged.has(dedupe)) continue;
+            nudged.add(dedupe);
+            const nudgedParent = await nudgeDepartedBeeParent({
+              pool,
+              member: flag.member,
+              reason: flag.reason,
+              departedNames: (prevOccupants?.get(flag.member) ?? []).filter(
+                (name) => !occupancy.find((m) => m.n === flag.member)?.occupants.includes(name),
+              ),
+              recordByName,
+              currentStates,
+              sendNudge,
+            });
+            flagged.push({ member: flag.member, reason: flag.reason, ...(nudgedParent ? { nudged: nudgedParent } : {}) });
+            await (deps.appendLedger ?? (async () => undefined))({
+              type: "pool.member.flagged",
+              pool: pool.key,
+              member: flag.member,
+              reason: flag.reason,
+            });
+          }
+          if (flagged.length > 0) outcome.flagged = flagged;
+          // Re-arm cleared flags so a future recurrence nudges again.
+          for (const member of view) {
+            if (!member.dirty) nudged.delete(`${pool.key}:${member.n}:dirty`);
+            if (member.onBaseBranch) nudged.delete(`${pool.key}:${member.n}:parked-branch`);
+          }
+
+          // (c) minFree pre-extend — background; report started/finished.
+          const settled = settledExtends.get(pool.key);
+          if (settled) {
+            settledExtends.delete(pool.key);
+            if (settled.error !== undefined) outcome.error = `pre-extend failed: ${settled.error}`;
+            else if (settled.created !== undefined) outcome.extended = settled.created;
+          }
+          if (plan.extendBy > 0 && !inFlightExtends.has(pool.key)) {
+            const newSize = canonicalMembers.length + plan.extendBy;
+            if (newSize > pool.config.maxSize) {
+              outcome.warned = `pool ${pool.pool} pre-extend exceeds maxSize: ${newSize}/${pool.config.maxSize} — consider cleaning or raising maxSize`;
+            }
+            const pending = extend(pool.repoPath, pool.pool, plan.extendBy);
+            inFlightExtends.set(pool.key, pending);
+            void pending
+              .then((created) => settledExtends.set(pool.key, { created: created.length }))
+              .catch((error: unknown) => settledExtends.set(pool.key, { error: error instanceof Error ? error.message : String(error) }))
+              .finally(() => inFlightExtends.delete(pool.key));
+            outcome.extendStarted = plan.extendBy;
+          }
+
+          previousOccupied.set(pool.key, plan.occupiedNow);
+          previousOccupants.set(
+            pool.key,
+            new Map(occupancy.map((member) => [member.n, member.occupants])),
+          );
+        });
       } catch (error) {
         outcome.error = error instanceof Error ? error.message : String(error);
       }

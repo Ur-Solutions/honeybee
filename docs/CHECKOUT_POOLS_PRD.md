@@ -252,21 +252,23 @@ Pattern-copy `src/colony.ts` (dir helper, file lock, atomic write):
 This file holds **only what cannot be derived**: the cursor, in-flight claims,
 parks. Config (branch, occupancy caps) is read from pro (`pro pool ls
 --porcelain`, cached via the existing 30s `proProjects` cache); membership is
-read from disk. If the file is deleted, pools still work — cursor resets, claims
-rebuild from live bees.
+read from disk. A genuinely absent file starts empty; an existing corrupt or
+malformed record is refused so pending claims and parked truth cannot be lost by
+an automatic reconstruction.
 
 ### 6.2 Occupancy model
 
 - **Derived truth**: a member is inhabited by every bee whose `SessionRecord.cwd`
-  realpath-prefixes the member path and whose `deriveState` is non-terminal
-  (reuse `resolveProSlotForCwd` on bee cwd; already how the TUI labels slots).
+  realpath-prefixes the member path and whose local runtime is positively live.
+  A done/sealed display state remains occupied until that runtime actually exits.
 - **Claims** cover the allocation→record gap only: written under the pool file
   lock at allocation, carrying `pendingUntil` (~120s). A claim is *consumed* once
-  a live bee with matching name/cwd exists, *expired* if `pendingUntil` passes
-  with no such bee. Free-count = `maxOccupancy − (live inhabitants + unconsumed
-  claims)` per member.
-- **Release is lazy**: bee goes terminal (sealed/dead/killed/cleaned) → member
-  simply stops counting it. Eager cleanup: `src/kill.ts` and `hive clean` drop
+  a positively live bee with its bound name exists, *expired* if `pendingUntil`
+  passes with no such bee. Unbound claims remain reserved; an arbitrary
+  inhabitant never consumes one by guess. Free-count = `maxOccupancy − (live
+  inhabitants + unconsumed claims)` per member.
+- **Release is lazy**: once the local runtime exits, the member stops counting
+  it. Eager cleanup: `src/kill.ts` and `hive clean` drop
   any matching claim; the daemon sweep (§6.6) garbage-collects expired claims.
   No stored "inhabited" bit means no staleness bugs — same philosophy as
   `deriveState`.

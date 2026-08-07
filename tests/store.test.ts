@@ -13,6 +13,7 @@ import {
   listActiveSessions,
   listActiveSessionsHot,
   listSessions,
+  listSessionsStrict,
   loadSession,
   rebuildActiveSessionIndex,
   safeName,
@@ -669,11 +670,44 @@ test("listSessions skips malformed session files", async () => {
     await mkdir(join(dir, "sessions"), { recursive: true });
     await writeFile(join(dir, "sessions", "bad.json"), "{not json");
     assert.deepEqual(await listSessions(), []);
+    await assert.rejects(listSessionsStrict(), /Invalid JSON in session record/);
   } finally {
     if (oldRoot === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = oldRoot;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("listSessionsStrict rejects load-bearing shape corruption that the tolerant display scan normalizes", async () => {
+  await withTempStore(async (dir) => {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    await writeFile(join(dir, "sessions", "CO.abc.json"), JSON.stringify({ ...makeRecord(dir), status: "mystery" }));
+    assert.equal((await listSessions())[0]?.status, "dead");
+    await assert.rejects(listSessionsStrict(), /unknown status/);
+  });
+});
+
+test("listSessionsStrict retries when a record publication crosses its directory-generation barrier", async () => {
+  await withTempStore(async (dir) => {
+    const sessions = join(dir, "sessions");
+    await mkdir(sessions, { recursive: true });
+    const first = makeRecord(dir);
+    await writeFile(join(sessions, `${first.name}.json`), JSON.stringify(first));
+    let injected = false;
+    const attempts: number[] = [];
+    const records = await listSessionsStrict({
+      onSnapshotRead: async (attempt) => {
+        attempts.push(attempt);
+        if (injected) return;
+        injected = true;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const second = makeRecord(dir, { name: "CO.new", tmuxTarget: "CO-new" });
+        await writeFile(join(sessions, `${second.name}.json`), JSON.stringify(second));
+      },
+    });
+    assert.ok(attempts.length >= 2, "a changed directory generation forces a fresh canonical scan");
+    assert.deepEqual(records.map((record) => record.name).sort(), ["CO.abc", "CO.new"]);
+  });
 });
 
 test("listSessions reads 1,200 records with bounded fan-out and coalesces concurrent snapshots", async () => {

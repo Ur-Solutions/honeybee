@@ -482,6 +482,46 @@ export async function listSessions(): Promise<string[]> {
 
 export const listTmuxSessions = listSessions;
 
+export type LocalRuntimeSnapshot = {
+  sessions: Set<string>;
+  panes: Set<string>;
+};
+
+/**
+ * One strict, internally consistent tmux liveness snapshot for pool safety.
+ * The ordinary substrate list methods are display-oriented and deliberately
+ * collapse tmux failures to empty collections. Allocation cannot use that
+ * contract: an empty result after an observation error could over-subscribe a
+ * checkout. One list-panes command is also the ordering barrier between the
+ * session and pane sets, so a concurrent tmux change cannot split them across
+ * two independently timed observations.
+ */
+export async function observeLocalRuntimeSnapshot(): Promise<LocalRuntimeSnapshot> {
+  const result = await tmux(["list-panes", "-a", "-F", "#{session_name}:#{pane_id}"], { reject: false });
+  if (!result.ok) {
+    // With no tmux server there are authoritatively no local runtimes. Other
+    // failures (timeout, permissions, a wedged socket) are uncertainty and
+    // must propagate to the allocator.
+    if (/no server running/i.test(result.stderr)) return { sessions: new Set(), panes: new Set() };
+    throw new Error(`tmux runtime observation failed: ${result.stderr || `exit ${result.exitCode}`}`);
+  }
+
+  const sessions = new Set<string>();
+  const panes = new Set<string>();
+  for (const line of result.stdout.split("\n")) {
+    if (!line) continue;
+    const separator = line.indexOf(":");
+    const session = separator > 0 ? line.slice(0, separator) : "";
+    const pane = separator > 0 ? line.slice(separator + 1) : "";
+    if (!session || !/^%\d+$/.test(pane)) {
+      throw new Error(`tmux runtime observation returned a malformed row: ${JSON.stringify(line)}`);
+    }
+    sessions.add(session);
+    panes.add(pane);
+  }
+  return { sessions, panes };
+}
+
 export async function listPanes(): Promise<Set<string>> {
   const result = await tmux(["list-panes", "-a", "-F", "#{pane_id}"], { reject: false });
   if (!result.ok) return new Set();

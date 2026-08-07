@@ -3,10 +3,17 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createPoolSweeper, memberNumberFromPath, memberSweepView, planPoolSweep, type MemberSweepView } from "../src/daemon/poolSweep.js";
-import { emptyPoolRecord, poolKeyFor, loadPoolRecord, savePoolRecord, type PoolClaim, type ResolvedPool } from "../src/pool.js";
+import {
+  createPoolSweeper,
+  memberNumberFromPath,
+  memberSweepView,
+  planPoolSweep,
+  type MemberSweepView,
+  type PoolSweeperDeps,
+} from "../src/daemon/poolSweep.js";
+import { emptyPoolRecord, poolKeyFor, loadPoolRecord, savePoolRecord, withPoolLock, type PoolClaim, type ResolvedPool } from "../src/pool.js";
 import type { ProRepoEntry } from "../src/proProjects.js";
-import type { BeeState } from "../src/state.js";
+import { isTerminalState, type BeeState } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 
 const NOW = Date.parse("2026-07-04T12:00:00Z");
@@ -133,7 +140,7 @@ type SweeperHarness = {
   ledger: Array<Record<string, unknown>>;
 };
 
-function buildSweeper(pool: () => ResolvedPool): SweeperHarness {
+function buildSweeper(pool: () => ResolvedPool, overrides: Partial<PoolSweeperDeps> = {}): SweeperHarness {
   let clock = NOW;
   const harness: SweeperHarness = {
     advance: (ms) => {
@@ -148,6 +155,16 @@ function buildSweeper(pool: () => ResolvedPool): SweeperHarness {
       now: () => clock,
       listRepoEntries: async () => [ENTRY],
       discoverPools: async () => [pool()],
+      // Most stateful tests exercise planning/mutation rather than substrate
+      // observation. Preserve their explicit state-map fixtures while the
+      // sealed-live/error regressions below inject strict-observer outcomes.
+      observeLiveBees: async (records, currentStates) => records
+        .filter((record) => {
+          const state = currentStates.get(record.name);
+          return state === undefined || !isTerminalState(state);
+        })
+        .map((record) => ({ name: record.name, cwd: record.cwd })),
+      canonicalizeMembers: async (members) => members,
       sync: async (repoPath, names) => {
         harness.syncCalls.push({ repoPath, names });
         return { ok: true, rows: names.map((name) => ({ status: "synced-ff", path: `/p/lab/demo/checkouts/widget/${name.split(":")[1]}` })), detail: "" };
@@ -162,6 +179,7 @@ function buildSweeper(pool: () => ResolvedPool): SweeperHarness {
       appendLedger: async (event) => {
         harness.ledger.push(event);
       },
+      ...overrides,
     }),
   };
   return harness;
@@ -180,8 +198,8 @@ test("sweeper: GCs expired claims under the lock", async () => {
   await withTempStore(async () => {
     const record = emptyPoolRecord(FACETS);
     record.claims.push(
-      { id: "old", member: 1, path: "/p/1", claimedAt: "x", pendingUntil: new Date(NOW - 1).toISOString() },
-      { id: "live", member: 1, path: "/p/1", claimedAt: "x", pendingUntil: new Date(NOW + 60_000).toISOString() },
+      { id: "old", member: 1, path: "/p/1", claimedAt: new Date(NOW - 1000).toISOString(), pendingUntil: new Date(NOW - 1).toISOString() },
+      { id: "live", member: 1, path: "/p/1", claimedAt: new Date(NOW - 1000).toISOString(), pendingUntil: new Date(NOW + 60_000).toISOString() },
     );
     await savePoolRecord(record);
     const h = buildSweeper(() => resolvedPool());
@@ -205,6 +223,114 @@ test("sweeper: refresh-on-vacate syncs a member the tick observed going terminal
     outcomes = await h.sweep(records, new Map<string, BeeState>([["b1", "dead"]]));
     assert.deepEqual(h.syncCalls, [{ repoPath: ENTRY.path, names: ["widget:core-1"] }]);
     assert.deepEqual(outcomes[0]!.synced, [{ member: 1, status: "synced-ff" }]);
+  });
+});
+
+test("sweeper: done/sealed display state cannot vacate a positively live runtime", async () => {
+  await withTempStore(async () => {
+    let runtimeLive = true;
+    const h = buildSweeper(() => resolvedPool(), {
+      observeLiveBees: async (records) => runtimeLive ? records.map((record) => ({ name: record.name, cwd: record.cwd })) : [],
+    });
+    const records = [bee("sealed-live", { status: "done" })];
+    await h.sweep(records, new Map<string, BeeState>([["sealed-live", "active"]]));
+
+    h.advance(1500);
+    const stillLive = await h.sweep(records, new Map<string, BeeState>([["sealed-live", "done"]]));
+    assert.deepEqual(stillLive, []);
+    assert.equal(h.syncCalls.length, 0, "display-terminal state must not mutate a live member checkout");
+
+    runtimeLive = false;
+    h.advance(1500);
+    const vacated = await h.sweep(records, new Map<string, BeeState>([["sealed-live", "done"]]));
+    assert.deepEqual(h.syncCalls, [{ repoPath: ENTRY.path, names: ["widget:core-1"] }]);
+    assert.deepEqual(vacated[0]!.synced, [{ member: 1, status: "synced-ff" }]);
+  });
+});
+
+test("sweeper: refresh-on-vacate holds the claim barrier until checkout sync completes", async () => {
+  await withTempStore(async () => {
+    let announceSync!: () => void;
+    const syncEntered = new Promise<void>((resolve) => {
+      announceSync = resolve;
+    });
+    let releaseSync!: () => void;
+    const syncGate = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    const h = buildSweeper(() => resolvedPool(), {
+      sync: async (_repoPath, names) => {
+        announceSync();
+        await syncGate;
+        return { ok: true, rows: names.map((name) => ({ status: "synced-ff", path: `/p/${name.split(":")[1]}` })), detail: "" };
+      },
+    });
+    const records = [bee("departing")];
+    await h.sweep(records, new Map<string, BeeState>([["departing", "active"]]));
+
+    h.advance(1500);
+    const sweep = h.sweep(records, new Map<string, BeeState>([["departing", "dead"]]));
+    await syncEntered;
+
+    let claimEntered = false;
+    const claim = withPoolLock(KEY, async () => {
+      claimEntered = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(claimEntered, false, "a new claim decision cannot overlap checkout refresh");
+
+    releaseSync();
+    await Promise.all([sweep, claim]);
+    assert.equal(claimEntered, true);
+  });
+});
+
+test("sweeper: occupancy observation failure aborts all pool mutations", async () => {
+  await withTempStore(async () => {
+    const record = emptyPoolRecord(FACETS);
+    record.claims.push({
+      id: "expired",
+      member: 1,
+      path: "/p/1",
+      claimedAt: new Date(NOW - 2000).toISOString(),
+      pendingUntil: new Date(NOW - 1000).toISOString(),
+    });
+    await savePoolRecord(record);
+    const h = buildSweeper(() => resolvedPool({ minFree: 3 }), {
+      observeLiveBees: async () => {
+        throw new Error("tmux snapshot unreadable");
+      },
+    });
+
+    const outcomes = await h.sweep([], new Map());
+    assert.match(outcomes[0]!.error ?? "", /occupancy observation failed closed: tmux snapshot unreadable/);
+    assert.deepEqual((await loadPoolRecord(KEY))!.claims.map((claim) => claim.id), ["expired"], "claim GC must wait behind the observation barrier");
+    assert.deepEqual(h.syncCalls, []);
+    assert.deepEqual(h.extendCalls, []);
+  });
+});
+
+test("sweeper: member canonicalization failure aborts that pool before mutation", async () => {
+  await withTempStore(async () => {
+    const record = emptyPoolRecord(FACETS);
+    record.claims.push({
+      id: "expired",
+      member: 1,
+      path: "/p/1",
+      claimedAt: new Date(NOW - 2000).toISOString(),
+      pendingUntil: new Date(NOW - 1000).toISOString(),
+    });
+    await savePoolRecord(record);
+    const h = buildSweeper(() => resolvedPool({ minFree: 3 }), {
+      canonicalizeMembers: async () => {
+        throw Object.assign(new Error("ENOENT: member realpath failed"), { code: "ENOENT" });
+      },
+    });
+
+    const outcomes = await h.sweep([], new Map());
+    assert.match(outcomes[0]!.error ?? "", /member realpath failed/);
+    assert.deepEqual((await loadPoolRecord(KEY))!.claims.map((claim) => claim.id), ["expired"]);
+    assert.deepEqual(h.extendCalls, []);
   });
 });
 
@@ -272,6 +398,10 @@ test("sweeper: a broken pool discovery or sync never throws out of the sweep", a
       now: () => clock,
       listRepoEntries: async () => [ENTRY],
       discoverPools: async () => [resolvedPool()],
+      observeLiveBees: async (records, currentStates) => records
+        .filter((record) => !isTerminalState(currentStates.get(record.name) ?? "active"))
+        .map((record) => ({ name: record.name, cwd: record.cwd })),
+      canonicalizeMembers: async (members) => members,
       sync: async () => {
         throw new Error("sync exploded");
       },

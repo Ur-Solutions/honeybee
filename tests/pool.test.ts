@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  allocatePoolMembers,
   bindPoolClaim,
+  canonicalizePoolMembers,
+  claimSpecificPoolMember,
   claimExpired,
   deriveMemberOccupancy,
   dropPoolClaimsForBee,
@@ -14,12 +17,14 @@ import {
   occupantsForPath,
   pickPoolMember,
   planPoolAllocations,
+  poolLiveBees,
   poolKeyFor,
   releasePoolClaim,
   releasePoolMemberClaims,
   savePoolRecord,
   setPoolMemberParked,
   validPoolKey,
+  withPoolLock,
   type MemberOccupancy,
   type PoolClaim,
   type ResolvedPool,
@@ -69,6 +74,76 @@ test("deriveMemberOccupancy counts inhabitants by realpath prefix (cwd may be a 
   assert.deepEqual(occupancy.map((m) => m.free), [0, 0]);
 });
 
+test("canonicalizePoolMembers resolves symlink members and never falls back after EACCES/ENOENT", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-pool-realpath-"));
+  try {
+    const canonical = join(root, "canonical-member");
+    const alias = join(root, "member-alias");
+    await mkdir(canonical);
+    await symlink(canonical, alias, "dir");
+    const aliased = member(1, { path: alias });
+
+    assert.equal((await canonicalizePoolMembers([aliased]))[0]!.path, await realpath(canonical));
+
+    for (const code of ["EACCES", "ENOENT"] as const) {
+      const failure = Object.assign(new Error(`${code}: canonicalization denied`), { code });
+      await assert.rejects(
+        canonicalizePoolMembers([aliased], async () => {
+          throw failure;
+        }),
+        (error: unknown) => error === failure,
+        `${code} must be propagated rather than substituting the lexical symlink path`,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("allocation and manual claim create no state when symlink member canonicalization fails", async () => {
+  await withTempStore(async (root) => {
+    const canonical = join(root, "canonical-member");
+    const alias = join(root, "member-alias");
+    await mkdir(canonical);
+    await symlink(canonical, alias, "dir");
+    const aliased = member(1, { path: alias });
+    const resolved: ResolvedPool = {
+      key: KEY,
+      ...FACETS,
+      repoPath: join(root, "repo"),
+      config: config(),
+      members: [aliased],
+    };
+    const listMembers = async () => [aliased];
+
+    const accessDenied = Object.assign(new Error("EACCES: member realpath failed"), { code: "EACCES" });
+    await assert.rejects(
+      allocatePoolMembers(resolved, 1, {
+        liveBees: [],
+        listMembers,
+        realpathPath: async () => {
+          throw accessDenied;
+        },
+      }),
+      (error: unknown) => error === accessDenied,
+    );
+    assert.equal(await loadPoolRecord(KEY), null);
+
+    const missing = Object.assign(new Error("ENOENT: member realpath failed"), { code: "ENOENT" });
+    await assert.rejects(
+      claimSpecificPoolMember(resolved, 1, {
+        liveBees: [],
+        listMembers,
+        realpathPath: async () => {
+          throw missing;
+        },
+      }),
+      (error: unknown) => error === missing,
+    );
+    assert.equal(await loadPoolRecord(KEY), null);
+  });
+});
+
 test("deriveMemberOccupancy: unconsumed claims count toward occupancy, expired claims never do", () => {
   const occupancy = deriveMemberOccupancy({
     members: [member(1), member(2)],
@@ -101,9 +176,10 @@ test("deriveMemberOccupancy: a claim bound to a live bee is consumed (no double 
   assert.equal(occupancy[0]!.free, 1); // 2 − 1 inhabitant − 0 pending
 });
 
-test("deriveMemberOccupancy: an unbound claim is consumed by an inhabitant beyond bound-claim coverage", () => {
-  // The seconds-wide window where the spawned bee's record exists but its
-  // claim has not been bound yet: bee + its own claim must count once, not twice.
+test("deriveMemberOccupancy: an arbitrary inhabitant never consumes an unbound claim", () => {
+  // The allocator cannot prove the inhabitant owns this claim. If it consumed
+  // the reservation and the real owner then appeared, maxOccupancy could be
+  // exceeded. Double-count briefly until bind is the safe direction.
   const occupancy = deriveMemberOccupancy({
     members: [member(1)],
     config: config({ maxOccupancy: 2 }),
@@ -112,8 +188,8 @@ test("deriveMemberOccupancy: an unbound claim is consumed by an inhabitant beyon
     liveBees: [{ name: "just-spawned", cwd: "/p/checkouts/widget/core-1" }],
     now: NOW,
   });
-  assert.equal(occupancy[0]!.pendingClaims.length, 0);
-  assert.equal(occupancy[0]!.free, 1);
+  assert.equal(occupancy[0]!.pendingClaims.length, 1);
+  assert.equal(occupancy[0]!.free, 0);
 });
 
 test("deriveMemberOccupancy: a claim bound to a DEAD bee stays pending until expiry", () => {
@@ -235,7 +311,7 @@ test("poolKeyFor slugs the facets; validPoolKey rejects traversal-ish keys", () 
   assert.equal(validPoolKey(""), false);
 });
 
-test("pool records roundtrip; a deleted or garbled file reads as absent (state rebuilds)", async () => {
+test("pool records roundtrip; only a genuinely absent file reads as absent", async () => {
   await withTempStore(async (root) => {
     assert.equal(await loadPoolRecord(KEY), null);
     const record = emptyPoolRecord(FACETS);
@@ -246,8 +322,48 @@ test("pool records roundtrip; a deleted or garbled file reads as absent (state r
     const loaded = await loadPoolRecord(KEY);
     assert.deepEqual(loaded, record);
 
-    await writeFile(join(root, "pools", `${KEY}.json`), "{ not json");
+    await rm(join(root, "pools", `${KEY}.json`));
     assert.equal(await loadPoolRecord(KEY), null);
+  });
+});
+
+test("corrupt pool JSON is refused by allocation, claim, release, and park paths without replacement", async () => {
+  await withTempStore(async (root) => {
+    const path = join(root, "pools", `${KEY}.json`);
+    await savePoolRecord(emptyPoolRecord(FACETS));
+    const corrupt = "{ not json";
+    await writeFile(path, corrupt);
+    const resolved: ResolvedPool = { key: KEY, ...FACETS, repoPath: "/p/repos/widget", config: config(), members: [member(1)] };
+
+    await assert.rejects(loadPoolRecord(KEY), /is corrupt .*refusing to treat it as empty/);
+    await assert.rejects(allocatePoolMembers(resolved, 1, { liveBees: [] }), /is corrupt/);
+    await assert.rejects(claimSpecificPoolMember(resolved, 1, { liveBees: [] }), /is corrupt/);
+    await assert.rejects(bindPoolClaim(KEY, "c1", "bee"), /is corrupt/);
+    await assert.rejects(releasePoolClaim(KEY, "c1"), /is corrupt/);
+    await assert.rejects(releasePoolMemberClaims(KEY, 1), /is corrupt/);
+    await assert.rejects(dropPoolClaimsForBee(KEY, "bee"), /is corrupt/);
+    await assert.rejects(setPoolMemberParked(resolved, 1, true), /is corrupt/);
+    assert.equal(await readFile(path, "utf8"), corrupt, "no adjacent mutation may reconstruct or overwrite corrupt truth");
+  });
+});
+
+test("malformed claims are refused whole so valid pending claims and parked truth are not partially reconstructed", async () => {
+  await withTempStore(async (root) => {
+    const path = join(root, "pools", `${KEY}.json`);
+    await mkdir(join(root, "pools"), { recursive: true });
+    const record = emptyPoolRecord(FACETS);
+    record.claims.push(claim(1, { id: "valid-pending" }));
+    record.parked = [5];
+    const malformed = {
+      ...record,
+      claims: [...record.claims, { member: 2, path: "/p/checkouts/widget/core-2", claimedAt: new Date(NOW).toISOString(), pendingUntil: new Date(NOW + 60_000).toISOString() }],
+    };
+    await writeFile(path, `${JSON.stringify(malformed, null, 2)}\n`);
+    const before = await readFile(path, "utf8");
+
+    await assert.rejects(loadPoolRecord(KEY), /claims\[1\]\.id/);
+    await assert.rejects(releasePoolClaim(KEY, "valid-pending"), /claims\[1\]\.id/);
+    assert.equal(await readFile(path, "utf8"), before);
   });
 });
 
@@ -317,26 +433,164 @@ function session(name: string, overrides: Partial<SessionRecord> = {}): SessionR
   };
 }
 
-test("liveBeesFromSessions keeps non-terminal local bees and drops dead/sealed/remote ones", async () => {
+test("liveBeesFromSessions counts every positively live local runtime, including sealed/done display-terminal bees", async () => {
   await withTempStore(async () => {
-    // Seals are read from disk by deriveState context builders; here the context
-    // is fabricated directly, so no store I/O happens.
     const records = [
       session("alive"),
       session("dead-bee"),
-      session("sealed-bee"),
+      session("sealed-bee", { agentPaneId: "%7" }),
       session("remote-bee", { node: "mini01" }),
       session("hsr-alive", { substrate: "hsr" }),
+      session("promoting", { substrate: "hsr" }),
+      session("demoting"),
       session("archived-bee", { status: "done" }),
     ];
     const context: StateContext = {
-      liveTargets: new Set([liveTargetKey(undefined, "alive"), liveTargetKey(undefined, "sealed-bee"), liveTargetKey("mini01", "remote-bee")]),
+      liveTargets: new Set([liveTargetKey(undefined, "alive"), liveTargetKey(undefined, "archived-bee"), liveTargetKey(undefined, "promoting"), liveTargetKey("mini01", "remote-bee")]),
+      livePanes: new Set(["%7"]),
       seals: new Set(["sealed-bee"]),
-      hsrLive: new Set(["hsr-alive"]),
+      hsrLive: new Set(["hsr-alive", "demoting"]),
       now: NOW,
     };
     const bees = liveBeesFromSessions(records, context);
-    assert.deepEqual(bees.map((bee) => bee.name).sort(), ["alive", "hsr-alive"]);
+    assert.deepEqual(bees.map((bee) => bee.name).sort(), ["alive", "archived-bee", "demoting", "hsr-alive", "promoting", "sealed-bee"]);
     assert.equal(bees[0]!.cwd, "/p/checkouts/widget/core-1");
+  });
+});
+
+test("poolLiveBees fails closed on local and HSR observation errors", async () => {
+  await assert.rejects(
+    poolLiveBees([], {
+      observeLocal: async () => {
+        throw new Error("empty-snapshot tmux observation failed");
+      },
+    }),
+    /empty-snapshot tmux observation failed/,
+  );
+
+  await assert.rejects(
+    poolLiveBees([session("tmux")], {
+      observeLocal: async () => {
+        throw new Error("tmux observation failed");
+      },
+    }),
+    /tmux observation failed/,
+  );
+
+  await assert.rejects(
+    poolLiveBees([session("hsr", { substrate: "hsr" })], {
+      observeHsr: async () => {
+        throw new Error("HSR observation failed");
+      },
+    }),
+    /HSR observation failed/,
+  );
+
+  await assert.rejects(
+    poolLiveBees([session("cwd")], {
+      observeLocal: async () => ({ sessions: new Set(["cwd"]), panes: new Set<string>() }),
+      realpathCwd: async () => {
+        throw new Error("cwd realpath failed");
+      },
+    }),
+    /cwd realpath failed/,
+  );
+});
+
+test("poolLiveBees refuses corrupt HSR runtime metadata instead of observing the runtime as absent", async () => {
+  await withTempStore(async (root) => {
+    const bee = session("hsr-corrupt", { substrate: "hsr" });
+    const runDir = join(root, "hsr", bee.name);
+    await assert.rejects(poolLiveBees([bee]), /HSR runtime metadata is missing/);
+    await mkdir(runDir, { recursive: true });
+    await writeFile(join(runDir, "meta.json"), "{ bad json");
+    await assert.rejects(poolLiveBees([bee]), /Invalid JSON in HSR metadata/);
+  });
+});
+
+test("poolLiveBees completes the strict record scan before starting its runtime observation barrier", async () => {
+  let releaseScan!: (records: SessionRecord[]) => void;
+  const scan = new Promise<SessionRecord[]>((resolve) => {
+    releaseScan = resolve;
+  });
+  let observed = false;
+  const pending = poolLiveBees(undefined, {
+    listSessions: () => scan,
+    observeLocal: async () => {
+      observed = true;
+      return { sessions: new Set(["alive"]), panes: new Set<string>() };
+    },
+    realpathCwd: async (cwd) => cwd,
+  });
+  await Promise.resolve();
+  assert.equal(observed, false, "runtime observation must not race ahead of the durable record snapshot");
+  releaseScan([session("alive")]);
+  assert.deepEqual(await pending, [{ name: "alive", cwd: "/p/checkouts/widget/core-1" }]);
+  assert.equal(observed, true);
+});
+
+test("the pool lock is a capacity barrier for concurrent claim decisions", async () => {
+  await withTempStore(async () => {
+    let announceFirst!: () => void;
+    const firstEntered = new Promise<void>((resolve) => {
+      announceFirst = resolve;
+    });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let first = true;
+    const reserve = (id: string) => withPoolLock(KEY, async () => {
+      const record = (await loadPoolRecord(KEY)) ?? emptyPoolRecord(FACETS);
+      const occupancy = deriveMemberOccupancy({ members: [member(1)], config: config(), claims: record.claims, parked: record.parked, liveBees: [], now: NOW });
+      if (occupancy[0]!.free < 1) return false;
+      if (first) {
+        first = false;
+        announceFirst();
+        await firstGate;
+      }
+      record.claims.push(claim(1, { id }));
+      await savePoolRecord(record);
+      return true;
+    });
+
+    const a = reserve("concurrent-a");
+    await firstEntered;
+    const b = reserve("concurrent-b");
+    releaseFirst();
+    const results = await Promise.all([a, b]);
+    assert.deepEqual(results.sort(), [false, true]);
+    assert.equal((await loadPoolRecord(KEY))!.claims.length, 1, "serialized decisions never exceed maxOccupancy=1");
+  });
+});
+
+test("concurrent allocators cannot both claim one maxOccupancy=1 member", async () => {
+  await withTempStore(async (root) => {
+    const memberPath = join(root, "member-1");
+    await mkdir(memberPath);
+    const onlyMember = member(1, { path: memberPath });
+    const resolved: ResolvedPool = {
+      key: KEY,
+      ...FACETS,
+      repoPath: join(root, "repo"),
+      config: config({ maxOccupancy: 1 }),
+      members: [onlyMember],
+    };
+    const options = {
+      liveBees: [],
+      listMembers: async () => [onlyMember],
+      extendPool: async () => {
+        throw new Error("test capacity exhausted");
+      },
+    };
+
+    const results = await Promise.allSettled([
+      allocatePoolMembers(resolved, 1, options),
+      allocatePoolMembers(resolved, 1, options),
+    ]);
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+    assert.match(String(results.find((result) => result.status === "rejected")?.reason), /test capacity exhausted/);
+    assert.equal((await loadPoolRecord(KEY))!.claims.length, 1);
   });
 });

@@ -234,6 +234,52 @@ export async function readHsrMeta(bee: string): Promise<HsrMeta | null> {
   }
 }
 
+/**
+ * Fail-closed metadata read for runtime-safety decisions. Missing meta is an
+ * observed absence; unreadable or malformed existing state is uncertainty and
+ * rejects instead of being converted to a dead HSR runtime.
+ */
+export async function readHsrMetaStrict(bee: string): Promise<HsrMeta | null> {
+  let raw: string;
+  try {
+    raw = await readFile(hsrMetaPath(bee), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(`Unable to read HSR metadata for ${bee}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Invalid JSON in HSR metadata for ${bee}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`Invalid HSR metadata shape for ${bee}`);
+  const object = parsed as Record<string, unknown>;
+  if (object.bee !== bee) throw new Error(`Invalid HSR metadata for ${bee}: stored bee identity does not match`);
+  if (!Number.isSafeInteger(object.hostPid) || (object.hostPid as number) < 0) {
+    throw new Error(`Invalid HSR metadata for ${bee}: hostPid must be a non-negative safe integer`);
+  }
+  if (!object.mirrorOfNode && (object.hostPid as number) < 1) {
+    throw new Error(`Invalid HSR metadata for ${bee}: local hostPid must be positive`);
+  }
+  if (object.status !== "queued" && object.status !== "running" && object.status !== "exited") {
+    throw new Error(`Invalid HSR metadata for ${bee}: unknown status`);
+  }
+  const validFingerprint = (value: unknown): value is ProcessBirthFingerprint => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const fingerprint = value as Record<string, unknown>;
+    return Number.isSafeInteger(fingerprint.pgid) && Number(fingerprint.pgid) > 0 &&
+      typeof fingerprint.startedAt === "string" && fingerprint.startedAt.length > 0;
+  };
+  if (object.hostFingerprint !== undefined && !validFingerprint(object.hostFingerprint)) {
+    throw new Error(`Invalid HSR metadata for ${bee}: malformed host fingerprint`);
+  }
+  if (object.childFingerprint !== undefined && !validFingerprint(object.childFingerprint)) {
+    throw new Error(`Invalid HSR metadata for ${bee}: malformed child fingerprint`);
+  }
+  return object as unknown as HsrMeta;
+}
+
 // Per-bee append serialization. The runner fires appendHsrEvent concurrently
 // (one per produced event, not awaited); on POSIX O_APPEND keeps each write
 // atomic, but a burst of same-turn events would race the libuv threadpool and

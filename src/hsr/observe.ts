@@ -27,6 +27,7 @@ import {
   hsrRingPath,
   hsrRoot,
   readHsrMeta,
+  readHsrMetaStrict,
   writeHsrMeta,
   type HsrMeta,
 } from "./runDir.js";
@@ -117,6 +118,20 @@ export async function hsrLiveness(): Promise<Map<string, boolean>> {
     liveness.set(row.bee, row.live);
   }
   return liveness;
+}
+
+/**
+ * Exact-record HSR liveness for fail-closed safety decisions. Unlike the
+ * display-oriented batch observer, malformed/unreadable metadata propagates
+ * instead of becoming `live: false`.
+ */
+export async function hsrLivenessStrict(bees: Iterable<string>): Promise<Map<string, boolean | null>> {
+  const names = [...new Set(bees)].sort();
+  const rows = await mapWithConcurrency(names, observationConcurrency(undefined), async (bee) => {
+    const meta = await readHsrMetaStrict(bee);
+    return { bee, live: meta ? isMetaLive(meta) : null };
+  });
+  return new Map(rows.map((row) => [row.bee, row.live]));
 }
 
 /** Tail of ring.txt (last `lines`, or all). Empty string if absent. */

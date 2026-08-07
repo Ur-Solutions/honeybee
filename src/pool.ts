@@ -10,18 +10,20 @@
  *   - hive owns ONLY what cannot be derived: the round-robin cursor, in-flight
  *     claims, and parked members — one JSON file per pool under
  *     `~/.hive/pools/<key>.json` (colony.ts pattern: dir + file lock + atomic
- *     write). Deleting the file is harmless: the cursor resets and claims
- *     rebuild from live bees.
+ *     write). A genuinely absent file starts empty; an unreadable or corrupt
+ *     file is never confused with absence because that could erase pending
+ *     claims or parked truth and over-subscribe a checkout.
  *   - Occupancy is derived on read (§6.2): a member is inhabited by every bee
- *     whose SessionRecord.cwd realpath-prefixes the member path and whose
- *     derived state is non-terminal. No stored "inhabited" bit, no staleness.
+ *     whose SessionRecord.cwd realpath-prefixes the member path and whose local
+ *     runtime is positively live. Display-terminal done/sealed state does not
+ *     release capacity while that runtime survives.
  */
 
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, realpath } from "node:fs/promises";
-import { basename, join } from "node:path";
-import { observeHsrLiveness, listSealedBeeNames } from "./cli/shared.js";
+import { basename, isAbsolute, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
+import { hsrLivenessStrict } from "./hsr/observe.js";
 import { withFileLock } from "./lock.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import {
@@ -34,9 +36,9 @@ import {
   type ProPoolMember,
   type ProRepoEntry,
 } from "./proProjects.js";
-import { deriveState, isTerminalState, liveTargetKey, type StateContext } from "./state.js";
-import { appendLedger, listSessions, type SessionRecord } from "./store.js";
-import { localSubstrate } from "./substrates/index.js";
+import { liveTargetKey, type StateContext } from "./state.js";
+import { appendLedger, listSessionsStrict, type SessionRecord } from "./store.js";
+import { observeLocalRuntimeSnapshot, type LocalRuntimeSnapshot } from "./substrates/local-tmux.js";
 
 // ── durable pool record (§6.1) ───────────────────────────────────────────────
 
@@ -118,9 +120,9 @@ export function emptyPoolRecord(facets: { area: string; project: string; repo: s
 }
 
 /**
- * Load a pool record, or null when none exists yet. Tolerant by design: the
- * file holds only reconstructible state, so a garbled record is treated as
- * absent (cursor resets, claims rebuild from live bees) rather than fatal.
+ * Load a pool record, or null only when none exists yet. Existing state is a
+ * safety boundary: malformed JSON/claims are refused rather than reconstructed
+ * because pending claims and parked members are not derivable from live bees.
  */
 export async function loadPoolRecord(key: string): Promise<PoolRecord | null> {
   if (!validPoolKey(key)) return null;
@@ -131,58 +133,110 @@ export async function loadPoolRecord(key: string): Promise<PoolRecord | null> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+  let parsed: unknown;
   try {
-    return normalizePoolRecord(JSON.parse(raw), key);
-  } catch {
-    return null;
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw corruptPoolRecord(key, `invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
+  return normalizePoolRecord(parsed, key);
 }
 
-function normalizePoolRecord(value: unknown, key: string): PoolRecord | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+function corruptPoolRecord(key: string, detail: string): Error {
+  return new Error(`pool state ${poolPath(key)} is corrupt (${detail}); refusing to treat it as empty — restore or explicitly remove it`);
+}
+
+function requiredString(value: unknown, key: string, field: string): string {
+  if (typeof value !== "string" || value.length === 0) throw corruptPoolRecord(key, `${field} must be a non-empty string`);
+  return value;
+}
+
+function normalizePoolRecord(value: unknown, key: string): PoolRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw corruptPoolRecord(key, "record must be an object");
   const object = value as Record<string, unknown>;
-  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  if (object.key !== key) throw corruptPoolRecord(key, `stored key must equal ${key}`);
+  const area = requiredString(object.area, key, "area");
+  const project = requiredString(object.project, key, "project");
+  const repo = requiredString(object.repo, key, "repo");
+  const pool = requiredString(object.pool, key, "pool");
+  if (poolKeyFor({ area, project, repo, pool }) !== key) throw corruptPoolRecord(key, "stored facets do not match the filename key");
+  if (!Number.isSafeInteger(object.rrCursor) || (object.rrCursor as number) < 0) {
+    throw corruptPoolRecord(key, "rrCursor must be a non-negative safe integer");
+  }
+  if (!Array.isArray(object.claims)) throw corruptPoolRecord(key, "claims must be an array");
+  if (!Array.isArray(object.parked)) throw corruptPoolRecord(key, "parked must be an array");
   const record: PoolRecord = {
     key,
-    area: str(object.area),
-    project: str(object.project),
-    repo: str(object.repo),
-    pool: str(object.pool),
-    rrCursor: typeof object.rrCursor === "number" && Number.isInteger(object.rrCursor) ? object.rrCursor : 0,
+    area,
+    project,
+    repo,
+    pool,
+    rrCursor: object.rrCursor as number,
     claims: [],
     parked: [],
   };
-  if (typeof object.colony === "string" && object.colony) record.colony = object.colony;
-  if (Array.isArray(object.claims)) {
-    for (const item of object.claims) {
-      if (!item || typeof item !== "object") continue;
-      const claim = item as Record<string, unknown>;
-      if (typeof claim.member !== "number" || typeof claim.path !== "string") continue;
-      if (typeof claim.claimedAt !== "string" || typeof claim.pendingUntil !== "string") continue;
-      record.claims.push({
-        id: typeof claim.id === "string" && claim.id ? claim.id : randomUUID(),
-        member: claim.member,
-        path: claim.path,
-        ...(typeof claim.beeName === "string" && claim.beeName ? { beeName: claim.beeName } : {}),
-        claimedAt: claim.claimedAt,
-        pendingUntil: claim.pendingUntil,
-      });
+  if (object.colony !== undefined) record.colony = requiredString(object.colony, key, "colony");
+  const claimIds = new Set<string>();
+  for (let index = 0; index < object.claims.length; index += 1) {
+    const item = object.claims[index];
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw corruptPoolRecord(key, `claims[${index}] must be an object`);
+    const claim = item as Record<string, unknown>;
+    const id = requiredString(claim.id, key, `claims[${index}].id`);
+    if (claimIds.has(id)) throw corruptPoolRecord(key, `duplicate claim id ${id}`);
+    claimIds.add(id);
+    if (!Number.isSafeInteger(claim.member) || (claim.member as number) < 1) {
+      throw corruptPoolRecord(key, `claims[${index}].member must be a positive safe integer`);
     }
+    const path = requiredString(claim.path, key, `claims[${index}].path`);
+    if (!isAbsolute(path)) throw corruptPoolRecord(key, `claims[${index}].path must be absolute`);
+    const claimedAt = requiredString(claim.claimedAt, key, `claims[${index}].claimedAt`);
+    const pendingUntil = requiredString(claim.pendingUntil, key, `claims[${index}].pendingUntil`);
+    const claimedAtMs = Date.parse(claimedAt);
+    const pendingUntilMs = Date.parse(pendingUntil);
+    if (!Number.isFinite(claimedAtMs)) throw corruptPoolRecord(key, `claims[${index}].claimedAt must be a timestamp`);
+    if (!Number.isFinite(pendingUntilMs)) throw corruptPoolRecord(key, `claims[${index}].pendingUntil must be a timestamp`);
+    if (pendingUntilMs < claimedAtMs) throw corruptPoolRecord(key, `claims[${index}].pendingUntil precedes claimedAt`);
+    if (claim.beeName !== undefined && (typeof claim.beeName !== "string" || claim.beeName.length === 0)) {
+      throw corruptPoolRecord(key, `claims[${index}].beeName must be a non-empty string when present`);
+    }
+    record.claims.push({
+      id,
+      member: claim.member as number,
+      path,
+      ...(typeof claim.beeName === "string" ? { beeName: claim.beeName } : {}),
+      claimedAt,
+      pendingUntil,
+    });
   }
-  if (Array.isArray(object.parked)) {
-    record.parked = [...new Set(object.parked.filter((n): n is number => typeof n === "number" && Number.isInteger(n)))];
+  const parked = new Set<number>();
+  for (let index = 0; index < object.parked.length; index += 1) {
+    const member = object.parked[index];
+    if (!Number.isSafeInteger(member) || (member as number) < 1) {
+      throw corruptPoolRecord(key, `parked[${index}] must be a positive safe integer`);
+    }
+    if (parked.has(member as number)) throw corruptPoolRecord(key, `parked contains duplicate member ${member}`);
+    parked.add(member as number);
   }
+  record.parked = [...parked];
   return record;
 }
 
 export async function savePoolRecord(record: PoolRecord): Promise<void> {
+  if (!validPoolKey(record.key)) throw new Error(`invalid pool key: ${record.key}`);
+  normalizePoolRecord(record, record.key);
   await mkdir(poolsDir(), { recursive: true });
   await atomicWriteFile(poolPath(record.key), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
 }
 
 /** All pool records on disk (for `hive pool` listings and daemon sweeps). */
 export async function listPoolRecords(): Promise<PoolRecord[]> {
-  const files = await readdir(poolsDir()).catch(() => [] as string[]);
+  let files: string[];
+  try {
+    files = await readdir(poolsDir());
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
   const records: PoolRecord[] = [];
   for (const file of files) {
     if (!file.endsWith(".json") || file.startsWith(".")) continue;
@@ -194,10 +248,10 @@ export async function listPoolRecords(): Promise<PoolRecord[]> {
 
 // ── occupancy derivation (§6.2) — pure over pre-gathered inputs ──────────────
 
-/** A live (non-terminal) bee, reduced to what occupancy needs. */
+/** A positively live local runtime, reduced to what occupancy needs. */
 export type LiveBee = {
   name: string;
-  /** Realpath'd cwd (resolveSpawnCwd realpaths at spawn). */
+  /** Realpath'd cwd (re-verified by the safety observation before allocation). */
   cwd: string;
 };
 
@@ -230,12 +284,12 @@ export type MemberOccupancy = {
 /**
  * Per-member occupancy (§6.2), pure over (roster, config, claims, live bees).
  *
- * Claim consumption is count-based per member: a claim bound to a live bee
- * name is consumed; unbound claims are consumed by inhabitants beyond those
- * already covered by bound claims (the seconds-wide window between a spawned
- * bee's record appearing and its claim being bound). Expired claims never
- * count. The scheme errs toward over-counting (a phantom pending claim makes
- * the allocator pick another member) — it can never over-subscribe a member.
+ * A claim bound to a positively live bee is consumed by that runtime. Unbound
+ * claims always remain pending: an arbitrary existing inhabitant is not proof
+ * that it is the just-spawned owner, and consuming the reservation on that
+ * guess could exceed maxOccupancy when the real owner appears. The short
+ * record→bind window may therefore double-count one runtime; that conservative
+ * under-allocation is the required fail-closed direction.
  */
 export function deriveMemberOccupancy(input: {
   members: ProPoolMember[];
@@ -251,17 +305,13 @@ export function deriveMemberOccupancy(input: {
     .sort((a, b) => a.n - b.n)
     .map((member) => {
       const occupants = occupantsForPath(member.path, input.liveBees);
-      const occupantNames = new Set(occupants.map((bee) => bee.name));
       const claims = input.claims.filter((claim) => claim.member === member.n && !claimExpired(claim, input.now));
       const bound = claims.filter((claim) => claim.beeName !== undefined);
       const unbound = claims.filter((claim) => claim.beeName === undefined);
       // Bound to a live bee → consumed (its bee is counted as an occupant, or
       // it is live elsewhere and no longer needs the reservation).
       const pendingBound = bound.filter((claim) => !liveNames.has(claim.beeName!));
-      // Inhabitants not accounted for by a bound claim consume unbound claims.
-      const coveredInhabitants = bound.filter((claim) => occupantNames.has(claim.beeName!)).length;
-      const consumedUnbound = Math.min(unbound.length, Math.max(0, occupants.length - coveredInhabitants));
-      const pendingClaims = [...pendingBound, ...unbound.slice(consumedUnbound)];
+      const pendingClaims = [...pendingBound, ...unbound];
       const isParked = parked.has(member.n);
       const free = isParked ? 0 : Math.max(0, input.config.maxOccupancy - occupants.length - pendingClaims.length);
       return {
@@ -327,44 +377,80 @@ export function planPoolAllocations(occupancy: MemberOccupancy[], rrCursor: numb
 // ── live-bee gathering (impure input to the pure derivations) ────────────────
 
 /**
- * All live (non-terminal) bees, from a CHEAP local liveness pass: tmux session
- * + pane sets, seal markers, and HSR run-dir observations — no pane captures
- * (terminal-vs-non-terminal never depends on pane content) and no remote node
- * probes (remote bees' cwds are remote paths; they can never inhabit a local
- * pool member, and remote-node pools are out of scope §9).
+ * Injectable safety observations used by tests to force ordering/error edges.
+ * Production defaults are strict: none may turn an observation failure into an
+ * empty collection.
  */
-export async function poolLiveBees(records?: SessionRecord[]): Promise<LiveBee[]> {
-  const sessions = records ?? (await listSessions());
-  const [states, livePanes, seals, hsr] = await Promise.all([
-    localSubstrate().listSessionStates().catch(() => new Map<string, string>()),
-    localSubstrate().listPanes().catch(() => new Set<string>()),
-    listSealedBeeNames(sessions),
-    observeHsrLiveness(),
+export type PoolLivenessDependencies = {
+  listSessions: () => Promise<SessionRecord[]>;
+  observeLocal: () => Promise<LocalRuntimeSnapshot>;
+  observeHsr: (bees: Iterable<string>) => Promise<Map<string, boolean | null>>;
+  realpathCwd: (cwd: string) => Promise<string>;
+};
+
+const DEFAULT_POOL_LIVENESS_DEPS: PoolLivenessDependencies = {
+  listSessions: listSessionsStrict,
+  observeLocal: observeLocalRuntimeSnapshot,
+  observeHsr: hsrLivenessStrict,
+  realpathCwd: realpath,
+};
+
+/**
+ * Every positively live local runtime that can mutate a pool checkout.
+ *
+ * The strict SessionRecord scan completes before runtime observation. Spawn
+ * creates its runtime before persisting the record, so that order is a safety
+ * barrier: every record in the snapshot either already had a runtime for the
+ * following observation, or remains covered by its pending allocation claim.
+ * Display state, stored lifecycle status, and seals are intentionally ignored;
+ * a done/sealed runtime that is still positively live can still write its cwd.
+ */
+export async function poolLiveBees(
+  records?: SessionRecord[],
+  dependencies: Partial<PoolLivenessDependencies> = {},
+): Promise<LiveBee[]> {
+  const deps: PoolLivenessDependencies = { ...DEFAULT_POOL_LIVENESS_DEPS, ...dependencies };
+  const sessions = records ?? (await deps.listSessions());
+  const local = sessions.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
+  const hsrRecords = local.filter((record) => record.substrate === "hsr");
+  const [runtime, hsrLiveness] = await Promise.all([
+    // Even an empty record snapshot still takes the tmux barrier: silently
+    // skipping a failed observer would make "no records" indistinguishable
+    // from an unreadable runtime substrate during a concurrent publication.
+    deps.observeLocal(),
+    deps.observeHsr(local.map((record) => record.name)),
   ]);
+  const missingHsr = hsrRecords.find((record) => hsrLiveness.get(record.name) === null || !hsrLiveness.has(record.name));
+  if (missingHsr) throw new Error(`HSR runtime metadata is missing for session ${missingHsr.name}`);
   const liveTargets = new Set<string>();
-  for (const target of states.keys()) liveTargets.add(liveTargetKey(undefined, target));
+  for (const target of runtime.sessions) liveTargets.add(liveTargetKey(undefined, target));
   const context: StateContext = {
     liveTargets,
-    livePanes,
-    seals,
-    hsrLive: hsr.hsrLive,
-    hsrStates: hsr.hsrStates,
-    hsrSnapshots: hsr.hsrSnapshots,
+    livePanes: runtime.panes,
+    hsrLive: new Set([...hsrLiveness].filter(([, live]) => live).map(([bee]) => bee)),
     now: Date.now(),
   };
-  return liveBeesFromSessions(sessions, context);
+  const liveBees = liveBeesFromSessions(sessions, context);
+  return Promise.all(liveBees.map(async (bee) => ({ ...bee, cwd: await deps.realpathCwd(bee.cwd) })));
 }
 
 /**
- * Reduce session records to the live-bee set occupancy counts (§6.2): local
- * bees whose derived state is non-terminal. Split from poolLiveBees so tests
- * can fabricate records + a StateContext without touching tmux.
+ * Reduce session records to positively live local runtimes (§6.2). This is
+ * deliberately not deriveState: display-terminal states such as done/sealed
+ * do not prove the process has exited and therefore cannot release capacity.
  */
 export function liveBeesFromSessions(records: SessionRecord[], context: StateContext): LiveBee[] {
   const bees: LiveBee[] = [];
   for (const record of records) {
     if (record.node && record.node !== LOCAL_NODE_NAME) continue;
-    if (isTerminalState(deriveState(record, context).state)) continue;
+    const targetLive = context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.liveTargets.has(record.tmuxTarget);
+    const paneLive = record.agentPaneId !== undefined && context.livePanes?.has(record.agentPaneId) === true;
+    // Observe both substrates around lifecycle transitions: the durable record
+    // can still name the old substrate while the replacement runtime is already
+    // live. Any positive local signal retains capacity.
+    const hsrLive = context.hsrLive?.has(record.name) === true;
+    const live = targetLive || paneLive || hsrLive;
+    if (!live) continue;
     bees.push({ name: record.name, cwd: record.cwd });
   }
   return bees;
@@ -460,6 +546,12 @@ export type PoolAllocation = {
 export type AllocatePoolOptions = {
   /** Injected live-bee set (tests); default gathers from the local substrate. */
   liveBees?: LiveBee[];
+  /** Injectable fresh pro roster (tests). */
+  listMembers?: (pool: ResolvedPool) => Promise<ProPoolMember[]>;
+  /** Injectable pro extension (tests). */
+  extendPool?: (repoPath: string, pool: string, count: number) => Promise<string[]>;
+  /** Injectable canonicalizer (tests); failures are always fatal to a safety decision. */
+  realpathPath?: (path: string) => Promise<string>;
   /** Loud warnings (soft maxSize breach) — default stderr. */
   onWarn?: (message: string) => void;
   /** Claim lifetime override (manual `hive pool claim --ttl`); default poolClaimTtlMs(). */
@@ -476,6 +568,9 @@ export type AllocatePoolOptions = {
 export async function allocatePoolMembers(pool: ResolvedPool, count: number, options: AllocatePoolOptions = {}): Promise<PoolAllocation[]> {
   if (!Number.isInteger(count) || count < 1) throw new Error(`pool allocation count must be a positive integer (got ${count})`);
   const warn = options.onWarn ?? ((message: string) => console.error(message));
+  const listMembers = options.listMembers ?? currentMembers;
+  const extendPool = options.extendPool ?? extendProPool;
+  const realpathPath = options.realpathPath ?? realpath;
   return withPoolLock(pool.key, async () => {
     const now = Date.now();
     const record = (await loadPoolRecord(pool.key)) ?? emptyPoolRecord(pool);
@@ -484,9 +579,9 @@ export async function allocatePoolMembers(pool: ResolvedPool, count: number, opt
     record.claims = record.claims.filter((claim) => !claimExpired(claim, now));
 
     invalidateProPoolCache(pool.repoPath);
-    let members = await currentMembers(pool);
+    let members = await listMembers(pool);
     const liveBees = options.liveBees ?? (await poolLiveBees());
-    const realMembers = await realpathMembers(members);
+    const realMembers = await canonicalizePoolMembers(members, realpathPath);
 
     let occupancy = deriveMemberOccupancy({ members: realMembers, config: pool.config, claims: record.claims, parked: record.parked, liveBees, now });
     let plan = planPoolAllocations(occupancy, record.rrCursor, count);
@@ -497,10 +592,10 @@ export async function allocatePoolMembers(pool: ResolvedPool, count: number, opt
       if (newSize > pool.config.maxSize) {
         warn(`warn: pool ${pool.pool} exceeds maxSize: ${newSize}/${pool.config.maxSize} — consider cleaning or raising maxSize`);
       }
-      const created = await extendProPool(pool.repoPath, pool.pool, plan.shortfall);
-      createdPaths = new Set(await Promise.all(created.map((path) => realpath(path).catch(() => path))));
-      members = await currentMembers(pool);
-      const refreshed = await realpathMembers(members);
+      const created = await extendPool(pool.repoPath, pool.pool, plan.shortfall);
+      createdPaths = new Set(await Promise.all(created.map((path) => realpathPath(path))));
+      members = await listMembers(pool);
+      const refreshed = await canonicalizePoolMembers(members, realpathPath);
       occupancy = deriveMemberOccupancy({ members: refreshed, config: pool.config, claims: record.claims, parked: record.parked, liveBees, now });
       plan = planPoolAllocations(occupancy, record.rrCursor, count);
       if (plan.shortfall > 0) {
@@ -532,10 +627,17 @@ async function currentMembers(pool: ResolvedPool): Promise<ProPoolMember[]> {
   return listing.members.filter((member) => member.repo === pool.repo && member.pool === pool.pool);
 }
 
-async function realpathMembers(members: ProPoolMember[]): Promise<ProPoolMember[]> {
+export async function canonicalizePoolMembers(
+  members: ProPoolMember[],
+  realpathPath: (path: string) => Promise<string> = realpath,
+): Promise<ProPoolMember[]> {
   return Promise.all(
     members.map(async (member) => {
-      const real = await realpath(member.path).catch(() => member.path);
+      // Member identity is load-bearing for cwd-prefix occupancy. Falling back
+      // to the unresolved spelling after an I/O error could hide a live bee
+      // behind a symlink and over-subscribe the checkout, so this read is
+      // intentionally fail-closed for allocation, claim, status, and sync.
+      const real = await realpathPath(member.path);
       return real === member.path ? member : { ...member, path: real };
     }),
   );
@@ -553,7 +655,10 @@ export async function claimSpecificPoolMember(pool: ResolvedPool, member: number
     record.claims = record.claims.filter((claim) => !claimExpired(claim, now));
 
     invalidateProPoolCache(pool.repoPath);
-    const members = await realpathMembers(await currentMembers(pool));
+    const members = await canonicalizePoolMembers(
+      await (options.listMembers ?? currentMembers)(pool),
+      options.realpathPath ?? realpath,
+    );
     const liveBees = options.liveBees ?? (await poolLiveBees());
     const occupancy = deriveMemberOccupancy({ members, config: pool.config, claims: record.claims, parked: record.parked, liveBees, now });
     const target = occupancy.find((m) => m.n === member);
@@ -671,12 +776,15 @@ export type PoolStatus = {
 };
 
 /** Full derived model for one pool: config (pro) + record (hive) + occupancy. */
-export async function poolStatus(pool: ResolvedPool, options: { liveBees?: LiveBee[] } = {}): Promise<PoolStatus> {
+export async function poolStatus(
+  pool: ResolvedPool,
+  options: { liveBees?: LiveBee[]; realpathPath?: (path: string) => Promise<string> } = {},
+): Promise<PoolStatus> {
   const now = Date.now();
   const record = (await loadPoolRecord(pool.key)) ?? emptyPoolRecord(pool);
   const liveBees = options.liveBees ?? (await poolLiveBees());
   const members = deriveMemberOccupancy({
-    members: await realpathMembers(pool.members),
+    members: await canonicalizePoolMembers(pool.members, options.realpathPath ?? realpath),
     config: pool.config,
     claims: record.claims,
     parked: record.parked,

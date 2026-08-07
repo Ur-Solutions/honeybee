@@ -1400,13 +1400,14 @@ succeed.
 
 Checkout pools (CHECKOUT_POOLS_PRD): named, elastically sized sets of
 pre-cloned `pro co` checkouts (`checkouts/<repo>/<pool>-<n>`) that bees claim
-round-robin and release by going terminal. Pool config (base branch,
+round-robin and release when their local runtime exits. Pool config (base branch,
 `maxOccupancy`, `maxSize`) and membership are **pro's** truth (`pro pool` —
 requires a pool-enabled `pro` on PATH; without one every pool verb fails with
 a typed, actionable error). hive owns only what cannot be derived — the
 round-robin cursor, in-flight claims, and parked members — in
-`~/.hive/pools/<key>.json` (key `<area>-<project>-<repo>-<pool>`). Deleting
-that file is harmless: the cursor resets and claims rebuild from live bees.
+`~/.hive/pools/<key>.json` (key `<area>-<project>-<repo>-<pool>`). A corrupt
+existing record is refused rather than reconstructed as empty, preserving
+pending claims and parked truth for operator repair.
 
 ```sh
 hive pool                          # pools in scope: occupancy like core 4/6 (2 busy · 4 free)
@@ -1433,11 +1434,14 @@ Scope: inside a pro project, verbs see that project's pools; outside, all
 projects. A pool argument resolves as the exact key first, else by unique
 pool name in scope.
 
-Occupancy is **derived, never stored**: a member is inhabited by every live,
-non-terminal bee whose cwd is inside the member path. Claims are short-lived
+Occupancy is **derived, never stored**: a member is inhabited by every
+positively live local bee runtime whose cwd is inside the member path. Stored
+done/sealed display state does not release capacity while the runtime survives.
+Claims are short-lived
 (~120 s, `HIVE_POOL_CLAIM_TTL_MS`) bridges between allocation and the bee's
 record existing; `hive kill`/`clean` drop a killed bee's claim eagerly, and
-expiry is the backstop. Free capacity per member is
+expiry is the backstop. An unbound claim remains reserved until bind rather
+than being guessed to belong to an arbitrary inhabitant. Free capacity per member is
 `maxOccupancy − (live inhabitants + unconsumed claims)`.
 
 Allocation picks the **emptiest** free member, ties broken round-robin (first

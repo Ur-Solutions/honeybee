@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { isBuzTier, type BuzTier } from "./buz_tiers.js";
 import { normalizeContract, type BeeContract } from "./contract.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
@@ -811,6 +811,40 @@ export function listSessions(): Promise<SessionRecord[]> {
   return pending;
 }
 
+export type ListSessionsStrictOptions = {
+  /** Test/telemetry barrier after a canonical snapshot has been read. */
+  onSnapshotRead?: (attempt: number) => Promise<void> | void;
+};
+
+const STRICT_SESSION_GENERATION_ATTEMPTS = 3;
+
+/**
+ * Fresh, full-history SessionRecord snapshot for safety decisions. Unlike the
+ * display-oriented listSessions(), malformed/unreadable records reject. The
+ * directory-generation barrier also prevents a caller from accepting a scan
+ * that raced a record publication/deletion. This deliberately includes done
+ * records: a display-terminal bee may still have a positively live runtime.
+ */
+export async function listSessionsStrict(options: ListSessionsStrictOptions = {}): Promise<SessionRecord[]> {
+  const paths = captureStorePaths();
+  for (let attempt = 1; attempt <= STRICT_SESSION_GENERATION_ATTEMPTS; attempt += 1) {
+    const before = await sessionDirectoryMtimes(paths);
+    const snapshot = await scanSessionsSnapshot(paths.currentDir, paths.legacyDir, { strict: true });
+    await options.onSnapshotRead?.(attempt);
+    const after = await sessionDirectoryMtimes(paths);
+    if (before.current !== after.current || before.legacy !== after.legacy) continue;
+    if (snapshot.readFailures.length > 0) {
+      if (snapshot.readFailures.length === 1) throw snapshot.readFailures[0]!.error;
+      throw new AggregateError(
+        snapshot.readFailures.map(({ error }) => error),
+        `could not authoritatively read ${snapshot.readFailures.length} session record(s)`,
+      );
+    }
+    return snapshot.records;
+  }
+  throw new Error("session directory generation advanced across every strict snapshot attempt");
+}
+
 /**
  * Index-only operational projection. The daemon uses this because its
  * parent-owned controller performs canonical reconciliation out of process;
@@ -1040,7 +1074,11 @@ type SessionSnapshotScan = {
   readFailures: Array<{ dir: string; file: string; error: unknown }>;
 };
 
-async function scanSessionsSnapshot(currentDir: string, legacyDir: string): Promise<SessionSnapshotScan> {
+async function scanSessionsSnapshot(
+  currentDir: string,
+  legacyDir: string,
+  options: { strict?: boolean } = {},
+): Promise<SessionSnapshotScan> {
   await mkdir(currentDir, { recursive: true });
   const [files, legacyFiles] = await Promise.all([
     readdir(currentDir),
@@ -1069,7 +1107,7 @@ async function scanSessionsSnapshot(currentDir: string, legacyDir: string): Prom
       const candidate = candidates[cursor++];
       if (!candidate) continue;
       try {
-        records.push(await readSessionRecord(join(candidate.dir, candidate.file)));
+        records.push(await readSessionRecord(join(candidate.dir, candidate.file), options.strict === true));
       } catch (error) {
         readFailures.push({ ...candidate, error });
       }
@@ -1140,7 +1178,7 @@ export function safeName(value: string) {
   return sanitized;
 }
 
-async function readSessionRecord(path: string): Promise<SessionRecord> {
+async function readSessionRecord(path: string, strict = false): Promise<SessionRecord> {
   const raw = await readFile(path, "utf8");
   let parsed: unknown;
   try {
@@ -1148,6 +1186,7 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   } catch (error) {
     throw new Error(`Invalid JSON in session record ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (strict) validateStrictSessionRecord(parsed, path);
   const record = normalizeSessionRecord(parsed, path);
   const source = basename(path);
   const expected = `${record.name}.json`;
@@ -1158,6 +1197,33 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
     );
   }
   return record;
+}
+
+function validateStrictSessionRecord(value: unknown, path: string): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid session record shape: ${path}`);
+  const object = value as Record<string, unknown>;
+  for (const key of ["name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt"]) {
+    const field = object[key];
+    if (typeof field !== "string" || field.length === 0) {
+      throw new Error(`Invalid session record ${path}: ${key} must be a non-empty string`);
+    }
+  }
+  if (!isAbsolute(object.cwd as string)) throw new Error(`Invalid session record ${path}: cwd must be absolute`);
+  if (!Number.isFinite(Date.parse(object.createdAt as string)) || !Number.isFinite(Date.parse(object.updatedAt as string))) {
+    throw new Error(`Invalid session record ${path}: createdAt/updatedAt must be timestamps`);
+  }
+  if (object.status !== "running" && object.status !== "dead" && object.status !== "kill_failed" && object.status !== "done" && object.status !== "archived") {
+    throw new Error(`Invalid session record ${path}: unknown status`);
+  }
+  if (object.node !== undefined && (typeof object.node !== "string" || object.node.length === 0)) {
+    throw new Error(`Invalid session record ${path}: node must be a non-empty string when present`);
+  }
+  if (object.substrate !== undefined && object.substrate !== "local-tmux" && object.substrate !== "hsr") {
+    throw new Error(`Invalid session record ${path}: unknown substrate`);
+  }
+  if (object.agentPaneId !== undefined && (typeof object.agentPaneId !== "string" || object.agentPaneId.length === 0)) {
+    throw new Error(`Invalid session record ${path}: agentPaneId must be a non-empty string when present`);
+  }
 }
 
 const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;

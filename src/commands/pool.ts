@@ -18,6 +18,7 @@ import {
   releasePoolMemberClaims,
   resolvePoolRef,
   setPoolMemberParked,
+  withPoolLock,
   type LiveBee,
   type MemberOccupancy,
   type PoolStatus,
@@ -362,34 +363,38 @@ export async function poolSyncCmd(parsed: Parsed) {
     console.log(dim("No pools to sync."));
     return;
   }
-  const liveBees = await poolLiveBees();
   let anyFailed = false;
   for (const pool of targets) {
-    const status = await poolStatus(pool, { liveBees });
-    // Sync only UNINHABITED, unclaimed, unparked members — pro's per-member
-    // dirty/parked preflight is the second net, but the occupancy guarantee
-    // lives here (§7): never rebase under a live bee.
-    const busy = status.members.filter((m) => m.occupants.length > 0 || m.pendingClaims.length > 0);
-    const freeMembers = status.members.filter((m) => !m.parked && m.occupants.length === 0 && m.pendingClaims.length === 0);
-    for (const m of busy) {
-      const line = `skipped-inhabited\t${m.path}\t${m.occupants.join(",") || "claimed"}`;
-      if (isPretty()) console.log(`${yellow("skipped-inhabited")} ${dim(tildify(m.path))} ${dim(m.occupants.join(", ") || "claimed")}`);
-      else console.log(line);
-    }
-    if (freeMembers.length === 0) continue;
-    // REPO:NAME qualification keeps multi-repo projects unambiguous.
-    const names = freeMembers.map((m) => `${pool.repo}:${pool.pool}-${m.n}`);
-    const result = await syncProCheckouts(pool.repoPath, names, { rebase: true });
-    if (!result.ok) anyFailed = true;
-    for (const row of result.rows) {
-      if (isPretty()) {
-        const color = row.status.startsWith("failed") ? yellow : row.status.startsWith("synced") ? green : dim;
-        console.log(`${color(row.status)} ${dim(tildify(row.path))}${row.detail ? ` ${dim(row.detail)}` : ""}`);
-      } else {
-        console.log(`${row.status}\t${row.path}${row.detail ? `\t${row.detail}` : ""}`);
+    const liveBees = await poolLiveBees();
+    await withPoolLock(pool.key, async () => {
+      const status = await poolStatus(pool, { liveBees });
+      // Sync only UNINHABITED, unclaimed, unparked members — pro's per-member
+      // dirty/parked preflight is the second net, but the occupancy guarantee
+      // lives here (§7): never rebase under a live bee. Keep the pool lock from
+      // the claim/park read through the checkout mutation so ownership cannot
+      // land in between.
+      const busy = status.members.filter((m) => m.occupants.length > 0 || m.pendingClaims.length > 0);
+      const freeMembers = status.members.filter((m) => !m.parked && m.occupants.length === 0 && m.pendingClaims.length === 0);
+      for (const m of busy) {
+        const line = `skipped-inhabited\t${m.path}\t${m.occupants.join(",") || "claimed"}`;
+        if (isPretty()) console.log(`${yellow("skipped-inhabited")} ${dim(tildify(m.path))} ${dim(m.occupants.join(", ") || "claimed")}`);
+        else console.log(line);
       }
-    }
-    if (!result.ok && result.detail) console.error(note(result.detail.split("\n").slice(-3).join("\n")));
+      if (freeMembers.length === 0) return;
+      // REPO:NAME qualification keeps multi-repo projects unambiguous.
+      const names = freeMembers.map((m) => `${pool.repo}:${pool.pool}-${m.n}`);
+      const result = await syncProCheckouts(pool.repoPath, names, { rebase: true });
+      if (!result.ok) anyFailed = true;
+      for (const row of result.rows) {
+        if (isPretty()) {
+          const color = row.status.startsWith("failed") ? yellow : row.status.startsWith("synced") ? green : dim;
+          console.log(`${color(row.status)} ${dim(tildify(row.path))}${row.detail ? ` ${dim(row.detail)}` : ""}`);
+        } else {
+          console.log(`${row.status}\t${row.path}${row.detail ? `\t${row.detail}` : ""}`);
+        }
+      }
+      if (!result.ok && result.detail) console.error(note(result.detail.split("\n").slice(-3).join("\n")));
+    });
   }
   if (anyFailed) process.exitCode = 1;
 }
