@@ -53,8 +53,11 @@ export type OperationAttemptKind = "command-dispatch" | "collection";
 
 /**
  * Durable ownership of one in-progress operation continuation. The random ids
- * distinguish service instances in one process; pid + birth identity lets a
- * peer prove that a crashed coordinator generation is gone before takeover.
+ * distinguish service instances in one process; pid + birth identity proves
+ * process-generation liveness while the renewable lease generation proves
+ * continuation liveness. Peers expire an attempt only after observing this
+ * generation unchanged for `leaseDurationMs` on their own monotonic clock, so
+ * wall-clock skew cannot steal a genuinely renewing attempt.
  */
 export type OperationAttempt = {
   kind: OperationAttemptKind;
@@ -63,6 +66,13 @@ export type OperationAttempt = {
   ownerPid: number;
   ownerBirth?: ProcessBirthFingerprint;
   startedAt: string;
+  /** Fixed bounded observation window used by peers (milliseconds). */
+  leaseDurationMs: number;
+  /** Informational wall-clock stamps; never sufficient alone for takeover. */
+  renewedAt: string;
+  leaseExpiresAt: string;
+  /** Fencing generation incremented by every durable continuation heartbeat. */
+  heartbeatSequence: number;
 };
 
 export type OperationRecord = {

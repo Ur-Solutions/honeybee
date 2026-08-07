@@ -14,6 +14,7 @@
 // NEVER blindly redelivered.
 import type { JsonValue } from "../comb/types.js";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import {
   captureProcessBirthFingerprint,
   inspectProcessBirth,
@@ -80,6 +81,17 @@ export type RunOperationsDeps = {
   sessions: SessionEvidenceReader;
   /** Injectable only to place deterministic tests at the post-ownership read barrier. */
   collectGitDiffMetadata?: typeof collectGitDiffMetadata;
+  /** Bounded durable continuation lease; production defaults to 15 seconds. */
+  operationAttemptLeaseMs?: number;
+  /** Renewal cadence; production defaults to one third of the lease. */
+  operationAttemptHeartbeatMs?: number;
+  /** Poll cadence for peers joining an attempt. */
+  operationAttemptPollMs?: number;
+  /** Injectable persistence faults for deterministic crash-boundary tests. */
+  operationPersistence?: {
+    appendRunEvents?: typeof appendRunEvents;
+    setOperationResult?: typeof setOperationResult;
+  };
   /** Reconcile a reservation and derive its current projection state. */
   settle(reservation: RunReservation): Promise<{ reservation: RunReservation; state: string }>;
   origin(extra?: { driverId?: string; providerId?: string }): Promise<{ nodeId: string; driverId?: string; providerId?: string }>;
@@ -96,6 +108,8 @@ export type RunOperations = {
 };
 
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled"]);
+export const DEFAULT_OPERATION_ATTEMPT_LEASE_MS = 15_000;
+const MAX_OPERATION_ATTEMPT_LEASE_MS = 60_000;
 
 function asObject(value: JsonValue | undefined): JsonObject | undefined {
   if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -105,6 +119,20 @@ function asObject(value: JsonValue | undefined): JsonObject | undefined {
 export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   const { protocolVersion, schemaDigest, now } = deps;
   const collectWorkingCopyDiff = deps.collectGitDiffMetadata ?? collectGitDiffMetadata;
+  const appendEvents = deps.operationPersistence?.appendRunEvents ?? appendRunEvents;
+  const persistOperationResult = deps.operationPersistence?.setOperationResult ?? setOperationResult;
+  const operationAttemptLeaseMs = Math.min(
+    MAX_OPERATION_ATTEMPT_LEASE_MS,
+    Math.max(20, Math.floor(deps.operationAttemptLeaseMs ?? DEFAULT_OPERATION_ATTEMPT_LEASE_MS)),
+  );
+  const operationAttemptHeartbeatMs = Math.max(
+    5,
+    Math.min(
+      Math.floor(operationAttemptLeaseMs / 2),
+      Math.floor(deps.operationAttemptHeartbeatMs ?? operationAttemptLeaseMs / 3),
+    ),
+  );
+  const operationAttemptPollMs = Math.max(1, Math.floor(deps.operationAttemptPollMs ?? 25));
   const operationOwnerId = randomUUID();
   let operationOwnerBirthPromise: Promise<Awaited<ReturnType<typeof captureProcessBirthFingerprint>>> | undefined;
   const operationOwnerBirth = () =>
@@ -134,15 +162,32 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   const pause = (milliseconds: number): Promise<void> =>
     new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+  const attemptHeartbeatSequence = (attempt: OperationAttempt): number =>
+    Number.isSafeInteger(attempt.heartbeatSequence) && attempt.heartbeatSequence >= 0
+      ? attempt.heartbeatSequence
+      : 0;
+
+  const attemptLeaseDurationMs = (attempt: OperationAttempt): number => {
+    const recorded = Number(attempt.leaseDurationMs);
+    return Number.isFinite(recorded) && recorded > 0
+      ? Math.min(MAX_OPERATION_ATTEMPT_LEASE_MS, Math.max(20, Math.floor(recorded)))
+      : operationAttemptLeaseMs;
+  };
+
   async function newOperationAttempt(kind: OperationAttemptKind): Promise<OperationAttempt> {
     const ownerBirth = await operationOwnerBirth();
+    const renewedAt = now();
     return {
       kind,
       attemptId: randomUUID(),
       ownerId: operationOwnerId,
       ownerPid: process.pid,
       ...(ownerBirth ? { ownerBirth } : {}),
-      startedAt: now().toISOString(),
+      startedAt: renewedAt.toISOString(),
+      leaseDurationMs: operationAttemptLeaseMs,
+      renewedAt: renewedAt.toISOString(),
+      leaseExpiresAt: new Date(renewedAt.getTime() + operationAttemptLeaseMs).toISOString(),
+      heartbeatSequence: 0,
     };
   }
 
@@ -156,18 +201,117 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
     return verdict === "gone" || verdict === "mismatch";
   }
 
+  type AttemptAbandonment = {
+    attemptId: string;
+    heartbeatSequence: number;
+    reason: "owner-dead" | "local-continuation-gone" | "lease-expired";
+  };
+
+  async function immediateAttemptAbandonment(
+    runId: string,
+    effectKey: string,
+    attempt: OperationAttempt,
+  ): Promise<AttemptAbandonment | undefined> {
+    const heartbeatSequence = attemptHeartbeatSequence(attempt);
+    if (attempt.ownerId === operationOwnerId && !inFlight.has(flightKey(runId, effectKey))) {
+      return { attemptId: attempt.attemptId, heartbeatSequence, reason: "local-continuation-gone" };
+    }
+    if (await operationAttemptOwnerDead(attempt)) {
+      return { attemptId: attempt.attemptId, heartbeatSequence, reason: "owner-dead" };
+    }
+    return undefined;
+  }
+
+  async function renewOperationAttempt(runId: string, effectKey: string, attemptId: string): Promise<boolean> {
+    let renewed = false;
+    await mutateOperation(runId, effectKey, (current) => {
+      if (current.operationAttempt?.attemptId !== attemptId) return current;
+      const renewedAt = now();
+      renewed = true;
+      return {
+        ...current,
+        operationAttempt: {
+          ...current.operationAttempt,
+          leaseDurationMs: attemptLeaseDurationMs(current.operationAttempt),
+          renewedAt: renewedAt.toISOString(),
+          leaseExpiresAt: new Date(renewedAt.getTime() + attemptLeaseDurationMs(current.operationAttempt)).toISOString(),
+          heartbeatSequence: attemptHeartbeatSequence(current.operationAttempt) + 1,
+        },
+      };
+    });
+    return renewed;
+  }
+
+  /**
+   * Renew one exact durable attempt while its continuation is active. A failed
+   * heartbeat deliberately does not keep the lease alive: peers will fence the
+   * stale generation, and guarded terminal writes prevent the old continuation
+   * from overwriting the recovery decision.
+   */
+  async function withOperationAttemptHeartbeat<T>(
+    runId: string,
+    effectKey: string,
+    attemptId: string,
+    continuation: () => Promise<T>,
+  ): Promise<T> {
+    let stop!: () => void;
+    let stopped = false;
+    const stoppedPromise = new Promise<void>((resolve) => {
+      stop = () => {
+        stopped = true;
+        resolve();
+      };
+    });
+    const heartbeat = (async () => {
+      while (!stopped) {
+        await Promise.race([pause(operationAttemptHeartbeatMs), stoppedPromise]);
+        if (stopped) return;
+        try {
+          if (!(await renewOperationAttempt(runId, effectKey, attemptId))) return;
+        } catch {
+          // Loss of durable renewal is itself loss of continuation liveness.
+          // The active work may finish, but only an exact-generation guarded
+          // terminal write can still become canonical.
+          return;
+        }
+      }
+    })();
+    try {
+      return await continuation();
+    } finally {
+      stop();
+      await heartbeat;
+    }
+  }
+
   async function waitForOperationAttempt(
     runId: string,
     effectKey: string,
     attempt: OperationAttempt,
-  ): Promise<{ record: OperationRecord; ownerDead: boolean }> {
+  ): Promise<{ record: OperationRecord; abandoned?: AttemptAbandonment }> {
     let current = (await readOperation(runId, effectKey))!;
+    let observedSequence = attemptHeartbeatSequence(attempt);
+    let observedAt = performance.now();
     while (current.operationAttempt?.attemptId === attempt.attemptId) {
-      if (await operationAttemptOwnerDead(attempt)) return { record: current, ownerDead: true };
-      await pause(25);
+      const immediate = await immediateAttemptAbandonment(runId, effectKey, current.operationAttempt);
+      if (immediate) return { record: current, abandoned: immediate };
+      const sequence = attemptHeartbeatSequence(current.operationAttempt);
+      if (sequence !== observedSequence) {
+        observedSequence = sequence;
+        observedAt = performance.now();
+      }
+      const elapsed = performance.now() - observedAt;
+      const leaseMs = attemptLeaseDurationMs(current.operationAttempt);
+      if (elapsed >= leaseMs) {
+        return {
+          record: current,
+          abandoned: { attemptId: attempt.attemptId, heartbeatSequence: observedSequence, reason: "lease-expired" },
+        };
+      }
+      await pause(Math.min(operationAttemptPollMs, Math.max(1, leaseMs - elapsed)));
       current = (await readOperation(runId, effectKey))!;
     }
-    return { record: current, ownerDead: false };
+    return { record: current };
   }
 
   const respond = (requestId: JsonValue, record: OperationRecord, outcome: "created" | "replayed"): JsonObject => ({
@@ -223,6 +367,95 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   /* Crash-window reconciliation                                     */
   /* -------------------------------------------------------------- */
 
+  const commandLeaseExpiredCause =
+    "command continuation lease expired during a non-deduplicating delivery window; not redelivered";
+
+  async function terminalizeAbandonedCommand(
+    runId: string,
+    effectKey: string,
+    abandonment?: AttemptAbandonment,
+  ): Promise<OperationRecord> {
+    const reconciled = await persistOperationResult(
+      runId,
+      effectKey,
+      { commandState: "indeterminate", cause: commandLeaseExpiredCause },
+      { commandState: "indeterminate", cause: commandLeaseExpiredCause, operationAttempt: undefined },
+      (current) =>
+        current.commandState === "dispatching" &&
+        (abandonment
+          ? current.operationAttempt?.attemptId === abandonment.attemptId &&
+            attemptHeartbeatSequence(current.operationAttempt) === abandonment.heartbeatSequence
+          : current.operationAttempt === undefined),
+    );
+    if (reconciled.commandState === "indeterminate") {
+      await appendEvents(
+        runId,
+        protocolVersion,
+        [{ type: "command.indeterminate", payload: { effectKey, cause: commandLeaseExpiredCause }, origin: await deps.origin() }],
+        { onlyIfAbsentKeys: true },
+      ).catch(() => undefined);
+    }
+    return reconciled;
+  }
+
+  async function joinCommandAttempt(
+    runId: string,
+    effectKey: string,
+    initial: OperationRecord,
+  ): Promise<OperationRecord> {
+    let current = initial;
+    while (current.commandState === "dispatching") {
+      if (!current.operationAttempt) {
+        current = await terminalizeAbandonedCommand(runId, effectKey);
+        continue;
+      }
+      const joined = await waitForOperationAttempt(runId, effectKey, current.operationAttempt);
+      current = joined.record;
+      if (joined.abandoned && current.commandState === "dispatching") {
+        current = await terminalizeAbandonedCommand(runId, effectKey, joined.abandoned);
+      }
+      // A heartbeat may renew between the abandonment observation and the
+      // guarded terminal write. Loop and join that still-live generation; do
+      // not return a nonterminal empty receipt to the replaying caller.
+    }
+    return current;
+  }
+
+  /** Best-effort atomic terminalization for a locally caught post-claim exit. */
+  async function terminalizeOwnedCommandAfterError(
+    runId: string,
+    effectKey: string,
+    attemptId: string,
+    error: unknown,
+  ): Promise<OperationRecord | undefined> {
+    try {
+      const current = await readOperation(runId, effectKey);
+      if (!current) return undefined;
+      if (current.commandState !== "dispatching") return current;
+      if (current.operationAttempt?.attemptId !== attemptId) return current;
+      const detail = error instanceof Error ? error.message : String(error);
+      const cause = `${commandLeaseExpiredCause}: local continuation exited (${detail})`;
+      const settled = await persistOperationResult(
+        runId,
+        effectKey,
+        { commandState: "indeterminate", cause },
+        { commandState: "indeterminate", cause, operationAttempt: undefined },
+        (record) => record.commandState === "dispatching" && record.operationAttempt?.attemptId === attemptId,
+      );
+      if (settled.commandState === "indeterminate") {
+        await appendEvents(
+          runId,
+          protocolVersion,
+          [{ type: "command.indeterminate", payload: { effectKey, cause: settled.cause ?? cause }, origin: await deps.origin() }],
+          { onlyIfAbsentKeys: true },
+        ).catch(() => undefined);
+      }
+      return settled;
+    } catch {
+      return undefined;
+    }
+  }
+
   async function reconcileOperations(runId: string): Promise<void> {
     const records = await listOperations(runId);
     if (records.length === 0) return;
@@ -230,31 +463,15 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
     const driverId = reservation ? driverIdOf(reservation) : undefined;
     for (const record of records) {
       if (record.method === "run.command" && record.commandState === "dispatching" && !inFlight.has(flightKey(runId, record.effectKey))) {
-        // A different service/process cannot use its empty local inFlight map
-        // as crash evidence. A durable owner with a live birth identity still
-        // owns the delivery; peers join it. Only a missing legacy owner or a
-        // proven-dead generation closes the ambiguous window as indeterminate.
-        if (record.operationAttempt && !(await operationAttemptOwnerDead(record.operationAttempt))) continue;
-        const cause = "coordinator crashed during a non-deduplicating delivery window; not redelivered";
-        const expectedAttemptId = record.operationAttempt?.attemptId;
-        const reconciled = await setOperationResult(
-          runId,
-          record.effectKey,
-          { commandState: "indeterminate", cause },
-          { commandState: "indeterminate", cause, operationAttempt: undefined },
-          (current) =>
-            current.commandState === "dispatching" &&
-            (expectedAttemptId === undefined
-              ? current.operationAttempt === undefined
-              : current.operationAttempt?.attemptId === expectedAttemptId),
-        );
+        // An empty local flight map is evidence only for this exact service
+        // owner. Other services must either prove the process generation dead
+        // or observe one heartbeat generation unchanged for a full lease.
+        const abandonment = record.operationAttempt
+          ? await immediateAttemptAbandonment(runId, record.effectKey, record.operationAttempt)
+          : undefined;
+        if (record.operationAttempt && !abandonment) continue;
+        const reconciled = await terminalizeAbandonedCommand(runId, record.effectKey, abandonment);
         if (reconciled.commandState !== "indeterminate") continue;
-        await appendRunEvents(
-          runId,
-          protocolVersion,
-          [{ type: "command.indeterminate", payload: { effectKey: record.effectKey, cause }, origin: await deps.origin() }],
-          { onlyIfAbsentKeys: true },
-        );
         continue;
       }
       // Self-heal missing per-effect lifecycle events: a crash can land
@@ -262,7 +479,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       // side effects — re-derive them idempotently (keyed, never type-only).
       const state = record.commandState;
       if (record.method === "run.command" && (state === "completed" || state === "failed" || state === "indeterminate")) {
-        await appendRunEvents(
+        await appendEvents(
           runId,
           protocolVersion,
           [
@@ -277,7 +494,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           { onlyIfAbsentKeys: true },
         );
       } else if (record.method === "run.collect" && record.collectionState === "complete" && record.collectionId) {
-        await appendRunEvents(
+        await appendEvents(
           runId,
           protocolVersion,
           [{ type: "collection.completed", payload: { collectionId: record.collectionId }, origin: await deps.origin() }],
@@ -293,7 +510,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         // resolves — best-effort here; the RPC retry surfaces errors.
         await progressRelease(runId, record.effectKey).catch(() => undefined);
       } else if (record.method === "run.cancel" && reservation?.cancel) {
-        await appendRunEvents(
+        await appendEvents(
           runId,
           protocolVersion,
           [{ type: "cancel.requested", payload: { effectKey: record.effectKey }, origin: await deps.origin() }],
@@ -316,7 +533,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
     const kind = String(command.kind);
     const driverId = driverIdOf(reservation);
     const attempt = async (): Promise<OperationRecord> => {
-      await appendRunEvents(
+      await appendEvents(
         runId,
         protocolVersion,
         [{ type: "command.accepted", payload: { effectKey, kind }, origin: await deps.origin() }],
@@ -362,7 +579,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           // `dispatching` here records the serialized claim attempt, not a
           // driver delivery. Keeping the corpus lifecycle complete also lets
           // restart reconciliation self-heal this exact event sequence.
-          await appendRunEvents(
+          await appendEvents(
             runId,
             protocolVersion,
             [
@@ -376,66 +593,74 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           // durable attempt instead of declaring it crashed from this service's
           // empty local inFlight map. A proven-dead owner reconciles to
           // indeterminate and is never allowed to redeliver.
-          const joined = await waitForOperationAttempt(runId, effectKey, record.operationAttempt);
-          record = joined.record;
-          if (joined.ownerDead && record.commandState === "dispatching") {
-            await reconcileOperations(runId);
-            record = (await readOperation(runId, effectKey)) ?? record;
-          }
+          record = await joinCommandAttempt(runId, effectKey, record);
         }
         return record;
       }
-      await appendRunEvents(
-        runId,
-        protocolVersion,
-        [{ type: "command.dispatching", payload: { effectKey }, origin: await deps.origin({ driverId }) }],
-        { onlyIfAbsentKeys: true },
-      );
-      let outcome: "completed" | "failed" | "indeterminate" = "completed";
-      let cause: string | undefined;
-      if (!(await sessionIsOurs(reservation))) {
-        outcome = "failed";
-        cause = "bound harness session is absent or belongs to a different run; nothing was delivered";
-      } else {
+      return withOperationAttemptHeartbeat(runId, effectKey, dispatchAttempt.attemptId, async () => {
         try {
-          if (kind === "send") {
-            await deps.control.send(reservation.beeName, String(command.text), record.deliveryId ?? effectKeyHash(effectKey));
-          } else if (kind === "interrupt") {
-            await deps.control.interrupt(reservation.beeName, typeof command.reason === "string" ? command.reason : undefined);
-          } else if (kind === "answer") {
-            await deps.control.answer(reservation.beeName, String(command.inputRequestId), command.answer as JsonValue);
-          } else {
+          await appendEvents(
+            runId,
+            protocolVersion,
+            [{ type: "command.dispatching", payload: { effectKey }, origin: await deps.origin({ driverId }) }],
+            { onlyIfAbsentKeys: true },
+          );
+          let outcome: "completed" | "failed" | "indeterminate" = "completed";
+          let cause: string | undefined;
+          if (!(await sessionIsOurs(reservation))) {
             outcome = "failed";
-            cause = `command kind ${kind} has no dispatch path`;
-          }
-        } catch (error) {
-          if (error instanceof HarnessDispatchError) {
-            outcome = error.outcome;
-            cause = error.message;
+            cause = "bound harness session is absent or belongs to a different run; nothing was delivered";
           } else {
-            outcome = "indeterminate";
-            cause = `dispatch failed unclassifiably: ${error instanceof Error ? error.message : String(error)}`;
+            try {
+              if (kind === "send") {
+                await deps.control.send(reservation.beeName, String(command.text), record.deliveryId ?? effectKeyHash(effectKey));
+              } else if (kind === "interrupt") {
+                await deps.control.interrupt(reservation.beeName, typeof command.reason === "string" ? command.reason : undefined);
+              } else if (kind === "answer") {
+                await deps.control.answer(reservation.beeName, String(command.inputRequestId), command.answer as JsonValue);
+              } else {
+                outcome = "failed";
+                cause = `command kind ${kind} has no dispatch path`;
+              }
+            } catch (error) {
+              if (error instanceof HarnessDispatchError) {
+                outcome = error.outcome;
+                cause = error.message;
+              } else {
+                outcome = "indeterminate";
+                cause = `dispatch failed unclassifiably: ${error instanceof Error ? error.message : String(error)}`;
+              }
+            }
           }
+          record = await persistOperationResult(
+            runId,
+            effectKey,
+            { commandState: outcome, ...(cause ? { cause } : {}) },
+            { commandState: outcome, ...(cause ? { cause } : {}), operationAttempt: undefined },
+            (current) => current.commandState === "dispatching" && current.operationAttempt?.attemptId === dispatchAttempt.attemptId,
+          );
+          // An expired attempt may finish after recovery fenced it. Its driver
+          // effect is already uncertain, but it must never overwrite or emit a
+          // lifecycle event inconsistent with the canonical indeterminate result.
+          if (record.commandState !== outcome) return record;
+          const events = [
+            { type: `command.${outcome}`, payload: { effectKey, ...(cause ? { cause } : {}) } as JsonValue, origin: await deps.origin({ driverId }) },
+          ];
+          if (outcome === "completed" && kind === "answer") {
+            events.push({
+              type: "needs_input.resolved",
+              payload: { inputRequestId: String(command.inputRequestId) } as JsonValue,
+              origin: await deps.origin({ driverId }),
+            });
+          }
+          await appendEvents(runId, protocolVersion, events, { onlyIfAbsentKeys: true });
+          return record;
+        } catch (error) {
+          const settled = await terminalizeOwnedCommandAfterError(runId, effectKey, dispatchAttempt.attemptId, error);
+          if (settled && settled.commandState !== "dispatching") return settled;
+          throw error;
         }
-      }
-      record = await setOperationResult(
-        runId,
-        effectKey,
-        { commandState: outcome, ...(cause ? { cause } : {}) },
-        { commandState: outcome, ...(cause ? { cause } : {}), operationAttempt: undefined },
-      );
-      const events = [
-        { type: `command.${outcome}`, payload: { effectKey, ...(cause ? { cause } : {}) } as JsonValue, origin: await deps.origin({ driverId }) },
-      ];
-      if (outcome === "completed" && kind === "answer") {
-        events.push({
-          type: "needs_input.resolved",
-          payload: { inputRequestId: String(command.inputRequestId) } as JsonValue,
-          origin: await deps.origin({ driverId }),
-        });
-      }
-      await appendRunEvents(runId, protocolVersion, events, { onlyIfAbsentKeys: true });
-      return record;
+      });
     };
     return singleFlight(flightKey(runId, effectKey), attempt);
   }
@@ -518,16 +743,8 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         const pending = inFlight.get(flightKey(validated.runId, validated.effectKey)) as Promise<OperationRecord> | undefined;
         if (pending) {
           current = await pending;
-        } else if (current.operationAttempt) {
-          const joined = await waitForOperationAttempt(validated.runId, validated.effectKey, current.operationAttempt);
-          current = joined.record;
-          if (joined.ownerDead && current.commandState === "dispatching") {
-            await reconcileOperations(validated.runId);
-            current = (await readOperation(validated.runId, validated.effectKey)) ?? current;
-          }
         } else {
-          await reconcileOperations(validated.runId);
-          current = (await readOperation(validated.runId, validated.effectKey)) ?? current;
+          current = await joinCommandAttempt(validated.runId, validated.effectKey, current);
         }
       }
       return respond(requestId, current, created ? "created" : "replayed");
@@ -580,7 +797,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             // events to an immutable terminal result.
             state = reservation.result.outcome;
           } else {
-            await appendRunEvents(
+            await appendEvents(
               validated.runId,
               protocolVersion,
               [{ type: "cancel.requested", payload: { effectKey: validated.effectKey, ...(reason ? { reason } : {}) }, origin: await deps.origin() }],
@@ -617,7 +834,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               if (reservation.result) {
                 state = reservation.result.outcome;
               } else {
-                await appendRunEvents(
+                await appendEvents(
                   validated.runId,
                   protocolVersion,
                   [
@@ -633,7 +850,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               }
             } else {
               if (reservation.indeterminateCause === "cancel_stop_unconfirmed") {
-                await appendRunEvents(
+                await appendEvents(
                   validated.runId,
                   protocolVersion,
                   [{
@@ -654,7 +871,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             }
           }
         }
-        return setOperationResult(validated.runId, validated.effectKey, { runId: validated.runId, state });
+        return persistOperationResult(validated.runId, validated.effectKey, { runId: validated.runId, state });
       });
       return respond(requestId, current, created ? "created" : "replayed");
     } catch (error) {
@@ -768,11 +985,8 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   async function tryClaimCollectionAttempt(
     runId: string,
     effectKey: string,
+    abandoned?: AttemptAbandonment,
   ): Promise<{ record: OperationRecord; claimed: boolean }> {
-    const observed = await readOperation(runId, effectKey);
-    if (!observed) throw executionError("AUTHORITY_UNAVAILABLE", `collection effect ${effectKey} has no durable record`);
-    const observedAttempt = observed.operationAttempt;
-    const observedOwnerDead = observedAttempt ? await operationAttemptOwnerDead(observedAttempt) : false;
     const candidate = await newOperationAttempt("collection");
     let claimed = false;
     const record = await mutateOperation(runId, effectKey, (current) => {
@@ -781,12 +995,15 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         (current.collectionState === "failed" && current.collectionFailure !== "retryable")
       ) return current;
 
-      if (observedAttempt && !observedOwnerDead) return current;
       if (current.operationAttempt) {
-        // Take over only the exact generation proven dead outside the lock. A
-        // changed owner is a new live fact and must be joined separately.
-        if (!observedAttempt || current.operationAttempt.attemptId !== observedAttempt.attemptId) return current;
-      } else if (observedAttempt) {
+        // Take over only the exact heartbeat generation observed abandoned
+        // outside the lock. A late renewal or changed owner is a new live fact.
+        if (
+          !abandoned ||
+          current.operationAttempt.attemptId !== abandoned.attemptId ||
+          attemptHeartbeatSequence(current.operationAttempt) !== abandoned.heartbeatSequence
+        ) return current;
+      } else if (abandoned) {
         // The observed owner settled while its liveness was inspected. Replay
         // that settlement rather than immediately turning its retryable failure
         // into another concurrent attempt.
@@ -828,107 +1045,139 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       // Local callers join the in-memory flight; other service instances and
       // processes join the durable operation attempt below.
       const current = await singleFlight<OperationRecord>(flightKey(validated.runId, validated.effectKey), async () => {
+        let abandonedAttempt: AttemptAbandonment | undefined;
         while (true) {
-          const claim = await tryClaimCollectionAttempt(validated.runId, validated.effectKey);
+          const claim = await tryClaimCollectionAttempt(validated.runId, validated.effectKey, abandonedAttempt);
+          abandonedAttempt = undefined;
           if (!claim.claimed) {
             if (claim.record.operationAttempt) {
               const joined = await waitForOperationAttempt(validated.runId, validated.effectKey, claim.record.operationAttempt);
-              if (joined.ownerDead || joined.record.operationAttempt) continue;
+              if (joined.abandoned) {
+                abandonedAttempt = joined.abandoned;
+                continue;
+              }
+              if (joined.record.operationAttempt) continue;
               return joined.record;
             }
             if (claim.record.collectionState === "collecting") continue;
             return claim.record;
           }
           const ownedAttemptId = claim.record.operationAttempt!.attemptId;
-          try {
-            return await withCollectionOccupancy(reservation, async (ownedWorkingCopy) => {
-              const entries = await collectEntries(reservation, ownedWorkingCopy);
-              const unsupported = requestedEvidenceKinds(reservation).filter((kind) => !COLLECTABLE_KINDS.has(kind));
-              if (unsupported.length > 0) {
-                // The evidence contract asked for kinds this node cannot collect
-                // (commands/tests/media): a "complete" manifest would silently
-                // pretend coverage. Return a typed PARTIAL failure carrying what
-                // WAS collected, with the gap recorded durably.
-                const cause = `requested evidence kinds are not collectable on this node: ${unsupported.join(", ")}`;
+          return withOperationAttemptHeartbeat(validated.runId, validated.effectKey, ownedAttemptId, async () => {
+            try {
+              return await withCollectionOccupancy(reservation, async (ownedWorkingCopy) => {
+                const entries = await collectEntries(reservation, ownedWorkingCopy);
+                const unsupported = requestedEvidenceKinds(reservation).filter((kind) => !COLLECTABLE_KINDS.has(kind));
+                if (unsupported.length > 0) {
+                  // The evidence contract asked for kinds this node cannot collect
+                  // (commands/tests/media): a "complete" manifest would silently
+                  // pretend coverage. Return a typed PARTIAL failure carrying what
+                  // WAS collected, with the gap recorded durably.
+                  const cause = `requested evidence kinds are not collectable on this node: ${unsupported.join(", ")}`;
+                  const manifest: JsonObject = {
+                    runId: validated.runId,
+                    collectionId: claim.record.collectionId!,
+                    state: "failed",
+                    entries: entries as unknown as JsonValue,
+                    createdAt: claim.record.createdAt,
+                  };
+                  return persistOperationResult(
+                    validated.runId,
+                    validated.effectKey,
+                    manifest,
+                    {
+                      collectionState: "failed",
+                      collectionFailure: "unrecoverable",
+                      manifest,
+                      cause,
+                      operationAttempt: undefined,
+                    },
+                    (op) => op.operationAttempt?.attemptId === ownedAttemptId,
+                  );
+                }
                 const manifest: JsonObject = {
                   runId: validated.runId,
                   collectionId: claim.record.collectionId!,
-                  state: "failed",
+                  state: "complete",
                   entries: entries as unknown as JsonValue,
                   createdAt: claim.record.createdAt,
+                  completedAt: now().toISOString(),
                 };
-                return setOperationResult(
+                const updated = await persistOperationResult(
+                  validated.runId,
+                  validated.effectKey,
+                  manifest,
+                  {
+                    collectionState: "complete",
+                    collectionFailure: undefined,
+                    manifest,
+                    cause: undefined,
+                    operationAttempt: undefined,
+                  },
+                  (op) => op.operationAttempt?.attemptId === ownedAttemptId,
+                );
+                if (updated.collectionState === "complete") {
+                  await appendEvents(
+                    validated.runId,
+                    protocolVersion,
+                    [{ type: "collection.completed", payload: { collectionId: claim.record.collectionId! }, origin: await deps.origin() }],
+                    { onlyIfAbsentKeys: true },
+                  );
+                }
+                return updated;
+              });
+            } catch (error) {
+              const cause = error instanceof Error ? error.message : String(error);
+              // The corpus error registry is the cross-repo retryability contract:
+              // known non-retryable protocol failures stay terminal, while raw
+              // coordinator/I/O faults map to retryable AUTHORITY_UNAVAILABLE.
+              const collectionFailure = toWireError(error).retryable ? "retryable" : "unrecoverable";
+              const manifest: JsonObject = {
+                runId: validated.runId,
+                collectionId: claim.record.collectionId!,
+                state: "failed",
+                entries: [] as JsonValue,
+                createdAt: claim.record.createdAt,
+              };
+              try {
+                return await persistOperationResult(
                   validated.runId,
                   validated.effectKey,
                   manifest,
                   {
                     collectionState: "failed",
-                    collectionFailure: "unrecoverable",
+                    collectionFailure,
                     manifest,
                     cause,
                     operationAttempt: undefined,
                   },
                   (op) => op.operationAttempt?.attemptId === ownedAttemptId,
                 );
+              } catch (settleError) {
+                // One final best-effort atomic settle covers a catch-path write
+                // fault. If persistence is still unavailable, stopping the
+                // heartbeat guarantees a later replay can expire and recover.
+                try {
+                  const settled = await persistOperationResult(
+                    validated.runId,
+                    validated.effectKey,
+                    manifest,
+                    {
+                      collectionState: "failed",
+                      collectionFailure,
+                      manifest,
+                      cause,
+                      operationAttempt: undefined,
+                    },
+                    (op) => op.operationAttempt?.attemptId === ownedAttemptId,
+                  );
+                  return settled;
+                } catch {
+                  throw settleError;
+                }
               }
-              const manifest: JsonObject = {
-                runId: validated.runId,
-                collectionId: claim.record.collectionId!,
-                state: "complete",
-                entries: entries as unknown as JsonValue,
-                createdAt: claim.record.createdAt,
-                completedAt: now().toISOString(),
-              };
-              const updated = await setOperationResult(
-                validated.runId,
-                validated.effectKey,
-                manifest,
-                {
-                  collectionState: "complete",
-                  collectionFailure: undefined,
-                  manifest,
-                  cause: undefined,
-                  operationAttempt: undefined,
-                },
-                (op) => op.operationAttempt?.attemptId === ownedAttemptId,
-              );
-              if (updated.collectionState === "complete") {
-                await appendRunEvents(
-                  validated.runId,
-                  protocolVersion,
-                  [{ type: "collection.completed", payload: { collectionId: claim.record.collectionId! }, origin: await deps.origin() }],
-                  { onlyIfAbsentKeys: true },
-                );
-              }
-              return updated;
-            });
-          } catch (error) {
-            const cause = error instanceof Error ? error.message : String(error);
-            // The corpus error registry is the cross-repo retryability contract:
-            // known non-retryable protocol failures stay terminal, while raw
-            // coordinator/I/O faults map to retryable AUTHORITY_UNAVAILABLE.
-            const collectionFailure = toWireError(error).retryable ? "retryable" : "unrecoverable";
-            const manifest: JsonObject = {
-              runId: validated.runId,
-              collectionId: claim.record.collectionId!,
-              state: "failed",
-              entries: [] as JsonValue,
-              createdAt: claim.record.createdAt,
-            };
-            return setOperationResult(
-              validated.runId,
-              validated.effectKey,
-              manifest,
-              {
-                collectionState: "failed",
-                collectionFailure,
-                manifest,
-                cause,
-                operationAttempt: undefined,
-              },
-              (op) => op.operationAttempt?.attemptId === ownedAttemptId,
-            );
-          }
+            }
+          });
         }
       });
       return respond(requestId, current, created ? "created" : "replayed");
@@ -995,7 +1244,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       if (!persisted) {
         throw executionError("RUN_VERSION_CONFLICT", `run ${validated.runId} environment was released before this retain could persist`);
       }
-      const current = await setOperationResult(validated.runId, validated.effectKey, {
+      const current = await persistOperationResult(validated.runId, validated.effectKey, {
         runId: validated.runId,
         retainedUntil: persisted.retainUntil,
       });
@@ -1115,7 +1364,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               reservation = await mutateReservation(runId, (record) =>
                 enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
               );
-              await appendRunEvents(
+              await appendEvents(
                 runId,
                 protocolVersion,
                 [{
@@ -1132,7 +1381,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             // resolve any earlier liveness doubt. The terminal helper preserves
             // an already-committed result while clearing only the loss episode.
             if (reservation.indeterminateCause === "release_stop_unconfirmed") {
-              await appendRunEvents(
+              await appendEvents(
                 runId,
                 protocolVersion,
                 [{
@@ -1165,7 +1414,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               reservation = await mutateReservation(runId, (record) =>
                 record.sealedAt ? record : { ...record, sealedAt: now().toISOString() },
               );
-              await appendRunEvents(
+              await appendEvents(
                 runId,
                 protocolVersion,
                 [
@@ -1191,7 +1440,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                 record.releasedAt ? record : { ...record, releasedAt: now().toISOString() },
               );
               if (reservation.environment) {
-                await appendRunEvents(
+                await appendEvents(
                   runId,
                   protocolVersion,
                   [
@@ -1216,13 +1465,13 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           // Honest non-terminal cleanup receipt: the environment is NOT
           // released (occupancy retained, nothing sealed) and a retry of this
           // same effect continues from the first pending step.
-          return setOperationResult(runId, effectKey, {
+          return persistOperationResult(runId, effectKey, {
             environmentState: "releasing",
             steps: { completed, unrecoverable, pending },
             cause: "harness stop unconfirmed; cleanup fenced until a retry confirms the stop",
           });
         }
-        return setOperationResult(runId, effectKey, {
+        return persistOperationResult(runId, effectKey, {
           environmentState: "released",
           steps: { completed, unrecoverable },
         });
