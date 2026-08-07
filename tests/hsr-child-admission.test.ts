@@ -58,7 +58,11 @@ test("detached runner publishes an OS-comparable host birth fingerprint", { skip
       kind: "stub",
       cwd: process.cwd(),
       authKind: "subscription",
-      spec: { command: process.execPath, args: [], env: process.env as Record<string, string> },
+      spec: {
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1_000)"],
+        env: process.env as Record<string, string>,
+      },
     });
     try {
       const meta = await readHsrMetaStrict(bee);
