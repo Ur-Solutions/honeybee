@@ -23,7 +23,11 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
-import { hsrLivenessStrict } from "./hsr/observe.js";
+import { hsrPoolLivenessStrict } from "./hsr/observe.js";
+import {
+  inspectProcessGroupBirth,
+  type ProcessIdentityVerdict,
+} from "./hsr/processIdentity.js";
 import { withFileLock } from "./lock.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import {
@@ -385,13 +389,15 @@ export type PoolLivenessDependencies = {
   listSessions: () => Promise<SessionRecord[]>;
   observeLocal: () => Promise<LocalRuntimeSnapshot>;
   observeHsr: (bees: Iterable<string>) => Promise<Map<string, boolean | null>>;
+  inspectLauncherGroup: (record: SessionRecord) => Promise<ProcessIdentityVerdict>;
   realpathCwd: (cwd: string) => Promise<string>;
 };
 
 const DEFAULT_POOL_LIVENESS_DEPS: PoolLivenessDependencies = {
   listSessions: listSessionsStrict,
   observeLocal: observeLocalRuntimeSnapshot,
-  observeHsr: hsrLivenessStrict,
+  observeHsr: hsrPoolLivenessStrict,
+  inspectLauncherGroup: (record) => inspectProcessGroupBirth(record.launcherPgid!, record.launcherFingerprint),
   realpathCwd: realpath,
 };
 
@@ -413,12 +419,14 @@ export async function poolLiveBees(
   const sessions = records ?? (await deps.listSessions());
   const local = sessions.filter((record) => !record.node || record.node === LOCAL_NODE_NAME);
   const hsrRecords = local.filter((record) => record.substrate === "hsr");
-  const [runtime, hsrLiveness] = await Promise.all([
+  const launcherRecords = local.filter((record) => record.launcherPgid !== undefined);
+  const [runtime, hsrLiveness, launcherVerdicts] = await Promise.all([
     // Even an empty record snapshot still takes the tmux barrier: silently
     // skipping a failed observer would make "no records" indistinguishable
     // from an unreadable runtime substrate during a concurrent publication.
     deps.observeLocal(),
     deps.observeHsr(local.map((record) => record.name)),
+    Promise.all(launcherRecords.map(async (record) => [record.name, await deps.inspectLauncherGroup(record)] as const)),
   ]);
   const missingHsr = hsrRecords.find((record) => hsrLiveness.get(record.name) === null || !hsrLiveness.has(record.name));
   if (missingHsr) throw new Error(`HSR runtime metadata is missing for session ${missingHsr.name}`);
@@ -430,7 +438,12 @@ export async function poolLiveBees(
     hsrLive: new Set([...hsrLiveness].filter(([, live]) => live).map(([bee]) => bee)),
     now: Date.now(),
   };
-  const liveBees = liveBeesFromSessions(sessions, context);
+  const liveProcessGroups = new Set(
+    launcherVerdicts
+      .filter(([, verdict]) => verdict !== "gone" && verdict !== "mismatch")
+      .map(([name]) => name),
+  );
+  const liveBees = liveBeesFromSessions(sessions, { ...context, liveProcessGroups });
   return Promise.all(liveBees.map(async (bee) => ({ ...bee, cwd: await deps.realpathCwd(bee.cwd) })));
 }
 
@@ -439,7 +452,10 @@ export async function poolLiveBees(
  * deliberately not deriveState: display-terminal states such as done/sealed
  * do not prove the process has exited and therefore cannot release capacity.
  */
-export function liveBeesFromSessions(records: SessionRecord[], context: StateContext): LiveBee[] {
+export function liveBeesFromSessions(
+  records: SessionRecord[],
+  context: StateContext & { liveProcessGroups?: ReadonlySet<string> },
+): LiveBee[] {
   const bees: LiveBee[] = [];
   for (const record of records) {
     if (record.node && record.node !== LOCAL_NODE_NAME) continue;
@@ -449,7 +465,8 @@ export function liveBeesFromSessions(records: SessionRecord[], context: StateCon
     // can still name the old substrate while the replacement runtime is already
     // live. Any positive local signal retains capacity.
     const hsrLive = context.hsrLive?.has(record.name) === true;
-    const live = targetLive || paneLive || hsrLive;
+    const launcherGroupLive = context.liveProcessGroups?.has(record.name) === true;
+    const live = targetLive || paneLive || hsrLive || launcherGroupLive;
     if (!live) continue;
     bees.push({ name: record.name, cwd: record.cwd });
   }
@@ -627,11 +644,66 @@ async function currentMembers(pool: ResolvedPool): Promise<ProPoolMember[]> {
   return listing.members.filter((member) => member.repo === pool.repo && member.pool === pool.pool);
 }
 
+/**
+ * Re-resolve one already-identified pool from pro's current porcelain. Callers
+ * use the stable pool key to choose the lock, then invoke this only after that
+ * lock is held so roster/config validation cannot race another Hive extension.
+ */
+export async function refreshResolvedPool(
+  pool: ResolvedPool,
+  reader: typeof listProPools = listProPools,
+): Promise<ResolvedPool> {
+  invalidateProPoolCache(pool.repoPath);
+  const listing = await reader(pool.repoPath);
+  const config = listing.pools.find((candidate) => candidate.repo === pool.repo && candidate.name === pool.pool);
+  if (!config) {
+    throw new Error(`pool ${pool.key} no longer exists in pro; re-run hive pool list and retry`);
+  }
+  return {
+    ...pool,
+    config,
+    members: listing.members.filter((member) => member.repo === pool.repo && member.pool === pool.pool),
+  };
+}
+
+export type ExtendPoolMembersOptions = {
+  refreshPool?: (pool: ResolvedPool) => Promise<ResolvedPool>;
+  extendPool?: (repoPath: string, pool: string, count: number) => Promise<string[]>;
+  canonicalizeMembers?: typeof canonicalizePoolMembers;
+  onWarn?: (message: string) => void;
+};
+
+/**
+ * Manual pool growth. The initial resolve only identifies the lock; current
+ * roster/config and physical member identity are revalidated inside it, and the
+ * lock remains held through pro's complete external clone mutation.
+ */
+export async function extendPoolMembers(
+  pool: ResolvedPool,
+  count: number,
+  options: ExtendPoolMembersOptions = {},
+): Promise<string[]> {
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`pool extend count must be a positive integer (got ${count})`);
+  }
+  return withPoolLock(pool.key, async () => {
+    const current = await (options.refreshPool ?? refreshResolvedPool)(pool);
+    await (options.canonicalizeMembers ?? canonicalizePoolMembers)(current.members);
+    const newSize = current.members.length + count;
+    if (newSize > current.config.maxSize) {
+      options.onWarn?.(
+        `pool ${current.pool} exceeds maxSize: ${newSize}/${current.config.maxSize} — consider cleaning or raising maxSize`,
+      );
+    }
+    return (options.extendPool ?? extendProPool)(current.repoPath, current.pool, count);
+  });
+}
+
 export async function canonicalizePoolMembers(
   members: ProPoolMember[],
   realpathPath: (path: string) => Promise<string> = realpath,
 ): Promise<ProPoolMember[]> {
-  return Promise.all(
+  const canonical = await Promise.all(
     members.map(async (member) => {
       // Member identity is load-bearing for cwd-prefix occupancy. Falling back
       // to the unresolved spelling after an I/O error could hide a live bee
@@ -641,6 +713,19 @@ export async function canonicalizePoolMembers(
       return real === member.path ? member : { ...member, path: real };
     }),
   );
+  const byPath = new Map<string, ProPoolMember>();
+  for (const member of canonical) {
+    const existing = byPath.get(member.path);
+    if (existing) {
+      throw new Error(
+        `pool roster aliases one physical checkout at ${member.path}: ` +
+        `${existing.repo}:${existing.pool}-${existing.n} and ${member.repo}:${member.pool}-${member.n}; ` +
+        `repair the pro pool roster before allocating or mutating this pool`,
+      );
+    }
+    byPath.set(member.path, member);
+  }
+  return canonical;
 }
 
 /**

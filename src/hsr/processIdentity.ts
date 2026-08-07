@@ -26,6 +26,8 @@ export type ProcessBirthFingerprint = {
 
 export type ProcessIdentityReader = (pid: number) => Promise<ProcessBirthFingerprint | null>;
 export type ProcessIdentityVerdict = "match" | "mismatch" | "gone" | "unverifiable";
+export type ProcessGroupPresence = "present" | "absent" | "unverifiable";
+export type ProcessGroupPresenceReader = (pgid: number) => Promise<ProcessGroupPresence>;
 
 /** Parse one coherent topology + birth-identity process census. */
 export function parseProcessRows(output: string): ProcessRow[] {
@@ -118,4 +120,54 @@ export async function inspectProcessBirth(
   } catch {
     return "unverifiable";
   }
+}
+
+/**
+ * Read process-group presence without sending a signal. Signal 0 is an OS
+ * identity probe: ESRCH proves absence, EPERM proves presence, and every other
+ * failure is uncertainty rather than death evidence.
+ */
+export async function readProcessGroupPresence(pgid: number): Promise<ProcessGroupPresence> {
+  if (!Number.isSafeInteger(pgid) || pgid <= 0) return "unverifiable";
+  try {
+    process.kill(-pgid, 0);
+    return "present";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "absent";
+    if (code === "EPERM") return "present";
+    return "unverifiable";
+  }
+}
+
+/**
+ * Observe the exact birth-bound process group persisted by a runtime.
+ *
+ * The group and its leader are deliberately checked together. A matching live
+ * leader plus a present group is the recorded mutator. A gone leader plus an
+ * absent group, or a birth-mismatched replacement, proves that exact group is
+ * gone. Every contradictory, partial, missing, or unreadable observation stays
+ * unverifiable so pool capacity fails closed.
+ */
+export async function inspectProcessGroupBirth(
+  pgid: number,
+  expected: ProcessBirthFingerprint | undefined,
+  identityReader: ProcessIdentityReader = readProcessBirthFingerprint,
+  groupReader: ProcessGroupPresenceReader = readProcessGroupPresence,
+): Promise<ProcessIdentityVerdict> {
+  if (!expected || expected.pgid !== pgid || !Number.isSafeInteger(pgid) || pgid <= 0) {
+    return "unverifiable";
+  }
+  const birth = await inspectProcessBirth(pgid, expected, identityReader);
+  if (birth === "mismatch") return "mismatch";
+
+  let presence: ProcessGroupPresence;
+  try {
+    presence = await groupReader(pgid);
+  } catch {
+    return "unverifiable";
+  }
+  if (birth === "match" && presence === "present") return "match";
+  if (birth === "gone" && presence === "absent") return "gone";
+  return "unverifiable";
 }

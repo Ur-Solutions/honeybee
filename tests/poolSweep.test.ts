@@ -11,7 +11,22 @@ import {
   type MemberSweepView,
   type PoolSweeperDeps,
 } from "../src/daemon/poolSweep.js";
-import { emptyPoolRecord, poolKeyFor, loadPoolRecord, savePoolRecord, withPoolLock, type PoolClaim, type ResolvedPool } from "../src/pool.js";
+import {
+  allocatePoolMembers,
+  canonicalizePoolMembers,
+  emptyPoolRecord,
+  extendPoolMembers,
+  loadPoolRecord,
+  poolKeyFor,
+  poolLiveBees,
+  savePoolRecord,
+  withPoolLock,
+  type PoolClaim,
+  type ResolvedPool,
+} from "../src/pool.js";
+import { isHsrPoolMutatorLive } from "../src/hsr/observe.js";
+import type { ProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
+import type { HsrMeta } from "../src/hsr/runDir.js";
 import type { ProRepoEntry } from "../src/proProjects.js";
 import { isTerminalState, type BeeState } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
@@ -165,6 +180,7 @@ function buildSweeper(pool: () => ResolvedPool, overrides: Partial<PoolSweeperDe
         })
         .map((record) => ({ name: record.name, cwd: record.cwd })),
       canonicalizeMembers: async (members) => members,
+      refreshPool: async () => pool(),
       sync: async (repoPath, names) => {
         harness.syncCalls.push({ repoPath, names });
         return { ok: true, rows: names.map((name) => ({ status: "synced-ff", path: `/p/lab/demo/checkouts/widget/${name.split(":")[1]}` })), detail: "" };
@@ -243,6 +259,55 @@ test("sweeper: done/sealed display state cannot vacate a positively live runtime
     runtimeLive = false;
     h.advance(1500);
     const vacated = await h.sweep(records, new Map<string, BeeState>([["sealed-live", "done"]]));
+    assert.deepEqual(h.syncCalls, [{ repoPath: ENTRY.path, names: ["widget:core-1"] }]);
+    assert.deepEqual(vacated[0]!.synced, [{ member: 1, status: "synced-ff" }]);
+  });
+});
+
+test("sweeper: HSR host death does not sync until exact child-group absence is confirmed", async () => {
+  await withTempStore(async () => {
+    const fingerprint: ProcessBirthFingerprint = { pgid: 4242, startedAt: "Fri Aug  7 12:00:00 2026" };
+    const meta: HsrMeta = {
+      bee: "hsr-child",
+      harness: "codex",
+      tier: "server",
+      hostPid: 3131,
+      childPid: 4242,
+      childPgid: 4242,
+      childFingerprint: fingerprint,
+      startedAt: new Date(NOW).toISOString(),
+      controlSocket: "/tmp/hsr-child.sock",
+      status: "running",
+    };
+    let child: "live" | "uncertain" | "absent" = "live";
+    const h = buildSweeper(() => resolvedPool(), {
+      observeLiveBees: (records) => poolLiveBees(records, {
+        observeLocal: async () => ({ sessions: new Set(), panes: new Set() }),
+        observeHsr: async (names) => {
+          const live = await isHsrPoolMutatorLive(meta, {
+            isHostAlive: () => false,
+            readProcessIdentity: async () => {
+              if (child === "uncertain") throw new Error("ps unavailable");
+              return child === "live" ? fingerprint : null;
+            },
+            readProcessGroupPresence: async () => child === "live" ? "present" : child === "absent" ? "absent" : "unverifiable",
+          });
+          return new Map([...names].map((name) => [name, live]));
+        },
+        realpathCwd: async (cwd) => cwd,
+      }),
+    });
+    const records = [bee("hsr-child", { substrate: "hsr" })];
+    await h.sweep(records, new Map<string, BeeState>([["hsr-child", "active"]]));
+
+    child = "uncertain";
+    h.advance(1500);
+    assert.deepEqual(await h.sweep(records, new Map<string, BeeState>([["hsr-child", "dead"]])), []);
+    assert.deepEqual(h.syncCalls, [], "identity uncertainty keeps the checkout occupied");
+
+    child = "absent";
+    h.advance(1500);
+    const vacated = await h.sweep(records, new Map<string, BeeState>([["hsr-child", "dead"]]));
     assert.deepEqual(h.syncCalls, [{ repoPath: ENTRY.path, names: ["widget:core-1"] }]);
     assert.deepEqual(vacated[0]!.synced, [{ member: 1, status: "synced-ff" }]);
   });
@@ -334,6 +399,34 @@ test("sweeper: member canonicalization failure aborts that pool before mutation"
   });
 });
 
+test("sweeper: duplicate canonical member identity preserves claims and blocks every mutation", async () => {
+  await withTempStore(async () => {
+    const record = emptyPoolRecord(FACETS);
+    record.claims.push({
+      id: "existing",
+      member: 1,
+      path: "/physical/core",
+      claimedAt: new Date(NOW - 2000).toISOString(),
+      pendingUntil: new Date(NOW - 1000).toISOString(),
+    });
+    await savePoolRecord(record);
+    const duplicate = resolvedPool({ minFree: 3 });
+    duplicate.members = [
+      duplicate.members[0]!,
+      { ...duplicate.members[0]!, n: 2, path: "/p/lab/demo/checkouts/widget/core-2" },
+    ];
+    const h = buildSweeper(() => duplicate, {
+      canonicalizeMembers: (members) => canonicalizePoolMembers(members, async () => "/physical/core"),
+    });
+
+    const outcomes = await h.sweep([], new Map());
+    assert.match(outcomes[0]!.error ?? "", /pool roster aliases one physical checkout/);
+    assert.deepEqual((await loadPoolRecord(KEY))!.claims.map((claim) => claim.id), ["existing"]);
+    assert.deepEqual(h.syncCalls, []);
+    assert.deepEqual(h.extendCalls, []);
+  });
+});
+
 test("sweeper: a member left dirty is flagged once (nudge to the departed bee's parent), never synced", async () => {
   await withTempStore(async () => {
     const h = buildSweeper(() => resolvedPool({ dirty: true }));
@@ -365,16 +458,224 @@ test("sweeper: minFree pre-extends in the background and reports completion next
     // 1 member, occ 1, free 1, minFree 3 → shortfall 2; maxSize 2 → loud warning.
     const h = buildSweeper(() => resolvedPool({ minFree: 3 }));
     const first = await h.sweep([], new Map());
-    assert.deepEqual(h.extendCalls, [{ pool: "core", count: 2 }]);
     assert.equal(first[0]!.extendStarted, 2);
-    assert.match(first[0]!.warned ?? "", /exceeds maxSize: 3\/2/);
+    assert.equal(first[0]!.warned, undefined, "limits are revalidated by the background job, not the scheduling snapshot");
     // Let the background extend settle, then the next sweep reports it. The
     // roster still shows free 1 < minFree, but the in-flight/settled bookkeeping
     // prevents a duplicate extend within the same settle cycle.
     await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(h.extendCalls, [{ pool: "core", count: 2 }]);
     h.advance(1500);
     const second = await h.sweep([], new Map());
     assert.equal(second[0]!.extended, 2);
+    assert.match(second[0]!.warned ?? "", /exceeds maxSize: 3\/2/);
+  });
+});
+
+test("background pre-extend revalidates after a manual extend and skips excess growth", async () => {
+  await withTempStore(async () => {
+    let members = [...resolvedPool().members];
+    const currentPool = (): ResolvedPool => ({
+      ...resolvedPool({ minFree: 2 }),
+      members,
+      config: { ...resolvedPool({ minFree: 2 }).config, maxSize: 1 },
+    });
+    const jobs: Array<() => Promise<void>> = [];
+    const mutationCounts: number[] = [];
+    const extend = async (_repoPath: string, _pool: string, count: number) => {
+      mutationCounts.push(count);
+      const first = Math.max(0, ...members.map((member) => member.n)) + 1;
+      const created = Array.from({ length: count }, (_, index) => ({
+        ...members[0]!,
+        n: first + index,
+        path: `/p/lab/demo/checkouts/widget/core-${first + index}`,
+      }));
+      members = [...members, ...created];
+      return created.map((member) => member.path);
+    };
+    const h = buildSweeper(currentPool, {
+      startBackground: (job) => jobs.push(job),
+      refreshPool: async () => currentPool(),
+      canonicalizeMembers: async (roster) => roster,
+      extend,
+    });
+
+    const scheduled = await h.sweep([], new Map());
+    assert.equal(scheduled[0]!.extendStarted, 1);
+    assert.equal(jobs.length, 1);
+
+    const warnings: string[] = [];
+    await extendPoolMembers(currentPool(), 1, {
+      refreshPool: async () => currentPool(),
+      canonicalizeMembers: async (roster) => roster,
+      extendPool: extend,
+      onWarn: (warning) => warnings.push(warning),
+    });
+    assert.deepEqual(mutationCounts, [1]);
+    assert.match(warnings[0] ?? "", /exceeds maxSize: 2\/1/, "manual limit warning uses the under-lock refreshed config");
+
+    await jobs.shift()!();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(mutationCounts, [1], "background recomputation sees the manual member and performs no clone");
+    assert.deepEqual(members.map((member) => member.n), [1, 2]);
+
+    h.advance(1500);
+    const reported = await h.sweep([], new Map());
+    assert.equal(reported[0]!.extended, 0);
+  });
+});
+
+test("paused background clone serializes allocator and manual extend external mutations", async () => {
+  await withTempStore(async () => {
+    let members = [...resolvedPool().members];
+    const currentPool = (): ResolvedPool => ({ ...resolvedPool({ minFree: 2 }), members });
+    const jobs: Array<() => Promise<void>> = [];
+    let announceBackground!: () => void;
+    const backgroundEntered = new Promise<void>((resolve) => { announceBackground = resolve; });
+    let releaseBackground!: () => void;
+    const backgroundGate = new Promise<void>((resolve) => { releaseBackground = resolve; });
+    let externalActive = 0;
+    let maxExternalActive = 0;
+    const mutationCounts: number[] = [];
+    const extend = async (_repoPath: string, _pool: string, count: number) => {
+      externalActive += 1;
+      maxExternalActive = Math.max(maxExternalActive, externalActive);
+      const call = mutationCounts.length;
+      mutationCounts.push(count);
+      try {
+        if (call === 0) {
+          announceBackground();
+          await backgroundGate;
+        }
+        const first = Math.max(0, ...members.map((member) => member.n)) + 1;
+        const created = Array.from({ length: count }, (_, index) => ({
+          ...members[0]!,
+          n: first + index,
+          path: `/p/lab/demo/checkouts/widget/core-${first + index}`,
+        }));
+        members = [...members, ...created];
+        return created.map((member) => member.path);
+      } finally {
+        externalActive -= 1;
+      }
+    };
+    const common = {
+      refreshPool: async () => currentPool(),
+      canonicalizeMembers: async (roster: typeof members) => roster,
+      extendPool: extend,
+    };
+    const h = buildSweeper(currentPool, {
+      startBackground: (job) => jobs.push(job),
+      refreshPool: common.refreshPool,
+      canonicalizeMembers: common.canonicalizeMembers,
+      extend,
+    });
+    await h.sweep([], new Map());
+    const background = jobs.shift()!();
+    await backgroundEntered;
+
+    let allocatorSettled = false;
+    let manualSettled = false;
+    const allocator = allocatePoolMembers(currentPool(), 2, {
+      liveBees: [],
+      listMembers: async () => members,
+      realpathPath: async (path) => path,
+      extendPool: extend,
+    }).finally(() => { allocatorSettled = true; });
+    const manual = extendPoolMembers(currentPool(), 1, common).finally(() => { manualSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(allocatorSettled, false);
+    assert.equal(manualSettled, false);
+    assert.equal(externalActive, 1, "background clone alone owns the external mutation section");
+
+    releaseBackground();
+    const [, allocations, manualCreated] = await Promise.all([background, allocator, manual]);
+    assert.equal(maxExternalActive, 1);
+    assert.deepEqual(mutationCounts, [1, 1], "allocator reuses refreshed members; only requested manual growth remains");
+    assert.deepEqual([...new Set(members.map((member) => member.n))], [1, 2, 3]);
+    assert.deepEqual(allocations.map((allocation) => allocation.member).sort(), [1, 2]);
+    assert.equal(manualCreated.length, 1);
+  });
+});
+
+test("two pool-sweeper service instances serialize and recompute one shared pre-extend", async () => {
+  await withTempStore(async () => {
+    let members = [...resolvedPool().members];
+    const currentPool = (): ResolvedPool => ({ ...resolvedPool({ minFree: 2 }), members });
+    const jobsA: Array<() => Promise<void>> = [];
+    const jobsB: Array<() => Promise<void>> = [];
+    let externalCalls = 0;
+    const extend = async (_repoPath: string, _pool: string, count: number) => {
+      externalCalls += 1;
+      const first = Math.max(0, ...members.map((member) => member.n)) + 1;
+      const created = Array.from({ length: count }, (_, index) => ({
+        ...members[0]!,
+        n: first + index,
+        path: `/p/lab/demo/checkouts/widget/core-${first + index}`,
+      }));
+      members = [...members, ...created];
+      return created.map((member) => member.path);
+    };
+    const overrides = {
+      refreshPool: async () => currentPool(),
+      canonicalizeMembers: async (roster: typeof members) => roster,
+      extend,
+    };
+    const a = buildSweeper(currentPool, { ...overrides, startBackground: (job) => jobsA.push(job) });
+    const b = buildSweeper(currentPool, { ...overrides, startBackground: (job) => jobsB.push(job) });
+    await a.sweep([], new Map());
+    await b.sweep([], new Map());
+    assert.equal(jobsA.length, 1);
+    assert.equal(jobsB.length, 1);
+
+    await Promise.all([jobsA.shift()!(), jobsB.shift()!()]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(externalCalls, 1, "the second service observes the first service's fresh capacity under the shared lock");
+    assert.deepEqual(members.map((member) => member.n), [1, 2]);
+
+    a.advance(1500);
+    b.advance(1500);
+    const reports = await Promise.all([a.sweep([], new Map()), b.sweep([], new Map())]);
+    assert.deepEqual(reports.map((rows) => rows[0]!.extended).sort(), [0, 1]);
+  });
+});
+
+test("background extend failure reports on the next tick and a later tick retries", async () => {
+  await withTempStore(async () => {
+    let members = [...resolvedPool().members];
+    const currentPool = (): ResolvedPool => ({ ...resolvedPool({ minFree: 2 }), members });
+    const jobs: Array<() => Promise<void>> = [];
+    let attempts = 0;
+    const h = buildSweeper(currentPool, {
+      startBackground: (job) => jobs.push(job),
+      refreshPool: async () => currentPool(),
+      canonicalizeMembers: async (roster) => roster,
+      extend: async (_repoPath, _pool, count) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("clone failed");
+        const created = { ...members[0]!, n: 2, path: "/p/lab/demo/checkouts/widget/core-2" };
+        members = [...members, created];
+        return Array.from({ length: count }, () => created.path);
+      },
+    });
+
+    await h.sweep([], new Map());
+    await jobs.shift()!();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    h.advance(1500);
+    const failed = await h.sweep([], new Map());
+    assert.match(failed[0]!.error ?? "", /pre-extend failed: clone failed/);
+    assert.equal(jobs.length, 0, "the reporting tick does not also launch a duplicate retry");
+
+    h.advance(1500);
+    const retry = await h.sweep([], new Map());
+    assert.equal(retry[0]!.extendStarted, 1);
+    await jobs.shift()!();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    h.advance(1500);
+    const recovered = await h.sweep([], new Map());
+    assert.equal(recovered[0]!.extended, 1);
+    assert.equal(attempts, 2);
   });
 });
 
@@ -402,6 +703,7 @@ test("sweeper: a broken pool discovery or sync never throws out of the sweep", a
         .filter((record) => !isTerminalState(currentStates.get(record.name) ?? "active"))
         .map((record) => ({ name: record.name, cwd: record.cwd })),
       canonicalizeMembers: async (members) => members,
+      refreshPool: async () => resolvedPool(),
       sync: async () => {
         throw new Error("sync exploded");
       },

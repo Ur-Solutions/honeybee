@@ -12,6 +12,7 @@ import {
   deriveMemberOccupancy,
   dropPoolClaimsForBee,
   emptyPoolRecord,
+  extendPoolMembers,
   liveBeesFromSessions,
   loadPoolRecord,
   occupantsForPath,
@@ -29,6 +30,13 @@ import {
   type PoolClaim,
   type ResolvedPool,
 } from "../src/pool.js";
+import { isHsrPoolMutatorLive } from "../src/hsr/observe.js";
+import {
+  inspectProcessGroupBirth,
+  type ProcessBirthFingerprint,
+  type ProcessIdentityVerdict,
+} from "../src/hsr/processIdentity.js";
+import type { HsrMeta } from "../src/hsr/runDir.js";
 import type { ProPoolConfig, ProPoolMember } from "../src/proProjects.js";
 import { liveTargetKey, type StateContext } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
@@ -98,6 +106,72 @@ test("canonicalizePoolMembers resolves symlink members and never falls back afte
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("canonicalizePoolMembers rejects two roster numbers that alias one physical checkout", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-pool-duplicate-realpath-"));
+  try {
+    const physical = join(root, "physical");
+    const alias1 = join(root, "core-1");
+    const alias2 = join(root, "core-2");
+    await mkdir(physical);
+    await symlink(physical, alias1, "dir");
+    await symlink(physical, alias2, "dir");
+    await assert.rejects(
+      canonicalizePoolMembers([member(1, { path: alias1 }), member(2, { path: alias2 })]),
+      /pool roster aliases one physical checkout.*core-1 and widget:core-2.*repair the pro pool roster/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("duplicate physical members preserve claims and block allocation, manual claim, and manual extend", async () => {
+  await withTempStore(async (root) => {
+    const physical = join(root, "physical");
+    const alias1 = join(root, "core-1");
+    const alias2 = join(root, "core-2");
+    await mkdir(physical);
+    await symlink(physical, alias1, "dir");
+    await symlink(physical, alias2, "dir");
+    const duplicates = [member(1, { path: alias1 }), member(2, { path: alias2 })];
+    const resolved: ResolvedPool = {
+      key: KEY,
+      ...FACETS,
+      repoPath: join(root, "repo"),
+      config: config(),
+      members: duplicates,
+    };
+    const record = emptyPoolRecord(FACETS);
+    record.claims.push({
+      ...claim(1, { id: "existing" }),
+      pendingUntil: new Date(Date.now() + 60_000).toISOString(),
+    });
+    await savePoolRecord(record);
+    let externalMutations = 0;
+
+    await assert.rejects(
+      allocatePoolMembers(resolved, 1, { liveBees: [], listMembers: async () => duplicates }),
+      /pool roster aliases one physical checkout/,
+    );
+    await assert.rejects(
+      claimSpecificPoolMember(resolved, 2, { liveBees: [], listMembers: async () => duplicates }),
+      /pool roster aliases one physical checkout/,
+    );
+    await assert.rejects(
+      extendPoolMembers(resolved, 1, {
+        refreshPool: async () => resolved,
+        extendPool: async () => {
+          externalMutations += 1;
+          return [];
+        },
+      }),
+      /pool roster aliases one physical checkout/,
+    );
+
+    assert.equal(externalMutations, 0);
+    assert.deepEqual((await loadPoolRecord(KEY))!.claims.map((entry) => entry.id), ["existing"]);
+  });
 });
 
 test("allocation and manual claim create no state when symlink member canonicalization fails", async () => {
@@ -433,6 +507,24 @@ function session(name: string, overrides: Partial<SessionRecord> = {}): SessionR
   };
 }
 
+const CHILD_FINGERPRINT: ProcessBirthFingerprint = { pgid: 4242, startedAt: "Fri Aug  7 12:00:00 2026" };
+
+function hsrMeta(overrides: Partial<HsrMeta> = {}): HsrMeta {
+  return {
+    bee: "hsr-child",
+    harness: "codex",
+    tier: "server",
+    hostPid: 3131,
+    childPid: 4242,
+    childPgid: 4242,
+    childFingerprint: CHILD_FINGERPRINT,
+    startedAt: new Date(NOW).toISOString(),
+    controlSocket: "/tmp/hsr-child.sock",
+    status: "running",
+    ...overrides,
+  };
+}
+
 test("liveBeesFromSessions counts every positively live local runtime, including sealed/done display-terminal bees", async () => {
   await withTempStore(async () => {
     const records = [
@@ -456,6 +548,116 @@ test("liveBeesFromSessions counts every positively live local runtime, including
     assert.deepEqual(bees.map((bee) => bee.name).sort(), ["alive", "archived-bee", "demoting", "hsr-alive", "promoting", "sealed-bee"]);
     assert.equal(bees[0]!.cwd, "/p/checkouts/widget/core-1");
   });
+});
+
+test("HSR pool occupancy retains host-gone child groups until exact absence is confirmed", async () => {
+  const meta = hsrMeta();
+  assert.equal(await isHsrPoolMutatorLive(meta, {
+    isHostAlive: () => false,
+    readProcessIdentity: async () => CHILD_FINGERPRINT,
+    readProcessGroupPresence: async () => "present",
+  }), true, "birth-matched live child group occupies after host death");
+
+  assert.equal(await isHsrPoolMutatorLive(meta, {
+    isHostAlive: () => false,
+    readProcessIdentity: async () => {
+      throw new Error("ps unavailable");
+    },
+    readProcessGroupPresence: async () => "unverifiable",
+  }), true, "unverifiable child/group identity fails closed as occupied");
+
+  assert.equal(await isHsrPoolMutatorLive(meta, {
+    isHostAlive: () => false,
+    readProcessIdentity: async () => null,
+    readProcessGroupPresence: async () => "absent",
+  }), false, "gone leader plus absent exact group releases capacity");
+
+  assert.equal(await isHsrPoolMutatorLive({ ...meta, status: "exited" }, {
+    isHostAlive: () => false,
+    readProcessIdentity: async () => CHILD_FINGERPRINT,
+    readProcessGroupPresence: async () => "present",
+  }), true, "an exited status alone cannot release a still-live detached child group");
+});
+
+test("poolLiveBees counts local launcher groups independently of absent tmux target/pane", async () => {
+  const fingerprint: ProcessBirthFingerprint = { pgid: 5151, startedAt: "Fri Aug  7 12:01:00 2026" };
+  const records = [
+    session("matching", { agentPaneId: "%51", launcherPgid: 5151, launcherFingerprint: fingerprint }),
+    session("uncertain", { agentPaneId: "%52", launcherPgid: 5252 }),
+    session("gone", { agentPaneId: "%53", launcherPgid: 5353, launcherFingerprint: { ...fingerprint, pgid: 5353 } }),
+    session("replacement", { agentPaneId: "%54", launcherPgid: 5454, launcherFingerprint: { ...fingerprint, pgid: 5454 } }),
+  ];
+  const verdicts = new Map<string, ProcessIdentityVerdict>([
+    ["matching", "match"],
+    ["uncertain", "unverifiable"],
+    ["gone", "gone"],
+    ["replacement", "mismatch"],
+  ]);
+  const live = await poolLiveBees(records, {
+    observeLocal: async () => ({ sessions: new Set(), panes: new Set() }),
+    observeHsr: async (names) => new Map([...names].map((name) => [name, false])),
+    inspectLauncherGroup: async (record) => verdicts.get(record.name)!,
+    realpathCwd: async (cwd) => cwd,
+  });
+  assert.deepEqual(live.map((entry) => entry.name).sort(), ["matching", "uncertain"]);
+});
+
+test("exact process-group observation distinguishes absence/replacement and retains uncertainty", async () => {
+  const expected: ProcessBirthFingerprint = { pgid: 6161, startedAt: "Fri Aug  7 12:02:00 2026" };
+  assert.equal(await inspectProcessGroupBirth(6161, expected, async () => expected, async () => "present"), "match");
+  assert.equal(await inspectProcessGroupBirth(6161, expected, async () => null, async () => "absent"), "gone");
+  assert.equal(await inspectProcessGroupBirth(
+    6161,
+    expected,
+    async () => ({ pgid: 6161, startedAt: "replacement birth" }),
+    async () => "present",
+  ), "mismatch");
+  assert.equal(await inspectProcessGroupBirth(6161, undefined, async () => expected, async () => "absent"), "unverifiable");
+  assert.equal(await inspectProcessGroupBirth(6161, expected, async () => null, async () => "present"), "unverifiable");
+});
+
+test("allocation extends for host-gone live/uncertain HSR children but reuses capacity after confirmed absence", async (t) => {
+  for (const scenario of [
+    { name: "child-live", identity: CHILD_FINGERPRINT, presence: "present" as const, expectedLive: true },
+    { name: "child-uncertain", identity: new Error("identity unavailable"), presence: "unverifiable" as const, expectedLive: true },
+    { name: "child-absent", identity: null, presence: "absent" as const, expectedLive: false },
+  ]) {
+    await t.test(scenario.name, async () => withTempStore(async () => {
+      const hsr = session("hsr-child", { substrate: "hsr" });
+      const liveBees = await poolLiveBees([hsr], {
+        observeLocal: async () => ({ sessions: new Set(), panes: new Set() }),
+        observeHsr: async (names) => {
+          const live = await isHsrPoolMutatorLive(hsrMeta(), {
+            isHostAlive: () => false,
+            readProcessIdentity: async () => {
+              if (scenario.identity instanceof Error) throw scenario.identity;
+              return scenario.identity;
+            },
+            readProcessGroupPresence: async () => scenario.presence,
+          });
+          return new Map([...names].map((name) => [name, live]));
+        },
+        realpathCwd: async (cwd) => cwd,
+      });
+      assert.equal(liveBees.length > 0, scenario.expectedLive);
+
+      let members = [member(1)];
+      const extendCounts: number[] = [];
+      const resolved: ResolvedPool = { key: KEY, ...FACETS, repoPath: "/p/repo", config: config(), members };
+      const allocations = await allocatePoolMembers(resolved, 1, {
+        liveBees,
+        listMembers: async () => members,
+        realpathPath: async (path) => path,
+        extendPool: async (_repoPath, _pool, count) => {
+          extendCounts.push(count);
+          members = [...members, member(2)];
+          return [member(2).path];
+        },
+      });
+      assert.deepEqual(extendCounts, scenario.expectedLive ? [1] : []);
+      assert.equal(allocations[0]!.member, scenario.expectedLive ? 2 : 1);
+    }));
+  }
 });
 
 test("poolLiveBees fails closed on local and HSR observation errors", async () => {
@@ -505,6 +707,13 @@ test("poolLiveBees refuses corrupt HSR runtime metadata instead of observing the
     await mkdir(runDir, { recursive: true });
     await writeFile(join(runDir, "meta.json"), "{ bad json");
     await assert.rejects(poolLiveBees([bee]), /Invalid JSON in HSR metadata/);
+    await writeFile(join(runDir, "meta.json"), JSON.stringify({
+      bee: bee.name,
+      hostPid: process.pid,
+      status: "running",
+      childPid: 4242,
+    }));
+    await assert.rejects(poolLiveBees([bee]), /childPid and childPgid must be stored together/);
   });
 });
 

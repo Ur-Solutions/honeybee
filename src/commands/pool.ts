@@ -10,6 +10,7 @@ import { flag, truthy, type Parsed } from "../parse.js";
 import {
   allocatePoolMembers,
   claimSpecificPoolMember,
+  extendPoolMembers,
   occupantsForPath,
   poolLiveBees,
   poolsForProject,
@@ -26,7 +27,6 @@ import {
 } from "../pool.js";
 import { choosePoolLaunch, poolCapacityCell, type PoolLaunchRow } from "../poolLaunchTui.js";
 import {
-  extendProPool,
   listProRepoEntries,
   ProPoolsUnavailableError,
   resolveProEntryForCwd,
@@ -342,11 +342,7 @@ export async function poolExtendCmd(parsed: Parsed) {
   const count = parsed.args[2] !== undefined ? Number(parsed.args[2]) : 1;
   if (!Number.isInteger(count) || count < 1) throw new Error(`hive pool extend: N must be a positive integer (got ${parsed.args[2]})`);
   const pool = await resolvePoolRef(ref, process.cwd());
-  const newSize = pool.members.length + count;
-  if (newSize > pool.config.maxSize) {
-    console.error(note(`pool ${pool.pool} exceeds maxSize: ${newSize}/${pool.config.maxSize} — consider cleaning or raising maxSize`));
-  }
-  const created = await extendProPool(pool.repoPath, pool.pool, count);
+  const created = await extendPoolMembers(pool, count, { onWarn: (message) => console.error(note(message)) });
   if (isPretty()) console.log(actionLine("ok", "pool", [bold(pool.pool), `extended by ${created.length}`]));
   for (const path of created) console.log(path);
 }

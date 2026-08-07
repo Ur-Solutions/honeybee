@@ -277,6 +277,28 @@ export async function readHsrMetaStrict(bee: string): Promise<HsrMeta | null> {
   if (object.childFingerprint !== undefined && !validFingerprint(object.childFingerprint)) {
     throw new Error(`Invalid HSR metadata for ${bee}: malformed child fingerprint`);
   }
+  for (const key of ["childPid", "childPgid"] as const) {
+    if (object[key] !== undefined && (!Number.isSafeInteger(object[key]) || Number(object[key]) <= 0)) {
+      throw new Error(`Invalid HSR metadata for ${bee}: ${key} must be a positive safe integer when present`);
+    }
+  }
+  const hasChildPid = object.childPid !== undefined;
+  const hasChildPgid = object.childPgid !== undefined;
+  if (hasChildPid !== hasChildPgid) {
+    throw new Error(`Invalid HSR metadata for ${bee}: childPid and childPgid must be stored together`);
+  }
+  if (hasChildPid && object.childPid !== object.childPgid) {
+    throw new Error(`Invalid HSR metadata for ${bee}: detached childPid and childPgid must match`);
+  }
+  if (object.childFingerprint !== undefined && !hasChildPid) {
+    throw new Error(`Invalid HSR metadata for ${bee}: child fingerprint has no child process group`);
+  }
+  if (
+    object.childFingerprint !== undefined &&
+    (object.childFingerprint as ProcessBirthFingerprint).pgid !== object.childPgid
+  ) {
+    throw new Error(`Invalid HSR metadata for ${bee}: child fingerprint does not match childPgid`);
+  }
   return object as unknown as HsrMeta;
 }
 

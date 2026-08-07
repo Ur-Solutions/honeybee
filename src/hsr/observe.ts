@@ -32,7 +32,9 @@ import {
   type HsrMeta,
 } from "./runDir.js";
 import {
+  inspectProcessGroupBirth,
   inspectProcessBirth,
+  type ProcessGroupPresenceReader,
   type ProcessIdentityReader,
   type ProcessIdentityVerdict,
 } from "./processIdentity.js";
@@ -130,6 +132,54 @@ export async function hsrLivenessStrict(bees: Iterable<string>): Promise<Map<str
   const rows = await mapWithConcurrency(names, observationConcurrency(undefined), async (bee) => {
     const meta = await readHsrMetaStrict(bee);
     return { bee, live: meta ? isMetaLive(meta) : null };
+  });
+  return new Map(rows.map((row) => [row.bee, row.live]));
+}
+
+export type HsrPoolLivenessDependencies = {
+  isHostAlive?: (pid: number) => boolean;
+  readProcessIdentity?: ProcessIdentityReader;
+  readProcessGroupPresence?: ProcessGroupPresenceReader;
+};
+
+/**
+ * Exact HSR mutator liveness for pool capacity decisions. A live host remains
+ * occupied. Once the host is gone, a birth-matched detached child group also
+ * remains occupied; partial or contradictory group evidence fails closed as
+ * occupied. Only confirmed exact-group absence (or a proven replacement birth)
+ * releases the checkout. This observer never signals a process.
+ */
+export async function isHsrPoolMutatorLive(
+  meta: HsrMeta,
+  deps: HsrPoolLivenessDependencies = {},
+): Promise<boolean> {
+  if (meta.mirrorOfNode) return meta.status === "running";
+  if (meta.status !== "exited" && (deps.isHostAlive ?? isPidAlive)(meta.hostPid)) return true;
+
+  // A host may die between starting the detached harness and publishing its
+  // child identity. Queued/running metadata without a complete group therefore
+  // cannot prove that no mutator exists.
+  if (!meta.childPid || !meta.childPgid || meta.childPid !== meta.childPgid) {
+    return meta.status !== "exited";
+  }
+  const verdict = await inspectProcessGroupBirth(
+    meta.childPgid,
+    meta.childFingerprint,
+    deps.readProcessIdentity,
+    deps.readProcessGroupPresence,
+  );
+  return verdict !== "gone" && verdict !== "mismatch";
+}
+
+/** Strict-meta batch wrapper used exclusively by pool safety decisions. */
+export async function hsrPoolLivenessStrict(
+  bees: Iterable<string>,
+  deps: HsrPoolLivenessDependencies = {},
+): Promise<Map<string, boolean | null>> {
+  const names = [...new Set(bees)].sort();
+  const rows = await mapWithConcurrency(names, observationConcurrency(undefined), async (bee) => {
+    const meta = await readHsrMetaStrict(bee);
+    return { bee, live: meta ? await isHsrPoolMutatorLive(meta, deps) : null };
   });
   return new Map(rows.map((row) => [row.bee, row.live]));
 }

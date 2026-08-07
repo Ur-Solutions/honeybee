@@ -26,6 +26,7 @@ import {
   poolsForProject,
   poolLiveBees,
   projectRepresentatives,
+  refreshResolvedPool,
   savePoolRecord,
   withPoolLock,
   type LiveBee,
@@ -147,6 +148,10 @@ export type PoolSweeperDeps = {
   observeLiveBees?: (records: SessionRecord[], currentStates: Map<string, BeeState>) => Promise<LiveBee[]>;
   /** Canonical member identity observer; injectable for tests. */
   canonicalizeMembers?: typeof canonicalizePoolMembers;
+  /** Fresh pro roster/config resolver, always called after the pool lock is acquired. */
+  refreshPool?: (pool: ResolvedPool) => Promise<ResolvedPool>;
+  /** @internal deterministic background-job scheduler for concurrency tests. */
+  startBackground?: (job: () => Promise<void>) => void;
 };
 
 /**
@@ -164,6 +169,10 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
   const extend = deps.extend ?? extendProPool;
   const observeLiveBees = deps.observeLiveBees ?? (() => poolLiveBees());
   const canonicalizeMembers = deps.canonicalizeMembers ?? canonicalizePoolMembers;
+  const refreshPool = deps.refreshPool ?? ((pool: ResolvedPool) => refreshResolvedPool(pool, deps.listPools ?? listProPools));
+  const startBackground = deps.startBackground ?? ((job: () => Promise<void>) => {
+    queueMicrotask(() => void job());
+  });
   const sendNudge =
     deps.sendNudge ??
     (async (recipient: SessionRecord, senderBee: SessionRecord, body: string) => {
@@ -185,10 +194,47 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
   const previousOccupants = new Map<string, Map<number, string[]>>();
   /** "key:n:reason" — flags already nudged; re-armed when the condition clears. */
   const nudged = new Set<string>();
+  type BackgroundExtendResult = { created: number; warned?: string };
   /** poolKey → background pre-extend in flight. */
-  const inFlightExtends = new Map<string, Promise<string[]>>();
+  const inFlightExtends = new Map<string, Promise<BackgroundExtendResult>>();
   /** poolKey → settled background result awaiting report. */
-  const settledExtends = new Map<string, { created?: number; error?: string }>();
+  const settledExtends = new Map<string, { created?: number; warned?: string; error?: string }>();
+
+  /**
+   * The long clone runs outside the daemon tick, but its own job takes the same
+   * cross-process lock as allocation/manual extend. Once acquired it discards
+   * the scheduling snapshot and re-resolves every capacity input before holding
+   * the lock through the complete external mutation.
+   */
+  const runBackgroundExtend = (
+    scheduledPool: ResolvedPool,
+    records: SessionRecord[],
+    currentStates: Map<string, BeeState>,
+  ): Promise<BackgroundExtendResult> => withPoolLock(scheduledPool.key, async () => {
+    const current = await refreshPool(scheduledPool);
+    const members = await canonicalizeMembers(current.members);
+    const liveBees = await observeLiveBees(records, currentStates);
+    const record = await loadPoolRecord(current.key);
+    const nowMs = now();
+    const occupancy = deriveMemberOccupancy({
+      members,
+      config: current.config,
+      claims: record?.claims ?? [],
+      parked: record?.parked ?? [],
+      liveBees,
+      now: nowMs,
+    });
+    const needed = current.config.minFree === undefined
+      ? 0
+      : Math.max(0, current.config.minFree - occupancy.reduce((sum, member) => sum + member.free, 0));
+    if (needed === 0) return { created: 0 };
+    const newSize = members.length + needed;
+    const warned = newSize > current.config.maxSize
+      ? `pool ${current.pool} pre-extend exceeds maxSize: ${newSize}/${current.config.maxSize} — consider cleaning or raising maxSize`
+      : undefined;
+    const created = await extend(current.repoPath, current.pool, needed);
+    return { created: created.length, ...(warned ? { warned } : {}) };
+  });
 
   return async (records, currentStates) => {
     const nowMs = now();
@@ -227,15 +273,19 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
 
     for (const pool of pools) {
       const outcome: PoolSweepOutcome = { pool: pool.key };
+      let scheduleExtend = false;
+      let scheduledPool = pool;
       try {
         // Member canonicalization is another observation barrier: a lexical
         // symlink spelling can hide an occupant whose SessionRecord.cwd is a
         // realpath. Resolve it before claim GC or any checkout mutation.
-        const canonicalMembers = await canonicalizeMembers(pool.members);
         // The decision and every checkout mutation share the allocator's pool
         // lock. Otherwise a claim/park could land after this occupancy read but
         // before sync, letting refresh-on-vacate rewrite a newly owned member.
         await withPoolLock(pool.key, async () => {
+          const current = await refreshPool(pool);
+          scheduledPool = current;
+          const canonicalMembers = await canonicalizeMembers(current.members);
           // (a) claim GC.
           const record = await loadPoolRecord(pool.key);
           if (record) {
@@ -249,25 +299,25 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
 
           const occupancy = deriveMemberOccupancy({
             members: canonicalMembers,
-            config: pool.config,
+            config: current.config,
             claims: record?.claims ?? [],
             parked: record?.parked ?? [],
             liveBees,
             now: nowMs,
           });
-          const view = memberSweepView(occupancy, pool.config.branch);
+          const view = memberSweepView(occupancy, current.config.branch);
           const plan = planPoolSweep({
             members: view,
             previousOccupied: previousOccupied.get(pool.key),
-            ...(pool.config.minFree !== undefined ? { minFree: pool.config.minFree } : {}),
+            ...(current.config.minFree !== undefined ? { minFree: current.config.minFree } : {}),
           });
 
           // (b) refresh-on-vacate.
           if (plan.syncMembers.length > 0) {
-            const names = plan.syncMembers.map((n) => `${pool.repo}:${pool.pool}-${n}`);
-            const result = await sync(pool.repoPath, names);
+            const names = plan.syncMembers.map((n) => `${current.repo}:${current.pool}-${n}`);
+            const result = await sync(current.repoPath, names);
             outcome.synced = result.rows.map((row) => ({
-              member: memberNumberFromPath(row.path, pool.pool),
+              member: memberNumberFromPath(row.path, current.pool),
               status: row.status,
             }));
           }
@@ -280,7 +330,7 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
             if (nudged.has(dedupe)) continue;
             nudged.add(dedupe);
             const nudgedParent = await nudgeDepartedBeeParent({
-              pool,
+              pool: current,
               member: flag.member,
               reason: flag.reason,
               departedNames: (prevOccupants?.get(flag.member) ?? []).filter(
@@ -311,18 +361,10 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
             settledExtends.delete(pool.key);
             if (settled.error !== undefined) outcome.error = `pre-extend failed: ${settled.error}`;
             else if (settled.created !== undefined) outcome.extended = settled.created;
+            if (settled.warned !== undefined) outcome.warned = settled.warned;
           }
-          if (plan.extendBy > 0 && !inFlightExtends.has(pool.key)) {
-            const newSize = canonicalMembers.length + plan.extendBy;
-            if (newSize > pool.config.maxSize) {
-              outcome.warned = `pool ${pool.pool} pre-extend exceeds maxSize: ${newSize}/${pool.config.maxSize} — consider cleaning or raising maxSize`;
-            }
-            const pending = extend(pool.repoPath, pool.pool, plan.extendBy);
-            inFlightExtends.set(pool.key, pending);
-            void pending
-              .then((created) => settledExtends.set(pool.key, { created: created.length }))
-              .catch((error: unknown) => settledExtends.set(pool.key, { error: error instanceof Error ? error.message : String(error) }))
-              .finally(() => inFlightExtends.delete(pool.key));
+          if (!settled && plan.extendBy > 0 && !inFlightExtends.has(pool.key)) {
+            scheduleExtend = true;
             outcome.extendStarted = plan.extendBy;
           }
 
@@ -332,6 +374,34 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
             new Map(occupancy.map((member) => [member.n, member.occupants])),
           );
         });
+        // Start only after the decision lock above has been released. Starting
+        // this job from inside it would recursively wait on the same file lock.
+        if (scheduleExtend && !inFlightExtends.has(pool.key)) {
+          let resolvePending!: (result: BackgroundExtendResult) => void;
+          let rejectPending!: (error: unknown) => void;
+          const pending = new Promise<BackgroundExtendResult>((resolve, reject) => {
+            resolvePending = resolve;
+            rejectPending = reject;
+          });
+          inFlightExtends.set(pool.key, pending);
+          void pending
+            .then((result) => settledExtends.set(pool.key, result))
+            .catch((error: unknown) => settledExtends.set(pool.key, {
+              error: error instanceof Error ? error.message : String(error),
+            }))
+            .finally(() => inFlightExtends.delete(pool.key));
+          try {
+            startBackground(async () => {
+              try {
+                resolvePending(await runBackgroundExtend(scheduledPool, records, currentStates));
+              } catch (error) {
+                rejectPending(error);
+              }
+            });
+          } catch (error) {
+            rejectPending(error);
+          }
+        }
       } catch (error) {
         outcome.error = error instanceof Error ? error.message : String(error);
       }
