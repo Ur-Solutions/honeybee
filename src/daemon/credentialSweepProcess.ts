@@ -14,6 +14,12 @@ import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { storeRoot } from "../fsx.js";
+import {
+  inspectProcessBirth,
+  readProcessBirthFingerprint,
+  type ProcessBirthFingerprint,
+  type ProcessIdentityReader,
+} from "../hsr/processIdentity.js";
 import { readFileLockIdentity, removeFileLockIfOwner, type FileLockOwnerIdentity } from "../lock.js";
 import { runCredentialPairSync, runCredentialSweep, type CredentialSweepProgress, type CredentialSweepTelemetry } from "./credentialSweep.js";
 import { envMs } from "./timeouts.js";
@@ -96,6 +102,7 @@ export type IsolatedCredentialSweeperOptions = {
   request?: (id: number, root: string) => CredentialSweepRequest;
   signalProcessGroup?: (pgid: number, signal: NodeJS.Signals) => void;
   isProcessGroupAlive?: (pgid: number) => boolean;
+  readProcessIdentity?: ProcessIdentityReader;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -188,6 +195,7 @@ export async function reapCredentialWorkerLocks(
 type PendingRequest = {
   id: number;
   target: CredentialSweepChild;
+  fingerprint?: ProcessBirthFingerprint;
   startedAt: number;
   telemetry: CredentialSweepTelemetry;
   activeWork: Map<number, number[]>;
@@ -217,12 +225,21 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
       return (error as NodeJS.ErrnoException).code === "EPERM";
     }
   });
+  const readProcessIdentity = options.readProcessIdentity ?? readProcessBirthFingerprint;
   const pause = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let child: CredentialSweepChild | null = null;
+  let childFingerprint: Promise<ProcessBirthFingerprint | undefined> | null = null;
   let nextId = 1;
   let pending: PendingRequest | null = null;
-  let terminating: Promise<boolean> | null = null;
-  let unconfirmedGroup: { pgid: number; workerPid: number; root: string; unconfirmable?: boolean } | null = null;
+  type WorkerTermination = { confirmed: boolean; identityCompromised: boolean };
+  let terminating: Promise<WorkerTermination> | null = null;
+  let unconfirmedGroup: {
+    pgid: number;
+    workerPid: number;
+    root: string;
+    fingerprint?: ProcessBirthFingerprint;
+    unconfirmable?: boolean;
+  } | null = null;
 
   const waitForGroupExit = async (pgid: number, ms: number): Promise<boolean> => {
     const deadline = Date.now() + ms;
@@ -230,16 +247,49 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
     return !isProcessGroupAlive(pgid);
   };
 
-  /** TERM -> bounded grace -> KILL -> bounded confirmation, then lock reap. */
-  const terminateWorkerGroup = async (target: CredentialSweepChild, requestRoot: string, reapLocks: boolean): Promise<boolean> => {
+  const captureWorkerFingerprint = async (pid: number | undefined): Promise<ProcessBirthFingerprint | undefined> => {
+    if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+    try {
+      return (await readProcessIdentity(pid)) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  type ExactGroupStopProof = "confirmed" | "still-owned" | "identity-compromised";
+
+  const exactGroupStopProof = async (
+    pid: number,
+    fingerprint: ProcessBirthFingerprint | undefined,
+  ): Promise<ExactGroupStopProof> => {
+    const identity = await inspectProcessBirth(pid, fingerprint, readProcessIdentity);
+    // A mismatch is a live replacement, not proof that it is safe to reap a
+    // lock carrying the same recycled numeric pid. Missing identity likewise
+    // fails closed. Only absence plus absence of the whole group confirms stop.
+    if (identity === "gone" && !isProcessGroupAlive(pid)) return "confirmed";
+    if (identity === "match" && isProcessGroupAlive(pid)) return "still-owned";
+    return "identity-compromised";
+  };
+
+  /** Birth-fenced TERM -> bounded grace -> birth-fenced KILL -> confirmation. */
+  const terminateWorkerGroup = async (
+    target: CredentialSweepChild,
+    fingerprint: ProcessBirthFingerprint | undefined,
+    requestRoot: string,
+    reapLocks: boolean,
+  ): Promise<WorkerTermination> => {
+    const failed = (identityCompromised: boolean): WorkerTermination => ({ confirmed: false, identityCompromised });
+    const confirmed: WorkerTermination = { confirmed: true, identityCompromised: false };
     const pid = target.pid;
     if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) {
-      try {
-        target.kill("SIGKILL");
-      } catch {
-        // No pid means descendants cannot be addressed or confirmed.
+      if (!processGroupsSupported) {
+        try {
+          target.kill("SIGKILL");
+        } catch {
+          // No portable descendant-tree confirmation exists on this platform.
+        }
       }
-      return false;
+      return failed(true);
     }
     if (!processGroupsSupported) {
       // Node has no descendant-tree termination primitive on Windows. Kill the
@@ -251,26 +301,37 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
         // already gone
       }
       await pause(killGraceMs);
-      return false;
+      return failed(true);
     }
-    if (isProcessGroupAlive(pid)) {
-      try {
-        signalProcessGroup(pid, "SIGTERM");
-      } catch {
-        // Re-probe below: ESRCH is success, EPERM remains live/unconfirmed.
-      }
-      if (!(await waitForGroupExit(pid, killGraceMs))) {
-        try {
-          signalProcessGroup(pid, "SIGKILL");
-        } catch {
-          // Re-probe below.
-        }
-      }
+    const beforeTerm = await inspectProcessBirth(pid, fingerprint, readProcessIdentity);
+    if (beforeTerm === "gone" && !isProcessGroupAlive(pid)) {
+      if (reapLocks) await cleanupLocks(requestRoot, pid).catch(() => undefined);
+      return confirmed;
     }
-    const confirmed = await waitForGroupExit(pid, killGraceMs);
-    if (!confirmed) return false;
+    if (beforeTerm !== "match" || !isProcessGroupAlive(pid)) return failed(true);
+    try {
+      signalProcessGroup(pid, "SIGTERM");
+    } catch {
+      // Re-probe below: ESRCH can be success; EPERM stays unconfirmed.
+    }
+    if (await waitForGroupExit(pid, killGraceMs)) {
+      const proof = await exactGroupStopProof(pid, fingerprint);
+      if (proof === "confirmed" && reapLocks) await cleanupLocks(requestRoot, pid).catch(() => undefined);
+      return proof === "confirmed" ? confirmed : failed(true);
+    }
+    // PID/PGID reuse during the TERM grace must never escalate against the
+    // replacement. Re-read the exact worker birth immediately before KILL.
+    if ((await inspectProcessBirth(pid, fingerprint, readProcessIdentity)) !== "match") return failed(true);
+    try {
+      signalProcessGroup(pid, "SIGKILL");
+    } catch {
+      // Re-probe below.
+    }
+    await waitForGroupExit(pid, killGraceMs);
+    const proof = await exactGroupStopProof(pid, fingerprint);
+    if (proof !== "confirmed") return failed(proof === "identity-compromised");
     if (reapLocks) await cleanupLocks(requestRoot, pid).catch(() => undefined);
-    return true;
+    return confirmed;
   };
 
   const rejectPending = (reason: string): void => {
@@ -322,28 +383,37 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
     wire.scanOffset = wire.buffer.length;
   };
 
-  const ensureChild = (): CredentialSweepChild => {
-    if (child) return child;
+  const ensureChild = async (): Promise<{ target: CredentialSweepChild; fingerprint?: ProcessBirthFingerprint }> => {
+    if (child) {
+      const target = child;
+      const fingerprint = await childFingerprint;
+      if (child !== target) throw new Error("credential sweep child exited during identity capture");
+      return { target, ...(fingerprint ? { fingerprint } : {}) };
+    }
     const spawned = spawnChild();
     const wire: ChildWireState = { buffer: "", scanOffset: 0, decoder: new StringDecoder("utf8") };
     spawned.on("exit", () => {
       if (child !== spawned) return;
       child = null;
+      childFingerprint = null;
       rejectPending("credential sweep child exited");
     });
     spawned.on("error", (error: unknown) => {
       if (child !== spawned) return;
       child = null;
+      childFingerprint = null;
       rejectPending(`credential sweep child error: ${error instanceof Error ? error.message : String(error)}`);
     });
     spawned.stdin.on("error", () => {
       if (child !== spawned) return;
       child = null;
+      childFingerprint = null;
       rejectPending("credential sweep child stdin error");
     });
     spawned.stdout.on("error", () => {
       if (child !== spawned) return;
       child = null;
+      childFingerprint = null;
       rejectPending("credential sweep child stdout error");
     });
     spawned.stdout.on("data", (chunk: Buffer | string) => {
@@ -351,20 +421,27 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
       ingestResponseText(spawned, wire, typeof chunk === "string" ? chunk : wire.decoder.write(chunk));
     });
     child = spawned;
-    return spawned;
+    childFingerprint = captureWorkerFingerprint(spawned.pid);
+    const fingerprint = childFingerprint ? await childFingerprint : undefined;
+    if (child !== spawned) throw new Error("credential sweep child exited during identity capture");
+    return { target: spawned, ...(fingerprint ? { fingerprint } : {}) };
   };
 
   const sweep = async (): Promise<CredentialSweepTelemetry> => {
     if (terminating) await terminating;
     if (unconfirmedGroup) {
-      if (unconfirmedGroup.unconfirmable || isProcessGroupAlive(unconfirmedGroup.pgid)) {
-        throw new Error(`credential sweep disabled: previous worker process group ${unconfirmedGroup.pgid} is still live`);
+      const proof = unconfirmedGroup.unconfirmable
+        ? "identity-compromised"
+        : await exactGroupStopProof(unconfirmedGroup.workerPid, unconfirmedGroup.fingerprint);
+      if (proof !== "confirmed") {
+        throw new Error(`credential sweep disabled: previous worker process group ${unconfirmedGroup.pgid} has not been confirmed stopped`);
       }
       await cleanupLocks(unconfirmedGroup.root, unconfirmedGroup.workerPid).catch(() => undefined);
       unconfirmedGroup = null;
     }
     if (pending) throw new Error("credential sweep already in flight");
-    const target = ensureChild();
+    const { target, fingerprint } = await ensureChild();
+    if (pending) throw new Error("credential sweep already in flight");
     const id = nextId++;
     return new Promise<CredentialSweepTelemetry>((resolveRequest, rejectRequest) => {
       const startedAt = now();
@@ -375,7 +452,10 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
         // structured timeout with a generic child-exited error.
         clearTimeout(current.timer);
         pending = null;
-        if (child === target) child = null;
+        if (child === target) {
+          child = null;
+          childFingerprint = null;
+        }
         const activePairIds = new Set([...current.activeWork.values()].flat());
         const telemetry: CredentialSweepTelemetry = {
           ...current.telemetry,
@@ -383,18 +463,19 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
           timedOutPairs: activePairIds.size,
         };
         const requestRoot = root();
-        const termination = terminateWorkerGroup(target, requestRoot, true);
+        const termination = terminateWorkerGroup(target, current.fingerprint, requestRoot, true);
         terminating = termination;
-        void termination.then((confirmed) => {
-          if (!confirmed && target.pid !== undefined) {
+        void termination.then((result) => {
+          if (!result.confirmed && target.pid !== undefined) {
             unconfirmedGroup = {
               pgid: target.pid,
               workerPid: target.pid,
               root: requestRoot,
-              ...(!processGroupsSupported ? { unconfirmable: true } : {}),
+              ...(current.fingerprint ? { fingerprint: current.fingerprint } : {}),
+              ...(!processGroupsSupported || result.identityCompromised ? { unconfirmable: true } : {}),
             };
           }
-          current.reject(new CredentialSweepTimeoutError(timeoutMs, telemetry, confirmed));
+          current.reject(new CredentialSweepTimeoutError(timeoutMs, telemetry, result.confirmed));
         }).finally(() => {
           if (terminating === termination) terminating = null;
         });
@@ -402,6 +483,7 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
       pending = {
         id,
         target,
+        ...(fingerprint ? { fingerprint } : {}),
         startedAt,
         telemetry: emptyTelemetry(),
         activeWork: new Map(),
@@ -423,11 +505,13 @@ export function createIsolatedCredentialSweeper(options: IsolatedCredentialSweep
   const close = async (): Promise<void> => {
     if (terminating) await terminating;
     const current = child;
+    const fingerprint = childFingerprint ? await childFingerprint : undefined;
     const hadPending = pending !== null;
     child = null;
+    childFingerprint = null;
     rejectPending("credential sweep child closed");
     if (!current) return;
-    await terminateWorkerGroup(current, root(), hadPending);
+    await terminateWorkerGroup(current, fingerprint, root(), hadPending);
   };
 
   return Object.assign(sweep, { close });

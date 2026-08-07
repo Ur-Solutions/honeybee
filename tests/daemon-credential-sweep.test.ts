@@ -30,6 +30,7 @@ import {
   type CredentialSweepChild,
 } from "../src/daemon/credentialSweepProcess.js";
 import { createCredentialSyncController } from "../src/daemon/credentialSyncController.js";
+import type { ProcessBirthFingerprint, ProcessIdentityReader } from "../src/hsr/processIdentity.js";
 import type { SessionRecord } from "../src/store.js";
 
 function account(id: string): AccountRecord {
@@ -492,6 +493,14 @@ function fakeChild(
   return child;
 }
 
+function fakeWorkerFingerprint(pid: number): ProcessBirthFingerprint {
+  return { pgid: pid, startedAt: `Mon Aug  7 10:00:${String(pid % 60).padStart(2, "0")} 2026` };
+}
+
+function fakeWorkerIdentityReader(children: Map<number, FakeChild>): ProcessIdentityReader {
+  return async (pid) => children.get(pid)?.alive ? fakeWorkerFingerprint(pid) : null;
+}
+
 test("isolated credential sweep kills a never-settling sync, releases its account lock, and the next run recovers", async () => {
   await withTempStore(async (root) => {
     const workerPid = 424_242;
@@ -517,6 +526,7 @@ test("isolated credential sweep kills a never-settling sync, releases its accoun
       spawnChild: () => (++spawns === 1 ? wedged : healthy),
       signalProcessGroup: (pgid, signal) => children.get(pgid)?.kill(signal),
       isProcessGroupAlive: (pgid) => children.get(pgid)?.alive ?? false,
+      readProcessIdentity: fakeWorkerIdentityReader(children),
     });
 
     await assert.rejects(
@@ -652,11 +662,13 @@ test("late partial stdout from a timed-out worker cannot corrupt its replacement
       spawnChild: () => (++spawns === 1 ? stale : healthy),
       signalProcessGroup: (pgid, signal) => children.get(pgid)?.kill(signal),
       isProcessGroupAlive: (pgid) => children.get(pgid)?.alive ?? false,
+      readProcessIdentity: fakeWorkerIdentityReader(children),
     });
 
     try {
       await assert.rejects(() => sweep(), CredentialSweepTimeoutError);
       const recovered = sweep();
+      await new Promise((resolveReady) => setImmediate(resolveReady));
       assert.ok(healthyReply, "replacement received its request");
 
       // The stale generation publishes an unterminated JSON prefix after it
@@ -666,6 +678,130 @@ test("late partial stdout from a timed-out worker cannot corrupt its replacement
       healthyReply();
       assert.deepEqual(await recovered, expected);
       assert.equal(spawns, 2);
+    } finally {
+      await sweep.close().catch(() => undefined);
+    }
+  });
+});
+
+test("credential sweep timeout never signals or reaps after worker PID reuse before TERM", async () => {
+  await withTempStore(async (root) => {
+    const pid = 425_100;
+    const worker = fakeChild(pid, () => undefined, { ignoreSigterm: true });
+    const recorded = fakeWorkerFingerprint(pid);
+    const replacement = { ...recorded, startedAt: "Mon Aug  7 10:05:00 2026" };
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    let identityReads = 0;
+    let lockReaps = 0;
+    const sweep = createIsolatedCredentialSweeper({
+      timeoutMs: 20,
+      killGraceMs: 5,
+      root: () => root,
+      spawnChild: () => worker,
+      readProcessIdentity: async () => (++identityReads === 1 ? recorded : replacement),
+      signalProcessGroup: (pgid, signal) => signals.push([pgid, signal]),
+      isProcessGroupAlive: () => true,
+      cleanupLocks: async () => {
+        lockReaps += 1;
+        return 1;
+      },
+    });
+
+    try {
+      await assert.rejects(
+        () => sweep(),
+        (error: unknown) => {
+          assert.ok(error instanceof CredentialSweepTimeoutError);
+          assert.equal(error.terminationConfirmed, false);
+          return true;
+        },
+      );
+      assert.deepEqual(signals, [], "the replacement incarnation is not sent TERM or KILL");
+      assert.equal(lockReaps, 0, "a recycled worker pid never authorizes lock cleanup");
+      await assert.rejects(() => sweep(), /has not been confirmed stopped/);
+      assert.equal(lockReaps, 0, "later reconciliation cannot reap by the compromised numeric pid");
+    } finally {
+      await sweep.close().catch(() => undefined);
+    }
+  });
+});
+
+test("credential sweep timeout fails closed when worker birth identity is unverifiable", async () => {
+  await withTempStore(async (root) => {
+    const pid = 425_150;
+    const worker = fakeChild(pid, () => undefined, { ignoreSigterm: true });
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    let lockReaps = 0;
+    const sweep = createIsolatedCredentialSweeper({
+      timeoutMs: 20,
+      killGraceMs: 5,
+      root: () => root,
+      spawnChild: () => worker,
+      readProcessIdentity: async () => null,
+      signalProcessGroup: (pgid, signal) => signals.push([pgid, signal]),
+      isProcessGroupAlive: () => true,
+      cleanupLocks: async () => {
+        lockReaps += 1;
+        return 1;
+      },
+    });
+
+    try {
+      await assert.rejects(
+        () => sweep(),
+        (error: unknown) => {
+          assert.ok(error instanceof CredentialSweepTimeoutError);
+          assert.equal(error.terminationConfirmed, false);
+          return true;
+        },
+      );
+      assert.deepEqual(signals, []);
+      assert.equal(lockReaps, 0);
+      await assert.rejects(() => sweep(), /has not been confirmed stopped/);
+      assert.equal(lockReaps, 0);
+    } finally {
+      await sweep.close().catch(() => undefined);
+    }
+  });
+});
+
+test("credential sweep timeout never SIGKILLs or reaps a replacement born during TERM grace", async () => {
+  await withTempStore(async (root) => {
+    const pid = 425_200;
+    const worker = fakeChild(pid, () => undefined, { ignoreSigterm: true });
+    const recorded = fakeWorkerFingerprint(pid);
+    const replacement = { ...recorded, startedAt: "Mon Aug  7 10:06:00 2026" };
+    const signals: Array<[number, NodeJS.Signals]> = [];
+    let identityReads = 0;
+    let lockReaps = 0;
+    const sweep = createIsolatedCredentialSweeper({
+      timeoutMs: 20,
+      killGraceMs: 5,
+      root: () => root,
+      spawnChild: () => worker,
+      // capture, pre-TERM revalidation, then the replacement before KILL
+      readProcessIdentity: async () => (++identityReads <= 2 ? recorded : replacement),
+      signalProcessGroup: (pgid, signal) => signals.push([pgid, signal]),
+      isProcessGroupAlive: () => true,
+      cleanupLocks: async () => {
+        lockReaps += 1;
+        return 1;
+      },
+    });
+
+    try {
+      await assert.rejects(
+        () => sweep(),
+        (error: unknown) => {
+          assert.ok(error instanceof CredentialSweepTimeoutError);
+          assert.equal(error.terminationConfirmed, false);
+          return true;
+        },
+      );
+      assert.deepEqual(signals, [[pid, "SIGTERM"]], "the replacement is never escalated to SIGKILL");
+      assert.equal(lockReaps, 0, "replacement detection keeps worker-owned locks fenced");
+      await assert.rejects(() => sweep(), /has not been confirmed stopped/);
+      assert.equal(lockReaps, 0, "a replacement observed during grace permanently fences numeric lock reaping");
     } finally {
       await sweep.close().catch(() => undefined);
     }
