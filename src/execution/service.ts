@@ -7,7 +7,11 @@
 // coordinator itself never resolves a cwd and never falls back to a CLI after
 // admission — if the launcher cannot satisfy the leased placement it throws a
 // typed error and the Run fails with that cause.
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import type { JsonValue } from "../comb/types.js";
+import { captureProcessBirthFingerprint, inspectProcessBirth } from "../hsr/processIdentity.js";
+import type { SpawnedRuntimeHandle } from "../spawnRuntime.js";
 import {
   computeSchemaDigest,
   createExecutionValidator,
@@ -37,12 +41,15 @@ import {
   acceptedCursorResetThroughSeq,
   appendRunEvents,
   appendRunTerminalEvents,
+  claimRunLaunchAttempt,
   classifyLaunch,
   clearLossEpisode,
+  commitRunLaunchStarted,
   commitRunTerminalResult,
   enterLossEpisode,
   ensureRunAcceptedFirst,
   lossEpisodePayload,
+  launchAttemptOwns,
   mutateReservation,
   readReservation,
   readRunEvents,
@@ -50,6 +57,8 @@ import {
   type RunEnvironmentFacts,
   type RunEventInput,
   type RunReservation,
+  type RunLaunchOwner,
+  type RunLaunchOwnerStatus,
   type StoredRunEvent,
 } from "./runStore.js";
 import { assertLeaseWindow, validateRunStart } from "./runStart.js";
@@ -79,6 +88,8 @@ export type RunLaunchResult = {
   /** Provider session reference (bee id / provider session id) once known. */
   sessionRef: string;
   environment: RunEnvironmentFacts;
+  /** Exact launched incarnation, used if this attempt loses its commit CAS. */
+  runtime?: SpawnedRuntimeHandle;
 };
 
 /**
@@ -107,6 +118,14 @@ export type ExecutionServiceOptions = {
   harnessProbe?: HarnessProbe;
   verifySignature?: SignatureVerifier;
   now?: () => Date;
+  /** Durable launch-owner identity and liveness seams (deterministic tests). */
+  launchOwner?: RunLaunchOwner;
+  inspectLaunchOwner?: (owner: RunLaunchOwner) => Promise<RunLaunchOwnerStatus>;
+  /** Test barrier after durable admission but before launch ownership claim. */
+  afterAdmission?: (reservation: RunReservation) => void | Promise<void>;
+  /** Test barrier after claim; production leaves this absent. */
+  afterLaunchClaim?: (reservation: RunReservation, attemptId: string) => void | Promise<void>;
+  /** @deprecated Elapsed time no longer grants launch authority. */
   launchGraceMs?: number;
 };
 
@@ -145,6 +164,27 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     return { stopped: result.ok, detail: result.ok ? "HSR stop confirmed" : result.stderr || "HSR stop unconfirmed" };
   });
   const inFlight = new Map<string, Promise<void>>();
+  let launchOwnerPromise: Promise<RunLaunchOwner> | undefined;
+  const launchOwner = (): Promise<RunLaunchOwner> => (launchOwnerPromise ??= (async () => {
+    if (options.launchOwner) return options.launchOwner;
+    const processFingerprint = await captureProcessBirthFingerprint(process.pid);
+    if (!processFingerprint) {
+      throw executionError("AUTHORITY_UNAVAILABLE", "cannot durably claim run.start: coordinator process birth identity is unavailable");
+    }
+    return {
+      ownerId: randomUUID(),
+      pid: process.pid,
+      hostname: hostname(),
+      processFingerprint,
+    };
+  })());
+  const inspectLaunchOwner = options.inspectLaunchOwner ?? (async (owner: RunLaunchOwner): Promise<RunLaunchOwnerStatus> => {
+    if (owner.hostname !== hostname()) return "unverifiable";
+    const verdict = await inspectProcessBirth(owner.pid, owner.processFingerprint);
+    if (verdict === "match") return "alive";
+    if (verdict === "gone" || verdict === "mismatch") return "dead";
+    return "unverifiable";
+  });
 
   let identityPromise: Promise<ExecutionNodeIdentity> | undefined;
   const identity = (): Promise<ExecutionNodeIdentity> => (identityPromise ??= loadNodeIdentity());
@@ -347,15 +387,61 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     return reservation.initiator?.kind === "agent" ? reservation.initiator.id : undefined;
   }
 
-  /** Run the launcher for a reservation this caller owns. Never throws. */
-  async function launch(reservation: RunReservation, lease: JsonObject): Promise<void> {
+  async function markLaunchLost(runId: string, error: IndeterminateExecutionError, wire = toWireError(error)): Promise<void> {
+    const lost = await mutateReservation(runId, (current) =>
+      enterLossEpisode(
+        { ...current, failureCause: current.failureCause ?? `${wire.code}: ${wire.message}` },
+        error.cause,
+        now().toISOString(),
+      ),
+    );
+    await appendRunEvents(
+      runId,
+      protocolVersion,
+      [{
+        type: "run.lost",
+        payload: lossEpisodePayload(lost, {
+          cause: error.cause,
+          ...(error.details !== undefined ? { detail: error.details } : {}),
+        }),
+        origin: await origin(),
+      }],
+      { onlyIfAbsentKeys: true },
+    );
+  }
+
+  async function cleanupUncommittedLaunch(
+    result: RunLaunchResult,
+    cause: string,
+    indeterminateCause = "launch_commit_cleanup_unconfirmed",
+  ): Promise<void> {
+    let stopped = false;
+    let detail = "launcher returned no exact runtime cleanup handle";
+    if (result.runtime) {
+      try {
+        const cleanup = await result.runtime.stop();
+        stopped = cleanup.stopped;
+        detail = cleanup.detail;
+      } catch (error) {
+        detail = error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (!stopped) {
+      throw indeterminateExecutionError(
+        "HARNESS_UNAVAILABLE",
+        `launched runtime could not commit ${cause} and exact cleanup was unconfirmed`,
+        indeterminateCause,
+        { detail, ...(result.runtime ? { runtime: result.runtime.identity } : {}) },
+      );
+    }
+  }
+
+  /** Run the launcher only for the exact durable attempt this service claimed. */
+  async function launch(reservation: RunReservation, lease: JsonObject, attemptId: string): Promise<void> {
     const runId = reservation.runId;
+    const existing = inFlight.get(runId);
+    if (existing) return existing;
     const attempt = (async () => {
-      await mutateReservation(runId, (current) => ({
-        ...current,
-        phase: "launching",
-        launchAttemptedAt: now().toISOString(),
-      }));
       await appendRunEvents(
         runId,
         protocolVersion,
@@ -375,19 +461,34 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           ...(spawnedById ? { spawnedById } : {}),
         });
         if (!result.sessionRef) {
-          throw indeterminateExecutionError(
-            "HARNESS_UNAVAILABLE",
-            "harness reached readiness without a canonical session reference",
-            "session_ref_missing",
-          );
+          await cleanupUncommittedLaunch(result, "without a canonical session reference", "session_ref_missing");
+          throw executionError("HARNESS_UNAVAILABLE", "harness reached readiness without a canonical session reference; exact cleanup confirmed");
         }
-        await mutateReservation(runId, (current) => ({
-          ...current,
-          phase: "started",
-          startedAt: now().toISOString(),
-          sessionRef: result.sessionRef,
-          environment: result.environment,
-        }));
+        const started = await commitRunLaunchStarted(
+          runId,
+          attemptId,
+          { sessionRef: result.sessionRef, environment: result.environment },
+          { now },
+        );
+        if (!started.committed) {
+          // A terminal decision or a different launch-attempt token won while
+          // the non-deduplicating launcher was in flight. Never overwrite it;
+          // tear down only the concrete incarnation returned by this attempt.
+          await cleanupUncommittedLaunch(
+            result,
+            "because launch ownership was lost",
+            started.reservation.cancel ? "cancel_stop_unconfirmed" : "launch_commit_cleanup_unconfirmed",
+          );
+          const settled = started.reservation.cancel && !started.reservation.result
+            ? await commitRunTerminalResult(
+                runId,
+                { outcome: "cancelled", cause: "cancel_requested" },
+                { now, canCommit: (record) => launchAttemptOwns(record, attemptId) && record.cancel !== undefined },
+              )
+            : started.reservation;
+          await appendRunTerminalEvents(settled, protocolVersion, await origin());
+          return;
+        }
         await appendRunEvents(
           runId,
           protocolVersion,
@@ -414,7 +515,12 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           let stopConfirmed = false;
           let detail = "";
           try {
-            const stop = await control.stop(reservation.beeName);
+            // Prefer the launcher-returned incarnation handle while it is
+            // available. The bound control path remains the compatibility
+            // fallback for injected launchers that predate exact handles.
+            const stop = result.runtime
+              ? await result.runtime.stop()
+              : await control.stop(reservation.beeName);
             stopConfirmed = stop.stopped;
             detail = stop.detail;
           } catch (error) {
@@ -452,39 +558,14 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       } catch (error) {
         const wire = toWireError(error);
         if (error instanceof IndeterminateExecutionError) {
-          const lost = await mutateReservation(runId, (current) =>
-            current.result
-              ? current
-              : enterLossEpisode(
-                  { ...current, failureCause: current.failureCause ?? `${wire.code}: ${wire.message}` },
-                  error.cause,
-                  now().toISOString(),
-                ),
-          );
-          if (lost.result) {
-            await appendRunTerminalEvents(lost, protocolVersion, await origin());
-          } else {
-            await appendRunEvents(
-              runId,
-              protocolVersion,
-              [{
-                type: "run.lost",
-                payload: lossEpisodePayload(lost, {
-                  cause: error.cause,
-                  ...(error.details !== undefined ? { detail: error.details } : {}),
-                }),
-                origin: await origin(),
-              }],
-              { onlyIfAbsentKeys: true },
-            );
-          }
+          await markLaunchLost(runId, error, wire);
           return;
         }
         const cause = `${wire.code}: ${wire.message}`;
         const failed = await commitRunTerminalResult(
           runId,
           { outcome: "failed", cause, failureCause: cause },
-          { now },
+          { now, canCommit: (record) => launchAttemptOwns(record, attemptId) },
         );
         await appendRunTerminalEvents(failed, protocolVersion, await origin());
       }
@@ -495,6 +576,40 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     } finally {
       if (inFlight.get(runId) === attempt) inFlight.delete(runId);
     }
+  }
+
+  /** Claim/continue one launch; only the atomic claim winner calls launcher. */
+  async function continueLaunch(reservation: RunReservation, lease: JsonObject): Promise<RunReservation> {
+    const claim = await claimRunLaunchAttempt(reservation.runId, await launchOwner(), {
+      now,
+      inspectOwner: inspectLaunchOwner,
+      evidence: () => options.sessions.evidence(reservation.beeName),
+    });
+    if (!claim.claimed || !claim.attemptId) return claim.reservation;
+    await options.afterLaunchClaim?.(claim.reservation, claim.attemptId);
+    const fresh = await readReservation(claim.reservation.runId);
+    if (!fresh || !launchAttemptOwns(fresh, claim.attemptId)) return fresh ?? claim.reservation;
+    if (Date.parse(fresh.leaseExpiresAt) < now().getTime()) {
+      const failureCause = "LEASE_DENIED: lease expired before the reserved launch could start";
+      const failed = await commitRunTerminalResult(
+        fresh.runId,
+        { outcome: "failed", cause: "lease_expired", failureCause },
+        { now, canCommit: (record) => launchAttemptOwns(record, claim.attemptId!) },
+      );
+      await appendRunTerminalEvents(failed, protocolVersion, await origin());
+      return failed;
+    }
+    if (fresh.cancel) {
+      const cancelled = await commitRunTerminalResult(
+        fresh.runId,
+        { outcome: "cancelled", cause: "cancel_requested" },
+        { now, canCommit: (record) => launchAttemptOwns(record, claim.attemptId!) },
+      );
+      await appendRunTerminalEvents(cancelled, protocolVersion, await origin());
+      return cancelled;
+    }
+    await launch(fresh, lease, claim.attemptId);
+    return (await readReservation(fresh.runId))!;
   }
 
   /**
@@ -660,6 +775,40 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       }
     }
     await ensureStartedReceipts(current);
+    if (
+      current.phase === "launching" &&
+      current.cancel &&
+      !current.result &&
+      current.indeterminateCause === "cancel_stop_unconfirmed"
+    ) {
+      // The launcher lost its started CAS to cancellation and its first exact
+      // stop was unconfirmed. A later proven process exit (or strict stop of
+      // the still-bound HSR execution) is enough to resolve cancellation; no
+      // second launch is ever admitted while this owner token remains.
+      const outcome = await options.sessions.outcome(current.beeName);
+      let stopConfirmed = Boolean(outcome && !outcome.live);
+      if (outcome?.live) {
+        try {
+          stopConfirmed = (await stopKnownExecution(current.beeName)).stopped;
+        } catch {
+          stopConfirmed = false;
+        }
+      }
+      if (stopConfirmed) {
+        await beginLostRecovery(current, ["run-identity", "process-stop"]);
+        const attemptId = current.launchAttempt?.attemptId;
+        current = await commitRunTerminalResult(
+          current.runId,
+          { outcome: "cancelled", cause: "cancel_requested" },
+          {
+            now,
+            clearIndeterminate: true,
+            canCommit: (record) => !!attemptId && launchAttemptOwns(record, attemptId) && record.cancel !== undefined,
+          },
+        );
+        await appendRunTerminalEvents(current, protocolVersion, await origin());
+      }
+    }
     const leaseExpired = Date.parse(current.leaseExpiresAt) < now().getTime();
     const terminalCancelStopDoubt =
       current.result?.outcome === "cancelled" && current.indeterminateCause === "cancel_stop_unconfirmed";
@@ -979,34 +1128,18 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // materialize, reconcile, or terminalize anything downstream.
       await ensureAcceptedReceipt(reservation);
       if (created) {
-        await launch(reservation, validated.lease);
+        await options.afterAdmission?.(reservation);
+        await continueLaunch(reservation, validated.lease);
         const settled = await reconcile((await readReservation(reservation.runId))!);
         return effectResponse(requestId, settled, "created", deriveState(settled, inFlight.has(settled.runId)).state);
       }
-      // Identical retry: replay the original receipt; continue the effect only
-      // when the durable evidence proves the launch never started.
+      // Identical retry: replay the original receipt. The atomic durable claim
+      // decides whether this process may continue the effect: reserved records
+      // are claimable; a launching record is claimable only after its exact
+      // owner is proven dead and positive launch evidence is absent.
       let current = await reconcile(reservation);
-      const classification = classifyLaunch(current, await options.sessions.evidence(current.beeName), {
-        inFlight: inFlight.has(current.runId),
-        nowMs: now().getTime(),
-        ...(options.launchGraceMs !== undefined ? { graceMs: options.launchGraceMs } : {}),
-      });
-      // A reservation that already carries a terminal result (e.g. cancelled
-      // before its launch ever started) must never relaunch on replay.
-      if (classification === "reserved-not-started" && !current.result) {
-        if (Date.parse(current.leaseExpiresAt) < now().getTime()) {
-          const failureCause = "LEASE_DENIED: lease expired before the reserved launch could start";
-          current = await commitRunTerminalResult(
-            current.runId,
-            { outcome: "failed", cause: "lease_expired", failureCause },
-            { now, canCommit: (record) => record.phase !== "started" },
-          );
-          await appendRunTerminalEvents(current, protocolVersion, await origin());
-        } else {
-          await launch(current, validated.lease);
-          current = await reconcile((await readReservation(current.runId))!);
-        }
-      }
+      current = await continueLaunch(current, validated.lease);
+      current = await reconcile((await readReservation(current.runId))!);
       return effectResponse(requestId, current, "replayed", deriveState(current, inFlight.has(current.runId)).state);
     } catch (error) {
       return effectError(requestId, error);

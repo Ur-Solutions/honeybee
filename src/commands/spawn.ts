@@ -50,7 +50,10 @@ import type { JsonValue, StoredCombVersion } from "../comb/types.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 import { hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../hsr/runDir.js";
 import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
+import { stopHsrIncarnationByPid } from "../hsr/substrate.js";
 import { transactionalRetire } from "../kill.js";
+import { withSessionLifecycleTransaction } from "../lifecycle.js";
+import { SpawnAfterForkError, type SpawnedRuntimeHandle } from "../spawnRuntime.js";
 import { attachTrack, loadTrack } from "../track.js";
 
 async function persistSpawnTiming(timer: SpawnTimer, label: string): Promise<void> {
@@ -188,6 +191,8 @@ export type SpawnOptions = {
    * run.start reservation. Only the in-process protocol launcher sets this.
    */
   executionRunId?: string;
+  /** Receives the exact HSR incarnation immediately after the host fork. */
+  onRuntimeLaunched?: (runtime: SpawnedRuntimeHandle) => void | Promise<void>;
   node?: NodeRecord;
   /**
    * Substrate override. HSR ("hsr") runs the bee pane-lessly under a detached
@@ -255,7 +260,15 @@ export type SpawnOptions = {
   waitForHost?: boolean;
 };
 
-export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
+export type SpawnRuntimeDependencies = {
+  spawnHsrHost?: typeof spawnHsrHost;
+  captureProcessBirthFingerprint?: typeof captureProcessBirthFingerprint;
+  saveSession?: typeof saveSession;
+  writeSpawnOptions?: typeof writeSpawnOptions;
+  stopHsrIncarnationByPid?: typeof stopHsrIncarnationByPid;
+};
+
+export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDependencies = {}): Promise<SessionRecord> {
   // When the caller threads a timer it also owns reporting (it has resolve/ready
   // phases to fold in); a bare spawnBee gets its own self-reporting timer so
   // swarm bees still emit their internal breakdown under HIVE_DEBUG_SPAWN.
@@ -539,7 +552,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     const hsrKitStamp = spec.homePath ? await readKitHomeStamp(spec.homePath) : kitStamp;
     const adapter = adapterFor(spec.kind);
     const runnerTier = adapter?.tier();
-    const hostPid = await spawnHsrHost({
+    const hostPid = await (runtimeDeps.spawnHsrHost ?? spawnHsrHost)({
       bee: name,
       comb: name, // solo comb — a forked sub-bee will carry its parent's comb
       kind: spec.kind,
@@ -551,76 +564,118 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
-    const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
-    // Publish a provisional "queued" meta NOW: spawn no longer waits for the
-    // child's cold start, so without this every observer (hasSession, hive run
-    // --wait, the daemon reconciler, Apiary) would read the fresh bee as dead
-    // during the boot window. The child overwrites this with its own startup
-    // meta; skip the write if the child already won that race.
-    if (runnerTier && !(await readHsrMeta(name))) {
-      await writeHsrMeta(name, {
-        bee: name,
-        harness: spec.kind,
-        tier: runnerTier,
+    // Fingerprint capture is best-effort; the retained spawn handle still gives
+    // stopHsrIncarnationByPid exact authority before metadata publication.
+    const runnerFingerprint = await (runtimeDeps.captureProcessBirthFingerprint ?? captureProcessBirthFingerprint)(hostPid)
+      .catch(() => undefined);
+    const runtime: SpawnedRuntimeHandle = {
+      identity: {
+        kind: "hsr",
+        beeName: name,
         hostPid,
         ...(runnerFingerprint ? { hostFingerprint: runnerFingerprint } : {}),
-        startedAt: new Date().toISOString(),
-        startupPhase: "harness",
-        controlSocket: hsrControlSocketPath(name),
-        status: "queued",
-      }).catch(() => undefined);
-    }
-    timer.mark("session-create");
-    const command = shellCommand(spec);
-    const now = new Date().toISOString();
-    const record: SessionRecord = {
-      name,
-      agent: spec.kind,
-      cwd: opts.cwd,
-      launchArgv,
-      command,
-      tmuxTarget: name, // logical id — HSR has no tmux target
-      substrate: "hsr",
-      runnerPid: hostPid,
-      ...(runnerFingerprint ? { runnerFingerprint } : {}),
-      ...(runnerTier ? { runnerTier } : {}),
-      combId: name,
-      createdAt: now,
-      updatedAt: now,
-      status: "running",
-      id: identity.id,
-      prefix: identity.prefix,
-      uuid: identity.uuid,
-      requestedAgent: spec.requestedKind,
-      homePath: spec.homePath,
-      ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
-      ...(opts.colony ? { colony: opts.colony } : {}),
-      ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
-      ...(opts.caste ? { caste: opts.caste } : {}),
-      ...(brief ? { brief } : {}),
-      ...(opts.contract ? { contract: opts.contract } : {}),
-      ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
-      ...(spawnedById ? { spawnedById } : {}),
-      ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
-      ...(opts.account ? { accountId: opts.account.id } : {}),
-      ...(opts.autoswap ? { autoswap: true } : {}),
-      ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
-      ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
-      ...hsrKitStamp,
+      },
+      async stop() {
+        try {
+          const result = await (runtimeDeps.stopHsrIncarnationByPid ?? stopHsrIncarnationByPid)(name, hostPid);
+          return {
+            stopped: result.ok,
+            detail: result.ok ? "exact launched HSR incarnation stop confirmed" : result.stderr || result.stdout || "exact HSR stop unconfirmed",
+          };
+        } catch (error) {
+          return { stopped: false, detail: error instanceof Error ? error.message : String(error) };
+        }
+      },
     };
-    await saveSession(record);
-    await writeSpawnOptions(record);
-    timer.mark("persist");
-    // The record is durable and a first prompt rides the pending-turn queue
-    // (deliverPromptText enqueues against the forked host pid), so the spawn
-    // returns without waiting for the child's Node cold start. `--wait-host`
-    // opts back into a confirmed-live host; observe/deriveState reconcile a
-    // host that never comes up either way.
-    if (opts.waitForHost && !(await waitForHsrHost(name, 5000))) {
-      console.error(note(`hsr host for ${name} did not report live within 5s; the daemon will reconcile`));
+    let postForkPhase: SpawnAfterForkError["phase"] = "runtime-publish";
+    let publishedRecord: SessionRecord | undefined;
+    try {
+      await opts.onRuntimeLaunched?.(runtime);
+      // Publish a provisional "queued" meta NOW: spawn no longer waits for the
+      // child's cold start, so without this every observer (hasSession, hive run
+      // --wait, the daemon reconciler, Apiary) would read the fresh bee as dead
+      // during the boot window. The child overwrites this with its own startup
+      // meta; skip the write if the child already won that race.
+      if (runnerTier && !(await readHsrMeta(name))) {
+        await writeHsrMeta(name, {
+          bee: name,
+          harness: spec.kind,
+          tier: runnerTier,
+          hostPid,
+          ...(runnerFingerprint ? { hostFingerprint: runnerFingerprint } : {}),
+          startedAt: new Date().toISOString(),
+          startupPhase: "harness",
+          controlSocket: hsrControlSocketPath(name),
+          status: "queued",
+        }).catch(() => undefined);
+      }
+      timer.mark("session-create");
+      const command = shellCommand(spec);
+      const now = new Date().toISOString();
+      const record: SessionRecord = {
+        name,
+        agent: spec.kind,
+        cwd: opts.cwd,
+        launchArgv,
+        command,
+        tmuxTarget: name, // logical id — HSR has no tmux target
+        substrate: "hsr",
+        runnerPid: hostPid,
+        ...(runnerFingerprint ? { runnerFingerprint } : {}),
+        ...(runnerTier ? { runnerTier } : {}),
+        combId: name,
+        createdAt: now,
+        updatedAt: now,
+        status: "running",
+        id: identity.id,
+        prefix: identity.prefix,
+        uuid: identity.uuid,
+        requestedAgent: spec.requestedKind,
+        homePath: spec.homePath,
+        ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
+        ...(opts.colony ? { colony: opts.colony } : {}),
+        ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
+        ...(opts.caste ? { caste: opts.caste } : {}),
+        ...(brief ? { brief } : {}),
+        ...(opts.contract ? { contract: opts.contract } : {}),
+        ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
+        ...(spawnedById ? { spawnedById } : {}),
+        ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
+        ...(opts.account ? { accountId: opts.account.id } : {}),
+        ...(opts.autoswap ? { autoswap: true } : {}),
+        ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
+        ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
+        ...hsrKitStamp,
+      };
+      postForkPhase = "session-save";
+      await (runtimeDeps.saveSession ?? saveSession)(record);
+      publishedRecord = record;
+      postForkPhase = "spawn-options";
+      await (runtimeDeps.writeSpawnOptions ?? writeSpawnOptions)(record);
+      timer.mark("persist");
+      // The record is durable and a first prompt rides the pending-turn queue
+      // (deliverPromptText enqueues against the forked host pid), so the spawn
+      // returns without waiting for the child's Node cold start. `--wait-host`
+      // opts back into a confirmed-live host; observe/deriveState reconcile a
+      // host that never comes up either way.
+      if (opts.waitForHost && !(await waitForHsrHost(name, 5000))) {
+        console.error(note(`hsr host for ${name} did not report live within 5s; the daemon will reconcile`));
+      }
+      if (ownsTimer) await persistSpawnTiming(timer, record.name);
+      return record;
+    } catch (error) {
+      const cleanup = await runtime.stop();
+      if (cleanup.stopped && publishedRecord) {
+        // Do not leave a successfully-written SessionRecord claiming a stopped
+        // post-fork runtime is live. Lifecycle CAS prevents a same-name/new-
+        // generation replacement from being rewritten by this rollback.
+        await withSessionLifecycleTransaction(publishedRecord, (lifecycle) => lifecycle.commit({
+          status: "dead",
+          updatedAt: new Date().toISOString(),
+        })).catch(() => undefined);
+      }
+      throw new SpawnAfterForkError(postForkPhase, runtime, cleanup, error);
     }
-    if (ownsTimer) await persistSpawnTiming(timer, record.name);
-    return record;
   }
 
   const tmuxTarget = safeTmuxTarget(name);
@@ -1004,7 +1059,13 @@ export function resolvePreambleFlags(parsed: Parsed): { preamble?: string; noPre
 
 export async function spawnSingleBee(
   parsed: Parsed,
-  trustedContext: { spawnedById?: string; executionRunId?: string; protocolLaunch?: boolean } = {},
+  trustedContext: {
+    spawnedById?: string;
+    executionRunId?: string;
+    protocolLaunch?: boolean;
+    onRuntimeLaunched?: (runtime: SpawnedRuntimeHandle) => void | Promise<void>;
+    runtimeDependencies?: SpawnRuntimeDependencies;
+  } = {},
 ): Promise<SessionRecord> {
   const requested = parsed.args[0];
   if (!requested) throw new Error("Usage: hive spawn <bee> [--template <name>] [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
@@ -1076,7 +1137,7 @@ export async function spawnSingleBee(
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(spawnedById ? { spawnedById } : {}), ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) });
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(spawnedById ? { spawnedById } : {}), ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}), ...(trustedContext.onRuntimeLaunched ? { onRuntimeLaunched: trustedContext.onRuntimeLaunched } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) }, trustedContext.runtimeDependencies);
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.

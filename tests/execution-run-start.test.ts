@@ -417,13 +417,9 @@ test("crash recovery: reserved-not-started relaunches once on identical retry", 
     await stageReservation(ctx, envelope);
     assert.equal((await readEffectIndex(String(envelope.effectKey)))?.phase, "committed");
     assert.deepEqual(await readRunEvents("run-0001"), [], "seed models committed admission before run.accepted append");
-    // Simulate a daemon crash after the launch attempt was recorded but before
-    // any spawn persistence, past the evidence grace window.
-    await mutateReservation("run-0001", (record) => ({
-      ...record,
-      phase: "launching",
-      launchAttemptedAt: new Date(Date.now() - 60_000).toISOString(),
-    }));
+    // Simulate a daemon crash after durable admission but before any service
+    // claimed the launch side effect. An unowned reservation is safely
+    // continuable; a claimed launch is governed by its birth-fenced owner.
 
     const counting = countingLauncher();
     const restarted = makeService({ launcher: counting.launcher });
@@ -1228,11 +1224,6 @@ test("crash recovery: lease expiry before a reserved-not-started relaunch fails 
     await stageReservation(ctx, envelope);
     assert.equal((await readEffectIndex(String(envelope.effectKey)))?.phase, "committed");
     assert.deepEqual(await readRunEvents("run-0001"), [], "seed models committed admission before run.accepted append");
-    await mutateReservation("run-0001", (record) => ({
-      ...record,
-      phase: "launching",
-      launchAttemptedAt: new Date(Date.now() - 60_000).toISOString(),
-    }));
     const counting = countingLauncher();
     // The retry arrives two hours later: the recorded receipt still replays,
     // but the expired lease cannot authorize the launch.

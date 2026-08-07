@@ -22,6 +22,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile } from "../fsx.js";
+import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import { withFileLock } from "../lock.js";
 import { safeName } from "../store.js";
 import type { JsonValue } from "../comb/types.js";
@@ -82,6 +83,26 @@ export type EffectReceipt = {
 
 export type RunReservationPhase = "reserved" | "launching" | "started" | "failed";
 
+/**
+ * Durable identity of the coordinator process that owns one launch attempt.
+ * A PID is only a locator: takeover requires this persisted OS-birth identity
+ * to prove that the exact owner incarnation is gone.
+ */
+export type RunLaunchOwner = {
+  ownerId: string;
+  pid: number;
+  hostname: string;
+  processFingerprint: ProcessBirthFingerprint;
+};
+
+/** One non-expiring launch lease. Age is diagnostic only, never authority. */
+export type RunLaunchAttempt = {
+  attemptId: string;
+  owner: RunLaunchOwner;
+  claimedAt: string;
+  takeoverOf?: string;
+};
+
 export type RunEnvironmentFacts = {
   providerId: string;
   environmentId: string;
@@ -132,7 +153,9 @@ export type RunReservation = {
   /** Deterministic HSR bee name this Run is bound to (derived from runId). */
   beeName: string;
   phase: RunReservationPhase;
-  /** Set when a launch attempt begins; the crash-window classifier keys off it. */
+  /** Durable, birth-fenced ownership of the only process launch allowed now. */
+  launchAttempt?: RunLaunchAttempt;
+  /** Diagnostic compatibility stamp; elapsed time never authorizes takeover. */
   launchAttemptedAt?: string;
   startedAt?: string;
   /** Provider session reference (bee id / provider session id) once known. */
@@ -267,6 +290,9 @@ export async function readReservation(runId: string): Promise<RunReservation | n
     // corrupt reservation fact — never cast it through.
     throw executionError("AUTHORITY_UNAVAILABLE", `run reservation for ${runId} carries a malformed initiator fact`);
   }
+  if (parsed.launchAttempt !== undefined && !isValidLaunchAttempt(parsed.launchAttempt)) {
+    throw executionError("AUTHORITY_UNAVAILABLE", `run reservation for ${runId} carries a malformed launch owner`);
+  }
   return parsed as unknown as RunReservation;
 }
 
@@ -277,6 +303,23 @@ function isValidInitiator(value: unknown): value is { kind: string; id: string }
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const { kind, id } = value as Record<string, unknown>;
   return typeof kind === "string" && INITIATOR_KINDS.has(kind) && typeof id === "string" && id.length > 0;
+}
+
+function isValidLaunchAttempt(value: unknown): value is RunLaunchAttempt {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const attempt = value as Record<string, unknown>;
+  if (typeof attempt.attemptId !== "string" || attempt.attemptId.length === 0) return false;
+  if (typeof attempt.claimedAt !== "string" || !Number.isFinite(Date.parse(attempt.claimedAt))) return false;
+  if (attempt.takeoverOf !== undefined && (typeof attempt.takeoverOf !== "string" || attempt.takeoverOf.length === 0)) return false;
+  if (attempt.owner === null || typeof attempt.owner !== "object" || Array.isArray(attempt.owner)) return false;
+  const owner = attempt.owner as Record<string, unknown>;
+  if (typeof owner.ownerId !== "string" || owner.ownerId.length === 0) return false;
+  if (!Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0) return false;
+  if (typeof owner.hostname !== "string" || owner.hostname.length === 0) return false;
+  if (owner.processFingerprint === null || typeof owner.processFingerprint !== "object" || Array.isArray(owner.processFingerprint)) return false;
+  const fingerprint = owner.processFingerprint as Record<string, unknown>;
+  return Number.isSafeInteger(fingerprint.pgid) && Number(fingerprint.pgid) > 0 &&
+    typeof fingerprint.startedAt === "string" && fingerprint.startedAt.length > 0;
 }
 
 async function writeReservation(reservation: RunReservation): Promise<void> {
@@ -474,6 +517,113 @@ export async function mutateReservation(
     await writeReservation(next);
     return next;
   });
+}
+
+export type RunLaunchOwnerStatus = "alive" | "dead" | "unverifiable";
+
+export type RunLaunchClaim = {
+  reservation: RunReservation;
+  /** True only for the caller that atomically installed this exact attempt. */
+  claimed: boolean;
+  disposition: "claimed" | "owned" | "busy" | "positive-evidence" | "settled";
+  attemptId?: string;
+};
+
+/**
+ * Atomically claim the launch side effect, or take it over only after BOTH:
+ * the previous owner incarnation is proven dead and no positive launch
+ * evidence exists while the reservation lock is held. A live/unverifiable
+ * owner is never stolen, regardless of claim age.
+ */
+export async function claimRunLaunchAttempt(
+  runId: string,
+  owner: RunLaunchOwner,
+  options: {
+    now?: () => Date;
+    inspectOwner: (owner: RunLaunchOwner) => Promise<RunLaunchOwnerStatus>;
+    evidence: () => Promise<LaunchEvidence>;
+  },
+): Promise<RunLaunchClaim> {
+  const clock = options.now ?? (() => new Date());
+  return withFileLock(admissionLockPath(), async () => {
+    const current = await readReservation(runId);
+    if (!current) throw executionError("RUN_UNKNOWN", `runId ${runId} names no Run reserved on this node`);
+    if (current.result || current.cancel || current.phase === "started" || current.phase === "failed") {
+      return { reservation: current, claimed: false, disposition: "settled" };
+    }
+
+    if (current.phase === "reserved") {
+      const attemptId = randomUUID();
+      const claimedAt = clock().toISOString();
+      const next: RunReservation = {
+        ...current,
+        phase: "launching",
+        launchAttempt: { attemptId, owner, claimedAt },
+        launchAttemptedAt: claimedAt,
+      };
+      await writeReservation(next);
+      return { reservation: next, claimed: true, disposition: "claimed", attemptId };
+    }
+
+    const existing = current.launchAttempt;
+    // A pre-ownership `launching` record is an unknowable legacy crash window.
+    // Age cannot prove spawn absence, so fail closed instead of manufacturing
+    // an owner and potentially launching a duplicate.
+    if (!existing) return { reservation: current, claimed: false, disposition: "busy" };
+    if (existing.owner.ownerId === owner.ownerId) {
+      return { reservation: current, claimed: false, disposition: "owned", attemptId: existing.attemptId };
+    }
+    if (current.indeterminateAt || await options.inspectOwner(existing.owner) !== "dead") {
+      return { reservation: current, claimed: false, disposition: "busy" };
+    }
+    const evidence = await options.evidence();
+    if (evidence.sessionExists) {
+      return { reservation: current, claimed: false, disposition: "positive-evidence" };
+    }
+
+    const attemptId = randomUUID();
+    const claimedAt = clock().toISOString();
+    const next: RunReservation = {
+      ...current,
+      launchAttempt: { attemptId, owner, claimedAt, takeoverOf: existing.attemptId },
+      launchAttemptedAt: claimedAt,
+    };
+    await writeReservation(next);
+    return { reservation: next, claimed: true, disposition: "claimed", attemptId };
+  });
+}
+
+/** Commit readiness only if this exact attempt still owns an unsettled Run. */
+export async function commitRunLaunchStarted(
+  runId: string,
+  attemptId: string,
+  result: { sessionRef: string; environment: RunEnvironmentFacts },
+  options: { now?: () => Date } = {},
+): Promise<{ reservation: RunReservation; committed: boolean }> {
+  const clock = options.now ?? (() => new Date());
+  let committed = false;
+  const reservation = await mutateReservation(runId, (current) => {
+    if (
+      current.phase !== "launching" ||
+      current.result ||
+      current.cancel ||
+      current.launchAttempt?.attemptId !== attemptId
+    ) return current;
+    committed = true;
+    return {
+      ...current,
+      phase: "started",
+      startedAt: clock().toISOString(),
+      sessionRef: result.sessionRef,
+      environment: result.environment,
+    };
+  });
+  return { reservation, committed };
+}
+
+/** Fresh-record predicate shared by conditional failure/cancellation commits. */
+export function launchAttemptOwns(record: RunReservation, attemptId: string): boolean {
+  return record.phase === "launching" && record.launchAttempt?.attemptId === attemptId;
 }
 
 export type RunTerminalDecision = {
@@ -1007,12 +1157,7 @@ export type LaunchClassification =
   | "booting-receipt-lost"
   | "indeterminate";
 
-/**
- * How long a crashed `launching` reservation waits before the absence of any
- * session/HSR evidence proves the spawn never persisted anything. The HSR
- * host is detached and writes its meta within a couple of seconds; until this
- * grace elapses the outcome is honestly indeterminate, never a relaunch.
- */
+/** @deprecated Elapsed time no longer authorizes a launch takeover. */
 export const LAUNCH_EVIDENCE_GRACE_MS = 15_000;
 
 export type LaunchEvidence = {
@@ -1063,9 +1208,9 @@ export function classifyLaunch(
     if (evidence.ready !== true) return "booting-receipt-lost";
     return "started-receipt-lost";
   }
-  const attempted = Date.parse(reservation.launchAttemptedAt ?? reservation.updatedAt);
-  const now = options.nowMs ?? Date.now();
-  const grace = options.graceMs ?? LAUNCH_EVIDENCE_GRACE_MS;
-  if (Number.isFinite(attempted) && now - attempted < grace) return "indeterminate";
-  return "reserved-not-started";
+  // Durable launch ownership is non-expiring. Another service may inspect the
+  // owner's exact process birth and CAS a takeover, but elapsed wall time alone
+  // never reopens the launch side effect. Legacy launching records have no
+  // birth-safe owner and therefore remain indeterminate forever.
+  return reservation.launchAttempt ? "launch-in-flight" : "indeterminate";
 }

@@ -21,6 +21,7 @@ import { nativeIsolationManifest, NATIVE_PROVIDER_ID } from "./describe.js";
 import { claimWorkingCopy, readWorkingCopy, type WorkingCopyRecord } from "./workingCopies.js";
 import type { RunLaunchRequest, RunLaunchResult, RunLauncher } from "./service.js";
 import { runKey, type RunEnvironmentFacts } from "./runStore.js";
+import { SpawnAfterForkError, type SpawnRuntimeCleanup, type SpawnedRuntimeHandle } from "../spawnRuntime.js";
 
 function asObject(value: JsonValue | undefined): JsonObject | undefined {
   if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -184,7 +185,7 @@ export async function recoverExplicitPlacementEnvironment(
   return environmentFactsForWorkingCopy(nodeId, reservation.runId, copy);
 }
 
-type SpawnedExecutionBee = { name: string; id?: string };
+type SpawnedExecutionBee = { name: string; id?: string; runtime?: SpawnedRuntimeHandle };
 
 export type HsrRunLauncherDependencies = {
   nodeId: () => Promise<string>;
@@ -212,7 +213,7 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
     // session envelopes beside Honeybee's identity before the operator prompt.
     const { driverId, model, brief, account, preamble } = resolveHsrHarnessLaunchConfig(intent);
 
-    let record;
+    let record: SpawnedExecutionBee;
     try {
       if (deps.spawn) {
         record = await deps.spawn(request, { driverId, ...(model ? { model } : {}), ...(brief ? { brief } : {}), ...(account ? { account } : {}), ...(preamble ? { preamble } : {}) }, copy.path);
@@ -224,7 +225,8 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
           ...(account ? { account } : {}),
           ...(preamble ? { preamble } : {}),
         });
-        record = await spawnSingleBee(
+        let runtime: SpawnedRuntimeHandle | undefined;
+        const spawned = await spawnSingleBee(
           {
             command: "spawn",
             args: brief ? [driverId, brief] : [driverId],
@@ -237,13 +239,38 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
           // overlays (thin profiles, account aliases, sole-account defaults,
           // config yolo) are bypassed so bees.<driver> config cannot change
           // harness, account, args, or yolo underneath the lease.
-          { executionRunId: runId, protocolLaunch: true, ...(request.spawnedById ? { spawnedById: request.spawnedById } : {}) },
+          {
+            executionRunId: runId,
+            protocolLaunch: true,
+            ...(request.spawnedById ? { spawnedById: request.spawnedById } : {}),
+            onRuntimeLaunched: (launched) => { runtime = launched; },
+          },
         );
+        record = { name: spawned.name, ...(spawned.id ? { id: spawned.id } : {}), ...(runtime ? { runtime } : {}) };
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof SpawnAfterForkError && !error.cleanup.stopped) {
+        throw indeterminateExecutionError(
+          "HARNESS_UNAVAILABLE",
+          `harness ${driverId} failed after host fork and exact cleanup was unconfirmed: ${message}`,
+          "spawn_cleanup_unconfirmed",
+          { phase: error.phase, runtime: error.runtime.identity, detail: error.cleanup.detail },
+        );
+      }
       throw executionError("HARNESS_UNAVAILABLE", `harness ${driverId} failed to start: ${message}`);
     }
+
+    const stopLaunched = async (): Promise<SpawnRuntimeCleanup> => {
+      if (record.runtime) return record.runtime.stop();
+      try {
+        if (deps.stop) return await deps.stop(record.name);
+        const result = await (await import("../hsr/substrate.js")).stopKnownHsrExecution(record.name);
+        return { stopped: result.ok, detail: result.ok ? "HSR stop confirmed" : result.stderr || "HSR stop unconfirmed" };
+      } catch (error) {
+        return { stopped: false, detail: error instanceof Error ? error.message : String(error) };
+      }
+    };
 
     // spawnSingleBee durably publishes queued/booting before the detached host
     // is ready. Execution must not turn that early record into harness.running:
@@ -254,17 +281,7 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
     const timeoutMs = deps.readinessTimeoutMs ?? (Number.isFinite(readinessTimeout) && readinessTimeout > 0 ? readinessTimeout : 120_000);
     const waitForReadiness = deps.waitForReadiness ?? (await import("../hsr/runnerHost.js")).waitForHsrReadiness;
     if (!(await waitForReadiness(record.name, timeoutMs))) {
-      let stop: { stopped: boolean; detail: string };
-      try {
-        if (deps.stop) {
-          stop = await deps.stop(record.name);
-        } else {
-          const result = await (await import("../hsr/substrate.js")).stopKnownHsrExecution(record.name);
-          stop = { stopped: result.ok, detail: result.ok ? "HSR stop confirmed" : result.stderr || "HSR stop unconfirmed" };
-        }
-      } catch (error) {
-        stop = { stopped: false, detail: error instanceof Error ? error.message : String(error) };
-      }
+      const stop = await stopLaunched();
       if (!stop.stopped) {
         throw indeterminateExecutionError(
           "HARNESS_UNAVAILABLE",
@@ -278,12 +295,17 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
 
     const environment = environmentFactsForWorkingCopy(nodeId, runId, copy);
     if (!record.id) {
-      throw indeterminateExecutionError(
-        "HARNESS_UNAVAILABLE",
-        `harness ${driverId} reached readiness without a canonical SessionRecord.id`,
-        "session_ref_missing",
-      );
+      const stop = await stopLaunched();
+      if (!stop.stopped) {
+        throw indeterminateExecutionError(
+          "HARNESS_UNAVAILABLE",
+          `harness ${driverId} reached readiness without a canonical SessionRecord.id and exact cleanup was unconfirmed`,
+          "session_ref_missing",
+          { detail: stop.detail, ...(record.runtime ? { runtime: record.runtime.identity } : {}) },
+        );
+      }
+      throw executionError("HARNESS_UNAVAILABLE", `harness ${driverId} reached readiness without a canonical SessionRecord.id; exact cleanup confirmed`);
     }
-    return { sessionRef: record.id, environment };
+    return { sessionRef: record.id, environment, ...(record.runtime ? { runtime: record.runtime } : {}) };
   };
 }

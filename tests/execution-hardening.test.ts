@@ -36,8 +36,8 @@ import {
 const RUN_ID = "run-0001";
 
 /** Hold the launcher after admission so race tests synchronize on state, not wall-clock sleeps. */
-function gatedCountingLauncher() {
-  const counting = countingLauncher();
+function gatedCountingLauncher(cleanup?: () => Promise<{ stopped: boolean; detail: string }>) {
+  const counting = countingLauncher(cleanup ? { cleanup } : {});
   let markEntered!: () => void;
   let releaseLaunch!: () => void;
   const entered = new Promise<void>((resolve) => { markEntered = resolve; });
@@ -314,7 +314,11 @@ test("a reservation without capabilityLeaseId fails closed on read", async () =>
 test("cancel during an in-flight launch stays nonterminal; the post-launch sweep resolves cancelled on confirmed stop", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
-    const counting = gatedCountingLauncher();
+    let exactStops = 0;
+    const counting = gatedCountingLauncher(async () => {
+      exactStops += 1;
+      return { stopped: true, detail: "exact fake runtime stop confirmed" };
+    });
     const control = fakeControl();
     const service = makeService({ launcher: counting.launcher, control: control.control });
     const startPromise = service.runStart(buildRunStartEnvelope(ctx));
@@ -331,8 +335,9 @@ test("cancel during an in-flight launch stays nonterminal; the post-launch sweep
     }
 
     await startPromise;
-    // The sweep stopped the newborn session (confirmed) and resolved cancelled.
-    assert.equal(control.calls.filter((call) => call.method === "stop").length, 1);
+    // The stale launch tears down only its returned runtime incarnation.
+    assert.equal(exactStops, 1);
+    assert.equal(control.calls.filter((call) => call.method === "stop").length, 0);
     const projection = ((await service.runGet({ protocolVersion: "0.1", runId: RUN_ID })) as { result: JsonObject }).result;
     assert.equal(projection.state, "cancelled");
     const types = (await readRunEvents(RUN_ID)).map((event) => event.type);
@@ -344,7 +349,7 @@ test("cancel during an in-flight launch stays nonterminal; the post-launch sweep
 test("cancel during launch with an unconfirmable stop projects lost, then converges once exit is proven", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
-    const counting = gatedCountingLauncher();
+    const counting = gatedCountingLauncher(async () => ({ stopped: false, detail: "clean stop unconfirmed" }));
     const control = fakeControl({ stopResult: { stopped: false, detail: "clean stop unconfirmed" } });
     const service = makeService({ launcher: counting.launcher, control: control.control });
     const startPromise = service.runStart(buildRunStartEnvelope(ctx));

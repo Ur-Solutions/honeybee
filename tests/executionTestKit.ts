@@ -12,7 +12,14 @@ import {
   loadNodeIdentity,
   type ExecutionBindingRecord,
 } from "../src/execution/nodeState.js";
-import { beeNameForRun, runKey, type RunEnvironmentFacts } from "../src/execution/runStore.js";
+import {
+  beeNameForRun,
+  runKey,
+  type RunEnvironmentFacts,
+  type RunLaunchOwner,
+  type RunLaunchOwnerStatus,
+  type RunReservation,
+} from "../src/execution/runStore.js";
 import {
   createExecutionService,
   storeSessionEvidenceSource,
@@ -203,7 +210,12 @@ export type CountingLauncher = { launcher: RunLauncher; calls: Array<{ runId: st
  * persists a session record stamped with executionRunId (atomically, like
  * spawnBee) and reports environment facts. `behavior` can delay or fail it.
  */
-export function countingLauncher(behavior: { failWith?: Error; delayMs?: number; persistSession?: boolean } = {}): CountingLauncher {
+export function countingLauncher(behavior: {
+  failWith?: Error;
+  delayMs?: number;
+  persistSession?: boolean;
+  cleanup?: () => Promise<{ stopped: boolean; detail: string }>;
+} = {}): CountingLauncher {
   const calls: Array<{ runId: string; beeName: string }> = [];
   const launcher: RunLauncher = async ({ runId, beeName }) => {
     calls.push({ runId, beeName });
@@ -225,7 +237,14 @@ export function countingLauncher(behavior: { failWith?: Error; delayMs?: number;
         executionRunId: runId,
       });
     }
-    return { sessionRef: `BEE.${beeName}`, environment: testEnvironmentFacts(runId) };
+    return {
+      sessionRef: `BEE.${beeName}`,
+      environment: testEnvironmentFacts(runId),
+      runtime: {
+        identity: { kind: "hsr", beeName, hostPid: process.pid },
+        stop: behavior.cleanup ?? (async () => ({ stopped: true, detail: "fake exact runtime stop confirmed" })),
+      },
+    };
   };
   return { launcher, calls };
 }
@@ -235,12 +254,29 @@ export type ServiceOptions = {
   control?: HarnessControl;
   sessions?: SessionEvidenceSource;
   now?: () => Date;
+  launchOwner?: RunLaunchOwner;
+  inspectLaunchOwner?: (owner: RunLaunchOwner) => Promise<RunLaunchOwnerStatus>;
+  afterAdmission?: (reservation: RunReservation) => void | Promise<void>;
+  afterLaunchClaim?: (reservation: RunReservation, attemptId: string) => void | Promise<void>;
   launchGraceMs?: number;
 };
+
+let testLaunchOwnerOrdinal = 0;
+
+function testLaunchOwner(): RunLaunchOwner {
+  testLaunchOwnerOrdinal += 1;
+  return {
+    ownerId: `test-service-${testLaunchOwnerOrdinal}`,
+    pid: process.pid,
+    hostname: "test-host",
+    processFingerprint: { pgid: process.pid, startedAt: "test-process-birth" },
+  };
+}
 
 /** An execution service over the real store with a fake launcher + probe. */
 export function makeService(opts: ServiceOptions = {}): ExecutionService {
   const control = opts.control ?? fakeControl().control;
+  const owner = opts.launchOwner ?? testLaunchOwner();
   return createExecutionService({
     launcher: opts.launcher ?? countingLauncher().launcher,
     sessions: opts.sessions ?? storeSessionEvidenceSource(),
@@ -248,6 +284,10 @@ export function makeService(opts: ServiceOptions = {}): ExecutionService {
     stopKnownExecution: control.stop,
     harnessProbe: async (kind) => (kind === "claude" ? { status: "ready" } : { status: "absent" }),
     ...(opts.now ? { now: opts.now } : {}),
+    launchOwner: owner,
+    inspectLaunchOwner: opts.inspectLaunchOwner ?? (async () => "alive"),
+    ...(opts.afterAdmission ? { afterAdmission: opts.afterAdmission } : {}),
+    ...(opts.afterLaunchClaim ? { afterLaunchClaim: opts.afterLaunchClaim } : {}),
     ...(opts.launchGraceMs !== undefined ? { launchGraceMs: opts.launchGraceMs } : {}),
   });
 }
