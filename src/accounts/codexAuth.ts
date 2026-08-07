@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -230,30 +231,99 @@ export async function syncCodexAuthToVaultLocked(
   return runCredentialSyncLocked(account, codexSyncStrategy, extraHome, options);
 }
 
-// Called while holding the ACTIVATING account's lock; the rescue itself is a
-// read-check-merge of the OWNER's vault, so it takes the owner's lock too —
-// otherwise it could interleave with the owner's own sync and lose a rotated
-// refresh token.
-export async function evacuateForeignCodexAuth(account: AccountRecord, homePath: string): Promise<void> {
+export type CodexAuthParkingIntent = {
+  ownerId: string;
+  notAccountId: string;
+  homePath: string;
+  authRaw: string;
+  authDigest: string;
+  authEmail?: string;
+  authAccountId?: string;
+  authLastRefreshMs?: number;
+  authMtimeMs: number;
+  authFreshnessMs: number;
+  source: string;
+};
+
+function codexAuthDigest(raw: string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function snapshotFromCodexParkingIntent(intent: CodexAuthParkingIntent): CodexAuthSnapshot | null {
+  if (codexAuthDigest(intent.authRaw) !== intent.authDigest) return null;
+  const snapshot = parseCodexAuth(intent.authRaw, intent.source, intent.authMtimeMs);
+  if (
+    !snapshot
+    || snapshot.email !== intent.authEmail
+    || snapshot.accountId !== intent.authAccountId
+    || snapshot.lastRefreshMs !== intent.authLastRefreshMs
+    || codexAuthFreshnessMs(snapshot) !== intent.authFreshnessMs
+  ) return null;
+  return snapshot;
+}
+
+/**
+ * Scan a home while holding only the ACTIVATING account's lock. A verified
+ * foreign occupant is returned as an exact-content/identity/freshness intent;
+ * no foreign-owner vault is written here.
+ */
+export async function evacuateForeignCodexAuth(account: AccountRecord, homePath: string): Promise<CodexAuthParkingIntent | null> {
   const occupant = await readHomeCodexAuth(homePath);
-  if (!occupant) return;
+  if (!occupant) return null;
   const currentVault = await readCodexAuthFile(join(accountDir(account), "auth.json"), "vault");
-  if ((await authorizeCodexAuthImport(occupant, account, currentVault, { authorization: "automatic" })).authorized) return;
+  if ((await authorizeCodexAuthImport(occupant, account, currentVault, { authorization: "automatic" })).authorized) return null;
   const owner = await findCodexAccountForSnapshot(occupant, account.id);
-  if (!owner) return;
-  await withAccountLock(owner.id, async () => {
+  if (!owner) return null;
+  return {
+    ownerId: owner.id,
+    notAccountId: account.id,
+    homePath,
+    authRaw: occupant.raw,
+    authDigest: codexAuthDigest(occupant.raw),
+    ...(occupant.email ? { authEmail: occupant.email } : {}),
+    ...(occupant.accountId ? { authAccountId: occupant.accountId } : {}),
+    ...(occupant.lastRefreshMs !== undefined ? { authLastRefreshMs: occupant.lastRefreshMs } : {}),
+    authMtimeMs: occupant.mtimeMs,
+    authFreshnessMs: codexAuthFreshnessMs(occupant),
+    source: occupant.source,
+  };
+}
+
+/** Fulfil a foreign-auth intent while holding only its real owner's lock. */
+export async function fulfillCodexAuthParkingIntent(intent: CodexAuthParkingIntent): Promise<boolean> {
+  const occupant = snapshotFromCodexParkingIntent(intent);
+  if (!occupant) return false;
+  let parked = false;
+  await withAccountLock(intent.ownerId, async () => {
+    // Registry ownership and provider identity may have changed while the
+    // activating account released its lock. The same exact snapshot must
+    // still resolve uniquely to the intended owner.
+    const owner = await findCodexAccountForSnapshot(occupant, intent.notAccountId);
+    if (!owner || owner.id !== intent.ownerId) return;
+
+    // A newer owner rotation may now live in B's vault OR one of B's homes.
+    // Harvest that evidence first under B's lock, then compare the intent to
+    // the resulting vault snapshot so the delayed park can never overwrite it.
+    await syncCodexAuthToVaultLocked(owner, undefined, {
+      authorization: "automatic",
+      emitSkipTelemetry: false,
+    });
     const vault = await readCodexAuthFile(join(accountDir(owner), "auth.json"), "vault");
     if (!(await authorizeCodexAuthImport(occupant, owner, vault, { authorization: "automatic" })).authorized) return;
     if (!isFresherCodexAuth(occupant, vault)) return;
     await saveCodexAuthToVaultLocked(owner, occupant.raw);
+    parked = true;
+  }, { timeoutMs: CROSS_ACCOUNT_LOCK_TIMEOUT_MS });
+  if (parked) {
     await appendLedger({
       type: "account.auth-evacuate",
-      account: owner.id,
+      account: intent.ownerId,
       tool: "codex",
-      home: homePath,
+      home: intent.homePath,
       ...(occupant.lastRefreshMs ? { lastRefreshAt: new Date(occupant.lastRefreshMs).toISOString() } : {}),
-    });
-  }, { timeoutMs: CROSS_ACCOUNT_LOCK_TIMEOUT_MS });
+    }).catch(() => undefined);
+  }
+  return parked;
 }
 
 async function findCodexAccountForSnapshot(snapshot: CodexAuthSnapshot, excludeId?: string): Promise<AccountRecord | null> {

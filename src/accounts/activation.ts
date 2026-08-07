@@ -31,7 +31,12 @@ import {
 } from "./claudeChain.js";
 import type { CredentialSyncSkip } from "./credentialSync.js";
 import { accountEmail } from "./utils.js";
-import { evacuateForeignCodexAuth, syncCodexAuthToVaultLocked } from "./codexAuth.js";
+import {
+  evacuateForeignCodexAuth,
+  fulfillCodexAuthParkingIntent,
+  syncCodexAuthToVaultLocked,
+  type CodexAuthParkingIntent,
+} from "./codexAuth.js";
 import {
   cursorAuthUnavailableReason,
   readCursorAuthFile,
@@ -176,6 +181,8 @@ export type ActivateAccountOptions = {
   now?: () => number;
   /** Internal two-phase automatic-import proof, populated before locking. */
   claudeIdentityProofs?: readonly ClaudeChainIdentityProof[];
+  /** Internal deterministic boundary hook used by reciprocal Codex lock tests. */
+  codexParkingIntentBarrier?: (intent: CodexAuthParkingIntent) => Promise<void>;
   /** Always-on phase observation; receives durations and secret-free lock owners. */
   onTiming?: (timing: ActivationTiming) => void;
 };
@@ -202,6 +209,8 @@ export type ActivationContext = {
   deferredLedger?: Array<Record<string, unknown>>;
   /** Foreign-owner writes run only after the activating account lock is released. */
   deferredClaudeParking?: ClaudeChainParkingIntent[];
+  /** Foreign Codex writes run only after the activating account lock is released. */
+  deferredCodexParking?: CodexAuthParkingIntent[];
   time?<T>(phase: string, fn: () => Promise<T>): Promise<T>;
 };
 
@@ -270,13 +279,18 @@ async function claudePreActivate(ctx: ActivationContext): Promise<void> {
 }
 
 async function codexPreActivate(ctx: ActivationContext): Promise<void> {
-  const { account, homePath, warn } = ctx;
+  const { account, homePath, options, warn } = ctx;
   // Codex rewrites auth.json when it refreshes tokens. Rescue the current
   // occupant before a swap stamp, then pull this account's newest attributed
   // auth into the vault so activation never revives an older refresh token.
-  await timeActivationStep(ctx, "rescue-foreign", () => evacuateForeignCodexAuth(account, homePath).catch((error) => {
+  const rescueIntent = await timeActivationStep(ctx, "rescue-foreign", () => evacuateForeignCodexAuth(account, homePath).catch((error) => {
     warn(`could not rescue existing Codex auth from ${homePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
   }));
+  if (rescueIntent) {
+    ctx.deferredCodexParking?.push(rescueIntent);
+    await options.codexParkingIntentBarrier?.(rescueIntent);
+  }
   const synced = await timeActivationStep(ctx, "sync-vault", () => syncCodexAuthToVaultLocked(account, homePath, {
     authorization: "automatic",
     trustExtraHome: true,
@@ -743,6 +757,7 @@ async function performAccountActivation(
   }
   const deferredLedger: Array<Record<string, unknown>> = [];
   const deferredClaudeParking: ClaudeChainParkingIntent[] = [];
+  const deferredCodexParking: CodexAuthParkingIntent[] = [];
   const ctx: ActivationContext = {
     account,
     homePath,
@@ -752,6 +767,7 @@ async function performAccountActivation(
     written: [],
     deferredLedger,
     deferredClaudeParking,
+    deferredCodexParking,
     async time<T>(phase: string, fn: () => Promise<T>): Promise<T> {
       const phaseStarted = performance.now();
       try {
@@ -848,6 +864,11 @@ async function performAccountActivation(
         for (const intent of deferredClaudeParking.splice(0)) {
           await fulfillClaudeChainParkingIntent(intent).catch((error) => {
             warn(`could not park a foreign Claude chain with ${intent.ownerId}: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        }
+        for (const intent of deferredCodexParking.splice(0)) {
+          await fulfillCodexAuthParkingIntent(intent).catch((error) => {
+            warn(`could not park foreign Codex auth with ${intent.ownerId}: ${error instanceof Error ? error.message : String(error)}`);
           });
         }
 

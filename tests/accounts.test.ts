@@ -40,6 +40,7 @@ import {
   type AccountRecord,
 } from "../src/accounts.js";
 import { verifyActivatedClaudeIdentity, type ActivationContext } from "../src/accounts/activation.js";
+import { evacuateForeignCodexAuth, fulfillCodexAuthParkingIntent } from "../src/accounts/codexAuth.js";
 import { buildAddGenericPasswordCommand, identityOnlyCredentials } from "../src/keychain.js";
 import { identityRecipeForAgent } from "../src/drivers.js";
 
@@ -484,6 +485,17 @@ function codexAuthJson(email: string, accountId: string, lastRefresh: string, to
   });
 }
 
+function activationBarrier(parties: number): () => Promise<void> {
+  let arrived = 0;
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  return async () => {
+    arrived += 1;
+    if (arrived === parties) release();
+    await released;
+  };
+}
+
 function opencodeAuthJson(provider: string, token: string): string {
   return JSON.stringify({ [provider]: { type: "api", key: token } });
 }
@@ -848,6 +860,154 @@ test("codex activation rescues a foreign occupant auth before stamping", async (
     assert.equal(tenantVault.tokens.refresh_token, "refresh-tenant-live");
     const homeAuth = JSON.parse(await readFile(join(home, "auth.json"), "utf8"));
     assert.equal(homeAuth.tokens.access_token, "access-incoming");
+  });
+});
+
+test("reciprocal Codex activations release A before parking with B and preserve both rotations", { timeout: 5_000 }, async () => {
+  await withTempStore(async (dir) => {
+    const accountA = await addAccount("codex", "reciprocal-a@a.b");
+    const accountB = await addAccount("codex", "reciprocal-b@c.d");
+    await writeFile(
+      join(accountDir(accountA), "auth.json"),
+      codexAuthJson("reciprocal-a@a.b", "acct-reciprocal-a", "2026-06-01T00:00:00.000Z", "a-old"),
+    );
+    await writeFile(
+      join(accountDir(accountB), "auth.json"),
+      codexAuthJson("reciprocal-b@c.d", "acct-reciprocal-b", "2026-06-01T00:00:00.000Z", "b-old"),
+    );
+    const homeForA = join(dir, "reciprocal-home-a");
+    const homeForB = join(dir, "reciprocal-home-b");
+    await mkdir(homeForA, { recursive: true });
+    await mkdir(homeForB, { recursive: true });
+    await writeFile(
+      join(homeForA, "auth.json"),
+      codexAuthJson("reciprocal-b@c.d", "acct-reciprocal-b", "2026-06-05T00:00:00.000Z", "b-live"),
+    );
+    await writeFile(
+      join(homeForB, "auth.json"),
+      codexAuthJson("reciprocal-a@a.b", "acct-reciprocal-a", "2026-06-06T00:00:00.000Z", "a-live"),
+    );
+
+    // Both activations rendezvous while each still owns its own account lock.
+    // They can only finish if neither scan tries to acquire the other's lock.
+    const barrier = activationBarrier(2);
+    const warnings: string[] = [];
+    await Promise.all([
+      activateAccountIntoHome(accountA, homeForA, {
+        codexParkingIntentBarrier: barrier,
+        onWarn: (warning) => warnings.push(warning),
+      }),
+      activateAccountIntoHome(accountB, homeForB, {
+        codexParkingIntentBarrier: barrier,
+        onWarn: (warning) => warnings.push(warning),
+      }),
+    ]);
+
+    assert.deepEqual(warnings, []);
+    const vaultA = JSON.parse(await readFile(join(accountDir(accountA), "auth.json"), "utf8"));
+    const vaultB = JSON.parse(await readFile(join(accountDir(accountB), "auth.json"), "utf8"));
+    assert.equal(vaultA.tokens.refresh_token, "refresh-a-live");
+    assert.equal(vaultB.tokens.refresh_token, "refresh-b-live");
+    const activatedA = JSON.parse(await readFile(join(homeForA, "auth.json"), "utf8"));
+    const activatedB = JSON.parse(await readFile(join(homeForB, "auth.json"), "utf8"));
+    assert.equal(activatedA.tokens.account_id, "acct-reciprocal-a");
+    assert.equal(activatedB.tokens.account_id, "acct-reciprocal-b");
+  });
+});
+
+test("deferred Codex parking revalidates stale intents against current owner vault and home rotations", async () => {
+  await withTempStore(async (dir) => {
+    const runScenario = async (suffix: string, newerEvidence: "vault" | "home") => {
+      const incoming = await addAccount("codex", `stale-incoming-${suffix}@a.b`);
+      const owner = await addAccount("codex", `stale-owner-${suffix}@c.d`);
+      const incomingAccountId = `acct-stale-incoming-${suffix}`;
+      const ownerAccountId = `acct-stale-owner-${suffix}`;
+      await writeFile(
+        join(accountDir(incoming), "auth.json"),
+        codexAuthJson(incoming.email!, incomingAccountId, "2026-06-01T00:00:00.000Z", `incoming-${suffix}`),
+      );
+      await writeFile(
+        join(accountDir(owner), "auth.json"),
+        codexAuthJson(owner.email!, ownerAccountId, "2026-06-01T00:00:00.000Z", `owner-old-${suffix}`),
+      );
+      const activationHome = join(dir, `stale-activation-${suffix}`);
+      await mkdir(activationHome, { recursive: true });
+      await writeFile(
+        join(activationHome, "auth.json"),
+        codexAuthJson(owner.email!, ownerAccountId, "2026-06-05T00:00:00.000Z", `owner-intent-${suffix}`),
+      );
+
+      let intentReady!: () => void;
+      const intentWasReady = new Promise<void>((resolve) => { intentReady = resolve; });
+      let continueActivation!: () => void;
+      const activationMayContinue = new Promise<void>((resolve) => { continueActivation = resolve; });
+      const activating = activateAccountIntoHome(incoming, activationHome, {
+        codexParkingIntentBarrier: async () => {
+          intentReady();
+          await activationMayContinue;
+        },
+      });
+      await intentWasReady;
+
+      // This genuine B-side rotation lands after A captured its intent. It is
+      // written under B's lock while A is still held, which would be impossible
+      // if activation had nested B beneath A.
+      await withAccountLock(owner.id, async () => {
+        const newer = codexAuthJson(owner.email!, ownerAccountId, "2026-06-09T00:00:00.000Z", `owner-newest-${suffix}`);
+        if (newerEvidence === "vault") {
+          await writeFile(join(accountDir(owner), "auth.json"), newer);
+        } else {
+          const ownerHome = join(dir, "homes", owner.id);
+          await mkdir(ownerHome, { recursive: true });
+          await writeFile(join(ownerHome, "auth.json"), newer);
+        }
+      });
+      continueActivation();
+      await activating;
+
+      const finalOwnerVault = JSON.parse(await readFile(join(accountDir(owner), "auth.json"), "utf8"));
+      assert.equal(finalOwnerVault.tokens.refresh_token, `refresh-owner-newest-${suffix}`);
+    };
+
+    await runScenario("vault", "vault");
+    await runScenario("home", "home");
+  });
+});
+
+test("Codex parking rejects changed content proof and ambiguous current registry identity", async () => {
+  await withTempStore(async () => {
+    const incoming = await addAccount("codex", "proof-incoming@a.b");
+    const owner = await addAccount("codex", "proof-owner@c.d");
+    await writeFile(
+      join(accountDir(incoming), "auth.json"),
+      codexAuthJson(incoming.email!, "acct-proof-incoming", "2026-06-01T00:00:00.000Z", "incoming"),
+    );
+    await writeFile(
+      join(accountDir(owner), "auth.json"),
+      codexAuthJson(owner.email!, "acct-proof-owner", "2026-06-01T00:00:00.000Z", "owner-old"),
+    );
+    const home = join(process.env.HIVE_STORE_ROOT!, "proof-home");
+    await mkdir(home, { recursive: true });
+    await writeFile(
+      join(home, "auth.json"),
+      codexAuthJson(owner.email!, "acct-proof-owner", "2026-06-05T00:00:00.000Z", "owner-live"),
+    );
+    const intent = await withAccountLock(incoming.id, () => evacuateForeignCodexAuth(incoming, home));
+    assert.ok(intent);
+
+    const changedRaw = intent.authRaw.replace("refresh-owner-live", "refresh-forged-live");
+    assert.equal(await fulfillCodexAuthParkingIntent({ ...intent, authRaw: changedRaw }), false);
+
+    const registry = JSON.parse(await readFile(accountsRegistryPath(), "utf8")) as AccountRecord[];
+    registry.push({
+      ...owner,
+      id: `${owner.id}-duplicate`,
+      addedAt: "2026-06-07T00:00:00.000Z",
+    });
+    await writeFile(accountsRegistryPath(), `${JSON.stringify(registry, null, 2)}\n`);
+    assert.equal(await fulfillCodexAuthParkingIntent(intent), false);
+    const ownerVault = JSON.parse(await readFile(join(accountDir(owner), "auth.json"), "utf8"));
+    assert.equal(ownerVault.tokens.refresh_token, "refresh-owner-old");
   });
 });
 
