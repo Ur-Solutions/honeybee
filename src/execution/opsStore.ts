@@ -66,6 +66,12 @@ export type OperationRecord = {
   /** run.collect only. */
   collectionId?: string;
   collectionState?: "collecting" | "complete" | "failed";
+  /**
+   * Internal recovery classification for a failed collection attempt. Missing
+   * on legacy records means terminal/fail-closed. Only explicitly retryable
+   * failures may re-enter `collecting` under the same stable effect.
+   */
+  collectionFailure?: "retryable" | "unrecoverable";
   manifest?: JsonObject;
   /** run.retain only. */
   retainUntil?: string;

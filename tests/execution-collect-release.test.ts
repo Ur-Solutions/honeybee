@@ -10,11 +10,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
+import { computeSchemaDigest, createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
 import { readEvidence } from "../src/execution/evidence.js";
 import { admitOperation, readOperation } from "../src/execution/opsStore.js";
 import { canonicalDigest } from "../src/comb/canonical.js";
-import { readReservation, readRunEvents } from "../src/execution/runStore.js";
+import { createRunOperations } from "../src/execution/operations.js";
+import { effectKeyHash, mutateReservation, readReservation, readRunEvents } from "../src/execution/runStore.js";
+import { storeSessionEvidenceSource } from "../src/execution/service.js";
 import { claimWorkingCopy, readWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import type { JsonValue } from "../src/comb/types.js";
 import {
@@ -40,17 +42,21 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return stdout;
 }
 
+async function initializeGitWorkingCopy(repo: string): Promise<string> {
+  await git(repo, ["init", "--initial-branch", "main"]);
+  await git(repo, ["config", "user.email", "test@example.com"]);
+  await git(repo, ["config", "user.name", "Test"]);
+  await writeFile(join(repo, "app.txt"), "one\n");
+  await git(repo, ["add", "."]);
+  await git(repo, ["commit", "-m", "init"]);
+  return (await git(repo, ["rev-parse", "HEAD"])).trim();
+}
+
 /** Real git working copy registered + claimed for the run, with a dirty edit. */
 async function withGitWorkingCopy(fn: (repo: string, head: string) => Promise<void>): Promise<void> {
   const repo = await mkdtemp(join(tmpdir(), "honeybee-h3-repo-"));
   try {
-    await git(repo, ["init", "--initial-branch", "main"]);
-    await git(repo, ["config", "user.email", "test@example.com"]);
-    await git(repo, ["config", "user.name", "Test"]);
-    await writeFile(join(repo, "app.txt"), "one\n");
-    await git(repo, ["add", "."]);
-    await git(repo, ["commit", "-m", "init"]);
-    const head = (await git(repo, ["rev-parse", "HEAD"])).trim();
+    const head = await initializeGitWorkingCopy(repo);
     await writeFile(join(repo, "app.txt"), "one\ntwo\n");
     await fn(repo, head);
   } finally {
@@ -165,6 +171,74 @@ test("run.collect works on a terminal run and after lease expiry (evidence is no
   });
 });
 
+test("run.collect retries the same stable effect after a transient failure and replaces it with complete", async () => {
+  await withTempStore(async () => {
+    const repo = await mkdtemp(join(tmpdir(), "honeybee-h3-repairable-"));
+    try {
+      const { ctx, service } = await startRun();
+      // Registered and owned, but not a git repository yet: diff collection
+      // fails transiently after admission rather than fabricating completion.
+      await registerWorkingCopy({
+        workingCopyId: "wc-0001",
+        productId: "prod-honeycomb-app",
+        path: repo,
+        snapshotDigest: SNAPSHOT_DIGEST,
+      });
+      await claimWorkingCopy("wc-0001", RUN_ID);
+
+      const envelope = collectEnvelope(ctx);
+      const failed = (await service.runCollect(envelope)) as JsonObject;
+      assert.equal((failed.result as JsonObject).state, "failed");
+      const failedReceipt = failed.receipt as JsonObject;
+      const failedRecord = (await readOperation(RUN_ID, `${RUN_ID}/collect`))!;
+      assert.equal(failedRecord.collectionFailure, "retryable");
+      assert.equal(failedRecord.collectionState, "failed");
+
+      await initializeGitWorkingCopy(repo);
+      const recovered = (await service.runCollect(collectEnvelope(ctx, `${RUN_ID}/collect`, "req-collect-recover"))) as JsonObject;
+      assert.equal((recovered.receipt as JsonObject).outcome, "replayed");
+      assert.equal((recovered.receipt as JsonObject).receiptId, failedReceipt.receiptId);
+      assert.equal((recovered.receipt as JsonObject).resultVersion, 2);
+      assert.equal((recovered.result as JsonObject).state, "complete");
+      const recoveredRecord = (await readOperation(RUN_ID, `${RUN_ID}/collect`))!;
+      assert.equal(recoveredRecord.collectionState, "complete");
+      assert.equal(recoveredRecord.collectionFailure, undefined);
+      assert.equal(recoveredRecord.cause, undefined);
+      assert.equal((await readRunEvents(RUN_ID)).filter((event) => event.type === "collection.completed").length, 1);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+test("run.collect retryable failure survives coordinator restart and the same effect resumes", async () => {
+  await withTempStore(async () => {
+    const repo = await mkdtemp(join(tmpdir(), "honeybee-h3-restart-repair-"));
+    try {
+      const { ctx, service } = await startRun();
+      await registerWorkingCopy({
+        workingCopyId: "wc-0001",
+        productId: "prod-honeycomb-app",
+        path: repo,
+        snapshotDigest: SNAPSHOT_DIGEST,
+      });
+      await claimWorkingCopy("wc-0001", RUN_ID);
+      const first = (await service.runCollect(collectEnvelope(ctx))) as JsonObject;
+      assert.equal((first.result as JsonObject).state, "failed");
+      assert.equal((await readOperation(RUN_ID, `${RUN_ID}/collect`))!.collectionFailure, "retryable");
+
+      await initializeGitWorkingCopy(repo);
+      const restarted = makeService({ control: fakeControl().control });
+      const recovered = (await restarted.runCollect(collectEnvelope(ctx, `${RUN_ID}/collect`, "req-after-restart"))) as JsonObject;
+      assert.equal((recovered.receipt as JsonObject).outcome, "replayed");
+      assert.equal((recovered.result as JsonObject).state, "complete");
+      assert.equal((await readOperation(RUN_ID, `${RUN_ID}/collect`))!.collectionState, "complete");
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+});
+
 test("run.retain extends the debug window monotonically; run.get projects retainedUntil", async () => {
   await withTempStore(async () => {
     const { ctx, service } = await startRun();
@@ -187,6 +261,113 @@ test("run.retain extends the debug window monotonically; run.get projects retain
     )) as JsonObject;
     assert.equal((replay.receipt as JsonObject).outcome, "replayed");
     assert.deepEqual(replay.result, { runId: RUN_ID, retainedUntil: until });
+  });
+});
+
+test("an admitted retain that loses to release is refused under the reservation lock and stays refused on restart", async () => {
+  await withTempStore(async () => {
+    const control = fakeControl();
+    const { ctx, service } = await startRun({ control });
+    const effectKey = `${RUN_ID}/retain-race`;
+    const retainUntil = "2036-02-01T00:00:00Z";
+    const envelope = buildOperationEnvelope(ctx, effectKey, { runId: RUN_ID, retainUntil });
+    // Simulate admission followed by a coordinator pause before the
+    // reservation mutation. This is the replay path that bypasses the NEW
+    // effect guard and used to settle a false retainedUntil after release.
+    await admitOperation({
+      runId: RUN_ID,
+      method: "run.retain",
+      effectKey,
+      requestDigest: String(envelope.requestDigest),
+      protocolVersion: "0.1",
+      schemaDigest: computeSchemaDigest(contract),
+      init: { retainUntil },
+    });
+
+    let reachedPause!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      reachedPause = resolve;
+    });
+    let resumeRetain!: () => void;
+    const resume = new Promise<void>((resolve) => {
+      resumeRetain = resolve;
+    });
+    const pausedOps = createRunOperations({
+      contract,
+      validator,
+      protocolVersion: "0.1",
+      schemaDigest: computeSchemaDigest(contract),
+      now: () => new Date(),
+      binding: async () => ctx.binding,
+      control: control.control,
+      sessions: storeSessionEvidenceSource(),
+      settle: async (reservation) => {
+        reachedPause();
+        await resume;
+        return { reservation, state: "running" };
+      },
+      origin: async () => ({ nodeId: ctx.nodeId }),
+    });
+
+    const pendingRetain = pausedOps.runRetain(envelope);
+    await paused;
+    const release = (await service.runRelease(buildOperationEnvelope(ctx, `${RUN_ID}/release`, { runId: RUN_ID }))) as JsonObject;
+    assert.equal((release.result as JsonObject).environmentState, "released");
+    resumeRetain();
+
+    const raced = (await pendingRetain) as JsonObject;
+    assert.equal((raced.error as JsonObject).code, "RUN_VERSION_CONFLICT");
+    const reservation = (await readReservation(RUN_ID))!;
+    assert.ok(reservation.releasedAt);
+    assert.equal(reservation.retainUntil, undefined);
+    assert.equal(reservation.retentionEffects?.[effectKeyHash(effectKey)], undefined);
+    assert.equal((await readOperation(RUN_ID, effectKey))!.result, undefined);
+
+    // A fresh lifecycle coordinator sees the same durable ordering and cannot
+    // turn the admitted loser into a successful retention receipt.
+    const restarted = makeService({ control: fakeControl().control });
+    const replay = (await restarted.runRetain(
+      buildOperationEnvelope(ctx, effectKey, { runId: RUN_ID, retainUntil }, { requestId: "req-retain-race-restart" }),
+    )) as JsonObject;
+    assert.equal((replay.error as JsonObject).code, "RUN_VERSION_CONFLICT");
+    assert.equal((await readOperation(RUN_ID, effectKey))!.result, undefined);
+  });
+});
+
+test("retain provenance recovers a crash after persistence but before the operation result", async () => {
+  await withTempStore(async () => {
+    const { ctx, service } = await startRun();
+    const effectKey = `${RUN_ID}/retain-crash`;
+    const retainUntil = "2036-02-01T00:00:00Z";
+    const envelope = buildOperationEnvelope(ctx, effectKey, { runId: RUN_ID, retainUntil });
+    await admitOperation({
+      runId: RUN_ID,
+      method: "run.retain",
+      effectKey,
+      requestDigest: String(envelope.requestDigest),
+      protocolVersion: "0.1",
+      schemaDigest: computeSchemaDigest(contract),
+      init: { retainUntil },
+    });
+    // Crash fixture: the serialized reservation write won, but the separate
+    // operation-result write did not happen before the coordinator exited.
+    const retentionEffectId = effectKeyHash(effectKey);
+    await mutateReservation(RUN_ID, (reservation) => ({
+      ...reservation,
+      retainUntil,
+      retentionEffects: {
+        ...(reservation.retentionEffects ?? {}),
+        [retentionEffectId]: { retainUntil, persistedAt: new Date().toISOString() },
+      },
+    }));
+    await service.runRelease(buildOperationEnvelope(ctx, `${RUN_ID}/release`, { runId: RUN_ID }));
+
+    const restarted = makeService({ control: fakeControl().control });
+    const replay = (await restarted.runRetain(
+      buildOperationEnvelope(ctx, effectKey, { runId: RUN_ID, retainUntil }, { requestId: "req-retain-crash-replay" }),
+    )) as JsonObject;
+    assert.equal((replay.receipt as JsonObject).outcome, "replayed");
+    assert.deepEqual(replay.result, { runId: RUN_ID, retainedUntil: retainUntil });
   });
 });
 

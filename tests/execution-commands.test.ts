@@ -4,10 +4,12 @@
 // (answer until needs_input.opened is bridged, checkpoint, refresh-credential).
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
+import { computeSchemaDigest, createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
 import { HarnessDispatchError } from "../src/execution/harnessControl.js";
-import { readOperation } from "../src/execution/opsStore.js";
-import { readRunEvents } from "../src/execution/runStore.js";
+import { admitOperation, readOperation } from "../src/execution/opsStore.js";
+import { createRunOperations } from "../src/execution/operations.js";
+import { effectKeyHash, readRunEvents } from "../src/execution/runStore.js";
+import { storeSessionEvidenceSource } from "../src/execution/service.js";
 import { saveSession, loadSession } from "../src/store.js";
 import {
   beeNameForRun,
@@ -366,5 +368,100 @@ test("run.command vs concurrent cancel: a cancel landing after the pre-lock sett
     // cancelled run never receives steering.
     assert.equal(await readOperation(RUN_ID, `${RUN_ID}/command/send-race`), null);
     assert.equal(control.calls.filter((call) => call.method === "send").length, 0);
+  });
+});
+
+test("run.command admitted before cancel rechecks the reservation at the dispatch barrier and never reaches the driver", async () => {
+  await withTempStore(async () => {
+    const control = fakeControl();
+    const { ctx, service } = await startRunningRun({ control });
+
+    let reachedDispatchBarrier!: () => void;
+    const atDispatchBarrier = new Promise<void>((resolve) => {
+      reachedDispatchBarrier = resolve;
+    });
+    let resumeDispatch!: () => void;
+    const resume = new Promise<void>((resolve) => {
+      resumeDispatch = resolve;
+    });
+    let blockAcceptedOrigin = true;
+    const racingOps = createRunOperations({
+      contract,
+      validator,
+      protocolVersion: "0.1",
+      schemaDigest: computeSchemaDigest(contract),
+      now: () => new Date(),
+      binding: async () => ctx.binding,
+      control: control.control,
+      sessions: storeSessionEvidenceSource(),
+      // Preserve the running snapshot captured before the concurrent cancel;
+      // the dispatch claim itself must close the remaining race.
+      settle: async (reservation) => ({ reservation, state: "running" }),
+      origin: async () => {
+        if (blockAcceptedOrigin) {
+          blockAcceptedOrigin = false;
+          reachedDispatchBarrier();
+          await resume;
+        }
+        return { nodeId: ctx.nodeId };
+      },
+    });
+    const effectKey = `${RUN_ID}/command/send-admitted-race`;
+    const envelope = sendEnvelope(ctx, "must not arrive", effectKey);
+    const pendingCommand = racingOps.runCommand(envelope);
+    await atDispatchBarrier;
+    assert.equal((await readOperation(RUN_ID, effectKey))?.commandState, "accepted", "effect is admitted before the barrier opens");
+
+    await service.runCancel(buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "race winner" }));
+    resumeDispatch();
+    const response = (await pendingCommand) as JsonObject;
+    assert.equal((response.result as JsonObject).commandState, "failed");
+    assert.match(String((response.result as JsonObject).cause), /nothing was delivered/);
+    assert.equal(control.calls.filter((call) => call.method === "send").length, 0);
+    assert.equal((await readOperation(RUN_ID, effectKey))?.commandState, "failed");
+    const events = await readRunEvents(RUN_ID);
+    assert.ok(events.some((event) => event.type === "command.failed"));
+    assert.ok(!events.some((event) => event.type === "command.completed"));
+  });
+});
+
+test("restart replay of a pre-admitted accepted command after cancel fails durably without delivery", async () => {
+  await withTempStore(async () => {
+    const initialControl = fakeControl();
+    const { ctx, service } = await startRunningRun({ control: initialControl });
+    const effectKey = `${RUN_ID}/command/send-admitted-restart`;
+    const envelope = sendEnvelope(ctx, "must not arrive after restart", effectKey);
+    // Crash fixture: admission committed, but the coordinator exited before
+    // it could claim accepted -> dispatching.
+    await admitOperation({
+      runId: RUN_ID,
+      method: "run.command",
+      effectKey,
+      requestDigest: String(envelope.requestDigest),
+      protocolVersion: "0.1",
+      schemaDigest: computeSchemaDigest(contract),
+      init: {
+        commandKind: "send",
+        commandState: "accepted",
+        deliveryId: `op-${effectKeyHash(effectKey).slice(0, 16)}`,
+      },
+    });
+    await service.runCancel(buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "cancelled while down" }));
+
+    const restartedControl = fakeControl();
+    const restarted = makeService({ control: restartedControl.control });
+    const replay = (await restarted.runCommand(
+      buildOperationEnvelope(
+        ctx,
+        effectKey,
+        { runId: RUN_ID, command: { kind: "send", text: "must not arrive after restart" } },
+        { requestId: "req-command-after-cancel-restart" },
+      ),
+    )) as JsonObject;
+    assert.equal((replay.receipt as JsonObject).outcome, "replayed");
+    assert.equal((replay.result as JsonObject).commandState, "failed");
+    assert.match(String((replay.result as JsonObject).cause), /nothing was delivered/);
+    assert.equal(restartedControl.calls.filter((call) => call.method === "send").length, 0);
+    assert.equal((await readOperation(RUN_ID, effectKey))?.commandState, "failed");
   });
 });

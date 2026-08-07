@@ -444,6 +444,19 @@ test("requested evidence kinds this node cannot collect yield a typed partial fa
     assert.ok((manifest.entries as JsonObject[]).some((entry) => entry.kind === "log"));
     const record = (await readOperation(RUN_ID, `${RUN_ID}/collect`))!;
     assert.match(record.cause!, /media, tests|tests, media/);
+    assert.equal(record.collectionFailure, "unrecoverable");
     assert.ok(!(await readRunEvents(RUN_ID)).some((event) => event.type === "collection.completed"));
+
+    // Unsupported/unrecoverable collection failures remain terminal across
+    // replay and restart; only failures explicitly classified retryable may
+    // re-enter under the same stable effect.
+    const restarted = makeService({ control: fakeControl().control });
+    const replay = (await restarted.runCollect(
+      buildOperationEnvelope(ctx, `${RUN_ID}/collect`, { runId: RUN_ID }, { requestId: "req-unsupported-replay" }),
+    )) as JsonObject;
+    assert.equal((replay.receipt as JsonObject).outcome, "replayed");
+    assert.equal((replay.result as JsonObject).state, "failed");
+    assert.equal((replay.receipt as JsonObject).resultVersion, (response.receipt as JsonObject).resultVersion);
+    assert.equal((await readOperation(RUN_ID, `${RUN_ID}/collect`))!.collectionFailure, "unrecoverable");
   });
 });

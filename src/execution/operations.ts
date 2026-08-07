@@ -254,12 +254,51 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       // claimer proceeds — a concurrent coordinator (even another process)
       // that lost the claim must not dispatch a second delivery.
       let claimed = false;
-      let record = await mutateOperation(runId, effectKey, (current) => {
+      let cancelledBeforeDelivery = false;
+      let record = await mutateOperation(runId, effectKey, async (current) => {
         if (current.commandState !== "accepted") return current;
+        // Admission guards apply only when a record is first created. An
+        // already-admitted `accepted` effect (including a restart replay) can
+        // reach this claim after cancellation/terminalization, so bind the
+        // accepted -> dispatching decision to the same global serialization
+        // boundary as those reservation mutations. If cleanup won, settle a
+        // durable failed command atomically and NEVER enter the driver window.
+        const fresh = await readReservation(runId);
+        if (!fresh) {
+          throw executionError("RUN_UNKNOWN", `runId ${runId} names no Run reserved on this node`);
+        }
+        if (fresh.cancel || fresh.result) {
+          cancelledBeforeDelivery = true;
+          const cause = fresh.result
+            ? `run became ${fresh.result.outcome} before command delivery; nothing was delivered`
+            : "run acquired a durable cancellation intent before command delivery; nothing was delivered";
+          return {
+            ...current,
+            commandState: "failed",
+            cause,
+            result: { commandState: "failed", cause },
+          };
+        }
         claimed = true;
         return { ...current, commandState: "dispatching" };
       });
-      if (!claimed) return record;
+      if (!claimed) {
+        if (cancelledBeforeDelivery) {
+          // `dispatching` here records the serialized claim attempt, not a
+          // driver delivery. Keeping the corpus lifecycle complete also lets
+          // restart reconciliation self-heal this exact event sequence.
+          await appendRunEvents(
+            runId,
+            protocolVersion,
+            [
+              { type: "command.dispatching", payload: { effectKey }, origin: await deps.origin({ driverId }) },
+              { type: "command.failed", payload: { effectKey, cause: record.cause! }, origin: await deps.origin({ driverId }) },
+            ],
+            { onlyIfAbsentKeys: true },
+          );
+        }
+        return record;
+      }
       await appendRunEvents(
         runId,
         protocolVersion,
@@ -633,15 +672,33 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         schemaDigest,
         init: { collectionId: `coll-${effectKeyHash(validated.effectKey).slice(0, 12)}`, collectionState: "collecting" },
       });
-      if (record.collectionState === "complete" || record.collectionState === "failed") {
-        // Completed collections replay byte-stable: the recorded manifest is
-        // the effect's result, not a fresh snapshot under an old receipt.
+      if (record.collectionState === "complete" || (record.collectionState === "failed" && record.collectionFailure !== "retryable")) {
+        // Complete and unsupported/unrecoverable failures replay byte-stable.
+        // Legacy failed records have no recovery classification and therefore
+        // remain terminal/fail-closed rather than being re-executed blindly.
         return respond(requestId, record, "replayed");
       }
       // Concurrent identical replays join one collection pass.
       const current = await singleFlight<OperationRecord>(flightKey(validated.runId, validated.effectKey), async () => {
-        const latest = await readOperation(validated.runId, validated.effectKey);
-        if (latest && (latest.collectionState === "complete" || latest.collectionState === "failed")) return latest;
+        let latest = await readOperation(validated.runId, validated.effectKey);
+        if (latest?.collectionState === "complete" || (latest?.collectionState === "failed" && latest.collectionFailure !== "retryable")) {
+          return latest;
+        }
+        if (latest?.collectionState === "failed" && latest.collectionFailure === "retryable") {
+          // Durable re-entry makes restart behavior explicit: a crash after
+          // this write leaves `collecting`, which is safe to resume because
+          // evidence writes are digest-addressed/idempotent. Preserve the last
+          // failed result until replacement so resultVersion can record the
+          // failed -> complete change.
+          latest = await mutateOperation(validated.runId, validated.effectKey, (op) =>
+            op.collectionState === "failed" && op.collectionFailure === "retryable"
+              ? { ...op, collectionState: "collecting", collectionFailure: undefined, cause: undefined }
+              : op,
+          );
+          if (latest.collectionState === "complete" || (latest.collectionState === "failed" && latest.collectionFailure !== "retryable")) {
+            return latest;
+          }
+        }
         try {
           const entries = await collectEntries(reservation);
           const unsupported = requestedEvidenceKinds(reservation).filter((kind) => !COLLECTABLE_KINDS.has(kind));
@@ -660,6 +717,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             };
             return setOperationResult(validated.runId, validated.effectKey, manifest, {
               collectionState: "failed",
+              collectionFailure: "unrecoverable",
               manifest,
               cause,
             });
@@ -674,7 +732,9 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           };
           const updated = await setOperationResult(validated.runId, validated.effectKey, manifest, {
             collectionState: "complete",
+            collectionFailure: undefined,
             manifest,
+            cause: undefined,
           });
           await appendRunEvents(
             validated.runId,
@@ -685,6 +745,10 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           return updated;
         } catch (error) {
           const cause = error instanceof Error ? error.message : String(error);
+          // The corpus error registry is the cross-repo retryability contract:
+          // known non-retryable protocol failures stay terminal, while raw
+          // coordinator/I/O faults map to retryable AUTHORITY_UNAVAILABLE.
+          const collectionFailure = toWireError(error).retryable ? "retryable" : "unrecoverable";
           const manifest: JsonObject = {
             runId: validated.runId,
             collectionId: record.collectionId!,
@@ -694,6 +758,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           };
           return setOperationResult(validated.runId, validated.effectKey, manifest, {
             collectionState: "failed",
+            collectionFailure,
             manifest,
             cause,
           });
@@ -715,6 +780,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       const prepared = await prepare(request, "run-retain-body", "run.retain");
       const { validated } = prepared;
       const retainUntil = String(validated.body.retainUntil);
+      const retentionEffectId = effectKeyHash(validated.effectKey);
       const { record, created } = await admitOperation({
         runId: validated.runId,
         method: "run.retain",
@@ -724,7 +790,15 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         schemaDigest,
         init: { retainUntil },
         guard: async () => {
-          if (prepared.reservation.releasedAt) {
+          // `prepare` precedes the admission lock. Re-read under that lock so
+          // a release that already won cannot leave behind a newly admitted
+          // retain effect; the post-admission mutation repeats this check for
+          // the remaining admitted-retain -> release window.
+          const fresh = await readReservation(validated.runId);
+          if (!fresh) {
+            throw executionError("RUN_UNKNOWN", `runId ${validated.runId} names no Run reserved on this node`);
+          }
+          if (fresh.releasedAt) {
             throw executionError("RUN_VERSION_CONFLICT", `run ${validated.runId} environment is already released; nothing to retain`);
           }
         },
@@ -732,15 +806,31 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       if (!created && record.result) return respond(requestId, record, "replayed");
       // Retention only ever EXTENDS the debug window (never shrinks another
       // effect's extension) and never extends execution/credential authority.
+      // Record per-effect provenance in the SAME reservation mutation so a
+      // replay can prove whether retain or release won even if the coordinator
+      // crashed before writing the operation result.
       const reservation = await mutateReservation(validated.runId, (current) => {
+        if (current.retentionEffects?.[retentionEffectId]) return current;
         if (current.releasedAt) return current;
         const existing = current.retainUntil ? Date.parse(current.retainUntil) : Number.NEGATIVE_INFINITY;
         const requested = Date.parse(retainUntil);
-        return requested > existing ? { ...current, retainUntil } : current;
+        const settledUntil = requested > existing ? retainUntil : current.retainUntil ?? retainUntil;
+        return {
+          ...current,
+          retainUntil: settledUntil,
+          retentionEffects: {
+            ...(current.retentionEffects ?? {}),
+            [retentionEffectId]: { retainUntil: settledUntil, persistedAt: now().toISOString() },
+          },
+        };
       });
+      const persisted = reservation.retentionEffects?.[retentionEffectId];
+      if (!persisted) {
+        throw executionError("RUN_VERSION_CONFLICT", `run ${validated.runId} environment was released before this retain could persist`);
+      }
       const current = await setOperationResult(validated.runId, validated.effectKey, {
         runId: validated.runId,
-        retainedUntil: reservation.retainUntil ?? retainUntil,
+        retainedUntil: persisted.retainUntil,
       });
       return respond(requestId, current, created ? "created" : "replayed");
     } catch (error) {

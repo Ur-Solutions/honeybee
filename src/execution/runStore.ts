@@ -152,6 +152,13 @@ export type RunReservation = {
   cancel?: { requestedAt: string; reason?: string };
   /** Debug-retention window (run.retain); extends retention only, never authority. */
   retainUntil?: string;
+  /**
+   * Durable proof that a particular retain effect persisted before release.
+   * The operation result is written separately, so this provenance lets a
+   * replay after a crash distinguish "retain won, result write was pending"
+   * from "release won before the reservation mutation".
+   */
+  retentionEffects?: Record<string, { retainUntil: string; persistedAt: string }>;
   /** Environment lifecycle stamps written by run.release's step ledger. */
   sealedAt?: string;
   releasedAt?: string;
