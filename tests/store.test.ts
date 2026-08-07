@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -185,6 +186,90 @@ test("active index rebuilds after missing/corrupt state and normalizes legacy ar
     assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.live"], "corruption triggers an authoritative rebuild");
     await rm(activeSessionIndexPath(), { force: true });
     assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.live"], "missing index triggers an authoritative rebuild");
+  });
+});
+
+test("checksum-valid v1 active index stays hot across upgrade until background migration", async () => {
+  await withTempStore(async (dir) => {
+    const indexed = makeRecord(dir, { name: "CO.v1-indexed", tmuxTarget: "CO.v1-indexed" });
+    await saveSession(indexed);
+    const root = dir;
+    const active = [indexed.name];
+    const updatedAt = "2026-08-07T00:00:00.000Z";
+    const checksum = createHash("sha256")
+      .update(JSON.stringify({ version: 1, root, active }))
+      .digest("hex");
+    const legacy = `${JSON.stringify({
+      version: 1,
+      complete: true,
+      root,
+      active,
+      checksum,
+      updatedAt,
+    }, null, 2)}\n`;
+    await writeFile(activeSessionIndexPath(), legacy);
+
+    assert.deepEqual((await listActiveSessions()).map((record) => record.name), active);
+    assert.equal(
+      await readFile(activeSessionIndexPath(), "utf8"),
+      legacy,
+      "the first post-upgrade hot read serves v1 without a synchronous rebuild or rewrite",
+    );
+  });
+});
+
+test("checksum-valid index canonical reconciliation discovers a live record written by an older binary", async () => {
+  await withTempStore(async (dir) => {
+    const indexed = makeRecord(dir, { name: "CO.indexed", tmuxTarget: "CO.indexed" });
+    await saveSession(indexed);
+
+    // Exact mixed-version writer: it atomically owns only the canonical
+    // SessionRecord and knows nothing about active-sessions.json.
+    const oldWriter = makeRecord(dir, { name: "CO.old-writer", tmuxTarget: "CO.old-writer" });
+    await writeFile(join(dir, "sessions", "CO.old-writer.json"), JSON.stringify(oldWriter));
+
+    const before = JSON.parse(await readFile(activeSessionIndexPath(), "utf8")) as {
+      active: string[];
+      checksum: string;
+    };
+    assert.deepEqual(before.active, ["CO.indexed"], "the still-valid checksum index initially omits the legacy write");
+    assert.equal(typeof before.checksum, "string");
+    assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.indexed"], "fresh hot reads remain index-only");
+
+    await rebuildActiveSessionIndex();
+    assert.deepEqual(
+      (await listActiveSessions()).map((record) => record.name).sort(),
+      ["CO.indexed", "CO.old-writer"],
+      "the canonical pass repairs mixed-version omission",
+    );
+  });
+});
+
+test("ambiguous active-record read retains membership without suppressing healthy active rows", async () => {
+  await withTempStore(async (dir) => {
+    const record = makeRecord(dir, { name: "CO.transient", tmuxTarget: "CO.transient" });
+    const healthy = makeRecord(dir, { name: "CO.healthy", tmuxTarget: "CO.healthy" });
+    await saveSession(record);
+    await saveSession(healthy);
+    const path = join(dir, "sessions", "CO.transient.json");
+    const valid = await readFile(path, "utf8");
+
+    // Model an atomic writer's transient/torn read window. Parse failure is not
+    // authoritative absence and must never be converted to index deletion.
+    await writeFile(path, "{\"name\":");
+    assert.deepEqual(
+      (await listActiveSessions()).map((candidate) => candidate.name),
+      ["CO.healthy"],
+      "one unreadable record does not blind every healthy active bee",
+    );
+    const afterFailure = JSON.parse(await readFile(activeSessionIndexPath(), "utf8")) as { active: string[] };
+    assert.deepEqual(afterFailure.active, ["CO.healthy", "CO.transient"]);
+
+    await writeFile(path, valid);
+    assert.deepEqual(
+      (await listActiveSessions()).map((candidate) => candidate.name).sort(),
+      ["CO.healthy", "CO.transient"],
+    );
   });
 });
 

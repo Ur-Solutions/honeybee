@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { renderTrackStatus } from "../src/commands/track.js";
+import { deliverTrackFollowUp, renderTrackStatus } from "../src/commands/track.js";
+import { recordSeal, validateSealArtifact } from "../src/seal.js";
+import { listActiveSessions, loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
 import {
   attachTrack,
   defineTrackFromFile,
@@ -167,6 +169,60 @@ test("track attachment rolls back when standing-postscript delivery fails", asyn
     assert.equal(await loadTrackAttachment("CO.failed"), null);
     const ledger = await readFile(join(store, "ledger.jsonl"), "utf8");
     assert.doesNotMatch(ledger, /track\.attach/);
+  });
+});
+
+test("track follow-up retires the completed-turn boundary and re-enters the active index", async () => {
+  await withStore(async (store) => {
+    const record: SessionRecord = {
+      name: "CO.track-follow-up",
+      id: "CO.track-follow-up",
+      agent: "codex",
+      cwd: store,
+      command: "codex",
+      tmuxTarget: "CO.track-follow-up",
+      createdAt: "2026-08-07T08:00:00.000Z",
+      updatedAt: "2026-08-07T08:01:00.000Z",
+      status: "running",
+      lastObservedState: "done",
+      lastObservedStateAt: "2026-08-07T08:01:00.000Z",
+    };
+    await saveSession(record);
+    await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "previous track turn" }));
+    assert.deepEqual(await listActiveSessions(), [], "completed warm turn starts outside the daemon hot set");
+
+    let delivered = false;
+    await deliverTrackFollowUp(record, "next standing track instructions", {
+      deliver: async () => {
+        delivered = true;
+        assert.deepEqual(await listActiveSessions(), [], "turn boundary is persisted only after delivery succeeds");
+      },
+      writeState: async () => undefined,
+      now: () => new Date("2026-08-07T08:02:00.000Z"),
+    });
+    assert.equal(delivered, true);
+    assert.deepEqual((await listActiveSessions()).map((candidate) => candidate.name), [record.name]);
+    const stored = await loadSession(record.name);
+    assert.equal(stored?.lastObservedState, undefined);
+    assert.equal(stored?.lastObservedStateAt, undefined);
+    assert.equal(stored?.lastPrompt, "next standing track instructions");
+    assert.equal(typeof stored?.sealHighWaterFilename, "string", "previous turn's seal becomes the high-water boundary");
+
+    await updateSession(record.name, {
+      lastObservedState: "done",
+      lastObservedStateAt: "2026-08-07T08:03:00.000Z",
+    });
+    const completedAgain = await loadSession(record.name);
+    assert.ok(completedAgain);
+    await assert.rejects(
+      () => deliverTrackFollowUp(completedAgain!, "failed follow-up", {
+        deliver: async () => { throw new Error("transport down"); },
+        writeState: async () => undefined,
+      }),
+      /transport down/,
+    );
+    assert.equal((await loadSession(record.name))?.lastObservedState, "done", "failed delivery preserves the completed boundary");
+    assert.deepEqual(await listActiveSessions(), []);
   });
 });
 

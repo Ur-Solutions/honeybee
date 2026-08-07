@@ -3,6 +3,7 @@ import { deliverPromptText, ensureLive, resolveBeeInCurrentPane, resolveSession,
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { writeHiveState } from "../hiveState.js";
 import { flag, truthy, type Parsed } from "../parse.js";
+import { nextTurnPatch } from "../seal.js";
 import { updateSession, type SessionRecord } from "../store.js";
 import {
   attachTrack,
@@ -234,20 +235,38 @@ async function trackQueueList(parsed: Parsed): Promise<void> {
 
 function deliveryForBee(bee: SessionRecord): TrackDelivery {
   return async (postscript) => {
-    await deliverPromptText(bee, postscript);
-    await recordTrackPrompt(bee, postscript);
+    await deliverTrackFollowUp(bee, postscript);
   };
 }
 
-async function recordTrackPrompt(bee: SessionRecord, postscript: string): Promise<void> {
-  const at = new Date().toISOString();
-  await updateSession(bee.name, {
+export type TrackFollowUpOptions = {
+  deliver?: (bee: SessionRecord, postscript: string) => Promise<void>;
+  writeState?: typeof writeHiveState;
+  now?: () => Date;
+};
+
+/**
+ * Deliver track standing instructions as a real next turn. Queued-track
+ * follow-ups can target a warm runtime whose previous turn is sealed/done;
+ * snapshot that boundary before delivery, then clear it only after delivery
+ * succeeds so the record re-enters the operational active index.
+ */
+export async function deliverTrackFollowUp(
+  bee: SessionRecord,
+  postscript: string,
+  options: TrackFollowUpOptions = {},
+): Promise<void> {
+  const turn = await nextTurnPatch(bee);
+  await (options.deliver ?? deliverPromptText)(bee, postscript);
+  const at = (options.now ?? (() => new Date()))().toISOString();
+  const persisted = await updateSession(bee.name, {
+    ...turn,
     updatedAt: at,
     status: "running",
     lastPrompt: postscript,
     lastPromptAt: at,
   });
-  await writeHiveState(bee, "working");
+  await (options.writeState ?? writeHiveState)(persisted ?? bee, "working");
 }
 
 async function trackStatus(parsed: Parsed): Promise<void> {

@@ -27,6 +27,11 @@ export type TransactionalKillOptions = {
   finalCredentialSyncBudgetMs?: number;
 };
 
+export type PurgeSessionDataOptions = Pick<
+  TransactionalKillOptions,
+  "emitLedger" | "finalCredentialSync" | "finalCredentialSyncBudgetMs"
+>;
+
 export type KillOutcome =
   | { ok: true; alreadyGone: boolean; attempts: number }
   | { ok: false; lastError: string; stillRunning: boolean; attempts: number };
@@ -62,7 +67,14 @@ type TeardownVerdict = {
  * the retry handle instead of leaving unaddressable seals/run data behind.
  * `deleteSession` remains the intentionally metadata-only low-level primitive.
  */
-export async function purgeSessionData(record: SessionRecord): Promise<void> {
+export async function purgeSessionData(
+  record: SessionRecord,
+  options: PurgeSessionDataOptions = {},
+): Promise<void> {
+  // Credential harvest can touch the keychain, vault, and account locks. It is
+  // deliberately bounded and completed before any artifact/session lock is
+  // acquired or any retry handle is deleted.
+  await runFinalCredentialSync(record, options);
   await rm(containedArtifactPath(sealsRoot(), record.name), { recursive: true, force: true });
   await rm(containedArtifactPath(hsrRoot(), record.name), { recursive: true, force: true });
   await removeBeeRequests(record.name);
@@ -192,7 +204,7 @@ export async function syncSessionCredentialsOnExit(record: SessionRecord, timeou
   if (outcome.failedPairs > 0 || outcome.timedOutPairs > 0) throw new Error("final credential sync failed");
 }
 
-async function finalCredentialSync(record: SessionRecord, options: TransactionalKillOptions): Promise<void> {
+async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessionDataOptions): Promise<void> {
   if (!record.accountId || !record.homePath) return;
   const budgetMs = options.finalCredentialSyncBudgetMs ?? 10_000;
   const sync = options.finalCredentialSync ?? ((candidate: SessionRecord) =>
@@ -266,8 +278,7 @@ export async function transactionalKill(
     return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
   }
 
-  await finalCredentialSync(record, options);
-  await purgeSessionData(record);
+  await purgeSessionData(record, options);
   if (emitLedger) {
     await appendLedger({
       type: "session.kill",
@@ -319,7 +330,7 @@ export async function transactionalRetire(
     return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
   }
 
-  await finalCredentialSync(record, options);
+  await runFinalCredentialSync(record, options);
   // Request closures BEFORE filing (retire keeps the file — revivable
   // history): a pending stop-failed from an earlier failed kill/retire is now
   // a fact resolved by this successful stop; everything else open closes with

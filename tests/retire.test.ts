@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { ensureHsrRunDir, hsrEventsPath, hsrMetaPath, hsrRingPath } from "../src/hsr/runDir.js";
-import { transactionalKill, transactionalRetire } from "../src/kill.js";
+import { purgeSessionData, transactionalKill, transactionalRetire } from "../src/kill.js";
 import { recordSeal, sealsRoot, validateSealArtifact } from "../src/seal.js";
 import { deriveState } from "../src/state.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
@@ -162,6 +162,50 @@ test("retire and purge stay bounded when their post-exit credential harvest neve
     assert.ok(Date.now() - startedAt < 500, "both lifecycle operations honor the short final-sync budget");
     assert.equal((await loadSession("retire-wedged-sync"))?.status, "done");
     assert.equal(await loadSession("purge-wedged-sync"), null);
+  });
+});
+
+test("direct clean purge harvests credentials before deleting artifacts/metadata and remains bounded", async () => {
+  await withTempStore(async () => {
+    const ordered = seed({
+      name: "clean-final-harvest",
+      tmuxTarget: "clean-final-harvest",
+      accountId: "codex-a",
+      homePath: "/tmp/test-only-codex-a",
+    });
+    await saveSession(ordered);
+    await recordSeal(ordered.name, validateSealArtifact({ status: "done", summary: "temporary test seal" }));
+    await ensureHsrRunDir(ordered.name);
+    await writeFile(hsrEventsPath(ordered.name), "temporary test events\n");
+
+    await purgeSessionData(ordered, {
+      emitLedger: false,
+      finalCredentialSync: async (record) => {
+        assert.equal(record.name, ordered.name);
+        assert.ok(await loadSession(ordered.name), "metadata is still the credential binding during harvest");
+        assert.ok((await readdir(join(sealsRoot(), ordered.name))).length > 0, "seals still exist during harvest");
+        assert.match(await readFile(hsrEventsPath(ordered.name), "utf8"), /temporary test events/);
+      },
+    });
+    assert.equal(await loadSession(ordered.name), null);
+    await assert.rejects(readdir(join(sealsRoot(), ordered.name)), /ENOENT/);
+    await assert.rejects(readFile(hsrEventsPath(ordered.name), "utf8"), /ENOENT/);
+
+    const bounded = seed({
+      name: "clean-wedged-harvest",
+      tmuxTarget: "clean-wedged-harvest",
+      accountId: "codex-a",
+      homePath: "/tmp/test-only-codex-a",
+    });
+    await saveSession(bounded);
+    const startedAt = Date.now();
+    await purgeSessionData(bounded, {
+      emitLedger: false,
+      finalCredentialSync: async () => new Promise<void>(() => undefined),
+      finalCredentialSyncBudgetMs: 20,
+    });
+    assert.ok(Date.now() - startedAt < 500, "destructive clean cannot wedge on credential harvest");
+    assert.equal(await loadSession(bounded.name), null);
   });
 });
 

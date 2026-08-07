@@ -47,6 +47,12 @@ export async function cmdDaemon(parsed: Parsed) {
       const { runSessionListWorker } = await import("../daemon/sessionListProcess.js");
       return runSessionListWorker();
     }
+    // Internal: one disposable full canonical active-index reconciliation.
+    // The session-list worker launches this only after serving its hot snapshot.
+    case "active-index-reconcile-worker": {
+      const { runActiveIndexReconcileWorker } = await import("../daemon/sessionListProcess.js");
+      return runActiveIndexReconcileWorker();
+    }
     // Internal: the disposable credential worker. A deadline breach kills the
     // process, so keychain/fs work and any account lock it owns cannot overlap
     // later daemon intervals.

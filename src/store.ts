@@ -280,7 +280,15 @@ export function isActiveSessionRecord(
   return !TERMINAL_OBSERVED_STATES.has(record.lastObservedState ?? "");
 }
 
-export const ACTIVE_SESSION_INDEX_VERSION = 1;
+export const ACTIVE_SESSION_INDEX_VERSION = 2;
+const LEGACY_ACTIVE_SESSION_INDEX_VERSION = 1;
+
+/**
+ * A mixed-version writer does not know about the derived active index. Bound
+ * how long its canonical SessionRecord can remain absent without making every
+ * hot-path read walk all historical records.
+ */
+export const DEFAULT_ACTIVE_SESSION_RECONCILE_INTERVAL_MS = 5 * 60_000;
 
 type ActiveSessionIndex = {
   version: typeof ACTIVE_SESSION_INDEX_VERSION;
@@ -288,6 +296,8 @@ type ActiveSessionIndex = {
   root: string;
   active: string[];
   checksum: string;
+  /** Last full current+legacy SessionRecord walk, not a delta membership write. */
+  reconciledAt: string;
   updatedAt: string;
 };
 
@@ -310,21 +320,34 @@ function activeSessionIndexLockPath(root: string): string {
   return join(root, ".active-sessions.lock");
 }
 
-function activeIndexChecksum(root: string, active: readonly string[]): string {
+function activeIndexChecksum(root: string, active: readonly string[], reconciledAt: string): string {
   return createHash("sha256")
-    .update(JSON.stringify({ version: ACTIVE_SESSION_INDEX_VERSION, root, active }))
+    .update(JSON.stringify({ version: ACTIVE_SESSION_INDEX_VERSION, root, active, reconciledAt }))
     .digest("hex");
 }
 
-function makeActiveSessionIndex(root: string, names: Iterable<string>): ActiveSessionIndex {
+function legacyActiveIndexChecksum(root: string, active: readonly string[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ version: LEGACY_ACTIVE_SESSION_INDEX_VERSION, root, active }))
+    .digest("hex");
+}
+
+function makeActiveSessionIndex(
+  root: string,
+  names: Iterable<string>,
+  options: { reconciledAt?: string } = {},
+): ActiveSessionIndex {
   const active = [...new Set(names)].sort((a, b) => a.localeCompare(b));
+  const now = new Date().toISOString();
+  const reconciledAt = options.reconciledAt ?? now;
   return {
     version: ACTIVE_SESSION_INDEX_VERSION,
     complete: true,
     root,
     active,
-    checksum: activeIndexChecksum(root, active),
-    updatedAt: new Date().toISOString(),
+    checksum: activeIndexChecksum(root, active, reconciledAt),
+    reconciledAt,
+    updatedAt: now,
   };
 }
 
@@ -332,9 +355,8 @@ async function readActiveSessionIndex(root: string): Promise<ActiveSessionIndex 
   try {
     const parsed = JSON.parse(await readFile(activeSessionIndexPath(root), "utf8")) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const candidate = parsed as Partial<ActiveSessionIndex>;
+    const candidate = parsed as Partial<ActiveSessionIndex> & { version?: unknown };
     if (
-      candidate.version !== ACTIVE_SESSION_INDEX_VERSION ||
       candidate.complete !== true ||
       candidate.root !== root ||
       !Array.isArray(candidate.active) ||
@@ -345,8 +367,26 @@ async function readActiveSessionIndex(root: string): Promise<ActiveSessionIndex 
     const normalized = [...new Set(candidate.active)].sort((a, b) => a.localeCompare(b));
     if (normalized.length !== candidate.active.length) return null;
     if (normalized.some((name, index) => name !== candidate.active![index])) return null;
-    if (candidate.checksum !== activeIndexChecksum(root, normalized)) return null;
-    return candidate as ActiveSessionIndex;
+    if (candidate.version === ACTIVE_SESSION_INDEX_VERSION) {
+      if (typeof candidate.reconciledAt !== "string") return null;
+      if (candidate.checksum !== activeIndexChecksum(root, normalized, candidate.reconciledAt)) return null;
+      return candidate as ActiveSessionIndex;
+    }
+    if (candidate.version !== LEGACY_ACTIVE_SESSION_INDEX_VERSION) return null;
+    if (candidate.checksum !== legacyActiveIndexChecksum(root, normalized)) return null;
+    // A checksum-valid v1 projection is safe to serve immediately. Normalize it
+    // only in memory; the paced canonical pass will publish v2 without making
+    // the first post-upgrade operational snapshot scan all historical rows.
+    const reconciledAt = candidate.updatedAt;
+    return {
+      version: ACTIVE_SESSION_INDEX_VERSION,
+      complete: true,
+      root,
+      active: normalized,
+      checksum: activeIndexChecksum(root, normalized, reconciledAt),
+      reconciledAt,
+      updatedAt: candidate.updatedAt,
+    };
   } catch {
     return null;
   }
@@ -357,8 +397,20 @@ async function writeActiveSessionIndex(index: ActiveSessionIndex): Promise<void>
 }
 
 async function rebuildActiveSessionIndexLocked(paths: StorePaths): Promise<ActiveSessionIndex> {
-  const records = await listSessionsSnapshot(paths.currentDir, paths.legacyDir);
-  const index = makeActiveSessionIndex(paths.root, records.filter(isActiveSessionRecord).map((record) => record.name));
+  const previous = await readActiveSessionIndex(paths.root);
+  const snapshot = await scanSessionsSnapshot(paths.currentDir, paths.legacyDir);
+  const names = new Set(snapshot.records.filter(isActiveSessionRecord).map((record) => record.name));
+  // A canonical pass may overlap an atomic writer or hit EACCES/EIO. Preserve
+  // prior membership for the affected filename; only a successful terminal
+  // parse or authoritative absence may remove a name.
+  if (previous) {
+    const previousNames = new Set(previous.active);
+    for (const failure of snapshot.readFailures) {
+      const name = failure.file.slice(0, -".json".length);
+      if (previousNames.has(name)) names.add(name);
+    }
+  }
+  const index = makeActiveSessionIndex(paths.root, names);
   await writeActiveSessionIndex(index);
   return index;
 }
@@ -398,7 +450,7 @@ async function updateActiveMembershipLocked(
   if (!changed) return;
   if (active) names.add(name);
   else names.delete(name);
-  await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names));
+  await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names, { reconciledAt: current.reconciledAt }));
 }
 
 function sessionLockPath(name: string): string {
@@ -612,8 +664,36 @@ export async function deleteSession(name: string) {
 }
 
 const DEFAULT_LIST_SESSION_CONCURRENCY = 32;
+const ACTIVE_INDEX_READ_WARNING_INTERVAL_MS = 60_000;
 const listSessionsInFlight = new Map<string, Promise<SessionRecord[]>>();
 const listActiveSessionsInFlight = new Map<string, Promise<SessionRecord[]>>();
+const activeIndexReadWarningAt = new Map<string, number>();
+
+function reportActiveIndexReadFailures(
+  root: string,
+  failures: readonly { name: string; error: unknown }[],
+): void {
+  const now = Date.now();
+  const due = failures.filter(({ name }) => {
+    const key = `${root}\0${name}`;
+    const previous = activeIndexReadWarningAt.get(key);
+    if (previous !== undefined && now >= previous && now - previous < ACTIVE_INDEX_READ_WARNING_INTERVAL_MS) {
+      return false;
+    }
+    activeIndexReadWarningAt.set(key, now);
+    return true;
+  });
+  if (due.length === 0) return;
+  const detail = due.map(({ name, error }) => {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    const message = error instanceof Error ? error.message : String(error);
+    return `${name}${code ? ` (${code})` : ""}: ${message}`;
+  });
+  process.emitWarning(
+    `active-session record read failed; membership retained for retry: ${detail.join("; ")}`,
+    { code: "HIVE_ACTIVE_INDEX_READ", type: "HiveStoreWarning" },
+  );
+}
 
 /**
  * Enumerate one store snapshot with bounded read fan-out. The old sequential
@@ -656,20 +736,36 @@ export function listActiveSessions(): Promise<SessionRecord[]> {
 async function listActiveSessionsSnapshot(paths: StorePaths): Promise<SessionRecord[]> {
   const index = await currentActiveSessionIndex(paths);
   const records: SessionRecord[] = [];
-  const stale: string[] = [];
+  const needsRecheck: string[] = [];
+  const recordNames = new Set<string>();
   let cursor = 0;
   const workerCount = Math.min(DEFAULT_LIST_SESSION_CONCURRENCY, index.active.length);
   await Promise.all(Array.from({ length: workerCount }, async () => {
     while (cursor < index.active.length) {
       const name = index.active[cursor++];
       if (!name) continue;
-      const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir).catch(() => null);
-      if (record && isActiveSessionRecord(record)) records.push(record);
-      else stale.push(name);
+      try {
+        const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
+        if (record && isActiveSessionRecord(record)) {
+          records.push(record);
+          recordNames.add(record.name);
+        } else {
+          // null is authoritative ENOENT from both stores; a successfully
+          // parsed terminal record is authoritative too. Both are safe to
+          // prune after the locked re-check below.
+          needsRecheck.push(name);
+        }
+      } catch {
+        // EACCES/EIO/torn JSON are not absence. Re-check under the membership
+        // lock, retain the name if ambiguity persists, and surface the failure
+        // to the caller instead of silently making the bee invisible forever.
+        needsRecheck.push(name);
+      }
     }
   }));
 
-  if (stale.length > 0) {
+  const readFailures: Array<{ name: string; error: unknown }> = [];
+  if (needsRecheck.length > 0) {
     // Re-check under the membership lock: a concurrent activation publishes
     // its name before its record, so the first read may legitimately see a
     // stale-looking entry while the writer is still in its critical section.
@@ -677,24 +773,57 @@ async function listActiveSessionsSnapshot(paths: StorePaths): Promise<SessionRec
       const current = (await readActiveSessionIndex(paths.root)) ?? await rebuildActiveSessionIndexLocked(paths);
       const names = new Set(current.active);
       let changed = false;
-      for (const name of stale) {
+      for (const name of needsRecheck) {
         if (!names.has(name)) continue;
-        const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir).catch(() => null);
-        if (!record || !isActiveSessionRecord(record)) {
-          names.delete(name);
-          changed = true;
+        try {
+          const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
+          if (record && isActiveSessionRecord(record)) {
+            if (!recordNames.has(record.name)) {
+              records.push(record);
+              recordNames.add(record.name);
+            }
+          } else {
+            names.delete(name);
+            changed = true;
+          }
+        } catch (error) {
+          readFailures.push({ name, error });
         }
       }
-      if (changed) await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names));
+      if (changed) {
+        await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names, { reconciledAt: current.reconciledAt }));
+      }
     }, { timeoutMs: 60_000 });
+  }
+
+  if (readFailures.length > 0) {
+    // One torn/EACCES record must not blind daemon work for every healthy bee.
+    // Preserve its membership for a later retry, emit bounded telemetry, and
+    // return the independently readable active projection.
+    reportActiveIndexReadFailures(paths.root, readFailures);
   }
 
   return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 async function listSessionsSnapshot(currentDir: string, legacyDir: string): Promise<SessionRecord[]> {
+  return (await scanSessionsSnapshot(currentDir, legacyDir)).records;
+}
+
+type SessionSnapshotScan = {
+  records: SessionRecord[];
+  readFailures: Array<{ dir: string; file: string; error: unknown }>;
+};
+
+async function scanSessionsSnapshot(currentDir: string, legacyDir: string): Promise<SessionSnapshotScan> {
   await mkdir(currentDir, { recursive: true });
-  const [files, legacyFiles] = await Promise.all([readdir(currentDir), readdir(legacyDir).catch(() => [])]);
+  const [files, legacyFiles] = await Promise.all([
+    readdir(currentDir),
+    readdir(legacyDir).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }),
+  ]);
   const seen = new Set<string>();
   const candidates: Array<{ dir: string; file: string }> = [];
 
@@ -707,18 +836,23 @@ async function listSessionsSnapshot(currentDir: string, legacyDir: string): Prom
   }
 
   const records: SessionRecord[] = [];
+  const readFailures: SessionSnapshotScan["readFailures"] = [];
   let cursor = 0;
   const workerCount = Math.min(DEFAULT_LIST_SESSION_CONCURRENCY, candidates.length);
   await Promise.all(Array.from({ length: workerCount }, async () => {
     while (cursor < candidates.length) {
       const candidate = candidates[cursor++];
       if (!candidate) continue;
-      const record = await readSessionRecord(join(candidate.dir, candidate.file)).catch(() => null);
-      if (record) records.push(record);
+      try {
+        records.push(await readSessionRecord(join(candidate.dir, candidate.file)));
+      } catch (error) {
+        readFailures.push({ ...candidate, error });
+      }
     }
   }));
 
-  return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return { records, readFailures };
 }
 
 export async function appendLedger(event: Record<string, unknown>) {

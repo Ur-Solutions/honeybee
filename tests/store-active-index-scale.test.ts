@@ -70,11 +70,24 @@ test("active index scales at 100/1k/3k/10k with 95% terminal history", { timeout
         assert.equal(active.length, expectedActive);
         assert.ok(active.every((candidate) => candidate.status === "running" && candidate.lastObservedState === undefined));
 
-        const manifest = JSON.parse(await readFile(activeSessionIndexPath(), "utf8")) as { active: string[] };
+        const manifestText = await readFile(activeSessionIndexPath(), "utf8");
+        const manifest = JSON.parse(manifestText) as { active: string[]; reconciledAt: string };
         assert.equal(manifest.active.length, expectedActive, "steady-state candidates equal 5% of history");
+
+        const repeatStarted = performance.now();
+        for (let pass = 0; pass < 5; pass += 1) {
+          assert.equal((await listActiveSessions()).length, expectedActive);
+        }
+        const repeatMs = performance.now() - repeatStarted;
+        assert.equal(
+          await readFile(activeSessionIndexPath(), "utf8"),
+          manifestText,
+          "fresh repeated hot reads do not rewrite/rebuild the canonical index",
+        );
         t.diagnostic(
           `session-hotpath n=${count} terminal=95% fullRows=${full.length} hotRows=${active.length} ` +
-          `full=${fullMs.toFixed(1)}ms rebuild=${rebuildMs.toFixed(1)}ms hot=${hotMs.toFixed(1)}ms`,
+          `full=${fullMs.toFixed(1)}ms rebuild=${rebuildMs.toFixed(1)}ms hot=${hotMs.toFixed(1)}ms ` +
+          `hot5=${repeatMs.toFixed(1)}ms reconciled=${manifest.reconciledAt}`,
         );
       } finally {
         await rm(root, { recursive: true, force: true });
