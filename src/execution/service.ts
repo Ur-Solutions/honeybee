@@ -162,6 +162,32 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   const driverIdOf = (reservation: RunReservation): string =>
     String((reservation.intent.harness as JsonObject | undefined)?.driverId ?? "");
 
+  const recoverableLostCauses = new Set([
+    "readiness_evidence_missing",
+    "session_ref_missing",
+    "environment_receipt_missing",
+    "readiness_stop_unconfirmed",
+  ]);
+
+  /** Establish the contract's lost -> recovering edge before convergence. */
+  async function beginLostRecovery(reservation: RunReservation, verified: string[]): Promise<void> {
+    if (
+      !reservation.indeterminateAt ||
+      !reservation.indeterminateCause ||
+      !recoverableLostCauses.has(reservation.indeterminateCause)
+    ) return;
+    await appendRunEvents(
+      reservation.runId,
+      protocolVersion,
+      [{
+        type: "run.recovering",
+        payload: { cause: reservation.indeterminateCause, verified },
+        origin: await origin(),
+      }],
+      { onlyIfAbsentTypes: true },
+    );
+  }
+
   /** Minimal immutable initiator fact from a validated authority envelope. */
   function initiatorOf(authority: JsonObject): { kind: string; id: string } | undefined {
     const actor = authority.actor;
@@ -383,6 +409,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
             { onlyIfAbsentTypes: true },
           );
         } else {
+          await beginLostRecovery(current, ["run-identity", "hsr-readiness", "session-identity", "environment-ownership"]);
           current = await mutateReservation(current.runId, (record) => {
             const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
             return record.phase === "launching"
@@ -430,6 +457,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       }
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
+        await beginLostRecovery(current, ["run-identity", "process-exit"]);
         const finishedAt = now().toISOString();
         current = await mutateReservation(current.runId, (record) => {
           const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
@@ -478,6 +506,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           }
         }
         if (stopConfirmed) {
+          await beginLostRecovery(current, ["run-identity", "process-stop"]);
           const finishedAt = now().toISOString();
           current = await mutateReservation(current.runId, (record) => {
             const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
