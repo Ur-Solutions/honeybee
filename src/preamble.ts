@@ -26,9 +26,20 @@
  */
 export const PREAMBLE_MAX_CHARS = 1200;
 
-/** Wrapper tags: identifiable in a transcript, and mechanically strippable. */
+/** Honeybee-owned wrapper tags: identifiable in a transcript and strippable. */
 export const PREAMBLE_OPEN_TAG = "<hive-session>";
 export const PREAMBLE_CLOSE_TAG = "</hive-session>";
+
+/**
+ * Hosts may frame their opaque layer with their own sibling `*-session`
+ * envelope (for example Apiary's `<apiary-session>`). Honeybee preserves a
+ * complete host envelope instead of nesting it inside `<hive-session>`.
+ */
+const SESSION_ENVELOPE = /^<([a-z][a-z0-9-]*-session)>\n?[\s\S]*?\n?<\/\1>$/i;
+
+export function isSessionPreambleEnvelope(text: string): boolean {
+  return SESSION_ENVELOPE.test(text.trim());
+}
 
 /**
  * How a preamble reaches the bee.
@@ -56,7 +67,8 @@ export type PreambleLayers = {
   identity?: PreambleIdentity;
   /**
    * L1/L2 — opaque text from the spawning environment (Apiary's host layer).
-   * Honeybee never parses or interprets it; it only budgets and frames it.
+   * Honeybee never parses or interprets its body. A complete host-owned
+   * `*-session` envelope is preserved; legacy plain text is framed as Hive.
    */
   host?: string;
   /** L3 — the operator's custom text (config.json `preamble.text`). */
@@ -93,21 +105,29 @@ export function identityLayer(identity: PreambleIdentity): string {
 }
 
 /**
- * Compose the layers into the wrapped block. Layers are joined by a blank line
- * in fixed order (identity → host → custom); empty/whitespace layers drop out
- * entirely, so a fully disabled preamble renders "" and every caller can treat
- * that as "inject nothing".
+ * Compose the layers into strippable envelopes. Legacy/plain host text keeps
+ * the original single `<hive-session>` block and fixed identity → host → custom
+ * order. A host-owned `*-session` envelope becomes a sibling of the single Hive
+ * block containing all Honeybee-owned text, so neither system has to parse the
+ * other's content and each owner appears exactly once. The source grouping
+ * means Honeybee custom text precedes a framed host; legacy ordering is
+ * unchanged for an unframed host.
+ * Empty/whitespace layers drop out entirely.
  */
 export function renderPreamble(layers: PreambleLayers, opts: { maxChars?: number } = {}): RenderedPreamble {
-  const parts = [
-    layers.identity ? identityLayer(layers.identity) : "",
-    layers.host?.trim() ?? "",
-    layers.custom?.trim() ?? "",
-  ].filter((part) => part.length > 0);
+  const identity = layers.identity ? identityLayer(layers.identity) : "";
+  const host = layers.host?.trim() ?? "";
+  const custom = layers.custom?.trim() ?? "";
+  const framedHost = host && isSessionPreambleEnvelope(host) ? host : "";
+  const wrapHive = (parts: string[]): string =>
+    parts.length > 0 ? `${PREAMBLE_OPEN_TAG}\n${parts.join("\n\n")}\n${PREAMBLE_CLOSE_TAG}` : "";
 
-  if (parts.length === 0) return { text: "", chars: 0, overBudget: false };
+  const sections = framedHost
+    ? [wrapHive([identity, custom].filter(Boolean)), framedHost]
+    : [wrapHive([identity, host, custom].filter(Boolean))];
+  const text = sections.filter(Boolean).join("\n\n");
+  if (!text) return { text: "", chars: 0, overBudget: false };
 
-  const text = `${PREAMBLE_OPEN_TAG}\n${parts.join("\n\n")}\n${PREAMBLE_CLOSE_TAG}`;
   const maxChars = opts.maxChars ?? PREAMBLE_MAX_CHARS;
   return { text, chars: text.length, overBudget: text.length > maxChars };
 }
@@ -128,5 +148,6 @@ export function prependPreamble(text: string | undefined, preamble: string): str
  * against double-injection when a caller re-delivers a brief.
  */
 export function hasPreamble(text: string | undefined): boolean {
-  return typeof text === "string" && text.includes(PREAMBLE_OPEN_TAG);
+  if (typeof text !== "string") return false;
+  return /^\s*<[a-z][a-z0-9-]*-session>/i.test(text);
 }

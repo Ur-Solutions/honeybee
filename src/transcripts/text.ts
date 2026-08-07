@@ -29,13 +29,13 @@ const COMMAND_NOISE_RE =
   /<(local-command-caveat|command-name|command-message|command-args|command-contents|local-command-stdout|system-reminder)\b[^>]*>[\s\S]*?<\/\1>/gi;
 
 /**
- * Hive's own session preamble (src/preamble.ts), when it rode the `message`
- * channel because the harness has no append-to-system-prompt flag. It is
- * PREPENDED to the bee's first real text, so it must be stripped rather than
- * used to skip the row — skipping would discard the operator's prompt with it,
- * and leaving it in would title every codex bee "You are a Honeybee bee: …".
+ * Session preamble envelopes, when they ride the `message` channel because the
+ * harness has no append-to-system-prompt flag. Honeybee owns `<hive-session>`;
+ * hosts may add a sibling such as Apiary's `<apiary-session>`. They are
+ * PREPENDED to the first real text, so strip the envelopes without skipping the
+ * row or discarding the operator's prompt.
  */
-const SESSION_PREAMBLE_RE = /<hive-session>[\s\S]*?<\/hive-session>\s*/gi;
+const SESSION_PREAMBLE_RE = /<([a-z][a-z0-9-]*-session)>[\s\S]*?<\/\1>\s*/gi;
 
 export function stripSessionPreamble(text: string): string {
   return text.replace(SESSION_PREAMBLE_RE, "");

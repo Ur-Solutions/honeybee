@@ -499,6 +499,12 @@ test("stripCommandNoise removes slash-command and harness blocks, keeps the real
   assert.equal(stripCommandNoise("<system-reminder>be careful</system-reminder>\nFix the parser"), "Fix the parser");
   // Tags carrying attributes are still stripped (opening tag is not anchored to a bare `<tag>`).
   assert.equal(stripCommandNoise('<system-reminder priority="high">hidden</system-reminder>visible'), "visible");
+  assert.equal(
+    stripCommandNoise(
+      "<hive-session>bee identity</hive-session>\n\n<apiary-session>host context</apiary-session>\n\nFix the parser",
+    ),
+    "Fix the parser",
+  );
 });
 
 test("firstUserText skips noise-only rows and returns the first real user message", () => {

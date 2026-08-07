@@ -148,8 +148,8 @@ export function createHsrRunLauncher(deps: { nodeId: () => Promise<string> }): R
 
     // Account and preamble selection come ONLY from the signed intent's
     // harness config — never from daemon profiles or ambient configuration.
-    // Keeping the preamble separate from brief lets spawn compose every layer
-    // into one <hive-session> block before delivering the operator's prompt.
+    // Keeping the preamble separate from brief lets spawn preserve host-owned
+    // session envelopes beside Honeybee's identity before the operator prompt.
     const { driverId, model, brief, account, preamble } = resolveHsrHarnessLaunchConfig(intent);
 
     const { spawnSingleBee } = await import("../commands/spawn.js");

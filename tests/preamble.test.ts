@@ -8,6 +8,7 @@ import { preambleChannelForAgent, systemPromptArgsForAgent } from "../src/driver
 import {
   hasPreamble,
   identityLayer,
+  isSessionPreambleEnvelope,
   prependPreamble,
   PREAMBLE_CLOSE_TAG,
   PREAMBLE_MAX_CHARS,
@@ -64,6 +65,19 @@ test("renderPreamble wraps layers in the strippable tag, in fixed order", () => 
   assert.ok(text.indexOf("HOST") < text.indexOf("CUSTOM"));
 });
 
+test("renderPreamble preserves a host-owned session envelope as a sibling", () => {
+  const apiary = "<apiary-session>\nHOST\n</apiary-session>";
+  const { text } = renderPreamble({ identity: IDENTITY, host: apiary, custom: "CUSTOM" });
+  assert.ok(text.startsWith(`${PREAMBLE_OPEN_TAG}\n`));
+  assert.equal(text.match(/<hive-session>/g)?.length, 1);
+  assert.ok(text.indexOf("CL.a1b") < text.indexOf("CUSTOM"));
+  assert.ok(text.indexOf("CUSTOM") < text.indexOf(PREAMBLE_CLOSE_TAG));
+  assert.ok(text.indexOf(PREAMBLE_CLOSE_TAG) < text.indexOf(apiary));
+  assert.ok(text.endsWith(apiary));
+  assert.equal(isSessionPreambleEnvelope(apiary), true);
+  assert.equal(isSessionPreambleEnvelope("HOST"), false);
+});
+
 test("renderPreamble drops empty layers and renders nothing when all are empty", () => {
   assert.equal(renderPreamble({}).text, "");
   assert.equal(renderPreamble({ host: "   ", custom: "" }).text, "");
@@ -112,6 +126,8 @@ test("prependPreamble separates the block from the body, and stands alone", () =
 test("hasPreamble detects an already-prefixed blob", () => {
   const { text } = renderPreamble({ identity: IDENTITY });
   assert.equal(hasPreamble(prependPreamble("body", text)), true);
+  assert.equal(hasPreamble("<apiary-session>\nHOST\n</apiary-session>\n\nbody"), true);
+  assert.equal(hasPreamble("explain <apiary-session> here"), false);
   assert.equal(hasPreamble("body"), false);
   assert.equal(hasPreamble(undefined), false);
 });

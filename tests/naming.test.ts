@@ -227,8 +227,7 @@ test("gatherTitleContext: preserves a task at the tail of a long launcher preamb
       const transcriptPath = join(sessionDir, "rollout-2026-08-07T09-00-00-session-own.jsonl");
       const firstUser = [
         "<hive-session>You are a Honeybee bee.</hive-session>",
-        "You are inside Apiary, a desktop workspace with the apiary MCP server connected.",
-        `Launcher instructions: ${"x".repeat(900)}`,
+        `<apiary-session>\nYou are inside Apiary, a desktop workspace with the apiary MCP server connected.\nLauncher instructions: ${"x".repeat(900)}\n</apiary-session>`,
         "ACTUAL TASK: Fix automatic naming so it captures thread intent.",
       ].join("\n\n");
       await mkdir(sessionDir, { recursive: true });
@@ -252,10 +251,7 @@ test("gatherTitleContext: preserves a task at the tail of a long launcher preamb
       }), { requireExchange: true });
 
       assert.ok(context?.firstUser);
-      assert.equal(context.firstUser.length, 700);
-      assert.match(context.firstUser, /^You are inside Apiary/);
-      assert.match(context.firstUser, /ACTUAL TASK: Fix automatic naming so it captures thread intent\.$/);
-      assert.match(context.firstUser, / … /);
+      assert.equal(context.firstUser, "ACTUAL TASK: Fix automatic naming so it captures thread intent.");
     } finally {
       await rm(home, { recursive: true, force: true });
     }
