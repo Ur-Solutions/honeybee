@@ -22,6 +22,7 @@ import { canonicalDigest } from "../comb/canonical.js";
 import type { JsonValue } from "../comb/types.js";
 import type { JsonObject } from "./contract.js";
 import { executionError } from "./errors.js";
+import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import { ensureExecutionRoot } from "./nodeState.js";
 import {
   admissionLockPath,
@@ -48,6 +49,22 @@ export type ReleaseStep = {
   completedAt?: string;
 };
 
+export type OperationAttemptKind = "command-dispatch" | "collection";
+
+/**
+ * Durable ownership of one in-progress operation continuation. The random ids
+ * distinguish service instances in one process; pid + birth identity lets a
+ * peer prove that a crashed coordinator generation is gone before takeover.
+ */
+export type OperationAttempt = {
+  kind: OperationAttemptKind;
+  attemptId: string;
+  ownerId: string;
+  ownerPid: number;
+  ownerBirth?: ProcessBirthFingerprint;
+  startedAt: string;
+};
+
 export type OperationRecord = {
   version: 1;
   method: OperationMethod;
@@ -70,8 +87,10 @@ export type OperationRecord = {
    * Internal recovery classification for a failed collection attempt. Missing
    * on legacy records means terminal/fail-closed. Only explicitly retryable
    * failures may re-enter `collecting` under the same stable effect.
-   */
+  */
   collectionFailure?: "retryable" | "unrecoverable";
+  /** run.command/run.collect continuation owner; cleared with its terminal write. */
+  operationAttempt?: OperationAttempt;
   manifest?: JsonObject;
   /** run.retain only. */
   retainUntil?: string;
@@ -307,8 +326,10 @@ export async function setOperationResult(
   effectKey: string,
   result: JsonObject,
   extra?: Partial<OperationRecord>,
+  guard?: (record: OperationRecord) => boolean,
 ): Promise<OperationRecord> {
   return mutateOperation(runId, effectKey, (record) => {
+    if (guard && !guard(record)) return record;
     const changed = record.result === undefined || canonicalDigest(record.result as JsonValue) !== canonicalDigest(result as JsonValue);
     return {
       ...record,

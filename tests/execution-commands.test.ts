@@ -6,7 +6,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { computeSchemaDigest, createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
 import { HarnessDispatchError } from "../src/execution/harnessControl.js";
-import { admitOperation, readOperation } from "../src/execution/opsStore.js";
+import { admitOperation, mutateOperation, readOperation } from "../src/execution/opsStore.js";
 import { createRunOperations } from "../src/execution/operations.js";
 import { effectKeyHash, readRunEvents } from "../src/execution/runStore.js";
 import { storeSessionEvidenceSource } from "../src/execution/service.js";
@@ -90,6 +90,62 @@ test("run.command send: durable receipt, control-socket dispatch, per-effect eve
     assert.deepEqual(replay.result, { commandState: "completed" });
     assert.equal(control.calls.filter((call) => call.method === "send").length, 1);
     assert.equal((await readRunEvents(RUN_ID)).length, events.length);
+  });
+});
+
+test("two service instances join one live durable command attempt instead of declaring the peer crashed", async () => {
+  await withTempStore(async () => {
+    const control = fakeControl();
+    let reachedDriver!: () => void;
+    const atDriver = new Promise<void>((resolve) => {
+      reachedDriver = resolve;
+    });
+    let resumeDriver!: () => void;
+    const resume = new Promise<void>((resolve) => {
+      resumeDriver = resolve;
+    });
+    let driverEffects = 0;
+    control.control.send = async () => {
+      // The durable dispatch owner has already been recorded when this entry is
+      // reached; withhold the actual effect to expose the second service race.
+      reachedDriver();
+      await resume;
+      driverEffects += 1;
+    };
+
+    const { ctx, service: serviceA } = await startRunningRun({ control });
+    const serviceB = makeService({ control: control.control });
+    const effectKey = `${RUN_ID}/command/send-two-service`;
+    const body: JsonObject = { runId: RUN_ID, command: { kind: "send", text: "once across services" } };
+    const first = serviceA.runCommand(buildOperationEnvelope(ctx, effectKey, body, { requestId: "req-service-a" }));
+    await atDriver;
+    const claimed = (await readOperation(RUN_ID, effectKey))!;
+    assert.equal(claimed.commandState, "dispatching");
+    assert.equal(claimed.operationAttempt?.kind, "command-dispatch");
+
+    let peerSettled = false;
+    const second = serviceB
+      .runCommand(buildOperationEnvelope(ctx, effectKey, body, { requestId: "req-service-b" }))
+      .finally(() => {
+        peerSettled = true;
+      });
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    assert.equal(peerSettled, false, "the peer joins the live owner instead of folding dispatching to indeterminate");
+    assert.equal((await readOperation(RUN_ID, effectKey))!.commandState, "dispatching");
+
+    resumeDriver();
+    const [a, b] = (await Promise.all([first, second])) as JsonObject[];
+    assert.equal(driverEffects, 1);
+    assert.deepEqual(a.result, { commandState: "completed" });
+    assert.deepEqual(b.result, a.result);
+    assert.equal((a.receipt as JsonObject).receiptId, (b.receipt as JsonObject).receiptId);
+    assert.equal((a.receipt as JsonObject).resultVersion, (b.receipt as JsonObject).resultVersion);
+    assert.equal((await readOperation(RUN_ID, effectKey))!.operationAttempt, undefined);
+    const events = await readRunEvents(RUN_ID);
+    for (const type of ["command.accepted", "command.dispatching", "command.completed"]) {
+      assert.equal(events.filter((event) => event.type === type && (event.payload as JsonObject).effectKey === effectKey).length, 1);
+    }
+    assert.equal(events.filter((event) => event.type === "command.indeterminate").length, 0);
   });
 });
 
@@ -270,18 +326,26 @@ test("run.command dispatch refusal is a durable failed command; a fresh effect c
 
 test("run.command crash window: durably dispatching with no live continuation becomes indeterminate and is never redelivered", async () => {
   await withTempStore(async () => {
-    const hanging = fakeControl({ hang: true });
-    const { ctx, service, startEnvelope } = await startRunningRun({ control: hanging });
+    const { ctx, startEnvelope } = await startRunningRun();
     const envelope = sendEnvelope(ctx, "crash window", `${RUN_ID}/command/send-crash`);
 
-    // Dispatch begins and never resolves (the crash window): do not await.
-    void service.runCommand(envelope);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    for (let i = 0; i < 100; i++) {
-      const record = await readOperation(RUN_ID, `${RUN_ID}/command/send-crash`);
-      if (record?.commandState === "dispatching") break;
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
+    // Crash fixture from the pre-owner ledger: dispatching persisted, but the
+    // coordinator generation (and its attempt owner fact) is gone. A genuinely
+    // live owner is covered by the two-service join barrier above.
+    await admitOperation({
+      runId: RUN_ID,
+      method: "run.command",
+      effectKey: `${RUN_ID}/command/send-crash`,
+      requestDigest: String(envelope.requestDigest),
+      protocolVersion: "0.1",
+      schemaDigest: computeSchemaDigest(contract),
+      init: {
+        commandKind: "send",
+        commandState: "accepted",
+        deliveryId: `op-${effectKeyHash(`${RUN_ID}/command/send-crash`).slice(0, 16)}`,
+      },
+    });
+    await mutateOperation(RUN_ID, `${RUN_ID}/command/send-crash`, (record) => ({ ...record, commandState: "dispatching" }));
     assert.equal((await readOperation(RUN_ID, `${RUN_ID}/command/send-crash`))?.commandState, "dispatching");
 
     // "Restart": a fresh coordinator over the same durable store.

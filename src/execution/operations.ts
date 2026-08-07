@@ -13,6 +13,12 @@
 // window that cannot prove delivery becomes `indeterminate` durably and is
 // NEVER blindly redelivered.
 import type { JsonValue } from "../comb/types.js";
+import { randomUUID } from "node:crypto";
+import {
+  captureProcessBirthFingerprint,
+  inspectProcessBirth,
+  sameProcessBirthFingerprint,
+} from "../hsr/processIdentity.js";
 import type { ExecutionContract, ExecutionValidator, JsonObject } from "./contract.js";
 import { isTransitionAllowed } from "./contract.js";
 import { executionError, toWireError } from "./errors.js";
@@ -27,6 +33,8 @@ import {
   readOperation,
   setOperationResult,
   type OperationMethod,
+  type OperationAttempt,
+  type OperationAttemptKind,
   type OperationRecord,
   type ReleaseStep,
   type ReleaseStepId,
@@ -44,7 +52,12 @@ import {
   type RunReservation,
 } from "./runStore.js";
 import type { SignatureVerifier } from "./signing.js";
-import { readWorkingCopy, releaseWorkingCopy } from "./workingCopies.js";
+import {
+  readWorkingCopy,
+  releaseWorkingCopy,
+  withWorkingCopyOccupancyLock,
+  type WorkingCopyRecord,
+} from "./workingCopies.js";
 import { arch as osArch, platform as osPlatform, release as osRelease } from "node:os";
 
 /* ---------------------------------------------------------------- */
@@ -65,6 +78,8 @@ export type RunOperationsDeps = {
   verifySignature?: SignatureVerifier;
   control: HarnessControl;
   sessions: SessionEvidenceReader;
+  /** Injectable only to place deterministic tests at the post-ownership read barrier. */
+  collectGitDiffMetadata?: typeof collectGitDiffMetadata;
   /** Reconcile a reservation and derive its current projection state. */
   settle(reservation: RunReservation): Promise<{ reservation: RunReservation; state: string }>;
   origin(extra?: { driverId?: string; providerId?: string }): Promise<{ nodeId: string; driverId?: string; providerId?: string }>;
@@ -89,6 +104,11 @@ function asObject(value: JsonValue | undefined): JsonObject | undefined {
 
 export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   const { protocolVersion, schemaDigest, now } = deps;
+  const collectWorkingCopyDiff = deps.collectGitDiffMetadata ?? collectGitDiffMetadata;
+  const operationOwnerId = randomUUID();
+  let operationOwnerBirthPromise: Promise<Awaited<ReturnType<typeof captureProcessBirthFingerprint>>> | undefined;
+  const operationOwnerBirth = () =>
+    (operationOwnerBirthPromise ??= captureProcessBirthFingerprint(process.pid));
   /** In-flight side-effect continuations, keyed `${runId}#${effectKey}`. */
   const inFlight = new Map<string, Promise<unknown>>();
   const flightKey = (runId: string, effectKey: string): string => `${runId}#${effectKey}`;
@@ -109,6 +129,45 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         if (inFlight.get(key) === attempt) inFlight.delete(key);
       });
     return attempt;
+  }
+
+  const pause = (milliseconds: number): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+  async function newOperationAttempt(kind: OperationAttemptKind): Promise<OperationAttempt> {
+    const ownerBirth = await operationOwnerBirth();
+    return {
+      kind,
+      attemptId: randomUUID(),
+      ownerId: operationOwnerId,
+      ownerPid: process.pid,
+      ...(ownerBirth ? { ownerBirth } : {}),
+      startedAt: now().toISOString(),
+    };
+  }
+
+  /** True only with birth-safe proof that this exact owner generation is gone. */
+  async function operationAttemptOwnerDead(attempt: OperationAttempt): Promise<boolean> {
+    if (attempt.ownerPid === process.pid) {
+      const currentBirth = await operationOwnerBirth();
+      return Boolean(attempt.ownerBirth && currentBirth && !sameProcessBirthFingerprint(attempt.ownerBirth, currentBirth));
+    }
+    const verdict = await inspectProcessBirth(attempt.ownerPid, attempt.ownerBirth);
+    return verdict === "gone" || verdict === "mismatch";
+  }
+
+  async function waitForOperationAttempt(
+    runId: string,
+    effectKey: string,
+    attempt: OperationAttempt,
+  ): Promise<{ record: OperationRecord; ownerDead: boolean }> {
+    let current = (await readOperation(runId, effectKey))!;
+    while (current.operationAttempt?.attemptId === attempt.attemptId) {
+      if (await operationAttemptOwnerDead(attempt)) return { record: current, ownerDead: true };
+      await pause(25);
+      current = (await readOperation(runId, effectKey))!;
+    }
+    return { record: current, ownerDead: false };
   }
 
   const respond = (requestId: JsonValue, record: OperationRecord, outcome: "created" | "replayed"): JsonObject => ({
@@ -171,11 +230,25 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
     const driverId = reservation ? driverIdOf(reservation) : undefined;
     for (const record of records) {
       if (record.method === "run.command" && record.commandState === "dispatching" && !inFlight.has(flightKey(runId, record.effectKey))) {
-        // Durably `dispatching` with no live continuation: the coordinator
-        // crashed inside the delivery window. Delivery cannot be proven either
-        // way, so the outcome is honestly indeterminate — never a redelivery.
+        // A different service/process cannot use its empty local inFlight map
+        // as crash evidence. A durable owner with a live birth identity still
+        // owns the delivery; peers join it. Only a missing legacy owner or a
+        // proven-dead generation closes the ambiguous window as indeterminate.
+        if (record.operationAttempt && !(await operationAttemptOwnerDead(record.operationAttempt))) continue;
         const cause = "coordinator crashed during a non-deduplicating delivery window; not redelivered";
-        await setOperationResult(runId, record.effectKey, { commandState: "indeterminate", cause }, { commandState: "indeterminate", cause });
+        const expectedAttemptId = record.operationAttempt?.attemptId;
+        const reconciled = await setOperationResult(
+          runId,
+          record.effectKey,
+          { commandState: "indeterminate", cause },
+          { commandState: "indeterminate", cause, operationAttempt: undefined },
+          (current) =>
+            current.commandState === "dispatching" &&
+            (expectedAttemptId === undefined
+              ? current.operationAttempt === undefined
+              : current.operationAttempt?.attemptId === expectedAttemptId),
+        );
+        if (reconciled.commandState !== "indeterminate") continue;
         await appendRunEvents(
           runId,
           protocolVersion,
@@ -255,6 +328,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       // that lost the claim must not dispatch a second delivery.
       let claimed = false;
       let cancelledBeforeDelivery = false;
+      const dispatchAttempt = await newOperationAttempt("command-dispatch");
       let record = await mutateOperation(runId, effectKey, async (current) => {
         if (current.commandState !== "accepted") return current;
         // Admission guards apply only when a record is first created. An
@@ -277,10 +351,11 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             commandState: "failed",
             cause,
             result: { commandState: "failed", cause },
+            operationAttempt: undefined,
           };
         }
         claimed = true;
-        return { ...current, commandState: "dispatching" };
+        return { ...current, commandState: "dispatching", operationAttempt: dispatchAttempt };
       });
       if (!claimed) {
         if (cancelledBeforeDelivery) {
@@ -296,6 +371,17 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             ],
             { onlyIfAbsentKeys: true },
           );
+        } else if (record.commandState === "dispatching" && record.operationAttempt) {
+          // Another live coordinator owns this exact delivery window. Join its
+          // durable attempt instead of declaring it crashed from this service's
+          // empty local inFlight map. A proven-dead owner reconciles to
+          // indeterminate and is never allowed to redeliver.
+          const joined = await waitForOperationAttempt(runId, effectKey, record.operationAttempt);
+          record = joined.record;
+          if (joined.ownerDead && record.commandState === "dispatching") {
+            await reconcileOperations(runId);
+            record = (await readOperation(runId, effectKey)) ?? record;
+          }
         }
         return record;
       }
@@ -336,7 +422,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         runId,
         effectKey,
         { commandState: outcome, ...(cause ? { cause } : {}) },
-        { commandState: outcome, ...(cause ? { cause } : {}) },
+        { commandState: outcome, ...(cause ? { cause } : {}), operationAttempt: undefined },
       );
       const events = [
         { type: `command.${outcome}`, payload: { effectKey, ...(cause ? { cause } : {}) } as JsonValue, origin: await deps.origin({ driverId }) },
@@ -432,6 +518,13 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         const pending = inFlight.get(flightKey(validated.runId, validated.effectKey)) as Promise<OperationRecord> | undefined;
         if (pending) {
           current = await pending;
+        } else if (current.operationAttempt) {
+          const joined = await waitForOperationAttempt(validated.runId, validated.effectKey, current.operationAttempt);
+          current = joined.record;
+          if (joined.ownerDead && current.commandState === "dispatching") {
+            await reconcileOperations(validated.runId);
+            current = (await readOperation(validated.runId, validated.effectKey)) ?? current;
+          }
         } else {
           await reconcileOperations(validated.runId);
           current = (await readOperation(validated.runId, validated.effectKey)) ?? current;
@@ -613,7 +706,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
     return placement?.kind === "explicit" && typeof placement.workingCopyId === "string" ? placement.workingCopyId : undefined;
   }
 
-  async function collectEntries(reservation: RunReservation): Promise<ManifestEntry[]> {
+  async function collectEntries(reservation: RunReservation, ownedWorkingCopy: WorkingCopyRecord | null): Promise<ManifestEntry[]> {
     const nodeId = (await deps.binding()).nodeId;
     const requested = new Set(
       (Array.isArray(asObject(reservation.intent.evidenceContract)?.collect)
@@ -634,12 +727,8 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       if (bytes) push("transcript", await putEvidence(reservation.runId, bytes), "application/x-ndjson");
     }
     if (requested.has("diff")) {
-      const workingCopyId = workingCopyIdOf(reservation);
-      const copy = workingCopyId ? await readWorkingCopy(workingCopyId) : null;
-      // Diff evidence only while this Run still owns the copy: after release
-      // (or under another Run's occupancy) the tree is no longer ours to read.
-      if (copy && copy.occupancy?.claimedByRunId === reservation.runId) {
-        const metadata = await collectGitDiffMetadata(copy, now().toISOString());
+      if (ownedWorkingCopy) {
+        const metadata = await collectWorkingCopyDiff(ownedWorkingCopy, now().toISOString());
         push("diff", await putEvidence(reservation.runId, JSON.stringify(metadata, null, 2)), "application/json");
       }
     }
@@ -656,6 +745,64 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   function requestedEvidenceKinds(reservation: RunReservation): string[] {
     const collect = asObject(reservation.intent.evidenceContract)?.collect;
     return (Array.isArray(collect) ? collect : []).filter((entry): entry is string => typeof entry === "string");
+  }
+
+  /**
+   * Hold one occupancy generation stable for the entire collection transaction.
+   * Revalidation occurs after acquisition; release and a successor claim cannot
+   * pass until all filesystem reads, evidence writes, and the durable manifest
+   * receipt have completed.
+   */
+  async function withCollectionOccupancy<T>(
+    reservation: RunReservation,
+    collect: (ownedWorkingCopy: WorkingCopyRecord | null) => Promise<T>,
+  ): Promise<T> {
+    const workingCopyId = workingCopyIdOf(reservation);
+    if (!workingCopyId || !requestedEvidenceKinds(reservation).includes("diff")) return collect(null);
+    return withWorkingCopyOccupancyLock(workingCopyId, async () => {
+      const copy = await readWorkingCopy(workingCopyId);
+      return collect(copy?.occupancy?.claimedByRunId === reservation.runId ? copy : null);
+    });
+  }
+
+  async function tryClaimCollectionAttempt(
+    runId: string,
+    effectKey: string,
+  ): Promise<{ record: OperationRecord; claimed: boolean }> {
+    const observed = await readOperation(runId, effectKey);
+    if (!observed) throw executionError("AUTHORITY_UNAVAILABLE", `collection effect ${effectKey} has no durable record`);
+    const observedAttempt = observed.operationAttempt;
+    const observedOwnerDead = observedAttempt ? await operationAttemptOwnerDead(observedAttempt) : false;
+    const candidate = await newOperationAttempt("collection");
+    let claimed = false;
+    const record = await mutateOperation(runId, effectKey, (current) => {
+      if (
+        current.collectionState === "complete" ||
+        (current.collectionState === "failed" && current.collectionFailure !== "retryable")
+      ) return current;
+
+      if (observedAttempt && !observedOwnerDead) return current;
+      if (current.operationAttempt) {
+        // Take over only the exact generation proven dead outside the lock. A
+        // changed owner is a new live fact and must be joined separately.
+        if (!observedAttempt || current.operationAttempt.attemptId !== observedAttempt.attemptId) return current;
+      } else if (observedAttempt) {
+        // The observed owner settled while its liveness was inspected. Replay
+        // that settlement rather than immediately turning its retryable failure
+        // into another concurrent attempt.
+        return current;
+      }
+      if (current.collectionState !== "collecting" && current.collectionFailure !== "retryable") return current;
+      claimed = true;
+      return {
+        ...current,
+        collectionState: "collecting",
+        collectionFailure: undefined,
+        cause: undefined,
+        operationAttempt: candidate,
+      };
+    });
+    return { record, claimed };
   }
 
   async function runCollect(request: JsonValue): Promise<JsonObject> {
@@ -678,90 +825,110 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         // remain terminal/fail-closed rather than being re-executed blindly.
         return respond(requestId, record, "replayed");
       }
-      // Concurrent identical replays join one collection pass.
+      // Local callers join the in-memory flight; other service instances and
+      // processes join the durable operation attempt below.
       const current = await singleFlight<OperationRecord>(flightKey(validated.runId, validated.effectKey), async () => {
-        let latest = await readOperation(validated.runId, validated.effectKey);
-        if (latest?.collectionState === "complete" || (latest?.collectionState === "failed" && latest.collectionFailure !== "retryable")) {
-          return latest;
-        }
-        if (latest?.collectionState === "failed" && latest.collectionFailure === "retryable") {
-          // Durable re-entry makes restart behavior explicit: a crash after
-          // this write leaves `collecting`, which is safe to resume because
-          // evidence writes are digest-addressed/idempotent. Preserve the last
-          // failed result until replacement so resultVersion can record the
-          // failed -> complete change.
-          latest = await mutateOperation(validated.runId, validated.effectKey, (op) =>
-            op.collectionState === "failed" && op.collectionFailure === "retryable"
-              ? { ...op, collectionState: "collecting", collectionFailure: undefined, cause: undefined }
-              : op,
-          );
-          if (latest.collectionState === "complete" || (latest.collectionState === "failed" && latest.collectionFailure !== "retryable")) {
-            return latest;
+        while (true) {
+          const claim = await tryClaimCollectionAttempt(validated.runId, validated.effectKey);
+          if (!claim.claimed) {
+            if (claim.record.operationAttempt) {
+              const joined = await waitForOperationAttempt(validated.runId, validated.effectKey, claim.record.operationAttempt);
+              if (joined.ownerDead || joined.record.operationAttempt) continue;
+              return joined.record;
+            }
+            if (claim.record.collectionState === "collecting") continue;
+            return claim.record;
           }
-        }
-        try {
-          const entries = await collectEntries(reservation);
-          const unsupported = requestedEvidenceKinds(reservation).filter((kind) => !COLLECTABLE_KINDS.has(kind));
-          if (unsupported.length > 0) {
-            // The evidence contract asked for kinds this node cannot collect
-            // (commands/tests/media): a "complete" manifest would silently
-            // pretend coverage. Return a typed PARTIAL failure carrying what
-            // WAS collected, with the gap recorded durably.
-            const cause = `requested evidence kinds are not collectable on this node: ${unsupported.join(", ")}`;
+          const ownedAttemptId = claim.record.operationAttempt!.attemptId;
+          try {
+            return await withCollectionOccupancy(reservation, async (ownedWorkingCopy) => {
+              const entries = await collectEntries(reservation, ownedWorkingCopy);
+              const unsupported = requestedEvidenceKinds(reservation).filter((kind) => !COLLECTABLE_KINDS.has(kind));
+              if (unsupported.length > 0) {
+                // The evidence contract asked for kinds this node cannot collect
+                // (commands/tests/media): a "complete" manifest would silently
+                // pretend coverage. Return a typed PARTIAL failure carrying what
+                // WAS collected, with the gap recorded durably.
+                const cause = `requested evidence kinds are not collectable on this node: ${unsupported.join(", ")}`;
+                const manifest: JsonObject = {
+                  runId: validated.runId,
+                  collectionId: claim.record.collectionId!,
+                  state: "failed",
+                  entries: entries as unknown as JsonValue,
+                  createdAt: claim.record.createdAt,
+                };
+                return setOperationResult(
+                  validated.runId,
+                  validated.effectKey,
+                  manifest,
+                  {
+                    collectionState: "failed",
+                    collectionFailure: "unrecoverable",
+                    manifest,
+                    cause,
+                    operationAttempt: undefined,
+                  },
+                  (op) => op.operationAttempt?.attemptId === ownedAttemptId,
+                );
+              }
+              const manifest: JsonObject = {
+                runId: validated.runId,
+                collectionId: claim.record.collectionId!,
+                state: "complete",
+                entries: entries as unknown as JsonValue,
+                createdAt: claim.record.createdAt,
+                completedAt: now().toISOString(),
+              };
+              const updated = await setOperationResult(
+                validated.runId,
+                validated.effectKey,
+                manifest,
+                {
+                  collectionState: "complete",
+                  collectionFailure: undefined,
+                  manifest,
+                  cause: undefined,
+                  operationAttempt: undefined,
+                },
+                (op) => op.operationAttempt?.attemptId === ownedAttemptId,
+              );
+              if (updated.collectionState === "complete") {
+                await appendRunEvents(
+                  validated.runId,
+                  protocolVersion,
+                  [{ type: "collection.completed", payload: { collectionId: claim.record.collectionId! }, origin: await deps.origin() }],
+                  { onlyIfAbsentKeys: true },
+                );
+              }
+              return updated;
+            });
+          } catch (error) {
+            const cause = error instanceof Error ? error.message : String(error);
+            // The corpus error registry is the cross-repo retryability contract:
+            // known non-retryable protocol failures stay terminal, while raw
+            // coordinator/I/O faults map to retryable AUTHORITY_UNAVAILABLE.
+            const collectionFailure = toWireError(error).retryable ? "retryable" : "unrecoverable";
             const manifest: JsonObject = {
               runId: validated.runId,
-              collectionId: record.collectionId!,
+              collectionId: claim.record.collectionId!,
               state: "failed",
-              entries: entries as unknown as JsonValue,
-              createdAt: record.createdAt,
+              entries: [] as JsonValue,
+              createdAt: claim.record.createdAt,
             };
-            return setOperationResult(validated.runId, validated.effectKey, manifest, {
-              collectionState: "failed",
-              collectionFailure: "unrecoverable",
+            return setOperationResult(
+              validated.runId,
+              validated.effectKey,
               manifest,
-              cause,
-            });
+              {
+                collectionState: "failed",
+                collectionFailure,
+                manifest,
+                cause,
+                operationAttempt: undefined,
+              },
+              (op) => op.operationAttempt?.attemptId === ownedAttemptId,
+            );
           }
-          const manifest: JsonObject = {
-            runId: validated.runId,
-            collectionId: record.collectionId!,
-            state: "complete",
-            entries: entries as unknown as JsonValue,
-            createdAt: record.createdAt,
-            completedAt: now().toISOString(),
-          };
-          const updated = await setOperationResult(validated.runId, validated.effectKey, manifest, {
-            collectionState: "complete",
-            collectionFailure: undefined,
-            manifest,
-            cause: undefined,
-          });
-          await appendRunEvents(
-            validated.runId,
-            protocolVersion,
-            [{ type: "collection.completed", payload: { collectionId: record.collectionId! }, origin: await deps.origin() }],
-            { onlyIfAbsentKeys: true },
-          );
-          return updated;
-        } catch (error) {
-          const cause = error instanceof Error ? error.message : String(error);
-          // The corpus error registry is the cross-repo retryability contract:
-          // known non-retryable protocol failures stay terminal, while raw
-          // coordinator/I/O faults map to retryable AUTHORITY_UNAVAILABLE.
-          const collectionFailure = toWireError(error).retryable ? "retryable" : "unrecoverable";
-          const manifest: JsonObject = {
-            runId: validated.runId,
-            collectionId: record.collectionId!,
-            state: "failed",
-            entries: [] as JsonValue,
-            createdAt: record.createdAt,
-          };
-          return setOperationResult(validated.runId, validated.effectKey, manifest, {
-            collectionState: "failed",
-            collectionFailure,
-            manifest,
-            cause,
-          });
         }
       });
       return respond(requestId, current, created ? "created" : "replayed");
@@ -905,72 +1072,83 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                   ? record
                   : { ...record, cancel: { requestedAt: now().toISOString(), reason: "released" } },
               );
-              settled = await deps.settle(reservation);
-              reservation = settled.reservation;
+              if (settled.state === "accepted" || settled.state === "starting") {
+                // Only unresolved launch states need another lifecycle fold.
+                // For running/lost runs this release effect owns the one stop
+                // attempt below; asking the general reconciler first would
+                // duplicate delivery and obscure which proof fenced cleanup.
+                settled = await deps.settle(reservation);
+                reservation = settled.reservation;
+              }
             }
-            let detail = "no live harness";
-            if (TERMINAL_RUN_STATES.has(settled.state)) {
-              // Provably over (exit fold, confirmed stop, or proven never
-              // started); indeterminateAt cannot be set here — a lost
-              // projection wins over any recorded result.
-              detail = "run already terminal; harness provably down";
-            } else {
-              const ours = await sessionIsOurs(reservation);
-              if ((settled.state === "accepted" || settled.state === "starting") && !ours) {
-                // A launch may still be CREATING the process: "no live
-                // harness" would be a guess, and releasing occupancy under a
-                // nascent harness could free a tree it is about to mutate.
-                await annotatePending("launch unresolved and no provable session yet");
-                break;
-              }
-              let stopConfirmed = true;
-              if (ours) {
-                const stop = await deps.control.stop(reservation.beeName);
-                detail = stop.detail;
-                stopConfirmed = stop.stopped;
-              }
-              if (!stopConfirmed) {
-                // Step stays pending (retryable); the run is honestly lost,
-                // not terminal, and every later cleanup step is fenced off.
-                reservation = await mutateReservation(runId, (record) =>
-                  record.result ? record : enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
-                );
-                if (!reservation.result) {
-                  await appendRunEvents(
-                    runId,
-                    protocolVersion,
-                    [{
-                      type: "run.lost",
-                      payload: lossEpisodePayload(reservation, { cause: "release_stop_unconfirmed", detail }),
-                      origin: await deps.origin(),
-                    }],
-                    { onlyIfAbsentKeys: true },
-                  );
-                  await annotatePending(detail);
-                  break;
-                }
-              }
-              // Stop confirmed (or nothing verifiable of ours remains):
-              // terminalize and resolve any earlier liveness doubt.
-              if (reservation.indeterminateCause === "release_stop_unconfirmed") {
-                await appendRunEvents(
-                  runId,
-                  protocolVersion,
-                  [{
-                    type: "run.recovering",
-                    payload: lossEpisodePayload(reservation, { cause: "release_stop_unconfirmed", verified: ["run-identity", "process-stop"] }),
-                    origin: await deps.origin(),
-                  }],
-                  { onlyIfAbsentKeys: true },
-                );
-              }
-              reservation = await commitRunTerminalResult(
-                runId,
-                { outcome: "cancelled", cause: "released" },
-                { now, clearIndeterminate: true },
+            const terminal = TERMINAL_RUN_STATES.has(settled.state);
+            const ours = await sessionIsOurs(reservation);
+            // A durable cancelled result is produced only by the lifecycle
+            // reconciler after a confirmed stop (or proof the Run never
+            // started). Preserve that proof so release after run.cancel does
+            // not deliver a duplicate stop. completed/failed results do not
+            // carry this liveness guarantee and must still probe an owned host.
+            const stopAlreadyProven = terminal && reservation.result?.outcome === "cancelled";
+            if (!terminal && (settled.state === "accepted" || settled.state === "starting") && !ours) {
+              // A launch may still be CREATING the process: "no live harness"
+              // would be a guess, and releasing occupancy under a nascent
+              // harness could free a tree it is about to mutate.
+              await annotatePending("launch unresolved and no provable session yet");
+              break;
+            }
+            let detail = stopAlreadyProven
+              ? "run cancellation already proved the harness down"
+              : terminal
+                ? "run terminal; no owned harness remains"
+                : "no live harness";
+            let stopConfirmed = true;
+            if (ours && !stopAlreadyProven) {
+              const stop = await deps.control.stop(reservation.beeName);
+              detail = stop.detail;
+              stopConfirmed = stop.stopped;
+            }
+            if (!stopConfirmed) {
+              // A terminal computation result says nothing about whether the
+              // owned process is actually down. Persist the keyed liveness-loss
+              // episode even if a concurrent terminal decision already won,
+              // and fence every destructive cleanup step until stop is proven.
+              reservation = await mutateReservation(runId, (record) =>
+                enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
               );
-              await appendRunTerminalEvents(reservation, protocolVersion, await deps.origin());
+              await appendRunEvents(
+                runId,
+                protocolVersion,
+                [{
+                  type: "run.lost",
+                  payload: lossEpisodePayload(reservation, { cause: "release_stop_unconfirmed", detail }),
+                  origin: await deps.origin(),
+                }],
+                { onlyIfAbsentKeys: true },
+              );
+              await annotatePending(detail);
+              break;
             }
+            // Stop confirmed (or no session belonging to this Run remains):
+            // resolve any earlier liveness doubt. The terminal helper preserves
+            // an already-committed result while clearing only the loss episode.
+            if (reservation.indeterminateCause === "release_stop_unconfirmed") {
+              await appendRunEvents(
+                runId,
+                protocolVersion,
+                [{
+                  type: "run.recovering",
+                  payload: lossEpisodePayload(reservation, { cause: "release_stop_unconfirmed", verified: ["run-identity", "process-stop"] }),
+                  origin: await deps.origin(),
+                }],
+                { onlyIfAbsentKeys: true },
+              );
+            }
+            reservation = await commitRunTerminalResult(
+              runId,
+              { outcome: "cancelled", cause: "released" },
+              { now, clearIndeterminate: true },
+            );
+            await appendRunTerminalEvents(reservation, protocolVersion, await deps.origin());
             current = await completeStep(runId, effectKey, stepId, "completed", detail);
           } else if (stepId === "occupancy-release") {
             const workingCopyId = workingCopyIdOf(reservation);

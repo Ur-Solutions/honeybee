@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { computeSchemaDigest, createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
-import { readEvidence } from "../src/execution/evidence.js";
+import { collectGitDiffMetadata, readEvidence } from "../src/execution/evidence.js";
 import { admitOperation, readOperation } from "../src/execution/opsStore.js";
 import { canonicalDigest } from "../src/comb/canonical.js";
 import { createRunOperations } from "../src/execution/operations.js";
@@ -236,6 +236,182 @@ test("run.collect retryable failure survives coordinator restart and the same ef
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
+  });
+});
+
+test("two service instances join one durable failed-to-collecting recovery attempt", async () => {
+  await withTempStore(async () => {
+    const repo = await mkdtemp(join(tmpdir(), "honeybee-h3-two-service-collect-"));
+    try {
+      const control = fakeControl();
+      const { ctx, service } = await startRun({ control });
+      await registerWorkingCopy({
+        workingCopyId: "wc-0001",
+        productId: "prod-honeycomb-app",
+        path: repo,
+        snapshotDigest: SNAPSHOT_DIGEST,
+      });
+      await claimWorkingCopy("wc-0001", RUN_ID);
+      const effectKey = `${RUN_ID}/collect-two-service`;
+      const failed = (await service.runCollect(collectEnvelope(ctx, effectKey))) as JsonObject;
+      assert.equal((failed.result as JsonObject).state, "failed");
+      await initializeGitWorkingCopy(repo);
+
+      let reachedCollector!: () => void;
+      const collectorPaused = new Promise<void>((resolve) => {
+        reachedCollector = resolve;
+      });
+      let resumeCollector!: () => void;
+      const resume = new Promise<void>((resolve) => {
+        resumeCollector = resolve;
+      });
+      const common = {
+        contract,
+        validator,
+        protocolVersion: "0.1",
+        schemaDigest: computeSchemaDigest(contract),
+        now: () => new Date(),
+        binding: async () => ctx.binding,
+        control: control.control,
+        sessions: storeSessionEvidenceSource(),
+        settle: async (reservation: NonNullable<Awaited<ReturnType<typeof readReservation>>>) => ({ reservation, state: "running" }),
+        origin: async () => ({ nodeId: ctx.nodeId }),
+      };
+      const serviceA = createRunOperations({
+        ...common,
+        collectGitDiffMetadata: async (copy, generatedAt) => {
+          reachedCollector();
+          await resume;
+          return collectGitDiffMetadata(copy, generatedAt);
+        },
+      });
+      let peerCollectorCalls = 0;
+      const serviceB = createRunOperations({
+        ...common,
+        collectGitDiffMetadata: async (copy, generatedAt) => {
+          peerCollectorCalls += 1;
+          return collectGitDiffMetadata(copy, generatedAt);
+        },
+      });
+
+      const aPromise = serviceA.runCollect(collectEnvelope(ctx, effectKey, "req-collect-service-a"));
+      await collectorPaused;
+      const owned = (await readOperation(RUN_ID, effectKey))!;
+      assert.equal(owned.collectionState, "collecting");
+      assert.equal(owned.operationAttempt?.kind, "collection");
+      assert.equal(owned.receipt.resultVersion, 1, "the prior failed receipt remains canonical until replacement");
+
+      let peerSettled = false;
+      const bPromise = serviceB.runCollect(collectEnvelope(ctx, effectKey, "req-collect-service-b")).finally(() => {
+        peerSettled = true;
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      assert.equal(peerSettled, false);
+      assert.equal(peerCollectorCalls, 0, "the peer never enters collection while the durable owner is live");
+      assert.equal((await readOperation(RUN_ID, effectKey))!.receipt.resultVersion, 1);
+
+      resumeCollector();
+      const [a, b] = (await Promise.all([aPromise, bPromise])) as JsonObject[];
+      assert.equal(peerCollectorCalls, 0);
+      assert.equal(canonicalDigest(a.result as JsonValue), canonicalDigest(b.result as JsonValue));
+      assert.equal((a.receipt as JsonObject).receiptId, (b.receipt as JsonObject).receiptId);
+      assert.equal((a.receipt as JsonObject).resultVersion, 2);
+      assert.equal((b.receipt as JsonObject).resultVersion, 2);
+      const completed = (await readOperation(RUN_ID, effectKey))!;
+      assert.equal(completed.collectionState, "complete");
+      assert.equal(completed.operationAttempt, undefined);
+      assert.equal(completed.receipt.resultVersion, 2);
+      assert.equal((await readRunEvents(RUN_ID)).filter((event) => event.type === "collection.completed").length, 1);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+test("run.collect holds working-copy ownership through its durable snapshot before release hands the copy to another run", async () => {
+  await withTempStore(async () => {
+    await withGitWorkingCopy(async (repo, head) => {
+      const control = fakeControl();
+      const { ctx, service } = await startRun({ control });
+      await registerWorkingCopy({
+        workingCopyId: "wc-0001",
+        productId: "prod-honeycomb-app",
+        path: repo,
+        snapshotDigest: SNAPSHOT_DIGEST,
+        revision: head,
+        branch: "main",
+      });
+      await claimWorkingCopy("wc-0001", RUN_ID);
+
+      let reachedOwnedRead!: () => void;
+      const ownedRead = new Promise<void>((resolve) => {
+        reachedOwnedRead = resolve;
+      });
+      let resumeCollection!: () => void;
+      const resume = new Promise<void>((resolve) => {
+        resumeCollection = resolve;
+      });
+      const pausedOps = createRunOperations({
+        contract,
+        validator,
+        protocolVersion: "0.1",
+        schemaDigest: computeSchemaDigest(contract),
+        now: () => new Date(),
+        binding: async () => ctx.binding,
+        control: control.control,
+        sessions: storeSessionEvidenceSource(),
+        settle: async (reservation) => ({ reservation, state: "running" }),
+        origin: async () => ({ nodeId: ctx.nodeId }),
+        collectGitDiffMetadata: async (copy, generatedAt) => {
+          // This callback is entered only after occupancy was revalidated while
+          // holding the shared per-copy lock, immediately before git reads.
+          reachedOwnedRead();
+          await resume;
+          return collectGitDiffMetadata(copy, generatedAt);
+        },
+      });
+
+      const collecting = pausedOps.runCollect(collectEnvelope(ctx, `${RUN_ID}/collect-ownership-barrier`));
+      await ownedRead;
+
+      let stopReached!: () => void;
+      const stopped = new Promise<void>((resolve) => {
+        stopReached = resolve;
+      });
+      const baseStop = control.control.stop;
+      control.control.stop = async (beeName) => {
+        stopReached();
+        return baseStop(beeName);
+      };
+      let handoffSettled = false;
+      const handoff = (async () => {
+        const released = (await service.runRelease(
+          buildOperationEnvelope(ctx, `${RUN_ID}/release-ownership-barrier`, { runId: RUN_ID }),
+        )) as JsonObject;
+        assert.equal((released.result as JsonObject).environmentState, "released");
+        await claimWorkingCopy("wc-0001", "run-B");
+        await writeFile(join(repo, "b-only.txt"), "belongs to run B\n");
+      })().finally(() => {
+        handoffSettled = true;
+      });
+      await stopped;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(handoffSettled, false, "release and successor claim wait for A's collection lease");
+      assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+
+      resumeCollection();
+      const collected = (await collecting) as JsonObject;
+      await handoff;
+      assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, "run-B");
+
+      const manifest = collected.result as JsonObject;
+      assert.equal(manifest.state, "complete");
+      const diffEntry = (manifest.entries as JsonObject[]).find((entry) => entry.kind === "diff")!;
+      const diff = JSON.parse((await readEvidence(String((diffEntry.ref as JsonObject).token))).toString()) as JsonObject;
+      const paths = (diff.status as JsonObject[]).map((entry) => entry.path);
+      assert.ok(paths.includes("app.txt"), "A's dirty state is present");
+      assert.ok(!paths.includes("b-only.txt"), "successor state cannot leak into A's evidence");
+    });
   });
 });
 
@@ -526,6 +702,79 @@ test("release with an unconfirmable stop FENCES cleanup: occupancy stays claimed
       assert.deepEqual(retry.result, { environmentState: "released", steps: { completed: 4, unrecoverable: 0 } });
       assert.equal((await readWorkingCopy("wc-0001"))!.occupancy, undefined);
       assert.equal((await readReservation(RUN_ID))!.result?.outcome, "cancelled");
+    });
+  });
+});
+
+test("release keeps cleanup fenced when a terminal result races an unconfirmed owned-harness stop", async () => {
+  await withTempStore(async () => {
+    await withGitWorkingCopy(async (repo, head) => {
+      const control = fakeControl({ stopResult: { stopped: false, detail: "owned harness may still be live" } });
+      const { ctx, service } = await startRun({ control });
+      await registerWorkingCopy({
+        workingCopyId: "wc-0001",
+        productId: "prod-honeycomb-app",
+        path: repo,
+        snapshotDigest: SNAPSHOT_DIGEST,
+        revision: head,
+        branch: "main",
+      });
+      await claimWorkingCopy("wc-0001", RUN_ID);
+
+      // Model the exact race: release settled the Run as running, then another
+      // terminal reconciler commits completion while the clean stop is in
+      // flight. stop=false must still dominate cleanup liveness.
+      const baseStop = control.control.stop;
+      let injectedTerminal = false;
+      control.control.stop = async (beeName) => {
+        if (!injectedTerminal) {
+          injectedTerminal = true;
+          await mutateReservation(RUN_ID, (record) => ({
+            ...record,
+            result: { outcome: "completed", finishedAt: new Date().toISOString(), harnessExitCode: 0 },
+          }));
+        }
+        return baseStop(beeName);
+      };
+
+      const envelope = buildOperationEnvelope(ctx, `${RUN_ID}/release-terminal-stop-race`, { runId: RUN_ID });
+      const first = (await service.runRelease(envelope)) as JsonObject;
+      assert.deepEqual(first.result, {
+        environmentState: "releasing",
+        steps: { completed: 0, unrecoverable: 0, pending: 4 },
+        cause: "harness stop unconfirmed; cleanup fenced until a retry confirms the stop",
+      });
+      const fenced = (await readReservation(RUN_ID))!;
+      assert.equal(fenced.result?.outcome, "completed", "the prior terminal winner remains immutable");
+      assert.equal(fenced.indeterminateCause, "release_stop_unconfirmed");
+      assert.ok(fenced.lossEpisodeId);
+      assert.equal(fenced.releasedAt, undefined);
+      assert.equal(fenced.sealedAt, undefined);
+      assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+      assert.ok((await readRunEvents(RUN_ID)).some((event) => event.type === "run.lost"));
+      assert.ok((await readOperation(RUN_ID, `${RUN_ID}/release-terminal-stop-race`))!.releaseSteps!.every(
+        (step) => step.status === "pending",
+      ));
+
+      control.behavior.stopResult = { stopped: true, detail: "owned harness is now down" };
+      const retry = (await service.runRelease(
+        buildOperationEnvelope(
+          ctx,
+          `${RUN_ID}/release-terminal-stop-race`,
+          { runId: RUN_ID },
+          { requestId: "req-release-terminal-stop-retry" },
+        ),
+      )) as JsonObject;
+      assert.equal((retry.receipt as JsonObject).outcome, "replayed");
+      assert.deepEqual(retry.result, { environmentState: "released", steps: { completed: 4, unrecoverable: 0 } });
+      const recovered = (await readReservation(RUN_ID))!;
+      assert.equal(recovered.result?.outcome, "completed");
+      assert.equal(recovered.indeterminateAt, undefined);
+      assert.ok(recovered.releasedAt);
+      assert.equal((await readWorkingCopy("wc-0001"))!.occupancy, undefined);
+      const events = await readRunEvents(RUN_ID);
+      assert.ok(events.some((event) => event.type === "run.recovering"));
+      assert.ok(events.some((event) => event.type === "run.completed"));
     });
   });
 });

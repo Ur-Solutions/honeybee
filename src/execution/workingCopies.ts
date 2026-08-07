@@ -7,6 +7,7 @@
 // idempotently). One JSON doc at `<executionRoot()>/working-copies.json`;
 // every mutation is lock -> read -> mutate -> atomic write.
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { isAbsolute, join, normalize } from "node:path";
 import { atomicWriteFile } from "../fsx.js";
 import { withFileLock } from "../lock.js";
@@ -36,6 +37,22 @@ function registryPath(): string {
 
 function lockPath(): string {
   return join(executionRoot(), ".working-copies.lock");
+}
+
+function occupancyLockPath(workingCopyId: string): string {
+  const key = createHash("sha256").update(workingCopyId).digest("hex");
+  return join(executionRoot(), "working-copy-locks", `${key}.lock`);
+}
+
+/**
+ * Serialize ownership handoff with every filesystem read made on behalf of the
+ * current occupant. Lock order is always per-copy -> registry; registry-only
+ * registration never waits on a per-copy lock, so no reverse-order cycle is
+ * possible. The hashed filename keeps opaque ids out of node-local paths.
+ */
+export async function withWorkingCopyOccupancyLock<T>(workingCopyId: string, action: () => Promise<T>): Promise<T> {
+  await ensureExecutionRoot();
+  return withFileLock(occupancyLockPath(workingCopyId), action, { timeoutMs: 90_000 });
 }
 
 /**
@@ -161,29 +178,33 @@ export async function readWorkingCopy(workingCopyId: string): Promise<WorkingCop
  * a placement the client never registered).
  */
 export async function claimWorkingCopy(workingCopyId: string, runId: string): Promise<WorkingCopyRecord> {
-  return mutateRegistry((file) => {
-    const record = file.copies.find((copy) => copy.workingCopyId === workingCopyId);
-    if (!record) {
-      throw executionError("MATERIALIZATION_FAILED", `working copy ${workingCopyId} is not registered on this node`);
-    }
-    if (record.occupancy && record.occupancy.claimedByRunId !== runId) {
-      throw executionError(
-        "MATERIALIZATION_FAILED",
-        `working copy ${workingCopyId} is occupied by run ${record.occupancy.claimedByRunId}`,
-        { workingCopyId, claimedByRunId: record.occupancy.claimedByRunId },
-      );
-    }
-    if (!record.occupancy) {
-      record.occupancy = { claimedByRunId: runId, claimedAt: new Date().toISOString() };
-    }
-    return record;
-  });
+  return withWorkingCopyOccupancyLock(workingCopyId, () =>
+    mutateRegistry((file) => {
+      const record = file.copies.find((copy) => copy.workingCopyId === workingCopyId);
+      if (!record) {
+        throw executionError("MATERIALIZATION_FAILED", `working copy ${workingCopyId} is not registered on this node`);
+      }
+      if (record.occupancy && record.occupancy.claimedByRunId !== runId) {
+        throw executionError(
+          "MATERIALIZATION_FAILED",
+          `working copy ${workingCopyId} is occupied by run ${record.occupancy.claimedByRunId}`,
+          { workingCopyId, claimedByRunId: record.occupancy.claimedByRunId },
+        );
+      }
+      if (!record.occupancy) {
+        record.occupancy = { claimedByRunId: runId, claimedAt: new Date().toISOString() };
+      }
+      return record;
+    }),
+  );
 }
 
 /** Idempotently release a Run's claim (no-op when vacant or claimed by another Run). */
 export async function releaseWorkingCopy(workingCopyId: string, runId: string): Promise<void> {
-  await mutateRegistry((file) => {
-    const record = file.copies.find((copy) => copy.workingCopyId === workingCopyId);
-    if (record?.occupancy?.claimedByRunId === runId) delete record.occupancy;
-  });
+  await withWorkingCopyOccupancyLock(workingCopyId, () =>
+    mutateRegistry((file) => {
+      const record = file.copies.find((copy) => copy.workingCopyId === workingCopyId);
+      if (record?.occupancy?.claimedByRunId === runId) delete record.occupancy;
+    }),
+  );
 }
