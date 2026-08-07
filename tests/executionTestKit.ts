@@ -24,6 +24,7 @@ import {
   createExecutionService,
   storeSessionEvidenceSource,
   type ExecutionService,
+  type ExecutionServiceOptions,
   type RunLauncher,
   type SessionEvidenceSource,
 } from "../src/execution/service.js";
@@ -258,6 +259,7 @@ export type ServiceOptions = {
   inspectLaunchOwner?: (owner: RunLaunchOwner) => Promise<RunLaunchOwnerStatus>;
   afterAdmission?: (reservation: RunReservation) => void | Promise<void>;
   afterLaunchClaim?: (reservation: RunReservation, attemptId: string) => void | Promise<void>;
+  appendLaunchEvents?: ExecutionServiceOptions["appendLaunchEvents"];
   launchGraceMs?: number;
 };
 
@@ -268,6 +270,7 @@ function testLaunchOwner(): RunLaunchOwner {
   return {
     ownerId: `test-service-${testLaunchOwnerOrdinal}`,
     pid: process.pid,
+    machineId: "test-machine",
     hostname: "test-host",
     processFingerprint: { pgid: process.pid, startedAt: "test-process-birth" },
   };
@@ -288,6 +291,7 @@ export function makeService(opts: ServiceOptions = {}): ExecutionService {
     inspectLaunchOwner: opts.inspectLaunchOwner ?? (async () => "alive"),
     ...(opts.afterAdmission ? { afterAdmission: opts.afterAdmission } : {}),
     ...(opts.afterLaunchClaim ? { afterLaunchClaim: opts.afterLaunchClaim } : {}),
+    ...(opts.appendLaunchEvents ? { appendLaunchEvents: opts.appendLaunchEvents } : {}),
     ...(opts.launchGraceMs !== undefined ? { launchGraceMs: opts.launchGraceMs } : {}),
   });
 }

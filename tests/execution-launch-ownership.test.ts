@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { JsonObject } from "../src/execution/contract.js";
+import { executionError } from "../src/execution/errors.js";
 import {
+  appendRunEvents,
   commitRunTerminalResult,
   readReservation,
   readRunEvents,
   type RunLaunchOwner,
 } from "../src/execution/runStore.js";
+import { inspectRunLaunchOwner } from "../src/execution/service.js";
 import {
   buildRunStartEnvelope,
   countingLauncher,
@@ -25,14 +28,53 @@ function barrier() {
   return { enter, entered, release, released };
 }
 
-function owner(ownerId: string, pid: number): RunLaunchOwner {
+function owner(
+  ownerId: string,
+  pid: number,
+  identity: { machineId?: string; hostname?: string } = {},
+): RunLaunchOwner {
   return {
     ownerId,
     pid,
-    hostname: "test-host",
+    machineId: identity.machineId ?? "machine-a",
+    hostname: identity.hostname ?? "test-host",
     processFingerprint: { pgid: pid, startedAt: `birth-${pid}` },
   };
 }
+
+test("same owner resumes durable preparation after transient launch-event publication failure", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const counting = countingLauncher();
+    let appendCalls = 0;
+    const service = makeService({
+      launcher: counting.launcher,
+      appendLaunchEvents: async (...args) => {
+        appendCalls += 1;
+        if (appendCalls === 1) {
+          throw executionError("AUTHORITY_UNAVAILABLE", "injected launch event-store rejection");
+        }
+        return appendRunEvents(...args);
+      },
+    });
+
+    const first = (await service.runStart(buildRunStartEnvelope(ctx))) as JsonObject;
+    assert.equal((first.error as JsonObject).code, "AUTHORITY_UNAVAILABLE");
+    assert.equal(counting.calls.length, 0, "publisher failure occurs before the launcher side effect");
+    assert.equal((await readReservation(RUN_ID))!.launchAttempt?.stage, "preparing");
+
+    const retry = (await service.runStart(buildRunStartEnvelope(ctx, { requestId: "req-retry" }))) as JsonObject;
+    assert.deepEqual(retry.result, { runId: RUN_ID, state: "running" });
+    assert.equal(counting.calls.length, 1);
+    assert.equal((await readReservation(RUN_ID))!.launchAttempt?.stage, "launching");
+
+    await service.runStart(buildRunStartEnvelope(ctx, { requestId: "req-replay" }));
+    assert.equal(counting.calls.length, 1, "settled replay never invokes the launcher again");
+    const types = (await readRunEvents(RUN_ID)).map((event) => event.type);
+    assert.equal(types.filter((type) => type === "environment.materializing").length, 1);
+    assert.equal(types.filter((type) => type === "harness.starting").length, 1);
+  });
+});
 
 test("two services: replay after durable admission elects exactly one launch owner", async () => {
   await withTempStore(async () => {
@@ -91,13 +133,13 @@ test("two services: a live launching owner is never stolen after the old grace w
   });
 });
 
-test("two services: a proven-dead birth-fenced owner permits one takeover", async () => {
+test("two services: hostname change on the same machine permits proven-dead owner takeover", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
     const claimed = barrier();
     const counting = countingLauncher();
-    const ownerA = owner("owner-a", 41001);
-    const ownerB = owner("owner-b", 41002);
+    const ownerA = owner("owner-a", 41001, { machineId: "machine-a", hostname: "old-hostname" });
+    const ownerB = owner("owner-b", 41002, { machineId: "machine-a", hostname: "new-hostname" });
     const serviceA = makeService({
       launcher: counting.launcher,
       launchOwner: ownerA,
@@ -109,7 +151,11 @@ test("two services: a proven-dead birth-fenced owner permits one takeover", asyn
     const serviceB = makeService({
       launcher: counting.launcher,
       launchOwner: ownerB,
-      inspectLaunchOwner: async (candidate) => candidate.ownerId === ownerA.ownerId ? "dead" : "alive",
+      inspectLaunchOwner: (candidate) => inspectRunLaunchOwner(
+        candidate,
+        { machineId: ownerB.machineId!, hostname: ownerB.hostname },
+        async () => candidate.ownerId === ownerA.ownerId ? "gone" : "match",
+      ),
     });
 
     const a = serviceA.runStart(buildRunStartEnvelope(ctx));
@@ -124,6 +170,48 @@ test("two services: a proven-dead birth-fenced owner permits one takeover", asyn
     claimed.release();
     await a;
     assert.equal(counting.calls.length, 1, "the stale A continuation revalidates its attempt token before launch");
+  });
+});
+
+test("two services: a foreign-machine owner on the shared store is never inspected or stolen", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const claimed = barrier();
+    const counting = countingLauncher();
+    const foreignOwner = owner("owner-foreign", 42001, { machineId: "machine-foreign", hostname: "shared-name" });
+    const localOwner = owner("owner-local", 42002, { machineId: "machine-local", hostname: "shared-name" });
+    let localBirthInspections = 0;
+    const serviceA = makeService({
+      launcher: counting.launcher,
+      launchOwner: foreignOwner,
+      afterLaunchClaim: async () => {
+        claimed.enter();
+        await claimed.released;
+      },
+    });
+    const serviceB = makeService({
+      launcher: counting.launcher,
+      launchOwner: localOwner,
+      inspectLaunchOwner: (candidate) => inspectRunLaunchOwner(
+        candidate,
+        { machineId: localOwner.machineId!, hostname: localOwner.hostname },
+        async () => {
+          localBirthInspections += 1;
+          return "gone";
+        },
+      ),
+    });
+
+    const a = serviceA.runStart(buildRunStartEnvelope(ctx));
+    await claimed.entered;
+    const b = (await serviceB.runStart(buildRunStartEnvelope(ctx, { requestId: "req-foreign" }))) as JsonObject;
+    assert.deepEqual(b.result, { runId: RUN_ID, state: "starting" });
+    assert.equal(localBirthInspections, 0, "a foreign PID is never interpreted through the local process table");
+    assert.equal(counting.calls.length, 0);
+
+    claimed.release();
+    await a;
+    assert.equal(counting.calls.length, 1, "only the foreign owner's original continuation launches");
   });
 });
 

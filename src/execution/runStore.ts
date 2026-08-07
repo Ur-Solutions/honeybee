@@ -91,6 +91,9 @@ export type RunReservationPhase = "reserved" | "launching" | "started" | "failed
 export type RunLaunchOwner = {
   ownerId: string;
   pid: number;
+  /** Stable machine identity; absent only on pre-machine-id reservations. */
+  machineId?: string;
+  /** Display/debug fact only when machineId is present. */
   hostname: string;
   processFingerprint: ProcessBirthFingerprint;
 };
@@ -100,6 +103,11 @@ export type RunLaunchAttempt = {
   attemptId: string;
   owner: RunLaunchOwner;
   claimedAt: string;
+  /**
+   * `preparing` proves the launcher side effect has not been invoked yet.
+   * Missing is a legacy/active attempt and is treated as already launching.
+   */
+  stage?: "preparing" | "launching";
   takeoverOf?: string;
 };
 
@@ -310,11 +318,13 @@ function isValidLaunchAttempt(value: unknown): value is RunLaunchAttempt {
   const attempt = value as Record<string, unknown>;
   if (typeof attempt.attemptId !== "string" || attempt.attemptId.length === 0) return false;
   if (typeof attempt.claimedAt !== "string" || !Number.isFinite(Date.parse(attempt.claimedAt))) return false;
+  if (attempt.stage !== undefined && attempt.stage !== "preparing" && attempt.stage !== "launching") return false;
   if (attempt.takeoverOf !== undefined && (typeof attempt.takeoverOf !== "string" || attempt.takeoverOf.length === 0)) return false;
   if (attempt.owner === null || typeof attempt.owner !== "object" || Array.isArray(attempt.owner)) return false;
   const owner = attempt.owner as Record<string, unknown>;
   if (typeof owner.ownerId !== "string" || owner.ownerId.length === 0) return false;
   if (!Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0) return false;
+  if (owner.machineId !== undefined && (typeof owner.machineId !== "string" || owner.machineId.length === 0)) return false;
   if (typeof owner.hostname !== "string" || owner.hostname.length === 0) return false;
   if (owner.processFingerprint === null || typeof owner.processFingerprint !== "object" || Array.isArray(owner.processFingerprint)) return false;
   const fingerprint = owner.processFingerprint as Record<string, unknown>;
@@ -558,7 +568,7 @@ export async function claimRunLaunchAttempt(
       const next: RunReservation = {
         ...current,
         phase: "launching",
-        launchAttempt: { attemptId, owner, claimedAt },
+        launchAttempt: { attemptId, owner, claimedAt, stage: "preparing" },
         launchAttemptedAt: claimedAt,
       };
       await writeReservation(next);
@@ -585,12 +595,39 @@ export async function claimRunLaunchAttempt(
     const claimedAt = clock().toISOString();
     const next: RunReservation = {
       ...current,
-      launchAttempt: { attemptId, owner, claimedAt, takeoverOf: existing.attemptId },
+      launchAttempt: { attemptId, owner, claimedAt, stage: "preparing", takeoverOf: existing.attemptId },
       launchAttemptedAt: claimedAt,
     };
     await writeReservation(next);
     return { reservation: next, claimed: true, disposition: "claimed", attemptId };
   });
+}
+
+/**
+ * Cross the last durable fence immediately before invoking the launcher.
+ * Only a `preparing` attempt can activate; a legacy/missing stage is already
+ * ambiguous and must never be resumed by this path.
+ */
+export async function activateRunLaunchAttempt(
+  runId: string,
+  attemptId: string,
+): Promise<{ reservation: RunReservation; activated: boolean }> {
+  let activated = false;
+  const reservation = await mutateReservation(runId, (current) => {
+    if (
+      current.phase !== "launching" ||
+      current.result ||
+      current.cancel ||
+      current.launchAttempt?.attemptId !== attemptId ||
+      current.launchAttempt.stage !== "preparing"
+    ) return current;
+    activated = true;
+    return {
+      ...current,
+      launchAttempt: { ...current.launchAttempt, stage: "launching" },
+    };
+  });
+  return { reservation, activated };
 }
 
 /** Commit readiness only if this exact attempt still owns an unsettled Run. */
@@ -607,7 +644,8 @@ export async function commitRunLaunchStarted(
       current.phase !== "launching" ||
       current.result ||
       current.cancel ||
-      current.launchAttempt?.attemptId !== attemptId
+      current.launchAttempt?.attemptId !== attemptId ||
+      current.launchAttempt.stage === "preparing"
     ) return current;
     committed = true;
     return {
@@ -1212,5 +1250,11 @@ export function classifyLaunch(
   // owner's exact process birth and CAS a takeover, but elapsed wall time alone
   // never reopens the launch side effect. Legacy launching records have no
   // birth-safe owner and therefore remain indeterminate forever.
+  if (reservation.launchAttempt?.stage === "preparing") {
+    // The durable side-effect fence has not been crossed. Another local
+    // in-flight continuation may still be publishing launch events; without
+    // one, cancellation may safely fold this as provably not started.
+    return options.inFlight ? "launch-in-flight" : "reserved-not-started";
+  }
   return reservation.launchAttempt ? "launch-in-flight" : "indeterminate";
 }
