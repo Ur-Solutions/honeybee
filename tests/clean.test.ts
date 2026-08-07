@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -163,6 +163,10 @@ test("hive clean --dead removes dead session metadata", async () => {
     const dead = session("dead", "dead-target");
     dead.updatedAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
     await writeFile(join(dir, "sessions", "dead.json"), `${JSON.stringify(dead)}\n`);
+    await mkdir(join(dir, "seals", "dead"), { recursive: true });
+    await mkdir(join(dir, "hsr", "dead"), { recursive: true });
+    await writeFile(join(dir, "seals", "dead", "seal.json"), "seal");
+    await writeFile(join(dir, "hsr", "dead", "events.jsonl"), "events");
 
     const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead", "--dry-run"], {
       cwd: process.cwd(),
@@ -179,6 +183,8 @@ test("hive clean --dead removes dead session metadata", async () => {
 
     assert.match(cleaned.stdout, /cleaned\tdead/);
     await assert.rejects(readFile(join(dir, "sessions", "dead.json"), "utf8"), /ENOENT/);
+    await assert.rejects(readdir(join(dir, "seals", "dead")), /ENOENT/, "clean purges seal history");
+    await assert.rejects(readdir(join(dir, "hsr", "dead")), /ENOENT/, "clean purges HSR run history");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -4,12 +4,12 @@ import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis,
 import { chooseCleanTargets, type CleanTuiCleanOutcome, type CleanTuiItem } from "../cleanTui.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note, tildify, truncate } from "../format.js";
 import { highlightUniqueSessionReference } from "../ids.js";
-import { transactionalKill } from "../kill.js";
+import { purgeSessionData, transactionalKill } from "../kill.js";
 import { LOCAL_NODE_NAME, listNodes } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { resolveSessionTranscript } from "../sessionMetadata.js";
 import { cleanStatePriority, deriveState, isTerminalState, liveTargetKey, type BeeState, type DerivedState } from "../state.js";
-import { deleteSession, listSessions, safeName, type SessionRecord } from "../store.js";
+import { listSessions, safeName, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { tmux } from "../tmux.js";
 import { renderTranscript } from "../transcripts.js";
@@ -138,7 +138,7 @@ export async function cmdCleanDead(parsed: Parsed) {
   }
 
   for (const record of dead) {
-    await deleteSession(record.name);
+    await purgeSessionData(record);
     if (isPretty()) console.log(actionLine("ok", "clean", [bold(record.name), record.agent, dim(tildify(record.cwd))]));
     else console.log(`cleaned\t${record.name}`);
   }
@@ -189,7 +189,7 @@ export async function cmdCleanCrashed(parsed: Parsed) {
   }
 
   for (const candidate of crashed) {
-    await deleteSession(candidate.record.name);
+    await purgeSessionData(candidate.record);
     printCleanSuccess(candidate.record, "removed crashed");
   }
 }
@@ -496,7 +496,7 @@ export async function cleanCandidatesForTui(candidates: CleanCandidate[]): Promi
 export async function cleanCandidate(candidate: CleanCandidate): Promise<CleanTuiCleanOutcome> {
   const record = candidate.record;
   if (candidate.mode === "delete") {
-    await deleteSession(record.name);
+    await purgeSessionData(record);
     return { name: record.name, ok: true, detail: "removed stale" };
   }
   const outcome = await transactionalKill(record);
