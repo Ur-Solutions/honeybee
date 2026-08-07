@@ -1,7 +1,6 @@
 import { rm } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { resolve, sep } from "node:path";
 import { readActivationHomeOwner, withActivationHomeLock } from "./accounts/activation.js";
-import { storeRoot } from "./fsx.js";
 import { hsrRoot } from "./hsr/runDir.js";
 import { sealsRoot } from "./seal.js";
 import {
@@ -229,15 +228,6 @@ function sessionBindingTime(record: SessionRecord): number {
   return 0;
 }
 
-function isDedicatedSessionHome(record: SessionRecord): boolean {
-  if (!record.accountId || !record.homePath) return false;
-  const target = resolve(record.homePath);
-  return [
-    join(storeRoot(), "homes", record.accountId),
-    join(storeRoot(), "login-homes", record.accountId),
-  ].some((candidate) => resolve(candidate) === target);
-}
-
 async function conflictingHomeBinding(record: SessionRecord): Promise<CredentialBindingConflict | null> {
   if (!record.accountId || !record.homePath) return null;
   const target = resolve(record.homePath);
@@ -304,36 +294,32 @@ async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessi
   const binding: { conflict: CredentialBindingConflict | null } = { conflict: null };
   let ok = false;
   try {
-    if (isDedicatedSessionHome(record)) {
-      await boundedCredentialSync(record, sync, budgetMs);
-      ok = true;
-    } else {
-      // Activation and final harvest take the same resolved-home lock. The
-      // activation stamp closes the activation→SessionRecord publication gap;
-      // the canonical re-read also catches legacy/current session claims.
-      let expired = false;
-      let overallTimer: NodeJS.Timeout | undefined;
-      const lockedHarvest = withActivationHomeLock(record.homePath, async () => {
-        binding.conflict = await conflictingHomeBinding(record);
-        if (binding.conflict || expired) return;
-        const remainingMs = budgetMs - (Date.now() - startedAt);
-        if (remainingMs <= 0) throw new Error(`final credential sync timed out after ${budgetMs}ms`);
-        await boundedCredentialSync(record, sync, remainingMs);
-        if (!expired) ok = true;
-      }, { timeoutMs: Math.max(1, budgetMs) });
-      try {
-        await Promise.race([
-          lockedHarvest,
-          new Promise<never>((_resolve, reject) => {
-            overallTimer = setTimeout(() => {
-              expired = true;
-              reject(new Error(`final credential ownership validation timed out after ${budgetMs}ms`));
-            }, budgetMs);
-          }),
-        ]);
-      } finally {
-        if (overallTimer) clearTimeout(overallTimer);
-      }
+    // Every home, including a nominal per-account slot, is publicly
+    // activatable through an explicit --home path. Activation and final
+    // harvest therefore always take the same resolved-home lock and validate
+    // its owner stamp before trusting bytes.
+    let expired = false;
+    let overallTimer: NodeJS.Timeout | undefined;
+    const lockedHarvest = withActivationHomeLock(record.homePath, async () => {
+      binding.conflict = await conflictingHomeBinding(record);
+      if (binding.conflict || expired) return;
+      const remainingMs = budgetMs - (Date.now() - startedAt);
+      if (remainingMs <= 0) throw new Error(`final credential sync timed out after ${budgetMs}ms`);
+      await boundedCredentialSync(record, sync, remainingMs);
+      if (!expired) ok = true;
+    }, { timeoutMs: Math.max(1, budgetMs) });
+    try {
+      await Promise.race([
+        lockedHarvest,
+        new Promise<never>((_resolve, reject) => {
+          overallTimer = setTimeout(() => {
+            expired = true;
+            reject(new Error(`final credential ownership validation timed out after ${budgetMs}ms`));
+          }, budgetMs);
+        }),
+      ]);
+    } finally {
+      if (overallTimer) clearTimeout(overallTimer);
     }
   } catch {
     // Runtime teardown must remain available during a credential outage. The

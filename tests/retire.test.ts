@@ -316,6 +316,48 @@ test("clean honors a rebind activation stamp before the new session record is pu
   });
 });
 
+test("clean honors a ready foreign owner stamp on the nominal dedicated home", async () => {
+  await withTempStore(async (dir) => {
+    const homePath = join(dir, "homes", "account-a");
+    const stale = seed({
+      name: "dedicated-home-account-a",
+      tmuxTarget: "dedicated-home-account-a",
+      accountId: "account-a",
+      homePath,
+      status: "dead",
+    });
+    await saveSession(stale);
+    const ownerPath = activationHomeOwnerPath(homePath);
+    await mkdir(dirname(ownerPath), { recursive: true });
+    await writeFile(ownerPath, JSON.stringify({
+      version: 1,
+      homePath,
+      accountId: "account-b",
+      generation: "explicit-dedicated-home-rebind-b",
+      state: "ready",
+      activatedAt: "2026-08-07T08:15:00.000Z",
+      updatedAt: "2026-08-07T08:15:00.000Z",
+    }));
+    let harvests = 0;
+
+    await purgeSessionData(stale, {
+      finalCredentialSync: async () => { harvests += 1; },
+    });
+
+    assert.equal(harvests, 0, "a nominal dedicated path can be explicitly rebound to another account");
+    assert.equal(await loadSession(stale.name), null);
+    const ledger = (await readFile(ledgerPath(), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.ok(ledger.some((event) =>
+      event.type === "account.final-sync" &&
+      event.session === stale.name &&
+      event.skipped === "home-rebound" &&
+      event.ownerAccount === "account-b"));
+  });
+});
+
 test("transactional kill revalidates shared-home ownership immediately after stop", async () => {
   await withTempStore(async (dir) => {
     const homePath = join(dir, "post-stop-shared-home");
