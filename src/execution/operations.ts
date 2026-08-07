@@ -33,7 +33,8 @@ import {
 } from "./opsStore.js";
 import {
   appendRunEvents,
-  clearLossEpisode,
+  appendRunTerminalEvents,
+  commitRunTerminalResult,
   enterLossEpisode,
   effectKeyHash,
   lastEventSeq,
@@ -437,15 +438,24 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             throw executionError("RUN_VERSION_CONFLICT", `run ${validated.runId} cannot be cancelled from state ${state}`);
           }
           reservation = await mutateReservation(validated.runId, (record) =>
-            record.cancel ? record : { ...record, cancel: { requestedAt: now().toISOString(), ...(reason ? { reason } : {}) } },
+            record.result || record.cancel
+              ? record
+              : { ...record, cancel: { requestedAt: now().toISOString(), ...(reason ? { reason } : {}) } },
           );
-          await appendRunEvents(
-            validated.runId,
-            protocolVersion,
-            [{ type: "cancel.requested", payload: { effectKey: validated.effectKey, ...(reason ? { reason } : {}) }, origin: await deps.origin() }],
-            { onlyIfAbsentKeys: true },
-          );
-          if (state === "accepted" || state === "starting") {
+          if (reservation.result) {
+            // A terminal decision won after the earlier settle but before the
+            // cancellation-intent mutation. Never attach late cancel intent or
+            // events to an immutable terminal result.
+            state = reservation.result.outcome;
+          } else {
+            await appendRunEvents(
+              validated.runId,
+              protocolVersion,
+              [{ type: "cancel.requested", payload: { effectKey: validated.effectKey, ...(reason ? { reason } : {}) }, origin: await deps.origin() }],
+              { onlyIfAbsentKeys: true },
+            );
+          }
+          if (!reservation.result && (state === "accepted" || state === "starting")) {
             // Launch may be in flight or sitting in an unresolved crash
             // window: cancellation stays a NONTERMINAL desired state here.
             // Terminal resolution belongs to reconciliation (which alone can
@@ -455,7 +465,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             const resettled = await deps.settle(reservation);
             reservation = resettled.reservation;
             state = resettled.state;
-          } else {
+          } else if (!reservation.result) {
             // running (or lost): stop only the session provably bound to THIS
             // run, only over its control socket — never a kill -9.
             let stopConfirmed = true;
@@ -470,21 +480,25 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               // `cancelled` over it — the run is honestly lost until a retry
               // confirms the stop or the session outcome proves exit.
               reservation = await mutateReservation(validated.runId, (record) =>
-                enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
+                record.result ? record : enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
               );
-              await appendRunEvents(
-                validated.runId,
-                protocolVersion,
-                [
-                  {
-                    type: "run.lost",
-                    payload: lossEpisodePayload(reservation, { cause: "cancel_stop_unconfirmed", ...(stopDetail ? { detail: stopDetail } : {}) }),
-                    origin: await deps.origin(),
-                  },
-                ],
-                { onlyIfAbsentKeys: true },
-              );
-              state = "lost";
+              if (reservation.result) {
+                state = reservation.result.outcome;
+              } else {
+                await appendRunEvents(
+                  validated.runId,
+                  protocolVersion,
+                  [
+                    {
+                      type: "run.lost",
+                      payload: lossEpisodePayload(reservation, { cause: "cancel_stop_unconfirmed", ...(stopDetail ? { detail: stopDetail } : {}) }),
+                      origin: await deps.origin(),
+                    },
+                  ],
+                  { onlyIfAbsentKeys: true },
+                );
+                state = "lost";
+              }
             } else {
               if (reservation.indeterminateCause === "cancel_stop_unconfirmed") {
                 await appendRunEvents(
@@ -498,23 +512,12 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                   { onlyIfAbsentKeys: true },
                 );
               }
-              reservation = await mutateReservation(validated.runId, (record) => {
-                const rest = clearLossEpisode(record);
-                return rest.result
-                  ? (rest as RunReservation)
-                  : {
-                      ...(rest as RunReservation),
-                      result: { outcome: "cancelled", cause: reason ?? "cancel_requested", finishedAt: now().toISOString() },
-                    };
-              });
-              if (reservation.result?.outcome === "cancelled") {
-                await appendRunEvents(
-                  validated.runId,
-                  protocolVersion,
-                  [{ type: "run.cancelled", payload: { ...(reason ? { reason } : {}), ...(stopDetail ? { stop: stopDetail } : {}) }, origin: await deps.origin() }],
-                  { onlyIfAbsentTypes: true },
-                );
-              }
+              reservation = await commitRunTerminalResult(
+                validated.runId,
+                { outcome: "cancelled", cause: reason ?? "cancel_requested" },
+                { now, clearIndeterminate: true },
+              );
+              await appendRunTerminalEvents(reservation, protocolVersion, await deps.origin());
               state = reservation.result?.outcome ?? "cancelled";
             }
           }
@@ -808,7 +811,9 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               // binds mid-release, then re-settle (reconciliation resolves a
               // provably-never-started reservation to cancelled).
               reservation = await mutateReservation(runId, (record) =>
-                record.cancel ? record : { ...record, cancel: { requestedAt: now().toISOString(), reason: "released" } },
+                record.result || record.cancel
+                  ? record
+                  : { ...record, cancel: { requestedAt: now().toISOString(), reason: "released" } },
               );
               settled = await deps.settle(reservation);
               reservation = settled.reservation;
@@ -838,20 +843,22 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                 // Step stays pending (retryable); the run is honestly lost,
                 // not terminal, and every later cleanup step is fenced off.
                 reservation = await mutateReservation(runId, (record) =>
-                  enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
+                  record.result ? record : enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
                 );
-                await appendRunEvents(
-                  runId,
-                  protocolVersion,
-                  [{
-                    type: "run.lost",
-                    payload: lossEpisodePayload(reservation, { cause: "release_stop_unconfirmed", detail }),
-                    origin: await deps.origin(),
-                  }],
-                  { onlyIfAbsentKeys: true },
-                );
-                await annotatePending(detail);
-                break;
+                if (!reservation.result) {
+                  await appendRunEvents(
+                    runId,
+                    protocolVersion,
+                    [{
+                      type: "run.lost",
+                      payload: lossEpisodePayload(reservation, { cause: "release_stop_unconfirmed", detail }),
+                      origin: await deps.origin(),
+                    }],
+                    { onlyIfAbsentKeys: true },
+                  );
+                  await annotatePending(detail);
+                  break;
+                }
               }
               // Stop confirmed (or nothing verifiable of ours remains):
               // terminalize and resolve any earlier liveness doubt.
@@ -867,23 +874,12 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                   { onlyIfAbsentKeys: true },
                 );
               }
-              reservation = await mutateReservation(runId, (record) => {
-                const rest = clearLossEpisode(record);
-                return rest.result
-                  ? (rest as RunReservation)
-                  : {
-                      ...(rest as RunReservation),
-                      result: { outcome: "cancelled", cause: "released", finishedAt: now().toISOString() },
-                    };
-              });
-              if (reservation.result?.outcome === "cancelled") {
-                await appendRunEvents(
-                  runId,
-                  protocolVersion,
-                  [{ type: "run.cancelled", payload: { cause: "released" }, origin: await deps.origin() }],
-                  { onlyIfAbsentTypes: true },
-                );
-              }
+              reservation = await commitRunTerminalResult(
+                runId,
+                { outcome: "cancelled", cause: "released" },
+                { now, clearIndeterminate: true },
+              );
+              await appendRunTerminalEvents(reservation, protocolVersion, await deps.origin());
             }
             current = await completeStep(runId, effectKey, stepId, "completed", detail);
           } else if (stepId === "occupancy-release") {

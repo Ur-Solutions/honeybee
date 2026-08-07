@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
 import { executionRoot } from "../src/execution/nodeState.js";
 import { createExecutionRpcMethods } from "../src/execution/rpcMethods.js";
-import { effectKeyHash, runKey } from "../src/execution/runStore.js";
+import { effectKeyHash, readReservation, readRunEvents, runKey } from "../src/execution/runStore.js";
 import type { ExecutionService } from "../src/execution/service.js";
 import {
   buildOperationEnvelope,
@@ -54,6 +54,13 @@ test("concurrent identical run.cancel and run.release progress once (one stop ea
       service.runCancel(buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, cancelBody, { requestId: "req-c2" })),
     ]);
     assert.equal(control.calls.filter((call) => call.method === "stop").length, 1, "cancel stops once");
+    const committed = (await readReservation(RUN_ID))!.result!;
+    const afterCancel = await readRunEvents(RUN_ID);
+    assert.deepEqual(
+      afterCancel.filter((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type)).map((event) => event.type),
+      [`run.${committed.outcome}`],
+      "operation terminal event is the committed reservation winner",
+    );
 
     const releaseBody: JsonObject = { runId: RUN_ID };
     const [r1, r2] = (await Promise.all([
@@ -64,6 +71,13 @@ test("concurrent identical run.cancel and run.release progress once (one stop ea
     // The run was already cancelled (terminal, session stopped by cancel), so
     // release's harness-stop step must not stop again.
     assert.equal(control.calls.filter((call) => call.method === "stop").length, 1);
+    assert.deepEqual(
+      (await readRunEvents(RUN_ID))
+        .filter((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type))
+        .map((event) => event.type),
+      [`run.${committed.outcome}`],
+      "release cannot append a second terminal-family member",
+    );
   });
 });
 

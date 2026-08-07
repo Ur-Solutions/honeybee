@@ -13,7 +13,13 @@ import {
   type ExecutionBindingRecord,
 } from "../src/execution/nodeState.js";
 import { beeNameForRun, runKey, type RunEnvironmentFacts } from "../src/execution/runStore.js";
-import { createExecutionService, storeSessionEvidenceSource, type ExecutionService, type RunLauncher } from "../src/execution/service.js";
+import {
+  createExecutionService,
+  storeSessionEvidenceSource,
+  type ExecutionService,
+  type RunLauncher,
+  type SessionEvidenceSource,
+} from "../src/execution/service.js";
 import { HarnessDispatchError, type HarnessControl, type HarnessStopResult } from "../src/execution/harnessControl.js";
 import { generateExecutionKeyPair, signCanonical, type ExecutionKeyPair } from "../src/execution/signing.js";
 import { saveSession } from "../src/store.js";
@@ -227,6 +233,7 @@ export function countingLauncher(behavior: { failWith?: Error; delayMs?: number;
 export type ServiceOptions = {
   launcher?: RunLauncher;
   control?: HarnessControl;
+  sessions?: SessionEvidenceSource;
   now?: () => Date;
   launchGraceMs?: number;
 };
@@ -236,7 +243,7 @@ export function makeService(opts: ServiceOptions = {}): ExecutionService {
   const control = opts.control ?? fakeControl().control;
   return createExecutionService({
     launcher: opts.launcher ?? countingLauncher().launcher,
-    sessions: storeSessionEvidenceSource(),
+    sessions: opts.sessions ?? storeSessionEvidenceSource(),
     control,
     stopKnownExecution: control.stop,
     harnessProbe: async (kind) => (kind === "claude" ? { status: "ready" } : { status: "absent" }),

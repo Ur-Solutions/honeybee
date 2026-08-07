@@ -20,6 +20,7 @@ import {
 } from "../src/execution/runStore.js";
 import { claimWorkingCopy, readWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import { loadSession, saveSession } from "../src/store.js";
+import type { SessionEvidenceSource } from "../src/execution/service.js";
 import {
   beeNameForRun,
   buildOperationEnvelope,
@@ -127,6 +128,106 @@ test("event self-healing: state written without its lifecycle events re-derives 
       assert.ok(types.includes(expected), `missing healed event ${expected}`);
     }
   });
+});
+
+test("terminal event repair is atomic and idempotent for every durable result", async () => {
+  for (const outcome of ["completed", "failed", "cancelled"] as const) {
+    await withTempStore(async () => {
+      const { service } = await startRunning();
+      // Crash gap: reservation commit succeeded, terminal event append did not.
+      await mutateReservation(RUN_ID, (record) => ({
+        ...record,
+        result: {
+          outcome,
+          ...(outcome === "failed" ? { cause: "harness_exited", harnessExitCode: 7 } : {}),
+          ...(outcome === "cancelled" ? { cause: "operator cancel" } : {}),
+          finishedAt: new Date().toISOString(),
+        },
+      }));
+
+      // Concurrent repair attempts serialize on the event lock and append one
+      // member of the mutually-exclusive terminal family.
+      await Promise.all(
+        Array.from({ length: 6 }, () => service.runGet({ protocolVersion: "0.1", runId: RUN_ID })),
+      );
+      const events = await readRunEvents(RUN_ID);
+      const terminal = events.filter((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type));
+      assert.deepEqual(terminal.map((event) => event.type), [`run.${outcome}`]);
+      assert.equal(events.at(-1)!.type, `run.${outcome}`);
+    });
+  }
+});
+
+test("stale exit folds cannot escape a concurrently committed cancellation", async () => {
+  for (const exitCode of [0, 17]) {
+    await withTempStore(async () => {
+      const ctx = await installTestAuthority();
+      const control = fakeControl();
+      let armed = false;
+      let gated = false;
+      let enterGate!: () => void;
+      let releaseGate!: () => void;
+      const gateEntered = new Promise<void>((resolve) => {
+        enterGate = resolve;
+      });
+      const gateReleased = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      const sessions: SessionEvidenceSource = {
+        async evidence() {
+          return { sessionExists: true, stampedRunId: RUN_ID };
+        },
+        async outcome() {
+          if (!armed || gated) return { live: true };
+          gated = true;
+          // Capture the down outcome, then hold it until cancellation has
+          // committed both its reservation result and terminal event.
+          const observed = { live: false, exitCode };
+          enterGate();
+          await gateReleased;
+          return observed;
+        },
+      };
+      const service = makeService({ control: control.control, sessions });
+      await service.runStart(buildRunStartEnvelope(ctx));
+
+      armed = true;
+      const staleFold = service.runGet({ protocolVersion: "0.1", runId: RUN_ID });
+      await gateEntered;
+      const cancelled = (await service.runCancel(
+        buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "race winner" }),
+      )) as JsonObject;
+      assert.deepEqual(cancelled.result, { runId: RUN_ID, state: "cancelled" });
+      assert.equal((await readReservation(RUN_ID))!.result?.outcome, "cancelled");
+
+      releaseGate();
+      const projection = await staleFold;
+      assert.ok("result" in projection, JSON.stringify(projection));
+      assert.equal(projection.result.state, "cancelled");
+      assert.equal((projection.result.result as JsonObject).outcome, "cancelled");
+      assert.deepEqual(service.validator.validate("run-projection", projection.result).errors, []);
+
+      const events = await readRunEvents(RUN_ID);
+      const terminal = events.filter((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type));
+      assert.deepEqual(terminal.map((event) => event.type), ["run.cancelled"]);
+      assert.equal(terminal[0]!.type, `run.${(await readReservation(RUN_ID))!.result!.outcome}`);
+      assert.deepEqual(
+        events.map((event) => event.type),
+        [
+          "run.accepted",
+          "environment.materializing",
+          "harness.starting",
+          "environment.ready",
+          "harness.running",
+          "cancel.requested",
+          "run.cancelled",
+        ],
+      );
+      assert.equal(events.at(-1)!.type, "run.cancelled", "no stale harness/result event may escape after terminal cancellation");
+      assert.ok(events.findIndex((event) => event.type === "cancel.requested") < events.findIndex((event) => event.type === "run.cancelled"));
+      for (const event of events) assert.deepEqual(service.validator.validate("run-event", event).errors, [], event.type);
+    });
+  }
 });
 
 test("lease expiry stops ongoing execution: confirmed stop -> cancelled(lease_expired); unconfirmed -> lost", async () => {

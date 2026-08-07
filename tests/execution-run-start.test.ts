@@ -20,6 +20,7 @@ import {
   readReservation,
   readRunEvents,
   runDir,
+  type RunEventInput,
 } from "../src/execution/runStore.js";
 import { validateRunStart } from "../src/execution/runStart.js";
 import type { JsonObject } from "../src/execution/contract.js";
@@ -40,6 +41,22 @@ import {
 
 const contract = loadExecutionContract();
 const validator = createExecutionValidator(contract);
+
+async function writePreUpgradeEventLog(runId: string, protocolVersion: string, inputs: RunEventInput[]): Promise<void> {
+  const timestamp = new Date().toISOString();
+  const events = inputs.map((input, index) => ({
+    protocolVersion,
+    runId,
+    seq: index + 1,
+    eventId: `legacy-${runId}-${index + 1}`,
+    type: input.type,
+    occurredAt: input.occurredAt ?? timestamp,
+    ingestedAt: timestamp,
+    origin: input.origin,
+    payload: input.payload,
+  }));
+  await writeFile(join(runDir(runId), "events.jsonl"), events.map((event) => `${JSON.stringify(event)}\n`).join(""));
+}
 
 function assertEnvelopeShape(response: JsonObject): void {
   assert.deepEqual(validator.validate("execution-response-envelope", response).errors, []);
@@ -441,7 +458,7 @@ test("reconcile migrates pre-upgrade missing or late run.accepted to the first l
         result: { outcome: "failed", cause: "HARNESS_UNAVAILABLE: legacy crash", finishedAt },
       }));
       const nodeId = (await requireExecutionBinding()).nodeId;
-      await appendRunEvents(staged.runId, "0.1", [
+      await writePreUpgradeEventLog(staged.runId, "0.1", [
         { type: "environment.materializing", payload: {}, origin: { nodeId } },
         { type: "harness.starting", payload: { operationId: staged.runId }, origin: { nodeId } },
         { type: "run.failed", payload: { cause: "HARNESS_UNAVAILABLE" }, origin: { nodeId } },
@@ -506,7 +523,7 @@ test("accepted-prefix migration explicitly resets a persisted pre-upgrade cursor
       result: { outcome: "failed", cause: "HARNESS_UNAVAILABLE: legacy crash", finishedAt },
     }));
     const nodeId = (await requireExecutionBinding()).nodeId;
-    await appendRunEvents(staged.runId, "0.1", [
+    await writePreUpgradeEventLog(staged.runId, "0.1", [
       { type: "environment.materializing", payload: {}, origin: { nodeId } },
       { type: "harness.starting", payload: { operationId: staged.runId }, origin: { nodeId } },
       { type: "run.failed", payload: { cause: "HARNESS_UNAVAILABLE" }, origin: { nodeId } },

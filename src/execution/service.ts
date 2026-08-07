@@ -36,8 +36,10 @@ import {
   admitRunStart,
   acceptedCursorResetThroughSeq,
   appendRunEvents,
+  appendRunTerminalEvents,
   classifyLaunch,
   clearLossEpisode,
+  commitRunTerminalResult,
   enterLossEpisode,
   ensureRunAcceptedFirst,
   lossEpisodePayload,
@@ -388,76 +390,68 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           if (stopConfirmed) {
             // The sweep owns terminal resolution for a cancel that landed
             // pre-running: confirmed stop -> atomically cancelled + event.
-            const resolved = await mutateReservation(runId, (record) => {
-              const rest = clearLossEpisode(record);
-              if (rest.result) return rest as RunReservation;
-              return {
-                ...(rest as RunReservation),
-                result: { outcome: "cancelled", cause: record.cancel?.reason ?? "cancel_requested", finishedAt: now().toISOString() },
-              };
-            });
-            if (resolved.result?.outcome === "cancelled") {
+            const resolved = await commitRunTerminalResult(
+              runId,
+              { outcome: "cancelled", cause: "cancel_requested" },
+              { now, clearIndeterminate: true },
+            );
+            await appendRunTerminalEvents(resolved, protocolVersion, await origin());
+          } else {
+            const unresolved = await mutateReservation(runId, (record) =>
+              record.result ? record : enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
+            );
+            if (!unresolved.result) {
               await appendRunEvents(
                 runId,
                 protocolVersion,
-                [{ type: "run.cancelled", payload: { cause: resolved.result.cause ?? "cancel_requested" }, origin: await origin() }],
-                { onlyIfAbsentTypes: true },
+                [{
+                  type: "run.lost",
+                  payload: lossEpisodePayload(unresolved, { cause: "cancel_stop_unconfirmed", ...(detail ? { detail } : {}) }),
+                  origin: await origin(),
+                }],
+                { onlyIfAbsentKeys: true },
               );
             }
-          } else {
-            const lost = await mutateReservation(runId, (record) =>
-              enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
-            );
-            await appendRunEvents(
-              runId,
-              protocolVersion,
-              [{
-                type: "run.lost",
-                payload: lossEpisodePayload(lost, { cause: "cancel_stop_unconfirmed", ...(detail ? { detail } : {}) }),
-                origin: await origin(),
-              }],
-              { onlyIfAbsentKeys: true },
-            );
           }
         }
       } catch (error) {
         const wire = toWireError(error);
         if (error instanceof IndeterminateExecutionError) {
           const lost = await mutateReservation(runId, (current) =>
-            enterLossEpisode(
-              { ...current, failureCause: current.failureCause ?? `${wire.code}: ${wire.message}` },
-              error.cause,
-              now().toISOString(),
-            ),
+            current.result
+              ? current
+              : enterLossEpisode(
+                  { ...current, failureCause: current.failureCause ?? `${wire.code}: ${wire.message}` },
+                  error.cause,
+                  now().toISOString(),
+                ),
           );
-          await appendRunEvents(
-            runId,
-            protocolVersion,
-            [{
-              type: "run.lost",
-              payload: lossEpisodePayload(lost, {
-                cause: error.cause,
-                ...(error.details !== undefined ? { detail: error.details } : {}),
-              }),
-              origin: await origin(),
-            }],
-            { onlyIfAbsentKeys: true },
-          );
+          if (lost.result) {
+            await appendRunTerminalEvents(lost, protocolVersion, await origin());
+          } else {
+            await appendRunEvents(
+              runId,
+              protocolVersion,
+              [{
+                type: "run.lost",
+                payload: lossEpisodePayload(lost, {
+                  cause: error.cause,
+                  ...(error.details !== undefined ? { detail: error.details } : {}),
+                }),
+                origin: await origin(),
+              }],
+              { onlyIfAbsentKeys: true },
+            );
+          }
           return;
         }
-        await mutateReservation(runId, (current) => ({
-          ...current,
-          phase: "failed",
-          failedAt: now().toISOString(),
-          failureCause: `${wire.code}: ${wire.message}`,
-          result: { outcome: "failed", cause: `${wire.code}: ${wire.message}`, finishedAt: now().toISOString() },
-        }));
-        await appendRunEvents(
+        const cause = `${wire.code}: ${wire.message}`;
+        const failed = await commitRunTerminalResult(
           runId,
-          protocolVersion,
-          [{ type: "run.failed", payload: { cause: wire.code, message: wire.message }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
+          { outcome: "failed", cause, failureCause: cause },
+          { now },
         );
+        await appendRunTerminalEvents(failed, protocolVersion, await origin());
       }
     })();
     inFlight.set(runId, attempt);
@@ -489,14 +483,16 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // require the canonical SessionRecord.id carried by launch evidence.
       if (!launchEvidence.sessionRef) {
         current = await mutateReservation(current.runId, (record) =>
-          enterLossEpisode(record, "session_ref_missing", now().toISOString()),
+          record.result ? record : enterLossEpisode(record, "session_ref_missing", now().toISOString()),
         );
-        await appendRunEvents(
-          current.runId,
-          protocolVersion,
-          [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "session_ref_missing" }), origin: await origin() }],
-          { onlyIfAbsentKeys: true },
-        );
+        if (!current.result) {
+          await appendRunEvents(
+            current.runId,
+            protocolVersion,
+            [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "session_ref_missing" }), origin: await origin() }],
+            { onlyIfAbsentKeys: true },
+          );
+        }
       } else {
         // Explicit placement already claimed its locator before spawn. Rebuild
         // its path-free environment receipt so the repaired lifecycle remains
@@ -507,18 +503,22 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         })();
         if (!recoveredEnvironment) {
           current = await mutateReservation(current.runId, (record) =>
-            enterLossEpisode({ ...record, sessionRef: launchEvidence.sessionRef }, "environment_receipt_missing", now().toISOString()),
+            record.result
+              ? record
+              : enterLossEpisode({ ...record, sessionRef: launchEvidence.sessionRef }, "environment_receipt_missing", now().toISOString()),
           );
-          await appendRunEvents(
-            current.runId,
-            protocolVersion,
-            [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "environment_receipt_missing" }), origin: await origin() }],
-            { onlyIfAbsentKeys: true },
-          );
+          if (!current.result) {
+            await appendRunEvents(
+              current.runId,
+              protocolVersion,
+              [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "environment_receipt_missing" }), origin: await origin() }],
+              { onlyIfAbsentKeys: true },
+            );
+          }
         } else {
           const recovering = await beginLostRecovery(current, ["run-identity", "hsr-readiness", "session-identity", "environment-ownership"]);
           current = await mutateReservation(current.runId, (record) => {
-            return record.phase === "launching"
+            return record.phase === "launching" && !record.result
               ? {
                   ...record,
                   phase: "started",
@@ -537,47 +537,41 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     } else if (classification === "booting-receipt-lost") {
       if (launchEvidence.ready === undefined && !current.indeterminateAt) {
         current = await mutateReservation(current.runId, (record) =>
-          enterLossEpisode(record, "readiness_evidence_missing", now().toISOString()),
+          record.result ? record : enterLossEpisode(record, "readiness_evidence_missing", now().toISOString()),
         );
-        await appendRunEvents(
-          current.runId,
-          protocolVersion,
-          [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "readiness_evidence_missing" }), origin: await origin() }],
-          { onlyIfAbsentKeys: true },
-        );
+        if (!current.result) {
+          await appendRunEvents(
+            current.runId,
+            protocolVersion,
+            [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "readiness_evidence_missing" }), origin: await origin() }],
+            { onlyIfAbsentKeys: true },
+          );
+        }
       }
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
         await beginLostRecovery(current, ["run-identity", "process-exit"]);
-        const finishedAt = now().toISOString();
-        current = await mutateReservation(current.runId, (record) => {
-          const rest = clearLossEpisode(record);
-          return {
-            ...(rest as RunReservation),
-            phase: "failed",
-            failedAt: record.failedAt ?? finishedAt,
-            failureCause: record.failureCause ?? "HARNESS_UNAVAILABLE: harness exited before readiness",
-            result: record.result ?? { outcome: "failed", cause: "HARNESS_UNAVAILABLE: harness exited before readiness", finishedAt },
-          };
-        });
-        await appendRunEvents(
+        const cause = "HARNESS_UNAVAILABLE: harness exited before readiness";
+        current = await commitRunTerminalResult(
           current.runId,
-          protocolVersion,
-          [{ type: "run.failed", payload: { cause: "HARNESS_UNAVAILABLE", message: "harness exited before readiness" }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
+          { outcome: "failed", cause, failureCause: cause },
+          { now, clearIndeterminate: true, canCommit: (record) => record.phase === "launching" },
         );
+        await appendRunTerminalEvents(current, protocolVersion, await origin());
       }
     } else if (classification === "indeterminate") {
       if (!current.indeterminateAt) {
         current = await mutateReservation(current.runId, (record) =>
-          enterLossEpisode(record, "start_outcome_indeterminate", now().toISOString()),
+          record.result ? record : enterLossEpisode(record, "start_outcome_indeterminate", now().toISOString()),
         );
-        await appendRunEvents(
-          current.runId,
-          protocolVersion,
-          [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "start_outcome_indeterminate" }), origin: await origin() }],
-          { onlyIfAbsentKeys: true },
-        );
+        if (!current.result) {
+          await appendRunEvents(
+            current.runId,
+            protocolVersion,
+            [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "start_outcome_indeterminate" }), origin: await origin() }],
+            { onlyIfAbsentKeys: true },
+          );
+        }
       }
 
       // A readiness timeout whose first stop was unconfirmed remains lost,
@@ -596,27 +590,17 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         }
         if (stopConfirmed) {
           await beginLostRecovery(current, ["run-identity", "process-stop"]);
-          const finishedAt = now().toISOString();
-          current = await mutateReservation(current.runId, (record) => {
-            const rest = clearLossEpisode(record);
-            return {
-              ...(rest as RunReservation),
-              phase: "failed",
-              failedAt: record.failedAt ?? finishedAt,
-              failureCause: record.failureCause ?? "HARNESS_UNAVAILABLE: readiness timed out; stop eventually confirmed",
-              result: record.result ?? {
-                outcome: "failed",
-                cause: "HARNESS_UNAVAILABLE: readiness timed out; stop eventually confirmed",
-                finishedAt,
-              },
-            };
-          });
-          await appendRunEvents(
+          const cause = "HARNESS_UNAVAILABLE: readiness timed out; stop eventually confirmed";
+          current = await commitRunTerminalResult(
             current.runId,
-            protocolVersion,
-            [{ type: "run.failed", payload: { cause: "HARNESS_UNAVAILABLE", message: "readiness timed out; stop confirmed" }, origin: await origin() }],
-            { onlyIfAbsentTypes: true },
+            { outcome: "failed", cause, failureCause: cause },
+            {
+              now,
+              clearIndeterminate: true,
+              canCommit: (record) => record.indeterminateCause === "readiness_stop_unconfirmed",
+            },
           );
+          await appendRunTerminalEvents(current, protocolVersion, await origin());
         }
       }
     }
@@ -651,61 +635,65 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // failure never strands a live harness behind a lost marker.
       if (!current.cancel) {
         current = await mutateReservation(current.runId, (record) =>
-          record.cancel ? record : { ...record, cancel: { requestedAt: now().toISOString(), reason: "lease_expired" } },
+          record.result || record.cancel
+            ? record
+            : { ...record, cancel: { requestedAt: now().toISOString(), reason: "lease_expired" } },
         );
-        await appendRunEvents(
-          current.runId,
-          protocolVersion,
-          [{ type: "cancel.requested", payload: { reason: "lease_expired" }, origin: await origin() }],
-          { onlyIfAbsentKeys: true },
-        );
-      }
-      const evidence = await options.sessions.evidence(current.beeName);
-      const ours = evidence.sessionExists && (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
-      let stopConfirmed = true;
-      let detail = "no live harness";
-      if (ours) {
-        try {
-          const stop = await control.stop(current.beeName);
-          stopConfirmed = stop.stopped;
-          detail = stop.detail;
-        } catch (error) {
-          stopConfirmed = false;
-          detail = error instanceof Error ? error.message : String(error);
+        if (!current.result && current.cancel?.reason === "lease_expired") {
+          await appendRunEvents(
+            current.runId,
+            protocolVersion,
+            [{ type: "cancel.requested", payload: { reason: "lease_expired" }, origin: await origin() }],
+            { onlyIfAbsentKeys: true },
+          );
         }
       }
-      if (stopConfirmed) {
-        if (current.indeterminateCause === "cancel_stop_unconfirmed") {
-          await beginLostRecovery(current, ["run-identity", "process-stop"]);
+      if (!current.result) {
+        const evidence = await options.sessions.evidence(current.beeName);
+        const ours = evidence.sessionExists && (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
+        let stopConfirmed = true;
+        let detail = "no live harness";
+        if (ours) {
+          try {
+            const stop = await control.stop(current.beeName);
+            stopConfirmed = stop.stopped;
+            detail = stop.detail;
+          } catch (error) {
+            stopConfirmed = false;
+            detail = error instanceof Error ? error.message : String(error);
+          }
         }
-        current = await mutateReservation(current.runId, (record) => {
-          const rest = clearLossEpisode(record);
-          if (rest.result) return rest as RunReservation;
-          return {
-            ...(rest as RunReservation),
-            result: { outcome: "cancelled", cause: record.cancel?.reason ?? "cancel_requested", finishedAt: now().toISOString() },
-          };
-        });
-        await appendRunEvents(
-          current.runId,
-          protocolVersion,
-          [{ type: "run.cancelled", payload: { cause: current.result?.cause ?? "cancel_requested" }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
-        );
-      } else {
-        current = await mutateReservation(current.runId, (record) =>
-          enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
-        );
-        await appendRunEvents(
-          current.runId,
-          protocolVersion,
-          [{
-            type: "run.lost",
-            payload: lossEpisodePayload(current, { cause: "cancel_stop_unconfirmed", detail }),
-            origin: await origin(),
-          }],
-          { onlyIfAbsentKeys: true },
-        );
+        if (stopConfirmed) {
+          if (current.indeterminateCause === "cancel_stop_unconfirmed") {
+            await beginLostRecovery(current, ["run-identity", "process-stop"]);
+          }
+          current = await commitRunTerminalResult(
+            current.runId,
+            { outcome: "cancelled", cause: "cancel_requested" },
+            {
+              now,
+              clearIndeterminate: true,
+              canCommit: (record) => record.phase === "started" && record.cancel !== undefined,
+            },
+          );
+          await appendRunTerminalEvents(current, protocolVersion, await origin());
+        } else {
+          current = await mutateReservation(current.runId, (record) =>
+            record.result ? record : enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
+          );
+          if (!current.result) {
+            await appendRunEvents(
+              current.runId,
+              protocolVersion,
+              [{
+                type: "run.lost",
+                payload: lossEpisodePayload(current, { cause: "cancel_stop_unconfirmed", detail }),
+                origin: await origin(),
+              }],
+              { onlyIfAbsentKeys: true },
+            );
+          }
+        }
       }
     }
     if (!current.result && current.cancel) {
@@ -719,64 +707,41 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         ...(options.launchGraceMs !== undefined ? { graceMs: options.launchGraceMs } : {}),
       });
       if (cancelClassification === "reserved-not-started") {
-        current = await mutateReservation(current.runId, (record) => {
-          if (record.result) return record;
-          const rest = clearLossEpisode(record);
-          return {
-            ...(rest as RunReservation),
-            result: { outcome: "cancelled", cause: record.cancel?.reason ?? "cancel_requested", finishedAt: now().toISOString() },
-          };
-        });
-        await appendRunEvents(
+        current = await commitRunTerminalResult(
           current.runId,
-          protocolVersion,
-          [{ type: "run.cancelled", payload: { cause: current.cancel?.reason ?? "cancel_requested" }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
+          { outcome: "cancelled", cause: "cancel_requested" },
+          { now, clearIndeterminate: true, canCommit: (record) => record.phase !== "started" },
         );
+        await appendRunTerminalEvents(current, protocolVersion, await origin());
       }
     }
     if (current.phase === "started" && !current.result) {
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
         const exitCode = outcome.exitCode ?? undefined;
-        // A run with durable cancellation intent whose harness is now provably
-        // down finished by being cancelled, not by "failing".
-        const terminal: "completed" | "failed" | "cancelled" = current.cancel
-          ? "cancelled"
-          : exitCode === 0
-            ? "completed"
-            : "failed";
-        current = await mutateReservation(current.runId, (record) => {
-          if (record.result) return record;
-          // Proven exit resolves any outstanding liveness doubt.
-          const rest = clearLossEpisode(record);
-          return {
-            ...(rest as RunReservation),
-            result: {
-              outcome: terminal,
-              ...(terminal === "failed" ? { cause: "harness_exited" } : {}),
-              ...(terminal === "cancelled" ? { cause: record.cancel?.reason ?? "cancel_requested" } : {}),
-              ...(exitCode !== undefined ? { harnessExitCode: exitCode } : {}),
-              finishedAt: now().toISOString(),
-            },
-          };
-        });
-        await appendRunEvents(
+        // The exit code is only a candidate. The terminal decision is made
+        // from the fresh record under the reservation lock, where an existing
+        // result or cancellation intent wins over this possibly stale read.
+        current = await commitRunTerminalResult(
           current.runId,
+          {
+            outcome: exitCode === 0 ? "completed" : "failed",
+            ...(exitCode === 0 ? {} : { cause: "harness_exited" }),
+            ...(exitCode !== undefined ? { harnessExitCode: exitCode } : {}),
+          },
+          { now, clearIndeterminate: true, canCommit: (record) => record.phase === "started" },
+        );
+        await appendRunTerminalEvents(
+          current,
           protocolVersion,
+          await origin(),
           [
             {
               type: "harness.exited",
               payload: exitCode !== undefined ? { exitCode } : {},
               origin: await origin({ driverId: driverIdOf(current) }),
             },
-            {
-              type: terminal === "completed" ? "run.completed" : terminal === "cancelled" ? "run.cancelled" : "run.failed",
-              payload: {},
-              origin: await origin(),
-            },
           ],
-          { onlyIfAbsentTypes: true },
         );
       }
     }
@@ -785,24 +750,20 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // clears only when the session outcome proves the harness exited.
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
-        current = await mutateReservation(current.runId, (record) => {
-          return clearLossEpisode(record);
-        });
-        await appendRunEvents(
-          current.runId,
+        current = await commitRunTerminalResult(current.runId, current.result, { now, clearIndeterminate: true });
+        await appendRunTerminalEvents(
+          current,
           protocolVersion,
+          await origin(),
           [{ type: "harness.exited", payload: {}, origin: await origin({ driverId: driverIdOf(current) }) }],
-          { onlyIfAbsentTypes: true },
         );
       }
     }
     // Self-heal missing lifecycle events: a crash can land between a durable
     // state write and its event append, and replays deliberately skip side
     // effects — so every read re-derives the events its state implies.
+    if (current.result) await appendRunTerminalEvents(current, protocolVersion, await origin());
     const repairs: RunEventInput[] = [];
-    if (current.result) {
-      repairs.push({ type: `run.${current.result.outcome}`, payload: {}, origin: await origin() });
-    }
     if (current.sealedAt && current.environment) {
       repairs.push({
         type: "environment.sealed",
@@ -989,24 +950,13 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // before its launch ever started) must never relaunch on replay.
       if (classification === "reserved-not-started" && !current.result) {
         if (Date.parse(current.leaseExpiresAt) < now().getTime()) {
-          const finishedAt = now().toISOString();
-          current = await mutateReservation(current.runId, (record) =>
-            record.phase === "started" || record.result
-              ? record
-              : {
-                  ...record,
-                  phase: "failed",
-                  failedAt: finishedAt,
-                  failureCause: "LEASE_DENIED: lease expired before the reserved launch could start",
-                  result: { outcome: "failed", cause: "lease_expired", finishedAt },
-                },
-          );
-          await appendRunEvents(
+          const failureCause = "LEASE_DENIED: lease expired before the reserved launch could start";
+          current = await commitRunTerminalResult(
             current.runId,
-            protocolVersion,
-            [{ type: "run.failed", payload: { cause: "lease_expired" }, origin: await origin() }],
-            { onlyIfAbsentTypes: true },
+            { outcome: "failed", cause: "lease_expired", failureCause },
+            { now, canCommit: (record) => record.phase !== "started" },
           );
+          await appendRunTerminalEvents(current, protocolVersion, await origin());
         } else {
           await launch(current, validated.lease);
           current = await reconcile((await readReservation(current.runId))!);

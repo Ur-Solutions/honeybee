@@ -7,7 +7,15 @@ import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
-import { appendRunEvents, beeNameForRun, readRunEvents, runDir, type StoredRunEvent } from "../src/execution/runStore.js";
+import {
+  appendRunEvents,
+  appendRunTerminalEvents,
+  beeNameForRun,
+  commitRunTerminalResult,
+  readRunEvents,
+  runDir,
+  type StoredRunEvent,
+} from "../src/execution/runStore.js";
 import { writeHsrMeta } from "../src/hsr/runDir.js";
 import {
   buildRunStartEnvelope,
@@ -160,9 +168,8 @@ test("event log: torn trailing record is recovered under the append lock, never 
     await appendFile(path, '{"protocolVersion":"0.1","runId":"run-0001","seq":6,"type":"harness.exi');
     const events = await readRunEvents("run-0001");
     assert.equal(events.length, 5, "torn tail is excluded from replay");
-    const appended = await appendRunEvents("run-0001", "0.1", [
-      { type: "run.completed", payload: {}, origin: { nodeId: "node-test" } },
-    ]);
+    const committed = await commitRunTerminalResult("run-0001", { outcome: "completed" });
+    const appended = await appendRunTerminalEvents(committed, "0.1", { nodeId: ctx.nodeId });
     assert.equal(appended[0]!.seq, 6, "seq continues from the recovered prefix");
     const raw = await readFile(path, "utf8");
     for (const line of raw.split("\n").filter((entry) => entry.trim().length > 0)) {
@@ -170,6 +177,29 @@ test("event log: torn trailing record is recovered under the append lock, never 
     }
     const after = await readRunEvents("run-0001");
     assert.deepEqual(after.map((event) => event.seq), [1, 2, 3, 4, 5, 6]);
+  });
+});
+
+test("event log: terminal result and event families admit one locked winner and reject direct bypass", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    await makeService().runStart(buildRunStartEnvelope(ctx));
+    const origin = { nodeId: ctx.nodeId };
+    const contenders = await Promise.all([
+      commitRunTerminalResult("run-0001", { outcome: "completed" }),
+      commitRunTerminalResult("run-0001", { outcome: "failed", cause: "race" }),
+    ]);
+    await Promise.all(contenders.map((reservation) => appendRunTerminalEvents(reservation, "0.1", origin)));
+    const terminal = (await readRunEvents("run-0001")).filter((event) =>
+      ["run.completed", "run.failed", "run.cancelled"].includes(event.type),
+    );
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0]!.type, `run.${contenders[0]!.result!.outcome}`);
+
+    await assert.rejects(
+      appendRunEvents("run-0001", "0.1", [{ type: "run.cancelled", payload: {}, origin }]),
+      (error: { code?: string }) => error.code === "AUTHORITY_UNAVAILABLE",
+    );
   });
 });
 

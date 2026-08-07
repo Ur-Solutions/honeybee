@@ -89,6 +89,15 @@ export type RunEnvironmentFacts = {
   workingCopy?: JsonObject;
 };
 
+export type RunTerminalOutcome = "completed" | "failed" | "cancelled";
+
+export type RunTerminalResult = {
+  outcome: RunTerminalOutcome;
+  cause?: string;
+  harnessExitCode?: number;
+  finishedAt: string;
+};
+
 export type RunReservation = {
   version: 1;
   runId: string;
@@ -132,7 +141,7 @@ export type RunReservation = {
   failedAt?: string;
   failureCause?: string;
   /** Terminal projection facts, appended once by the terminal reconciler. */
-  result?: { outcome: "completed" | "failed" | "cancelled"; cause?: string; harnessExitCode?: number; finishedAt: string };
+  result?: RunTerminalResult;
   /** Set when recovery declared the start outcome unknowable. */
   indeterminateAt?: string;
   /** Machine-readable reason reconciliation uses to retry/resolve lost state. */
@@ -460,6 +469,58 @@ export async function mutateReservation(
   });
 }
 
+export type RunTerminalDecision = {
+  outcome: RunTerminalOutcome;
+  cause?: string;
+  harnessExitCode?: number;
+  /** Launch/admission failures also advance the internal launch phase. */
+  failureCause?: string;
+};
+
+/**
+ * Decide a Run's one durable terminal result while holding the reservation
+ * lock. The freshest record wins: an already-committed result is immutable,
+ * and cancellation intent present before this mutation converts any stale
+ * completion/failure candidate into `cancelled`.
+ */
+export async function commitRunTerminalResult(
+  runId: string,
+  decision: RunTerminalDecision,
+  options: {
+    now?: () => Date;
+    clearIndeterminate?: boolean;
+    /** Additional fresh-record fence for path-specific terminal decisions. */
+    canCommit?: (reservation: RunReservation) => boolean;
+  } = {},
+): Promise<RunReservation> {
+  const clock = options.now ?? (() => new Date());
+  return mutateReservation(runId, (current) => {
+    if (current.result) return options.clearIndeterminate ? clearLossEpisode(current) : current;
+    if (options.canCommit && !options.canCommit(current)) return current;
+    const base = options.clearIndeterminate ? clearLossEpisode(current) : current;
+
+    const outcome: RunTerminalOutcome = current.cancel ? "cancelled" : decision.outcome;
+    const cause =
+      outcome === "cancelled"
+        ? current.cancel?.reason ?? (decision.outcome === "cancelled" ? decision.cause : undefined) ?? "cancel_requested"
+        : decision.cause;
+    const finishedAt = clock().toISOString();
+    const result: RunTerminalResult = {
+      outcome,
+      ...(cause ? { cause } : {}),
+      ...(decision.harnessExitCode !== undefined ? { harnessExitCode: decision.harnessExitCode } : {}),
+      finishedAt,
+    };
+    return {
+      ...base,
+      ...(outcome === "failed" && decision.failureCause
+        ? { phase: "failed" as const, failedAt: finishedAt, failureCause: decision.failureCause }
+        : {}),
+      result,
+    };
+  });
+}
+
 /* ---------------------------------------------------------------- */
 /* Sequence-addressed control events                                 */
 /* ---------------------------------------------------------------- */
@@ -494,6 +555,14 @@ export type StoredRunEvent = {
   origin: { nodeId: string; driverId?: string; providerId?: string };
   payload: JsonValue;
 };
+
+export const RUN_TERMINAL_EVENT_TYPES = ["run.completed", "run.failed", "run.cancelled"] as const;
+export type RunTerminalEventType = (typeof RUN_TERMINAL_EVENT_TYPES)[number];
+const RUN_TERMINAL_EVENT_TYPE_SET = new Set<string>(RUN_TERMINAL_EVENT_TYPES);
+
+function terminalEventType(outcome: RunTerminalOutcome): RunTerminalEventType {
+  return `run.${outcome}` as RunTerminalEventType;
+}
 
 type ParsedEventLog = {
   events: StoredRunEvent[];
@@ -656,7 +725,9 @@ export async function ensureRunAcceptedFirst(
  * event with the same eventFamilyKey (type + identifying payload member)
  * already exists — never type-only. A torn trailing record from a crashed
  * append is truncated (still under the lock) before new bytes go in, so
- * partial bytes can never be concatenated into a hybrid record.
+ * partial bytes can never be concatenated into a hybrid record. The Run
+ * terminal family (completed/failed/cancelled) is always mutually exclusive:
+ * a same-type retry is a no-op and a different-type contender fails closed.
  */
 export async function appendRunEvents(
   runId: string,
@@ -667,6 +738,8 @@ export async function appendRunEvents(
     onlyIfAbsentKeys?: boolean;
     /** Under the same event lock, omit selected inputs once markerType exists. */
     skipTypesWhenMarkerPresent?: { markerType: string; types: string[] };
+    /** Internal guard used by appendRunTerminalEvents. */
+    terminalFamilyType?: RunTerminalEventType;
   } = {},
 ): Promise<StoredRunEvent[]> {
   await mkdir(runDir(runId), { recursive: true, mode: 0o700 });
@@ -675,6 +748,34 @@ export async function appendRunEvents(
     if (log.tornTail) {
       const valid = log.events.map((event) => `${JSON.stringify(event)}\n`).join("");
       await atomicWriteFile(eventsPath(runId), valid, { mode: 0o600 });
+    }
+    const terminalInputs = inputs.filter((input) => RUN_TERMINAL_EVENT_TYPE_SET.has(input.type));
+    if (terminalInputs.length > 0 && !options.terminalFamilyType) {
+      throw executionError(
+        "AUTHORITY_UNAVAILABLE",
+        `run ${runId} terminal events must be derived from its committed reservation result`,
+      );
+    }
+    if (terminalInputs.length > 0 || options.terminalFamilyType) {
+      const requestedTerminalType = options.terminalFamilyType ?? (terminalInputs[0]?.type as RunTerminalEventType | undefined);
+      if (terminalInputs.length !== 1 || !requestedTerminalType || terminalInputs[0]!.type !== requestedTerminalType) {
+        throw executionError(
+          "AUTHORITY_UNAVAILABLE",
+          `run ${runId} terminal append must contain exactly one matching terminal-family member`,
+        );
+      }
+      const existingTerminal = log.events.filter((event) => RUN_TERMINAL_EVENT_TYPE_SET.has(event.type));
+      if (existingTerminal.length > 0) {
+        if (existingTerminal.length === 1 && existingTerminal[0]!.type === requestedTerminalType) {
+          // Idempotent replay. Skip the whole batch: any precursor (notably
+          // harness.exited) must never be appended after the terminal event.
+          return [];
+        }
+        throw executionError(
+          "AUTHORITY_UNAVAILABLE",
+          `run ${runId} event log terminal family conflicts with requested result ${requestedTerminalType}`,
+        );
+      }
     }
     const present = new Set(log.events.map((event) => event.type));
     const presentKeys = new Set(log.events.map((event) => eventFamilyKey(event.type, event.payload)));
@@ -710,6 +811,44 @@ export async function appendRunEvents(
     if (lines.length > 0) await appendFile(eventsPath(runId), lines, { mode: 0o600 });
     return appended;
   });
+}
+
+/**
+ * Append (or repair after a reservation-write crash gap) the one terminal
+ * Run event derived from a durable reservation result. The event lock treats
+ * completed/failed/cancelled as one mutually-exclusive family, so concurrent
+ * reconciliation can never append two terminal event types.
+ *
+ * `precursors` are appended in the same locked batch before the terminal
+ * member. If the terminal member already exists, the entire batch is a no-op
+ * to preserve legal ordering.
+ */
+export async function appendRunTerminalEvents(
+  reservation: RunReservation,
+  protocolVersion: string,
+  eventOrigin: RunEventInput["origin"],
+  precursors: RunEventInput[] = [],
+): Promise<StoredRunEvent[]> {
+  // Re-read under the same lock that commits terminal decisions. Callers may
+  // hold a stale projection, but terminal publication must use the one durable
+  // winner (or no-op when no result has committed yet).
+  const committed = await withFileLock(admissionLockPath(), async () => {
+    const current = await readReservation(reservation.runId);
+    if (!current) throw executionError("RUN_UNKNOWN", `runId ${reservation.runId} names no Run reserved on this node`);
+    return current;
+  });
+  if (!committed.result) return [];
+  const type = terminalEventType(committed.result.outcome);
+  const payload: JsonObject = {
+    ...(committed.result.cause ? { cause: committed.result.cause } : {}),
+    ...(committed.result.harnessExitCode !== undefined ? { harnessExitCode: committed.result.harnessExitCode } : {}),
+  };
+  return appendRunEvents(
+    committed.runId,
+    protocolVersion,
+    [...precursors, { type, payload, origin: eventOrigin }],
+    { onlyIfAbsentTypes: true, terminalFamilyType: type },
+  );
 }
 
 /** Last durable seq for a Run (0 when no events yet). */
