@@ -454,7 +454,7 @@ export async function startOpenCodeRunner(
   const spawn = buildOpenCodeSpawn(opts, password);
   const selection = openCodeSelection(opts);
   const cwd = await canonicalDirectory(opts.cwd);
-  const autoApprove = (opts.args ?? []).includes("--auto");
+  const autoApprove = Boolean(opts.cellSandbox) || (opts.args ?? []).includes("--auto");
 
   const child = await spawnSessionChild(spawn.command, spawn.args, { cwd: opts.cwd, env: spawn.env });
   const sseAbort = new AbortController();

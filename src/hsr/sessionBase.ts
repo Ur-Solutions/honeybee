@@ -25,6 +25,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { cleanupCellSandboxCommand, wrapCellSandboxCommand } from "./cellSandbox.js";
 import type { RunnerEvent } from "./types.js";
 import { appendHsrEvent, appendRingText, writeHsrRing } from "./runDir.js";
 
@@ -331,21 +332,28 @@ export async function spawnSessionChild(
   args: string[],
   opts: { cwd: string; env: Record<string, string> },
 ): Promise<ChildProcess> {
-  const child: ChildProcess = spawn(command, args, {
+  const wrapped = await wrapCellSandboxCommand(command, args);
+  const child: ChildProcess = spawn(wrapped.command, wrapped.args, {
     cwd: opts.cwd,
     env: opts.env,
     detached: true,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  await new Promise<void>((resolve, reject) => {
-    const onError = (err: Error): void => reject(err);
-    child.once("error", onError);
-    child.once("spawn", () => {
-      child.removeListener("error", onError);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: Error): void => reject(err);
+      child.once("error", onError);
+      child.once("spawn", () => {
+        child.removeListener("error", onError);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    cleanupCellSandboxCommand();
+    throw error;
+  }
   child.on("error", () => undefined);
+  child.once("exit", cleanupCellSandboxCommand);
   trackChildProcessTree(child);
   return child;
 }

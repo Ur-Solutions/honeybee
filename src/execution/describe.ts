@@ -10,6 +10,7 @@ import { cpus, totalmem, arch as osArch, platform as osPlatform, release as osRe
 import type { JsonValue } from "../comb/types.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { resolveAgent } from "../agents.js";
+import { probeCellSandbox } from "../hsr/cellSandbox.js";
 import type { JsonObject } from "./contract.js";
 import { executionError } from "./errors.js";
 import { signCanonical } from "./signing.js";
@@ -21,8 +22,8 @@ export const GIT_WORKTREE_MATERIALIZER_ID = "git-worktree";
 /** How long a capability snapshot stays fresh (scheduler input, not a promise). */
 export const DESCRIPTOR_TTL_MS = 5 * 60_000;
 
-/** Harness drivers this slice advertises (the Phase 0-1 checkpoint pair). */
-export const ADVERTISED_HARNESSES = ["claude", "codex"] as const;
+/** Harness drivers covered by the common OS-enforced execution Cell boundary. */
+export const ADVERTISED_HARNESSES = ["claude", "codex", "opencode", "grok", "kimi"] as const;
 
 /**
  * run.command variants the HSR control socket actually delivers (H3).
@@ -62,16 +63,26 @@ export const PRODUCED_EVENT_TYPES = [
   "environment.released",
 ] as const;
 
-export type HarnessProbe = (kind: string) => Promise<{ status: "ready" | "absent"; command?: string }>;
+export type HarnessProbe = (kind: string) => Promise<{
+  status: "ready" | "absent";
+  command?: string;
+  installHint?: string;
+}>;
 
 /** Default probe: the driver's resolved executable is runnable on this node. */
-export async function probeHarness(kind: string): Promise<{ status: "ready" | "absent"; command?: string }> {
+export async function probeHarness(kind: string): Promise<{
+  status: "ready" | "absent";
+  command?: string;
+  installHint?: string;
+}> {
   try {
     const spec = resolveAgent(kind);
     await assertExecutableAvailable(spec.command);
+    const containment = probeCellSandbox();
+    if (containment.status !== "ready") return containment;
     return { status: "ready", command: spec.command };
   } catch {
-    return { status: "absent" };
+    return { status: "absent", installHint: `install the ${kind} CLI on this node's PATH` };
   }
 }
 
@@ -116,7 +127,7 @@ export async function buildNodeDescriptor(deps: NodeDescriptorDeps): Promise<Jso
       accountResidency: "node-resident",
       status: result.status,
       ...(result.status === "absent"
-        ? { installHint: `install the ${kind} CLI on this node's PATH and re-run node discovery` }
+        ? { installHint: `${result.installHint ?? `install the ${kind} CLI on this node's PATH`}; re-run node discovery` }
         : {}),
     });
   }
@@ -165,13 +176,17 @@ export async function buildNodeDescriptor(deps: NodeDescriptorDeps): Promise<Jso
   return descriptor;
 }
 
-/** Honest native-host isolation: dedicated files per working copy, shared everything else. */
+/** Honest native-host isolation: OS-fenced Cell writes, host-shared network. */
 export function nativeIsolationManifest(): JsonObject {
   return {
     filesystem: "dedicated",
-    processes: "shared",
+    // Bubblewrap gives Linux Cells a private PID namespace. Seatbelt fences
+    // process operations but does not create a distinct macOS PID namespace.
+    processes: osPlatform() === "linux" ? "namespaced" : "shared",
     network: "shared",
     browserProfile: "none",
-    deviations: ["native host: process and network isolation are advisory"],
+    deviations: [
+      "native host: filesystem reads and network are shared; writes are OS-enforced to the Cell and provider state",
+    ],
   };
 }

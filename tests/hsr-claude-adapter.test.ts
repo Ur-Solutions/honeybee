@@ -250,6 +250,19 @@ test("execution Cells replace bypass mode with Claude's fail-closed cwd sandbox"
   });
 });
 
+test("runner-wide Cell containment makes Claude unattended without a nested provider sandbox", () => {
+  const { config } = buildClaudeStreamConfig(optsFor({
+    cwd: "/cells/widget",
+    filesystemWriteScope: "cwd",
+    cellSandbox: "macos-seatbelt",
+    args: ["--model", "fable"],
+  }));
+  assert.ok(config.args.includes("--dangerously-skip-permissions"));
+  assert.ok(!config.args.includes("--settings"), "the common OS boundary owns containment");
+  const sources = config.args.indexOf("--setting-sources");
+  assert.deepEqual(config.args.slice(sources, sources + 2), ["--setting-sources", "user"]);
+});
+
 test("adapterFor resolves stub and claude, undefined otherwise", () => {
   assert.equal(adapterFor("stub"), stubAdapter);
   assert.equal(adapterFor("claude"), claudeAdapter);

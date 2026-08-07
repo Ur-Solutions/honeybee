@@ -8,6 +8,11 @@ import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { loadAdapterFor } from "./adapter-loader.js";
+import {
+  initializeCellSandbox,
+  shutdownCellSandbox,
+  withoutAmbientProviderState,
+} from "./cellSandbox.js";
 import { runHsrHost } from "./host.js";
 import { hsrRunDir } from "./runDir.js";
 import type { RunnerOpts } from "./types.js";
@@ -49,6 +54,12 @@ export async function runHsrHostFromPayload(payloadPath: string | undefined): Pr
     process.exit(1);
     return;
   }
+  if (payload.filesystemWriteScope === "cwd") {
+    // This detached process belongs to one execution Cell. Align process.cwd
+    // before Sandbox Runtime discovers repository-local mandatory denies; the
+    // provider child receives the same absolute cwd below.
+    process.chdir(realpathSync(payload.cwd));
+  }
   const adapter = await loadAdapterFor(payload.kind);
   if (!adapter) {
     process.stderr.write(`hive __hsr-run: no HSR adapter for harness "${payload.kind}"\n`);
@@ -57,15 +68,29 @@ export async function runHsrHostFromPayload(payloadPath: string | undefined): Pr
   }
   // The harness child needs a complete env (PATH etc.), not just the spawn
   // overrides. Overlay the payload's resolved spec on the inherited host env.
-  const childEnv: Record<string, string> = {};
+  let childEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (typeof value === "string") childEnv[key] = value;
+  }
+  if (payload.filesystemWriteScope === "cwd") {
+    childEnv = withoutAmbientProviderState(payload.kind, childEnv, payload.spec.env);
   }
   Object.assign(childEnv, payload.spec.env);
   // HSR children have no pane, so HIVE_BEE is the pane-less identity anchor.
   childEnv.HIVE_BEE = payload.bee;
   childEnv.HIVE_COMB = payload.comb ?? payload.bee;
   if (payload.parent) childEnv.HIVE_PARENT = payload.parent;
+  let cellSandbox: RunnerOpts["cellSandbox"];
+  if (payload.filesystemWriteScope === "cwd") {
+    const initialized = initializeCellSandbox({
+      kind: payload.kind,
+      cwd: payload.cwd,
+      runDir: hsrRunDir(payload.bee),
+      env: childEnv,
+    });
+    childEnv = initialized.env;
+    cellSandbox = initialized.backend;
+  }
   const opts: RunnerOpts = {
     bee: payload.bee,
     cwd: payload.cwd,
@@ -76,6 +101,7 @@ export async function runHsrHostFromPayload(payloadPath: string | undefined): Pr
     ...(payload.model ? { model: payload.model } : {}),
     ...(payload.resume ? { resume: true } : {}),
     ...(payload.filesystemWriteScope ? { filesystemWriteScope: payload.filesystemWriteScope } : {}),
+    ...(cellSandbox ? { cellSandbox } : {}),
     command: payload.spec.command,
     args: payload.spec.args,
     runDir: hsrRunDir(payload.bee),
@@ -87,11 +113,13 @@ export async function runHsrHostFromPayload(payloadPath: string | undefined): Pr
     } catch {
       // best-effort; we're exiting regardless
     }
+    shutdownCellSandbox();
     process.exit(0);
   };
   process.on("SIGTERM", () => void shutdown());
   process.on("SIGINT", () => void shutdown());
   await handle.done;
+  shutdownCellSandbox();
   process.exit(0);
 }
 

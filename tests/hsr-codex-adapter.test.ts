@@ -332,6 +332,23 @@ test("execution Cells combine Codex workspace-write with the provider's shared n
   ]);
 });
 
+test("runner-wide Cell containment leaves Codex git writable and removes the nested network shim", () => {
+  const opts: RunnerOpts = {
+    bee: "CO.cell",
+    cwd: "/cells/widget",
+    env: {},
+    runDir: "/tmp/run",
+    filesystemWriteScope: "cwd",
+    cellSandbox: "linux-bubblewrap",
+  };
+  assert.deepEqual(buildCodexThreadRequestParams(opts, "thread/start"), {
+    cwd: "/cells/widget",
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+  });
+  assert.deepEqual(buildCodexSpawn(opts).args, ["app-server"]);
+});
+
 test("codex app-server handshake acknowledges initialize before thread/start", async () => {
   const root = await mkdtemp(join(tmpdir(), "honeybee-hsr-codex-rpc-"));
   const previousStore = process.env.HIVE_STORE_ROOT;

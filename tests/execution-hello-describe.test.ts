@@ -48,6 +48,7 @@ test("node.describe: signed, owner-scoped, honest about absent harnesses and the
     const identity = await loadNodeIdentity();
     assert.ok(verifyCanonicalSignature(identity.publicKey, descriptor as Record<string, never>), "descriptor signature verifies");
     const harnesses = descriptor.harnesses as Array<Record<string, unknown>>;
+    assert.deepEqual(harnesses.map((entry) => entry.driverId), ["claude", "codex", "opencode", "grok", "kimi"]);
     const claude = harnesses.find((entry) => entry.driverId === "claude")!;
     const codex = harnesses.find((entry) => entry.driverId === "codex")!;
     assert.equal(claude.status, "ready");

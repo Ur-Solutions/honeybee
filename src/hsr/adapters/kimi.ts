@@ -446,7 +446,7 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
 
     const requestedModel = opts.model ? normalizeKimiModel(opts.model) : kimiModelFromArgs(opts.args ?? []);
     const selectedModel = requestedModel ?? configValue(setup, "model");
-    const selectedMode = kimiModeFromArgs(opts.args ?? []);
+    const selectedMode = opts.cellSandbox ? "yolo" : kimiModeFromArgs(opts.args ?? []);
     if (!selectedModel) throw new Error("Kimi ACP session did not expose a model config option");
     if (!configOptions(setup).some((option) => stringField(option, "id", "configId", "config_id") === "mode")) {
       throw new Error("Kimi ACP session did not expose a mode config option");

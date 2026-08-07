@@ -296,11 +296,11 @@ test("run.start validation matrix fails closed before any reservation", async ()
         envelope: buildRunStartEnvelope(ctx, {
           runId: "run-v12",
           mutateIntent: (intent) => {
-            (intent.harness as JsonObject).driverId = "opencode";
+            (intent.harness as JsonObject).driverId = "droid";
             intent.requiredCapabilities = [];
           },
           mutateLease: (lease) => {
-            (lease.allowedHarness as JsonObject).driverId = "opencode";
+            (lease.allowedHarness as JsonObject).driverId = "droid";
             lease.capabilities = [];
           },
         }),

@@ -118,7 +118,7 @@ export function buildGrokSpawn(opts: RunnerOpts): GrokSpawnConfig {
   const args = ["--no-auto-update", "agent", "--no-leader", ...supportedAgentExtras(callerArgs)];
   if (model) args.push("--model", model);
   if (reasoning) args.push("--reasoning-effort", reasoning);
-  if (hasAlwaysApprove(callerArgs)) args.push("--always-approve");
+  if (opts.cellSandbox || hasAlwaysApprove(callerArgs)) args.push("--always-approve");
   args.push("stdio");
   return { command: opts.command ?? "grok", args, env };
 }

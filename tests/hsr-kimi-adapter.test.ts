@@ -142,6 +142,16 @@ test("Kimi ACP initializes, creates/resumes, then applies model and mode through
   } finally {
     await cleanup(resumed);
   }
+
+  const contained = await start({ args: [], cellSandbox: "macos-seatbelt" });
+  try {
+    const log = await rpcLog(contained.logPath);
+    assert.ok(log.some((entry) => entry.method === "session/set_config_option"
+      && (entry.params as { configId?: string; value?: string }).configId === "mode"
+      && (entry.params as { value?: string }).value === "yolo"));
+  } finally {
+    await cleanup(contained);
+  }
 });
 
 test("Kimi ACP serializes sends and releases next-tool sends at a tool boundary", async () => {

@@ -849,8 +849,9 @@ export type SpawnOverlays = {
  * intent, so every local overlay is bypassed: the agent is the exact signed
  * driverId, no alias/profile account is offered (the account comes only from
  * the signed config.account, threaded as --account by the launcher), argv is
- * exactly the launcher's, and yolo is disabled because the execution Cell
- * supplies a narrower harness-native write boundary. A local
+ * exactly the launcher's, and yolo stays disabled at this layer. The adapter
+ * enters unattended mode only after the detached runner has installed the
+ * common OS-enforced Cell boundary. A local
  * `bees.<driver>` config entry can therefore never change harness, account,
  * args, or yolo underneath the signed intent.
  */

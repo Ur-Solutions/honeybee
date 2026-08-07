@@ -288,9 +288,22 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
       callerArgs = ["--resume", opts.sessionId, ...callerArgs];
     }
   }
-  if (opts.filesystemWriteScope === "cwd") {
+  if (opts.cellSandbox) {
+    // The whole Claude process tree is already inside the OS Cell boundary.
+    // Run unattended inside that boundary and ignore repository-local Claude
+    // settings, which could otherwise add ambient behavior even though they
+    // cannot widen the kernel filesystem policy.
+    callerArgs = callerArgs.filter((arg) => arg !== "--dangerously-skip-permissions");
+    callerArgs = [
+      "--dangerously-skip-permissions",
+      "--setting-sources", "user",
+      ...callerArgs,
+    ];
+  } else if (opts.filesystemWriteScope === "cwd") {
     // A protocol Cell is intentionally autonomous but not permissionless. The
-    // CLI's native Seatbelt/bubblewrap sandbox enforces cwd-only subprocess
+    // CLI's native Seatbelt/bubblewrap sandbox is the compatibility fallback
+    // when an older caller requests cwd scoping without the runner-wide Cell
+    // boundary. It covers Bash but not every provider-side file primitive.
     // writes; acceptEdits gives built-in file tools the same cwd boundary and
     // still asks before an operator explicitly grants an outside path. The
     // unsandboxed-command escape hatch is disabled. Network stays broadly

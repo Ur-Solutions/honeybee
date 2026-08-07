@@ -160,6 +160,12 @@ export type RunnerOpts = {
    * working copy while host reads and network access remain available.
    */
   filesystemWriteScope?: "cwd";
+  /**
+   * Whole-process-tree containment selected by the detached runner host after
+   * its OS dependency probe succeeds. Provider adapters may safely suppress
+   * their own narrower approval sandboxes only when this fact is present.
+   */
+  cellSandbox?: "macos-seatbelt" | "linux-bubblewrap";
 };
 
 /**

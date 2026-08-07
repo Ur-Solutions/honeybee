@@ -116,6 +116,9 @@ test("Grok ACP pure spawn, update, usage, permission, question, and error mappin
     bee: "b", cwd: "/tmp", env: { XAI_API_KEY: "secret" }, runDir: "/tmp/r", authKind: "api-key",
   });
   assert.equal(apiKey.env.XAI_API_KEY, "secret");
+  assert.ok(buildGrokSpawn({
+    bee: "cell", cwd: "/tmp", env: {}, runDir: "/tmp/r", cellSandbox: "linux-bubblewrap",
+  }).args.includes("--always-approve"));
   assert.equal(grokReasoningFromArgs(["--reasoning-effort=medium", "--effort", "high"]), "high");
   assert.equal(grokReasoningFromArgs(["--effort=low"]), "low");
   assert.equal(grokModeFromArgs(["--permission-mode", "plan"]), "plan");

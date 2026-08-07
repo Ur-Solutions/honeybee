@@ -69,6 +69,7 @@ async function startRig(input: {
   resume?: boolean;
   sessionId?: string;
   cwd?: string;
+  cellSandbox?: RunnerOpts['cellSandbox'];
 } = {}): Promise<Rig> {
   const root = await mkdtemp(join(tmpdir(), "hive-opencode-adapter-"));
   const cwd = input.cwd ?? root;
@@ -89,6 +90,7 @@ async function startRig(input: {
     args: [fixture, ...(input.args ?? [])],
     ...(input.resume ? { resume: true } : {}),
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    ...(input.cellSandbox ? { cellSandbox: input.cellSandbox } : {}),
   };
 
   let session: RunnerSession;
@@ -310,6 +312,18 @@ test("startup uses random Basic auth, subscribes before prompt, filters sessions
     });
     assert.equal(rig.events.filter((event) => event.type === "turn_start").length, 2);
     assert.equal(rig.events.filter((event) => event.type === "turn_end").length, 1);
+  } finally {
+    await rig.cleanup();
+  }
+});
+
+test("runner-wide Cell containment installs an allow-all OpenCode permission policy", async () => {
+  const rig = await startRig({ cellSandbox: "linux-bubblewrap" });
+  try {
+    const created = (await rig.state()).requests.find((request) => request.path === "/session");
+    assert.deepEqual(created?.body && (created.body as { permission?: unknown }).permission, [
+      { permission: "*", pattern: "*", action: "allow" },
+    ]);
   } finally {
     await rig.cleanup();
   }

@@ -467,7 +467,7 @@ export function buildCodexSpawn(opts: RunnerOpts): { command: string; args: stri
   const authKind = opts.authKind ?? "subscription";
   const env: Record<string, string> = { ...opts.env };
   for (const key of harnessAllowance("codex", authKind)?.scrubEnv ?? []) delete env[key];
-  const cellNetwork = opts.filesystemWriteScope === "cwd"
+  const cellNetwork = opts.filesystemWriteScope === "cwd" && !opts.cellSandbox
     ? ["-c", "sandbox_workspace_write.network_access=true"]
     : [];
   return {
@@ -541,7 +541,12 @@ export function buildCodexThreadRequestParams(
   method: "thread/start" | "thread/resume",
 ): Record<string, unknown> {
   const model = codexModelFromArgs(opts.args) ?? opts.model;
-  const sandbox = opts.filesystemWriteScope === "cwd" ? "workspace-write" : "danger-full-access";
+  // workspace-write deliberately makes .git read-only. A runner-wide Cell
+  // sandbox is stronger across the full process tree while still allowing the
+  // agent to create the commits Apiary needs for landing.
+  const sandbox = opts.filesystemWriteScope === "cwd" && !opts.cellSandbox
+    ? "workspace-write"
+    : "danger-full-access";
   return method === "thread/resume"
     ? {
         threadId: opts.sessionId as string,
