@@ -310,7 +310,8 @@ test("set-model on a downed HSR bee records the selection and revive applies it"
     await seedBee(store, bee, {
       agent: "codex",
       requestedAgent: "codex",
-      command: "codex",
+      launchArgv: [fakeCodex],
+      command: fakeCodex,
       tmuxTarget: bee,
       substrate: "hsr",
       runnerPid: 2 ** 31 - 1,
