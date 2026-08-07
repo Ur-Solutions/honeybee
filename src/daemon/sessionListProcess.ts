@@ -12,7 +12,7 @@ import { StringDecoder } from "node:string_decoder";
 import { storeRoot } from "../fsx.js";
 import {
   DEFAULT_ACTIVE_SESSION_RECONCILE_INTERVAL_MS,
-  listActiveSessions,
+  listActiveSessionsHot,
   rebuildActiveSessionIndex,
   type SessionRecord,
 } from "../store.js";
@@ -122,7 +122,7 @@ export async function runSessionListWorker(
   output: Writable = process.stdout,
   options: SessionListWorkerOptions = {},
 ): Promise<void> {
-  const listActive = options.listActive ?? listActiveSessions;
+  const listActive = options.listActive ?? listActiveSessionsHot;
   const lines = createInterface({ input, terminal: false });
   for await (const line of lines) {
     let request: SessionListRequest | null = null;

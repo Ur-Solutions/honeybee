@@ -1,8 +1,18 @@
 import { rm } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { join, resolve, sep } from "node:path";
+import { readActivationHomeOwner, withActivationHomeLock } from "./accounts/activation.js";
+import { storeRoot } from "./fsx.js";
 import { hsrRoot } from "./hsr/runDir.js";
 import { sealsRoot } from "./seal.js";
-import { appendLedger, deleteSession, safeName, updateSession, type SessionRecord } from "./store.js";
+import {
+  appendLedger,
+  deleteSession,
+  isActiveSessionRecord,
+  listSessions,
+  safeName,
+  updateSession,
+  type SessionRecord,
+} from "./store.js";
 import { syncCredentialPairIsolated } from "./daemon/credentialSweepProcess.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { dropPoolClaimsForBee } from "./pool.js";
@@ -204,11 +214,74 @@ export async function syncSessionCredentialsOnExit(record: SessionRecord, timeou
   if (outcome.failedPairs > 0 || outcome.timedOutPairs > 0) throw new Error("final credential sync failed");
 }
 
-async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessionDataOptions): Promise<void> {
-  if (!record.accountId || !record.homePath) return;
-  const budgetMs = options.finalCredentialSyncBudgetMs ?? 10_000;
-  const sync = options.finalCredentialSync ?? ((candidate: SessionRecord) =>
-    syncSessionCredentialsOnExit(candidate, Math.max(1, budgetMs - 1_000)));
+type CredentialBindingConflict = {
+  accountId: string;
+  reason: "home-rebound" | "activation-incomplete";
+  session?: string;
+  activationGeneration?: string;
+};
+
+function sessionBindingTime(record: SessionRecord): number {
+  for (const value of [record.updatedAt, record.lastPromptAt, record.createdAt]) {
+    const parsed = Date.parse(value ?? "");
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function isDedicatedSessionHome(record: SessionRecord): boolean {
+  if (!record.accountId || !record.homePath) return false;
+  const target = resolve(record.homePath);
+  return [
+    join(storeRoot(), "homes", record.accountId),
+    join(storeRoot(), "login-homes", record.accountId),
+  ].some((candidate) => resolve(candidate) === target);
+}
+
+async function conflictingHomeBinding(record: SessionRecord): Promise<CredentialBindingConflict | null> {
+  if (!record.accountId || !record.homePath) return null;
+  const target = resolve(record.homePath);
+  const owner = await readActivationHomeOwner(target);
+  if (owner) {
+    if (owner.state !== "ready") {
+      return {
+        accountId: owner.accountId,
+        reason: "activation-incomplete",
+        activationGeneration: owner.generation,
+      };
+    }
+    return owner.accountId === record.accountId
+      ? null
+      : { accountId: owner.accountId, reason: "home-rebound", activationGeneration: owner.generation };
+  }
+
+  // No post-upgrade lock-serialized claim exists. Fall back to canonical
+  // legacy SessionRecords and conservatively reject any newer/live foreign
+  // binding for this resolved custom home.
+  const recordTime = sessionBindingTime(record);
+  const candidates = (await listSessions()).filter((candidate) =>
+    candidate.name !== record.name &&
+    Boolean(candidate.accountId) &&
+    candidate.accountId !== record.accountId &&
+    Boolean(candidate.homePath) &&
+    resolve(candidate.homePath!) === target &&
+    (isActiveSessionRecord(candidate) || sessionBindingTime(candidate) > recordTime));
+  candidates.sort((a, b) => {
+    const live = Number(isActiveSessionRecord(b)) - Number(isActiveSessionRecord(a));
+    if (live !== 0) return live;
+    return sessionBindingTime(b) - sessionBindingTime(a);
+  });
+  const conflict = candidates[0];
+  return conflict?.accountId
+    ? { accountId: conflict.accountId, reason: "home-rebound", session: conflict.name }
+    : null;
+}
+
+async function boundedCredentialSync(
+  record: SessionRecord,
+  sync: (record: SessionRecord) => Promise<void>,
+  budgetMs: number,
+): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   try {
     await Promise.race([
@@ -217,17 +290,70 @@ async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessi
         timer = setTimeout(() => reject(new Error(`final credential sync timed out after ${budgetMs}ms`)), budgetMs);
       }),
     ]);
-    if (options.emitLedger !== false) {
-      await appendLedger({ type: "account.final-sync", session: record.name, account: record.accountId, ok: true });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessionDataOptions): Promise<void> {
+  if (!record.accountId || !record.homePath) return;
+  const budgetMs = options.finalCredentialSyncBudgetMs ?? 10_000;
+  const sync = options.finalCredentialSync ?? ((candidate: SessionRecord) =>
+    syncSessionCredentialsOnExit(candidate, Math.max(1, budgetMs - 1_000)));
+  const startedAt = Date.now();
+  const binding: { conflict: CredentialBindingConflict | null } = { conflict: null };
+  let ok = false;
+  try {
+    if (isDedicatedSessionHome(record)) {
+      await boundedCredentialSync(record, sync, budgetMs);
+      ok = true;
+    } else {
+      // Activation and final harvest take the same resolved-home lock. The
+      // activation stamp closes the activation→SessionRecord publication gap;
+      // the canonical re-read also catches legacy/current session claims.
+      let expired = false;
+      let overallTimer: NodeJS.Timeout | undefined;
+      const lockedHarvest = withActivationHomeLock(record.homePath, async () => {
+        binding.conflict = await conflictingHomeBinding(record);
+        if (binding.conflict || expired) return;
+        const remainingMs = budgetMs - (Date.now() - startedAt);
+        if (remainingMs <= 0) throw new Error(`final credential sync timed out after ${budgetMs}ms`);
+        await boundedCredentialSync(record, sync, remainingMs);
+        if (!expired) ok = true;
+      }, { timeoutMs: Math.max(1, budgetMs) });
+      try {
+        await Promise.race([
+          lockedHarvest,
+          new Promise<never>((_resolve, reject) => {
+            overallTimer = setTimeout(() => {
+              expired = true;
+              reject(new Error(`final credential ownership validation timed out after ${budgetMs}ms`));
+            }, budgetMs);
+          }),
+        ]);
+      } finally {
+        if (overallTimer) clearTimeout(overallTimer);
+      }
     }
   } catch {
     // Runtime teardown must remain available during a credential outage. The
     // daemon's historical-home sweep remains the recovery backstop.
-    if (options.emitLedger !== false) {
-      await appendLedger({ type: "account.final-sync", session: record.name, account: record.accountId, ok: false }).catch(() => undefined);
-    }
-  } finally {
-    if (timer) clearTimeout(timer);
+    ok = false;
+  }
+  if (options.emitLedger !== false) {
+    const conflict = binding.conflict;
+    await appendLedger({
+      type: "account.final-sync",
+      session: record.name,
+      account: record.accountId,
+      ok,
+      ...(conflict ? {
+        skipped: conflict.reason,
+        ownerAccount: conflict.accountId,
+        ...(conflict.session ? { ownerSession: conflict.session } : {}),
+        ...(conflict.activationGeneration ? { ownerGeneration: conflict.activationGeneration } : {}),
+      } : {}),
+    }).catch(() => undefined);
   }
 }
 

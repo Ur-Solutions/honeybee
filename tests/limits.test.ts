@@ -1463,6 +1463,30 @@ test("indexed account commitments match full-history parity while terminal rows 
   });
 });
 
+test("account commitments include an older-writer live record without daemon reconciliation", async () => {
+  await withTempStore(async (dir) => {
+    const indexed = liveSession("indexed", "account-a", "working");
+    const oldWriter = liveSession("older-writer", "account-b", "active");
+    await saveSession(indexed);
+    const baseline = await accountCommitments("claude");
+    assert.equal(baseline.get("account-a"), AUTO_COMMITMENT_BUSY_PERCENT);
+    assert.equal(baseline.get("account-b"), undefined);
+
+    // Exact mixed-version boundary: the older process publishes only its
+    // canonical record, leaving the checksum-valid derived index untouched.
+    await sleep(5);
+    await writeFile(join(dir, "sessions", `${oldWriter.name}.json`), JSON.stringify(oldWriter));
+
+    const commitments = await accountCommitments("claude");
+    assert.equal(commitments.get("account-a"), AUTO_COMMITMENT_BUSY_PERCENT);
+    assert.equal(
+      commitments.get("account-b"),
+      AUTO_COMMITMENT_BUSY_PERCENT,
+      "auto-pick must not under-rank an account solely because the daemon is absent",
+    );
+  });
+});
+
 test("decayedPickDebit decays linearly and treats clock skew as fresh", () => {
   const t0 = Date.parse("2026-06-10T12:00:00Z");
   const pick = { at: "2026-06-10T12:00:00Z", percent: AUTO_PICK_DEBIT_PERCENT };

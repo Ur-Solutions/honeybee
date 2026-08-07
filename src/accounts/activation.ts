@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -12,7 +12,7 @@ import {
 } from "../keychain.js";
 import { kitMaterializeHome, readKitHomeStamp, type KitMaterializeTiming } from "../kit.js";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
-import { type LockOwnerMetadata, withFileLock } from "../lock.js";
+import { type LockOptions, type LockOwnerMetadata, withFileLock } from "../lock.js";
 import { appendLedger } from "../store.js";
 import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./registry.js";
 import {
@@ -444,6 +444,55 @@ function activationHomeLockPath(homePath: string): string {
   return join(storeRoot(), "locks", "activation-homes", `${activationHomeKey(homePath)}.lock`);
 }
 
+export type ActivationHomeOwner = {
+  version: 1;
+  homePath: string;
+  accountId: string;
+  generation: string;
+  state: "activating" | "ready";
+  activatedAt: string;
+  updatedAt: string;
+};
+
+export function activationHomeOwnerPath(homePath: string): string {
+  return join(storeRoot(), "activation-home-owners", `${activationHomeKey(homePath)}.json`);
+}
+
+export function withActivationHomeLock<T>(
+  homePath: string,
+  fn: () => Promise<T>,
+  options: LockOptions = {},
+): Promise<T> {
+  return withFileLock(activationHomeLockPath(homePath), fn, options);
+}
+
+export async function readActivationHomeOwner(homePath: string): Promise<ActivationHomeOwner | null> {
+  try {
+    const parsed = JSON.parse(await readFile(activationHomeOwnerPath(homePath), "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("owner stamp is not an object");
+    const owner = parsed as Partial<ActivationHomeOwner>;
+    if (
+      owner.version !== 1 ||
+      owner.homePath !== resolve(homePath) ||
+      typeof owner.accountId !== "string" || !owner.accountId ||
+      typeof owner.generation !== "string" || !owner.generation ||
+      (owner.state !== "activating" && owner.state !== "ready") ||
+      typeof owner.activatedAt !== "string" ||
+      typeof owner.updatedAt !== "string"
+    ) throw new Error("owner stamp has invalid fields");
+    return owner as ActivationHomeOwner;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(
+      `Invalid activation-home owner stamp for ${resolve(homePath)}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+async function writeActivationHomeOwner(owner: ActivationHomeOwner): Promise<void> {
+  await atomicWriteFile(activationHomeOwnerPath(owner.homePath), `${JSON.stringify(owner, null, 2)}\n`, { mode: 0o600 });
+}
+
 function emptyActivationTiming(): ActivationTiming {
   return {
     totalMs: 0,
@@ -558,8 +607,23 @@ async function performAccountActivation(
   try {
     let homeLockAcquiredAt = 0;
     try {
-      await withFileLock(activationHomeLockPath(homePath), async () => {
+      await withActivationHomeLock(homePath, async () => {
         homeLockAcquiredAt = performance.now();
+        // Claim the home before touching credentials. A failed activation may
+        // conservatively leave an "activating" owner, which is safer than
+        // letting a stale session harvest partially replaced bytes into its
+        // old account vault. The next activation supersedes this generation.
+        const activatedAt = new Date(options.now?.() ?? Date.now()).toISOString();
+        const owner: ActivationHomeOwner = {
+          version: 1,
+          homePath: resolve(homePath),
+          accountId: account.id,
+          generation: randomUUID(),
+          state: "activating",
+          activatedAt,
+          updatedAt: activatedAt,
+        };
+        await writeActivationHomeOwner(owner);
         let accountLockAcquiredAt = 0;
         try {
           await withAccountLock(account.id, async () => {
@@ -597,6 +661,11 @@ async function performAccountActivation(
               throw new Error(`Vault has no credentials for ${account.id}. Capture them first: hive account login ${account.tool} ${account.label}`);
             }
             await hooks.finalizeCredentials?.(ctx);
+            await writeActivationHomeOwner({
+              ...owner,
+              state: "ready",
+              updatedAt: new Date(options.now?.() ?? Date.now()).toISOString(),
+            });
           }, {
             onAcquired: ({ waitMs, owner }) => {
               timing.accountLockWaitMs = waitMs;

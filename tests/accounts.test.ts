@@ -27,6 +27,7 @@ import {
   parseClaudeChain,
   parseClaudeChainStrict,
   PROVIDER_BY_CLI,
+  readActivationHomeOwner,
   removeAccount,
   resolveSpawnAgent,
   roundRobinAccountTool,
@@ -180,6 +181,9 @@ test("activate seeds creds into a home; codex keeps a legacy .codex auth mirror"
     assert.match(config, /model_reasoning_effort = "xhigh"/);
     assert.match(config, /service_tier = "fast"/);
     assert.match(config, /\[notice\]\nhide_full_access_warning = true/);
+    const owner = await readActivationHomeOwner(slot);
+    assert.equal(owner?.accountId, account.id);
+    assert.equal(owner?.state, "ready");
   });
 });
 

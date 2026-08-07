@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { activationHomeOwnerPath } from "../src/accounts.js";
 import { ensureHsrRunDir, hsrEventsPath, hsrMetaPath, hsrRingPath } from "../src/hsr/runDir.js";
 import { purgeSessionData, transactionalKill, transactionalRetire } from "../src/kill.js";
 import { recordSeal, sealsRoot, validateSealArtifact } from "../src/seal.js";
 import { deriveState } from "../src/state.js";
-import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { ledgerPath, loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { KillResult, Substrate } from "../src/substrates/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -206,6 +207,155 @@ test("direct clean purge harvests credentials before deleting artifacts/metadata
     });
     assert.ok(Date.now() - startedAt < 500, "destructive clean cannot wedge on credential harvest");
     assert.equal(await loadSession(bounded.name), null);
+  });
+});
+
+test("clean skips stale-account harvest when a newer live record owns the shared custom home", async () => {
+  await withTempStore(async (dir) => {
+    const homePath = join(dir, "shared-custom-home");
+    const stale = seed({
+      name: "old-account-record",
+      tmuxTarget: "old-account-record",
+      accountId: "account-a",
+      homePath,
+      status: "dead",
+      updatedAt: "2026-08-07T08:00:00.000Z",
+    });
+    const current = seed({
+      name: "new-account-record",
+      tmuxTarget: "new-account-record",
+      accountId: "account-b",
+      homePath,
+      status: "running",
+      updatedAt: "2026-08-07T08:05:00.000Z",
+    });
+    await saveSession(stale);
+    await saveSession(current);
+    let harvests = 0;
+
+    await purgeSessionData(stale, {
+      finalCredentialSync: async () => { harvests += 1; },
+    });
+
+    assert.equal(harvests, 0, "account B bytes must never be trusted as account A's final rotation");
+    assert.equal(await loadSession(stale.name), null);
+    assert.equal((await loadSession(current.name))?.accountId, "account-b", "clean deletes only the stale record");
+    const ledger = (await readFile(ledgerPath(), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.ok(ledger.some((event) =>
+      event.type === "account.final-sync" &&
+      event.session === stale.name &&
+      event.skipped === "home-rebound" &&
+      event.ownerAccount === "account-b"));
+  });
+});
+
+test("clean honors a rebind activation stamp before the new session record is published", async () => {
+  await withTempStore(async (dir) => {
+    const homePath = join(dir, "activation-gap-home");
+    const stale = seed({
+      name: "pre-activation-account-a",
+      tmuxTarget: "pre-activation-account-a",
+      accountId: "account-a",
+      homePath,
+      status: "dead",
+    });
+    await saveSession(stale);
+    const ownerPath = activationHomeOwnerPath(homePath);
+    await mkdir(dirname(ownerPath), { recursive: true });
+    await writeFile(ownerPath, JSON.stringify({
+      version: 1,
+      homePath,
+      accountId: "account-b",
+      generation: "activation-b-generation",
+      state: "ready",
+      activatedAt: "2026-08-07T08:05:00.000Z",
+      updatedAt: "2026-08-07T08:05:00.000Z",
+    }));
+    let harvests = 0;
+
+    await purgeSessionData(stale, {
+      emitLedger: false,
+      finalCredentialSync: async () => { harvests += 1; },
+    });
+
+    assert.equal(harvests, 0, "account B's lock-serialized claim closes the activation-to-record gap");
+    assert.equal(await loadSession(stale.name), null);
+
+    const failedHomePath = join(dir, "failed-activation-home");
+    const failed = seed({
+      name: "failed-activation-account-a",
+      tmuxTarget: "failed-activation-account-a",
+      accountId: "account-a",
+      homePath: failedHomePath,
+      status: "dead",
+    });
+    await saveSession(failed);
+    const failedOwnerPath = activationHomeOwnerPath(failedHomePath);
+    await mkdir(dirname(failedOwnerPath), { recursive: true });
+    await writeFile(failedOwnerPath, JSON.stringify({
+      version: 1,
+      homePath: failedHomePath,
+      accountId: "account-a",
+      generation: "failed-account-a-generation",
+      state: "activating",
+      activatedAt: "2026-08-07T08:10:00.000Z",
+      updatedAt: "2026-08-07T08:10:00.000Z",
+    }));
+    await purgeSessionData(failed, {
+      emitLedger: false,
+      finalCredentialSync: async () => { harvests += 1; },
+    });
+    assert.equal(
+      harvests,
+      0,
+      "a matching but incomplete activation cannot authorize possibly-foreign bytes",
+    );
+  });
+});
+
+test("transactional kill revalidates shared-home ownership immediately after stop", async () => {
+  await withTempStore(async (dir) => {
+    const homePath = join(dir, "post-stop-shared-home");
+    const stale = seed({
+      name: "stopping-account-a",
+      tmuxTarget: "stopping-account-a",
+      accountId: "account-a",
+      homePath,
+      updatedAt: "2026-08-07T08:00:00.000Z",
+    });
+    const rebound = seed({
+      name: "started-account-b",
+      tmuxTarget: "started-account-b",
+      accountId: "account-b",
+      homePath,
+      updatedAt: "2026-08-07T08:05:00.000Z",
+    });
+    await saveSession(stale);
+    let live = true;
+    const substrate = fakeSubstrate({
+      hasSession: async () => live,
+      kill: async () => {
+        live = false;
+        await saveSession(rebound);
+        return killOk();
+      },
+    });
+    let harvests = 0;
+
+    const outcome = await transactionalKill(stale, {
+      substrate,
+      pollIntervalMs: 0,
+      emitLedger: false,
+      finalCredentialSync: async () => { harvests += 1; },
+    });
+
+    assert.equal(outcome.ok, true);
+    assert.equal(harvests, 0, "post-stop binding re-read observes the account B rebind before harvesting");
+    assert.equal(await loadSession(stale.name), null);
+    assert.equal((await loadSession(rebound.name))?.accountId, "account-b");
   });
 });
 

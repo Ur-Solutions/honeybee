@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { test } from "node:test";
 import {
   activeSessionIndexPath,
-  listActiveSessions,
+  listActiveSessionsHot,
   listSessions,
   rebuildActiveSessionIndex,
   type SessionRecord,
@@ -61,7 +61,7 @@ test("active index scales at 100/1k/3k/10k with 95% terminal history", { timeout
         const rebuildMs = performance.now() - rebuildStarted;
 
         const hotStarted = performance.now();
-        const active = await listActiveSessions();
+        const active = await listActiveSessionsHot();
         const hotMs = performance.now() - hotStarted;
 
         const expectedActive = count / 20;
@@ -76,7 +76,7 @@ test("active index scales at 100/1k/3k/10k with 95% terminal history", { timeout
 
         const repeatStarted = performance.now();
         for (let pass = 0; pass < 5; pass += 1) {
-          assert.equal((await listActiveSessions()).length, expectedActive);
+          assert.equal((await listActiveSessionsHot()).length, expectedActive);
         }
         const repeatMs = performance.now() - repeatStarted;
         assert.equal(
@@ -96,6 +96,35 @@ test("active index scales at 100/1k/3k/10k with 95% terminal history", { timeout
   } finally {
     if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = previousRoot;
+  }
+});
+
+test("fresh direct-list process trusts an unchanged directory generation without scanning history", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-index-fresh-process-"));
+  const previousRoot = process.env.HIVE_STORE_ROOT;
+  try {
+    process.env.HIVE_STORE_ROOT = root;
+    await seedScale(root, 100);
+    await rebuildActiveSessionIndex();
+    const before = await readFile(activeSessionIndexPath(), "utf8");
+    const env = { ...process.env, HIVE_STORE_ROOT: root };
+    const { stdout } = await execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      "--input-type=module",
+      "--eval",
+      'import { listActiveSessions } from "./src/store.ts"; process.stdout.write(String((await listActiveSessions()).length));',
+    ], { cwd: process.cwd(), env });
+    assert.equal(stdout, "5");
+    assert.equal(
+      await readFile(activeSessionIndexPath(), "utf8"),
+      before,
+      "a first call in a new process performs only cheap freshness reads when the generation is covered",
+    );
+  } finally {
+    if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -122,7 +151,7 @@ test("separate writer processes serialize active-index membership without lost u
       execFileAsync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", writer("CO.left")], { cwd: process.cwd(), env }),
       execFileAsync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", writer("CO.right")], { cwd: process.cwd(), env }),
     ]);
-    const active = await listActiveSessions();
+    const active = await listActiveSessionsHot();
     assert.equal(active.length, 40);
     assert.equal(new Set(active.map((candidate) => candidate.name)).size, 40);
   } finally {

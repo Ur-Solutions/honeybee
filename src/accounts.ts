@@ -117,6 +117,10 @@ export {
 
 export {
   captureAccountFromHome,
+  activationHomeOwnerPath,
+  readActivationHomeOwner,
+  withActivationHomeLock,
+  type ActivationHomeOwner,
   type ActivateAccountOptions,
   activateAccountIntoHome,
   accountHasCredentials,

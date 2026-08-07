@@ -10,7 +10,7 @@ import {
   runSessionListWorker,
   type SessionListChild,
 } from "../src/daemon/sessionListProcess.js";
-import { listActiveSessions, rebuildActiveSessionIndex, saveSession, type SessionRecord } from "../src/store.js";
+import { listActiveSessionsHot, rebuildActiveSessionIndex, saveSession, type SessionRecord } from "../src/store.js";
 
 function record(name: string, overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -248,7 +248,7 @@ test("non-blocking startup reconcile repairs an exact older-writer omission for 
       const before = process.env.HIVE_STORE_ROOT;
       process.env.HIVE_STORE_ROOT = request.root;
       try {
-        return { id: request.id, ok: true, records: await listActiveSessions() };
+        return { id: request.id, ok: true, records: await listActiveSessionsHot() };
       } finally {
         if (before === undefined) delete process.env.HIVE_STORE_ROOT;
         else process.env.HIVE_STORE_ROOT = before;

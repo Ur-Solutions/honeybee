@@ -11,6 +11,7 @@ import {
   isActiveSessionRecord,
   ledgerPath,
   listActiveSessions,
+  listActiveSessionsHot,
   listSessions,
   loadSession,
   rebuildActiveSessionIndex,
@@ -189,6 +190,36 @@ test("active index rebuilds after missing/corrupt state and normalizes legacy ar
   });
 });
 
+test("canonical active-index reconciliation retries a directory generation race", async () => {
+  await withTempStore(async (dir) => {
+    const sessions = join(dir, "sessions");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(join(sessions, "CO.before.json"), JSON.stringify(makeRecord(dir, {
+      name: "CO.before",
+      tmuxTarget: "CO.before",
+    })));
+    const attempts: number[] = [];
+
+    const active = await rebuildActiveSessionIndex({
+      onAttempt: async (attempt) => {
+        attempts.push(attempt);
+        if (attempt !== 1) return;
+        await writeFile(join(sessions, "CO.raced.json"), JSON.stringify(makeRecord(dir, {
+          name: "CO.raced",
+          tmuxTarget: "CO.raced",
+        })));
+      },
+    });
+
+    assert.equal(active, 2);
+    assert.deepEqual(attempts, [1, 2], "the first changed generation is discarded and rescanned once stable");
+    assert.deepEqual(
+      (await listActiveSessionsHot()).map((record) => record.name).sort(),
+      ["CO.before", "CO.raced"],
+    );
+  });
+});
+
 test("checksum-valid v1 active index stays hot across upgrade until background migration", async () => {
   await withTempStore(async (dir) => {
     const indexed = makeRecord(dir, { name: "CO.v1-indexed", tmuxTarget: "CO.v1-indexed" });
@@ -209,7 +240,7 @@ test("checksum-valid v1 active index stays hot across upgrade until background m
     }, null, 2)}\n`;
     await writeFile(activeSessionIndexPath(), legacy);
 
-    assert.deepEqual((await listActiveSessions()).map((record) => record.name), active);
+    assert.deepEqual((await listActiveSessionsHot()).map((record) => record.name), active);
     assert.equal(
       await readFile(activeSessionIndexPath(), "utf8"),
       legacy,
@@ -218,13 +249,31 @@ test("checksum-valid v1 active index stays hot across upgrade until background m
   });
 });
 
-test("checksum-valid index canonical reconciliation discovers a live record written by an older binary", async () => {
+test("direct active listing trusts an unchanged fresh generation without a canonical rewrite", async () => {
+  await withTempStore(async (dir) => {
+    const indexed = makeRecord(dir, { name: "CO.fresh-index", tmuxTarget: "CO.fresh-index" });
+    await saveSession(indexed);
+    await listActiveSessions();
+    const before = await readFile(activeSessionIndexPath(), "utf8");
+
+    assert.deepEqual((await listActiveSessions()).map((record) => record.name), [indexed.name]);
+    assert.equal(
+      await readFile(activeSessionIndexPath(), "utf8"),
+      before,
+      "a fresh process pays only index + directory stat reads when no canonical writer generation changed",
+    );
+  });
+});
+
+test("direct active listing discovers an older-writer record without a daemon or manual rebuild", async () => {
   await withTempStore(async (dir) => {
     const indexed = makeRecord(dir, { name: "CO.indexed", tmuxTarget: "CO.indexed" });
     await saveSession(indexed);
+    await listActiveSessions();
 
     // Exact mixed-version writer: it atomically owns only the canonical
     // SessionRecord and knows nothing about active-sessions.json.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     const oldWriter = makeRecord(dir, { name: "CO.old-writer", tmuxTarget: "CO.old-writer" });
     await writeFile(join(dir, "sessions", "CO.old-writer.json"), JSON.stringify(oldWriter));
 
@@ -234,13 +283,15 @@ test("checksum-valid index canonical reconciliation discovers a live record writ
     };
     assert.deepEqual(before.active, ["CO.indexed"], "the still-valid checksum index initially omits the legacy write");
     assert.equal(typeof before.checksum, "string");
-    assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.indexed"], "fresh hot reads remain index-only");
-
-    await rebuildActiveSessionIndex();
+    assert.deepEqual(
+      (await listActiveSessionsHot()).map((record) => record.name),
+      ["CO.indexed"],
+      "the daemon's separately reconciled hot projection remains non-blocking",
+    );
     assert.deepEqual(
       (await listActiveSessions()).map((record) => record.name).sort(),
       ["CO.indexed", "CO.old-writer"],
-      "the canonical pass repairs mixed-version omission",
+      "a direct safety-sensitive caller performs its startup canonical pass",
     );
   });
 });
@@ -258,7 +309,7 @@ test("ambiguous active-record read retains membership without suppressing health
     // authoritative absence and must never be converted to index deletion.
     await writeFile(path, "{\"name\":");
     assert.deepEqual(
-      (await listActiveSessions()).map((candidate) => candidate.name),
+      (await listActiveSessionsHot()).map((candidate) => candidate.name),
       ["CO.healthy"],
       "one unreadable record does not blind every healthy active bee",
     );
@@ -267,7 +318,7 @@ test("ambiguous active-record read retains membership without suppressing health
 
     await writeFile(path, valid);
     assert.deepEqual(
-      (await listActiveSessions()).map((candidate) => candidate.name).sort(),
+      (await listActiveSessionsHot()).map((candidate) => candidate.name).sort(),
       ["CO.healthy", "CO.transient"],
     );
   });

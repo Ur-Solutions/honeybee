@@ -298,6 +298,8 @@ type ActiveSessionIndex = {
   checksum: string;
   /** Last full current+legacy SessionRecord walk, not a delta membership write. */
   reconciledAt: string;
+  /** Exact directory generations observed by that full walk. */
+  directoryMtimeMs?: { current: number; legacy: number };
   updatedAt: string;
 };
 
@@ -320,9 +322,20 @@ function activeSessionIndexLockPath(root: string): string {
   return join(root, ".active-sessions.lock");
 }
 
-function activeIndexChecksum(root: string, active: readonly string[], reconciledAt: string): string {
+function activeIndexChecksum(
+  root: string,
+  active: readonly string[],
+  reconciledAt: string,
+  directoryMtimeMs?: ActiveSessionIndex["directoryMtimeMs"],
+): string {
   return createHash("sha256")
-    .update(JSON.stringify({ version: ACTIVE_SESSION_INDEX_VERSION, root, active, reconciledAt }))
+    .update(JSON.stringify({
+      version: ACTIVE_SESSION_INDEX_VERSION,
+      root,
+      active,
+      reconciledAt,
+      ...(directoryMtimeMs ? { directoryMtimeMs } : {}),
+    }))
     .digest("hex");
 }
 
@@ -335,7 +348,10 @@ function legacyActiveIndexChecksum(root: string, active: readonly string[]): str
 function makeActiveSessionIndex(
   root: string,
   names: Iterable<string>,
-  options: { reconciledAt?: string } = {},
+  options: {
+    reconciledAt?: string;
+    directoryMtimeMs?: ActiveSessionIndex["directoryMtimeMs"];
+  } = {},
 ): ActiveSessionIndex {
   const active = [...new Set(names)].sort((a, b) => a.localeCompare(b));
   const now = new Date().toISOString();
@@ -345,8 +361,9 @@ function makeActiveSessionIndex(
     complete: true,
     root,
     active,
-    checksum: activeIndexChecksum(root, active, reconciledAt),
+    checksum: activeIndexChecksum(root, active, reconciledAt, options.directoryMtimeMs),
     reconciledAt,
+    ...(options.directoryMtimeMs ? { directoryMtimeMs: options.directoryMtimeMs } : {}),
     updatedAt: now,
   };
 }
@@ -369,7 +386,19 @@ async function readActiveSessionIndex(root: string): Promise<ActiveSessionIndex 
     if (normalized.some((name, index) => name !== candidate.active![index])) return null;
     if (candidate.version === ACTIVE_SESSION_INDEX_VERSION) {
       if (typeof candidate.reconciledAt !== "string") return null;
-      if (candidate.checksum !== activeIndexChecksum(root, normalized, candidate.reconciledAt)) return null;
+      if (candidate.directoryMtimeMs !== undefined && (
+        typeof candidate.directoryMtimeMs !== "object" ||
+        typeof candidate.directoryMtimeMs.current !== "number" ||
+        !Number.isFinite(candidate.directoryMtimeMs.current) ||
+        typeof candidate.directoryMtimeMs.legacy !== "number" ||
+        !Number.isFinite(candidate.directoryMtimeMs.legacy)
+      )) return null;
+      if (candidate.checksum !== activeIndexChecksum(
+        root,
+        normalized,
+        candidate.reconciledAt,
+        candidate.directoryMtimeMs,
+      )) return null;
       return candidate as ActiveSessionIndex;
     }
     if (candidate.version !== LEGACY_ACTIVE_SESSION_INDEX_VERSION) return null;
@@ -396,34 +425,73 @@ async function writeActiveSessionIndex(index: ActiveSessionIndex): Promise<void>
   await atomicWriteFile(activeSessionIndexPath(index.root), `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
 }
 
-async function rebuildActiveSessionIndexLocked(paths: StorePaths): Promise<ActiveSessionIndex> {
-  const previous = await readActiveSessionIndex(paths.root);
-  const snapshot = await scanSessionsSnapshot(paths.currentDir, paths.legacyDir);
-  const names = new Set(snapshot.records.filter(isActiveSessionRecord).map((record) => record.name));
-  // A canonical pass may overlap an atomic writer or hit EACCES/EIO. Preserve
-  // prior membership for the affected filename; only a successful terminal
-  // parse or authoritative absence may remove a name.
-  if (previous) {
-    const previousNames = new Set(previous.active);
-    for (const failure of snapshot.readFailures) {
-      const name = failure.file.slice(0, -".json".length);
-      if (previousNames.has(name)) names.add(name);
+async function sessionDirectoryMtimes(paths: StorePaths): Promise<{ current: number; legacy: number }> {
+  const directoryMtime = async (path: string): Promise<number> => {
+    try {
+      return (await stat(path)).mtimeMs;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+      throw error;
     }
+  };
+  const [current, legacy] = await Promise.all([
+    directoryMtime(paths.currentDir),
+    directoryMtime(paths.legacyDir),
+  ]);
+  return { current, legacy };
+}
+
+const ACTIVE_SESSION_RECONCILE_GENERATION_ATTEMPTS = 3;
+
+export type ActiveSessionIndexRebuildOptions = {
+  /** Attempt observation hook used by deterministic race tests/telemetry. */
+  onAttempt?: (attempt: number) => Promise<void> | void;
+};
+
+async function rebuildActiveSessionIndexLocked(
+  paths: StorePaths,
+  options: ActiveSessionIndexRebuildOptions = {},
+): Promise<ActiveSessionIndex> {
+  await mkdir(paths.currentDir, { recursive: true });
+  const previous = await readActiveSessionIndex(paths.root);
+  for (let attempt = 1; attempt <= ACTIVE_SESSION_RECONCILE_GENERATION_ATTEMPTS; attempt += 1) {
+    const generationBefore = await sessionDirectoryMtimes(paths);
+    await options.onAttempt?.(attempt);
+    const snapshot = await scanSessionsSnapshot(paths.currentDir, paths.legacyDir);
+    const generationAfter = await sessionDirectoryMtimes(paths);
+    if (
+      generationAfter.current !== generationBefore.current ||
+      generationAfter.legacy !== generationBefore.legacy
+    ) {
+      if (attempt < ACTIVE_SESSION_RECONCILE_GENERATION_ATTEMPTS) continue;
+      throw new Error(
+        `session directories changed during ${ACTIVE_SESSION_RECONCILE_GENERATION_ATTEMPTS} ` +
+        "active-index reconciliation attempts; prior projection preserved",
+      );
+    }
+    if (previous && snapshot.readFailures.length > 0) {
+      throw new AggregateError(
+        snapshot.readFailures.map((failure) => failure.error),
+        "active-index reconciliation could not authoritatively read every canonical record",
+      );
+    }
+    const names = new Set(snapshot.records.filter(isActiveSessionRecord).map((record) => record.name));
+    const index = makeActiveSessionIndex(paths.root, names, { directoryMtimeMs: generationAfter });
+    await writeActiveSessionIndex(index);
+    return index;
   }
-  const index = makeActiveSessionIndex(paths.root, names);
-  await writeActiveSessionIndex(index);
-  return index;
+  throw new Error("active-index reconciliation exhausted without an authoritative generation");
 }
 
 /**
  * Rebuild the derived index from authoritative current + legacy record files.
  * Safe to call operationally: history is only read, never moved or deleted.
  */
-export async function rebuildActiveSessionIndex(): Promise<number> {
+export async function rebuildActiveSessionIndex(options: ActiveSessionIndexRebuildOptions = {}): Promise<number> {
   const paths = captureStorePaths();
   const index = await withFileLock(
     activeSessionIndexLockPath(paths.root),
-    () => rebuildActiveSessionIndexLocked(paths),
+    () => rebuildActiveSessionIndexLocked(paths, options),
     { timeoutMs: 60_000 },
   );
   return index.active.length;
@@ -450,7 +518,10 @@ async function updateActiveMembershipLocked(
   if (!changed) return;
   if (active) names.add(name);
   else names.delete(name);
-  await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names, { reconciledAt: current.reconciledAt }));
+  await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names, {
+    reconciledAt: current.reconciledAt,
+    directoryMtimeMs: current.directoryMtimeMs,
+  }));
 }
 
 function sessionLockPath(name: string): string {
@@ -666,7 +737,8 @@ export async function deleteSession(name: string) {
 const DEFAULT_LIST_SESSION_CONCURRENCY = 32;
 const ACTIVE_INDEX_READ_WARNING_INTERVAL_MS = 60_000;
 const listSessionsInFlight = new Map<string, Promise<SessionRecord[]>>();
-const listActiveSessionsInFlight = new Map<string, Promise<SessionRecord[]>>();
+const listActiveSessionsHotInFlight = new Map<string, Promise<SessionRecord[]>>();
+const listActiveSessionsSafetyInFlight = new Map<string, Promise<SessionRecord[]>>();
 const activeIndexReadWarningAt = new Map<string, number>();
 
 function reportActiveIndexReadFailures(
@@ -717,20 +789,82 @@ export function listSessions(): Promise<SessionRecord[]> {
 }
 
 /**
- * Operational snapshot for daemon/account hot paths. Only names in the
- * derived active index are opened and parsed; listSessions() remains the
- * explicit full-history API for TUI/search/retention/revive consumers.
+ * Index-only operational projection. The daemon uses this because its
+ * parent-owned controller performs canonical reconciliation out of process;
+ * other consumers should use listActiveSessions() so a daemonless process
+ * cannot trust a mixed-version omission forever.
  */
-export function listActiveSessions(): Promise<SessionRecord[]> {
+export function listActiveSessionsHot(): Promise<SessionRecord[]> {
   const paths = captureStorePaths();
-  const current = listActiveSessionsInFlight.get(paths.root);
+  const current = listActiveSessionsHotInFlight.get(paths.root);
   if (current) return current;
 
   const pending = listActiveSessionsSnapshot(paths).finally(() => {
-    if (listActiveSessionsInFlight.get(paths.root) === pending) listActiveSessionsInFlight.delete(paths.root);
+    if (listActiveSessionsHotInFlight.get(paths.root) === pending) listActiveSessionsHotInFlight.delete(paths.root);
   });
-  listActiveSessionsInFlight.set(paths.root, pending);
+  listActiveSessionsHotInFlight.set(paths.root, pending);
   return pending;
+}
+
+/**
+ * Safety-sensitive active projection for direct/account-selection consumers.
+ * A file-per-record writer publishes through temp+rename, which advances the
+ * sessions directory mtime even when an older binary knows nothing about the
+ * derived index. Trust a checksum-valid projection only when both canonical
+ * directory generations exactly match its last full reconciliation;
+ * otherwise do one canonical pass before returning.
+ *
+ * A failed canonical pass rejects instead of returning a known-stale
+ * projection, so automatic account selection fails closed rather than
+ * under-counting commitments. Concurrent callers share one pass per root.
+ */
+export function listActiveSessions(): Promise<SessionRecord[]> {
+  const paths = captureStorePaths();
+  const current = listActiveSessionsSafetyInFlight.get(paths.root);
+  if (current) return current;
+
+  const pending = (async () => {
+    const index = await currentActiveSessionIndex(paths);
+    if (!(await activeSessionDirectoriesCovered(paths, index))) {
+      await withFileLock(
+        activeSessionIndexLockPath(paths.root),
+        async () => {
+          const currentIndex = await readActiveSessionIndex(paths.root);
+          if (!currentIndex || !(await activeSessionDirectoriesCovered(paths, currentIndex))) {
+            await rebuildActiveSessionIndexLocked(paths);
+          }
+        },
+        { timeoutMs: 60_000 },
+      );
+    }
+    return listActiveSessionsSnapshot(paths);
+  })().finally(() => {
+    if (listActiveSessionsSafetyInFlight.get(paths.root) === pending) {
+      listActiveSessionsSafetyInFlight.delete(paths.root);
+    }
+  });
+  listActiveSessionsSafetyInFlight.set(paths.root, pending);
+  return pending;
+}
+
+async function activeSessionDirectoriesCovered(paths: StorePaths, index: ActiveSessionIndex): Promise<boolean> {
+  let directoryMtimeMs: { current: number; legacy: number };
+  try {
+    directoryMtimeMs = await sessionDirectoryMtimes(paths);
+  } catch {
+    // An ambiguous stat must not authorize a stale account commitment.
+    return false;
+  }
+  if (index.directoryMtimeMs) {
+    return directoryMtimeMs.current === index.directoryMtimeMs.current &&
+      directoryMtimeMs.legacy === index.directoryMtimeMs.legacy;
+  }
+  // v1 and early-v2 indexes predate the exact generation pair. Their wall
+  // clock cannot order same-ms writes or survive clock skew soundly, so direct
+  // safety-sensitive consumers upgrade them with one canonical pass. The
+  // daemon may still serve them through listActiveSessionsHot while its
+  // isolated reconciler performs that upgrade in the background.
+  return false;
 }
 
 async function listActiveSessionsSnapshot(paths: StorePaths): Promise<SessionRecord[]> {
@@ -791,7 +925,10 @@ async function listActiveSessionsSnapshot(paths: StorePaths): Promise<SessionRec
         }
       }
       if (changed) {
-        await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names, { reconciledAt: current.reconciledAt }));
+        await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names, {
+          reconciledAt: current.reconciledAt,
+          directoryMtimeMs: current.directoryMtimeMs,
+        }));
       }
     }, { timeoutMs: 60_000 });
   }
