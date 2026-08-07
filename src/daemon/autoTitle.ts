@@ -49,15 +49,17 @@ export const AUTO_TITLE_RETRY_BACKOFF_MS = 10 * 60_000;
 export const AUTO_TITLE_WATCHDOG_MS = 2 * 60_000;
 
 /**
- * Is this bee eligible for an auto-title attempt right now? Already-titled bees
- * (any source) are done. Otherwise it must be under the attempt cap and, if a
- * prior attempt was made, past the backoff window.
+ * Is this bee eligible for an auto-title attempt right now? Untitled bees and
+ * bees carrying a provisional provider first-prompt fallback are eligible.
+ * User, auto, and explicit provider titles are already authoritative. Eligible
+ * records must also be under the attempt cap and past any retry backoff.
  */
 export function isAutoTitleCandidate(record: SessionRecord, now: number, backoffMs = AUTO_TITLE_RETRY_BACKOFF_MS): boolean {
   // Archived/dead history is immutable and cannot acquire a new exchange.
   // Scanning it on every cold daemon start only reopens old transcripts.
   if (record.status !== "running") return false;
-  if (record.title || record.titleSource) return false;
+  const provisionalProviderTitle = record.titleSource === "provider" && record.providerTitleKind === "fallback";
+  if (!provisionalProviderTitle && (record.title || record.titleSource)) return false;
   if ((record.autoTitleAttempts ?? 0) >= MAX_AUTO_TITLE_ATTEMPTS) return false;
   if (!record.autoTitleAt) return true;
   const last = Date.parse(record.autoTitleAt);
@@ -136,11 +138,20 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
             finished.push({ bee: record.name, ok: false, skipped: "record removed while generating" });
             return;
           }
-          if (!canWriteTitle(fresh, "auto")) {
-            finished.push({ bee: record.name, ok: false, skipped: "user title set while generating" });
+          // An explicit provider-generated title that arrives while the model
+          // is running is authoritative; only its provisional fallback is a
+          // valid auto-title replacement target.
+          const explicitProviderTitle = fresh.titleSource === "provider" && fresh.providerTitleKind !== "fallback";
+          if (explicitProviderTitle || !canWriteTitle(fresh, "auto")) {
+            finished.push({ bee: record.name, ok: false, skipped: "authoritative title set while generating" });
             return;
           }
-          await deps.updateSession(record.name, { title, titleSource: "auto", updatedAt: new Date(deps.now()).toISOString() });
+          await deps.updateSession(record.name, {
+            title,
+            titleSource: "auto",
+            providerTitleKind: undefined,
+            updatedAt: new Date(deps.now()).toISOString(),
+          });
           // Fire-and-forget: the tmux mirror is best-effort and must not delay
           // (or fail) the outcome report.
           void deps.mirrorTitle(fresh, title).catch(() => undefined);

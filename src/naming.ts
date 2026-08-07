@@ -1,8 +1,9 @@
 // Title generation for bees. The canonical `name`/`id` stays mechanical
 // (tmux target, selectors); `title` is the semantic display layer. Titles come
 // from three writers with strict precedence — user > auto > provider — so a
-// hand-set title is never stomped by automation, and an auto-generated one is
-// never stomped by a provider's first-user-prompt fallback.
+// hand-set title is never stomped by automation. Provider title provenance is
+// tracked separately: a raw first-prompt fallback is provisional and remains
+// eligible for the semantic auto-titler once an exchange is available.
 
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
@@ -65,7 +66,10 @@ export async function gatherTitleContext(
   const tx = await latestTranscript(record.agent, record.cwd, lookup).catch(() => null);
   const reliableTx = tx && isAnchoredTranscriptMatch(tx, lookup) ? tx : null;
 
-  const firstUser = clampContext(reliableTx ? firstUserText(reliableTx.rows) : "");
+  // Launchers commonly prepend a substantial system/product envelope to the
+  // first user row (Apiary's workspace instructions are one example). Preserve
+  // both ends so the operator's task at the tail survives the context budget.
+  const firstUser = clampContext(reliableTx ? firstUserText(reliableTx.rows) : "", { preserveTail: true });
   const lastAssistant = clampContext(reliableTx ? lastAssistantText(reliableTx.rows) : "");
   const brief = clampContext(record.brief ?? "");
 
@@ -87,9 +91,16 @@ export async function gatherTitleContext(
   };
 }
 
-function clampContext(value: string): string {
+function clampContext(value: string, options: { preserveTail?: boolean } = {}): string {
   const collapsed = value.replace(/\s+/g, " ").trim();
   if (collapsed.length <= CONTEXT_FIELD_MAX_CHARS) return collapsed;
+  if (options.preserveTail) {
+    const omission = " … ";
+    const remaining = CONTEXT_FIELD_MAX_CHARS - omission.length;
+    const headChars = Math.floor(remaining / 2);
+    const tailChars = remaining - headChars;
+    return `${collapsed.slice(0, headChars)}${omission}${collapsed.slice(-tailChars)}`;
+  }
   return `${collapsed.slice(0, CONTEXT_FIELD_MAX_CHARS)}…`;
 }
 

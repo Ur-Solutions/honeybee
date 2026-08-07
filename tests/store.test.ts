@@ -259,13 +259,40 @@ test("autoTitleAttempts round-trips, and invalid on-disk values are dropped", as
   });
 });
 
-test("updateSession can clear autoTitleAttempts (rename --clear path)", async () => {
+test("provider fallback title provenance round-trips", async () => {
   await withTempStore(async (dir) => {
-    await saveSession(makeRecord(dir, { title: "x", titleSource: "auto", autoTitleAt: "2026-06-10T00:00:00.000Z", autoTitleAttempts: 3 }));
-    await updateSession("CO.abc", { title: undefined, titleSource: undefined, autoTitleAt: undefined, autoTitleAttempts: undefined });
+    await saveSession(makeRecord(dir, {
+      title: "Raw first prompt",
+      titleSource: "provider",
+      providerTitleKind: "fallback",
+    }));
+    const stored = await loadSession("CO.abc");
+    assert.equal(stored?.title, "Raw first prompt");
+    assert.equal(stored?.titleSource, "provider");
+    assert.equal(stored?.providerTitleKind, "fallback");
+  });
+});
+
+test("updateSession can clear autoTitleAttempts and provider title provenance (rename --clear path)", async () => {
+  await withTempStore(async (dir) => {
+    await saveSession(makeRecord(dir, {
+      title: "x",
+      titleSource: "auto",
+      providerTitleKind: "fallback",
+      autoTitleAt: "2026-06-10T00:00:00.000Z",
+      autoTitleAttempts: 3,
+    }));
+    await updateSession("CO.abc", {
+      title: undefined,
+      titleSource: undefined,
+      providerTitleKind: undefined,
+      autoTitleAt: undefined,
+      autoTitleAttempts: undefined,
+    });
     const cleared = await loadSession("CO.abc");
     assert.equal(cleared?.title, undefined);
     assert.equal(cleared?.titleSource, undefined);
+    assert.equal(cleared?.providerTitleKind, undefined);
     assert.equal(cleared?.autoTitleAt, undefined);
     assert.equal(cleared?.autoTitleAttempts, undefined);
   });

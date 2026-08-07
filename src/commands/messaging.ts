@@ -121,7 +121,14 @@ export async function cmdRename(parsed: Parsed) {
     if (clear) {
       // Dropping autoTitleAt + the attempt counter makes the bee a fresh daemon
       // auto-title candidate again.
-      await updateSession(record.name, { title: undefined, titleSource: undefined, autoTitleAt: undefined, autoTitleAttempts: undefined, updatedAt: now });
+      await updateSession(record.name, {
+        title: undefined,
+        titleSource: undefined,
+        providerTitleKind: undefined,
+        autoTitleAt: undefined,
+        autoTitleAttempts: undefined,
+        updatedAt: now,
+      });
       await writeHiveTitle(record, "");
       if (isPretty()) console.log(actionLine("ok", "rename", [bold(record.name), dim("title cleared")]));
       else console.log(`renamed\t${record.name}\t`);
@@ -144,6 +151,7 @@ export async function cmdRename(parsed: Parsed) {
     await updateSession(record.name, {
       title,
       titleSource: source,
+      providerTitleKind: undefined,
       updatedAt: now,
       // Stamp autoTitleAt so the daemon's backoff sees a recent attempt; the bee
       // is no longer a candidate once title+titleSource are set, so the attempt

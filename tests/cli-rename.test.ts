@@ -62,12 +62,17 @@ async function runCli(args: string[], root: string, extraEnv: Record<string, str
 
 test("rename <title>: sets a user title", async () => {
   await withStore(async (root) => {
-    const name = await writeBee(root);
+    const name = await writeBee(root, {
+      title: "Raw first prompt",
+      titleSource: "provider",
+      providerTitleKind: "fallback",
+    });
     const result = await runCli(["rename", name, "My", "explicit", "title"], root);
     assert.equal(result.code, 0, result.stderr);
     const rec = await readBee(root, name);
     assert.equal(rec.title, "My explicit title");
     assert.equal(rec.titleSource, "user");
+    assert.equal(rec.providerTitleKind, undefined);
   });
 });
 
@@ -108,6 +113,7 @@ test("rename --clear: drops title, source, and the auto-title bookkeeping", asyn
     const name = await writeBee(root, {
       title: "Old title",
       titleSource: "auto",
+      providerTitleKind: "fallback",
       autoTitleAt: "2026-06-10T12:00:00.000Z",
       autoTitleAttempts: 3,
     });
@@ -116,6 +122,7 @@ test("rename --clear: drops title, source, and the auto-title bookkeeping", asyn
     const rec = await readBee(root, name);
     assert.equal(rec.title, undefined);
     assert.equal(rec.titleSource, undefined);
+    assert.equal(rec.providerTitleKind, undefined);
     assert.equal(rec.autoTitleAt, undefined);
     assert.equal(rec.autoTitleAttempts, undefined, "cleared so the daemon treats it as a fresh candidate");
   });

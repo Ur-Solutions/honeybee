@@ -183,6 +183,7 @@ test("latestTranscript inherits Claude ai-title metadata", async () => {
 
     assert.ok(tx);
     assert.equal(tx.title, "Repair Title Inheritance");
+    assert.equal(tx.titleKind, "generated");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -244,6 +245,32 @@ test("latestTranscript ignores the Codex reasoning-summary mode when titling", a
 
     assert.ok(tx);
     assert.equal(tx.title, "Implement inherited bee titles");
+    assert.equal(tx.titleKind, "fallback");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("latestTranscript distinguishes Codex title metadata from its first-prompt fallback", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-codex-generated-title-"));
+  try {
+    const cwd = join(dir, "workspace");
+    const sessionDir = join(dir, "sessions", "2026", "08", "07");
+    const chatPath = join(sessionDir, "rollout-2026-08-07T09-00-00-session.jsonl");
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      chatPath,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-session", cwd, conversation_title: "Generated Provider Title" } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "A much longer raw user prompt" } }),
+      ].join("\n") + "\n",
+    );
+
+    const tx = await latestTranscript("codex", cwd, { homePath: dir });
+
+    assert.ok(tx);
+    assert.equal(tx.title, "Generated Provider Title");
+    assert.equal(tx.titleKind, "generated");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

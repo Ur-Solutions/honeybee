@@ -26,6 +26,13 @@ export type TranscriptFile = {
   score: number;
   matchedBy: string[];
   title?: string;
+  /**
+   * Whether `title` came from real provider title metadata or from Honeybee's
+   * immediate first-user-prompt fallback. The distinction matters because the
+   * fallback is only a provisional display label and must not block the
+   * semantic auto-titler once a completed exchange is available.
+   */
+  titleKind?: "generated" | "fallback";
 };
 
 export type TranscriptLookupOptions = {

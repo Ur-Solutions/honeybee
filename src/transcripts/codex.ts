@@ -15,7 +15,14 @@ export const codexAdapter: TranscriptAdapter = {
 
 /** Rows/session-id/cwd/title derived once per parsed rollout (cached in the
  * parsed-file LRU) — normalization walks every row and is not free. */
-type CodexDerived = { rows: TranscriptRow[]; sessionId: string; metaCwd: string; startedAtMs?: number; title?: string };
+type CodexDerived = {
+  rows: TranscriptRow[];
+  sessionId: string;
+  metaCwd: string;
+  startedAtMs?: number;
+  title?: string;
+  titleKind?: TranscriptFile["titleKind"];
+};
 
 async function loadCodexTranscript(path: string, cwd: string, options: TranscriptLookupOptions, knownStat?: StatHint): Promise<TranscriptFile | null> {
   const entry = await readJsonlCached(path, knownStat);
@@ -32,9 +39,9 @@ async function loadCodexTranscript(path: string, cwd: string, options: Transcrip
     const eventMessages = codexEventMessages(rawRows);
     const rows = rawRows.flatMap((row) => normalizeCodexRow(row, eventMessages));
     const metaCwd = String(sessionMeta?.payload?.cwd ?? sessionMeta?.payload?.original_cwd ?? "");
-    return { rows, sessionId, metaCwd, ...(startedAtMs !== null ? { startedAtMs } : {}), title: extractCodexTitle(rawRows, rows) };
+    return { rows, sessionId, metaCwd, ...(startedAtMs !== null ? { startedAtMs } : {}), ...extractCodexTitle(rawRows, rows) };
   });
-  const { rows, sessionId, metaCwd, startedAtMs, title } = derived;
+  const { rows, sessionId, metaCwd, startedAtMs, title, titleKind } = derived;
   if (rows.length === 0) return null;
   // Title-generator subprocesses run `codex exec` in a dedicated cwd
   // (namingGeneratorCwd). codex stores rollouts globally per-home rather than
@@ -43,7 +50,17 @@ async function loadCodexTranscript(path: string, cwd: string, options: Transcrip
   // prompt: "You are a session-title generator…") as the bee's title. Skip them.
   if (isGeneratorTranscriptCwd(metaCwd)) return null;
   const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, startedAtMs, mtimeMs, cwd, transcriptCwd: metaCwd, options, promptMatches: entry.promptMatches });
-  return { provider: "codex", path, sessionId, ...(startedAtMs !== undefined ? { startedAtMs } : {}), mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
+  return {
+    provider: "codex",
+    path,
+    sessionId,
+    ...(startedAtMs !== undefined ? { startedAtMs } : {}),
+    mtimeMs,
+    rows,
+    score,
+    matchedBy,
+    ...(title ? { title, titleKind } : {}),
+  };
 }
 
 type CodexConversationRole = "user" | "assistant";
@@ -116,16 +133,17 @@ function codexSessionStartMs(rows: TranscriptRow[]): number | null {
   return transcriptStartMs(rows);
 }
 
-function extractCodexTitle(rawRows: TranscriptRow[], rows: TranscriptRow[]): string | undefined {
+function extractCodexTitle(rawRows: TranscriptRow[], rows: TranscriptRow[]): Pick<TranscriptFile, "title" | "titleKind"> {
   for (let i = rawRows.length - 1; i >= 0; i -= 1) {
     const payload = objectPayload(rawRows[i]);
     const title = firstTitleField(payload, ["title", "conversation_title", "conversationTitle", "thread_title", "threadTitle"]);
-    if (title) return title;
+    if (title) return { title, titleKind: "generated" };
   }
 
   // Note: turn_context/session_meta payload.summary is the reasoning-summary
   // MODE ("auto"), not a conversation summary — never use it as a title.
-  return firstUserPromptTitle(rows);
+  const fallback = firstUserPromptTitle(rows);
+  return fallback ? { title: fallback, titleKind: "fallback" } : {};
 }
 
 function firstTitleField(object: Record<string, unknown> | undefined, keys: string[]): string | undefined {

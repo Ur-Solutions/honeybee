@@ -149,6 +149,14 @@ export type SessionRecord = {
   title?: string;
   /** Who set `title`: user beats auto beats provider (see naming.ts). */
   titleSource?: "user" | "auto" | "provider";
+  /**
+   * Provenance within titleSource:"provider". A fallback is Honeybee's
+   * provisional first-prompt label and remains eligible for semantic naming;
+   * generated means explicit provider title metadata. Kept separate from
+   * titleSource so older Honeybee binaries preserve it as an unknown field
+   * during mixed-version rollouts instead of dropping a new enum value.
+   */
+  providerTitleKind?: "generated" | "fallback";
   /** Timestamp of the auto-titler's most recent attempt (claim + backoff key). */
   autoTitleAt?: string;
   /** How many times the auto-titler has attempted this bee (retry cap). */
@@ -547,6 +555,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "launcherPgid",
   "poolMember",
   "titleSource",
+  "providerTitleKind",
   "autoTitleAttempts",
   "runtimeGeneration",
   "buzAccept",
@@ -661,6 +670,9 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
 
   if (object.titleSource === "user" || object.titleSource === "auto" || object.titleSource === "provider") {
     record.titleSource = object.titleSource;
+  }
+  if (object.providerTitleKind === "generated" || object.providerTitleKind === "fallback") {
+    record.providerTitleKind = object.providerTitleKind;
   }
 
   if (typeof object.autoTitleAttempts === "number" && Number.isFinite(object.autoTitleAttempts)) {

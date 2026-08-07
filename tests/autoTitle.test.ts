@@ -77,10 +77,12 @@ test("isAutoTitleCandidate: untitled and unattempted is eligible", () => {
   assert.equal(isAutoTitleCandidate(bee(), NOW), true);
 });
 
-test("isAutoTitleCandidate: any existing title (or source) is done", () => {
+test("isAutoTitleCandidate: authoritative titles are done; provider fallbacks remain eligible", () => {
   assert.equal(isAutoTitleCandidate(bee({ title: "x" }), NOW), false);
   assert.equal(isAutoTitleCandidate(bee({ titleSource: "auto" }), NOW), false);
   assert.equal(isAutoTitleCandidate(bee({ titleSource: "user", title: "x" }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({ titleSource: "provider", title: "Provider title" }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({ titleSource: "provider", providerTitleKind: "fallback", title: "Raw first prompt" }), NOW), true);
 });
 
 test("isAutoTitleCandidate: historical records are never rescanned", () => {
@@ -122,6 +124,26 @@ test("auto-title: claims (attempt #1), generates in the background, reports next
   // Titled now — no further attempts.
   assert.deepEqual(await dispatch([store.get(record.name)!]), []);
   assert.equal(capture.claims.length, 1);
+});
+
+test("auto-title: replaces a provisional provider fallback after the first exchange", async () => {
+  const record = bee({
+    title: "You are inside Apiary, a desktop workspace...",
+    titleSource: "provider",
+    providerTitleKind: "fallback",
+  });
+  const store = new Map([[record.name, record]]);
+  const capture: Capture = { claims: [], updates: [] };
+  const dispatch = createAutoTitleDispatcher(buildDeps({ store, capture }));
+
+  await dispatch([record]);
+  await settle();
+  const outcomes = await dispatch([store.get(record.name)!]);
+
+  assert.deepEqual(outcomes, [{ bee: record.name, ok: true, title: "Generated title" }]);
+  assert.equal(store.get(record.name)?.title, "Generated title");
+  assert.equal(store.get(record.name)?.titleSource, "auto");
+  assert.equal(store.get(record.name)?.providerTitleKind, undefined);
 });
 
 test("auto-title: skips already-titled and capped bees", async () => {
@@ -248,8 +270,32 @@ test("auto-title: a user title set during generation wins", async () => {
 
   const outcomes = await dispatch([store.get(record.name)!]);
   assert.equal(outcomes[0]?.ok, false);
-  assert.match(outcomes[0]?.skipped ?? "", /user title/);
+  assert.match(outcomes[0]?.skipped ?? "", /authoritative title/);
   assert.equal(store.get(record.name)?.title, "Mine");
+});
+
+test("auto-title: explicit provider metadata arriving during generation wins", async () => {
+  const record = bee({ title: "Raw first prompt", titleSource: "provider", providerTitleKind: "fallback" });
+  const store = new Map([[record.name, record]]);
+  const capture: Capture = { claims: [], updates: [] };
+  let release!: (value: string) => void;
+  const gate = new Promise<string>((resolve) => { release = resolve; });
+  const dispatch = createAutoTitleDispatcher(buildDeps({ store, capture, generate: () => gate }));
+
+  await dispatch([record]);
+  store.set(record.name, {
+    ...store.get(record.name)!,
+    title: "Provider AI Title",
+    titleSource: "provider",
+    providerTitleKind: "generated",
+  });
+  release("Generated title");
+  await settle();
+
+  const outcomes = await dispatch([store.get(record.name)!]);
+  assert.equal(outcomes[0]?.ok, false);
+  assert.match(outcomes[0]?.skipped ?? "", /authoritative title/);
+  assert.equal(store.get(record.name)?.title, "Provider AI Title");
 });
 
 test("auto-title: a never-settling generation is freed by the watchdog, not wedged forever", async () => {

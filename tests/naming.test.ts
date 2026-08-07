@@ -218,6 +218,50 @@ test("gatherTitleContext: requireExchange ignores cwd-only transcript matches", 
   });
 });
 
+test("gatherTitleContext: preserves a task at the tail of a long launcher preamble", async () => {
+  await withTempStore(async () => {
+    const home = await mkdtemp(join(tmpdir(), "hive-naming-apiary-preamble-"));
+    try {
+      const cwd = join(home, "workspace");
+      const sessionDir = join(home, "sessions", "2026", "08", "07");
+      const transcriptPath = join(sessionDir, "rollout-2026-08-07T09-00-00-session-own.jsonl");
+      const firstUser = [
+        "<hive-session>You are a Honeybee bee.</hive-session>",
+        "You are inside Apiary, a desktop workspace with the apiary MCP server connected.",
+        `Launcher instructions: ${"x".repeat(900)}`,
+        "ACTUAL TASK: Fix automatic naming so it captures thread intent.",
+      ].join("\n\n");
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        transcriptPath,
+        [
+          JSON.stringify({ type: "session_meta", payload: { id: "session-own", cwd, timestamp: "2026-08-07T09:00:00.000Z" } }),
+          JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: firstUser } }),
+          JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "I will repair the automatic naming pipeline." } }),
+        ].join("\n") + "\n",
+      );
+
+      const context = await gatherTitleContext(bee({
+        agent: "codex",
+        cwd,
+        command: "codex",
+        homePath: home,
+        transcriptPath,
+        providerSessionId: "session-own",
+        createdAt: "2026-08-07T09:00:00.000Z",
+      }), { requireExchange: true });
+
+      assert.ok(context?.firstUser);
+      assert.equal(context.firstUser.length, 700);
+      assert.match(context.firstUser, /^You are inside Apiary/);
+      assert.match(context.firstUser, /ACTUAL TASK: Fix automatic naming so it captures thread intent\.$/);
+      assert.match(context.firstUser, / … /);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
 /* ------------------------------ generation ------------------------------ */
 
 test("generateTitle normalizes runner output and threads the prompt through", async () => {
@@ -245,8 +289,12 @@ test("generateTitle throws when the runner yields nothing usable", async () => {
 
 /* ------------------- provider title precedence on sync ------------------ */
 
-function tx(title: string, matchedBy: string[] = ["session-id"]): TranscriptFile {
-  return { provider: "claude", path: "/tmp/t.jsonl", sessionId: "s1", mtimeMs: 1, rows: [], score: 0, matchedBy, title };
+function tx(
+  title: string,
+  matchedBy: string[] = ["session-id"],
+  titleKind: TranscriptFile["titleKind"] = "generated",
+): TranscriptFile {
+  return { provider: "claude", path: "/tmp/t.jsonl", sessionId: "s1", mtimeMs: 1, rows: [], score: 0, matchedBy, title, titleKind };
 }
 
 test("persistSessionTranscriptMetadata: provider titles untitled records and stamps the source", async () => {
@@ -268,6 +316,44 @@ test("persistSessionTranscriptMetadata: provider keeps refreshing provider/legac
     const stored = await loadSession(record.name);
     assert.equal(stored?.title, "Newer provider title");
     assert.equal(stored?.titleSource, "provider");
+  });
+});
+
+test("persistSessionTranscriptMetadata: first-prompt titles are provisional and legacy fallbacks are reclassified", async () => {
+  await withTempStore(async () => {
+    const fresh = bee({ name: "CL.fresh-fallback" });
+    await saveSession(fresh);
+    await persistSessionTranscriptMetadata(fresh, tx("You are inside Apiary...", ["session-id"], "fallback"));
+    const freshStored = await loadSession(fresh.name);
+    assert.equal(freshStored?.titleSource, "provider");
+    assert.equal(freshStored?.providerTitleKind, "fallback");
+
+    const legacy = bee({
+      name: "CL.legacy-fallback",
+      title: "You are inside Apiary...",
+      titleSource: "provider",
+    });
+    await saveSession(legacy);
+    await persistSessionTranscriptMetadata(legacy, {
+      ...tx("You are inside Apiary...", ["session-id"], "fallback"),
+      path: "/tmp/legacy-fallback.jsonl",
+      sessionId: "s2",
+    });
+    const legacyStored = await loadSession(legacy.name);
+    assert.equal(legacyStored?.titleSource, "provider");
+    assert.equal(legacyStored?.providerTitleKind, "fallback");
+  });
+});
+
+test("persistSessionTranscriptMetadata: explicit provider metadata upgrades a provisional fallback", async () => {
+  await withTempStore(async () => {
+    const record = bee({ title: "Raw first prompt", titleSource: "provider", providerTitleKind: "fallback" });
+    await saveSession(record);
+    await persistSessionTranscriptMetadata(record, tx("Provider AI Title"));
+    const stored = await loadSession(record.name);
+    assert.equal(stored?.title, "Provider AI Title");
+    assert.equal(stored?.titleSource, "provider");
+    assert.equal(stored?.providerTitleKind, "generated");
   });
 });
 

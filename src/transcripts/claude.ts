@@ -35,15 +35,16 @@ async function loadClaudeTranscript(path: string, options: TranscriptLookupOptio
   const startedAtMs = transcriptStartMs(rows) ?? undefined;
   const { score, matchedBy } = scoreTranscript({ rows, path, sessionId, startedAtMs, mtimeMs, options, promptMatches: entry.promptMatches });
   const title = memoizedDerived(entry, "claude-title", () => extractClaudeTitle(rows));
-  return { provider: "claude", path, sessionId, ...(startedAtMs !== undefined ? { startedAtMs } : {}), mtimeMs, rows, score, matchedBy, ...(title ? { title } : {}) };
+  return { provider: "claude", path, sessionId, ...(startedAtMs !== undefined ? { startedAtMs } : {}), mtimeMs, rows, score, matchedBy, ...(title ?? {}) };
 }
 
-function extractClaudeTitle(rows: TranscriptRow[]): string | undefined {
+function extractClaudeTitle(rows: TranscriptRow[]): Pick<TranscriptFile, "title" | "titleKind"> | undefined {
   for (let i = rows.length - 1; i >= 0; i -= 1) {
     const row = rows[i]!;
     if (row.type !== "ai-title") continue;
     const title = normalizeTitleCandidate(row.aiTitle);
-    if (title) return title;
+    if (title) return { title, titleKind: "generated" };
   }
-  return firstUserPromptTitle(rows);
+  const fallback = firstUserPromptTitle(rows);
+  return fallback ? { title: fallback, titleKind: "fallback" } : undefined;
 }

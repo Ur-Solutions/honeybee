@@ -125,9 +125,23 @@ async function persistFields(
   if (allowMetadata) {
     if (tx.path !== record.transcriptPath) fields.transcriptPath = tx.path;
     if (tx.sessionId !== record.providerSessionId) fields.providerSessionId = tx.sessionId;
-    if (tx.title && tx.title !== record.title && canWriteTitle(record, "provider")) {
+    const incomingTitleKind = tx.titleKind ?? "generated";
+    // Records written before title provenance was split called both explicit
+    // provider metadata and raw prompt fallbacks "provider". When the current
+    // adapter derives the exact same title as a fallback, reclassify it so the
+    // semantic auto-titler can repair existing running sessions too.
+    const legacyFallback = tx.title && tx.title === record.title &&
+      record.titleSource === "provider" && !record.providerTitleKind && incomingTitleKind === "fallback";
+    if (legacyFallback) {
+      fields.providerTitleKind = "fallback";
+    } else if (
+      tx.title &&
+      (tx.title !== record.title || record.titleSource !== "provider" || record.providerTitleKind !== incomingTitleKind) &&
+      canWriteTitle(record, "provider")
+    ) {
       fields.title = tx.title;
       fields.titleSource = "provider";
+      fields.providerTitleKind = incomingTitleKind;
     }
   }
   if (options.markRunning && record.status !== "running") fields.status = "running";
