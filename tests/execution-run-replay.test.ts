@@ -296,6 +296,11 @@ test("legacy terminal fixtures canonicalize to the reservation winner and reset 
       const repaired = reset.result.events as unknown as StoredRunEvent[];
       assert.deepEqual(repaired.map((event) => event.seq), repaired.map((_, index) => index + 1));
       assert.equal(
+        reset.result.nextAfterSeq,
+        oldHead + 1,
+        `${fixture.label}: the canonical terminal generation advances beyond every invalidated cursor`,
+      );
+      assert.equal(
         (repaired[0]!.payload as JsonObject).cursorResetThroughSeq,
         oldHead,
         `${fixture.label}: accepted prefix resets every old cursor through the legacy head`,
@@ -307,8 +312,25 @@ test("legacy terminal fixtures canonicalize to the reservation winner and reset 
       } else {
         assert.notEqual(terminal[0]!.eventId, fixture.terminals[0].eventId, "a wrong fact cannot keep its published identity");
       }
+      const repairMarkers = repaired.filter((event) => event.type === "surface.intent.proposed");
+      assert.equal(
+        repairMarkers.length,
+        fixture.terminals.length,
+        `${fixture.label}: rewrite adds only enough projection-neutral markers to outgrow the old head`,
+      );
       assert.deepEqual(
-        repaired.slice(-2).map((event) => [event.type, event.eventId]),
+        repairMarkers.map((event) => event.payload),
+        repairMarkers.map((_, index) => ({
+          intent: "execution-history-rebased",
+          key: `execution-history-rebased:${oldHead}:${index + 1}`,
+          cursorResetThroughSeq: oldHead,
+          ordinal: index + 1,
+          count: fixture.terminals.length,
+        })),
+      );
+      assert.deepEqual(
+        repaired.filter((event) => ["environment.sealed", "environment.released"].includes(event.type))
+          .map((event) => [event.type, event.eventId]),
         [
           ["environment.sealed", "legacy-environment-sealed"],
           ["environment.released", "legacy-environment-released"],
@@ -316,6 +338,16 @@ test("legacy terminal fixtures canonicalize to the reservation winner and reset 
         `${fixture.label}: legal post-terminal retain/release history survives the rewrite`,
       );
       for (const event of repaired) assert.deepEqual(validator.validate("run-event", event).errors, [], event.type);
+
+      const continued = await service.runEvents({
+        protocolVersion: "0.1",
+        runId: "run-0001",
+        afterSeq: reset.result.nextAfterSeq,
+        limit: 1,
+      });
+      assert.ok("result" in continued, fixture.label);
+      assert.deepEqual(continued.result.events, [], fixture.label);
+      assert.equal(continued.result.nextAfterSeq, oldHead + 1, fixture.label);
 
       await service.runGet({ protocolVersion: "0.1", runId: "run-0001" });
       assert.deepEqual(await readRunEvents("run-0001"), repaired, `${fixture.label}: canonical repair is idempotent`);

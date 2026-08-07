@@ -20,6 +20,7 @@ import {
   readReservation,
   readRunEvents,
   runDir,
+  runKey,
   type RunEventInput,
 } from "../src/execution/runStore.js";
 import { validateRunStart } from "../src/execution/runStart.js";
@@ -440,7 +441,7 @@ test("crash recovery: reserved-not-started relaunches once on identical retry", 
   });
 });
 
-test("reconcile migrates pre-upgrade missing or late run.accepted to the first legal event", async () => {
+test("reconcile migrates pre-upgrade missing or late run.accepted to a generation-safe legal prefix", async () => {
   for (const acceptedLate of [false, true]) {
     await withTempStore(async () => {
       const ctx = await installTestAuthority();
@@ -479,8 +480,9 @@ test("reconcile migrates pre-upgrade missing or late run.accepted to the first l
         "environment.materializing",
         "harness.starting",
         "run.failed",
+        ...(acceptedLate ? ["surface.intent.proposed"] : []),
       ]);
-      assert.deepEqual(events.map((event) => event.seq), [1, 2, 3, 4]);
+      assert.deepEqual(events.map((event) => event.seq), events.map((_, index) => index + 1));
       assert.equal(new Set(events.map((event) => event.eventId)).size, events.length);
       assert.deepEqual(events[0]!.payload, {
         effectKey: staged.effectKey,
@@ -488,7 +490,7 @@ test("reconcile migrates pre-upgrade missing or late run.accepted to the first l
         cursorResetThroughSeq: legacyHead,
       });
       assert.deepEqual(
-        events.filter((event) => event.type !== "run.accepted").map((event) => event.eventId),
+        events.filter((event) => !["run.accepted", "surface.intent.proposed"].includes(event.type)).map((event) => event.eventId),
         legacyEvents.filter((event) => event.type !== "run.accepted").map((event) => event.eventId),
         "accepted-prefix repair preserves every previously published event identity",
       );
@@ -498,12 +500,157 @@ test("reconcile migrates pre-upgrade missing or late run.accepted to the first l
           legacyEvents.find((event) => event.type === "run.accepted")!.eventId,
           "a late accepted receipt keeps its published identity when moved to the legal prefix",
         );
+        assert.equal(events.at(-1)!.seq, legacyHead + 1, "the repaired head is beyond every invalidated legacy cursor");
+        assert.deepEqual(events.at(-1)!.payload, {
+          intent: "execution-history-rebased",
+          key: `execution-history-rebased:${legacyHead}:1`,
+          cursorResetThroughSeq: legacyHead,
+          ordinal: 1,
+          count: 1,
+        });
+        assert.equal(
+          events.at(-1)!.eventId,
+          `evt-${runKey(staged.runId)}-history-rebased-${legacyHead}-1`,
+          "the projection-neutral repair notification has a deterministic identity",
+        );
       }
       const page = await service.runEvents({ protocolVersion: "0.1", runId: staged.runId, afterSeq: 0 });
       assert.ok("result" in page);
       assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
     });
   }
+});
+
+test("late accepted at the legacy head or middle resets partial/full cursors and then polls empty across restart", async () => {
+  for (const placement of ["head", "middle"] as const) {
+    await withTempStore(async () => {
+      const ctx = await installTestAuthority();
+      const staged = await stageReservation(ctx, buildRunStartEnvelope(ctx));
+      const finishedAt = new Date().toISOString();
+      await mutateReservation(staged.runId, (record) => ({
+        ...record,
+        phase: "failed",
+        failedAt: finishedAt,
+        failureCause: "HARNESS_UNAVAILABLE: legacy crash",
+        result: { outcome: "failed", cause: "HARNESS_UNAVAILABLE: legacy crash", finishedAt },
+      }));
+      const nodeId = (await requireExecutionBinding()).nodeId;
+      const accepted: RunEventInput = {
+        type: "run.accepted",
+        payload: { effectKey: staged.effectKey, receiptId: staged.receipt.receiptId },
+        origin: { nodeId },
+      };
+      const materializing: RunEventInput = { type: "environment.materializing", payload: {}, origin: { nodeId } };
+      const starting: RunEventInput = {
+        type: "harness.starting",
+        payload: { operationId: staged.runId },
+        origin: { nodeId },
+      };
+      const failed: RunEventInput = {
+        type: "run.failed",
+        payload: { cause: "HARNESS_UNAVAILABLE: legacy crash" },
+        origin: { nodeId },
+      };
+      await writePreUpgradeEventLog(
+        staged.runId,
+        "0.1",
+        placement === "head"
+          ? [materializing, starting, failed, accepted]
+          : [materializing, accepted, starting, failed],
+      );
+      const legacy = await readRunEvents(staged.runId);
+      const oldHead = legacy.at(-1)!.seq;
+      const counting = countingLauncher();
+      const service = makeService({ launcher: counting.launcher });
+
+      for (const cursor of [2, oldHead]) {
+        const stale = await service.runEvents({ protocolVersion: "0.1", runId: staged.runId, afterSeq: cursor, limit: 1 });
+        assert.ok("error" in stale, `${placement} cursor ${cursor}`);
+        assert.equal(stale.error.code, "CURSOR_EXPIRED", `${placement} cursor ${cursor}`);
+        assert.deepEqual(stale.error.checkpoint, { nextSeq: 0 });
+      }
+
+      const reset = await service.runEvents({ protocolVersion: "0.1", runId: staged.runId, afterSeq: 0, limit: 1 });
+      assert.ok("result" in reset);
+      assert.equal(reset.result.nextAfterSeq, oldHead + 1, placement);
+      const repaired = reset.result.events as unknown as Array<{ seq: number; eventId: string; type: string }>;
+      assert.equal(repaired.at(-1)!.type, "surface.intent.proposed");
+      assert.deepEqual(validator.validate("run-events-page", reset.result).errors, [], placement);
+      for (const event of repaired) assert.deepEqual(validator.validate("run-event", event).errors, [], event.type);
+
+      const restarted = makeService({ launcher: counting.launcher });
+      const continued = await restarted.runEvents({
+        protocolVersion: "0.1",
+        runId: staged.runId,
+        afterSeq: reset.result.nextAfterSeq,
+        limit: 1,
+      });
+      assert.ok("result" in continued, placement);
+      assert.deepEqual(continued.result.events, [], placement);
+      assert.equal(continued.result.nextAfterSeq, oldHead + 1, placement);
+      assert.equal(counting.calls.length, 0, "history repair never repeats the launch side effect");
+
+      const beforeReplay = await readRunEvents(staged.runId);
+      await restarted.runGet({ protocolVersion: "0.1", runId: staged.runId });
+      assert.deepEqual(await readRunEvents(staged.runId), beforeReplay, `${placement}: repair is restart-idempotent`);
+      assert.deepEqual(
+        beforeReplay.filter((event) => event.type !== "surface.intent.proposed").map((event) => event.eventId),
+        [legacy[placement === "head" ? 3 : 1]!.eventId, ...legacy.filter((event) => event.type !== "run.accepted").map((event) => event.eventId)],
+        `${placement}: every legacy event keeps its identity while accepted moves to seq 1`,
+      );
+    });
+  }
+});
+
+test("a restart self-heals the old equal-head reset generation once", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const staged = await stageReservation(ctx, buildRunStartEnvelope(ctx));
+    const finishedAt = new Date().toISOString();
+    await mutateReservation(staged.runId, (record) => ({
+      ...record,
+      phase: "failed",
+      failedAt: finishedAt,
+      failureCause: "HARNESS_UNAVAILABLE: legacy crash",
+      result: { outcome: "failed", cause: "HARNESS_UNAVAILABLE: legacy crash", finishedAt },
+    }));
+    const nodeId = (await requireExecutionBinding()).nodeId;
+    const oldHead = 4;
+    await writePreUpgradeEventLog(staged.runId, "0.1", [
+      {
+        type: "run.accepted",
+        payload: {
+          effectKey: staged.effectKey,
+          receiptId: staged.receipt.receiptId,
+          cursorResetThroughSeq: oldHead,
+        },
+        origin: { nodeId },
+      },
+      { type: "environment.materializing", payload: {}, origin: { nodeId } },
+      { type: "harness.starting", payload: { operationId: staged.runId }, origin: { nodeId } },
+      { type: "run.failed", payload: { cause: "HARNESS_UNAVAILABLE: legacy crash" }, origin: { nodeId } },
+    ]);
+
+    const restarted = makeService();
+    const stale = await restarted.runEvents({ protocolVersion: "0.1", runId: staged.runId, afterSeq: oldHead });
+    assert.ok("error" in stale);
+    assert.equal(stale.error.code, "CURSOR_EXPIRED");
+    const reset = await restarted.runEvents({ protocolVersion: "0.1", runId: staged.runId, afterSeq: 0 });
+    assert.ok("result" in reset);
+    assert.equal(reset.result.nextAfterSeq, oldHead + 1);
+    const once = await readRunEvents(staged.runId);
+    assert.equal(once.filter((event) => event.type === "surface.intent.proposed").length, 1);
+
+    const empty = await makeService().runEvents({
+      protocolVersion: "0.1",
+      runId: staged.runId,
+      afterSeq: oldHead + 1,
+    });
+    assert.ok("result" in empty);
+    assert.deepEqual(empty.result.events, []);
+    assert.equal(empty.result.nextAfterSeq, oldHead + 1);
+    assert.deepEqual(await readRunEvents(staged.runId), once, "restart does not append a second repair marker");
+  });
 });
 
 test("accepted-prefix migration explicitly resets a persisted pre-upgrade cursor", async () => {

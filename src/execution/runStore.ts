@@ -849,6 +849,8 @@ export async function readRunEvents(runId: string): Promise<StoredRunEvent[]> {
  * discarded exactly like appendRunEvents does before the rewrite.
  */
 const ACCEPTED_CURSOR_RESET_FIELD = "cursorResetThroughSeq";
+const HISTORY_REBASE_EVENT_TYPE = "surface.intent.proposed";
+const HISTORY_REBASE_INTENT = "execution-history-rebased";
 
 function acceptedSemanticPayload(payload: JsonValue): JsonValue {
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return payload;
@@ -863,6 +865,90 @@ export function acceptedCursorResetThroughSeq(events: StoredRunEvent[]): number 
       typeof accepted.payload !== "object" || Array.isArray(accepted.payload)) return null;
   const value = (accepted.payload as JsonObject)[ACCEPTED_CURSOR_RESET_FIELD];
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : null;
+}
+
+/**
+ * Finish one rewritten numeric-cursor generation without inventing a Run
+ * state transition. `surface.intent.proposed` is already optional protocol
+ * vocabulary and projection-neutral in Apiary; here it truthfully notifies a
+ * consumer that the execution history was rebased. The markers are durable,
+ * deterministic, and have no execution side effect.
+ *
+ * A v1 cursor has no generation token, so the repaired physical head itself
+ * must be strictly greater than every cursor invalidated by the rewrite. One
+ * marker normally suffices; a terminal-family repair can remove several stale
+ * members, so append the minimum number required to restore that invariant.
+ */
+function finishRewrittenEventGeneration(
+  runId: string,
+  protocolVersion: string,
+  candidate: StoredRunEvent[],
+  resetThroughSeq: number,
+  markerOrigin: RunEventInput["origin"],
+  ingestedAt: string,
+): { events: StoredRunEvent[]; markers: StoredRunEvent[] } {
+  const accepted = candidate[0];
+  if (
+    !accepted ||
+    accepted.type !== "run.accepted" ||
+    accepted.payload === null ||
+    typeof accepted.payload !== "object" ||
+    Array.isArray(accepted.payload)
+  ) {
+    throw executionError(
+      "AUTHORITY_UNAVAILABLE",
+      `run ${runId} cannot reset a rewritten event generation without its canonical accepted prefix`,
+    );
+  }
+  if (!Number.isSafeInteger(resetThroughSeq) || resetThroughSeq < 1) {
+    throw executionError("AUTHORITY_UNAVAILABLE", `run ${runId} carries an invalid event-generation reset watermark`);
+  }
+
+  const rewritten: StoredRunEvent[] = [
+    {
+      ...accepted,
+      payload: {
+        ...(accepted.payload as JsonObject),
+        [ACCEPTED_CURSOR_RESET_FIELD]: resetThroughSeq,
+      },
+    },
+    ...candidate.slice(1),
+  ];
+  const markerCount = Math.max(0, resetThroughSeq + 1 - rewritten.length);
+  const occupiedIds = new Set(rewritten.map((event) => event.eventId));
+  const markers: StoredRunEvent[] = [];
+  for (let ordinal = 1; ordinal <= markerCount; ordinal += 1) {
+    const eventId = `evt-${runKey(runId)}-history-rebased-${resetThroughSeq}-${ordinal}`;
+    if (occupiedIds.has(eventId)) {
+      throw executionError("AUTHORITY_UNAVAILABLE", `run ${runId} event-history repair marker identity collides with durable history`);
+    }
+    occupiedIds.add(eventId);
+    markers.push({
+      protocolVersion,
+      runId,
+      seq: 0,
+      eventId,
+      type: HISTORY_REBASE_EVENT_TYPE,
+      occurredAt: ingestedAt,
+      ingestedAt,
+      origin: markerOrigin,
+      payload: {
+        intent: HISTORY_REBASE_INTENT,
+        key: `${HISTORY_REBASE_INTENT}:${resetThroughSeq}:${ordinal}`,
+        [ACCEPTED_CURSOR_RESET_FIELD]: resetThroughSeq,
+        ordinal,
+        count: markerCount,
+      },
+    });
+  }
+  const events = [...rewritten, ...markers].map((event, index) => ({ ...event, seq: index + 1 }));
+  if (events.at(-1)!.seq <= resetThroughSeq) {
+    throw executionError(
+      "AUTHORITY_UNAVAILABLE",
+      `run ${runId} rewritten event generation did not advance beyond cursor ${resetThroughSeq}`,
+    );
+  }
+  return { events, markers };
 }
 
 export async function ensureRunAcceptedFirst(
@@ -883,6 +969,29 @@ export async function ensureRunAcceptedFirst(
     }
     const alreadyCanonical = accepted.length === 1 && log.events[0]?.type === "run.accepted";
     if (alreadyCanonical) {
+      const resetThroughSeq = acceptedCursorResetThroughSeq(log.events);
+      if (resetThroughSeq !== null && (log.events.at(-1)?.seq ?? 0) <= resetThroughSeq) {
+        // Self-heal generations written by the first reset implementation:
+        // moving a late accepted receipt to seq 1 did not grow the log, so a
+        // reset replay returned the same numeric cursor it then expired.
+        const repaired = finishRewrittenEventGeneration(
+          runId,
+          protocolVersion,
+          log.events,
+          resetThroughSeq,
+          input.origin,
+          new Date().toISOString(),
+        );
+        await atomicWriteFile(
+          eventsPath(runId),
+          repaired.events.map((event) => `${JSON.stringify(event)}\n`).join(""),
+          { mode: 0o600 },
+        );
+        // Match the established contract for an actual rewrite: callers get
+        // the complete repaired generation, while a no-op canonical replay
+        // still returns []. The service intentionally ignores this detail.
+        return repaired.events;
+      }
       if (log.tornTail) {
         // Preserve the byte-stable accepted receipt and every complete event;
         // only discard the torn suffix. Re-minting seq-1 here would change its
@@ -895,8 +1004,10 @@ export async function ensureRunAcceptedFirst(
     const ingestedAt = new Date().toISOString();
     const oldHead = log.events.length > 0 ? log.events[log.events.length - 1]!.seq : 0;
     const previousAccepted = accepted[0];
-    const resetPayload = oldHead > 0 && input.payload !== null && typeof input.payload === "object" && !Array.isArray(input.payload)
-      ? { ...(input.payload as JsonObject), [ACCEPTED_CURSOR_RESET_FIELD]: oldHead }
+    const previousReset = previousAccepted ? acceptedCursorResetThroughSeq([previousAccepted]) : null;
+    const resetThroughSeq = Math.max(oldHead, previousReset ?? 0);
+    const resetPayload = resetThroughSeq > 0 && input.payload !== null && typeof input.payload === "object" && !Array.isArray(input.payload)
+      ? { ...(input.payload as JsonObject), [ACCEPTED_CURSOR_RESET_FIELD]: resetThroughSeq }
       : input.payload;
     const prefix: StoredRunEvent = {
       protocolVersion,
@@ -909,10 +1020,13 @@ export async function ensureRunAcceptedFirst(
       payload: resetPayload,
       type: "run.accepted",
     };
-    const migrated = [prefix, ...log.events.filter((event) => event.type !== "run.accepted")].map((event, index) => ({
+    const candidate = [prefix, ...log.events.filter((event) => event.type !== "run.accepted")].map((event, index) => ({
       ...event,
       seq: index + 1,
     }));
+    const migrated = resetThroughSeq > 0
+      ? finishRewrittenEventGeneration(runId, protocolVersion, candidate, resetThroughSeq, input.origin, ingestedAt).events
+      : candidate;
     await atomicWriteFile(eventsPath(runId), migrated.map((event) => `${JSON.stringify(event)}\n`).join(""), { mode: 0o600 });
     return migrated;
   });
@@ -1114,38 +1228,23 @@ export async function appendRunTerminalEvents(
           canonical,
           ...nonTerminal.slice(insertionIndex),
         ];
-        const accepted = migrated[0];
-        if (
-          !accepted ||
-          accepted.type !== "run.accepted" ||
-          accepted.payload === null ||
-          typeof accepted.payload !== "object" ||
-          Array.isArray(accepted.payload)
-        ) {
-          throw executionError(
-            "AUTHORITY_UNAVAILABLE",
-            `run ${current.runId} cannot reset a repaired terminal generation without its canonical accepted prefix`,
-          );
-        }
-        const previousReset = (accepted.payload as JsonObject)[ACCEPTED_CURSOR_RESET_FIELD];
-        migrated[0] = {
-          ...accepted,
-          payload: {
-            ...(accepted.payload as JsonObject),
-            [ACCEPTED_CURSOR_RESET_FIELD]: Math.max(
-              oldHead,
-              typeof previousReset === "number" && Number.isSafeInteger(previousReset) ? previousReset : 0,
-            ),
-          },
-        };
-        const resequenced = migrated.map((event, index) => ({ ...event, seq: index + 1 }));
+        const previousReset = acceptedCursorResetThroughSeq(migrated);
+        const resetThroughSeq = Math.max(oldHead, previousReset ?? 0);
+        const repaired = finishRewrittenEventGeneration(
+          current.runId,
+          protocolVersion,
+          migrated,
+          resetThroughSeq,
+          eventOrigin,
+          ingestedAt,
+        );
         await atomicWriteFile(
           eventsPath(current.runId),
-          resequenced.map((event) => `${JSON.stringify(event)}\n`).join(""),
+          repaired.events.map((event) => `${JSON.stringify(event)}\n`).join(""),
           { mode: 0o600 },
         );
-        const repairedIds = new Set([...insertedPrecursors, canonical].map((event) => event.eventId));
-        return resequenced.filter((event) => repairedIds.has(event.eventId));
+        const repairedIds = new Set([...insertedPrecursors, canonical, ...repaired.markers].map((event) => event.eventId));
+        return repaired.events.filter((event) => repairedIds.has(event.eventId));
       }
 
       const present = new Set(log.events.map((event) => event.type));
