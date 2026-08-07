@@ -731,16 +731,24 @@ export async function deleteSession(name: string) {
   // daemon persists observed state constantly) can't recreate the record file
   // right after we remove it, resurrecting a zombie bee in `hive ls`.
   await withSessionLock(name, async () => {
-    const paths = captureStorePaths();
-    await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
-      // Deletion is explicit purge. Remove canonical files first, then the
-      // derived name: a crash leaves only a stale index entry, never a hidden
-      // record that could still own a live runtime.
-      await rm(join(paths.currentDir, `${safeName(name)}.json`), { force: true });
-      await rm(join(paths.legacyDir, `${safeName(name)}.json`), { force: true });
-      await updateActiveMembershipLocked(paths, name, false);
-    }, { timeoutMs: 60_000 });
+    await deleteSessionLocked(name);
   });
+}
+
+/**
+ * Delete a record WITHOUT acquiring its session lock. Only lifecycle purge
+ * commits and other callers already inside withSessionLock may use this.
+ */
+export async function deleteSessionLocked(name: string): Promise<void> {
+  const paths = captureStorePaths();
+  await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
+    // Deletion is explicit purge. Remove canonical files first, then the
+    // derived name: a crash leaves only a stale index entry, never a hidden
+    // record that could still own a live runtime.
+    await rm(join(paths.currentDir, `${safeName(name)}.json`), { force: true });
+    await rm(join(paths.legacyDir, `${safeName(name)}.json`), { force: true });
+    await updateActiveMembershipLocked(paths, name, false);
+  }, { timeoutMs: 60_000 });
   await appendLedger({ type: "session.delete", name, ts: new Date().toISOString() });
 }
 

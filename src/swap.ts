@@ -12,9 +12,12 @@ import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCo
 import { resumeArgsForAgent } from "./drivers.js";
 import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
 import { captureProcessBirthFingerprint, type ProcessBirthFingerprint } from "./hsr/processIdentity.js";
+import { stopHsrIncarnationByPid } from "./hsr/substrate.js";
+import { withSessionLifecycleTransaction } from "./lifecycle.js";
 import { closeRequestsForNewIncarnation } from "./requests/store.js";
-import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
+import { appendLedger, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
+import type { NewSessionResult } from "./substrates/types.js";
 import { nextRuntimeIncarnationPatch } from "./seal.js";
 import { copyThreadForFork } from "./threadCopy.js";
 
@@ -127,12 +130,11 @@ export async function swapAccount(
   const pollIntervalMs = Math.max(0, options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
   const activate = options.activate ?? activateAccountIntoHome;
 
-  return withSessionLock(record.name, async () => {
+  return withSessionLifecycleTransaction(record, async (lifecycle) => {
     // 0. Re-validate under the lock before any side effects: a concurrent
     //    kill/clean may have deleted the record, and proceeding would respawn
     //    the session and resurrect the deleted bee.
-    const current = await loadSession(record.name);
-    if (!current) throw new Error(`Session ${record.name} no longer exists; aborting swap`);
+    const current = await lifecycle.refresh();
     if (!current.homePath) {
       throw new Error(`Session ${record.name} lost its dedicated home; aborting swap`);
     }
@@ -152,10 +154,7 @@ export async function swapAccount(
     // 1. Ensure the process is stopped. The tmux session must be fully gone
     //    before we relaunch into the same target.
     if (await substrate.hasSession(current.tmuxTarget)) {
-      const killResult = await substrate.kill(current.tmuxTarget, {
-        launcherPgid: current.launcherPgid,
-        launcherFingerprint: current.launcherFingerprint,
-      });
+      const killResult = await substrate.kill(current.tmuxTarget);
       if (!killResult.ok) {
         throw new Error(`Could not stop ${record.name} before swap: ${killResult.stderr || killResult.stdout || `exit ${killResult.exitCode}`}`);
       }
@@ -210,6 +209,7 @@ export async function swapAccount(
     let launcherFingerprint: ProcessBirthFingerprint | undefined;
     let runnerPid: number | undefined;
     let runnerFingerprint: ProcessBirthFingerprint | undefined;
+    let tmuxLaunch: NewSessionResult | undefined;
     const incarnation = await nextRuntimeIncarnationPatch(current);
     try {
       await activate(account, targetHomePath);
@@ -242,6 +242,7 @@ export async function swapAccount(
       if (!current.node) await assertAgentAuthFreshForSpawn(spec, account.id);
 
       if (hsr) {
+        await lifecycle.refresh();
         runnerPid = await (options.spawnHsrHost ?? spawnHsrHost)({
           bee: current.name,
           comb: current.combId ?? current.name,
@@ -262,6 +263,7 @@ export async function swapAccount(
       } else {
         // The swap re-creates the session, so the agent runs in a fresh pane —
         // re-pin to it (the old agentPaneId is now dead).
+        await lifecycle.refresh();
         const launch = await substrate.newSession(current.tmuxTarget, current.cwd, {
           command: spec.command,
           args: spec.args,
@@ -271,8 +273,20 @@ export async function swapAccount(
         paneId = launch.paneId;
         launcherPgid = launch.launcherPgid;
         launcherFingerprint = launch.launcherFingerprint;
+        tmuxLaunch = launch;
       }
     } catch (error) {
+      // A wait/probe can fail after spawn returned. Roll back that exact host
+      // before restoring credentials; never leave a pre-commit HSR runtime
+      // alive and untracked.
+      let failure: unknown = error;
+      if (runnerPid) {
+        try {
+          await cleanupHsrSwapLaunch(current.name, runnerPid, error);
+        } catch (cleanupError) {
+          failure = cleanupError;
+        }
+      }
       // Activation happens before relaunch. A normal swap uses a distinct
       // target home, so the source was never overwritten and needs no rollback.
       // Retain the old restoration only for a deliberately custom layout where
@@ -281,35 +295,39 @@ export async function swapAccount(
         try {
           await activate(currentAccount, sourceHomePath);
         } catch (rollbackError) {
-          const original = error instanceof Error ? error.message : String(error);
+          const original = failure instanceof Error ? failure.message : String(failure);
           const rollback = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
           throw new Error(`${original}; restoring account ${currentAccount.id} also failed: ${rollback}`);
         }
       }
-      throw error;
+      throw failure;
     }
 
-    // 4. Persist the new binding and command from the under-lock snapshot so
-    //    a concurrent daemon merge (title, transcript metadata, observed
-    //    state) isn't clobbered; saveSessionLocked avoids re-acquiring the
-    //    non-reentrant session lock we already hold.
-    const updated: SessionRecord = {
-      ...current,
-      ...incarnation,
-      accountId: account.id,
-      homePath: targetHomePath,
-      providerSessionId: launchProviderSessionId,
-      ...(relocatedTranscriptPath ? { transcriptPath: relocatedTranscriptPath } : {}),
-      command: shellCommand(spec),
-      ...(paneId ? { agentPaneId: paneId } : {}),
-      launcherPgid,
-      launcherFingerprint,
-      runnerPid,
-      runnerFingerprint,
-      status: "running",
-      updatedAt: new Date().toISOString(),
-    };
-    await saveSessionLocked(updated);
+    // 4. Persist the new binding through a generation CAS. If an old binary or
+    // other non-participating writer changed lifecycle truth despite the
+    // lifecycle lock, tear down only the exact incarnation launched above.
+    let updated: SessionRecord;
+    try {
+      updated = await lifecycle.commit({
+        ...incarnation,
+        accountId: account.id,
+        homePath: targetHomePath,
+        providerSessionId: launchProviderSessionId,
+        ...(relocatedTranscriptPath ? { transcriptPath: relocatedTranscriptPath } : {}),
+        command: shellCommand(spec),
+        ...(paneId ? { agentPaneId: paneId } : {}),
+        ...(launcherPgid ? { launcherPgid } : {}),
+        ...(launcherFingerprint ? { launcherFingerprint } : {}),
+        ...(runnerPid ? { runnerPid } : {}),
+        ...(runnerFingerprint ? { runnerFingerprint } : {}),
+        status: "running",
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      if (runnerPid) await cleanupHsrSwapLaunch(current.name, runnerPid, error);
+      else if (tmuxLaunch) await cleanupTmuxSwapLaunch(substrate, current.tmuxTarget, tmuxLaunch, error);
+      throw error;
+    }
     // The swap replaced the runtime: requests opened against the previous
     // generation are superseded (next to the nextRuntimeIncarnationPatch
     // application, per docs/INTERVENTION_REQUESTS.md; the daemon reconciler
@@ -330,6 +348,29 @@ export async function swapAccount(
     });
     return updated;
   });
+}
+
+async function cleanupHsrSwapLaunch(bee: string, hostPid: number, cause: unknown): Promise<void> {
+  const stopped = await stopHsrIncarnationByPid(bee, hostPid);
+  if (stopped.ok) return;
+  const original = cause instanceof Error ? cause.message : String(cause);
+  throw new Error(`${original}; exact launched HSR swap cleanup failed: ${stopped.stderr || stopped.stdout}`);
+}
+
+async function cleanupTmuxSwapLaunch(
+  substrate: Substrate,
+  target: string,
+  launch: NewSessionResult,
+  cause: unknown,
+): Promise<void> {
+  if (!substrate.killIncarnation) {
+    const original = cause instanceof Error ? cause.message : String(cause);
+    throw new Error(`${original}; substrate ${substrate.kind} cannot clean exact launched swap pane ${launch.paneId}`);
+  }
+  const stopped = await substrate.killIncarnation(target, launch);
+  if (stopped.ok) return;
+  const original = cause instanceof Error ? cause.message : String(cause);
+  throw new Error(`${original}; exact launched tmux swap cleanup failed: ${stopped.stderr || stopped.stdout || launch.paneId}`);
 }
 
 /**

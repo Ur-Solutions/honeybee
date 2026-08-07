@@ -144,6 +144,19 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     return { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
   }
 
+  async function killIncarnation(_target: string, launch: NewSessionResult): Promise<KillResult> {
+    // Remote pane ids are server-global and exact, so this cannot select a
+    // replacement session that reused the logical bee name.
+    const result = await runTmux(["kill-pane", "-t", launch.paneId]);
+    const absent = result.exitCode === 1 && /can't find pane|no server running/i.test(result.stderr);
+    return {
+      ok: result.exitCode === 0 || absent,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: absent ? 0 : result.exitCode,
+    };
+  }
+
   // Pane-target commands (capture-pane, paste-buffer, send-keys) only honor
   // tmux's "=" exact-match prefix in the session part of a "session:" target,
   // hence the `=name:` form (exact session, active pane).
@@ -258,6 +271,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     hasSession,
     newSession,
     kill,
+    killIncarnation,
     capture,
     sendText,
     sendEnter,

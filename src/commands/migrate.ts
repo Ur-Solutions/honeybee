@@ -12,22 +12,24 @@ import { hsrObservations, readEventTail, type HsrObservation } from "../hsr/obse
 import { readPendingHsrTurns } from "../hsr/pendingTurns.js";
 import { connectRpcClient } from "../hsr/rpc.js";
 import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta } from "../hsr/runDir.js";
-import { hsrSubstrate, stopKnownHsrExecution } from "../hsr/substrate.js";
+import { hsrSubstrate, stopHsrIncarnationByPid, stopKnownHsrExecution } from "../hsr/substrate.js";
+import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
+import { withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "../lifecycle.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { waitForAgentReady } from "../readiness.js";
 import { authPromptLossRequestId } from "../requests/keys.js";
 import { closeRequestsForNewIncarnation, openRequest, readBeeRequests, resolveRequest } from "../requests/store.js";
 import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
-import { appendLedger, listSessions, storeRoot, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, listSessions, storeRoot, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
+import type { NewSessionResult, Substrate } from "../substrates/types.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
 import { formatShellCommand, hasSession } from "../tmux.js";
 import { identityRecipeForAgent, modelArgsForAgent } from "../drivers.js";
 import { deliverPromptText, resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
 import { loginSeatLiveDigest } from "./account.js";
-import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
-import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
+import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "../hsr/runnerHost.js";
 import { appendFile, readFile, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { RunnerEvent } from "../hsr/types.js";
@@ -243,10 +245,8 @@ export async function quiesceHsrBee(record: SessionRecord, now: boolean, verb = 
  * then waits until it is no longer live; SIGTERMs the host pid as a fallback.
  */
 export async function stopHsrRunner(record: SessionRecord): Promise<void> {
-  // The substrate validates the persisted host/child birth identities before
-  // every fallback signal and confirms the process group is down. A missing or
-  // legacy fingerprint is deliberately unconfirmed; never fall back to the
-  // record's recyclable numeric runnerPid here.
+  // The strict substrate path validates persisted process-birth identities
+  // before every fallback signal; never act on a recyclable numeric PID.
   const result = await stopKnownHsrExecution(record.name);
   if (!result.ok) throw new Error(result.stderr || `HSR stop unconfirmed for ${record.name}`);
 }
@@ -348,8 +348,32 @@ export async function reviveHsrRunner(
     replayLaunch?: boolean;
     activateCredentials?: boolean;
     deferRequestClosure?: boolean;
+    afterLaunch?: (launch: { kind: "hsr"; hostPid: number }) => Promise<void>;
+    spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
+    waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
+    stopHsrIncarnation?: typeof stopHsrIncarnationByPid;
   } = {},
 ): Promise<SessionRecord> {
+  return withSessionLifecycleTransaction(record, (lifecycle) =>
+    reviveHsrRunnerInTransaction(lifecycle, tool, opts));
+}
+
+async function reviveHsrRunnerInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  tool: string,
+  opts: {
+    fresh?: boolean;
+    sessionOverride?: string;
+    replayLaunch?: boolean;
+    activateCredentials?: boolean;
+    deferRequestClosure?: boolean;
+    afterLaunch?: (launch: { kind: "hsr"; hostPid: number }) => Promise<void>;
+    spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
+    waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
+    stopHsrIncarnation?: typeof stopHsrIncarnationByPid;
+  } = {},
+): Promise<SessionRecord> {
+  const record = await lifecycle.refresh();
   const adapter = adapterFor(tool);
   const fresh = opts.fresh === true;
   const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
@@ -358,7 +382,8 @@ export async function reviveHsrRunner(
     activateCredentials: opts.activateCredentials,
   });
   const incarnation = await nextRuntimeIncarnationPatch(record);
-  const hostPid = await spawnHsrHost({
+  await lifecycle.refresh();
+  const hostPid = await (opts.spawnHsrHost ?? spawnHsrHost)({
     bee: record.name,
     comb: record.combId ?? record.name,
     ...(record.parentId ? { parent: record.parentId } : {}),
@@ -372,34 +397,73 @@ export async function reviveHsrRunner(
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
   const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
-  if (!(await waitForHsrHost(record.name, 5000))) {
-    console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
+  let restored: SessionRecord;
+  try {
+    if (!(await (opts.waitForHsrHost ?? waitForHsrHost)(record.name, 5000))) {
+      console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
+    }
+    await opts.afterLaunch?.({ kind: "hsr", hostPid });
+    const runnerTier = adapter?.tier();
+    // The lifecycle CAS merges into the latest record so daemon metadata
+    // writes survive, while deletion/replacement can never fabricate a
+    // fallback row.
+    const renderedCommand = shellCommand(spec);
+    restored = await lifecycle.commit({
+      ...incarnation,
+      ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
+      substrate: "hsr",
+      runnerPid: hostPid,
+      runnerFingerprint,
+      ...(runnerTier ? { runnerTier } : {}),
+      ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
+      // Clear both halves of the provider-thread anchor. Keeping the old path
+      // lets transcript discovery re-adopt the abandoned session id moments
+      // after a successful --fresh launch.
+      ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
+      ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
+      updatedAt: new Date().toISOString(),
+      status: "running",
+    });
+  } catch (error) {
+    await confirmLaunchedHsrStopped(record.name, hostPid, error, opts.stopHsrIncarnation);
+    throw error;
   }
-  const runnerTier = adapter?.tier();
-  // Field-merge, not a full-record save, so daemon writes since `record`
-  // loaded survive; null = record deleted concurrently, nothing to persist
-  // (HIVE-49).
-  const renderedCommand = shellCommand(spec);
-  const patch: Partial<SessionRecord> = {
-    ...incarnation,
-    ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
-    substrate: "hsr",
-    runnerPid: hostPid,
-    runnerFingerprint,
-    ...(runnerTier ? { runnerTier } : {}),
-    ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
-    // Clear both halves of the provider-thread anchor. Keeping the old path
-    // lets transcript discovery re-adopt the abandoned session id moments
-    // after a successful --fresh launch.
-    ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
-    ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
-    updatedAt: new Date().toISOString(),
-    status: "running",
-  };
-  const restored = (await updateSession(record.name, patch)) ?? { ...record, ...patch };
   await writeSpawnOptions(restored);
   if (!opts.deferRequestClosure) await closeSupersededRequests(record, incarnation);
   return restored;
+}
+
+async function confirmLaunchedHsrStopped(
+  bee: string,
+  hostPid: number,
+  cause: unknown,
+  stop: typeof stopHsrIncarnationByPid = stopHsrIncarnationByPid,
+): Promise<void> {
+  const stopped = await stop(bee, hostPid);
+  if (stopped.ok) return;
+  const original = cause instanceof Error ? cause.message : String(cause);
+  throw new Error(`${original}; exact launched HSR incarnation cleanup failed: ${stopped.stderr || stopped.stdout}`);
+}
+
+async function confirmLaunchedTmuxStopped(
+  substrate: Substrate,
+  target: string,
+  launch: NewSessionResult,
+  cause: unknown,
+): Promise<void> {
+  if (!substrate.killIncarnation) {
+    const original = cause instanceof Error ? cause.message : String(cause);
+    throw new Error(`${original}; substrate ${substrate.kind} cannot tear down exact launched incarnation ${launch.paneId}`);
+  }
+  const result = await substrate.killIncarnation(target, launch).catch((error) => ({
+    ok: false,
+    stdout: "",
+    stderr: error instanceof Error ? error.message : String(error),
+    exitCode: 1,
+  }));
+  if (result.ok) return;
+  const original = cause instanceof Error ? cause.message : String(cause);
+  throw new Error(`${original}; exact launched tmux incarnation cleanup failed: ${result.stderr || result.stdout || launch.paneId}`);
 }
 
 /**
@@ -546,6 +610,21 @@ export async function recoverAuthNeededBee(
     activateCredentials?: boolean;
   },
 ): Promise<{ record: SessionRecord; replayedPrompts: number; promptSource: AuthPromptRecovery["source"] }> {
+  return withSessionLifecycleTransaction(record, (lifecycle) =>
+    recoverAuthNeededBeeInTransaction(lifecycle, account, options));
+}
+
+async function recoverAuthNeededBeeInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  account: AccountRecord,
+  options: {
+    source: AuthResumeSource;
+    attempt?: number;
+    events?: RunnerEvent[];
+    activateCredentials?: boolean;
+  },
+): Promise<{ record: SessionRecord; replayedPrompts: number; promptSource: AuthPromptRecovery["source"] }> {
+  const record = await lifecycle.refresh();
   if (!record.homePath) throw new Error(`hive auth-resume: ${record.name} has no dedicated home`);
   const promptRecovery = await collectAuthRecoveryPrompts(record, options.events);
   // The ordinary HSR stop intentionally clears pending turns. Stage an
@@ -563,7 +642,7 @@ export async function recoverAuthNeededBee(
   // Credential selection already chose and, when needed, activated the best
   // persisted chain. Skip revive's generic second activation so the decision
   // cannot be changed between the stop and the new child boot.
-  const revived = await reviveRecord(record, {
+  const revived = await reviveRecordInTransaction(lifecycle, {
     fresh: false,
     skipCredentialActivation: true,
     deferRequestClosure: true,
@@ -587,12 +666,11 @@ export async function recoverAuthNeededBee(
     record.name,
     revived.runtimeGeneration ?? (record.runtimeGeneration ?? 0) + 1,
   ).catch(() => undefined);
-  const cleared =
-    (await updateSession(record.name, {
+  const cleared = await lifecycle.commit({
       lastObservedState: undefined,
       lastObservedStateAt: undefined,
       updatedAt: new Date().toISOString(),
-    })) ?? revived;
+    });
 
   for (const prompt of promptRecovery.prompts) {
     await deliverPromptText(cleared, prompt);
@@ -654,40 +732,70 @@ export async function hsrChildSurvives(bee: string, windowMs: number): Promise<b
  * restores the interactive bee where it started (interactive→interactive resume
  * works, so the recovery keeps continuity).
  */
-export async function reviveTmuxPane(record: SessionRecord, tool: string, opts: { fresh?: boolean } = {}): Promise<void> {
+export async function reviveTmuxPane(
+  record: SessionRecord,
+  tool: string,
+  opts: {
+    fresh?: boolean;
+    substrate?: Substrate;
+    afterLaunch?: (launch: { kind: "tmux"; result: NewSessionResult }) => Promise<void>;
+  } = {},
+): Promise<void> {
+  await withSessionLifecycleTransaction(record, (lifecycle) =>
+    reviveTmuxPaneInTransaction(lifecycle, tool, opts));
+}
+
+async function reviveTmuxPaneInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  tool: string,
+  opts: {
+    fresh?: boolean;
+    substrate?: Substrate;
+    afterLaunch?: (launch: { kind: "tmux"; result: NewSessionResult }) => Promise<void>;
+  } = {},
+): Promise<SessionRecord> {
+  const record = await lifecycle.refresh();
   const spec = await buildResumeSpec(record, tool, opts.fresh ? [] : resumeArgs(tool, record.providerSessionId));
   const incarnation = await nextRuntimeIncarnationPatch(record);
   const tmuxTarget = safeTmuxTarget(record.name);
-  const substrate = localSubstrate();
+  const substrate = opts.substrate ?? localSubstrate();
+  await lifecycle.refresh();
   const launch = await substrate.newSession(tmuxTarget, record.cwd, {
     command: spec.command,
     args: spec.args,
     env: spec.env,
     tmuxOptions: spec.tmuxOptions,
   });
-  // Field-merge, not a full-record save, so daemon writes since `record`
-  // loaded survive; explicit undefined deletes the HSR fields; null = record
-  // deleted concurrently, nothing to persist (HIVE-49).
-  const restored = await updateSession(record.name, {
-    ...incarnation,
-    command: shellCommand(spec),
-    tmuxTarget,
-    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
-    ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
-    combId: tmuxTarget,
-    updatedAt: new Date().toISOString(),
-    status: "running",
-    substrate: undefined,
-    runnerPid: undefined,
-    runnerFingerprint: undefined,
-    runnerTier: undefined,
-    // A fresh relaunch abandons the old provider session. Its transcript path
-    // is an equally strong anchor, so retaining it would re-adopt the old id.
-    ...(opts.fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
-  });
-  if (restored) await writeSpawnOptions(restored);
+  // The lifecycle CAS preserves concurrent metadata writes; explicit
+  // undefined deletes the HSR fields.
+  let restored: SessionRecord;
+  try {
+    await opts.afterLaunch?.({ kind: "tmux", result: launch });
+    restored = await lifecycle.commit({
+      ...incarnation,
+      command: shellCommand(spec),
+      tmuxTarget,
+      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+      ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
+      combId: tmuxTarget,
+      updatedAt: new Date().toISOString(),
+      status: "running",
+      substrate: undefined,
+      runnerPid: undefined,
+      runnerFingerprint: undefined,
+      runnerTier: undefined,
+      // A fresh relaunch abandons the old provider session. Its transcript path
+      // is an equally strong anchor, so retaining it would re-adopt the old id.
+      ...(opts.fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
+    });
+  } catch (error) {
+    await confirmLaunchedTmuxStopped(substrate, tmuxTarget, launch, error);
+    throw error;
+  }
+  await writeSpawnOptions(restored);
   await closeSupersededRequests(record, incarnation);
+  return restored;
 }
 
 
@@ -700,7 +808,12 @@ export async function reviveTmuxPane(record: SessionRecord, tool: string, opts: 
 export async function cmdPromote(parsed: Parsed): Promise<void> {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive promote <bee> [--now]");
-  const record = await resolveSession(target);
+  const initialRecord = await resolveSession(target);
+  await withSessionLifecycleTransaction(initialRecord, (lifecycle) => promoteInTransaction(lifecycle, parsed));
+}
+
+async function promoteInTransaction(lifecycle: SessionLifecycleTransaction, parsed: Parsed): Promise<void> {
+  let record = await lifecycle.refresh();
   if (record.substrate !== "hsr") {
     throw new Error(`hive promote: ${record.name} is already on tmux (not an HSR bee)`);
   }
@@ -714,7 +827,7 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
       record.providerSessionId = meta.sessionId;
       // Field-merge, not a full-record save: a full save would revert daemon
       // writes (auto-title, observed state) since `record` loaded (HIVE-49).
-      await updateSession(record.name, { providerSessionId: meta.sessionId });
+      record = await lifecycle.commit({ providerSessionId: meta.sessionId });
     }
   }
   const tool = assertResumable(record, "promote");
@@ -735,6 +848,7 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
   const tmuxTarget = safeTmuxTarget(record.name);
   const substrate = localSubstrate();
   if (await substrate.hasSession(tmuxTarget)) throw new Error(`hive promote: a tmux session already exists: ${tmuxTarget}`);
+  await lifecycle.refresh();
   const launch = await substrate.newSession(tmuxTarget, record.cwd, {
     command: spec.command,
     args: spec.args,
@@ -748,11 +862,8 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
   //     is already gone. Instead: tear down the dead remnant and re-fork the
   //     HSR runner so the bee is restored exactly where it was.
   if (!(await tmuxSessionSurvives(substrate, tmuxTarget, RESUME_LIVENESS_SETTLE_MS))) {
-    await substrate.kill(tmuxTarget, {
-      launcherPgid: launch.launcherPgid,
-      launcherFingerprint: launch.launcherFingerprint,
-    }).catch(() => undefined);
-    await reviveHsrRunner(record, tool);
+    await confirmLaunchedTmuxStopped(substrate, tmuxTarget, launch, new Error("promote resume exited"));
+    await reviveHsrRunnerInTransaction(lifecycle, tool);
     throw new Error(
       `hive promote: ${record.name} exited immediately after the ${record.agent} resume — its provider session is not interactively resumable; left running on HSR`,
     );
@@ -761,27 +872,31 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
   // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier
   //    (explicit undefined = delete), set the pane fields; KEEP
   //    uuid/providerSessionId/id/lineage/account. Field-merge under the lock
-  //    (updateSession) instead of a full-record save so daemon writes that
-  //    landed since `record` was loaded (auto-title, observed state) survive
-  //    the flip (HIVE-49). null = record deleted mid-promote (concurrent
-  //    kill) — don't resurrect it.
+  //    with a generation CAS so daemon metadata writes survive and a deleted
+  //    or replaced record cannot be resurrected.
   const command = shellCommand(spec);
-  const promoted = await updateSession(record.name, {
-    ...incarnation,
-    command,
-    tmuxTarget,
-    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-    ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
-    ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
-    combId: tmuxTarget,
-    updatedAt: new Date().toISOString(),
-    status: "running",
-    substrate: undefined,
-    runnerPid: undefined,
-    runnerFingerprint: undefined,
-    runnerTier: undefined,
-  });
-  if (promoted) await writeSpawnOptions(promoted);
+  let promoted: SessionRecord;
+  try {
+    promoted = await lifecycle.commit({
+      ...incarnation,
+      command,
+      tmuxTarget,
+      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+      ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
+      combId: tmuxTarget,
+      updatedAt: new Date().toISOString(),
+      status: "running",
+      substrate: undefined,
+      runnerPid: undefined,
+      runnerFingerprint: undefined,
+      runnerTier: undefined,
+    });
+  } catch (error) {
+    await confirmLaunchedTmuxStopped(substrate, tmuxTarget, launch, error);
+    throw error;
+  }
+  await writeSpawnOptions(promoted);
   await closeSupersededRequests(record, incarnation);
   await appendLedger({ type: "session.promote", session: record.name, from: "hsr", to: "local-tmux", providerSessionId: record.providerSessionId });
 
@@ -802,7 +917,12 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
 export async function cmdDemote(parsed: Parsed): Promise<void> {
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive demote <bee> [--now]");
-  const record = await resolveSession(target);
+  const initialRecord = await resolveSession(target);
+  await withSessionLifecycleTransaction(initialRecord, (lifecycle) => demoteInTransaction(lifecycle, parsed));
+}
+
+async function demoteInTransaction(lifecycle: SessionLifecycleTransaction, parsed: Parsed): Promise<void> {
+  const record = await lifecycle.refresh();
   if (record.substrate === "hsr") {
     throw new Error(`hive demote: ${record.name} is already on HSR (not a tmux bee)`);
   }
@@ -831,6 +951,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
   const spec = await buildResumeSpec(record, tool, []);
   const incarnation = await nextRuntimeIncarnationPatch(record);
   const runnerTier = adapter.tier();
+  await lifecycle.refresh();
   const hostPid = await spawnHsrHost({
     bee: record.name,
     comb: record.combId ?? record.name,
@@ -857,8 +978,8 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
   //     report a dead bee whose tmux pane is already gone. Roll back: stop the
   //     dead runner and re-launch the interactive pane where the bee started.
   if (!(await hsrChildSurvives(record.name, RESUME_LIVENESS_SETTLE_MS))) {
-    await stopHsrRunner({ ...record, substrate: "hsr", runnerPid: hostPid, runnerFingerprint });
-    await reviveTmuxPane(record, tool);
+    await confirmLaunchedHsrStopped(record.name, hostPid, new Error("demote resume exited"));
+    await reviveTmuxPaneInTransaction(lifecycle, tool);
     throw new Error(
       `hive demote: ${record.name} exited immediately after the ${record.agent} headless resume — its provider session is not headlessly resumable; left running on tmux`,
     );
@@ -866,28 +987,32 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
 
   // 5. Flip the record to HSR: set substrate/runnerPid/runnerTier, make
   //    tmuxTarget the logical id, delete the pane fields (explicit undefined
-  //    = delete); keep the rest. Field-merge under the lock (updateSession)
-  //    instead of a full-record save so daemon writes that landed since
-  //    `record` was loaded survive the flip (HIVE-49). null = record deleted
-  //    mid-demote (concurrent kill) — don't resurrect it.
+  //    = delete); keep the rest. Commit with a generation CAS so daemon
+  //    metadata writes survive and a deleted/replaced row is never revived.
   const command = shellCommand(spec);
-  const demoted = await updateSession(record.name, {
-    ...incarnation,
-    command,
-    substrate: "hsr",
-    runnerPid: hostPid,
-    runnerFingerprint,
-    ...(runnerTier ? { runnerTier } : {}),
-    ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
-    tmuxTarget: record.name,
-    combId: record.name,
-    updatedAt: new Date().toISOString(),
-    status: "running",
-    agentPaneId: undefined,
-    launcherPgid: undefined,
-    launcherFingerprint: undefined,
-  });
-  if (demoted) await writeSpawnOptions(demoted);
+  let demoted: SessionRecord;
+  try {
+    demoted = await lifecycle.commit({
+      ...incarnation,
+      command,
+      substrate: "hsr",
+      runnerPid: hostPid,
+      runnerFingerprint,
+      ...(runnerTier ? { runnerTier } : {}),
+      ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
+      tmuxTarget: record.name,
+      combId: record.name,
+      updatedAt: new Date().toISOString(),
+      status: "running",
+      agentPaneId: undefined,
+      launcherPgid: undefined,
+      launcherFingerprint: undefined,
+    });
+  } catch (error) {
+    await confirmLaunchedHsrStopped(record.name, hostPid, error);
+    throw error;
+  }
+  await writeSpawnOptions(demoted);
   await closeSupersededRequests(record, incarnation);
   await appendLedger({ type: "session.demote", session: record.name, from: "local-tmux", to: "hsr", providerSessionId: record.providerSessionId });
 
@@ -1192,7 +1317,7 @@ async function waitForRevivedReady(records: SessionRecord[], parsed: Parsed): Pr
 /**
  * Pure relaunch core: re-create a bee's runtime in its OWN cwd/home and resume
  * (or, with `fresh`, start anew) its provider session. No `parsed`, no console
- * output — it does only the resolveAgent/newSession-or-HSR/updateSession/
+ * output — it does only the resolveAgent/newSession-or-HSR/lifecycle-CAS/
  * appendLedger work and returns the updated record. It does NOT guard liveness
  * (the caller does, so `restore` can decide per-bee whether to skip a live one).
  * Non-fresh revive requires an exact provider session id; falling back to a
@@ -1210,8 +1335,39 @@ export async function reviveRecord(
     sessionOverride?: string;
     skipCredentialActivation?: boolean;
     deferRequestClosure?: boolean;
+    substrate?: Substrate;
+    afterLaunch?: (
+      launch:
+        | { kind: "tmux"; result: NewSessionResult }
+        | { kind: "hsr"; hostPid: number },
+    ) => Promise<void>;
+    spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
+    waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
+    stopHsrIncarnation?: typeof stopHsrIncarnationByPid;
   },
 ): Promise<SessionRecord> {
+  return withSessionLifecycleTransaction(record, (lifecycle) => reviveRecordInTransaction(lifecycle, opts));
+}
+
+async function reviveRecordInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  opts: {
+    fresh: boolean;
+    sessionOverride?: string;
+    skipCredentialActivation?: boolean;
+    deferRequestClosure?: boolean;
+    substrate?: Substrate;
+    afterLaunch?: (
+      launch:
+        | { kind: "tmux"; result: NewSessionResult }
+        | { kind: "hsr"; hostPid: number },
+    ) => Promise<void>;
+    spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
+    waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
+    stopHsrIncarnation?: typeof stopHsrIncarnationByPid;
+  },
+): Promise<SessionRecord> {
+  const record = await lifecycle.refresh();
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   const fresh = opts.fresh;
   // sessionOverride resumes (and persists) a specific provider session — used to
@@ -1225,12 +1381,19 @@ export async function reviveRecord(
     );
   }
   if (record.substrate === "hsr") {
-    const updated = await reviveHsrRunner(record, tool, {
+    if (await hsrSubstrate().hasSession(record.name)) {
+      throw new Error(`hive revive: ${record.name} is already running (${record.name})`);
+    }
+    const updated = await reviveHsrRunnerInTransaction(lifecycle, tool, {
       fresh,
       sessionOverride,
       replayLaunch: true,
       activateCredentials: opts.skipCredentialActivation !== true,
       deferRequestClosure: opts.deferRequestClosure,
+      afterLaunch: opts.afterLaunch,
+      spawnHsrHost: opts.spawnHsrHost,
+      waitForHsrHost: opts.waitForHsrHost,
+      stopHsrIncarnation: opts.stopHsrIncarnation,
     });
     await appendLedger({
       type: "bee.revive",
@@ -1240,7 +1403,10 @@ export async function reviveRecord(
     });
     return updated;
   }
-  const substrate = substrateFor(record);
+  const substrate = opts.substrate ?? substrateFor(record);
+  if (await substrate.hasSession(record.tmuxTarget)) {
+    throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
+  }
 
   // Mirror the swap relaunch: rebuild the agent command from the configured
   // kind (preserving the original permission mode) and append the resume args.
@@ -1292,6 +1458,7 @@ export async function reviveRecord(
     }
   }
 
+  await lifecycle.refresh();
   const incarnation = await nextRuntimeIncarnationPatch(record);
   const launch = await substrate.newSession(record.tmuxTarget, record.cwd, {
     command: spec.command,
@@ -1300,8 +1467,10 @@ export async function reviveRecord(
     tmuxOptions: spec.tmuxOptions,
   });
 
-  const updated =
-    (await updateSession(record.name, {
+  let updated: SessionRecord;
+  try {
+    await opts.afterLaunch?.({ kind: "tmux", result: launch });
+    updated = await lifecycle.commit({
       ...incarnation,
       status: "running",
       lastReviveCommand: shellCommand(spec),
@@ -1320,7 +1489,11 @@ export async function reviveRecord(
       // discovery will immediately restore the abandoned provider id.
       ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
       updatedAt: new Date().toISOString(),
-    })) ?? record;
+    });
+  } catch (error) {
+    await confirmLaunchedTmuxStopped(substrate, record.tmuxTarget, launch, error);
+    throw error;
+  }
   await writeSpawnOptions(updated);
   if (!opts.deferRequestClosure) await closeSupersededRequests(record, incarnation);
   await appendLedger({
@@ -1417,11 +1590,11 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
   const model = parsed.args[1];
   if (!target || (!model && !clear)) throw new Error(usage);
   if (model && clear) throw new Error(`hive set-model: pass either <model> or --clear, not both\n${usage}`);
-  const record = await resolveSession(target);
-  if (record.node && record.node !== LOCAL_NODE_NAME) {
-    throw new Error(`hive set-model: ${record.name} is on remote node ${record.node}; set-model only supports local bees`);
+  const initialRecord = await resolveSession(target);
+  if (initialRecord.node && initialRecord.node !== LOCAL_NODE_NAME) {
+    throw new Error(`hive set-model: ${initialRecord.name} is on remote node ${initialRecord.node}; set-model only supports local bees`);
   }
-  const tool = canonicalAgentKind(record.agent).toLowerCase();
+  const tool = canonicalAgentKind(initialRecord.agent).toLowerCase();
   // OpenCode multiplexes providers. Persist the qualified selector as the
   // first-class model so revive/promote/demote can rebuild it without a
   // separate provider field on SessionRecord.
@@ -1430,11 +1603,35 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
     throw new Error("hive set-model: opencode requires a qualified provider/model selector");
   }
   if (!clear && modelArgsForAgent(tool, model).length === 0) {
-    throw new Error(`hive set-model: ${record.agent} has no model selector (no model flag known for ${tool})`);
+    throw new Error(`hive set-model: ${initialRecord.agent} has no model selector (no model flag known for ${tool})`);
   }
   const fresh = truthy(flag(parsed, "fresh"));
   const now = truthy(flag(parsed, "now"));
   const extraLine = parsed.rest.length > 0 ? parsed.rest.map(shellQuoteIfNeeded).join(" ") : undefined;
+
+  await withSessionLifecycleTransaction(initialRecord, (lifecycle) => setModelInTransaction(lifecycle, {
+    tool,
+    clear,
+    model,
+    fresh,
+    now,
+    extraLine,
+  }));
+}
+
+async function setModelInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  options: {
+    tool: string;
+    clear: boolean;
+    model?: string;
+    fresh: boolean;
+    now: boolean;
+    extraLine?: string;
+  },
+): Promise<void> {
+  const { tool, clear, model, fresh, now, extraLine } = options;
+  let record = await lifecycle.refresh();
 
   // Server-tier harnesses mint their provider thread id at RUNTIME — backfill
   // it from the HSR meta (mirrors promote) so the resume gate below can see it.
@@ -1442,7 +1639,7 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
     const meta = await readHsrMeta(record.name).catch(() => null);
     if (meta?.sessionId) {
       record.providerSessionId = meta.sessionId;
-      await updateSession(record.name, { providerSessionId: meta.sessionId });
+      record = await lifecycle.commit({ providerSessionId: meta.sessionId });
     }
   }
 
@@ -1455,7 +1652,7 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
   }
 
   const previous = { model: record.model, modelExtraArgs: record.modelExtraArgs };
-  // Explicit undefined deletes the field (replace semantics; see updateSession).
+  // Explicit undefined deletes the field (record merge semantics).
   const applyFields: Partial<SessionRecord> = {
     model: clear ? undefined : model,
     modelExtraArgs: extraLine,
@@ -1464,7 +1661,7 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
   };
 
   if (!alive) {
-    const updated = (await updateSession(record.name, applyFields)) ?? { ...record, ...applyFields };
+    const updated = await lifecycle.commit(applyFields);
     await appendLedger({
       type: "bee.set_model",
       session: record.name,
@@ -1504,7 +1701,7 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
     }
   }
 
-  const updated = (await updateSession(record.name, applyFields)) ?? { ...record, ...applyFields };
+  const updated = await lifecycle.commit(applyFields);
 
   // Restore the previous selection and relaunch it — the recovery mirror of
   // promote/demote's rollback, so a bad model name never leaves a dead bee.
@@ -1514,13 +1711,13 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
       modelExtraArgs: previous.modelExtraArgs,
       updatedAt: new Date().toISOString(),
     };
-    const restored = (await updateSession(record.name, restoredFields)) ?? { ...record, ...restoredFields };
-    if (record.substrate === "hsr") await reviveHsrRunner(restored, tool, { fresh });
-    else await reviveTmuxPane(restored, tool, { fresh });
+    await lifecycle.commit(restoredFields);
+    if (record.substrate === "hsr") await reviveHsrRunnerInTransaction(lifecycle, tool, { fresh });
+    else await reviveTmuxPaneInTransaction(lifecycle, tool, { fresh });
   };
 
   if (record.substrate === "hsr") {
-    await reviveHsrRunner(updated, tool, { fresh });
+    await reviveHsrRunnerInTransaction(lifecycle, tool, { fresh });
     if (!(await hsrChildSurvives(record.name, RESUME_LIVENESS_SETTLE_MS))) {
       await rollback().catch(() => undefined);
       throw new Error(
@@ -1528,7 +1725,7 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
       );
     }
   } else {
-    await reviveTmuxPane(updated, tool, { fresh });
+    await reviveTmuxPaneInTransaction(lifecycle, tool, { fresh, substrate });
     if (!(await tmuxSessionSurvives(substrate, record.tmuxTarget, RESUME_LIVENESS_SETTLE_MS))) {
       await rollback().catch(() => undefined);
       throw new Error(

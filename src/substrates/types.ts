@@ -1,5 +1,3 @@
-import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
-
 export type SubstrateKind = "local-tmux" | "ssh-tmux" | "hsr" | "remote-hsr";
 
 export const LOCAL_NODE = "local";
@@ -45,6 +43,13 @@ export type Substrate = {
   hasSession(target: string): Promise<boolean>;
   newSession(target: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult>;
   kill(target: string, options?: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint }): Promise<KillResult>;
+  /**
+   * Tear down only the exact pane/process returned by newSession. Lifecycle
+   * rollback uses this after a launched runtime loses its generation CAS; it
+   * must never fall back to killing a same-name replacement session, and `ok`
+   * must mean the exact incarnation is confirmed gone.
+   */
+  killIncarnation?(target: string, launch: NewSessionResult): Promise<KillResult>;
   // Combs (multiple bees sharing one session via split panes) are retired
   // (APIA-85), so the pane-spawn/pane-kill verbs (`newPane`/`killPane`) are gone
   // from this interface. Pane PINNING stays: pane-scoped I/O below still targets
@@ -81,3 +86,4 @@ export type Substrate = {
   attachCommand(target: string): string[];
   attachSession(target: string): Promise<void>;
 };
+import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";

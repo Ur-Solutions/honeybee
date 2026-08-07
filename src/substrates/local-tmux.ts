@@ -487,6 +487,15 @@ export function createLocalTmuxSubstrate(): Substrate {
     hasSession,
     newSession,
     kill,
+    killIncarnation: async (_target, launch) => {
+      const result = await killPane(launch.paneId, {
+        launcherPgid: launch.launcherPgid,
+        launcherFingerprint: launch.launcherFingerprint,
+      });
+      return !result.ok && /can't find pane|no server running/i.test(result.stderr)
+        ? { ...result, ok: true, exitCode: 0 }
+        : result;
+    },
     capture,
     sendText,
     sendEnter,

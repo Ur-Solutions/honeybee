@@ -2,14 +2,15 @@ import { rm } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { canonicalActivationHomePath, readActivationHomeOwner, withActivationHomeLock } from "./accounts/activation.js";
 import { hsrRoot } from "./hsr/runDir.js";
+import { withSessionLifecycleLock, withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "./lifecycle.js";
 import { sealsRoot } from "./seal.js";
 import {
   appendLedger,
-  deleteSession,
+  deleteSessionLocked,
   isActiveSessionRecord,
   listSessions,
   safeName,
-  updateSession,
+  withSessionLock,
   type SessionRecord,
 } from "./store.js";
 import { syncCredentialPairIsolated } from "./daemon/credentialSweepProcess.js";
@@ -34,6 +35,8 @@ export type TransactionalKillOptions = {
   finalCredentialSync?: (record: SessionRecord) => Promise<void>;
   /** Hard outer budget for finalCredentialSync (default 10s). */
   finalCredentialSyncBudgetMs?: number;
+  /** Deterministic race-test hook after old-runtime teardown confirmation. */
+  afterTeardown?: (record: SessionRecord) => Promise<void>;
 };
 
 export type PurgeSessionDataOptions = Pick<
@@ -80,14 +83,48 @@ export async function purgeSessionData(
   record: SessionRecord,
   options: PurgeSessionDataOptions = {},
 ): Promise<void> {
+  // Hardened readers intentionally reject a malformed embedded name, but
+  // clean/purge must still be able to contain and remove its sanitized file
+  // and artifacts. Such a record cannot participate in generation CAS (it is
+  // not authoritative readable input), so serialize on the sanitized
+  // lifecycle + session locks and retain the record-last retry semantics.
+  if (safeName(record.name) !== record.name) {
+    await withSessionLifecycleLock(record.name, async () => {
+      await runFinalCredentialSync(record, options);
+      await withSessionLock(record.name, async () => {
+        await rm(containedArtifactPath(sealsRoot(), record.name), { recursive: true, force: true });
+        await rm(containedArtifactPath(hsrRoot(), record.name), { recursive: true, force: true });
+        await removeBeeRequests(record.name);
+        await deleteSessionLocked(record.name);
+      });
+      if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
+    });
+    return;
+  }
+  await withSessionLifecycleTransaction(record, async (lifecycle) => {
+    await purgeSessionDataInTransaction(lifecycle, options);
+  });
+}
+
+async function purgeSessionDataInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  options: PurgeSessionDataOptions,
+): Promise<void> {
+  const record = await lifecycle.refresh();
   // Credential harvest can touch the keychain, vault, and account locks. It is
   // deliberately bounded and completed before any artifact/session lock is
   // acquired or any retry handle is deleted.
   await runFinalCredentialSync(record, options);
-  await rm(containedArtifactPath(sealsRoot(), record.name), { recursive: true, force: true });
-  await rm(containedArtifactPath(hsrRoot(), record.name), { recursive: true, force: true });
-  await removeBeeRequests(record.name);
-  await deleteSession(record.name);
+  // The short record lock below is the destructive CAS point. Everything in
+  // the callback is known not to re-acquire that lock; if cleanup is
+  // interrupted, the canonical record remains the retry handle until the last
+  // delete step.
+  await lifecycle.destructiveCommit(async (current) => {
+    await rm(containedArtifactPath(sealsRoot(), current.name), { recursive: true, force: true });
+    await rm(containedArtifactPath(hsrRoot(), current.name), { recursive: true, force: true });
+    await removeBeeRequests(current.name);
+    await deleteSessionLocked(current.name);
+  });
   if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
 }
 
@@ -379,46 +416,50 @@ export async function transactionalKill(
   record: SessionRecord,
   options: TransactionalKillOptions = {},
 ): Promise<KillOutcome> {
-  const emitLedger = options.emitLedger !== false;
-  const node = record.node ?? LOCAL_NODE_NAME;
-  const verdict = await teardownSession(record, options);
+  return withSessionLifecycleTransaction(record, async (lifecycle) => {
+    const current = await lifecycle.refresh();
+    const emitLedger = options.emitLedger !== false;
+    const node = current.node ?? LOCAL_NODE_NAME;
+    const verdict = await teardownSession(current, options);
+    await options.afterTeardown?.(current);
 
-  // Only the poll verdict decides failure: when it confirmed the session is
-  // gone (stillRunning === false) we proceed to deleteSession even if the
-  // substrate's kill call reported failure — the session may have died
-  // between the hasSession fast-path and the kill (a benign race).
-  if (verdict.stillRunning) {
-    const lastError = verdict.lastError ?? "session still exists after kill";
-    await updateSession(record.name, {
-      status: "kill_failed",
-      lastError,
-      updatedAt: new Date().toISOString(),
-    });
-    await openStopFailedRequest(record, lastError);
+    // Only the poll verdict decides failure: when it confirmed the session is
+    // gone (stillRunning === false) we proceed to purge even if the kill call
+    // reported failure — the session may have died between the probe and kill.
+    if (verdict.stillRunning) {
+      const lastError = verdict.lastError ?? "session still exists after kill";
+      const failed = await lifecycle.commit({
+        status: "kill_failed",
+        lastError,
+        updatedAt: new Date().toISOString(),
+      });
+      await openStopFailedRequest(failed, lastError);
+      if (emitLedger) {
+        await appendLedger({
+          type: "session.kill",
+          session: current.name,
+          node,
+          ok: false,
+          attempts: verdict.attempts,
+          lastError,
+        });
+      }
+      return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
+    }
+
+    await lifecycle.refresh();
+    await purgeSessionDataInTransaction(lifecycle, options);
     if (emitLedger) {
       await appendLedger({
         type: "session.kill",
-        session: record.name,
+        session: current.name,
         node,
-        ok: false,
+        ok: true,
         attempts: verdict.attempts,
-        lastError,
       });
     }
-    return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
-  }
-
-  await purgeSessionData(record, options);
-  if (emitLedger) {
-    await appendLedger({
-      type: "session.kill",
-      session: record.name,
-      node,
-      ok: true,
-      attempts: verdict.attempts,
-    });
-  }
-  return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
+    return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
+  });
 }
 
 /**
@@ -435,54 +476,57 @@ export async function transactionalRetire(
   record: SessionRecord,
   options: TransactionalKillOptions = {},
 ): Promise<KillOutcome> {
-  const emitLedger = options.emitLedger !== false;
-  const node = record.node ?? LOCAL_NODE_NAME;
-  const verdict = await teardownSession(record, options);
+  return withSessionLifecycleTransaction(record, async (lifecycle) => {
+    const current = await lifecycle.refresh();
+    const emitLedger = options.emitLedger !== false;
+    const node = current.node ?? LOCAL_NODE_NAME;
+    const verdict = await teardownSession(current, options);
+    await options.afterTeardown?.(current);
 
-  if (verdict.stillRunning) {
-    const lastError = verdict.lastError ?? "session still exists after retire";
-    await updateSession(record.name, {
-      status: "kill_failed",
-      lastError,
+    if (verdict.stillRunning) {
+      const lastError = verdict.lastError ?? "session still exists after retire";
+      const failed = await lifecycle.commit({
+        status: "kill_failed",
+        lastError,
+        updatedAt: new Date().toISOString(),
+      });
+      await openStopFailedRequest(failed, lastError);
+      if (emitLedger) {
+        await appendLedger({
+          type: "session.retire",
+          session: current.name,
+          node,
+          ok: false,
+          attempts: verdict.attempts,
+          lastError,
+        });
+      }
+      return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
+    }
+
+    await lifecycle.refresh();
+    await runFinalCredentialSync(current, options);
+    const retired = await lifecycle.commit({
+      status: "done",
       updatedAt: new Date().toISOString(),
+      // A retired bee must not keep reporting a stale error from an earlier
+      // failed kill; explicit undefined deletes the field.
+      lastError: undefined,
     });
-    await openStopFailedRequest(record, lastError);
+    // Request closures happen only after the generation-checked terminal
+    // commit. A stale retire can therefore never close a replacement's asks.
+    await resolveRequest(retired.name, stopFailedRequestId(retired.name, retired.runtimeGeneration ?? 0), { by: "stop-succeeded" }).catch(() => undefined);
+    await cancelOpenRequests(retired.name, {}, "scope-closed", "retired").catch(() => undefined);
+    if (retired.poolKey) await dropPoolClaimsForBee(retired.poolKey, retired.name).catch(() => undefined);
     if (emitLedger) {
       await appendLedger({
         type: "session.retire",
-        session: record.name,
+        session: current.name,
         node,
-        ok: false,
+        ok: true,
         attempts: verdict.attempts,
-        lastError,
       });
     }
-    return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
-  }
-
-  await runFinalCredentialSync(record, options);
-  // Request closures BEFORE filing (retire keeps the file — revivable
-  // history): a pending stop-failed from an earlier failed kill/retire is now
-  // a fact resolved by this successful stop; everything else open closes with
-  // the bee. Order matters — resolve first so cancel-all can't claim it.
-  await resolveRequest(record.name, stopFailedRequestId(record.name, record.runtimeGeneration ?? 0), { by: "stop-succeeded" }).catch(() => undefined);
-  await cancelOpenRequests(record.name, {}, "scope-closed", "retired").catch(() => undefined);
-  await updateSession(record.name, {
-    status: "done",
-    updatedAt: new Date().toISOString(),
-    // A retired bee must not keep reporting a stale error from an earlier
-    // failed kill; explicit undefined deletes the field.
-    lastError: undefined,
+    return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
   });
-  if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
-  if (emitLedger) {
-    await appendLedger({
-      type: "session.retire",
-      session: record.name,
-      node,
-      ok: true,
-      attempts: verdict.attempts,
-    });
-  }
-  return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
 }

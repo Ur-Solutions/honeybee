@@ -25,6 +25,7 @@ import type {
   Substrate,
   TmuxWindowOptions,
 } from "../substrates/types.js";
+import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
 import { LOCAL_NODE } from "../substrates/types.js";
 import {
   ensureOrphanedChildGroupStopped,
@@ -37,6 +38,7 @@ import { readHsrMeta, type HsrMeta } from "./runDir.js";
 import { sameProcessBirthFingerprint } from "./processIdentity.js";
 import { connectRpcClient } from "./rpc.js";
 import { clearPendingHsrTurns, enqueuePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
+import { spawnedHsrHostHasExited, stopSpawnedHsrHost } from "./runnerHost.js";
 
 /** A queued or running host is live while its detached host pid is alive. */
 async function hasSession(bee: string): Promise<boolean> {
@@ -217,6 +219,39 @@ export async function stopHsrIncarnation(
         stderr: `HSR stop unconfirmed for ${bee}: host or detached harness process group remains live`,
         exitCode: 1,
       };
+}
+
+/**
+ * Stop only the runner-host incarnation returned by spawnHsrHost. If metadata
+ * already names a replacement, leave it untouched and report whether the
+ * launched pid is independently confirmed gone.
+ */
+export async function stopHsrIncarnationByPid(bee: string, expectedHostPid: number): Promise<KillResult> {
+  // Check the spawn handle before metadata. If this process already reaped the
+  // exact child, a recycled same-number pid in replacement metadata must never
+  // be adopted or signalled.
+  if (spawnedHsrHostHasExited(expectedHostPid)) {
+    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+  }
+  const current = await readHsrMeta(bee);
+  if (current?.hostPid === expectedHostPid) return stopHsrIncarnation(bee, current);
+  // Publication may lag spawn. The spawning process retains the returned
+  // ChildProcess handle, so rollback does not adopt whatever same-name
+  // metadata appeared meanwhile; the host's SIGTERM path retains its existing
+  // birth-validated descendant teardown.
+  const spawnedStop = await stopSpawnedHsrHost(expectedHostPid);
+  if (spawnedStop === "stopped") {
+    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+  }
+  if (spawnedStop === "unknown" && !isPidAlive(expectedHostPid)) {
+    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+  }
+  return {
+    ok: false,
+    stdout: "",
+    stderr: `HSR stop unconfirmed for ${bee}: metadata names a replacement while launched host ${expectedHostPid} remains observable`,
+    exitCode: 1,
+  };
 }
 
 /** Generic user kill keeps its traditional idempotent no-session success. */

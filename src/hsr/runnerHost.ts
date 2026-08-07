@@ -11,6 +11,14 @@ import type { HsrRunPayload } from "./runner-entry.js";
 export { runHsrHostFromPayload } from "./runner-entry.js";
 export type { HsrRunPayload } from "./runner-entry.js";
 
+// Parent-process handles for detached hosts launched by this process. Keeping
+// the returned ChildProcess and an observed-exit tombstone lets immediate
+// rollback target its own spawn before meta.json exists, without looking up a
+// same-name runtime or adopting a later same-number pid from metadata. Normal
+// SIGTERM shutdown still runs the host's birth-validated descendant teardown.
+const spawnedHosts = new Map<number, ReturnType<typeof spawnChild>>();
+const recentlyExitedSpawnedHosts = new Set<number>();
+
 
 /** process.execArgv minus flags that would change the child's execution mode. */
 export function inheritableExecArgvForHsr(): string[] {
@@ -94,11 +102,59 @@ export async function spawnHsrHost(payload: HsrRunPayload): Promise<number> {
     child.once("error", () => undefined);
     if (!child.pid) throw new Error(`hive __hsr-run: spawn failed (no pid for ${payload.bee})`);
     const pid = child.pid;
+    recentlyExitedSpawnedHosts.delete(pid);
+    spawnedHosts.set(pid, child);
+    child.once("exit", () => {
+      spawnedHosts.delete(pid);
+      recentlyExitedSpawnedHosts.add(pid);
+      const expiry = setTimeout(() => recentlyExitedSpawnedHosts.delete(pid), 60_000);
+      expiry.unref?.();
+    });
     child.unref();
     return pid;
   } finally {
     await logHandle.close().catch(() => undefined);
   }
+}
+
+async function waitForSpawnedHostExit(child: ReturnType<typeof spawnChild>, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      resolve(child.exitCode !== null || child.signalCode !== null);
+    }, timeoutMs);
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    child.once("exit", onExit);
+  });
+}
+
+/** True only when this spawning process observed the exact child exit. */
+export function spawnedHsrHostHasExited(expectedPid: number): boolean {
+  if (recentlyExitedSpawnedHosts.has(expectedPid)) return true;
+  const child = spawnedHosts.get(expectedPid);
+  return !!child && (child.exitCode !== null || child.signalCode !== null);
+}
+
+export type SpawnedHsrHostStop = "stopped" | "unconfirmed" | "unknown";
+
+/** Stop only a detached HSR host born from this process's spawn handle. */
+export async function stopSpawnedHsrHost(expectedPid: number): Promise<SpawnedHsrHostStop> {
+  if (spawnedHsrHostHasExited(expectedPid)) return "stopped";
+  const child = spawnedHosts.get(expectedPid);
+  if (!child || child.pid !== expectedPid) return "unknown";
+  if (await waitForSpawnedHostExit(child, 0)) return "stopped";
+  child.kill("SIGTERM");
+  if (await waitForSpawnedHostExit(child, 3_000)) return "stopped";
+  child.kill("SIGKILL");
+  await waitForSpawnedHostExit(child, 1_000);
+  // A forced host exit cannot prove its detached harness tree also stopped.
+  // The caller must surface this instead of silently accepting an untracked
+  // runtime whose replacement metadata cannot safely be adopted for cleanup.
+  return "unconfirmed";
 }
 
 
