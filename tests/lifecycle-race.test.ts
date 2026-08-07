@@ -3,10 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { reviveRecord } from "../src/commands/migrate.js";
+import { reviveRecord, stopRuntimeForAuthResume } from "../src/commands/migrate.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { transactionalKill, transactionalRetire } from "../src/kill.js";
 import { LifecycleConflictError } from "../src/lifecycle.js";
+import { createSshTmuxSubstrate, type SshTmuxExecHook } from "../src/substrates/ssh-tmux.js";
 import { deleteSession, loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { KillResult, NewSessionResult, Substrate } from "../src/substrates/types.js";
 
@@ -242,6 +243,128 @@ test("tmux revive that loses its generation CAS tears down only its launched pan
     assert.deepEqual(rig.panes(), new Set(["%replacement"]), "exact cleanup preserves the replacement pane");
     assert.equal((await loadSession(record.name))?.runtimeGeneration, 7);
   });
+});
+
+test("replacement commit rejects a legacy terminal status write without a generation bump", async () => {
+  await withTempStore(async () => {
+    const record = { ...seed("legacy-terminal-cas"), status: "dead" as const };
+    await saveSession(record);
+    const rig = fakeTmux(false);
+
+    await assert.rejects(
+      reviveRecord(record, {
+        fresh: true,
+        substrate: rig.substrate,
+        afterLaunch: async () => {
+          // Mixed-version terminal writer: status + target teardown, but no
+          // runtimeGeneration bump. The replacement must not overwrite done
+          // with running after its newly launched pane was killed.
+          await updateSession(record.name, { status: "done" });
+          await rig.substrate.kill(record.tmuxTarget);
+        },
+      }),
+      LifecycleConflictError,
+    );
+
+    assert.equal(rig.runtime(), null, "the exact launched replacement is absent");
+    const persisted = await loadSession(record.name);
+    assert.equal(persisted?.status, "done", "terminal legacy truth wins the CAS");
+    assert.equal(persisted?.runtimeGeneration, undefined, "legacy writer did not need a generation bump");
+  });
+});
+
+test("remote tmux revive that loses its CAS refuses missing-pane cleanup while its child group survives", async () => {
+  await withTempStore(async () => {
+    const record = { ...seed("remote-tmux-cas-loss"), status: "dead" as const, node: "mini01" };
+    await saveSession(record);
+    const signals: string[] = [];
+    const startedAt = "Fri Aug  7 10:00:00 2026";
+    const hook: SshTmuxExecHook = async (argv, input) => {
+      if (argv.includes("has-session")) return { stdout: "", stderr: "can't find session", exitCode: 1 };
+      if (argv.includes("new-session") || input?.includes("new-session")) {
+        return { stdout: "%77:4242\n", stderr: "", exitCode: 0 };
+      }
+      if (argv.includes("/bin/ps")) {
+        return { stdout: `4242 1 4242 ${startedAt}\n`, stderr: "", exitCode: 0 };
+      }
+      if (argv.includes("/bin/kill")) {
+        const signal = argv.find((word) => /^-(?:0|TERM|KILL)$/.test(word)) ?? "unknown";
+        signals.push(signal);
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (argv.includes("kill-pane") || argv.includes("list-panes")) {
+        return { stdout: "", stderr: "can't find pane: %77", exitCode: 1 };
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    };
+    const remote = createSshTmuxSubstrate({
+      node: {
+        name: "mini01",
+        kind: "ssh-tmux",
+        endpoint: "trmd@mini01",
+        capabilities: ["*"],
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+      },
+      execHook: hook,
+      sleep: async () => undefined,
+    });
+
+    await assert.rejects(
+      reviveRecord(record, {
+        fresh: true,
+        substrate: remote,
+        afterLaunch: async (launch) => {
+          assert.equal(launch.kind, "tmux");
+          assert.deepEqual(launch.result.launcherFingerprint, { pgid: 4242, startedAt });
+          await updateSession(record.name, { runtimeGeneration: 7, status: "running" });
+        },
+      }),
+      /exact launched tmux incarnation cleanup failed.*absence unconfirmed/,
+    );
+
+    assert.ok(signals.includes("-TERM"));
+    assert.ok(signals.includes("-KILL"));
+    assert.equal((await loadSession(record.name))?.runtimeGeneration, 7);
+  });
+});
+
+test("auth-resume stop aborts on a liveness probe error instead of launching from assumed absence", async () => {
+  const record = seed("auth-resume-probe-error");
+  const rig = fakeTmux(true);
+  let kills = 0;
+  rig.substrate.hasSession = async () => { throw new Error("tmux probe failed"); };
+  rig.substrate.kill = async () => {
+    kills += 1;
+    return ok();
+  };
+
+  await assert.rejects(
+    stopRuntimeForAuthResume(record, rig.substrate),
+    /initial liveness observation failed.*tmux probe failed/,
+  );
+  assert.equal(kills, 0);
+});
+
+test("auth-resume stop rejects an unconfirmed exact-group kill", async () => {
+  const record = {
+    ...seed("auth-resume-kill-error"),
+    launcherPgid: 4242,
+    launcherFingerprint: { pgid: 4242, startedAt: "Fri Aug  7 10:00:00 2026" },
+  };
+  const rig = fakeTmux(true);
+  rig.substrate.kill = async () => ({
+    ok: false,
+    stdout: "",
+    stderr: "matching launcher group remains live",
+    exitCode: 1,
+  });
+
+  await assert.rejects(
+    stopRuntimeForAuthResume(record, rig.substrate),
+    /exact cleanup unconfirmed.*matching launcher group remains live/,
+  );
+  assert.equal(rig.runtime()?.live, true);
 });
 
 test("HSR revive whose record disappears never fabricates a fallback and stops its exact host", async () => {

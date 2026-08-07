@@ -37,6 +37,7 @@ type LifecycleIdentity = {
   createdAt: string;
   id?: string;
   uuid?: string;
+  status?: SessionRecord["status"];
   runtimeGeneration: number;
 };
 
@@ -46,14 +47,20 @@ function lifecycleIdentity(record: SessionRecord): LifecycleIdentity {
     createdAt: record.createdAt,
     ...(record.id ? { id: record.id } : {}),
     ...(record.uuid ? { uuid: record.uuid } : {}),
+    ...(record.status ? { status: record.status } : {}),
     runtimeGeneration: record.runtimeGeneration ?? 0,
   };
 }
 
-function sameLifecycleIdentity(record: SessionRecord, expected: LifecycleIdentity): boolean {
+function sameLifecycleIdentity(
+  record: SessionRecord,
+  expected: LifecycleIdentity,
+  options: { includeStatus?: boolean } = {},
+): boolean {
   return record.name === expected.name
     && record.createdAt === expected.createdAt
     && (record.runtimeGeneration ?? 0) === expected.runtimeGeneration
+    && (options.includeStatus === false || record.status === expected.status)
     && (expected.id === undefined || record.id === expected.id)
     && (expected.uuid === undefined || record.uuid === expected.uuid);
 }
@@ -150,7 +157,11 @@ export async function withSessionLifecycleTransaction<T>(
     const current = await loadSession(expected.name);
     if (!current) throw new LifecycleConflictError(`Session ${expected.name} no longer exists`);
     const expectedIdentity = lifecycleIdentity(expected);
-    if (!sameLifecycleIdentity(current, expectedIdentity)) {
+    // A queued operation may legitimately observe a terminal status written by
+    // the operation ahead of it (retire -> revive). Adopt the authoritative
+    // status when entering the lock, then bind it for every in-flight refresh
+    // and commit so a mixed-version terminal write after launch invalidates CAS.
+    if (!sameLifecycleIdentity(current, expectedIdentity, { includeStatus: false })) {
       throw new LifecycleConflictError(
         `Session ${expected.name} is now runtime generation ${current.runtimeGeneration ?? 0}; `
         + `caller observed ${expected.runtimeGeneration ?? 0}`,

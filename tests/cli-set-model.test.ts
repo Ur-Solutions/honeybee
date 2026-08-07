@@ -166,6 +166,44 @@ test("set-model refuses a live bee with no resumable session id unless --fresh",
   });
 });
 
+test("set-model aborts on a liveness probe error without changing or launching the model", async () => {
+  await withRig(async ({ store, socket }) => {
+    const bee = "CO.probe-error";
+    await seedBee(store, bee, { status: "running", providerSessionId: "sess-probe" });
+
+    await assert.rejects(
+      hive(store, socket, ["set-model", bee, "gpt-5.5"], { PATH: "/definitely-missing" }),
+      /could not observe CO-probe-error.*(?:ENOENT|tmux has-session exited 1)/,
+    );
+    assert.equal((await readBee(store, bee)).model, undefined);
+  });
+});
+
+test("set-model refuses relaunch when pane teardown cannot prove the old process group stopped", { skip: !tmuxAvailable() }, async () => {
+  await withRig(async ({ store, socket }) => {
+    const bee = "CO.unconfirmed-group";
+    const target = "CO-unconfirmed-group";
+    await tmux(["new-session", "-d", "-s", target, "sleep 120"]);
+    const pane = await tmux(["display-message", "-p", "-t", `=${target}:`, "#{pane_pid}"]);
+    const launcherPgid = Number(pane.stdout.trim());
+    assert.ok(Number.isSafeInteger(launcherPgid) && launcherPgid > 0);
+    await seedBee(store, bee, {
+      status: "running",
+      providerSessionId: "sess-group",
+      launcherPgid,
+      // Deliberately missing launcherFingerprint: signalling must fail closed.
+    });
+
+    await assert.rejects(
+      hive(store, socket, ["set-model", bee, "gpt-5.5"]),
+      /exact cleanup unconfirmed.*missing or mismatched birth fingerprint/,
+    );
+
+    assert.equal((await readBee(store, bee)).model, undefined, "selection stays aligned with the old runtime");
+    assert.equal(await hasSession(target), false, "tmux removed the pane, but that alone did not authorize relaunch");
+  });
+});
+
 test("set-model relaunches a live tmux bee resuming its session with the new selection", { skip: !tmuxAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const bee = "CO.live-switch";

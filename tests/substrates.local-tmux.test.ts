@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { NodeRecord } from "../src/node.js";
 import { clearSubstrateCache, localSubstrate, LOCAL_NODE, substrateFor, substrateForNode, substrateForRecord } from "../src/substrates/index.js";
-import { createLocalTmuxSubstrate, hasSession, kill as tmuxKillSession, newSession, sendText, terminateProcessGroup, tmux } from "../src/substrates/local-tmux.js";
+import { createLocalTmuxSubstrate, hasSession, kill as tmuxKillSession, killPane, newSession, sendText, terminateProcessGroup, tmux } from "../src/substrates/local-tmux.js";
 import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import * as legacyTmux from "../src/tmux.js";
 
@@ -228,11 +228,12 @@ test("local fallback never signals a reused launcher PID or process group", asyn
   const recorded = { pgid: 7373, startedAt: "Mon Aug  7 09:00:00 2026" };
   const replacement = { pgid: 7373, startedAt: "Mon Aug  7 09:01:00 2026" };
   const signals: Array<[number, NodeJS.Signals | 0]> = [];
-  await terminateProcessGroup(7373, recorded, {
+  const result = await terminateProcessGroup(7373, recorded, {
     readProcessIdentity: async () => replacement,
-    kill: (pid, signal) => signals.push([pid, signal]),
+    kill: (pid, signal) => { signals.push([pid, signal]); },
   });
   assert.deepEqual(signals, [], "same numeric PID/PGID with a new birth receives no signal");
+  assert.equal(result.status, "indeterminate", "a mismatched birth is not exact-group absence proof");
 });
 
 test("local fallback revalidates launcher birth before SIGKILL escalation", async () => {
@@ -240,12 +241,67 @@ test("local fallback revalidates launcher birth before SIGKILL escalation", asyn
   const replacement = { pgid: 7474, startedAt: "Mon Aug  7 09:01:00 2026" };
   let reads = 0;
   const signals: Array<[number, NodeJS.Signals | 0]> = [];
-  await terminateProcessGroup(7474, recorded, {
+  const result = await terminateProcessGroup(7474, recorded, {
     readProcessIdentity: async () => (++reads === 1 ? recorded : replacement),
-    kill: (pid, signal) => signals.push([pid, signal]),
+    kill: (pid, signal) => { signals.push([pid, signal]); },
     sleep: async () => undefined,
   });
-  assert.deepEqual(signals, [[-7474, "SIGTERM"]], "replacement group is not escalated to SIGKILL");
+  assert.deepEqual(signals, [[-7474, "SIGTERM"], [-7474, 0]], "replacement group is only checked, never escalated to SIGKILL");
+  assert.equal(result.status, "indeterminate");
+});
+
+test("exact group stop is indeterminate without a matching birth fingerprint", async () => {
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  const result = await terminateProcessGroup(7575, undefined, {
+    kill: (pid, signal) => { signals.push([pid, signal]); },
+  });
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /missing or mismatched birth fingerprint/);
+  assert.deepEqual(signals, []);
+});
+
+test("exact group stop reports signal failure while the matching group remains live", async () => {
+  const recorded = { pgid: 7676, startedAt: "Mon Aug  7 09:00:00 2026" };
+  const result = await terminateProcessGroup(7676, recorded, {
+    readProcessIdentity: async () => recorded,
+    kill: (_pid, signal) => {
+      if (signal === "SIGTERM") throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    },
+  });
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /SIGTERM.*operation not permitted/);
+});
+
+test("exact group stop confirms post-TERM birth-aware absence", async () => {
+  const recorded = { pgid: 7777, startedAt: "Mon Aug  7 09:00:00 2026" };
+  let reads = 0;
+  const signals: Array<NodeJS.Signals | 0> = [];
+  const result = await terminateProcessGroup(7777, recorded, {
+    readProcessIdentity: async () => (++reads === 1 ? recorded : null),
+    kill: (_pid, signal) => {
+      signals.push(signal);
+      if (signal === 0) throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+    },
+    sleep: async () => undefined,
+  });
+  assert.deepEqual(result, { status: "confirmed", reason: "absent" });
+  assert.deepEqual(signals, ["SIGTERM", 0]);
+});
+
+test("missing exact pane does not hide a live matching launcher group", async () => {
+  const recorded = { pgid: 7878, startedAt: "Mon Aug  7 09:00:00 2026" };
+  const result = await killPane("%99999999", {
+    launcherPgid: 7878,
+    launcherFingerprint: recorded,
+  }, {
+    readProcessIdentity: async () => recorded,
+    kill: (_pid, signal) => {
+      if (signal === "SIGKILL") throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    },
+    sleep: async () => undefined,
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.stderr, /SIGKILL.*operation not permitted|absence unconfirmed/);
 });
 
 test("local newSession cleans up its hive-launch tmpdir when tmux refuses the session", { timeout: 30_000 }, async () => {

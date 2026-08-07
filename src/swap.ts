@@ -17,6 +17,7 @@ import { withSessionLifecycleTransaction } from "./lifecycle.js";
 import { closeRequestsForNewIncarnation } from "./requests/store.js";
 import { appendLedger, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
+import { stopRuntimeStrict } from "./substrates/stop.js";
 import type { NewSessionResult } from "./substrates/types.js";
 import { nextRuntimeIncarnationPatch } from "./seal.js";
 import { copyThreadForFork } from "./threadCopy.js";
@@ -151,23 +152,17 @@ export async function swapAccount(
       throw new Error(`Bee ${current.name} has no recorded provider session id; refusing to switch Claude accounts without thread continuity`);
     }
 
-    // 1. Ensure the process is stopped. The tmux session must be fully gone
-    //    before we relaunch into the same target.
-    if (await substrate.hasSession(current.tmuxTarget)) {
-      const killResult = await substrate.kill(current.tmuxTarget);
-      if (!killResult.ok) {
-        throw new Error(`Could not stop ${record.name} before swap: ${killResult.stderr || killResult.stdout || `exit ${killResult.exitCode}`}`);
-      }
-    }
-    let gone = false;
-    for (let i = 0; i < pollAttempts; i += 1) {
-      if (!(await substrate.hasSession(current.tmuxTarget).catch(() => true))) {
-        gone = true;
-        break;
-      }
-      if (pollIntervalMs > 0) await sleep(pollIntervalMs);
-    }
-    if (!gone) throw new Error(`Session ${current.tmuxTarget} still alive after kill; aborting swap`);
+    // 1. Ensure both the exact persisted launcher group and tmux target are
+    //    positively absent before credentials are activated or a replacement
+    //    runtime is launched.
+    await stopRuntimeStrict(substrate, current.tmuxTarget, {
+      launcherPgid: current.launcherPgid,
+      launcherFingerprint: current.launcherFingerprint,
+      pollAttempts,
+      pollIntervalMs,
+      sleep,
+      context: `Could not stop ${record.name} before swap`,
+    });
 
     // Resume ids are backed by home-local transcript files for Claude/Codex.
     // Claude cross-account moves must additionally mint a fresh id so its

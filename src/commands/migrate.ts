@@ -23,6 +23,7 @@ import { closeRequestsForNewIncarnation, openRequest, readBeeRequests, resolveRe
 import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
 import { appendLedger, listSessions, storeRoot, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
+import { stopRuntimeStrict } from "../substrates/stop.js";
 import type { NewSessionResult, Substrate } from "../substrates/types.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
 import { formatShellCommand, hasSession } from "../tmux.js";
@@ -930,21 +931,23 @@ async function demoteInTransaction(lifecycle: SessionLifecycleTransaction, parse
   const adapter = adapterFor(tool);
   if (!adapter) throw new Error(`hive demote: no HSR adapter for ${record.agent}`);
   const now = truthy(flag(parsed, "now"));
+  const tmuxSubstrate = localSubstrate();
 
   // 1. Quiesce. A tmux bee's mid-turn state is heuristic, so absent --now we
   //    proceed best-effort; --now sends Ctrl-C to the agent pane first.
   if (now) {
-    await localSubstrate().sendKey(record.tmuxTarget, "C-c", record.agentPaneId).catch(() => undefined);
+    await tmuxSubstrate.sendKey(record.tmuxTarget, "C-c", record.agentPaneId).catch(() => undefined);
     await sleep(300);
   } else {
     console.error(note(`${record.name}: a tmux bee's mid-turn state is heuristic — demoting without waiting (use --now to interrupt first)`));
   }
 
   // 2. Kill the tmux session/pane — but keep the record.
-  await localSubstrate().kill(record.tmuxTarget, {
+  await stopRuntimeStrict(tmuxSubstrate, record.tmuxTarget, {
     launcherPgid: record.launcherPgid,
     launcherFingerprint: record.launcherFingerprint,
-  }).catch(() => undefined);
+    context: `hive demote: could not stop ${record.name}`,
+  });
 
   // 3. Build the headless spec (the adapter appends the resume + stream flags)
   //    and fork the runner host with resume:true against the same session id.
@@ -1212,23 +1215,18 @@ async function readLoginMarkerDigest(markerPath: string): Promise<string | null>
   }
 }
 
-async function stopRuntimeForAuthResume(record: SessionRecord): Promise<void> {
-  const substrate = substrateFor(record);
+export async function stopRuntimeForAuthResume(
+  record: SessionRecord,
+  substrate: Substrate = substrateFor(record),
+): Promise<void> {
   const target = record.substrate === "hsr" ? record.name : record.tmuxTarget;
-  if (!(await substrate.hasSession(target).catch(() => false))) return;
-  const result = await substrate.kill(target, {
+  await stopRuntimeStrict(substrate, target, {
     launcherPgid: record.launcherPgid,
     launcherFingerprint: record.launcherFingerprint,
+    pollAttempts: 50,
+    pollIntervalMs: 100,
+    context: `hive auth-resume: could not stop ${record.name}`,
   });
-  if (!result.ok) {
-    throw new Error(`hive auth-resume: could not stop ${record.name}: ${result.stderr || result.stdout || `exit ${result.exitCode}`}`);
-  }
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    if (!(await substrate.hasSession(target).catch(() => true))) return;
-    await sleep(100);
-  }
-  throw new Error(`hive auth-resume: ${record.name} did not stop within 5s; retry after the runtime exits`);
 }
 
 /**
@@ -1644,7 +1642,13 @@ async function setModelInTransaction(
   }
 
   const substrate = substrateFor(record);
-  const alive = await substrate.hasSession(record.tmuxTarget).catch(() => false);
+  let alive: boolean;
+  try {
+    alive = await substrate.hasSession(record.tmuxTarget);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`hive set-model: could not observe ${record.tmuxTarget} before changing runtime: ${detail}`);
+  }
   if (alive && !fresh && !record.providerSessionId) {
     throw new Error(
       `hive set-model: ${record.name} has no recorded provider session id to resume; retry with --fresh to relaunch on a new provider session`,
@@ -1687,18 +1691,13 @@ async function setModelInTransaction(
       await localSubstrate().sendKey(record.tmuxTarget, "C-c", record.agentPaneId).catch(() => undefined);
       await sleep(300);
     }
-    await localSubstrate().kill(record.tmuxTarget, {
+    await stopRuntimeStrict(substrate, record.tmuxTarget, {
       launcherPgid: record.launcherPgid,
       launcherFingerprint: record.launcherFingerprint,
-    }).catch(() => undefined);
-    const deadline = Date.now() + 4_000;
-    while (Date.now() < deadline) {
-      if (!(await substrate.hasSession(record.tmuxTarget).catch(() => true))) break;
-      await sleep(250);
-    }
-    if (await substrate.hasSession(record.tmuxTarget).catch(() => false)) {
-      throw new Error(`hive set-model: ${record.tmuxTarget} is still alive after kill; aborting before relaunch`);
-    }
+      pollAttempts: 16,
+      pollIntervalMs: 250,
+      context: `hive set-model: could not stop ${record.tmuxTarget} before relaunch`,
+    });
   }
 
   const updated = await lifecycle.commit(applyFields);

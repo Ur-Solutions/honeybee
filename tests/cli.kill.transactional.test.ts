@@ -197,14 +197,13 @@ test("transactionalKill: substrate.kill throws → ok=false, record persisted wi
   });
 });
 
-test("transactionalKill: kill reports failure but the poll confirms gone → ok=true, record deleted (race)", async () => {
+test("transactionalKill: pane absence cannot override an unconfirmed exact cleanup", async () => {
   await withTempStore(async (dir) => {
     const record = seed({ name: "race", tmuxTarget: "race" });
     await saveSession(record);
 
-    // Race: the session dies between the fast-path hasSession (true) and the
-    // kill call, so kill fails with "can't find session" — but the post-kill
-    // poll CONFIRMS the session is gone, which must win.
+    // The visible session dies between the first probe and kill, but a false
+    // kill result means exact detached-group absence was not proven.
     let probes = 0;
     const substrate = makeSubstrate({
       hasSession: async () => {
@@ -215,9 +214,9 @@ test("transactionalKill: kill reports failure but the poll confirms gone → ok=
     });
 
     const outcome = await transactionalKill(record, { substrate, pollIntervalMs: 0 });
-    assert.equal(outcome.ok, true, "poll-confirmed-gone must override the kill failure");
+    assert.equal(outcome.ok, false, "pane absence must not override exact cleanup failure");
     const after = await readFile(join(dir, "sessions", "race.json"), "utf8").catch(() => null);
-    assert.equal(after, null, "record should be deleted once the poll confirms the session is gone");
+    assert.notEqual(after, null, "record remains as the retry handle for an indeterminate stop");
   });
 });
 
@@ -280,13 +279,13 @@ test("transactionalKill: session gone still signals a recorded launcher process 
       kill: async (_target, options) => {
         killCalls += 1;
         assert.equal(options?.launcherPgid, 1234);
-        return killErr("no such session");
+        return killOk();
       },
     });
 
     const outcome = await transactionalKill(record, { substrate, pollAttempts: 1, pollIntervalMs: 0 });
 
-    assert.deepEqual(outcome, { ok: true, alreadyGone: false, attempts: 1 });
+    assert.deepEqual(outcome, { ok: true, alreadyGone: true, attempts: 1 });
     assert.equal(killCalls, 1);
   });
 });

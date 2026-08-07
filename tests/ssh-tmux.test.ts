@@ -84,8 +84,30 @@ test("newSession streams env-bearing launches over stdin so values never enter t
   assert.ok(!call.argv.join(" ").includes("bar baz"), "env value is absent from the process argv");
   assert.equal(
     call.input,
-    "exec tmux new-session -d -P -F '#{pane_id}' -s alpha -c /remote/path env 'FOO=bar baz' codex --cwd /work/space\n",
+    "exec tmux new-session -d -P -F '#{pane_id}:#{pane_pid}' -s alpha -c /remote/path env 'FOO=bar baz' codex --cwd /work/space\n",
   );
+});
+
+test("newSession captures the remote launcher process-group birth identity", async () => {
+  const cap = captureExec();
+  cap.respondWith((call) => {
+    if (call.argv.includes("new-session")) return { exitCode: 0, stdout: "%42:4242\n" };
+    if (call.argv.includes("/bin/ps")) {
+      return { exitCode: 0, stdout: "4242 1 4242 Fri Aug  7 10:00:00 2026\n" };
+    }
+    return { exitCode: 0 };
+  });
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  const launch = await s.newSession("alpha", "/remote/path", { command: "codex", args: [] });
+
+  assert.deepEqual(launch, {
+    paneId: "%42",
+    launcherPgid: 4242,
+    launcherFingerprint: { pgid: 4242, startedAt: "Fri Aug  7 10:00:00 2026" },
+  });
+  assert.deepEqual(cap.calls[1]!.argv, [
+    "ssh", ...MUX, "trmd@mini01", "/bin/ps", "-o", "pid=,ppid=,pgid=,lstart=", "-p", "4242",
+  ]);
 });
 
 test("newSession keeps token values out of the ssh command line while delivering them", async () => {
@@ -323,13 +345,13 @@ test("listSessions quotes the #{session_name} format for the remote shell", asyn
   assert.deepEqual(await s2.listSessions(), []);
 });
 
-test("kill targets the exact session name and returns the underlying exit code", async () => {
+test("kill without remote process-group evidence stays unconfirmed", async () => {
   const cap = captureExec();
   cap.respondWith(() => ({ exitCode: 0 }));
   const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
   const r = await s.kill("alpha");
-  assert.equal(r.ok, true);
-  assert.equal(r.exitCode, 0);
+  assert.equal(r.ok, false);
+  assert.match(r.stderr, /process-group identity was not recorded/);
   assert.deepEqual(cap.calls[0]!.argv, ["ssh", ...MUX, "trmd@mini01", "tmux", "kill-session", "-t", "=alpha"]);
 
   const cap2 = captureExec();
@@ -338,6 +360,60 @@ test("kill targets the exact session name and returns the underlying exit code",
   const r2 = await s2.kill("alpha");
   assert.equal(r2.ok, false);
   assert.equal(r2.exitCode, 1);
+});
+
+test("kill confirms remote group and exact session absence after TERM", async () => {
+  const cap = captureExec();
+  let groupAlive = true;
+  cap.respondWith((call) => {
+    if (call.argv.includes("/bin/ps")) {
+      return groupAlive
+        ? { exitCode: 0, stdout: "4242 1 4242 Fri Aug  7 10:00:00 2026\n" }
+        : { exitCode: 1 };
+    }
+    if (call.argv.includes("/bin/kill")) {
+      if (call.argv.includes("-TERM")) {
+        groupAlive = false;
+        return { exitCode: 0 };
+      }
+      return groupAlive
+        ? { exitCode: 0 }
+        : { exitCode: 1, stderr: "kill: 4242: No such process" };
+    }
+    if (call.argv.includes("kill-session")) return { exitCode: 0 };
+    if (call.argv.includes("has-session")) return { exitCode: 1, stderr: "can't find session: alpha" };
+    return { exitCode: 0 };
+  });
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook, sleep: async () => undefined });
+  const fingerprint = { pgid: 4242, startedAt: "Fri Aug  7 10:00:00 2026" };
+  const result = await s.kill("alpha", { launcherPgid: 4242, launcherFingerprint: fingerprint });
+
+  assert.equal(result.ok, true);
+  assert.equal(groupAlive, false);
+  assert.ok(cap.calls.some((call) => call.argv.includes("-TERM")));
+  assert.ok(cap.calls.some((call) => call.argv.includes("has-session")), "session absence is positively probed");
+});
+
+test("killIncarnation rejects missing pane while the matching remote group survives", async () => {
+  const cap = captureExec();
+  cap.respondWith((call) => {
+    if (call.argv.includes("/bin/ps")) {
+      return { exitCode: 0, stdout: "4242 1 4242 Fri Aug  7 10:00:00 2026\n" };
+    }
+    if (call.argv.includes("/bin/kill")) return { exitCode: 0 };
+    if (call.argv.includes("kill-pane")) return { exitCode: 1, stderr: "can't find pane: %42" };
+    if (call.argv.includes("list-panes")) return { exitCode: 0, stdout: "%99\n" };
+    return { exitCode: 0 };
+  });
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook, sleep: async () => undefined });
+  const result = await s.killIncarnation!("alpha", {
+    paneId: "%42",
+    launcherPgid: 4242,
+    launcherFingerprint: { pgid: 4242, startedAt: "Fri Aug  7 10:00:00 2026" },
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.stderr, /absence unconfirmed/);
 });
 
 test("probe caches ProbeResult within the TTL window", async () => {

@@ -2,8 +2,13 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
 import type { NodeRecord } from "../node.js";
-import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
-import { formatShellCommand, paneArg } from "./local-tmux.js";
+import { parseProcessRows, type ProcessBirthFingerprint } from "../hsr/processIdentity.js";
+import {
+  formatShellCommand,
+  paneArg,
+  terminateProcessGroup,
+  type ExactProcessGroupStopResult,
+} from "./local-tmux.js";
 import type { KillResult, LaunchSpec, NewSessionResult, ProbeResult, Substrate, TmuxWindowOptions } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -18,7 +23,45 @@ export type SshTmuxOptions = {
   node: NodeRecord;
   execHook?: SshTmuxExecHook;
   now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 };
+
+type ExactRemoteTargetAbsence =
+  | { status: "absent" }
+  | { status: "present" }
+  | { status: "indeterminate"; reason: string };
+
+function parseRemoteLaunchResult(stdout: string): { paneId: string; panePid?: number } {
+  const raw = stdout.trim();
+  const separator = raw.lastIndexOf(":");
+  if (separator < 0) return { paneId: raw };
+  const paneId = raw.slice(0, separator);
+  const parsed = Number(raw.slice(separator + 1));
+  const panePid = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+  return { paneId, ...(panePid ? { panePid } : {}) };
+}
+
+function exactRemoteStopResult(
+  command: { stdout: string; stderr: string; exitCode: number },
+  group: ExactProcessGroupStopResult,
+  target: ExactRemoteTargetAbsence,
+  label: string,
+): KillResult {
+  if (group.status === "confirmed" && target.status === "absent") {
+    return { ok: true, stdout: command.stdout, stderr: command.stderr, exitCode: 0 };
+  }
+  const reasons = [
+    ...(group.status === "indeterminate" ? [group.reason] : []),
+    ...(target.status === "present" ? [`${label} remains live`] : []),
+    ...(target.status === "indeterminate" ? [`${label} absence unconfirmed: ${target.reason}`] : []),
+  ];
+  return {
+    ok: false,
+    stdout: command.stdout,
+    stderr: [command.stderr.trim(), ...reasons].filter(Boolean).join("; "),
+    exitCode: command.exitCode === 0 ? 1 : command.exitCode,
+  };
+}
 
 export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
   const node = options.node;
@@ -110,7 +153,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
       ...spec.args,
     ];
     // -P -F prints the new pane id so spawn can pin the bee to it.
-    const tmuxArgs = ["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", target, "-c", cwd, ...commandWords];
+    const tmuxArgs = ["new-session", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-s", target, "-c", cwd, ...commandWords];
     // An env-bearing launch may contain caller-minted tokens. Never put those
     // values in the local ssh argv (visible via ps); stream the fully quoted
     // remote command over stdin to `sh -s`. The SSH command line then carries
@@ -119,9 +162,10 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
       ? await runSsh(["sh", "-s"], { input: `exec ${["tmux", ...tmuxArgs].map(shellQuote).join(" ")}\n` })
       : await runTmux(tmuxArgs);
     if (result.exitCode !== 0) throw new Error(`Remote tmux new-session failed: ${result.stderr.trim() || result.stdout.trim()}`);
-    const paneId = result.stdout.trim();
+    const { paneId, panePid } = parseRemoteLaunchResult(result.stdout);
     await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
-    return { paneId };
+    const identity = await captureRemoteLauncherIdentity(panePid);
+    return { paneId, ...identity };
   }
 
   // Combs are retired (APIA-85): no remote pane-split (`newPane`) / pane-kill
@@ -139,21 +183,96 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     }
   }
 
-  async function kill(target: string, _options: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint } = {}): Promise<KillResult> {
+  async function kill(target: string, killOptions: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint } = {}): Promise<KillResult> {
+    const group = await stopRemoteProcessGroup(killOptions.launcherPgid, killOptions.launcherFingerprint);
     const result = await runTmux(["kill-session", "-t", `=${target}`]);
-    return { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+    const targetAbsence = await inspectRemoteSessionAbsence(target);
+    return exactRemoteStopResult(result, group, targetAbsence, `remote tmux session ${target}`);
   }
 
   async function killIncarnation(_target: string, launch: NewSessionResult): Promise<KillResult> {
     // Remote pane ids are server-global and exact, so this cannot select a
     // replacement session that reused the logical bee name.
+    const group = await stopRemoteProcessGroup(launch.launcherPgid, launch.launcherFingerprint);
     const result = await runTmux(["kill-pane", "-t", launch.paneId]);
-    const absent = result.exitCode === 1 && /can't find pane|no server running/i.test(result.stderr);
+    const targetAbsence = await inspectRemotePaneAbsence(launch.paneId);
+    return exactRemoteStopResult(result, group, targetAbsence, `remote tmux pane ${launch.paneId}`);
+  }
+
+  async function captureRemoteLauncherIdentity(
+    panePid: number | undefined,
+  ): Promise<{ launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint }> {
+    if (!panePid) return {};
+    try {
+      const pane = await readRemoteProcessBirth(panePid);
+      if (!pane) return { launcherPgid: panePid };
+      const launcherPgid = pane.pgid;
+      const leader = launcherPgid === panePid ? pane : await readRemoteProcessBirth(launcherPgid);
+      const launcherFingerprint = leader?.pgid === launcherPgid ? leader : undefined;
+      return {
+        launcherPgid,
+        ...(launcherFingerprint ? { launcherFingerprint } : {}),
+      };
+    } catch {
+      // Keep the recyclable locator so later teardown knows evidence is
+      // incomplete and fails closed instead of treating pane absence as proof.
+      return { launcherPgid: panePid };
+    }
+  }
+
+  async function readRemoteProcessBirth(pid: number): Promise<ProcessBirthFingerprint | null> {
+    const result = await runSsh(["/bin/ps", "-o", "pid=,ppid=,pgid=,lstart=", "-p", String(pid)]);
+    if (result.exitCode === 0) {
+      const row = parseProcessRows(result.stdout).find((candidate) => candidate.pid === pid);
+      return row ? { pgid: row.pgid, startedAt: row.startedAt } : null;
+    }
+    if (result.exitCode === 1 && !result.stdout.trim()) return null;
+    throw new Error(`remote process identity read on ${node.name} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`);
+  }
+
+  async function signalRemoteProcessGroup(pid: number, signal: NodeJS.Signals | 0): Promise<void> {
+    const signalArg = signal === 0 ? "-0" : `-${signal.slice(3)}`;
+    const result = await runSsh(["/bin/kill", signalArg, "--", String(pid)]);
+    if (result.exitCode === 0) return;
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`;
+    const error = new Error(`remote process-group signal on ${node.name} failed: ${detail}`) as Error & { code?: string };
+    if (/no such process/i.test(detail)) error.code = "ESRCH";
+    throw error;
+  }
+
+  async function stopRemoteProcessGroup(
+    pgid: number | undefined,
+    fingerprint: ProcessBirthFingerprint | undefined,
+  ): Promise<ExactProcessGroupStopResult> {
+    if (!pgid) {
+      return { status: "indeterminate", reason: "remote launcher process-group identity was not recorded" };
+    }
+    return terminateProcessGroup(pgid, fingerprint, {
+      platform: "linux",
+      readProcessIdentity: readRemoteProcessBirth,
+      kill: signalRemoteProcessGroup,
+      ...(options.sleep ? { sleep: options.sleep } : {}),
+    });
+  }
+
+  async function inspectRemoteSessionAbsence(target: string): Promise<ExactRemoteTargetAbsence> {
+    try {
+      return (await hasSession(target)) ? { status: "present" } : { status: "absent" };
+    } catch (error) {
+      return { status: "indeterminate", reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async function inspectRemotePaneAbsence(paneId: string): Promise<ExactRemoteTargetAbsence> {
+    const result = await runTmux(["list-panes", "-a", "-F", "#{pane_id}"]);
+    if (result.exitCode === 0) {
+      const panes = new Set(result.stdout.split("\n").map((value) => value.trim()).filter(Boolean));
+      return panes.has(paneId) ? { status: "present" } : { status: "absent" };
+    }
+    if (/can't find pane|no server running/i.test(result.stderr)) return { status: "absent" };
     return {
-      ok: result.exitCode === 0 || absent,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: absent ? 0 : result.exitCode,
+      status: "indeterminate",
+      reason: result.stderr.trim() || result.stdout.trim() || `remote pane probe exited ${result.exitCode}`,
     };
   }
 

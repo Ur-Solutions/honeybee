@@ -106,7 +106,9 @@ export async function tmux(args: string[], options: { reject?: boolean } = {}): 
 // those use the `=name:` form (exact session, active pane).
 export async function hasSession(target: string): Promise<boolean> {
   const result = await tmux(["has-session", "-t", `=${target}`], { reject: false });
-  return result.ok;
+  if (result.ok) return true;
+  if (isTmuxServerOrTargetAbsent(result.stderr, "session")) return false;
+  throw new Error(result.stderr.trim() || result.stdout.trim() || `tmux has-session exited ${result.exitCode}`);
 }
 
 // A pane id (e.g. "%7") is globally unique on a tmux server, so "-t %7" is exact
@@ -208,10 +210,12 @@ export async function capture(target: string, lines = 80, paneId?: string): Prom
 export async function kill(
   target: string,
   options: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint } = {},
+  deps: TmuxProcessSignalDependencies = {},
 ): Promise<KillResult> {
-  await terminateProcessGroup(options.launcherPgid, options.launcherFingerprint);
+  const group = await terminateProcessGroup(options.launcherPgid, options.launcherFingerprint, deps);
   const result = await tmux(["kill-session", "-t", `=${target}`], { reject: false });
-  return result;
+  const targetAbsence = await inspectSessionAbsence(target);
+  return exactStopResult(result, group, targetAbsence, `tmux session ${target}`);
 }
 
 // A pane id ("%7") is globally unique on the server, so "-t %7" is exact on its
@@ -221,10 +225,12 @@ export async function kill(
 export async function killPane(
   paneId: string,
   options: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint } = {},
+  deps: TmuxProcessSignalDependencies = {},
 ): Promise<KillResult> {
-  await terminateProcessGroup(options.launcherPgid, options.launcherFingerprint);
+  const group = await terminateProcessGroup(options.launcherPgid, options.launcherFingerprint, deps);
   const result = await tmux(["kill-pane", "-t", paneId], { reject: false });
-  return result;
+  const targetAbsence = await inspectPaneAbsence(paneId);
+  return exactStopResult(result, group, targetAbsence, `tmux pane ${paneId}`);
 }
 
 function parseLaunchResult(stdout: string): NewSessionResult {
@@ -247,37 +253,160 @@ function parsePositiveInt(value: string): number | undefined {
 
 export type TmuxProcessSignalDependencies = {
   readProcessIdentity?: ProcessIdentityReader;
-  kill?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  kill?: (pid: number, signal: NodeJS.Signals | 0) => void | Promise<void>;
   sleep?: (ms: number) => Promise<void>;
+  platform?: NodeJS.Platform;
 };
+
+export type ExactProcessGroupStopResult =
+  | { status: "confirmed"; reason: "not-recorded" | "absent" }
+  | { status: "indeterminate"; reason: string };
+
+type ExactTargetAbsence =
+  | { status: "absent" }
+  | { status: "present" }
+  | { status: "indeterminate"; reason: string };
 
 export async function terminateProcessGroup(
   pgid: number | undefined,
   fingerprint: ProcessBirthFingerprint | undefined,
   deps: TmuxProcessSignalDependencies = {},
-): Promise<void> {
-  if (!pgid || process.platform === "win32") return;
-  if (fingerprint?.pgid !== pgid || (await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity)) !== "match") return;
-  const kill = deps.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => process.kill(pid, signal));
+): Promise<ExactProcessGroupStopResult> {
+  if (!pgid) return { status: "confirmed", reason: "not-recorded" };
+  if ((deps.platform ?? process.platform) === "win32") {
+    return { status: "indeterminate", reason: `process-group verification is unavailable for ${pgid} on win32` };
+  }
+  if (fingerprint?.pgid !== pgid) {
+    return { status: "indeterminate", reason: `missing or mismatched birth fingerprint for process group ${pgid}` };
+  }
+  const kill = deps.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => { process.kill(pid, signal); });
+  const initialBirth = await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity);
+  if (initialBirth === "gone") return confirmProcessGroupAbsent(pgid, fingerprint, kill, deps.readProcessIdentity);
+  if (initialBirth !== "match") {
+    return { status: "indeterminate", reason: `process-group ${pgid} birth identity is ${initialBirth}` };
+  }
+
   try {
-    kill(-pgid, "SIGTERM");
-  } catch {
-    return;
+    await kill(-pgid, "SIGTERM");
+  } catch (error) {
+    const absent = await confirmProcessGroupAbsent(pgid, fingerprint, kill, deps.readProcessIdentity);
+    if (absent.status === "confirmed") return absent;
+    return { status: "indeterminate", reason: `SIGTERM for process group ${pgid} failed: ${errorMessage(error)}; ${absent.reason}` };
   }
   await (deps.sleep ?? sleep)(500);
-  // The group id can be recycled during the grace. Escalate only while its
-  // exact persisted leader birth still matches.
-  if ((await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity)) !== "match") return;
-  try {
-    kill(-pgid, 0);
-  } catch {
-    return;
+
+  const afterTermBirth = await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity);
+  const afterTermPresence = await inspectProcessGroupPresence(pgid, kill);
+  if (afterTermBirth === "gone" && afterTermPresence.status === "absent") {
+    return { status: "confirmed", reason: "absent" };
   }
-  try {
-    kill(-pgid, "SIGKILL");
-  } catch {
-    // Already gone or not signalable; tmux teardown result remains authoritative.
+  // A different/unreadable leader can be a recycled group. Never escalate a
+  // destructive signal without continuity from the persisted birth proof.
+  if (afterTermBirth === "mismatch" || afterTermBirth === "unverifiable") {
+    return { status: "indeterminate", reason: `process-group ${pgid} birth identity became ${afterTermBirth} after SIGTERM` };
   }
+  if (afterTermPresence.status === "indeterminate") {
+    return { status: "indeterminate", reason: afterTermPresence.reason };
+  }
+  if (afterTermPresence.status === "absent") {
+    return { status: "indeterminate", reason: `process-group ${pgid} absence conflicted with a live leader birth` };
+  }
+
+  // If the leader exited but signal-0 still sees the group, its remaining
+  // members keep the PGID allocated; this is continuity of the exact group,
+  // not a recycled group. Escalation is therefore still fenced to our birth.
+  try {
+    await kill(-pgid, "SIGKILL");
+  } catch (error) {
+    const absent = await confirmProcessGroupAbsent(pgid, fingerprint, kill, deps.readProcessIdentity);
+    if (absent.status === "confirmed") return absent;
+    return { status: "indeterminate", reason: `SIGKILL for process group ${pgid} failed: ${errorMessage(error)}; ${absent.reason}` };
+  }
+  await (deps.sleep ?? sleep)(50);
+  return confirmProcessGroupAbsent(pgid, fingerprint, kill, deps.readProcessIdentity);
+}
+
+async function confirmProcessGroupAbsent(
+  pgid: number,
+  fingerprint: ProcessBirthFingerprint,
+  kill: NonNullable<TmuxProcessSignalDependencies["kill"]>,
+  reader?: ProcessIdentityReader,
+): Promise<ExactProcessGroupStopResult> {
+  const birth = await inspectProcessBirth(pgid, fingerprint, reader);
+  const presence = await inspectProcessGroupPresence(pgid, kill);
+  if (birth === "gone" && presence.status === "absent") return { status: "confirmed", reason: "absent" };
+  if (presence.status === "indeterminate") return { status: "indeterminate", reason: presence.reason };
+  return {
+    status: "indeterminate",
+    reason: `process-group ${pgid} absence unconfirmed (birth=${birth}, group=${presence.status})`,
+  };
+}
+
+async function inspectProcessGroupPresence(
+  pgid: number,
+  kill: NonNullable<TmuxProcessSignalDependencies["kill"]>,
+): Promise<{ status: "present" } | { status: "absent" } | { status: "indeterminate"; reason: string }> {
+  try {
+    await kill(-pgid, 0);
+    return { status: "present" };
+  } catch (error) {
+    if (isNoSuchProcessError(error)) return { status: "absent" };
+    return { status: "indeterminate", reason: `could not verify process-group ${pgid} absence: ${errorMessage(error)}` };
+  }
+}
+
+async function inspectSessionAbsence(target: string): Promise<ExactTargetAbsence> {
+  try {
+    return (await hasSession(target)) ? { status: "present" } : { status: "absent" };
+  } catch (error) {
+    return { status: "indeterminate", reason: errorMessage(error) };
+  }
+}
+
+async function inspectPaneAbsence(paneId: string): Promise<ExactTargetAbsence> {
+  const result = await tmux(["list-panes", "-a", "-F", "#{pane_id}"], { reject: false });
+  if (result.ok) {
+    const panes = new Set(result.stdout.split("\n").map((value) => value.trim()).filter(Boolean));
+    return panes.has(paneId) ? { status: "present" } : { status: "absent" };
+  }
+  if (isTmuxServerOrTargetAbsent(result.stderr, "pane")) return { status: "absent" };
+  return { status: "indeterminate", reason: result.stderr.trim() || result.stdout.trim() || `tmux pane probe exited ${result.exitCode}` };
+}
+
+function exactStopResult(
+  command: TmuxResult,
+  group: ExactProcessGroupStopResult,
+  target: ExactTargetAbsence,
+  label: string,
+): KillResult {
+  if (group.status === "confirmed" && target.status === "absent") {
+    return { ok: true, stdout: command.stdout, stderr: command.stderr, exitCode: 0 };
+  }
+  const reasons = [
+    ...(group.status === "indeterminate" ? [group.reason] : []),
+    ...(target.status === "present" ? [`${label} remains live`] : []),
+    ...(target.status === "indeterminate" ? [`${label} absence unconfirmed: ${target.reason}`] : []),
+  ];
+  return {
+    ok: false,
+    stdout: command.stdout,
+    stderr: [command.stderr.trim(), ...reasons].filter(Boolean).join("; "),
+    exitCode: command.exitCode === 0 ? 1 : command.exitCode,
+  };
+}
+
+function isNoSuchProcessError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "ESRCH" || /no such process/i.test(errorMessage(error));
+}
+
+function isTmuxServerOrTargetAbsent(stderr: string, target: "session" | "pane"): boolean {
+  return new RegExp(`can't find ${target}|no server running`, "i").test(stderr)
+    || /error connecting to .*\(No such file or directory\)/i.test(stderr);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -479,22 +608,22 @@ function shellQuote(value: string): string {
 
 export type { LaunchSpec };
 
-export function createLocalTmuxSubstrate(): Substrate {
+export function createLocalTmuxSubstrate(
+  options: { processSignalDependencies?: TmuxProcessSignalDependencies } = {},
+): Substrate {
+  const processSignalDependencies = options.processSignalDependencies;
   return {
     kind: "local-tmux",
     node: LOCAL_NODE,
     probe,
     hasSession,
     newSession,
-    kill,
+    kill: (target, killOptions) => kill(target, killOptions, processSignalDependencies),
     killIncarnation: async (_target, launch) => {
-      const result = await killPane(launch.paneId, {
+      return killPane(launch.paneId, {
         launcherPgid: launch.launcherPgid,
         launcherFingerprint: launch.launcherFingerprint,
-      });
-      return !result.ok && /can't find pane|no server running/i.test(result.stderr)
-        ? { ...result, ok: true, exitCode: 0 }
-        : result;
+      }, processSignalDependencies);
     },
     capture,
     sendText,

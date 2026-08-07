@@ -175,7 +175,8 @@ async function teardownSession(
   // exited on its own still needs that, so the already-gone fast-path must not
   // skip the RPC there (it is idempotent on the remote).
   const needsRemoteCleanup = substrate.kind === "remote-hsr";
-  if (!alreadyGone || record.launcherPgid || needsRemoteCleanup) {
+  const needsRemoteGroupProof = substrate.kind === "ssh-tmux";
+  if (!alreadyGone || record.launcherPgid || needsRemoteCleanup || needsRemoteGroupProof) {
     attempts += 1;
     try {
       const killResult = await substrate.kill(record.tmuxTarget, {
@@ -217,7 +218,9 @@ async function teardownSession(
     alreadyGone,
     killReturnedFailure,
     stillRunning,
-    ...(stillRunning ? { lastError: lastProbeError ?? killStderr ?? "session still exists after kill" } : {}),
+    ...(stillRunning || killReturnedFailure
+      ? { lastError: lastProbeError ?? killStderr ?? "exact runtime cleanup is unconfirmed" }
+      : {}),
   };
 }
 
@@ -424,11 +427,10 @@ export async function transactionalKill(
     const verdict = await teardownSession(current, options);
     await options.afterTeardown?.(current);
 
-    // Only the poll verdict decides failure: when it confirmed the session is
-    // gone (stillRunning === false) we proceed to purge even if the kill call
-    // reported failure — the session may have died between the probe and kill.
-    if (verdict.stillRunning) {
-      const lastError = verdict.lastError ?? "session still exists after kill";
+    // Pane/session absence cannot override an indeterminate exact process-group
+    // stop: an escaped child may have survived after tmux removed the target.
+    if (verdict.stillRunning || verdict.killReturnedFailure) {
+      const lastError = verdict.lastError ?? "exact runtime cleanup is unconfirmed";
       const failed = await lifecycle.commit({
         status: "kill_failed",
         lastError,
@@ -484,8 +486,8 @@ export async function transactionalRetire(
     const verdict = await teardownSession(current, options);
     await options.afterTeardown?.(current);
 
-    if (verdict.stillRunning) {
-      const lastError = verdict.lastError ?? "session still exists after retire";
+    if (verdict.stillRunning || verdict.killReturnedFailure) {
+      const lastError = verdict.lastError ?? "exact runtime cleanup is unconfirmed";
       const failed = await lifecycle.commit({
         status: "kill_failed",
         lastError,

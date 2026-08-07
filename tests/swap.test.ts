@@ -23,7 +23,12 @@ async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
-type FakeCall = { method: string; target: string; spec?: LaunchSpec };
+type FakeCall = {
+  method: string;
+  target: string;
+  spec?: LaunchSpec;
+  killOptions?: Parameters<Substrate["kill"]>[1];
+};
 
 function fakeSubstrate(initiallyAlive: boolean) {
   const calls: FakeCall[] = [];
@@ -38,8 +43,8 @@ function fakeSubstrate(initiallyAlive: boolean) {
       alive = true;
       return { paneId: "%0" };
     },
-    kill: async (target) => {
-      calls.push({ method: "kill", target });
+    kill: async (target, killOptions) => {
+      calls.push({ method: "kill", target, killOptions });
       alive = false;
       return { ok: true, stdout: "", stderr: "", exitCode: 0 };
     },
@@ -56,7 +61,7 @@ function fakeSubstrate(initiallyAlive: boolean) {
     attachCommand: () => [],
     attachSession: async () => undefined,
   };
-  return { substrate, calls };
+  return { substrate, calls, setAlive: (value: boolean) => { alive = value; } };
 }
 
 function record(overrides: Partial<SessionRecord> = {}): SessionRecord {
@@ -129,6 +134,38 @@ test("swapAccount re-keys a Claude thread when moving it to another account", as
     const persisted = await loadSession("CL.test");
     assert.equal(persisted?.accountId, "claude-new");
     assert.equal(persisted?.homePath, targetHome);
+  });
+});
+
+test("swapAccount refuses activation when tmux is gone but the old exact group stop is unconfirmed", async () => {
+  await withTempStore(async () => {
+    const rig = fakeSubstrate(true);
+    const fingerprint = { pgid: 4242, startedAt: "Fri Aug  7 10:00:00 2026" };
+    const existing = record({ launcherPgid: 4242, launcherFingerprint: fingerprint });
+    await saveSession(existing);
+    let activations = 0;
+    rig.substrate.kill = async (target, killOptions) => {
+      rig.calls.push({ method: "kill", target, killOptions });
+      rig.setAlive(false); // kill-session removed the pane, but the group survived.
+      return { ok: false, stdout: "", stderr: "exact launcher group remains live", exitCode: 1 };
+    };
+
+    await assert.rejects(
+      swapAccount(existing, account, {
+        substrate: rig.substrate,
+        sleep: async () => undefined,
+        activate: async () => {
+          activations += 1;
+          return [];
+        },
+      }),
+      /exact cleanup unconfirmed.*launcher group remains live/,
+    );
+
+    assert.equal(activations, 0, "credentials are not activated after an unconfirmed stop");
+    assert.equal(rig.calls.some((call) => call.method === "newSession"), false, "replacement runtime is not launched");
+    assert.deepEqual(rig.calls[0]?.killOptions, { launcherPgid: 4242, launcherFingerprint: fingerprint });
+    assert.equal((await loadSession(existing.name))?.accountId, existing.accountId);
   });
 });
 
