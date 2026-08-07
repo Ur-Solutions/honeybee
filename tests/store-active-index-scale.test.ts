@@ -11,8 +11,10 @@ import {
   listActiveSessionsHot,
   listSessions,
   rebuildActiveSessionIndex,
+  touchSession,
   type SessionRecord,
 } from "../src/store.js";
+import { accountCommitments } from "../src/limits/commitments.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,6 +41,24 @@ async function seedScale(root: string, count: number): Promise<void> {
     await Promise.all(Array.from({ length: Math.min(250, count - offset) }, (_, inner) => {
       const candidate = record(offset + inner, root);
       return writeFile(join(dir, `${candidate.name}.json`), JSON.stringify(candidate));
+    }));
+  }
+}
+
+async function seedHeartbeatScale(root: string, count: number): Promise<void> {
+  const dir = join(root, "sessions");
+  await mkdir(dir, { recursive: true });
+  for (let offset = 0; offset < count; offset += 250) {
+    await Promise.all(Array.from({ length: Math.min(250, count - offset) }, (_, inner) => {
+      const index = offset + inner;
+      const candidate = record(index, root);
+      const heartbeatCandidate: SessionRecord = index % 20 === 0 ? {
+        ...candidate,
+        accountId: `codex-${index % 4}`,
+        lastObservedState: "working",
+        lastObservedStateAt: "2026-08-01T00:00:00.000Z",
+      } : candidate;
+      return writeFile(join(dir, `${heartbeatCandidate.name}.json`), JSON.stringify(heartbeatCandidate));
     }));
   }
 }
@@ -121,6 +141,154 @@ test("fresh direct-list process trusts an unchanged directory generation without
       before,
       "a first call in a new process performs only cheap freshness reads when the generation is covered",
     );
+  } finally {
+    if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("continuous active heartbeats keep strict commitments hot at 3k/10k", { timeout: 120_000 }, async (t) => {
+  const previousRoot = process.env.HIVE_STORE_ROOT;
+  try {
+    for (const count of [3_000, 10_000]) {
+      const root = await mkdtemp(join(tmpdir(), `honeybee-heartbeat-scale-${count}-`));
+      process.env.HIVE_STORE_ROOT = root;
+      let running = true;
+      let writer: Promise<void> | null = null;
+      try {
+        await seedHeartbeatScale(root, count);
+        await rebuildActiveSessionIndex();
+        const indexBefore = await readFile(activeSessionIndexPath(), "utf8");
+        let heartbeat = 0;
+        let firstHeartbeat!: () => void;
+        const firstHeartbeatWritten = new Promise<void>((resolve) => { firstHeartbeat = resolve; });
+        writer = (async () => {
+          while (running) {
+            const activeIndex = (heartbeat % (count / 20)) * 20;
+            heartbeat += 1;
+            await touchSession(`CO.${String(activeIndex).padStart(5, "0")}`, {
+              lastObservedState: "working",
+              lastObservedStateAt: new Date(Date.parse("2026-08-01T00:00:00.000Z") + heartbeat * 61_000).toISOString(),
+            });
+            if (heartbeat === 1) firstHeartbeat();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+        })();
+        await firstHeartbeatWritten;
+
+        const latencies: number[] = [];
+        for (let pass = 0; pass < 5; pass += 1) {
+          const started = performance.now();
+          const commitments = await accountCommitments("codex");
+          latencies.push(performance.now() - started);
+          assert.ok([...commitments.values()].reduce((sum, value) => sum + value, 0) > 0);
+        }
+        running = false;
+        await writer;
+        writer = null;
+
+        assert.equal(
+          await readFile(activeSessionIndexPath(), "utf8"),
+          indexBefore,
+          "continuous same-state heartbeats must cause zero membership rebuilds",
+        );
+        const sorted = [...latencies].sort((left, right) => left - right);
+        t.diagnostic(
+          `heartbeat-commitments n=${count} active=${count / 20} rebuilds=0 writes=${heartbeat} ` +
+          `p50=${sorted[Math.floor(sorted.length / 2)]!.toFixed(1)}ms max=${Math.max(...latencies).toFixed(1)}ms`,
+        );
+      } finally {
+        running = false;
+        await writer?.catch(() => undefined);
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousRoot;
+  }
+});
+
+test("a cross-process legacy writer remains visible during a modern heartbeat", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-heartbeat-legacy-race-"));
+  const previousRoot = process.env.HIVE_STORE_ROOT;
+  try {
+    process.env.HIVE_STORE_ROOT = root;
+    const indexed: SessionRecord = {
+      ...record(0, root),
+      accountId: "indexed-account",
+      lastObservedState: "working",
+      lastObservedStateAt: "2026-08-01T00:00:00.000Z",
+    };
+    await mkdir(join(root, "sessions"), { recursive: true });
+    await writeFile(join(root, "sessions", `${indexed.name}.json`), JSON.stringify(indexed));
+    await rebuildActiveSessionIndex();
+
+    const legacy: SessionRecord = {
+      ...indexed,
+      name: "CO.legacy-race",
+      tmuxTarget: "CO-legacy-race",
+      accountId: "legacy-account",
+    };
+    const env = { ...process.env, HIVE_STORE_ROOT: root, LEGACY_RECORD: JSON.stringify(legacy) };
+    await touchSession(indexed.name, {
+      lastObservedState: "working",
+      lastObservedStateAt: "2026-08-01T00:01:01.000Z",
+    }, {
+      onBeforeObservationWrite: async () => {
+        await execFileAsync(process.execPath, [
+          "--input-type=module",
+          "--eval",
+          'import { writeFile } from "node:fs/promises"; import { join } from "node:path"; const value = JSON.parse(process.env.LEGACY_RECORD); await writeFile(join(process.env.HIVE_STORE_ROOT, "sessions", `${value.name}.json`), JSON.stringify(value));',
+        ], { cwd: process.cwd(), env });
+      },
+    });
+
+    const commitments = await accountCommitments("codex");
+    assert.equal(commitments.get("indexed-account"), 8);
+    assert.equal(commitments.get("legacy-account"), 8, "strict selection rebuilds for the un-signalled writer");
+  } finally {
+    if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("separate heartbeat writers preserve the newest observation lease", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeybee-heartbeat-processes-"));
+  const previousRoot = process.env.HIVE_STORE_ROOT;
+  try {
+    process.env.HIVE_STORE_ROOT = root;
+    const indexed: SessionRecord = {
+      ...record(0, root),
+      lastObservedState: "working",
+      lastObservedStateAt: "2026-08-01T00:00:00.000Z",
+    };
+    await mkdir(join(root, "sessions"), { recursive: true });
+    await writeFile(join(root, "sessions", `${indexed.name}.json`), JSON.stringify(indexed));
+    await rebuildActiveSessionIndex();
+    const indexBefore = await readFile(activeSessionIndexPath(), "utf8");
+    const env = { ...process.env, HIVE_STORE_ROOT: root };
+    const writer = (observedAt: string) => execFileAsync(process.execPath, [
+      "--import",
+      "tsx",
+      "--input-type=module",
+      "--eval",
+      `import { touchSession } from "./src/store.ts"; await touchSession("${indexed.name}", { lastObservedState: "working", lastObservedStateAt: "${observedAt}" });`,
+    ], { cwd: process.cwd(), env });
+
+    await Promise.all([
+      writer("2026-08-01T00:01:01.000Z"),
+      writer("2026-08-01T00:02:02.000Z"),
+    ]);
+
+    assert.equal(
+      (await listActiveSessionsHot())[0]?.lastObservedStateAt,
+      "2026-08-01T00:02:02.000Z",
+      "lock serialization plus monotonic persistence prevents an older writer from winning",
+    );
+    assert.equal(await readFile(activeSessionIndexPath(), "utf8"), indexBefore);
   } finally {
     if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = previousRoot;

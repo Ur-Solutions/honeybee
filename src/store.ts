@@ -314,6 +314,32 @@ type StorePaths = {
   legacyDir: string;
 };
 
+const SESSION_OBSERVATION_VERSION = 1;
+
+/**
+ * Same-state observation freshness is deliberately split from canonical
+ * membership truth. The sidecar is atomic and bound to a checksum of every
+ * stable SessionRecord field:
+ *
+ * - crash before its rename leaves the previous timestamp authoritative;
+ * - crash after its rename exposes the newer timestamp but cannot change
+ *   active membership or account commitment classification;
+ * - any canonical write by a modern or legacy process changes the base
+ *   checksum (unless its stable contents are identical), invalidating the
+ *   sidecar without acknowledging that writer's sessions-directory mtime;
+ * - modern heartbeat writers serialize in a lock namespace outside sessions,
+ *   so their locks cannot masquerade as legacy membership generations.
+ */
+type PersistedSessionObservation = {
+  version: typeof SESSION_OBSERVATION_VERSION;
+  root: string;
+  name: string;
+  baseChecksum: string;
+  lastObservedState: string | null;
+  lastObservedStateAt: string;
+  checksum: string;
+};
+
 function captureStorePaths(): StorePaths {
   return { root: storeRoot(), currentDir: sessionsDir(), legacyDir: legacySessionsDir() };
 }
@@ -325,6 +351,98 @@ export function activeSessionIndexPath(root = storeRoot()): string {
 
 function activeSessionIndexLockPath(root: string): string {
   return join(root, ".active-sessions.lock");
+}
+
+function sessionObservationPath(root: string, name: string): string {
+  const directory = resolve(root, "session-observations");
+  const target = resolve(directory, `${safeName(name)}.json`);
+  if (dirname(target) !== directory) {
+    throw new Error(`session observation escaped its store root: ${name}`);
+  }
+  return target;
+}
+
+function sessionObservationLockPath(root: string, name: string): string {
+  const directory = resolve(root, ".session-observation-locks");
+  const target = resolve(directory, `.${safeName(name)}.lock`);
+  if (dirname(target) !== directory) {
+    throw new Error(`session observation lock escaped its store root: ${name}`);
+  }
+  return target;
+}
+
+function sessionObservationBaseChecksum(record: SessionRecord): string {
+  return createHash("sha256").update(sessionFingerprint(record)).digest("hex");
+}
+
+function sessionObservationChecksum(
+  observation: Omit<PersistedSessionObservation, "checksum">,
+): string {
+  return createHash("sha256").update(JSON.stringify(observation)).digest("hex");
+}
+
+function makeSessionObservation(
+  root: string,
+  record: SessionRecord,
+  lastObservedStateAt: string,
+): PersistedSessionObservation {
+  const body: Omit<PersistedSessionObservation, "checksum"> = {
+    version: SESSION_OBSERVATION_VERSION,
+    root,
+    name: record.name,
+    baseChecksum: sessionObservationBaseChecksum(record),
+    lastObservedState: record.lastObservedState ?? null,
+    lastObservedStateAt,
+  };
+  return { ...body, checksum: sessionObservationChecksum(body) };
+}
+
+async function readSessionObservation(root: string, name: string): Promise<PersistedSessionObservation | null> {
+  try {
+    const parsed = JSON.parse(await readFile(sessionObservationPath(root, name), "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const candidate = parsed as Partial<PersistedSessionObservation>;
+    if (
+      candidate.version !== SESSION_OBSERVATION_VERSION ||
+      candidate.root !== root ||
+      candidate.name !== name ||
+      typeof candidate.baseChecksum !== "string" ||
+      !(candidate.lastObservedState === null || typeof candidate.lastObservedState === "string") ||
+      typeof candidate.lastObservedStateAt !== "string" ||
+      !Number.isFinite(Date.parse(candidate.lastObservedStateAt)) ||
+      typeof candidate.checksum !== "string"
+    ) return null;
+    const body: Omit<PersistedSessionObservation, "checksum"> = {
+      version: SESSION_OBSERVATION_VERSION,
+      root,
+      name,
+      baseChecksum: candidate.baseChecksum,
+      lastObservedState: candidate.lastObservedState,
+      lastObservedStateAt: candidate.lastObservedStateAt,
+    };
+    if (candidate.checksum !== sessionObservationChecksum(body)) return null;
+    return { ...body, checksum: candidate.checksum };
+  } catch {
+    // The canonical SessionRecord remains authoritative. A missing, torn, or
+    // unreadable observation lease can only lose freshness, never membership.
+    return null;
+  }
+}
+
+async function applySessionObservation(root: string, record: SessionRecord): Promise<SessionRecord> {
+  const observation = await readSessionObservation(root, record.name);
+  if (!observation) return record;
+  if (observation.baseChecksum !== sessionObservationBaseChecksum(record)) return record;
+  if (observation.lastObservedState !== (record.lastObservedState ?? null)) return record;
+  const canonicalAt = Date.parse(record.lastObservedStateAt ?? "");
+  const observedAt = Date.parse(observation.lastObservedStateAt);
+  if (Number.isFinite(canonicalAt) && canonicalAt >= observedAt) return record;
+  return { ...record, lastObservedStateAt: observation.lastObservedStateAt };
+}
+
+async function sessionObservationNames(root: string): Promise<ReadonlySet<string>> {
+  const files = await readdir(join(root, "session-observations")).catch(() => [] as string[]);
+  return new Set(files.filter((name) => name.endsWith(".json")));
 }
 
 function activeIndexChecksum(
@@ -572,15 +690,18 @@ export async function saveSessionLocked(record: SessionRecord) {
   // Deactivation reverses the order: terminal truth lands first, then the name
   // disappears. Readers validate indexed candidates against the record and
   // prune either crash residue without touching history.
-  await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
-    if (isActiveSessionRecord(record)) {
-      await updateActiveMembershipLocked(paths, record.name, true);
-      await atomicWriteFile(join(paths.currentDir, `${safeName(record.name)}.json`), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-    } else {
-      await atomicWriteFile(join(paths.currentDir, `${safeName(record.name)}.json`), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-      await updateActiveMembershipLocked(paths, record.name, false);
-    }
-  }, { timeoutMs: 60_000 });
+  await withFileLock(sessionObservationLockPath(paths.root, record.name), async () => {
+    await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
+      if (isActiveSessionRecord(record)) {
+        await updateActiveMembershipLocked(paths, record.name, true);
+        await atomicWriteFile(join(paths.currentDir, `${safeName(record.name)}.json`), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+      } else {
+        await atomicWriteFile(join(paths.currentDir, `${safeName(record.name)}.json`), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+        await updateActiveMembershipLocked(paths, record.name, false);
+      }
+      await rm(sessionObservationPath(paths.root, record.name), { force: true });
+    }, { timeoutMs: 60_000 });
+  });
   await appendLedger(compactSaveEvent(record));
 }
 
@@ -622,12 +743,79 @@ export function shouldPersistObservationHeartbeat(
  * not wrap calls to it in withSessionLock for the same record or they deadlock.
  *
  * Writes are skipped when the merge changes nothing but `lastObservedStateAt`,
- * unless the stored timestamp is older than TOUCH_HEARTBEAT_MS.
+ * unless the stored timestamp is older than TOUCH_HEARTBEAT_MS. Due same-state
+ * timestamps are persisted as observation leases outside the canonical
+ * sessions directory; state or other field changes still use the canonical
+ * record transaction below.
  *
  * Returns the merged record, or null when the record no longer exists on disk.
  */
-export async function touchSession(name: string, fields: Partial<SessionRecord>): Promise<SessionRecord | null> {
+export type TouchSessionOptions = {
+  /** Barrier used by deterministic mixed-writer regression tests/telemetry. */
+  onBeforeObservationWrite?: () => Promise<void> | void;
+};
+
+export async function touchSession(
+  name: string,
+  fields: Partial<SessionRecord>,
+  options: TouchSessionOptions = {},
+): Promise<SessionRecord | null> {
+  const observation = await touchSessionObservation(name, fields, options);
+  if (observation.handled) return observation.record;
   return mergeSessionFields(name, fields, { skipNoopWrites: true });
+}
+
+type TouchSessionObservationResult =
+  | { handled: false }
+  | { handled: true; record: SessionRecord | null };
+
+/**
+ * Persist a same-state freshness lease without mutating the canonical sessions
+ * directory. The directory mtime is reserved as the mixed-version membership
+ * signal: legacy/full writers still advance it, while modern heartbeat churn
+ * cannot hide or imitate such a write.
+ */
+async function touchSessionObservation(
+  name: string,
+  fields: Partial<SessionRecord>,
+  options: TouchSessionOptions,
+): Promise<TouchSessionObservationResult> {
+  const keys = Object.keys(fields);
+  if (
+    keys.length === 0 ||
+    !keys.every((key) => key === "lastObservedState" || key === "lastObservedStateAt") ||
+    !Object.prototype.hasOwnProperty.call(fields, "lastObservedStateAt") ||
+    typeof fields.lastObservedStateAt !== "string"
+  ) return { handled: false };
+
+  const paths = captureStorePaths();
+  return withFileLock(sessionObservationLockPath(paths.root, name), async () => {
+    const canonical = await loadCanonicalSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
+    if (!canonical) return { handled: true, record: null };
+    const existing = await applySessionObservation(paths.root, canonical);
+    if (
+      Object.prototype.hasOwnProperty.call(fields, "lastObservedState") &&
+      fields.lastObservedState !== existing.lastObservedState
+    ) return { handled: false };
+
+    const merged: SessionRecord = { ...existing, ...fields, name: existing.name };
+    if (existing.lastObservedStateAt === merged.lastObservedStateAt) {
+      return { handled: true, record: merged };
+    }
+    if (!shouldPersistObservationHeartbeat(existing)) {
+      return { handled: true, record: merged };
+    }
+    const previousAt = Date.parse(existing.lastObservedStateAt ?? "");
+    const nextAt = Date.parse(merged.lastObservedStateAt ?? "");
+    if (Number.isFinite(previousAt) && Number.isFinite(nextAt) && nextAt - previousAt < TOUCH_HEARTBEAT_MS) {
+      return { handled: true, record: merged };
+    }
+
+    await options.onBeforeObservationWrite?.();
+    const lease = makeSessionObservation(paths.root, canonical, merged.lastObservedStateAt!);
+    await atomicWriteFile(sessionObservationPath(paths.root, name), `${JSON.stringify(lease, null, 2)}\n`, { mode: 0o600 });
+    return { handled: true, record: merged };
+  });
 }
 
 /**
@@ -656,44 +844,47 @@ async function mergeSessionFields(
 ): Promise<SessionRecord | null> {
   return withSessionLock(name, async () => {
     const paths = captureStorePaths();
-    const existing = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
-    if (!existing) return null;
-    const merged: SessionRecord = { ...existing, ...fields, name: existing.name };
-    // An explicitly-undefined patch value means "delete this field". Strip the
-    // keys so the returned record matches what JSON.stringify persists.
-    const bag = merged as Record<string, unknown>;
-    for (const key of Object.keys(bag)) {
-      if (bag[key] === undefined) delete bag[key];
-    }
-    if (options.skipNoopWrites && sessionFingerprint(existing) === sessionFingerprint(merged)) {
-      if (existing.lastObservedStateAt === merged.lastObservedStateAt) return merged;
-      if (!shouldPersistObservationHeartbeat(existing)) return merged;
-      const previousAt = Date.parse(existing.lastObservedStateAt ?? "");
-      const nextAt = Date.parse(merged.lastObservedStateAt ?? "");
-      if (Number.isFinite(previousAt) && Number.isFinite(nextAt) && nextAt - previousAt < TOUCH_HEARTBEAT_MS) {
-        return merged;
+    return withFileLock(sessionObservationLockPath(paths.root, name), async () => {
+      const existing = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir, paths.root);
+      if (!existing) return null;
+      const merged: SessionRecord = { ...existing, ...fields, name: existing.name };
+      // An explicitly-undefined patch value means "delete this field". Strip the
+      // keys so the returned record matches what JSON.stringify persists.
+      const bag = merged as Record<string, unknown>;
+      for (const key of Object.keys(bag)) {
+        if (bag[key] === undefined) delete bag[key];
       }
-    }
-    await mkdir(paths.currentDir, { recursive: true });
-    const wasActive = isActiveSessionRecord(existing);
-    const isActive = isActiveSessionRecord(merged);
-    if (wasActive === isActive) {
-      // Rebuilds only care about membership. An active→active metadata write or
-      // terminal→terminal annotation may safely run alongside a rebuild: both
-      // versions classify identically.
-      await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
-    } else {
-      await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
-        if (isActive) {
-          await updateActiveMembershipLocked(paths, existing.name, true);
-          await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
-        } else {
-          await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
-          await updateActiveMembershipLocked(paths, existing.name, false);
+      if (options.skipNoopWrites && sessionFingerprint(existing) === sessionFingerprint(merged)) {
+        if (existing.lastObservedStateAt === merged.lastObservedStateAt) return merged;
+        if (!shouldPersistObservationHeartbeat(existing)) return merged;
+        const previousAt = Date.parse(existing.lastObservedStateAt ?? "");
+        const nextAt = Date.parse(merged.lastObservedStateAt ?? "");
+        if (Number.isFinite(previousAt) && Number.isFinite(nextAt) && nextAt - previousAt < TOUCH_HEARTBEAT_MS) {
+          return merged;
         }
-      }, { timeoutMs: 60_000 });
-    }
-    return merged;
+      }
+      await mkdir(paths.currentDir, { recursive: true });
+      const wasActive = isActiveSessionRecord(existing);
+      const isActive = isActiveSessionRecord(merged);
+      if (wasActive === isActive) {
+        // Rebuilds only care about membership. An active→active metadata write or
+        // terminal→terminal annotation may safely run alongside a rebuild: both
+        // versions classify identically.
+        await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+      } else {
+        await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
+          if (isActive) {
+            await updateActiveMembershipLocked(paths, existing.name, true);
+            await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+          } else {
+            await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+            await updateActiveMembershipLocked(paths, existing.name, false);
+          }
+        }, { timeoutMs: 60_000 });
+      }
+      await rm(sessionObservationPath(paths.root, existing.name), { force: true });
+      return merged;
+    });
   });
 }
 
@@ -708,10 +899,14 @@ function sessionFingerprint(record: SessionRecord): string {
 
 export async function loadSession(name: string): Promise<SessionRecord | null> {
   const paths = captureStorePaths();
-  return loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
+  return loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir, paths.root);
 }
 
-async function loadSessionFromDirectories(name: string, currentDir: string, legacyDir: string): Promise<SessionRecord | null> {
+async function loadCanonicalSessionFromDirectories(
+  name: string,
+  currentDir: string,
+  legacyDir: string,
+): Promise<SessionRecord | null> {
   try {
     return await readSessionRecord(join(currentDir, `${safeName(name)}.json`));
   } catch (error) {
@@ -724,6 +919,19 @@ async function loadSessionFromDirectories(name: string, currentDir: string, lega
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+}
+
+async function loadSessionFromDirectories(
+  name: string,
+  currentDir: string,
+  legacyDir: string,
+  root = dirname(currentDir),
+  observations?: ReadonlySet<string>,
+): Promise<SessionRecord | null> {
+  const record = await loadCanonicalSessionFromDirectories(name, currentDir, legacyDir);
+  if (!record) return null;
+  if (observations && !observations.has(`${safeName(record.name)}.json`)) return record;
+  return applySessionObservation(root, record);
 }
 
 export async function deleteSession(name: string) {
@@ -741,14 +949,17 @@ export async function deleteSession(name: string) {
  */
 export async function deleteSessionLocked(name: string): Promise<void> {
   const paths = captureStorePaths();
-  await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
-    // Deletion is explicit purge. Remove canonical files first, then the
-    // derived name: a crash leaves only a stale index entry, never a hidden
-    // record that could still own a live runtime.
-    await rm(join(paths.currentDir, `${safeName(name)}.json`), { force: true });
-    await rm(join(paths.legacyDir, `${safeName(name)}.json`), { force: true });
-    await updateActiveMembershipLocked(paths, name, false);
-  }, { timeoutMs: 60_000 });
+  await withFileLock(sessionObservationLockPath(paths.root, name), async () => {
+    await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
+      // Deletion is explicit purge. Remove canonical files first, then the
+      // derived name: a crash leaves only a stale index entry, never a hidden
+      // record that could still own a live runtime.
+      await rm(join(paths.currentDir, `${safeName(name)}.json`), { force: true });
+      await rm(join(paths.legacyDir, `${safeName(name)}.json`), { force: true });
+      await rm(sessionObservationPath(paths.root, name), { force: true });
+      await updateActiveMembershipLocked(paths, name, false);
+    }, { timeoutMs: 60_000 });
+  });
   await appendLedger({ type: "session.delete", name, ts: new Date().toISOString() });
 }
 
@@ -972,6 +1183,7 @@ async function listActiveSessionsSnapshotWithIndex(
   options: { ambiguousReadPolicy: "tolerate" | "reject" },
 ): Promise<ActiveSessionsSafetySnapshot> {
   const index = await currentActiveSessionIndex(paths);
+  const observations = await sessionObservationNames(paths.root);
   const records: SessionRecord[] = [];
   const needsRecheck: string[] = [];
   const recordNames = new Set<string>();
@@ -982,7 +1194,7 @@ async function listActiveSessionsSnapshotWithIndex(
       const name = index.active[cursor++];
       if (!name) continue;
       try {
-        const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
+        const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir, paths.root, observations);
         if (record && isActiveSessionRecord(record)) {
           records.push(record);
           recordNames.add(record.name);
@@ -1013,7 +1225,7 @@ async function listActiveSessionsSnapshotWithIndex(
       for (const name of needsRecheck) {
         if (!names.has(name)) continue;
         try {
-          const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
+          const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir, paths.root, observations);
           if (record && isActiveSessionRecord(record)) {
             if (!recordNames.has(record.name)) {
               records.push(record);
@@ -1080,12 +1292,14 @@ async function scanSessionsSnapshot(
   options: { strict?: boolean } = {},
 ): Promise<SessionSnapshotScan> {
   await mkdir(currentDir, { recursive: true });
-  const [files, legacyFiles] = await Promise.all([
+  const root = dirname(currentDir);
+  const [files, legacyFiles, observations] = await Promise.all([
     readdir(currentDir),
     readdir(legacyDir).catch((error: unknown) => {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
     }),
+    sessionObservationNames(root),
   ]);
   const seen = new Set<string>();
   const candidates: Array<{ dir: string; file: string }> = [];
@@ -1107,7 +1321,8 @@ async function scanSessionsSnapshot(
       const candidate = candidates[cursor++];
       if (!candidate) continue;
       try {
-        records.push(await readSessionRecord(join(candidate.dir, candidate.file), options.strict === true));
+        const record = await readSessionRecord(join(candidate.dir, candidate.file), options.strict === true);
+        records.push(observations.has(candidate.file) ? await applySessionObservation(root, record) : record);
       } catch (error) {
         readFailures.push({ ...candidate, error });
       }

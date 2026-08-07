@@ -438,20 +438,70 @@ test("touchSession skips the write when only lastObservedStateAt churns within t
     await saveSession(makeRecord(dir, { lastObservedState: "working", lastObservedStateAt: observedAt }));
     const path = join(dir, "sessions", "CO.abc.json");
     const before = await readFile(path, "utf8");
+    const directoryBefore = (await stat(join(dir, "sessions"))).mtimeMs;
+    const indexBefore = await readFile(activeSessionIndexPath(), "utf8");
 
     // Same state, timestamp only 2s newer: the daemon-tick case. No write.
     await touchSession("CO.abc", { lastObservedState: "working", lastObservedStateAt: "2026-05-28T00:00:02.000Z" });
     assert.equal(await readFile(path, "utf8"), before);
 
-    // Timestamp past the 60s heartbeat: persisted.
+    // Timestamp past the 60s heartbeat: persisted as an atomic observation
+    // lease outside the canonical membership-generation directory.
     await touchSession("CO.abc", { lastObservedState: "working", lastObservedStateAt: "2026-05-28T00:01:01.000Z" });
     assert.equal((await loadSession("CO.abc"))?.lastObservedStateAt, "2026-05-28T00:01:01.000Z");
+    assert.equal(await readFile(path, "utf8"), before, "same-state heartbeat does not rewrite canonical membership truth");
+    assert.equal((await stat(join(dir, "sessions"))).mtimeMs, directoryBefore, "heartbeat does not advance the legacy-writer generation");
+    assert.equal(await readFile(activeSessionIndexPath(), "utf8"), indexBefore, "heartbeat does not refresh or rebuild membership");
 
     // A meaningful field change writes immediately, fresh timestamp or not.
     await touchSession("CO.abc", { lastObservedState: "idle_with_output", lastObservedStateAt: "2026-05-28T00:01:02.000Z" });
     const after = await loadSession("CO.abc");
     assert.equal(after?.lastObservedState, "idle_with_output");
     assert.equal(after?.lastObservedStateAt, "2026-05-28T00:01:02.000Z");
+  });
+});
+
+test("a same-state observation lease cannot mask a later legacy canonical change", async () => {
+  await withTempStore(async (dir) => {
+    const record = makeRecord(dir, {
+      lastObservedState: "working",
+      lastObservedStateAt: "2026-05-28T00:00:00.000Z",
+    });
+    await saveSession(record);
+    await listActiveSessions();
+    await touchSession(record.name, {
+      lastObservedState: "working",
+      lastObservedStateAt: "2026-05-28T00:01:01.000Z",
+    });
+
+    // A non-cooperating older writer knows only the canonical JSON file. Its
+    // changed stable fingerprint invalidates the sidecar, and its directory
+    // write remains visible to the strict active-index generation check.
+    const legacy = {
+      ...record,
+      lastObservedState: "idle_with_output",
+      lastObservedStateAt: "2026-05-28T00:02:00.000Z",
+    };
+    await writeFile(join(dir, "sessions", `${record.name}.json`), JSON.stringify(legacy));
+
+    assert.equal((await loadSession(record.name))?.lastObservedState, "idle_with_output");
+    assert.equal((await loadSession(record.name))?.lastObservedStateAt, "2026-05-28T00:02:00.000Z");
+    assert.equal((await listActiveSessions())[0]?.lastObservedState, "idle_with_output");
+  });
+});
+
+test("a torn observation lease loses freshness without hiding canonical membership", async () => {
+  await withTempStore(async (dir) => {
+    const record = makeRecord(dir, {
+      lastObservedState: "working",
+      lastObservedStateAt: "2026-05-28T00:00:00.000Z",
+    });
+    await saveSession(record);
+    await mkdir(join(dir, "session-observations"), { recursive: true });
+    await writeFile(join(dir, "session-observations", `${record.name}.json`), "{\"version\":");
+
+    assert.equal((await loadSession(record.name))?.lastObservedStateAt, record.lastObservedStateAt);
+    assert.deepEqual((await listActiveSessions()).map((candidate) => candidate.name), [record.name]);
   });
 });
 
