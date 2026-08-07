@@ -13,12 +13,12 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-test("resolveHsrEntry derives source and built entries after resolving the CLI", async () => {
+test("resolveHsrEntry derives source and built entries from the runnerHost module", async () => {
   const sourcePaths = new Map([
-    ["/linked/hive", "/pkg/src/cli.ts"],
+    ["/linked/runnerHost", "/pkg/src/hsr/runnerHost.ts"],
     ["/pkg/src/hsr/runner-entry.ts", "/pkg/src/hsr/runner-entry.ts"],
   ]);
-  const source = await resolveHsrEntry("/linked/hive", async (path) => {
+  const source = await resolveHsrEntry("/linked/runnerHost", async (path) => {
     const resolved = sourcePaths.get(path);
     if (!resolved) throw new Error("ENOENT");
     return resolved;
@@ -29,15 +29,23 @@ test("resolveHsrEntry derives source and built entries after resolving the CLI",
     "/tmp/payload.json",
   ]);
 
-  const built = await resolveHsrEntry("/pkg/dist/cli.js", async (path) => path);
+  const built = await resolveHsrEntry("/pkg/dist/hsr/runnerHost.js", async (path) => path);
   assert.deepEqual(built, { path: "/pkg/dist/hsr/runner-entry.js", mode: "dedicated" });
 });
 
-test("resolveHsrEntry retains the __hsr-run CLI fallback", async () => {
-  const fallback = await resolveHsrEntry("/linked/hive", async (path) => {
-    if (path === "/linked/hive") return "/pkg/dist/cli.js";
-    throw new Error("ENOENT");
-  });
+test("resolveHsrEntry fails closed instead of relaunching an embedding test file", async () => {
+  await assert.rejects(
+    () => resolveHsrEntry("/pkg/tests/hsr-child-admission.test.ts", async (path) => {
+      if (path.endsWith("hsr-child-admission.test.ts")) return path;
+      throw new Error("ENOENT");
+    }),
+    /dedicated runner entry unavailable.*tests\/runner-entry\.ts/,
+  );
+  await assert.rejects(() => resolveHsrEntry(""), /runnerHost module entry path/);
+});
+
+test("hsrEntryArgv retains an explicit __hsr-run compatibility entry", () => {
+  const fallback = { path: "/pkg/dist/cli.js", mode: "cli-fallback" } as const;
   assert.deepEqual(fallback, { path: "/pkg/dist/cli.js", mode: "cli-fallback" });
   assert.deepEqual(hsrEntryArgv(fallback, "/tmp/payload.json"), [
     "/pkg/dist/cli.js",
@@ -45,14 +53,38 @@ test("resolveHsrEntry retains the __hsr-run CLI fallback", async () => {
     "/tmp/payload.json",
   ]);
   assert.equal(dedicatedHsrEntryCandidate("/usr/local/bin/hive"), undefined);
-  await assert.rejects(() => resolveHsrEntry(""), /process\.argv\[1\] is empty/);
 });
 
-test("inheritableExecArgvForHsr preserves the tsx loader but removes test modes", () => {
+test("inheritableExecArgvForHsr preserves only source loaders, never embedding execution modes", () => {
   const original = process.execArgv;
   try {
-    process.execArgv = ["--import", "tsx", "--test", "--test-reporter=spec", "--watch", "--watch-path=src"];
-    assert.deepEqual(inheritableExecArgvForHsr(), ["--import", "tsx", "--test-reporter=spec", "--watch-path=src"]);
+    process.execArgv = [
+      "--input-type=module",
+      "-e",
+      "spawnHsrHost()",
+      "--require",
+      "/pkg/preflight.cjs",
+      "--import",
+      "tsx",
+      "--test",
+      "--test-reporter",
+      "spec",
+      "--test-concurrency=1",
+      "--watch",
+      "--watch-path",
+      "src",
+      "--inspect=0",
+      "--loader=file:///pkg/loader.mjs",
+      "-r/pkg/register.cjs",
+    ];
+    assert.deepEqual(inheritableExecArgvForHsr(), [
+      "--require",
+      "/pkg/preflight.cjs",
+      "--import",
+      "tsx",
+      "--loader=file:///pkg/loader.mjs",
+      "-r/pkg/register.cjs",
+    ]);
   } finally {
     process.execArgv = original;
   }

@@ -5,6 +5,7 @@ import { spawn as spawnChild } from "node:child_process";
 import { mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ensureOrphanedChildGroupStopped } from "./observe.js";
 import { ensureHsrRunDir, hsrRunDir, readHsrMeta, readHsrMetaStrict } from "./runDir.js";
 import { redactHsrPayloadError, type HsrRunPayload } from "./runner-entry.js";
@@ -22,11 +23,32 @@ const recentlyExitedSpawnedHosts = new Set<number>();
 const HSR_CHILD_ADMISSION_TIMEOUT_MS = 30_000;
 
 
-/** process.execArgv minus flags that would change the child's execution mode. */
+const HSR_PRELOAD_FLAGS = new Set(["--import", "--require", "-r", "--loader", "--experimental-loader"]);
+const HSR_PRELOAD_PREFIXES = ["--import=", "--require=", "--loader=", "--experimental-loader="];
+
+/**
+ * Preserve only hooks needed to execute a source runner entry. Inheriting the
+ * embedding process's execution mode (`-e`, `--test`, `--watch`, inspectors,
+ * etc.) can make Node ignore the appended entry or stall every detached host.
+ */
 export function inheritableExecArgvForHsr(): string[] {
-  return process.execArgv.filter(
-    (arg) => arg !== "--test" && !arg.startsWith("--test=") && arg !== "--watch" && !arg.startsWith("--watch="),
-  );
+  const inherited: string[] = [];
+  for (let index = 0; index < process.execArgv.length; index += 1) {
+    const arg = process.execArgv[index]!;
+    if (
+      HSR_PRELOAD_PREFIXES.some((prefix) => arg.startsWith(prefix)) ||
+      (arg.startsWith("-r") && arg !== "-r" && !arg.startsWith("--"))
+    ) {
+      inherited.push(arg);
+      continue;
+    }
+    if (!HSR_PRELOAD_FLAGS.has(arg)) continue;
+    const value = process.execArgv[index + 1];
+    if (value === undefined) continue;
+    inherited.push(arg, value);
+    index += 1;
+  }
+  return inherited;
 }
 
 
@@ -37,38 +59,39 @@ export type ResolvedHsrEntry = {
 
 type Realpath = (path: string) => Promise<string>;
 
-/** Candidate emitted beside cli.ts/cli.js for source and built execution. */
-export function dedicatedHsrEntryCandidate(cliEntry: string): string | undefined {
-  const extension = extname(cliEntry);
+/** Candidate emitted beside runnerHost.ts/runnerHost.js in source and builds. */
+export function dedicatedHsrEntryCandidate(runnerHostEntry: string): string | undefined {
+  const extension = extname(runnerHostEntry);
   if (![".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"].includes(extension)) return undefined;
-  return join(dirname(cliEntry), "hsr", `runner-entry${extension}`);
+  return join(dirname(runnerHostEntry), `runner-entry${extension}`);
 }
 
 
 /**
- * Resolve the dedicated child entry, retaining the CLI's hidden __hsr-run path
- * as a compatibility fallback for incomplete or custom package layouts.
+ * Resolve the dedicated child from this module's own location. process.argv[1]
+ * belongs to the embedding executable and may be a test file or another CLI;
+ * treating it as Hive's CLI can recursively relaunch arbitrary entrypoints.
  */
 export async function resolveHsrEntry(
-  raw: string | undefined = process.argv[1],
+  raw: string | undefined = fileURLToPath(import.meta.url),
   resolveRealpath: Realpath = realpath,
 ): Promise<ResolvedHsrEntry> {
-  if (!raw) throw new Error("hsr: could not resolve CLI entry path (process.argv[1] is empty)");
-  let cliEntry = raw;
+  if (!raw) throw new Error("hsr: could not resolve runnerHost module entry path");
+  let runnerHostEntry = raw;
   try {
-    cliEntry = await resolveRealpath(raw);
+    runnerHostEntry = await resolveRealpath(raw);
   } catch {
-    // Preserve the current raw-entry fallback when argv[1] cannot be resolved.
+    // Keep the raw module path so the expected sibling remains diagnostic.
   }
-  const candidate = dedicatedHsrEntryCandidate(cliEntry);
-  if (candidate) {
-    try {
-      return { path: await resolveRealpath(candidate), mode: "dedicated" };
-    } catch {
-      // Older/custom installs may not contain the dedicated artifact.
-    }
+  const candidate = dedicatedHsrEntryCandidate(runnerHostEntry);
+  if (!candidate) {
+    throw new Error(`hsr: unsupported runnerHost module entry ${runnerHostEntry}`);
   }
-  return { path: cliEntry, mode: "cli-fallback" };
+  try {
+    return { path: await resolveRealpath(candidate), mode: "dedicated" };
+  } catch {
+    throw new Error(`hsr: dedicated runner entry unavailable (expected ${candidate})`);
+  }
 }
 
 
