@@ -6,6 +6,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -82,7 +83,7 @@ function failOnceAt(operation: DeliveredCredentialEraseOperation, occurrence = 1
   };
 }
 
-test("delivered credential locator v1 binds canonical owned home and inode; erase succeeds and is idempotent", async () => {
+test("delivered credential locator v2 binds canonical owned home, generation, and inode; erase succeeds and is idempotent", async () => {
   await withTempStore(async (dir) => {
     const bee = "locator-valid";
     const secret = "SECRET-valid-locator-never-recorded";
@@ -95,6 +96,7 @@ test("delivered credential locator v1 binds canonical owned home and inode; eras
     const rawLocator = await readFile(locator, "utf8");
     const parsed = JSON.parse(rawLocator) as {
       version: number;
+      generation: string;
       bee: string;
       home: { canonicalPath: string; device: string; inode: string; uid: string };
       files: Array<{
@@ -105,7 +107,8 @@ test("delivered credential locator v1 binds canonical owned home and inode; eras
         linkCount: string;
       }>;
     };
-    assert.equal(parsed.version, 1);
+    assert.equal(parsed.version, 2);
+    assert.match(parsed.generation, /^[a-f0-9]{64}$/);
     assert.equal(parsed.bee, bee);
     assert.equal(parsed.home.canonicalPath, await realpath(home));
     assert.deepEqual(parsed.files.map((file) => file.homeRelPath), ["auth.json"]);
@@ -274,6 +277,178 @@ test("changed inode/retarget and a new hard link are not overwritten or removed"
     if (!linkedResult.ok) assert.equal(linkedResult.code, "target-unverified");
     assert.equal(await readFile(secondName, "utf8"), "LINKED-CREDENTIAL");
     assert.equal(await exists(linked.locator), true);
+  });
+});
+
+test("active root credential absence after a home rename fails closed with the locator and secret preserved", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "root-home-rename";
+    const secret = "ROOT-SECRET-MUST-REMAIN-LOCATABLE";
+    const { home, locator } = await deliverFixture(dir, bee, secret);
+    const renamedHome = `${home}-renamed`;
+    let raced = false;
+
+    const result = await shredDeliveredCredentials(bee, {
+      async beforeOperation(operation) {
+        if (operation !== "target-lstat" || raced) return;
+        raced = true;
+        await rename(home, renamedHome);
+        await mkdir(home, { mode: 0o700 });
+      },
+    });
+
+    assert.deepEqual(result, { ok: false, status: "incomplete", code: "target-unverified", retryable: true });
+    assert.equal(await readFile(join(renamedHome, "auth.json"), "utf8"), secret);
+    assert.equal(await exists(join(home, "auth.json")), false);
+    assert.equal(await exists(locator), true, "active locator survives ambiguous absence");
+  });
+});
+
+test("active nested credential absence after a home rename also fails closed", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "nested-home-rename";
+    const home = join(dir, "nested-race-home");
+    const renamedHome = `${home}-renamed`;
+    const secret = "NESTED-SECRET-MUST-REMAIN-LOCATABLE";
+    await deliverAndRecordCredentials(bee, home, fakeCredentials(secret, "credentials/auth.json"));
+    let raced = false;
+
+    const result = await shredDeliveredCredentials(bee, {
+      async beforeOperation(operation) {
+        if (operation !== "target-lstat" || raced) return;
+        raced = true;
+        await rename(home, renamedHome);
+        await mkdir(join(home, "credentials"), { recursive: true, mode: 0o700 });
+      },
+    });
+
+    assert.deepEqual(result, { ok: false, status: "incomplete", code: "target-unverified", retryable: true });
+    assert.equal(await readFile(join(renamedHome, "credentials", "auth.json"), "utf8"), secret);
+    assert.equal(await exists(deliveredCredsPath(dir, bee)), true);
+  });
+});
+
+test("a home rename with a replacement target never erases the replacement inode", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "replacement-home-inode";
+    const original = "ORIGINAL-DELIVERED-SECRET";
+    const replacement = "REPLACEMENT-MUST-SURVIVE";
+    const { home, locator } = await deliverFixture(dir, bee, original);
+    const renamedHome = `${home}-renamed`;
+    let raced = false;
+
+    const result = await shredDeliveredCredentials(bee, {
+      async beforeOperation(operation) {
+        if (operation !== "target-lstat" || raced) return;
+        raced = true;
+        await rename(home, renamedHome);
+        await mkdir(home, { mode: 0o700 });
+        await writeFile(join(home, "auth.json"), replacement, { mode: 0o600 });
+      },
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "target-unverified");
+    assert.equal(await readFile(join(renamedHome, "auth.json"), "utf8"), original);
+    assert.equal(await readFile(join(home, "auth.json"), "utf8"), replacement);
+    assert.equal(await exists(locator), true);
+  });
+});
+
+test("a durable zero receipt survives failure before unlink and makes restart retry idempotent", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "zero-receipt-restart";
+    const { target, locator } = await deliverFixture(dir, bee, "ZERO-BEFORE-RECEIPT-RESTART");
+
+    const first = await shredDeliveredCredentials(bee, failOnceAt("target-unlink"));
+    assert.equal(first.ok, false);
+    if (!first.ok) assert.equal(first.code, "unlink-failed");
+    assert.ok((await readFile(target)).every((byte) => byte === 0));
+    assert.equal(await exists(locator), true);
+    const receiptFiles = await readdir(join(dir, "hsr", bee, "delivered-creds-erasure"));
+    assert.equal(receiptFiles.filter((name) => name.endsWith(".zeroed.json")).length, 1);
+
+    assert.deepEqual(await shredDeliveredCredentials(bee), { ok: true, status: "erased", erasedFiles: 1 });
+    assert.equal(await exists(target), false);
+    assert.equal(await exists(locator), false);
+    assert.deepEqual(await shredDeliveredCredentials(bee), { ok: true, status: "already-absent", erasedFiles: 0 });
+  });
+});
+
+test("a receipt never authorizes unlinking a replacement inode", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "receipt-replacement-inode";
+    const replacement = "POST-RECEIPT-REPLACEMENT-MUST-SURVIVE";
+    const { target, locator } = await deliverFixture(dir, bee, "ORIGINAL-SECRET");
+    const first = await shredDeliveredCredentials(bee, failOnceAt("target-unlink"));
+    assert.equal(first.ok, false);
+    await unlink(target);
+    await writeFile(target, replacement, { mode: 0o600 });
+
+    const retry = await shredDeliveredCredentials(bee);
+    assert.equal(retry.ok, false);
+    if (!retry.ok) assert.equal(retry.code, "target-unverified");
+    assert.equal(await readFile(target, "utf8"), replacement);
+    assert.equal(await exists(locator), true);
+  });
+});
+
+test("same-process concurrent erase calls join one complete per-bee transaction", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "single-flight-erase";
+    await deliverFixture(dir, bee, "SINGLE-FLIGHT-SECRET");
+    let releaseWrite!: () => void;
+    let reachedWrite!: () => void;
+    const writeReleased = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const writeReached = new Promise<void>((resolve) => { reachedWrite = resolve; });
+    let writes = 0;
+    const first = shredDeliveredCredentials(bee, {
+      async beforeOperation(operation) {
+        if (operation !== "target-write") return;
+        writes += 1;
+        reachedWrite();
+        await writeReleased;
+      },
+    });
+    await writeReached;
+    const second = shredDeliveredCredentials(bee, {
+      beforeOperation() {
+        throw new Error("joined caller must not run a competing transaction");
+      },
+    });
+    assert.equal(second, first, "concurrent callers receive the same transaction promise");
+    releaseWrite();
+
+    const [left, right] = await Promise.all([first, second]);
+    assert.deepEqual(left, { ok: true, status: "erased", erasedFiles: 1 });
+    assert.deepEqual(right, left);
+    assert.equal(writes, 1);
+  });
+});
+
+test("partial multi-file erase resumes from receipts without treating an active missing file as erased", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "partial-multi-file";
+    const home = join(dir, "partial-multi-home");
+    const firstTarget = join(home, "first.json");
+    const secondTarget = join(home, "nested", "second.json");
+    await deliverAndRecordCredentials(bee, home, {
+      files: [
+        { homeRelPath: "first.json", contentB64: Buffer.from("FIRST-SECRET").toString("base64"), mode: 0o600 },
+        { homeRelPath: "nested/second.json", contentB64: Buffer.from("SECOND-SECRET").toString("base64"), mode: 0o600 },
+      ],
+    });
+
+    const first = await shredDeliveredCredentials(bee, failOnceAt("target-write", 2));
+    assert.equal(first.ok, false);
+    if (!first.ok) assert.equal(first.code, "overwrite-failed");
+    assert.equal(await exists(firstTarget), false, "first file was receipt-backed and unlinked");
+    assert.equal(await readFile(secondTarget, "utf8"), "SECOND-SECRET");
+    assert.equal(await exists(deliveredCredsPath(dir, bee)), true);
+
+    assert.deepEqual(await shredDeliveredCredentials(bee), { ok: true, status: "erased", erasedFiles: 1 });
+    assert.equal(await exists(secondTarget), false);
+    assert.equal(await exists(deliveredCredsPath(dir, bee)), false);
   });
 });
 

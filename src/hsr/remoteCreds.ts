@@ -28,11 +28,11 @@
  */
 
 import { execFile } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { lstat, mkdir, open, readFile, realpath, unlink, type FileHandle } from "node:fs/promises";
-import { isAbsolute, join, resolve, win32 } from "node:path";
+import { link, lstat, mkdir, open, readFile, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { promisify } from "node:util";
-import { atomicWriteFile } from "../fsx.js";
 import { homeEnvForAgent, identityRecipeForAgent } from "../drivers.js";
 import { ephemeralHarnesses, ephemeralPolicyFor } from "./harness.js";
 import { hsrRunDir } from "./runDir.js";
@@ -261,8 +261,11 @@ export function homeDirForSpec(kind: string, env: Record<string, string>): strin
   return homeEnv ? env[homeEnv] : undefined;
 }
 
-const DELIVERED_CREDS_LOCATOR_VERSION = 1 as const;
+const LEGACY_DELIVERED_CREDS_LOCATOR_VERSION = 1 as const;
+const DELIVERED_CREDS_LOCATOR_VERSION = 2 as const;
+const ZEROED_RECEIPT_VERSION = 1 as const;
 const MAX_LOCATOR_BYTES = 64 * 1024;
+const MAX_RECEIPT_BYTES = 16 * 1024;
 const ZERO_CHUNK_BYTES = 64 * 1024;
 
 type PhysicalIdentity = {
@@ -284,6 +287,8 @@ type DeliveredCredentialTarget = PhysicalIdentity & {
 
 export type DeliveredCredentialsLocator = {
   version: typeof DELIVERED_CREDS_LOCATOR_VERSION;
+  /** Random, non-secret identity binding erase receipts to this delivery. */
+  generation: string;
   bee: string;
   home: OwnedHomeIdentity;
   files: DeliveredCredentialTarget[];
@@ -301,6 +306,28 @@ type PreparedCredential = {
   identity: DeliveredCredentialTarget;
 };
 
+type LegacyDeliveredCredentialsLocator = Omit<DeliveredCredentialsLocator, "version" | "generation"> & {
+  version: typeof LEGACY_DELIVERED_CREDS_LOCATOR_VERSION;
+};
+
+type ParsedDeliveredCredentialsLocator = DeliveredCredentialsLocator | LegacyDeliveredCredentialsLocator;
+
+type ZeroedTargetIdentity = PhysicalIdentity & {
+  size: string;
+  ctimeNs: string;
+  mtimeNs: string;
+  birthtimeNs: string;
+};
+
+type ZeroedCredentialReceipt = {
+  version: typeof ZEROED_RECEIPT_VERSION;
+  bee: string;
+  locatorGeneration: string;
+  fileIndex: number;
+  homeRelPath: string;
+  zeroed: ZeroedTargetIdentity;
+};
+
 export type DeliveredCredentialEraseOperation =
   | "locator-open"
   | "locator-stat"
@@ -315,6 +342,9 @@ export type DeliveredCredentialEraseOperation =
   | "target-write"
   | "target-sync"
   | "target-verify-read"
+  | "receipt-open"
+  | "receipt-commit"
+  | "receipt-directory-sync"
   | "target-pre-unlink-lstat"
   | "target-unlink"
   | "target-absence"
@@ -333,6 +363,8 @@ export type DeliveredCredentialEraseFailureCode =
   | "home-unverified"
   | "target-unverified"
   | "overwrite-failed"
+  | "erase-state-invalid"
+  | "erase-state-persist-failed"
   | "unlink-failed"
   | "absence-unverified"
   | "locator-remove-failed";
@@ -580,6 +612,7 @@ async function prepareDeliveredCredentials(homeDir: string, creds: DeliveredCred
   Object.defineProperty(paths, locatorDraftSymbol, {
     value: {
       version: DELIVERED_CREDS_LOCATOR_VERSION,
+      generation: randomBytes(32).toString("hex"),
       home,
       files: prepared.map((item) => item.identity),
     } satisfies LocatorDraft,
@@ -638,6 +671,63 @@ function deliveredCredsPath(bee: string): string {
   return join(hsrRunDir(bee), "delivered-creds.json");
 }
 
+async function syncDirectory(path: string): Promise<void> {
+  const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
+  const handle = await open(path, constants.O_RDONLY | directoryFlag | requireNoFollowFlag());
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Create the immutable locator without replacing an older delivery. The file
+ * and its directory entry are durable before secret bytes are written.
+ */
+async function writeDurableExclusiveLocator(path: string, data: string): Promise<void> {
+  let handle: FileHandle;
+  try {
+    handle = await open(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | requireNoFollowFlag(),
+      0o600,
+    );
+  } catch {
+    throw new Error("delivered credential locator already exists or is unsafe");
+  }
+  let identity: PhysicalIdentity | undefined;
+  try {
+    const opened = await handle.stat({ bigint: true });
+    identity = physicalIdentity(opened);
+    if (!opened.isFile() || opened.uid !== currentUid() || opened.nlink !== 1n) {
+      throw new Error("delivered credential locator is unsafe");
+    }
+    await handle.writeFile(data, { encoding: "utf8" });
+    await handle.sync();
+    const written = await handle.stat({ bigint: true });
+    if (
+      !samePhysicalIdentity(written, identity) ||
+      !written.isFile() ||
+      written.uid !== currentUid() ||
+      written.nlink !== 1n ||
+      written.size !== BigInt(Buffer.byteLength(data))
+    ) {
+      throw new Error("delivered credential locator write is unsafe");
+    }
+    await syncDirectory(dirname(path));
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    const named = await lstatOrAbsent(path).catch(() => null);
+    if (identity && named && named.isFile() && named.nlink === 1n && samePhysicalIdentity(named, identity)) {
+      await unlink(path).catch(() => undefined);
+      await syncDirectory(dirname(path)).catch(() => undefined);
+    }
+    throw error;
+  }
+  await handle.close().catch(() => undefined);
+}
+
 /** Record the strict locator carried by paths returned from this module. */
 export async function recordDeliveredCredentials(bee: string, paths: string[]): Promise<void> {
   if (paths.length === 0) return;
@@ -645,10 +735,9 @@ export async function recordDeliveredCredentials(bee: string, paths: string[]): 
   const draft = (paths as DeliveredCredentialPaths)[locatorDraftSymbol];
   if (!draft) throw new Error("delivered credential paths have no trusted locator identity");
   await mkdir(hsrRunDir(bee), { recursive: true, mode: 0o700 });
-  await atomicWriteFile(
+  await writeDurableExclusiveLocator(
     deliveredCredsPath(bee),
     `${JSON.stringify({ ...draft, bee } satisfies DeliveredCredentialsLocator, null, 2)}\n`,
-    { mode: 0o600 },
   );
 }
 
@@ -679,11 +768,12 @@ export async function deliverAndRecordCredentials(
 }
 
 type LoadedLocator = {
-  locator: DeliveredCredentialsLocator;
+  locator: ParsedDeliveredCredentialsLocator;
   locatorIdentity: PhysicalIdentity;
+  locatorGeneration: string;
 };
 
-function parseLocator(raw: string, bee: string): DeliveredCredentialsLocator | null {
+function parseLocator(raw: string, bee: string): ParsedDeliveredCredentialsLocator | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw) as unknown;
@@ -692,8 +782,16 @@ function parseLocator(raw: string, bee: string): DeliveredCredentialsLocator | n
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const root = parsed as Record<string, unknown>;
-  if (!keysExactly(root, ["version", "bee", "home", "files"])) return null;
-  if (root.version !== DELIVERED_CREDS_LOCATOR_VERSION || root.bee !== bee) return null;
+  const isLegacy = root.version === LEGACY_DELIVERED_CREDS_LOCATOR_VERSION;
+  if (isLegacy) {
+    if (!keysExactly(root, ["version", "bee", "home", "files"])) return null;
+  } else {
+    if (!keysExactly(root, ["version", "generation", "bee", "home", "files"])) return null;
+    if (root.version !== DELIVERED_CREDS_LOCATOR_VERSION || typeof root.generation !== "string" || !/^[a-f0-9]{64}$/.test(root.generation)) {
+      return null;
+    }
+  }
+  if (root.bee !== bee) return null;
   if (!root.home || typeof root.home !== "object" || Array.isArray(root.home)) return null;
   const home = root.home as Record<string, unknown>;
   if (!keysExactly(home, ["canonicalPath", "device", "inode", "uid"])) return null;
@@ -755,12 +853,20 @@ function parseLocator(raw: string, bee: string): DeliveredCredentialsLocator | n
       parentDirectories,
     });
   }
-  return {
-    version: DELIVERED_CREDS_LOCATOR_VERSION,
-    bee,
-    home: home as OwnedHomeIdentity,
-    files,
-  };
+  return isLegacy
+    ? {
+        version: LEGACY_DELIVERED_CREDS_LOCATOR_VERSION,
+        bee,
+        home: home as OwnedHomeIdentity,
+        files,
+      }
+    : {
+        version: DELIVERED_CREDS_LOCATOR_VERSION,
+        generation: root.generation as string,
+        bee,
+        home: home as OwnedHomeIdentity,
+        files,
+      };
 }
 
 async function callBefore(options: DeliveredCredentialEraseOptions, operation: DeliveredCredentialEraseOperation): Promise<void> {
@@ -797,7 +903,11 @@ async function loadLocator(bee: string, options: DeliveredCredentialEraseOptions
     }
     const locator = parseLocator(raw, bee);
     if (!locator) throw new DeliveredCredentialsLocatorError("locator-invalid");
-    return { locator, locatorIdentity: physicalIdentity(before) };
+    const locatorGeneration =
+      locator.version === DELIVERED_CREDS_LOCATOR_VERSION
+        ? locator.generation
+        : createHash("sha256").update(raw, "utf8").digest("hex");
+    return { locator, locatorIdentity: physicalIdentity(before), locatorGeneration };
   } catch (error) {
     if (error instanceof DeliveredCredentialsLocatorError) throw error;
     throw new DeliveredCredentialsLocatorError("locator-unreadable");
@@ -806,7 +916,7 @@ async function loadLocator(bee: string, options: DeliveredCredentialEraseOptions
   }
 }
 
-/** Read only a strictly valid v1 locator. Missing is empty; bad state throws. */
+/** Read only a strictly valid v1/v2 locator. Missing is empty; bad state throws. */
 export async function readDeliveredCredentials(bee: string): Promise<string[]> {
   const loaded = await loadLocator(bee, {});
   return loaded ? loaded.locator.files.map((file) => targetFor(loaded.locator.home, file.homeRelPath)) : [];
@@ -838,12 +948,258 @@ async function verifyOwnedHome(
   }
 }
 
-async function overwriteAndUnlink(
-  home: OwnedHomeIdentity,
-  targetIdentity: DeliveredCredentialTarget,
+function zeroedTargetIdentity(info: BigIntStats): ZeroedTargetIdentity {
+  return {
+    ...physicalIdentity(info),
+    size: info.size.toString(),
+    ctimeNs: info.ctimeNs.toString(),
+    mtimeNs: info.mtimeNs.toString(),
+    birthtimeNs: info.birthtimeNs.toString(),
+  };
+}
+
+function sameZeroedTargetIdentity(info: BigIntStats, identity: ZeroedTargetIdentity): boolean {
+  return (
+    samePhysicalIdentity(info, identity) &&
+    info.size.toString() === identity.size &&
+    info.ctimeNs.toString() === identity.ctimeNs &&
+    info.mtimeNs.toString() === identity.mtimeNs &&
+    info.birthtimeNs.toString() === identity.birthtimeNs
+  );
+}
+
+function zeroReceiptDirectory(bee: string): string {
+  return join(hsrRunDir(bee), "delivered-creds-erasure");
+}
+
+function zeroReceiptPath(loaded: LoadedLocator, fileIndex: number): string {
+  return join(zeroReceiptDirectory(loaded.locator.bee), `${loaded.locatorGeneration}.${fileIndex}.zeroed.json`);
+}
+
+async function verifyZeroReceiptDirectory(bee: string, create: boolean): Promise<string | null> {
+  const path = zeroReceiptDirectory(bee);
+  if (create) {
+    try {
+      await mkdir(path, { mode: 0o700 });
+    } catch (error) {
+      if (errnoCode(error) !== "EEXIST") throw error;
+    }
+  }
+  const info = await lstatOrAbsent(path);
+  if (!info) return null;
+  if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== currentUid() || (Number(info.mode) & 0o077) !== 0) {
+    throw new Error("delivered credential erase state directory is unsafe");
+  }
+  return path;
+}
+
+function expectedZeroReceipt(
+  loaded: LoadedLocator,
+  fileIndex: number,
+  zeroed: ZeroedTargetIdentity,
+): ZeroedCredentialReceipt {
+  const file = loaded.locator.files[fileIndex]!;
+  return {
+    version: ZEROED_RECEIPT_VERSION,
+    bee: loaded.locator.bee,
+    locatorGeneration: loaded.locatorGeneration,
+    fileIndex,
+    homeRelPath: file.homeRelPath,
+    zeroed,
+  };
+}
+
+function parseZeroReceipt(raw: string): ZeroedCredentialReceipt | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const root = parsed as Record<string, unknown>;
+  if (!keysExactly(root, ["version", "bee", "locatorGeneration", "fileIndex", "homeRelPath", "zeroed"])) return null;
+  if (
+    root.version !== ZEROED_RECEIPT_VERSION ||
+    typeof root.bee !== "string" ||
+    typeof root.locatorGeneration !== "string" ||
+    !/^[a-f0-9]{64}$/.test(root.locatorGeneration) ||
+    typeof root.fileIndex !== "number" ||
+    !Number.isSafeInteger(root.fileIndex) ||
+    root.fileIndex < 0 ||
+    typeof root.homeRelPath !== "string" ||
+    !isSafeCredentialRelativePath(root.homeRelPath) ||
+    !root.zeroed ||
+    typeof root.zeroed !== "object" ||
+    Array.isArray(root.zeroed)
+  ) {
+    return null;
+  }
+  const zeroed = root.zeroed as Record<string, unknown>;
+  if (!keysExactly(zeroed, ["device", "inode", "size", "ctimeNs", "mtimeNs", "birthtimeNs"])) return null;
+  if (![zeroed.device, zeroed.inode, zeroed.size, zeroed.ctimeNs, zeroed.mtimeNs, zeroed.birthtimeNs].every(decimalIdentity)) {
+    return null;
+  }
+  return {
+    version: ZEROED_RECEIPT_VERSION,
+    bee: root.bee,
+    locatorGeneration: root.locatorGeneration,
+    fileIndex: root.fileIndex,
+    homeRelPath: root.homeRelPath,
+    zeroed: zeroed as ZeroedTargetIdentity,
+  };
+}
+
+function sameZeroReceipt(actual: ZeroedCredentialReceipt, expected: ZeroedCredentialReceipt): boolean {
+  return (
+    actual.version === expected.version &&
+    actual.bee === expected.bee &&
+    actual.locatorGeneration === expected.locatorGeneration &&
+    actual.fileIndex === expected.fileIndex &&
+    actual.homeRelPath === expected.homeRelPath &&
+    actual.zeroed.device === expected.zeroed.device &&
+    actual.zeroed.inode === expected.zeroed.inode &&
+    actual.zeroed.size === expected.zeroed.size &&
+    actual.zeroed.ctimeNs === expected.zeroed.ctimeNs &&
+    actual.zeroed.mtimeNs === expected.zeroed.mtimeNs &&
+    actual.zeroed.birthtimeNs === expected.zeroed.birthtimeNs
+  );
+}
+
+async function loadZeroReceipt(
+  loaded: LoadedLocator,
+  fileIndex: number,
   options: DeliveredCredentialEraseOptions,
-): Promise<{ ok: true; erased: boolean } | { ok: false; code: DeliveredCredentialEraseFailureCode }> {
+): Promise<ZeroedCredentialReceipt | null> {
+  const directory = await verifyZeroReceiptDirectory(loaded.locator.bee, false);
+  if (!directory) return null;
+  let handle: FileHandle;
+  try {
+    await callBefore(options, "receipt-open");
+    handle = await open(zeroReceiptPath(loaded, fileIndex), constants.O_RDONLY | requireNoFollowFlag());
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT") return null;
+    throw new Error("delivered credential erase receipt is unreadable");
+  }
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (
+      !before.isFile() ||
+      before.uid !== currentUid() ||
+      before.nlink < 1n ||
+      before.size <= 0n ||
+      before.size > BigInt(MAX_RECEIPT_BYTES)
+    ) {
+      throw new Error("delivered credential erase receipt is invalid");
+    }
+    const raw = await handle.readFile({ encoding: "utf8" });
+    const after = await handle.stat({ bigint: true });
+    if (!samePhysicalIdentity(after, physicalIdentity(before)) || after.size !== before.size) {
+      throw new Error("delivered credential erase receipt changed");
+    }
+    const receipt = parseZeroReceipt(raw);
+    if (!receipt) throw new Error("delivered credential erase receipt is invalid");
+    const file = loaded.locator.files[fileIndex];
+    if (
+      !file ||
+      receipt.bee !== loaded.locator.bee ||
+      receipt.locatorGeneration !== loaded.locatorGeneration ||
+      receipt.fileIndex !== fileIndex ||
+      receipt.homeRelPath !== file.homeRelPath ||
+      receipt.zeroed.device !== file.device ||
+      receipt.zeroed.inode !== file.inode
+    ) {
+      throw new Error("delivered credential erase receipt does not match locator");
+    }
+    await callBefore(options, "receipt-directory-sync");
+    await syncDirectory(directory);
+    return receipt;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/** Commit a fully-written receipt by hard-linking it into its final name. */
+async function persistZeroReceipt(
+  loaded: LoadedLocator,
+  fileIndex: number,
+  receipt: ZeroedCredentialReceipt,
+  options: DeliveredCredentialEraseOptions,
+): Promise<void> {
+  const directory = await verifyZeroReceiptDirectory(loaded.locator.bee, true);
+  if (!directory) throw new Error("delivered credential erase state directory is absent");
+  const finalPath = zeroReceiptPath(loaded, fileIndex);
+  const stagedPath = join(directory, `.${loaded.locatorGeneration}.${fileIndex}.${process.pid}.${randomBytes(16).toString("hex")}.tmp`);
+  const raw = `${JSON.stringify(receipt, null, 2)}\n`;
+  const handle = await open(
+    stagedPath,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | requireNoFollowFlag(),
+    0o600,
+  );
+  try {
+    await handle.writeFile(raw, { encoding: "utf8" });
+    await handle.sync();
+    const info = await handle.stat({ bigint: true });
+    if (!info.isFile() || info.uid !== currentUid() || info.nlink !== 1n || info.size !== BigInt(Buffer.byteLength(raw))) {
+      throw new Error("delivered credential erase receipt staging is unsafe");
+    }
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await unlink(stagedPath).catch(() => undefined);
+    throw error;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+  try {
+    await callBefore(options, "receipt-commit");
+    await verifyZeroReceiptDirectory(loaded.locator.bee, false);
+    try {
+      await link(stagedPath, finalPath);
+    } catch (error) {
+      if (errnoCode(error) !== "EEXIST") throw error;
+      const existing = await loadZeroReceipt(loaded, fileIndex, options);
+      if (!existing || !sameZeroReceipt(existing, receipt)) {
+        throw new Error("delivered credential erase receipt conflicts with existing state");
+      }
+      return;
+    }
+    await callBefore(options, "receipt-directory-sync");
+    await syncDirectory(directory);
+  } finally {
+    await unlink(stagedPath).catch(() => undefined);
+    await syncDirectory(directory).catch(() => undefined);
+  }
+}
+
+async function verifyZeroBytes(
+  handle: FileHandle,
+  size: number,
+  options: DeliveredCredentialEraseOptions,
+): Promise<boolean> {
+  const verify = Buffer.alloc(Math.min(ZERO_CHUNK_BYTES, Math.max(1, size)));
+  let position = 0;
+  while (position < size) {
+    const length = Math.min(verify.length, size - position);
+    await callBefore(options, "target-verify-read");
+    const { bytesRead } = await handle.read(verify, 0, length, position);
+    if (bytesRead !== length) return false;
+    for (let index = 0; index < bytesRead; index += 1) {
+      if (verify[index] !== 0) return false;
+    }
+    position += bytesRead;
+  }
+  return true;
+}
+
+async function zeroCredentialTarget(
+  loaded: LoadedLocator,
+  fileIndex: number,
+  options: DeliveredCredentialEraseOptions,
+): Promise<{ ok: true; receipt: ZeroedCredentialReceipt } | { ok: false; code: DeliveredCredentialEraseFailureCode }> {
+  const home = loaded.locator.home;
+  const targetIdentity = loaded.locator.files[fileIndex]!;
   const target = targetFor(home, targetIdentity.homeRelPath);
+  if (!(await verifyOwnedHome(home, options))) return { ok: false, code: "home-unverified" };
   if (!(await verifyParentDirectories(home, targetIdentity, options))) {
     return { ok: false, code: "target-unverified" };
   }
@@ -854,7 +1210,10 @@ async function overwriteAndUnlink(
   } catch {
     return { ok: false, code: "target-unverified" };
   }
-  if (!initial) return { ok: true, erased: false };
+  // An active locator is the sole durable evidence that this inode may still
+  // contain a secret. Absence without a committed zero receipt is uncertainty,
+  // never success (including a root-level home rename + empty replacement).
+  if (!initial) return { ok: false, code: "target-unverified" };
   if (
     !initial.isFile() ||
     initial.isSymbolicLink() ||
@@ -890,6 +1249,7 @@ async function overwriteAndUnlink(
     ) {
       return { ok: false, code: "target-unverified" };
     }
+    if (!(await verifyOwnedHome(home, {}))) return { ok: false, code: "home-unverified" };
     if (!(await verifyParentDirectories(home, targetIdentity, options))) {
       return { ok: false, code: "target-unverified" };
     }
@@ -915,48 +1275,124 @@ async function overwriteAndUnlink(
     }
     await callBefore(options, "target-sync");
     await handle.sync();
-
-    const verify = Buffer.alloc(Math.min(ZERO_CHUNK_BYTES, Math.max(1, size)));
-    position = 0;
-    while (position < size) {
-      const length = Math.min(verify.length, size - position);
-      await callBefore(options, "target-verify-read");
-      const { bytesRead } = await handle.read(verify, 0, length, position);
-      if (bytesRead !== length) return { ok: false, code: "overwrite-failed" };
-      for (let index = 0; index < bytesRead; index += 1) {
-        if (verify[index] !== 0) return { ok: false, code: "overwrite-failed" };
-      }
-      position += bytesRead;
-    }
+    if (!(await verifyZeroBytes(handle, size, options))) return { ok: false, code: "overwrite-failed" };
     const after = await handle.stat({ bigint: true });
     if (!samePhysicalIdentity(after, targetIdentity) || after.nlink !== 1n || after.size !== opened.size) {
       return { ok: false, code: "overwrite-failed" };
     }
+    const receipt = expectedZeroReceipt(loaded, fileIndex, zeroedTargetIdentity(after));
+    try {
+      await persistZeroReceipt(loaded, fileIndex, receipt, options);
+    } catch {
+      return { ok: false, code: "erase-state-persist-failed" };
+    }
+    return { ok: true, receipt };
   } catch {
     return { ok: false, code: "overwrite-failed" };
   } finally {
     await handle.close().catch(() => undefined);
   }
+}
 
+async function unlinkZeroedTarget(
+  loaded: LoadedLocator,
+  fileIndex: number,
+  receipt: ZeroedCredentialReceipt,
+  options: DeliveredCredentialEraseOptions,
+): Promise<{ ok: true; erased: boolean } | { ok: false; code: DeliveredCredentialEraseFailureCode }> {
+  const home = loaded.locator.home;
+  const targetIdentity = loaded.locator.files[fileIndex]!;
+  const target = targetFor(home, targetIdentity.homeRelPath);
+  let initial: BigIntStats | null;
   try {
-    await callBefore(options, "target-pre-unlink-lstat");
-    const beforeUnlink = await lstat(target, { bigint: true });
+    await callBefore(options, "target-lstat");
+    initial = await lstatOrAbsent(target);
+  } catch {
+    return { ok: false, code: "target-unverified" };
+  }
+  // Receipt-backed absence is safe: the exact delivered inode was verified
+  // zero and fsynced before the durable receipt became visible.
+  if (!initial) return { ok: true, erased: false };
+  if (!(await verifyOwnedHome(home, options))) return { ok: false, code: "home-unverified" };
+  if (!(await verifyParentDirectories(home, targetIdentity, options))) return { ok: false, code: "target-unverified" };
+  if (
+    !initial.isFile() ||
+    initial.isSymbolicLink() ||
+    initial.uid !== currentUid() ||
+    initial.nlink !== 1n ||
+    !sameZeroedTargetIdentity(initial, receipt.zeroed)
+  ) {
+    return { ok: false, code: "target-unverified" };
+  }
+
+  let handle: FileHandle;
+  try {
+    await callBefore(options, "target-open");
+    handle = await open(target, constants.O_RDONLY | requireNoFollowFlag());
+  } catch {
+    return { ok: false, code: "target-unverified" };
+  }
+  try {
+    await callBefore(options, "target-fstat");
+    const opened = await handle.stat({ bigint: true });
     if (
-      !beforeUnlink.isFile() ||
-      beforeUnlink.isSymbolicLink() ||
-      beforeUnlink.nlink !== 1n ||
-      !samePhysicalIdentity(beforeUnlink, targetIdentity)
+      !opened.isFile() ||
+      opened.uid !== currentUid() ||
+      opened.nlink !== 1n ||
+      !sameZeroedTargetIdentity(opened, receipt.zeroed) ||
+      opened.size > BigInt(Number.MAX_SAFE_INTEGER) ||
+      !(await verifyZeroBytes(handle, Number(opened.size), options))
     ) {
       return { ok: false, code: "target-unverified" };
     }
   } catch {
     return { ok: false, code: "target-unverified" };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+
+  const expectedParent = targetIdentity.parentDirectories.at(-1) ?? home;
+  let parentHandle: FileHandle;
+  try {
+    const directoryFlag = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
+    parentHandle = await open(dirname(target), constants.O_RDONLY | directoryFlag | requireNoFollowFlag());
+    const openedParent = await parentHandle.stat({ bigint: true });
+    if (!openedParent.isDirectory() || openedParent.uid !== currentUid() || !samePhysicalIdentity(openedParent, expectedParent)) {
+      await parentHandle.close().catch(() => undefined);
+      return { ok: false, code: "target-unverified" };
+    }
+  } catch {
+    return { ok: false, code: "target-unverified" };
+  }
+
+  try {
+    // Run the deterministic race hook before the final identity checks. A home
+    // rename or replacement performed here is detected before unlink.
+    await callBefore(options, "target-unlink");
+  } catch {
+    await parentHandle.close().catch(() => undefined);
+    return { ok: false, code: "unlink-failed" };
   }
   try {
-    await callBefore(options, "target-unlink");
+    if (!(await verifyOwnedHome(home, {}))) return { ok: false, code: "home-unverified" };
+    if (!(await verifyParentDirectories(home, targetIdentity))) return { ok: false, code: "target-unverified" };
+    await callBefore(options, "target-pre-unlink-lstat");
+    const beforeUnlink = await lstat(target, { bigint: true });
+    if (
+      !beforeUnlink.isFile() ||
+      beforeUnlink.isSymbolicLink() ||
+      beforeUnlink.uid !== currentUid() ||
+      beforeUnlink.nlink !== 1n ||
+      !sameZeroedTargetIdentity(beforeUnlink, receipt.zeroed)
+    ) {
+      return { ok: false, code: "target-unverified" };
+    }
     await unlink(target);
+    await parentHandle.sync();
   } catch {
     return { ok: false, code: "unlink-failed" };
+  } finally {
+    await parentHandle.close().catch(() => undefined);
   }
   try {
     await callBefore(options, "target-absence");
@@ -967,13 +1403,28 @@ async function overwriteAndUnlink(
   return { ok: true, erased: true };
 }
 
-/**
- * Strict, retryable destructive erase. Any malformed/foreign/changed state is
- * a typed non-success and leaves the locator in place for a later restart.
- */
-export async function shredDeliveredCredentials(
+async function overwriteAndUnlink(
+  loaded: LoadedLocator,
+  fileIndex: number,
+  options: DeliveredCredentialEraseOptions,
+): Promise<{ ok: true; erased: boolean } | { ok: false; code: DeliveredCredentialEraseFailureCode }> {
+  let receipt: ZeroedCredentialReceipt | null;
+  try {
+    receipt = await loadZeroReceipt(loaded, fileIndex, options);
+  } catch {
+    return { ok: false, code: "erase-state-invalid" };
+  }
+  if (!receipt) {
+    const zeroed = await zeroCredentialTarget(loaded, fileIndex, options);
+    if (!zeroed.ok) return zeroed;
+    receipt = zeroed.receipt;
+  }
+  return unlinkZeroedTarget(loaded, fileIndex, receipt, options);
+}
+
+async function shredDeliveredCredentialsTransaction(
   bee: string,
-  options: DeliveredCredentialEraseOptions = {},
+  options: DeliveredCredentialEraseOptions,
 ): Promise<DeliveredCredentialEraseResult> {
   let loaded: LoadedLocator | null;
   try {
@@ -983,11 +1434,10 @@ export async function shredDeliveredCredentials(
     return eraseFailure("locator-unreadable");
   }
   if (!loaded) return { ok: true, status: "already-absent", erasedFiles: 0 };
-  if (!(await verifyOwnedHome(loaded.locator.home, options))) return eraseFailure("home-unverified");
 
   let erasedFiles = 0;
-  for (const file of loaded.locator.files) {
-    const result = await overwriteAndUnlink(loaded.locator.home, file, options);
+  for (let fileIndex = 0; fileIndex < loaded.locator.files.length; fileIndex += 1) {
+    const result = await overwriteAndUnlink(loaded, fileIndex, options);
     if (!result.ok) return eraseFailure(result.code);
     if (result.erased) erasedFiles += 1;
   }
@@ -1005,11 +1455,48 @@ export async function shredDeliveredCredentials(
       return eraseFailure("locator-remove-failed");
     }
     await callBefore(options, "locator-unlink");
+    const afterHook = await lstat(locatorPath, { bigint: true });
+    if (
+      !afterHook.isFile() ||
+      afterHook.isSymbolicLink() ||
+      afterHook.nlink !== 1n ||
+      !samePhysicalIdentity(afterHook, loaded.locatorIdentity)
+    ) {
+      return eraseFailure("locator-remove-failed");
+    }
     await unlink(locatorPath);
+    await syncDirectory(dirname(locatorPath));
     await callBefore(options, "locator-absence");
     if ((await lstatOrAbsent(locatorPath)) !== null) return eraseFailure("locator-remove-failed");
   } catch {
     return eraseFailure("locator-remove-failed");
   }
   return { ok: true, status: "erased", erasedFiles };
+}
+
+// The remote runner-host is a per-node singleton, so same-process serialization
+// covers its kill/refresh/close races. Identical callers join one full durable
+// transaction instead of independently producing competing zero fingerprints.
+// Cross-process mutation remains forbidden by the runner-host singleton
+// contract; exclusive locator creation additionally prevents a refresh from
+// replacing an active delivery record.
+const shredTransactions = new Map<string, Promise<DeliveredCredentialEraseResult>>();
+
+/**
+ * Strict, retryable destructive erase. Any malformed/foreign/changed state is
+ * a typed non-success and leaves the locator in place for a later restart.
+ */
+export function shredDeliveredCredentials(
+  bee: string,
+  options: DeliveredCredentialEraseOptions = {},
+): Promise<DeliveredCredentialEraseResult> {
+  if (!isSafeBeeName(bee)) return Promise.resolve(eraseFailure("locator-invalid"));
+  const key = deliveredCredsPath(bee);
+  const existing = shredTransactions.get(key);
+  if (existing) return existing;
+  const transaction = shredDeliveredCredentialsTransaction(bee, options).finally(() => {
+    if (shredTransactions.get(key) === transaction) shredTransactions.delete(key);
+  });
+  shredTransactions.set(key, transaction);
+  return transaction;
 }
