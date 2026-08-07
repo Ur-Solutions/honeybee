@@ -313,6 +313,25 @@ test("buildCodexThreadRequestParams passes the argv model out-of-band to codex a
   });
 });
 
+test("execution Cells combine Codex workspace-write with the provider's shared network contract", () => {
+  const opts: RunnerOpts = {
+    bee: "CO.cell",
+    cwd: "/cells/widget",
+    env: {},
+    runDir: "/tmp/run",
+    filesystemWriteScope: "cwd",
+  };
+  assert.deepEqual(buildCodexThreadRequestParams(opts, "thread/start"), {
+    cwd: "/cells/widget",
+    approvalPolicy: "never",
+    sandbox: "workspace-write",
+  });
+  assert.deepEqual(buildCodexSpawn(opts).args, [
+    "app-server",
+    "-c", "sandbox_workspace_write.network_access=true",
+  ]);
+});
+
 test("codex app-server handshake acknowledges initialize before thread/start", async () => {
   const root = await mkdtemp(join(tmpdir(), "honeybee-hsr-codex-rpc-"));
   const previousStore = process.env.HIVE_STORE_ROOT;

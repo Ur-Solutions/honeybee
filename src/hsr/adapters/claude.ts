@@ -288,6 +288,37 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
       callerArgs = ["--resume", opts.sessionId, ...callerArgs];
     }
   }
+  if (opts.filesystemWriteScope === "cwd") {
+    // A protocol Cell is intentionally autonomous but not permissionless. The
+    // CLI's native Seatbelt/bubblewrap sandbox enforces cwd-only subprocess
+    // writes; acceptEdits gives built-in file tools the same cwd boundary and
+    // still asks before an operator explicitly grants an outside path. The
+    // unsandboxed-command escape hatch is disabled. Network stays broadly
+    // available (matching the native provider's `network: shared` contract),
+    // including localhost dev servers.
+    callerArgs = callerArgs.filter((arg) => arg !== "--dangerously-skip-permissions");
+    const cellSettings = JSON.stringify({
+      sandbox: {
+        enabled: true,
+        failIfUnavailable: true,
+        autoAllowBashIfSandboxed: true,
+        allowUnsandboxedCommands: false,
+        network: {
+          allowedDomains: ["*"],
+          allowLocalBinding: true,
+          allowAllUnixSockets: true,
+        },
+      },
+    });
+    callerArgs = [
+      "--permission-mode", "acceptEdits",
+      // Keep the isolated account/home settings (Apiary MCP, auth), but do not
+      // admit repository-local settings that could widen sandbox paths.
+      "--setting-sources", "user",
+      "--settings", cellSettings,
+      ...callerArgs,
+    ];
+  }
   const requiredFlags = policy?.requiredFlags ?? [];
   const streamFlags = callerArgs.includes("-p") ? requiredFlags.filter((f) => f !== "-p") : [...requiredFlags];
   const args = [...streamFlags, ...callerArgs];

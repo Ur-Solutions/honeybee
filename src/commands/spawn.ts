@@ -536,6 +536,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       authKind: "subscription",
       ...(opts.account ? { accountId: opts.account.id } : {}),
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
     // Publish a provisional "queued" meta NOW: spawn no longer waits for the
@@ -848,13 +849,14 @@ export type SpawnOverlays = {
  * intent, so every local overlay is bypassed: the agent is the exact signed
  * driverId, no alias/profile account is offered (the account comes only from
  * the signed config.account, threaded as --account by the launcher), argv is
- * exactly the launcher's, and yolo is the driver registry default. A local
+ * exactly the launcher's, and yolo is disabled because the execution Cell
+ * supplies a narrower harness-native write boundary. A local
  * `bees.<driver>` config entry can therefore never change harness, account,
  * args, or yolo underneath the signed intent.
  */
 export async function resolveSpawnOverlays(requested: string, parsed: Parsed, protocolLaunch: boolean): Promise<SpawnOverlays> {
   if (protocolLaunch) {
-    return { agent: requested, extraArgs: parsed.rest, yolo: agentDefaultsToYolo(requested) };
+    return { agent: requested, extraArgs: parsed.rest, yolo: false };
   }
   const { agent: resolvedAgent, account: aliasAccount } = await resolveSpawnAgentWithAuto(requested, parsed);
   const profile = await resolveProfileOverlay(requested);

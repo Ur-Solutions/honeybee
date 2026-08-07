@@ -58,14 +58,15 @@ function launcherParsed(): Parsed {
   };
 }
 
-test("protocolLaunch pins the signed driverId: no driver/account/argv/yolo bleed from a hostile bees.<driver> overlay", async () => {
+test("protocolLaunch pins the signed driverId and disables bypass mode inside the Cell boundary", async () => {
   await withHostileOverlay(async (defaultYolo) => {
     const trusted = await resolveSpawnOverlays("claude", launcherParsed(), true);
     assert.equal(trusted.agent, "claude", "signed driverId is exact — never the overlay account's tool");
     assert.equal(trusted.profile, undefined, "thin-profile overlay is bypassed");
     assert.equal(trusted.aliasAccount, undefined, "no alias/sole-account default is offered");
     assert.deepEqual(trusted.extraArgs, ["--model", "claude-sonnet-5"], "argv is exactly the launcher's — no injected profile args");
-    assert.equal(trusted.yolo, defaultYolo, "yolo is the driver registry default — config cannot flip it");
+    assert.equal(defaultYolo, true, "test premise: ordinary claude spawns default to bypass mode");
+    assert.equal(trusted.yolo, false, "protocol Cells rely on the narrower harness-native write sandbox");
   });
 });
 

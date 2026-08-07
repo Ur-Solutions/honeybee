@@ -222,6 +222,34 @@ test("command/args prepends stream-json flags then preserves caller args, no dup
   ]);
 });
 
+test("execution Cells replace bypass mode with Claude's fail-closed cwd sandbox", () => {
+  const { config } = buildClaudeStreamConfig(optsFor({
+    cwd: "/cells/widget",
+    filesystemWriteScope: "cwd",
+    args: ["--model", "fable", "--dangerously-skip-permissions"],
+  }));
+  assert.ok(!config.args.includes("--dangerously-skip-permissions"));
+  const mode = config.args.indexOf("--permission-mode");
+  assert.deepEqual(config.args.slice(mode, mode + 2), ["--permission-mode", "acceptEdits"]);
+  const sources = config.args.indexOf("--setting-sources");
+  assert.deepEqual(config.args.slice(sources, sources + 2), ["--setting-sources", "user"]);
+  const settingsIndex = config.args.indexOf("--settings");
+  const settings = JSON.parse(config.args[settingsIndex + 1]);
+  assert.deepEqual(settings, {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      autoAllowBashIfSandboxed: true,
+      allowUnsandboxedCommands: false,
+      network: {
+        allowedDomains: ["*"],
+        allowLocalBinding: true,
+        allowAllUnixSockets: true,
+      },
+    },
+  });
+});
+
 test("adapterFor resolves stub and claude, undefined otherwise", () => {
   assert.equal(adapterFor("stub"), stubAdapter);
   assert.equal(adapterFor("claude"), claudeAdapter);

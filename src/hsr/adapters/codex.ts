@@ -13,8 +13,9 @@
  *     persistence + child teardown) comes from sessionBase.ts (HIVE-20)
  *
  * v1 scoping: ONE `codex app-server` child per BEE hosting ONE thread. sessionId
- * is the thread id learned from the thread/start response. yolo =
- * approvalPolicy:"never" + sandbox:"danger-full-access" ⇒ no approval prompts.
+ * is the thread id learned from the thread/start response. Ordinary HSR uses
+ * approvalPolicy:"never" + sandbox:"danger-full-access"; execution Cells use
+ * the same no-prompt policy with Codex's workspace-write sandbox rooted at cwd.
  *
  * Protocol field names are taken verbatim from the generated app-server bindings
  * (codex-cli 0.142.5): ThreadStartResponse.thread.id, UserInput{type:"text",text,
@@ -466,7 +467,17 @@ export function buildCodexSpawn(opts: RunnerOpts): { command: string; args: stri
   const authKind = opts.authKind ?? "subscription";
   const env: Record<string, string> = { ...opts.env };
   for (const key of harnessAllowance("codex", authKind)?.scrubEnv ?? []) delete env[key];
-  return { command, args: [...CODEX_APP_SERVER_ARGS, ...codexConfigOverridesFromArgs(opts.args)], env };
+  const cellNetwork = opts.filesystemWriteScope === "cwd"
+    ? ["-c", "sandbox_workspace_write.network_access=true"]
+    : [];
+  return {
+    command,
+    // The execution provider advertises network:shared. Keep that contract
+    // while narrowing disk writes; last-write config prevents an ambient home
+    // profile from silently making a Cell offline.
+    args: [...CODEX_APP_SERVER_ARGS, ...codexConfigOverridesFromArgs(opts.args), ...cellNetwork],
+    env,
+  };
 }
 
 /**
@@ -530,19 +541,20 @@ export function buildCodexThreadRequestParams(
   method: "thread/start" | "thread/resume",
 ): Record<string, unknown> {
   const model = codexModelFromArgs(opts.args) ?? opts.model;
+  const sandbox = opts.filesystemWriteScope === "cwd" ? "workspace-write" : "danger-full-access";
   return method === "thread/resume"
     ? {
         threadId: opts.sessionId as string,
         ...(model ? { model } : {}),
         cwd: opts.cwd,
         approvalPolicy: "never",
-        sandbox: "danger-full-access",
+        sandbox,
       }
     : {
         ...(model ? { model } : {}),
         cwd: opts.cwd,
         approvalPolicy: "never",
-        sandbox: "danger-full-access",
+        sandbox,
       };
 }
 

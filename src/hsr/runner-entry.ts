@@ -21,6 +21,8 @@ export type HsrRunPayload = {
   authKind?: "subscription" | "api-key";
   accountId?: string;
   model?: string;
+  /** Trusted execution-protocol filesystem boundary. */
+  filesystemWriteScope?: "cwd";
   /** Resume an existing provider session instead of starting fresh. */
   resume?: boolean;
   /** Lineage for HIVE_COMB/HIVE_PARENT env stamping (APIA-82). */
@@ -73,6 +75,7 @@ export async function runHsrHostFromPayload(payloadPath: string | undefined): Pr
     ...(payload.accountId ? { accountId: payload.accountId } : {}),
     ...(payload.model ? { model: payload.model } : {}),
     ...(payload.resume ? { resume: true } : {}),
+    ...(payload.filesystemWriteScope ? { filesystemWriteScope: payload.filesystemWriteScope } : {}),
     command: payload.spec.command,
     args: payload.spec.args,
     runDir: hsrRunDir(payload.bee),

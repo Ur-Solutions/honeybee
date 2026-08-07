@@ -154,6 +154,12 @@ export type RunnerOpts = {
   accountId?: string;
   /** Internal boot-probe hint: this CODEX_HOME was contended before admission. */
   codexBootContended?: boolean;
+  /**
+   * Provider-enforced filesystem mutation boundary. Execution-protocol Cells
+   * set `cwd`: harness file tools and subprocesses may write only inside the
+   * working copy while host reads and network access remain available.
+   */
+  filesystemWriteScope?: "cwd";
 };
 
 /**
