@@ -23,8 +23,8 @@ const SYNC_BY_TOOL: Record<
   string,
   (account: AccountRecord, extraHome: string | undefined, options: SyncAccountCredentialsOptions) => Promise<AccountCredentialSyncResult>
 > = {
-  claude: (account, extraHome) => syncClaudeChainToVault(account, extraHome),
-  codex: (account, extraHome) => syncCodexAuthToVault(account, extraHome),
+  claude: (account, extraHome, options) => syncClaudeChainToVault(account, extraHome, {}, options),
+  codex: (account, extraHome, options) => syncCodexAuthToVault(account, extraHome, options),
   grok: (account, extraHome, options) => syncGrokAuthToVault(account, extraHome, options),
   cursor: (account, extraHome, options) => syncCursorAuthToVault(account, extraHome, options),
 };

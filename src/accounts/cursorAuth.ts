@@ -307,12 +307,16 @@ async function cursorHomesForAccount(
   extraHome?: string,
   options: SyncAccountCredentialsOptions = {},
 ): Promise<string[]> {
-  const homes = new Map<string, string>([[LIVE_STORE, LIVE_STORE]]);
+  const homes = new Map<string, string>();
+  if (options.homeScope !== "extra-only") homes.set(LIVE_STORE, LIVE_STORE);
+  if (options.homeScope === "machine-only") return [...homes.values()];
   const consider = async (home: string, trusted: boolean) => {
     if (!trusted) return;
     if ((await stat(home).catch(() => null))?.isDirectory()) homes.set(home, home);
   };
-  for (const home of dedicatedHomesFor(account)) await consider(home, true);
+  if (options.homeScope !== "extra-only") {
+    for (const home of dedicatedHomesFor(account)) await consider(home, true);
+  }
   if (extraHome) await consider(extraHome, options.trustExtraHome === true || isDedicatedHomeForAccount(account, extraHome));
   return [...homes.values()];
 }

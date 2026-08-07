@@ -9,7 +9,7 @@ import { appendLedger } from "../store.js";
 import { accountDir, withAccountLock, listAccounts, CROSS_ACCOUNT_LOCK_TIMEOUT_MS, type AccountRecord } from "./registry.js";
 import { accountEmail, emailFromJwt, expFromJwt } from "./utils.js";
 import { candidateHomes, dedicatedHomesFor, defaultHomeForAccount } from "./homes.js";
-import { runCredentialSyncLocked, type CredentialSyncStrategy } from "./credentialSync.js";
+import { runCredentialSyncLocked, type CredentialSyncStrategy, type SyncAccountCredentialsOptions } from "./credentialSync.js";
 
 const execFileP = promisify(execFile);
 
@@ -107,17 +107,24 @@ async function homeBelongsToCodexAccount(homePath: string, account: AccountRecor
 }
 
 /** Homes attributable to the Codex account: dedicated slots + email-matched shared homes. */
-export async function codexHomesForAccount(account: AccountRecord, extraHome?: string): Promise<string[]> {
+export async function codexHomesForAccount(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<string[]> {
   const vault = await readCodexAuthFile(join(accountDir(account), "auth.json"), "vault");
   const matched = new Map<string, string>();
-  const consider = async (home: string) => {
-    if ((await stat(home).catch(() => null))?.isDirectory() && await homeBelongsToCodexAccount(home, account, vault)) {
+  const consider = async (home: string, trusted = false) => {
+    if ((await stat(home).catch(() => null))?.isDirectory() && (trusted || await homeBelongsToCodexAccount(home, account, vault))) {
       matched.set(resolve(home), home);
     }
   };
-  for (const dir of dedicatedHomesFor(account)) await consider(dir);
-  if (extraHome) await consider(extraHome);
-  if ((await codexAccountEmails(account, vault)).size > 0) {
+  if (options.homeScope === "machine-only") return [];
+  if (options.homeScope !== "extra-only") {
+    for (const dir of dedicatedHomesFor(account)) await consider(dir);
+  }
+  if (extraHome) await consider(extraHome, options.trustExtraHome === true);
+  if (options.homeScope !== "extra-only" && (await codexAccountEmails(account, vault)).size > 0) {
     for (const home of await candidateHomes("codex")) await consider(home);
   }
   return [...matched.values()];
@@ -133,7 +140,7 @@ export type CodexAuthSyncResult = { auth: CodexAuthSnapshot | null; vaultUpdated
 
 const codexSyncStrategy: CredentialSyncStrategy<CodexAuthSnapshot, CodexAuthSyncResult> = {
   readVaultSnapshot: (account) => readCodexAuthFile(join(accountDir(account), "auth.json"), "vault"),
-  homesForAccount: (account, extraHome) => codexHomesForAccount(account, extraHome),
+  homesForAccount: (account, extraHome, options) => codexHomesForAccount(account, extraHome, options),
   readHomeSnapshot: (_account, home) => readHomeCodexAuth(home),
   belongsToAccount: (snapshot, account, vault) => codexAuthBelongsToAccount(snapshot, account, vault),
   isFresher: isFresherCodexAuth,
@@ -154,12 +161,20 @@ const codexSyncStrategy: CredentialSyncStrategy<CodexAuthSnapshot, CodexAuthSync
  * account homes, later launches can force sign-in again. Identity checks keep
  * swapped/shared homes from poisoning a different account's vault entry.
  */
-export async function syncCodexAuthToVault(account: AccountRecord, extraHome?: string): Promise<CodexAuthSyncResult> {
-  return withAccountLock(account.id, () => syncCodexAuthToVaultLocked(account, extraHome));
+export async function syncCodexAuthToVault(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<CodexAuthSyncResult> {
+  return withAccountLock(account.id, () => syncCodexAuthToVaultLocked(account, extraHome, options));
 }
 
-export async function syncCodexAuthToVaultLocked(account: AccountRecord, extraHome?: string): Promise<CodexAuthSyncResult> {
-  return runCredentialSyncLocked(account, codexSyncStrategy, extraHome);
+export async function syncCodexAuthToVaultLocked(
+  account: AccountRecord,
+  extraHome?: string,
+  options: SyncAccountCredentialsOptions = {},
+): Promise<CodexAuthSyncResult> {
+  return runCredentialSyncLocked(account, codexSyncStrategy, extraHome, options);
 }
 
 // Called while holding the ACTIVATING account's lock; the rescue itself is a

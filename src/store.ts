@@ -823,8 +823,43 @@ export function listActiveSessionsHot(): Promise<SessionRecord[]> {
  * projection, so automatic account selection fails closed rather than
  * under-counting commitments. Concurrent callers share one pass per root.
  */
-export function listActiveSessions(): Promise<SessionRecord[]> {
+export type ListActiveSessionsOptions = {
+  /** Test/telemetry barrier after the shared record snapshot is materialized. */
+  onSnapshotRead?: () => Promise<void> | void;
+};
+
+const ACTIVE_SESSION_CALLER_GENERATION_ATTEMPTS = 3;
+
+export function listActiveSessions(options: ListActiveSessionsOptions = {}): Promise<SessionRecord[]> {
   const paths = captureStorePaths();
+  return listActiveSessionsForCaller(paths, options, 1);
+}
+
+async function listActiveSessionsForCaller(
+  paths: StorePaths,
+  options: ListActiveSessionsOptions,
+  attempt: number,
+): Promise<SessionRecord[]> {
+  // This is the caller's linearization generation. It is deliberately outside
+  // the shared flight: a caller arriving after an older-writer rename must not
+  // inherit an earlier caller's already-in-flight projection.
+  const callerGeneration = await sessionDirectoryMtimes(paths);
+  const records = await sharedActiveSessionsSafetySnapshot(paths, options);
+  const index = await readActiveSessionIndex(paths.root);
+  if (
+    index?.directoryMtimeMs?.current === callerGeneration.current &&
+    index.directoryMtimeMs.legacy === callerGeneration.legacy
+  ) return records;
+  if (attempt >= ACTIVE_SESSION_CALLER_GENERATION_ATTEMPTS) {
+    throw new Error("active-session directory generation advanced across every strict snapshot attempt");
+  }
+  return listActiveSessionsForCaller(paths, {}, attempt + 1);
+}
+
+function sharedActiveSessionsSafetySnapshot(
+  paths: StorePaths,
+  options: ListActiveSessionsOptions,
+): Promise<SessionRecord[]> {
   const current = listActiveSessionsSafetyInFlight.get(paths.root);
   if (current) return current;
 
@@ -842,7 +877,9 @@ export function listActiveSessions(): Promise<SessionRecord[]> {
         { timeoutMs: 60_000 },
       );
     }
-    return listActiveSessionsSnapshot(paths, { ambiguousReadPolicy: "reject" });
+    const records = await listActiveSessionsSnapshot(paths, { ambiguousReadPolicy: "reject" });
+    await options.onSnapshotRead?.();
+    return records;
   })().finally(() => {
     if (listActiveSessionsSafetyInFlight.get(paths.root) === pending) {
       listActiveSessionsSafetyInFlight.delete(paths.root);

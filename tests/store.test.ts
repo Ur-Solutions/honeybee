@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -292,6 +292,39 @@ test("direct active listing discovers an older-writer record without a daemon or
       (await listActiveSessions()).map((record) => record.name).sort(),
       ["CO.indexed", "CO.old-writer"],
       "a direct safety-sensitive caller performs its startup canonical pass",
+    );
+  });
+});
+
+test("a later strict caller cannot join a pre-writer in-flight snapshot", async () => {
+  await withTempStore(async (dir) => {
+    const indexed = makeRecord(dir, { name: "CO.flight-old", tmuxTarget: "CO.flight-old" });
+    await saveSession(indexed);
+    await listActiveSessions();
+    let snapshotRead!: () => void;
+    const snapshotReady = new Promise<void>((resolveReady) => { snapshotRead = resolveReady; });
+    let releaseSnapshot!: () => void;
+    const snapshotGate = new Promise<void>((resolveGate) => { releaseSnapshot = resolveGate; });
+    const first = listActiveSessions({
+      onSnapshotRead: async () => {
+        snapshotRead();
+        await snapshotGate;
+      },
+    });
+    await snapshotReady;
+
+    const oldWriter = makeRecord(dir, { name: "CO.flight-new", tmuxTarget: "CO.flight-new" });
+    const temporary = join(dir, "sessions", ".CO.flight-new.legacy-tmp");
+    await writeFile(temporary, JSON.stringify(oldWriter));
+    await rename(temporary, join(dir, "sessions", "CO.flight-new.json"));
+    const second = listActiveSessions();
+    releaseSnapshot();
+
+    assert.deepEqual((await first).map((record) => record.name), [indexed.name], "the first call linearizes before the writer");
+    assert.deepEqual(
+      (await second).map((record) => record.name).sort(),
+      [indexed.name, oldWriter.name].sort(),
+      "the later caller validates its own generation instead of inheriting the old flight",
     );
   });
 });

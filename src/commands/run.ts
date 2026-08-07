@@ -1,7 +1,12 @@
 // `hive run`/x/xa/open — spawn a bee, hand it a prompt, and optionally wait,
 // attach, or present it where you are.
 // Extracted from cli.ts (HIVE-15).
-import { activateAccountIntoHome, defaultHomeForAccount, seedClaudeHomeAcceptance } from "../accounts.js";
+import {
+  activateAccountIntoHome,
+  defaultHomeForAccount,
+  seedClaudeHomeAcceptance,
+  withReadyActivationHomeOwner,
+} from "../accounts.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { bootMsForAgent } from "../drivers.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
@@ -436,6 +441,8 @@ export async function cmdOpenRaw(parsed: Parsed) {
   // Pull it back now so the next activation does not stamp an old credential
   // over the live one.
   if (account && spec.homePath) {
-    await syncCredentialPairIsolated(account.id, spec.homePath).catch(() => undefined);
+    await withReadyActivationHomeOwner(account.id, spec.homePath, (lockedHomePath) =>
+      syncCredentialPairIsolated(account.id, lockedHomePath)
+    ).catch(() => undefined);
   }
 }

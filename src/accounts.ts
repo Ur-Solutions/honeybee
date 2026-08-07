@@ -121,6 +121,7 @@ export {
   activationHomeOwnerPath,
   readActivationHomeOwner,
   withActivationHomeLock,
+  withReadyActivationHomeOwner,
   type ActivationHomeOwner,
   type ActivateAccountOptions,
   activateAccountIntoHome,

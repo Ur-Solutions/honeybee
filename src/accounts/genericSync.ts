@@ -33,7 +33,10 @@ async function genericCredentialHomesForAccount(
     if (!trusted) return;
     if ((await stat(home).catch(() => null))?.isDirectory()) homes.set(resolve(home), home);
   };
-  for (const home of dedicatedHomesFor(account)) await consider(home, true);
+  if (options.homeScope === "machine-only") return [];
+  if (options.homeScope !== "extra-only") {
+    for (const home of dedicatedHomesFor(account)) await consider(home, true);
+  }
   if (extraHome) await consider(extraHome, options.trustExtraHome === true || isDedicatedHomeForAccount(account, extraHome));
   return [...homes.values()];
 }

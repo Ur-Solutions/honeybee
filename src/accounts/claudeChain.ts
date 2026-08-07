@@ -6,6 +6,7 @@ import { appendLedger } from "../store.js";
 import { accountDir, withAccountLock, listAccounts, CROSS_ACCOUNT_LOCK_TIMEOUT_MS, type AccountRecord } from "./registry.js";
 import { accountEmail } from "./utils.js";
 import { candidateHomes, dedicatedHomesFor } from "./homes.js";
+import type { SyncAccountCredentialsOptions } from "./credentialSync.js";
 
 type RawClaudeKeychainReader = (homePath: string) => Promise<keychain.ClaudeKeychainReadResult>;
 
@@ -317,8 +318,13 @@ export async function claudeProfileEmailCached(accessToken: string): Promise<str
  * running or past claude rotated the chain there — the vault catches up, so
  * a later activation does not stamp a dead link over a live one.
  */
-export async function syncClaudeChainToVault(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<ChainSyncResult> {
-  const locked = await withAccountLock(account.id, () => syncClaudeChainToVaultLocked(account, extraHome, deps));
+export async function syncClaudeChainToVault(
+  account: AccountRecord,
+  extraHome?: string,
+  deps: ChainSyncDeps = {},
+  options: SyncAccountCredentialsOptions = {},
+): Promise<ChainSyncResult> {
+  const locked = await withAccountLock(account.id, () => syncClaudeChainToVaultLocked(account, extraHome, deps, options));
   // Cross-account parking deliberately happens only after the scanned
   // account's lock is gone. The owner write then takes its own lock and
   // revalidates both registry ownership and vault freshness.
@@ -328,14 +334,25 @@ export async function syncClaudeChainToVault(account: AccountRecord, extraHome?:
   return { chain: locked.chain, vaultUpdated: locked.vaultUpdated };
 }
 
-export async function syncClaudeChainToVaultLocked(account: AccountRecord, extraHome?: string, deps: ChainSyncDeps = {}): Promise<LockedChainSyncResult> {
+export async function syncClaudeChainToVaultLocked(
+  account: AccountRecord,
+  extraHome?: string,
+  deps: ChainSyncDeps = {},
+  options: SyncAccountCredentialsOptions = {},
+): Promise<LockedChainSyncResult> {
   const vaultPath = join(accountDir(account), ".credentials.json");
   const vaultRaw = await readFile(vaultPath, "utf8").catch(() => null);
   const vault = isRawClaudeCredentialPayload(vaultRaw) ? parseClaudeChain(vaultRaw, "vault") : null;
   let refusedNonRaw = vaultRaw === null || isRawClaudeCredentialPayload(vaultRaw) ? 0 : 1;
   const homes = new Map<string, string>();
-  for (const home of await claudeHomesForAccount(account)) homes.set(resolve(home), home);
-  if (extraHome && !homes.has(resolve(extraHome)) && (await homeBelongsToAccount(extraHome, account))) {
+  if (options.homeScope !== "extra-only" && options.homeScope !== "machine-only") {
+    for (const home of await claudeHomesForAccount(account)) homes.set(resolve(home), home);
+  }
+  if (
+    extraHome &&
+    !homes.has(resolve(extraHome)) &&
+    (options.trustExtraHome === true || await homeBelongsToAccount(extraHome, account))
+  ) {
     homes.set(resolve(extraHome), extraHome);
   }
   const expected = accountEmail(account);

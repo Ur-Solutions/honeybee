@@ -1,13 +1,22 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import type { AccountRecord } from "../src/accounts.js";
-import { accountLockPath, withAccountLock } from "../src/accounts.js";
+import {
+  accountDir,
+  accountLockPath,
+  activationHomeOwnerPath,
+  addAccount,
+  canonicalActivationHomePath,
+  withActivationHomeLock,
+  withAccountLock,
+  withReadyActivationHomeOwner,
+} from "../src/accounts.js";
 import { fileLockMutationGuardPath, readFileLockIdentity } from "../src/lock.js";
 import {
   planCredentialSweep,
@@ -88,7 +97,18 @@ async function withTempStore<T>(fn: (root: string) => Promise<T>): Promise<T> {
   }
 }
 
-test("credential sweep plan collapses 3k records to 19 canonical pairs and current/newest evidence wins", () => {
+async function writeDated(path: string, text: string, timestamp: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, text);
+  const when = new Date(timestamp);
+  await utimes(path, when, when);
+}
+
+function genericAuth(token: string): string {
+  return JSON.stringify({ "zai-coding-plan": { type: "api", key: token } });
+}
+
+test("credential sweep plan collapses 3k records to 19 canonical pairs and current/newest evidence wins", async () => {
   const accounts = Array.from({ length: 19 }, (_, index) => account(`codex-${index}`));
   const records = Array.from({ length: 3_000 }, (_, index) => {
     const pair = index % 19;
@@ -103,14 +123,14 @@ test("credential sweep plan collapses 3k records to 19 canonical pairs and curre
   // A current record beats newer retired history for the same canonical pair.
   records.push(record("CO.current", "codex-0", "/tmp/sweep-home-0", "2026-07-01T00:00:00.000Z", "running"));
 
-  const plan = planCredentialSweep(records, accounts);
+  const plan = await planCredentialSweep(records, accounts);
   assert.equal(plan.attemptedPairs, 3_001);
   assert.equal(plan.uniquePairs, 19);
   assert.equal(plan.duplicatePairs, 2_982);
   assert.equal(plan.extraPairs.length, 19);
   assert.equal(plan.skippedPairs, 2_982);
   assert.equal(plan.pairs.find((pair) => pair.account.id === "codex-0")?.evidence.name, "CO.current");
-  assert.equal(plan.pairs.find((pair) => pair.account.id === "codex-0")?.homePath, resolve("/tmp/sweep-home-0"));
+  assert.equal(plan.pairs.find((pair) => pair.account.id === "codex-0")?.homePath, await canonicalActivationHomePath("/tmp/sweep-home-0"));
 });
 
 test("credential sweep runs canonical accounts once and skips their dedicated session pairs", async () => {
@@ -132,6 +152,7 @@ test("credential sweep runs canonical accounts once and skips their dedicated se
         calls.push({ ...(home ? { home } : {}), ...(options?.trustExtraHome ? { trusted: true } : {}) });
         return { auth: null, vaultUpdated: false };
       },
+      accountHomes: async () => [canonicalHome],
       now: (() => {
         let value = 100;
         return () => value++;
@@ -140,8 +161,8 @@ test("credential sweep runs canonical accounts once and skips their dedicated se
     });
 
     assert.deepEqual(calls, [
-      {},
-      { home: historicalHome, trusted: true },
+      { home: await canonicalActivationHomePath(canonicalHome), trusted: true },
+      { home: await canonicalActivationHomePath(historicalHome), trusted: true },
     ]);
     assert.equal(result.attemptedPairs, 3);
     assert.equal(result.uniquePairs, 2);
@@ -150,6 +171,170 @@ test("credential sweep runs canonical accounts once and skips their dedicated se
     assert.equal(result.skippedPairs, 2, "one duplicate + one account-sweep-covered pair");
     assert.equal(result.completedAccounts, 1);
     assert.equal(result.completedPairs, 1);
+  });
+});
+
+test("periodic account scan skips a nominal home rebound to a foreign ready owner", async () => {
+  await withTempStore(async (root) => {
+    const original = await addAccount("opencode", "sweep-original", { provider: "zai-coding-plan" });
+    const rebound = await addAccount("opencode", "sweep-rebound", { provider: "zai-coding-plan" });
+    const relative = join("xdg-data", "opencode", "auth.json");
+    const originalVault = join(accountDir(original), relative);
+    const nominalHome = join(root, "homes", original.id);
+    await writeDated(originalVault, genericAuth("account-a-vault"), "2026-08-07T08:00:00.000Z");
+    await writeDated(join(nominalHome, relative), genericAuth("account-b-home"), "2026-08-07T08:10:00.000Z");
+    const ownerPath = await activationHomeOwnerPath(nominalHome);
+    await mkdir(dirname(ownerPath), { recursive: true });
+    await writeFile(ownerPath, JSON.stringify({
+      version: 1,
+      homePath: await canonicalActivationHomePath(nominalHome),
+      accountId: rebound.id,
+      generation: "periodic-rebound-b",
+      state: "ready",
+      activatedAt: "2026-08-07T08:10:00.000Z",
+      updatedAt: "2026-08-07T08:10:00.000Z",
+    }));
+
+    const sweep = () => runCredentialSweep({
+      listAccounts: async () => [original],
+      listSessions: async () => [record("CO.rebound", rebound.id, nominalHome, "2026-08-07T08:10:00.000Z", "running")],
+      accountHomes: async () => [nominalHome],
+      concurrency: 1,
+    });
+    await sweep();
+
+    assert.match(await readFile(originalVault, "utf8"), /account-a-vault/);
+    assert.doesNotMatch(await readFile(originalVault, "utf8"), /account-b-home/);
+
+    await writeFile(ownerPath, JSON.stringify({
+      version: 1,
+      homePath: await canonicalActivationHomePath(nominalHome),
+      accountId: original.id,
+      generation: "periodic-incomplete-a",
+      state: "activating",
+      activatedAt: "2026-08-07T08:11:00.000Z",
+      updatedAt: "2026-08-07T08:11:00.000Z",
+    }));
+    await sweep();
+    assert.doesNotMatch(await readFile(originalVault, "utf8"), /account-b-home/, "activating never authorizes bytes");
+
+    await writeFile(ownerPath, "{malformed");
+    const malformed = await sweep();
+    assert.equal(malformed.failedAccounts, 1, "malformed owner state fails the account scan closed");
+    assert.doesNotMatch(await readFile(originalVault, "utf8"), /account-b-home/);
+  });
+});
+
+test("periodic extra pair skips stale account evidence when a newer live foreign session owns the home", async () => {
+  await withTempStore(async (root) => {
+    const original = await addAccount("opencode", "extra-original", { provider: "zai-coding-plan" });
+    const rebound = await addAccount("opencode", "extra-rebound", { provider: "zai-coding-plan" });
+    const relative = join("xdg-data", "opencode", "auth.json");
+    const originalVault = join(accountDir(original), relative);
+    const sharedHome = join(root, "shared-extra-home");
+    await writeDated(originalVault, genericAuth("extra-a-vault"), "2026-08-07T08:00:00.000Z");
+    await writeDated(join(sharedHome, relative), genericAuth("extra-b-home"), "2026-08-07T08:10:00.000Z");
+    const result = await runCredentialSweep({
+      listAccounts: async () => [original],
+      listSessions: async () => [
+        record("CO.old-a", original.id, sharedHome, "2026-08-07T08:00:00.000Z", "done"),
+        record("CO.live-b", rebound.id, sharedHome, "2026-08-07T08:10:00.000Z", "running"),
+      ],
+      accountHomes: async () => [],
+      concurrency: 1,
+    });
+
+    assert.match(await readFile(originalVault, "utf8"), /extra-a-vault/);
+    assert.doesNotMatch(await readFile(originalVault, "utf8"), /extra-b-home/);
+    assert.equal(result.completedPairs, 0);
+  });
+});
+
+test("periodic sweep physically deduplicates aliases and rejects their foreign binding", async () => {
+  await withTempStore(async (root) => {
+    const original = await addAccount("opencode", "alias-original", { provider: "zai-coding-plan" });
+    const rebound = await addAccount("opencode", "alias-rebound", { provider: "zai-coding-plan" });
+    const relative = join("xdg-data", "opencode", "auth.json");
+    const originalVault = join(accountDir(original), relative);
+    const physicalHome = join(root, "physical-alias-home");
+    const aliasHome = join(root, "periodic-home-alias");
+    await writeDated(originalVault, genericAuth("alias-a-vault"), "2026-08-07T08:00:00.000Z");
+    await writeDated(join(physicalHome, relative), genericAuth("alias-b-home"), "2026-08-07T08:10:00.000Z");
+    await symlink(physicalHome, aliasHome);
+    const result = await runCredentialSweep({
+      listAccounts: async () => [original],
+      listSessions: async () => [
+        record("CO.old-a-alias", original.id, aliasHome, "2026-08-07T08:00:00.000Z", "done"),
+        record("CO.old-a-real", original.id, physicalHome, "2026-08-07T08:01:00.000Z", "done"),
+        record("CO.live-b-real", rebound.id, physicalHome, "2026-08-07T08:10:00.000Z", "running"),
+      ],
+      accountHomes: async () => [],
+      concurrency: 1,
+    });
+
+    assert.equal(result.attemptedPairs, 3);
+    assert.equal(result.uniquePairs, 2, "real and alias spellings collapse to one physical pair per account");
+    assert.equal(result.duplicatePairs, 1);
+    assert.match(await readFile(originalVault, "utf8"), /alias-a-vault/);
+    assert.doesNotMatch(await readFile(originalVault, "utf8"), /alias-b-home/);
+  });
+});
+
+test("interactive pair sync rejects a rebound alias and holds its canonical owner lock through sync", async () => {
+  await withTempStore(async (root) => {
+    const physicalHome = join(root, "interactive-physical-home");
+    const aliasHome = join(root, "interactive-home-alias");
+    await mkdir(physicalHome, { recursive: true });
+    await symlink(physicalHome, aliasHome);
+    const canonicalHome = await canonicalActivationHomePath(physicalHome);
+    const ownerPath = await activationHomeOwnerPath(aliasHome);
+    await mkdir(dirname(ownerPath), { recursive: true });
+    const writeOwner = (accountId: string) => writeFile(ownerPath, JSON.stringify({
+      version: 1,
+      homePath: canonicalHome,
+      accountId,
+      generation: `interactive-${accountId}`,
+      state: "ready",
+      activatedAt: "2026-08-07T09:00:00.000Z",
+      updatedAt: "2026-08-07T09:00:00.000Z",
+    }));
+
+    await writeOwner("account-b");
+    let syncCalls = 0;
+    const rebound = await withReadyActivationHomeOwner("account-a", aliasHome, async () => {
+      syncCalls += 1;
+    });
+    assert.deepEqual(rebound, { authorized: false });
+    assert.equal(syncCalls, 0, "foreign ready owner prevents the interactive vault sync");
+
+    await writeOwner("account-a");
+    let releaseSync!: () => void;
+    const syncGate = new Promise<void>((resolveSync) => {
+      releaseSync = resolveSync;
+    });
+    let enteredSync!: () => void;
+    const syncEntered = new Promise<void>((resolveEntered) => {
+      enteredSync = resolveEntered;
+    });
+    const guardedSync = withReadyActivationHomeOwner("account-a", aliasHome, async (lockedHomePath) => {
+      assert.equal(lockedHomePath, canonicalHome, "sync receives the stable physical home identity");
+      enteredSync();
+      await syncGate;
+      return "synced";
+    });
+    await syncEntered;
+
+    let rebindAcquired = false;
+    const rebind = withActivationHomeLock(physicalHome, async () => {
+      rebindAcquired = true;
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+    assert.equal(rebindAcquired, false, "a concurrent rebind cannot enter while isolated sync reads the home");
+
+    releaseSync();
+    assert.deepEqual(await guardedSync, { authorized: true, value: "synced" });
+    await rebind;
+    assert.equal(rebindAcquired, true);
   });
 });
 

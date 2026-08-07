@@ -19,6 +19,8 @@ export type SyncAccountCredentialsOptions = {
    * only when a live SessionRecord binds that home to the account.
    */
   trustExtraHome?: boolean;
+  /** Internal sweep scope: inspect only the already-authorized extraHome. */
+  homeScope?: "all" | "extra-only" | "machine-only";
 };
 
 /** A ledger record. `type` is required; the rest is tool-specific payload. */

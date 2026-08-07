@@ -137,9 +137,12 @@ export async function grokHomesForAccount(
       matched.set(resolve(home), home);
     }
   };
-  for (const dir of dedicatedHomesFor(account)) await consider(dir, true);
+  if (options.homeScope === "machine-only") return [];
+  if (options.homeScope !== "extra-only") {
+    for (const dir of dedicatedHomesFor(account)) await consider(dir, true);
+  }
   if (extraHome) await consider(extraHome, options.trustExtraHome === true || isDedicatedHomeForAccount(account, extraHome));
-  if ((await grokAccountEmails(account, vault)).size > 0) {
+  if (options.homeScope !== "extra-only" && (await grokAccountEmails(account, vault)).size > 0) {
     for (const home of await candidateHomes("grok")) await consider(home, false);
   }
   return [...matched.values()];

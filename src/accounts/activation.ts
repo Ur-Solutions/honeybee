@@ -551,6 +551,27 @@ export async function readActivationHomeOwner(homePath: string): Promise<Activat
   }
 }
 
+/**
+ * Run work against a home only while its latest lock-serialized activation
+ * claim is ready for the expected account. This intentionally has no legacy
+ * fallback: callers without canonical SessionRecord evidence must fail closed
+ * when the durable owner stamp is absent or incomplete.
+ */
+export async function withReadyActivationHomeOwner<T>(
+  accountId: string,
+  homePath: string,
+  fn: (canonicalHomePath: string) => Promise<T>,
+  options: LockOptions = {},
+): Promise<{ authorized: false } | { authorized: true; value: T }> {
+  return withActivationHomeLock(homePath, async (canonicalHomePath) => {
+    const owner = await readActivationHomeOwner(canonicalHomePath);
+    if (!owner || owner.state !== "ready" || owner.accountId !== accountId) {
+      return { authorized: false };
+    }
+    return { authorized: true, value: await fn(canonicalHomePath) };
+  }, options);
+}
+
 async function writeActivationHomeOwner(owner: ActivationHomeOwner): Promise<void> {
   const canonicalHomePath = await canonicalActivationHomePath(owner.homePath);
   const canonicalOwner = { ...owner, homePath: canonicalHomePath };
