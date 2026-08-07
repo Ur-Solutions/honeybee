@@ -466,7 +466,11 @@ function authMethodId(initialized: unknown, authKind: "subscription" | "api-key"
 /** Start one local Grok ACP child and complete auth/session setup. */
 export async function startGrokRunner(opts: RunnerOpts, dependencies: GrokRunnerDependencies = {}): Promise<RunnerSession> {
   const spawn = dependencies.spawn ?? buildGrokSpawn(opts);
-  const child: ChildProcess = await spawnSessionChild(spawn.command, spawn.args, { cwd: opts.cwd, env: spawn.env });
+  const child: ChildProcess = await spawnSessionChild(spawn.command, spawn.args, {
+    cwd: opts.cwd,
+    env: spawn.env,
+    onChildSpawn: opts.onChildSpawn,
+  });
   if (!child.stdin || !child.stdout) throw new Error("hsr grok: ACP child has no stdio pipes");
   const peer = createAcpRpcPeer(child.stdin, child.stdout);
   child.stderr?.resume();

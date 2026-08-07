@@ -28,7 +28,7 @@ import { confirmPausedAccount, confirmSpawnReady, dangerousMode, deliverBrief, h
 import { cmdSend } from "../commands/messaging.js";
 import { maybeLinkHere, newBeeAccountRows, resolveAccountFlag, resolvePreambleFlags } from "../commands/spawn.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
-import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
+import { readHsrMetaStrict } from "../hsr/runDir.js";
 
 /**
  * RETIRED (APIA-85). `hive split` was the comb splitter: it created an adjacent
@@ -376,7 +376,11 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       ...(model ? { model } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
-    const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
+    const admittedMeta = await readHsrMetaStrict(name);
+    const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
+    if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
+      throw new Error(`HSR fork ${name} returned without complete process birth admission`);
+    }
     const command = shellCommand(spec);
     record = {
       name,
@@ -387,7 +391,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       tmuxTarget: name, // logical id — HSR has no tmux target
       substrate: "hsr",
       runnerPid: hostPid,
-      ...(runnerFingerprint ? { runnerFingerprint } : {}),
+      runnerFingerprint,
       ...(runnerTier ? { runnerTier } : {}),
       combId: name, // fork is its own comb
       forkedFromId: source.id ?? source.name,

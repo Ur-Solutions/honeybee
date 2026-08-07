@@ -6,8 +6,9 @@ import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
 import { realUserHome } from "../env.js";
 import {
-  captureProcessBirthFingerprint,
+  captureProcessBirthFingerprintWithRetry,
   inspectProcessBirth,
+  type ProcessBirthCaptureOptions,
   type ProcessBirthFingerprint,
   type ProcessIdentityReader,
 } from "../hsr/processIdentity.js";
@@ -118,15 +119,20 @@ export function paneArg(target: string, paneId?: string): string {
   return paneId && paneId.length > 0 ? paneId : `=${target}:`;
 }
 
-export async function newSession(name: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult> {
+export async function newSession(
+  name: string,
+  cwd: string,
+  spec: LaunchSpec,
+  birthCapture: ProcessBirthCaptureOptions = {},
+): Promise<NewSessionResult> {
   const launcher = await createLauncher(spec);
   try {
     // -P -F prints the new pane's id so spawn can pin the bee to it.
     const result = await tmux(["new-session", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
     const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
     await applyTmuxWindowOptions(paneId || `=${name}:`, spec.tmuxOptions);
-    const launcherFingerprint = launcherPgid ? await captureProcessBirthFingerprint(launcherPgid) : undefined;
-    return { paneId, ...(launcherPgid ? { launcherPgid } : {}), ...(launcherFingerprint ? { launcherFingerprint } : {}) };
+    const launcherFingerprint = await admitTmuxLauncher(paneId, launcherPgid, birthCapture);
+    return { paneId, launcherPgid: launcherPgid!, launcherFingerprint };
   } catch (error) {
     // The runner only deletes the payload tmpdir once it actually starts; if
     // tmux itself refuses the session, clean up here instead of leaking it.
@@ -137,7 +143,13 @@ export async function newSession(name: string, cwd: string, spec: LaunchSpec): P
 
 // Low-level tmux pane split. Combs are retired (APIA-85) so this is no longer on
 // the Substrate interface, but it stays exported for direct low-level callers.
-export async function newPane(target: string, cwd: string, spec: LaunchSpec, opts?: { dir?: "h" | "v" | "window" }): Promise<NewSessionResult> {
+export async function newPane(
+  target: string,
+  cwd: string,
+  spec: LaunchSpec,
+  opts?: { dir?: "h" | "v" | "window" },
+  birthCapture: ProcessBirthCaptureOptions = {},
+): Promise<NewSessionResult> {
   const launcher = await createLauncher(spec);
   const command = shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath]);
   try {
@@ -146,8 +158,8 @@ export async function newPane(target: string, cwd: string, spec: LaunchSpec, opt
       const result = await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-t", `=${target}:`, "-c", cwd, command]);
       const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
       await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
-      const launcherFingerprint = launcherPgid ? await captureProcessBirthFingerprint(launcherPgid) : undefined;
-      return { paneId, ...(launcherPgid ? { launcherPgid } : {}), ...(launcherFingerprint ? { launcherFingerprint } : {}) };
+      const launcherFingerprint = await admitTmuxLauncher(paneId, launcherPgid, birthCapture);
+      return { paneId, launcherPgid: launcherPgid!, launcherFingerprint };
     }
     // Split the comb's active window. -h = horizontal (side-by-side); default
     // (no -h) is vertical (stacked). -P -F prints the new pane's id so the
@@ -156,8 +168,8 @@ export async function newPane(target: string, cwd: string, spec: LaunchSpec, opt
     const result = await tmux(["split-window", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-t", `=${target}:`, "-c", cwd, ...direction, command]);
     const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
     await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
-    const launcherFingerprint = launcherPgid ? await captureProcessBirthFingerprint(launcherPgid) : undefined;
-    return { paneId, ...(launcherPgid ? { launcherPgid } : {}), ...(launcherFingerprint ? { launcherFingerprint } : {}) };
+    const launcherFingerprint = await admitTmuxLauncher(paneId, launcherPgid, birthCapture);
+    return { paneId, launcherPgid: launcherPgid!, launcherFingerprint };
   } catch (error) {
     // The runner only deletes the payload tmpdir once it actually starts; if
     // tmux itself refuses the split, clean up here instead of leaking it.
@@ -244,6 +256,35 @@ function parseLaunchResult(stdout: string): NewSessionResult {
   const [paneId = "", pidRaw = ""] = legacy ? [legacy[1], legacy[2]] : raw.split(":");
   const launcherPgid = parsePositiveInt(pidRaw);
   return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
+}
+
+async function admitTmuxLauncher(
+  paneId: string,
+  launcherPgid: number | undefined,
+  birthCapture: ProcessBirthCaptureOptions,
+): Promise<ProcessBirthFingerprint> {
+  const fingerprint = launcherPgid
+    ? await captureProcessBirthFingerprintWithRetry(launcherPgid, birthCapture)
+    : undefined;
+  if (paneId && launcherPgid && fingerprint?.pgid === launcherPgid) return fingerprint;
+
+  // The pane id is the unrecycled live handle returned by this exact tmux
+  // create call. Roll it back before returning an error; no SessionRecord is
+  // allowed to publish a runtime whose future group teardown is unprovable.
+  const command = paneId
+    ? await tmux(["kill-pane", "-t", paneId], { reject: false })
+    : { ok: false, stdout: "", stderr: "tmux did not return an exact pane id", exitCode: 1 };
+  const absence = paneId ? await inspectPaneAbsence(paneId) : { status: "indeterminate" as const, reason: "missing exact pane id" };
+  const reason = !launcherPgid
+    ? "tmux did not return a launcher process-group id"
+    : fingerprint
+      ? `launcher birth fingerprint pgid ${fingerprint.pgid} does not match ${launcherPgid}`
+      : `launcher ${launcherPgid} has no verifiable birth fingerprint`;
+  if (absence.status !== "absent") {
+    const cleanup = absence.status === "indeterminate" ? absence.reason : `tmux pane ${paneId} is still present`;
+    throw new Error(`Local tmux birth admission failed: ${reason}; exact pane rollback unconfirmed: ${cleanup || command.stderr}`);
+  }
+  throw new Error(`Local tmux birth admission failed: ${reason}; exact pane ${paneId} rolled back`);
 }
 
 function parsePositiveInt(value: string): number | undefined {
@@ -654,7 +695,10 @@ function shellQuote(value: string): string {
 export type { LaunchSpec };
 
 export function createLocalTmuxSubstrate(
-  options: { processSignalDependencies?: TmuxProcessSignalDependencies } = {},
+  options: {
+    processSignalDependencies?: TmuxProcessSignalDependencies;
+    processBirthCapture?: ProcessBirthCaptureOptions;
+  } = {},
 ): Substrate {
   const processSignalDependencies = options.processSignalDependencies;
   return {
@@ -662,7 +706,7 @@ export function createLocalTmuxSubstrate(
     node: LOCAL_NODE,
     probe,
     hasSession,
-    newSession,
+    newSession: (name, cwd, spec) => newSession(name, cwd, spec, options.processBirthCapture),
     kill: (target, killOptions) => kill(target, killOptions, processSignalDependencies),
     killIncarnation: async (_target, launch) => {
       return killPane(launch.paneId, {

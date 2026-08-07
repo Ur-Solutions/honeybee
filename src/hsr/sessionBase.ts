@@ -288,7 +288,11 @@ async function terminateChildProcessTree(child: ChildProcess, hasChildExited: ()
 export async function spawnSessionChild(
   command: string,
   args: string[],
-  opts: { cwd: string; env: Record<string, string> },
+  opts: {
+    cwd: string;
+    env: Record<string, string>;
+    onChildSpawn?: (identity: { pid: number; pgid: number }) => Promise<void>;
+  },
 ): Promise<ChildProcess> {
   const wrapped = await wrapCellSandboxCommand(command, args);
   const child: ChildProcess = spawn(wrapped.command, wrapped.args, {
@@ -313,6 +317,35 @@ export async function spawnSessionChild(
   child.on("error", () => undefined);
   child.once("exit", cleanupCellSandboxCommand);
   trackChildProcessTree(child);
+  if (opts.onChildSpawn) {
+    let exited = child.exitCode !== null || child.signalCode !== null;
+    let resolveExited!: () => void;
+    const exitedPromise = new Promise<void>((resolve) => { resolveExited = resolve; });
+    const noteExit = (): void => {
+      if (exited) return;
+      exited = true;
+      resolveExited();
+    };
+    if (exited) resolveExited();
+    else child.once("exit", noteExit);
+    try {
+      const pid = child.pid;
+      if (!pid) throw new Error("spawned HSR child has no process id");
+      await opts.onChildSpawn({ pid, pgid: pid });
+      if (exited || child.exitCode !== null || child.signalCode !== null) {
+        throw new Error(`HSR child ${pid} exited before birth admission completed`);
+      }
+    } catch (error) {
+      await stopChildGroup(child, () => exited, exitedPromise).catch(() => undefined);
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`HSR child birth admission failed: ${detail}`);
+    } finally {
+      child.removeListener("exit", noteExit);
+    }
+  }
   return child;
 }
 

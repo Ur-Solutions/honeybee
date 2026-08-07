@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { reviveRecord, stopRuntimeForAuthResume } from "../src/commands/migrate.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
+import { ensureHsrRunDir, hsrControlSocketPath, writeHsrMeta } from "../src/hsr/runDir.js";
 import { transactionalKill, transactionalRetire } from "../src/kill.js";
 import { LifecycleConflictError } from "../src/lifecycle.js";
 import { createSshTmuxSubstrate, type SshTmuxExecHook } from "../src/substrates/ssh-tmux.js";
@@ -376,12 +377,39 @@ test("HSR revive whose record disappears never fabricates a fallback and stops i
       tmuxTarget: "hsr-cas-loss",
     };
     await saveSession(record);
+    await ensureHsrRunDir(record.name);
+    await writeHsrMeta(record.name, {
+      bee: record.name,
+      harness: "stub",
+      tier: "stream",
+      hostPid: process.pid,
+      hostFingerprint: { pgid: process.pid, startedAt: "prior-test-host-birth" },
+      childAdmission: "none",
+      startedAt: "2026-08-06T00:00:00.000Z",
+      endedAt: "2026-08-06T00:01:00.000Z",
+      controlSocket: hsrControlSocketPath(record.name),
+      status: "exited",
+    });
     let stoppedPid: number | undefined;
 
     await assert.rejects(
       reviveRecord(record, {
         fresh: true,
-        spawnHsrHost: async () => 42_424,
+        spawnHsrHost: async () => {
+          await ensureHsrRunDir(record.name);
+          await writeHsrMeta(record.name, {
+            bee: record.name,
+            harness: "stub",
+            tier: "stream",
+            hostPid: 42_424,
+            hostFingerprint: { pgid: 42_424, startedAt: "test-host-birth" },
+            childAdmission: "none",
+            startedAt: "2026-08-07T00:00:00.000Z",
+            controlSocket: hsrControlSocketPath(record.name),
+            status: "queued",
+          });
+          return 42_424;
+        },
         waitForHsrHost: async () => true,
         stopHsrIncarnation: async (bee, hostPid) => {
           assert.equal(bee, record.name);

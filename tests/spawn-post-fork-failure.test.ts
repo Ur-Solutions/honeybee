@@ -20,7 +20,17 @@ const HOST_PID = 43123;
 function baseRuntimeDeps(overrides: SpawnRuntimeDependencies): SpawnRuntimeDependencies {
   return {
     spawnHsrHost: async () => HOST_PID,
-    captureProcessBirthFingerprint: async () => ({ pgid: HOST_PID, startedAt: "fake-host-birth" }),
+    readHsrMetaStrict: async (bee) => ({
+      bee,
+      harness: "stub",
+      tier: "stream",
+      hostPid: HOST_PID,
+      hostFingerprint: { pgid: HOST_PID, startedAt: "fake-host-birth" },
+      childAdmission: "none",
+      startedAt: "2026-08-07T00:00:00.000Z",
+      controlSocket: "/tmp/fake-hsr-control.sock",
+      status: "queued",
+    }),
     stopHsrIncarnationByPid: async () => ({ ok: true, stdout: "", stderr: "", exitCode: 0 }),
     ...overrides,
   };

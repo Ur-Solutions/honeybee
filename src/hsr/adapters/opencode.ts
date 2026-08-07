@@ -456,7 +456,11 @@ export async function startOpenCodeRunner(
   const cwd = await canonicalDirectory(opts.cwd);
   const autoApprove = Boolean(opts.cellSandbox) || (opts.args ?? []).includes("--auto");
 
-  const child = await spawnSessionChild(spawn.command, spawn.args, { cwd: opts.cwd, env: spawn.env });
+  const child = await spawnSessionChild(spawn.command, spawn.args, {
+    cwd: opts.cwd,
+    env: spawn.env,
+    onChildSpawn: opts.onChildSpawn,
+  });
   const sseAbort = new AbortController();
   let stopping = false;
   const plumbing = attachSessionPlumbing(opts.bee, child, { onChildExit: () => sseAbort.abort() });

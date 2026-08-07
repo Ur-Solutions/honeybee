@@ -69,7 +69,15 @@ function optsFor(bee: string): RunnerOpts {
 test("runner-host: spawn+turn, sessionId, needs_input, snapshot, liveness, stop", async () => {
   await withTempStore(async () => {
     const bee = "betatest";
-    const handle = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee) });
+    const handle = await runHsrHost({
+      bee,
+      adapter: stubAdapter,
+      opts: optsFor(bee),
+      processBirthCapture: {
+        timeoutMs: 0,
+        capture: async (pid) => ({ pgid: pid, startedAt: `test-birth:${pid}` }),
+      },
+    });
     const client = await connectRpcClient(handle.controlSocket);
     const events: RunnerEvent[] = [];
     client.on("event", (p) => events.push(p as RunnerEvent));
@@ -181,6 +189,7 @@ test("reapDeadHosts: stale running meta with a dead host pid flips to exited", a
       tier: "stream",
       hostPid: deadPid,
       hostFingerprint: { pgid: deadPid, startedAt: "Mon Aug  7 09:00:00 2026" },
+      childAdmission: "none",
       startedAt: new Date().toISOString(),
       controlSocket: hsrControlSocketPath(bee),
       status: "running",
@@ -189,7 +198,7 @@ test("reapDeadHosts: stale running meta with a dead host pid flips to exited", a
     const live = await hsrLiveness();
     assert.equal(live.get(bee), false, "dead host should read as not alive");
 
-    const reaped = await reapDeadHosts();
+    const reaped = await reapDeadHosts({ readProcessIdentity: async () => null });
     assert.deepEqual(reaped, [bee]);
 
     const meta = await readHsrMeta(bee);
@@ -197,6 +206,6 @@ test("reapDeadHosts: stale running meta with a dead host pid flips to exited", a
     assert.ok(meta?.endedAt, "reaped meta.endedAt should be set");
 
     // Idempotent: a second reap finds nothing to do.
-    assert.deepEqual(await reapDeadHosts(), []);
+    assert.deepEqual(await reapDeadHosts({ readProcessIdentity: async () => null }), []);
   });
 });

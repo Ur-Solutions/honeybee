@@ -188,7 +188,11 @@ async function teardownSession(
   // skip the RPC there (it is idempotent on the remote).
   const needsRemoteCleanup = substrate.kind === "remote-hsr";
   const needsRemoteGroupProof = substrate.kind === "ssh-tmux";
-  if (!alreadyGone || record.launcherPgid || needsRemoteCleanup || needsRemoteGroupProof) {
+  // Local HSR hasSession is host-authoritative: a crashed host reports false
+  // while its detached harness child can remain live. Its kill implementation
+  // is the strict incarnation/group cleanup hook and must always run.
+  const needsLocalHsrCleanup = substrate.kind === "hsr";
+  if (!alreadyGone || record.launcherPgid || needsRemoteCleanup || needsRemoteGroupProof || needsLocalHsrCleanup) {
     attempts += 1;
     try {
       const killResult = await substrate.kill(record.tmuxTarget, {

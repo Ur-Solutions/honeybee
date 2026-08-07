@@ -25,13 +25,18 @@ import {
   ensureHsrRunDir,
   hsrControlSocketPath,
   readHsrMeta,
+  readHsrMetaStrict,
   writeHsrMeta,
   type HsrMeta,
 } from "./runDir.js";
 import { codexStartupConcurrency, withCodexStartupSlot } from "./startupQueue.js";
 import { drainPendingHsrTurns, removePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
 import { isAuthNeededMessage, pendingNeedsInput } from "./observe.js";
-import { captureProcessBirthFingerprint } from "./processIdentity.js";
+import {
+  captureProcessBirthFingerprintWithRetry,
+  sameProcessBirthFingerprint,
+  type ProcessBirthCaptureOptions,
+} from "./processIdentity.js";
 
 export type HsrHostHandle = {
   bee: string;
@@ -63,10 +68,17 @@ export async function runHsrHost(params: {
   hostPid?: number;
   /** Detached local hosts publish startup immediately; in-process remote hosts opt out. */
   queueStartup?: boolean;
+  /** Injectable bounded birth capture for deterministic admission tests. */
+  processBirthCapture?: ProcessBirthCaptureOptions;
+  /** Test barrier after exact child identity is durable, before readiness. */
+  afterChildAdmission?: (identity: { pid: number; pgid: number }) => Promise<void>;
 }): Promise<HsrHostHandle> {
   const { bee, adapter, opts } = params;
   const hostPid = params.hostPid ?? process.pid;
-  const hostFingerprint = await captureProcessBirthFingerprint(hostPid);
+  const hostFingerprint = await captureProcessBirthFingerprintWithRetry(hostPid, params.processBirthCapture);
+  if (!hostFingerprint) {
+    throw new Error(`HSR host birth admission failed: process ${hostPid} has no verifiable birth fingerprint`);
+  }
   const controlSocket = hsrControlSocketPath(bee);
   const monotonicStart = performance.now();
   const phaseTimings: NonNullable<HsrMeta["phaseTimingsMs"]> = {};
@@ -83,35 +95,62 @@ export async function runHsrHost(params: {
     codexStartupConcurrency() > 0;
   const bootsCodexAppServer = adapter.harness === "codex" && tier === "server";
 
-  let startupMeta: HsrMeta | undefined;
-  if (publishStartup) {
-    // Publish liveness before the native harness handshake. This lets x/run
-    // durably enqueue the first turn and return immediately for every local
-    // HSR harness. Keep the established `queued` status for rolling-version
-    // compatibility; startupPhase refines admission backpressure vs harness
-    // boot for new observers without making older daemons reject the meta.
-    startupMeta = {
-      bee,
-      harness: adapter.harness,
-      tier,
-      hostPid,
-      ...(hostFingerprint ? { hostFingerprint } : {}),
-      startedAt,
-      ...(queueCodexStartup ? { queuedAt: startedAt } : {}),
-      startupPhase: queueCodexStartup ? "admission" : "harness",
-      controlSocket,
-      status: "queued",
-      phaseTimingsMs: phaseTimings,
+  // Publish a durable pending admission for EVERY host before an adapter may
+  // spawn. Remote in-process hosts used to skip this record until readiness,
+  // leaving the same crash window as detached local hosts. `pending` is never
+  // absence proof: a dead host cannot be reaped/retired until exact child
+  // identity is admitted or a completed no-child admission is persisted.
+  let meta: HsrMeta = {
+    bee,
+    harness: adapter.harness,
+    tier,
+    hostPid,
+    hostFingerprint,
+    childAdmission: "pending",
+    startedAt,
+    ...(queueCodexStartup ? { queuedAt: startedAt } : {}),
+    ...(publishStartup ? { startupPhase: queueCodexStartup ? "admission" as const : "harness" as const } : {}),
+    controlSocket,
+    status: "queued",
+    phaseTimingsMs: phaseTimings,
+  };
+  // Never replace an unreadable/corrupt locator with apparently healthy
+  // startup state. A valid prior incarnation is expected on revive; lifecycle
+  // ownership is responsible for stopping it before this launch.
+  await readHsrMetaStrict(bee);
+  await writeHsrMeta(bee, meta);
+
+  const admitChild = async (identity: { pid: number; pgid: number }): Promise<void> => {
+    const childFingerprint = await captureProcessBirthFingerprintWithRetry(identity.pid, params.processBirthCapture);
+    if (!childFingerprint || childFingerprint.pgid !== identity.pgid) {
+      throw new Error(`process ${identity.pid}/${identity.pgid} has no matching birth fingerprint`);
+    }
+    const current = await readHsrMetaStrict(bee);
+    if (
+      !current || current.hostPid !== hostPid || current.startedAt !== startedAt ||
+      !sameProcessBirthFingerprint(current.hostFingerprint, hostFingerprint)
+    ) {
+      throw new Error(`HSR metadata no longer owns host incarnation ${hostPid}`);
+    }
+    meta = {
+      ...current,
+      childPid: identity.pid,
+      childPgid: identity.pgid,
+      childFingerprint,
+      childAdmission: "admitted",
     };
-    await writeHsrMeta(bee, startupMeta);
-  }
+    await writeHsrMeta(bee, meta);
+    await params.afterChildAdmission?.(identity);
+    await opts.onChildSpawn?.(identity);
+  };
+  const admittedOpts: RunnerOpts = { ...opts, onChildSpawn: admitChild };
 
   let session: Awaited<ReturnType<RunnerAdapter["start"]>>;
   try {
-    const startAdapter = async (startOpts: RunnerOpts = opts) => {
-      if (startupMeta?.startupPhase === "admission") {
-        startupMeta = { ...startupMeta, startupPhase: "harness", phaseTimingsMs: phaseTimings };
-        await writeHsrMeta(bee, startupMeta);
+    const startAdapter = async (startOpts: RunnerOpts = admittedOpts) => {
+      if (meta.startupPhase === "admission") {
+        meta = { ...meta, startupPhase: "harness", phaseTimingsMs: phaseTimings };
+        await writeHsrMeta(bee, meta);
       }
       const adapterStarted = performance.now();
       try {
@@ -131,12 +170,12 @@ export async function runHsrHost(params: {
             const maintenanceStarted = performance.now();
             await probeCodexHomeLogs(codexHomeFromEnv(opts.env)).catch(() => undefined);
             phaseTimings.maintenanceProbe = performance.now() - maintenanceStarted;
-            return await startAdapter(waited ? { ...opts, codexBootContended: true } : opts);
+            return await startAdapter(waited ? { ...admittedOpts, codexBootContended: true } : admittedOpts);
           } finally {
             phaseTimings.homeLockHeld = performance.now() - heldAt;
           }
         })
-      : startAdapter(opts);
+      : startAdapter(admittedOpts);
     session = queueCodexStartup
       ? await withCodexStartupSlot(bee, startWithHomeLock, {
           onTiming: ({ waitMs, heldMs }) => {
@@ -152,35 +191,39 @@ export async function runHsrHost(params: {
     if (bootsCodexAppServer && opts.accountId && error instanceof CodexBootProbeError) {
       await recordAccountBootFailure(opts.accountId).catch(() => undefined);
     }
-    if (startupMeta) {
-      await writeHsrMeta(bee, {
-        ...startupMeta,
+    const current = await readHsrMetaStrict(bee).catch(() => null);
+    if (
+      current && current.hostPid === hostPid && current.startedAt === startedAt &&
+      sameProcessBirthFingerprint(current.hostFingerprint, hostFingerprint)
+    ) {
+      meta = {
+        ...current,
         status: "exited",
         exitCode: null,
         endedAt: new Date().toISOString(),
         phaseTimingsMs: phaseTimings,
-      }).catch(() => undefined);
+      };
+      await writeHsrMeta(bee, meta).catch(() => undefined);
     }
     throw error;
   }
 
-  const childFingerprint = session.pid ? await captureProcessBirthFingerprint(session.pid) : undefined;
-  let meta: HsrMeta = {
-    bee,
-    harness: adapter.harness,
-    tier,
+  if (session.pid) {
+    if (meta.childAdmission !== "admitted" || meta.childPid !== session.pid || meta.childPgid !== session.pid) {
+      await session.stop().catch(() => undefined);
+      throw new Error(`HSR child birth admission did not commit exact process ${session.pid}`);
+    }
+  } else if (meta.childAdmission === "pending") {
+    // Turn-tier sessions have no child while idle. Persist the completed
+    // admission outcome; their first per-turn spawn invokes admitChild before
+    // any protocol bytes are delivered.
+    meta = { ...meta, childAdmission: "none" };
+  }
+  meta = {
+    ...meta,
     ...(session.sessionId ? { sessionId: session.sessionId } : {}),
-    hostPid,
-    ...(hostFingerprint ? { hostFingerprint } : {}),
-    childPid: session.pid,
-    childPgid: session.pid, // detached ⇒ pgid === child pid
-    ...(childFingerprint ? { childFingerprint } : {}),
-    startedAt: startupMeta?.startedAt ?? new Date().toISOString(),
-    ...(startupMeta?.queuedAt ? { queuedAt: startupMeta.queuedAt } : {}),
-    ...(startupMeta?.startupPhase ? { startupPhase: startupMeta.startupPhase } : {}),
-    controlSocket,
-    status: startupMeta ? "queued" : "running",
-    ...(!startupMeta ? { runningAt: new Date().toISOString() } : {}),
+    status: publishStartup ? "queued" : "running",
+    ...(!publishStartup ? { runningAt: new Date().toISOString() } : {}),
     phaseTimingsMs: phaseTimings,
   };
   await writeHsrMeta(bee, meta);
@@ -250,7 +293,7 @@ export async function runHsrHost(params: {
     throw error;
   }
 
-  if (startupMeta) {
+  if (publishStartup) {
     try {
       // Serialize the state flip with sendText's queued/booting decision. A
       // sender either persists a turn that this drain consumes, or sees running

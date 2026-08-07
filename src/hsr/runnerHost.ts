@@ -2,11 +2,11 @@
 // detached child entry. The child lifecycle lives in runner-entry.ts; its
 // __hsr-run compatibility export stays here for the existing CLI dispatch.
 import { spawn as spawnChild } from "node:child_process";
-import { mkdtemp, open, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, extname, join } from "node:path";
-import { ensureHsrRunDir, hsrRunDir, readHsrMeta } from "./runDir.js";
-import type { HsrRunPayload } from "./runner-entry.js";
+import { ensureHsrRunDir, hsrRunDir, readHsrMeta, readHsrMetaStrict } from "./runDir.js";
+import { redactHsrPayloadError, type HsrRunPayload } from "./runner-entry.js";
 
 export { runHsrHostFromPayload } from "./runner-entry.js";
 export type { HsrRunPayload } from "./runner-entry.js";
@@ -18,6 +18,7 @@ export type { HsrRunPayload } from "./runner-entry.js";
 // SIGTERM shutdown still runs the host's birth-validated descendant teardown.
 const spawnedHosts = new Map<number, ReturnType<typeof spawnChild>>();
 const recentlyExitedSpawnedHosts = new Set<number>();
+const HSR_CHILD_ADMISSION_TIMEOUT_MS = 30_000;
 
 
 /** process.execArgv minus flags that would change the child's execution mode. */
@@ -75,6 +76,12 @@ export function hsrEntryArgv(entry: ResolvedHsrEntry, payloadPath: string): stri
   return [entry.path, ...(entry.mode === "cli-fallback" ? ["__hsr-run"] : []), payloadPath];
 }
 
+export type SpawnHsrHostDependencies = {
+  makeTempDir?: (prefix: string) => Promise<string>;
+  resolveEntry?: () => Promise<ResolvedHsrEntry>;
+  spawn?: typeof spawnChild;
+};
+
 
 /**
  * Fork the detached `hive __hsr-run` host for a bee and return its pid. Mirrors
@@ -82,17 +89,20 @@ export function hsrEntryArgv(entry: ResolvedHsrEntry, payloadPath: string): stri
  * host's stdout/stderr to a log file under the run dir, detached + unref'd so it
  * survives the CLI process.
  */
-export async function spawnHsrHost(payload: HsrRunPayload): Promise<number> {
+export async function spawnHsrHost(
+  payload: HsrRunPayload,
+  dependencies: SpawnHsrHostDependencies = {},
+): Promise<number> {
   await ensureHsrRunDir(payload.bee);
-  const dir = await mkdtemp(join(tmpdir(), "hive-hsr-payload-"));
+  const dir = await (dependencies.makeTempDir ?? mkdtemp)(join(tmpdir(), "hive-hsr-payload-"));
   const payloadPath = join(dir, "payload.json");
-  await writeFile(payloadPath, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
-
-  const logHandle = await open(join(hsrRunDir(payload.bee), "host.log"), "a", 0o600);
+  let logHandle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const entry = await resolveHsrEntry();
+    await writeFile(payloadPath, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
+    logHandle = await open(join(hsrRunDir(payload.bee), "host.log"), "a", 0o600);
+    const entry = await (dependencies.resolveEntry ?? (() => resolveHsrEntry()))();
     const childArgv = [...inheritableExecArgvForHsr(), ...hsrEntryArgv(entry, payloadPath)];
-    const child = spawnChild(process.execPath, childArgv, {
+    const child = (dependencies.spawn ?? spawnChild)(process.execPath, childArgv, {
       detached: true,
       stdio: ["ignore", logHandle.fd, logHandle.fd],
       env: { ...process.env },
@@ -111,10 +121,53 @@ export async function spawnHsrHost(payload: HsrRunPayload): Promise<number> {
       expiry.unref?.();
     });
     child.unref();
+    try {
+      await waitForSpawnedHostChildAdmission(payload.bee, pid, HSR_CHILD_ADMISSION_TIMEOUT_MS);
+    } catch (error) {
+      const stopped = await stopSpawnedHsrHost(pid);
+      const detail = error instanceof Error ? error.message : String(error);
+      if (stopped !== "stopped") {
+        throw new Error(`${detail}; exact spawned HSR host rollback is ${stopped}`);
+      }
+      throw error;
+    }
     return pid;
+  } catch (error) {
+    // If the child never consumed the capability (entry resolution/spawn
+    // failure, early crash, admission timeout), the parent owns cleanup. This
+    // is deliberately recursive only over the exact mkdtemp directory it just
+    // created; the operator-supplied child path uses stricter unlink+rmdir.
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    throw redactHsrPayloadError(error, payload);
   } finally {
-    await logHandle.close().catch(() => undefined);
+    await logHandle?.close().catch(() => undefined);
   }
+}
+
+async function waitForSpawnedHostChildAdmission(bee: string, hostPid: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let observedExpectedHost = false;
+  while (Date.now() < deadline) {
+    const meta = await readHsrMetaStrict(bee);
+    if (meta) {
+      if (meta.hostPid !== hostPid && observedExpectedHost) {
+        throw new Error(`HSR birth admission for ${bee} was replaced before publication`);
+      }
+      if (meta.hostPid === hostPid) observedExpectedHost = true;
+      if (meta.hostPid === hostPid && meta.status === "exited") {
+        throw new Error(`HSR birth admission for ${bee} exited before a runnable child was admitted`);
+      }
+      if (
+        meta.hostPid === hostPid &&
+        (meta.childAdmission === "admitted" || meta.childAdmission === "none")
+      ) return;
+    }
+    if (spawnedHsrHostHasExited(hostPid)) {
+      throw new Error(`HSR host ${hostPid} exited before child birth admission for ${bee}`);
+    }
+    await sleep(HSR_HOST_POLL_INTERVAL_MS);
+  }
+  throw new Error(`HSR child birth admission for ${bee} timed out after ${timeoutMs}ms`);
 }
 
 async function waitForSpawnedHostExit(child: ReturnType<typeof spawnChild>, timeoutMs: number): Promise<boolean> {

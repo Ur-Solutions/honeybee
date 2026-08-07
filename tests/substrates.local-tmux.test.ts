@@ -352,6 +352,24 @@ test("local newSession cleans up its hive-launch tmpdir when tmux refuses the se
   }
 });
 
+test("local newSession birth capture failure rolls back the exact pane and returns no running runtime", { timeout: 30_000 }, async () => {
+  const target = `hive-birth-admission-failure-${process.pid}`;
+  try {
+    await assert.rejects(
+      newSession(
+        target,
+        "/tmp",
+        { command: "sleep", args: ["30"] },
+        { timeoutMs: 0, capture: async () => undefined },
+      ),
+      /Local tmux birth admission failed.*exact pane .* rolled back/,
+    );
+    assert.equal(await hasSession(target), false, "failed admission leaves no tmux session to publish");
+  } finally {
+    await tmuxKillSession(target).catch(() => undefined);
+  }
+});
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

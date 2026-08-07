@@ -9,8 +9,16 @@
  */
 
 import { execFile } from "node:child_process";
+import { performance } from "node:perf_hooks";
 
 const PROCESS_CENSUS_TIMEOUT_MS = 5_000;
+// The current Node process already has an immutable per-incarnation clock
+// origin. This self identity keeps in-process remote hosts verifiable inside a
+// contained Cell where `/bin/ps` process enumeration is intentionally denied.
+const SELF_PROCESS_BIRTH: ProcessBirthFingerprint = {
+  pgid: process.pid,
+  startedAt: `node-time-origin:${performance.timeOrigin}`,
+};
 
 export type ProcessRow = {
   pid: number;
@@ -28,6 +36,20 @@ export type ProcessIdentityReader = (pid: number) => Promise<ProcessBirthFingerp
 export type ProcessIdentityVerdict = "match" | "mismatch" | "gone" | "unverifiable";
 export type ProcessGroupPresence = "present" | "absent" | "unverifiable";
 export type ProcessGroupPresenceReader = (pgid: number) => Promise<ProcessGroupPresence>;
+
+export type ProcessBirthCaptureOptions = {
+  /** Total admission budget. Zero still performs one capture attempt. */
+  timeoutMs?: number;
+  /** Delay between capture attempts. */
+  pollIntervalMs?: number;
+  /** Injectable capture implementation for deterministic admission tests. */
+  capture?: (pid: number) => Promise<ProcessBirthFingerprint | undefined>;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+};
+
+const DEFAULT_BIRTH_CAPTURE_TIMEOUT_MS = 1_000;
+const DEFAULT_BIRTH_CAPTURE_POLL_MS = 10;
 
 /** Parse one coherent topology + birth-identity process census. */
 export function parseProcessRows(output: string): ProcessRow[] {
@@ -70,6 +92,7 @@ export async function listProcessRows(): Promise<ProcessRow[]> {
 export async function readProcessBirthFingerprint(pid: number): Promise<ProcessBirthFingerprint | null> {
   if (process.platform === "win32") throw new Error("process birth identity is unavailable on win32");
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  if (pid === process.pid) return SELF_PROCESS_BIRTH;
   let output: string;
   try {
     output = await execPs(["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(pid)]);
@@ -90,6 +113,31 @@ export async function captureProcessBirthFingerprint(pid: number): Promise<Proce
     return (await readProcessBirthFingerprint(pid)) ?? undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Capture a newly-created process's immutable birth identity within a bounded
+ * admission window. A just-spawned process can briefly miss the first `ps`
+ * census under load; callers must retry that observation, but must never
+ * publish a durable ready/running record when the budget expires.
+ */
+export async function captureProcessBirthFingerprintWithRetry(
+  pid: number,
+  options: ProcessBirthCaptureOptions = {},
+): Promise<ProcessBirthFingerprint | undefined> {
+  const timeoutMs = Math.max(0, options.timeoutMs ?? DEFAULT_BIRTH_CAPTURE_TIMEOUT_MS);
+  const pollIntervalMs = Math.max(0, options.pollIntervalMs ?? DEFAULT_BIRTH_CAPTURE_POLL_MS);
+  const capture = options.capture ?? captureProcessBirthFingerprint;
+  const pause = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = options.now ?? Date.now;
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    const fingerprint = await capture(pid);
+    if (fingerprint) return fingerprint;
+    const remaining = deadline - now();
+    if (remaining <= 0) return undefined;
+    await pause(Math.min(pollIntervalMs, remaining));
   }
 }
 

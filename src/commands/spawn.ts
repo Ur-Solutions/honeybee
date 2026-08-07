@@ -48,8 +48,7 @@ import { loadCombVersion } from "../comb/registry.js";
 import { validateContract } from "../comb/schema.js";
 import type { JsonValue, StoredCombVersion } from "../comb/types.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
-import { hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../hsr/runDir.js";
-import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
+import { readHsrMetaStrict } from "../hsr/runDir.js";
 import { stopHsrIncarnationByPid } from "../hsr/substrate.js";
 import { transactionalRetire } from "../kill.js";
 import { withSessionLifecycleTransaction } from "../lifecycle.js";
@@ -262,7 +261,7 @@ export type SpawnOptions = {
 
 export type SpawnRuntimeDependencies = {
   spawnHsrHost?: typeof spawnHsrHost;
-  captureProcessBirthFingerprint?: typeof captureProcessBirthFingerprint;
+  readHsrMetaStrict?: typeof readHsrMetaStrict;
   saveSession?: typeof saveSession;
   writeSpawnOptions?: typeof writeSpawnOptions;
   stopHsrIncarnationByPid?: typeof stopHsrIncarnationByPid;
@@ -564,10 +563,8 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
       ...(opts.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
-    // Fingerprint capture is best-effort; the retained spawn handle still gives
-    // stopHsrIncarnationByPid exact authority before metadata publication.
-    const runnerFingerprint = await (runtimeDeps.captureProcessBirthFingerprint ?? captureProcessBirthFingerprint)(hostPid)
-      .catch(() => undefined);
+    const admittedMeta = await (runtimeDeps.readHsrMetaStrict ?? readHsrMetaStrict)(name);
+    const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
     const runtime: SpawnedRuntimeHandle = {
       identity: {
         kind: "hsr",
@@ -587,28 +584,15 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
         }
       },
     };
+    if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
+      const cleanup = await runtime.stop();
+      const detail = cleanup.stopped ? "exact host rollback confirmed" : `exact host rollback unconfirmed: ${cleanup.detail}`;
+      throw new Error(`HSR host ${hostPid} has no complete birth admission; ${detail}`);
+    }
     let postForkPhase: SpawnAfterForkError["phase"] = "runtime-publish";
     let publishedRecord: SessionRecord | undefined;
     try {
       await opts.onRuntimeLaunched?.(runtime);
-      // Publish a provisional "queued" meta NOW: spawn no longer waits for the
-      // child's cold start, so without this every observer (hasSession, hive run
-      // --wait, the daemon reconciler, Apiary) would read the fresh bee as dead
-      // during the boot window. The child overwrites this with its own startup
-      // meta; skip the write if the child already won that race.
-      if (runnerTier && !(await readHsrMeta(name))) {
-        await writeHsrMeta(name, {
-          bee: name,
-          harness: spec.kind,
-          tier: runnerTier,
-          hostPid,
-          ...(runnerFingerprint ? { hostFingerprint: runnerFingerprint } : {}),
-          startedAt: new Date().toISOString(),
-          startupPhase: "harness",
-          controlSocket: hsrControlSocketPath(name),
-          status: "queued",
-        }).catch(() => undefined);
-      }
       timer.mark("session-create");
       const command = shellCommand(spec);
       const now = new Date().toISOString();
@@ -621,7 +605,7 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
         tmuxTarget: name, // logical id — HSR has no tmux target
         substrate: "hsr",
         runnerPid: hostPid,
-        ...(runnerFingerprint ? { runnerFingerprint } : {}),
+        runnerFingerprint,
         ...(runnerTier ? { runnerTier } : {}),
         combId: name,
         createdAt: now,

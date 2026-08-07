@@ -18,14 +18,14 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createServer } from "node:net";
 import { test } from "node:test";
 import { killOrphanedChildGroup, reapDeadHosts } from "../src/hsr/observe.js";
 import { buildController, serve } from "../src/hsr/remoteHost.js";
 import { connectRpcClient } from "../src/hsr/rpc.js";
-import { ensureHsrRunDir, hsrRunDir, readHsrMeta, writeHsrMeta } from "../src/hsr/runDir.js";
+import { ensureHsrRunDir, hsrMetaPath, hsrRunDir, readHsrMeta, writeHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate, stopHsrIncarnation } from "../src/hsr/substrate.js";
 import { captureProcessBirthFingerprint, type ProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 
@@ -222,6 +222,65 @@ test("remote kill RPC signals the orphaned child group when the host is gone (an
   });
 });
 
+test("remote restart kill fails closed on corrupt metadata and preserves a live detached child plus run dir", async () => {
+  await withTempStore(async () => {
+    const bee = "remote-corrupt-meta";
+    const orphan = spawnOrphan();
+    try {
+      await ensureHsrRunDir(bee);
+      const corrupt = `{"bee":"${bee}","childPid":${orphan.pid as number}`;
+      await writeFile(hsrMetaPath(bee), corrupt, { mode: 0o600 });
+      // A fresh controller has no in-memory handle: this is the serve-restart
+      // shape that previously collapsed tolerant null into "already stopped"
+      // and deleted the only locator while the child kept mutating.
+      const controller = buildController();
+      try {
+        const result = await controller.methods.kill!({ bee }, { connectionId: 1, close() {} }) as { ok?: boolean; error?: string };
+        assert.equal(result.ok, false);
+        assert.match(result.error ?? "", /Invalid JSON in HSR metadata/);
+        assert.equal(isPidAlive(orphan.pid as number), true, "untrusted child locator is never signalled");
+        assert.equal(existsSync(hsrRunDir(bee)), true, "run state remains the repair/retry handle");
+        assert.equal(await readFile(hsrMetaPath(bee), "utf8"), corrupt);
+      } finally {
+        await controller.close();
+      }
+    } finally {
+      try {
+        process.kill(-(orphan.pid as number), "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  });
+});
+
+test("remote restart kill distinguishes unreadable metadata from ENOENT and preserves state", async () => {
+  await withTempStore(async (dir) => {
+    const bee = "remote-unreadable-meta";
+    const orphan = spawnOrphan();
+    try {
+      await writeOrphanedMeta(bee, orphan.pid as number, dir);
+      await chmod(hsrMetaPath(bee), 0o000);
+      const controller = buildController();
+      try {
+        const result = await controller.methods.kill!({ bee }, { connectionId: 1, close() {} }) as { ok?: boolean; error?: string };
+        assert.equal(result.ok, false);
+        assert.match(result.error ?? "", /Unable to read HSR metadata.*EACCES|permission denied/i);
+        assert.equal(isPidAlive(orphan.pid as number), true);
+        assert.equal(existsSync(hsrRunDir(bee)), true);
+      } finally {
+        await controller.close();
+      }
+    } finally {
+      try {
+        process.kill(-(orphan.pid as number), "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  });
+});
+
 test("local substrate kill signals the orphaned child group of a crashed local host", async () => {
   await withTempStore(async (dir) => {
     const bee = "localorphan";
@@ -351,6 +410,7 @@ test("local HSR fallback treats a reused host PID as the old host gone without s
       tier: "stream" as const,
       hostPid: 5151,
       hostFingerprint: recorded,
+      childAdmission: "none" as const,
       startedAt: new Date().toISOString(),
       controlSocket: "/tmp/none.sock",
       status: "running" as const,

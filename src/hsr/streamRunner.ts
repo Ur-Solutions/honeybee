@@ -63,7 +63,11 @@ function safeJsonParse(line: string): unknown {
 export async function startStreamRunner(config: StreamRunnerConfig, opts: RunnerOpts): Promise<RunnerSession> {
   const bee = opts.bee;
 
-  const child = await spawnSessionChild(config.command, config.args, { cwd: opts.cwd, env: opts.env });
+  const child = await spawnSessionChild(config.command, config.args, {
+    cwd: opts.cwd,
+    env: opts.env,
+    onChildSpawn: opts.onChildSpawn,
+  });
   const plumbing = attachSessionPlumbing(bee, child);
 
   const session: RunnerSession = {

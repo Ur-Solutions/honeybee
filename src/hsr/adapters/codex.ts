@@ -602,7 +602,11 @@ async function createLiveCodexHandshakeAttempt(params: {
   method: "thread/start" | "thread/resume";
   requestParams: Record<string, unknown>;
 }): Promise<LiveCodexHandshakeAttempt> {
-  const child = await spawnSessionChild(params.command, params.args, { cwd: params.opts.cwd, env: params.env });
+  const child = await spawnSessionChild(params.command, params.args, {
+    cwd: params.opts.cwd,
+    env: params.env,
+    onChildSpawn: params.opts.onChildSpawn,
+  });
   forwardCodexStderr(child);
   const peer = createCodexRpcPeer(child.stdin!, child.stdout!);
 

@@ -101,6 +101,8 @@ export type HsrMeta = {
   childPgid?: number;
   /** OS birth identity of childPid; also binds the detached child PGID. */
   childFingerprint?: ProcessBirthFingerprint;
+  /** Durable outcome of the adapter's child-spawn admission. */
+  childAdmission?: "pending" | "none" | "admitted";
   startedAt: string; // ISO — detached host startup (includes any queued/starting wait)
   /** Set when this host entered the bounded Codex cold-start queue. */
   queuedAt?: string;
@@ -228,6 +230,23 @@ export async function readHsrMeta(bee: string): Promise<HsrMeta | null> {
     };
     if (object.hostFingerprint !== undefined && !validFingerprint(object.hostFingerprint)) return null;
     if (object.childFingerprint !== undefined && !validFingerprint(object.childFingerprint)) return null;
+    for (const key of ["childPid", "childPgid"] as const) {
+      if (object[key] !== undefined && (!Number.isSafeInteger(object[key]) || Number(object[key]) <= 0)) return null;
+    }
+    const hasChildPid = object.childPid !== undefined;
+    const hasChildPgid = object.childPgid !== undefined;
+    if (hasChildPid !== hasChildPgid || (hasChildPid && object.childPid !== object.childPgid)) return null;
+    if (object.childFingerprint !== undefined && !hasChildPid) return null;
+    if (object.childFingerprint !== undefined && object.childFingerprint.pgid !== object.childPgid) return null;
+    if (
+      object.childAdmission !== undefined &&
+      object.childAdmission !== "pending" &&
+      object.childAdmission !== "none" &&
+      object.childAdmission !== "admitted"
+    ) return null;
+    const hasChildIdentity = hasChildPid || object.childFingerprint !== undefined;
+    if (object.childAdmission === "admitted" && (!hasChildPid || !validFingerprint(object.childFingerprint))) return null;
+    if ((object.childAdmission === "pending" || object.childAdmission === "none") && hasChildIdentity) return null;
     return object as unknown as HsrMeta;
   } catch {
     return null;
@@ -298,6 +317,21 @@ export async function readHsrMetaStrict(bee: string): Promise<HsrMeta | null> {
     (object.childFingerprint as ProcessBirthFingerprint).pgid !== object.childPgid
   ) {
     throw new Error(`Invalid HSR metadata for ${bee}: child fingerprint does not match childPgid`);
+  }
+  if (
+    object.childAdmission !== undefined &&
+    object.childAdmission !== "pending" &&
+    object.childAdmission !== "none" &&
+    object.childAdmission !== "admitted"
+  ) {
+    throw new Error(`Invalid HSR metadata for ${bee}: unknown child admission state`);
+  }
+  const hasChildIdentity = hasChildPid || object.childFingerprint !== undefined;
+  if (object.childAdmission === "admitted" && (!hasChildPid || !validFingerprint(object.childFingerprint))) {
+    throw new Error(`Invalid HSR metadata for ${bee}: admitted child birth identity is incomplete`);
+  }
+  if ((object.childAdmission === "pending" || object.childAdmission === "none") && hasChildIdentity) {
+    throw new Error(`Invalid HSR metadata for ${bee}: ${object.childAdmission} admission cannot carry child identity`);
   }
   return object as unknown as HsrMeta;
 }

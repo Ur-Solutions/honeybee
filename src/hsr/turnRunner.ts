@@ -115,7 +115,11 @@ export async function startTurnRunner(config: TurnRunnerConfig, opts: RunnerOpts
     const args = [...config.baseArgs, ...config.turnArgs(knownSessionId)];
     let child: ChildProcess;
     try {
-      child = await spawnSessionChild(config.command, args, { cwd: opts.cwd, env: opts.env });
+      child = await spawnSessionChild(config.command, args, {
+        cwd: opts.cwd,
+        env: opts.env,
+        onChildSpawn: opts.onChildSpawn,
+      });
     } catch (error) {
       core.ingestEvent({
         type: "error",

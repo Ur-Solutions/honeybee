@@ -166,6 +166,13 @@ export type RunnerOpts = {
    * their own narrower approval sandboxes only when this fact is present.
    */
   cellSandbox?: "macos-seatbelt" | "linux-bubblewrap";
+  /**
+   * Internal host admission hook. Every detached harness child invokes this
+   * synchronously after the OS `spawn` event and before protocol readiness.
+   * A rejection forces exact ChildProcess rollback and the adapter never
+   * returns a live session.
+   */
+  onChildSpawn?: (identity: { pid: number; pgid: number }) => Promise<void>;
 };
 
 /**

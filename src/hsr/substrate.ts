@@ -34,18 +34,18 @@ import {
   listHsrBees,
   type HsrProcessSignalDependencies,
 } from "./observe.js";
-import { readHsrMeta, type HsrMeta } from "./runDir.js";
+import { readHsrMeta, readHsrMetaStrict, type HsrMeta } from "./runDir.js";
 import { sameProcessBirthFingerprint } from "./processIdentity.js";
 import { connectRpcClient } from "./rpc.js";
 import { clearPendingHsrTurns, enqueuePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
-import { spawnedHsrHostHasExited, stopSpawnedHsrHost } from "./runnerHost.js";
+import { stopSpawnedHsrHost } from "./runnerHost.js";
 
 /** A queued or running host is live while its detached host pid is alive. */
-async function hasSession(bee: string): Promise<boolean> {
-  const meta = await readHsrMeta(bee);
+async function hasSession(bee: string, deps: HsrProcessSignalDependencies = {}): Promise<boolean> {
+  const meta = await readHsrMetaStrict(bee);
   if (!meta || meta.status === "exited") return false;
   if (meta.mirrorOfNode) return meta.status === "running";
-  return await inspectHsrHostProcess(meta) === "match";
+  return await inspectHsrHostProcess(meta, deps) === "match";
 }
 
 /** Rendered text tail from ring.txt (Substrate.capture compat). */
@@ -110,7 +110,7 @@ async function waitUntilHostStopped(
     // strongest available confirmation. Detached production hosts always have
     // another pid and still require observed OS exit below.
     if (expected.hostPid === process.pid) {
-      const latest = await readHsrMeta(bee);
+      const latest = await readHsrMetaStrict(bee);
       if (sameHostIncarnation(expected, latest) && latest?.status === "exited") return true;
     }
     await (deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(50);
@@ -121,7 +121,7 @@ async function waitUntilHostStopped(
   const identity = await inspectHsrHostProcess(expected, deps);
   if (identity === "gone" || identity === "mismatch") return true;
   if (identity !== "match" || expected.hostPid !== process.pid) return false;
-  const latest = await readHsrMeta(bee);
+  const latest = await readHsrMetaStrict(bee);
   return sameHostIncarnation(expected, latest) && latest?.status === "exited";
 }
 
@@ -172,7 +172,7 @@ export async function stopHsrIncarnation(
   // stop attempt above throws) — signalling meta.hostPid then would target a
   // recycled/unrelated pid.
   if (!stopped) {
-    const latest = await readHsrMeta(bee);
+    const latest = await readHsrMetaStrict(bee);
     if (sameHostIncarnation(initial, latest)) ownedMeta = latest!;
     // Only signal the exact runtime incarnation read at entry. A replacement
     // host under the same bee name is not ours to shoot by a recycled pid.
@@ -185,7 +185,7 @@ export async function stopHsrIncarnation(
       }
       stopped = await waitUntilHostStopped(bee, initial, 2_000, deps);
       if (!stopped) {
-        const current = await readHsrMeta(bee);
+        const current = await readHsrMetaStrict(bee);
         const currentIdentity = await inspectHsrHostProcess(initial, deps);
         if (current && current.status !== "exited" && sameHostIncarnation(initial, current) && currentIdentity === "match") {
           try {
@@ -206,19 +206,20 @@ export async function stopHsrIncarnation(
     }
   }
 
-  const finalMeta = await readHsrMeta(bee);
+  const finalMeta = await readHsrMetaStrict(bee);
   if (sameHostIncarnation(initial, finalMeta)) ownedMeta = finalMeta!;
   const childStopped = stopped ? await confirmChildGroupStopped(ownedMeta, deps) : false;
   const confirmed = stopped && childStopped;
-  await clearPendingHsrTurns(bee).catch(() => undefined);
-  return confirmed
-    ? { ok: true, stdout: "", stderr: "", exitCode: 0 }
-    : {
-        ok: false,
-        stdout: "",
-        stderr: `HSR stop unconfirmed for ${bee}: host or detached harness process group remains live`,
-        exitCode: 1,
-      };
+  if (confirmed) {
+    await clearPendingHsrTurns(bee).catch(() => undefined);
+    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+  }
+  return {
+    ok: false,
+    stdout: "",
+    stderr: `HSR stop unconfirmed for ${bee}: host or detached harness process group remains live`,
+    exitCode: 1,
+  };
 }
 
 /**
@@ -230,38 +231,40 @@ export async function stopHsrIncarnationByPid(bee: string, expectedHostPid: numb
   // Check the spawn handle before metadata. If this process already reaped the
   // exact child, a recycled same-number pid in replacement metadata must never
   // be adopted or signalled.
-  if (spawnedHsrHostHasExited(expectedHostPid)) {
-    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
-  }
-  const current = await readHsrMeta(bee);
+  const current = await readHsrMetaStrict(bee);
   if (current?.hostPid === expectedHostPid) return stopHsrIncarnation(bee, current);
   // Publication may lag spawn. The spawning process retains the returned
   // ChildProcess handle, so rollback does not adopt whatever same-name
   // metadata appeared meanwhile; the host's SIGTERM path retains its existing
   // birth-validated descendant teardown.
   const spawnedStop = await stopSpawnedHsrHost(expectedHostPid);
-  if (spawnedStop === "stopped") {
-    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
-  }
-  if (spawnedStop === "unknown" && !isPidAlive(expectedHostPid)) {
-    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
-  }
+  // The exact host handle proves only host exit. Without metadata, a detached
+  // harness child may have escaped during startup, so neither a clean handle
+  // exit nor numeric pid absence is sufficient child-group absence proof.
   return {
     ok: false,
     stdout: "",
-    stderr: `HSR stop unconfirmed for ${bee}: metadata names a replacement while launched host ${expectedHostPid} remains observable`,
+    stderr: `HSR stop unconfirmed for ${bee}: ${
+      spawnedStop === "unconfirmed" || isPidAlive(expectedHostPid)
+        ? `launched host ${expectedHostPid} or its child tree remains observable`
+        : `metadata does not prove child absence for launched host ${expectedHostPid}`
+    }`,
     exitCode: 1,
   };
 }
 
-/** Generic user kill keeps its traditional idempotent no-session success. */
-async function kill(bee: string): Promise<KillResult> {
-  const initial = await readHsrMeta(bee);
+/** Generic user kill also fails closed when the child locator is absent. */
+async function kill(bee: string, deps: HsrProcessSignalDependencies = {}): Promise<KillResult> {
+  const initial = await readHsrMetaStrict(bee);
   if (!initial) {
-    await clearPendingHsrTurns(bee).catch(() => undefined);
-    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    return {
+      ok: false,
+      stdout: "",
+      stderr: `HSR stop unconfirmed for ${bee}: metadata is absent and detached child absence is unproven`,
+      exitCode: 1,
+    };
   }
-  return stopHsrIncarnation(bee, initial);
+  return stopHsrIncarnation(bee, initial, deps);
 }
 
 /**
@@ -270,7 +273,7 @@ async function kill(bee: string): Promise<KillResult> {
  * publication may simply be late, so terminal failure must remain forbidden.
  */
 export async function stopKnownHsrExecution(bee: string): Promise<KillResult> {
-  const initial = await readHsrMeta(bee);
+  const initial = await readHsrMetaStrict(bee);
   if (!initial) {
     return {
       ok: false,
@@ -287,7 +290,13 @@ let cached: Substrate | undefined;
 /** The singleton HSR substrate (local-only, record-routed). */
 export function hsrSubstrate(): Substrate {
   if (cached) return cached;
-  cached = {
+  cached = createHsrSubstrate();
+  return cached;
+}
+
+/** Injectable HSR substrate for deterministic incarnation-safety tests. */
+export function createHsrSubstrate(processSignals: HsrProcessSignalDependencies = {}): Substrate {
+  return {
     kind: "hsr",
     node: LOCAL_NODE,
     // The runner host sees tool events inline, so it can hold a next-tool send.
@@ -295,7 +304,7 @@ export function hsrSubstrate(): Substrate {
     async probe(): Promise<ProbeResult> {
       return { ok: true };
     },
-    hasSession,
+    hasSession: (target: string) => hasSession(target, processSignals),
     // Spawn forks the runner host directly (hive __hsr-run) and records the bee;
     // it never routes through newSession.
     newSession(): Promise<NewSessionResult> {
@@ -303,7 +312,7 @@ export function hsrSubstrate(): Substrate {
     },
     // Combs are retired (APIA-85): no newPane/killPane. Killing an HSR bee is
     // killing its runner host (kill), since there is no pane.
-    kill: (target: string) => kill(target),
+    kill: (target: string) => kill(target, processSignals),
     capture: (target: string, lines?: number) => capture(target, lines),
     sendText: (target: string, text: string, paneId?: string, options?: SendTextOptions) =>
       sendText(target, text, paneId, options),
@@ -343,5 +352,4 @@ export function hsrSubstrate(): Substrate {
       throw new Error("HSR bees have no tmux target; use hive tail/transcript");
     },
   };
-  return cached;
 }

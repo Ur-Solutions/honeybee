@@ -278,6 +278,7 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
   const child: ChildProcess = await spawnSessionChild(spawn.command, spawn.args, {
     cwd: opts.cwd,
     env: spawn.env,
+    onChildSpawn: opts.onChildSpawn,
   });
   if (!child.stdin || !child.stdout) throw new Error("hsr kimi: ACP child has no stdio pipes");
   const peer = createAcpRpcPeer(child.stdin, child.stdout);

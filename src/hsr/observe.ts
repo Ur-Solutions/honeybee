@@ -762,7 +762,12 @@ export function inspectHsrChildProcess(
   meta: HsrMeta | null,
   deps: HsrProcessSignalDependencies = {},
 ): Promise<HsrChildProcessVerdict> {
-  if (!meta?.childPid && !meta?.childPgid) return Promise.resolve("absent");
+  if (!meta?.childPid && !meta?.childPgid) {
+    // Only a completed no-child admission is durable absence. `pending` and
+    // legacy missing admission state can be the pre-publication orphan window:
+    // treating either as absent would let reap/kill discard the sole locator.
+    return Promise.resolve(meta?.childAdmission === "none" ? "absent" : "unverifiable");
+  }
   const pid = meta.childPid;
   const pgid = meta.childPgid ?? pid;
   if (!pid || !pgid || meta.childFingerprint?.pgid !== pgid) return Promise.resolve("unverifiable");
@@ -842,7 +847,10 @@ export async function ensureOrphanedChildGroupStopped(
 export async function reapDeadHosts(deps: HsrProcessSignalDependencies = {}): Promise<string[]> {
   const reaped: string[] = [];
   for (const bee of await listHsrBees()) {
-    const meta = await readHsrMeta(bee);
+    // Corrupt or unreadable existing metadata is uncertainty, not absence.
+    // Preserve it for explicit repair instead of overwriting the only runtime
+    // locator with an exited record.
+    const meta = await readHsrMetaStrict(bee).catch(() => null);
     if (!meta || meta.status === "exited") continue;
     // A mirror has no local host pid to reap: the remoteEventMirror owns its
     // status (flips to "exited" when the bee leaves the remote list). Skip it.

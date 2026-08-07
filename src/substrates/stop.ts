@@ -49,7 +49,10 @@ export async function stopRuntimeStrict(
   // record without its birth evidence cannot use pane absence as process-death
   // proof, so still enter kill() and let the substrate fail closed.
   const needsRemoteGroupProof = substrate.kind === "ssh-tmux";
-  const mustKill = initiallyAlive || options.launcherPgid !== undefined || needsRemoteGroupProof;
+  // HSR liveness tracks the host, not its detached child. A false observation
+  // therefore still requires the substrate's strict incarnation cleanup.
+  const needsLocalHsrCleanup = substrate.kind === "hsr";
+  const mustKill = initiallyAlive || options.launcherPgid !== undefined || needsRemoteGroupProof || needsLocalHsrCleanup;
   let attempts = 0;
   if (mustKill) {
     attempts += 1;

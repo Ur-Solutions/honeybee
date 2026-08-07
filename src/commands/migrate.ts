@@ -11,9 +11,8 @@ import { adapterFor } from "../hsr/adapters/index.js";
 import { hsrObservations, readEventTail, type HsrObservation } from "../hsr/observe.js";
 import { readPendingHsrTurns } from "../hsr/pendingTurns.js";
 import { connectRpcClient } from "../hsr/rpc.js";
-import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta } from "../hsr/runDir.js";
+import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta, readHsrMetaStrict } from "../hsr/runDir.js";
 import { hsrSubstrate, stopHsrIncarnationByPid, stopKnownHsrExecution } from "../hsr/substrate.js";
-import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import { withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "../lifecycle.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
@@ -397,7 +396,11 @@ async function reviveHsrRunnerInTransaction(
     ...(record.model ? { model: record.model } : {}),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
-  const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
+  const admittedMeta = await readHsrMetaStrict(record.name);
+  const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
+  if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
+    await confirmLaunchedHsrStopped(record.name, hostPid, new Error("HSR revive returned without complete process birth admission"), opts.stopHsrIncarnation);
+  }
   let restored: SessionRecord;
   try {
     if (!(await (opts.waitForHsrHost ?? waitForHsrHost)(record.name, 5000))) {
@@ -414,7 +417,7 @@ async function reviveHsrRunnerInTransaction(
       ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
       substrate: "hsr",
       runnerPid: hostPid,
-      runnerFingerprint,
+      runnerFingerprint: runnerFingerprint!,
       ...(runnerTier ? { runnerTier } : {}),
       ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
       // Clear both halves of the provider-thread anchor. Keeping the old path
@@ -968,7 +971,11 @@ async function demoteInTransaction(lifecycle: SessionLifecycleTransaction, parse
     ...(record.model ? { model: record.model } : {}),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
-  const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
+  const admittedMeta = await readHsrMetaStrict(record.name);
+  const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
+  if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
+    await confirmLaunchedHsrStopped(record.name, hostPid, new Error("HSR demote returned without complete process birth admission"));
+  }
 
   // 4. Wait briefly for the host to report live (as spawnBee's HSR path does).
   if (!(await waitForHsrHost(record.name, 5000))) {
@@ -1000,7 +1007,7 @@ async function demoteInTransaction(lifecycle: SessionLifecycleTransaction, parse
       command,
       substrate: "hsr",
       runnerPid: hostPid,
-      runnerFingerprint,
+      runnerFingerprint: runnerFingerprint!,
       ...(runnerTier ? { runnerTier } : {}),
       ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
       tmuxTarget: record.name,
@@ -1382,6 +1389,10 @@ async function reviveRecordInTransaction(
     if (await hsrSubstrate().hasSession(record.name)) {
       throw new Error(`hive revive: ${record.name} is already running (${record.name})`);
     }
+    // A dead host is not proof that its detached harness group is gone. Reuse
+    // the strict incarnation teardown before replacing meta.json; otherwise a
+    // revive could erase the only locator for a crashed host's live child.
+    await stopHsrRunner(record);
     const updated = await reviveHsrRunnerInTransaction(lifecycle, tool, {
       fresh,
       sessionOverride,

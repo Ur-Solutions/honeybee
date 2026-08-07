@@ -44,7 +44,7 @@ import {
   reapDeadHosts,
   type HsrProcessSignalDependencies,
 } from "./observe.js";
-import { readHsrMeta, hsrRunDir, readHsrRestart, writeHsrRestart, type HsrMeta } from "./runDir.js";
+import { readHsrMeta, readHsrMetaStrict, hsrRunDir, readHsrRestart, writeHsrRestart, type HsrMeta } from "./runDir.js";
 import { sameProcessBirthFingerprint } from "./processIdentity.js";
 import {
   recordDeliveredCredentials,
@@ -157,11 +157,24 @@ export type RunnerHostController = {
 
 export type RunnerHostControllerOptions = {
   processSignals?: HsrProcessSignalDependencies;
+  /** Injectable in-process host start for strict controller lifecycle tests. */
+  runHost?: typeof runHsrHost;
+  /** Injectable strict credential erasure boundary. */
+  shredCredentials?: (bee: string) => Promise<void | { ok: boolean; error?: string }>;
 };
 
 export function buildController(options: RunnerHostControllerOptions = {}): RunnerHostController {
   const version = versionString();
   const processSignals = options.processSignals ?? {};
+  const runHost = options.runHost ?? runHsrHost;
+  const shredCredentials = options.shredCredentials ?? shredDeliveredCredentials;
+
+  async function eraseCredentialsStrict(bee: string): Promise<void> {
+    const result = await shredCredentials(bee);
+    if (result && !result.ok) {
+      throw new Error(result.error ?? `credential erasure unconfirmed for ${bee}`);
+    }
+  }
 
   // Live event relays, one cached client per observed bee (ref-counted across
   // subscribers) — mirrors hsrControl.ts. server is assigned by attachServer.
@@ -221,7 +234,7 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
       const identity = await inspectHsrHostProcess(initial, processSignals);
       if (identity === "gone" || identity === "mismatch") return true;
       if (identity === "unverifiable") return false;
-      const latest = await readHsrMeta(bee);
+      const latest = await readHsrMetaStrict(bee);
       // Remote runners are hosted in-process, so finalized meta is the stop
       // proof even while the shared serve process itself remains alive.
       if (sameHostIncarnation(initial, latest) && latest?.status === "exited") return true;
@@ -230,23 +243,41 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
     return false;
   }
 
+  async function stopTrackedHandle(bee: string, handle: HsrHostHandle): Promise<boolean> {
+    // The handle is not durable identity by itself: snapshot the exact meta
+    // incarnation before calling user/provider teardown, then require the same
+    // locator plus birth-fenced child absence afterward.
+    const initial = await readHsrMetaStrict(bee);
+    if (!initial) return false;
+    let resolved = false;
+    try {
+      await handle.stop();
+      resolved = true;
+    } catch {
+      // Fall through to strict child-group recovery below. Keep the handle in
+      // the map until that durable proof succeeds.
+    }
+    const latest = await readHsrMetaStrict(bee);
+    if (!sameHostIncarnation(initial, latest)) return false;
+    if (resolved && latest?.status !== "exited") return false;
+    if (!(await ensureOrphanedChildGroupStopped(latest, processSignals))) return false;
+    if (handles.get(bee) === handle) handles.delete(bee);
+    return true;
+  }
+
   /** Stop a runner: prefer the in-process handle, else socket + birth-validated fallback. */
   async function stopRunner(bee: string): Promise<boolean> {
     const handle = handles.get(bee);
-    if (handle) {
-      handles.delete(bee);
-      await handle.stop().catch(() => undefined);
-      return true;
-    }
-    const meta = await readHsrMeta(bee);
-    if (!meta) return true;
+    if (handle) return stopTrackedHandle(bee, handle);
+    const meta = await readHsrMetaStrict(bee);
+    if (!meta) return false;
     let stopped = false;
     if (meta.controlSocket && meta.status === "running") {
       const result = await proxyCall(bee, "stop");
       if (result.ok) stopped = await waitForStoppedIncarnation(bee, meta, 2_500);
     }
     if (!stopped && meta.status === "running") {
-      const latest = await readHsrMeta(bee);
+      const latest = await readHsrMetaStrict(bee);
       const identity = await inspectHsrHostProcess(meta, processSignals);
       if (identity === "match" && sameHostIncarnation(meta, latest) && latest?.status === "running") {
         try {
@@ -351,7 +382,11 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
         // Record BEFORE forking so a failed runner start still shreds the creds.
         await recordDeliveredCredentials(bee, deliveredCredPaths);
       } catch {
-        await shredDeliveredCredentials(bee).catch(() => undefined);
+        try {
+          await eraseCredentialsStrict(bee);
+        } catch {
+          return { ok: false, error: "failed to write delivered credentials; cleanup unconfirmed and run state preserved" };
+        }
         return { ok: false, error: "failed to write delivered credentials into the remote home" };
       }
       if (homeEnv) childEnv[homeEnv] = homeDir;
@@ -400,10 +435,16 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
 
     let handle: HsrHostHandle;
     try {
-      handle = await runHsrHost({ bee, adapter, opts });
+      handle = await runHost({ bee, adapter, opts });
     } catch (error) {
       // Runner never started — do not leave the delivered credential on disk.
-      if (deliveredCredPaths.length > 0) await shredDeliveredCredentials(bee).catch(() => undefined);
+      if (deliveredCredPaths.length > 0) {
+        try {
+          await eraseCredentialsStrict(bee);
+        } catch {
+          throw new Error(`runner startup failed for ${bee}; credential erasure unconfirmed and run state preserved`);
+        }
+      }
       throw error;
     }
     handles.set(bee, handle);
@@ -479,7 +520,11 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
         if (!(await stopRunner(bee))) return { ok: false, error: `stop unconfirmed for ${bee}; credentials not replaced` };
         // Destroy the OLD delivered credential BEFORE writing the fresh one, so the
         // dead access token never lingers on the remote.
-        await shredDeliveredCredentials(bee).catch(() => undefined);
+        try {
+          await eraseCredentialsStrict(bee);
+        } catch {
+          return { ok: false, error: `old credential erasure unconfirmed for ${bee}; credentials not replaced` };
+        }
         const result = await startRunner(
           {
             bee,
@@ -634,6 +679,9 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
       const p = (params ?? {}) as { bee?: unknown };
       const bee = String(p.bee ?? "");
       if (!bee) return { ok: false, error: "bee required" };
+      if (!(await stopRunner(bee))) {
+        return { ok: false, error: `stop unconfirmed for ${bee}; run state preserved` };
+      }
       const relay = relays.get(bee);
       if (relay) {
         try {
@@ -644,14 +692,20 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
         }
         relays.delete(bee);
       }
-      if (!(await stopRunner(bee))) {
-        return { ok: false, error: `stop unconfirmed for ${bee}; run state preserved` };
-      }
       // APIA-93: destroy any ephemeral credential delivered into the remote home
       // BEFORE removing the run dir (which holds the delivered-paths record), so
-      // nothing persists remotely once the bee is gone. Best-effort shred.
-      await shredDeliveredCredentials(bee).catch(() => undefined);
-      await rm(hsrRunDir(bee), { recursive: true, force: true }).catch(() => undefined);
+      // nothing persists remotely once the bee is gone. Erasure is a strict
+      // transaction boundary: uncertainty preserves the locator for retry.
+      try {
+        await eraseCredentialsStrict(bee);
+      } catch {
+        return { ok: false, error: `credential erasure unconfirmed for ${bee}; run state preserved` };
+      }
+      try {
+        await rm(hsrRunDir(bee), { recursive: true, force: true });
+      } catch {
+        return { ok: false, error: `run state removal unconfirmed for ${bee}` };
+      }
       return { ok: true, stdout: "", stderr: "", exitCode: 0 };
     }),
 
@@ -681,10 +735,17 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
         }
       }
       relays.clear();
-      for (const handle of handles.values()) {
-        await handle.stop().catch(() => undefined);
+      const unresolved: string[] = [];
+      for (const [bee, handle] of [...handles]) {
+        try {
+          if (!(await stopTrackedHandle(bee, handle))) unresolved.push(bee);
+        } catch {
+          unresolved.push(bee);
+        }
       }
-      handles.clear();
+      if (unresolved.length > 0) {
+        throw new Error(`runner-host close left unconfirmed HSR runtimes: ${unresolved.join(", ")}`);
+      }
     },
   };
 }
