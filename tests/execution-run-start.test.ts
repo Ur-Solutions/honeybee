@@ -20,7 +20,7 @@ import {
 } from "../src/execution/runStore.js";
 import { validateRunStart } from "../src/execution/runStart.js";
 import type { JsonObject } from "../src/execution/contract.js";
-import { saveSession } from "../src/store.js";
+import { deleteSession, saveSession } from "../src/store.js";
 import { claimWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import {
@@ -454,10 +454,17 @@ test("crash recovery: started-receipt-lost binds the session without a second la
     assert.equal((await readReservation("run-0001"))!.indeterminateCause, "readiness_evidence_missing");
     assert.equal(counting.calls.length, 0, "record-only identity evidence must not relaunch the process");
 
+    // If the partial record itself disappears, that loss of evidence is not
+    // proof spawn never happened and must never reopen the launch side effect.
+    await deleteSession(beeNameForRun("run-0001"));
+    const evidenceGone = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r2" }))) as JsonObject;
+    assert.deepEqual(evidenceGone.result, { runId: "run-0001", state: "lost" });
+    assert.equal(counting.calls.length, 0, "recoverable lost state stays sticky when its evidence disappears");
+
     // Canonical identity alone is still not readiness: without running HSR
     // metadata the replay must remain lost and emit no harness.running.
     await saveSession({ ...crashedSession, id: "CO.canonical-0001", updatedAt: new Date().toISOString() });
-    const identityOnly = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r2" }))) as JsonObject;
+    const identityOnly = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r3" }))) as JsonObject;
     assert.deepEqual(identityOnly.result, { runId: "run-0001", state: "lost" });
     assert.ok(!(await readRunEvents("run-0001")).some((event) => event.type === "harness.running"));
 
@@ -475,7 +482,7 @@ test("crash recovery: started-receipt-lost binds the session without a second la
       controlSocket: "/tmp/honeybee-ready-proof.sock",
       status: "running",
     });
-    const response = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r3" }))) as JsonObject;
+    const response = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r4" }))) as JsonObject;
     assertEnvelopeShape(response);
     assert.equal((response.receipt as JsonObject).outcome, "replayed");
     assert.deepEqual(response.result, { runId: "run-0001", state: "running" });

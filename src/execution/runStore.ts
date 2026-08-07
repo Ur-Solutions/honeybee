@@ -642,12 +642,16 @@ export function classifyLaunch(
   // publication, or a recovered working-copy claim). Keep inspecting evidence
   // so the Run can converge;
   // every other indeterminate launch remains sticky and is never relaunched.
-  if (
-    reservation.indeterminateAt &&
-    reservation.indeterminateCause !== "readiness_evidence_missing" &&
-    reservation.indeterminateCause !== "session_ref_missing" &&
-    reservation.indeterminateCause !== "environment_receipt_missing"
-  ) return "indeterminate";
+  if (reservation.indeterminateAt) {
+    const receiptFactCanAppearLater =
+      reservation.indeterminateCause === "readiness_evidence_missing" ||
+      reservation.indeterminateCause === "session_ref_missing" ||
+      reservation.indeterminateCause === "environment_receipt_missing";
+    // Losing the evidence that originally put the Run into a recoverable lost
+    // state is never proof that spawn did not happen. Stay sticky rather than
+    // falling through to reserved-not-started and launching a duplicate.
+    if (!receiptFactCanAppearLater || !evidence.sessionExists) return "indeterminate";
+  }
   if (evidence.sessionExists) {
     if (evidence.stampedRunId !== undefined && evidence.stampedRunId !== reservation.runId) return "indeterminate";
     // Identity evidence is not readiness evidence. Only a running HSR meta
