@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +7,14 @@ import { test } from "node:test";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { runHsrHost } from "../src/hsr/host.js";
 import { reapDeadHosts } from "../src/hsr/observe.js";
+import {
+  capturePersistableProcessBirthFingerprint,
+  captureProcessBirthFingerprint,
+  inspectProcessBirth,
+} from "../src/hsr/processIdentity.js";
+import { spawnHsrHost } from "../src/hsr/runnerHost.js";
 import { ensureHsrRunDir, hsrControlSocketPath, hsrMetaPath, hsrRunDir, readHsrMetaStrict, writeHsrMeta } from "../src/hsr/runDir.js";
+import { stopHsrIncarnationByPid } from "../src/hsr/substrate.js";
 import type { ProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import type { RunnerOpts } from "../src/hsr/types.js";
 
@@ -23,6 +31,15 @@ async function withTempStore(fn: () => Promise<void>): Promise<void> {
   }
 }
 
+function detachedRuntimeAvailable(): boolean {
+  try {
+    execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(process.pid)], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function opts(bee: string): RunnerOpts {
   return {
     bee,
@@ -31,6 +48,44 @@ function opts(bee: string): RunnerOpts {
     runDir: hsrRunDir(bee),
   };
 }
+
+test("detached runner publishes an OS-comparable host birth fingerprint", { skip: !detachedRuntimeAvailable() }, async () => {
+  await withTempStore(async () => {
+    const bee = "cross-process-host-birth";
+    const hostPid = await spawnHsrHost({
+      bee,
+      comb: bee,
+      kind: "stub",
+      cwd: process.cwd(),
+      authKind: "subscription",
+      spec: { command: process.execPath, args: [], env: process.env as Record<string, string> },
+    });
+    try {
+      const meta = await readHsrMetaStrict(bee);
+      assert.equal(meta?.hostPid, hostPid);
+      assert.ok(meta?.hostFingerprint);
+      assert.doesNotMatch(meta.hostFingerprint.startedAt, /^node-time-origin:/);
+      assert.equal(await inspectProcessBirth(hostPid, meta.hostFingerprint), "match");
+    } finally {
+      const stopped = await stopHsrIncarnationByPid(bee, hostPid);
+      assert.equal(stopped.ok, true, stopped.stderr);
+    }
+  });
+});
+
+test("contained self fallback stays process-local and cannot become a durable detached identity", async () => {
+  const denied = async (): Promise<never> => { throw new Error("process census denied"); };
+  assert.equal(await capturePersistableProcessBirthFingerprint(process.pid, denied), undefined);
+  const local = await captureProcessBirthFingerprint(process.pid, denied);
+  assert.ok(local);
+  assert.match(local.startedAt, /^node-time-origin:/);
+  assert.equal(await inspectProcessBirth(process.pid, local, denied), "match");
+  assert.equal(
+    await captureProcessBirthFingerprint(process.pid + 1, denied),
+    undefined,
+    "the synthetic token is never minted for an external/detached pid",
+  );
+});
 
 function isGroupAlive(pgid: number): boolean {
   try {

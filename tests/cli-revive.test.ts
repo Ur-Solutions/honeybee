@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { readHsrMeta } from "../src/hsr/runDir.js";
+import { ensureHsrRunDir, hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
 import { recordSeal, sealedBeeNames, validateSealArtifact } from "../src/seal.js";
@@ -16,6 +16,16 @@ const execFileAsync = promisify(execFile);
 function tmuxAvailable(): boolean {
   try {
     execFileSync("tmux", ["-V"], { stdio: "ignore" });
+    execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(process.pid)], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function detachedRuntimeAvailable(): boolean {
+  try {
+    execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(process.pid)], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -95,6 +105,26 @@ async function withStoreEnv<T>(store: string, fn: () => Promise<T>): Promise<T> 
 async function killHsrBee(store: string, bee: string): Promise<void> {
   await withStoreEnv(store, async () => {
     await hsrSubstrate().kill(bee).catch(() => undefined);
+  });
+}
+
+async function seedStoppedHsrRuntime(store: string, bee: string): Promise<void> {
+  await withStoreEnv(store, async () => {
+    const deadPid = 2 ** 31 - 1;
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "stub",
+      tier: "stream",
+      hostPid: deadPid,
+      hostFingerprint: { pgid: deadPid, startedAt: "Fri Aug  7 00:00:00 2026" },
+      childAdmission: "none",
+      startedAt: "2026-08-07T00:00:00.000Z",
+      controlSocket: hsrControlSocketPath(bee),
+      status: "exited",
+      exitCode: 0,
+      endedAt: "2026-08-07T00:00:01.000Z",
+    });
   });
 }
 
@@ -257,7 +287,7 @@ test("a failed revive cannot rewrite the recorded command or argv", { skip: !tmu
   });
 });
 
-test("revive routes local HSR records through the runner host", async () => {
+test("revive routes local HSR records through the runner host", { skip: !detachedRuntimeAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const bee = "HSR.revive";
     await seedBee(store, bee, {
@@ -273,6 +303,7 @@ test("revive routes local HSR records through the runner host", async () => {
       lastObservedStateAt: "2026-06-25T00:01:00.000Z",
       terminalTranscriptDiscoveryAt: "2026-06-25T00:01:00.000Z",
     });
+    await seedStoppedHsrRuntime(store, bee);
     await withStoreEnv(store, () => recordSeal(bee, validateSealArtifact({ status: "done", summary: "old runtime" })));
 
     try {
@@ -307,7 +338,7 @@ test("revive routes local HSR records through the runner host", async () => {
   });
 });
 
-test("revive --fresh clears an HSR bee's stale provider id and transcript anchor", async () => {
+test("revive --fresh clears an HSR bee's stale provider id and transcript anchor", { skip: !detachedRuntimeAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const bee = "HSR.fresh";
     await seedBee(store, bee, {
@@ -321,6 +352,7 @@ test("revive --fresh clears an HSR bee's stale provider id and transcript anchor
       providerSessionId: "stale-provider-id",
       transcriptPath: "/tmp/stale-provider-id.jsonl",
     });
+    await seedStoppedHsrRuntime(store, bee);
 
     try {
       const result = await hive(store, socket, ["revive", bee, "--fresh", "--no-wait"]);
@@ -335,7 +367,7 @@ test("revive --fresh clears an HSR bee's stale provider id and transcript anchor
   });
 });
 
-test("revive --all continues after a per-bee failure", async () => {
+test("revive --all continues after a per-bee failure", { skip: !detachedRuntimeAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const bad = "HSR.bad";
     const good = "HSR.good";
@@ -349,6 +381,7 @@ test("revive --all continues after a per-bee failure", async () => {
       providerSessionId: "sess-bad",
       updatedAt: "2026-06-25T00:00:02.000Z",
     });
+    await seedStoppedHsrRuntime(store, bad);
     await seedBee(store, good, {
       agent: "stub",
       requestedAgent: "stub",
@@ -359,6 +392,7 @@ test("revive --all continues after a per-bee failure", async () => {
       providerSessionId: "sess-good",
       updatedAt: "2026-06-25T00:00:01.000Z",
     });
+    await seedStoppedHsrRuntime(store, good);
 
     try {
       const result = await hiveResult(store, socket, ["revive", "--all"]);
@@ -384,7 +418,7 @@ test("revive --all continues after a per-bee failure", async () => {
   });
 });
 
-test("revive --crashed replays the same recorded launch path", async () => {
+test("revive --crashed replays the same recorded launch path", { skip: !detachedRuntimeAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const bee = "HSR.crashed";
     await seedBee(store, bee, {
@@ -398,6 +432,7 @@ test("revive --crashed replays the same recorded launch path", async () => {
       providerSessionId: "sess-crashed",
       status: "running",
     });
+    await seedStoppedHsrRuntime(store, bee);
 
     try {
       const result = await hive(store, socket, ["revive", "--crashed", "--no-wait"]);

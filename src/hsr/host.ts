@@ -33,6 +33,7 @@ import { codexStartupConcurrency, withCodexStartupSlot } from "./startupQueue.js
 import { drainPendingHsrTurns, removePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
 import { isAuthNeededMessage, pendingNeedsInput } from "./observe.js";
 import {
+  capturePersistableProcessBirthFingerprint,
   captureProcessBirthFingerprintWithRetry,
   sameProcessBirthFingerprint,
   type ProcessBirthCaptureOptions,
@@ -75,7 +76,16 @@ export async function runHsrHost(params: {
 }): Promise<HsrHostHandle> {
   const { bee, adapter, opts } = params;
   const hostPid = params.hostPid ?? process.pid;
-  const hostFingerprint = await captureProcessBirthFingerprintWithRetry(hostPid, params.processBirthCapture);
+  const hostFingerprint = await captureProcessBirthFingerprintWithRetry(hostPid, {
+    ...params.processBirthCapture,
+    // queueStartup marks the detached local runner-entry process. Its identity
+    // is persisted for a different parent/daemon process, so an in-process
+    // node-time-origin fallback is not admissible. Remote controllers host
+    // runners in-process and retain the contained fallback when ps is denied.
+    capture: params.processBirthCapture?.capture ?? (params.queueStartup
+      ? capturePersistableProcessBirthFingerprint
+      : undefined),
+  });
   if (!hostFingerprint) {
     throw new Error(`HSR host birth admission failed: process ${hostPid} has no verifiable birth fingerprint`);
   }

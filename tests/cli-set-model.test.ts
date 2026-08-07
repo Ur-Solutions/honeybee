@@ -6,12 +6,23 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
+import { ensureHsrRunDir, hsrControlSocketPath, writeHsrMeta } from "../src/hsr/runDir.js";
 
 const execFileAsync = promisify(execFile);
 
 function tmuxAvailable(): boolean {
   try {
     execFileSync("tmux", ["-V"], { stdio: "ignore" });
+    execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(process.pid)], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function detachedRuntimeAvailable(): boolean {
+  try {
+    execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(process.pid)], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -73,6 +84,31 @@ async function killHsrBee(store: string, bee: string): Promise<void> {
   try {
     const { hsrSubstrate } = await import("../src/hsr/substrate.js");
     await hsrSubstrate().kill(bee).catch(() => undefined);
+  } finally {
+    if (prev === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = prev;
+  }
+}
+
+async function seedStoppedHsrRuntime(store: string, bee: string): Promise<void> {
+  const prev = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = store;
+  try {
+    const deadPid = 2 ** 31 - 1;
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "codex",
+      tier: "server",
+      hostPid: deadPid,
+      hostFingerprint: { pgid: deadPid, startedAt: "Fri Aug  7 00:00:00 2026" },
+      childAdmission: "none",
+      startedAt: "2026-08-07T00:00:00.000Z",
+      controlSocket: hsrControlSocketPath(bee),
+      status: "exited",
+      exitCode: 0,
+      endedAt: "2026-08-07T00:00:01.000Z",
+    });
   } finally {
     if (prev === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = prev;
@@ -260,7 +296,7 @@ test("set-model rolls the record back when the relaunched harness dies immediate
 // the selection on a downed HSR bee, then prove the HSR revive path rebuilds
 // the runner spec WITH it. The live HSR switch is exercised against a real
 // codex bee (quiesce → stop runner → re-fork resuming the same thread).
-test("set-model on a downed HSR bee records the selection and revive applies it", async () => {
+test("set-model on a downed HSR bee records the selection and revive applies it", { skip: !detachedRuntimeAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const bee = "HSR.switch"
     await seedBee(store, bee, {
@@ -272,6 +308,7 @@ test("set-model on a downed HSR bee records the selection and revive applies it"
       runnerPid: 2 ** 31 - 1,
       providerSessionId: "sess-hsr-switch",
     })
+    await seedStoppedHsrRuntime(store, bee)
 
     try {
       const result = await hive(store, socket, [

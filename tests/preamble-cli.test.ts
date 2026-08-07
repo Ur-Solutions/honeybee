@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,15 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+
+function detachedRuntimeAvailable(): boolean {
+  try {
+    execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(process.pid)], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * End-to-end coverage for the session preamble (session-preamble epic): that it
@@ -46,7 +55,7 @@ async function readRecord(storeRoot: string, name: string): Promise<Record<strin
   return JSON.parse(await readFile(join(storeRoot, "sessions", `${name}.json`), "utf8")) as Record<string, unknown>;
 }
 
-test("the message channel prepends the preamble to a stub bee's first prompt, once", async () => {
+test("the message channel prepends the preamble to a stub bee's first prompt, once", { skip: !detachedRuntimeAvailable() }, async () => {
   await withStore(async (storeRoot, cwd) => {
     const name = `hive-test-preamble-msg-${process.pid}`;
     const env = { HIVE_STORE_ROOT: storeRoot, HIVE_STUB_CMD: process.execPath };
@@ -87,7 +96,7 @@ test("the message channel prepends the preamble to a stub bee's first prompt, on
   });
 });
 
-test("--no-preamble and HIVE_PREAMBLE_DISABLE both inject nothing", async () => {
+test("--no-preamble and HIVE_PREAMBLE_DISABLE both inject nothing", { skip: !detachedRuntimeAvailable() }, async () => {
   await withStore(async (storeRoot, cwd) => {
     const base = { HIVE_STORE_ROOT: storeRoot, HIVE_STUB_CMD: process.execPath };
     const flagName = `hive-test-preamble-off-${process.pid}`;
@@ -113,12 +122,12 @@ test("--no-preamble and HIVE_PREAMBLE_DISABLE both inject nothing", async () => 
   });
 });
 
-test("a claude spawn carries the preamble in argv, so revive re-applies it", async () => {
+test("a claude spawn carries the preamble in argv, so revive re-applies it", { skip: !detachedRuntimeAvailable() }, async () => {
   await withStore(async (storeRoot, cwd) => {
     const name = `hive-test-preamble-argv-${process.pid}`;
-    // `true` boots and exits immediately: enough to persist a record with the
-    // resolved argv without needing a real claude on PATH.
-    const env = { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: "true" };
+    // Admission now requires a runnable child, so keep the fake harness alive
+    // long enough to persist and inspect its exact argv.
+    const env = { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: "sh -c 'sleep 120' --" };
     try {
       const spawned = await runCli(
         ["spawn", "claude", "--name", name, "--cwd", cwd, "--substrate", "hsr", "--preamble", "HOST_LAYER_MARKER", "--no-wait"],
@@ -143,11 +152,11 @@ test("a claude spawn carries the preamble in argv, so revive re-applies it", asy
   });
 });
 
-test("config preamble.text layers after the host layer for every spawn", async () => {
+test("config preamble.text layers after the host layer for every spawn", { skip: !detachedRuntimeAvailable() }, async () => {
   await withStore(async (storeRoot, cwd) => {
     await writeFile(join(storeRoot, "config.json"), JSON.stringify({ preamble: { text: "CONFIG_LAYER_MARKER" } }));
     const name = `hive-test-preamble-config-${process.pid}`;
-    const env = { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: "true" };
+    const env = { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: "sh -c 'sleep 120' --" };
     try {
       const spawned = await runCli(
         ["spawn", "claude", "--name", name, "--cwd", cwd, "--substrate", "hsr", "--preamble", "HOST_LAYER_MARKER", "--no-wait"],

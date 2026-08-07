@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdtemp, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +9,16 @@ import { hasSession, kill } from "../src/tmux.js";
 
 const execFileAsync = promisify(execFile);
 
-test("run sends to arbitrary executables without provider readiness checks", async () => {
+function detachedRuntimeAvailable(): boolean {
+  try {
+    execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(process.pid)], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("run sends to arbitrary executables without provider readiness checks", { skip: !detachedRuntimeAvailable() }, async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-run-store-"));
   const cwd = await mkdtemp(join(tmpdir(), "honeybee-run-cwd-"));
   const name = `hive-test-arbitrary-${process.pid}`;
@@ -45,7 +54,7 @@ test("run sends to arbitrary executables without provider readiness checks", asy
   }
 });
 
-test("run --rm cleans up when known driver readiness fails", async () => {
+test("run --rm cleans up when known driver readiness fails", { skip: !detachedRuntimeAvailable() }, async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-run-store-"));
   const cwd = await mkdtemp(join(tmpdir(), "honeybee-run-cwd-"));
   const name = `hive-test-cleanup-${process.pid}`;
@@ -85,7 +94,7 @@ test("run --rm cleans up when known driver readiness fails", async () => {
   }
 });
 
-test("run skips pane readiness for HSR bees and sends over the control socket", async () => {
+test("run skips pane readiness for HSR bees and sends over the control socket", { skip: !detachedRuntimeAvailable() }, async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-run-hsr-store-"));
   const cwd = await mkdtemp(join(tmpdir(), "honeybee-run-hsr-cwd-"));
   const name = `hive-test-run-hsr-${process.pid}`;
@@ -125,7 +134,7 @@ test("run skips pane readiness for HSR bees and sends over the control socket", 
   }
 });
 
-test("x spawns, delivers the prompt, and keeps the session (fire-and-forget)", async () => {
+test("x spawns, delivers the prompt, and keeps the session (fire-and-forget)", { skip: !detachedRuntimeAvailable() }, async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "honeybee-x-store-"));
   const cwd = await mkdtemp(join(tmpdir(), "honeybee-x-cwd-"));
   const name = `hive-test-x-${process.pid}`;

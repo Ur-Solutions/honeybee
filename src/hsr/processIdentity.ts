@@ -92,7 +92,6 @@ export async function listProcessRows(): Promise<ProcessRow[]> {
 export async function readProcessBirthFingerprint(pid: number): Promise<ProcessBirthFingerprint | null> {
   if (process.platform === "win32") throw new Error("process birth identity is unavailable on win32");
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  if (pid === process.pid) return SELF_PROCESS_BIRTH;
   let output: string;
   try {
     output = await execPs(["-o", "pid=,ppid=,pgid=,lstart=", "-p", String(pid)]);
@@ -107,13 +106,35 @@ export async function readProcessBirthFingerprint(pid: number): Promise<ProcessB
   return row ? { pgid: row.pgid, startedAt: row.startedAt } : null;
 }
 
-/** Best-effort persistence helper; absence makes later destructive recovery fail closed. */
-export async function captureProcessBirthFingerprint(pid: number): Promise<ProcessBirthFingerprint | undefined> {
+/**
+ * Capture only an OS identity that another process can compare later.
+ * Detached hosts and every durable cross-process locator must use this form;
+ * failure is an admission failure, never permission to publish a local token.
+ */
+export async function capturePersistableProcessBirthFingerprint(
+  pid: number,
+  reader: ProcessIdentityReader = readProcessBirthFingerprint,
+): Promise<ProcessBirthFingerprint | undefined> {
   try {
-    return (await readProcessBirthFingerprint(pid)) ?? undefined;
+    return (await reader(pid)) ?? undefined;
   } catch {
     return undefined;
   }
+}
+
+/** Best-effort identity, including the contained in-process host fallback. */
+export async function captureProcessBirthFingerprint(
+  pid: number,
+  reader: ProcessIdentityReader = readProcessBirthFingerprint,
+): Promise<ProcessBirthFingerprint | undefined> {
+  const persistable = await capturePersistableProcessBirthFingerprint(pid, reader);
+  if (persistable) return persistable;
+  // A remote controller can host logical HSR sessions in-process inside a
+  // contained Cell where /bin/ps is intentionally unavailable. Keep that
+  // supported shape verifiable by the same process, but never prefer this
+  // process-local clock over the OS identity that detached local hosts must
+  // persist for their parent/daemon observers.
+  return pid === process.pid ? SELF_PROCESS_BIRTH : undefined;
 }
 
 /**
@@ -160,6 +181,12 @@ export async function inspectProcessBirth(
 ): Promise<ProcessIdentityVerdict> {
   if (!expected || !Number.isSafeInteger(expected.pgid) || expected.pgid <= 0 || !expected.startedAt) {
     return "unverifiable";
+  }
+  // Only the process that minted the contained-host fallback can validate it.
+  // An external observer must continue through the OS reader, where the
+  // incomparable node-time-origin token safely yields mismatch/unverifiable.
+  if (pid === process.pid && sameProcessBirthFingerprint(expected, SELF_PROCESS_BIRTH)) {
+    return "match";
   }
   try {
     const current = await reader(pid);
