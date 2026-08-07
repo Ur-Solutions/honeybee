@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -53,6 +53,13 @@ async function withStore(fn: (storeRoot: string, cwd: string) => Promise<void>):
 
 async function readRecord(storeRoot: string, name: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(join(storeRoot, "sessions", `${name}.json`), "utf8")) as Record<string, unknown>;
+}
+
+async function writeDurableFakeClaude(storeRoot: string): Promise<string> {
+  const path = join(storeRoot, "fake-claude");
+  await writeFile(path, `#!${process.execPath}\nsetInterval(() => {}, 1_000);\n`, { mode: 0o700 });
+  await chmod(path, 0o700);
+  return path;
 }
 
 test("the message channel prepends the preamble to a stub bee's first prompt, once", { skip: !detachedRuntimeAvailable() }, async () => {
@@ -126,8 +133,10 @@ test("a claude spawn carries the preamble in argv, so revive re-applies it", { s
   await withStore(async (storeRoot, cwd) => {
     const name = `hive-test-preamble-argv-${process.pid}`;
     // Admission now requires a runnable child, so keep the fake harness alive
-    // long enough to persist and inspect its exact argv.
-    const env = { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: "sh -c 'sleep 120' --" };
+    // long enough to persist and inspect its exact argv. It must be a real
+    // executable because the Claude adapter prepends provider flags; a `sh -c`
+    // override would receive those flags before `-c` and exit during admission.
+    const env = { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: await writeDurableFakeClaude(storeRoot) };
     try {
       const spawned = await runCli(
         ["spawn", "claude", "--name", name, "--cwd", cwd, "--substrate", "hsr", "--preamble", "HOST_LAYER_MARKER", "--no-wait"],
@@ -156,7 +165,7 @@ test("config preamble.text layers after the host layer for every spawn", { skip:
   await withStore(async (storeRoot, cwd) => {
     await writeFile(join(storeRoot, "config.json"), JSON.stringify({ preamble: { text: "CONFIG_LAYER_MARKER" } }));
     const name = `hive-test-preamble-config-${process.pid}`;
-    const env = { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: "sh -c 'sleep 120' --" };
+    const env = { HIVE_STORE_ROOT: storeRoot, HIVE_CLAUDE_CMD: await writeDurableFakeClaude(storeRoot) };
     try {
       const spawned = await runCli(
         ["spawn", "claude", "--name", name, "--cwd", cwd, "--substrate", "hsr", "--preamble", "HOST_LAYER_MARKER", "--no-wait"],
