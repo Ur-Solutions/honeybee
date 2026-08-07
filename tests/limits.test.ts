@@ -7,6 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { addAccount, accountDir, clearAccountBootFailure, recordAccountBootFailure, setAccountPaused } from "../src/accounts.js";
 import { withCodexHomeBootLock } from "../src/codexBoot.js";
 import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
+import { saveSession } from "../src/store.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -1408,10 +1409,17 @@ function liveSession(name: string, accountId: string, state: string, agent = "cl
   };
 }
 
-test("sessionCommitmentPercent weighs busy over parked and ignores dead/unbound sessions", () => {
+test("sessionCommitmentPercent weighs busy/parked work and explicitly zeros completed or failed turns", () => {
   assert.equal(sessionCommitmentPercent(liveSession("s1", "a", "active")), AUTO_COMMITMENT_BUSY_PERCENT);
   assert.equal(sessionCommitmentPercent(liveSession("s2", "a", "working")), AUTO_COMMITMENT_BUSY_PERCENT);
   assert.equal(sessionCommitmentPercent(liveSession("s3", "a", "ready")), AUTO_COMMITMENT_PARKED_PERCENT);
+  assert.equal(sessionCommitmentPercent(liveSession("auth", "a", "auth-needed")), AUTO_COMMITMENT_PARKED_PERCENT);
+  assert.equal(sessionCommitmentPercent(liveSession("needs-input", "a", "blocked")), AUTO_COMMITMENT_PARKED_PERCENT);
+  assert.equal(sessionCommitmentPercent(liveSession("offline-node", "a", "node_unreachable")), AUTO_COMMITMENT_PARKED_PERCENT);
+  for (const state of ["done", "sealed", "crashed", "dead", "error", "kill_failed", "archived", "retired", "killed"]) {
+    assert.equal(sessionCommitmentPercent(liveSession(`terminal-${state}`, "a", state)), 0, `${state} must not bias auto-selection`);
+  }
+  assert.equal(sessionCommitmentPercent({ ...liveSession("kill-failed", "a", "active"), status: "kill_failed" }), 0);
   assert.equal(sessionCommitmentPercent({ ...liveSession("s4", "a", "active"), status: "dead" }), 0);
   assert.equal(sessionCommitmentPercent({ ...liveSession("s5", "a", "active"), accountId: undefined }), 0);
 });
@@ -1424,6 +1432,8 @@ test("accountCommitments sums per account and filters by tool", async () => {
     liveSession("s4", "b", "active"),
     liveSession("s5", "b", "active", "codex"),
     { ...liveSession("s6", "b", "active"), status: "dead" as const },
+    liveSession("s7", "b", "done"),
+    liveSession("s8", "b", "crashed"),
   ];
   const claude = await accountCommitments("claude", sessions);
   assert.equal(claude.get("a"), 2 * AUTO_COMMITMENT_BUSY_PERCENT + AUTO_COMMITMENT_PARKED_PERCENT);
@@ -1431,6 +1441,26 @@ test("accountCommitments sums per account and filters by tool", async () => {
   const codex = await accountCommitments("codex", sessions);
   assert.equal(codex.get("b"), AUTO_COMMITMENT_BUSY_PERCENT);
   assert.equal(codex.get("a"), undefined);
+});
+
+test("indexed account commitments match full-history parity while terminal rows stay cold", async () => {
+  await withTempStore(async () => {
+    const sessions = [
+      liveSession("busy", "a", "working"),
+      liveSession("parked", "a", "ready"),
+      liveSession("sealed", "a", "done"),
+      liveSession("crashed", "b", "crashed"),
+      { ...liveSession("filed", "b", "active"), status: "done" as const },
+      { ...liveSession("kill-failed", "b", "kill_failed"), status: "kill_failed" as const },
+    ];
+    for (const session of sessions) await saveSession(session);
+
+    const fromHistory = await accountCommitments("claude", sessions);
+    const fromIndex = await accountCommitments("claude");
+    assert.deepEqual(fromIndex, fromHistory);
+    assert.equal(fromIndex.get("a"), AUTO_COMMITMENT_BUSY_PERCENT + AUTO_COMMITMENT_PARKED_PERCENT);
+    assert.equal(fromIndex.get("b"), undefined);
+  });
 });
 
 test("decayedPickDebit decays linearly and treats clock skew as fresh", () => {

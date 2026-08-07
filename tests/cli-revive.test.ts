@@ -9,7 +9,7 @@ import { readHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
 import { recordSeal, sealedBeeNames, validateSealArtifact } from "../src/seal.js";
-import type { SessionRecord } from "../src/store.js";
+import { listActiveSessions, type SessionRecord } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -155,6 +155,9 @@ test("revive --session resumes and persists the exact provider session id", { sk
     assert.deepEqual(record.launchArgv, original.launchArgv, "the structured launch is immutable");
     assert.match(String(record.lastReviveCommand), /--original-flag 'two words' resume sess-exact/);
     assert.doesNotMatch(String(record.lastReviveCommand), /resume --last/);
+    await withStoreEnv(store, async () => {
+      assert.deepEqual((await listActiveSessions()).map((candidate) => candidate.name), [bee], "revive restores active-index membership");
+    });
   });
 });
 

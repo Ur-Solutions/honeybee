@@ -4,11 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  activeSessionIndexPath,
   appendLedger,
   deleteSession,
+  isActiveSessionRecord,
   ledgerPath,
+  listActiveSessions,
   listSessions,
   loadSession,
+  rebuildActiveSessionIndex,
   safeName,
   saveSession,
   shouldPersistObservationHeartbeat,
@@ -51,6 +55,21 @@ test("safeName neutralizes empty and dot-only path segments", () => {
   assert.equal(safeName(".."), "--");
   assert.equal(safeName("..."), "---");
   assert.equal(safeName(""), "-");
+});
+
+test("active-session policy keeps recoverable daemon work and excludes settled history", () => {
+  const record = makeRecord("/tmp");
+  assert.equal(isActiveSessionRecord(record), true);
+  assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "auth-needed" }), true);
+  assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "blocked" }), true, "needs-input remains daemon-visible");
+  assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "node_unreachable" }), true);
+  assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "error" }), true, "provider errors can recover");
+  assert.equal(isActiveSessionRecord({ ...record, status: "kill_failed", lastObservedState: "kill_failed" }), true, "unconfirmed teardown remains observable");
+  assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "crashed" }), false);
+  assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "done" }), false, "completed current turn leaves the hot set");
+  assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "sealed" }), false);
+  assert.equal(isActiveSessionRecord({ ...record, status: "dead" }), false);
+  assert.equal(isActiveSessionRecord({ ...record, status: "done" }), false);
 });
 
 test("store root is read at call time and session files are private", async () => {
@@ -122,6 +141,91 @@ test("updateSession deletes fields patched to explicit undefined", async () => {
     assert.equal(reloaded?.runnerPid, undefined);
     assert.equal(reloaded?.runnerTier, undefined);
   });
+});
+
+test("active index follows crash, sealed-turn re-prompt, retire, and revive boundaries without deleting history", async () => {
+  await withTempStore(async () => {
+    const record = makeRecord("/tmp", { accountId: "codex-a" });
+    await saveSession(record);
+    assert.deepEqual((await listActiveSessions()).map((item) => item.name), [record.name]);
+
+    await touchSession(record.name, { lastObservedState: "crashed", lastObservedStateAt: "2026-05-28T00:01:00.000Z" });
+    assert.deepEqual(await listActiveSessions(), [], "crash is retained but leaves daemon hot paths");
+    assert.equal((await loadSession(record.name))?.lastObservedState, "crashed", "history remains explicitly readable");
+
+    await updateSession(record.name, { status: "running", lastObservedState: undefined, lastObservedStateAt: undefined });
+    assert.deepEqual((await listActiveSessions()).map((item) => item.name), [record.name], "revive re-enters the index");
+
+    await touchSession(record.name, { lastObservedState: "done", lastObservedStateAt: "2026-05-28T00:02:00.000Z" });
+    assert.deepEqual(await listActiveSessions(), [], "sealed/current-turn-done is cold history");
+    await updateSession(record.name, { status: "running", lastObservedState: undefined, lastObservedStateAt: undefined, lastPrompt: "follow up" });
+    assert.deepEqual((await listActiveSessions()).map((item) => item.name), [record.name], "a follow-up turn reactivates the warm runtime");
+
+    await updateSession(record.name, { status: "done" });
+    assert.deepEqual(await listActiveSessions(), [], "retire removes operational membership");
+    assert.equal((await listSessions()).length, 1, "retire never deletes the file-per-record history");
+  });
+});
+
+test("active index rebuilds after missing/corrupt state and normalizes legacy archived records", async () => {
+  await withTempStore(async (dir) => {
+    const sessions = join(dir, "sessions");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(join(sessions, "CO.live.json"), JSON.stringify(makeRecord(dir, { name: "CO.live" })));
+    await writeFile(join(sessions, "CO.old.json"), JSON.stringify(makeRecord(dir, {
+      name: "CO.old",
+      status: "archived" as unknown as "done",
+    })));
+
+    assert.equal(await rebuildActiveSessionIndex(), 1);
+    assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.live"]);
+    assert.equal((await listSessions()).find((record) => record.name === "CO.old")?.status, "done");
+
+    await writeFile(activeSessionIndexPath(), "{broken");
+    assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.live"], "corruption triggers an authoritative rebuild");
+    await rm(activeSessionIndexPath(), { force: true });
+    assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.live"], "missing index triggers an authoritative rebuild");
+  });
+});
+
+test("active list self-heals both terminal-write and activation-index crash residue", async () => {
+  await withTempStore(async (dir) => {
+    const record = makeRecord(dir, { name: "CO.boundary", tmuxTarget: "CO.boundary" });
+    await saveSession(record);
+
+    // Crash after terminal record commit but before membership removal.
+    await writeFile(join(dir, "sessions", "CO.boundary.json"), JSON.stringify({ ...record, lastObservedState: "crashed" }));
+    assert.deepEqual(await listActiveSessions(), []);
+    const healed = JSON.parse(await readFile(activeSessionIndexPath(), "utf8")) as { active: string[] };
+    assert.deepEqual(healed.active, []);
+
+    // Activation publishes the name first. A crash before the record becomes
+    // live leaves the same conservative residue and is also pruned.
+    await saveSession(record);
+    await writeFile(join(dir, "sessions", "CO.boundary.json"), JSON.stringify({ ...record, status: "done" }));
+    assert.deepEqual(await listActiveSessions(), []);
+    assert.equal((await listSessions()).length, 1, "crash repair never deletes the authoritative record");
+  });
+});
+
+test("active indexes are isolated across store-root switches", async () => {
+  const previousRoot = process.env.HIVE_STORE_ROOT;
+  const first = await mkdtemp(join(tmpdir(), "honeybee-index-root-a-"));
+  const second = await mkdtemp(join(tmpdir(), "honeybee-index-root-b-"));
+  try {
+    process.env.HIVE_STORE_ROOT = first;
+    await saveSession(makeRecord(first, { name: "CO.first", tmuxTarget: "CO.first" }));
+    process.env.HIVE_STORE_ROOT = second;
+    await saveSession(makeRecord(second, { name: "CO.second", tmuxTarget: "CO.second" }));
+    assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.second"]);
+    process.env.HIVE_STORE_ROOT = first;
+    assert.deepEqual((await listActiveSessions()).map((record) => record.name), ["CO.first"]);
+  } finally {
+    if (previousRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousRoot;
+    await rm(first, { recursive: true, force: true });
+    await rm(second, { recursive: true, force: true });
+  }
 });
 
 test("updateSession flip preserves fields merged concurrently after the caller's load (HIVE-49)", async () => {

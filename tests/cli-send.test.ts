@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { recordSeal, sealedBeeNames, validateSealArtifact } from "../src/seal.js";
-import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { listActiveSessions, loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import { setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
 
 const execFileAsync = promisify(execFile);
@@ -73,6 +73,7 @@ test("hive send starts a new turn above the previous seal", { skip: !tmuxAvailab
       await saveSession(record);
       await recordSeal(name, validateSealArtifact({ status: "done", summary: "first turn complete" }));
       assert.equal((await sealedBeeNames([record])).has(name), true);
+      assert.deepEqual(await listActiveSessions(), [], "completed turn starts outside daemon hot paths");
     });
 
     await hive(store, socket, "send", name, "follow-up turn");
@@ -87,6 +88,7 @@ test("hive send starts a new turn above the previous seal", { skip: !tmuxAvailab
       assert.equal(stored.lastObservedStateAt, undefined);
       assert.equal(typeof stored.sealHighWaterFilename, "string");
       assert.equal((await sealedBeeNames([stored])).has(name), false, "the old seal no longer pins state to done");
+      assert.deepEqual((await listActiveSessions()).map((record) => record.name), [name], "successful follow-up reactivates index membership");
     });
   } finally {
     await tmux(["kill-server"], { reject: false }).catch(() => undefined);
