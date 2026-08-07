@@ -181,6 +181,20 @@ test("stop retries on every reconcile pass: a transient first failure never stra
     const reservation = (await readReservation(RUN_ID))!;
     assert.equal(reservation.result?.cause, "lease_expired");
     assert.equal(reservation.indeterminateAt, undefined);
+    const events = await readRunEvents(RUN_ID);
+    assert.deepEqual(events.slice(-4).map((event) => event.type), [
+      "cancel.requested",
+      "run.lost",
+      "run.recovering",
+      "run.cancelled",
+    ]);
+    const lostId = (events.find((event) => event.type === "run.lost")!.payload as JsonObject).lossEpisodeId;
+    assert.ok(typeof lostId === "string" && lostId.length > 0);
+    assert.equal(
+      (events.find((event) => event.type === "run.recovering")!.payload as JsonObject).lossEpisodeId,
+      lostId,
+      "one durable loss episode spans unconfirmed stop and terminal recovery",
+    );
   });
 });
 

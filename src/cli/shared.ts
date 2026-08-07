@@ -222,7 +222,7 @@ export async function deliverPromptText(record: SessionRecord, promptText: strin
   // return instead of polling the boot. (remote-hsr keeps the retry loop:
   // runnerPid there is a pid on the remote node, unverifiable here.)
   if (substrate.kind === "hsr" && record.runnerPid !== undefined) {
-    if (await enqueueTurnForBootingHsrHost(record.tmuxTarget, record.runnerPid, prompt)) return;
+    if (await enqueueTurnForBootingHsrHost(record.tmuxTarget, record.runnerPid, prompt, record.runnerFingerprint)) return;
   }
   await retryWhileHsrHostBoots(attempt, {
     onRetry: () => {

@@ -2,6 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
 import type { NodeRecord } from "../node.js";
+import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import { formatShellCommand, paneArg } from "./local-tmux.js";
 import type { KillResult, LaunchSpec, NewSessionResult, ProbeResult, Substrate, TmuxWindowOptions } from "./types.js";
 
@@ -138,7 +139,7 @@ export function createSshTmuxSubstrate(options: SshTmuxOptions): Substrate {
     }
   }
 
-  async function kill(target: string, _options: { launcherPgid?: number } = {}): Promise<KillResult> {
+  async function kill(target: string, _options: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint } = {}): Promise<KillResult> {
     const result = await runTmux(["kill-session", "-t", `=${target}`]);
     return { ok: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
   }

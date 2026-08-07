@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { NodeRecord } from "../src/node.js";
 import { clearSubstrateCache, localSubstrate, LOCAL_NODE, substrateFor, substrateForNode, substrateForRecord } from "../src/substrates/index.js";
-import { createLocalTmuxSubstrate, hasSession, kill as tmuxKillSession, newSession, sendText, tmux } from "../src/substrates/local-tmux.js";
+import { createLocalTmuxSubstrate, hasSession, kill as tmuxKillSession, newSession, sendText, terminateProcessGroup, tmux } from "../src/substrates/local-tmux.js";
+import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import * as legacyTmux from "../src/tmux.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -207,7 +208,9 @@ test("local kill terminates the supplied launcher process group", { timeout: 10_
   assert.ok(child.pid);
   child.unref();
   try {
-    await tmuxKillSession(`missing-${process.pid}`, { launcherPgid: child.pid });
+    const launcherFingerprint = await captureProcessBirthFingerprint(child.pid);
+    assert.ok(launcherFingerprint);
+    await tmuxKillSession(`missing-${process.pid}`, { launcherPgid: child.pid, launcherFingerprint });
     await sleep(200);
     assert.equal(processGroupAlive(child.pid), false);
   } finally {
@@ -219,6 +222,30 @@ test("local kill terminates the supplied launcher process group", { timeout: 10_
       }
     }
   }
+});
+
+test("local fallback never signals a reused launcher PID or process group", async () => {
+  const recorded = { pgid: 7373, startedAt: "Mon Aug  7 09:00:00 2026" };
+  const replacement = { pgid: 7373, startedAt: "Mon Aug  7 09:01:00 2026" };
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  await terminateProcessGroup(7373, recorded, {
+    readProcessIdentity: async () => replacement,
+    kill: (pid, signal) => signals.push([pid, signal]),
+  });
+  assert.deepEqual(signals, [], "same numeric PID/PGID with a new birth receives no signal");
+});
+
+test("local fallback revalidates launcher birth before SIGKILL escalation", async () => {
+  const recorded = { pgid: 7474, startedAt: "Mon Aug  7 09:00:00 2026" };
+  const replacement = { pgid: 7474, startedAt: "Mon Aug  7 09:01:00 2026" };
+  let reads = 0;
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  await terminateProcessGroup(7474, recorded, {
+    readProcessIdentity: async () => (++reads === 1 ? recorded : replacement),
+    kill: (pid, signal) => signals.push([pid, signal]),
+    sleep: async () => undefined,
+  });
+  assert.deepEqual(signals, [[-7474, "SIGTERM"]], "replacement group is not escalated to SIGKILL");
 });
 
 test("local newSession cleans up its hive-launch tmpdir when tmux refuses the session", { timeout: 30_000 }, async () => {

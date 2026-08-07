@@ -6,6 +6,12 @@ import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
 import { realUserHome } from "../env.js";
 import {
+  captureProcessBirthFingerprint,
+  inspectProcessBirth,
+  type ProcessBirthFingerprint,
+  type ProcessIdentityReader,
+} from "../hsr/processIdentity.js";
+import {
   LOCAL_NODE,
   type KillResult,
   type LaunchSpec,
@@ -117,7 +123,8 @@ export async function newSession(name: string, cwd: string, spec: LaunchSpec): P
     const result = await tmux(["new-session", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-s", name, "-c", cwd, shellCommand([process.execPath, launcher.runnerPath, launcher.payloadPath])]);
     const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
     await applyTmuxWindowOptions(paneId || `=${name}:`, spec.tmuxOptions);
-    return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
+    const launcherFingerprint = launcherPgid ? await captureProcessBirthFingerprint(launcherPgid) : undefined;
+    return { paneId, ...(launcherPgid ? { launcherPgid } : {}), ...(launcherFingerprint ? { launcherFingerprint } : {}) };
   } catch (error) {
     // The runner only deletes the payload tmpdir once it actually starts; if
     // tmux itself refuses the session, clean up here instead of leaking it.
@@ -137,7 +144,8 @@ export async function newPane(target: string, cwd: string, spec: LaunchSpec, opt
       const result = await tmux(["new-window", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-t", `=${target}:`, "-c", cwd, command]);
       const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
       await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
-      return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
+      const launcherFingerprint = launcherPgid ? await captureProcessBirthFingerprint(launcherPgid) : undefined;
+      return { paneId, ...(launcherPgid ? { launcherPgid } : {}), ...(launcherFingerprint ? { launcherFingerprint } : {}) };
     }
     // Split the comb's active window. -h = horizontal (side-by-side); default
     // (no -h) is vertical (stacked). -P -F prints the new pane's id so the
@@ -146,7 +154,8 @@ export async function newPane(target: string, cwd: string, spec: LaunchSpec, opt
     const result = await tmux(["split-window", "-d", "-P", "-F", "#{pane_id}:#{pane_pid}", "-t", `=${target}:`, "-c", cwd, ...direction, command]);
     const { paneId, launcherPgid } = parseLaunchResult(result.stdout);
     await applyTmuxWindowOptions(paneId || `=${target}:`, spec.tmuxOptions);
-    return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
+    const launcherFingerprint = launcherPgid ? await captureProcessBirthFingerprint(launcherPgid) : undefined;
+    return { paneId, ...(launcherPgid ? { launcherPgid } : {}), ...(launcherFingerprint ? { launcherFingerprint } : {}) };
   } catch (error) {
     // The runner only deletes the payload tmpdir once it actually starts; if
     // tmux itself refuses the split, clean up here instead of leaking it.
@@ -196,9 +205,12 @@ export async function capture(target: string, lines = 80, paneId?: string): Prom
   return result.stdout.trimEnd();
 }
 
-export async function kill(target: string, options: { launcherPgid?: number } = {}): Promise<KillResult> {
+export async function kill(
+  target: string,
+  options: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint } = {},
+): Promise<KillResult> {
+  await terminateProcessGroup(options.launcherPgid, options.launcherFingerprint);
   const result = await tmux(["kill-session", "-t", `=${target}`], { reject: false });
-  await terminateProcessGroup(options.launcherPgid);
   return result;
 }
 
@@ -206,9 +218,12 @@ export async function kill(target: string, options: { launcherPgid?: number } = 
 // own — no "=name:" wrapping needed. Low-level tmux pane kill: combs are retired
 // (APIA-85) so this is no longer on the Substrate interface, but it stays
 // exported for direct low-level callers (e.g. sidebar-layout teardown).
-export async function killPane(paneId: string, options: { launcherPgid?: number } = {}): Promise<KillResult> {
+export async function killPane(
+  paneId: string,
+  options: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint } = {},
+): Promise<KillResult> {
+  await terminateProcessGroup(options.launcherPgid, options.launcherFingerprint);
   const result = await tmux(["kill-pane", "-t", paneId], { reject: false });
-  await terminateProcessGroup(options.launcherPgid);
   return result;
 }
 
@@ -230,21 +245,36 @@ function parsePositiveInt(value: string): number | undefined {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-async function terminateProcessGroup(pgid: number | undefined): Promise<void> {
+export type TmuxProcessSignalDependencies = {
+  readProcessIdentity?: ProcessIdentityReader;
+  kill?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  sleep?: (ms: number) => Promise<void>;
+};
+
+export async function terminateProcessGroup(
+  pgid: number | undefined,
+  fingerprint: ProcessBirthFingerprint | undefined,
+  deps: TmuxProcessSignalDependencies = {},
+): Promise<void> {
   if (!pgid || process.platform === "win32") return;
+  if (fingerprint?.pgid !== pgid || (await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity)) !== "match") return;
+  const kill = deps.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => process.kill(pid, signal));
   try {
-    process.kill(-pgid, "SIGTERM");
+    kill(-pgid, "SIGTERM");
   } catch {
     return;
   }
-  await sleep(500);
+  await (deps.sleep ?? sleep)(500);
+  // The group id can be recycled during the grace. Escalate only while its
+  // exact persisted leader birth still matches.
+  if ((await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity)) !== "match") return;
   try {
-    process.kill(-pgid, 0);
+    kill(-pgid, 0);
   } catch {
     return;
   }
   try {
-    process.kill(-pgid, "SIGKILL");
+    kill(-pgid, "SIGKILL");
   } catch {
     // Already gone or not signalable; tmux teardown result remains authoritative.
   }

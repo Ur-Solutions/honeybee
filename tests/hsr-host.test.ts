@@ -180,6 +180,7 @@ test("reapDeadHosts: stale running meta with a dead host pid flips to exited", a
       harness: "stub",
       tier: "stream",
       hostPid: deadPid,
+      hostFingerprint: { pgid: deadPid, startedAt: "Mon Aug  7 09:00:00 2026" },
       startedAt: new Date().toISOString(),
       controlSocket: hsrControlSocketPath(bee),
       status: "running",

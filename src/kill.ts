@@ -141,7 +141,10 @@ async function teardownSession(
   if (!alreadyGone || record.launcherPgid || needsRemoteCleanup) {
     attempts += 1;
     try {
-      const killResult = await substrate.kill(record.tmuxTarget, { launcherPgid: record.launcherPgid });
+      const killResult = await substrate.kill(record.tmuxTarget, {
+        launcherPgid: record.launcherPgid,
+        launcherFingerprint: record.launcherFingerprint,
+      });
       if (!killResult.ok) {
         killReturnedFailure = true;
         killStderr = killResult.stderr?.trim() || killResult.stdout?.trim() || `kill exited with code ${killResult.exitCode}`;

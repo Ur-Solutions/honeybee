@@ -28,6 +28,7 @@ import { confirmPausedAccount, confirmSpawnReady, dangerousMode, deliverBrief, h
 import { cmdSend } from "../commands/messaging.js";
 import { maybeLinkHere, newBeeAccountRows, resolveAccountFlag, resolvePreambleFlags } from "../commands/spawn.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
+import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
 
 /**
  * RETIRED (APIA-85). `hive split` was the comb splitter: it created an adjacent
@@ -375,6 +376,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       ...(model ? { model } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
+    const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
     const command = shellCommand(spec);
     record = {
       name,
@@ -385,6 +387,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       tmuxTarget: name, // logical id — HSR has no tmux target
       substrate: "hsr",
       runnerPid: hostPid,
+      ...(runnerFingerprint ? { runnerFingerprint } : {}),
       ...(runnerTier ? { runnerTier } : {}),
       combId: name, // fork is its own comb
       forkedFromId: source.id ?? source.name,
@@ -435,6 +438,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       tmuxTarget,
       ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
       ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+      ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
       combId: tmuxTarget, // fork is its own comb (new session)
       forkedFromId: source.id ?? source.name,
       forkedAt: now,

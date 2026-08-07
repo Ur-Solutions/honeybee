@@ -18,7 +18,7 @@
 //     and failed — recovery classification lives in classifyLaunch();
 //   - events are append-only, seq starts at 1, and replay after restart reads
 //     the same bytes (no in-memory-only control history).
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile } from "../fsx.js";
@@ -137,6 +137,8 @@ export type RunReservation = {
   indeterminateAt?: string;
   /** Machine-readable reason reconciliation uses to retry/resolve lost state. */
   indeterminateCause?: string;
+  /** Stable idempotency member for one lost -> recovering episode. */
+  lossEpisodeId?: string;
   /** Durable cancellation intent (run.cancel is desired state, not an RPC race). */
   cancel?: { requestedAt: string; reason?: string };
   /** Debug-retention window (run.retain); extends retention only, never authority. */
@@ -147,6 +149,39 @@ export type RunReservation = {
   createdAt: string;
   updatedAt: string;
 };
+
+/** Enter (or backfill) one durable liveness-loss episode. */
+export function enterLossEpisode(record: RunReservation, cause: string, observedAt: string): RunReservation {
+  const indeterminateAt = record.indeterminateAt ?? observedAt;
+  return {
+    ...record,
+    indeterminateAt,
+    indeterminateCause: record.indeterminateCause ?? cause,
+    // Legacy reservations already carrying indeterminateAt predate this field;
+    // their timestamp is a stable backfill. A genuinely NEW episode gets a
+    // random durable identity: two episodes may occur within the same clock
+    // tick (or under a fixed test clock) and must never deduplicate together.
+    lossEpisodeId: record.lossEpisodeId ?? (record.indeterminateAt ? record.indeterminateAt : randomUUID()),
+  };
+}
+
+/** Resolve one episode completely so a later independent loss gets a new key. */
+export function clearLossEpisode(record: RunReservation): RunReservation {
+  const {
+    indeterminateAt: _indeterminateAt,
+    indeterminateCause: _indeterminateCause,
+    lossEpisodeId: _lossEpisodeId,
+    ...rest
+  } = record;
+  return rest as RunReservation;
+}
+
+/** Add the persisted episode member to run.lost/run.recovering payloads. */
+export function lossEpisodePayload(record: RunReservation, payload: JsonObject): JsonObject {
+  const lossEpisodeId = record.lossEpisodeId ?? record.indeterminateAt;
+  if (!lossEpisodeId) throw executionError("AUTHORITY_UNAVAILABLE", `run ${record.runId} has no durable loss episode id`);
+  return { ...payload, lossEpisodeId };
+}
 
 export type EffectIndexEntry = {
   effectKey: string;
@@ -444,7 +479,7 @@ export type RunEventInput = {
  */
 export function eventFamilyKey(type: string, payload: JsonValue): string {
   const doc = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? (payload as JsonObject) : {};
-  const member = doc.effectKey ?? doc.collectionId ?? doc.inputRequestId ?? "";
+  const member = doc.effectKey ?? doc.collectionId ?? doc.inputRequestId ?? doc.lossEpisodeId ?? "";
   return `${type}#${typeof member === "string" ? member : JSON.stringify(member)}`;
 }
 
@@ -530,6 +565,89 @@ export async function readRunEvents(runId: string): Promise<StoredRunEvent[]> {
 }
 
 /**
+ * Repair the admission/event crash window without leaving an illegal prefix.
+ *
+ * Older coordinators could write materializing/starting/terminal events before
+ * a retry finally appended run.accepted. Apiary cannot project that log at all,
+ * so appending yet another accepted event at the tail is not a repair. Under
+ * the same per-run event lock used by append, migrate a validated log to one
+ * canonical accepted prefix and preserve every other event (including its
+ * eventId) in order. Existing seq cursors necessarily name the pre-migration
+ * generation; the accepted receipt carries the old head so run.events can
+ * issue the protocol's explicit CURSOR_EXPIRED/reset handoff. A torn tail is
+ * discarded exactly like appendRunEvents does before the rewrite.
+ */
+const ACCEPTED_CURSOR_RESET_FIELD = "cursorResetThroughSeq";
+
+function acceptedSemanticPayload(payload: JsonValue): JsonValue {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const { [ACCEPTED_CURSOR_RESET_FIELD]: _reset, ...semantic } = payload as JsonObject;
+  return semantic;
+}
+
+/** Old cursor head invalidated by an accepted-prefix migration, if any. */
+export function acceptedCursorResetThroughSeq(events: StoredRunEvent[]): number | null {
+  const accepted = events[0];
+  if (!accepted || accepted.type !== "run.accepted" || accepted.payload === null ||
+      typeof accepted.payload !== "object" || Array.isArray(accepted.payload)) return null;
+  const value = (accepted.payload as JsonObject)[ACCEPTED_CURSOR_RESET_FIELD];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : null;
+}
+
+export async function ensureRunAcceptedFirst(
+  runId: string,
+  protocolVersion: string,
+  input: RunEventInput,
+): Promise<StoredRunEvent[]> {
+  if (input.type !== "run.accepted") {
+    throw executionError("AUTHORITY_UNAVAILABLE", "ensureRunAcceptedFirst requires a run.accepted input");
+  }
+  await mkdir(runDir(runId), { recursive: true, mode: 0o700 });
+  return withFileLock(eventsLockPath(runId), async () => {
+    const log = await readEventLog(runId);
+    const accepted = log.events.filter((event) => event.type === "run.accepted");
+    const canonicalPayload = JSON.stringify(input.payload);
+    if (accepted.some((event) => JSON.stringify(acceptedSemanticPayload(event.payload)) !== canonicalPayload)) {
+      throw executionError("AUTHORITY_UNAVAILABLE", `run ${runId} carries a conflicting run.accepted receipt`);
+    }
+    const alreadyCanonical = accepted.length === 1 && log.events[0]?.type === "run.accepted";
+    if (alreadyCanonical) {
+      if (log.tornTail) {
+        // Preserve the byte-stable accepted receipt and every complete event;
+        // only discard the torn suffix. Re-minting seq-1 here would change its
+        // ingestedAt on an otherwise valid replay prefix.
+        await atomicWriteFile(eventsPath(runId), log.events.map((event) => `${JSON.stringify(event)}\n`).join(""), { mode: 0o600 });
+      }
+      return [];
+    }
+
+    const ingestedAt = new Date().toISOString();
+    const oldHead = log.events.length > 0 ? log.events[log.events.length - 1]!.seq : 0;
+    const previousAccepted = accepted[0];
+    const resetPayload = oldHead > 0 && input.payload !== null && typeof input.payload === "object" && !Array.isArray(input.payload)
+      ? { ...(input.payload as JsonObject), [ACCEPTED_CURSOR_RESET_FIELD]: oldHead }
+      : input.payload;
+    const prefix: StoredRunEvent = {
+      protocolVersion,
+      runId,
+      seq: 1,
+      eventId: previousAccepted?.eventId ?? (oldHead > 0 ? `evt-${runKey(runId)}-accepted-prefix` : `evt-${runKey(runId)}-1`),
+      occurredAt: previousAccepted?.occurredAt ?? input.occurredAt ?? ingestedAt,
+      ingestedAt: previousAccepted?.ingestedAt ?? ingestedAt,
+      origin: input.origin,
+      payload: resetPayload,
+      type: "run.accepted",
+    };
+    const migrated = [prefix, ...log.events.filter((event) => event.type !== "run.accepted")].map((event, index) => ({
+      ...event,
+      seq: index + 1,
+    }));
+    await atomicWriteFile(eventsPath(runId), migrated.map((event) => `${JSON.stringify(event)}\n`).join(""), { mode: 0o600 });
+    return migrated;
+  });
+}
+
+/**
  * Append control events with the next monotonic seq, under the per-run lock.
  * `onlyIfAbsentTypes` makes state-changing appends idempotent across restart
  * reconciliation: an event type listed there is skipped when it already
@@ -544,7 +662,12 @@ export async function appendRunEvents(
   runId: string,
   protocolVersion: string,
   inputs: RunEventInput[],
-  options: { onlyIfAbsentTypes?: boolean; onlyIfAbsentKeys?: boolean } = {},
+  options: {
+    onlyIfAbsentTypes?: boolean;
+    onlyIfAbsentKeys?: boolean;
+    /** Under the same event lock, omit selected inputs once markerType exists. */
+    skipTypesWhenMarkerPresent?: { markerType: string; types: string[] };
+  } = {},
 ): Promise<StoredRunEvent[]> {
   await mkdir(runDir(runId), { recursive: true, mode: 0o700 });
   return withFileLock(eventsLockPath(runId), async () => {
@@ -559,6 +682,11 @@ export async function appendRunEvents(
     const appended: StoredRunEvent[] = [];
     let lines = "";
     for (const input of inputs) {
+      if (
+        options.skipTypesWhenMarkerPresent &&
+        present.has(options.skipTypesWhenMarkerPresent.markerType) &&
+        options.skipTypesWhenMarkerPresent.types.includes(input.type)
+      ) continue;
       if (options.onlyIfAbsentTypes && present.has(input.type)) continue;
       if (options.onlyIfAbsentKeys && presentKeys.has(eventFamilyKey(input.type, input.payload))) continue;
       seq += 1;

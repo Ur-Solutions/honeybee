@@ -11,9 +11,10 @@
 import { randomUUID, createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { atomicWriteFile, defaultIsPidAlive, storeRoot } from "../fsx.js";
+import { atomicWriteFile, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
 import { hsrRunDir, readHsrMeta } from "./runDir.js";
+import { inspectProcessBirth, type ProcessBirthFingerprint, type ProcessIdentityReader } from "./processIdentity.js";
 
 export type PendingHsrTurn = {
   id: string;
@@ -123,15 +124,27 @@ export async function drainPendingHsrTurns(
  * false when the host is past booting (running/exited) or provably dead — the
  * caller then falls back to the live-send path or its normal error.
  */
-export async function enqueueTurnForBootingHsrHost(bee: string, hostPid: number | undefined, text: string): Promise<boolean> {
+export async function enqueueTurnForBootingHsrHost(
+  bee: string,
+  hostPid: number | undefined,
+  text: string,
+  hostFingerprint?: ProcessBirthFingerprint,
+  processIdentityReader?: ProcessIdentityReader,
+): Promise<boolean> {
   return withHsrTurnDeliveryLock(bee, async () => {
     const meta = await readHsrMeta(bee);
     if (meta) {
-      if (meta.status !== "queued" || !defaultIsPidAlive(meta.hostPid)) return false;
+      if (
+        meta.status !== "queued" ||
+        await inspectProcessBirth(meta.hostPid, meta.hostFingerprint, processIdentityReader) !== "match"
+      ) return false;
       await enqueuePendingHsrTurn(bee, text);
       return true;
     }
-    if (hostPid === undefined || !defaultIsPidAlive(hostPid)) return false;
+    if (
+      hostPid === undefined ||
+      await inspectProcessBirth(hostPid, hostFingerprint, processIdentityReader) !== "match"
+    ) return false;
     await enqueuePendingHsrTurn(bee, text);
     return true;
   });

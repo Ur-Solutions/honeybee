@@ -12,6 +12,7 @@ import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { enqueueTurnForBootingHsrHost, readPendingHsrTurns } from "../src/hsr/pendingTurns.js";
 import { hsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
+import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import type { RunnerOpts } from "../src/hsr/types.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -54,7 +55,9 @@ const DEAD_PID = 2 ** 30;
 test("enqueueTurnForBootingHsrHost: persists a turn before meta exists when the host pid is alive", async () => {
   await withTempStore(async () => {
     const bee = "preboot";
-    assert.equal(await enqueueTurnForBootingHsrHost(bee, process.pid, "hello"), true);
+    const identity = await captureProcessBirthFingerprint(process.pid);
+    assert.ok(identity);
+    assert.equal(await enqueueTurnForBootingHsrHost(bee, process.pid, "hello", identity), true);
     const files = await readdir(join(hsrRunDir(bee), "pending-turns"));
     assert.equal(files.filter((name) => name.endsWith(".json")).length, 1);
   });
@@ -98,11 +101,14 @@ test("enqueueTurnForBootingHsrHost: refuses on a running or exited meta (caller 
 test("enqueueTurnForBootingHsrHost: accepts against a queued meta with a live host", async () => {
   await withTempStore(async () => {
     const bee = "queuedhost";
+    const identity = await captureProcessBirthFingerprint(process.pid);
+    assert.ok(identity);
     await writeHsrMeta(bee, {
       bee,
       harness: "stub",
       tier: "stream",
       hostPid: process.pid,
+      hostFingerprint: identity,
       startedAt: new Date().toISOString(),
       controlSocket: join(hsrRunDir(bee), "control.sock"),
       status: "queued",
@@ -125,7 +131,9 @@ test("enqueueTurnForBootingHsrHost: accepts against a queued meta with a live ho
 test("a turn enqueued before host boot is drained into the harness at queued→running", async () => {
   await withTempStore(async () => {
     const bee = "drainer";
-    assert.equal(await enqueueTurnForBootingHsrHost(bee, process.pid, "hello-from-before-boot"), true);
+    const identity = await captureProcessBirthFingerprint(process.pid);
+    assert.ok(identity);
+    assert.equal(await enqueueTurnForBootingHsrHost(bee, process.pid, "hello-from-before-boot", identity), true);
     const handle = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee), queueStartup: true });
     try {
       const sub = hsrSubstrate();
@@ -137,6 +145,18 @@ test("a turn enqueued before host boot is drained into the harness at queued→r
     } finally {
       await handle.stop();
     }
+  });
+});
+
+test("queued-turn handoff refuses a recycled host PID before meta publication", async () => {
+  await withTempStore(async () => {
+    const recorded = { pgid: 8181, startedAt: "Mon Aug  7 09:00:00 2026" };
+    const replacement = { pgid: 8181, startedAt: "Mon Aug  7 09:01:00 2026" };
+    assert.equal(
+      await enqueueTurnForBootingHsrHost("reused-preboot", 8181, "must-not-queue", recorded, async () => replacement),
+      false,
+    );
+    assert.deepEqual(await readPendingHsrTurns("reused-preboot"), []);
   });
 });
 

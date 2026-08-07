@@ -30,6 +30,11 @@ import {
   writeHsrMeta,
   type HsrMeta,
 } from "./runDir.js";
+import {
+  inspectProcessBirth,
+  type ProcessIdentityReader,
+  type ProcessIdentityVerdict,
+} from "./processIdentity.js";
 import type { RunnerEvent } from "./types.js";
 
 const DEFAULT_HSR_DISCOVERY_CONCURRENCY = 64;
@@ -657,6 +662,15 @@ const ORPHAN_STOP_GRACE_MS = 2_000;
 const ORPHAN_STOP_POLL_MS = 25;
 const ORPHAN_KILL_CONFIRM_MS = 1_000;
 
+export type HsrProcessSignalDependencies = {
+  /** Current OS birth identity; injectable for deterministic PID-reuse tests. */
+  readProcessIdentity?: ProcessIdentityReader;
+  /** process.kill-compatible signal function; negative ids are process groups. */
+  kill?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  isProcessGroupAlive?: (pgid: number) => boolean;
+  sleep?: (ms: number) => Promise<void>;
+};
+
 /** Signal-0 liveness probe of a whole process group. */
 export function isHsrProcessGroupAlive(pgid: number): boolean {
   if (!Number.isInteger(pgid) || pgid <= 0) return false;
@@ -666,6 +680,28 @@ export function isHsrProcessGroupAlive(pgid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+/** Birth-validated state of the exact host incarnation recorded in meta. */
+export function inspectHsrHostProcess(
+  meta: HsrMeta,
+  deps: HsrProcessSignalDependencies = {},
+): Promise<ProcessIdentityVerdict> {
+  return inspectProcessBirth(meta.hostPid, meta.hostFingerprint, deps.readProcessIdentity);
+}
+
+export type HsrChildProcessVerdict = ProcessIdentityVerdict | "absent";
+
+/** Birth-validated state of the exact child/group leader recorded in meta. */
+export function inspectHsrChildProcess(
+  meta: HsrMeta | null,
+  deps: HsrProcessSignalDependencies = {},
+): Promise<HsrChildProcessVerdict> {
+  if (!meta?.childPid && !meta?.childPgid) return Promise.resolve("absent");
+  const pid = meta.childPid;
+  const pgid = meta.childPgid ?? pid;
+  if (!pid || !pgid || meta.childFingerprint?.pgid !== pgid) return Promise.resolve("unverifiable");
+  return inspectProcessBirth(pid, meta.childFingerprint, deps.readProcessIdentity);
 }
 
 /**
@@ -678,30 +714,58 @@ export function isHsrProcessGroupAlive(pgid: number): boolean {
  * recorded child group, grant a short grace, then SIGKILL. Returns true when a
  * live group was signalled. Never throws.
  */
-export async function killOrphanedChildGroup(meta: HsrMeta | null): Promise<boolean> {
+export async function killOrphanedChildGroup(
+  meta: HsrMeta | null,
+  deps: HsrProcessSignalDependencies = {},
+): Promise<boolean> {
   const pgid = meta?.childPgid ?? meta?.childPid ?? 0;
-  if (!isHsrProcessGroupAlive(pgid)) return false;
+  const groupAlive = deps.isProcessGroupAlive ?? isHsrProcessGroupAlive;
+  const kill = deps.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => process.kill(pid, signal));
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  // PID/PGID numbers can be recycled.  Match both the child's OS birth and
+  // group before every destructive signal.  Gone/mismatch proves the original
+  // incarnation is gone but never authorizes signalling its replacement;
+  // missing/unreadable identity fails closed.
+  if ((await inspectHsrChildProcess(meta, deps)) !== "match" || !groupAlive(pgid)) return false;
   try {
-    process.kill(-pgid, "SIGTERM");
+    kill(-pgid, "SIGTERM");
   } catch {
     // Died between the probe and the signal.
   }
   const deadline = Date.now() + ORPHAN_STOP_GRACE_MS;
-  while (isHsrProcessGroupAlive(pgid) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, ORPHAN_STOP_POLL_MS));
+  while (groupAlive(pgid) && Date.now() < deadline) {
+    await sleep(ORPHAN_STOP_POLL_MS);
   }
-  if (isHsrProcessGroupAlive(pgid)) {
+  if (groupAlive(pgid) && (await inspectHsrChildProcess(meta, deps)) === "match") {
     try {
-      process.kill(-pgid, "SIGKILL");
+      kill(-pgid, "SIGKILL");
     } catch {
       // best-effort
     }
     const confirmDeadline = Date.now() + ORPHAN_KILL_CONFIRM_MS;
-    while (isHsrProcessGroupAlive(pgid) && Date.now() < confirmDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, ORPHAN_STOP_POLL_MS));
+    while (groupAlive(pgid) && Date.now() < confirmDeadline) {
+      await sleep(ORPHAN_STOP_POLL_MS);
     }
   }
   return true;
+}
+
+/** Confirm the recorded child group is gone, signalling only a birth match. */
+export async function ensureOrphanedChildGroupStopped(
+  meta: HsrMeta | null,
+  deps: HsrProcessSignalDependencies = {},
+): Promise<boolean> {
+  const before = await inspectHsrChildProcess(meta, deps);
+  if (before === "absent" || before === "gone" || before === "mismatch") return true;
+  if (before !== "match") return false;
+  await killOrphanedChildGroup(meta, deps);
+  const pgid = meta?.childPgid ?? meta?.childPid ?? 0;
+  const groupAlive = deps.isProcessGroupAlive ?? isHsrProcessGroupAlive;
+  if (!groupAlive(pgid)) return true;
+  // A live group whose birth-verified leader vanished may still contain the
+  // original descendants, but it can no longer be revalidated before another
+  // signal. Preserve unconfirmed state instead of risking a recycled PGID.
+  return false;
 }
 
 /**
@@ -710,7 +774,7 @@ export async function killOrphanedChildGroup(meta: HsrMeta | null): Promise<bool
  * endedAt) and return the reaped bee names. Crash-adoption v1 — no pipe
  * recovery.
  */
-export async function reapDeadHosts(): Promise<string[]> {
+export async function reapDeadHosts(deps: HsrProcessSignalDependencies = {}): Promise<string[]> {
   const reaped: string[] = [];
   for (const bee of await listHsrBees()) {
     const meta = await readHsrMeta(bee);
@@ -718,11 +782,13 @@ export async function reapDeadHosts(): Promise<string[]> {
     // A mirror has no local host pid to reap: the remoteEventMirror owns its
     // status (flips to "exited" when the bee leaves the remote list). Skip it.
     if (meta.mirrorOfNode) continue;
-    if (isPidAlive(meta.hostPid)) continue;
+    const host = await inspectHsrHostProcess(meta, deps);
+    if (host === "match") continue;
+    if (host === "unverifiable") continue;
     // The dead host never ran finalize, so its detached harness child may still
     // be running with no control plane — kill the group before flipping meta,
     // or the leak outlives the reap.
-    await killOrphanedChildGroup(meta);
+    if (!(await ensureOrphanedChildGroupStopped(meta, deps))) continue;
     await writeHsrMeta(bee, { ...meta, status: "exited", endedAt: new Date().toISOString() });
     reaped.push(bee);
   }

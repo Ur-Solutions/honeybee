@@ -33,8 +33,11 @@ import {
 } from "./opsStore.js";
 import {
   appendRunEvents,
+  clearLossEpisode,
+  enterLossEpisode,
   effectKeyHash,
   lastEventSeq,
+  lossEpisodePayload,
   mutateReservation,
   readReservation,
   type RunReservation,
@@ -467,7 +470,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               // `cancelled` over it — the run is honestly lost until a retry
               // confirms the stop or the session outcome proves exit.
               reservation = await mutateReservation(validated.runId, (record) =>
-                record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
+                enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
               );
               await appendRunEvents(
                 validated.runId,
@@ -475,16 +478,28 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                 [
                   {
                     type: "run.lost",
-                    payload: { cause: "cancel_stop_unconfirmed", ...(stopDetail ? { detail: stopDetail } : {}) },
+                    payload: lossEpisodePayload(reservation, { cause: "cancel_stop_unconfirmed", ...(stopDetail ? { detail: stopDetail } : {}) }),
                     origin: await deps.origin(),
                   },
                 ],
-                { onlyIfAbsentTypes: true },
+                { onlyIfAbsentKeys: true },
               );
               state = "lost";
             } else {
+              if (reservation.indeterminateCause === "cancel_stop_unconfirmed") {
+                await appendRunEvents(
+                  validated.runId,
+                  protocolVersion,
+                  [{
+                    type: "run.recovering",
+                    payload: lossEpisodePayload(reservation, { cause: "cancel_stop_unconfirmed", verified: ["run-identity", "process-stop"] }),
+                    origin: await deps.origin(),
+                  }],
+                  { onlyIfAbsentKeys: true },
+                );
+              }
               reservation = await mutateReservation(validated.runId, (record) => {
-                const { indeterminateAt: _resolved, ...rest } = record;
+                const rest = clearLossEpisode(record);
                 return rest.result
                   ? (rest as RunReservation)
                   : {
@@ -823,21 +838,37 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                 // Step stays pending (retryable); the run is honestly lost,
                 // not terminal, and every later cleanup step is fenced off.
                 reservation = await mutateReservation(runId, (record) =>
-                  record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
+                  enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
                 );
                 await appendRunEvents(
                   runId,
                   protocolVersion,
-                  [{ type: "run.lost", payload: { cause: "release_stop_unconfirmed", detail }, origin: await deps.origin() }],
-                  { onlyIfAbsentTypes: true },
+                  [{
+                    type: "run.lost",
+                    payload: lossEpisodePayload(reservation, { cause: "release_stop_unconfirmed", detail }),
+                    origin: await deps.origin(),
+                  }],
+                  { onlyIfAbsentKeys: true },
                 );
                 await annotatePending(detail);
                 break;
               }
               // Stop confirmed (or nothing verifiable of ours remains):
               // terminalize and resolve any earlier liveness doubt.
+              if (reservation.indeterminateCause === "release_stop_unconfirmed") {
+                await appendRunEvents(
+                  runId,
+                  protocolVersion,
+                  [{
+                    type: "run.recovering",
+                    payload: lossEpisodePayload(reservation, { cause: "release_stop_unconfirmed", verified: ["run-identity", "process-stop"] }),
+                    origin: await deps.origin(),
+                  }],
+                  { onlyIfAbsentKeys: true },
+                );
+              }
               reservation = await mutateReservation(runId, (record) => {
-                const { indeterminateAt: _resolved, ...rest } = record;
+                const rest = clearLossEpisode(record);
                 return rest.result
                   ? (rest as RunReservation)
                   : {

@@ -1,3 +1,5 @@
+import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
+
 export type SubstrateKind = "local-tmux" | "ssh-tmux" | "hsr" | "remote-hsr";
 
 export const LOCAL_NODE = "local";
@@ -14,7 +16,7 @@ export type LaunchSpec = {
 export type ProbeResult = { ok: true } | { ok: false; reason: string };
 
 /** newSession returns the pane id so spawn can pin the bee, plus local launcher metadata when available. */
-export type NewSessionResult = { paneId: string; launcherPgid?: number };
+export type NewSessionResult = { paneId: string; launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint };
 
 export type KillResult = {
   ok: boolean;
@@ -42,7 +44,7 @@ export type Substrate = {
   probe(): Promise<ProbeResult>;
   hasSession(target: string): Promise<boolean>;
   newSession(target: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult>;
-  kill(target: string, options?: { launcherPgid?: number }): Promise<KillResult>;
+  kill(target: string, options?: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint }): Promise<KillResult>;
   // Combs (multiple bees sharing one session via split panes) are retired
   // (APIA-85), so the pane-spawn/pane-kill verbs (`newPane`/`killPane`) are gone
   // from this interface. Pane PINNING stays: pane-scoped I/O below still targets

@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { appendFile } from "node:fs/promises";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import type { RunnerEvent, RunnerTier } from "./types.js";
+import type { ProcessBirthFingerprint } from "./processIdentity.js";
 
 /** Root of all HSR run dirs: `~/.hive/hsr`. */
 export function hsrRoot(): string {
@@ -94,8 +95,12 @@ export type HsrMeta = {
   tier: RunnerTier;
   sessionId?: string;
   hostPid: number;
+  /** OS birth identity required before signalling a meta-derived host PID. */
+  hostFingerprint?: ProcessBirthFingerprint;
   childPid?: number;
   childPgid?: number;
+  /** OS birth identity of childPid; also binds the detached child PGID. */
+  childFingerprint?: ProcessBirthFingerprint;
   startedAt: string; // ISO — detached host startup (includes any queued/starting wait)
   /** Set when this host entered the bounded Codex cold-start queue. */
   queuedAt?: string;
@@ -215,6 +220,14 @@ export async function readHsrMeta(bee: string): Promise<HsrMeta | null> {
     // Require the load-bearing identity fields; everything else is optional.
     if (typeof object.bee !== "string" || typeof object.hostPid !== "number") return null;
     if (object.status !== "queued" && object.status !== "running" && object.status !== "exited") return null;
+    const validFingerprint = (value: unknown): value is ProcessBirthFingerprint => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const fingerprint = value as Record<string, unknown>;
+      return Number.isSafeInteger(fingerprint.pgid) && Number(fingerprint.pgid) > 0 &&
+        typeof fingerprint.startedAt === "string" && fingerprint.startedAt.length > 0;
+    };
+    if (object.hostFingerprint !== undefined && !validFingerprint(object.hostFingerprint)) return null;
+    if (object.childFingerprint !== undefined && !validFingerprint(object.childFingerprint)) return null;
     return object as unknown as HsrMeta;
   } catch {
     return null;

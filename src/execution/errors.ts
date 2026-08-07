@@ -27,19 +27,27 @@ export type ExecutionErrorWire = {
   message: string;
   retryable: boolean;
   details?: JsonValue;
+  checkpoint?: { nextSeq: number; checkpointDigest?: string; artifactId?: string };
 };
 
 export class ExecutionProtocolError extends Error {
   readonly code: ExecutionErrorCode;
   readonly retryable: boolean;
   readonly details?: JsonValue;
+  readonly checkpoint?: { nextSeq: number; checkpointDigest?: string; artifactId?: string };
 
-  constructor(code: ExecutionErrorCode, message: string, details?: JsonValue) {
+  constructor(
+    code: ExecutionErrorCode,
+    message: string,
+    details?: JsonValue,
+    checkpoint?: { nextSeq: number; checkpointDigest?: string; artifactId?: string },
+  ) {
     super(message);
     this.name = "ExecutionProtocolError";
     this.code = code;
     this.retryable = RETRYABLE.has(code);
     if (details !== undefined) this.details = details;
+    if (checkpoint !== undefined) this.checkpoint = checkpoint;
   }
 
   toWire(): ExecutionErrorWire {
@@ -48,6 +56,7 @@ export class ExecutionProtocolError extends Error {
       message: this.message,
       retryable: this.retryable,
       ...(this.details !== undefined ? { details: this.details } : {}),
+      ...(this.checkpoint !== undefined ? { checkpoint: this.checkpoint } : {}),
     };
   }
 }
@@ -69,8 +78,13 @@ export class IndeterminateExecutionError extends ExecutionProtocolError {
   }
 }
 
-export function executionError(code: ExecutionErrorCode, message: string, details?: JsonValue): ExecutionProtocolError {
-  return new ExecutionProtocolError(code, message, details);
+export function executionError(
+  code: ExecutionErrorCode,
+  message: string,
+  details?: JsonValue,
+  checkpoint?: { nextSeq: number; checkpointDigest?: string; artifactId?: string },
+): ExecutionProtocolError {
+  return new ExecutionProtocolError(code, message, details, checkpoint);
 }
 
 export function indeterminateExecutionError(

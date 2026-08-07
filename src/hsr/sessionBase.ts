@@ -28,6 +28,9 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { cleanupCellSandboxCommand, wrapCellSandboxCommand } from "./cellSandbox.js";
 import type { RunnerEvent } from "./types.js";
 import { appendHsrEvent, appendRingText, writeHsrRing } from "./runDir.js";
+import { listProcessRows, type ProcessRow } from "./processIdentity.js";
+
+export { parseProcessRows } from "./processIdentity.js";
 
 // Debounce ring.txt writes so a chatty turn does not thrash the disk.
 const RING_DEBOUNCE_MS = 50;
@@ -37,18 +40,7 @@ const STOP_POLL_MS = 25;
 // Tool-use usually arrives just before the subprocess is created, so take one
 // bounded delayed sample rather than an immediate miss plus a second scan.
 const TOOL_OWNERSHIP_SAMPLE_MS = 250;
-// A census normally completes in tens of milliseconds, but this cleanup is
-// most important when the machine is already under severe scheduler pressure.
-const PROCESS_CENSUS_TIMEOUT_MS = 5_000;
-
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-
-type ProcessRow = {
-  pid: number;
-  ppid: number;
-  pgid: number;
-  startedAt: string;
-};
 
 type ProcessIdentity = { pgid: number; startedAt: string };
 
@@ -73,40 +65,6 @@ type OwnedProcessScope = {
 const ownershipScopes = new Set<OwnedProcessScope>();
 const ownershipByChild = new WeakMap<ChildProcess, OwnedProcessScope>();
 let ownershipRefresh: Promise<void> | undefined;
-
-/** Parse one coherent topology + birth-identity process census. */
-export function parseProcessRows(output: string): ProcessRow[] {
-  const rows: ProcessRow[] = [];
-  for (const line of output.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
-    if (!match) continue;
-    const pid = Number(match[1]);
-    const ppid = Number(match[2]);
-    const pgid = Number(match[3]);
-    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid) || !Number.isSafeInteger(pgid)) continue;
-    rows.push({ pid, ppid, pgid, startedAt: match[4] });
-  }
-  return rows;
-}
-
-function execPs(args: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      "/bin/ps",
-      args,
-      { maxBuffer: 16 * 1024 * 1024, timeout: PROCESS_CENSUS_TIMEOUT_MS, killSignal: "SIGKILL" },
-      (error, stdout) => {
-        if (error) reject(error);
-        else resolve(stdout);
-      },
-    );
-  });
-}
-
-async function listProcessRows(): Promise<ProcessRow[]> {
-  if (process.platform === "win32") return Promise.resolve([]);
-  return parseProcessRows(await execPs(["-A", "-o", "pid=,ppid=,pgid=,lstart="]));
-}
 
 /**
  * Grow a scope from identities that still match their recorded start time.

@@ -277,6 +277,13 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
     }
 
     const environment = environmentFactsForWorkingCopy(nodeId, runId, copy);
-    return { ...(record.id ? { sessionRef: record.id } : {}), environment };
+    if (!record.id) {
+      throw indeterminateExecutionError(
+        "HARNESS_UNAVAILABLE",
+        `harness ${driverId} reached readiness without a canonical SessionRecord.id`,
+        "session_ref_missing",
+      );
+    }
+    return { sessionRef: record.id, environment };
   };
 }

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { enqueuePendingHsrTurn, readPendingHsrTurns } from "../src/hsr/pendingTurns.js";
+import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import type { SealRecord } from "../src/seal.js";
 import { sessionLivenessFailure } from "../src/sessionLiveness.js";
 import { deleteSession, saveSession, type SessionRecord } from "../src/store.js";
@@ -374,6 +375,8 @@ async function writeFakeRecord(root: string, saved: SessionRecord): Promise<void
 
 async function writeLiveHsr(root: string, bee: string, ring: string): Promise<void> {
   const runDir = join(root, "hsr", bee);
+  const hostFingerprint = await captureProcessBirthFingerprint(process.pid);
+  assert.ok(hostFingerprint, "test process must expose a verifiable birth fingerprint");
   await mkdir(runDir, { recursive: true });
   await writeFile(join(runDir, "ring.txt"), ring);
   await writeFile(join(runDir, "meta.json"), JSON.stringify({
@@ -381,6 +384,7 @@ async function writeLiveHsr(root: string, bee: string, ring: string): Promise<vo
     harness: "stub",
     tier: "stream",
     hostPid: process.pid,
+    hostFingerprint,
     startedAt: new Date().toISOString(),
     controlSocket: join(runDir, "control.sock"),
     status: "running",

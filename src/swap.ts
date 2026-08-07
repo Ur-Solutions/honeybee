@@ -11,6 +11,7 @@ import {
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, splitShellWords } from "./agents.js";
 import { resumeArgsForAgent } from "./drivers.js";
 import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
+import { captureProcessBirthFingerprint, type ProcessBirthFingerprint } from "./hsr/processIdentity.js";
 import { closeRequestsForNewIncarnation } from "./requests/store.js";
 import { appendLedger, loadSession, saveSessionLocked, withSessionLock, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
@@ -151,7 +152,10 @@ export async function swapAccount(
     // 1. Ensure the process is stopped. The tmux session must be fully gone
     //    before we relaunch into the same target.
     if (await substrate.hasSession(current.tmuxTarget)) {
-      const killResult = await substrate.kill(current.tmuxTarget);
+      const killResult = await substrate.kill(current.tmuxTarget, {
+        launcherPgid: current.launcherPgid,
+        launcherFingerprint: current.launcherFingerprint,
+      });
       if (!killResult.ok) {
         throw new Error(`Could not stop ${record.name} before swap: ${killResult.stderr || killResult.stdout || `exit ${killResult.exitCode}`}`);
       }
@@ -203,7 +207,9 @@ export async function swapAccount(
     let spec: ReturnType<typeof resolveAgent>;
     let paneId: string | undefined;
     let launcherPgid: number | undefined;
+    let launcherFingerprint: ProcessBirthFingerprint | undefined;
     let runnerPid: number | undefined;
+    let runnerFingerprint: ProcessBirthFingerprint | undefined;
     const incarnation = await nextRuntimeIncarnationPatch(current);
     try {
       await activate(account, targetHomePath);
@@ -249,6 +255,7 @@ export async function swapAccount(
           ...(model ? { model } : {}),
           spec: { command: spec.command, args: spec.args, env: spec.env },
         });
+        runnerFingerprint = await captureProcessBirthFingerprint(runnerPid);
         if (!(await (options.waitForHsrHost ?? waitForHsrHost)(current.name, 5_000))) {
           console.error(`hsr host for ${current.name} did not report live within 5s; the daemon will reconcile`);
         }
@@ -263,6 +270,7 @@ export async function swapAccount(
         });
         paneId = launch.paneId;
         launcherPgid = launch.launcherPgid;
+        launcherFingerprint = launch.launcherFingerprint;
       }
     } catch (error) {
       // Activation happens before relaunch. A normal swap uses a distinct
@@ -294,8 +302,10 @@ export async function swapAccount(
       ...(relocatedTranscriptPath ? { transcriptPath: relocatedTranscriptPath } : {}),
       command: shellCommand(spec),
       ...(paneId ? { agentPaneId: paneId } : {}),
-      ...(launcherPgid ? { launcherPgid } : {}),
-      ...(runnerPid ? { runnerPid } : {}),
+      launcherPgid,
+      launcherFingerprint,
+      runnerPid,
+      runnerFingerprint,
       status: "running",
       updatedAt: new Date().toISOString(),
     };

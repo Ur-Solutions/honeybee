@@ -31,6 +31,7 @@ import {
 import { codexStartupConcurrency, withCodexStartupSlot } from "./startupQueue.js";
 import { drainPendingHsrTurns, removePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
 import { isAuthNeededMessage, pendingNeedsInput } from "./observe.js";
+import { captureProcessBirthFingerprint } from "./processIdentity.js";
 
 export type HsrHostHandle = {
   bee: string;
@@ -65,6 +66,7 @@ export async function runHsrHost(params: {
 }): Promise<HsrHostHandle> {
   const { bee, adapter, opts } = params;
   const hostPid = params.hostPid ?? process.pid;
+  const hostFingerprint = await captureProcessBirthFingerprint(hostPid);
   const controlSocket = hsrControlSocketPath(bee);
   const monotonicStart = performance.now();
   const phaseTimings: NonNullable<HsrMeta["phaseTimingsMs"]> = {};
@@ -93,6 +95,7 @@ export async function runHsrHost(params: {
       harness: adapter.harness,
       tier,
       hostPid,
+      ...(hostFingerprint ? { hostFingerprint } : {}),
       startedAt,
       ...(queueCodexStartup ? { queuedAt: startedAt } : {}),
       startupPhase: queueCodexStartup ? "admission" : "harness",
@@ -161,14 +164,17 @@ export async function runHsrHost(params: {
     throw error;
   }
 
+  const childFingerprint = session.pid ? await captureProcessBirthFingerprint(session.pid) : undefined;
   let meta: HsrMeta = {
     bee,
     harness: adapter.harness,
     tier,
     ...(session.sessionId ? { sessionId: session.sessionId } : {}),
     hostPid,
+    ...(hostFingerprint ? { hostFingerprint } : {}),
     childPid: session.pid,
     childPgid: session.pid, // detached ⇒ pgid === child pid
+    ...(childFingerprint ? { childFingerprint } : {}),
     startedAt: startupMeta?.startedAt ?? new Date().toISOString(),
     ...(startupMeta?.queuedAt ? { queuedAt: startupMeta.queuedAt } : {}),
     ...(startupMeta?.startupPhase ? { startupPhase: startupMeta.startupPhase } : {}),

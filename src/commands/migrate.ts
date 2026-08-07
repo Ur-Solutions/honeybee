@@ -12,7 +12,7 @@ import { hsrObservations, readEventTail, type HsrObservation } from "../hsr/obse
 import { readPendingHsrTurns } from "../hsr/pendingTurns.js";
 import { connectRpcClient } from "../hsr/rpc.js";
 import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta } from "../hsr/runDir.js";
-import { hsrSubstrate } from "../hsr/substrate.js";
+import { hsrSubstrate, stopKnownHsrExecution } from "../hsr/substrate.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { waitForAgentReady } from "../readiness.js";
@@ -27,6 +27,7 @@ import { identityRecipeForAgent, modelArgsForAgent } from "../drivers.js";
 import { deliverPromptText, resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
 import { loginSeatLiveDigest } from "./account.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
+import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import { appendFile, readFile, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { RunnerEvent } from "../hsr/types.js";
@@ -242,21 +243,12 @@ export async function quiesceHsrBee(record: SessionRecord, now: boolean, verb = 
  * then waits until it is no longer live; SIGTERMs the host pid as a fallback.
  */
 export async function stopHsrRunner(record: SessionRecord): Promise<void> {
-  // hsrSubstrate().kill connects the control socket, calls "stop", waits for the
-  // host to finalize, and falls back to SIGTERM — and it never touches the record.
-  await hsrSubstrate().kill(record.name).catch(() => undefined);
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    if (!(await hsrSubstrate().hasSession(record.name).catch(() => false))) return;
-    await sleep(100);
-  }
-  if (record.runnerPid) {
-    try {
-      process.kill(record.runnerPid, "SIGTERM");
-    } catch {
-      // already gone / not signalable
-    }
-  }
+  // The substrate validates the persisted host/child birth identities before
+  // every fallback signal and confirms the process group is down. A missing or
+  // legacy fingerprint is deliberately unconfirmed; never fall back to the
+  // record's recyclable numeric runnerPid here.
+  const result = await stopKnownHsrExecution(record.name);
+  if (!result.ok) throw new Error(result.stderr || `HSR stop unconfirmed for ${record.name}`);
 }
 
 
@@ -379,6 +371,7 @@ export async function reviveHsrRunner(
     ...(record.model ? { model: record.model } : {}),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
+  const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
   if (!(await waitForHsrHost(record.name, 5000))) {
     console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
   }
@@ -392,6 +385,7 @@ export async function reviveHsrRunner(
     ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
     substrate: "hsr",
     runnerPid: hostPid,
+    runnerFingerprint,
     ...(runnerTier ? { runnerTier } : {}),
     ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
     // Clear both halves of the provider-thread anchor. Keeping the old path
@@ -680,11 +674,13 @@ export async function reviveTmuxPane(record: SessionRecord, tool: string, opts: 
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
     ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+    ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
     combId: tmuxTarget,
     updatedAt: new Date().toISOString(),
     status: "running",
     substrate: undefined,
     runnerPid: undefined,
+    runnerFingerprint: undefined,
     runnerTier: undefined,
     // A fresh relaunch abandons the old provider session. Its transcript path
     // is an equally strong anchor, so retaining it would re-adopt the old id.
@@ -752,7 +748,10 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
   //     is already gone. Instead: tear down the dead remnant and re-fork the
   //     HSR runner so the bee is restored exactly where it was.
   if (!(await tmuxSessionSurvives(substrate, tmuxTarget, RESUME_LIVENESS_SETTLE_MS))) {
-    await substrate.kill(tmuxTarget, { launcherPgid: launch.launcherPgid }).catch(() => undefined);
+    await substrate.kill(tmuxTarget, {
+      launcherPgid: launch.launcherPgid,
+      launcherFingerprint: launch.launcherFingerprint,
+    }).catch(() => undefined);
     await reviveHsrRunner(record, tool);
     throw new Error(
       `hive promote: ${record.name} exited immediately after the ${record.agent} resume — its provider session is not interactively resumable; left running on HSR`,
@@ -773,11 +772,13 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
     ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+    ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
     combId: tmuxTarget,
     updatedAt: new Date().toISOString(),
     status: "running",
     substrate: undefined,
     runnerPid: undefined,
+    runnerFingerprint: undefined,
     runnerTier: undefined,
   });
   if (promoted) await writeSpawnOptions(promoted);
@@ -820,7 +821,10 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
   }
 
   // 2. Kill the tmux session/pane — but keep the record.
-  await localSubstrate().kill(record.tmuxTarget, { launcherPgid: record.launcherPgid }).catch(() => undefined);
+  await localSubstrate().kill(record.tmuxTarget, {
+    launcherPgid: record.launcherPgid,
+    launcherFingerprint: record.launcherFingerprint,
+  }).catch(() => undefined);
 
   // 3. Build the headless spec (the adapter appends the resume + stream flags)
   //    and fork the runner host with resume:true against the same session id.
@@ -840,6 +844,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
     ...(record.model ? { model: record.model } : {}),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
+  const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
 
   // 4. Wait briefly for the host to report live (as spawnBee's HSR path does).
   if (!(await waitForHsrHost(record.name, 5000))) {
@@ -852,7 +857,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
   //     report a dead bee whose tmux pane is already gone. Roll back: stop the
   //     dead runner and re-launch the interactive pane where the bee started.
   if (!(await hsrChildSurvives(record.name, RESUME_LIVENESS_SETTLE_MS))) {
-    await stopHsrRunner({ ...record, substrate: "hsr", runnerPid: hostPid });
+    await stopHsrRunner({ ...record, substrate: "hsr", runnerPid: hostPid, runnerFingerprint });
     await reviveTmuxPane(record, tool);
     throw new Error(
       `hive demote: ${record.name} exited immediately after the ${record.agent} headless resume — its provider session is not headlessly resumable; left running on tmux`,
@@ -871,6 +876,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
     command,
     substrate: "hsr",
     runnerPid: hostPid,
+    runnerFingerprint,
     ...(runnerTier ? { runnerTier } : {}),
     ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
     tmuxTarget: record.name,
@@ -879,6 +885,7 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
     status: "running",
     agentPaneId: undefined,
     launcherPgid: undefined,
+    launcherFingerprint: undefined,
   });
   if (demoted) await writeSpawnOptions(demoted);
   await closeSupersededRequests(record, incarnation);
@@ -1084,7 +1091,10 @@ async function stopRuntimeForAuthResume(record: SessionRecord): Promise<void> {
   const substrate = substrateFor(record);
   const target = record.substrate === "hsr" ? record.name : record.tmuxTarget;
   if (!(await substrate.hasSession(target).catch(() => false))) return;
-  const result = await substrate.kill(target, { launcherPgid: record.launcherPgid });
+  const result = await substrate.kill(target, {
+    launcherPgid: record.launcherPgid,
+    launcherFingerprint: record.launcherFingerprint,
+  });
   if (!result.ok) {
     throw new Error(`hive auth-resume: could not stop ${record.name}: ${result.stderr || result.stdout || `exit ${result.exitCode}`}`);
   }
@@ -1298,6 +1308,7 @@ export async function reviveRecord(
       combId: record.combId ?? record.tmuxTarget,
       ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
       ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+      ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
       ...(sessionOverride ? { providerSessionId: sessionOverride } : {}),
       // Self-heal a drifted accountId: the home's true owner is authoritative,
       // so a record that pointed at the wrong account is corrected on revive.
@@ -1479,7 +1490,10 @@ export async function cmdSetModel(parsed: Parsed): Promise<void> {
       await localSubstrate().sendKey(record.tmuxTarget, "C-c", record.agentPaneId).catch(() => undefined);
       await sleep(300);
     }
-    await localSubstrate().kill(record.tmuxTarget, { launcherPgid: record.launcherPgid }).catch(() => undefined);
+    await localSubstrate().kill(record.tmuxTarget, {
+      launcherPgid: record.launcherPgid,
+      launcherFingerprint: record.launcherFingerprint,
+    }).catch(() => undefined);
     const deadline = Date.now() + 4_000;
     while (Date.now() < deadline) {
       if (!(await substrate.hasSession(record.tmuxTarget).catch(() => true))) break;

@@ -10,6 +10,7 @@ import { readWorkingCopy, registerWorkingCopy } from "../src/execution/workingCo
 import type { JsonObject } from "../src/execution/contract.js";
 import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
+import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import { withTempStore, SNAPSHOT_DIGEST } from "./executionTestKit.js";
 
 const NODE = "node-test";
@@ -162,6 +163,7 @@ test("HSR readiness timeout is indeterminate when known spawn metadata is delaye
       harness: "claude",
       tier: "stream",
       hostPid: process.pid,
+      hostFingerprint: (await captureProcessBirthFingerprint(process.pid))!,
       startedAt: new Date().toISOString(),
       runningAt: new Date().toISOString(),
       controlSocket: "/tmp/honeybee-late-ready.sock",

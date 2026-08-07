@@ -23,7 +23,6 @@ import { realpathSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
 // homeEnvForAgent maps a harness kind → its home env var (CODEX_HOME /
 // CLAUDE_CONFIG_DIR / …). drivers.js is already in the runner-host bundle closure
 // (via remoteCreds' homeDirForSpec) and imports NO accounts/vault graph, so this
@@ -36,8 +35,17 @@ import {
   type RpcMethodHandler,
   type RpcServer,
 } from "./rpc.js";
-import { hsrObservations, killOrphanedChildGroup, pendingNeedsInput, readEventTail, reapDeadHosts } from "./observe.js";
-import { readHsrMeta, hsrRunDir, readHsrRestart, writeHsrRestart } from "./runDir.js";
+import {
+  ensureOrphanedChildGroupStopped,
+  hsrObservations,
+  inspectHsrHostProcess,
+  pendingNeedsInput,
+  readEventTail,
+  reapDeadHosts,
+  type HsrProcessSignalDependencies,
+} from "./observe.js";
+import { readHsrMeta, hsrRunDir, readHsrRestart, writeHsrRestart, type HsrMeta } from "./runDir.js";
+import { sameProcessBirthFingerprint } from "./processIdentity.js";
 import {
   recordDeliveredCredentials,
   shredDeliveredCredentials,
@@ -147,8 +155,13 @@ export type RunnerHostController = {
   close(): Promise<void>;
 };
 
-export function buildController(): RunnerHostController {
+export type RunnerHostControllerOptions = {
+  processSignals?: HsrProcessSignalDependencies;
+};
+
+export function buildController(options: RunnerHostControllerOptions = {}): RunnerHostController {
   const version = versionString();
+  const processSignals = options.processSignals ?? {};
 
   // Live event relays, one cached client per observed bee (ref-counted across
   // subscribers) — mirrors hsrControl.ts. server is assigned by attachServer.
@@ -198,45 +211,65 @@ export function buildController(): RunnerHostController {
     };
   }
 
-  /** Stop a runner: prefer the in-process handle, else control-socket stop + SIGTERM fallback. */
-  async function stopRunner(bee: string): Promise<void> {
+  const sameHostIncarnation = (left: HsrMeta, right: HsrMeta | null): boolean =>
+    !!right && left.hostPid === right.hostPid && left.startedAt === right.startedAt &&
+    sameProcessBirthFingerprint(left.hostFingerprint, right.hostFingerprint);
+
+  async function waitForStoppedIncarnation(bee: string, initial: HsrMeta, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const identity = await inspectHsrHostProcess(initial, processSignals);
+      if (identity === "gone" || identity === "mismatch") return true;
+      if (identity === "unverifiable") return false;
+      const latest = await readHsrMeta(bee);
+      // Remote runners are hosted in-process, so finalized meta is the stop
+      // proof even while the shared serve process itself remains alive.
+      if (sameHostIncarnation(initial, latest) && latest?.status === "exited") return true;
+      await (processSignals.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(50);
+    }
+    return false;
+  }
+
+  /** Stop a runner: prefer the in-process handle, else socket + birth-validated fallback. */
+  async function stopRunner(bee: string): Promise<boolean> {
     const handle = handles.get(bee);
     if (handle) {
       handles.delete(bee);
       await handle.stop().catch(() => undefined);
-      return;
+      return true;
     }
     const meta = await readHsrMeta(bee);
+    if (!meta) return true;
     let stopped = false;
-    if (meta?.controlSocket && meta.status === "running") {
+    if (meta.controlSocket && meta.status === "running") {
       const result = await proxyCall(bee, "stop");
-      if (result.ok) {
-        const deadline = Date.now() + 2_500;
-        while (Date.now() < deadline) {
-          const m = await readHsrMeta(bee);
-          if (!m || m.status !== "running" || !isPidAlive(m.hostPid)) {
-            stopped = true;
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-      }
+      if (result.ok) stopped = await waitForStoppedIncarnation(bee, meta, 2_500);
     }
-    if (!stopped && meta && meta.status === "running") {
-      if (isPidAlive(meta.hostPid)) {
+    if (!stopped && meta.status === "running") {
+      const latest = await readHsrMeta(bee);
+      const identity = await inspectHsrHostProcess(meta, processSignals);
+      if (identity === "match" && sameHostIncarnation(meta, latest) && latest?.status === "running") {
         try {
-          process.kill(meta.hostPid, "SIGTERM");
+          (processSignals.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => process.kill(pid, signal)))(meta.hostPid, "SIGTERM");
         } catch {
           // already gone / not signalable
         }
-      } else {
+        stopped = await waitForStoppedIncarnation(bee, meta, 2_500);
+      } else if (identity === "gone" || identity === "mismatch") {
         // The host died without finalize (a previous serve was SIGKILLed/OOMed:
         // its in-process runners carried the serve's pid as hostPid), so the
         // harness child group is orphaned and unreachable over any control
         // socket. Signal the recorded child group directly (HIVE-53).
-        await killOrphanedChildGroup(meta);
+        stopped = await ensureOrphanedChildGroupStopped(meta, processSignals);
       }
     }
+    if (!stopped && meta.status === "exited") {
+      const identity = await inspectHsrHostProcess(meta, processSignals);
+      stopped = identity === "gone" || identity === "mismatch" ||
+        (identity === "match" && meta.hostPid === process.pid);
+      if (stopped) stopped = await ensureOrphanedChildGroupStopped(meta, processSignals);
+    }
+    return stopped;
   }
 
   type SpawnLikeParams = {
@@ -443,7 +476,7 @@ export function buildController(): RunnerHostController {
       refreshing.add(bee);
       try {
         // Stop the current runner but KEEP the run dir (meta / descriptor / events).
-        await stopRunner(bee);
+        if (!(await stopRunner(bee))) return { ok: false, error: `stop unconfirmed for ${bee}; credentials not replaced` };
         // Destroy the OLD delivered credential BEFORE writing the fresh one, so the
         // dead access token never lingers on the remote.
         await shredDeliveredCredentials(bee).catch(() => undefined);
@@ -611,7 +644,9 @@ export function buildController(): RunnerHostController {
         }
         relays.delete(bee);
       }
-      await stopRunner(bee);
+      if (!(await stopRunner(bee))) {
+        return { ok: false, error: `stop unconfirmed for ${bee}; run state preserved` };
+      }
       // APIA-93: destroy any ephemeral credential delivered into the remote home
       // BEFORE removing the run dir (which holds the delivered-paths record), so
       // nothing persists remotely once the bee is gone. Best-effort shred.
@@ -655,14 +690,14 @@ export function buildController(): RunnerHostController {
 }
 
 /** Start the runner-host control socket. Returns an RpcServer whose close also tears down the controller. */
-export async function serve(socketPath: string): Promise<RpcServer> {
+export async function serve(socketPath: string, options: RunnerHostControllerOptions = {}): Promise<RpcServer> {
   // Startup reaper (HIVE-53): a previous serve that died without finalize
   // (SIGKILL/OOM) left its in-process runners' meta "running" with hostPid =
   // the dead serve's pid and their detached harness children orphaned. Adopt
   // them before accepting control traffic: kill the orphaned child groups and
   // flip their meta so the control plane restarts from a truthful view.
-  await reapDeadHosts().catch(() => undefined);
-  const controller = buildController();
+  await reapDeadHosts(options.processSignals).catch(() => undefined);
+  const controller = buildController(options);
   const server = await startRpcServer({ socketPath, methods: controller.methods });
   controller.attachServer(server);
   return {

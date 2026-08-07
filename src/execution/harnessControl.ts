@@ -13,8 +13,9 @@
 //   - "indeterminate": the transport broke after the request may have left
 //     this process (mid-call close, timeout, partial write) — the coordinator
 //     records indeterminate and never blindly redelivers (RFC §10.6).
-import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
 import type { JsonValue } from "../comb/types.js";
+import { inspectProcessBirth, sameProcessBirthFingerprint, type ProcessIdentityReader } from "../hsr/processIdentity.js";
+import type { HsrMeta } from "../hsr/runDir.js";
 
 export type DispatchFailureOutcome = "failed" | "indeterminate";
 
@@ -44,14 +45,33 @@ export type HarnessControl = {
   stop(beeName: string): Promise<HarnessStopResult>;
 };
 
-type LiveMeta = { controlSocket: string; hostPid: number };
+export type HsrHarnessControlOptions = { processIdentityReader?: ProcessIdentityReader };
 
-async function liveMeta(beeName: string): Promise<LiveMeta | null> {
+async function liveMeta(beeName: string, options: HsrHarnessControlOptions): Promise<HsrMeta | null> {
   const { readHsrMeta } = await import("../hsr/runDir.js");
   const meta = await readHsrMeta(beeName);
   if (!meta || meta.status === "exited" || !meta.controlSocket) return null;
-  if (!meta.mirrorOfNode && !isPidAlive(meta.hostPid)) return null;
-  return { controlSocket: meta.controlSocket, hostPid: meta.hostPid };
+  if (!meta.mirrorOfNode) {
+    const identity = await inspectProcessBirth(meta.hostPid, meta.hostFingerprint, options.processIdentityReader);
+    if (identity !== "match") return null;
+  }
+  return meta;
+}
+
+async function initialHostStopped(
+  beeName: string,
+  initial: HsrMeta,
+  options: HsrHarnessControlOptions,
+): Promise<boolean> {
+  const { readHsrMeta } = await import("../hsr/runDir.js");
+  const current = await readHsrMeta(beeName);
+  if (initial.mirrorOfNode) return !current || current.status === "exited";
+  const verdict = await inspectProcessBirth(initial.hostPid, initial.hostFingerprint, options.processIdentityReader);
+  if (verdict === "gone" || verdict === "mismatch") return true;
+  return verdict === "match" && !!current && current.status === "exited" &&
+    current.hostPid === initial.hostPid &&
+    current.startedAt === initial.startedAt &&
+    sameProcessBirthFingerprint(current.hostFingerprint, initial.hostFingerprint);
 }
 
 /** Classify an RPC failure that happened AFTER a connection was established. */
@@ -61,8 +81,13 @@ function classifyCallFailure(error: unknown): DispatchFailureOutcome {
   return typeof (error as { code?: unknown })?.code === "number" ? "failed" : "indeterminate";
 }
 
-async function callControl(beeName: string, method: string, params: unknown): Promise<unknown> {
-  const meta = await liveMeta(beeName);
+async function callControl(
+  beeName: string,
+  method: string,
+  params: unknown,
+  options: HsrHarnessControlOptions,
+): Promise<unknown> {
+  const meta = await liveMeta(beeName, options);
   if (!meta) {
     throw new HarnessDispatchError("failed", `no live runner host for ${beeName}; nothing was delivered`);
   }
@@ -88,19 +113,19 @@ async function callControl(beeName: string, method: string, params: unknown): Pr
   }
 }
 
-export function hsrHarnessControl(): HarnessControl {
+export function hsrHarnessControl(options: HsrHarnessControlOptions = {}): HarnessControl {
   return {
     async send(beeName, text, deliveryId) {
       // deliveryId rides the host's in-memory turn tracker only; no pending-
       // turn journal file is written, so the HSR auth-recovery drain can never
       // blindly redeliver a protocol command later.
-      await callControl(beeName, "send", { text, deliveryId });
+      await callControl(beeName, "send", { text, deliveryId }, options);
     },
     async answer(beeName, inputRequestId, answer) {
-      await callControl(beeName, "answer", { requestId: inputRequestId, answer });
+      await callControl(beeName, "answer", { requestId: inputRequestId, answer }, options);
     },
     async interrupt(beeName) {
-      await callControl(beeName, "interrupt", undefined);
+      await callControl(beeName, "interrupt", undefined, options);
     },
     async pendingInputId(beeName) {
       const { pendingNeedsInput } = await import("../hsr/observe.js");
@@ -109,15 +134,33 @@ export function hsrHarnessControl(): HarnessControl {
     },
     async stop(beeName) {
       const { readHsrMeta } = await import("../hsr/runDir.js");
-      const meta = await liveMeta(beeName);
-      if (!meta) return { stopped: true, detail: "no live harness" };
+      const recorded = await readHsrMeta(beeName);
+      if (!recorded || recorded.status === "exited") return { stopped: true, detail: "no live harness" };
+      if (!recorded.mirrorOfNode) {
+        const identity = await inspectProcessBirth(
+          recorded.hostPid,
+          recorded.hostFingerprint,
+          options.processIdentityReader,
+        );
+        if (identity === "gone" || identity === "mismatch") {
+          return { stopped: true, detail: "recorded harness incarnation exited" };
+        }
+        if (identity !== "match") {
+          return { stopped: false, detail: "clean stop unconfirmed: runner host birth identity is unavailable" };
+        }
+      }
+      const meta = await liveMeta(beeName, options);
+      if (!meta) {
+        return await initialHostStopped(beeName, recorded, options)
+          ? { stopped: true, detail: "recorded harness incarnation exited" }
+          : { stopped: false, detail: "clean stop unconfirmed: runner host changed during ownership validation" };
+      }
       try {
-        await callControl(beeName, "stop", undefined);
+        await callControl(beeName, "stop", undefined, options);
       } catch (error) {
         // The host may have exited between the liveness read and the call;
         // re-check before declaring the stop unconfirmed.
-        const still = await liveMeta(beeName);
-        if (!still) return { stopped: true, detail: "harness exited" };
+        if (await initialHostStopped(beeName, meta, options)) return { stopped: true, detail: "harness exited" };
         return {
           stopped: false,
           detail: `clean stop unconfirmed: ${error instanceof Error ? error.message : String(error)}; refusing to signal an unverified pid`,
@@ -127,8 +170,7 @@ export function hsrHarnessControl(): HarnessControl {
       // finalize its meta, exactly like the substrate's clean-stop path.
       const deadline = Date.now() + 2_500;
       while (Date.now() < deadline) {
-        const current = await readHsrMeta(beeName);
-        if (!current || current.status === "exited" || !isPidAlive(current.hostPid)) {
+        if (await initialHostStopped(beeName, meta, options)) {
           return { stopped: true, detail: "clean stop confirmed" };
         }
         await new Promise((resolve) => setTimeout(resolve, 50));

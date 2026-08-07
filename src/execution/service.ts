@@ -21,6 +21,7 @@ import {
   ExecutionProtocolError,
   IndeterminateExecutionError,
   executionError,
+  indeterminateExecutionError,
   toWireError,
   type ExecutionErrorWire,
 } from "./errors.js";
@@ -33,8 +34,13 @@ import {
 } from "./nodeState.js";
 import {
   admitRunStart,
+  acceptedCursorResetThroughSeq,
   appendRunEvents,
   classifyLaunch,
+  clearLossEpisode,
+  enterLossEpisode,
+  ensureRunAcceptedFirst,
+  lossEpisodePayload,
   mutateReservation,
   readReservation,
   readRunEvents,
@@ -69,7 +75,7 @@ export type RunLaunchRequest = {
 
 export type RunLaunchResult = {
   /** Provider session reference (bee id / provider session id) once known. */
-  sessionRef?: string;
+  sessionRef: string;
   environment: RunEnvironmentFacts;
 };
 
@@ -167,6 +173,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     "session_ref_missing",
     "environment_receipt_missing",
     "readiness_stop_unconfirmed",
+    "cancel_stop_unconfirmed",
+    "release_stop_unconfirmed",
   ]);
 
   /**
@@ -175,12 +183,17 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
    * crash may leave indeterminateAt/cause without its run.lost event. Repair
    * both edges together under one event-log lock before any recovered receipt.
    */
-  async function beginLostRecovery(reservation: RunReservation, verified: string[]): Promise<void> {
+  async function beginLostRecovery(reservation: RunReservation, verified: string[]): Promise<RunReservation | null> {
     if (
       !reservation.indeterminateAt ||
       !reservation.indeterminateCause ||
       !recoverableLostCauses.has(reservation.indeterminateCause)
-    ) return;
+    ) return null;
+    const durable = reservation.lossEpisodeId
+      ? reservation
+      : await mutateReservation(reservation.runId, (record) =>
+          enterLossEpisode(record, reservation.indeterminateCause!, reservation.indeterminateAt!),
+        );
     const eventOrigin = await origin();
     await appendRunEvents(
       reservation.runId,
@@ -188,16 +201,31 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       [
         {
           type: "run.lost",
-          payload: { cause: reservation.indeterminateCause },
+          payload: lossEpisodePayload(durable, { cause: durable.indeterminateCause! }),
           origin: eventOrigin,
         },
         {
           type: "run.recovering",
-          payload: { cause: reservation.indeterminateCause, verified },
+          payload: lossEpisodePayload(durable, { cause: durable.indeterminateCause!, verified }),
           origin: eventOrigin,
         },
       ],
-      { onlyIfAbsentTypes: true },
+      { onlyIfAbsentKeys: true },
+    );
+    return durable;
+  }
+
+  /** Repair the admission/event crash gap for every read/reconcile entrypoint. */
+  async function ensureAcceptedReceipt(reservation: RunReservation): Promise<void> {
+    await ensureRunAcceptedFirst(
+      reservation.runId,
+      protocolVersion,
+      {
+        type: "run.accepted",
+        payload: { effectKey: reservation.effectKey, receiptId: reservation.receipt.receiptId },
+        origin: await origin(),
+        occurredAt: reservation.createdAt,
+      },
     );
   }
 
@@ -208,29 +236,54 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
    * Unresolved lost state is excluded; its recovery path must establish
    * run.recovering and clear indeterminateAt first.
    */
-  async function ensureStartedReceipts(reservation: RunReservation): Promise<void> {
+  async function ensureStartedReceipts(
+    reservation: RunReservation,
+    recoveryEpisodeId?: string,
+  ): Promise<void> {
     if (
       reservation.phase !== "started" ||
-      reservation.indeterminateAt ||
+      (reservation.indeterminateAt && !recoveryEpisodeId) ||
       !reservation.environment ||
       !reservation.sessionRef
     ) return;
+    const recoveryPayload: JsonObject = recoveryEpisodeId ? { lossEpisodeId: recoveryEpisodeId } : {};
+    const runningPayload: JsonObject = {
+      sessionRef: reservation.sessionRef,
+      ...(recoveryEpisodeId ? { recovered: true, lossEpisodeId: recoveryEpisodeId } : {}),
+    };
     await appendRunEvents(
       reservation.runId,
       protocolVersion,
       [
+        // A normal started-state write proves the earlier launch phases too.
+        // A lost recovery deliberately skips these: Apiary requires
+        // lost -> recovering -> running, not recovering -> materializing.
+        ...(!recoveryEpisodeId
+          ? [
+              { type: "environment.materializing", payload: {}, origin: await origin({ providerId: NATIVE_PROVIDER_ID }) },
+              { type: "harness.starting", payload: { operationId: reservation.runId }, origin: await origin({ driverId: driverIdOf(reservation) }) },
+            ]
+          : []),
         {
           type: "environment.ready",
-          payload: { environmentId: reservation.environment.environmentId },
+          payload: { environmentId: reservation.environment.environmentId, ...recoveryPayload },
           origin: await origin({ providerId: reservation.environment.providerId }),
         },
         {
           type: "harness.running",
-          payload: { sessionRef: reservation.sessionRef },
+          payload: runningPayload,
           origin: await origin({ driverId: driverIdOf(reservation) }),
         },
       ],
-      { onlyIfAbsentTypes: true },
+      recoveryEpisodeId
+        ? { onlyIfAbsentKeys: true }
+        : {
+            onlyIfAbsentTypes: true,
+            skipTypesWhenMarkerPresent: {
+              markerType: "run.recovering",
+              types: ["environment.materializing", "harness.starting"],
+            },
+          },
     );
   }
 
@@ -286,11 +339,18 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           lease,
           ...(spawnedById ? { spawnedById } : {}),
         });
+        if (!result.sessionRef) {
+          throw indeterminateExecutionError(
+            "HARNESS_UNAVAILABLE",
+            "harness reached readiness without a canonical session reference",
+            "session_ref_missing",
+          );
+        }
         await mutateReservation(runId, (current) => ({
           ...current,
           phase: "started",
           startedAt: now().toISOString(),
-          ...(result.sessionRef ? { sessionRef: result.sessionRef } : {}),
+          sessionRef: result.sessionRef,
           environment: result.environment,
         }));
         await appendRunEvents(
@@ -304,7 +364,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
             },
             {
               type: "harness.running",
-              payload: result.sessionRef ? { sessionRef: result.sessionRef } : {},
+              payload: { sessionRef: result.sessionRef },
               origin: await origin({ driverId: driverIdOf(reservation) }),
             },
           ],
@@ -329,7 +389,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
             // The sweep owns terminal resolution for a cancel that landed
             // pre-running: confirmed stop -> atomically cancelled + event.
             const resolved = await mutateReservation(runId, (record) => {
-              const { indeterminateAt: _resolved, ...rest } = record;
+              const rest = clearLossEpisode(record);
               if (rest.result) return rest as RunReservation;
               return {
                 ...(rest as RunReservation),
@@ -345,38 +405,43 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
               );
             }
           } else {
-            await mutateReservation(runId, (record) =>
-              record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
+            const lost = await mutateReservation(runId, (record) =>
+              enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
             );
             await appendRunEvents(
               runId,
               protocolVersion,
-              [{ type: "run.lost", payload: { cause: "cancel_stop_unconfirmed", ...(detail ? { detail } : {}) }, origin: await origin() }],
-              { onlyIfAbsentTypes: true },
+              [{
+                type: "run.lost",
+                payload: lossEpisodePayload(lost, { cause: "cancel_stop_unconfirmed", ...(detail ? { detail } : {}) }),
+                origin: await origin(),
+              }],
+              { onlyIfAbsentKeys: true },
             );
           }
         }
       } catch (error) {
         const wire = toWireError(error);
         if (error instanceof IndeterminateExecutionError) {
-          await mutateReservation(runId, (current) => ({
-            ...current,
-            indeterminateAt: current.indeterminateAt ?? now().toISOString(),
-            indeterminateCause: current.indeterminateCause ?? error.cause,
-            failureCause: current.failureCause ?? `${wire.code}: ${wire.message}`,
-          }));
+          const lost = await mutateReservation(runId, (current) =>
+            enterLossEpisode(
+              { ...current, failureCause: current.failureCause ?? `${wire.code}: ${wire.message}` },
+              error.cause,
+              now().toISOString(),
+            ),
+          );
           await appendRunEvents(
             runId,
             protocolVersion,
             [{
               type: "run.lost",
-              payload: {
+              payload: lossEpisodePayload(lost, {
                 cause: error.cause,
                 ...(error.details !== undefined ? { detail: error.details } : {}),
-              },
+              }),
               origin: await origin(),
             }],
-            { onlyIfAbsentTypes: true },
+            { onlyIfAbsentKeys: true },
           );
           return;
         }
@@ -410,6 +475,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
    * from run.start replays, run.get, and run.events.
    */
   async function reconcile(reservation: RunReservation): Promise<RunReservation> {
+    await ensureAcceptedReceipt(reservation);
     const launchEvidence = await options.sessions.evidence(reservation.beeName);
     const classification = classifyLaunch(reservation, launchEvidence, {
       inFlight: inFlight.has(reservation.runId),
@@ -422,16 +488,14 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // the provisional xr-* lookup name would leak the wrong public identity;
       // require the canonical SessionRecord.id carried by launch evidence.
       if (!launchEvidence.sessionRef) {
-        current = await mutateReservation(current.runId, (record) => ({
-          ...record,
-          indeterminateAt: record.indeterminateAt ?? now().toISOString(),
-          indeterminateCause: record.indeterminateCause ?? "session_ref_missing",
-        }));
+        current = await mutateReservation(current.runId, (record) =>
+          enterLossEpisode(record, "session_ref_missing", now().toISOString()),
+        );
         await appendRunEvents(
           current.runId,
           protocolVersion,
-          [{ type: "run.lost", payload: { cause: "session_ref_missing" }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
+          [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "session_ref_missing" }), origin: await origin() }],
+          { onlyIfAbsentKeys: true },
         );
       } else {
         // Explicit placement already claimed its locator before spawn. Rebuild
@@ -442,25 +506,21 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           return recoverExplicitPlacementEnvironment(await canonicalNodeId(), current);
         })();
         if (!recoveredEnvironment) {
-          current = await mutateReservation(current.runId, (record) => ({
-            ...record,
-            sessionRef: launchEvidence.sessionRef,
-            indeterminateAt: record.indeterminateAt ?? now().toISOString(),
-            indeterminateCause: record.indeterminateCause ?? "environment_receipt_missing",
-          }));
+          current = await mutateReservation(current.runId, (record) =>
+            enterLossEpisode({ ...record, sessionRef: launchEvidence.sessionRef }, "environment_receipt_missing", now().toISOString()),
+          );
           await appendRunEvents(
             current.runId,
             protocolVersion,
-            [{ type: "run.lost", payload: { cause: "environment_receipt_missing" }, origin: await origin() }],
-            { onlyIfAbsentTypes: true },
+            [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "environment_receipt_missing" }), origin: await origin() }],
+            { onlyIfAbsentKeys: true },
           );
         } else {
-          await beginLostRecovery(current, ["run-identity", "hsr-readiness", "session-identity", "environment-ownership"]);
+          const recovering = await beginLostRecovery(current, ["run-identity", "hsr-readiness", "session-identity", "environment-ownership"]);
           current = await mutateReservation(current.runId, (record) => {
-            const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
             return record.phase === "launching"
               ? {
-                  ...(rest as RunReservation),
+                  ...record,
                   phase: "started",
                   startedAt: record.startedAt ?? now().toISOString(),
                   sessionRef: launchEvidence.sessionRef,
@@ -468,20 +528,22 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
                 }
               : record;
           });
+          if (recovering?.lossEpisodeId) {
+            await ensureStartedReceipts(current, recovering.lossEpisodeId);
+            current = await mutateReservation(current.runId, (record) => clearLossEpisode(record));
+          }
         }
       }
     } else if (classification === "booting-receipt-lost") {
       if (launchEvidence.ready === undefined && !current.indeterminateAt) {
-        current = await mutateReservation(current.runId, (record) => ({
-          ...record,
-          indeterminateAt: record.indeterminateAt ?? now().toISOString(),
-          indeterminateCause: record.indeterminateCause ?? "readiness_evidence_missing",
-        }));
+        current = await mutateReservation(current.runId, (record) =>
+          enterLossEpisode(record, "readiness_evidence_missing", now().toISOString()),
+        );
         await appendRunEvents(
           current.runId,
           protocolVersion,
-          [{ type: "run.lost", payload: { cause: "readiness_evidence_missing" }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
+          [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "readiness_evidence_missing" }), origin: await origin() }],
+          { onlyIfAbsentKeys: true },
         );
       }
       const outcome = await options.sessions.outcome(current.beeName);
@@ -489,7 +551,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         await beginLostRecovery(current, ["run-identity", "process-exit"]);
         const finishedAt = now().toISOString();
         current = await mutateReservation(current.runId, (record) => {
-          const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
+          const rest = clearLossEpisode(record);
           return {
             ...(rest as RunReservation),
             phase: "failed",
@@ -508,15 +570,13 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     } else if (classification === "indeterminate") {
       if (!current.indeterminateAt) {
         current = await mutateReservation(current.runId, (record) =>
-          record.indeterminateAt
-            ? record
-            : { ...record, indeterminateAt: now().toISOString(), indeterminateCause: "start_outcome_indeterminate" },
+          enterLossEpisode(record, "start_outcome_indeterminate", now().toISOString()),
         );
         await appendRunEvents(
           current.runId,
           protocolVersion,
-          [{ type: "run.lost", payload: { cause: "start_outcome_indeterminate" }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
+          [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "start_outcome_indeterminate" }), origin: await origin() }],
+          { onlyIfAbsentKeys: true },
         );
       }
 
@@ -538,7 +598,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           await beginLostRecovery(current, ["run-identity", "process-stop"]);
           const finishedAt = now().toISOString();
           current = await mutateReservation(current.runId, (record) => {
-            const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
+            const rest = clearLossEpisode(record);
             return {
               ...(rest as RunReservation),
               phase: "failed",
@@ -558,6 +618,26 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
             { onlyIfAbsentTypes: true },
           );
         }
+      }
+    }
+    // A started Run may lose liveness more than once. Positive durable
+    // readiness/session evidence repairs each episode independently. Publish
+    // the episode-keyed running receipt BEFORE clearing its durable key so a
+    // crash cannot strand Apiary at recovering with no way to replay it.
+    if (
+      current.phase === "started" &&
+      current.indeterminateAt &&
+      recoverableLostCauses.has(current.indeterminateCause ?? "") &&
+      launchEvidence.ready === true &&
+      launchEvidence.sessionRef === current.sessionRef &&
+      (launchEvidence.stampedRunId === undefined || launchEvidence.stampedRunId === current.runId) &&
+      current.environment &&
+      current.sessionRef
+    ) {
+      const recovering = await beginLostRecovery(current, ["run-identity", "hsr-readiness", "session-identity", "environment-ownership"]);
+      if (recovering?.lossEpisodeId) {
+        await ensureStartedReceipts(current, recovering.lossEpisodeId);
+        current = await mutateReservation(current.runId, (record) => clearLossEpisode(record));
       }
     }
     await ensureStartedReceipts(current);
@@ -595,8 +675,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         }
       }
       if (stopConfirmed) {
+        if (current.indeterminateCause === "cancel_stop_unconfirmed") {
+          await beginLostRecovery(current, ["run-identity", "process-stop"]);
+        }
         current = await mutateReservation(current.runId, (record) => {
-          const { indeterminateAt: _resolved, ...rest } = record;
+          const rest = clearLossEpisode(record);
           if (rest.result) return rest as RunReservation;
           return {
             ...(rest as RunReservation),
@@ -611,13 +694,17 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         );
       } else {
         current = await mutateReservation(current.runId, (record) =>
-          record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
+          enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
         );
         await appendRunEvents(
           current.runId,
           protocolVersion,
-          [{ type: "run.lost", payload: { cause: "cancel_stop_unconfirmed", detail }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
+          [{
+            type: "run.lost",
+            payload: lossEpisodePayload(current, { cause: "cancel_stop_unconfirmed", detail }),
+            origin: await origin(),
+          }],
+          { onlyIfAbsentKeys: true },
         );
       }
     }
@@ -634,7 +721,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       if (cancelClassification === "reserved-not-started") {
         current = await mutateReservation(current.runId, (record) => {
           if (record.result) return record;
-          const { indeterminateAt: _resolved, ...rest } = record;
+          const rest = clearLossEpisode(record);
           return {
             ...(rest as RunReservation),
             result: { outcome: "cancelled", cause: record.cancel?.reason ?? "cancel_requested", finishedAt: now().toISOString() },
@@ -662,7 +749,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         current = await mutateReservation(current.runId, (record) => {
           if (record.result) return record;
           // Proven exit resolves any outstanding liveness doubt.
-          const { indeterminateAt: _resolved, ...rest } = record;
+          const rest = clearLossEpisode(record);
           return {
             ...(rest as RunReservation),
             result: {
@@ -699,8 +786,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
         current = await mutateReservation(current.runId, (record) => {
-          const { indeterminateAt: _resolved, ...rest } = record;
-          return rest as RunReservation;
+          return clearLossEpisode(record);
         });
         await appendRunEvents(
           current.runId,
@@ -885,12 +971,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // Admission and event append are separate durable writes. An identical
       // retry after a crash in between must repair run.accepted before it can
       // materialize, reconcile, or terminalize anything downstream.
-      await appendRunEvents(
-        reservation.runId,
-        protocolVersion,
-        [{ type: "run.accepted", payload: { effectKey: reservation.effectKey, receiptId: reservation.receipt.receiptId }, origin: await origin() }],
-        { onlyIfAbsentTypes: true },
-      );
+      await ensureAcceptedReceipt(reservation);
       if (created) {
         await launch(reservation, validated.lease);
         const settled = await reconcile((await readReservation(reservation.runId))!);
@@ -968,8 +1049,24 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       await ops.reconcileOperations(reservation.runId);
       const doc = request as JsonObject;
       const afterSeq = Number(doc.afterSeq ?? 0);
-      const limit = typeof doc.limit === "number" && doc.limit >= 1 ? Math.floor(doc.limit) : Number.POSITIVE_INFINITY;
       const all = await readRunEvents(reservation.runId);
+      const cursorResetThrough = acceptedCursorResetThroughSeq(all);
+      if (cursorResetThrough !== null && afterSeq > 0 && afterSeq <= cursorResetThrough) {
+        throw executionError(
+          "CURSOR_EXPIRED",
+          `run ${reservation.runId} event history was repaired; cursor ${afterSeq} belongs to the pre-repair generation`,
+          undefined,
+          { nextSeq: 0 },
+        );
+      }
+      // A reset page is deliberately complete even when the stale consumer's
+      // normal page size is smaller. Numeric v1 cursors carry no generation;
+      // returning the repaired head in one page makes its next cursor greater
+      // than every invalidated pre-repair cursor and removes the ambiguity.
+      const resetReplay = cursorResetThrough !== null && afterSeq === 0;
+      const limit = resetReplay
+        ? Number.POSITIVE_INFINITY
+        : typeof doc.limit === "number" && doc.limit >= 1 ? Math.floor(doc.limit) : Number.POSITIVE_INFINITY;
       const events: StoredRunEvent[] = [];
       for (const event of all) {
         if (event.seq <= afterSeq) continue;
@@ -1045,26 +1142,46 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
 export function storeSessionEvidenceSource(): SessionEvidenceSource {
   return {
     async evidence(beeName) {
-      const [{ loadSession }, { readHsrMeta }] = await Promise.all([import("../store.js"), import("../hsr/runDir.js")]);
+      const [{ loadSession }, { readHsrMeta }, { inspectHsrHostProcess }] = await Promise.all([
+        import("../store.js"),
+        import("../hsr/runDir.js"),
+        import("../hsr/observe.js"),
+      ]);
       const record = await loadSession(beeName);
       const meta = await readHsrMeta(beeName);
+      let ready: boolean | undefined;
+      if (meta) {
+        if (meta.status !== "running" || typeof meta.runningAt !== "string") {
+          ready = false;
+        } else if (meta.mirrorOfNode) {
+          ready = true;
+        } else {
+          const identity = await inspectHsrHostProcess(meta);
+          if (identity === "match") ready = true;
+          else if (identity === "gone" || identity === "mismatch") ready = false;
+        }
+      }
       return {
         sessionExists: record !== null || meta !== null,
         ...(record?.executionRunId !== undefined ? { stampedRunId: record.executionRunId } : {}),
         ...(record?.id !== undefined ? { sessionRef: record.id } : {}),
-        ...(meta !== null ? { ready: meta.status === "running" && typeof meta.runningAt === "string" } : {}),
+        ...(ready !== undefined ? { ready } : {}),
       };
     },
     async outcome(beeName) {
-      const [{ loadSession }, { readHsrMeta }, { defaultIsPidAlive }] = await Promise.all([
+      const [{ loadSession }, { readHsrMeta }, { inspectHsrHostProcess }] = await Promise.all([
         import("../store.js"),
         import("../hsr/runDir.js"),
-        import("../fsx.js"),
+        import("../hsr/observe.js"),
       ]);
       const meta = await readHsrMeta(beeName);
       if (meta) {
         if (meta.status === "exited") return { live: false, exitCode: meta.exitCode ?? null };
-        if (!meta.mirrorOfNode && !defaultIsPidAlive(meta.hostPid)) return { live: false, exitCode: null };
+        if (!meta.mirrorOfNode) {
+          const identity = await inspectHsrHostProcess(meta);
+          if (identity === "gone" || identity === "mismatch") return { live: false, exitCode: null };
+          if (identity !== "match") return null;
+        }
         return { live: true };
       }
       const record = await loadSession(beeName);

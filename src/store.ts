@@ -9,6 +9,7 @@ import { withFileLock } from "./lock.js";
 import type { PreambleChannel } from "./preamble.js";
 import { dedupeTags, isValidSessionTag, MAX_TAGS_PER_BEE } from "./tags.js";
 import type { CombActivationBinding } from "./comb/types.js";
+import type { ProcessBirthFingerprint } from "./hsr/processIdentity.js";
 
 /**
  * Per-bee task auto-supply config (see tasks/supplyConfig.ts for semantics
@@ -50,6 +51,8 @@ export type SessionRecord = {
   agentPaneId?: string;
   /** Local tmux launcher process group; best-effort cleanup for drivers that survive pane teardown. */
   launcherPgid?: number;
+  /** OS birth identity required before signalling launcherPgid. */
+  launcherFingerprint?: ProcessBirthFingerprint;
   /**
    * LEGACY, read-only (APIA-85). Combs — multiple bees sharing one tmux session
    * via split panes — are retired: Apiary lineage views + HSR subagents replaced
@@ -172,6 +175,8 @@ export type SessionRecord = {
   substrate?: "local-tmux" | "hsr";
   /** HSR: runner process pid (structured-tier child or server). */
   runnerPid?: number;
+  /** OS birth identity for pre-meta queued-turn validation and legacy migration safety. */
+  runnerFingerprint?: ProcessBirthFingerprint;
   /** HSR: resolved runner tier for this bee ("server"|"stream"|"turn"|"pty"). */
   runnerTier?: string;
   buzAccept?: BuzTier[];
@@ -1155,8 +1160,10 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "launchArgv",
   "substrate",
   "runnerPid",
+  "runnerFingerprint",
   "remoteTokenExpiresAt",
   "launcherPgid",
+  "launcherFingerprint",
   "poolMember",
   "titleSource",
   "providerTitleKind",
@@ -1286,6 +1293,15 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   if (typeof object.runnerPid === "number" && Number.isSafeInteger(object.runnerPid) && object.runnerPid > 0) {
     record.runnerPid = object.runnerPid;
   }
+  const readFingerprint = (value: unknown): ProcessBirthFingerprint | undefined => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const fingerprint = value as Record<string, unknown>;
+    if (!Number.isSafeInteger(fingerprint.pgid) || Number(fingerprint.pgid) <= 0) return undefined;
+    if (typeof fingerprint.startedAt !== "string" || fingerprint.startedAt.length === 0) return undefined;
+    return { pgid: Number(fingerprint.pgid), startedAt: fingerprint.startedAt };
+  };
+  const runnerFingerprint = readFingerprint(object.runnerFingerprint);
+  if (runnerFingerprint) record.runnerFingerprint = runnerFingerprint;
   if (typeof object.remoteTokenExpiresAt === "number" && Number.isFinite(object.remoteTokenExpiresAt) && object.remoteTokenExpiresAt > 0) {
     record.remoteTokenExpiresAt = object.remoteTokenExpiresAt;
   }
@@ -1306,6 +1322,8 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   if (typeof object.launcherPgid === "number" && Number.isSafeInteger(object.launcherPgid) && object.launcherPgid > 0) {
     record.launcherPgid = object.launcherPgid;
   }
+  const launcherFingerprint = readFingerprint(object.launcherFingerprint);
+  if (launcherFingerprint) record.launcherFingerprint = launcherFingerprint;
   // Pool member numbers are 1-based (`<pool>-<n>`); validated like launcherPgid.
   if (typeof object.poolMember === "number" && Number.isSafeInteger(object.poolMember) && object.poolMember > 0) {
     record.poolMember = object.poolMember;

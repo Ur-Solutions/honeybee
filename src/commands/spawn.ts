@@ -49,6 +49,7 @@ import { validateContract } from "../comb/schema.js";
 import type { JsonValue, StoredCombVersion } from "../comb/types.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 import { hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../hsr/runDir.js";
+import { captureProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import { transactionalRetire } from "../kill.js";
 import { attachTrack, loadTrack } from "../track.js";
 
@@ -550,6 +551,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       ...(opts.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
+    const runnerFingerprint = await captureProcessBirthFingerprint(hostPid);
     // Publish a provisional "queued" meta NOW: spawn no longer waits for the
     // child's cold start, so without this every observer (hasSession, hive run
     // --wait, the daemon reconciler, Apiary) would read the fresh bee as dead
@@ -561,6 +563,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
         harness: spec.kind,
         tier: runnerTier,
         hostPid,
+        ...(runnerFingerprint ? { hostFingerprint: runnerFingerprint } : {}),
         startedAt: new Date().toISOString(),
         startupPhase: "harness",
         controlSocket: hsrControlSocketPath(name),
@@ -579,6 +582,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
       tmuxTarget: name, // logical id — HSR has no tmux target
       substrate: "hsr",
       runnerPid: hostPid,
+      ...(runnerFingerprint ? { runnerFingerprint } : {}),
       ...(runnerTier ? { runnerTier } : {}),
       combId: name,
       createdAt: now,
@@ -643,6 +647,7 @@ export async function spawnBee(opts: SpawnOptions): Promise<SessionRecord> {
     tmuxTarget,
     ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
     ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+    ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
     // Solo combs: every bee gets combId == tmuxTarget at spawn (§12 Q3).
     combId: tmuxTarget,
     createdAt: now,
