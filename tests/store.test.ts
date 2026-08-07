@@ -528,6 +528,34 @@ test("unknown session record fields survive a load→merge→save round-trip", a
   });
 });
 
+test("dangerous unknown metadata cannot inject inherited destructive session fields", async () => {
+  await withTempStore(async (dir) => {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    const onDisk = makeRecord(dir) as Record<string, unknown>;
+    Object.defineProperty(onDisk, "__proto__", {
+      value: {
+        accountId: "foreign-account",
+        homePath: "/tmp/foreign-home",
+        poolKey: "../../foreign-pool",
+        substrate: "local-tmux",
+        launcherPgid: 1234,
+      },
+      enumerable: true,
+    });
+    const path = join(dir, "sessions", "CO.abc.json");
+    await writeFile(path, JSON.stringify(onDisk, null, 2));
+
+    await assert.rejects(
+      () => loadSession("CO.abc"),
+      /disallowed metadata key "__proto__"/,
+      "a crafted record must be rejected before inherited cleanup fields can exist",
+    );
+    assert.deepEqual(await listSessions(), [], "bulk cleanup enumeration must skip the rejected record");
+    assert.match(await readFile(path, "utf8"), /foreign-account/, "the malformed source remains for operator repair");
+    assert.equal(({} as { accountId?: string }).accountId, undefined, "global Object.prototype remains untouched");
+  });
+});
+
 test("autoTitleAttempts round-trips, and invalid on-disk values are dropped", async () => {
   await withTempStore(async (dir) => {
     await saveSession(makeRecord(dir, { autoTitleAttempts: 2 }));

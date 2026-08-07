@@ -1170,9 +1170,27 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "combActivations",
 ]);
 
+const DANGEROUS_SESSION_META_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
 function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid session record shape: ${path}`);
-  const object = value as Record<string, unknown>;
+  // Parse through a null-prototype bag so neither a polluted Object.prototype
+  // nor JSON keys such as `__proto__` can supply security-sensitive fields.
+  // Dangerous meta keys are rejected instead of round-tripped: older binaries
+  // never emitted them, and accepting them would let a later plain assignment
+  // mutate the normalized record's prototype.
+  const object = Object.create(null) as Record<string, unknown>;
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (DANGEROUS_SESSION_META_KEYS.has(key)) {
+      throw new Error(`Invalid session record ${path}: disallowed metadata key ${JSON.stringify(key)}`);
+    }
+    Object.defineProperty(object, key, {
+      value: raw,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
   for (const key of ["name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt"]) {
     if (typeof object[key] !== "string") throw new Error(`Invalid session record ${path}: missing string ${key}`);
   }
@@ -1335,7 +1353,14 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   // extra runtime properties (invisible to the SessionRecord type) and are
   // serialized back out on the next save.
   for (const [key, raw] of Object.entries(object)) {
-    if (!KNOWN_SESSION_KEYS.has(key)) (record as Record<string, unknown>)[key] = raw;
+    if (!KNOWN_SESSION_KEYS.has(key)) {
+      Object.defineProperty(record, key, {
+        value: raw,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
   }
 
   return record;
