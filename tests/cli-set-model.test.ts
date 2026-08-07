@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdir, readFile, rm, writeFile, mkdtemp } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, rm, writeFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -113,6 +113,13 @@ async function seedStoppedHsrRuntime(store: string, bee: string): Promise<void> 
     if (prev === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = prev;
   }
+}
+
+async function installCodexAppServerStub(store: string): Promise<string> {
+  const target = join(store, "fake-codex-app-server");
+  await copyFile(join(process.cwd(), "tests", "fixtures", "codex-app-server-stub.mjs"), target);
+  await chmod(target, 0o700);
+  return target;
 }
 
 async function withRig(fn: (ctx: { store: string; socket: string }) => Promise<void>): Promise<void> {
@@ -299,6 +306,7 @@ test("set-model rolls the record back when the relaunched harness dies immediate
 test("set-model on a downed HSR bee records the selection and revive applies it", { skip: !detachedRuntimeAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const bee = "HSR.switch"
+    const fakeCodex = await installCodexAppServerStub(store)
     await seedBee(store, bee, {
       agent: "codex",
       requestedAgent: "codex",
@@ -316,7 +324,7 @@ test("set-model on a downed HSR bee records the selection and revive applies it"
       ])
       assert.match(result.stdout, /set-model\tHSR\.switch\tgpt-5\.5\trecorded/)
 
-      await hive(store, socket, ["revive", bee, "--no-wait"])
+      await hive(store, socket, ["revive", bee, "--no-wait"], { HIVE_CODEX_CMD: fakeCodex })
       const record = await readBee(store, bee)
       assert.equal(record.model, "gpt-5.5")
       assert.equal(record.modelExtraArgs, "-c model_reasoning_effort=high")
