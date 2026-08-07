@@ -12,6 +12,8 @@ import {
   appendRunTerminalEvents,
   beeNameForRun,
   commitRunTerminalResult,
+  mutateReservation,
+  readReservation,
   readRunEvents,
   runDir,
   type StoredRunEvent,
@@ -201,6 +203,124 @@ test("event log: terminal result and event families admit one locked winner and 
       (error: { code?: string }) => error.code === "AUTHORITY_UNAVAILABLE",
     );
   });
+});
+
+test("legacy terminal fixtures canonicalize to the reservation winner and reset partial-consumer cursors", async () => {
+  const fixtures = [
+    {
+      label: "canonical plus stale extra",
+      terminals: [
+        { type: "run.cancelled", payload: { cause: "legacy cancel" }, eventId: "legacy-terminal-cancelled" },
+        { type: "run.completed", payload: {}, eventId: "legacy-terminal-stale-completed" },
+      ],
+      expectedCanonicalEventId: "legacy-terminal-cancelled",
+    },
+    {
+      label: "wrong-only terminal",
+      terminals: [
+        { type: "run.completed", payload: {}, eventId: "legacy-terminal-wrong-completed" },
+      ],
+      expectedCanonicalEventId: undefined,
+    },
+  ] as const;
+
+  for (const fixture of fixtures) {
+    await withTempStore(async () => {
+      const ctx = await installTestAuthority();
+      const service = makeService();
+      await service.runStart(buildRunStartEnvelope(ctx));
+      const base = await readRunEvents("run-0001");
+      const finishedAt = new Date().toISOString();
+      await mutateReservation("run-0001", (record) => ({
+        ...record,
+        result: { outcome: "cancelled", cause: "legacy cancel", finishedAt },
+        sealedAt: finishedAt,
+        releasedAt: finishedAt,
+      }));
+
+      const reservation = await readReservation("run-0001");
+      assert.ok(reservation?.environment);
+      const origin = { nodeId: ctx.nodeId };
+      const timestamp = new Date().toISOString();
+      const suffix = [
+        ...fixture.terminals.map((terminal) => ({ ...terminal, origin })),
+        {
+          type: "environment.sealed",
+          payload: { environmentId: reservation.environment.environmentId },
+          eventId: "legacy-environment-sealed",
+          origin,
+        },
+        {
+          type: "environment.released",
+          payload: { environmentId: reservation.environment.environmentId },
+          eventId: "legacy-environment-released",
+          origin,
+        },
+      ];
+      const legacy = [
+        ...base,
+        ...suffix.map((event, index) => ({
+          protocolVersion: "0.1",
+          runId: "run-0001",
+          seq: base.length + index + 1,
+          eventId: event.eventId,
+          type: event.type,
+          occurredAt: timestamp,
+          ingestedAt: timestamp,
+          origin: event.origin,
+          payload: event.payload,
+        })),
+      ];
+      await writeFile(join(runDir("run-0001"), "events.jsonl"), legacy.map((event) => `${JSON.stringify(event)}\n`).join(""));
+      const oldHead = legacy.at(-1)!.seq;
+      const partialCursor = base.length + fixture.terminals.length;
+
+      await Promise.all(
+        Array.from({ length: 6 }, () => appendRunTerminalEvents(reservation, "0.1", origin)),
+      );
+
+      const stale = await service.runEvents({
+        protocolVersion: "0.1",
+        runId: "run-0001",
+        afterSeq: partialCursor,
+        limit: 1,
+      });
+      assert.ok("error" in stale, fixture.label);
+      assert.equal(stale.error.code, "CURSOR_EXPIRED", fixture.label);
+      assert.deepEqual(stale.error.checkpoint, { nextSeq: 0 });
+      assert.deepEqual(validator.validate("error", stale.error).errors, []);
+
+      const reset = await service.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0, limit: 1 });
+      assert.ok("result" in reset, fixture.label);
+      assert.deepEqual(validator.validate("run-events-page", reset.result).errors, [], fixture.label);
+      const repaired = reset.result.events as unknown as StoredRunEvent[];
+      assert.deepEqual(repaired.map((event) => event.seq), repaired.map((_, index) => index + 1));
+      assert.equal(
+        (repaired[0]!.payload as JsonObject).cursorResetThroughSeq,
+        oldHead,
+        `${fixture.label}: accepted prefix resets every old cursor through the legacy head`,
+      );
+      const terminal = repaired.filter((event) => ["run.completed", "run.failed", "run.cancelled"].includes(event.type));
+      assert.deepEqual(terminal.map((event) => event.type), ["run.cancelled"], fixture.label);
+      if (fixture.expectedCanonicalEventId) {
+        assert.equal(terminal[0]!.eventId, fixture.expectedCanonicalEventId, "the already-canonical winner keeps its identity");
+      } else {
+        assert.notEqual(terminal[0]!.eventId, fixture.terminals[0].eventId, "a wrong fact cannot keep its published identity");
+      }
+      assert.deepEqual(
+        repaired.slice(-2).map((event) => [event.type, event.eventId]),
+        [
+          ["environment.sealed", "legacy-environment-sealed"],
+          ["environment.released", "legacy-environment-released"],
+        ],
+        `${fixture.label}: legal post-terminal retain/release history survives the rewrite`,
+      );
+      for (const event of repaired) assert.deepEqual(validator.validate("run-event", event).errors, [], event.type);
+
+      await service.runGet({ protocolVersion: "0.1", runId: "run-0001" });
+      assert.deepEqual(await readRunEvents("run-0001"), repaired, `${fixture.label}: canonical repair is idempotent`);
+    });
+  }
 });
 
 test("event log: interior corruption and sequence reuse fail closed, never partial replay", async () => {

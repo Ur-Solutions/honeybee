@@ -217,6 +217,39 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     return durable;
   }
 
+  /**
+   * Publish the observable end of one liveness-loss episode before its durable
+   * marker is cleared. This is intentionally separate from terminal append:
+   * an already-published terminal member may precede a later stop doubt, and
+   * appendRunTerminalEvents must not place an exit precursor after it.
+   */
+  async function publishLossRecoveryExit(
+    reservation: RunReservation,
+    verified: string[],
+    exitCode?: number,
+  ): Promise<RunReservation | null> {
+    const recovering = await beginLostRecovery(reservation, verified);
+    if (!recovering?.lossEpisodeId) return null;
+    await appendRunEvents(
+      recovering.runId,
+      protocolVersion,
+      [{
+        type: "harness.exited",
+        payload: lossEpisodePayload(recovering, exitCode !== undefined ? { exitCode } : {}),
+        origin: await origin({ driverId: driverIdOf(recovering) }),
+      }],
+      { onlyIfAbsentKeys: true },
+    );
+    return recovering;
+  }
+
+  /** Clear exactly the episode whose complete recovery stream is durable. */
+  async function clearPublishedLossEpisode(recovering: RunReservation): Promise<RunReservation> {
+    return mutateReservation(recovering.runId, (record) =>
+      record.lossEpisodeId === recovering.lossEpisodeId ? clearLossEpisode(record) : record,
+    );
+  }
+
   /** Repair the admission/event crash gap for every read/reconcile entrypoint. */
   async function ensureAcceptedReceipt(reservation: RunReservation): Promise<void> {
     await ensureRunAcceptedFirst(
@@ -398,9 +431,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
             await appendRunTerminalEvents(resolved, protocolVersion, await origin());
           } else {
             const unresolved = await mutateReservation(runId, (record) =>
-              record.result ? record : enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
+              record.cancel || record.result?.outcome === "cancelled"
+                ? enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString())
+                : record,
             );
-            if (!unresolved.result) {
+            if (unresolved.indeterminateCause === "cancel_stop_unconfirmed") {
               await appendRunEvents(
                 runId,
                 protocolVersion,
@@ -626,14 +661,19 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     }
     await ensureStartedReceipts(current);
     const leaseExpired = Date.parse(current.leaseExpiresAt) < now().getTime();
-    if (current.phase === "started" && !current.result && (current.cancel !== undefined || leaseExpired)) {
+    const terminalCancelStopDoubt =
+      current.result?.outcome === "cancelled" && current.indeterminateCause === "cancel_stop_unconfirmed";
+    if (
+      current.phase === "started" &&
+      ((!current.result && (current.cancel !== undefined || leaseExpired)) || terminalCancelStopDoubt)
+    ) {
       // Durable desired-state stop reconciler. Two ways in: execution
       // authority died with the lease (a still-running harness must not
       // continue unbounded), or a cancellation intent exists whose stop was
       // never confirmed. EVERY reconcile pass retries the clean stop until it
       // is confirmed or the session outcome proves exit — a transient stop
       // failure never strands a live harness behind a lost marker.
-      if (!current.cancel) {
+      if (!current.result && !current.cancel) {
         current = await mutateReservation(current.runId, (record) =>
           record.result || record.cancel
             ? record
@@ -648,7 +688,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           );
         }
       }
-      if (!current.result) {
+      if (!current.result || terminalCancelStopDoubt) {
         const evidence = await options.sessions.evidence(current.beeName);
         const ours = evidence.sessionExists && (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
         let stopConfirmed = true;
@@ -664,24 +704,30 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           }
         }
         if (stopConfirmed) {
-          if (current.indeterminateCause === "cancel_stop_unconfirmed") {
-            await beginLostRecovery(current, ["run-identity", "process-stop"]);
+          const recovering = current.indeterminateCause === "cancel_stop_unconfirmed"
+            ? await publishLossRecoveryExit(current, ["run-identity", "process-stop"])
+            : null;
+          if (current.result) {
+            if (recovering) current = await clearPublishedLossEpisode(recovering);
+          } else {
+            current = await commitRunTerminalResult(
+              current.runId,
+              { outcome: "cancelled", cause: "cancel_requested" },
+              {
+                now,
+                clearIndeterminate: true,
+                canCommit: (record) => record.phase === "started" && record.cancel !== undefined,
+              },
+            );
           }
-          current = await commitRunTerminalResult(
-            current.runId,
-            { outcome: "cancelled", cause: "cancel_requested" },
-            {
-              now,
-              clearIndeterminate: true,
-              canCommit: (record) => record.phase === "started" && record.cancel !== undefined,
-            },
-          );
           await appendRunTerminalEvents(current, protocolVersion, await origin());
         } else {
           current = await mutateReservation(current.runId, (record) =>
-            record.result ? record : enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString()),
+            !record.result || record.result.outcome === "cancelled"
+              ? enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString())
+              : record,
           );
-          if (!current.result) {
+          if (current.indeterminateCause === "cancel_stop_unconfirmed") {
             await appendRunEvents(
               current.runId,
               protocolVersion,
@@ -747,16 +793,15 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     }
     if (current.result && current.indeterminateAt) {
       // A terminal fact recorded while a stop was unconfirmable: the doubt
-      // clears only when the session outcome proves the harness exited.
+      // clears only after the stream durably shows recovering + exited.
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
-        current = await commitRunTerminalResult(current.runId, current.result, { now, clearIndeterminate: true });
-        await appendRunTerminalEvents(
+        const recovering = await publishLossRecoveryExit(
           current,
-          protocolVersion,
-          await origin(),
-          [{ type: "harness.exited", payload: {}, origin: await origin({ driverId: driverIdOf(current) }) }],
+          ["run-identity", "process-exit"],
+          outcome.exitCode ?? undefined,
         );
+        if (recovering) current = await clearPublishedLossEpisode(recovering);
       }
     }
     // Self-heal missing lifecycle events: a crash can land between a durable

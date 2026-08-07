@@ -571,6 +571,13 @@ function terminalEventType(outcome: RunTerminalOutcome): RunTerminalEventType {
   return `run.${outcome}` as RunTerminalEventType;
 }
 
+function terminalEventPayload(result: RunTerminalResult): JsonObject {
+  return {
+    ...(result.cause ? { cause: result.cause } : {}),
+    ...(result.harnessExitCode !== undefined ? { harnessExitCode: result.harnessExitCode } : {}),
+  };
+}
+
 type ParsedEventLog = {
   events: StoredRunEvent[];
   /** Byte length of the valid prefix; bytes past it are a torn trailing record. */
@@ -822,9 +829,10 @@ export async function appendRunEvents(
 
 /**
  * Append (or repair after a reservation-write crash gap) the one terminal
- * Run event derived from a durable reservation result. The event lock treats
- * completed/failed/cancelled as one mutually-exclusive family, so concurrent
- * reconciliation can never append two terminal event types.
+ * Run event derived from a durable reservation result. Admission + event
+ * serialization treats completed/failed/cancelled as one mutually-exclusive
+ * family, so concurrent reconciliation cannot append two terminal types and
+ * pre-serialization conflicts can be rewritten to the durable winner.
  *
  * `precursors` are appended in the same locked batch before the terminal
  * member. If the terminal member already exists, the entire batch is a no-op
@@ -836,26 +844,148 @@ export async function appendRunTerminalEvents(
   eventOrigin: RunEventInput["origin"],
   precursors: RunEventInput[] = [],
 ): Promise<StoredRunEvent[]> {
-  // Re-read under the same lock that commits terminal decisions. Callers may
-  // hold a stale projection, but terminal publication must use the one durable
-  // winner (or no-op when no result has committed yet).
-  const committed = await withFileLock(admissionLockPath(), async () => {
+  // Hold admission serialization THROUGH event serialization. A caller may
+  // carry a stale projection and a pre-upgrade log may already contain the
+  // losing side of an old terminal race; neither may race a fresh terminal
+  // decision or a second repair while we publish the durable winner.
+  return withFileLock(admissionLockPath(), async () => {
     const current = await readReservation(reservation.runId);
     if (!current) throw executionError("RUN_UNKNOWN", `runId ${reservation.runId} names no Run reserved on this node`);
-    return current;
+    const result = current.result;
+    if (!result) return [];
+
+    await mkdir(runDir(current.runId), { recursive: true, mode: 0o700 });
+    return withFileLock(eventsLockPath(current.runId), async () => {
+      const log = await readEventLog(current.runId);
+      const validLines = log.events.map((event) => `${JSON.stringify(event)}\n`).join("");
+      if (log.tornTail) await atomicWriteFile(eventsPath(current.runId), validLines, { mode: 0o600 });
+
+      if (precursors.some((input) => RUN_TERMINAL_EVENT_TYPE_SET.has(input.type))) {
+        throw executionError(
+          "AUTHORITY_UNAVAILABLE",
+          `run ${current.runId} terminal precursors cannot contain another terminal-family member`,
+        );
+      }
+
+      const type = terminalEventType(result.outcome);
+      const payload = terminalEventPayload(result);
+      const existingTerminal = log.events.filter((event) => RUN_TERMINAL_EVENT_TYPE_SET.has(event.type));
+      const canonicalTerminal = existingTerminal.find((event) => event.type === type);
+
+      if (existingTerminal.length === 1 && canonicalTerminal) {
+        // Idempotent replay. Skip the whole batch: ordinary exit precursors
+        // belong before the terminal. Post-terminal loss recovery publishes
+        // its episode-keyed exit explicitly instead.
+        return [];
+      }
+
+      if (existingTerminal.length > 0) {
+        // A pre-serialization coordinator could persist the wrong terminal or
+        // a canonical winner followed by a stale extra. Replace the whole
+        // family with the reservation's durable winner, but retain every
+        // non-terminal event in order (notably legal retain/release events).
+        // Re-sequencing invalidates numeric v1 cursors, so advance the existing
+        // accepted-prefix generation reset through the old head.
+        const oldHead = log.events.at(-1)?.seq ?? 0;
+        const terminalIndex = canonicalTerminal
+          ? log.events.indexOf(canonicalTerminal)
+          : log.events.findIndex((event) => RUN_TERMINAL_EVENT_TYPE_SET.has(event.type));
+        const nonTerminal = log.events.filter((event) => !RUN_TERMINAL_EVENT_TYPE_SET.has(event.type));
+        const insertionIndex = log.events
+          .slice(0, terminalIndex)
+          .filter((event) => !RUN_TERMINAL_EVENT_TYPE_SET.has(event.type)).length;
+        const ingestedAt = new Date().toISOString();
+        const presentTypes = new Set(nonTerminal.map((event) => event.type));
+        const insertedPrecursors: StoredRunEvent[] = precursors
+          .filter((input) => !presentTypes.has(input.type))
+          .map((input) => ({
+            protocolVersion,
+            runId: current.runId,
+            seq: 0,
+            eventId: `evt-${runKey(current.runId)}-terminal-repair-${randomUUID()}`,
+            type: input.type,
+            occurredAt: input.occurredAt ?? ingestedAt,
+            ingestedAt,
+            origin: input.origin,
+            payload: input.payload,
+          }));
+        const canonical = canonicalTerminal ?? {
+          protocolVersion,
+          runId: current.runId,
+          seq: 0,
+          eventId: `evt-${runKey(current.runId)}-terminal-repair-${randomUUID()}`,
+          type,
+          occurredAt: result.finishedAt,
+          ingestedAt,
+          origin: eventOrigin,
+          payload,
+        };
+        const migrated = [
+          ...nonTerminal.slice(0, insertionIndex),
+          ...insertedPrecursors,
+          canonical,
+          ...nonTerminal.slice(insertionIndex),
+        ];
+        const accepted = migrated[0];
+        if (
+          !accepted ||
+          accepted.type !== "run.accepted" ||
+          accepted.payload === null ||
+          typeof accepted.payload !== "object" ||
+          Array.isArray(accepted.payload)
+        ) {
+          throw executionError(
+            "AUTHORITY_UNAVAILABLE",
+            `run ${current.runId} cannot reset a repaired terminal generation without its canonical accepted prefix`,
+          );
+        }
+        const previousReset = (accepted.payload as JsonObject)[ACCEPTED_CURSOR_RESET_FIELD];
+        migrated[0] = {
+          ...accepted,
+          payload: {
+            ...(accepted.payload as JsonObject),
+            [ACCEPTED_CURSOR_RESET_FIELD]: Math.max(
+              oldHead,
+              typeof previousReset === "number" && Number.isSafeInteger(previousReset) ? previousReset : 0,
+            ),
+          },
+        };
+        const resequenced = migrated.map((event, index) => ({ ...event, seq: index + 1 }));
+        await atomicWriteFile(
+          eventsPath(current.runId),
+          resequenced.map((event) => `${JSON.stringify(event)}\n`).join(""),
+          { mode: 0o600 },
+        );
+        const repairedIds = new Set([...insertedPrecursors, canonical].map((event) => event.eventId));
+        return resequenced.filter((event) => repairedIds.has(event.eventId));
+      }
+
+      const present = new Set(log.events.map((event) => event.type));
+      let seq = log.events.at(-1)?.seq ?? 0;
+      const appended: StoredRunEvent[] = [];
+      let lines = "";
+      for (const input of [...precursors, { type, payload, origin: eventOrigin }]) {
+        if (present.has(input.type)) continue;
+        const ingestedAt = new Date().toISOString();
+        const event: StoredRunEvent = {
+          protocolVersion,
+          runId: current.runId,
+          seq: ++seq,
+          eventId: `evt-${runKey(current.runId)}-${seq}`,
+          type: input.type,
+          occurredAt: input.occurredAt ?? ingestedAt,
+          ingestedAt,
+          origin: input.origin,
+          payload: input.payload,
+        };
+        present.add(event.type);
+        appended.push(event);
+        lines += `${JSON.stringify(event)}\n`;
+      }
+      if (lines.length > 0) await appendFile(eventsPath(current.runId), lines, { mode: 0o600 });
+      return appended;
+    });
   });
-  if (!committed.result) return [];
-  const type = terminalEventType(committed.result.outcome);
-  const payload: JsonObject = {
-    ...(committed.result.cause ? { cause: committed.result.cause } : {}),
-    ...(committed.result.harnessExitCode !== undefined ? { harnessExitCode: committed.result.harnessExitCode } : {}),
-  };
-  return appendRunEvents(
-    committed.runId,
-    protocolVersion,
-    [...precursors, { type, payload, origin: eventOrigin }],
-    { onlyIfAbsentTypes: true, terminalFamilyType: type },
-  );
 }
 
 /** Last durable seq for a Run (0 when no events yet). */

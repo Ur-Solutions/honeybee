@@ -283,10 +283,11 @@ test("stop retries on every reconcile pass: a transient first failure never stra
     assert.equal(reservation.result?.cause, "lease_expired");
     assert.equal(reservation.indeterminateAt, undefined);
     const events = await readRunEvents(RUN_ID);
-    assert.deepEqual(events.slice(-4).map((event) => event.type), [
+    assert.deepEqual(events.slice(-5).map((event) => event.type), [
       "cancel.requested",
       "run.lost",
       "run.recovering",
+      "harness.exited",
       "run.cancelled",
     ]);
     const lostId = (events.find((event) => event.type === "run.lost")!.payload as JsonObject).lossEpisodeId;
@@ -371,6 +372,68 @@ test("cancel during launch with an unconfirmable stop projects lost, then conver
     assert.equal((await readReservation(RUN_ID))!.indeterminateAt, undefined, "doubt resolved");
     types = (await readRunEvents(RUN_ID)).map((event) => event.type);
     assert.ok(types.includes("run.cancelled"));
+  });
+});
+
+test("two services preserve pre-launch cancellation while retrying an unconfirmed post-launch stop to stream convergence", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const counting = gatedCountingLauncher();
+    const control = fakeControl({ stopResult: { stopped: false, detail: "clean stop unconfirmed" } });
+    const launcherService = makeService({ launcher: counting.launcher, control: control.control });
+    // This independent service cannot see launcherService's in-memory flight.
+    // Zero grace makes the no-session barrier a deterministic never-started
+    // classification while the launcher is paused before persisting evidence.
+    const cancellingService = makeService({ control: control.control, launchGraceMs: 0 });
+
+    const startPromise = launcherService.runStart(buildRunStartEnvelope(ctx));
+    await counting.entered;
+    const cancelled = (await cancellingService.runCancel(
+      buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "two-service race" }),
+    )) as JsonObject;
+    assert.deepEqual(cancelled.result, { runId: RUN_ID, state: "cancelled" });
+    const cancellationResult = structuredClone((await readReservation(RUN_ID))!.result);
+    assert.equal(cancellationResult?.outcome, "cancelled");
+
+    counting.release();
+    const started = await startPromise;
+    assert.equal((started.result as JsonObject).state, "lost");
+    let reservation = (await readReservation(RUN_ID))!;
+    assert.deepEqual(reservation.result, cancellationResult, "launch never replaces the durable cancelled result");
+    assert.equal(reservation.phase, "started");
+    assert.equal(reservation.indeterminateCause, "cancel_stop_unconfirmed");
+    const unconfirmedStops = control.calls.filter((call) => call.method === "stop").length;
+    assert.ok(unconfirmedStops >= 2, "post-launch sweep and reconciliation both retry the unconfirmed stop");
+
+    let events = await readRunEvents(RUN_ID);
+    const lost = events.find((event) => event.type === "run.lost")!;
+    const lossEpisodeId = (lost.payload as JsonObject).lossEpisodeId;
+    assert.equal(typeof lossEpisodeId, "string");
+    assert.ok(events.findIndex((event) => event.type === "run.cancelled") < events.indexOf(lost));
+    assert.equal(events.at(-1)!.type, "run.lost", "the partial stream exposes the live-runtime doubt");
+
+    control.behavior.stopResult = { stopped: true, detail: "clean stop confirmed" };
+    const settled = await cancellingService.runGet({ protocolVersion: "0.1", runId: RUN_ID });
+    assert.ok("result" in settled, JSON.stringify(settled));
+    assert.equal(settled.result.state, "cancelled");
+    assert.ok(control.calls.filter((call) => call.method === "stop").length > unconfirmedStops);
+    reservation = (await readReservation(RUN_ID))!;
+    assert.deepEqual(reservation.result, cancellationResult, "stop recovery preserves the original terminal fact");
+    assert.equal(reservation.indeterminateAt, undefined);
+
+    events = await readRunEvents(RUN_ID);
+    const recovering = events.find((event) => event.type === "run.recovering")!;
+    const exited = events.find((event) =>
+      event.type === "harness.exited" && (event.payload as JsonObject).lossEpisodeId === lossEpisodeId,
+    )!;
+    assert.equal((recovering.payload as JsonObject).lossEpisodeId, lossEpisodeId);
+    assert.ok(events.indexOf(lost) < events.indexOf(recovering));
+    assert.ok(events.indexOf(recovering) < events.indexOf(exited));
+    assert.equal(events.at(-1)!.type, "harness.exited", "recovery cannot clear doubt while Apiary still ends at lost");
+    assert.equal(events.filter((event) => event.type === "run.cancelled").length, 1);
+    for (const event of events) {
+      assert.deepEqual(launcherService.validator.validate("run-event", event).errors, [], event.type);
+    }
   });
 });
 
