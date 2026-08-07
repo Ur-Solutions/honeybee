@@ -6,7 +6,7 @@ import { appendLedger } from "../store.js";
 import { accountDir, withAccountLock, listAccounts, CROSS_ACCOUNT_LOCK_TIMEOUT_MS, type AccountRecord } from "./registry.js";
 import { accountEmail } from "./utils.js";
 import { candidateHomes, dedicatedHomesFor } from "./homes.js";
-import type { SyncAccountCredentialsOptions } from "./credentialSync.js";
+import type { CredentialSyncSkip, SyncAccountCredentialsOptions } from "./credentialSync.js";
 
 type RawClaudeKeychainReader = (homePath: string) => Promise<keychain.ClaudeKeychainReadResult>;
 
@@ -278,8 +278,21 @@ export type ClaudeChainParkingIntent = {
   source: string;
 };
 
-export type ChainSyncResult = { chain: ClaudeChain | null; vaultUpdated: boolean };
+export type ChainSyncResult = {
+  chain: ClaudeChain | null;
+  vaultUpdated: boolean;
+  skipped: CredentialSyncSkip[];
+};
 export type LockedChainSyncResult = ChainSyncResult & { parkingIntents: ClaudeChainParkingIntent[] };
+
+export type ClaudeChainIdentityProof = {
+  /** Exact decoded bytes read before the network lookup. */
+  raw: string;
+  /** Exact source locator read before the network lookup. */
+  source: string;
+  /** Authoritative email returned by Anthropic for this access token. */
+  email: string;
+};
 
 export type ChainSyncDeps = {
   /** Resolve a fresh token's identity (tests inject; default is the memoized OAuth profile lookup). */
@@ -287,6 +300,11 @@ export type ChainSyncDeps = {
   /** Read the exact representation Claude receives from Keychain. */
   readKeychainRaw?: RawClaudeKeychainReader;
   now?: () => number;
+  /**
+   * Automatic two-phase proofs. The wrapper obtains these without holding the
+   * account/home lock; the locked phase re-reads and byte-matches the content.
+   */
+  identityProofs?: readonly ClaudeChainIdentityProof[];
 };
 
 /**
@@ -311,6 +329,72 @@ export async function claudeProfileEmailCached(accessToken: string): Promise<str
   return email;
 }
 
+async function claudeSyncHomes(
+  account: AccountRecord,
+  extraHome: string | undefined,
+  options: SyncAccountCredentialsOptions,
+): Promise<Map<string, string>> {
+  const homes = new Map<string, string>();
+  if (options.homeScope !== "extra-only" && options.homeScope !== "machine-only") {
+    for (const home of await claudeHomesForAccount(account)) homes.set(resolve(home), home);
+  }
+  if (
+    extraHome
+    && !homes.has(resolve(extraHome))
+    && (options.trustExtraHome === true || await homeBelongsToAccount(extraHome, account))
+  ) {
+    homes.set(resolve(extraHome), extraHome);
+  }
+  return homes;
+}
+
+async function readClaudeSyncCandidate(
+  home: string,
+  readKeychainRaw: RawClaudeKeychainReader,
+): Promise<ClaudeChain | null> {
+  const [keychainRead, fileRaw] = await Promise.all([
+    readKeychainRaw(home),
+    readFile(join(home, ".credentials.json"), "utf8").catch(() => null),
+  ]);
+  if (keychainRead.status === "unreadable") return null;
+  const keychainRaw = keychainRead.status === "present" ? keychainRead.raw : null;
+  if (keychainRaw !== null) {
+    return isRawClaudeCredentialPayload(keychainRaw)
+      ? parseClaudeChain(keychainRaw, `${home}:keychain`)
+      : null;
+  }
+  return isRawClaudeCredentialPayload(fileRaw)
+    ? parseClaudeChain(fileRaw, `${home}:file`)
+    : null;
+}
+
+/**
+ * Phase one of automatic Claude recovery. Resolve provider identity without
+ * holding an activation/account lock. The locked importer accepts the proof
+ * only when a second authoritative read yields the exact same bytes/source.
+ */
+export async function prepareClaudeChainIdentityProofs(
+  account: AccountRecord,
+  extraHome?: string,
+  deps: Pick<ChainSyncDeps, "fetchProfileEmail" | "readKeychainRaw" | "now"> = {},
+  options: SyncAccountCredentialsOptions = {},
+): Promise<ClaudeChainIdentityProof[]> {
+  const profileOf = deps.fetchProfileEmail ?? claudeProfileEmailCached;
+  const readKeychainRaw = deps.readKeychainRaw ?? defaultRawClaudeKeychainReader();
+  const nowMs = (deps.now ?? Date.now)();
+  const vaultRaw = await readFile(join(accountDir(account), ".credentials.json"), "utf8").catch(() => null);
+  const vault = isRawClaudeCredentialPayload(vaultRaw) ? parseClaudeChain(vaultRaw, "vault") : null;
+  const proofs: ClaudeChainIdentityProof[] = [];
+  const homes = await claudeSyncHomes(account, extraHome, options);
+  await Promise.all([...homes.values()].map(async (home) => {
+    const chain = await readClaudeSyncCandidate(home, readKeychainRaw).catch(() => null);
+    if (!chain || !isBetterClaudeChain(chain, vault) || chain.expiresAt <= nowMs) return;
+    const email = await profileOf(String(chain.oauth.accessToken)).catch(() => null);
+    if (email) proofs.push({ raw: chain.raw, source: chain.source, email });
+  }));
+  return proofs.sort((a, b) => a.source.localeCompare(b.source));
+}
+
 /**
  * Pull the freshest attributed chain link into the vault. Reads the vault
  * snapshot plus every home attributable to the account (and extraHome when
@@ -324,14 +408,22 @@ export async function syncClaudeChainToVault(
   deps: ChainSyncDeps = {},
   options: SyncAccountCredentialsOptions = {},
 ): Promise<ChainSyncResult> {
-  const locked = await withAccountLock(account.id, () => syncClaudeChainToVaultLocked(account, extraHome, deps, options));
+  const identityProofs = options.authorization === "automatic"
+    ? (deps.identityProofs ?? await prepareClaudeChainIdentityProofs(account, extraHome, deps, options))
+    : deps.identityProofs;
+  const locked = await withAccountLock(account.id, () => syncClaudeChainToVaultLocked(
+    account,
+    extraHome,
+    { ...deps, identityProofs },
+    options,
+  ));
   // Cross-account parking deliberately happens only after the scanned
   // account's lock is gone. The owner write then takes its own lock and
   // revalidates both registry ownership and vault freshness.
   for (const intent of locked.parkingIntents) {
     await fulfillClaudeChainParkingIntent(intent).catch(() => undefined);
   }
-  return { chain: locked.chain, vaultUpdated: locked.vaultUpdated };
+  return { chain: locked.chain, vaultUpdated: locked.vaultUpdated, skipped: locked.skipped };
 }
 
 export async function syncClaudeChainToVaultLocked(
@@ -344,17 +436,7 @@ export async function syncClaudeChainToVaultLocked(
   const vaultRaw = await readFile(vaultPath, "utf8").catch(() => null);
   const vault = isRawClaudeCredentialPayload(vaultRaw) ? parseClaudeChain(vaultRaw, "vault") : null;
   let refusedNonRaw = vaultRaw === null || isRawClaudeCredentialPayload(vaultRaw) ? 0 : 1;
-  const homes = new Map<string, string>();
-  if (options.homeScope !== "extra-only" && options.homeScope !== "machine-only") {
-    for (const home of await claudeHomesForAccount(account)) homes.set(resolve(home), home);
-  }
-  if (
-    extraHome &&
-    !homes.has(resolve(extraHome)) &&
-    (options.trustExtraHome === true || await homeBelongsToAccount(extraHome, account))
-  ) {
-    homes.set(resolve(extraHome), extraHome);
-  }
+  const homes = await claudeSyncHomes(account, extraHome, options);
   const expected = accountEmail(account);
   const profileOf = deps.fetchProfileEmail ?? claudeProfileEmailCached;
   const readKeychainRaw = deps.readKeychainRaw ?? defaultRawClaudeKeychainReader();
@@ -362,6 +444,19 @@ export async function syncClaudeChainToVaultLocked(
   let best = vault;
   const quarantinedHomes = new Set<string>();
   const parkingIntents = new Map<string, ClaudeChainParkingIntent>();
+  const skipped: CredentialSyncSkip[] = [];
+  const recordSkip = async (skip: CredentialSyncSkip): Promise<void> => {
+    skipped.push(skip);
+    if (options.authorization === "automatic" && options.emitSkipTelemetry !== false) {
+      await appendLedger({
+        type: "account.credential-sync-skipped",
+        account: account.id,
+        tool: "claude",
+        reason: skip.reason,
+        ...(skip.source ? { from: skip.source } : {}),
+      });
+    }
+  };
   for (const home of homes.values()) {
     const [keychainRead, fileRaw] = await Promise.all([
       readKeychainRaw(home),
@@ -389,6 +484,25 @@ export async function syncClaudeChainToVaultLocked(
     // the file when no keychain item exists at all.
     const chain = fromKeychain ?? (isRawClaudeCredentialPayload(fileRaw) ? parseClaudeChain(fileRaw, `${home}:file`) : null);
     if (!chain || !isBetterClaudeChain(chain, best)) continue;
+    if (options.authorization === "automatic") {
+      const proof = deps.identityProofs?.find((candidate) => candidate.source === chain.source && candidate.raw === chain.raw);
+      if (!expected || !proof) {
+        const sourceWasProved = deps.identityProofs?.some((candidate) => candidate.source === chain.source) === true;
+        await recordSkip({
+          reason: sourceWasProved ? "content-changed-after-proof" : "identity-unverifiable",
+          source: chain.source,
+        });
+        continue;
+      }
+      if (proof.email !== expected) {
+        const intent = await planClaudeChainParking(chain, proof.email, account).catch(() => null);
+        if (intent) parkingIntents.set(`${intent.ownerId}\0${intent.chainRaw}`, intent);
+        await recordSkip({ reason: "foreign-identity", source: chain.source });
+        continue;
+      }
+      best = chain;
+      continue;
+    }
     // Adopting a home chain rewrites the vault — the one moment a foreign
     // chain can hijack the account. A dedicated home is the account's by
     // construction, but its CONTENTS may not be: racing account swaps stamp
@@ -420,7 +534,9 @@ export async function syncClaudeChainToVaultLocked(
       refusedSources: refusedNonRaw,
     }).catch(() => undefined);
   }
-  if (!best || best === vault) return { chain: best, vaultUpdated: false, parkingIntents: [...parkingIntents.values()] };
+  if (!best || best === vault) {
+    return { chain: best, vaultUpdated: false, skipped, parkingIntents: [...parkingIntents.values()] };
+  }
   // A rotated link harvested from one home is the only live link in the OAuth
   // chain. Keeping it in the vault alone strands every other active home on
   // the now-dead refresh token: their next turn fails even though the account
@@ -433,7 +549,7 @@ export async function syncClaudeChainToVaultLocked(
     from: best.source,
     expiresAt: new Date(best.expiresAt).toISOString(),
   });
-  return { chain: best, vaultUpdated: true, parkingIntents: [...parkingIntents.values()] };
+  return { chain: best, vaultUpdated: true, skipped, parkingIntents: [...parkingIntents.values()] };
 }
 
 /**
@@ -441,10 +557,12 @@ export async function syncClaudeChainToVaultLocked(
  * The returned intent is fulfilled only after the scanned account lock exits.
  */
 async function planClaudeChainParking(chain: ClaudeChain, email: string, notAccount: AccountRecord): Promise<ClaudeChainParkingIntent | null> {
-  const owner = (await listAccounts()).find(
+  const owners = (await listAccounts()).filter(
     (candidate) => candidate.tool === "claude" && candidate.id !== notAccount.id && accountEmail(candidate) === email,
   );
-  if (!owner) return null;
+  // Email-only Claude identity cannot distinguish duplicate registrations.
+  if (owners.length !== 1) return null;
+  const owner = owners[0]!;
   return {
     ownerId: owner.id,
     ownerEmail: email,
@@ -463,13 +581,13 @@ export async function fulfillClaudeChainParkingIntent(intent: ClaudeChainParking
     // victim's lock and waited for the owner. Re-read/validate both before the
     // write, then compare against the owner's current vault inside the same
     // critical section so an already-fresher rotation always wins.
-    const owner = (await listAccounts()).find(
-      (candidate) => candidate.id === intent.ownerId
-        && candidate.id !== intent.notAccountId
+    const owners = (await listAccounts()).filter(
+      (candidate) => candidate.id !== intent.notAccountId
         && candidate.tool === "claude"
         && accountEmail(candidate) === intent.ownerEmail,
     );
-    if (!owner) return;
+    if (owners.length !== 1 || owners[0]?.id !== intent.ownerId) return;
+    const owner = owners[0]!;
     const chain = parseClaudeChainStrict(intent.chainRaw, intent.source);
     if (!chain || chain.expiresAt !== intent.chainExpiresAt) return;
     const vault = parseClaudeChainStrict(
@@ -493,21 +611,22 @@ export async function fulfillClaudeChainParkingIntent(intent: ClaudeChainParking
  * lock; the rescue itself takes the OWNER's lock so it cannot interleave with
  * the owner's own refresh/persist of the same vault file.
  */
-export async function evacuateForeignClaudeChain(account: AccountRecord, homePath: string): Promise<void> {
+export async function evacuateForeignClaudeChain(
+  account: AccountRecord,
+  homePath: string,
+  options: Pick<SyncAccountCredentialsOptions, "authorization"> & Pick<ChainSyncDeps, "identityProofs"> = {},
+): Promise<ClaudeChainParkingIntent | null> {
   const occupant = await readHomeClaudeChain(homePath);
-  if (!occupant) return;
-  const email = await homeClaudeEmail(homePath);
-  if (!email || email === accountEmail(account)) return;
-  const owner = (await listAccounts()).find(
-    (candidate) => candidate.tool === "claude" && candidate.id !== account.id && accountEmail(candidate) === email,
+  if (!occupant) return null;
+  const proof = options.identityProofs?.find(
+    (candidate) => candidate.source === occupant.source && candidate.raw === occupant.raw,
   );
-  if (!owner) return;
-  await withAccountLock(owner.id, async () => {
-    const vault = parseClaudeChainStrict(await readFile(join(accountDir(owner), ".credentials.json"), "utf8").catch(() => null), "vault");
-    if (vault && vault.expiresAt >= occupant.expiresAt) return;
-    await saveClaudeChainToVaultLocked(owner, occupant.raw);
-    await appendLedger({ type: "account.chain-evacuate", account: owner.id, home: homePath });
-  }, { timeoutMs: CROSS_ACCOUNT_LOCK_TIMEOUT_MS });
+  // Automatic activation may only rescue exact bytes whose identity the
+  // provider proved before the home/account locks were acquired.
+  if (options.authorization === "automatic" && !proof) return null;
+  const email = proof?.email ?? await homeClaudeEmail(homePath);
+  if (!email || email === accountEmail(account)) return null;
+  return planClaudeChainParking(occupant, email, account);
 }
 
 // Claude Code's public OAuth client id (the same one the CLI itself uses).

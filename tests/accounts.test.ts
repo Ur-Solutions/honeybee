@@ -552,7 +552,7 @@ test("claude activation re-asserts the bypass flag every time, surviving a vault
   });
 });
 
-test("generic file-backed activation pulls newer dedicated-home credentials into the vault", async () => {
+test("generic file-backed activation declines unverifiable home import and still stamps vault-to-home", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("opencode", "minimax", { provider: "minimax-coding-plan" });
     const rel = join("xdg-data", "opencode", "auth.json");
@@ -571,9 +571,9 @@ test("generic file-backed activation pulls newer dedicated-home credentials into
     await activateAccountIntoHome(account, home);
 
     const vault = JSON.parse(await readFile(join(accountDir(account), rel), "utf8"));
-    assert.equal(vault["minimax-coding-plan"].key, "fresh-key");
+    assert.equal(vault["minimax-coding-plan"].key, "old-key");
     const activated = JSON.parse(await readFile(join(home, rel), "utf8"));
-    assert.equal(activated["minimax-coding-plan"].key, "fresh-key");
+    assert.equal(activated["minimax-coding-plan"].key, "old-key");
   });
 });
 
@@ -862,7 +862,7 @@ test("activation pulls a fresher home chain into the vault instead of stamping a
     await mkdir(home, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-live", now + 8 * 3_600_000, "r-live"));
 
-    await activateAccountIntoHome(account, home);
+    await activateAccountIntoHome(account, home, { fetchProfileEmail: async () => "rot@a.b" });
 
     const vault = JSON.parse(await readFile(join(accountDir(account), ".credentials.json"), "utf8"));
     assert.equal(vault.claudeAiOauth.accessToken, "tok-live");
@@ -934,7 +934,9 @@ test("activation rescues a foreign occupant's fresher chain into its own vault",
     await writeFile(join(home, ".credentials.json"), chainJson("tok-tenant-live", now + 8 * 3_600_000));
     await writeFile(join(home, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "tenant@b.c" } }));
 
-    await activateAccountIntoHome(incoming, home);
+    await activateAccountIntoHome(incoming, home, {
+      fetchProfileEmail: async (token) => token === "tok-tenant-live" ? "tenant@b.c" : "incoming@a.b",
+    });
 
     // The tenant's live link was evacuated before the stamp destroyed it.
     const tenantVault = JSON.parse(await readFile(join(accountDir(tenant), ".credentials.json"), "utf8"));

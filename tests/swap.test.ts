@@ -382,7 +382,7 @@ test("swapAccount threads the new account's model into the resumed opencode comm
   });
 });
 
-test("swapAccount rescues generic file-backed credentials before overwriting the home", async () => {
+test("swapAccount declines unverifiable generic rescue while activating the target vault", async () => {
   await withTempStore(async (dir) => {
     const { substrate } = fakeSubstrate(false);
     const currentAccount: AccountRecord = {
@@ -419,7 +419,7 @@ test("swapAccount rescues generic file-backed credentials before overwriting the
     });
 
     const rescued = JSON.parse(await readFile(join(accountDir(currentAccount), "xdg-data", "opencode", "auth.json"), "utf8"));
-    assert.equal(rescued["zai-coding-plan"].key, "fresh-current");
+    assert.equal(rescued["zai-coding-plan"].key, "old-current");
     const targetHome = join(dir, "homes", targetAccount.id);
     const stamped = JSON.parse(await readFile(join(targetHome, "xdg-data", "opencode", "auth.json"), "utf8"));
     assert.equal(stamped["zai-coding-plan"].key, "target-key");

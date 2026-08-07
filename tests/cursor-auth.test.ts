@@ -115,13 +115,13 @@ test("cursor sync pulls the live store only when it is attributable to the accou
     // (1) A FOREIGN login in the live store must never enter this vault.
     const foreign = makeJwt({ sub: "auth0|someone-else", iat: PAST_S + 100, exp: FUTURE_S });
     await writeFile(livePath, authJson({ accessToken: foreign }));
-    const refused = await syncCursorAuthToVault(account);
+    const refused = await syncCursorAuthToVault(account, undefined, { authorization: "automatic" });
     assert.equal(refused.vaultUpdated, false, "unattributed live tokens are refused");
 
     // (2) The account's own rotation (same JWT sub, newer iat) is pulled in.
     const rotated = makeJwt({ sub: "auth0|u1", iat: PAST_S + 200, exp: FUTURE_S });
     await writeFile(livePath, authJson({ accessToken: rotated }));
-    const pulled = await syncCursorAuthToVault(account);
+    const pulled = await syncCursorAuthToVault(account, undefined, { authorization: "automatic" });
     assert.equal(pulled.vaultUpdated, true, "the account's own rotation is pulled");
     const vault = JSON.parse(await readFile(join(accountDir(account), "auth.json"), "utf8")) as { accessToken: string };
     assert.equal(vault.accessToken, rotated);

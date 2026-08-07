@@ -10,6 +10,8 @@ import { accountEmail } from "./utils.js";
 import { dedicatedHomesFor, isDedicatedHomeForAccount } from "./homes.js";
 import {
   runCredentialSyncLocked,
+  type CredentialImportAuthorization,
+  type CredentialSyncSkip,
   type CredentialSyncStrategy,
   type SyncAccountCredentialsOptions,
 } from "./credentialSync.js";
@@ -246,6 +248,46 @@ export async function cursorAuthBelongsToAccount(
   return false;
 }
 
+async function authorizeCursorAuthImport(
+  snapshot: CursorAuthSnapshot,
+  account: AccountRecord,
+  vault: CursorAuthSnapshot | null,
+  options: SyncAccountCredentialsOptions,
+): Promise<CredentialImportAuthorization> {
+  if (options.authorization !== "automatic") {
+    return await cursorAuthBelongsToAccount(snapshot, account, vault)
+      ? { authorized: true }
+      : {
+          authorized: false,
+          reason: snapshot.subs.size === 0 && snapshot.emails.size === 0 ? "identity-unverifiable" : "foreign-identity",
+          source: snapshot.source,
+        };
+  }
+  // When the registry has an explicit identity, it is authoritative over a
+  // possibly already-poisoned vault snapshot. Opaque/API-key-only candidate
+  // bytes cannot be tied back to that identity and therefore fail closed.
+  const explicitEmail = accountEmail(account);
+  if (explicitEmail) {
+    if (snapshot.emails.size === 0) {
+      const stableSubMatch = vault !== null
+        && [...snapshot.subs].some((sub) => vault.subs.has(sub));
+      return stableSubMatch
+        ? { authorized: true }
+        : { authorized: false, reason: "identity-unverifiable", source: snapshot.source };
+    }
+    return [...snapshot.emails].every((email) => email === explicitEmail)
+      ? { authorized: true }
+      : { authorized: false, reason: "foreign-identity", source: snapshot.source };
+  }
+  return await cursorAuthBelongsToAccount(snapshot, account, vault)
+    ? { authorized: true }
+    : {
+        authorized: false,
+        reason: snapshot.subs.size === 0 && snapshot.emails.size === 0 ? "identity-unverifiable" : "foreign-identity",
+        source: snapshot.source,
+      };
+}
+
 function cursorAuthFreshnessMs(snapshot: CursorAuthSnapshot): number {
   return snapshot.issuedAtMs ?? snapshot.expiresAtMs ?? snapshot.mtimeMs;
 }
@@ -321,7 +363,11 @@ async function cursorHomesForAccount(
   return [...homes.values()];
 }
 
-export type CursorAuthSyncResult = { auth: CursorAuthSnapshot | null; vaultUpdated: boolean };
+export type CursorAuthSyncResult = {
+  auth: CursorAuthSnapshot | null;
+  vaultUpdated: boolean;
+  skipped: CredentialSyncSkip[];
+};
 
 const cursorSyncStrategy: CredentialSyncStrategy<CursorAuthSnapshot, CursorAuthSyncResult> = {
   readVaultSnapshot: (account) => readCursorAuthFile(join(accountDir(account), "auth.json"), "vault"),
@@ -329,7 +375,7 @@ const cursorSyncStrategy: CredentialSyncStrategy<CursorAuthSnapshot, CursorAuthS
   readHomeSnapshot: (_account, home) => (home === LIVE_STORE ? readCursorLiveAuth() : readCursorAuthFile(join(home, "auth.json"), `${home}:auth.json`)),
   // The identity guard is what keeps the machine-global live store — which may
   // hold ANY account's tokens — from poisoning this account's vault.
-  belongsToAccount: (snapshot, account, vault) => cursorAuthBelongsToAccount(snapshot, account, vault),
+  authorizeImport: authorizeCursorAuthImport,
   isFresher: isFresherCursorAuth,
   save: (account, snapshot) => saveCursorAuthToVaultLocked(account, snapshot.raw),
   ledger: (account, snapshot) => ({
@@ -339,7 +385,7 @@ const cursorSyncStrategy: CredentialSyncStrategy<CursorAuthSnapshot, CursorAuthS
     from: snapshot.source,
     ...(snapshot.issuedAtMs ? { refreshedAt: new Date(snapshot.issuedAtMs).toISOString() } : {}),
   }),
-  result: (auth, vaultUpdated) => ({ auth, vaultUpdated }),
+  result: (auth, vaultUpdated, skipped) => ({ auth, vaultUpdated, skipped }),
 };
 
 export async function syncCursorAuthToVault(

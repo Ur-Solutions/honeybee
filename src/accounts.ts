@@ -103,7 +103,11 @@ export {
 
 export { type GenericCredentialSyncResult, syncGenericCredentialsToVault } from "./accounts/genericSync.js";
 
-export { type SyncAccountCredentialsOptions } from "./accounts/credentialSync.js";
+export {
+  type CredentialImportAuthorization,
+  type CredentialSyncSkip,
+  type SyncAccountCredentialsOptions,
+} from "./accounts/credentialSync.js";
 
 export {
   type AccountCredentialSyncResult,

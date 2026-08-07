@@ -6,6 +6,8 @@ import { accountEmail, parseTimeMs } from "./utils.js";
 import { candidateHomes, dedicatedHomesFor, isDedicatedHomeForAccount } from "./homes.js";
 import {
   runCredentialSyncLocked,
+  type CredentialImportAuthorization,
+  type CredentialSyncSkip,
   type CredentialSyncStrategy,
   type SyncAccountCredentialsOptions,
 } from "./credentialSync.js";
@@ -116,6 +118,31 @@ async function grokAuthBelongsToAccount(snapshot: GrokAuthSnapshot | null, accou
   return emails.size === 0 || [...snapshot.emails].some((email) => emails.has(email));
 }
 
+async function authorizeGrokAuthImport(
+  snapshot: GrokAuthSnapshot,
+  account: AccountRecord,
+  vault: GrokAuthSnapshot | null,
+  options: SyncAccountCredentialsOptions,
+): Promise<CredentialImportAuthorization> {
+  if (options.authorization !== "automatic") {
+    return await grokAuthBelongsToAccount(snapshot, account, vault)
+      ? { authorized: true }
+      : { authorized: false, reason: "foreign-identity", source: snapshot.source };
+  }
+  const explicitEmail = accountEmail(account);
+  const expected = explicitEmail ? new Set([explicitEmail]) : await grokAccountEmails(account, vault);
+  if (expected.size === 0 || snapshot.emails.size === 0) {
+    return { authorized: false, reason: "identity-unverifiable", source: snapshot.source };
+  }
+  // A bundle can contain more than one auth entry. Every identity-bearing
+  // entry must belong to the account; one matching entry cannot launder a
+  // second foreign credential into the vault.
+  if (![...snapshot.emails].every((email) => expected.has(email))) {
+    return { authorized: false, reason: "foreign-identity", source: snapshot.source };
+  }
+  return { authorized: true };
+}
+
 async function homeBelongsToGrokAccount(homePath: string, account: AccountRecord, vault?: GrokAuthSnapshot | null): Promise<boolean> {
   const target = resolve(homePath);
   const dedicated = dedicatedHomesFor(account).some((dir) => resolve(dir) === target);
@@ -154,13 +181,17 @@ async function saveGrokAuthToVaultLocked(account: AccountRecord, sourceRaw: stri
   await atomicWriteFile(vaultPath, sourceRaw.endsWith("\n") ? sourceRaw : `${sourceRaw}\n`, { mode: 0o600 });
 }
 
-export type GrokAuthSyncResult = { auth: GrokAuthSnapshot | null; vaultUpdated: boolean };
+export type GrokAuthSyncResult = {
+  auth: GrokAuthSnapshot | null;
+  vaultUpdated: boolean;
+  skipped: CredentialSyncSkip[];
+};
 
 const grokSyncStrategy: CredentialSyncStrategy<GrokAuthSnapshot, GrokAuthSyncResult> = {
   readVaultSnapshot: (account) => readGrokAuthFile(join(accountDir(account), "auth.json"), "vault"),
   homesForAccount: (account, extraHome, options) => grokHomesForAccount(account, extraHome, options),
   readHomeSnapshot: (_account, home) => readHomeGrokAuth(home),
-  belongsToAccount: (snapshot, account, vault) => grokAuthBelongsToAccount(snapshot, account, vault),
+  authorizeImport: authorizeGrokAuthImport,
   isFresher: isFresherGrokAuth,
   save: (account, snapshot) => saveGrokAuthToVaultLocked(account, snapshot.raw),
   ledger: (account, snapshot) => ({
@@ -170,7 +201,7 @@ const grokSyncStrategy: CredentialSyncStrategy<GrokAuthSnapshot, GrokAuthSyncRes
     from: snapshot.source,
     ...(snapshot.createTimeMs ? { refreshedAt: new Date(snapshot.createTimeMs).toISOString() } : {}),
   }),
-  result: (auth, vaultUpdated) => ({ auth, vaultUpdated }),
+  result: (auth, vaultUpdated, skipped) => ({ auth, vaultUpdated, skipped }),
 };
 
 export async function syncGrokAuthToVault(

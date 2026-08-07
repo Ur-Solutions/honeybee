@@ -9,7 +9,13 @@ import { appendLedger } from "../store.js";
 import { accountDir, withAccountLock, listAccounts, CROSS_ACCOUNT_LOCK_TIMEOUT_MS, type AccountRecord } from "./registry.js";
 import { accountEmail, emailFromJwt, expFromJwt } from "./utils.js";
 import { candidateHomes, dedicatedHomesFor, defaultHomeForAccount } from "./homes.js";
-import { runCredentialSyncLocked, type CredentialSyncStrategy, type SyncAccountCredentialsOptions } from "./credentialSync.js";
+import {
+  runCredentialSyncLocked,
+  type CredentialImportAuthorization,
+  type CredentialSyncSkip,
+  type CredentialSyncStrategy,
+  type SyncAccountCredentialsOptions,
+} from "./credentialSync.js";
 
 const execFileP = promisify(execFile);
 
@@ -94,8 +100,51 @@ async function codexAccountEmails(account: AccountRecord, vault?: CodexAuthSnaps
 
 async function codexAuthBelongsToAccount(snapshot: CodexAuthSnapshot | null, account: AccountRecord, vault?: CodexAuthSnapshot | null): Promise<boolean> {
   if (!snapshot?.email) return true;
-  const emails = await codexAccountEmails(account, vault);
+  const explicitEmail = accountEmail(account);
+  const emails = explicitEmail ? new Set([explicitEmail]) : await codexAccountEmails(account, vault);
   return emails.size === 0 || emails.has(snapshot.email);
+}
+
+async function authorizeCodexAuthImport(
+  snapshot: CodexAuthSnapshot,
+  account: AccountRecord,
+  vault: CodexAuthSnapshot | null,
+  options: SyncAccountCredentialsOptions,
+): Promise<CredentialImportAuthorization> {
+  if (options.authorization !== "automatic") {
+    return await codexAuthBelongsToAccount(snapshot, account, vault)
+      ? { authorized: true }
+      : { authorized: false, reason: "foreign-identity", source: snapshot.source };
+  }
+
+  // Automatic recovery requires positive continuity with provider-issued
+  // identity in the vault/account record. Path ownership and a SessionRecord
+  // are never evidence about these bytes. When both dimensions exist, either
+  // one contradicting the account rejects the whole bundle.
+  let matched = false;
+  if (vault?.accountId) {
+    if (!snapshot.accountId) {
+      return { authorized: false, reason: "identity-unverifiable", source: snapshot.source };
+    }
+    if (snapshot.accountId !== vault.accountId) {
+      return { authorized: false, reason: "foreign-identity", source: snapshot.source };
+    }
+    matched = true;
+  }
+  const explicitEmail = accountEmail(account);
+  const emails = explicitEmail ? new Set([explicitEmail]) : await codexAccountEmails(account, vault);
+  if (emails.size > 0) {
+    if (!snapshot.email) {
+      return { authorized: false, reason: "identity-unverifiable", source: snapshot.source };
+    }
+    if (!emails.has(snapshot.email)) {
+      return { authorized: false, reason: "foreign-identity", source: snapshot.source };
+    }
+    matched = true;
+  }
+  return matched
+    ? { authorized: true }
+    : { authorized: false, reason: "identity-unverifiable", source: snapshot.source };
 }
 
 async function homeBelongsToCodexAccount(homePath: string, account: AccountRecord, vault?: CodexAuthSnapshot | null): Promise<boolean> {
@@ -136,13 +185,17 @@ async function saveCodexAuthToVaultLocked(account: AccountRecord, sourceRaw: str
   await atomicWriteFile(vaultPath, sourceRaw.endsWith("\n") ? sourceRaw : `${sourceRaw}\n`, { mode: 0o600 });
 }
 
-export type CodexAuthSyncResult = { auth: CodexAuthSnapshot | null; vaultUpdated: boolean };
+export type CodexAuthSyncResult = {
+  auth: CodexAuthSnapshot | null;
+  vaultUpdated: boolean;
+  skipped: CredentialSyncSkip[];
+};
 
 const codexSyncStrategy: CredentialSyncStrategy<CodexAuthSnapshot, CodexAuthSyncResult> = {
   readVaultSnapshot: (account) => readCodexAuthFile(join(accountDir(account), "auth.json"), "vault"),
   homesForAccount: (account, extraHome, options) => codexHomesForAccount(account, extraHome, options),
   readHomeSnapshot: (_account, home) => readHomeCodexAuth(home),
-  belongsToAccount: (snapshot, account, vault) => codexAuthBelongsToAccount(snapshot, account, vault),
+  authorizeImport: authorizeCodexAuthImport,
   isFresher: isFresherCodexAuth,
   save: (account, snapshot) => saveCodexAuthToVaultLocked(account, snapshot.raw),
   ledger: (account, snapshot) => ({
@@ -152,7 +205,7 @@ const codexSyncStrategy: CredentialSyncStrategy<CodexAuthSnapshot, CodexAuthSync
     from: snapshot.source,
     ...(snapshot.lastRefreshMs ? { lastRefreshAt: new Date(snapshot.lastRefreshMs).toISOString() } : {}),
   }),
-  result: (auth, vaultUpdated) => ({ auth, vaultUpdated }),
+  result: (auth, vaultUpdated, skipped) => ({ auth, vaultUpdated, skipped }),
 };
 
 /**
@@ -183,12 +236,14 @@ export async function syncCodexAuthToVaultLocked(
 // refresh token.
 export async function evacuateForeignCodexAuth(account: AccountRecord, homePath: string): Promise<void> {
   const occupant = await readHomeCodexAuth(homePath);
-  if (!occupant?.email) return;
-  if (await codexAuthBelongsToAccount(occupant, account)) return;
-  const owner = await findCodexAccountByEmail(occupant.email, account.id);
+  if (!occupant) return;
+  const currentVault = await readCodexAuthFile(join(accountDir(account), "auth.json"), "vault");
+  if ((await authorizeCodexAuthImport(occupant, account, currentVault, { authorization: "automatic" })).authorized) return;
+  const owner = await findCodexAccountForSnapshot(occupant, account.id);
   if (!owner) return;
   await withAccountLock(owner.id, async () => {
     const vault = await readCodexAuthFile(join(accountDir(owner), "auth.json"), "vault");
+    if (!(await authorizeCodexAuthImport(occupant, owner, vault, { authorization: "automatic" })).authorized) return;
     if (!isFresherCodexAuth(occupant, vault)) return;
     await saveCodexAuthToVaultLocked(owner, occupant.raw);
     await appendLedger({
@@ -201,11 +256,16 @@ export async function evacuateForeignCodexAuth(account: AccountRecord, homePath:
   }, { timeoutMs: CROSS_ACCOUNT_LOCK_TIMEOUT_MS });
 }
 
-async function findCodexAccountByEmail(email: string, excludeId?: string): Promise<AccountRecord | null> {
+async function findCodexAccountForSnapshot(snapshot: CodexAuthSnapshot, excludeId?: string): Promise<AccountRecord | null> {
+  const matches: AccountRecord[] = [];
   for (const candidate of (await listAccounts()).filter((account) => account.tool === "codex" && account.id !== excludeId)) {
-    if ((await codexAccountEmails(candidate)).has(email)) return candidate;
+    const vault = await readCodexAuthFile(join(accountDir(candidate), "auth.json"), "vault");
+    if ((await authorizeCodexAuthImport(snapshot, candidate, vault, { authorization: "automatic" })).authorized) {
+      matches.push(candidate);
+    }
   }
-  return null;
+  // Duplicate/ambiguous identities cannot prove which vault owns the bytes.
+  return matches.length === 1 ? matches[0]! : null;
 }
 
 /** Email claim from auth.json's id_token JWT — decoded, not verified (local fact). */

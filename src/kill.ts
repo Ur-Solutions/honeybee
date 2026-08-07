@@ -244,8 +244,9 @@ async function openStopFailedRequest(record: SessionRecord, lastError: string): 
 /**
  * Harvest a runner home's last rotated credential after its process is
  * confirmed gone, before retire/purge makes the SessionRecord historical or
- * removes it. The explicit record binding is the trust proof for an arbitrary
- * home; provider-specific sync still validates identities where possible.
+ * removes it. The record plus physical owner validation authorizes the home as
+ * a locator; the isolated worker still requires provider content identity
+ * before those bytes may enter the account vault.
  */
 export async function syncSessionCredentialsOnExit(record: SessionRecord, timeoutMs?: number): Promise<void> {
   if (!record.accountId || !record.homePath) return;

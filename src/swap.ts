@@ -201,7 +201,10 @@ export async function swapAccount(
     const rescueRegistry = current.accountId && accountRegistry.length === 0 ? await (options.listAccounts ?? listAccounts)() : accountRegistry;
     const currentAccount = current.accountId ? rescueRegistry.find((candidate) => candidate.id === current.accountId) : undefined;
     if (currentAccount && currentAccount.tool === tool && currentAccount.id !== account.id) {
-      await syncAccountCredentialsToVault(currentAccount, sourceHomePath, { trustExtraHome: true }).catch(() => undefined);
+      await syncAccountCredentialsToVault(currentAccount, sourceHomePath, {
+        authorization: "automatic",
+        trustExtraHome: true,
+      }).catch(() => undefined);
     }
     let spec: ReturnType<typeof resolveAgent>;
     let paneId: string | undefined;

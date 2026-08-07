@@ -5,6 +5,7 @@ import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./re
 import { dedicatedHomesFor, isDedicatedHomeForAccount } from "./homes.js";
 import {
   runCredentialSyncLocked,
+  type CredentialSyncSkip,
   type CredentialSyncStrategy,
   type SyncAccountCredentialsOptions,
 } from "./credentialSync.js";
@@ -21,7 +22,11 @@ type GenericCredentialBundle = {
   source: string;
 };
 
-export type GenericCredentialSyncResult = { credentials: GenericCredentialBundle | null; vaultUpdated: boolean };
+export type GenericCredentialSyncResult = {
+  credentials: GenericCredentialBundle | null;
+  vaultUpdated: boolean;
+  skipped: CredentialSyncSkip[];
+};
 
 async function genericCredentialHomesForAccount(
   account: AccountRecord,
@@ -76,14 +81,17 @@ async function saveGenericCredentialBundleToVaultLocked(account: AccountRecord, 
   }
 }
 
-// No belongsToAccount guard: genericCredentialHomesForAccount only ever yields
-// dedicated (or explicitly session-trusted) homes, so every candidate is the
-// account's by construction — the file bytes carry no common identity claim to
-// re-verify against.
+// Generic bytes have no content identity. Explicit/manual sync can still use
+// path attribution as an operator-directed recovery action, but the shared
+// engine rejects them in automatic mode because this strategy deliberately
+// supplies no authorizeImport implementation.
 const genericSyncStrategy: CredentialSyncStrategy<GenericCredentialBundle, GenericCredentialSyncResult> = {
   readVaultSnapshot: (account) => readGenericCredentialBundle(account, accountDir(account), "vault"),
   homesForAccount: (account, extraHome, options) => genericCredentialHomesForAccount(account, extraHome, options),
   readHomeSnapshot: (account, home) => readGenericCredentialBundle(account, home, home),
+  authorizeImport: (bundle, _account, _vault, options) => options.authorization === "automatic"
+    ? { authorized: false, reason: "identity-unverifiable", source: bundle.source }
+    : { authorized: true },
   isFresher: isFresherGenericCredentialBundle,
   save: (account, bundle) => saveGenericCredentialBundleToVaultLocked(account, bundle),
   ledger: (account, bundle) => ({
@@ -94,7 +102,7 @@ const genericSyncStrategy: CredentialSyncStrategy<GenericCredentialBundle, Gener
     files: bundle.files.map((file) => file.relative),
     refreshedAt: new Date(bundle.freshnessMs).toISOString(),
   }),
-  result: (credentials, vaultUpdated) => ({ credentials, vaultUpdated }),
+  result: (credentials, vaultUpdated, skipped) => ({ credentials, vaultUpdated, skipped }),
 };
 
 export async function syncGenericCredentialsToVault(

@@ -13,6 +13,7 @@ import {
   activationHomeOwnerPath,
   addAccount,
   canonicalActivationHomePath,
+  syncAccountCredentialsToVault,
   withActivationHomeLock,
   withAccountLock,
   withReadyActivationHomeOwner,
@@ -151,7 +152,7 @@ test("credential sweep runs canonical accounts once and skips their dedicated se
       listSessions: async () => records,
       syncAccount: async (_account, home, options) => {
         calls.push({ ...(home ? { home } : {}), ...(options?.trustExtraHome ? { trusted: true } : {}) });
-        return { auth: null, vaultUpdated: false };
+        return { auth: null, vaultUpdated: false, skipped: [] };
       },
       accountHomes: async () => [canonicalHome],
       now: (() => {
@@ -232,12 +233,15 @@ test("unstamped nominal homes require affirmative legacy account evidence", asyn
     const relative = join("xdg-data", "opencode", "auth.json");
     const originalVault = join(accountDir(original), relative);
     const nominalHome = join(root, "homes", original.id);
+    const syncExplicitly = (account: AccountRecord, home?: string, options = {}) =>
+      syncAccountCredentialsToVault(account, home, { ...options, authorization: "explicit" });
     await writeDated(originalVault, genericAuth("legacy-a-vault"), "2026-08-07T08:00:00.000Z");
     await writeDated(join(nominalHome, relative), genericAuth("unattributed-b-home"), "2026-08-07T08:10:00.000Z");
 
     const unproven = await runCredentialSweep({
       listAccounts: async () => [original],
       listSessions: async () => [],
+      syncAccount: syncExplicitly,
       accountHomes: async () => [nominalHome],
       concurrency: 1,
     });
@@ -251,6 +255,7 @@ test("unstamped nominal homes require affirmative legacy account evidence", asyn
       listSessions: async () => [
         record("CO.legacy-a", original.id, nominalHome, "2026-08-07T08:20:00.000Z", "done"),
       ],
+      syncAccount: syncExplicitly,
       accountHomes: async () => [nominalHome],
       concurrency: 1,
     });
@@ -266,6 +271,8 @@ test("a ready owner stamp yields to newer live mixed-version session evidence", 
     const relative = join("xdg-data", "opencode", "auth.json");
     const originalVault = join(accountDir(original), relative);
     const nominalHome = join(root, "homes", original.id);
+    const syncExplicitly = (account: AccountRecord, home?: string, options = {}) =>
+      syncAccountCredentialsToVault(account, home, { ...options, authorization: "explicit" });
     await writeDated(originalVault, genericAuth("stamped-a-vault"), "2026-08-07T08:00:00.000Z");
     await writeDated(join(nominalHome, relative), genericAuth("mixed-version-b-home"), "2026-08-07T08:10:00.000Z");
     const ownerPath = await activationHomeOwnerPath(nominalHome);
@@ -285,6 +292,7 @@ test("a ready owner stamp yields to newer live mixed-version session evidence", 
     const rejected = await runCredentialSweep({
       listAccounts: async () => [original],
       listSessions: async () => [liveForeign],
+      syncAccount: syncExplicitly,
       accountHomes: async () => [nominalHome],
       concurrency: 1,
     });
@@ -297,6 +305,7 @@ test("a ready owner stamp yields to newer live mixed-version session evidence", 
     const recovered = await runCredentialSweep({
       listAccounts: async () => [original],
       listSessions: async () => [{ ...liveForeign, status: "done", updatedAt: "2026-08-07T08:10:00.000Z" }],
+      syncAccount: syncExplicitly,
       accountHomes: async () => [nominalHome],
       concurrency: 1,
     });

@@ -383,13 +383,17 @@ export async function runCredentialSweep(
         const evidence = plan.pairs.find((pair) => pair.account.id === account.id && pair.homePath === canonicalHome)?.evidence;
         const outcome = await withAuthorizedSweepHome(plan, account, rawHome, evidence, (lockedHome, stampedOwner) =>
           deps.syncAccount(account, lockedHome, {
+            authorization: "automatic",
             trustExtraHome: stampedOwner || dedicatedHomesById.get(account.id)?.has(canonicalHome) === true || Boolean(evidence),
             homeScope: "extra-only",
           }));
         if (outcome.authorized && outcome.value?.vaultUpdated) telemetry.vaultUpdates += 1;
       }
       if (account.tool === "cursor") {
-        const result = await deps.syncAccount(account, undefined, { homeScope: "machine-only" });
+        const result = await deps.syncAccount(account, undefined, {
+          authorization: "automatic",
+          homeScope: "machine-only",
+        });
         if (result.vaultUpdated) telemetry.vaultUpdates += 1;
       }
       telemetry.completedAccounts += 1;
@@ -404,7 +408,11 @@ export async function runCredentialSweep(
       deps.onProgress?.({ type: "work-start", workId: pairWorkId, pairIds: [pair.id] });
       try {
         const outcome = await withAuthorizedSweepHome(plan, account, pair.homePath, pair.evidence, (lockedHome) =>
-          deps.syncAccount(account, lockedHome, { trustExtraHome: true, homeScope: "extra-only" }));
+          deps.syncAccount(account, lockedHome, {
+            authorization: "automatic",
+            trustExtraHome: true,
+            homeScope: "extra-only",
+          }));
         if (outcome.authorized) {
           telemetry.completedPairs += 1;
           if (outcome.value?.vaultUpdated) telemetry.vaultUpdates += 1;
@@ -472,6 +480,7 @@ export async function runCredentialPairSync(
   deps.onProgress?.({ type: "work-start", workId: 1, pairIds: [0] });
   try {
     const synced = await deps.syncAccount(account, resolve(homePath), {
+      authorization: "automatic",
       trustExtraHome: true,
       homeScope: "extra-only",
     });

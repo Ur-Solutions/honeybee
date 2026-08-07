@@ -22,11 +22,14 @@ import {
   fulfillClaudeChainParkingIntent,
   mergeCredentialsJson,
   parseClaudeChainStrict,
+  prepareClaudeChainIdentityProofs,
   refreshVaultClaudeChainIfStaleLocked,
   syncClaudeChainToVaultLocked,
+  type ClaudeChainIdentityProof,
   type ClaudeChainParkingIntent,
   type RefreshedClaudeToken,
 } from "./claudeChain.js";
+import type { CredentialSyncSkip } from "./credentialSync.js";
 import { accountEmail } from "./utils.js";
 import { evacuateForeignCodexAuth, syncCodexAuthToVaultLocked } from "./codexAuth.js";
 import {
@@ -171,6 +174,8 @@ export type ActivateAccountOptions = {
   /** Profile lookup override (tests). Defaults to claudeProfileEmailCached. */
   fetchProfileEmail?: (accessToken: string) => Promise<string | null>;
   now?: () => number;
+  /** Internal two-phase automatic-import proof, populated before locking. */
+  claudeIdentityProofs?: readonly ClaudeChainIdentityProof[];
   /** Always-on phase observation; receives durations and secret-free lock owners. */
   onTiming?: (timing: ActivationTiming) => void;
 };
@@ -204,6 +209,18 @@ function timeActivationStep<T>(ctx: ActivationContext, phase: string, fn: () => 
   return ctx.time ? ctx.time(phase, fn) : fn();
 }
 
+function deferCredentialSyncSkips(ctx: ActivationContext, skipped: readonly CredentialSyncSkip[]): void {
+  for (const skip of skipped) {
+    ctx.deferredLedger?.push({
+      type: "account.credential-sync-skipped",
+      account: ctx.account.id,
+      tool: ctx.account.tool,
+      reason: skip.reason,
+      ...(skip.source ? { from: skip.source } : {}),
+    });
+  }
+}
+
 type ActivationHooks = {
   /** Runs before the copy: pull the freshest live credential into the vault; may refuse. */
   preActivate?(ctx: ActivationContext): Promise<void>;
@@ -219,11 +236,27 @@ async function claudePreActivate(ctx: ActivationContext): Promise<void> {
   // rotated live link exists only there — rescue it into its own vault
   // before stamping over it, or that account's next activation revives a
   // dead link and logs it out.
-  await timeActivationStep(ctx, "rescue-foreign", () => evacuateForeignClaudeChain(account, homePath).catch(() => undefined));
+  const rescueIntent = await timeActivationStep(ctx, "rescue-foreign", () => evacuateForeignClaudeChain(account, homePath, {
+    authorization: "automatic",
+    identityProofs: options.claudeIdentityProofs,
+  }).catch(() => null));
+  if (rescueIntent) ctx.deferredClaudeParking?.push(rescueIntent);
   // (2) Pull the account's own freshest link into the vault so we never
   // stamp a dead link over a live one.
-  const synced = await timeActivationStep(ctx, "sync-vault", () => syncClaudeChainToVaultLocked(account, homePath).catch(() => undefined));
-  if (synced?.parkingIntents.length) ctx.deferredClaudeParking?.push(...synced.parkingIntents);
+  const synced = await timeActivationStep(ctx, "sync-vault", () => syncClaudeChainToVaultLocked(
+    account,
+    homePath,
+    {
+      identityProofs: options.claudeIdentityProofs,
+      fetchProfileEmail: options.fetchProfileEmail,
+      now: options.now,
+    },
+    { authorization: "automatic", trustExtraHome: true, emitSkipTelemetry: false },
+  ).catch(() => undefined));
+  if (synced) {
+    if (synced.parkingIntents.length) ctx.deferredClaudeParking?.push(...synced.parkingIntents);
+    deferCredentialSyncSkips(ctx, synced.skipped);
+  }
   // (3) A stale chain would make claude boot onto an expired access token
   // and replay a possibly-rotated refresh token. Refresh it ourselves and
   // persist the rotation; on failure, refuse to stamp a known-dead chain.
@@ -244,16 +277,28 @@ async function codexPreActivate(ctx: ActivationContext): Promise<void> {
   await timeActivationStep(ctx, "rescue-foreign", () => evacuateForeignCodexAuth(account, homePath).catch((error) => {
     warn(`could not rescue existing Codex auth from ${homePath}: ${error instanceof Error ? error.message : String(error)}`);
   }));
-  await timeActivationStep(ctx, "sync-vault", () => syncCodexAuthToVaultLocked(account, homePath).catch((error) => {
+  const synced = await timeActivationStep(ctx, "sync-vault", () => syncCodexAuthToVaultLocked(account, homePath, {
+    authorization: "automatic",
+    trustExtraHome: true,
+    emitSkipTelemetry: false,
+  }).catch((error) => {
     warn(`could not sync refreshed Codex auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
   }));
+  if (synced) deferCredentialSyncSkips(ctx, synced.skipped);
 }
 
 async function grokPreActivate(ctx: ActivationContext): Promise<void> {
   const { account, homePath, options, warn } = ctx;
-  await timeActivationStep(ctx, "sync-vault", () => syncGrokAuthToVaultLocked(account, homePath).catch((error) => {
+  const synced = await timeActivationStep(ctx, "sync-vault", () => syncGrokAuthToVaultLocked(account, homePath, {
+    authorization: "automatic",
+    trustExtraHome: true,
+    emitSkipTelemetry: false,
+  }).catch((error) => {
     warn(`could not sync refreshed Grok auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
   }));
+  if (synced) deferCredentialSyncSkips(ctx, synced.skipped);
   const vault = await readGrokAuthFile(join(accountDir(account), "auth.json"), "vault");
   const reason = grokAuthUnavailableReason(vault, options.now?.() ?? Date.now());
   if (reason) {
@@ -267,9 +312,14 @@ async function cursorPreActivate(ctx: ActivationContext): Promise<void> {
   // persists whatever token a bee last used into the machine-global store, so
   // the sync's identity guard (JWT sub ↔ recorded authId) decides whether the
   // live store is this account's rotation or another account's session.
-  await timeActivationStep(ctx, "sync-vault", () => syncCursorAuthToVaultLocked(account).catch((error) => {
+  const synced = await timeActivationStep(ctx, "sync-vault", () => syncCursorAuthToVaultLocked(account, undefined, {
+    authorization: "automatic",
+    emitSkipTelemetry: false,
+  }).catch((error) => {
     warn(`could not sync refreshed cursor auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
   }));
+  if (synced) deferCredentialSyncSkips(ctx, synced.skipped);
   const vault = await readCursorAuthFile(join(accountDir(account), "auth.json"), "vault");
   const reason = cursorAuthUnavailableReason(vault, options.now?.() ?? Date.now());
   if (reason) {
@@ -282,9 +332,15 @@ async function genericPreActivate(ctx: ActivationContext): Promise<void> {
   // Other identity recipes are file-based. Pull back changes only from the
   // account's attributed homes; arbitrary --home paths are not trusted here
   // because their credential files do not carry a common identity claim.
-  await timeActivationStep(ctx, "sync-vault", () => syncGenericCredentialsToVaultLocked(account, homePath).catch((error) => {
+  const synced = await timeActivationStep(ctx, "sync-vault", () => syncGenericCredentialsToVaultLocked(account, homePath, {
+    authorization: "automatic",
+    trustExtraHome: true,
+    emitSkipTelemetry: false,
+  }).catch((error) => {
     warn(`could not sync refreshed credentials for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
   }));
+  if (synced) deferCredentialSyncSkips(ctx, synced.skipped);
 }
 
 async function codexSeedHomeDefaults({ homePath, written }: ActivationContext): Promise<void> {
@@ -667,13 +723,31 @@ async function performAccountActivation(
   const warn = options.onWarn ?? (() => undefined);
   const hooks = activationHooksFor(account.tool);
   const timing = emptyActivationTiming();
+  let effectiveOptions = options;
+  if (account.tool === "claude") {
+    // Provider identity lookup must not retain either the physical-home lock
+    // or the account lock. The locked phase below re-reads and byte-matches
+    // this proof before importing anything from a home.
+    const proofStarted = performance.now();
+    const claudeIdentityProofs = await prepareClaudeChainIdentityProofs(
+      account,
+      homePath,
+      {
+        fetchProfileEmail: options.fetchProfileEmail,
+        now: options.now,
+      },
+      { authorization: "automatic", trustExtraHome: true },
+    );
+    timing.preActivateStepsMs["identity-proof"] = performance.now() - proofStarted;
+    effectiveOptions = { ...options, claudeIdentityProofs };
+  }
   const deferredLedger: Array<Record<string, unknown>> = [];
   const deferredClaudeParking: ClaudeChainParkingIntent[] = [];
   const ctx: ActivationContext = {
     account,
     homePath,
     recipe,
-    options,
+    options: effectiveOptions,
     warn,
     written: [],
     deferredLedger,
