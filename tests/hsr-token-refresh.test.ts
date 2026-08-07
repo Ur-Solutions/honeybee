@@ -13,7 +13,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { test } from "node:test";
 
 import { codexNotificationToEvents, isCodexAuthExpiryError } from "../src/hsr/adapters/codex.js";
@@ -296,7 +296,7 @@ test("refreshCreds RPC: restarts with resume, shreds the OLD credential, records
       await waitFor(() => fileExists(oldPath), "old credential written");
       await waitFor(async () => (await readHsrMeta(bee))?.sessionId === "thread-x", "session id learned");
       assert.equal(await readFile(oldPath, "utf8"), OLD);
-      assert.deepEqual(await readDeliveredCredentials(bee), [oldPath]);
+      assert.deepEqual(await readDeliveredCredentials(bee), [await realpath(oldPath)]);
 
       // Refresh: deliver a fresh credential (different filename) and restart+resume.
       const refreshRes = (await controller.methods.refreshCreds!({
@@ -311,7 +311,7 @@ test("refreshCreds RPC: restarts with resume, shreds the OLD credential, records
       await waitFor(() => fileExists(newPath), "new credential delivered");
       assert.equal(await readFile(newPath, "utf8"), NEW);
       assert.equal((await stat(newPath)).mode & 0o777, 0o600);
-      assert.deepEqual(await readDeliveredCredentials(bee), [newPath], "kill now shreds the NEW credential");
+      assert.deepEqual(await readDeliveredCredentials(bee), [await realpath(newPath)], "kill now shreds the NEW credential");
 
       // The runner is live again on the SAME thread id after the restart.
       await waitFor(async () => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -114,7 +114,7 @@ test("rejecting in-memory stop with a live unverifiable child fails kill, refres
     assert.equal(refreshed.ok, false);
     assert.match(refreshed.error ?? "", /stop unconfirmed/);
     assert.equal(await readFile(credential, "utf8"), "old-secret");
-    assert.deepEqual(await readDeliveredCredentials(bee), [credential]);
+    assert.deepEqual(await readDeliveredCredentials(bee), [await realpath(credential)]);
 
     await assert.rejects(controller.close(), /unconfirmed HSR runtimes.*rejecting-live-handle/);
     assert.equal(existsSync(hsrRunDir(bee)), true);
