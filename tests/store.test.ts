@@ -296,7 +296,7 @@ test("direct active listing discovers an older-writer record without a daemon or
   });
 });
 
-test("a later strict caller cannot join a pre-writer in-flight snapshot", async () => {
+test("a later strict caller cannot join stale records after the global index advances", async () => {
   await withTempStore(async (dir) => {
     const indexed = makeRecord(dir, { name: "CO.flight-old", tmuxTarget: "CO.flight-old" });
     await saveSession(indexed);
@@ -317,6 +317,10 @@ test("a later strict caller cannot join a pre-writer in-flight snapshot", async 
     const temporary = join(dir, "sessions", ".CO.flight-new.legacy-tmp");
     await writeFile(temporary, JSON.stringify(oldWriter));
     await rename(temporary, join(dir, "sessions", "CO.flight-new.json"));
+    // A background reconciler can publish G+1 while A still holds its old G
+    // records. B must compare against the generation attached to A's result,
+    // never this newer global index.
+    await rebuildActiveSessionIndex();
     const second = listActiveSessions();
     releaseSnapshot();
 

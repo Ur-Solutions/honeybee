@@ -208,7 +208,7 @@ async function defaultAccountHomes(account: AccountRecord): Promise<string[]> {
   return homes;
 }
 
-function legacyForeignBinding(
+function legacyOwnBinding(
   plan: CredentialSweepPlan,
   accountId: string,
   canonicalHomePath: string,
@@ -221,7 +221,16 @@ function legacyForeignBinding(
       if (!ownEvidence || preferEvidence(binding.record, ownEvidence)) ownEvidence = binding.record;
     }
   }
-  const ownTime = ownEvidence ? evidenceTime(ownEvidence) : 0;
+  return ownEvidence ?? null;
+}
+
+function legacyForeignBinding(
+  plan: CredentialSweepPlan,
+  accountId: string,
+  canonicalHomePath: string,
+  ownEvidence: SessionRecord,
+): SessionRecord | null {
+  const ownTime = evidenceTime(ownEvidence);
   const foreign = plan.bindings
     .filter((binding) =>
       binding.homePath === canonicalHomePath &&
@@ -249,8 +258,15 @@ async function withAuthorizedSweepHome<T>(
     if (owner) {
       if (owner.state !== "ready" || owner.accountId !== account.id) return { authorized: false };
       stampedOwner = true;
-    } else if (legacyForeignBinding(plan, account.id, canonicalHomePath, evidence)) {
-      return { authorized: false };
+    } else {
+      // A nominal/dedicated pathname is not ownership proof: public --home
+      // activation can rebind it, and pre-upgrade homes have no durable owner
+      // stamp. Require affirmative same-account SessionRecord evidence, then
+      // reject any newer or live foreign binding for the same physical home.
+      const ownEvidence = legacyOwnBinding(plan, account.id, canonicalHomePath, evidence);
+      if (!ownEvidence || legacyForeignBinding(plan, account.id, canonicalHomePath, ownEvidence)) {
+        return { authorized: false };
+      }
     }
     return { authorized: true, value: await fn(canonicalHomePath, stampedOwner) };
   });

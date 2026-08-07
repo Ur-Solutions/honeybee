@@ -225,6 +225,39 @@ test("periodic account scan skips a nominal home rebound to a foreign ready owne
   });
 });
 
+test("unstamped nominal homes require affirmative legacy account evidence", async () => {
+  await withTempStore(async (root) => {
+    const original = await addAccount("opencode", "legacy-proof", { provider: "zai-coding-plan" });
+    const relative = join("xdg-data", "opencode", "auth.json");
+    const originalVault = join(accountDir(original), relative);
+    const nominalHome = join(root, "homes", original.id);
+    await writeDated(originalVault, genericAuth("legacy-a-vault"), "2026-08-07T08:00:00.000Z");
+    await writeDated(join(nominalHome, relative), genericAuth("unattributed-b-home"), "2026-08-07T08:10:00.000Z");
+
+    const unproven = await runCredentialSweep({
+      listAccounts: async () => [original],
+      listSessions: async () => [],
+      accountHomes: async () => [nominalHome],
+      concurrency: 1,
+    });
+    assert.match(await readFile(originalVault, "utf8"), /legacy-a-vault/);
+    assert.doesNotMatch(await readFile(originalVault, "utf8"), /unattributed-b-home/);
+    assert.equal(unproven.vaultUpdates, 0, "a dedicated pathname alone does not authorize credential bytes");
+
+    await writeDated(join(nominalHome, relative), genericAuth("legacy-a-rotated"), "2026-08-07T08:20:00.000Z");
+    const proven = await runCredentialSweep({
+      listAccounts: async () => [original],
+      listSessions: async () => [
+        record("CO.legacy-a", original.id, nominalHome, "2026-08-07T08:20:00.000Z", "done"),
+      ],
+      accountHomes: async () => [nominalHome],
+      concurrency: 1,
+    });
+    assert.match(await readFile(originalVault, "utf8"), /legacy-a-rotated/);
+    assert.equal(proven.vaultUpdates, 1, "affirmative same-account legacy evidence permits recovery");
+  });
+});
+
 test("periodic extra pair skips stale account evidence when a newer live foreign session owns the home", async () => {
   await withTempStore(async (root) => {
     const original = await addAccount("opencode", "extra-original", { provider: "zai-coding-plan" });

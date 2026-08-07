@@ -743,7 +743,12 @@ const DEFAULT_LIST_SESSION_CONCURRENCY = 32;
 const ACTIVE_INDEX_READ_WARNING_INTERVAL_MS = 60_000;
 const listSessionsInFlight = new Map<string, Promise<SessionRecord[]>>();
 const listActiveSessionsHotInFlight = new Map<string, Promise<SessionRecord[]>>();
-const listActiveSessionsSafetyInFlight = new Map<string, Promise<SessionRecord[]>>();
+type ActiveSessionsSafetySnapshot = {
+  records: SessionRecord[];
+  /** Directory generation carried by the exact index used for `records`. */
+  directoryMtimeMs: { current: number; legacy: number } | null;
+};
+const listActiveSessionsSafetyInFlight = new Map<string, Promise<ActiveSessionsSafetySnapshot>>();
 const activeIndexReadWarningAt = new Map<string, number>();
 
 function reportActiveIndexReadFailures(
@@ -844,12 +849,11 @@ async function listActiveSessionsForCaller(
   // the shared flight: a caller arriving after an older-writer rename must not
   // inherit an earlier caller's already-in-flight projection.
   const callerGeneration = await sessionDirectoryMtimes(paths);
-  const records = await sharedActiveSessionsSafetySnapshot(paths, options);
-  const index = await readActiveSessionIndex(paths.root);
+  const snapshot = await sharedActiveSessionsSafetySnapshot(paths, options);
   if (
-    index?.directoryMtimeMs?.current === callerGeneration.current &&
-    index.directoryMtimeMs.legacy === callerGeneration.legacy
-  ) return records;
+    snapshot.directoryMtimeMs?.current === callerGeneration.current &&
+    snapshot.directoryMtimeMs.legacy === callerGeneration.legacy
+  ) return snapshot.records;
   if (attempt >= ACTIVE_SESSION_CALLER_GENERATION_ATTEMPTS) {
     throw new Error("active-session directory generation advanced across every strict snapshot attempt");
   }
@@ -859,7 +863,7 @@ async function listActiveSessionsForCaller(
 function sharedActiveSessionsSafetySnapshot(
   paths: StorePaths,
   options: ListActiveSessionsOptions,
-): Promise<SessionRecord[]> {
+): Promise<ActiveSessionsSafetySnapshot> {
   const current = listActiveSessionsSafetyInFlight.get(paths.root);
   if (current) return current;
 
@@ -877,9 +881,9 @@ function sharedActiveSessionsSafetySnapshot(
         { timeoutMs: 60_000 },
       );
     }
-    const records = await listActiveSessionsSnapshot(paths, { ambiguousReadPolicy: "reject" });
+    const snapshot = await listActiveSessionsSnapshotWithIndex(paths, { ambiguousReadPolicy: "reject" });
     await options.onSnapshotRead?.();
-    return records;
+    return snapshot;
   })().finally(() => {
     if (listActiveSessionsSafetyInFlight.get(paths.root) === pending) {
       listActiveSessionsSafetyInFlight.delete(paths.root);
@@ -913,6 +917,13 @@ async function listActiveSessionsSnapshot(
   paths: StorePaths,
   options: { ambiguousReadPolicy: "tolerate" | "reject" },
 ): Promise<SessionRecord[]> {
+  return (await listActiveSessionsSnapshotWithIndex(paths, options)).records;
+}
+
+async function listActiveSessionsSnapshotWithIndex(
+  paths: StorePaths,
+  options: { ambiguousReadPolicy: "tolerate" | "reject" },
+): Promise<ActiveSessionsSafetySnapshot> {
   const index = await currentActiveSessionIndex(paths);
   const records: SessionRecord[] = [];
   const needsRecheck: string[] = [];
@@ -992,7 +1003,10 @@ async function listActiveSessionsSnapshot(
     }
   }
 
-  return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return {
+    records: records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+    directoryMtimeMs: index.directoryMtimeMs ?? null,
+  };
 }
 
 async function listSessionsSnapshot(currentDir: string, legacyDir: string): Promise<SessionRecord[]> {
