@@ -12,8 +12,10 @@ import { executionError, indeterminateExecutionError } from "../src/execution/er
 import { requireExecutionBinding } from "../src/execution/nodeState.js";
 import {
   admitRunStart,
+  appendRunEvents,
   beeNameForRun,
   mutateReservation,
+  readEffectIndex,
   readReservation,
   readRunEvents,
   runDir,
@@ -30,6 +32,7 @@ import {
   makeService,
   withTempStore,
   SNAPSHOT_DIGEST,
+  testEnvironmentFacts,
   type TestAuthority,
 } from "./executionTestKit.js";
 
@@ -393,6 +396,8 @@ test("crash recovery: reserved-not-started relaunches once on identical retry", 
     const ctx = await installTestAuthority();
     const envelope = buildRunStartEnvelope(ctx);
     await stageReservation(ctx, envelope);
+    assert.equal((await readEffectIndex(String(envelope.effectKey)))?.phase, "committed");
+    assert.deepEqual(await readRunEvents("run-0001"), [], "seed models committed admission before run.accepted append");
     // Simulate a daemon crash after the launch attempt was recorded but before
     // any spawn persistence, past the evidence grace window.
     await mutateReservation("run-0001", (record) => ({
@@ -409,6 +414,14 @@ test("crash recovery: reserved-not-started relaunches once on identical retry", 
     assert.deepEqual(response.result, { runId: "run-0001", state: "running" });
     assert.equal(counting.calls.length, 1, "the interrupted effect continues with exactly one launch");
     assert.equal((await readReservation("run-0001"))!.phase, "started");
+    const events = await readRunEvents("run-0001");
+    assert.deepEqual(
+      events.map((event) => event.type),
+      ["run.accepted", "environment.materializing", "harness.starting", "environment.ready", "harness.running"],
+    );
+    const page = await restarted.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0 });
+    assert.ok("result" in page);
+    assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
   });
 });
 
@@ -544,7 +557,7 @@ test("record-only boot recovery emits lost -> recovering -> failed when exit bec
     assert.ok("result" in failed);
     assert.equal(failed.result.state, "failed");
     const events = await readRunEvents("run-0001");
-    assert.deepEqual(events.map((event) => event.type), ["run.lost", "run.recovering", "run.failed"]);
+    assert.deepEqual(events.map((event) => event.type), ["run.accepted", "run.lost", "run.recovering", "run.failed"]);
     const page = await service.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0 });
     assert.ok("result" in page);
     assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
@@ -614,9 +627,203 @@ test("session and environment receipt recovery causes both establish lost -> rec
       const events = await readRunEvents("run-0001");
       assert.deepEqual(
         events.map((event) => event.type),
-        ["run.lost", "run.recovering", "environment.ready", "harness.running"],
+        ["run.accepted", "run.lost", "run.recovering", "environment.ready", "harness.running"],
       );
       assert.equal((events[1]!.payload as JsonObject).cause, cause);
+      const page = await service.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0 });
+      assert.ok("result" in page);
+      assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
+    });
+  }
+});
+
+test("seeded indeterminate reservations repair a missing run.lost before running or failed convergence", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const envelope = buildRunStartEnvelope(ctx);
+    await stageReservation(ctx, envelope);
+    const now = new Date().toISOString();
+    await mutateReservation("run-0001", (record) => ({
+      ...record,
+      phase: "launching",
+      launchAttemptedAt: now,
+      indeterminateAt: now,
+      indeterminateCause: "session_ref_missing",
+    }));
+    await registerWorkingCopy({
+      workingCopyId: "wc-0001",
+      productId: "prod-honeycomb-app",
+      path: "/tmp/wc-0001",
+      snapshotDigest: SNAPSHOT_DIGEST,
+      origin: "https://git.example.com/acme/honeycomb-app.git",
+      revision: "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c",
+    });
+    await claimWorkingCopy("wc-0001", "run-0001");
+    const bee = beeNameForRun("run-0001");
+    await saveSession({
+      name: bee,
+      agent: "claude",
+      cwd: "/",
+      command: "claude",
+      tmuxTarget: bee,
+      substrate: "hsr",
+      createdAt: now,
+      updatedAt: now,
+      status: "running",
+      id: "CO.canonical-seeded",
+      executionRunId: "run-0001",
+    });
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "claude",
+      tier: "stream",
+      hostPid: process.pid,
+      startedAt: now,
+      runningAt: now,
+      controlSocket: "/tmp/honeybee-seeded-ready.sock",
+      status: "running",
+    });
+    assert.deepEqual(await readRunEvents("run-0001"), [], "seed models crash before run.lost append");
+
+    const service = makeService({ launcher: countingLauncher().launcher });
+    const recovered = (await service.runStart(buildRunStartEnvelope(ctx, { requestId: "req-seeded-running" }))) as JsonObject;
+    assert.deepEqual(recovered.result, { runId: "run-0001", state: "running" });
+    const events = await readRunEvents("run-0001");
+    assert.deepEqual(
+      events.map((event) => event.type),
+      ["run.accepted", "run.lost", "run.recovering", "environment.ready", "harness.running"],
+    );
+    const page = await service.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0 });
+    assert.ok("result" in page);
+    assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
+  });
+
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const envelope = buildRunStartEnvelope(ctx);
+    await stageReservation(ctx, envelope);
+    const now = new Date().toISOString();
+    await mutateReservation("run-0001", (record) => ({
+      ...record,
+      phase: "launching",
+      launchAttemptedAt: now,
+      indeterminateAt: now,
+      indeterminateCause: "readiness_evidence_missing",
+    }));
+    const bee = beeNameForRun("run-0001");
+    await saveSession({
+      name: bee,
+      agent: "claude",
+      cwd: "/",
+      command: "claude",
+      tmuxTarget: bee,
+      substrate: "hsr",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+      id: "CO.canonical-seeded-dead",
+      executionRunId: "run-0001",
+    });
+    assert.deepEqual(await readRunEvents("run-0001"), [], "seed models crash before run.lost append");
+
+    const service = makeService({ launcher: countingLauncher().launcher });
+    const failed = await service.runGet({ protocolVersion: "0.1", runId: "run-0001" });
+    assert.ok("result" in failed);
+    assert.equal(failed.result.state, "failed");
+    const events = await readRunEvents("run-0001");
+    assert.deepEqual(events.map((event) => event.type), ["run.lost", "run.recovering", "run.failed"]);
+    const page = await service.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0 });
+    assert.ok("result" in page);
+    assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
+  });
+});
+
+test("durable started state repairs readiness receipts before running and later completed projection", async () => {
+  for (const priorRecovery of [false, true]) {
+    await withTempStore(async () => {
+      const ctx = await installTestAuthority();
+      const envelope = buildRunStartEnvelope(ctx);
+      const staged = await stageReservation(ctx, envelope);
+      const now = new Date().toISOString();
+      await mutateReservation("run-0001", (record) => ({
+        ...record,
+        phase: "started",
+        startedAt: now,
+        sessionRef: "CO.canonical-started-gap",
+        environment: testEnvironmentFacts("run-0001"),
+      }));
+      if (priorRecovery) {
+        const nodeId = (await requireExecutionBinding()).nodeId;
+        await appendRunEvents(
+          "run-0001",
+          "0.1",
+          [
+            {
+              type: "run.accepted",
+              payload: { effectKey: staged.effectKey, receiptId: staged.receipt.receiptId },
+              origin: { nodeId },
+            },
+            { type: "run.lost", payload: { cause: "session_ref_missing" }, origin: { nodeId } },
+            {
+              type: "run.recovering",
+              payload: { cause: "session_ref_missing", verified: ["run-identity", "hsr-readiness"] },
+              origin: { nodeId },
+            },
+          ],
+        );
+      }
+      const bee = beeNameForRun("run-0001");
+      await saveSession({
+        name: bee,
+        agent: "claude",
+        cwd: "/",
+        command: "claude",
+        tmuxTarget: bee,
+        substrate: "hsr",
+        createdAt: now,
+        updatedAt: now,
+        status: "running",
+        id: "CO.canonical-started-gap",
+        executionRunId: "run-0001",
+      });
+      await ensureHsrRunDir(bee);
+      const liveMeta = {
+        bee,
+        harness: "claude",
+        tier: "stream" as const,
+        hostPid: process.pid,
+        startedAt: now,
+        runningAt: now,
+        controlSocket: "/tmp/honeybee-started-gap.sock",
+        status: "running" as const,
+      };
+      await writeHsrMeta(bee, liveMeta);
+      const counting = countingLauncher();
+      const service = makeService({ launcher: counting.launcher });
+      if (priorRecovery) {
+        const running = await service.runGet({ protocolVersion: "0.1", runId: "run-0001" });
+        assert.ok("result" in running);
+        assert.equal(running.result.state, "running");
+      } else {
+        const running = (await service.runStart(buildRunStartEnvelope(ctx, { requestId: "req-started-gap" }))) as JsonObject;
+        assert.deepEqual(running.result, { runId: "run-0001", state: "running" });
+      }
+      assert.equal(counting.calls.length, 0);
+      const runningTypes = (await readRunEvents("run-0001")).map((event) => event.type);
+      assert.deepEqual(
+        runningTypes,
+        priorRecovery
+          ? ["run.accepted", "run.lost", "run.recovering", "environment.ready", "harness.running"]
+          : ["run.accepted", "environment.ready", "harness.running"],
+      );
+
+      await writeHsrMeta(bee, { ...liveMeta, status: "exited", exitCode: 0, endedAt: new Date().toISOString() });
+      const completed = await service.runGet({ protocolVersion: "0.1", runId: "run-0001" });
+      assert.ok("result" in completed);
+      assert.equal(completed.result.state, "completed");
+      const finalTypes = (await readRunEvents("run-0001")).map((event) => event.type);
+      assert.deepEqual(finalTypes.slice(-4), ["environment.ready", "harness.running", "harness.exited", "run.completed"]);
       const page = await service.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0 });
       assert.ok("result" in page);
       assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
@@ -687,6 +894,11 @@ test("readiness failure with unconfirmed stop stays lost until reconciliation pr
     assert.equal(reservation.result?.outcome, "failed");
     const events = await readRunEvents("run-0001");
     assert.deepEqual(events.slice(-2).map((event) => event.type), ["run.recovering", "run.failed"]);
+    assert.deepEqual(
+      events.filter((event) => event.type.startsWith("run.")).map((event) => event.type),
+      ["run.accepted", "run.lost", "run.recovering", "run.failed"],
+      "IndeterminateExecutionError launch path persists both legal recovery edges",
+    );
     const page = await service.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0 });
     assert.ok("result" in page);
     assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
@@ -753,7 +965,10 @@ test("crash recovery: lease expiry before a reserved-not-started relaunch fails 
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
     const expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
-    await stageReservation(ctx, buildRunStartEnvelope(ctx, { expiresAt }));
+    const envelope = buildRunStartEnvelope(ctx, { expiresAt });
+    await stageReservation(ctx, envelope);
+    assert.equal((await readEffectIndex(String(envelope.effectKey)))?.phase, "committed");
+    assert.deepEqual(await readRunEvents("run-0001"), [], "seed models committed admission before run.accepted append");
     await mutateReservation("run-0001", (record) => ({
       ...record,
       phase: "launching",
@@ -769,6 +984,11 @@ test("crash recovery: lease expiry before a reserved-not-started relaunch fails 
     assert.deepEqual(response.result, { runId: "run-0001", state: "failed" });
     assert.equal(counting.calls.length, 0);
     assert.equal((await readReservation("run-0001"))!.result?.cause, "lease_expired");
+    const events = await readRunEvents("run-0001");
+    assert.deepEqual(events.map((event) => event.type), ["run.accepted", "run.failed"]);
+    const page = await service.runEvents({ protocolVersion: "0.1", runId: "run-0001", afterSeq: 0 });
+    assert.ok("result" in page);
+    assert.deepEqual(validator.validate("run-events-page", page.result).errors, []);
   });
 });
 

@@ -169,21 +169,67 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     "readiness_stop_unconfirmed",
   ]);
 
-  /** Establish the contract's lost -> recovering edge before convergence. */
+  /**
+   * Establish the contract's lost -> recovering edge before convergence.
+   * Reservation mutation and event append are separate durable writes, so a
+   * crash may leave indeterminateAt/cause without its run.lost event. Repair
+   * both edges together under one event-log lock before any recovered receipt.
+   */
   async function beginLostRecovery(reservation: RunReservation, verified: string[]): Promise<void> {
     if (
       !reservation.indeterminateAt ||
       !reservation.indeterminateCause ||
       !recoverableLostCauses.has(reservation.indeterminateCause)
     ) return;
+    const eventOrigin = await origin();
     await appendRunEvents(
       reservation.runId,
       protocolVersion,
-      [{
-        type: "run.recovering",
-        payload: { cause: reservation.indeterminateCause, verified },
-        origin: await origin(),
-      }],
+      [
+        {
+          type: "run.lost",
+          payload: { cause: reservation.indeterminateCause },
+          origin: eventOrigin,
+        },
+        {
+          type: "run.recovering",
+          payload: { cause: reservation.indeterminateCause, verified },
+          origin: eventOrigin,
+        },
+      ],
+      { onlyIfAbsentTypes: true },
+    );
+  }
+
+  /**
+   * Repair the second coordinator-write gap: phase=started is persisted only
+   * after launcher readiness succeeds, so its session/environment facts are
+   * durable proof that these receipts belong before any later terminal fold.
+   * Unresolved lost state is excluded; its recovery path must establish
+   * run.recovering and clear indeterminateAt first.
+   */
+  async function ensureStartedReceipts(reservation: RunReservation): Promise<void> {
+    if (
+      reservation.phase !== "started" ||
+      reservation.indeterminateAt ||
+      !reservation.environment ||
+      !reservation.sessionRef
+    ) return;
+    await appendRunEvents(
+      reservation.runId,
+      protocolVersion,
+      [
+        {
+          type: "environment.ready",
+          payload: { environmentId: reservation.environment.environmentId },
+          origin: await origin({ providerId: reservation.environment.providerId }),
+        },
+        {
+          type: "harness.running",
+          payload: { sessionRef: reservation.sessionRef },
+          origin: await origin({ driverId: driverIdOf(reservation) }),
+        },
+      ],
       { onlyIfAbsentTypes: true },
     );
   }
@@ -422,23 +468,6 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
                 }
               : record;
           });
-          await appendRunEvents(
-            current.runId,
-            protocolVersion,
-            [
-              {
-                type: "environment.ready",
-                payload: { environmentId: recoveredEnvironment.environmentId },
-                origin: await origin({ providerId: recoveredEnvironment.providerId }),
-              },
-              {
-                type: "harness.running",
-                payload: { sessionRef: launchEvidence.sessionRef },
-                origin: await origin({ driverId: driverIdOf(current) }),
-              },
-            ],
-            { onlyIfAbsentTypes: true },
-          );
         }
       }
     } else if (classification === "booting-receipt-lost") {
@@ -531,6 +560,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         }
       }
     }
+    await ensureStartedReceipts(current);
     const leaseExpired = Date.parse(current.leaseExpiresAt) < now().getTime();
     if (current.phase === "started" && !current.result && (current.cancel !== undefined || leaseExpired)) {
       // Durable desired-state stop reconciler. Two ways in: execution
@@ -852,13 +882,16 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         intent: validated.intent,
         ...(initiator ? { initiator } : {}),
       });
+      // Admission and event append are separate durable writes. An identical
+      // retry after a crash in between must repair run.accepted before it can
+      // materialize, reconcile, or terminalize anything downstream.
+      await appendRunEvents(
+        reservation.runId,
+        protocolVersion,
+        [{ type: "run.accepted", payload: { effectKey: reservation.effectKey, receiptId: reservation.receipt.receiptId }, origin: await origin() }],
+        { onlyIfAbsentTypes: true },
+      );
       if (created) {
-        await appendRunEvents(
-          reservation.runId,
-          protocolVersion,
-          [{ type: "run.accepted", payload: { effectKey: reservation.effectKey, receiptId: reservation.receipt.receiptId }, origin: await origin() }],
-          { onlyIfAbsentTypes: true },
-        );
         await launch(reservation, validated.lease);
         const settled = await reconcile((await readReservation(reservation.runId))!);
         return effectResponse(requestId, settled, "created", deriveState(settled, inFlight.has(settled.runId)).state);
