@@ -117,6 +117,7 @@ export {
 
 export {
   captureAccountFromHome,
+  canonicalActivationHomePath,
   activationHomeOwnerPath,
   readActivationHomeOwner,
   withActivationHomeLock,

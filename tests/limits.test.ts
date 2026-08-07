@@ -7,7 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { addAccount, accountDir, clearAccountBootFailure, recordAccountBootFailure, setAccountPaused } from "../src/accounts.js";
 import { withCodexHomeBootLock } from "../src/codexBoot.js";
 import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
-import { saveSession } from "../src/store.js";
+import { activeSessionIndexPath, saveSession } from "../src/store.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -1484,6 +1484,29 @@ test("account commitments include an older-writer live record without daemon rec
       AUTO_COMMITMENT_BUSY_PERCENT,
       "auto-pick must not under-rank an account solely because the daemon is absent",
     );
+  });
+});
+
+test("account commitments reject an ambiguous indexed live record instead of undercounting", async () => {
+  await withTempStore(async (dir) => {
+    const healthy = liveSession("commitment-healthy", "account-a", "working");
+    const unreadable = liveSession("commitment-torn", "account-b", "active");
+    await saveSession(healthy);
+    await saveSession(unreadable);
+    const baseline = await accountCommitments("claude");
+    assert.equal(baseline.get("account-a"), AUTO_COMMITMENT_BUSY_PERCENT);
+    assert.equal(baseline.get("account-b"), AUTO_COMMITMENT_BUSY_PERCENT);
+
+    // In-place corruption does not advance the sessions directory generation,
+    // modeling EIO/EACCES/torn reads after a checksum-valid reconciliation.
+    await writeFile(join(dir, "sessions", `${unreadable.name}.json`), "{\"name\":");
+    await assert.rejects(
+      () => accountCommitments("claude"),
+      (error: unknown) => error instanceof AggregateError && /authoritatively read/.test(error.message),
+      "auto-pick must fail closed instead of returning account A's partial total",
+    );
+    const index = JSON.parse(await readFile(activeSessionIndexPath(), "utf8")) as { active: string[] };
+    assert.ok(index.active.includes(unreadable.name), "ambiguous membership remains for retry");
   });
 });
 

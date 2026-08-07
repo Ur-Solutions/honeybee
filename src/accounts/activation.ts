@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { identityRecipeForAgent, type IdentityRecipe } from "../drivers.js";
 import {
@@ -436,12 +436,47 @@ type ActivationOutcome = { written: string[]; timing: ActivationTiming };
 
 const activationFlights = new Map<string, Promise<ActivationOutcome>>();
 
-function activationHomeKey(homePath: string): string {
-  return createHash("sha256").update(resolve(homePath)).digest("hex").slice(0, 32);
+/**
+ * Stable physical identity for a home. Existing aliases collapse through
+ * realpath; a not-yet-created home is expressed beneath the nearest real
+ * existing ancestor so later operations never follow the caller's alias.
+ * Dangling symlink components and permission/I/O ambiguity fail closed.
+ */
+export async function canonicalActivationHomePath(homePath: string): Promise<string> {
+  let cursor = resolve(homePath);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      const existing = await realpath(cursor);
+      return join(existing, ...missing);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`Could not canonicalize activation home ${resolve(homePath)}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      try {
+        const info = await lstat(cursor);
+        // lstat succeeded while realpath failed: normally a dangling symlink.
+        throw new Error(
+          `Could not canonicalize activation home ${resolve(homePath)}: ` +
+          `${cursor} exists but has no stable physical target${info.isSymbolicLink() ? " (dangling symlink)" : ""}`,
+        );
+      } catch (lstatError) {
+        if ((lstatError as NodeJS.ErrnoException).code !== "ENOENT") throw lstatError;
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) throw new Error(`Could not find an existing parent for activation home ${resolve(homePath)}`);
+      missing.unshift(basename(cursor));
+      cursor = parent;
+    }
+  }
 }
 
-function activationHomeLockPath(homePath: string): string {
-  return join(storeRoot(), "locks", "activation-homes", `${activationHomeKey(homePath)}.lock`);
+function activationHomeKey(canonicalHomePath: string): string {
+  return createHash("sha256").update(canonicalHomePath).digest("hex").slice(0, 32);
+}
+
+function activationHomeLockPath(canonicalHomePath: string): string {
+  return join(storeRoot(), "locks", "activation-homes", `${activationHomeKey(canonicalHomePath)}.lock`);
 }
 
 export type ActivationHomeOwner = {
@@ -454,43 +489,72 @@ export type ActivationHomeOwner = {
   updatedAt: string;
 };
 
-export function activationHomeOwnerPath(homePath: string): string {
-  return join(storeRoot(), "activation-home-owners", `${activationHomeKey(homePath)}.json`);
+function activationHomeOwnerPathCanonical(canonicalHomePath: string): string {
+  return join(storeRoot(), "activation-home-owners", `${activationHomeKey(canonicalHomePath)}.json`);
 }
 
-export function withActivationHomeLock<T>(
+export async function activationHomeOwnerPath(homePath: string): Promise<string> {
+  return activationHomeOwnerPathCanonical(await canonicalActivationHomePath(homePath));
+}
+
+export async function withActivationHomeLock<T>(
   homePath: string,
-  fn: () => Promise<T>,
+  fn: (canonicalHomePath: string) => Promise<T>,
   options: LockOptions = {},
 ): Promise<T> {
-  return withFileLock(activationHomeLockPath(homePath), fn, options);
+  const canonicalHomePath = await canonicalActivationHomePath(homePath);
+  return withFileLock(activationHomeLockPath(canonicalHomePath), () => fn(canonicalHomePath), options);
 }
 
 export async function readActivationHomeOwner(homePath: string): Promise<ActivationHomeOwner | null> {
+  const lexicalHomePath = resolve(homePath);
+  const canonicalHomePath = await canonicalActivationHomePath(homePath);
+  const canonicalPath = activationHomeOwnerPathCanonical(canonicalHomePath);
+  // Compatibility for a pre-canonicalization stamp written through an alias.
+  // New writes always use canonicalPath; malformed canonical state never falls
+  // back to a legacy alias claim.
+  const paths = [canonicalPath];
+  if (lexicalHomePath !== canonicalHomePath) {
+    paths.push(activationHomeOwnerPathCanonical(lexicalHomePath));
+  }
   try {
-    const parsed = JSON.parse(await readFile(activationHomeOwnerPath(homePath), "utf8")) as unknown;
+    let raw: string | null = null;
+    for (const path of paths) {
+      try {
+        raw = await readFile(path, "utf8");
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("owner stamp is not an object");
     const owner = parsed as Partial<ActivationHomeOwner>;
+    const ownerCanonicalHomePath = typeof owner.homePath === "string"
+      ? await canonicalActivationHomePath(owner.homePath)
+      : null;
     if (
       owner.version !== 1 ||
-      owner.homePath !== resolve(homePath) ||
+      ownerCanonicalHomePath !== canonicalHomePath ||
       typeof owner.accountId !== "string" || !owner.accountId ||
       typeof owner.generation !== "string" || !owner.generation ||
       (owner.state !== "activating" && owner.state !== "ready") ||
       typeof owner.activatedAt !== "string" ||
       typeof owner.updatedAt !== "string"
     ) throw new Error("owner stamp has invalid fields");
-    return owner as ActivationHomeOwner;
+    return { ...(owner as ActivationHomeOwner), homePath: canonicalHomePath };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw new Error(
-      `Invalid activation-home owner stamp for ${resolve(homePath)}: ${error instanceof Error ? error.message : String(error)}`,
+      `Invalid activation-home owner stamp for ${canonicalHomePath}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
 
 async function writeActivationHomeOwner(owner: ActivationHomeOwner): Promise<void> {
-  await atomicWriteFile(activationHomeOwnerPath(owner.homePath), `${JSON.stringify(owner, null, 2)}\n`, { mode: 0o600 });
+  const canonicalHomePath = await canonicalActivationHomePath(owner.homePath);
+  const canonicalOwner = { ...owner, homePath: canonicalHomePath };
+  await atomicWriteFile(activationHomeOwnerPathCanonical(canonicalHomePath), `${JSON.stringify(canonicalOwner, null, 2)}\n`, { mode: 0o600 });
 }
 
 function emptyActivationTiming(): ActivationTiming {
@@ -549,7 +613,8 @@ async function copyFileAtomicallyIfChanged(source: string, target: string): Prom
  * lives in the activation hooks (preActivate + seedHomeDefaults).
  */
 export async function activateAccountIntoHome(account: AccountRecord, homePath: string, options: ActivateAccountOptions = {}): Promise<string[]> {
-  const flightKey = `${account.id}\0${resolve(homePath)}`;
+  const canonicalHomePath = await canonicalActivationHomePath(homePath);
+  const flightKey = `${account.id}\0${canonicalHomePath}`;
   const existing = activationFlights.get(flightKey);
   if (existing) {
     const joinedAt = performance.now();
@@ -561,7 +626,7 @@ export async function activateAccountIntoHome(account: AccountRecord, homePath: 
     });
     return [...outcome.written];
   }
-  const flight = performAccountActivation(account, homePath, options);
+  const flight = performAccountActivation(account, canonicalHomePath, options);
   activationFlights.set(flightKey, flight);
   try {
     const outcome = await flight;
@@ -607,7 +672,8 @@ async function performAccountActivation(
   try {
     let homeLockAcquiredAt = 0;
     try {
-      await withActivationHomeLock(homePath, async () => {
+      await withActivationHomeLock(homePath, async (lockedHomePath) => {
+        if (lockedHomePath !== homePath) throw new Error("activation home identity changed before lock acquisition");
         homeLockAcquiredAt = performance.now();
         // Claim the home before touching credentials. A failed activation may
         // conservatively leave an "activating" owner, which is safer than
@@ -616,7 +682,7 @@ async function performAccountActivation(
         const activatedAt = new Date(options.now?.() ?? Date.now()).toISOString();
         const owner: ActivationHomeOwner = {
           version: 1,
-          homePath: resolve(homePath),
+          homePath,
           accountId: account.id,
           generation: randomUUID(),
           state: "activating",

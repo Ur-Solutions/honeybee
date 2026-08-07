@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { isBuzTier, type BuzTier } from "./buz_tiers.js";
 import { normalizeContract, type BeeContract } from "./contract.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
@@ -525,7 +525,12 @@ async function updateActiveMembershipLocked(
 }
 
 function sessionLockPath(name: string): string {
-  return join(storeRoot(), "sessions", `.${name}.lock`);
+  const root = resolve(storeRoot(), "sessions");
+  const target = resolve(root, `.${safeName(name)}.lock`);
+  if (dirname(target) !== root) {
+    throw new Error(`session lock escaped its store root: ${name}`);
+  }
+  return target;
 }
 
 export async function withSessionLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
@@ -799,7 +804,7 @@ export function listActiveSessionsHot(): Promise<SessionRecord[]> {
   const current = listActiveSessionsHotInFlight.get(paths.root);
   if (current) return current;
 
-  const pending = listActiveSessionsSnapshot(paths).finally(() => {
+  const pending = listActiveSessionsSnapshot(paths, { ambiguousReadPolicy: "tolerate" }).finally(() => {
     if (listActiveSessionsHotInFlight.get(paths.root) === pending) listActiveSessionsHotInFlight.delete(paths.root);
   });
   listActiveSessionsHotInFlight.set(paths.root, pending);
@@ -837,7 +842,7 @@ export function listActiveSessions(): Promise<SessionRecord[]> {
         { timeoutMs: 60_000 },
       );
     }
-    return listActiveSessionsSnapshot(paths);
+    return listActiveSessionsSnapshot(paths, { ambiguousReadPolicy: "reject" });
   })().finally(() => {
     if (listActiveSessionsSafetyInFlight.get(paths.root) === pending) {
       listActiveSessionsSafetyInFlight.delete(paths.root);
@@ -867,7 +872,10 @@ async function activeSessionDirectoriesCovered(paths: StorePaths, index: ActiveS
   return false;
 }
 
-async function listActiveSessionsSnapshot(paths: StorePaths): Promise<SessionRecord[]> {
+async function listActiveSessionsSnapshot(
+  paths: StorePaths,
+  options: { ambiguousReadPolicy: "tolerate" | "reject" },
+): Promise<SessionRecord[]> {
   const index = await currentActiveSessionIndex(paths);
   const records: SessionRecord[] = [];
   const needsRecheck: string[] = [];
@@ -934,17 +942,33 @@ async function listActiveSessionsSnapshot(paths: StorePaths): Promise<SessionRec
   }
 
   if (readFailures.length > 0) {
-    // One torn/EACCES record must not blind daemon work for every healthy bee.
-    // Preserve its membership for a later retry, emit bounded telemetry, and
-    // return the independently readable active projection.
+    // Both policies retain ambiguous membership and emit bounded telemetry.
+    // Daemon work stays available from the readable subset; direct account
+    // selection rejects because partial totals could stack new work onto the
+    // unreadable bee's account.
     reportActiveIndexReadFailures(paths.root, readFailures);
+    if (options.ambiguousReadPolicy === "reject") {
+      throw new AggregateError(
+        readFailures.map(({ error }) => error),
+        `could not authoritatively read ${readFailures.length} indexed active session record(s)`,
+      );
+    }
   }
 
   return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 async function listSessionsSnapshot(currentDir: string, legacyDir: string): Promise<SessionRecord[]> {
-  return (await scanSessionsSnapshot(currentDir, legacyDir)).records;
+  const snapshot = await scanSessionsSnapshot(currentDir, legacyDir);
+  if (snapshot.readFailures.length > 0) {
+    const detail = snapshot.readFailures.map(({ dir, file, error }) =>
+      `${join(dir, file)}: ${error instanceof Error ? error.message : String(error)}`);
+    process.emitWarning(
+      `session record scan skipped malformed/unreadable source(s): ${detail.join("; ")}`,
+      { code: "HIVE_SESSION_RECORD_READ", type: "HiveStoreWarning" },
+    );
+  }
+  return snapshot.records;
 }
 
 type SessionSnapshotScan = {
@@ -1060,7 +1084,16 @@ async function readSessionRecord(path: string): Promise<SessionRecord> {
   } catch (error) {
     throw new Error(`Invalid JSON in session record ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return normalizeSessionRecord(parsed, path);
+  const record = normalizeSessionRecord(parsed, path);
+  const source = basename(path);
+  const expected = `${record.name}.json`;
+  if (record.name !== safeName(record.name) || source !== expected) {
+    throw new Error(
+      `Invalid session record identity ${path}: embedded name ${JSON.stringify(record.name)} ` +
+      `must be canonical and match source filename ${JSON.stringify(source)}`,
+    );
+  }
+  return record;
 }
 
 const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;

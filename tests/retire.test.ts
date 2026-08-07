@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -10,7 +10,7 @@ import { ensureHsrRunDir, hsrEventsPath, hsrMetaPath, hsrRingPath } from "../src
 import { purgeSessionData, transactionalKill, transactionalRetire } from "../src/kill.js";
 import { recordSeal, sealsRoot, validateSealArtifact } from "../src/seal.js";
 import { deriveState } from "../src/state.js";
-import { ledgerPath, loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { ledgerPath, listSessions, loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { KillResult, Substrate } from "../src/substrates/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -263,7 +263,7 @@ test("clean honors a rebind activation stamp before the new session record is pu
       status: "dead",
     });
     await saveSession(stale);
-    const ownerPath = activationHomeOwnerPath(homePath);
+    const ownerPath = await activationHomeOwnerPath(homePath);
     await mkdir(dirname(ownerPath), { recursive: true });
     await writeFile(ownerPath, JSON.stringify({
       version: 1,
@@ -293,7 +293,7 @@ test("clean honors a rebind activation stamp before the new session record is pu
       status: "dead",
     });
     await saveSession(failed);
-    const failedOwnerPath = activationHomeOwnerPath(failedHomePath);
+    const failedOwnerPath = await activationHomeOwnerPath(failedHomePath);
     await mkdir(dirname(failedOwnerPath), { recursive: true });
     await writeFile(failedOwnerPath, JSON.stringify({
       version: 1,
@@ -327,7 +327,7 @@ test("clean honors a ready foreign owner stamp on the nominal dedicated home", a
       status: "dead",
     });
     await saveSession(stale);
-    const ownerPath = activationHomeOwnerPath(homePath);
+    const ownerPath = await activationHomeOwnerPath(homePath);
     await mkdir(dirname(ownerPath), { recursive: true });
     await writeFile(ownerPath, JSON.stringify({
       version: 1,
@@ -355,6 +355,154 @@ test("clean honors a ready foreign owner stamp on the nominal dedicated home", a
       event.session === stale.name &&
       event.skipped === "home-rebound" &&
       event.ownerAccount === "account-b"));
+  });
+});
+
+test("clean resolves symlink aliases to the foreign physical-home owner", async () => {
+  await withTempStore(async (dir) => {
+    const physicalHome = join(dir, "physical-shared-home");
+    const aliasHome = join(dir, "shared-home-alias");
+    await mkdir(physicalHome, { recursive: true });
+    await symlink(physicalHome, aliasHome);
+    const stale = seed({
+      name: "symlink-stale-account-a",
+      tmuxTarget: "symlink-stale-account-a",
+      accountId: "account-a",
+      homePath: physicalHome,
+      status: "dead",
+    });
+    await saveSession(stale);
+    const ownerPath = await activationHomeOwnerPath(aliasHome);
+    await mkdir(dirname(ownerPath), { recursive: true });
+    await writeFile(ownerPath, JSON.stringify({
+      version: 1,
+      homePath: physicalHome,
+      accountId: "account-b",
+      generation: "symlink-alias-rebind-b",
+      state: "ready",
+      activatedAt: "2026-08-07T08:20:00.000Z",
+      updatedAt: "2026-08-07T08:20:00.000Z",
+    }));
+    let harvests = 0;
+
+    await purgeSessionData(stale, {
+      finalCredentialSync: async () => { harvests += 1; },
+    });
+
+    assert.equal(harvests, 0, "an alias and its physical target cannot hold separate credential claims");
+    const ledger = (await readFile(ledgerPath(), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.ok(ledger.some((event) =>
+      event.type === "account.final-sync" &&
+      event.session === stale.name &&
+      event.skipped === "home-rebound" &&
+      event.ownerAccount === "account-b"));
+  });
+});
+
+test("final harvest keeps the locked physical home when its input alias is retargeted", async () => {
+  await withTempStore(async (dir) => {
+    const firstHome = join(dir, "locked-physical-home");
+    const secondHome = join(dir, "retargeted-physical-home");
+    const aliasHome = join(dir, "mutable-home-alias");
+    await mkdir(firstHome, { recursive: true });
+    await mkdir(secondHome, { recursive: true });
+    await writeFile(join(firstHome, "identity"), "account-a");
+    await writeFile(join(secondHome, "identity"), "account-b");
+    await symlink(firstHome, aliasHome);
+    const stale = seed({
+      name: "retarget-race-account-a",
+      tmuxTarget: "retarget-race-account-a",
+      accountId: "account-a",
+      homePath: aliasHome,
+      status: "dead",
+    });
+    await saveSession(stale);
+    const ownerPath = await activationHomeOwnerPath(firstHome);
+    await mkdir(dirname(ownerPath), { recursive: true });
+    await writeFile(ownerPath, JSON.stringify({
+      version: 1,
+      homePath: firstHome,
+      accountId: "account-a",
+      generation: "locked-account-a",
+      state: "ready",
+      activatedAt: "2026-08-07T08:25:00.000Z",
+      updatedAt: "2026-08-07T08:25:00.000Z",
+    }));
+    let harvestedHome = "";
+    let harvestedIdentity = "";
+
+    await purgeSessionData(stale, {
+      finalCredentialSync: async (candidate) => {
+        await rm(aliasHome);
+        await symlink(secondHome, aliasHome);
+        harvestedHome = candidate.homePath ?? "";
+        harvestedIdentity = await readFile(join(harvestedHome, "identity"), "utf8");
+      },
+    });
+
+    assert.equal(harvestedHome, await realpath(firstHome));
+    assert.equal(harvestedIdentity, "account-a", "retargeting the alias cannot redirect the locked harvest");
+  });
+});
+
+test("purge contains malicious session and pool lock path components", async () => {
+  await withTempStore(async (dir) => {
+    const sentinelDir = join(dir, "outside-sentinel");
+    const sentinelFile = join(sentinelDir, "keep.txt");
+    await mkdir(sentinelDir, { recursive: true });
+    await writeFile(sentinelFile, "keep");
+    const malicious = seed({
+      name: "x/../../outside-sentinel",
+      tmuxTarget: "malicious-not-live",
+      status: "dead",
+    });
+    malicious.poolKey = "x/../../outside-sentinel";
+
+    await purgeSessionData(malicious, { emitLedger: false });
+
+    assert.equal(await readFile(sentinelFile, "utf8"), "keep", "artifact cleanup must stay inside its roots");
+    await assert.rejects(() => readFile(join(dir, "outside-sentinel.lock"), "utf8"), { code: "ENOENT" });
+  });
+});
+
+test("clean skips a filename-identity forgery without purging the real victim", async () => {
+  await withTempStore(async (dir) => {
+    const victim = seed({ name: "CO.victim", tmuxTarget: "CO.victim", status: "running" });
+    await saveSession(victim);
+    await recordSeal(victim.name, validateSealArtifact({ status: "done", summary: "keep victim seal" }));
+    await ensureHsrRunDir(victim.name);
+    await writeFile(hsrEventsPath(victim.name), "keep victim run\n");
+    const requestPath = join(dir, "requests", `${victim.name}.json`);
+    await mkdir(dirname(requestPath), { recursive: true });
+    await writeFile(requestPath, "keep victim request\n");
+    await writeFile(join(dir, "sessions", "evil.json"), JSON.stringify({
+      ...victim,
+      name: victim.name,
+      status: "dead",
+      updatedAt: "2026-08-07T08:30:00.000Z",
+    }));
+    const warnings: Error[] = [];
+    const onWarning = (warning: Error) => { warnings.push(warning); };
+    process.on("warning", onWarning);
+    try {
+      const dead = (await listSessions()).filter((record) => record.status === "dead");
+      for (const record of dead) await purgeSessionData(record, { emitLedger: false });
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("warning", onWarning);
+    }
+
+    assert.equal((await loadSession(victim.name))?.status, "running");
+    assert.match(await readFile(hsrEventsPath(victim.name), "utf8"), /keep victim run/);
+    assert.match(await readFile(requestPath, "utf8"), /keep victim request/);
+    assert.ok((await readdir(join(sealsRoot(), victim.name))).length > 0, "victim seals survive");
+    assert.match(await readFile(join(dir, "sessions", "evil.json"), "utf8"), /CO\.victim/, "corrupt source is left for operator repair");
+    assert.ok(warnings.some((warning) =>
+      (warning as Error & { code?: string }).code === "HIVE_SESSION_RECORD_READ" &&
+      /evil\.json/.test(warning.message)), "the forged source is reported and skipped");
   });
 });
 

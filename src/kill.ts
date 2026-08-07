@@ -1,6 +1,6 @@
 import { rm } from "node:fs/promises";
 import { resolve, sep } from "node:path";
-import { readActivationHomeOwner, withActivationHomeLock } from "./accounts/activation.js";
+import { canonicalActivationHomePath, readActivationHomeOwner, withActivationHomeLock } from "./accounts/activation.js";
 import { hsrRoot } from "./hsr/runDir.js";
 import { sealsRoot } from "./seal.js";
 import {
@@ -228,10 +228,12 @@ function sessionBindingTime(record: SessionRecord): number {
   return 0;
 }
 
-async function conflictingHomeBinding(record: SessionRecord): Promise<CredentialBindingConflict | null> {
+async function conflictingHomeBinding(
+  record: SessionRecord,
+  canonicalHomePath: string,
+): Promise<CredentialBindingConflict | null> {
   if (!record.accountId || !record.homePath) return null;
-  const target = resolve(record.homePath);
-  const owner = await readActivationHomeOwner(target);
+  const owner = await readActivationHomeOwner(canonicalHomePath);
   if (owner) {
     if (owner.state !== "ready") {
       return {
@@ -249,13 +251,17 @@ async function conflictingHomeBinding(record: SessionRecord): Promise<Credential
   // legacy SessionRecords and conservatively reject any newer/live foreign
   // binding for this resolved custom home.
   const recordTime = sessionBindingTime(record);
-  const candidates = (await listSessions()).filter((candidate) =>
-    candidate.name !== record.name &&
-    Boolean(candidate.accountId) &&
-    candidate.accountId !== record.accountId &&
-    Boolean(candidate.homePath) &&
-    resolve(candidate.homePath!) === target &&
-    (isActiveSessionRecord(candidate) || sessionBindingTime(candidate) > recordTime));
+  const candidates: SessionRecord[] = [];
+  for (const candidate of await listSessions()) {
+    if (
+      candidate.name === record.name ||
+      !candidate.accountId ||
+      candidate.accountId === record.accountId ||
+      !candidate.homePath ||
+      (!isActiveSessionRecord(candidate) && sessionBindingTime(candidate) <= recordTime)
+    ) continue;
+    if (await canonicalActivationHomePath(candidate.homePath) === canonicalHomePath) candidates.push(candidate);
+  }
   candidates.sort((a, b) => {
     const live = Number(isActiveSessionRecord(b)) - Number(isActiveSessionRecord(a));
     if (live !== 0) return live;
@@ -300,12 +306,12 @@ async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessi
     // its owner stamp before trusting bytes.
     let expired = false;
     let overallTimer: NodeJS.Timeout | undefined;
-    const lockedHarvest = withActivationHomeLock(record.homePath, async () => {
-      binding.conflict = await conflictingHomeBinding(record);
+    const lockedHarvest = withActivationHomeLock(record.homePath, async (canonicalHomePath) => {
+      binding.conflict = await conflictingHomeBinding(record, canonicalHomePath);
       if (binding.conflict || expired) return;
       const remainingMs = budgetMs - (Date.now() - startedAt);
       if (remainingMs <= 0) throw new Error(`final credential sync timed out after ${budgetMs}ms`);
-      await boundedCredentialSync(record, sync, remainingMs);
+      await boundedCredentialSync({ ...record, homePath: canonicalHomePath }, sync, remainingMs);
       if (!expired) ok = true;
     }, { timeoutMs: Math.max(1, budgetMs) });
     try {

@@ -104,6 +104,9 @@ function poolPath(key: string): string {
  * `pro pool extend` clone.
  */
 export async function withPoolLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  // Validate before constructing or creating the lock path. Persisted session
+  // metadata is not trusted to provide a canonical pool key during purge.
+  if (!validPoolKey(key)) throw new Error(`Invalid pool key: ${key}`);
   return withFileLock(join(poolsDir(), `.${key}.lock`), fn, { timeoutMs: 120_000 });
 }
 

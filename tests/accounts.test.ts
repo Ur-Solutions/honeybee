@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -1572,6 +1572,52 @@ test("activations of distinct accounts run in parallel, not serialized on one lo
     assert.equal(fastHome.claudeAiOauth.accessToken, "tok-fast");
     const slowHome = JSON.parse(await readFile(join(dir, "homes", slowAccount.id, ".credentials.json"), "utf8"));
     assert.equal(slowHome.claudeAiOauth.accessToken, "tok-slow-new");
+  });
+});
+
+test("real and symlink aliases serialize one physical home and publish one canonical owner", async () => {
+  await withTempStore(async (dir) => {
+    const first = await addAccount("claude", "alias-first@a.b");
+    const second = await addAccount("claude", "alias-second@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(first), ".credentials.json"), chainJson("first-expired", now - 1_000, "r-first"));
+    await writeFile(join(accountDir(second), ".credentials.json"), chainJson("second-fresh", now + 8 * 3_600_000, "r-second"));
+    const physicalHome = join(dir, "physical-home");
+    const aliasHome = join(dir, "alias-home");
+    await mkdir(physicalHome, { recursive: true });
+    await symlink(physicalHome, aliasHome);
+
+    let refreshStarted!: () => void;
+    const inRefresh = new Promise<void>((resolve) => { refreshStarted = resolve; });
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    const firstActivation = activateAccountIntoHome(first, physicalHome, {
+      refreshClaudeToken: async () => {
+        refreshStarted();
+        await refreshGate;
+        return { accessToken: "first-refreshed", refreshToken: "r-first-2", expiresAt: now + 8 * 3_600_000 };
+      },
+    });
+    await inRefresh;
+
+    let secondFinished = false;
+    const secondActivation = activateAccountIntoHome(second, aliasHome).then((written) => {
+      secondFinished = true;
+      return written;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(secondFinished, false, "the alias activation must queue behind the physical-home lock");
+    releaseRefresh();
+    await Promise.all([firstActivation, secondActivation]);
+
+    const canonicalHome = await realpath(physicalHome);
+    const ownerFromReal = await readActivationHomeOwner(physicalHome);
+    const ownerFromAlias = await readActivationHomeOwner(aliasHome);
+    assert.equal(ownerFromReal?.accountId, second.id);
+    assert.deepEqual(ownerFromAlias, ownerFromReal);
+    assert.equal(ownerFromReal?.homePath, canonicalHome, "the durable owner claim stores physical identity");
+    const credentials = JSON.parse(await readFile(join(physicalHome, ".credentials.json"), "utf8"));
+    assert.equal(credentials.claudeAiOauth.accessToken, "second-fresh");
   });
 });
 
