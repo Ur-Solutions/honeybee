@@ -4,8 +4,8 @@
 // the intent's target. A copy of product B can never run snapshot A.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ExecutionProtocolError } from "../src/execution/errors.js";
-import { materializeExplicitPlacement } from "../src/execution/launcher.js";
+import { ExecutionProtocolError, IndeterminateExecutionError } from "../src/execution/errors.js";
+import { createHsrRunLauncher, materializeExplicitPlacement } from "../src/execution/launcher.js";
 import { readWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import type { JsonObject } from "../src/execution/contract.js";
 import { withTempStore, SNAPSHOT_DIGEST } from "./executionTestKit.js";
@@ -93,6 +93,63 @@ test("explicit placement: unregistered copy, wrong node, and string placements s
       materializeExplicitPlacement(NODE, { runId: "run-0001", intent: fresh }),
       "MATERIALIZATION_FAILED",
       "fresh placement not materializable in H1",
+    );
+  });
+});
+
+test("HSR readiness timeout stops a runtime that becomes ready just after the deadline", async () => {
+  await withTempStore(async () => {
+    await registerCopy();
+    let lateReady = false;
+    let stopCalls = 0;
+    const launcher = createHsrRunLauncher({
+      nodeId: async () => NODE,
+      readinessTimeoutMs: 1,
+      spawn: async (request) => ({ name: request.beeName, id: "CO.canonical" }),
+      waitForReadiness: async () => {
+        lateReady = true; // readiness raced the timeout boundary
+        return false;
+      },
+      stop: async () => {
+        stopCalls += 1;
+        return { stopped: lateReady, detail: "late-ready host stopped and confirmed" };
+      },
+    });
+    await assert.rejects(
+      () => launcher({
+        runId: "run-0001",
+        beeName: "xr-provisional",
+        intent: { ...intentFor(), harness: { driverId: "claude", config: {} } },
+        lease: {},
+      }),
+      (error: unknown) => error instanceof ExecutionProtocolError && !(error instanceof IndeterminateExecutionError),
+    );
+    assert.equal(stopCalls, 1, "timeout always stops even when readiness lands late");
+  });
+});
+
+test("HSR readiness timeout surfaces an indeterminate launch when stop cannot be confirmed", async () => {
+  await withTempStore(async () => {
+    await registerCopy();
+    const launcher = createHsrRunLauncher({
+      nodeId: async () => NODE,
+      readinessTimeoutMs: 1,
+      spawn: async (request) => ({ name: request.beeName, id: "CO.canonical" }),
+      waitForReadiness: async () => false,
+      stop: async () => ({ stopped: false, detail: "SIGTERM and SIGKILL liveness probes still see the host" }),
+    });
+    await assert.rejects(
+      () => launcher({
+        runId: "run-0001",
+        beeName: "xr-provisional",
+        intent: { ...intentFor(), harness: { driverId: "claude", config: {} } },
+        lease: {},
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof IndeterminateExecutionError);
+        assert.equal(error.cause, "readiness_stop_unconfirmed");
+        return true;
+      },
     );
   });
 });

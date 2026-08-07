@@ -27,8 +27,8 @@ import type {
 } from "../substrates/types.js";
 import { LOCAL_NODE } from "../substrates/types.js";
 import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
-import { hsrSnapshot, killOrphanedChildGroup, listHsrBees } from "./observe.js";
-import { readHsrMeta } from "./runDir.js";
+import { hsrSnapshot, isHsrProcessGroupAlive, killOrphanedChildGroup, listHsrBees } from "./observe.js";
+import { readHsrMeta, type HsrMeta } from "./runDir.js";
 import { connectRpcClient } from "./rpc.js";
 import { clearPendingHsrTurns, enqueuePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
 
@@ -76,15 +76,40 @@ async function sendText(bee: string, text: string, _paneId?: string, options?: S
   });
 }
 
-/** Poll meta until the host is no longer queued/running (clean exit), or timeout. */
-async function waitUntilNotRunning(bee: string, timeoutMs: number): Promise<boolean> {
+/** Poll the same runtime incarnation until it is no longer live. */
+async function waitUntilHostStopped(bee: string, expectedHostPid: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const meta = await readHsrMeta(bee);
-    if (!meta || meta.status === "exited" || !isPidAlive(meta.hostPid)) return true;
+    if (!isPidAlive(expectedHostPid)) return true;
+    // Remote/in-process hosts deliberately share this process (the host test
+    // exercises that supported shape). Their process cannot exit when one
+    // logical HSR session stops, so the incarnation's finalized meta is the
+    // strongest available confirmation. Detached production hosts always have
+    // another pid and still require observed OS exit below.
+    if (expectedHostPid === process.pid) {
+      const latest = await readHsrMeta(bee);
+      if (latest?.hostPid === expectedHostPid && latest.status === "exited") return true;
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  return false;
+  // Meta status is not enough: finalize writes `exited` immediately before the
+  // host process itself returns. Confirm OS liveness so terminal Run state can
+  // never race that final process-exit window.
+  if (!isPidAlive(expectedHostPid)) return true;
+  if (expectedHostPid !== process.pid) return false;
+  const latest = await readHsrMeta(bee);
+  return latest?.hostPid === expectedHostPid && latest.status === "exited";
+}
+
+function childGroupOf(meta: HsrMeta | null): number {
+  return meta?.childPgid ?? meta?.childPid ?? 0;
+}
+
+async function confirmChildGroupStopped(meta: HsrMeta | null): Promise<boolean> {
+  const pgid = childGroupOf(meta);
+  if (!isHsrProcessGroupAlive(pgid)) return true;
+  await killOrphanedChildGroup(meta);
+  return !isHsrProcessGroupAlive(pgid);
 }
 
 /**
@@ -96,17 +121,29 @@ async function waitUntilNotRunning(bee: string, timeoutMs: number): Promise<bool
  * killing an already-dead bee is a no-op success.
  */
 async function kill(bee: string): Promise<KillResult> {
-  const meta = await readHsrMeta(bee);
-  let stopped = false;
-  if (meta?.controlSocket) {
+  const initial = await readHsrMeta(bee);
+  if (!initial) {
+    await clearPendingHsrTurns(bee).catch(() => undefined);
+    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+  }
+  // An `exited` meta can be visible just before the detached host process
+  // returns. Treat it as a reason not to signal a possibly recycled pid, but
+  // still confirm both the recorded host incarnation and its child group.
+  let stopped = initial.status === "exited"
+    ? await waitUntilHostStopped(bee, initial.hostPid, 1_000)
+    : false;
+  // `ownedMeta` may learn childPid/childPgid only while meta still names the
+  // initial host. A replacement incarnation is never adopted for cleanup.
+  let ownedMeta: HsrMeta = initial;
+  if (initial.status !== "exited" && initial.controlSocket) {
     try {
-      const client = await connectRpcClient(meta.controlSocket);
+      const client = await connectRpcClient(initial.controlSocket);
       try {
         await client.call("stop");
       } finally {
         client.close();
       }
-      stopped = await waitUntilNotRunning(bee, 2_500);
+      stopped = await waitUntilHostStopped(bee, initial.hostPid, 2_500);
     } catch {
       // Host unreachable / socket stale — fall through to the signal fallback.
     }
@@ -115,22 +152,57 @@ async function kill(bee: string): Promise<KillResult> {
   // "exited" meta means the bee stopped cleanly (its socket file is gone, so the
   // stop attempt above throws) — signalling meta.hostPid then would target a
   // recycled/unrelated pid.
-  if (!stopped && meta && meta.status !== "exited") {
-    if (isPidAlive(meta.hostPid)) {
+  if (!stopped) {
+    const latest = await readHsrMeta(bee);
+    if (latest?.hostPid === initial.hostPid) ownedMeta = latest;
+    // Only signal the exact runtime incarnation read at entry. A replacement
+    // host under the same bee name is not ours to shoot by a recycled pid.
+    if (latest && latest.status !== "exited" && latest.hostPid === initial.hostPid && isPidAlive(initial.hostPid)) {
       try {
-        process.kill(meta.hostPid, "SIGTERM");
+        process.kill(initial.hostPid, "SIGTERM");
       } catch {
         // Already gone or not signalable.
       }
+      stopped = await waitUntilHostStopped(bee, initial.hostPid, 2_000);
+      if (!stopped) {
+        const current = await readHsrMeta(bee);
+        if (current && current.status !== "exited" && current.hostPid === initial.hostPid && isPidAlive(initial.hostPid)) {
+          try {
+            process.kill(initial.hostPid, "SIGKILL");
+          } catch {
+            // Already gone or not signalable.
+          }
+        }
+        stopped = await waitUntilHostStopped(bee, initial.hostPid, 1_000);
+      }
+    } else if (!latest || latest.status === "exited") {
+      stopped = !isPidAlive(initial.hostPid);
+    } else if (latest.hostPid !== initial.hostPid) {
+      // Replacement raced the stop. If the initial pid is still observable we
+      // cannot prove ownership (it could also have been recycled), so preserve
+      // lost/unconfirmed state and leave BOTH replacement host/group untouched.
+      stopped = !isPidAlive(initial.hostPid);
     } else {
       // The host died without finalize (crashed __hsr-run): its detached
       // harness child is orphaned with no control socket. Signal the recorded
       // child group directly so kill actually stops the harness (HIVE-53).
-      await killOrphanedChildGroup(meta);
+      stopped = true;
     }
   }
+
+  const finalMeta = await readHsrMeta(bee);
+  if (finalMeta?.hostPid === initial.hostPid) ownedMeta = finalMeta;
+  const childStopped = stopped ? await confirmChildGroupStopped(ownedMeta) : false;
+  const confirmed = stopped && childStopped;
   await clearPendingHsrTurns(bee).catch(() => undefined);
-  return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+  return confirmed
+    ? { ok: true, stdout: "", stderr: "", exitCode: 0 }
+    : {
+        ok: false,
+        stdout: "",
+        stderr: `HSR stop unconfirmed for ${bee}: host or detached harness process group remains live`,
+        exitCode: 1,
+      };
 }
 
 let cached: Substrate | undefined;

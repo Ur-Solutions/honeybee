@@ -52,8 +52,34 @@ export class ExecutionProtocolError extends Error {
   }
 }
 
+/**
+ * An execution effect reached a point where a side effect may still be live,
+ * so the coordinator must persist a lost/indeterminate Run instead of a
+ * comfortable terminal failure. This is intentionally an internal subtype:
+ * callers still see the corpus HARNESS_UNAVAILABLE error shape if it escapes,
+ * while run.start consumes it to preserve honest durable state.
+ */
+export class IndeterminateExecutionError extends ExecutionProtocolError {
+  readonly cause: string;
+
+  constructor(code: ExecutionErrorCode, message: string, cause: string, details?: JsonValue) {
+    super(code, message, details);
+    this.name = "IndeterminateExecutionError";
+    this.cause = cause;
+  }
+}
+
 export function executionError(code: ExecutionErrorCode, message: string, details?: JsonValue): ExecutionProtocolError {
   return new ExecutionProtocolError(code, message, details);
+}
+
+export function indeterminateExecutionError(
+  code: ExecutionErrorCode,
+  message: string,
+  cause: string,
+  details?: JsonValue,
+): IndeterminateExecutionError {
+  return new IndeterminateExecutionError(code, message, cause, details);
 }
 
 /** Coerce any thrown value to a wire error; unknown failures are NODE-side internal faults. */

@@ -20,6 +20,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { createServer } from "node:net";
 import { test } from "node:test";
 import { killOrphanedChildGroup, reapDeadHosts } from "../src/hsr/observe.js";
 import { serve } from "../src/hsr/remoteHost.js";
@@ -218,6 +219,68 @@ test("local substrate kill signals the orphaned child group of a crashed local h
         orphan.kill("SIGKILL");
       } catch {
         // already dead — the expected outcome
+      }
+    }
+  });
+});
+
+test("local substrate stop never adopts a replacement incarnation's child process group", { timeout: 10_000 }, async () => {
+  await withTempStore(async (dir) => {
+    const bee = "replacement-race";
+    const initialHost = spawnOrphan();
+    const replacementHost = spawnOrphan();
+    const replacementChild = spawnOrphan();
+    const socketPath = join(dir, "race.sock");
+    const server = createServer((socket) => {
+      socket.once("data", () => {
+        void writeHsrMeta(bee, {
+          bee,
+          harness: "stub",
+          tier: "stream",
+          hostPid: replacementHost.pid as number,
+          childPid: replacementChild.pid as number,
+          childPgid: replacementChild.pid as number,
+          startedAt: new Date().toISOString(),
+          runningAt: new Date().toISOString(),
+          controlSocket: socketPath,
+          status: "running",
+        }).finally(() => socket.destroy());
+      });
+    });
+    try {
+      await new Promise<void>((resolveListen, rejectListen) => {
+        server.once("error", rejectListen);
+        server.listen(socketPath, resolveListen);
+      });
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, {
+        bee,
+        harness: "stub",
+        tier: "stream",
+        hostPid: initialHost.pid as number,
+        startedAt: new Date().toISOString(),
+        controlSocket: socketPath,
+        status: "queued",
+      });
+
+      const result = await hsrSubstrate().kill(bee);
+      assert.equal(result.ok, false, "a still-live initial pid plus replacement meta is honestly unconfirmed");
+      assert.equal(isPidAlive(initialHost.pid as number), true, "initial host is not blindly signalled after identity changes");
+      assert.equal(isPidAlive(replacementHost.pid as number), true, "replacement host is untouched");
+      assert.equal(isPidAlive(replacementChild.pid as number), true, "replacement child process group is untouched");
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      for (const processToStop of [initialHost, replacementHost]) {
+        try {
+          processToStop.kill("SIGKILL");
+        } catch {
+          // already dead
+        }
+      }
+      try {
+        process.kill(-(replacementChild.pid as number), "SIGKILL");
+      } catch {
+        // already dead
       }
     }
   });

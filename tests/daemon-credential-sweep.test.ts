@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
@@ -187,12 +188,16 @@ test("credential sync controller never overlaps repeated intervals and explicitl
 });
 
 type FakeChild = CredentialSweepChild & {
+  stdin: PassThrough;
+  stdout: PassThrough;
   killed: NodeJS.Signals[];
+  alive: boolean;
 };
 
 function fakeChild(
   pid: number,
   serve: (request: { id: number; root: string }, stdout: PassThrough) => void,
+  options: { ignoreSigterm?: boolean } = {},
 ): FakeChild {
   const emitter = new EventEmitter();
   const stdin = new PassThrough();
@@ -205,17 +210,22 @@ function fakeChild(
     buffer = lines.pop() ?? "";
     for (const line of lines) serve(JSON.parse(line) as { id: number; root: string }, stdout);
   });
-  return {
+  const child: FakeChild = {
     pid,
     stdin,
     stdout,
     killed,
+    alive: true,
     kill: (signal?: NodeJS.Signals) => {
-      killed.push(signal ?? "SIGTERM");
+      const delivered = signal ?? "SIGTERM";
+      killed.push(delivered);
+      if (delivered === "SIGTERM" && options.ignoreSigterm) return;
+      child.alive = false;
       setImmediate(() => emitter.emit("exit"));
     },
     on: (event, listener) => emitter.on(event, listener),
   };
+  return child;
 }
 
 test("isolated credential sweep kills a never-settling sync, releases its account lock, and the next run recovers", async () => {
@@ -229,17 +239,20 @@ test("isolated credential sweep kills a never-settling sync, releases its accoun
       stdout.write(`${JSON.stringify({ id: request.id, kind: "progress", progress: { type: "plan", telemetry: plan } })}\n`);
       stdout.write(`${JSON.stringify({ id: request.id, kind: "progress", progress: { type: "work-start", workId: 1, pairIds: [7] } })}\n`);
       // Never sends a result.
-    });
+    }, { ignoreSigterm: true });
     const recoveredTelemetry = telemetry({ completedAccounts: 1, completedPairs: 2, durationMs: 4 });
     const healthy = fakeChild(workerPid + 1, (request, stdout) => {
       stdout.write(`${JSON.stringify({ id: request.id, kind: "result", ok: true, telemetry: recoveredTelemetry })}\n`);
     });
     let spawns = 0;
+    const children = new Map<number, FakeChild>([[wedged.pid!, wedged], [healthy.pid!, healthy]]);
     const sweep = createIsolatedCredentialSweeper({
       timeoutMs: 30,
       killGraceMs: 100,
       root: () => root,
       spawnChild: () => (++spawns === 1 ? wedged : healthy),
+      signalProcessGroup: (pgid, signal) => children.get(pgid)?.kill(signal),
+      isProcessGroupAlive: (pgid) => children.get(pgid)?.alive ?? false,
     });
 
     await assert.rejects(
@@ -250,10 +263,11 @@ test("isolated credential sweep kills a never-settling sync, releases its accoun
         assert.equal(error.telemetry.uniquePairs, 19);
         assert.equal(error.telemetry.skippedPairs, 2_998);
         assert.equal(error.telemetry.timedOutPairs, 1);
+        assert.equal(error.terminationConfirmed, true);
         return true;
       },
     );
-    assert.deepEqual(wedged.killed, ["SIGKILL"]);
+    assert.deepEqual(wedged.killed, ["SIGTERM", "SIGKILL"]);
     await assert.rejects(() => readFile(lockPath, "utf8"), { code: "ENOENT" });
 
     // Recovery is immediate rather than waiting for the ordinary 60s stale
@@ -352,5 +366,126 @@ test("credential lock reaper recovers a worker killed while holding its generati
     let acquired = false;
     await withAccountLock(accountId, async () => { acquired = true; }, { timeoutMs: 200 });
     assert.equal(acquired, true, "the dead generation guard cannot strand future activations");
+  });
+});
+
+test("late partial stdout from a timed-out worker cannot corrupt its replacement's response", async () => {
+  await withTempStore(async (root) => {
+    const stale = fakeChild(425_000, () => undefined, { ignoreSigterm: true });
+    const expected = telemetry({ completedAccounts: 1, completedPairs: 1, durationMs: 3 });
+    let healthyReply: (() => void) | undefined;
+    const healthy = fakeChild(425_001, (request, stdout) => {
+      healthyReply = () => {
+        stdout.write(`${JSON.stringify({ id: request.id, kind: "result", ok: true, telemetry: expected })}\n`);
+      };
+    });
+    const children = new Map<number, FakeChild>([[stale.pid!, stale], [healthy.pid!, healthy]]);
+    let spawns = 0;
+    const sweep = createIsolatedCredentialSweeper({
+      timeoutMs: 30,
+      killGraceMs: 20,
+      root: () => root,
+      spawnChild: () => (++spawns === 1 ? stale : healthy),
+      signalProcessGroup: (pgid, signal) => children.get(pgid)?.kill(signal),
+      isProcessGroupAlive: (pgid) => children.get(pgid)?.alive ?? false,
+    });
+
+    try {
+      await assert.rejects(() => sweep(), CredentialSweepTimeoutError);
+      const recovered = sweep();
+      assert.ok(healthyReply, "replacement received its request");
+
+      // The stale generation publishes an unterminated JSON prefix after it
+      // was detached and after the new generation exists. A shared decoder or
+      // buffer would prepend this to the healthy response and lose it.
+      stale.stdout.write('{"id":');
+      healthyReply();
+      assert.deepEqual(await recovered, expected);
+      assert.equal(spawns, 2);
+    } finally {
+      await sweep.close().catch(() => undefined);
+    }
+  });
+});
+
+test("credential sweep timeout kills a SIGTERM-resistant helper grandchild before reaping the worker lock", { timeout: 10_000 }, async () => {
+  await withTempStore(async (root) => {
+    const marker = join(root, "helper-mutations.log");
+    const lockPath = join(root, "locks", "accounts", "helper.lock");
+    let worker: ChildProcess | undefined;
+    const helperSource = String.raw`
+      const fs = require("node:fs");
+      const marker = process.argv[1];
+      process.on("SIGTERM", () => {});
+      fs.appendFileSync(marker, "started\n");
+      setInterval(() => fs.appendFileSync(marker, "tick\n"), 10);
+    `;
+    const workerSource = String.raw`
+      const { spawn } = require("node:child_process");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      process.on("SIGTERM", () => {});
+      let buffer = "";
+      process.stdin.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline));
+        const lockDir = path.join(request.root, "locks", "accounts");
+        fs.mkdirSync(lockDir, { recursive: true });
+        fs.writeFileSync(path.join(lockDir, "helper.lock"), JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+        const helper = ${JSON.stringify(helperSource)};
+        spawn(process.execPath, ["--input-type=commonjs", "-e", helper, ${JSON.stringify(marker)}], { stdio: "ignore" });
+        process.stdout.write(JSON.stringify({ id: request.id, kind: "progress", progress: { type: "plan", telemetry: ${JSON.stringify(telemetry())} } }) + "\n");
+        process.stdout.write(JSON.stringify({ id: request.id, kind: "progress", progress: { type: "work-start", workId: 1, pairIds: [0] } }) + "\n");
+      });
+      process.stdout.write("ready\n");
+      setInterval(() => {}, 1000);
+    `;
+
+    worker = spawn(process.execPath, ["--input-type=commonjs", "-e", workerSource], {
+      detached: true,
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    await new Promise<void>((resolveReady, rejectReady) => {
+      worker!.once("error", rejectReady);
+      worker!.stdout!.once("data", (chunk) => {
+        assert.match(chunk.toString("utf8"), /ready/);
+        resolveReady();
+      });
+    });
+
+    const sweep = createIsolatedCredentialSweeper({
+      timeoutMs: 2_000,
+      killGraceMs: 150,
+      root: () => root,
+      spawnChild: () => worker as unknown as CredentialSweepChild,
+    });
+
+    try {
+      await assert.rejects(
+        () => sweep(),
+        (error: unknown) => {
+          assert.ok(error instanceof CredentialSweepTimeoutError);
+          assert.equal(error.terminationConfirmed, true, error.message);
+          assert.equal(error.telemetry.timedOutPairs, 1);
+          return true;
+        },
+      );
+      await assert.rejects(() => readFile(lockPath, "utf8"), { code: "ENOENT" });
+      const before = await readFile(marker, "utf8");
+      assert.match(before, /started/, "the helper actually ran and mutated before timeout");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+      assert.equal(await readFile(marker, "utf8"), before, "no descendant mutates after group confirmation + lock reap");
+    } finally {
+      await sweep.close().catch(() => undefined);
+      if (worker?.pid) {
+        try {
+          process.kill(-worker.pid, "SIGKILL");
+        } catch {
+          // Expected once the sweep has confirmed the group dead.
+        }
+      }
+    }
   });
 });

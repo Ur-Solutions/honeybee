@@ -34,6 +34,25 @@ import {
 
 const RUN_ID = "run-0001";
 
+/** Hold the launcher after admission so race tests synchronize on state, not wall-clock sleeps. */
+function gatedCountingLauncher() {
+  const counting = countingLauncher();
+  let markEntered!: () => void;
+  let releaseLaunch!: () => void;
+  const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+  const released = new Promise<void>((resolve) => { releaseLaunch = resolve; });
+  return {
+    calls: counting.calls,
+    entered,
+    release: releaseLaunch,
+    launcher: async (request: Parameters<typeof counting.launcher>[0]) => {
+      markEntered();
+      await released;
+      return counting.launcher(request);
+    },
+  };
+}
+
 async function startRunning(opts: { control?: ReturnType<typeof fakeControl>; expiresAt?: string } = {}) {
   const ctx = await installTestAuthority();
   const counting = countingLauncher();
@@ -179,16 +198,21 @@ test("a reservation without capabilityLeaseId fails closed on read", async () =>
 test("cancel during an in-flight launch stays nonterminal; the post-launch sweep resolves cancelled on confirmed stop", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
-    const counting = countingLauncher({ delayMs: 200 });
+    const counting = gatedCountingLauncher();
     const control = fakeControl();
     const service = makeService({ launcher: counting.launcher, control: control.control });
     const startPromise = service.runStart(buildRunStartEnvelope(ctx));
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await counting.entered;
 
-    const response = (await service.runCancel(buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "race" }))) as JsonObject;
-    const midState = String((response.result as JsonObject).state);
-    assert.ok(["starting", "accepted"].includes(midState), `nonterminal during launch, got ${midState}`);
-    assert.ok(!(await readRunEvents(RUN_ID)).some((event) => event.type === "run.cancelled"), "no run.cancelled before the stop is real");
+    try {
+      const response = (await service.runCancel(buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "race" }))) as JsonObject;
+      assert.ok(response.result, `cancel failed: ${JSON.stringify(response.error)}`);
+      const midState = String((response.result as JsonObject).state);
+      assert.ok(["starting", "accepted"].includes(midState), `nonterminal during launch, got ${midState}`);
+      assert.ok(!(await readRunEvents(RUN_ID)).some((event) => event.type === "run.cancelled"), "no run.cancelled before the stop is real");
+    } finally {
+      counting.release();
+    }
 
     await startPromise;
     // The sweep stopped the newborn session (confirmed) and resolved cancelled.
@@ -204,12 +228,16 @@ test("cancel during an in-flight launch stays nonterminal; the post-launch sweep
 test("cancel during launch with an unconfirmable stop projects lost, then converges once exit is proven", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
-    const counting = countingLauncher({ delayMs: 150 });
+    const counting = gatedCountingLauncher();
     const control = fakeControl({ stopResult: { stopped: false, detail: "clean stop unconfirmed" } });
     const service = makeService({ launcher: counting.launcher, control: control.control });
     const startPromise = service.runStart(buildRunStartEnvelope(ctx));
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    await service.runCancel(buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "race" }));
+    await counting.entered;
+    try {
+      await service.runCancel(buildOperationEnvelope(ctx, `${RUN_ID}/cancel`, { runId: RUN_ID, reason: "race" }));
+    } finally {
+      counting.release();
+    }
     await startPromise;
 
     const projection = ((await service.runGet({ protocolVersion: "0.1", runId: RUN_ID })) as { result: JsonObject }).result;
@@ -234,7 +262,7 @@ test("cancel during launch with an unconfirmable stop projects lost, then conver
 test("release during an in-flight launch fences all cleanup; reconciliation completes it after the launch resolves", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
-    const counting = countingLauncher({ delayMs: 200 });
+    const counting = gatedCountingLauncher();
     const control = fakeControl();
     const service = makeService({ launcher: counting.launcher, control: control.control });
     await registerWorkingCopy({
@@ -248,14 +276,18 @@ test("release during an in-flight launch fences all cleanup; reconciliation comp
     const startPromise = service.runStart(buildRunStartEnvelope(ctx, { mutateIntent: (intent) => {
       (intent.placement as JsonObject).workingCopyId = "wc-race";
     } }));
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await counting.entered;
 
-    const response = (await service.runRelease(buildOperationEnvelope(ctx, `${RUN_ID}/release`, { runId: RUN_ID }))) as JsonObject;
-    const result = response.result as JsonObject;
-    assert.equal(result.environmentState, "releasing", "fenced, not released");
-    // Nothing was freed while the launch could still bind a harness to it.
-    assert.equal((await readWorkingCopy("wc-race"))!.occupancy?.claimedByRunId, RUN_ID);
-    assert.ok(!(await readRunEvents(RUN_ID)).some((event) => event.type === "environment.released"));
+    try {
+      const response = (await service.runRelease(buildOperationEnvelope(ctx, `${RUN_ID}/release`, { runId: RUN_ID }))) as JsonObject;
+      const result = response.result as JsonObject;
+      assert.equal(result.environmentState, "releasing", "fenced, not released");
+      // Nothing was freed while the launch could still bind a harness to it.
+      assert.equal((await readWorkingCopy("wc-race"))!.occupancy?.claimedByRunId, RUN_ID);
+      assert.ok(!(await readRunEvents(RUN_ID)).some((event) => event.type === "environment.released"));
+    } finally {
+      counting.release();
+    }
 
     await startPromise;
     // Read-side reconciliation (not an exact release retry) continues the

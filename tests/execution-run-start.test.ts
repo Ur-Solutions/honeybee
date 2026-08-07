@@ -8,7 +8,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { loadExecutionContract, createExecutionValidator } from "../src/execution/contract.js";
-import { executionError } from "../src/execution/errors.js";
+import { executionError, indeterminateExecutionError } from "../src/execution/errors.js";
 import { requireExecutionBinding } from "../src/execution/nodeState.js";
 import {
   admitRunStart,
@@ -21,12 +21,14 @@ import {
 import { validateRunStart } from "../src/execution/runStart.js";
 import type { JsonObject } from "../src/execution/contract.js";
 import { saveSession } from "../src/store.js";
+import { claimWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import {
   buildRunStartEnvelope,
   countingLauncher,
   installTestAuthority,
   makeService,
   withTempStore,
+  SNAPSHOT_DIGEST,
   type TestAuthority,
 } from "./executionTestKit.js";
 
@@ -419,9 +421,18 @@ test("crash recovery: started-receipt-lost binds the session without a second la
       phase: "launching",
       launchAttemptedAt: new Date().toISOString(),
     }));
+    await registerWorkingCopy({
+      workingCopyId: "wc-0001",
+      productId: "prod-honeycomb-app",
+      path: "/tmp/wc-0001",
+      snapshotDigest: SNAPSHOT_DIGEST,
+      origin: "https://git.example.com/acme/honeycomb-app.git",
+      revision: "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c",
+    });
+    await claimWorkingCopy("wc-0001", "run-0001");
     // The spawn persisted its record (stamped with the runId) before the crash.
     const now = new Date().toISOString();
-    await saveSession({
+    const crashedSession = {
       name: beeNameForRun("run-0001"),
       agent: "claude",
       cwd: "/",
@@ -432,18 +443,79 @@ test("crash recovery: started-receipt-lost binds the session without a second la
       updatedAt: now,
       status: "running",
       executionRunId: "run-0001",
-    });
+    } as const;
+    await saveSession(crashedSession);
 
     const counting = countingLauncher();
     const restarted = makeService({ launcher: counting.launcher });
+    const waiting = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r1" }))) as JsonObject;
+    assert.deepEqual(waiting.result, { runId: "run-0001", state: "lost" });
+    assert.equal((await readReservation("run-0001"))!.indeterminateCause, "session_ref_missing");
+    assert.equal(counting.calls.length, 0, "missing canonical identity must not relaunch the live process");
+
+    // Canonical id publication can lag the process/session record. A later
+    // replay converges from lost using CO.*, never the provisional xr-* name.
+    await saveSession({ ...crashedSession, id: "CO.canonical-0001", updatedAt: new Date().toISOString() });
     const response = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r2" }))) as JsonObject;
     assertEnvelopeShape(response);
     assert.equal((response.receipt as JsonObject).outcome, "replayed");
     assert.deepEqual(response.result, { runId: "run-0001", state: "running" });
     assert.equal(counting.calls.length, 0, "an already-started run must never launch twice");
-    assert.equal((await readReservation("run-0001"))!.phase, "started");
+    const repaired = (await readReservation("run-0001"))!;
+    assert.equal(repaired.phase, "started");
+    assert.equal(repaired.sessionRef, "CO.canonical-0001", "canonical SessionRecord.id survives the lost receipt");
+    assert.equal(repaired.environment?.environmentId.startsWith("env-"), true, "path-free environment receipt is rebuilt");
     const events = await readRunEvents("run-0001");
-    assert.ok(events.some((event) => event.type === "harness.running"), "repair appends the missing running event");
+    assert.deepEqual(events.slice(-2).map((event) => event.type), ["environment.ready", "harness.running"]);
+    const running = events.find((event) => event.type === "harness.running")!;
+    assert.deepEqual(running.payload, { sessionRef: "CO.canonical-0001" });
+    assert.notEqual((running.payload as JsonObject).sessionRef, beeNameForRun("run-0001"), "provisional xr-* name never escapes as sessionRef");
+  });
+});
+
+test("readiness failure with unconfirmed stop stays lost until reconciliation proves exit", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const launcher = async () => {
+      throw indeterminateExecutionError(
+        "HARNESS_UNAVAILABLE",
+        "harness claude readiness timed out and stop was unconfirmed",
+        "readiness_stop_unconfirmed",
+      );
+    };
+    const stop = { stopped: false };
+    const control = {
+      ...(await import("./executionTestKit.js")).fakeControl().control,
+      stop: async () => ({ stopped: stop.stopped, detail: stop.stopped ? "confirmed" : "still live" }),
+    };
+    const service = makeService({ launcher, control });
+    const first = (await service.runStart(buildRunStartEnvelope(ctx))) as JsonObject;
+    assert.deepEqual(first.result, { runId: "run-0001", state: "lost" });
+    let reservation = (await readReservation("run-0001"))!;
+    assert.equal(reservation.phase, "launching");
+    assert.equal(reservation.result, undefined, "possibly-live runtime never receives a terminal failed result");
+    assert.equal(reservation.indeterminateCause, "readiness_stop_unconfirmed");
+
+    const now = new Date().toISOString();
+    await saveSession({
+      name: beeNameForRun("run-0001"),
+      agent: "claude",
+      cwd: "/",
+      command: "claude",
+      tmuxTarget: beeNameForRun("run-0001"),
+      substrate: "hsr",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+      id: "CO.canonical-dead",
+      executionRunId: "run-0001",
+    });
+    const reconciled = await service.runGet({ protocolVersion: "0.1", runId: "run-0001" });
+    assert.ok("result" in reconciled);
+    assert.equal(reconciled.result.state, "failed");
+    reservation = (await readReservation("run-0001"))!;
+    assert.equal(reservation.indeterminateAt, undefined);
+    assert.equal(reservation.result?.outcome, "failed");
   });
 });
 

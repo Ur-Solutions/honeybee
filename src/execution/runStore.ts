@@ -135,6 +135,8 @@ export type RunReservation = {
   result?: { outcome: "completed" | "failed" | "cancelled"; cause?: string; harnessExitCode?: number; finishedAt: string };
   /** Set when recovery declared the start outcome unknowable. */
   indeterminateAt?: string;
+  /** Machine-readable reason reconciliation uses to retry/resolve lost state. */
+  indeterminateCause?: string;
   /** Durable cancellation intent (run.cancel is desired state, not an RPC race). */
   cancel?: { requestedAt: string; reason?: string };
   /** Debug-retention window (run.retain); extends retention only, never authority. */
@@ -614,6 +616,8 @@ export type LaunchEvidence = {
   sessionExists: boolean;
   /** The executionRunId stamped on that session record, when present. */
   stampedRunId?: string;
+  /** Canonical SessionRecord.id (CO.* / provider-stable ref), never beeName. */
+  sessionRef?: string;
   /** False when durable HSR evidence exists but has not reached runningAt. */
   ready?: boolean;
 };
@@ -633,7 +637,15 @@ export function classifyLaunch(
   if (reservation.phase === "reserved") return options.inFlight ? "launch-in-flight" : "reserved-not-started";
   // phase === "launching"
   if (options.inFlight) return "launch-in-flight";
-  if (reservation.indeterminateAt) return "indeterminate";
+  // These two lost states name receipt facts that can legitimately appear on
+  // a later reconciliation pass (SessionRecord.id publication or a recovered
+  // working-copy claim). Keep inspecting evidence so the Run can converge;
+  // every other indeterminate launch remains sticky and is never relaunched.
+  if (
+    reservation.indeterminateAt &&
+    reservation.indeterminateCause !== "session_ref_missing" &&
+    reservation.indeterminateCause !== "environment_receipt_missing"
+  ) return "indeterminate";
   if (evidence.sessionExists) {
     if (evidence.stampedRunId !== undefined && evidence.stampedRunId !== reservation.runId) return "indeterminate";
     if (evidence.ready === false) return "booting-receipt-lost";

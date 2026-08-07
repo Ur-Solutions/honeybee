@@ -655,9 +655,10 @@ export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservat
 // mirrors streamRunner.ts stop().
 const ORPHAN_STOP_GRACE_MS = 2_000;
 const ORPHAN_STOP_POLL_MS = 25;
+const ORPHAN_KILL_CONFIRM_MS = 1_000;
 
 /** Signal-0 liveness probe of a whole process group. */
-function isPgidAlive(pgid: number): boolean {
+export function isHsrProcessGroupAlive(pgid: number): boolean {
   if (!Number.isInteger(pgid) || pgid <= 0) return false;
   try {
     process.kill(-pgid, 0);
@@ -679,21 +680,25 @@ function isPgidAlive(pgid: number): boolean {
  */
 export async function killOrphanedChildGroup(meta: HsrMeta | null): Promise<boolean> {
   const pgid = meta?.childPgid ?? meta?.childPid ?? 0;
-  if (!isPgidAlive(pgid)) return false;
+  if (!isHsrProcessGroupAlive(pgid)) return false;
   try {
     process.kill(-pgid, "SIGTERM");
   } catch {
     // Died between the probe and the signal.
   }
   const deadline = Date.now() + ORPHAN_STOP_GRACE_MS;
-  while (isPgidAlive(pgid) && Date.now() < deadline) {
+  while (isHsrProcessGroupAlive(pgid) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, ORPHAN_STOP_POLL_MS));
   }
-  if (isPgidAlive(pgid)) {
+  if (isHsrProcessGroupAlive(pgid)) {
     try {
       process.kill(-pgid, "SIGKILL");
     } catch {
       // best-effort
+    }
+    const confirmDeadline = Date.now() + ORPHAN_KILL_CONFIRM_MS;
+    while (isHsrProcessGroupAlive(pgid) && Date.now() < confirmDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, ORPHAN_STOP_POLL_MS));
     }
   }
   return true;

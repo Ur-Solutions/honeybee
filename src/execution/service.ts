@@ -17,7 +17,13 @@ import {
   type JsonObject,
 } from "./contract.js";
 import { assertDescribeScope, buildNodeDescriptor, NATIVE_PROVIDER_ID, type HarnessProbe } from "./describe.js";
-import { ExecutionProtocolError, executionError, toWireError, type ExecutionErrorWire } from "./errors.js";
+import {
+  ExecutionProtocolError,
+  IndeterminateExecutionError,
+  executionError,
+  toWireError,
+  type ExecutionErrorWire,
+} from "./errors.js";
 import { negotiateHello, supportedFeatures, type HelloResult } from "./hello.js";
 import {
   loadNodeIdentity,
@@ -274,6 +280,28 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         }
       } catch (error) {
         const wire = toWireError(error);
+        if (error instanceof IndeterminateExecutionError) {
+          await mutateReservation(runId, (current) => ({
+            ...current,
+            indeterminateAt: current.indeterminateAt ?? now().toISOString(),
+            indeterminateCause: current.indeterminateCause ?? error.cause,
+            failureCause: current.failureCause ?? `${wire.code}: ${wire.message}`,
+          }));
+          await appendRunEvents(
+            runId,
+            protocolVersion,
+            [{
+              type: "run.lost",
+              payload: {
+                cause: error.cause,
+                ...(error.details !== undefined ? { detail: error.details } : {}),
+              },
+              origin: await origin(),
+            }],
+            { onlyIfAbsentTypes: true },
+          );
+          return;
+        }
         await mutateReservation(runId, (current) => ({
           ...current,
           phase: "failed",
@@ -304,23 +332,82 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
    * from run.start replays, run.get, and run.events.
    */
   async function reconcile(reservation: RunReservation): Promise<RunReservation> {
-    const classification = classifyLaunch(reservation, await options.sessions.evidence(reservation.beeName), {
+    const launchEvidence = await options.sessions.evidence(reservation.beeName);
+    const classification = classifyLaunch(reservation, launchEvidence, {
       inFlight: inFlight.has(reservation.runId),
       nowMs: now().getTime(),
       ...(options.launchGraceMs !== undefined ? { graceMs: options.launchGraceMs } : {}),
     });
     let current = reservation;
     if (classification === "started-receipt-lost") {
-      // The process started durably but the receipt path crashed: bind it.
-      current = await mutateReservation(current.runId, (record) =>
-        record.phase === "launching" ? { ...record, phase: "started", startedAt: record.startedAt ?? now().toISOString() } : record,
-      );
-      await appendRunEvents(
-        current.runId,
-        protocolVersion,
-        [{ type: "harness.running", payload: {}, origin: await origin({ driverId: driverIdOf(current) }) }],
-        { onlyIfAbsentTypes: true },
-      );
+      // The process started durably but the receipt path crashed. Binding to
+      // the provisional xr-* lookup name would leak the wrong public identity;
+      // require the canonical SessionRecord.id carried by launch evidence.
+      if (!launchEvidence.sessionRef) {
+        current = await mutateReservation(current.runId, (record) => ({
+          ...record,
+          indeterminateAt: record.indeterminateAt ?? now().toISOString(),
+          indeterminateCause: record.indeterminateCause ?? "session_ref_missing",
+        }));
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "run.lost", payload: { cause: "session_ref_missing" }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+      } else {
+        // Explicit placement already claimed its locator before spawn. Rebuild
+        // its path-free environment receipt so the repaired lifecycle remains
+        // environment.ready -> harness.running after a coordinator crash.
+        const recoveredEnvironment = current.environment ?? await (async () => {
+          const { recoverExplicitPlacementEnvironment } = await import("./launcher.js");
+          return recoverExplicitPlacementEnvironment(await canonicalNodeId(), current);
+        })();
+        if (!recoveredEnvironment) {
+          current = await mutateReservation(current.runId, (record) => ({
+            ...record,
+            sessionRef: launchEvidence.sessionRef,
+            indeterminateAt: record.indeterminateAt ?? now().toISOString(),
+            indeterminateCause: record.indeterminateCause ?? "environment_receipt_missing",
+          }));
+          await appendRunEvents(
+            current.runId,
+            protocolVersion,
+            [{ type: "run.lost", payload: { cause: "environment_receipt_missing" }, origin: await origin() }],
+            { onlyIfAbsentTypes: true },
+          );
+        } else {
+          current = await mutateReservation(current.runId, (record) => {
+            const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
+            return record.phase === "launching"
+              ? {
+                  ...(rest as RunReservation),
+                  phase: "started",
+                  startedAt: record.startedAt ?? now().toISOString(),
+                  sessionRef: launchEvidence.sessionRef,
+                  environment: recoveredEnvironment,
+                }
+              : record;
+          });
+          await appendRunEvents(
+            current.runId,
+            protocolVersion,
+            [
+              {
+                type: "environment.ready",
+                payload: { environmentId: recoveredEnvironment.environmentId },
+                origin: await origin({ providerId: recoveredEnvironment.providerId }),
+              },
+              {
+                type: "harness.running",
+                payload: { sessionRef: launchEvidence.sessionRef },
+                origin: await origin({ driverId: driverIdOf(current) }),
+              },
+            ],
+            { onlyIfAbsentTypes: true },
+          );
+        }
+      }
     } else if (classification === "booting-receipt-lost") {
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
@@ -339,16 +426,59 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           { onlyIfAbsentTypes: true },
         );
       }
-    } else if (classification === "indeterminate" && !current.indeterminateAt) {
-      current = await mutateReservation(current.runId, (record) =>
-        record.indeterminateAt ? record : { ...record, indeterminateAt: now().toISOString() },
-      );
-      await appendRunEvents(
-        current.runId,
-        protocolVersion,
-        [{ type: "run.lost", payload: { cause: "start_outcome_indeterminate" }, origin: await origin() }],
-        { onlyIfAbsentTypes: true },
-      );
+    } else if (classification === "indeterminate") {
+      if (!current.indeterminateAt) {
+        current = await mutateReservation(current.runId, (record) =>
+          record.indeterminateAt
+            ? record
+            : { ...record, indeterminateAt: now().toISOString(), indeterminateCause: "start_outcome_indeterminate" },
+        );
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "run.lost", payload: { cause: "start_outcome_indeterminate" }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+      }
+
+      // A readiness timeout whose first stop was unconfirmed remains lost,
+      // never terminally failed, while the runtime may be live. Reconciliation
+      // retries a now-available control socket and resolves only after stop or
+      // outcome evidence proves the process is down.
+      if (current.indeterminateCause === "readiness_stop_unconfirmed") {
+        const outcome = await options.sessions.outcome(current.beeName);
+        let stopConfirmed = Boolean(outcome && !outcome.live);
+        if (outcome?.live) {
+          try {
+            stopConfirmed = (await control.stop(current.beeName)).stopped;
+          } catch {
+            stopConfirmed = false;
+          }
+        }
+        if (stopConfirmed) {
+          const finishedAt = now().toISOString();
+          current = await mutateReservation(current.runId, (record) => {
+            const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
+            return {
+              ...(rest as RunReservation),
+              phase: "failed",
+              failedAt: record.failedAt ?? finishedAt,
+              failureCause: record.failureCause ?? "HARNESS_UNAVAILABLE: readiness timed out; stop eventually confirmed",
+              result: record.result ?? {
+                outcome: "failed",
+                cause: "HARNESS_UNAVAILABLE: readiness timed out; stop eventually confirmed",
+                finishedAt,
+              },
+            };
+          });
+          await appendRunEvents(
+            current.runId,
+            protocolVersion,
+            [{ type: "run.failed", payload: { cause: "HARNESS_UNAVAILABLE", message: "readiness timed out; stop confirmed" }, origin: await origin() }],
+            { onlyIfAbsentTypes: true },
+          );
+        }
+      }
     }
     const leaseExpired = Date.parse(current.leaseExpiresAt) < now().getTime();
     if (current.phase === "started" && !current.result && (current.cancel !== undefined || leaseExpired)) {
@@ -837,6 +967,7 @@ export function storeSessionEvidenceSource(): SessionEvidenceSource {
       return {
         sessionExists: record !== null || meta !== null,
         ...(record?.executionRunId !== undefined ? { stampedRunId: record.executionRunId } : {}),
+        ...(record?.id !== undefined ? { sessionRef: record.id } : {}),
         ...(meta !== null ? { ready: meta.status === "running" && typeof meta.runningAt === "string" } : {}),
       };
     },
