@@ -94,6 +94,8 @@ export type ExecutionServiceOptions = {
   sessions: SessionEvidenceSource;
   /** Harness steering/stop channel; defaults to the HSR control-socket path. */
   control?: HarnessControl;
+  /** Strict stop for a spawn-known runtime; missing HSR meta is unconfirmed. */
+  stopKnownExecution?: (beeName: string) => Promise<{ stopped: boolean; detail: string }>;
   harnessProbe?: HarnessProbe;
   verifySignature?: SignatureVerifier;
   now?: () => Date;
@@ -130,6 +132,10 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   const protocolVersion = typeof contract.profile.protocolVersion === "string" ? contract.profile.protocolVersion : "0.1";
   const now = options.now ?? (() => new Date());
   const control = options.control ?? hsrHarnessControl();
+  const stopKnownExecution = options.stopKnownExecution ?? (async (beeName: string) => {
+    const result = await (await import("../hsr/substrate.js")).stopKnownHsrExecution(beeName);
+    return { stopped: result.ok, detail: result.ok ? "HSR stop confirmed" : result.stderr || "HSR stop unconfirmed" };
+  });
   const inFlight = new Map<string, Promise<void>>();
 
   let identityPromise: Promise<ExecutionNodeIdentity> | undefined;
@@ -409,16 +415,32 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         }
       }
     } else if (classification === "booting-receipt-lost") {
+      if (launchEvidence.ready === undefined && !current.indeterminateAt) {
+        current = await mutateReservation(current.runId, (record) => ({
+          ...record,
+          indeterminateAt: record.indeterminateAt ?? now().toISOString(),
+          indeterminateCause: record.indeterminateCause ?? "readiness_evidence_missing",
+        }));
+        await appendRunEvents(
+          current.runId,
+          protocolVersion,
+          [{ type: "run.lost", payload: { cause: "readiness_evidence_missing" }, origin: await origin() }],
+          { onlyIfAbsentTypes: true },
+        );
+      }
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
         const finishedAt = now().toISOString();
-        current = await mutateReservation(current.runId, (record) => ({
-          ...record,
-          phase: "failed",
-          failedAt: record.failedAt ?? finishedAt,
-          failureCause: record.failureCause ?? "HARNESS_UNAVAILABLE: harness exited before readiness",
-          result: record.result ?? { outcome: "failed", cause: "HARNESS_UNAVAILABLE: harness exited before readiness", finishedAt },
-        }));
+        current = await mutateReservation(current.runId, (record) => {
+          const { indeterminateAt: _lostAt, indeterminateCause: _lostCause, ...rest } = record;
+          return {
+            ...(rest as RunReservation),
+            phase: "failed",
+            failedAt: record.failedAt ?? finishedAt,
+            failureCause: record.failureCause ?? "HARNESS_UNAVAILABLE: harness exited before readiness",
+            result: record.result ?? { outcome: "failed", cause: "HARNESS_UNAVAILABLE: harness exited before readiness", finishedAt },
+          };
+        });
         await appendRunEvents(
           current.runId,
           protocolVersion,
@@ -450,7 +472,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         let stopConfirmed = Boolean(outcome && !outcome.live);
         if (outcome?.live) {
           try {
-            stopConfirmed = (await control.stop(current.beeName)).stopped;
+            stopConfirmed = (await stopKnownExecution(current.beeName)).stopped;
           } catch {
             stopConfirmed = false;
           }
@@ -985,6 +1007,10 @@ export function storeSessionEvidenceSource(): SessionEvidenceSource {
       }
       const record = await loadSession(beeName);
       if (!record) return null;
+      // A record-only HSR session proves identity/ownership, not process
+      // liveness. Its host meta may be delayed; wait for it (or a later record
+      // terminal state) instead of treating the label "running" as proof.
+      if (record.substrate === "hsr" && record.status === "running") return null;
       return record.status === "running" ? { live: true } : { live: false, exitCode: null };
     },
   };

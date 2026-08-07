@@ -120,12 +120,7 @@ async function confirmChildGroupStopped(meta: HsrMeta | null): Promise<boolean> 
  * as a fallback (its SIGTERM handler stops the child too). Never throws —
  * killing an already-dead bee is a no-op success.
  */
-async function kill(bee: string): Promise<KillResult> {
-  const initial = await readHsrMeta(bee);
-  if (!initial) {
-    await clearPendingHsrTurns(bee).catch(() => undefined);
-    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
-  }
+async function stopHsrIncarnation(bee: string, initial: HsrMeta): Promise<KillResult> {
   // An `exited` meta can be visible just before the detached host process
   // returns. Treat it as a reason not to signal a possibly recycled pid, but
   // still confirm both the recorded host incarnation and its child group.
@@ -203,6 +198,34 @@ async function kill(bee: string): Promise<KillResult> {
         stderr: `HSR stop unconfirmed for ${bee}: host or detached harness process group remains live`,
         exitCode: 1,
       };
+}
+
+/** Generic user kill keeps its traditional idempotent no-session success. */
+async function kill(bee: string): Promise<KillResult> {
+  const initial = await readHsrMeta(bee);
+  if (!initial) {
+    await clearPendingHsrTurns(bee).catch(() => undefined);
+    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+  }
+  return stopHsrIncarnation(bee, initial);
+}
+
+/**
+ * Strict stop for an execution launcher that already knows spawn returned.
+ * Missing metadata is not evidence that the detached host is dead: startup
+ * publication may simply be late, so terminal failure must remain forbidden.
+ */
+export async function stopKnownHsrExecution(bee: string): Promise<KillResult> {
+  const initial = await readHsrMeta(bee);
+  if (!initial) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: `HSR stop unconfirmed for ${bee}: spawned runtime metadata is not yet observable`,
+      exitCode: 1,
+    };
+  }
+  return stopHsrIncarnation(bee, initial);
 }
 
 let cached: Substrate | undefined;

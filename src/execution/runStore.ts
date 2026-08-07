@@ -618,7 +618,7 @@ export type LaunchEvidence = {
   stampedRunId?: string;
   /** Canonical SessionRecord.id (CO.* / provider-stable ref), never beeName. */
   sessionRef?: string;
-  /** False when durable HSR evidence exists but has not reached runningAt. */
+  /** True only when durable HSR meta is running and carries runningAt. */
   ready?: boolean;
 };
 
@@ -637,18 +637,22 @@ export function classifyLaunch(
   if (reservation.phase === "reserved") return options.inFlight ? "launch-in-flight" : "reserved-not-started";
   // phase === "launching"
   if (options.inFlight) return "launch-in-flight";
-  // These two lost states name receipt facts that can legitimately appear on
-  // a later reconciliation pass (SessionRecord.id publication or a recovered
-  // working-copy claim). Keep inspecting evidence so the Run can converge;
+  // These lost states name receipt facts that can legitimately appear on a
+  // later reconciliation pass (positive HSR readiness, SessionRecord.id
+  // publication, or a recovered working-copy claim). Keep inspecting evidence
+  // so the Run can converge;
   // every other indeterminate launch remains sticky and is never relaunched.
   if (
     reservation.indeterminateAt &&
+    reservation.indeterminateCause !== "readiness_evidence_missing" &&
     reservation.indeterminateCause !== "session_ref_missing" &&
     reservation.indeterminateCause !== "environment_receipt_missing"
   ) return "indeterminate";
   if (evidence.sessionExists) {
     if (evidence.stampedRunId !== undefined && evidence.stampedRunId !== reservation.runId) return "indeterminate";
-    if (evidence.ready === false) return "booting-receipt-lost";
+    // Identity evidence is not readiness evidence. Only a running HSR meta
+    // carrying runningAt can repair the public harness.running receipt.
+    if (evidence.ready !== true) return "booting-receipt-lost";
     return "started-receipt-lost";
   }
   const attempted = Date.parse(reservation.launchAttemptedAt ?? reservation.updatedAt);

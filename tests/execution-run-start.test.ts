@@ -22,6 +22,7 @@ import { validateRunStart } from "../src/execution/runStart.js";
 import type { JsonObject } from "../src/execution/contract.js";
 import { saveSession } from "../src/store.js";
 import { claimWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
+import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import {
   buildRunStartEnvelope,
   countingLauncher,
@@ -450,13 +451,31 @@ test("crash recovery: started-receipt-lost binds the session without a second la
     const restarted = makeService({ launcher: counting.launcher });
     const waiting = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r1" }))) as JsonObject;
     assert.deepEqual(waiting.result, { runId: "run-0001", state: "lost" });
-    assert.equal((await readReservation("run-0001"))!.indeterminateCause, "session_ref_missing");
-    assert.equal(counting.calls.length, 0, "missing canonical identity must not relaunch the live process");
+    assert.equal((await readReservation("run-0001"))!.indeterminateCause, "readiness_evidence_missing");
+    assert.equal(counting.calls.length, 0, "record-only identity evidence must not relaunch the process");
 
-    // Canonical id publication can lag the process/session record. A later
-    // replay converges from lost using CO.*, never the provisional xr-* name.
+    // Canonical identity alone is still not readiness: without running HSR
+    // metadata the replay must remain lost and emit no harness.running.
     await saveSession({ ...crashedSession, id: "CO.canonical-0001", updatedAt: new Date().toISOString() });
-    const response = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r2" }))) as JsonObject;
+    const identityOnly = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r2" }))) as JsonObject;
+    assert.deepEqual(identityOnly.result, { runId: "run-0001", state: "lost" });
+    assert.ok(!(await readRunEvents("run-0001")).some((event) => event.type === "harness.running"));
+
+    // Positive runningAt metadata finally proves readiness. The next replay
+    // converges from lost using CO.*, never the provisional xr-* name.
+    const bee = beeNameForRun("run-0001");
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "claude",
+      tier: "stream",
+      hostPid: process.pid,
+      startedAt: now,
+      runningAt: new Date().toISOString(),
+      controlSocket: "/tmp/honeybee-ready-proof.sock",
+      status: "running",
+    });
+    const response = (await restarted.runStart(buildRunStartEnvelope(ctx, { requestId: "req-r3" }))) as JsonObject;
     assertEnvelopeShape(response);
     assert.equal((response.receipt as JsonObject).outcome, "replayed");
     assert.deepEqual(response.result, { runId: "run-0001", state: "running" });
@@ -476,17 +495,34 @@ test("crash recovery: started-receipt-lost binds the session without a second la
 test("readiness failure with unconfirmed stop stays lost until reconciliation proves exit", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
-    const launcher = async () => {
+    const launcher = async ({ runId, beeName }: { runId: string; beeName: string }) => {
+      const startedAt = new Date().toISOString();
+      await saveSession({
+        name: beeName,
+        agent: "claude",
+        cwd: "/",
+        command: "claude",
+        tmuxTarget: beeName,
+        substrate: "hsr",
+        createdAt: startedAt,
+        updatedAt: startedAt,
+        status: "running",
+        id: "CO.canonical-record-only",
+        executionRunId: runId,
+      });
       throw indeterminateExecutionError(
         "HARNESS_UNAVAILABLE",
         "harness claude readiness timed out and stop was unconfirmed",
         "readiness_stop_unconfirmed",
       );
     };
-    const stop = { stopped: false };
+    let stopCalls = 0;
     const control = {
       ...(await import("./executionTestKit.js")).fakeControl().control,
-      stop: async () => ({ stopped: stop.stopped, detail: stop.stopped ? "confirmed" : "still live" }),
+      stop: async () => {
+        stopCalls += 1;
+        return { stopped: true, detail: "would be a false confirmation without HSR meta" };
+      },
     };
     const service = makeService({ launcher, control });
     const first = (await service.runStart(buildRunStartEnvelope(ctx))) as JsonObject;
@@ -495,6 +531,7 @@ test("readiness failure with unconfirmed stop stays lost until reconciliation pr
     assert.equal(reservation.phase, "launching");
     assert.equal(reservation.result, undefined, "possibly-live runtime never receives a terminal failed result");
     assert.equal(reservation.indeterminateCause, "readiness_stop_unconfirmed");
+    assert.equal(stopCalls, 0, "record-only 'running' is not process liveness and cannot trigger confirmed stop");
 
     const now = new Date().toISOString();
     await saveSession({

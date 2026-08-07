@@ -259,7 +259,7 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
         if (deps.stop) {
           stop = await deps.stop(record.name);
         } else {
-          const result = await (await import("../hsr/substrate.js")).hsrSubstrate().kill(record.name);
+          const result = await (await import("../hsr/substrate.js")).stopKnownHsrExecution(record.name);
           stop = { stopped: result.ok, detail: result.ok ? "HSR stop confirmed" : result.stderr || "HSR stop unconfirmed" };
         }
       } catch (error) {

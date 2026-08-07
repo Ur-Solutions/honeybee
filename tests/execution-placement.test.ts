@@ -8,6 +8,8 @@ import { ExecutionProtocolError, IndeterminateExecutionError } from "../src/exec
 import { createHsrRunLauncher, materializeExplicitPlacement } from "../src/execution/launcher.js";
 import { readWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import type { JsonObject } from "../src/execution/contract.js";
+import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
+import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { withTempStore, SNAPSHOT_DIGEST } from "./executionTestKit.js";
 
 const NODE = "node-test";
@@ -128,20 +130,20 @@ test("HSR readiness timeout stops a runtime that becomes ready just after the de
   });
 });
 
-test("HSR readiness timeout surfaces an indeterminate launch when stop cannot be confirmed", async () => {
+test("HSR readiness timeout is indeterminate when known spawn metadata is delayed", async () => {
   await withTempStore(async () => {
     await registerCopy();
+    const bee = "xr-provisional";
     const launcher = createHsrRunLauncher({
       nodeId: async () => NODE,
       readinessTimeoutMs: 1,
       spawn: async (request) => ({ name: request.beeName, id: "CO.canonical" }),
       waitForReadiness: async () => false,
-      stop: async () => ({ stopped: false, detail: "SIGTERM and SIGKILL liveness probes still see the host" }),
     });
     await assert.rejects(
       () => launcher({
         runId: "run-0001",
-        beeName: "xr-provisional",
+        beeName: bee,
         intent: { ...intentFor(), harness: { driverId: "claude", config: {} } },
         lease: {},
       }),
@@ -151,5 +153,20 @@ test("HSR readiness timeout surfaces an indeterminate launch when stop cannot be
         return true;
       },
     );
+
+    // Publication can land after the timeout/stop attempt. The strict
+    // execution stop must not have treated missing meta as proof of death.
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "claude",
+      tier: "stream",
+      hostPid: process.pid,
+      startedAt: new Date().toISOString(),
+      runningAt: new Date().toISOString(),
+      controlSocket: "/tmp/honeybee-late-ready.sock",
+      status: "running",
+    });
+    assert.equal(await hsrSubstrate().hasSession(bee), true, "late-ready host remains observable for reconciliation");
   });
 });

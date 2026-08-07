@@ -233,10 +233,12 @@ export type ServiceOptions = {
 
 /** An execution service over the real store with a fake launcher + probe. */
 export function makeService(opts: ServiceOptions = {}): ExecutionService {
+  const control = opts.control ?? fakeControl().control;
   return createExecutionService({
     launcher: opts.launcher ?? countingLauncher().launcher,
     sessions: storeSessionEvidenceSource(),
-    control: opts.control ?? fakeControl().control,
+    control,
+    stopKnownExecution: control.stop,
     harnessProbe: async (kind) => (kind === "claude" ? { status: "ready" } : { status: "absent" }),
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.launchGraceMs !== undefined ? { launchGraceMs: opts.launchGraceMs } : {}),
