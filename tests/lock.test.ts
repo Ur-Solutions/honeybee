@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { fileLockMutationGuardPath, readFileLockIdentity, removeFileLockIfOwner, withFileLock, withGuardedFileLockOwner } from "../src/lock.js";
+import { fileLockMutationGuardPath, publishLockMutationGuardAtomically, readFileLockIdentity, removeFileLockIfOwner, withFileLock, withGuardedFileLockOwner } from "../src/lock.js";
 
 async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-lock-"));
@@ -58,6 +58,42 @@ test("stale-lock steal admits exactly one waiter at a time", async () => {
       );
     await Promise.all([worker(), worker(), worker(), worker(), worker()]);
     assert.equal(maxInside, 1, "two waiters stole the same stale lock and overlapped");
+  });
+});
+
+test("empty and truncated guard-initialization crashes never publish an authoritative guard", async () => {
+  await withTempDir(async (dir) => {
+    const guardPath = join(dir, "generation.mutate-fingerprint");
+    const complete = JSON.stringify({
+      pid: process.pid,
+      hostname: hostname(),
+      createdAt: "2026-08-07T00:00:00.000Z",
+      token: "complete",
+      lockFingerprint: "fingerprint",
+    });
+
+    for (const [name, fragment] of [["empty", ""], ["truncated", '{"pid":']] as const) {
+      // A synchronous stand-in for SIGKILL at either point: the initializer
+      // fails before the hard-link commit. The authoritative path must remain
+      // absent even though an incomplete inode existed.
+      await assert.rejects(
+        publishLockMutationGuardAtomically(guardPath, complete, async (handle) => {
+          if (fragment) await handle.writeFile(fragment);
+          throw new Error(`simulated ${name} initializer crash`);
+        }),
+        new RegExp(`simulated ${name}`),
+      );
+      await assert.rejects(readFile(guardPath, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+
+      // A real SIGKILL cannot run cleanup and leaves the unique init sibling.
+      // Such debris is non-authoritative and cannot block a later complete
+      // contender from publishing the generation guard.
+      const crashDebris = `${guardPath}.init-crashed-${name}`;
+      await writeFile(crashDebris, fragment);
+      assert.equal(await publishLockMutationGuardAtomically(guardPath, complete), true);
+      assert.deepEqual(JSON.parse(await readFile(guardPath, "utf8")), JSON.parse(complete));
+      await rm(guardPath, { force: true });
+    }
   });
 });
 

@@ -1,4 +1,4 @@
-import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
+import { link, open, readFile, rename, rm, stat, utimes, type FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
@@ -60,6 +60,41 @@ export function fileLockMutationGuardPath(path: string, expected: FileLockOwnerI
   return `${path}.mutate-${expected.fingerprint}`;
 }
 
+export type LockGuardInitWriter = (handle: FileHandle, raw: string) => Promise<void>;
+
+/**
+ * Publish a complete guard record without ever exposing an initializing inode
+ * at the authoritative path. `link` is the no-overwrite commit point: two
+ * complete contenders may race, but only one inode becomes the guard. A
+ * SIGKILL before that point leaves at worst an ignored `.init-*` sibling.
+ */
+export async function publishLockMutationGuardAtomically(
+  guardPath: string,
+  raw: string,
+  writeInit: LockGuardInitWriter = (handle, content) => handle.writeFile(content),
+): Promise<boolean> {
+  const initToken = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  const initPath = `${guardPath}.init-${initToken}`;
+  const handle = await open(initPath, "wx", 0o600);
+  try {
+    try {
+      await writeInit(handle, raw);
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+    try {
+      await link(initPath, guardPath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
+    await rm(initPath, { force: true }).catch(() => undefined);
+  }
+}
+
 async function reclaimDeadMutationGuard(guardPath: string, expected: FileLockOwnerIdentity): Promise<boolean> {
   let guardOwner: { pid?: unknown; hostname?: unknown; lockFingerprint?: unknown } | null = null;
   try {
@@ -89,24 +124,17 @@ async function acquireMutationGuard(path: string, expected: FileLockOwnerIdentit
   const deadline = performance.now() + Math.max(0, timeoutMs);
   while (true) {
     try {
-      const handle = await open(guardPath, "wx", 0o600);
       const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
-      try {
-        await handle.writeFile(JSON.stringify({
-          pid: process.pid,
-          hostname: hostname(),
-          createdAt: new Date().toISOString(),
-          token,
-          lockFingerprint: expected.fingerprint,
-        }));
-      } catch (error) {
-        await handle.close().catch(() => undefined);
-        await rm(guardPath, { force: true }).catch(() => undefined);
-        throw error;
-      }
+      const published = await publishLockMutationGuardAtomically(guardPath, JSON.stringify({
+        pid: process.pid,
+        hostname: hostname(),
+        createdAt: new Date().toISOString(),
+        token,
+        lockFingerprint: expected.fingerprint,
+      }));
+      if (!published) throw Object.assign(new Error(`Lock mutation guard exists: ${guardPath}`), { code: "EEXIST" });
       return {
         release: async () => {
-          await handle.close().catch(() => undefined);
           await rm(guardPath, { force: true }).catch(() => undefined);
         },
       };
