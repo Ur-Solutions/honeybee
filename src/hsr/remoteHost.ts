@@ -47,9 +47,9 @@ import {
 import { readHsrMeta, readHsrMetaStrict, hsrRunDir, readHsrRestart, writeHsrRestart, type HsrMeta } from "./runDir.js";
 import { sameProcessBirthFingerprint } from "./processIdentity.js";
 import {
-  recordDeliveredCredentials,
+  deliverAndRecordCredentials,
   shredDeliveredCredentials,
-  writeDeliveredCredentials,
+  type DeliveredCredentialEraseResult,
 } from "./remoteCreds.js";
 import { runHsrHost, type HsrHostHandle } from "./host.js";
 import { adapterFor } from "./adapters/index.js";
@@ -160,7 +160,7 @@ export type RunnerHostControllerOptions = {
   /** Injectable in-process host start for strict controller lifecycle tests. */
   runHost?: typeof runHsrHost;
   /** Injectable strict credential erasure boundary. */
-  shredCredentials?: (bee: string) => Promise<void | { ok: boolean; error?: string }>;
+  shredCredentials?: (bee: string) => Promise<void | DeliveredCredentialEraseResult | { ok: boolean; error?: string }>;
 };
 
 export function buildController(options: RunnerHostControllerOptions = {}): RunnerHostController {
@@ -172,7 +172,8 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
   async function eraseCredentialsStrict(bee: string): Promise<void> {
     const result = await shredCredentials(bee);
     if (result && !result.ok) {
-      throw new Error(result.error ?? `credential erasure unconfirmed for ${bee}`);
+      const detail = "code" in result ? result.code : result.error;
+      throw new Error(detail ? `credential erasure unconfirmed for ${bee} (${detail})` : `credential erasure unconfirmed for ${bee}`);
     }
   }
 
@@ -378,9 +379,10 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
       const { homeDir, homeEnv } = resolveRemoteSpawnHome(bee, kind, p.home);
       homeDirResolved = homeDir;
       try {
-        deliveredCredPaths = await writeDeliveredCredentials(homeDir, creds);
-        // Record BEFORE forking so a failed runner start still shreds the creds.
-        await recordDeliveredCredentials(bee, deliveredCredPaths);
+        // The strict locator is committed while the no-follow target fds are
+        // still empty, before secret bytes are written through them. A crash can
+        // therefore never strand a delivered credential without erase identity.
+        deliveredCredPaths = await deliverAndRecordCredentials(bee, homeDir, creds);
       } catch {
         try {
           await eraseCredentialsStrict(bee);
