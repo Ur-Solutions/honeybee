@@ -5,7 +5,7 @@ import { spawn as spawnChild } from "node:child_process";
 import { mkdtemp, open, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, extname, join } from "node:path";
-import { ensureHsrRunDir, hsrRunDir } from "./runDir.js";
+import { ensureHsrRunDir, hsrRunDir, readHsrMeta } from "./runDir.js";
 import type { HsrRunPayload } from "./runner-entry.js";
 
 export { runHsrHostFromPayload } from "./runner-entry.js";
@@ -130,6 +130,30 @@ export async function waitForHsrHost(
       hasSession = (name) => substrate.hasSession(name);
     }
     if (await hasSession(bee).catch(() => false)) return true;
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) break;
+    await pause(Math.min(HSR_HOST_POLL_INTERVAL_MS, remainingMs));
+  }
+  return false;
+}
+
+/**
+ * Strong readiness gate: unlike hasSession, a queued/booting host is not ready.
+ * Used by execution protocol launches before emitting harness.running.
+ */
+export async function waitForHsrReadiness(
+  bee: string,
+  timeoutMs: number,
+  dependencies: Pick<WaitForHsrHostDependencies, "now" | "sleep"> & { readMeta?: typeof readHsrMeta } = {},
+): Promise<boolean> {
+  const now = dependencies.now ?? Date.now;
+  const pause = dependencies.sleep ?? sleep;
+  const readMeta = dependencies.readMeta ?? readHsrMeta;
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
+    const meta = await readMeta(bee).catch(() => null);
+    if (meta?.status === "running" && typeof meta.runningAt === "string") return true;
+    if (meta?.status === "exited") return false;
     const remainingMs = deadline - now();
     if (remainingMs <= 0) break;
     await pause(Math.min(HSR_HOST_POLL_INTERVAL_MS, remainingMs));

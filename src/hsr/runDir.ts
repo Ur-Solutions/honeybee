@@ -103,6 +103,22 @@ export type HsrMeta = {
   startupPhase?: "admission" | "harness";
   /** Set once the harness session and control socket are ready for direct turns. */
   runningAt?: string;
+  /**
+   * Secret-free monotonic durations measured by this runtime incarnation.
+   * Values are elapsed milliseconds, never wall-clock subtraction, so clock
+   * adjustments cannot make phase evidence regress.
+   */
+  phaseTimingsMs?: {
+    startupSlotWait?: number;
+    startupSlotHeld?: number;
+    homeLockWait?: number;
+    homeLockHeld?: number;
+    maintenanceProbe?: number;
+    adapterReadiness?: number;
+    ready?: number;
+    firstTurn?: number;
+    firstToken?: number;
+  };
   controlSocket: string;
   status: "queued" | "running" | "exited";
   exitCode?: number | null;

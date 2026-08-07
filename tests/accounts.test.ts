@@ -24,6 +24,7 @@ import {
   claudeCredentialsEquivalent,
   normalizeAccountRecord,
   parseClaudeChain,
+  parseClaudeChainStrict,
   PROVIDER_BY_CLI,
   removeAccount,
   resolveSpawnAgent,
@@ -309,6 +310,26 @@ test("post-activation identity check is network-free when the effective token is
   });
 });
 
+test("post-activation identity check rejects legacy hex keychain text even when it decodes to the vault token", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "hex-unhealthy@a.b");
+    const now = Date.now();
+    const credentials = chainJson("tok-own", now + 3_600_000, "r");
+    await writeFile(join(accountDir(account), ".credentials.json"), credentials);
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), credentials);
+
+    await assert.rejects(
+      verifyActivatedClaudeIdentity(
+        activationContext(account, home),
+        { readKeychain: async () => Buffer.from(credentials, "utf8").toString("hex") },
+      ),
+      /unusable macOS Keychain entry.*raw Claude credential JSON/i,
+    );
+  });
+});
+
 test("post-activation identity check fails open when the profile lookup is unavailable", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("claude", "offline@a.b");
@@ -345,6 +366,8 @@ test("parseClaudeChain decodes hex-encoded keychain payloads", () => {
   assert.equal(chain?.refreshToken, "refresh-hex");
   assert.equal(chain?.expiresAt, 1_797_782_400_000);
   assert.equal(chain?.raw, raw);
+  assert.equal(parseClaudeChainStrict(hexPayload(raw), "health"), null, "migration decoding must not bless hex as healthy");
+  assert.equal(parseClaudeChainStrict(raw, "health")?.oauth.accessToken, "tok-hex");
 });
 
 function fakeJwt(payload: Record<string, unknown>): string {
@@ -1422,5 +1445,43 @@ test("concurrent activations of the SAME account still serialize and refresh onc
       const creds = JSON.parse(await readFile(join(home, ".credentials.json"), "utf8"));
       assert.equal(creds.claudeAiOauth.accessToken, "tok-new");
     }
+  });
+});
+
+test("activation failure timings retain truthful account/home lock hold durations", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "timing-failure@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("expired", now - 1, "r1"));
+    let observed: import("../src/accounts/activation.js").ActivationTiming | undefined;
+    await assert.rejects(
+      activateAccountIntoHome(account, join(dir, "home"), {
+        refreshClaudeToken: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          throw new Error("forced refresh failure");
+        },
+        onTiming: (timing) => { observed = timing; },
+      }),
+      /forced refresh failure/,
+    );
+    assert.ok(observed, "failure must still report timing");
+    assert.ok(observed.accountLockHeldMs >= 15, JSON.stringify(observed));
+    assert.ok(observed.homeLockHeldMs >= observed.accountLockHeldMs, JSON.stringify(observed));
+    assert.ok(observed.preActivateMs >= 15, JSON.stringify(observed));
+  });
+});
+
+test("credential copy freshness hits skip writes without skipping identity-safe preActivate", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "fresh-copy@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("fresh", now + 3_600_000, "r"));
+    const home = join(dir, "home");
+    const timings: import("../src/accounts/activation.js").ActivationTiming[] = [];
+    await activateAccountIntoHome(account, home, { onTiming: (timing) => timings.push(timing) });
+    await activateAccountIntoHome(account, home, { onTiming: (timing) => timings.push(timing) });
+    assert.ok(timings[0]!.credentialFreshMisses > 0);
+    assert.ok(timings[1]!.credentialFreshHits > 0);
+    assert.ok(timings[1]!.preActivateMs >= 0, "fresh copy must still execute preActivate");
   });
 });

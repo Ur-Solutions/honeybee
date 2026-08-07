@@ -13,11 +13,11 @@
  * recover on its own — bee CO.66ad0 reached 5.1M live rows behind a 1.4GB WAL
  * and timed out `initialize` on every boot until the home was reclaimed by hand.
  *
- * This runs on the boot path, inside the home's boot lock and BEFORE codex is
- * spawned, which is the one moment hive knows the home may be quiet. It is
- * deliberately self-arbitrating: wal_checkpoint(TRUNCATE) reports `busy` when
- * another app-server still holds a snapshot, so a concurrent boot costs a few
- * milliseconds and reclaims nothing rather than needing to count processes.
+ * Full reclaim runs after a host exits, outside the next boot's adapter
+ * readiness path. It remains deliberately self-arbitrating:
+ * wal_checkpoint(TRUNCATE) reports `busy` when another app-server still holds
+ * a snapshot, so an active home costs a few milliseconds and reclaims nothing
+ * rather than needing to count processes.
  */
 
 import { execFile } from "node:child_process";
@@ -27,7 +27,7 @@ import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
 
-/** Total wall-clock this may add to a bee's boot. */
+/** Total wall-clock budget for one post-session maintenance pass. */
 const MAINTENANCE_BUDGET_MS = 5_000;
 /**
  * Pages released per incremental_vacuum call. Measured at roughly 4k pages/sec,
@@ -42,6 +42,8 @@ const BUSY_TIMEOUT_MS = 250;
 const AUTO_VACUUM_INCREMENTAL = 2;
 /** Remaining budget below which another vacuum chunk is not worth starting. */
 const CHUNK_FLOOR_MS = 750;
+export const CODEX_HOME_BOOT_PROBE_BUDGET_MS = 100;
+const BOOT_PROBE_MAX_DBS = 32;
 
 export type CodexHomeMaintenanceResult = {
   /** Bytes released across every logs DB in the home (db + wal). */
@@ -52,6 +54,14 @@ export type CodexHomeMaintenanceResult = {
 
 const NOTHING: CodexHomeMaintenanceResult = { reclaimedBytes: 0, busy: false };
 
+export type CodexHomeSafetyProbe = {
+  dbCount: number;
+  bytes: number;
+  timedOut: boolean;
+};
+
+const EMPTY_PROBE: CodexHomeSafetyProbe = { dbCount: 0, bytes: 0, timedOut: false };
+
 export function codexHomeMaintenanceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.HIVE_CODEX_HOME_MAINTENANCE !== "0";
 }
@@ -61,6 +71,43 @@ async function sizeOf(path: string): Promise<number> {
     return (await stat(path)).size;
   } catch {
     return 0;
+  }
+}
+
+/**
+ * Bounded, read-only boot probe. It never opens SQLite and therefore cannot
+ * checkpoint/vacuum a multi-GB database on the adapter critical path. The
+ * heavy reclaim remains available for post-session maintenance below.
+ */
+export async function probeCodexHomeLogs(
+  home: string,
+  options: { budgetMs?: number; env?: NodeJS.ProcessEnv } = {},
+): Promise<CodexHomeSafetyProbe> {
+  if (!codexHomeMaintenanceEnabled(options.env ?? process.env)) return EMPTY_PROBE;
+  const budgetMs = Math.max(1, options.budgetMs ?? CODEX_HOME_BOOT_PROBE_BUDGET_MS);
+  let timer: NodeJS.Timeout | undefined;
+  const work = (async (): Promise<CodexHomeSafetyProbe> => {
+    let names: string[];
+    try {
+      names = (await readdir(home)).filter((name) => /^logs_\d+\.sqlite$/.test(name)).slice(0, BOOT_PROBE_MAX_DBS);
+    } catch {
+      return EMPTY_PROBE;
+    }
+    let bytes = 0;
+    for (const name of names) {
+      const db = join(home, name);
+      bytes += (await sizeOf(db)) + (await sizeOf(`${db}-wal`));
+    }
+    return { dbCount: names.length, bytes, timedOut: false };
+  })();
+  const timeout = new Promise<CodexHomeSafetyProbe>((resolve) => {
+    timer = setTimeout(() => resolve({ ...EMPTY_PROBE, timedOut: true }), budgetMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

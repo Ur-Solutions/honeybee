@@ -181,6 +181,20 @@ export function createHsrRunLauncher(deps: { nodeId: () => Promise<string> }): R
       throw executionError("HARNESS_UNAVAILABLE", `harness ${driverId} failed to start: ${message}`);
     }
 
+    // spawnSingleBee durably publishes queued/booting before the detached host
+    // is ready. Execution must not turn that early record into harness.running:
+    // wait for the HSR control socket + adapter handshake (`runningAt`). On a
+    // bounded failure, stop the exact newly-owned bee before reporting failure
+    // so a late-ready zombie cannot outlive a terminal Run.
+    const { waitForHsrReadiness } = await import("../hsr/runnerHost.js");
+    const readinessTimeout = Number(process.env.HIVE_EXECUTION_HSR_READY_TIMEOUT_MS);
+    const timeoutMs = Number.isFinite(readinessTimeout) && readinessTimeout > 0 ? readinessTimeout : 120_000;
+    if (!(await waitForHsrReadiness(record.name, timeoutMs))) {
+      const { hsrSubstrate } = await import("../hsr/substrate.js");
+      await hsrSubstrate().kill(record.name).catch(() => undefined);
+      throw executionError("HARNESS_UNAVAILABLE", `harness ${driverId} did not reach HSR readiness within ${timeoutMs}ms`);
+    }
+
     const workingCopy: JsonObject = {
       workingCopyId: copy.workingCopyId,
       nodeId,

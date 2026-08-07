@@ -69,6 +69,16 @@ export type ClaudeRefreshOptions = {
 
 export function parseClaudeChain(raw: string | null, source: string): ClaudeChain | null {
   const decoded = decodeClaudeCredentialsRaw(raw);
+  return parseClaudeChainJson(decoded, source);
+}
+
+/** Health acceptance: raw JSON only; legacy hex is migration input, not healthy. */
+export function parseClaudeChainStrict(raw: string | null, source: string): ClaudeChain | null {
+  if (!raw?.trimStart().startsWith("{")) return null;
+  return parseClaudeChainJson(raw, source);
+}
+
+function parseClaudeChainJson(decoded: string | null, source: string): ClaudeChain | null {
   if (!decoded) return null;
   try {
     const parsed = JSON.parse(decoded) as { claudeAiOauth?: Record<string, unknown> };

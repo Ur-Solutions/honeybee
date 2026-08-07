@@ -112,6 +112,12 @@ test("Codex HSR cold starts queue visibly and admit only the configured concurre
       async () => (await hsrSubstrate().capture("queued-two")).includes("echo:hello from the queue"),
       "queued prompt drained after admission",
     );
+    const timed = await readHsrMeta("queued-two");
+    assert.ok((timed?.phaseTimingsMs?.startupSlotWait ?? 0) >= 100, JSON.stringify(timed?.phaseTimingsMs));
+    assert.ok((timed?.phaseTimingsMs?.adapterReadiness ?? -1) >= 0);
+    assert.ok((timed?.phaseTimingsMs?.ready ?? -1) >= 0);
+    assert.ok((timed?.phaseTimingsMs?.firstTurn ?? -1) >= 0);
+    assert.ok((timed?.phaseTimingsMs?.firstToken ?? -1) >= (timed?.phaseTimingsMs?.firstTurn ?? 0));
   } finally {
     await secondHandle?.stop().catch(() => undefined);
     await firstHandle?.stop().catch(() => undefined);
@@ -178,6 +184,10 @@ test("same-home Codex starts serialize inside separate admission slots", async (
     secondHandle = await second;
     assert.equal(secondStarts, 1);
     assert.equal(secondContended, true, "the admitted home-lock waiter gets the slower first probe");
+    const secondMeta = await readHsrMeta("home-lock-two");
+    assert.ok((secondMeta?.phaseTimingsMs?.homeLockWait ?? 0) >= 100, JSON.stringify(secondMeta?.phaseTimingsMs));
+    assert.ok((secondMeta?.phaseTimingsMs?.homeLockHeld ?? -1) >= 0);
+    assert.ok((secondMeta?.phaseTimingsMs?.maintenanceProbe ?? -1) >= 0);
   } finally {
     releaseFirst.resolve();
     await secondHandle?.stop().catch(() => undefined);

@@ -40,8 +40,8 @@ export function claudeKeychainService(homePath: string): string {
   return `Claude Code-credentials-${createHash("sha256").update(path).digest("hex").slice(0, 8)}`;
 }
 
-/** Read the claude credentials for a home from the keychain; null when absent/unavailable. */
-export async function readClaudeKeychain(homePath: string): Promise<string | null> {
+/** Raw `security -w` rendering. Health checks use this to reject hex corruption. */
+export async function readClaudeKeychainRaw(homePath: string): Promise<string | null> {
   if (!keychainAvailable()) return null;
   try {
     // macOS may show a one-time "security wants to access ..." consent dialog
@@ -51,6 +51,29 @@ export async function readClaudeKeychain(homePath: string): Promise<string | nul
     return value.length > 0 ? value : null;
   } catch {
     return null;
+  }
+}
+
+/** Read credentials with legacy hex decoding for migration/rescue callers. */
+export async function readClaudeKeychain(homePath: string): Promise<string | null> {
+  const raw = await readClaudeKeychainRaw(homePath);
+  return raw === null ? null : decodeSecurityPasswordOutput(raw);
+}
+
+/**
+ * `security find-generic-password -w` renders non-plain/multiline data as hex.
+ * Normalize that transport representation at the bridge boundary so no caller
+ * can mistake hex text for Claude's credential JSON or persist it into vaults.
+ */
+export function decodeSecurityPasswordOutput(raw: string): string {
+  const trimmed = raw.trim();
+  if (!/^(?:[0-9a-fA-F]{2})+$/.test(trimmed)) return raw;
+  try {
+    const decoded = Buffer.from(trimmed, "hex").toString("utf8");
+    JSON.parse(decoded);
+    return decoded;
+  } catch {
+    return raw;
   }
 }
 
@@ -68,13 +91,11 @@ function quoteSecurityToken(value: string): string {
 const SECURITY_LINE_MAX = 4000;
 
 /**
- * Build the `security -i` command line that stores a secret. The secret is
- * hex-encoded (-X) so it needs no quoting and survives arbitrary content —
- * including the multi-line pretty-printed JSON that mergeCredentialsJson
- * produces. When the hex of the exact bytes would overflow the interpreter's
- * line buffer, the secret is re-serialized as compact JSON (semantically
- * identical for every consumer; the login-seat digest baseline is computed
- * from a post-write read-back, never from this input). Returns null when it
+ * Build the `security -i` command line that stores a secret as a NORMAL
+ * password string (`-w`). Claude expects JSON text from its keychain bridge;
+ * `-X` creates a data/hex representation that `security -w` renders as hex and
+ * Claude rejects as "Not logged in". Multi-line JSON is compacted to one line
+ * before quoting for the interpreter. Returns null when it
  * still cannot fit, or when account/service/keychain contain bytes that
  * would break the one-command-per-line protocol — callers fail closed
  * rather than fall back to argv. The optional trailing keychain path targets
@@ -83,18 +104,22 @@ const SECURITY_LINE_MAX = 4000;
  */
 export function buildAddGenericPasswordCommand(account: string, service: string, secret: string, keychainPath?: string): string | null {
   const assemble = (data: string): string | null => {
-    const parts = ["add-generic-password", "-U", "-a", quoteSecurityToken(account), "-s", quoteSecurityToken(service), "-X", Buffer.from(data, "utf8").toString("hex")];
+    const parts = ["add-generic-password", "-U", "-a", quoteSecurityToken(account), "-s", quoteSecurityToken(service), "-w", quoteSecurityToken(data)];
     if (keychainPath !== undefined) parts.push(quoteSecurityToken(keychainPath));
     const command = parts.join(" ");
     return command.length > SECURITY_LINE_MAX || /[\r\n\0]/.test(command) ? null : command;
   };
-  const exact = assemble(secret);
-  if (exact !== null) return exact;
+  // Prefer compact JSON even when pretty JSON happens to fit: a one-line plain
+  // password is the format Claude itself writes and reads.
+  let compact: string | null = null;
   try {
-    return assemble(JSON.stringify(JSON.parse(secret)));
+    compact = JSON.stringify(JSON.parse(secret));
   } catch {
-    return null;
+    // Non-JSON test/general secrets retain the exact representation when safe.
   }
+  const exact = assemble(compact ?? secret);
+  if (exact !== null) return exact;
+  return null;
 }
 
 export type KeychainWriteReport =
@@ -129,33 +154,67 @@ export function identityOnlyCredentials(credentials: string): string | null {
  */
 export async function writeClaudeKeychainEntry(homePath: string, credentials: string): Promise<KeychainWriteReport> {
   if (!keychainAvailable()) return { ok: false, reason: "unavailable" };
+  // Repair legacy vaults that captured `security -w`'s hex rendering. Refuse
+  // anything that still is not credential JSON instead of faithfully storing
+  // an unusable string and reporting success.
+  const normalized = decodeSecurityPasswordOutput(credentials);
+  try {
+    JSON.parse(normalized);
+  } catch {
+    return { ok: false, reason: "unrepresentable" };
+  }
   const username = userInfo().username;
   const service = claudeKeychainService(homePath);
-  let mode: "full" | "identity-only" = "full";
-  let command = buildAddGenericPasswordCommand(username, service, credentials);
-  if (command === null) {
-    const minimal = identityOnlyCredentials(credentials);
-    command = minimal === null ? null : buildAddGenericPasswordCommand(username, service, minimal);
-    mode = "identity-only";
-  }
-  if (command === null) return { ok: false, reason: "unrepresentable" }; // fail closed, never argv
-  try {
-    // -U updates in place. The secret must not travel via argv — argv is
-    // visible to any local process while `security` runs — so the whole
-    // command is fed to `security -i` on stdin instead. A failing command
-    // sets the exit status, which rejects the promise below.
-    const pending = execFileAsync("security", ["-i"], { timeout: SECURITY_EXEC_TIMEOUT_MS });
-    const stdin = pending.child.stdin;
-    if (stdin) {
-      // Swallow EPIPE from an early security exit; the exit status carries
-      // the real failure.
-      stdin.on("error", () => {});
-      stdin.end(`${command}\n`);
+  const writeAndVerify = async (command: string, expected: string): Promise<boolean> => {
+    try {
+      // -U updates in place. The secret must not travel via argv — argv is
+      // visible to any local process while `security` runs — so the whole
+      // command is fed to `security -i` on stdin instead. A failing command
+      // sets the exit status, which rejects the promise below.
+      const pending = execFileAsync("security", ["-i"], { timeout: SECURITY_EXEC_TIMEOUT_MS });
+      const stdin = pending.child.stdin;
+      if (stdin) {
+        // Swallow EPIPE from an early security exit; the exit status carries
+        // the real failure.
+        stdin.on("error", () => {});
+        stdin.end(`${command}\n`);
+      }
+      await pending;
+      // Success from `security -i` is not sufficient: verify the exact service
+      // reads back as semantically equivalent Claude JSON. This catches command
+      // tokenizer/format changes and prevents another hex-text corruption from
+      // being blessed as a healthy activation.
+      const rawReadback = await readClaudeKeychainRaw(homePath);
+      if (rawReadback === null || !rawReadback.trimStart().startsWith("{") || !credentialsJsonEquivalent(rawReadback, expected)) {
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
     }
-    await pending;
-    return { ok: true, mode };
+  };
+
+  const fullCommand = buildAddGenericPasswordCommand(username, service, normalized);
+  if (fullCommand !== null && await writeAndVerify(fullCommand, normalized)) return { ok: true, mode: "full" };
+
+  // A representable full payload can still read back as hex when it contains
+  // bytes Keychain does not classify as a plain password. Retry the minimal
+  // OAuth identity, which is the load-bearing Claude login and is ASCII in
+  // normal provider payloads; never report success without raw JSON readback.
+  const minimal = identityOnlyCredentials(normalized);
+  const minimalCommand = minimal === null ? null : buildAddGenericPasswordCommand(username, service, minimal);
+  if (minimal !== null && minimalCommand !== null && await writeAndVerify(minimalCommand, minimal)) {
+    return { ok: true, mode: "identity-only" };
+  }
+  return { ok: false, reason: fullCommand === null && minimalCommand === null ? "unrepresentable" : "rejected" };
+}
+
+function credentialsJsonEquivalent(actual: string | null, expected: string): boolean {
+  if (actual === null) return false;
+  try {
+    return JSON.stringify(JSON.parse(actual)) === JSON.stringify(JSON.parse(expected));
   } catch {
-    return { ok: false, reason: "rejected" };
+    return false;
   }
 }
 

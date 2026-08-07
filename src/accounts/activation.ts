@@ -1,9 +1,18 @@
+import { createHash } from "node:crypto";
 import { mkdir, readFile, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { identityRecipeForAgent, type IdentityRecipe } from "../drivers.js";
-import { keychainAvailable, readClaudeKeychain, writeClaudeKeychainEntry } from "../keychain.js";
-import { kitMaterializeHome, readKitHomeStamp } from "../kit.js";
-import { atomicWriteFile } from "../fsx.js";
+import {
+  decodeSecurityPasswordOutput,
+  keychainAvailable,
+  readClaudeKeychain,
+  readClaudeKeychainRaw,
+  writeClaudeKeychainEntry,
+} from "../keychain.js";
+import { kitMaterializeHome, readKitHomeStamp, type KitMaterializeTiming } from "../kit.js";
+import { atomicWriteFile, storeRoot } from "../fsx.js";
+import { type LockOwnerMetadata, withFileLock } from "../lock.js";
 import { appendLedger } from "../store.js";
 import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./registry.js";
 import {
@@ -12,7 +21,7 @@ import {
   claudeTokenExpiry,
   evacuateForeignClaudeChain,
   mergeCredentialsJson,
-  parseClaudeChain,
+  parseClaudeChainStrict,
   refreshVaultClaudeChainIfStaleLocked,
   syncClaudeChainToVaultLocked,
   type RefreshedClaudeToken,
@@ -37,7 +46,7 @@ import { seedClaudeHomeAcceptance, seedClaudeHomeDefaults, seedCodexHomeDefaults
  */
 export async function captureAccountFromHome(account: AccountRecord, homePath: string): Promise<string[]> {
   const recipe = recipeFor(account);
-  return withAccountLock(account.id, async () => {
+  const captured = await withAccountLock(account.id, async () => {
     const captured: string[] = [];
     const capturedCredentials: string[] = [];
     for (const relative of recipe.credentialFiles) {
@@ -114,10 +123,32 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
         `No credential files found in ${homePath} for ${account.id} (looked for: ${recipe.credentialFiles.join(", ")})`,
       );
     }
-    await appendLedger({ type: "account.capture", account: account.id, home: homePath, files: captured });
     return captured;
   });
+  await appendLedger({ type: "account.capture", account: account.id, home: homePath, files: captured });
+  return captured;
 }
+
+export type ActivationTiming = {
+  totalMs: number;
+  homeLockWaitMs: number;
+  homeLockHeldMs: number;
+  accountLockWaitMs: number;
+  accountLockHeldMs: number;
+  preActivateMs: number;
+  preActivateStepsMs: Record<string, number>;
+  credentialCopyMs: number;
+  credentialFreshHits: number;
+  credentialFreshMisses: number;
+  identityVerificationMs: number;
+  configCopyMs: number;
+  defaultsMs: number;
+  kit?: KitMaterializeTiming;
+  gatewaySeedMs: number;
+  accountLockOwner: LockOwnerMetadata | null;
+  homeLockOwner: LockOwnerMetadata | null;
+  singleFlight: boolean;
+};
 
 export type ActivateAccountOptions = {
   /** Surface non-fatal activation warnings (stale chain, failed refresh). */
@@ -127,6 +158,8 @@ export type ActivateAccountOptions = {
   /** Profile lookup override (tests). Defaults to claudeProfileEmailCached. */
   fetchProfileEmail?: (accessToken: string) => Promise<string | null>;
   now?: () => number;
+  /** Always-on phase observation; receives durations and secret-free lock owners. */
+  onTiming?: (timing: ActivationTiming) => void;
 };
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -147,29 +180,39 @@ export type ActivationContext = {
   warn: (message: string) => void;
   /** Home-relative paths written so far; hooks append what they stamp. */
   written: string[];
+  /** Deferred so identity diagnostics never extend the credential lock. */
+  deferredLedger?: Array<Record<string, unknown>>;
+  time?<T>(phase: string, fn: () => Promise<T>): Promise<T>;
 };
+
+function timeActivationStep<T>(ctx: ActivationContext, phase: string, fn: () => Promise<T>): Promise<T> {
+  return ctx.time ? ctx.time(phase, fn) : fn();
+}
 
 type ActivationHooks = {
   /** Runs before the copy: pull the freshest live credential into the vault; may refuse. */
   preActivate?(ctx: ActivationContext): Promise<void>;
-  /** Runs after the copy: re-seed home defaults/acceptances/keychain, appending to written. */
+  /** Credential-adjacent post-copy work; remains inside the account lock. */
+  finalizeCredentials?(ctx: ActivationContext): Promise<void>;
+  /** Non-secret home defaults run after releasing the account lock. */
   seedHomeDefaults?(ctx: ActivationContext): Promise<void>;
 };
 
-async function claudePreActivate({ account, homePath, options, warn }: ActivationContext): Promise<void> {
+async function claudePreActivate(ctx: ActivationContext): Promise<void> {
+  const { account, homePath, options, warn } = ctx;
   // (1) The home may currently hold ANOTHER account's chain (swap). The
   // rotated live link exists only there — rescue it into its own vault
   // before stamping over it, or that account's next activation revives a
   // dead link and logs it out.
-  await evacuateForeignClaudeChain(account, homePath).catch(() => undefined);
+  await timeActivationStep(ctx, "rescue-foreign", () => evacuateForeignClaudeChain(account, homePath).catch(() => undefined));
   // (2) Pull the account's own freshest link into the vault so we never
   // stamp a dead link over a live one.
-  await syncClaudeChainToVaultLocked(account, homePath).catch(() => undefined);
+  await timeActivationStep(ctx, "sync-vault", () => syncClaudeChainToVaultLocked(account, homePath).catch(() => undefined));
   // (3) A stale chain would make claude boot onto an expired access token
   // and replay a possibly-rotated refresh token. Refresh it ourselves and
   // persist the rotation; on failure, refuse to stamp a known-dead chain.
   try {
-    await refreshVaultClaudeChainIfStaleLocked(account, options);
+    await timeActivationStep(ctx, "refresh", () => refreshVaultClaudeChainIfStaleLocked(account, options));
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     warn(`could not refresh the stale OAuth chain for ${account.id}: ${detail}`);
@@ -177,22 +220,24 @@ async function claudePreActivate({ account, homePath, options, warn }: Activatio
   }
 }
 
-async function codexPreActivate({ account, homePath, warn }: ActivationContext): Promise<void> {
+async function codexPreActivate(ctx: ActivationContext): Promise<void> {
+  const { account, homePath, warn } = ctx;
   // Codex rewrites auth.json when it refreshes tokens. Rescue the current
   // occupant before a swap stamp, then pull this account's newest attributed
   // auth into the vault so activation never revives an older refresh token.
-  await evacuateForeignCodexAuth(account, homePath).catch((error) => {
+  await timeActivationStep(ctx, "rescue-foreign", () => evacuateForeignCodexAuth(account, homePath).catch((error) => {
     warn(`could not rescue existing Codex auth from ${homePath}: ${error instanceof Error ? error.message : String(error)}`);
-  });
-  await syncCodexAuthToVaultLocked(account, homePath).catch((error) => {
+  }));
+  await timeActivationStep(ctx, "sync-vault", () => syncCodexAuthToVaultLocked(account, homePath).catch((error) => {
     warn(`could not sync refreshed Codex auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  }));
 }
 
-async function grokPreActivate({ account, homePath, options, warn }: ActivationContext): Promise<void> {
-  await syncGrokAuthToVaultLocked(account, homePath).catch((error) => {
+async function grokPreActivate(ctx: ActivationContext): Promise<void> {
+  const { account, homePath, options, warn } = ctx;
+  await timeActivationStep(ctx, "sync-vault", () => syncGrokAuthToVaultLocked(account, homePath).catch((error) => {
     warn(`could not sync refreshed Grok auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  }));
   const vault = await readGrokAuthFile(join(accountDir(account), "auth.json"), "vault");
   const reason = grokAuthUnavailableReason(vault, options.now?.() ?? Date.now());
   if (reason) {
@@ -200,14 +245,15 @@ async function grokPreActivate({ account, homePath, options, warn }: ActivationC
   }
 }
 
-async function cursorPreActivate({ account, options, warn }: ActivationContext): Promise<void> {
+async function cursorPreActivate(ctx: ActivationContext): Promise<void> {
+  const { account, options, warn } = ctx;
   // Pull the freshest ATTRIBUTED credential into the vault first: cursor
   // persists whatever token a bee last used into the machine-global store, so
   // the sync's identity guard (JWT sub ↔ recorded authId) decides whether the
   // live store is this account's rotation or another account's session.
-  await syncCursorAuthToVaultLocked(account).catch((error) => {
+  await timeActivationStep(ctx, "sync-vault", () => syncCursorAuthToVaultLocked(account).catch((error) => {
     warn(`could not sync refreshed cursor auth for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  }));
   const vault = await readCursorAuthFile(join(accountDir(account), "auth.json"), "vault");
   const reason = cursorAuthUnavailableReason(vault, options.now?.() ?? Date.now());
   if (reason) {
@@ -215,13 +261,14 @@ async function cursorPreActivate({ account, options, warn }: ActivationContext):
   }
 }
 
-async function genericPreActivate({ account, homePath, warn }: ActivationContext): Promise<void> {
+async function genericPreActivate(ctx: ActivationContext): Promise<void> {
+  const { account, homePath, warn } = ctx;
   // Other identity recipes are file-based. Pull back changes only from the
   // account's attributed homes; arbitrary --home paths are not trusted here
   // because their credential files do not carry a common identity claim.
-  await syncGenericCredentialsToVaultLocked(account, homePath).catch((error) => {
+  await timeActivationStep(ctx, "sync-vault", () => syncGenericCredentialsToVaultLocked(account, homePath).catch((error) => {
     warn(`could not sync refreshed credentials for ${account.id}: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  }));
 }
 
 async function codexSeedHomeDefaults({ homePath, written }: ActivationContext): Promise<void> {
@@ -231,7 +278,7 @@ async function codexSeedHomeDefaults({ homePath, written }: ActivationContext): 
 }
 
 async function claudeSeedHomeDefaults(ctx: ActivationContext): Promise<void> {
-  const { account, homePath, recipe, warn, written } = ctx;
+  const { homePath, written } = ctx;
   if (await seedClaudeHomeDefaults(homePath)) {
     if (!written.includes("settings.json")) written.push("settings.json");
   }
@@ -247,6 +294,11 @@ async function claudeSeedHomeDefaults(ctx: ActivationContext): Promise<void> {
   // engages when the CLI is launched with the flag.
   await seedClaudeHomeAcceptance(homePath, { yolo: true, trustCwd: process.cwd() });
   if (!written.includes(".claude.json")) written.push(".claude.json");
+}
+
+/** Keychain is an effective credential store, so stamp + verify it under the account lock. */
+async function claudeFinalizeCredentials(ctx: ActivationContext): Promise<void> {
+  const { account, homePath, recipe, warn, written } = ctx;
   // On macOS, claude prefers the per-config-dir Keychain entry over the
   // credentials file — seed it so an activated home doesn't resolve a stale
   // identity from an old entry. Merged, not replaced: home-local sibling
@@ -255,17 +307,19 @@ async function claudeSeedHomeDefaults(ctx: ActivationContext): Promise<void> {
   // back to stamping the identity alone rather than leaving the old one.
   if (keychainAvailable()) {
     const credentials = (await readFile(join(accountDir(account), recipe.credentialFiles[0]!), "utf8")).trim();
-    const existing = await readClaudeKeychain(homePath);
+    const existingRaw = await readClaudeKeychainRaw(homePath);
+    const existing = existingRaw === null ? null : decodeSecurityPasswordOutput(existingRaw);
     const merged = mergeCredentialsJson(existing, credentials);
     // Elide a provably-redundant keychain write. When the existing entry is
-    // already semantically identical to the merged target (order/format and
-    // hex-encoding aside), the `security -i` subprocess would re-stamp the
+    // already raw JSON and semantically identical to the merged target
+    // (order/format aside), the `security -i` subprocess would re-stamp the
     // exact same identity — the dominant cost of re-activating an already-live
     // home. claudeCredentialsEquivalent only reports true on a proven parse of
-    // both sides, so a parse failure (or an absent/foreign entry) always falls
-    // through to the write. The independent identity reread below still runs,
-    // catching any post-read external mutation exactly as on the write path.
-    if (existing !== null && claudeCredentialsEquivalent(existing, merged)) {
+    // both sides. Crucially, legacy hex text is migration input, never a health
+    // hit: accepting it here caused activation to preserve credentials Claude
+    // itself rejected as "Not logged in". The independent strict identity
+    // reread below still catches any post-read external mutation.
+    if (existingRaw?.trimStart().startsWith("{") && claudeCredentialsEquivalent(existingRaw, merged)) {
       written.push("keychain");
     } else {
       const write = await writeClaudeKeychainEntry(homePath, merged);
@@ -281,7 +335,7 @@ async function claudeSeedHomeDefaults(ctx: ActivationContext): Promise<void> {
       }
     }
   }
-  await verifyActivatedClaudeIdentity(ctx);
+  await timeActivationStep(ctx, "identity-verification", () => verifyActivatedClaudeIdentity(ctx));
 }
 
 /**
@@ -302,17 +356,32 @@ async function claudeSeedHomeDefaults(ctx: ActivationContext): Promise<void> {
  * VERIFIED foreign identity refuses.
  */
 export async function verifyActivatedClaudeIdentity(
-  { account, homePath, options, warn }: ActivationContext,
-  deps: { readKeychain?: typeof readClaudeKeychain } = {},
+  ctx: ActivationContext,
+  deps: { readKeychain?: typeof readClaudeKeychainRaw } = {},
 ): Promise<void> {
+  const { account, homePath, options, warn } = ctx;
   const expected = accountEmail(account);
   if (!expected) return;
-  const readKeychain = deps.readKeychain ?? readClaudeKeychain;
-  const effective =
-    parseClaudeChain(await readKeychain(homePath), `${homePath}:keychain`) ??
-    parseClaudeChain(await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null), `${homePath}:file`);
+  const readKeychain = deps.readKeychain ?? readClaudeKeychainRaw;
+  const rawKeychain = await readKeychain(homePath);
+  // Keychain presence is authoritative even when malformed: Claude does not
+  // fall back to the file when an unusable keychain item exists. Strictly
+  // reject hex/corrupt text rather than proving the identity of a file Claude
+  // will never consume.
+  const effective = rawKeychain !== null
+    ? parseClaudeChainStrict(rawKeychain, `${homePath}:keychain`)
+    : parseClaudeChainStrict(
+        await readFile(join(homePath, ".credentials.json"), "utf8").catch(() => null),
+        `${homePath}:file`,
+      );
+  if (rawKeychain !== null && !effective) {
+    throw new Error(`Activation produced an unusable macOS Keychain entry for ${homePath}; expected raw Claude credential JSON`);
+  }
   if (!effective) return;
-  const vault = parseClaudeChain(await readFile(join(accountDir(account), ".credentials.json"), "utf8").catch(() => null), "vault");
+  const vault = parseClaudeChainStrict(
+    await readFile(join(accountDir(account), ".credentials.json"), "utf8").catch(() => null),
+    "vault",
+  );
   if (vault && vault.oauth.accessToken === effective.oauth.accessToken) return;
   const profileOf = options.fetchProfileEmail ?? claudeProfileEmailCached;
   let actual: string | null = null;
@@ -323,7 +392,11 @@ export async function verifyActivatedClaudeIdentity(
     return;
   }
   if (actual !== null && actual !== expected) {
-    await appendLedger({ type: "account.activation-identity-mismatch", account: account.id, home: homePath, expected, actual, source: effective.source }).catch(() => {});
+    // Do not perform the non-secret ledger write while the credential lock is
+    // held. The outer activation flushes this after both locks are released.
+    const event = { type: "account.activation-identity-mismatch", account: account.id, home: homePath, expected, actual, source: effective.source };
+    if (ctx.deferredLedger) ctx.deferredLedger.push(event);
+    else await appendLedger(event).catch(() => undefined);
     throw new Error(
       `Activation identity mismatch for ${homePath}: the credential claude would boot with (${effective.source}) belongs to ${actual}, not ${expected} — a bee on this home would bill ${actual}. Repair with: hive login ${account.id}`,
     );
@@ -331,7 +404,7 @@ export async function verifyActivatedClaudeIdentity(
 }
 
 const ACTIVATION_HOOKS: Record<string, ActivationHooks> = {
-  claude: { preActivate: claudePreActivate, seedHomeDefaults: claudeSeedHomeDefaults },
+  claude: { preActivate: claudePreActivate, finalizeCredentials: claudeFinalizeCredentials, seedHomeDefaults: claudeSeedHomeDefaults },
   codex: { preActivate: codexPreActivate, seedHomeDefaults: codexSeedHomeDefaults },
   grok: { preActivate: grokPreActivate },
   cursor: { preActivate: cursorPreActivate },
@@ -341,6 +414,61 @@ const GENERIC_ACTIVATION_HOOKS: ActivationHooks = { preActivate: genericPreActiv
 
 function activationHooksFor(tool: string): ActivationHooks {
   return ACTIVATION_HOOKS[tool] ?? GENERIC_ACTIVATION_HOOKS;
+}
+
+type ActivationOutcome = { written: string[]; timing: ActivationTiming };
+
+const activationFlights = new Map<string, Promise<ActivationOutcome>>();
+
+function activationHomeKey(homePath: string): string {
+  return createHash("sha256").update(resolve(homePath)).digest("hex").slice(0, 32);
+}
+
+function activationHomeLockPath(homePath: string): string {
+  return join(storeRoot(), "locks", "activation-homes", `${activationHomeKey(homePath)}.lock`);
+}
+
+function emptyActivationTiming(): ActivationTiming {
+  return {
+    totalMs: 0,
+    homeLockWaitMs: 0,
+    homeLockHeldMs: 0,
+    accountLockWaitMs: 0,
+    accountLockHeldMs: 0,
+    preActivateMs: 0,
+    preActivateStepsMs: {},
+    credentialCopyMs: 0,
+    credentialFreshHits: 0,
+    credentialFreshMisses: 0,
+    identityVerificationMs: 0,
+    configCopyMs: 0,
+    defaultsMs: 0,
+    gatewaySeedMs: 0,
+    accountLockOwner: null,
+    homeLockOwner: null,
+    singleFlight: false,
+  };
+}
+
+function notifyActivationTiming(callback: ActivateAccountOptions["onTiming"], timing: ActivationTiming): void {
+  try {
+    callback?.(timing);
+  } catch {
+    // Telemetry cannot make a credential activation fail.
+  }
+}
+
+/** Byte freshness fast path; mode repair still forces an atomic rewrite. */
+async function copyFileAtomicallyIfChanged(source: string, target: string): Promise<boolean> {
+  const data = await readFile(source, "utf8");
+  const [current, targetInfo] = await Promise.all([
+    readFile(target, "utf8").catch(() => null),
+    stat(target).catch(() => null),
+  ]);
+  if (current === data && targetInfo?.isFile() && (targetInfo.mode & 0o777) === 0o600) return false;
+  await mkdir(dirname(target), { recursive: true });
+  await atomicWriteFile(target, data, { mode: 0o600 });
+  return true;
 }
 
 /**
@@ -356,62 +484,179 @@ function activationHooksFor(tool: string): ActivationHooks {
  * lives in the activation hooks (preActivate + seedHomeDefaults).
  */
 export async function activateAccountIntoHome(account: AccountRecord, homePath: string, options: ActivateAccountOptions = {}): Promise<string[]> {
+  const flightKey = `${account.id}\0${resolve(homePath)}`;
+  const existing = activationFlights.get(flightKey);
+  if (existing) {
+    const joinedAt = performance.now();
+    const outcome = await existing;
+    notifyActivationTiming(options.onTiming, {
+      ...outcome.timing,
+      totalMs: performance.now() - joinedAt,
+      singleFlight: true,
+    });
+    return [...outcome.written];
+  }
+  const flight = performAccountActivation(account, homePath, options);
+  activationFlights.set(flightKey, flight);
+  try {
+    const outcome = await flight;
+    return [...outcome.written];
+  } finally {
+    if (activationFlights.get(flightKey) === flight) activationFlights.delete(flightKey);
+  }
+}
+
+async function performAccountActivation(
+  account: AccountRecord,
+  homePath: string,
+  options: ActivateAccountOptions,
+): Promise<ActivationOutcome> {
+  const started = performance.now();
   const recipe = recipeFor(account);
   const warn = options.onWarn ?? (() => undefined);
   const hooks = activationHooksFor(account.tool);
-  return withAccountLock(account.id, async () => {
-    const ctx: ActivationContext = { account, homePath, recipe, options, warn, written: [] };
-    await hooks.preActivate?.(ctx);
-    // Refuse to activate without the primary credential: copying only the
-    // supporting snapshots would clobber the home's settings without a login.
-    const primary = join(accountDir(account), recipe.credentialFiles[0]!);
-    if (!(await stat(primary).catch(() => null))?.isFile()) {
-      throw new Error(`Vault has no credentials for ${account.id}. Capture them first: hive account login ${account.tool} ${account.label}`);
-    }
-    const written = ctx.written;
-    for (const relative of recipe.credentialFiles) {
-      const source = join(accountDir(account), relative);
-      const info = await stat(source).catch(() => null);
-      if (!info?.isFile()) continue;
-      const targets = [relative, ...(recipe.activationMirrors?.[relative] ? [recipe.activationMirrors[relative]!] : [])];
-      for (const homeRelative of targets) {
-        const target = join(homePath, homeRelative);
-        await mkdir(dirname(target), { recursive: true });
-        const data = await readFile(source, "utf8");
-        await atomicWriteFile(target, data, { mode: 0o600 });
-        written.push(homeRelative);
+  const timing = emptyActivationTiming();
+  const deferredLedger: Array<Record<string, unknown>> = [];
+  const ctx: ActivationContext = {
+    account,
+    homePath,
+    recipe,
+    options,
+    warn,
+    written: [],
+    deferredLedger,
+    async time<T>(phase: string, fn: () => Promise<T>): Promise<T> {
+      const phaseStarted = performance.now();
+      try {
+        return await fn();
+      } finally {
+        const duration = performance.now() - phaseStarted;
+        timing.preActivateStepsMs[phase] = (timing.preActivateStepsMs[phase] ?? 0) + duration;
+        if (phase === "identity-verification") timing.identityVerificationMs += duration;
       }
+    },
+  };
+  let failure: unknown;
+  try {
+    let homeLockAcquiredAt = 0;
+    try {
+      await withFileLock(activationHomeLockPath(homePath), async () => {
+        homeLockAcquiredAt = performance.now();
+        let accountLockAcquiredAt = 0;
+        try {
+          await withAccountLock(account.id, async () => {
+            accountLockAcquiredAt = performance.now();
+            const preStarted = performance.now();
+            try {
+              await hooks.preActivate?.(ctx);
+            } finally {
+              timing.preActivateMs = performance.now() - preStarted;
+            }
+            // Refuse to activate without the primary credential: copying only the
+            // supporting snapshots would clobber the home's settings without a login.
+            const primary = join(accountDir(account), recipe.credentialFiles[0]!);
+            if (!(await stat(primary).catch(() => null))?.isFile()) {
+              throw new Error(`Vault has no credentials for ${account.id}. Capture them first: hive account login ${account.tool} ${account.label}`);
+            }
+            const copyStarted = performance.now();
+            try {
+              for (const relative of recipe.credentialFiles) {
+                const source = join(accountDir(account), relative);
+                const info = await stat(source).catch(() => null);
+                if (!info?.isFile()) continue;
+                const targets = [relative, ...(recipe.activationMirrors?.[relative] ? [recipe.activationMirrors[relative]!] : [])];
+                for (const homeRelative of targets) {
+                  const changed = await copyFileAtomicallyIfChanged(source, join(homePath, homeRelative));
+                  if (changed) timing.credentialFreshMisses += 1;
+                  else timing.credentialFreshHits += 1;
+                  if (!ctx.written.includes(homeRelative)) ctx.written.push(homeRelative);
+                }
+              }
+            } finally {
+              timing.credentialCopyMs = performance.now() - copyStarted;
+            }
+            if (ctx.written.length === 0) {
+              throw new Error(`Vault has no credentials for ${account.id}. Capture them first: hive account login ${account.tool} ${account.label}`);
+            }
+            await hooks.finalizeCredentials?.(ctx);
+          }, {
+            onAcquired: ({ waitMs, owner }) => {
+              timing.accountLockWaitMs = waitMs;
+              timing.accountLockOwner = owner;
+            },
+            onTimeout: ({ waitMs, owner }) => {
+              timing.accountLockWaitMs = waitMs;
+              timing.accountLockOwner = owner;
+            },
+          });
+        } finally {
+          timing.accountLockHeldMs = accountLockAcquiredAt > 0 ? performance.now() - accountLockAcquiredAt : 0;
+        }
+
+        // Config/default/capability convergence is home-scoped, not secret-vault
+        // work. It remains serialized for the same home while different homes
+        // proceed independently after the account chain is safe.
+        const configStarted = performance.now();
+        for (const relative of recipe.configFiles ?? []) {
+          const source = join(accountDir(account), relative);
+          const info = await stat(source).catch(() => null);
+          if (!info?.isFile()) continue;
+          await copyFileAtomicallyIfChanged(source, join(homePath, relative));
+          if (!ctx.written.includes(relative)) ctx.written.push(relative);
+        }
+        timing.configCopyMs = performance.now() - configStarted;
+
+        const defaultsStarted = performance.now();
+        await hooks.seedHomeDefaults?.(ctx);
+        timing.defaultsMs = performance.now() - defaultsStarted;
+
+        const kitStamp = await readKitHomeStamp(homePath);
+        await kitMaterializeHome(homePath, account.tool, {
+          warn,
+          profile: kitStamp.kitProfile,
+          onTiming: (kitTiming) => { timing.kit = kitTiming; },
+        });
+        const gatewayStarted = performance.now();
+        const gatewaySeed = await seedGatewayMcp(homePath, account.tool);
+        timing.gatewaySeedMs = performance.now() - gatewayStarted;
+        for (const relative of gatewaySeed.written) {
+          if (!ctx.written.includes(relative)) ctx.written.push(relative);
+        }
+      }, {
+        timeoutMs: 3 * 60_000,
+        onAcquired: ({ waitMs, owner }) => {
+          timing.homeLockWaitMs = waitMs;
+          timing.homeLockOwner = owner;
+        },
+        onTimeout: ({ waitMs, owner }) => {
+          timing.homeLockWaitMs = waitMs;
+          timing.homeLockOwner = owner;
+        },
+      });
+    } finally {
+      timing.homeLockHeldMs = homeLockAcquiredAt > 0 ? performance.now() - homeLockAcquiredAt : 0;
     }
-    if (written.length === 0) {
-      throw new Error(`Vault has no credentials for ${account.id}. Capture them first: hive account login ${account.tool} ${account.label}`);
-    }
-    for (const relative of recipe.configFiles ?? []) {
-      const source = join(accountDir(account), relative);
-      const info = await stat(source).catch(() => null);
-      if (!info?.isFile()) continue;
-      const target = join(homePath, relative);
-      await mkdir(dirname(target), { recursive: true });
-      const data = await readFile(source, "utf8");
-      await atomicWriteFile(target, data, { mode: 0o600 });
-      written.push(relative);
-    }
-    await hooks.seedHomeDefaults?.(ctx);
-    // trmdy/kit: converge the home's capability set (skills, MCP config,
-    // instruction regions) on every activation, mirroring the seeders'
-    // merge discipline. Converge toward the home's STANDING profile (its
-    // ownership-manifest stamp), so a plain activation never reverts a home
-    // that was explicitly materialized with --kit-profile. Kit owns only
-    // manifest-claimed files; best-effort — activation never fails on
-    // capability sync, and this is a no-op without a kit binary.
-    const kitStamp = await readKitHomeStamp(homePath);
-    await kitMaterializeHome(homePath, account.tool, { warn, profile: kitStamp.kitProfile });
-    const gatewaySeed = await seedGatewayMcp(homePath, account.tool);
-    for (const relative of gatewaySeed.written) {
-      if (!written.includes(relative)) written.push(relative);
-    }
-    await appendLedger({ type: "account.activate", account: account.id, tool: account.tool, home: homePath, files: written });
-    return written;
-  });
+  } catch (error) {
+    failure = error;
+  }
+
+  // Every filesystem/account lock is released before these non-secret writes.
+  for (const event of deferredLedger) await appendLedger(event).catch(() => undefined);
+  if (!failure) {
+    await appendLedger({ type: "account.activate", account: account.id, tool: account.tool, home: homePath, files: ctx.written });
+  }
+  timing.totalMs = performance.now() - started;
+  await appendLedger({
+    type: "account.activation-timing",
+    account: account.id,
+    tool: account.tool,
+    homeKey: activationHomeKey(homePath),
+    outcome: failure ? "failed" : "ready",
+    ...timing,
+  }).catch(() => undefined);
+  notifyActivationTiming(options.onTiming, timing);
+  if (failure) throw failure;
+  return { written: ctx.written, timing };
 }
 
 /** True when the vault holds the account's PRIMARY credential file. */

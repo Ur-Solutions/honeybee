@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { withFileLock } from "../src/lock.js";
@@ -110,5 +110,34 @@ test("heartbeat stops refreshing after release", async () => {
     await withFileLock(path, async () => undefined, { staleMs: 90 });
     await sleep(150); // longer than the heartbeat interval (staleMs / 3)
     await assert.rejects(stat(path), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+  });
+});
+
+test("dead local owner is reclaimed immediately and callbacks expose only sanitized prior-owner metadata", async () => {
+  await withTempDir(async (dir) => {
+    const path = join(dir, "dead-owner.lock");
+    await writeFile(path, JSON.stringify({
+      pid: 999_999,
+      hostname: hostname(),
+      createdAt: "2026-08-07T00:00:00.000Z",
+      token: "must-not-leak",
+      secret: "also-must-not-leak",
+    }));
+    let waited: unknown;
+    let acquired: unknown;
+    await withFileLock(path, async () => undefined, {
+      timeoutMs: 1_000,
+      pollMs: 5,
+      onWait: (info) => { waited = info; },
+      onAcquired: (info) => { acquired = info; },
+    });
+    assert.deepEqual((waited as { owner: unknown }).owner, {
+      pid: 999_999,
+      hostname: hostname(),
+      createdAt: "2026-08-07T00:00:00.000Z",
+    });
+    assert.equal((acquired as { waited: boolean }).waited, true);
+    assert.ok((acquired as { waitMs: number }).waitMs >= 0);
+    assert.doesNotMatch(JSON.stringify(acquired), /must-not-leak|also-must-not-leak/);
   });
 });

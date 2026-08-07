@@ -9,17 +9,23 @@
  *   spawn-timing CL-ab12: total 15234ms · resolve 12ms · activate 8ms ·
  *     exec-check 3ms · allocate 5ms · session-create 41ms · ready 15120ms
  *
- * Disabled by default the timer is a no-op object, so the hot path pays
- * nothing and production output is unchanged.
+ * Measurement is always on and uses a monotonic clock so the durable ledger can
+ * diagnose production stalls. HIVE_DEBUG_SPAWN controls only stderr rendering.
  */
+import { performance } from "node:perf_hooks";
+
+export type SpawnTimingReport = {
+  label: string;
+  totalMs: number;
+  phases: Array<{ name: string; ms: number }>;
+};
+
 export type SpawnTimer = {
   /** Record the elapsed time since the previous mark (or timer start) under `phase`. */
   mark(phase: string): void;
   /** Emit the accumulated breakdown to stderr. `label` overrides the start label (e.g. the final bee name). */
-  report(label?: string): void;
+  report(label?: string): SpawnTimingReport;
 };
-
-const NOOP: SpawnTimer = { mark() {}, report() {} };
 
 export function spawnTimingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const value = env.HIVE_DEBUG_SPAWN;
@@ -31,21 +37,22 @@ export function spawnTimingEnabled(env: NodeJS.ProcessEnv = process.env): boolea
  * lazily on each mark/report so the caller never threads a clock through.
  */
 export function startSpawnTimer(label: string, env: NodeJS.ProcessEnv = process.env): SpawnTimer {
-  if (!spawnTimingEnabled(env)) return NOOP;
-  const start = Date.now();
+  const debug = spawnTimingEnabled(env);
+  const start = performance.now();
   let last = start;
   const phases: Array<{ name: string; ms: number }> = [];
   return {
     mark(phase: string) {
-      const now = Date.now();
+      const now = performance.now();
       phases.push({ name: phase, ms: now - last });
       last = now;
     },
     report(reportLabel?: string) {
-      const total = Date.now() - start;
+      const total = performance.now() - start;
       const parts = phases.map((p) => `${p.name} ${p.ms}ms`).join(" · ");
       const name = reportLabel ?? label;
-      process.stderr.write(`spawn-timing ${name}: total ${total}ms${parts ? ` · ${parts}` : ""}\n`);
+      if (debug) process.stderr.write(`spawn-timing ${name}: total ${Math.round(total)}ms${parts ? ` · ${phases.map((p) => `${p.name} ${Math.round(p.ms)}ms`).join(" · ")}` : ""}\n`);
+      return { label: name, totalMs: total, phases: phases.map((phase) => ({ ...phase })) };
     },
   };
 }

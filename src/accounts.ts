@@ -53,6 +53,7 @@ export {
   type ClaudeChain,
   type RefreshedClaudeToken,
   parseClaudeChain,
+  parseClaudeChainStrict,
   readHomeClaudeChain,
   homeClaudeEmail,
   claudeHomesForAccount,

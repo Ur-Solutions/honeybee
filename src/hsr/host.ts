@@ -15,9 +15,10 @@
  * Node builtins only. No cli.ts / daemon / SubstrateHsr coupling.
  */
 
+import { performance } from "node:perf_hooks";
 import { clearAccountBootFailure, recordAccountBootFailure } from "../accounts/bootHealth.js";
 import { CodexBootProbeError, codexHomeFromEnv, withCodexHomeBootLock } from "../codexBoot.js";
-import { reclaimCodexHomeLogs } from "../codexHomeMaintenance.js";
+import { probeCodexHomeLogs, reclaimCodexHomeLogs } from "../codexHomeMaintenance.js";
 import type { RunnerAdapter, RunnerInputAnswer, RunnerOpts } from "./types.js";
 import { startRpcServer, type RpcMethodHandler } from "./rpc.js";
 import {
@@ -65,6 +66,9 @@ export async function runHsrHost(params: {
   const { bee, adapter, opts } = params;
   const hostPid = params.hostPid ?? process.pid;
   const controlSocket = hsrControlSocketPath(bee);
+  const monotonicStart = performance.now();
+  const phaseTimings: NonNullable<HsrMeta["phaseTimingsMs"]> = {};
+  const elapsed = (): number => Math.max(0, performance.now() - monotonicStart);
 
   await ensureHsrRunDir(bee);
   const tier = adapter.tier();
@@ -94,6 +98,7 @@ export async function runHsrHost(params: {
       startupPhase: queueCodexStartup ? "admission" : "harness",
       controlSocket,
       status: "queued",
+      phaseTimingsMs: phaseTimings,
     };
     await writeHsrMeta(bee, startupMeta);
   }
@@ -102,29 +107,40 @@ export async function runHsrHost(params: {
   try {
     const startAdapter = async (startOpts: RunnerOpts = opts) => {
       if (startupMeta?.startupPhase === "admission") {
-        startupMeta = { ...startupMeta, startupPhase: "harness" };
+        startupMeta = { ...startupMeta, startupPhase: "harness", phaseTimingsMs: phaseTimings };
         await writeHsrMeta(bee, startupMeta);
       }
-      return adapter.start(startOpts);
+      const adapterStarted = performance.now();
+      try {
+        return await adapter.start(startOpts);
+      } finally {
+        phaseTimings.adapterReadiness = performance.now() - adapterStarted;
+      }
     };
     const startWithHomeLock = () => bootsCodexAppServer
-      ? withCodexHomeBootLock(codexHomeFromEnv(opts.env), async ({ waited }) => {
-          // Reclaim the home's log DBs before codex opens them. Holding the boot
-          // lock with no app-server spawned yet is the one moment hive knows the
-          // home may be quiet, and codex's own PASSIVE checkpoint never gets it.
-          // A home left to grow eventually stalls this very handshake, and then
-          // codex can no longer run the retention that would have shrunk it.
-          const reclaimed = await reclaimCodexHomeLogs(codexHomeFromEnv(opts.env)).catch(() => null);
-          if (reclaimed && reclaimed.reclaimedBytes > 0) {
-            process.stderr.write(
-              `hive: reclaimed ${(reclaimed.reclaimedBytes / 1048576).toFixed(0)}MB from codex home logs\n`,
-            );
+      ? withCodexHomeBootLock(codexHomeFromEnv(opts.env), async ({ waited, waitMs }) => {
+          phaseTimings.homeLockWait = waitMs;
+          const heldAt = performance.now();
+          try {
+            // Boot performs only a bounded, read-only size probe. SQLite
+            // checkpoint/vacuum is deferred until this runtime exits so a
+            // multi-GB/busy DB cannot consume the adapter readiness budget.
+            const maintenanceStarted = performance.now();
+            await probeCodexHomeLogs(codexHomeFromEnv(opts.env)).catch(() => undefined);
+            phaseTimings.maintenanceProbe = performance.now() - maintenanceStarted;
+            return await startAdapter(waited ? { ...opts, codexBootContended: true } : opts);
+          } finally {
+            phaseTimings.homeLockHeld = performance.now() - heldAt;
           }
-          return startAdapter(waited ? { ...opts, codexBootContended: true } : opts);
         })
       : startAdapter(opts);
     session = queueCodexStartup
-      ? await withCodexStartupSlot(bee, startWithHomeLock)
+      ? await withCodexStartupSlot(bee, startWithHomeLock, {
+          onTiming: ({ waitMs, heldMs }) => {
+            phaseTimings.startupSlotWait = waitMs;
+            phaseTimings.startupSlotHeld = heldMs;
+          },
+        })
       : await startWithHomeLock();
     if (bootsCodexAppServer && opts.accountId) {
       await clearAccountBootFailure(opts.accountId).catch(() => undefined);
@@ -139,6 +155,7 @@ export async function runHsrHost(params: {
         status: "exited",
         exitCode: null,
         endedAt: new Date().toISOString(),
+        phaseTimingsMs: phaseTimings,
       }).catch(() => undefined);
     }
     throw error;
@@ -158,6 +175,7 @@ export async function runHsrHost(params: {
     controlSocket,
     status: startupMeta ? "queued" : "running",
     ...(!startupMeta ? { runningAt: new Date().toISOString() } : {}),
+    phaseTimingsMs: phaseTimings,
   };
   await writeHsrMeta(bee, meta);
 
@@ -232,7 +250,8 @@ export async function runHsrHost(params: {
       // sender either persists a turn that this drain consumes, or sees running
       // after the lock is released and uses the live RPC socket.
       await withHsrTurnDeliveryLock(bee, async () => {
-        meta = { ...meta, status: "running", runningAt: new Date().toISOString() };
+        phaseTimings.ready = elapsed();
+        meta = { ...meta, status: "running", runningAt: new Date().toISOString(), phaseTimingsMs: phaseTimings };
         await writeHsrMeta(bee, meta);
         await drainPendingHsrTurns(bee, (turn) => sendTrackedTurn(turn.text, undefined, turn.filename));
       });
@@ -282,9 +301,21 @@ export async function runHsrHost(params: {
       status: "exited",
       exitCode,
       endedAt: new Date().toISOString(),
+      phaseTimingsMs: phaseTimings,
     };
     await writeHsrMeta(bee, meta).catch(() => undefined);
     await server.close().catch(() => undefined);
+    // Heavy SQLite maintenance is a shutdown concern. Acquire the same home
+    // boot lock briefly; if another boot already owns it, skip rather than
+    // delaying or contending with the newborn adapter.
+    if (bootsCodexAppServer) {
+      await withCodexHomeBootLock(codexHomeFromEnv(opts.env), async () => {
+        const reclaimed = await reclaimCodexHomeLogs(codexHomeFromEnv(opts.env)).catch(() => null);
+        if (reclaimed && reclaimed.reclaimedBytes > 0) {
+          process.stderr.write(`hive: reclaimed ${(reclaimed.reclaimedBytes / 1048576).toFixed(0)}MB from codex home logs after exit\n`);
+        }
+      }, { timeoutMs: 250, pollMs: 25 }).catch(() => undefined);
+    }
     resolveDone();
   };
 
@@ -292,6 +323,19 @@ export async function runHsrHost(params: {
   void (async () => {
     try {
       for await (const event of session.events) {
+        let timingChanged = false;
+        if (event.type === "turn_start" && phaseTimings.firstTurn === undefined) {
+          phaseTimings.firstTurn = elapsed();
+          timingChanged = true;
+        }
+        if (event.type === "text" && event.text.length > 0 && phaseTimings.firstToken === undefined) {
+          phaseTimings.firstToken = elapsed();
+          timingChanged = true;
+        }
+        if (timingChanged) {
+          meta = { ...meta, phaseTimingsMs: phaseTimings };
+          await writeHsrMeta(bee, meta).catch(() => undefined);
+        }
         if (event.type === "turn_start") {
           openTurns.push({ deliveryId: awaitingTurnStart.shift(), authFailed: false });
         } else if (

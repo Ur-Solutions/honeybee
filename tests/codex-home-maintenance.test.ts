@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { codexHomeMaintenanceEnabled, reclaimCodexHomeLogs } from "../src/codexHomeMaintenance.js";
+import { codexHomeMaintenanceEnabled, probeCodexHomeLogs, reclaimCodexHomeLogs } from "../src/codexHomeMaintenance.js";
 
 const execFileP = promisify(execFile);
 
@@ -160,6 +160,25 @@ test("reclaim honours its budget and the HIVE_CODEX_HOME_MAINTENANCE kill switch
     const disabled = await reclaimCodexHomeLogs(home, { env: { HIVE_CODEX_HOME_MAINTENANCE: "0" } });
     assert.deepEqual(disabled, { reclaimedBytes: 0, busy: false });
     assert.equal(await sizeOf(db), before, "the kill switch must not touch the DB at all");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("boot safety probe observes a large Codex DB without vacuuming it", async (t) => {
+  if (!(await hasSqlite3())) return t.skip("sqlite3 not available");
+  const home = await mkdtemp(join(tmpdir(), "honeybee-codex-home-probe-"));
+  try {
+    const db = await seedBloatedHome(home);
+    const before = (await sizeOf(db)) + (await sizeOf(`${db}-wal`));
+    const started = Date.now();
+    const probe = await probeCodexHomeLogs(home, { budgetMs: 100 });
+    const elapsed = Date.now() - started;
+    const after = (await sizeOf(db)) + (await sizeOf(`${db}-wal`));
+    assert.equal(probe.dbCount, 1);
+    assert.ok(probe.bytes > 0);
+    assert.ok(elapsed < 1_000, `bounded probe took ${elapsed}ms`);
+    assert.equal(after, before, "read-only boot probe must not checkpoint/vacuum");
   } finally {
     await rm(home, { recursive: true, force: true });
   }
