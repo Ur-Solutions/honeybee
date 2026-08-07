@@ -236,18 +236,45 @@ test("local fallback never signals a reused launcher PID or process group", asyn
   assert.equal(result.status, "indeterminate", "a mismatched birth is not exact-group absence proof");
 });
 
-test("local fallback revalidates launcher birth before SIGKILL escalation", async () => {
+test("post-TERM gone leader plus present numeric group fails closed before SIGKILL", async () => {
   const recorded = { pgid: 7474, startedAt: "Mon Aug  7 09:00:00 2026" };
-  const replacement = { pgid: 7474, startedAt: "Mon Aug  7 09:01:00 2026" };
-  let reads = 0;
+  let leader = recorded as typeof recorded | null;
   const signals: Array<[number, NodeJS.Signals | 0]> = [];
   const result = await terminateProcessGroup(7474, recorded, {
-    readProcessIdentity: async () => (++reads === 1 ? recorded : replacement),
-    kill: (pid, signal) => { signals.push([pid, signal]); },
+    readProcessIdentity: async () => leader,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      if (signal === "SIGTERM") leader = null;
+    },
     sleep: async () => undefined,
   });
-  assert.deepEqual(signals, [[-7474, "SIGTERM"], [-7474, 0]], "replacement group is only checked, never escalated to SIGKILL");
+  assert.deepEqual(signals, [[-7474, "SIGTERM"], [-7474, 0]], "leaderless numeric group is probed but never SIGKILLed");
   assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /leader birth identity is gone immediately before SIGKILL/);
+});
+
+test("replacement group appearing at the post-TERM presence barrier is never SIGKILLed", async () => {
+  const recorded = { pgid: 7475, startedAt: "Mon Aug  7 09:00:00 2026" };
+  const replacement = { pgid: 7475, startedAt: "Mon Aug  7 09:01:00 2026" };
+  let leader: typeof recorded | null = recorded;
+  const signals: Array<[number, NodeJS.Signals | 0, string]> = [];
+  const result = await terminateProcessGroup(7475, recorded, {
+    readProcessIdentity: async () => leader,
+    kill: (pid, signal) => {
+      signals.push([pid, signal, leader?.startedAt ?? "gone"]);
+      if (signal === "SIGTERM") leader = null;
+      // Deterministic race barrier: the original is gone after TERM, then a
+      // replacement takes the numeric group while signal-0 observes it.
+      if (signal === 0) leader = replacement;
+    },
+    sleep: async () => undefined,
+  });
+  assert.deepEqual(signals, [
+    [-7475, "SIGTERM", recorded.startedAt],
+    [-7475, 0, "gone"],
+  ], "the replacement receives neither SIGTERM nor SIGKILL");
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /leader birth identity is mismatch immediately before SIGKILL/);
 });
 
 test("exact group stop is indeterminate without a matching birth fingerprint", async () => {

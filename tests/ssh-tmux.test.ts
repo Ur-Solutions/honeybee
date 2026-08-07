@@ -394,6 +394,34 @@ test("kill confirms remote group and exact session absence after TERM", async ()
   assert.ok(cap.calls.some((call) => call.argv.includes("has-session")), "session absence is positively probed");
 });
 
+test("kill leaves remote cleanup unconfirmed when the leader is gone but its numeric group remains", async () => {
+  const cap = captureExec();
+  let leaderAlive = true;
+  cap.respondWith((call) => {
+    if (call.argv.includes("/bin/ps")) {
+      return leaderAlive
+        ? { exitCode: 0, stdout: "4242 1 4242 Fri Aug  7 10:00:00 2026\n" }
+        : { exitCode: 1 };
+    }
+    if (call.argv.includes("/bin/kill")) {
+      if (call.argv.includes("-TERM")) leaderAlive = false;
+      return { exitCode: 0 };
+    }
+    if (call.argv.includes("kill-session")) return { exitCode: 0 };
+    if (call.argv.includes("has-session")) return { exitCode: 1, stderr: "can't find session: alpha" };
+    return { exitCode: 0 };
+  });
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook, sleep: async () => undefined });
+  const result = await s.kill("alpha", {
+    launcherPgid: 4242,
+    launcherFingerprint: { pgid: 4242, startedAt: "Fri Aug  7 10:00:00 2026" },
+  });
+
+  assert.equal(result.ok, false, "tmux absence cannot confirm a leaderless remote group teardown");
+  assert.match(result.stderr, /leader birth identity is gone immediately before SIGKILL/);
+  assert.equal(cap.calls.some((call) => call.argv.includes("-KILL")), false, "the unproven remote group is never SIGKILLed");
+});
+
 test("killIncarnation rejects missing pane while the matching remote group survives", async () => {
   const cap = captureExec();
   cap.respondWith((call) => {

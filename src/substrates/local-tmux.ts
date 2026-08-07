@@ -295,26 +295,31 @@ export async function terminateProcessGroup(
   }
   await (deps.sleep ?? sleep)(500);
 
-  const afterTermBirth = await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity);
   const afterTermPresence = await inspectProcessGroupPresence(pgid, kill);
-  if (afterTermBirth === "gone" && afterTermPresence.status === "absent") {
-    return { status: "confirmed", reason: "absent" };
-  }
-  // A different/unreadable leader can be a recycled group. Never escalate a
-  // destructive signal without continuity from the persisted birth proof.
-  if (afterTermBirth === "mismatch" || afterTermBirth === "unverifiable") {
-    return { status: "indeterminate", reason: `process-group ${pgid} birth identity became ${afterTermBirth} after SIGTERM` };
-  }
   if (afterTermPresence.status === "indeterminate") {
     return { status: "indeterminate", reason: afterTermPresence.reason };
   }
   if (afterTermPresence.status === "absent") {
-    return { status: "indeterminate", reason: `process-group ${pgid} absence conflicted with a live leader birth` };
+    const afterTermBirth = await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity);
+    if (afterTermBirth === "gone") return { status: "confirmed", reason: "absent" };
+    return {
+      status: "indeterminate",
+      reason: `process-group ${pgid} absence conflicted with leader birth identity ${afterTermBirth}`,
+    };
   }
 
-  // If the leader exited but signal-0 still sees the group, its remaining
-  // members keep the PGID allocated; this is continuity of the exact group,
-  // not a recycled group. Escalation is therefore still fenced to our birth.
+  // The presence probe above is only a numeric-PGID observation. The group can
+  // be recycled between it and escalation, so re-read the immutable leader
+  // birth immediately before SIGKILL. A missing leader plus a present group is
+  // not continuity proof: without a persisted member identity it could be a
+  // replacement group and must fail closed.
+  const beforeKillBirth = await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity);
+  if (beforeKillBirth !== "match") {
+    return {
+      status: "indeterminate",
+      reason: `process-group ${pgid} leader birth identity is ${beforeKillBirth} immediately before SIGKILL`,
+    };
+  }
   try {
     await kill(-pgid, "SIGKILL");
   } catch (error) {
