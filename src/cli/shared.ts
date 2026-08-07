@@ -21,7 +21,7 @@ import { matchesSessionReference } from "../ids.js";
 import { LOCAL_NODE_NAME, loadNode, loadNodeSync, supportsCapability, type NodeRecord } from "../node.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
-import { sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
+import { nextTurnPatch, sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
 import { ensureSessionLive } from "../sessionLiveness.js";
 import { liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { assembleStateContext } from "../view/context.js";
@@ -106,11 +106,16 @@ export async function deliverBrief(parsed: Parsed, record: SessionRecord, briefT
       console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, briefing anyway`]));
     }
   }
+  // Snapshot the completed-turn boundary before delivery, then persist it only
+  // after delivery succeeds. This reactivates a sealed/done warm runtime in the
+  // operational index without letting a failed brief retire its old seal.
+  const turn = await nextTurnPatch(record);
   const delivered = augmentBrief(parsed, briefText);
   await deliverPromptText(record, delivered);
   await writeHiveState(record, "working");
   const now = new Date().toISOString();
   const persisted = await updateSession(record.name, {
+    ...turn,
     updatedAt: now,
     status: "running",
     brief: briefText,

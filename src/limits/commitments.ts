@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { canonicalAgentKind } from "../agents.js";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
-import { listSessions, type SessionRecord } from "../store.js";
+import { listActiveSessions, type SessionRecord } from "../store.js";
 
 /**
  * Effective-load points a busy (active/working) bee adds to its account. The
@@ -42,10 +42,28 @@ export const AUTO_COMMITMENT_PARKED_PERCENT = 2;
 /** Observed states that mean "generating right now" across drivers. */
 const BUSY_STATES = new Set(["active", "working"]);
 
+/**
+ * States with a recoverable live runtime but no current generation. They stay
+ * daemon-visible, yet contribute no placement load until a new turn starts.
+ */
+const ZERO_COMMITMENT_STATES = new Set([
+  "dead",
+  "crashed",
+  "done",
+  "sealed",
+  "archived",
+  "retired",
+  "killed",
+  "error",
+  "kill_failed",
+]);
+
 /** Commitment points a single session contributes to its bound account. */
 export function sessionCommitmentPercent(session: SessionRecord): number {
   if (session.status !== "running" || !session.accountId) return 0;
-  return BUSY_STATES.has(session.lastObservedState ?? "") ? AUTO_COMMITMENT_BUSY_PERCENT : AUTO_COMMITMENT_PARKED_PERCENT;
+  const state = session.lastObservedState ?? "";
+  if (ZERO_COMMITMENT_STATES.has(state)) return 0;
+  return BUSY_STATES.has(state) ? AUTO_COMMITMENT_BUSY_PERCENT : AUTO_COMMITMENT_PARKED_PERCENT;
 }
 
 /**
@@ -55,7 +73,7 @@ export function sessionCommitmentPercent(session: SessionRecord): number {
  */
 export async function accountCommitments(tool: string, sessions?: SessionRecord[]): Promise<Map<string, number>> {
   const kind = canonicalAgentKind(tool).toLowerCase();
-  const records = sessions ?? (await listSessions());
+  const records = sessions ?? (await listActiveSessions());
   const totals = new Map<string, number>();
   for (const session of records) {
     if (!session.accountId) continue;

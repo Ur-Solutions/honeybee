@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -247,6 +248,159 @@ export async function ensureStore() {
   await mkdir(sessionsDir(), { recursive: true });
 }
 
+/**
+ * Persisted observed states that have no daemon work left to do. A later send
+ * or revive clears the turn/runtime boundary before setting status=running,
+ * which transactionally puts the record back in the active index.
+ */
+const TERMINAL_OBSERVED_STATES = new Set([
+  "dead",
+  "crashed",
+  "done",
+  "sealed",   // legacy spelling for a completed/sealed current turn
+  "archived", // legacy spelling for a filed record
+  "retired",
+  "killed",
+]);
+
+/**
+ * Whether a record belongs in operational hot paths. This is deliberately
+ * narrower than status=running: a crashed bee or a warm runtime whose current
+ * turn is sealed/done remains revivable history, but does not need probing and
+ * must not bias automatic account selection.
+ */
+export function isActiveSessionRecord(
+  record: Pick<SessionRecord, "status" | "lastObservedState">,
+): boolean {
+  // kill_failed means teardown could not prove the runtime stopped. Keep it in
+  // the daemon work set until an operator retries/repairs it. Likewise a
+  // provider/runtime `error` observation can recover on a later tick. Neither
+  // contributes an account commitment (limits/commitments owns that policy).
+  if (record.status !== "running" && record.status !== "kill_failed") return false;
+  return !TERMINAL_OBSERVED_STATES.has(record.lastObservedState ?? "");
+}
+
+export const ACTIVE_SESSION_INDEX_VERSION = 1;
+
+type ActiveSessionIndex = {
+  version: typeof ACTIVE_SESSION_INDEX_VERSION;
+  complete: true;
+  root: string;
+  active: string[];
+  checksum: string;
+  updatedAt: string;
+};
+
+type StorePaths = {
+  root: string;
+  currentDir: string;
+  legacyDir: string;
+};
+
+function captureStorePaths(): StorePaths {
+  return { root: storeRoot(), currentDir: sessionsDir(), legacyDir: legacySessionsDir() };
+}
+
+/** Root-scoped operational index. The file-per-record store remains canonical. */
+export function activeSessionIndexPath(root = storeRoot()): string {
+  return join(root, "active-sessions.json");
+}
+
+function activeSessionIndexLockPath(root: string): string {
+  return join(root, ".active-sessions.lock");
+}
+
+function activeIndexChecksum(root: string, active: readonly string[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ version: ACTIVE_SESSION_INDEX_VERSION, root, active }))
+    .digest("hex");
+}
+
+function makeActiveSessionIndex(root: string, names: Iterable<string>): ActiveSessionIndex {
+  const active = [...new Set(names)].sort((a, b) => a.localeCompare(b));
+  return {
+    version: ACTIVE_SESSION_INDEX_VERSION,
+    complete: true,
+    root,
+    active,
+    checksum: activeIndexChecksum(root, active),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function readActiveSessionIndex(root: string): Promise<ActiveSessionIndex | null> {
+  try {
+    const parsed = JSON.parse(await readFile(activeSessionIndexPath(root), "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const candidate = parsed as Partial<ActiveSessionIndex>;
+    if (
+      candidate.version !== ACTIVE_SESSION_INDEX_VERSION ||
+      candidate.complete !== true ||
+      candidate.root !== root ||
+      !Array.isArray(candidate.active) ||
+      !candidate.active.every((name): name is string => typeof name === "string" && name.length > 0) ||
+      typeof candidate.checksum !== "string" ||
+      typeof candidate.updatedAt !== "string"
+    ) return null;
+    const normalized = [...new Set(candidate.active)].sort((a, b) => a.localeCompare(b));
+    if (normalized.length !== candidate.active.length) return null;
+    if (normalized.some((name, index) => name !== candidate.active![index])) return null;
+    if (candidate.checksum !== activeIndexChecksum(root, normalized)) return null;
+    return candidate as ActiveSessionIndex;
+  } catch {
+    return null;
+  }
+}
+
+async function writeActiveSessionIndex(index: ActiveSessionIndex): Promise<void> {
+  await atomicWriteFile(activeSessionIndexPath(index.root), `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
+}
+
+async function rebuildActiveSessionIndexLocked(paths: StorePaths): Promise<ActiveSessionIndex> {
+  const records = await listSessionsSnapshot(paths.currentDir, paths.legacyDir);
+  const index = makeActiveSessionIndex(paths.root, records.filter(isActiveSessionRecord).map((record) => record.name));
+  await writeActiveSessionIndex(index);
+  return index;
+}
+
+/**
+ * Rebuild the derived index from authoritative current + legacy record files.
+ * Safe to call operationally: history is only read, never moved or deleted.
+ */
+export async function rebuildActiveSessionIndex(): Promise<number> {
+  const paths = captureStorePaths();
+  const index = await withFileLock(
+    activeSessionIndexLockPath(paths.root),
+    () => rebuildActiveSessionIndexLocked(paths),
+    { timeoutMs: 60_000 },
+  );
+  return index.active.length;
+}
+
+async function currentActiveSessionIndex(paths: StorePaths): Promise<ActiveSessionIndex> {
+  const current = await readActiveSessionIndex(paths.root);
+  if (current) return current;
+  return withFileLock(
+    activeSessionIndexLockPath(paths.root),
+    async () => (await readActiveSessionIndex(paths.root)) ?? rebuildActiveSessionIndexLocked(paths),
+    { timeoutMs: 60_000 },
+  );
+}
+
+async function updateActiveMembershipLocked(
+  paths: StorePaths,
+  name: string,
+  active: boolean,
+): Promise<void> {
+  const current = (await readActiveSessionIndex(paths.root)) ?? await rebuildActiveSessionIndexLocked(paths);
+  const names = new Set(current.active);
+  const changed = active ? !names.has(name) : names.has(name);
+  if (!changed) return;
+  if (active) names.add(name);
+  else names.delete(name);
+  await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names));
+}
+
 function sessionLockPath(name: string): string {
   return join(storeRoot(), "sessions", `.${name}.lock`);
 }
@@ -277,8 +431,23 @@ export async function saveSession(record: SessionRecord) {
  * reentrant, so calling saveSession there would deadlock.
  */
 export async function saveSessionLocked(record: SessionRecord) {
-  await ensureStore();
-  await atomicWriteFile(recordPath(record.name), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+  const paths = captureStorePaths();
+  await mkdir(paths.currentDir, { recursive: true });
+  // Full saves are uncommon (spawn/fork/re-create), so always take the global
+  // membership lock. Activation is indexed BEFORE the live record lands: a
+  // crash can leave a harmless stale name, never an unindexed live runtime.
+  // Deactivation reverses the order: terminal truth lands first, then the name
+  // disappears. Readers validate indexed candidates against the record and
+  // prune either crash residue without touching history.
+  await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
+    if (isActiveSessionRecord(record)) {
+      await updateActiveMembershipLocked(paths, record.name, true);
+      await atomicWriteFile(join(paths.currentDir, `${safeName(record.name)}.json`), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    } else {
+      await atomicWriteFile(join(paths.currentDir, `${safeName(record.name)}.json`), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+      await updateActiveMembershipLocked(paths, record.name, false);
+    }
+  }, { timeoutMs: 60_000 });
   await appendLedger(compactSaveEvent(record));
 }
 
@@ -353,7 +522,8 @@ async function mergeSessionFields(
   options: { skipNoopWrites?: boolean } = {},
 ): Promise<SessionRecord | null> {
   return withSessionLock(name, async () => {
-    const existing = await loadSession(name);
+    const paths = captureStorePaths();
+    const existing = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
     if (!existing) return null;
     const merged: SessionRecord = { ...existing, ...fields, name: existing.name };
     // An explicitly-undefined patch value means "delete this field". Strip the
@@ -371,7 +541,25 @@ async function mergeSessionFields(
         return merged;
       }
     }
-    await atomicWriteFile(recordPath(existing.name), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+    await mkdir(paths.currentDir, { recursive: true });
+    const wasActive = isActiveSessionRecord(existing);
+    const isActive = isActiveSessionRecord(merged);
+    if (wasActive === isActive) {
+      // Rebuilds only care about membership. An active→active metadata write or
+      // terminal→terminal annotation may safely run alongside a rebuild: both
+      // versions classify identically.
+      await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+    } else {
+      await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
+        if (isActive) {
+          await updateActiveMembershipLocked(paths, existing.name, true);
+          await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+        } else {
+          await atomicWriteFile(join(paths.currentDir, `${safeName(existing.name)}.json`), `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+          await updateActiveMembershipLocked(paths, existing.name, false);
+        }
+      }, { timeoutMs: 60_000 });
+    }
     return merged;
   });
 }
@@ -386,14 +574,19 @@ function sessionFingerprint(record: SessionRecord): string {
 }
 
 export async function loadSession(name: string): Promise<SessionRecord | null> {
+  const paths = captureStorePaths();
+  return loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir);
+}
+
+async function loadSessionFromDirectories(name: string, currentDir: string, legacyDir: string): Promise<SessionRecord | null> {
   try {
-    return await readSessionRecord(recordPath(name));
+    return await readSessionRecord(join(currentDir, `${safeName(name)}.json`));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 
   try {
-    return await readSessionRecord(legacyRecordPath(name));
+    return await readSessionRecord(join(legacyDir, `${safeName(name)}.json`));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
@@ -405,14 +598,22 @@ export async function deleteSession(name: string) {
   // daemon persists observed state constantly) can't recreate the record file
   // right after we remove it, resurrecting a zombie bee in `hive ls`.
   await withSessionLock(name, async () => {
-    await rm(recordPath(name), { force: true });
-    await rm(legacyRecordPath(name), { force: true });
+    const paths = captureStorePaths();
+    await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
+      // Deletion is explicit purge. Remove canonical files first, then the
+      // derived name: a crash leaves only a stale index entry, never a hidden
+      // record that could still own a live runtime.
+      await rm(join(paths.currentDir, `${safeName(name)}.json`), { force: true });
+      await rm(join(paths.legacyDir, `${safeName(name)}.json`), { force: true });
+      await updateActiveMembershipLocked(paths, name, false);
+    }, { timeoutMs: 60_000 });
   });
   await appendLedger({ type: "session.delete", name, ts: new Date().toISOString() });
 }
 
 const DEFAULT_LIST_SESSION_CONCURRENCY = 32;
 const listSessionsInFlight = new Map<string, Promise<SessionRecord[]>>();
+const listActiveSessionsInFlight = new Map<string, Promise<SessionRecord[]>>();
 
 /**
  * Enumerate one store snapshot with bounded read fan-out. The old sequential
@@ -433,6 +634,62 @@ export function listSessions(): Promise<SessionRecord[]> {
   });
   listSessionsInFlight.set(root, pending);
   return pending;
+}
+
+/**
+ * Operational snapshot for daemon/account hot paths. Only names in the
+ * derived active index are opened and parsed; listSessions() remains the
+ * explicit full-history API for TUI/search/retention/revive consumers.
+ */
+export function listActiveSessions(): Promise<SessionRecord[]> {
+  const paths = captureStorePaths();
+  const current = listActiveSessionsInFlight.get(paths.root);
+  if (current) return current;
+
+  const pending = listActiveSessionsSnapshot(paths).finally(() => {
+    if (listActiveSessionsInFlight.get(paths.root) === pending) listActiveSessionsInFlight.delete(paths.root);
+  });
+  listActiveSessionsInFlight.set(paths.root, pending);
+  return pending;
+}
+
+async function listActiveSessionsSnapshot(paths: StorePaths): Promise<SessionRecord[]> {
+  const index = await currentActiveSessionIndex(paths);
+  const records: SessionRecord[] = [];
+  const stale: string[] = [];
+  let cursor = 0;
+  const workerCount = Math.min(DEFAULT_LIST_SESSION_CONCURRENCY, index.active.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < index.active.length) {
+      const name = index.active[cursor++];
+      if (!name) continue;
+      const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir).catch(() => null);
+      if (record && isActiveSessionRecord(record)) records.push(record);
+      else stale.push(name);
+    }
+  }));
+
+  if (stale.length > 0) {
+    // Re-check under the membership lock: a concurrent activation publishes
+    // its name before its record, so the first read may legitimately see a
+    // stale-looking entry while the writer is still in its critical section.
+    await withFileLock(activeSessionIndexLockPath(paths.root), async () => {
+      const current = (await readActiveSessionIndex(paths.root)) ?? await rebuildActiveSessionIndexLocked(paths);
+      const names = new Set(current.active);
+      let changed = false;
+      for (const name of stale) {
+        if (!names.has(name)) continue;
+        const record = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir).catch(() => null);
+        if (!record || !isActiveSessionRecord(record)) {
+          names.delete(name);
+          changed = true;
+        }
+      }
+      if (changed) await writeActiveSessionIndex(makeActiveSessionIndex(paths.root, names));
+    }, { timeoutMs: 60_000 });
+  }
+
+  return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 async function listSessionsSnapshot(currentDir: string, legacyDir: string): Promise<SessionRecord[]> {
@@ -516,14 +773,6 @@ function rememberLedgerSize(path: string, maxBytes: number, estimatedSize: numbe
 
 async function writeLedgerLine(path: string, line: string): Promise<void> {
   await appendFile(path, line, { mode: 0o600 });
-}
-
-function recordPath(name: string) {
-  return join(sessionsDir(), `${safeName(name)}.json`);
-}
-
-function legacyRecordPath(name: string) {
-  return join(legacySessionsDir(), `${safeName(name)}.json`);
 }
 
 export function safeName(value: string) {

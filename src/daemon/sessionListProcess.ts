@@ -10,7 +10,7 @@ import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { storeRoot } from "../fsx.js";
-import { listSessions, type SessionRecord } from "../store.js";
+import { listActiveSessions, type SessionRecord } from "../store.js";
 import { envMs } from "./timeouts.js";
 
 type SessionListRequest = { id: number; root: string };
@@ -35,7 +35,10 @@ export async function runSessionListWorker(input: Readable = process.stdin, outp
     let response: SessionListResponse;
     try {
       process.env.HIVE_STORE_ROOT = request.root;
-      response = { id: request.id, ok: true, records: await listSessions() };
+      // The daemon needs only records that can still change or require
+      // recovery. Historical rows stay in file-per-record storage and are read
+      // explicitly by CLI/history consumers; never serialize them through IPC.
+      response = { id: request.id, ok: true, records: await listActiveSessions() };
     } catch (error) {
       response = { id: request.id, ok: false, error: error instanceof Error ? error.message : String(error) };
     } finally {

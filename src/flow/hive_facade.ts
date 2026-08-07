@@ -23,7 +23,7 @@ import {
 } from "../buz.js";
 import { transactionalRetire } from "../kill.js";
 import { LOCAL_NODE_NAME, loadNodeSync, type NodeRecord } from "../node.js";
-import { loadLatestSeal, recordSeal, type SealArtifact, type SealRecord } from "../seal.js";
+import { loadLatestSeal, nextTurnPatch, recordSeal, type SealArtifact, type SealRecord } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { appendLedger, loadSession, updateSession, type SessionRecord } from "../store.js";
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
@@ -168,9 +168,10 @@ export class HiveFacade {
   async send(target: BeeRef, text: string): Promise<void> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
+    const turn = await nextTurnPatch(record);
     await substrateFor(record).sendText(record.tmuxTarget, text, record.agentPaneId);
     const now = new Date().toISOString();
-    await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: text, lastPromptAt: now });
+    await updateSession(record.name, { ...turn, updatedAt: now, status: "running", lastPrompt: text, lastPromptAt: now });
     await appendLedger({
       type: "flow.send",
       flowName: this.flowName,
@@ -183,9 +184,11 @@ export class HiveFacade {
   async brief(target: BeeRef, text: string): Promise<void> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
+    const turn = await nextTurnPatch(record);
     await substrateFor(record).sendText(record.tmuxTarget, text, record.agentPaneId);
     const now = new Date().toISOString();
     await updateSession(record.name, {
+      ...turn,
       updatedAt: now,
       status: "running",
       brief: text,

@@ -12,7 +12,7 @@ import {
 } from "../src/daemon/sessionListProcess.js";
 import type { SessionRecord } from "../src/store.js";
 
-function record(name: string): SessionRecord {
+function record(name: string, overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
     name,
     agent: "codex",
@@ -22,6 +22,7 @@ function record(name: string): SessionRecord {
     createdAt: "2026-07-22T00:00:00.000Z",
     updatedAt: "2026-07-22T00:00:00.000Z",
     status: "running",
+    ...overrides,
   };
 }
 
@@ -70,7 +71,7 @@ test("isolated session list kills a never-settling scan and recovers on the next
   await list.close();
 });
 
-test("session-list worker scopes consecutive requests to different HIVE_STORE_ROOT values", async () => {
+test("session-list worker scopes roots and serializes only the active projection", async () => {
   const firstRoot = await mkdtemp(join(tmpdir(), "hive-session-list-a-"));
   const secondRoot = await mkdtemp(join(tmpdir(), "hive-session-list-b-"));
   const previousRoot = process.env.HIVE_STORE_ROOT;
@@ -78,6 +79,10 @@ test("session-list worker scopes consecutive requests to different HIVE_STORE_RO
     for (const [root, name] of [[firstRoot, "CO.first"], [secondRoot, "CO.second"]] as const) {
       await mkdir(join(root, "sessions"), { recursive: true });
       await writeFile(join(root, "sessions", `${name}.json`), JSON.stringify(record(name)));
+      await writeFile(join(root, "sessions", `${name}-history.json`), JSON.stringify(record(`${name}-history`, {
+        status: "done",
+        lastObservedState: "done",
+      })));
     }
     const input = new PassThrough();
     const output = new PassThrough();
