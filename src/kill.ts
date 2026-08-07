@@ -234,6 +234,7 @@ async function conflictingHomeBinding(
 ): Promise<CredentialBindingConflict | null> {
   if (!record.accountId || !record.homePath) return null;
   const owner = await readActivationHomeOwner(canonicalHomePath);
+  let bindingTime = sessionBindingTime(record);
   if (owner) {
     if (owner.state !== "ready") {
       return {
@@ -242,15 +243,23 @@ async function conflictingHomeBinding(
         activationGeneration: owner.generation,
       };
     }
-    return owner.accountId === record.accountId
-      ? null
-      : { accountId: owner.accountId, reason: "home-rebound", activationGeneration: owner.generation };
+    if (owner.accountId !== record.accountId) {
+      return { accountId: owner.accountId, reason: "home-rebound", activationGeneration: owner.generation };
+    }
+    bindingTime = Date.parse(owner.updatedAt);
+    if (!Number.isFinite(bindingTime)) {
+      return {
+        accountId: owner.accountId,
+        reason: "activation-incomplete",
+        activationGeneration: owner.generation,
+      };
+    }
   }
 
-  // No post-upgrade lock-serialized claim exists. Fall back to canonical
-  // legacy SessionRecords and conservatively reject any newer/live foreign
-  // binding for this resolved custom home.
-  const recordTime = sessionBindingTime(record);
+  // Mixed-version writers do not update owner stamps. Even a matching ready
+  // stamp must therefore yield to a live or newer foreign SessionRecord for
+  // the same physical home. Without a stamp, the record itself is the legacy
+  // ownership reference point.
   const candidates: SessionRecord[] = [];
   for (const candidate of await listSessions()) {
     if (
@@ -258,7 +267,7 @@ async function conflictingHomeBinding(
       !candidate.accountId ||
       candidate.accountId === record.accountId ||
       !candidate.homePath ||
-      (!isActiveSessionRecord(candidate) && sessionBindingTime(candidate) <= recordTime)
+      (!isActiveSessionRecord(candidate) && sessionBindingTime(candidate) <= bindingTime)
     ) continue;
     if (await canonicalActivationHomePath(candidate.homePath) === canonicalHomePath) candidates.push(candidate);
   }

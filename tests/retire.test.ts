@@ -358,6 +358,66 @@ test("clean honors a ready foreign owner stamp on the nominal dedicated home", a
   });
 });
 
+test("clean rejects newer live foreign evidence after a stale matching owner stamp", async () => {
+  await withTempStore(async (dir) => {
+    const homePath = join(dir, "mixed-version-stamped-home");
+    const stale = seed({
+      name: "stamped-account-a-old",
+      tmuxTarget: "stamped-account-a-old",
+      accountId: "account-a",
+      homePath,
+      status: "dead",
+      updatedAt: "2026-08-07T08:00:00.000Z",
+    });
+    const foreign = seed({
+      name: "old-writer-account-b-live",
+      tmuxTarget: "old-writer-account-b-live",
+      accountId: "account-b",
+      homePath,
+      status: "running",
+      updatedAt: "2026-08-07T08:10:00.000Z",
+    });
+    await saveSession(stale);
+    await saveSession(foreign);
+    const ownerPath = await activationHomeOwnerPath(homePath);
+    await mkdir(dirname(ownerPath), { recursive: true });
+    const owner = (updatedAt: string, generation: string) => ({
+      version: 1 as const,
+      homePath,
+      accountId: "account-a",
+      generation,
+      state: "ready" as const,
+      activatedAt: updatedAt,
+      updatedAt,
+    });
+    await writeFile(ownerPath, JSON.stringify(owner("2026-08-07T08:05:00.000Z", "stale-a-stamp")));
+    let harvests = 0;
+
+    await purgeSessionData(stale, {
+      emitLedger: false,
+      finalCredentialSync: async () => { harvests += 1; },
+    });
+    assert.equal(harvests, 0, "an old writer's newer live B record invalidates stale ready(A)");
+
+    await saveSession({ ...foreign, status: "done", updatedAt: "2026-08-07T08:10:00.000Z" });
+    await writeFile(ownerPath, JSON.stringify(owner("2026-08-07T08:20:00.000Z", "fresh-a-restamp")));
+    const restored = seed({
+      name: "stamped-account-a-restored",
+      tmuxTarget: "stamped-account-a-restored",
+      accountId: "account-a",
+      homePath,
+      status: "dead",
+      updatedAt: "2026-08-07T08:20:00.000Z",
+    });
+    await saveSession(restored);
+    await purgeSessionData(restored, {
+      emitLedger: false,
+      finalCredentialSync: async () => { harvests += 1; },
+    });
+    assert.equal(harvests, 1, "a newer ready(A) restamp supersedes terminal older B evidence");
+  });
+});
+
 test("clean resolves symlink aliases to the foreign physical-home owner", async () => {
   await withTempStore(async (dir) => {
     const physicalHome = join(dir, "physical-shared-home");

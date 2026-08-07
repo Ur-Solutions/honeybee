@@ -230,7 +230,15 @@ function legacyForeignBinding(
   canonicalHomePath: string,
   ownEvidence: SessionRecord,
 ): SessionRecord | null {
-  const ownTime = evidenceTime(ownEvidence);
+  return foreignBindingAfter(plan, accountId, canonicalHomePath, evidenceTime(ownEvidence));
+}
+
+function foreignBindingAfter(
+  plan: CredentialSweepPlan,
+  accountId: string,
+  canonicalHomePath: string,
+  ownTime: number,
+): SessionRecord | null {
   const foreign = plan.bindings
     .filter((binding) =>
       binding.homePath === canonicalHomePath &&
@@ -257,6 +265,11 @@ async function withAuthorizedSweepHome<T>(
     let stampedOwner = false;
     if (owner) {
       if (owner.state !== "ready" || owner.accountId !== account.id) return { authorized: false };
+      const ownerTime = Date.parse(owner.updatedAt);
+      if (
+        !Number.isFinite(ownerTime) ||
+        foreignBindingAfter(plan, account.id, canonicalHomePath, ownerTime)
+      ) return { authorized: false };
       stampedOwner = true;
     } else {
       // A nominal/dedicated pathname is not ownership proof: public --home

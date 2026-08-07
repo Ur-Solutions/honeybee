@@ -258,6 +258,52 @@ test("unstamped nominal homes require affirmative legacy account evidence", asyn
   });
 });
 
+test("a ready owner stamp yields to newer live mixed-version session evidence", async () => {
+  await withTempStore(async (root) => {
+    const original = await addAccount("opencode", "stamped-original", { provider: "zai-coding-plan" });
+    const rebound = await addAccount("opencode", "stamped-rebound", { provider: "zai-coding-plan" });
+    const relative = join("xdg-data", "opencode", "auth.json");
+    const originalVault = join(accountDir(original), relative);
+    const nominalHome = join(root, "homes", original.id);
+    await writeDated(originalVault, genericAuth("stamped-a-vault"), "2026-08-07T08:00:00.000Z");
+    await writeDated(join(nominalHome, relative), genericAuth("mixed-version-b-home"), "2026-08-07T08:10:00.000Z");
+    const ownerPath = await activationHomeOwnerPath(nominalHome);
+    await mkdir(dirname(ownerPath), { recursive: true });
+    const owner = (updatedAt: string, generation: string) => ({
+      version: 1 as const,
+      homePath: nominalHome,
+      accountId: original.id,
+      generation,
+      state: "ready" as const,
+      activatedAt: updatedAt,
+      updatedAt,
+    });
+    await writeFile(ownerPath, JSON.stringify(owner("2026-08-07T08:05:00.000Z", "before-old-writer")));
+
+    const liveForeign = record("CO.mixed-b", rebound.id, nominalHome, "2026-08-07T08:10:00.000Z", "running");
+    const rejected = await runCredentialSweep({
+      listAccounts: async () => [original],
+      listSessions: async () => [liveForeign],
+      accountHomes: async () => [nominalHome],
+      concurrency: 1,
+    });
+    assert.match(await readFile(originalVault, "utf8"), /stamped-a-vault/);
+    assert.doesNotMatch(await readFile(originalVault, "utf8"), /mixed-version-b-home/);
+    assert.equal(rejected.vaultUpdates, 0);
+
+    await writeDated(join(nominalHome, relative), genericAuth("stamped-a-restored"), "2026-08-07T08:20:00.000Z");
+    await writeFile(ownerPath, JSON.stringify(owner("2026-08-07T08:20:00.000Z", "after-old-writer")));
+    const recovered = await runCredentialSweep({
+      listAccounts: async () => [original],
+      listSessions: async () => [{ ...liveForeign, status: "done", updatedAt: "2026-08-07T08:10:00.000Z" }],
+      accountHomes: async () => [nominalHome],
+      concurrency: 1,
+    });
+    assert.match(await readFile(originalVault, "utf8"), /stamped-a-restored/);
+    assert.equal(recovered.vaultUpdates, 1, "a newer A restamp supersedes terminal older foreign evidence");
+  });
+});
+
 test("periodic extra pair skips stale account evidence when a newer live foreign session owns the home", async () => {
   await withTempStore(async (root) => {
     const original = await addAccount("opencode", "extra-original", { provider: "zai-coding-plan" });
