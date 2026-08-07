@@ -181,6 +181,14 @@ export type ActivateAccountOptions = {
   now?: () => number;
   /** Internal two-phase automatic-import proof, populated before locking. */
   claudeIdentityProofs?: readonly ClaudeChainIdentityProof[];
+  /** Internal deterministic Keychain seam used by activation race tests. */
+  claudeKeychainDeps?: {
+    available?: typeof keychainAvailable;
+    readRaw?: typeof readClaudeKeychainRaw;
+    writeEntry?: typeof writeClaudeKeychainEntry;
+  };
+  /** Internal boundary hook after Claude's credential stamp and before its authoritative reread. */
+  claudePostCredentialWriteBarrier?: () => Promise<void>;
   /** Internal deterministic boundary hook used by reciprocal Codex lock tests. */
   codexParkingIntentBarrier?: (intent: CodexAuthParkingIntent) => Promise<void>;
   /** Always-on phase observation; receives durations and secret-free lock owners. */
@@ -384,16 +392,19 @@ async function claudeSeedHomeDefaults(ctx: ActivationContext): Promise<void> {
 
 /** Keychain is an effective credential store, so stamp + verify it under the account lock. */
 async function claudeFinalizeCredentials(ctx: ActivationContext): Promise<void> {
-  const { account, homePath, recipe, warn, written } = ctx;
+  const { account, homePath, options, recipe, warn, written } = ctx;
+  const keychainIsAvailable = options.claudeKeychainDeps?.available ?? keychainAvailable;
+  const readKeychain = options.claudeKeychainDeps?.readRaw ?? readClaudeKeychainRaw;
+  const writeKeychain = options.claudeKeychainDeps?.writeEntry ?? writeClaudeKeychainEntry;
   // On macOS, claude prefers the per-config-dir Keychain entry over the
   // credentials file — seed it so an activated home doesn't resolve a stale
   // identity from an old entry. Merged, not replaced: home-local sibling
   // keys (mcpOAuth, ...) survive the identity stamp — except when the merged
   // payload overflows the `security -i` line buffer, where the writer falls
   // back to stamping the identity alone rather than leaving the old one.
-  if (keychainAvailable()) {
+  if (keychainIsAvailable()) {
     const credentials = (await readFile(join(accountDir(account), recipe.credentialFiles[0]!), "utf8")).trim();
-    const existingRaw = await readClaudeKeychainRaw(homePath);
+    const existingRaw = await readKeychain(homePath);
     const existing = existingRaw === null ? null : decodeSecurityPasswordOutput(existingRaw);
     const merged = mergeCredentialsJson(existing, credentials);
     // Elide a provably-redundant keychain write. When the existing entry is
@@ -408,7 +419,7 @@ async function claudeFinalizeCredentials(ctx: ActivationContext): Promise<void> 
     if (existingRaw?.trimStart().startsWith("{") && claudeCredentialsEquivalent(existingRaw, merged)) {
       written.push("keychain");
     } else {
-      const write = await writeClaudeKeychainEntry(homePath, merged);
+      const write = await writeKeychain(homePath, merged);
       if (write.ok) {
         written.push(write.mode === "identity-only" ? "keychain (identity-only)" : "keychain");
         if (write.mode === "identity-only") {
@@ -421,7 +432,8 @@ async function claudeFinalizeCredentials(ctx: ActivationContext): Promise<void> 
       }
     }
   }
-  await timeActivationStep(ctx, "identity-verification", () => verifyActivatedClaudeIdentity(ctx));
+  await options.claudePostCredentialWriteBarrier?.();
+  await timeActivationStep(ctx, "identity-verification", () => verifyActivatedClaudeIdentity(ctx, { readKeychain }));
 }
 
 /**
@@ -437,9 +449,9 @@ async function claudeFinalizeCredentials(ctx: ActivationContext): Promise<void> 
  *
  * Network-frugal: when the effective token IS the account's vault link — the
  * normal post-activation state — identity is proven by equality and no
- * lookup runs. Only divergent tokens hit the profile endpoint, and an
- * unverifiable lookup (offline, rate-limited) warns and passes: only a
- * VERIFIED foreign identity refuses.
+ * lookup runs. An exact account/content proof prepared before the locks is
+ * also authoritative. Every other divergent token must receive a positive
+ * profile match; unavailable or identity-less lookups fail closed.
  */
 export async function verifyActivatedClaudeIdentity(
   ctx: ActivationContext,
@@ -469,15 +481,30 @@ export async function verifyActivatedClaudeIdentity(
     "vault",
   );
   if (vault && vault.oauth.accessToken === effective.oauth.accessToken) return;
-  const profileOf = options.fetchProfileEmail ?? claudeProfileEmailCached;
-  let actual: string | null = null;
-  try {
-    actual = await profileOf(String(effective.oauth.accessToken));
-  } catch (error) {
-    warn(`could not verify the activated identity of ${homePath}: ${error instanceof Error ? error.message : String(error)}`);
-    return;
+  const contentProof = options.claudeIdentityProofs?.find(
+    (candidate) => candidate.source === effective.source && candidate.raw === effective.raw,
+  );
+  let actual = contentProof?.email ?? null;
+  if (!actual) {
+    const profileOf = options.fetchProfileEmail ?? claudeProfileEmailCached;
+    try {
+      actual = await profileOf(String(effective.oauth.accessToken));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      warn(`could not verify the activated identity of ${homePath}: ${detail}`);
+      throw new Error(
+        `Cannot activate ${account.id}: the effective Claude credential in ${effective.source} diverges from the vault and its identity could not be positively verified (${detail}). Repair with: hive login ${account.id}`,
+      );
+    }
   }
-  if (actual !== null && actual !== expected) {
+  if (!actual) {
+    const detail = "the profile endpoint returned no account identity";
+    warn(`could not verify the activated identity of ${homePath}: ${detail}`);
+    throw new Error(
+      `Cannot activate ${account.id}: the effective Claude credential in ${effective.source} diverges from the vault and its identity could not be positively verified (${detail}). Repair with: hive login ${account.id}`,
+    );
+  }
+  if (actual !== expected) {
     // Do not perform the non-secret ledger write while the credential lock is
     // held. The outer activation flushes this after both locks are released.
     const event = { type: "account.activation-identity-mismatch", account: account.id, home: homePath, expected, actual, source: effective.source };

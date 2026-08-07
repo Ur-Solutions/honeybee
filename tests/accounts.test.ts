@@ -39,7 +39,7 @@ import {
   withAccountLock,
   type AccountRecord,
 } from "../src/accounts.js";
-import { verifyActivatedClaudeIdentity, type ActivationContext } from "../src/accounts/activation.js";
+import { verifyActivatedClaudeIdentity, type ActivateAccountOptions, type ActivationContext } from "../src/accounts/activation.js";
 import { evacuateForeignCodexAuth, fulfillCodexAuthParkingIntent } from "../src/accounts/codexAuth.js";
 import { buildAddGenericPasswordCommand, identityOnlyCredentials } from "../src/keychain.js";
 import { identityRecipeForAgent } from "../src/drivers.js";
@@ -255,12 +255,19 @@ function chainJson(accessToken: string, expiresAt: number, refreshToken?: string
   return JSON.stringify({ claudeAiOauth: { accessToken, expiresAt, ...(refreshToken ? { refreshToken } : {}) } });
 }
 
-function activationContext(account: AccountRecord, homePath: string, overrides: { fetchProfileEmail?: (token: string) => Promise<string | null>; warn?: (message: string) => void } = {}): ActivationContext {
+function activationContext(
+  account: AccountRecord,
+  homePath: string,
+  overrides: Pick<ActivateAccountOptions, "fetchProfileEmail" | "claudeIdentityProofs"> & { warn?: (message: string) => void } = {},
+): ActivationContext {
   return {
     account,
     homePath,
     recipe: identityRecipeForAgent("claude")!,
-    options: overrides.fetchProfileEmail ? { fetchProfileEmail: overrides.fetchProfileEmail } : {},
+    options: {
+      ...(overrides.fetchProfileEmail ? { fetchProfileEmail: overrides.fetchProfileEmail } : {}),
+      ...(overrides.claudeIdentityProofs ? { claudeIdentityProofs: overrides.claudeIdentityProofs } : {}),
+    },
     warn: overrides.warn ?? (() => {}),
     written: [],
   };
@@ -317,6 +324,32 @@ test("post-activation identity check is network-free when the effective token is
   });
 });
 
+test("post-activation identity check accepts an exact divergent account/content proof without a second lookup", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "proved@a.b");
+    const now = Date.now();
+    await writeFile(join(accountDir(account), ".credentials.json"), chainJson("tok-vault", now + 3_600_000, "r-vault"));
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    const effectiveRaw = chainJson("tok-rotated", now + 7_200_000, "r-rotated");
+    const source = `${home}:keychain`;
+    let lookups = 0;
+
+    await verifyActivatedClaudeIdentity(
+      activationContext(account, home, {
+        claudeIdentityProofs: [{ raw: effectiveRaw, source, email: "proved@a.b" }],
+        fetchProfileEmail: async () => {
+          lookups += 1;
+          throw new Error("profile lookup must not run for exact proved content");
+        },
+      }),
+      { readKeychain: async () => effectiveRaw },
+    );
+
+    assert.equal(lookups, 0);
+  });
+});
+
 test("post-activation identity check rejects legacy hex keychain text even when it decodes to the vault token", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("claude", "hex-unhealthy@a.b");
@@ -337,7 +370,7 @@ test("post-activation identity check rejects legacy hex keychain text even when 
   });
 });
 
-test("post-activation identity check fails open when the profile lookup is unavailable", async () => {
+test("post-activation identity check fails closed when the profile lookup is unavailable", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("claude", "offline@a.b");
     const now = Date.now();
@@ -346,19 +379,71 @@ test("post-activation identity check fails open when the profile lookup is unava
     await mkdir(home, { recursive: true });
     await writeFile(join(home, ".credentials.json"), chainJson("tok-own", now + 3_600_000, "r"));
     const warnings: string[] = [];
-    // Divergent token, but the lookup errors (offline/rate-limited): only a
-    // VERIFIED foreign identity may refuse an activation.
-    await verifyActivatedClaudeIdentity(
-      activationContext(account, home, {
-        fetchProfileEmail: async () => {
-          throw new Error("HTTP 429");
-        },
-        warn: (message) => warnings.push(message),
-      }),
-      { readKeychain: async () => chainJson("tok-divergent", now + 3_600_000, "r") },
+    await assert.rejects(
+      verifyActivatedClaudeIdentity(
+        activationContext(account, home, {
+          fetchProfileEmail: async () => {
+            throw new Error("HTTP 429");
+          },
+          warn: (message) => warnings.push(message),
+        }),
+        { readKeychain: async () => chainJson("tok-divergent", now + 3_600_000, "r") },
+      ),
+      /diverges from the vault.*could not be positively verified.*HTTP 429/i,
     );
     assert.equal(warnings.length, 1);
     assert.match(warnings[0]!, /could not verify/i);
+  });
+});
+
+test("post-write old-writer Keychain replacement plus unavailable lookup leaves activation unready and gates launch", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "race-a@a.b");
+    const now = Date.now();
+    const vaultRaw = chainJson("tok-a", now + 3_600_000, "refresh-a");
+    const foreignRaw = chainJson("tok-b", now + 3_600_000, "refresh-b");
+    await writeFile(join(accountDir(account), ".credentials.json"), vaultRaw);
+    const home = join(dir, "homes", account.id);
+
+    let effectiveKeychain: string | null = null;
+    let credentialWritten!: () => void;
+    const credentialWasWritten = new Promise<void>((resolve) => { credentialWritten = resolve; });
+    let releaseVerification!: () => void;
+    const verificationMayContinue = new Promise<void>((resolve) => { releaseVerification = resolve; });
+    let launches = 0;
+    const warnings: string[] = [];
+    const launching = (async () => {
+      await activateAccountIntoHome(account, home, {
+        fetchProfileEmail: async (token) => {
+          assert.equal(token, "tok-b");
+          throw new Error("offline after old-writer replacement");
+        },
+        onWarn: (warning) => warnings.push(warning),
+        claudeKeychainDeps: {
+          available: () => true,
+          readRaw: async () => effectiveKeychain,
+          writeEntry: async (_homePath, credentials) => {
+            effectiveKeychain = credentials;
+            return { ok: true, mode: "full" };
+          },
+        },
+        claudePostCredentialWriteBarrier: async () => {
+          credentialWritten();
+          await verificationMayContinue;
+        },
+      });
+      launches += 1;
+    })();
+
+    await credentialWasWritten;
+    assert.equal(parseClaudeChainStrict(effectiveKeychain, "keychain")?.oauth.accessToken, "tok-a", "the new writer stamped A first");
+    effectiveKeychain = foreignRaw; // A pre-upgrade writer re-stamps its in-memory B chain.
+    releaseVerification();
+
+    await assert.rejects(launching, /diverges from the vault.*could not be positively verified.*old-writer replacement/i);
+    assert.equal((await readActivationHomeOwner(home))?.state, "activating", "failed verification never marks the home ready");
+    assert.equal(launches, 0, "a caller awaiting activation never reaches its launch step");
+    assert.equal(warnings.length, 1);
   });
 });
 
