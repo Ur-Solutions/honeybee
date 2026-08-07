@@ -6,9 +6,9 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { ensureHsrRunDir, hsrEventsPath, hsrRunDir } from "../src/hsr/runDir.js";
-import { transactionalKill } from "../src/kill.js";
+import { purgeSessionData, transactionalKill } from "../src/kill.js";
 import { recordSeal, sealsRoot, validateSealArtifact } from "../src/seal.js";
-import { saveSession, type SessionRecord } from "../src/store.js";
+import { safeName, saveSession, type SessionRecord } from "../src/store.js";
 import type { KillResult, Substrate } from "../src/substrates/types.js";
 import { hasSession as tmuxHasSession, kill as tmuxKill, newSession as tmuxNewSession } from "../src/tmux.js";
 
@@ -119,6 +119,26 @@ test("transactionalKill: substrate.kill ok and hasSession=false → ok=true, rec
     assert.equal(killEvent.node, "local");
     assert.equal(typeof killEvent.attempts, "number");
     assert.equal(killCalls + probeCalls > 0, true);
+  });
+});
+
+test("purgeSessionData contains malformed session names inside artifact roots", async () => {
+  await withTempStore(async (dir) => {
+    const record = seed({ name: "..", tmuxTarget: "malformed-name" });
+    const artifactName = safeName(record.name);
+    await saveSession(record);
+    await mkdir(join(sealsRoot(), artifactName), { recursive: true });
+    await mkdir(hsrRunDir(artifactName), { recursive: true });
+    await writeFile(join(sealsRoot(), artifactName, "seal.json"), "seal\n");
+    await writeFile(join(hsrRunDir(artifactName), "events.jsonl"), "events\n");
+    await writeFile(join(dir, "store-sentinel.txt"), "keep\n");
+
+    await purgeSessionData(record);
+
+    assert.equal(await readFile(join(dir, "store-sentinel.txt"), "utf8"), "keep\n");
+    await assert.rejects(readdir(join(sealsRoot(), artifactName)), /ENOENT/);
+    await assert.rejects(readdir(hsrRunDir(artifactName)), /ENOENT/);
+    await assert.rejects(readFile(join(dir, "sessions", `${artifactName}.json`), "utf8"), /ENOENT/);
   });
 });
 

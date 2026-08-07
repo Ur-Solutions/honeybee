@@ -1,8 +1,8 @@
 import { rm } from "node:fs/promises";
-import { join } from "node:path";
-import { hsrRunDir } from "./hsr/runDir.js";
+import { resolve, sep } from "node:path";
+import { hsrRoot } from "./hsr/runDir.js";
 import { sealsRoot } from "./seal.js";
-import { appendLedger, deleteSession, updateSession, type SessionRecord } from "./store.js";
+import { appendLedger, deleteSession, safeName, updateSession, type SessionRecord } from "./store.js";
 import { syncCredentialPairIsolated } from "./daemon/credentialSweepProcess.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { dropPoolClaimsForBee } from "./pool.js";
@@ -63,11 +63,25 @@ type TeardownVerdict = {
  * `deleteSession` remains the intentionally metadata-only low-level primitive.
  */
 export async function purgeSessionData(record: SessionRecord): Promise<void> {
-  await rm(join(sealsRoot(), record.name), { recursive: true, force: true });
-  await rm(hsrRunDir(record.name), { recursive: true, force: true });
+  await rm(containedArtifactPath(sealsRoot(), record.name), { recursive: true, force: true });
+  await rm(containedArtifactPath(hsrRoot(), record.name), { recursive: true, force: true });
   await removeBeeRequests(record.name);
   await deleteSession(record.name);
   if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
+}
+
+/**
+ * Session JSON is durable input and may be hand-edited or corrupted. Never let
+ * its display name become a recursive-delete path: sanitize the leaf and then
+ * prove the resolved target remains a strict child of the artifact root.
+ */
+function containedArtifactPath(root: string, bee: string): string {
+  const resolvedRoot = resolve(root);
+  const target = resolve(resolvedRoot, safeName(bee));
+  if (!target.startsWith(`${resolvedRoot}${sep}`)) {
+    throw new Error(`Refusing to purge artifact path outside ${resolvedRoot}`);
+  }
+  return target;
 }
 
 /**
