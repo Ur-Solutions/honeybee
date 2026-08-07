@@ -190,6 +190,7 @@ export type CodexAuthSyncResult = {
   auth: CodexAuthSnapshot | null;
   vaultUpdated: boolean;
   skipped: CredentialSyncSkip[];
+  harvested?: boolean;
 };
 
 const codexSyncStrategy: CredentialSyncStrategy<CodexAuthSnapshot, CodexAuthSyncResult> = {
@@ -206,7 +207,7 @@ const codexSyncStrategy: CredentialSyncStrategy<CodexAuthSnapshot, CodexAuthSync
     from: snapshot.source,
     ...(snapshot.lastRefreshMs ? { lastRefreshAt: new Date(snapshot.lastRefreshMs).toISOString() } : {}),
   }),
-  result: (auth, vaultUpdated, skipped) => ({ auth, vaultUpdated, skipped }),
+  result: (auth, vaultUpdated, skipped, harvested) => ({ auth, vaultUpdated, skipped, harvested }),
 };
 
 /**

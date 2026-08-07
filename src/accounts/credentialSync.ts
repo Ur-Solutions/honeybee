@@ -31,6 +31,12 @@ export type SyncAccountCredentialsOptions = {
   authorization?: "explicit" | "automatic";
   /** Emit secret-free skip ledger rows. Defaults to true for automatic sync. */
   emitSkipTelemetry?: boolean;
+  /**
+   * Recovery queues require affirmative identity evidence from extraHome even
+   * when its credential is equal to/older than the vault. Missing content is
+   * not a successful harvest and must leave the queue item intact.
+   */
+  requirePositiveHomeEvidence?: boolean;
 };
 
 export type CredentialSyncSkip = {
@@ -76,7 +82,7 @@ export type CredentialSyncStrategy<TSnapshot, TResult> = {
   /** The ledger record for a vault update. */
   ledger(account: AccountRecord, snapshot: TSnapshot): LedgerEntry;
   /** Wrap the outcome in the tool's public result shape. */
-  result(snapshot: TSnapshot | null, vaultUpdated: boolean, skipped: CredentialSyncSkip[]): TResult;
+  result(snapshot: TSnapshot | null, vaultUpdated: boolean, skipped: CredentialSyncSkip[], harvested: boolean): TResult;
 };
 
 /**
@@ -94,18 +100,24 @@ export async function runCredentialSyncLocked<TSnapshot, TResult>(
   const vault = await strategy.readVaultSnapshot(account);
   let best = vault;
   const skipped: CredentialSyncSkip[] = [];
+  let harvested = false;
   for (const home of await strategy.homesForAccount(account, extraHome, options)) {
     const snapshot = await strategy.readHomeSnapshot(account, home);
     if (!snapshot) continue;
-    if (!strategy.isFresher(snapshot, best)) continue;
+    const fresher = strategy.isFresher(snapshot, best);
     // Automatic recovery fails closed unless the provider strategy positively
     // authorizes these exact bytes. Explicit/manual sync keeps the historical
     // operator-directed recovery contract for identity-less providers.
-    const authorization = strategy.authorizeImport
-      ? await strategy.authorizeImport(snapshot, account, vault, options)
-      : options.authorization === "automatic"
-        ? { authorized: false as const, reason: "identity-unverifiable" as const }
-        : { authorized: true as const };
+    const mustAuthorizeEvidence = options.requirePositiveHomeEvidence === true;
+    const authorization = fresher || mustAuthorizeEvidence
+      ? strategy.authorizeImport
+        ? await strategy.authorizeImport(snapshot, account, vault, options)
+        : options.authorization === "automatic"
+          ? { authorized: false as const, reason: "identity-unverifiable" as const }
+          : { authorized: true as const }
+      : null;
+    if (!fresher && !mustAuthorizeEvidence) continue;
+    if (!authorization) continue;
     if (!authorization.authorized) {
       const skip: CredentialSyncSkip = {
         reason: authorization.reason,
@@ -123,10 +135,12 @@ export async function runCredentialSyncLocked<TSnapshot, TResult>(
       }
       continue;
     }
+    harvested = true;
+    if (!fresher) continue;
     best = snapshot;
   }
-  if (!best || best === vault) return strategy.result(best, false, skipped);
+  if (!best || best === vault) return strategy.result(best, false, skipped, harvested);
   await strategy.save(account, best);
   await appendLedger(strategy.ledger(account, best));
-  return strategy.result(best, true, skipped);
+  return strategy.result(best, true, skipped, harvested);
 }

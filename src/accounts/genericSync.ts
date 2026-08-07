@@ -26,6 +26,7 @@ export type GenericCredentialSyncResult = {
   credentials: GenericCredentialBundle | null;
   vaultUpdated: boolean;
   skipped: CredentialSyncSkip[];
+  harvested?: boolean;
 };
 
 async function genericCredentialHomesForAccount(
@@ -102,7 +103,7 @@ const genericSyncStrategy: CredentialSyncStrategy<GenericCredentialBundle, Gener
     files: bundle.files.map((file) => file.relative),
     refreshedAt: new Date(bundle.freshnessMs).toISOString(),
   }),
-  result: (credentials, vaultUpdated, skipped) => ({ credentials, vaultUpdated, skipped }),
+  result: (credentials, vaultUpdated, skipped, harvested) => ({ credentials, vaultUpdated, skipped, harvested }),
 };
 
 export async function syncGenericCredentialsToVault(

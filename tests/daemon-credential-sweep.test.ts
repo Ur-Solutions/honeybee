@@ -82,6 +82,9 @@ function telemetry(overrides: Partial<CredentialSweepTelemetry> = {}): Credentia
     failedPairs: 0,
     timedOutPairs: 0,
     vaultUpdates: 0,
+    quarantinedItems: 0,
+    completedQuarantinedItems: 0,
+    retainedQuarantinedItems: 0,
     ...overrides,
   };
 }

@@ -156,19 +156,39 @@ export async function withSessionLifecycleTransaction<T>(
   return withSessionLifecycleLock(expected.name, async () => {
     const current = await loadSession(expected.name);
     if (!current) throw new LifecycleConflictError(`Session ${expected.name} no longer exists`);
-    const expectedIdentity = lifecycleIdentity(expected);
-    // A queued operation may legitimately observe a terminal status written by
-    // the operation ahead of it (retire -> revive). Adopt the authoritative
-    // status when entering the lock, then bind it for every in-flight refresh
-    // and commit so a mixed-version terminal write after launch invalidates CAS.
-    if (!sameLifecycleIdentity(current, expectedIdentity, { includeStatus: false })) {
-      throw new LifecycleConflictError(
-        `Session ${expected.name} is now runtime generation ${current.runtimeGeneration ?? 0}; `
-        + `caller observed ${expected.runtimeGeneration ?? 0}`,
-      );
-    }
+    validateTransactionEntry(expected, current);
     return fn(new LockedSessionLifecycleTransaction(current));
   });
+}
+
+/**
+ * Idempotent destructive-entry variant. Absence means the exact record-last
+ * purge already committed; a replacement generation remains a hard conflict.
+ */
+export async function withSessionLifecycleTransactionIfPresent<T>(
+  expected: SessionRecord,
+  fn: (transaction: SessionLifecycleTransaction) => Promise<T>,
+): Promise<T | undefined> {
+  return withSessionLifecycleLock(expected.name, async () => {
+    const current = await loadSession(expected.name);
+    if (!current) return undefined;
+    validateTransactionEntry(expected, current);
+    return fn(new LockedSessionLifecycleTransaction(current));
+  });
+}
+
+function validateTransactionEntry(expected: SessionRecord, current: SessionRecord): void {
+  const expectedIdentity = lifecycleIdentity(expected);
+  // A queued operation may legitimately observe a terminal status written by
+  // the operation ahead of it (retire -> revive). Adopt the authoritative
+  // status when entering the lock, then bind it for every in-flight refresh
+  // and commit so a mixed-version terminal write after launch invalidates CAS.
+  if (!sameLifecycleIdentity(current, expectedIdentity, { includeStatus: false })) {
+    throw new LifecycleConflictError(
+      `Session ${expected.name} is now runtime generation ${current.runtimeGeneration ?? 0}; `
+      + `caller observed ${expected.runtimeGeneration ?? 0}`,
+    );
+  }
 }
 
 /** Low-level lifecycle serialization for malformed-record purge recovery. */

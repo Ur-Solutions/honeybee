@@ -9,6 +9,15 @@ import {
   type AccountCredentialSyncResult,
   type AccountRecord,
 } from "../accounts.js";
+import {
+  beginCredentialHarvestAttempt,
+  credentialHarvestHomeIdentityMatches,
+  listCredentialHarvestWorkItems,
+  recordCredentialHarvestAttempt,
+  removeCredentialHarvestWorkItem,
+  type CredentialHarvestAttemptOutcome,
+  type CredentialHarvestWorkItem,
+} from "../accounts/credentialHarvestQueue.js";
 import type { SyncAccountCredentialsOptions } from "../accounts/credentialSync.js";
 import { candidateHomes, dedicatedHomesFor } from "../accounts/homes.js";
 import { isActiveSessionRecord, listSessions, type SessionRecord } from "../store.js";
@@ -56,6 +65,9 @@ export type CredentialSweepTelemetry = {
   failedPairs: number;
   timedOutPairs: number;
   vaultUpdates: number;
+  quarantinedItems: number;
+  completedQuarantinedItems: number;
+  retainedQuarantinedItems: number;
 };
 
 export type CredentialSweepProgress =
@@ -73,6 +85,7 @@ export type CredentialSweepDeps = {
     options?: SyncAccountCredentialsOptions,
   ) => Promise<AccountCredentialSyncResult>;
   accountHomes: (account: AccountRecord) => Promise<string[]>;
+  listQuarantined: () => Promise<CredentialHarvestWorkItem[]>;
   now: () => number;
   concurrency: number;
   onProgress?: (progress: CredentialSweepProgress) => void;
@@ -285,6 +298,86 @@ async function withAuthorizedSweepHome<T>(
   });
 }
 
+type QuarantinedHarvestDeps = Pick<
+  CredentialSweepDeps,
+  "syncAccount" | "now"
+>;
+
+/**
+ * Consume one purged-record recovery handle under the canonical home lock.
+ * The provider sync takes the account lock inside this callback, preserving
+ * lifecycle -> home -> account lock order. Every stale/rebound/replaced shape
+ * stays quarantined; only a completed, content-authorized sync may delete it.
+ */
+async function consumeQuarantinedHarvest(
+  item: CredentialHarvestWorkItem,
+  account: AccountRecord | undefined,
+  plan: CredentialSweepPlan,
+  deps: QuarantinedHarvestDeps,
+): Promise<{ removed: boolean; vaultUpdated: boolean }> {
+  return withActivationHomeLock(item.home.path, async (canonicalHomePath) => {
+    let current = await beginCredentialHarvestAttempt(item, deps.now);
+    if (!current) return { removed: false, vaultUpdated: false };
+    const retain = async (outcome: CredentialHarvestAttemptOutcome): Promise<{ removed: false; vaultUpdated: false }> => {
+      current = await recordCredentialHarvestAttempt(current!, outcome, deps.now) ?? current;
+      return { removed: false, vaultUpdated: false };
+    };
+
+    if (canonicalHomePath !== item.home.path || !(await credentialHarvestHomeIdentityMatches(item.home))) {
+      return retain("home-replaced");
+    }
+    if (!account) return retain("unknown-account");
+
+    let owner;
+    try {
+      owner = await readActivationHomeOwner(canonicalHomePath);
+    } catch {
+      return retain("sync-failed");
+    }
+    if (item.evidence.kind === "activation-owner") {
+      if (
+        !owner ||
+        owner.accountId !== item.accountId ||
+        owner.generation !== item.evidence.ownerGeneration
+      ) return retain("home-rebound");
+      if (owner.state !== "ready") return retain("owner-incomplete");
+      const ownerTime = Date.parse(owner.updatedAt);
+      if (!Number.isFinite(ownerTime) || foreignBindingAfter(plan, item.accountId, canonicalHomePath, ownerTime)) {
+        return retain("home-rebound");
+      }
+    } else {
+      // An unstamped legacy association is valid only while it remains the
+      // latest evidence. Any owner generation (even the same account) is a
+      // later activation and must not inherit this stale queue capability.
+      if (owner) return retain("home-rebound");
+      const evidenceTime = Date.parse(item.evidence.sessionUpdatedAt);
+      if (!Number.isFinite(evidenceTime) || foreignBindingAfter(plan, item.accountId, canonicalHomePath, evidenceTime)) {
+        return retain("home-rebound");
+      }
+    }
+
+    try {
+      const result = await deps.syncAccount(account, canonicalHomePath, {
+        authorization: "automatic",
+        trustExtraHome: true,
+        homeScope: "extra-only",
+        requirePositiveHomeEvidence: true,
+      });
+      // Automatic provider identity/content rejection is a normal return, not
+      // an exception. It is never positive harvest evidence and must retain
+      // the item for a later rotated credential or explicit operator action.
+      if (result.skipped.length > 0) return retain("content-rejected");
+      if (result.harvested !== true) return retain("no-credential-evidence");
+      return {
+        removed: await removeCredentialHarvestWorkItem(current),
+        vaultUpdated: result.vaultUpdated,
+      };
+    } catch {
+      return retain("sync-failed");
+    }
+  });
+}
+
 function initialTelemetry(plan: CredentialSweepPlan): CredentialSweepTelemetry {
   return {
     durationMs: 0,
@@ -302,6 +395,9 @@ function initialTelemetry(plan: CredentialSweepPlan): CredentialSweepTelemetry {
     failedPairs: 0,
     timedOutPairs: 0,
     vaultUpdates: 0,
+    quarantinedItems: 0,
+    completedQuarantinedItems: 0,
+    retainedQuarantinedItems: 0,
   };
 }
 
@@ -320,14 +416,21 @@ export async function runCredentialSweep(
     listSessions,
     syncAccount: syncAccountCredentialsToVault,
     accountHomes: defaultAccountHomes,
+    listQuarantined: listCredentialHarvestWorkItems,
     now: Date.now,
     concurrency: envConcurrency("HIVE_DAEMON_CHAIN_SYNC_CONCURRENCY", DEFAULT_ACCOUNT_CONCURRENCY),
     ...overrides,
   };
   const startedAt = deps.now();
-  const [accounts, records] = await Promise.all([deps.listAccounts(), deps.listSessions()]);
+  const [accounts, records, quarantined] = await Promise.all([
+    deps.listAccounts(),
+    deps.listSessions(),
+    deps.listQuarantined(),
+  ]);
   const plan = await planCredentialSweep(records, accounts);
   const telemetry = initialTelemetry(plan);
+  telemetry.quarantinedItems = quarantined.length;
+  telemetry.retainedQuarantinedItems = quarantined.length;
 
   // Resolve the account scan before emitting its plan so physical aliases are
   // scheduled once even when a session pair spells the same home differently.
@@ -374,7 +477,46 @@ export async function runCredentialSweep(
   }
 
   let nextWorkId = 1;
+  const accountsById = new Map(plan.accounts.map((account) => [account.id, account]));
+  const quarantinedByAccount = new Map<string, CredentialHarvestWorkItem[]>();
+  for (const item of quarantined) {
+    const items = quarantinedByAccount.get(item.accountId) ?? [];
+    items.push(item);
+    quarantinedByAccount.set(item.accountId, items);
+  }
+
+  // Unknown/deleted accounts still get a durable failed-closed attempt stamp.
+  for (const [accountId, items] of quarantinedByAccount) {
+    if (accountsById.has(accountId)) continue;
+    for (const item of items) {
+      const workId = nextWorkId++;
+      const quarantinePairId = -(workId + 1);
+      deps.onProgress?.({ type: "work-start", workId, pairIds: [quarantinePairId] });
+      try {
+        await consumeQuarantinedHarvest(item, undefined, plan, deps);
+      } finally {
+        deps.onProgress?.({ type: "work-end", workId });
+      }
+    }
+  }
+
   await mapWithConcurrency(plan.accounts, deps.concurrency, async (account) => {
+    for (const item of quarantinedByAccount.get(account.id) ?? []) {
+      const quarantineWorkId = nextWorkId++;
+      const quarantinePairId = -(quarantineWorkId + 1);
+      deps.onProgress?.({ type: "work-start", workId: quarantineWorkId, pairIds: [quarantinePairId] });
+      try {
+        const outcome = await consumeQuarantinedHarvest(item, account, plan, deps);
+        if (outcome.removed) {
+          telemetry.completedQuarantinedItems += 1;
+          telemetry.retainedQuarantinedItems -= 1;
+        }
+        if (outcome.vaultUpdated) telemetry.vaultUpdates += 1;
+      } finally {
+        deps.onProgress?.({ type: "work-end", workId: quarantineWorkId });
+      }
+    }
+
     const accountWorkId = nextWorkId++;
     deps.onProgress?.({ type: "work-start", workId: accountWorkId, pairIds: canonicalPairIds.get(account.id) ?? [] });
     try {
@@ -469,6 +611,9 @@ export async function runCredentialPairSync(
     failedPairs: 0,
     timedOutPairs: 0,
     vaultUpdates: 0,
+    quarantinedItems: 0,
+    completedQuarantinedItems: 0,
+    retainedQuarantinedItems: 0,
   };
   deps.onProgress?.({ type: "plan", telemetry: { ...result } });
   if (!account) {
@@ -483,7 +628,10 @@ export async function runCredentialPairSync(
       authorization: "automatic",
       trustExtraHome: true,
       homeScope: "extra-only",
+      requirePositiveHomeEvidence: true,
     });
+    if (synced.skipped.length > 0) throw new Error("credential content identity was rejected");
+    if (synced.harvested !== true) throw new Error("no positive credential evidence was harvested");
     result.completedPairs = 1;
     if (synced.vaultUpdated) result.vaultUpdates = 1;
   } catch {

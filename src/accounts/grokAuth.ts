@@ -185,6 +185,7 @@ export type GrokAuthSyncResult = {
   auth: GrokAuthSnapshot | null;
   vaultUpdated: boolean;
   skipped: CredentialSyncSkip[];
+  harvested?: boolean;
 };
 
 const grokSyncStrategy: CredentialSyncStrategy<GrokAuthSnapshot, GrokAuthSyncResult> = {
@@ -201,7 +202,7 @@ const grokSyncStrategy: CredentialSyncStrategy<GrokAuthSnapshot, GrokAuthSyncRes
     from: snapshot.source,
     ...(snapshot.createTimeMs ? { refreshedAt: new Date(snapshot.createTimeMs).toISOString() } : {}),
   }),
-  result: (auth, vaultUpdated, skipped) => ({ auth, vaultUpdated, skipped }),
+  result: (auth, vaultUpdated, skipped, harvested) => ({ auth, vaultUpdated, skipped, harvested }),
 };
 
 export async function syncGrokAuthToVault(

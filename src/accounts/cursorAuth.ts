@@ -367,6 +367,7 @@ export type CursorAuthSyncResult = {
   auth: CursorAuthSnapshot | null;
   vaultUpdated: boolean;
   skipped: CredentialSyncSkip[];
+  harvested?: boolean;
 };
 
 const cursorSyncStrategy: CredentialSyncStrategy<CursorAuthSnapshot, CursorAuthSyncResult> = {
@@ -385,7 +386,7 @@ const cursorSyncStrategy: CredentialSyncStrategy<CursorAuthSnapshot, CursorAuthS
     from: snapshot.source,
     ...(snapshot.issuedAtMs ? { refreshedAt: new Date(snapshot.issuedAtMs).toISOString() } : {}),
   }),
-  result: (auth, vaultUpdated, skipped) => ({ auth, vaultUpdated, skipped }),
+  result: (auth, vaultUpdated, skipped, harvested) => ({ auth, vaultUpdated, skipped, harvested }),
 };
 
 export async function syncCursorAuthToVault(

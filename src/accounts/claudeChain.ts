@@ -282,6 +282,7 @@ export type ChainSyncResult = {
   chain: ClaudeChain | null;
   vaultUpdated: boolean;
   skipped: CredentialSyncSkip[];
+  harvested?: boolean;
 };
 export type LockedChainSyncResult = ChainSyncResult & { parkingIntents: ClaudeChainParkingIntent[] };
 
@@ -388,7 +389,11 @@ export async function prepareClaudeChainIdentityProofs(
   const homes = await claudeSyncHomes(account, extraHome, options);
   await Promise.all([...homes.values()].map(async (home) => {
     const chain = await readClaudeSyncCandidate(home, readKeychainRaw).catch(() => null);
-    if (!chain || !isBetterClaudeChain(chain, vault) || chain.expiresAt <= nowMs) return;
+    if (
+      !chain ||
+      chain.expiresAt <= nowMs ||
+      (options.requirePositiveHomeEvidence !== true && !isBetterClaudeChain(chain, vault))
+    ) return;
     const email = await profileOf(String(chain.oauth.accessToken)).catch(() => null);
     if (email) proofs.push({ raw: chain.raw, source: chain.source, email });
   }));
@@ -423,7 +428,12 @@ export async function syncClaudeChainToVault(
   for (const intent of locked.parkingIntents) {
     await fulfillClaudeChainParkingIntent(intent).catch(() => undefined);
   }
-  return { chain: locked.chain, vaultUpdated: locked.vaultUpdated, skipped: locked.skipped };
+  return {
+    chain: locked.chain,
+    vaultUpdated: locked.vaultUpdated,
+    skipped: locked.skipped,
+    harvested: locked.harvested,
+  };
 }
 
 export async function syncClaudeChainToVaultLocked(
@@ -445,6 +455,7 @@ export async function syncClaudeChainToVaultLocked(
   const quarantinedHomes = new Set<string>();
   const parkingIntents = new Map<string, ClaudeChainParkingIntent>();
   const skipped: CredentialSyncSkip[] = [];
+  let harvested = false;
   const recordSkip = async (skip: CredentialSyncSkip): Promise<void> => {
     skipped.push(skip);
     if (options.authorization === "automatic" && options.emitSkipTelemetry !== false) {
@@ -483,7 +494,9 @@ export async function syncClaudeChainToVaultLocked(
     // A present, valid keychain entry is equally authoritative: only consult
     // the file when no keychain item exists at all.
     const chain = fromKeychain ?? (isRawClaudeCredentialPayload(fileRaw) ? parseClaudeChain(fileRaw, `${home}:file`) : null);
-    if (!chain || !isBetterClaudeChain(chain, best)) continue;
+    if (!chain) continue;
+    const better = isBetterClaudeChain(chain, best);
+    if (!better && options.requirePositiveHomeEvidence !== true) continue;
     if (options.authorization === "automatic") {
       const proof = deps.identityProofs?.find((candidate) => candidate.source === chain.source && candidate.raw === chain.raw);
       if (!expected || !proof) {
@@ -500,7 +513,8 @@ export async function syncClaudeChainToVaultLocked(
         await recordSkip({ reason: "foreign-identity", source: chain.source });
         continue;
       }
-      best = chain;
+      harvested = true;
+      if (better) best = chain;
       continue;
     }
     // Adopting a home chain rewrites the vault — the one moment a foreign
@@ -524,7 +538,8 @@ export async function syncClaudeChainToVaultLocked(
         continue;
       }
     }
-    best = chain;
+    harvested = true;
+    if (better) best = chain;
   }
   if (refusedNonRaw > 0) {
     await appendLedger({
@@ -535,7 +550,7 @@ export async function syncClaudeChainToVaultLocked(
     }).catch(() => undefined);
   }
   if (!best || best === vault) {
-    return { chain: best, vaultUpdated: false, skipped, parkingIntents: [...parkingIntents.values()] };
+    return { chain: best, vaultUpdated: false, skipped, harvested, parkingIntents: [...parkingIntents.values()] };
   }
   // A rotated link harvested from one home is the only live link in the OAuth
   // chain. Keeping it in the vault alone strands every other active home on
@@ -549,7 +564,7 @@ export async function syncClaudeChainToVaultLocked(
     from: best.source,
     expiresAt: new Date(best.expiresAt).toISOString(),
   });
-  return { chain: best, vaultUpdated: true, skipped, parkingIntents: [...parkingIntents.values()] };
+  return { chain: best, vaultUpdated: true, skipped, harvested, parkingIntents: [...parkingIntents.values()] };
 }
 
 /**

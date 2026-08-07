@@ -1,8 +1,18 @@
 import { rm } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { canonicalActivationHomePath, readActivationHomeOwner, withActivationHomeLock } from "./accounts/activation.js";
+import {
+  enqueueCredentialHarvestWorkItem,
+  removeCredentialHarvestWorkItemForHome,
+  type CredentialHarvestWorkItem,
+} from "./accounts/credentialHarvestQueue.js";
 import { hsrRoot } from "./hsr/runDir.js";
-import { withSessionLifecycleLock, withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "./lifecycle.js";
+import {
+  withSessionLifecycleLock,
+  withSessionLifecycleTransaction,
+  withSessionLifecycleTransactionIfPresent,
+  type SessionLifecycleTransaction,
+} from "./lifecycle.js";
 import { sealsRoot } from "./seal.js";
 import {
   appendLedger,
@@ -35,13 +45,15 @@ export type TransactionalKillOptions = {
   finalCredentialSync?: (record: SessionRecord) => Promise<void>;
   /** Hard outer budget for finalCredentialSync (default 10s). */
   finalCredentialSyncBudgetMs?: number;
+  /** Deterministic crash-window hook after durable quarantine, before purge. */
+  afterFinalCredentialQuarantine?: (item: CredentialHarvestWorkItem) => Promise<void>;
   /** Deterministic race-test hook after old-runtime teardown confirmation. */
   afterTeardown?: (record: SessionRecord) => Promise<void>;
 };
 
 export type PurgeSessionDataOptions = Pick<
   TransactionalKillOptions,
-  "emitLedger" | "finalCredentialSync" | "finalCredentialSyncBudgetMs"
+  "emitLedger" | "finalCredentialSync" | "finalCredentialSyncBudgetMs" | "afterFinalCredentialQuarantine"
 >;
 
 export type KillOutcome =
@@ -90,7 +102,7 @@ export async function purgeSessionData(
   // lifecycle + session locks and retain the record-last retry semantics.
   if (safeName(record.name) !== record.name) {
     await withSessionLifecycleLock(record.name, async () => {
-      await runFinalCredentialSync(record, options);
+      await runFinalCredentialSync(record, options, "purge");
       await withSessionLock(record.name, async () => {
         await rm(containedArtifactPath(sealsRoot(), record.name), { recursive: true, force: true });
         await rm(containedArtifactPath(hsrRoot(), record.name), { recursive: true, force: true });
@@ -101,7 +113,7 @@ export async function purgeSessionData(
     });
     return;
   }
-  await withSessionLifecycleTransaction(record, async (lifecycle) => {
+  await withSessionLifecycleTransactionIfPresent(record, async (lifecycle) => {
     await purgeSessionDataInTransaction(lifecycle, options);
   });
 }
@@ -114,7 +126,7 @@ async function purgeSessionDataInTransaction(
   // Credential harvest can touch the keychain, vault, and account locks. It is
   // deliberately bounded and completed before any artifact/session lock is
   // acquired or any retry handle is deleted.
-  await runFinalCredentialSync(record, options);
+  await runFinalCredentialSync(record, options, "purge");
   // The short record lock below is the destructive CAS point. Everything in
   // the callback is known not to re-acquire that lock; if cleanup is
   // interrupted, the canonical record remains the retry handle until the last
@@ -344,46 +356,97 @@ async function boundedCredentialSync(
   }
 }
 
-async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessionDataOptions): Promise<void> {
+type FinalCredentialSyncMode = "purge" | "retire";
+
+async function quarantineFinalCredentialHarvest(
+  record: SessionRecord,
+  canonicalHomePath: string,
+  owner: Awaited<ReturnType<typeof readActivationHomeOwner>>,
+): Promise<CredentialHarvestWorkItem | null> {
+  try {
+    return await enqueueCredentialHarvestWorkItem(record, canonicalHomePath, owner);
+  } catch (error) {
+    // A stopped runtime cannot rotate a credential in a home that no longer
+    // exists. There is no content-bearing locator to preserve in that case.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/**
+ * Perform the bounded post-exit harvest while the canonical home is fenced.
+ * A destructive caller may proceed after failure only when either ownership
+ * is positively foreign/stale (there is nothing safe to recover for this
+ * account) or a secret-free recovery item was atomically persisted first.
+ * Ambiguous validation/storage failures retain the SessionRecord by throwing.
+ */
+async function runFinalCredentialSync(
+  record: SessionRecord,
+  options: PurgeSessionDataOptions,
+  mode: FinalCredentialSyncMode,
+): Promise<void> {
   if (!record.accountId || !record.homePath) return;
   const budgetMs = options.finalCredentialSyncBudgetMs ?? 10_000;
-  const sync = options.finalCredentialSync ?? ((candidate: SessionRecord) =>
-    syncSessionCredentialsOnExit(candidate, Math.max(1, budgetMs - 1_000)));
   const startedAt = Date.now();
   const binding: { conflict: CredentialBindingConflict | null } = { conflict: null };
   let ok = false;
+  let quarantined: CredentialHarvestWorkItem | null = null;
+  let quarantineId: string | undefined;
+  let recoveryUnnecessary = false;
+  let operationError: unknown;
   try {
     // Every home, including a nominal per-account slot, is publicly
     // activatable through an explicit --home path. Activation and final
     // harvest therefore always take the same resolved-home lock and validate
     // its owner stamp before trusting bytes.
-    let expired = false;
-    let overallTimer: NodeJS.Timeout | undefined;
-    const lockedHarvest = withActivationHomeLock(record.homePath, async (canonicalHomePath) => {
+    await withActivationHomeLock(record.homePath, async (canonicalHomePath) => {
       binding.conflict = await conflictingHomeBinding(record, canonicalHomePath);
-      if (binding.conflict || expired) return;
+      const owner = await readActivationHomeOwner(canonicalHomePath);
+      const recoverableIncompleteOwner = binding.conflict?.reason === "activation-incomplete"
+        && owner?.accountId === record.accountId;
+      if (binding.conflict && !recoverableIncompleteOwner) return;
+      if (recoverableIncompleteOwner) {
+        if (mode === "purge") {
+          quarantined = await quarantineFinalCredentialHarvest(record, canonicalHomePath, owner);
+          if (quarantined) {
+            quarantineId = quarantined.id;
+            await options.afterFinalCredentialQuarantine?.(quarantined);
+          } else {
+            recoveryUnnecessary = true;
+          }
+        }
+        return;
+      }
       const remainingMs = budgetMs - (Date.now() - startedAt);
       if (remainingMs <= 0) throw new Error(`final credential sync timed out after ${budgetMs}ms`);
-      await boundedCredentialSync({ ...record, homePath: canonicalHomePath }, sync, remainingMs);
-      if (!expired) ok = true;
+      const candidate = { ...record, homePath: canonicalHomePath };
+      try {
+        if (options.finalCredentialSync) {
+          // Injectable tests/fallbacks are not assumed cancellable. Production
+          // uses the disposable process below; a late injected settlement has
+          // no queue capability and can never remove this generation's item.
+          await boundedCredentialSync(candidate, options.finalCredentialSync, remainingMs);
+        } else {
+          // The inner deadline leaves time for birth-fenced TERM/KILL and lock
+          // reaping before this activation-home lock is released.
+          await syncSessionCredentialsOnExit(candidate, Math.max(1, remainingMs - 1_000));
+        }
+        ok = true;
+        await removeCredentialHarvestWorkItemForHome(record.accountId!, canonicalHomePath);
+      } catch {
+        if (mode === "purge") {
+          quarantined = await quarantineFinalCredentialHarvest(record, canonicalHomePath, owner);
+          if (quarantined) {
+            quarantineId = quarantined.id;
+            await options.afterFinalCredentialQuarantine?.(quarantined);
+          } else {
+            recoveryUnnecessary = true;
+          }
+        }
+      }
     }, { timeoutMs: Math.max(1, budgetMs) });
-    try {
-      await Promise.race([
-        lockedHarvest,
-        new Promise<never>((_resolve, reject) => {
-          overallTimer = setTimeout(() => {
-            expired = true;
-            reject(new Error(`final credential ownership validation timed out after ${budgetMs}ms`));
-          }, budgetMs);
-        }),
-      ]);
-    } finally {
-      if (overallTimer) clearTimeout(overallTimer);
-    }
-  } catch {
-    // Runtime teardown must remain available during a credential outage. The
-    // daemon's historical-home sweep remains the recovery backstop.
-    ok = false;
+  } catch (error) {
+    operationError = error;
   }
   if (options.emitLedger !== false) {
     const conflict = binding.conflict;
@@ -392,6 +455,7 @@ async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessi
       session: record.name,
       account: record.accountId,
       ok,
+      ...(quarantineId ? { quarantined: true, quarantineId } : {}),
       ...(conflict ? {
         skipped: conflict.reason,
         ownerAccount: conflict.accountId,
@@ -399,6 +463,14 @@ async function runFinalCredentialSync(record: SessionRecord, options: PurgeSessi
         ...(conflict.activationGeneration ? { ownerGeneration: conflict.activationGeneration } : {}),
       } : {}),
     }).catch(() => undefined);
+  }
+  if (mode === "purge" && operationError) {
+    throw new Error(
+      `final credential recovery could not be made durable; refusing to purge ${record.name}: ${errorMessage(operationError)}`,
+    );
+  }
+  if (mode === "purge" && !ok && !binding.conflict && !quarantined && !recoveryUnnecessary) {
+    throw new Error(`final credential recovery was unsuccessful; refusing to purge ${record.name} without a quarantine item`);
   }
 }
 
@@ -508,7 +580,7 @@ export async function transactionalRetire(
     }
 
     await lifecycle.refresh();
-    await runFinalCredentialSync(current, options);
+    await runFinalCredentialSync(current, options, "retire");
     const retired = await lifecycle.commit({
       status: "done",
       updatedAt: new Date().toISOString(),
