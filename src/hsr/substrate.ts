@@ -35,7 +35,7 @@ import {
   type HsrProcessSignalDependencies,
 } from "./observe.js";
 import { readHsrMeta, readHsrMetaStrict, type HsrMeta } from "./runDir.js";
-import { sameProcessBirthFingerprint } from "./processIdentity.js";
+import { readProcessBirthFingerprint, sameProcessBirthFingerprint } from "./processIdentity.js";
 import { connectRpcClient } from "./rpc.js";
 import { clearPendingHsrTurns, enqueuePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
 import { stopSpawnedHsrHost } from "./runnerHost.js";
@@ -99,6 +99,17 @@ async function waitUntilHostStopped(
   timeoutMs: number,
   deps: HsrProcessSignalDependencies = {},
 ): Promise<boolean> {
+  // An exited pre-fingerprint host is never safe to signal, but exact numeric
+  // PID absence is sufficient to prove that the recorded host is no longer
+  // running. A live/reused PID or an unreadable census remains unconfirmed.
+  if (expected.status === "exited" && !expected.hostFingerprint) {
+    try {
+      const current = await (deps.readProcessIdentity ?? readProcessBirthFingerprint)(expected.hostPid);
+      if (current === null) return true;
+    } catch {
+      return false;
+    }
+  }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const identity = await inspectHsrHostProcess(expected, deps);

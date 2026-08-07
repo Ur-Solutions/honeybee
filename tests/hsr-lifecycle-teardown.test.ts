@@ -110,6 +110,81 @@ test("confirmed exact HSR child absence permits retire without signalling", asyn
   });
 });
 
+test("exited legacy HSR metadata reconciles only from exact PID and group absence", async () => {
+  await withTempStore(async () => {
+    const session = record("legacy-exited-absence");
+    await saveSession(session);
+    await ensureHsrRunDir(session.name);
+    await writeHsrMeta(session.name, {
+      bee: session.name,
+      harness: "stub",
+      tier: "stream",
+      hostPid: hostBirth.pgid,
+      childPid: childBirth.pgid,
+      childPgid: childBirth.pgid,
+      startedAt: "2026-08-07T10:00:00.000Z",
+      endedAt: "2026-08-07T10:00:05.000Z",
+      controlSocket: join("/tmp", `${session.name}-missing.sock`),
+      status: "exited",
+    });
+    const signals: Array<[number, NodeJS.Signals | 0]> = [];
+    const substrate = createHsrSubstrate({
+      readProcessIdentity: async () => null,
+      readProcessGroupPresence: async () => "absent",
+      isProcessGroupAlive: () => false,
+      kill: (pid, signal) => signals.push([pid, signal]),
+    });
+
+    const outcome = await transactionalRetire(session, { substrate, pollIntervalMs: 0, emitLedger: false });
+    assert.equal(outcome.ok, true);
+    assert.deepEqual(signals, [], "legacy absence reconciliation never signals numeric identities");
+    assert.equal((await loadSession(session.name))?.status, "done");
+  });
+});
+
+test("exited legacy HSR metadata remains fail-closed for reused or uncertain identities", async () => {
+  for (const [label, leader, group] of [
+    ["reused", { pgid: childBirth.pgid, startedAt: "Fri Aug  7 10:05:00 2026" }, "present"],
+    ["partial", null, "present"],
+    ["uncertain", null, "unverifiable"],
+  ] as const) {
+    await withTempStore(async () => {
+      const session = record(`legacy-exited-${label}`);
+      await saveSession(session);
+      await ensureHsrRunDir(session.name);
+      await writeHsrMeta(session.name, {
+        bee: session.name,
+        harness: "stub",
+        tier: "stream",
+        hostPid: hostBirth.pgid,
+        childPid: childBirth.pgid,
+        childPgid: childBirth.pgid,
+        startedAt: "2026-08-07T10:00:00.000Z",
+        endedAt: "2026-08-07T10:00:05.000Z",
+        controlSocket: join("/tmp", `${session.name}-missing.sock`),
+        status: "exited",
+      });
+      const signals: Array<[number, NodeJS.Signals | 0]> = [];
+      const substrate = createHsrSubstrate({
+        readProcessIdentity: async (pid) => pid === hostBirth.pgid ? null : leader,
+        readProcessGroupPresence: async () => group,
+        isProcessGroupAlive: () => group === "present",
+        kill: (pid, signal) => signals.push([pid, signal]),
+      });
+
+      const outcome = await transactionalRetire(session, {
+        substrate,
+        pollAttempts: 1,
+        pollIntervalMs: 0,
+        emitLedger: false,
+      });
+      assert.equal(outcome.ok, false, label);
+      assert.equal((await loadSession(session.name))?.status, "kill_failed", label);
+      assert.deepEqual(signals, [], `${label} legacy evidence never authorizes a signal`);
+    });
+  }
+});
+
 for (const operation of ["kill", "retire"] as const) {
   test(`transactional ${operation} fails closed on malformed existing HSR metadata`, async () => {
     await withTempStore(async () => {

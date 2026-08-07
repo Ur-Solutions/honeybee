@@ -34,6 +34,8 @@ import {
 import {
   inspectProcessGroupBirth,
   inspectProcessBirth,
+  readProcessBirthFingerprint,
+  readProcessGroupPresence,
   type ProcessGroupPresenceReader,
   type ProcessIdentityReader,
   type ProcessIdentityVerdict,
@@ -733,6 +735,8 @@ export type HsrProcessSignalDependencies = {
   /** process.kill-compatible signal function; negative ids are process groups. */
   kill?: (pid: number, signal: NodeJS.Signals | 0) => void;
   isProcessGroupAlive?: (pgid: number) => boolean;
+  /** Strict, non-signalling group census used for legacy exited metadata. */
+  readProcessGroupPresence?: ProcessGroupPresenceReader;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -827,6 +831,32 @@ export async function ensureOrphanedChildGroupStopped(
 ): Promise<boolean> {
   const before = await inspectHsrChildProcess(meta, deps);
   if (before === "absent" || before === "gone" || before === "mismatch") return true;
+  // Pre-fingerprint Honeybee persisted the detached child PID/PGID but no OS
+  // birth token. Never signal such a recyclable numeric identity. An already
+  // finalized legacy host can still be reconciled safely when two independent,
+  // non-destructive observations agree that both the leader PID and its whole
+  // process group are absent. Live/reused, unreadable, partially published, and
+  // contradictory evidence remains unconfirmed.
+  if (
+    before === "unverifiable" &&
+    meta?.status === "exited" &&
+    meta.childAdmission === undefined &&
+    meta.childFingerprint === undefined &&
+    meta.childPid !== undefined &&
+    meta.childPid === meta.childPgid
+  ) {
+    try {
+      const identityReader = deps.readProcessIdentity ?? readProcessBirthFingerprint;
+      const groupReader = deps.readProcessGroupPresence ?? readProcessGroupPresence;
+      const [leader, group] = await Promise.all([
+        identityReader(meta.childPid),
+        groupReader(meta.childPgid),
+      ]);
+      if (leader === null && group === "absent") return true;
+    } catch {
+      return false;
+    }
+  }
   if (before !== "match") return false;
   await killOrphanedChildGroup(meta, deps);
   const pgid = meta?.childPgid ?? meta?.childPid ?? 0;
