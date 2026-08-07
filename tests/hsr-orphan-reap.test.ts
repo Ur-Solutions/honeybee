@@ -21,6 +21,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { killOrphanedChildGroup, reapDeadHosts } from "../src/hsr/observe.js";
 import { buildController, serve } from "../src/hsr/remoteHost.js";
@@ -38,6 +39,20 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> {
   const prev = process.env.HIVE_STORE_ROOT;
   const dir = await mkdtemp("/tmp/hb-orph-");
+  process.env.HIVE_STORE_ROOT = dir;
+  try {
+    await fn(dir);
+  } finally {
+    if (prev === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = prev;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** Tests without AF_UNIX sockets can use the Cell-scoped portable temp root. */
+async function withPortableTempStore(fn: (dir: string) => Promise<void>): Promise<void> {
+  const prev = process.env.HIVE_STORE_ROOT;
+  const dir = await mkdtemp(join(tmpdir(), "hb-orph-portable-"));
   process.env.HIVE_STORE_ROOT = dir;
   try {
     await fn(dir);
@@ -223,7 +238,7 @@ test("remote kill RPC signals the orphaned child group when the host is gone (an
 });
 
 test("remote restart kill fails closed on corrupt metadata and preserves a live detached child plus run dir", async () => {
-  await withTempStore(async () => {
+  await withPortableTempStore(async () => {
     const bee = "remote-corrupt-meta";
     const orphan = spawnOrphan();
     try {
@@ -255,11 +270,25 @@ test("remote restart kill fails closed on corrupt metadata and preserves a live 
 });
 
 test("remote restart kill distinguishes unreadable metadata from ENOENT and preserves state", async () => {
-  await withTempStore(async (dir) => {
+  await withPortableTempStore(async (dir) => {
     const bee = "remote-unreadable-meta";
     const orphan = spawnOrphan();
     try {
-      await writeOrphanedMeta(bee, orphan.pid as number, dir);
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, {
+        bee,
+        harness: "stub",
+        tier: "stream",
+        hostPid: 71_001,
+        hostFingerprint: { pgid: 71_001, startedAt: "unreadable-host-birth" },
+        childPid: orphan.pid as number,
+        childPgid: orphan.pid as number,
+        childFingerprint: { pgid: orphan.pid as number, startedAt: "unreadable-child-birth" },
+        childAdmission: "admitted",
+        startedAt: new Date().toISOString(),
+        controlSocket: join(dir, "gone.sock"),
+        status: "running",
+      });
       await chmod(hsrMetaPath(bee), 0o000);
       const controller = buildController();
       try {

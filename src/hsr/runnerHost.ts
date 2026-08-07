@@ -5,6 +5,7 @@ import { spawn as spawnChild } from "node:child_process";
 import { mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, extname, join } from "node:path";
+import { ensureOrphanedChildGroupStopped } from "./observe.js";
 import { ensureHsrRunDir, hsrRunDir, readHsrMeta, readHsrMetaStrict } from "./runDir.js";
 import { redactHsrPayloadError, type HsrRunPayload } from "./runner-entry.js";
 
@@ -125,9 +126,13 @@ export async function spawnHsrHost(
       await waitForSpawnedHostChildAdmission(payload.bee, pid, HSR_CHILD_ADMISSION_TIMEOUT_MS);
     } catch (error) {
       const stopped = await stopSpawnedHsrHost(pid);
+      const meta = await readHsrMetaStrict(payload.bee).catch(() => null);
+      const childStopped = meta?.hostPid === pid
+        ? await ensureOrphanedChildGroupStopped(meta)
+        : false;
       const detail = error instanceof Error ? error.message : String(error);
-      if (stopped !== "stopped") {
-        throw new Error(`${detail}; exact spawned HSR host rollback is ${stopped}`);
+      if ((stopped !== "stopped" && stopped !== "unconfirmed") || !childStopped) {
+        throw new Error(`${detail}; exact spawned HSR host/child rollback is unconfirmed`);
       }
       throw error;
     }
