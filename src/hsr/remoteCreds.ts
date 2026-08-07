@@ -28,9 +28,11 @@
  */
 
 import { execFile } from "node:child_process";
-import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, mkdir, open, readFile, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { isAbsolute, join, resolve, win32 } from "node:path";
 import { promisify } from "node:util";
+import { atomicWriteFile } from "../fsx.js";
 import { homeEnvForAgent, identityRecipeForAgent } from "../drivers.js";
 import { ephemeralHarnesses, ephemeralPolicyFor } from "./harness.js";
 import { hsrRunDir } from "./runDir.js";
@@ -259,67 +261,755 @@ export function homeDirForSpec(kind: string, env: Record<string, string>): strin
   return homeEnv ? env[homeEnv] : undefined;
 }
 
+const DELIVERED_CREDS_LOCATOR_VERSION = 1 as const;
+const MAX_LOCATOR_BYTES = 64 * 1024;
+const ZERO_CHUNK_BYTES = 64 * 1024;
+
+type PhysicalIdentity = {
+  device: string;
+  inode: string;
+};
+
+type OwnedHomeIdentity = PhysicalIdentity & {
+  canonicalPath: string;
+  uid: string;
+};
+
+type DeliveredCredentialTarget = PhysicalIdentity & {
+  homeRelPath: string;
+  parentDirectories: Array<PhysicalIdentity & { homeRelPath: string }>;
+  /** Delivery requires one physical name so zeroing cannot mutate a hard-link victim. */
+  linkCount: "1";
+};
+
+export type DeliveredCredentialsLocator = {
+  version: typeof DELIVERED_CREDS_LOCATOR_VERSION;
+  bee: string;
+  home: OwnedHomeIdentity;
+  files: DeliveredCredentialTarget[];
+};
+
+type LocatorDraft = Omit<DeliveredCredentialsLocator, "bee">;
+const locatorDraftSymbol = Symbol("delivered-credentials-locator-draft");
+type DeliveredCredentialPaths = string[] & { [locatorDraftSymbol]?: LocatorDraft };
+
+type PreparedCredential = {
+  handle: FileHandle;
+  home: OwnedHomeIdentity;
+  target: string;
+  content: Buffer;
+  identity: DeliveredCredentialTarget;
+};
+
+export type DeliveredCredentialEraseOperation =
+  | "locator-open"
+  | "locator-stat"
+  | "home-realpath"
+  | "home-lstat"
+  | "target-parent-lstat"
+  | "target-parent-realpath"
+  | "target-lstat"
+  | "target-realpath"
+  | "target-open"
+  | "target-fstat"
+  | "target-write"
+  | "target-sync"
+  | "target-verify-read"
+  | "target-pre-unlink-lstat"
+  | "target-unlink"
+  | "target-absence"
+  | "locator-pre-unlink-lstat"
+  | "locator-unlink"
+  | "locator-absence";
+
+/** Deterministic failure hook used by security regressions; production omits it. */
+export type DeliveredCredentialEraseOptions = {
+  beforeOperation?: (operation: DeliveredCredentialEraseOperation) => void | Promise<void>;
+};
+
+export type DeliveredCredentialEraseFailureCode =
+  | "locator-unreadable"
+  | "locator-invalid"
+  | "home-unverified"
+  | "target-unverified"
+  | "overwrite-failed"
+  | "unlink-failed"
+  | "absence-unverified"
+  | "locator-remove-failed";
+
+export type DeliveredCredentialEraseResult =
+  | { ok: true; status: "erased" | "already-absent"; erasedFiles: number }
+  | { ok: false; status: "incomplete"; code: DeliveredCredentialEraseFailureCode; retryable: true };
+
+export class DeliveredCredentialsLocatorError extends Error {
+  readonly code: "locator-unreadable" | "locator-invalid";
+
+  constructor(code: "locator-unreadable" | "locator-invalid") {
+    super(code === "locator-unreadable" ? "delivered credential locator is unreadable" : "delivered credential locator is invalid");
+    this.name = "DeliveredCredentialsLocatorError";
+    this.code = code;
+  }
+}
+
+function errnoCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+function physicalIdentity(info: BigIntStats): PhysicalIdentity {
+  return { device: info.dev.toString(), inode: info.ino.toString() };
+}
+
+function samePhysicalIdentity(info: BigIntStats, identity: PhysicalIdentity): boolean {
+  return info.dev.toString() === identity.device && info.ino.toString() === identity.inode;
+}
+
+function currentUid(): bigint {
+  if (typeof process.getuid !== "function") {
+    throw new Error("remote credential delivery requires a POSIX uid");
+  }
+  return BigInt(process.getuid());
+}
+
+function requireNoFollowFlag(): number {
+  if (typeof constants.O_NOFOLLOW !== "number" || constants.O_NOFOLLOW === 0) {
+    throw new Error("remote credential delivery requires O_NOFOLLOW");
+  }
+  return constants.O_NOFOLLOW;
+}
+
+function credentialPathComponents(value: unknown): string[] | null {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) return null;
+  if (isAbsolute(value) || win32.isAbsolute(value) || value.includes("\\")) return null;
+  const components = value.split("/");
+  if (components.some((component) => component.length === 0 || component === "." || component === "..")) return null;
+  return components;
+}
+
+function isSafeCredentialRelativePath(value: unknown): value is string {
+  return credentialPathComponents(value) !== null;
+}
+
+function isStrictBase64(value: string): boolean {
+  if (value.length === 0) return true;
+  if (value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return false;
+  return Buffer.from(value, "base64").toString("base64") === value;
+}
+
+function keysExactly(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function decimalIdentity(value: unknown): value is string {
+  return typeof value === "string" && /^(?:0|[1-9][0-9]*)$/.test(value);
+}
+
+function isSafeBeeName(bee: string): boolean {
+  return bee.length > 0 && bee.length <= 255 && bee !== "." && bee !== ".." && !bee.includes("/") && !bee.includes("\\") && !bee.includes("\0");
+}
+
+async function canonicalOwnedHome(homeDir: string): Promise<OwnedHomeIdentity> {
+  if (typeof homeDir !== "string" || homeDir.length === 0 || homeDir.includes("\0")) {
+    throw new Error("invalid remote credential home");
+  }
+  const requested = resolve(homeDir);
+  await mkdir(requested, { recursive: true, mode: 0o700 });
+  const requestedInfo = await lstat(requested, { bigint: true });
+  // A final symlink makes the caller-selected home mutable after validation.
+  if (requestedInfo.isSymbolicLink()) throw new Error("invalid remote credential home");
+  const canonicalPath = await realpath(requested);
+  const info = await lstat(canonicalPath, { bigint: true });
+  const uid = currentUid();
+  if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== uid || (Number(info.mode) & 0o077) !== 0) {
+    throw new Error("invalid remote credential home");
+  }
+  return { canonicalPath, uid: uid.toString(), ...physicalIdentity(info) };
+}
+
+function targetFor(home: OwnedHomeIdentity, homeRelPath: string): string {
+  const components = credentialPathComponents(homeRelPath);
+  if (!components) throw new Error("invalid remote credential target");
+  return join(home.canonicalPath, ...components);
+}
+
+async function lstatOrAbsent(path: string): Promise<BigIntStats | null> {
+  try {
+    return await lstat(path, { bigint: true });
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function ensureOwnedParentDirectories(
+  home: OwnedHomeIdentity,
+  homeRelPath: string,
+): Promise<DeliveredCredentialTarget["parentDirectories"]> {
+  const components = credentialPathComponents(homeRelPath);
+  if (!components) throw new Error("invalid remote credential target");
+  const parents: DeliveredCredentialTarget["parentDirectories"] = [];
+  let current = home.canonicalPath;
+  for (let index = 0; index < components.length - 1; index += 1) {
+    current = join(current, components[index]!);
+    let info = await lstatOrAbsent(current);
+    if (!info) {
+      try {
+        await mkdir(current, { mode: 0o700 });
+      } catch (error) {
+        if (errnoCode(error) !== "EEXIST") throw error;
+      }
+      info = await lstat(current, { bigint: true });
+    }
+    if (
+      !info.isDirectory() ||
+      info.isSymbolicLink() ||
+      info.uid !== currentUid() ||
+      (Number(info.mode) & 0o077) !== 0 ||
+      (await realpath(current)) !== current
+    ) {
+      throw new Error("remote credential parent directory is unsafe");
+    }
+    parents.push({
+      homeRelPath: components.slice(0, index + 1).join("/"),
+      ...physicalIdentity(info),
+    });
+  }
+  return parents;
+}
+
+async function verifyParentDirectories(
+  home: OwnedHomeIdentity,
+  file: DeliveredCredentialTarget,
+  options?: DeliveredCredentialEraseOptions,
+): Promise<boolean> {
+  for (const parent of file.parentDirectories) {
+    const path = targetFor(home, parent.homeRelPath);
+    try {
+      if (options) await callBefore(options, "target-parent-lstat");
+      const info = await lstat(path, { bigint: true });
+      if (
+        !info.isDirectory() ||
+        info.isSymbolicLink() ||
+        info.uid !== currentUid() ||
+        (Number(info.mode) & 0o077) !== 0 ||
+        !samePhysicalIdentity(info, parent)
+      ) {
+        return false;
+      }
+      if (options) await callBefore(options, "target-parent-realpath");
+      if ((await realpath(path)) !== path) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function prepareDeliveredCredentials(homeDir: string, creds: DeliveredCredentials): Promise<{
+  paths: DeliveredCredentialPaths;
+  prepared: PreparedCredential[];
+}> {
+  const home = await canonicalOwnedHome(homeDir);
+  const files = creds.files ?? [];
+  const seen = new Set<string>();
+  const decoded = files.map((file) => {
+    if (!isSafeCredentialRelativePath(file.homeRelPath) || seen.has(file.homeRelPath)) {
+      throw new Error("invalid remote credential target");
+    }
+    seen.add(file.homeRelPath);
+    if (!isStrictBase64(file.contentB64) || (file.mode ?? 0o600) !== 0o600) {
+      throw new Error("invalid remote credential payload");
+    }
+    return { file, content: Buffer.from(file.contentB64, "base64") };
+  });
+
+  const prepared: PreparedCredential[] = [];
+  try {
+    for (const { file, content } of decoded) {
+      const parentDirectories = await ensureOwnedParentDirectories(home, file.homeRelPath);
+      const target = targetFor(home, file.homeRelPath);
+      if ((await lstatOrAbsent(target)) !== null) throw new Error("remote credential target already exists");
+      const handle = await open(
+        target,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | requireNoFollowFlag(),
+        0o600,
+      );
+      let createdIdentity: PhysicalIdentity | undefined;
+      try {
+        const info = await handle.stat({ bigint: true });
+        createdIdentity = physicalIdentity(info);
+        const canonicalTarget = await realpath(target);
+        if (
+          !info.isFile() ||
+          info.isSymbolicLink() ||
+          info.uid !== currentUid() ||
+          info.nlink !== 1n ||
+          canonicalTarget !== target
+        ) {
+          throw new Error("remote credential target identity is unsafe");
+        }
+        prepared.push({
+          handle,
+          home,
+          target,
+          content,
+          identity: { homeRelPath: file.homeRelPath, parentDirectories, linkCount: "1", ...physicalIdentity(info) },
+        });
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        const named = await lstatOrAbsent(target).catch(() => null);
+        if (createdIdentity && named && named.isFile() && named.nlink === 1n && samePhysicalIdentity(named, createdIdentity)) {
+          await unlink(target).catch(() => undefined);
+        }
+        throw error;
+      }
+    }
+  } catch (error) {
+    for (const item of prepared) {
+      await item.handle.close().catch(() => undefined);
+      const info = await lstatOrAbsent(item.target).catch(() => null);
+      if (info && samePhysicalIdentity(info, item.identity) && info.nlink === 1n) {
+        await unlink(item.target).catch(() => undefined);
+      }
+    }
+    throw error;
+  }
+
+  const paths = prepared.map((item) => item.target) as DeliveredCredentialPaths;
+  Object.defineProperty(paths, locatorDraftSymbol, {
+    value: {
+      version: DELIVERED_CREDS_LOCATOR_VERSION,
+      home,
+      files: prepared.map((item) => item.identity),
+    } satisfies LocatorDraft,
+  });
+  return { paths, prepared };
+}
+
+async function writePreparedCredentials(prepared: PreparedCredential[]): Promise<void> {
+  try {
+    for (const item of prepared) {
+      if (!(await verifyParentDirectories(item.home, item.identity))) {
+        throw new Error("remote credential parent identity changed");
+      }
+      await item.handle.writeFile(item.content);
+      await item.handle.chmod(0o600);
+      await item.handle.sync();
+      const info = await item.handle.stat({ bigint: true });
+      if (
+        !samePhysicalIdentity(info, item.identity) ||
+        !info.isFile() ||
+        info.nlink !== 1n ||
+        info.size !== BigInt(item.content.length)
+      ) {
+        throw new Error("remote credential write identity changed");
+      }
+    }
+  } finally {
+    for (const item of prepared) await item.handle.close().catch(() => undefined);
+  }
+}
+
 /**
- * Write the delivered credential files into the freshly-created isolated home
- * (0700 dir, 0600 files) BEFORE the runner forks. Returns the absolute paths
- * written, for the run-dir record `kill` shreds. Secrets are never logged.
+ * Compatibility delivery primitive. It safely creates contained credential
+ * targets but cannot make the subsequent locator write crash-atomic; new call
+ * sites must use deliverAndRecordCredentials below.
  */
 export async function writeDeliveredCredentials(homeDir: string, creds: DeliveredCredentials): Promise<string[]> {
-  await mkdir(homeDir, { recursive: true, mode: 0o700 });
-  const written: string[] = [];
-  for (const file of creds.files ?? []) {
-    const target = join(homeDir, file.homeRelPath);
-    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-    const mode = file.mode ?? 0o600;
-    await writeFile(target, Buffer.from(file.contentB64, "base64"), { mode });
-    // writeFile's create mode is masked by umask; re-assert so it is exactly 0600.
-    await chmod(target, mode).catch(() => undefined);
-    written.push(target);
+  const { paths, prepared } = await prepareDeliveredCredentials(homeDir, creds);
+  try {
+    await writePreparedCredentials(prepared);
+    return paths;
+  } catch (error) {
+    // Legacy callers have not recorded a locator yet. Remove only the exact
+    // single-link inodes this invocation created; never follow a replacement.
+    for (const item of prepared) {
+      const info = await lstatOrAbsent(item.target).catch(() => null);
+      if (info && samePhysicalIdentity(info, item.identity) && info.isFile() && info.nlink === 1n) {
+        await unlink(item.target).catch(() => undefined);
+      }
+    }
+    throw error;
   }
-  return written;
 }
 
 function deliveredCredsPath(bee: string): string {
   return join(hsrRunDir(bee), "delivered-creds.json");
 }
 
-/** Record delivered credential paths in the bee's run dir so `kill` can shred them. */
+/** Record the strict locator carried by paths returned from this module. */
 export async function recordDeliveredCredentials(bee: string, paths: string[]): Promise<void> {
   if (paths.length === 0) return;
+  if (!isSafeBeeName(bee)) throw new Error("invalid delivered credential owner");
+  const draft = (paths as DeliveredCredentialPaths)[locatorDraftSymbol];
+  if (!draft) throw new Error("delivered credential paths have no trusted locator identity");
   await mkdir(hsrRunDir(bee), { recursive: true, mode: 0o700 });
-  await writeFile(deliveredCredsPath(bee), `${JSON.stringify({ paths }, null, 2)}\n`, { mode: 0o600 });
-}
-
-/** Read back the delivered credential paths (empty when none/unreadable). */
-export async function readDeliveredCredentials(bee: string): Promise<string[]> {
-  try {
-    const raw = await readFile(deliveredCredsPath(bee), "utf8");
-    const parsed = JSON.parse(raw) as { paths?: unknown };
-    return Array.isArray(parsed.paths) ? parsed.paths.filter((p): p is string => typeof p === "string") : [];
-  } catch {
-    return [];
-  }
+  await atomicWriteFile(
+    deliveredCredsPath(bee),
+    `${JSON.stringify({ ...draft, bee } satisfies DeliveredCredentialsLocator, null, 2)}\n`,
+    { mode: 0o600 },
+  );
 }
 
 /**
- * Destroy every delivered credential file so nothing persists on the remote
- * after the bee dies. Best-effort shred: overwrite the bytes then unlink.
+ * Crash-safe delivery: persist inode identities while targets are still empty,
+ * then write secret bytes through the already-open no-follow descriptors.
  */
-export async function shredDeliveredCredentials(bee: string): Promise<void> {
-  const paths = await readDeliveredCredentials(bee);
-  for (const path of paths) {
-    await overwriteThenUnlink(path);
+export async function deliverAndRecordCredentials(
+  bee: string,
+  homeDir: string,
+  creds: DeliveredCredentials,
+): Promise<string[]> {
+  const { paths, prepared } = await prepareDeliveredCredentials(homeDir, creds);
+  try {
+    await recordDeliveredCredentials(bee, paths);
+  } catch (error) {
+    for (const item of prepared) {
+      await item.handle.close().catch(() => undefined);
+      const info = await lstatOrAbsent(item.target).catch(() => null);
+      if (info && samePhysicalIdentity(info, item.identity) && info.isFile() && info.nlink === 1n) {
+        await unlink(item.target).catch(() => undefined);
+      }
+    }
+    throw error;
   }
-  await rm(deliveredCredsPath(bee), { force: true }).catch(() => undefined);
+  await writePreparedCredentials(prepared);
+  return paths;
 }
 
-async function overwriteThenUnlink(path: string): Promise<void> {
+type LoadedLocator = {
+  locator: DeliveredCredentialsLocator;
+  locatorIdentity: PhysicalIdentity;
+};
+
+function parseLocator(raw: string, bee: string): DeliveredCredentialsLocator | null {
+  let parsed: unknown;
   try {
-    const info = await stat(path).catch(() => null);
-    if (info?.isFile() && info.size > 0) {
-      await writeFile(path, Buffer.alloc(info.size, 0), { mode: 0o600 }).catch(() => undefined);
-    }
-  } finally {
-    await rm(path, { force: true }).catch(() => undefined);
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return null;
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const root = parsed as Record<string, unknown>;
+  if (!keysExactly(root, ["version", "bee", "home", "files"])) return null;
+  if (root.version !== DELIVERED_CREDS_LOCATOR_VERSION || root.bee !== bee) return null;
+  if (!root.home || typeof root.home !== "object" || Array.isArray(root.home)) return null;
+  const home = root.home as Record<string, unknown>;
+  if (!keysExactly(home, ["canonicalPath", "device", "inode", "uid"])) return null;
+  if (
+    typeof home.canonicalPath !== "string" ||
+    home.canonicalPath.length === 0 ||
+    home.canonicalPath.includes("\0") ||
+    !isAbsolute(home.canonicalPath) ||
+    resolve(home.canonicalPath) !== home.canonicalPath ||
+    !decimalIdentity(home.device) ||
+    !decimalIdentity(home.inode) ||
+    !decimalIdentity(home.uid)
+  ) {
+    return null;
+  }
+  if (!Array.isArray(root.files) || root.files.length === 0) return null;
+  const seen = new Set<string>();
+  const files: DeliveredCredentialTarget[] = [];
+  for (const value of root.files) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const file = value as Record<string, unknown>;
+    if (!keysExactly(file, ["homeRelPath", "parentDirectories", "device", "inode", "linkCount"])) return null;
+    if (typeof file.homeRelPath !== "string") return null;
+    const homeRelPath = file.homeRelPath;
+    const components = credentialPathComponents(homeRelPath);
+    if (
+      !components ||
+      seen.has(homeRelPath) ||
+      !decimalIdentity(file.device) ||
+      !decimalIdentity(file.inode) ||
+      file.linkCount !== "1" ||
+      !Array.isArray(file.parentDirectories) ||
+      file.parentDirectories.length !== components.length - 1
+    ) {
+      return null;
+    }
+    const parentDirectories: DeliveredCredentialTarget["parentDirectories"] = [];
+    for (let index = 0; index < file.parentDirectories.length; index += 1) {
+      const value = file.parentDirectories[index];
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const parent = value as Record<string, unknown>;
+      if (!keysExactly(parent, ["homeRelPath", "device", "inode"])) return null;
+      if (
+        typeof parent.homeRelPath !== "string" ||
+        parent.homeRelPath !== components.slice(0, index + 1).join("/") ||
+        !decimalIdentity(parent.device) ||
+        !decimalIdentity(parent.inode)
+      ) {
+        return null;
+      }
+      parentDirectories.push(parent as PhysicalIdentity & { homeRelPath: string });
+    }
+    seen.add(homeRelPath);
+    files.push({
+      homeRelPath,
+      device: file.device,
+      inode: file.inode,
+      linkCount: "1",
+      parentDirectories,
+    });
+  }
+  return {
+    version: DELIVERED_CREDS_LOCATOR_VERSION,
+    bee,
+    home: home as OwnedHomeIdentity,
+    files,
+  };
+}
+
+async function callBefore(options: DeliveredCredentialEraseOptions, operation: DeliveredCredentialEraseOperation): Promise<void> {
+  await options.beforeOperation?.(operation);
+}
+
+async function loadLocator(bee: string, options: DeliveredCredentialEraseOptions): Promise<LoadedLocator | null> {
+  if (!isSafeBeeName(bee)) throw new DeliveredCredentialsLocatorError("locator-invalid");
+  let handle: FileHandle;
+  try {
+    await callBefore(options, "locator-open");
+    handle = await open(deliveredCredsPath(bee), constants.O_RDONLY | requireNoFollowFlag());
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT") return null;
+    throw new DeliveredCredentialsLocatorError("locator-unreadable");
+  }
+  try {
+    await callBefore(options, "locator-stat");
+    const before = await handle.stat({ bigint: true });
+    if (
+      !before.isFile() ||
+      before.isSymbolicLink() ||
+      before.uid !== currentUid() ||
+      before.nlink !== 1n ||
+      before.size <= 0n ||
+      before.size > BigInt(MAX_LOCATOR_BYTES)
+    ) {
+      throw new DeliveredCredentialsLocatorError("locator-invalid");
+    }
+    const raw = await handle.readFile({ encoding: "utf8" });
+    const after = await handle.stat({ bigint: true });
+    if (!samePhysicalIdentity(after, physicalIdentity(before)) || after.size !== before.size) {
+      throw new DeliveredCredentialsLocatorError("locator-invalid");
+    }
+    const locator = parseLocator(raw, bee);
+    if (!locator) throw new DeliveredCredentialsLocatorError("locator-invalid");
+    return { locator, locatorIdentity: physicalIdentity(before) };
+  } catch (error) {
+    if (error instanceof DeliveredCredentialsLocatorError) throw error;
+    throw new DeliveredCredentialsLocatorError("locator-unreadable");
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/** Read only a strictly valid v1 locator. Missing is empty; bad state throws. */
+export async function readDeliveredCredentials(bee: string): Promise<string[]> {
+  const loaded = await loadLocator(bee, {});
+  return loaded ? loaded.locator.files.map((file) => targetFor(loaded.locator.home, file.homeRelPath)) : [];
+}
+
+function eraseFailure(code: DeliveredCredentialEraseFailureCode): DeliveredCredentialEraseResult {
+  return { ok: false, status: "incomplete", code, retryable: true };
+}
+
+async function verifyOwnedHome(
+  home: OwnedHomeIdentity,
+  options: DeliveredCredentialEraseOptions,
+): Promise<boolean> {
+  try {
+    await callBefore(options, "home-realpath");
+    if ((await realpath(home.canonicalPath)) !== home.canonicalPath) return false;
+    await callBefore(options, "home-lstat");
+    const info = await lstat(home.canonicalPath, { bigint: true });
+    return (
+      info.isDirectory() &&
+      !info.isSymbolicLink() &&
+      info.uid === currentUid() &&
+      info.uid.toString() === home.uid &&
+      (Number(info.mode) & 0o077) === 0 &&
+      samePhysicalIdentity(info, home)
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function overwriteAndUnlink(
+  home: OwnedHomeIdentity,
+  targetIdentity: DeliveredCredentialTarget,
+  options: DeliveredCredentialEraseOptions,
+): Promise<{ ok: true; erased: boolean } | { ok: false; code: DeliveredCredentialEraseFailureCode }> {
+  const target = targetFor(home, targetIdentity.homeRelPath);
+  if (!(await verifyParentDirectories(home, targetIdentity, options))) {
+    return { ok: false, code: "target-unverified" };
+  }
+  let initial: BigIntStats | null;
+  try {
+    await callBefore(options, "target-lstat");
+    initial = await lstatOrAbsent(target);
+  } catch {
+    return { ok: false, code: "target-unverified" };
+  }
+  if (!initial) return { ok: true, erased: false };
+  if (
+    !initial.isFile() ||
+    initial.isSymbolicLink() ||
+    initial.uid !== currentUid() ||
+    initial.nlink !== 1n ||
+    !samePhysicalIdentity(initial, targetIdentity)
+  ) {
+    return { ok: false, code: "target-unverified" };
+  }
+  try {
+    await callBefore(options, "target-realpath");
+    if ((await realpath(target)) !== target) return { ok: false, code: "target-unverified" };
+  } catch {
+    return { ok: false, code: "target-unverified" };
+  }
+
+  let handle: FileHandle;
+  try {
+    await callBefore(options, "target-open");
+    handle = await open(target, constants.O_RDWR | requireNoFollowFlag());
+  } catch {
+    return { ok: false, code: "target-unverified" };
+  }
+  try {
+    await callBefore(options, "target-fstat");
+    const opened = await handle.stat({ bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.uid !== currentUid() ||
+      opened.nlink !== 1n ||
+      !samePhysicalIdentity(opened, targetIdentity) ||
+      opened.size > BigInt(Number.MAX_SAFE_INTEGER)
+    ) {
+      return { ok: false, code: "target-unverified" };
+    }
+    if (!(await verifyParentDirectories(home, targetIdentity, options))) {
+      return { ok: false, code: "target-unverified" };
+    }
+    // Re-resolve the pathname after opening. It must still name the fd's inode
+    // beneath the canonical home immediately before destructive I/O.
+    await callBefore(options, "target-realpath");
+    if ((await realpath(target)) !== target) return { ok: false, code: "target-unverified" };
+    await callBefore(options, "target-pre-unlink-lstat");
+    const named = await lstat(target, { bigint: true });
+    if (!samePhysicalIdentity(named, targetIdentity) || named.nlink !== 1n || !named.isFile() || named.isSymbolicLink()) {
+      return { ok: false, code: "target-unverified" };
+    }
+
+    const size = Number(opened.size);
+    const zeroes = Buffer.alloc(Math.min(ZERO_CHUNK_BYTES, Math.max(1, size)), 0);
+    let position = 0;
+    while (position < size) {
+      const length = Math.min(zeroes.length, size - position);
+      await callBefore(options, "target-write");
+      const { bytesWritten } = await handle.write(zeroes, 0, length, position);
+      if (bytesWritten <= 0) return { ok: false, code: "overwrite-failed" };
+      position += bytesWritten;
+    }
+    await callBefore(options, "target-sync");
+    await handle.sync();
+
+    const verify = Buffer.alloc(Math.min(ZERO_CHUNK_BYTES, Math.max(1, size)));
+    position = 0;
+    while (position < size) {
+      const length = Math.min(verify.length, size - position);
+      await callBefore(options, "target-verify-read");
+      const { bytesRead } = await handle.read(verify, 0, length, position);
+      if (bytesRead !== length) return { ok: false, code: "overwrite-failed" };
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (verify[index] !== 0) return { ok: false, code: "overwrite-failed" };
+      }
+      position += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    if (!samePhysicalIdentity(after, targetIdentity) || after.nlink !== 1n || after.size !== opened.size) {
+      return { ok: false, code: "overwrite-failed" };
+    }
+  } catch {
+    return { ok: false, code: "overwrite-failed" };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+
+  try {
+    await callBefore(options, "target-pre-unlink-lstat");
+    const beforeUnlink = await lstat(target, { bigint: true });
+    if (
+      !beforeUnlink.isFile() ||
+      beforeUnlink.isSymbolicLink() ||
+      beforeUnlink.nlink !== 1n ||
+      !samePhysicalIdentity(beforeUnlink, targetIdentity)
+    ) {
+      return { ok: false, code: "target-unverified" };
+    }
+  } catch {
+    return { ok: false, code: "target-unverified" };
+  }
+  try {
+    await callBefore(options, "target-unlink");
+    await unlink(target);
+  } catch {
+    return { ok: false, code: "unlink-failed" };
+  }
+  try {
+    await callBefore(options, "target-absence");
+    if ((await lstatOrAbsent(target)) !== null) return { ok: false, code: "absence-unverified" };
+  } catch {
+    return { ok: false, code: "absence-unverified" };
+  }
+  return { ok: true, erased: true };
+}
+
+/**
+ * Strict, retryable destructive erase. Any malformed/foreign/changed state is
+ * a typed non-success and leaves the locator in place for a later restart.
+ */
+export async function shredDeliveredCredentials(
+  bee: string,
+  options: DeliveredCredentialEraseOptions = {},
+): Promise<DeliveredCredentialEraseResult> {
+  let loaded: LoadedLocator | null;
+  try {
+    loaded = await loadLocator(bee, options);
+  } catch (error) {
+    if (error instanceof DeliveredCredentialsLocatorError) return eraseFailure(error.code);
+    return eraseFailure("locator-unreadable");
+  }
+  if (!loaded) return { ok: true, status: "already-absent", erasedFiles: 0 };
+  if (!(await verifyOwnedHome(loaded.locator.home, options))) return eraseFailure("home-unverified");
+
+  let erasedFiles = 0;
+  for (const file of loaded.locator.files) {
+    const result = await overwriteAndUnlink(loaded.locator.home, file, options);
+    if (!result.ok) return eraseFailure(result.code);
+    if (result.erased) erasedFiles += 1;
+  }
+
+  const locatorPath = deliveredCredsPath(bee);
+  try {
+    await callBefore(options, "locator-pre-unlink-lstat");
+    const beforeUnlink = await lstat(locatorPath, { bigint: true });
+    if (
+      !beforeUnlink.isFile() ||
+      beforeUnlink.isSymbolicLink() ||
+      beforeUnlink.nlink !== 1n ||
+      !samePhysicalIdentity(beforeUnlink, loaded.locatorIdentity)
+    ) {
+      return eraseFailure("locator-remove-failed");
+    }
+    await callBefore(options, "locator-unlink");
+    await unlink(locatorPath);
+    await callBefore(options, "locator-absence");
+    if ((await lstatOrAbsent(locatorPath)) !== null) return eraseFailure("locator-remove-failed");
+  } catch {
+    return eraseFailure("locator-remove-failed");
+  }
+  return { ok: true, status: "erased", erasedFiles };
 }
