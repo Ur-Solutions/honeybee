@@ -9,7 +9,7 @@
  * where Apiary and the operator can reach them.
  */
 
-import { accessSync, constants, mkdirSync, realpathSync } from "node:fs";
+import { accessSync, constants, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
@@ -221,6 +221,37 @@ function providerWriteRoots(kind: string, env: Record<string, string>, cwd: stri
   return [...roots];
 }
 
+/**
+ * Hive buz must be explicitly available inside a Cell. The session preamble
+ * instructs every bee to report over `hive buz`, and any local OS process may
+ * already send buz unconditionally, so allowing the mailbox subtree grants no
+ * authority the Cell contract means to withhold — while leaving it under the
+ * store-wide write deny strands a cell-bound bee's reports (observed live as
+ * `EPERM: mkdir ~/.hive/buz/<bee>`). The rest of the hive store (sessions,
+ * daemon state, machine identity) stays read-only.
+ *
+ * Every send also appends one audit line to `<store>/ledger.jsonl`, allowed as
+ * a single file and pre-created because the Linux backend can only bind paths
+ * that exist at wrap time. Ledger ROTATION is a different story: its lock
+ * protocol creates randomly named store-root siblings that a file-granular
+ * policy cannot cover, so buildCellSandboxState pins HIVE_LEDGER_MAX_BYTES=0
+ * in the Cell env — in-cell appends skip rotation entirely and the next
+ * host-side append rotates as usual.
+ */
+function hiveBuzWritePaths(env: Record<string, string>, cwd: string): string[] {
+  const home = env.HOME ?? homedir();
+  const configuredRoot = env.HIVE_STORE_ROOT ?? join(home, ".hive");
+  const buzDir = ensurePrivateDirectory(join(configuredRoot, "buz"));
+  if (cwd === buzDir || cwd.startsWith(`${buzDir}${sep}`)) {
+    throw new Error(`Cell sandbox refuses a buz root that contains the Cell: ${buzDir}`);
+  }
+  const ledgerFile = join(realpathSync(configuredRoot), "ledger.jsonl");
+  // Append-mode create: never truncates an existing ledger, and matches
+  // appendLedger's own 0600 create mode.
+  writeFileSync(ledgerFile, "", { flag: "a", mode: 0o600 });
+  return [buzDir, ledgerFile];
+}
+
 function scratchEnvironment(scratchRoot: string): Record<string, string> {
   const temp = ensurePrivateDirectory(join(scratchRoot, "tmp"));
   const cache = ensurePrivateDirectory(join(scratchRoot, "cache"));
@@ -255,13 +286,18 @@ export function buildCellSandboxState(input: {
   const cwd = canonicalExistingDirectory(input.cwd, "cwd");
   const runDir = ensurePrivateDirectory(input.runDir);
   const scratchRoot = ensurePrivateDirectory(join(runDir, "cell-sandbox"));
-  const nextEnv = { ...input.env, ...scratchEnvironment(scratchRoot) };
+  // HIVE_LEDGER_MAX_BYTES=0 disables in-cell ledger rotation; the rotation
+  // lock cannot work under the file-granular ledger allowance (see
+  // hiveBuzWritePaths). Deliberately overrides any inherited value: a nonzero
+  // setting would break every in-cell `hive buz` send at rotation pressure.
+  const nextEnv = { ...input.env, ...scratchEnvironment(scratchRoot), HIVE_LEDGER_MAX_BYTES: "0" };
   const hostHome = homedir();
   const allowWrite = [...new Set([
     ...getDefaultWritePaths(),
     cwd,
     scratchRoot,
     ...providerWriteRoots(input.kind, nextEnv, cwd),
+    ...hiveBuzWritePaths(nextEnv, cwd),
   ])];
   // Sandbox Runtime intentionally includes a few compatibility paths by
   // default. They are not part of Apiary's Cell contract, so carve them back

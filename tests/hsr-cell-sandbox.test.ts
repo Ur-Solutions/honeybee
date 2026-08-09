@@ -83,6 +83,54 @@ test("Cell policy permits only the Cell, provider state, and per-run scratch out
   }
 });
 
+test("Cell policy explicitly allows hive buz mailboxes and the ledger append, with rotation pinned off", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hive-cell-buz-policy-"));
+  const bin = join(root, "bin");
+  const cell = join(root, "cell");
+  const runDir = join(root, "run");
+  const store = join(root, "store");
+  await Promise.all([mkdir(bin), mkdir(cell), mkdir(runDir)]);
+  try {
+    for (const name of ["bash", "bwrap", "rg"]) await executable(join(bin, name));
+    const built = buildCellSandboxState({
+      kind: "codex",
+      cwd: cell,
+      runDir,
+      platform: "linux",
+      env: { PATH: bin, HOME: join(root, "home"), HIVE_STORE_ROOT: store, HIVE_LEDGER_MAX_BYTES: "12345" },
+    });
+    const canonicalStore = await realpath(store);
+    assert.ok(built.state.allowWrite.includes(join(canonicalStore, "buz")), "buz mailbox subtree is writable");
+    assert.ok(built.state.allowWrite.includes(join(canonicalStore, "ledger.jsonl")), "ledger append target is writable");
+    // The Linux backend can only bind paths that exist at wrap time.
+    assert.equal(await readFile(join(store, "ledger.jsonl"), "utf8"), "");
+    assert.equal(built.env.HIVE_LEDGER_MAX_BYTES, "0", "in-cell ledger rotation is pinned off");
+    assert.ok(!built.state.allowWrite.includes(canonicalStore), "the store root itself stays read-only");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Cell policy refuses a buz root that contains the Cell", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hive-cell-buz-broad-"));
+  const bin = join(root, "bin");
+  const cell = join(root, "store", "buz", "cell");
+  const runDir = join(root, "run");
+  await Promise.all([mkdir(bin), mkdir(cell, { recursive: true }), mkdir(runDir)]);
+  try {
+    for (const name of ["bash", "bwrap", "rg"]) await executable(join(bin, name));
+    assert.throws(() => buildCellSandboxState({
+      kind: "codex",
+      cwd: cell,
+      runDir,
+      platform: "linux",
+      env: { PATH: bin, HOME: join(root, "home"), HIVE_STORE_ROOT: join(root, "store") },
+    }), /refuses a buz root that contains the Cell/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Cell policy refuses a provider home broad enough to reopen the checkout", async () => {
   const root = await mkdtemp(join(tmpdir(), "hive-cell-broad-home-"));
   const bin = join(root, "bin");
@@ -163,10 +211,17 @@ test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical
   const canonical = join(root, "canonical");
   const runDir = join(root, "run");
   const provider = join(root, "codex-home");
-  await Promise.all([mkdir(cell), mkdir(canonical), mkdir(runDir), mkdir(provider)]);
+  const store = join(root, "store");
+  await Promise.all([mkdir(cell), mkdir(canonical), mkdir(runDir), mkdir(provider), mkdir(store)]);
+  await mkdir(join(store, "sessions"));
   const originalCwd = process.cwd();
   try {
-    const baseEnv = { ...process.env, HOME: process.env.HOME ?? root, CODEX_HOME: provider } as Record<string, string>;
+    const baseEnv = {
+      ...process.env,
+      HOME: process.env.HOME ?? root,
+      CODEX_HOME: provider,
+      HIVE_STORE_ROOT: store,
+    } as Record<string, string>;
     assert.equal((await run("git", ["init", "-q"], { cwd: cell, env: baseEnv })).code, 0);
     await writeFile(join(cell, "base.txt"), "base\n");
     assert.equal((await run("git", ["add", "base.txt"], { cwd: cell, env: baseEnv })).code, 0);
@@ -182,12 +237,22 @@ test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical
       `printf escaped > ${JSON.stringify(join(canonical, "escaped.txt"))} 2>/dev/null || true`,
       "git add inside.txt",
       "git -c user.name=Cell -c user.email=cell@example.test commit -qm contained",
+      // Hive buz is explicitly available inside the Cell: mailbox writes and
+      // the ledger append succeed while the rest of the store stays read-only.
+      `mkdir -p ${JSON.stringify(join(store, "buz", "cl.test", "outbox"))}`,
+      `printf msg > ${JSON.stringify(join(store, "buz", "cl.test", "outbox", "note.md"))}`,
+      `printf '{"type":"buz.send"}\\n' >> ${JSON.stringify(join(store, "ledger.jsonl"))}`,
+      `printf stray > ${JSON.stringify(join(store, "sessions", "escaped.json"))} 2>/dev/null || true`,
     ].join("; ");
     const wrapped = await wrapCellSandboxCommand("/bin/bash", ["-c", script]);
     const outcome = await run(wrapped.command, wrapped.args, { cwd: cell, env: initialized.env });
     assert.equal(outcome.code, 0, outcome.stderr);
     assert.equal(await readFile(join(cell, "inside.txt"), "utf8"), "inside");
     await assert.rejects(readFile(join(canonical, "escaped.txt"), "utf8"), /ENOENT/);
+    assert.equal(await readFile(join(store, "buz", "cl.test", "outbox", "note.md"), "utf8"), "msg");
+    assert.equal(await readFile(join(store, "ledger.jsonl"), "utf8"), '{"type":"buz.send"}\n');
+    await assert.rejects(readFile(join(store, "sessions", "escaped.json"), "utf8"), /ENOENT/);
+    assert.equal(initialized.env.HIVE_LEDGER_MAX_BYTES, "0");
     const count = await run("git", ["rev-list", "--count", "HEAD"], { cwd: cell, env: baseEnv });
     assert.equal(count.stdout.trim(), "2", count.stderr);
 
