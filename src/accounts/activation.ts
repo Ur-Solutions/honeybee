@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { identityRecipeForAgent, type IdentityRecipe } from "../drivers.js";
 import {
+  credentialDigest,
   decodeSecurityPasswordOutput,
   keychainAvailable,
   readClaudeKeychainRaw,
@@ -14,6 +15,7 @@ import { kitMaterializeHome, readKitHomeStamp, type KitMaterializeTiming } from 
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import { type LockOptions, type LockOwnerMetadata, withFileLock } from "../lock.js";
 import { appendLedger } from "../store.js";
+import { appendUsageEvent } from "../usage.js";
 import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./registry.js";
 import {
   claudeCredentialsEquivalent,
@@ -50,18 +52,44 @@ import { seedGatewayMcp } from "./gatewayMcp.js";
 import { seedClaudeHomeAcceptance, seedClaudeHomeDefaults, seedCodexHomeDefaults } from "./homeDefaults.js";
 
 /**
+ * Freshness baseline recorded when a login seat starts, used to arbitrate
+ * which credential store the login actually wrote. Without it a present
+ * keychain item always wins — which replays a STALE keychain over the vault
+ * when the login landed only in .credentials.json (observed 2026-08-09: a
+ * fresh file login was overwritten by an unchanged keychain relic).
+ */
+export type CaptureFreshnessBaseline = {
+  /** credentialDigest of the decoded keychain entry at seat start; null when absent. */
+  keychainDigest: string | null;
+  /** Marker mtime at seat start; files at/after this are login output. */
+  fileMtimeMs: number;
+};
+
+export type CaptureAccountOptions = {
+  baseline?: CaptureFreshnessBaseline;
+  /** Deterministic Keychain seam (tests). Defaults to the real bridge. */
+  claudeKeychainDeps?: {
+    available?: typeof keychainAvailable;
+    readState?: typeof readClaudeKeychainState;
+  };
+};
+
+/**
  * Copy the recipe's credential files out of a home into the vault. Files that
  * don't exist in the home are skipped; at least one must be captured.
  */
-export async function captureAccountFromHome(account: AccountRecord, homePath: string): Promise<string[]> {
+export async function captureAccountFromHome(account: AccountRecord, homePath: string, options: CaptureAccountOptions = {}): Promise<string[]> {
   const recipe = recipeFor(account);
+  let arbitration: "file-over-unchanged-keychain" | null = null;
   const captured = await withAccountLock(account.id, async () => {
     const captured: string[] = [];
     const capturedCredentials: string[] = [];
     const primary = recipe.credentialFiles[0]!;
     let authoritativeClaudeCredential: string | null = null;
-    if (account.tool === "claude" && keychainAvailable()) {
-      const keychainRead = await readClaudeKeychainState(homePath);
+    const captureKeychainAvailable = options.claudeKeychainDeps?.available ?? keychainAvailable;
+    const readCaptureKeychainState = options.claudeKeychainDeps?.readState ?? readClaudeKeychainState;
+    if (account.tool === "claude" && captureKeychainAvailable()) {
+      const keychainRead = await readCaptureKeychainState(homePath);
       if (keychainRead.status === "unreadable") {
         throw new Error(`Cannot capture ${account.id}: the authoritative macOS Keychain entry for ${homePath} is unreadable (${keychainRead.reason})`);
       }
@@ -71,6 +99,26 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
           throw new Error(`Cannot capture ${account.id}: the authoritative macOS Keychain entry for ${homePath} is malformed`);
         }
         authoritativeClaudeCredential = decoded;
+      }
+    }
+    // Baseline arbitration: capture must vault the credential the login just
+    // produced, which is not always the keychain. When the keychain entry is
+    // byte-identical to the seat's pre-login baseline and the credentials
+    // file changed after the baseline, the login wrote the FILE — an
+    // unchanged keychain must never override it (its chain is a stale relic
+    // whose replay can revoke the fresh login's whole chain).
+    if (authoritativeClaudeCredential !== null && options.baseline) {
+      const keychainChanged = credentialDigest(authoritativeClaudeCredential) !== options.baseline.keychainDigest;
+      if (!keychainChanged) {
+        const filePath = join(homePath, primary);
+        const info = await stat(filePath).catch(() => null);
+        if (info?.isFile() && info.mtimeMs >= options.baseline.fileMtimeMs) {
+          const fileRaw = await readFile(filePath, "utf8").catch(() => null);
+          if (parseClaudeChainStrict(fileRaw, `${homePath}:file`)) {
+            authoritativeClaudeCredential = null;
+            arbitration = "file-over-unchanged-keychain";
+          }
+        }
       }
     }
     for (const relative of recipe.credentialFiles) {
@@ -146,7 +194,16 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
     }
     return captured;
   });
-  await appendLedger({ type: "account.capture", account: account.id, home: homePath, files: captured });
+  await appendLedger({
+    type: "account.capture",
+    account: account.id,
+    home: homePath,
+    files: captured,
+    ...(arbitration ? { arbitration } : {}),
+  });
+  // A fresh capture is positive auth evidence: it closes any standing
+  // auth-failed health state so the account rejoins auto-selection.
+  await appendUsageEvent({ ts: new Date().toISOString(), kind: "auth_ok", account: account.id, source: "capture" }).catch(() => undefined);
   return captured;
 }
 

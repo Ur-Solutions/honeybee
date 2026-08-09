@@ -41,7 +41,7 @@ import {
 } from "../src/accounts.js";
 import { verifyActivatedClaudeIdentity, type ActivateAccountOptions, type ActivationContext } from "../src/accounts/activation.js";
 import { evacuateForeignCodexAuth, fulfillCodexAuthParkingIntent } from "../src/accounts/codexAuth.js";
-import { buildAddGenericPasswordCommand, identityOnlyCredentials } from "../src/keychain.js";
+import { buildAddGenericPasswordCommand, credentialDigest, identityOnlyCredentials } from "../src/keychain.js";
 import { identityRecipeForAgent } from "../src/drivers.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -1962,5 +1962,54 @@ test("credential copy freshness hits skip writes without skipping identity-safe 
     assert.ok(timings[0]!.credentialFreshMisses > 0);
     assert.ok(timings[1]!.credentialFreshHits > 0);
     assert.ok(timings[1]!.preActivateMs >= 0, "fresh copy must still execute preActivate");
+  });
+});
+
+test("login capture prefers a fresh credentials file over an unchanged stale keychain entry", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "capture-arbitration@a.b");
+    const now = Date.now();
+    const staleKeychain = chainJson("tok-stale-keychain", now + 3_600_000, "refresh-stale");
+    const freshFile = chainJson("tok-fresh-login", now + 8 * 3_600_000, "refresh-fresh");
+    const home = join(dir, "homes", account.id);
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, ".credentials.json"), freshFile);
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    const claudeKeychainDeps = {
+      available: () => true,
+      readState: async () => ({ status: "present" as const, raw: staleKeychain }),
+    };
+    const vaultToken = async () =>
+      (JSON.parse(await readFile(vaultPath, "utf8")) as { claudeAiOauth: { accessToken: string } }).claudeAiOauth.accessToken;
+
+    // Without a baseline the present keychain item remains authoritative.
+    await captureAccountFromHome(account, home, { claudeKeychainDeps });
+    assert.equal(await vaultToken(), "tok-stale-keychain");
+
+    // Baseline proves the keychain did NOT change while the file did: the
+    // login landed in the file, and the unchanged keychain relic must never
+    // overwrite it (replaying its rotated-away refresh token can revoke the
+    // fresh login's whole chain — the 2026-08-09 login incident).
+    await captureAccountFromHome(account, home, {
+      claudeKeychainDeps,
+      baseline: { keychainDigest: credentialDigest(staleKeychain), fileMtimeMs: 0 },
+    });
+    assert.equal(await vaultToken(), "tok-fresh-login");
+
+    // A keychain that DID change since the baseline stays authoritative.
+    await captureAccountFromHome(account, home, {
+      claudeKeychainDeps,
+      baseline: { keychainDigest: "digest-of-something-else", fileMtimeMs: 0 },
+    });
+    assert.equal(await vaultToken(), "tok-stale-keychain");
+
+    // An unchanged keychain with an UNCHANGED file also stays authoritative:
+    // arbitration only flips when the file is provably the login's output.
+    await writeFile(vaultPath, chainJson("tok-reset", now, "refresh-reset"));
+    await captureAccountFromHome(account, home, {
+      claudeKeychainDeps,
+      baseline: { keychainDigest: credentialDigest(staleKeychain), fileMtimeMs: Number.MAX_SAFE_INTEGER },
+    });
+    assert.equal(await vaultToken(), "tok-stale-keychain");
   });
 });

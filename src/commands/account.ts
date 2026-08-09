@@ -256,7 +256,12 @@ export async function runLoginSeat(parsed: Parsed, account: AccountRecord) {
   };
   const captureIfLoggedIn = async (): Promise<boolean> => {
     if (!(await loggedIn())) return false;
-    const captured = await captureAccountFromHome(account, seatHome);
+    // The baseline lets capture arbitrate WHICH store the login wrote: an
+    // unchanged keychain relic must never override a login that landed in
+    // .credentials.json (stale-chain replay revokes the fresh login).
+    const captured = await captureAccountFromHome(account, seatHome, {
+      baseline: { keychainDigest: baselineDigest, fileMtimeMs: baselineMs },
+    });
     await substrate.kill(target).catch(() => undefined);
     if (isPretty()) console.log(actionLine("ok", "capture", [bold(account.id), `${captured.length} file(s)`]));
     else console.log(`captured\t${account.id}\t${captured.join(",")}`);
