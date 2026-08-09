@@ -8,6 +8,7 @@ import { exhaustionForAgent } from "../src/drivers.js";
 import type { SessionRecord } from "../src/store.js";
 import {
   appendUsageEvent,
+  isRecentlyAuthFailed,
   isRecentlyExhausted,
   readUsageEvents,
   transcriptTokenTotals,
@@ -201,5 +202,49 @@ test("usage sampler emits exhaustion on the rising edge only and samples token d
     const samples = events.filter((event) => event.kind === "sample");
     assert.deepEqual(samples.map((sample) => (sample.kind === "sample" ? sample.inputTokens : 0)), [100, 250]);
     assert.equal(events.filter((event) => event.kind === "exhausted").length, 2);
+  });
+});
+
+test("auth failure events mark the account auth-failed until positive auth evidence lands", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-08T20:52:00.000Z");
+    const account = "claude-revoked";
+    await appendUsageEvent({
+      ts: new Date(now).toISOString(),
+      kind: "auth_failed",
+      account,
+      source: "limits-probe",
+      detail: "/api/oauth/usage: HTTP 401 — OAuth access token has been revoked",
+    });
+
+    let summary = await usageSummary(account, now + 60_000);
+    assert.equal(summary.lastAuthFailureAt, new Date(now).toISOString());
+    assert.match(summary.lastAuthFailureDetail ?? "", /revoked/);
+    assert.equal(isRecentlyAuthFailed(summary, now + 60_000), true);
+
+    // A trailing sample is NOT recovery: the sampler's throttle can flush
+    // pre-failure spend with a post-failure timestamp.
+    await appendUsageEvent({
+      ts: new Date(now + 120_000).toISOString(),
+      kind: "sample",
+      account,
+      bee: "CL.a",
+      agent: "claude",
+      inputTokens: 100,
+      outputTokens: 10,
+    });
+    summary = await usageSummary(account, now + 180_000);
+    assert.equal(isRecentlyAuthFailed(summary, now + 180_000), true, "samples must not clear auth failure");
+
+    // Positive evidence (successful probe / fresh capture) recovers.
+    await appendUsageEvent({ ts: new Date(now + 240_000).toISOString(), kind: "auth_ok", account, source: "capture" });
+    summary = await usageSummary(account, now + 300_000);
+    assert.equal(isRecentlyAuthFailed(summary, now + 300_000), false);
+
+    // The cool-off bounds a never-recovered failure.
+    await appendUsageEvent({ ts: new Date(now + 360_000).toISOString(), kind: "auth_failed", account });
+    summary = await usageSummary(account, now + 400_000);
+    assert.equal(isRecentlyAuthFailed(summary, now + 400_000), true);
+    assert.equal(isRecentlyAuthFailed(summary, now + 360_000 + 25 * 60 * 60 * 1000), false, "24h cool-off expires");
   });
 });

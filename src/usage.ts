@@ -33,7 +33,30 @@ export type ExhaustionEvent = {
   resetHint?: string;
 };
 
-export type UsageEvent = UsageSample | ExhaustionEvent;
+/**
+ * A REAL authentication failure observed against the provider (401/revoked
+ * token, rejected refresh) — not a missing credential file. Recorded by the
+ * limits probe and the HSR event pump so account health reflects whether the
+ * credential actually authenticates, not merely whether it exists.
+ */
+export type AuthFailureEvent = {
+  ts: string;
+  kind: "auth_failed";
+  account: string;
+  /** Where the failure was observed: "limits-probe", a bee name, ... */
+  source?: string;
+  detail?: string;
+};
+
+/** Positive authentication evidence: a successful probe or a fresh capture. */
+export type AuthOkEvent = {
+  ts: string;
+  kind: "auth_ok";
+  account: string;
+  source?: string;
+};
+
+export type UsageEvent = UsageSample | ExhaustionEvent | AuthFailureEvent | AuthOkEvent;
 
 export function usageDir(): string {
   return join(storeRoot(), "usage");
@@ -65,7 +88,7 @@ export async function readUsageEvents(accountId: string): Promise<UsageEvent[]> 
     if (!trimmed) continue;
     try {
       const parsed = JSON.parse(trimmed) as UsageEvent;
-      if (parsed && (parsed.kind === "sample" || parsed.kind === "exhausted")) events.push(parsed);
+      if (parsed && (parsed.kind === "sample" || parsed.kind === "exhausted" || parsed.kind === "auth_failed" || parsed.kind === "auth_ok")) events.push(parsed);
     } catch {
       // skip torn final line
     }
@@ -91,6 +114,16 @@ export type UsageSummary = {
    * flushes pre-limit spend with a timestamp after the exhaustion event.
    */
   recoveredAfterExhaustion?: boolean;
+  /** Last observed REAL provider auth failure (401/revoked/refresh rejected). */
+  lastAuthFailureAt?: string;
+  lastAuthFailureDetail?: string;
+  /**
+   * True when positive auth evidence (auth_ok: successful probe or fresh
+   * capture) landed after the last failure. Samples deliberately do NOT
+   * recover auth: the sampler's throttle can flush pre-failure spend with a
+   * post-failure timestamp.
+   */
+  recoveredAfterAuthFailure?: boolean;
   /** Sum of token deltas across samples in the trailing window. */
   windowInputTokens: number;
   windowOutputTokens: number;
@@ -115,6 +148,16 @@ export async function usageSummary(accountId: string, now = Date.now(), windowMs
       summary.lastExhaustedAt = event.ts;
       summary.recoveredAfterExhaustion = false;
       if (event.resetHint) summary.lastResetHint = event.resetHint;
+      continue;
+    }
+    if (event.kind === "auth_failed") {
+      summary.lastAuthFailureAt = event.ts;
+      summary.recoveredAfterAuthFailure = false;
+      if (event.detail) summary.lastAuthFailureDetail = event.detail;
+      continue;
+    }
+    if (event.kind === "auth_ok") {
+      if (summary.lastAuthFailureAt) summary.recoveredAfterAuthFailure = true;
       continue;
     }
     summary.sampleCount += 1;
@@ -146,6 +189,27 @@ export async function usageSummary(accountId: string, now = Date.now(), windowMs
  * later activity evidence inside the cool-off window. Factual heuristic for
  * display and the deterministic autoswap selector — never a quota judgment.
  */
+/**
+ * Auth failures do not self-heal — a revoked/rejected token stays dead until
+ * a re-login or successful probe records auth_ok — but a bounded cool-off
+ * keeps a transient provider blip from stranding an account forever.
+ */
+export const AUTH_FAILURE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Whether the account's credential is currently known NOT to authenticate:
+ * a real provider auth failure with no later positive auth evidence inside
+ * the cool-off window. Used by `hive account list` (state column) and both
+ * account pickers (auto excludes such accounts while any healthy one exists).
+ */
+export function isRecentlyAuthFailed(summary: UsageSummary, now = Date.now(), coolOffMs = AUTH_FAILURE_COOLDOWN_MS): boolean {
+  if (!summary.lastAuthFailureAt) return false;
+  const ts = Date.parse(summary.lastAuthFailureAt);
+  if (!Number.isFinite(ts)) return false;
+  if (summary.recoveredAfterAuthFailure) return false;
+  return now - ts < coolOffMs;
+}
+
 export function isRecentlyExhausted(summary: UsageSummary, now = Date.now(), coolOffMs = DEFAULT_WINDOW_MS): boolean {
   if (!summary.lastExhaustedAt) return false;
   const ts = Date.parse(summary.lastExhaustedAt);
