@@ -13,7 +13,7 @@ import { resolveSelector } from "../selectors.js";
 import { storeRoot } from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
 import { swapAccount } from "../swap.js";
-import { isRecentlyExhausted, listUsageAccounts, usageSummary } from "../usage.js";
+import { isRecentlyAuthFailed, isRecentlyExhausted, listUsageAccounts, usageSummary } from "../usage.js";
 import { clampUsageInterval, runUsageTui } from "../usageTui.js";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -150,16 +150,20 @@ export async function accountList(parsed: Parsed) {
       accountHasCredentials(account),
     ]);
     const exhausted = isRecentlyExhausted(summary, now);
+    const authFailed = isRecentlyAuthFailed(summary, now);
     if (json) {
       return {
-        json: { ...account, credentials: hasCreds, paused: Boolean(account.pausedAt), exhausted, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null },
+        json: { ...account, credentials: hasCreds, paused: Boolean(account.pausedAt), exhausted, authFailed, lastAuthFailureAt: summary.lastAuthFailureAt ?? null, lastExhaustedAt: summary.lastExhaustedAt ?? null, resetHint: summary.lastResetHint ?? null },
         row: null,
       };
     }
     // Paused outranks exhausted in the cell: it's the operator's own standing
     // decision, while exhaustion is transient and visible in EXHAUSTED/RESET.
-    const plain = !hasCreds ? "no-creds" : account.pausedAt ? "paused" : exhausted ? "exhausted" : "ok";
-    const state = !hasCreds ? yellow(plain) : account.pausedAt ? yellow(plain) : exhausted ? red(plain) : green(plain);
+    // auth-failed outranks exhausted: a revoked credential does not reset on a
+    // window boundary — it needs `hive login` (a credential FILE existing is
+    // not health; the probe's real authentication result is).
+    const plain = !hasCreds ? "no-creds" : account.pausedAt ? "paused" : authFailed ? "auth-failed" : exhausted ? "exhausted" : "ok";
+    const state = !hasCreds ? yellow(plain) : account.pausedAt ? yellow(plain) : authFailed ? red(plain) : exhausted ? red(plain) : green(plain);
     return {
       json: null,
       row: [

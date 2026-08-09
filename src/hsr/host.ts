@@ -17,6 +17,7 @@
 
 import { performance } from "node:perf_hooks";
 import { clearAccountBootFailure, recordAccountBootFailure } from "../accounts/bootHealth.js";
+import { appendUsageEvent } from "../usage.js";
 import { CodexBootProbeError, codexHomeFromEnv, withCodexHomeBootLock } from "../codexBoot.js";
 import { probeCodexHomeLogs, reclaimCodexHomeLogs } from "../codexHomeMaintenance.js";
 import type { RunnerAdapter, RunnerInputAnswer, RunnerOpts } from "./types.js";
@@ -250,6 +251,7 @@ export async function runHsrHost(params: {
   // it in place so auth recovery can replay the operator's exact text.
   const awaitingTurnStart: string[] = [];
   const openTurns: Array<{ deliveryId?: string; authFailed: boolean }> = [];
+  let lastAccountAuthFailureRecordedAt = 0;
 
   const sendTrackedTurn = async (text: string, mode: unknown, deliveryId: unknown): Promise<void> => {
     const trackedId = mode !== "next-tool" && typeof deliveryId === "string" ? deliveryId : undefined;
@@ -402,6 +404,19 @@ export async function runHsrHost(params: {
           (event.type === "auth_expired" && event.requiresLogin === true)
         ) {
           if (openTurns[0]) openTurns[0].authFailed = true;
+          // Account health must see the REAL runtime auth failure (a revoked
+          // token 401s every bee on the account while the credential file
+          // still exists). Throttled per host: one record per failure burst.
+          if (opts.accountId && Date.now() - lastAccountAuthFailureRecordedAt > 5 * 60_000) {
+            lastAccountAuthFailureRecordedAt = Date.now();
+            await appendUsageEvent({
+              ts: new Date().toISOString(),
+              kind: "auth_failed",
+              account: opts.accountId,
+              source: bee,
+              detail: (event.type === "error" ? event.message : event.type === "auth_expired" ? event.detail ?? "auth expired" : "auth failure").slice(0, 200),
+            }).catch(() => undefined);
+          }
         } else if (event.type === "turn_end") {
           const completed = openTurns.shift();
           if (completed?.deliveryId && !completed.authFailed) {

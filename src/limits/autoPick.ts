@@ -24,6 +24,7 @@ import { canonicalAgentKind } from "../agents.js";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
 import type { SessionRecord } from "../store.js";
+import { isRecentlyAuthFailed, usageSummary } from "../usage.js";
 import { type CachedLimitsOptions, agePickedLimitsCacheEntry, cachedAccountLimits } from "./cache.js";
 import { accountCommitments, pendingPickDebits, recordAutoPick } from "./commitments.js";
 import { scheduleDetachedLimitsRefresh } from "./refresh.js";
@@ -279,6 +280,16 @@ function pickableAccounts(kind: string, registered: AccountRecord[], includePaus
   return pool;
 }
 
+/** Accounts whose last REAL provider authentication attempt failed without later recovery. */
+async function recentAuthFailures(accounts: AccountRecord[], now: number): Promise<Set<string>> {
+  const failed = new Set<string>();
+  await Promise.all(accounts.map(async (account) => {
+    const summary = await usageSummary(account.id, now).catch(() => null);
+    if (summary && isRecentlyAuthFailed(summary, now)) failed.add(account.id);
+  }));
+  return failed;
+}
+
 /**
  * Resolve the `auto` account query: among the tool's accounts with vaulted
  * credentials, pick the one with the least pace-adjusted weekly load (an
@@ -303,13 +314,19 @@ export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps
   }
   const now = (deps.now ?? Date.now)();
   const bootFailures = await recentAccountBootFailures(now);
-  const healthy = candidates.filter((account) => !bootFailures.has(account.id));
-  const skipped = healthy.length > 0 ? candidates.filter((account) => bootFailures.has(account.id)) : [];
+  // A credential FILE existing is not health: an account whose last real
+  // authentication attempt failed (revoked token, rejected refresh) must not
+  // keep winning the pick — every bee placed on it strands at /login while
+  // `account list` looks green (the 2026-08-08 incident shape).
+  const authFailures = await recentAuthFailures(candidates, now);
+  const unhealthy = (accountId: string): boolean => bootFailures.has(accountId) || authFailures.has(accountId);
+  const healthy = candidates.filter((account) => !unhealthy(account.id));
+  const skipped = healthy.length > 0 ? candidates.filter((account) => unhealthy(account.id)) : [];
   const eligible = healthy.length > 0 ? healthy : candidates;
   const bootHealthReason = skipped.length > 0
-    ? `; skipped ${skipped.map((account) => account.id).join(", ")} for recent boot failure`
-    : healthy.length === 0 && bootFailures.size > 0
-      ? "; every credentialed account has a recent boot failure; using last resort"
+    ? `; skipped ${skipped.map((account) => `${account.id} for recent ${authFailures.has(account.id) ? "auth" : "boot"} failure`).join(", ")}`
+    : healthy.length === 0 && (bootFailures.size > 0 || authFailures.size > 0)
+      ? "; every credentialed account has a recent boot/auth failure; using last resort"
       : "";
   // A single candidate wins regardless of usage — skip the limits round-trips
   // and the pick bookkeeping (there is no herd to steer with one account).
@@ -447,22 +464,32 @@ export async function pickRoundRobinAccount(tool: string, options: { includePaus
   if (candidates.length === 0) {
     throw new Error(`No ${kind} account has vaulted credentials; capture some with: hive login <account>`);
   }
-  candidates.sort((a, b) => a.addedAt.localeCompare(b.addedAt) || a.id.localeCompare(b.id));
+  // rr is deliberately not LIMITS-aware, but auth validity is not load: an
+  // account whose credential is known not to authenticate strands its bee at
+  // /login. Skip such accounts while any healthy one exists.
+  const authFailures = await recentAuthFailures(candidates, Date.now());
+  const healthy = candidates.filter((account) => !authFailures.has(account.id));
+  const skippedAuth = healthy.length > 0 ? candidates.length - healthy.length : 0;
+  const pool2 = healthy.length > 0 ? healthy : candidates;
+  pool2.sort((a, b) => a.addedAt.localeCompare(b.addedAt) || a.id.localeCompare(b.id));
   // A single candidate cycle is a no-op; still update the cursor so a later
   // registration starts cleanly from a known anchor.
   return withFileLock(cursorLockPath(), async () => {
     const cursor = await readCursor();
     const prevId = cursor[kind]?.lastAccountId;
-    const prevIndex = prevId ? candidates.findIndex((a) => a.id === prevId) : -1;
-    const nextIndex = (prevIndex + 1) % candidates.length;
-    const chosen = candidates[nextIndex]!;
+    const prevIndex = prevId ? pool2.findIndex((a) => a.id === prevId) : -1;
+    const nextIndex = (prevIndex + 1) % pool2.length;
+    const chosen = pool2[nextIndex]!;
     const next: CursorFile = { ...cursor, [kind]: { lastAccountId: chosen.id } };
     await writeCursor(next);
-    const reason = prevId
-      ? `round-robin: next after ${prevId}`
-      : candidates.length === 1
-        ? `only ${kind} account with credentials`
-        : "round-robin: first pick";
+    const reason = [
+      prevId
+        ? `round-robin: next after ${prevId}`
+        : pool2.length === 1
+          ? `only ${kind} account with credentials`
+          : "round-robin: first pick",
+      ...(skippedAuth > 0 ? [`skipped ${skippedAuth} account(s) for recent auth failure`] : []),
+    ].join("; ");
     return { account: chosen, reason };
   });
 }

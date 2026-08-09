@@ -7,7 +7,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { addAccount, accountDir, clearAccountBootFailure, recordAccountBootFailure, setAccountPaused } from "../src/accounts.js";
 import { withCodexHomeBootLock } from "../src/codexBoot.js";
 import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
+import { pickRoundRobinAccount } from "../src/limits/autoPick.js";
 import { activeSessionIndexPath, saveSession } from "../src/store.js";
+import { appendUsageEvent, isRecentlyAuthFailed, usageSummary } from "../src/usage.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -1137,7 +1139,7 @@ test("pickLeastLoadedAccount uses a failed account as the last credentialed reso
     });
 
     assert.equal(choice.account.id, only.id);
-    assert.match(choice.reason, /every credentialed account has a recent boot failure; using last resort/);
+    assert.match(choice.reason, /every credentialed account has a recent boot\/auth failure; using last resort/);
   });
 });
 
@@ -1711,4 +1713,118 @@ test("limitsRefreshCliEntry maps cli-x entries to the full cli sibling", async (
   assert.equal(limitsRefreshCliEntry("/x/src/cli-x.ts"), "/x/src/cli.ts");
   assert.equal(limitsRefreshCliEntry("/x/bin/other.js"), null);
   assert.equal(limitsRefreshCliEntry(undefined), null);
+});
+
+test("accountLimits records auth_failed on a revoked-token probe and auth_ok on recovery", async () => {
+  await withTempStore(async () => {
+    const account = await addAccount("claude", "revoked@a.b");
+    await mkdir(accountDir(account), { recursive: true });
+    await writeFile(
+      join(accountDir(account), ".credentials.json"),
+      JSON.stringify({ claudeAiOauth: { accessToken: "tok-vault", expiresAt: Date.now() + 3_600_000 } }),
+    );
+    const deps = {
+      fetchClaudeProfileEmail: async () => "revoked@a.b",
+      readKeychain: async () => null,
+    };
+
+    const [failed] = await accountLimits([account], {
+      ...deps,
+      fetchClaudeUsage: async () => {
+        throw new Error("/api/oauth/usage: HTTP 401 — OAuth access token has been revoked");
+      },
+    });
+    assert.equal(failed!.ok, false);
+    assert.match(failed!.error ?? "", /revoked/);
+    let summary = await usageSummary(account.id);
+    assert.equal(isRecentlyAuthFailed(summary), true, "the probe's real 401 must land in account health");
+    assert.match(summary.lastAuthFailureDetail ?? "", /revoked/);
+
+    const [ok] = await accountLimits([account], {
+      ...deps,
+      fetchClaudeUsage: async () => ({ five_hour: { utilization: 5, resets_at: "2026-08-10T09:30:00Z" } }),
+    });
+    assert.equal(ok!.ok, true);
+    summary = await usageSummary(account.id);
+    assert.equal(isRecentlyAuthFailed(summary), false, "a successful probe is positive auth evidence");
+  });
+});
+
+test("accountLimits does not mark auth-failed for missing credentials or unsupported providers", async () => {
+  await withTempStore(async () => {
+    const noCreds = await addAccount("claude", "no-creds@a.b");
+    const [result] = await accountLimits([noCreds], {
+      fetchClaudeProfileEmail: async () => null,
+      readKeychain: async () => null,
+      fetchClaudeUsage: async () => {
+        throw new Error("must not be called without a token");
+      },
+    });
+    assert.equal(result!.ok, false);
+    const summary = await usageSummary(noCreds.id);
+    assert.equal(isRecentlyAuthFailed(summary), false, "a missing credential is no-creds, not an auth failure");
+  });
+});
+
+test("pickLeastLoadedAccount skips accounts with a standing auth failure", async () => {
+  await withTempStore(async () => {
+    const bad = await addAccount("codex", "auth-bad@a.b");
+    const good = await addAccount("codex", "auth-good@a.b");
+    const now = Date.parse("2026-08-09T06:00:00Z");
+    await appendUsageEvent({
+      ts: new Date(now).toISOString(),
+      kind: "auth_failed",
+      account: bad.id,
+      source: "limits-probe",
+      detail: "HTTP 401",
+    });
+
+    const choice = await pickLeastLoadedAccount("codex", {
+      hasCredentials: async () => true,
+      now: () => now + 60_000,
+      fetchLimits: async (accounts) =>
+        accounts.map((account) => okLimits(account.id, account.id === bad.id ? 0 : 90, 10, "2026-08-16T06:00:00Z")),
+    });
+    assert.equal(choice.account.id, good.id, "an auth-failed account must not win even with the lowest load");
+    assert.match(choice.reason, new RegExp(`skipped ${bad.id} for recent auth failure`));
+
+    await appendUsageEvent({ ts: new Date(now + 120_000).toISOString(), kind: "auth_ok", account: bad.id, source: "capture" });
+    const recovered = await pickLeastLoadedAccount("codex", {
+      hasCredentials: async () => true,
+      now: () => now + 180_000,
+      ttlMs: 0,
+      fetchLimits: async (accounts) =>
+        accounts.map((account) => okLimits(account.id, account.id === bad.id ? 0 : 90, 10, "2026-08-16T06:00:00Z")),
+    });
+    assert.equal(recovered.account.id, bad.id, "recovery evidence returns the account to auto selection");
+  });
+});
+
+test("pickRoundRobinAccount skips auth-failed accounts while a healthy one exists", async () => {
+  await withTempStore(async () => {
+    const bad = await addAccount("codex", "rr-bad@a.b");
+    const good = await addAccount("codex", "rr-good@a.b");
+    for (const account of [bad, good]) {
+      await mkdir(accountDir(account), { recursive: true });
+      await writeFile(join(accountDir(account), "auth.json"), "{}");
+    }
+    await appendUsageEvent({
+      ts: new Date().toISOString(),
+      kind: "auth_failed",
+      account: bad.id,
+      source: "limits-probe",
+    });
+
+    const first = await pickRoundRobinAccount("codex");
+    const second = await pickRoundRobinAccount("codex");
+    assert.equal(first.account.id, good.id);
+    assert.equal(second.account.id, good.id, "the cycle never lands on the auth-failed account");
+    assert.match(first.reason, /skipped 1 account\(s\) for recent auth failure/);
+
+    await appendUsageEvent({ ts: new Date().toISOString(), kind: "auth_ok", account: bad.id });
+    const picked = new Set<string>();
+    picked.add((await pickRoundRobinAccount("codex")).account.id);
+    picked.add((await pickRoundRobinAccount("codex")).account.id);
+    assert.deepEqual([...picked].sort(), [bad.id, good.id].sort(), "recovery restores the full rr cycle");
+  });
 });

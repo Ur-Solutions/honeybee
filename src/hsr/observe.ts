@@ -488,6 +488,11 @@ export function isAuthNeededMessage(message: string): boolean {
   if (m.includes("access token") && m.includes("could not be refreshed")) return true;
   if (m.includes("access token") && m.includes("couldn't be refreshed")) return true;
   if (m.includes("access token") && m.includes("cannot be refreshed")) return true;
+  // Anthropic's revocation shape ("401 OAuth access token has been revoked",
+  // 2026-08-08 incident) previously fell through to a generic error, so the
+  // bee never showed auth-needed and nothing reached account health.
+  if ((m.includes("token") || m.includes("oauth")) && m.includes("revoked")) return true;
+  if (m.includes("401") && (m.includes("oauth") || m.includes("unauthorized") || m.includes("authentication"))) return true;
   if ((m.includes("please log in") || m.includes("please login") || m.includes("sign in again")) && m.includes("auth")) return true;
   return false;
 }

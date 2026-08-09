@@ -311,7 +311,14 @@ async function claudeOauthGet(accessToken: string, url: string): Promise<unknown
     },
     signal: AbortSignal.timeout(15_000),
   });
-  if (!response.ok) throw new Error(`${new URL(url).pathname}: HTTP ${response.status}`);
+  if (!response.ok) {
+    // Keep the provider's own diagnosis: "HTTP 401" alone cannot distinguish
+    // an expired token from a REVOKED chain ("OAuth access token has been
+    // revoked"), and the auth-health recorder keys on that distinction.
+    const body = await response.text().catch(() => "");
+    const detail = body.replace(/\s+/g, " ").trim().slice(0, 200);
+    throw new Error(`${new URL(url).pathname}: HTTP ${response.status}${detail ? ` — ${detail}` : ""}`);
+  }
   return response.json();
 }
 

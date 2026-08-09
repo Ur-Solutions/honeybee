@@ -13,6 +13,7 @@ import { type AccountRecord, PROVIDER_BY_CLI, listAccounts } from "../accounts.j
 import { mapWithConcurrency } from "../concurrency.js";
 import { readClaudeKeychain } from "../keychain.js";
 import { providerAdapter } from "../providers.js";
+import { appendUsageEvent, usageSummary } from "../usage.js";
 import { claudeLimits } from "./claude.js";
 import { codexLimits } from "./codex.js";
 import type { AccountLimits, LimitsDeps } from "./types.js";
@@ -32,6 +33,51 @@ function memoizeKeychainReads(readKeychain: typeof readClaudeKeychain): typeof r
     byHome.set(key, read);
     return read;
   };
+}
+
+/**
+ * A REAL provider auth failure, as opposed to a missing credential, an
+ * unsupported provider, or a transport error. These are the failures that
+ * mean "this credential does not authenticate" — the account must show
+ * auth-failed and drop out of auto-selection until positive evidence lands.
+ */
+export function isAuthFailureLimitsError(message: string): boolean {
+  const m = message.toLowerCase();
+  return /\bhttp 401\b/.test(m)
+    || m.includes("revoked")
+    || m.includes("unauthorized")
+    || m.includes("invalid_grant")
+    || m.includes("refresh failed");
+}
+
+/** Suppress duplicate auth_failed appends from tight probe loops (--live). */
+const AUTH_FAILURE_DEDUP_MS = 5 * 60_000;
+
+/**
+ * Persist what the limits probe just learned about the credential: it is the
+ * one place a revoked token is actually observed (the 2026-08-08 incident:
+ * `hive account list` said "ok" from file existence while every probe got
+ * `401 OAuth access token has been revoked`). Success records recovery only
+ * when a failure is standing, so steady-state probes append nothing.
+ */
+async function recordLimitsAuthOutcome(accountId: string, limits: AccountLimits, now = Date.now()): Promise<void> {
+  const summary = await usageSummary(accountId, now);
+  const standingFailure = summary.lastAuthFailureAt !== undefined && summary.recoveredAfterAuthFailure !== true;
+  if (limits.ok) {
+    if (standingFailure) {
+      await appendUsageEvent({ ts: new Date(now).toISOString(), kind: "auth_ok", account: accountId, source: "limits-probe" });
+    }
+    return;
+  }
+  if (!limits.error || !isAuthFailureLimitsError(limits.error)) return;
+  if (standingFailure && now - Date.parse(summary.lastAuthFailureAt!) < AUTH_FAILURE_DEDUP_MS) return;
+  await appendUsageEvent({
+    ts: new Date(now).toISOString(),
+    kind: "auth_failed",
+    account: accountId,
+    source: "limits-probe",
+    detail: limits.error.slice(0, 200),
+  });
 }
 
 /**
@@ -59,22 +105,25 @@ export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps 
       const provider = account.provider ?? PROVIDER_BY_CLI[account.tool];
       const stampProvider = (limits: AccountLimits): AccountLimits =>
         account.provider ? { ...limits, provider: account.provider } : limits;
+      let result: AccountLimits;
       try {
         const adapter = providerAdapter(provider);
-        if (adapter?.fetchLimits) return stampProvider(await adapter.fetchLimits(account, sweepDeps));
-        if (provider === "anthropic") return stampProvider(await claudeLimits(account, sweepDeps));
-        if (provider === "openai") return stampProvider(await codexLimits(account, sweepDeps));
-        return stampProvider({
-          account: account.id,
-          tool: account.tool,
-          ok: false,
-          source: "unsupported" as const,
-          // fix #8: never print "undefined …" for a provider-less (legacy
-          // opencode) account.
-          error: provider ? `${provider} has no limits source` : "account has no provider",
-        });
+        if (adapter?.fetchLimits) result = stampProvider(await adapter.fetchLimits(account, sweepDeps));
+        else if (provider === "anthropic") result = stampProvider(await claudeLimits(account, sweepDeps));
+        else if (provider === "openai") result = stampProvider(await codexLimits(account, sweepDeps));
+        else {
+          result = stampProvider({
+            account: account.id,
+            tool: account.tool,
+            ok: false,
+            source: "unsupported" as const,
+            // fix #8: never print "undefined …" for a provider-less (legacy
+            // opencode) account.
+            error: provider ? `${provider} has no limits source` : "account has no provider",
+          });
+        }
       } catch (error) {
-        return stampProvider({
+        result = stampProvider({
           account: account.id,
           tool: account.tool,
           ok: false,
@@ -82,6 +131,10 @@ export async function accountLimits(accounts: AccountRecord[], deps: LimitsDeps 
           error: error instanceof Error ? error.message : String(error),
         });
       }
+      // The probe is the authentication check account health keys on; its
+      // outcome must never make the sweep itself fail.
+      await recordLimitsAuthOutcome(account.id, result).catch(() => undefined);
+      return result;
     },
   );
 }
