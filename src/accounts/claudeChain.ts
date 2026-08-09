@@ -30,6 +30,21 @@ function decodeClaudeCredentialsRaw(raw: string | null): string | null {
   }
 }
 
+/**
+ * Consumable JSON view of a keychain rendering: raw JSON passes through and a
+ * legacy `security -w` hex rendering of valid credential JSON decodes. Null
+ * means the entry's content is genuinely unknown (corrupt/truncated) and must
+ * be quarantined — a decodable entry is a readable, usually STALE credential
+ * whose rotated-away refresh token can trip the provider's reuse detection
+ * (HIVE-2), so it must be repaired in place, never skipped indefinitely.
+ */
+export function consumableClaudeKeychainPayload(raw: string | null): string | null {
+  if (raw === null) return null;
+  if (isRawClaudeCredentialPayload(raw)) return raw;
+  const decoded = keychain.decodeSecurityPasswordOutput(raw);
+  return isRawClaudeCredentialPayload(decoded) ? decoded : null;
+}
+
 /** True only for the raw JSON representation Claude itself can consume. */
 export function isRawClaudeCredentialPayload(raw: string | null): boolean {
   if (!raw) return false;
@@ -360,9 +375,8 @@ async function readClaudeSyncCandidate(
   if (keychainRead.status === "unreadable") return null;
   const keychainRaw = keychainRead.status === "present" ? keychainRead.raw : null;
   if (keychainRaw !== null) {
-    return isRawClaudeCredentialPayload(keychainRaw)
-      ? parseClaudeChain(keychainRaw, `${home}:keychain`)
-      : null;
+    const consumable = consumableClaudeKeychainPayload(keychainRaw);
+    return consumable !== null ? parseClaudeChain(consumable, `${home}:keychain`) : null;
   }
   return isRawClaudeCredentialPayload(fileRaw)
     ? parseClaudeChain(fileRaw, `${home}:file`)
@@ -479,18 +493,22 @@ export async function syncClaudeChainToVaultLocked(
       continue;
     }
     const keychainRaw = keychainRead.status === "present" ? keychainRead.raw : null;
-    // Claude treats a present keychain item as authoritative. If that exact
-    // value is not consumable JSON, quarantine the whole home: falling back
-    // to its file can select an older chain and then overwrite a fresher but
-    // malformed keychain link (the 2026-08-07 production incident shape).
-    if (keychainRaw !== null && !isRawClaudeCredentialPayload(keychainRaw)) {
+    // Claude treats a present keychain item as authoritative. A legacy hex
+    // rendering that decodes to valid credential JSON is still readable — use
+    // the decoded view so the freshest link is never missed and distribution
+    // can repair the entry to raw JSON. Only an entry whose content cannot be
+    // decoded at all quarantines the whole home: falling back to its file can
+    // select an older chain and then overwrite a fresher but malformed
+    // keychain link (the 2026-08-07 production incident shape).
+    const keychainConsumable = consumableClaudeKeychainPayload(keychainRaw);
+    if (keychainRaw !== null && keychainConsumable === null) {
       refusedNonRaw += 1;
       quarantinedHomes.add(resolve(home));
       if (fileRaw !== null && !isRawClaudeCredentialPayload(fileRaw)) refusedNonRaw += 1;
       continue;
     }
     if (fileRaw !== null && !isRawClaudeCredentialPayload(fileRaw)) refusedNonRaw += 1;
-    const fromKeychain = isRawClaudeCredentialPayload(keychainRaw) ? parseClaudeChain(keychainRaw, `${home}:keychain`) : null;
+    const fromKeychain = keychainConsumable !== null ? parseClaudeChain(keychainConsumable, `${home}:keychain`) : null;
     // A present, valid keychain entry is equally authoritative: only consult
     // the file when no keychain item exists at all.
     const chain = fromKeychain ?? (isRawClaudeCredentialPayload(fileRaw) ? parseClaudeChain(fileRaw, `${home}:file`) : null);
@@ -713,9 +731,15 @@ async function distributeClaudeChainLocked(
         continue;
       }
       const existingRaw = existingEntry.status === "present" ? existingEntry.raw : null;
-      // Even outside a sweep adoption, do not write through a malformed
-      // authoritative item. The activation writer repair owns recovery.
-      if (existingRaw !== null && !isRawClaudeCredentialPayload(existingRaw)) {
+      const existingConsumable = consumableClaudeKeychainPayload(existingRaw);
+      // Even outside a sweep adoption, do not write through an entry whose
+      // content cannot be decoded — its bytes are genuinely unknown. But a
+      // legacy hex rendering of valid credential JSON is a READABLE stale
+      // credential: leaving it in place keeps a rotated-away refresh token
+      // live on the home (replaying it revokes the whole chain — the
+      // 2026-08-08 revocation shape), so repair it with the fresh chain
+      // instead of skipping it on every refresh forever.
+      if (existingRaw !== null && existingConsumable === null) {
         await appendLedger({
           type: "account.chain-propagation-refused",
           account: account.id,
@@ -724,7 +748,16 @@ async function distributeClaudeChainLocked(
         }).catch(() => undefined);
         continue;
       }
-      const keychainWrite = await keychain.writeClaudeKeychainEntry(home, mergeCredentialsJson(existingRaw, sourceRaw));
+      const repairingLegacyEntry = existingRaw !== null && !isRawClaudeCredentialPayload(existingRaw);
+      const keychainWrite = await keychain.writeClaudeKeychainEntry(home, mergeCredentialsJson(existingConsumable, sourceRaw));
+      if (repairingLegacyEntry && keychainWrite.ok) {
+        await appendLedger({
+          type: "account.chain-keychain-repaired",
+          account: account.id,
+          home,
+          reason: "legacy-hex-rendering",
+        }).catch(() => undefined);
+      }
       // A failed or degraded keychain write MUST be visible: claude prefers
       // the keychain over .credentials.json, so a home whose file is fresh
       // but whose keychain kept a previous identity silently bills every bee

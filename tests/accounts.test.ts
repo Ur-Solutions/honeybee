@@ -483,15 +483,14 @@ test("chain sync refuses to treat hex text as a Claude-consumable distribution s
   });
 });
 
-test("chain sync quarantines a home with a malformed authoritative keychain instead of adopting its older file", async () => {
+test("chain sync quarantines a home with an undecodable authoritative keychain instead of adopting its older file", async () => {
   await withTempStore(async (dir) => {
     const account = await addAccount("claude", "keychain-quarantine@a.b");
     const now = Date.now();
     const vaultRaw = chainJson("tok-vault", now + 1_000, "refresh-vault");
     const fileRaw = chainJson("tok-file-older", now + 2 * 3_600_000, "refresh-file-older");
-    const malformedFresherKeychain = hexPayload(
-      chainJson("tok-keychain-live", now + 8 * 3_600_000, "refresh-keychain-live"),
-    );
+    // Hex chars that decode to non-JSON garbage: content genuinely unknown.
+    const undecodableKeychain = "deadbeef";
     const vaultPath = join(accountDir(account), ".credentials.json");
     const home = join(dir, "homes", account.id);
     const filePath = join(home, ".credentials.json");
@@ -501,7 +500,7 @@ test("chain sync quarantines a home with a malformed authoritative keychain inst
 
     const result = await syncClaudeChainToVault(account, undefined, {
       readKeychainRaw: async (candidate) => candidate === home
-        ? { status: "present", raw: malformedFresherKeychain }
+        ? { status: "present", raw: undecodableKeychain }
         : { status: "absent" },
       fetchProfileEmail: async () => {
         throw new Error("quarantined sources must not reach identity verification");
@@ -512,6 +511,39 @@ test("chain sync quarantines a home with a malformed authoritative keychain inst
     assert.equal(result.chain?.oauth.accessToken, "tok-vault");
     assert.equal(await readFile(vaultPath, "utf8"), vaultRaw, "the older file was not adopted into the vault");
     assert.equal(await readFile(filePath, "utf8"), fileRaw, "no distribution rewrote the quarantined home");
+  });
+});
+
+test("chain sync adopts a fresher legacy-hex keychain chain instead of quarantining it (repair, not skip)", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "keychain-legacy-hex@a.b");
+    const now = Date.now();
+    const vaultRaw = chainJson("tok-vault", now + 1_000, "refresh-vault");
+    const liveRaw = chainJson("tok-keychain-live", now + 8 * 3_600_000, "refresh-keychain-live");
+    // `security -w` renders non-plain data as hex; the underlying item is a
+    // perfectly readable (and here fresher) credential — skipping it forever
+    // leaves a rotated-away refresh token live on the home (HIVE-2 replay).
+    const legacyHexKeychain = hexPayload(liveRaw);
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    const home = join(dir, "homes", account.id);
+    const filePath = join(home, ".credentials.json");
+    await mkdir(home, { recursive: true });
+    await writeFile(vaultPath, vaultRaw);
+    await writeFile(filePath, chainJson("tok-file-older", now + 2 * 3_600_000, "refresh-file-older"));
+
+    const result = await syncClaudeChainToVault(account, undefined, {
+      readKeychainRaw: async (candidate) => candidate === home
+        ? { status: "present", raw: legacyHexKeychain }
+        : { status: "absent" },
+      fetchProfileEmail: async () => "keychain-legacy-hex@a.b",
+    });
+
+    assert.equal(result.vaultUpdated, true);
+    assert.equal(result.chain?.oauth.accessToken, "tok-keychain-live");
+    const vault = JSON.parse(await readFile(vaultPath, "utf8"));
+    assert.equal(vault.claudeAiOauth.accessToken, "tok-keychain-live", "the decoded legacy chain was adopted into the vault");
+    const homeFile = JSON.parse(await readFile(filePath, "utf8"));
+    assert.equal(homeFile.claudeAiOauth.accessToken, "tok-keychain-live", "distribution repaired the home instead of skipping it");
   });
 });
 
