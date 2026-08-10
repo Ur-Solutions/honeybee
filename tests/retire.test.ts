@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -688,4 +688,47 @@ test("an hsr record that is not live derives crashed when still marked running",
   const record = { ...seed({ name: "hsr-bee", tmuxTarget: "hsr-bee", status: "running" }), substrate: "hsr" as const };
   const derived = deriveState(record, { liveTargets: new Set<string>(), hsrLive: new Set<string>() });
   assert.equal(derived.state, "crashed");
+});
+
+test("archive filing is a same-directory rename(2) commit; crashed-commit residue never reaches readers", async () => {
+  await withTempStore(async (dir) => {
+    const record = { ...seed({ name: "atomic-archive", tmuxTarget: "atomic-archive" }), substrate: "hsr" as const };
+    await saveSession(record);
+    const recordPath = join(dir, "sessions", "atomic-archive.json");
+    const before = await stat(recordPath);
+
+    // A crash between atomicWriteFile's temp write and its rename leaves
+    // exactly this shape behind: a same-directory temp holding a truncated
+    // document that never reached its destination.
+    const residue = join(dir, "sessions", ".atomic-archive.json.12345.1754800000000.1.tmp");
+    await writeFile(residue, '{"name":"atomic-archive","status":"do', { mode: 0o600 });
+
+    const outcome = await transactionalRetire(record, { substrate: fakeSubstrate({}), pollIntervalMs: 0 });
+    assert.equal(outcome.ok, true);
+
+    // Rename-based commit: the destination is REPLACED (fresh inode), never
+    // truncated and rewritten in place, so a concurrent reader can only ever
+    // observe the old or the new complete document.
+    const after = await stat(recordPath);
+    assert.notEqual(after.ino, before.ino, "the archive commit lands via rename(2), not an in-place write");
+    assert.equal((await loadSession("atomic-archive"))?.status, "done");
+
+    // The read side ignores the residue instead of tripping on it.
+    const statuses = (await listSessions()).filter((r) => r.name === "atomic-archive").map((r) => r.status);
+    assert.deepEqual(statuses, ["done"]);
+    await stat(residue); // still present — inert, reads neither consume nor delete it
+  });
+});
+
+test("leftover archive temp files never materialize a phantom or corrupt session", async () => {
+  await withTempStore(async (dir) => {
+    const live = { ...seed({ name: "still-here", tmuxTarget: "still-here" }), substrate: "hsr" as const };
+    await saveSession(live);
+    // Residue for a bee that never committed at all: it must not exist.
+    await writeFile(join(dir, "sessions", ".ghost-bee.json.999.1754800000000.2.tmp"), '{"name":"ghost-bee"', { mode: 0o600 });
+
+    const listed = await listSessions();
+    assert.deepEqual(listed.map((r) => r.name), ["still-here"], "temp residue is invisible to listSessions");
+    assert.equal(await loadSession("ghost-bee"), null, "temp residue never loads as a record");
+  });
 });
