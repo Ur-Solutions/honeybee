@@ -7,7 +7,10 @@ import { connectRpcClient } from "../src/hsr/rpc.js";
 import { runHsrHost } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { hsrRunDir } from "../src/hsr/runDir.js";
-import { startHsrControlServer } from "../src/daemon/hsrControl.js";
+import { acceptHsrMessage, startHsrControlServer } from "../src/daemon/hsrControl.js";
+import { generateMessageId, listMessages } from "../src/buz.js";
+import { readBeeRequests } from "../src/requests/store.js";
+import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -62,6 +65,7 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
         spawn: 2,
         spawnEnv: 1,
         spawnParent: 1,
+        message: 1,
         fork: 1,
         handoff: 1,
         execution: 1,
@@ -197,5 +201,136 @@ test("hsr control socket: spawn with an unknown kind returns ok:false", async ()
       client.close();
       await server.close();
     }
+  });
+});
+
+test("hsr-control message durably accepts a cold idle bee and rejects an archived bee", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const cold: SessionRecord = {
+      name: "cold-idle",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "cold-idle",
+      substrate: "hsr",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+      providerSessionId: "provider-thread-cold-idle",
+    };
+    const archived: SessionRecord = { ...cold, name: "archived", tmuxTarget: "archived", status: "done" };
+    await saveSession(cold);
+    await saveSession(archived);
+
+    const accepted = await acceptHsrMessage({
+      bee: cold.name,
+      text: "continue from here",
+    });
+    assert.equal(accepted.ok, true);
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.delivery, "queued");
+    assert.equal(typeof accepted.messageId, "string");
+    const queued = await listMessages(cold.name, "queue");
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0]!.message.body, "continue from here");
+    const recovering = (await loadSession(cold.name))!;
+    assert.equal(recovering.status, "dead", "acceptance does not fabricate runtime lifecycle status");
+    assert.equal(recovering.lastObservedState, undefined, "acceptance does not fabricate a daemon observation");
+    assert.equal(recovering.recoveryMessageId, accepted.messageId);
+    assert.equal(typeof recovering.recoveryRequestedAt, "string");
+
+    const refused = await acceptHsrMessage({
+      bee: archived.name,
+      text: "do not revive archived work",
+    });
+    assert.equal(refused.ok, false);
+    assert.match(String(refused.error), /archived/);
+    assert.equal((await listMessages(archived.name, "queue")).length, 0);
+  });
+});
+
+test("hsr-control message reports missing cwd as durable UNDELIVERABLE needs-action", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "missing-cwd-message",
+      agent: "codex",
+      cwd: join(tmpdir(), "definitely-missing-hsr-message-cwd-71f23a"),
+      command: "codex",
+      tmuxTarget: "missing-cwd-message",
+      substrate: "hsr",
+      providerSessionId: "thread-missing-cwd",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+    };
+    await saveSession(record);
+
+    const result = await acceptHsrMessage({ bee: record.name, text: "please continue" });
+    assert.equal(result.ok, true);
+    assert.equal(result.accepted, true);
+    assert.equal(result.outcome, "UNDELIVERABLE");
+    assert.equal(result.delivery, "undeliverable");
+    assert.equal((await listMessages(record.name, "queue")).length, 1, "persist-first keeps the exact message queued");
+    assert.equal((await loadSession(record.name))?.recoveryRequestedAt, undefined, "doomed work is explicitly failed, not left in the hot set");
+    const request = (await readBeeRequests(record.name))[0]!;
+    assert.equal(request.kind, "manual-action");
+    assert.equal(request.scope, "bee");
+    assert.equal(request.evidence.detail, "missing-cwd");
+    assert.match(request.question ?? "", /Restore or recreate the working copy/);
+  });
+});
+
+test("hsr-control message skips missing providerSessionId into needs-action without a wake loop", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "missing-provider-message",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "missing-provider-message",
+      substrate: "hsr",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+    };
+    await saveSession(record);
+    const result = await acceptHsrMessage({ bee: record.name, text: "resume this" });
+    assert.equal(result.outcome, "UNDELIVERABLE");
+    assert.equal((await readBeeRequests(record.name))[0]?.evidence.detail, "missing-provider-session");
+    assert.equal((await loadSession(record.name))?.recoveryRequestedAt, undefined);
+  });
+});
+
+test("hsr-control messageId makes client retries idempotent", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "idempotent-message",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "idempotent-message",
+      substrate: "hsr",
+      providerSessionId: "thread-idempotent",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+    };
+    await saveSession(record);
+    const messageId = generateMessageId();
+    const first = await acceptHsrMessage({ bee: record.name, text: "same operation", messageId });
+    const retry = await acceptHsrMessage({ bee: record.name, text: "same operation", messageId });
+    assert.equal(first.messageId, messageId);
+    assert.equal(retry.messageId, messageId);
+    assert.equal(retry.idempotent, true);
+    assert.equal((await listMessages(record.name, "queue")).length, 1);
+
+    const collision = await acceptHsrMessage({ bee: record.name, text: "different operation", messageId });
+    assert.equal(collision.ok, false);
+    assert.match(String(collision.error), /different payload/);
+    assert.equal((await listMessages(record.name, "queue")).length, 1);
   });
 });

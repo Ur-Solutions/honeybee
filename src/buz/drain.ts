@@ -15,6 +15,8 @@ import {
   serializeBuzMessage,
 } from "./storage.js";
 import { formatBuzInjection } from "./inject.js";
+import { classifyBuzDeliveryFailure } from "./errors.js";
+import { clearMessageRecovery } from "./recovery.js";
 import { type BuzMessage, type DaemonDrainContext, type DrainResult } from "../buz.js";
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -85,19 +87,22 @@ export async function processQueueForBee(
       try {
         await context.transport.substrate.sendText(context.transport.tmuxTarget, formatBuzInjection(message), context.transport.agentPaneId);
       } catch (error) {
-        const retriesPath = `${entry.path}.retries`;
-        const prev = Number((await readFile(retriesPath, "utf8").catch(() => "0")).trim()) || 0;
-        const next = prev + 1;
-        await withFileLock(recipientWriteLockPath(record.name), async () => {
-          if (next >= maxFailures) {
-            await mkdir(quarantineDir, { recursive: true });
-            await rename(entry.path, join(quarantineDir, entry.file));
-            await rm(retriesPath, { force: true });
-            result.quarantined.push(entry.file);
-          } else {
-            await atomicWriteFile(retriesPath, String(next), { mode: 0o600 });
-          }
-        });
+        const failureClass = (context.classifyFailure ?? classifyBuzDeliveryFailure)(error);
+        if (failureClass === "delivery-rejected") {
+          const retriesPath = `${entry.path}.retries`;
+          const prev = Number((await readFile(retriesPath, "utf8").catch(() => "0")).trim()) || 0;
+          const next = prev + 1;
+          await withFileLock(recipientWriteLockPath(record.name), async () => {
+            if (next >= maxFailures) {
+              await mkdir(quarantineDir, { recursive: true });
+              await rename(entry.path, join(quarantineDir, entry.file));
+              await rm(retriesPath, { force: true });
+              result.quarantined.push(entry.file);
+            } else {
+              await atomicWriteFile(retriesPath, String(next), { mode: 0o600 });
+            }
+          });
+        }
         result.errors.push({ id: message.id, message: error instanceof Error ? error.message : String(error) });
         await appendLedger({
           type: "buz.deliver",
@@ -105,6 +110,7 @@ export async function processQueueForBee(
           recipient: record.name,
           tier: "queue",
           ok: false,
+          failureClass,
           error: error instanceof Error ? error.message : String(error),
         });
         // Daemon dispatcher: stop after first failure so a broken substrate
@@ -128,6 +134,7 @@ export async function processQueueForBee(
       });
 
       result.delivered.push(message.id);
+      await clearMessageRecovery(record.name, message.id, { resolveRequestBy: "buz-delivery" }).catch(() => undefined);
       await appendLedger({
         type: "buz.deliver",
         messageId: message.id,

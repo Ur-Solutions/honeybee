@@ -6,7 +6,7 @@ import { stat, utimes } from "node:fs/promises";
 import { withFileLock } from "../lock.js";
 import { appendLedger } from "../store.js";
 import { resetTaskSupplyFeedsForHumanInteraction, TASK_SUPPLY_SENDER_NAME } from "../tasks/supplyConfig.js";
-import { generateMessageId } from "./ids.js";
+import { generateMessageId, isUuidV7 } from "./ids.js";
 import { formatBuzInjection } from "./inject.js";
 import { downgradeTier, resolveBuzAccept } from "./policy.js";
 import {
@@ -70,7 +70,10 @@ export async function sendBuzMessage(input: BuzSendInput): Promise<BuzSendResult
     ? { effective: input.tier, downgraded: false as const }
     : downgradeTier(input.tier, accepted);
   const sentAt = new Date().toISOString();
-  const id = generateMessageId();
+  if (input.messageId !== undefined && !isUuidV7(input.messageId)) {
+    throw new Error("buz messageId must be an RFC 9562 UUIDv7");
+  }
+  const id = input.messageId ?? generateMessageId();
   const message: BuzMessage = {
     id,
     from: input.sender,

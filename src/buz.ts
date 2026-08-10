@@ -42,6 +42,7 @@
 // ──────────────────────────────────────────────────────────────────────────
 
 import type { BuzTier } from "./buz_tiers.js";
+import type { BuzDeliveryFailureClass } from "./buz/errors.js";
 import type { SessionRecord } from "./store.js";
 import type { Substrate } from "./substrates/index.js";
 
@@ -84,6 +85,8 @@ export type BuzSendInput = {
   sender: BuzSender;
   tier: BuzTier;
   body: string;
+  /** Optional caller-owned UUIDv7 for idempotent acceptance/retry protocols. */
+  messageId?: string;
   subject?: string;
   transport?: BuzTransportContext;
   node?: string;
@@ -143,6 +146,8 @@ export type DaemonDrainContext = {
    * terminates.
    */
   stopOnFirstFailure?: boolean;
+  /** Override the transport-vs-definite-refusal classifier in tests/adapters. */
+  classifyFailure?: (error: unknown) => BuzDeliveryFailureClass;
 };
 
 export type DrainResult = {
@@ -156,6 +161,7 @@ export type DrainResult = {
 // ──────────────────────────────────────────────────────────────────────────
 
 export { generateMessageId } from "./buz/ids.js";
+export { isUuidV7 } from "./buz/ids.js";
 
 export { BUZ_INJECTION_MARKER, formatBuzInjection, type BuzInjectionMeta } from "./buz/inject.js";
 
@@ -187,3 +193,15 @@ export { sendBuzMessage } from "./buz/send.js";
 export { cancelQueuedBuzMessage } from "./buz/cancel.js";
 
 export { processQueueForBee } from "./buz/drain.js";
+
+export {
+  clearMessageRecovery,
+  openMessageDeliveryRequest,
+  type MessageUndeliverableReason,
+} from "./buz/recovery.js";
+
+export {
+  BuzDeliveryRejectedError,
+  classifyBuzDeliveryFailure,
+  type BuzDeliveryFailureClass,
+} from "./buz/errors.js";

@@ -1,9 +1,8 @@
 // Buz queue dispatcher (tier-B drain).
 //
-// The daemon's only Phase 2 dispatcher: every tick, any bee whose CURRENT
-// observed state is idle_with_output and whose queue/ mailbox is non-empty
-// gets drained — each message is pasted into the tmux pane via the
-// recipient's substrate and the file moved to inbox/ on success.
+// Every tick, queued mail drains into an idle runtime. Runtime recovery is a
+// separate detached dispatcher (buzRecovery.ts): credential activation and
+// provider spawn must never run inline with queue draining or the tick budget.
 //
 // Triggering on the current state (not just the active->idle_with_output
 // transition) matters: a message queued while the recipient is ALREADY idle
@@ -42,6 +41,7 @@ const DEFAULT_BUZ_STALE_SCAN_INTERVAL_MS = 60_000;
 
 export type BuzDispatchTrigger = {
   record: SessionRecord;
+  action: "drain" | "ensure";
   /** The transition that accompanied this tick's observation, if any. */
   transition?: TickTransition;
 };
@@ -103,7 +103,7 @@ export type BuzStalenessDeps = {
 
 /**
  * Stateful daemon-facing dispatcher: normal queue draining plus a throttled
- * scan for old queued mail addressed to a currently live recipient. Warnings
+ * scan for old queued mail. Warnings
  * remain in every TickResult (so daemon status can surface them), while
  * `newlyStale` only fires on an edge/change to avoid log spam.
  */
@@ -124,7 +124,6 @@ export function createBuzDrainDispatcher(
   let lastScanAt = Number.NEGATIVE_INFINITY;
   let warnings: StaleBuzQueue[] = [];
   let previousKeys = new Map<string, string>();
-
   return async (records, transitions, currentStates) => {
     const drained = await dispatchBuzDrains(records, transitions, {
       ...deps,
@@ -135,7 +134,7 @@ export function createBuzDrainDispatcher(
     if (nowMs - lastScanAt >= scanIntervalMs) {
       lastScanAt = nowMs;
       try {
-        warnings = await findStaleBuzQueues(records, currentStates, {
+        warnings = await findStaleBuzQueues(records, {
           now: () => nowMs,
           staleAfterMs,
           mailboxConcurrency: deps.mailboxConcurrency,
@@ -185,7 +184,6 @@ export function createBuzDrainDispatcher(
 
 export async function findStaleBuzQueues(
   records: SessionRecord[],
-  currentStates: ReadonlyMap<string, BeeState>,
   deps: Pick<
     BuzStalenessDeps,
     "now" | "staleAfterMs" | "mailboxConcurrency" | "listQueue"
@@ -196,8 +194,7 @@ export async function findStaleBuzQueues(
   const listQueue =
     deps.listQueue ??
     ((record: SessionRecord) => listMessages(record.name, "queue"));
-  const candidates = records.filter((record) =>
-    buzRecipientIsLive(currentStates.get(record.name) ?? record.lastObservedState));
+  const candidates = records.filter(buzRecipientIsSendable);
   const scanned = await mapWithConcurrency(
     candidates,
     deps.mailboxConcurrency ??
@@ -223,26 +220,15 @@ export async function findStaleBuzQueues(
     .sort((a, b) => b.ageMs - a.ageMs || a.recipient.localeCompare(b.recipient));
 }
 
-function buzRecipientIsLive(state: string | undefined): boolean {
-  switch (state) {
-    case "auth-needed":
-    case "blocked":
-    case "ready":
-    case "active":
-    case "idle_with_output":
-    case "queued":
-    case "booting":
-    case "wedged":
-      return true;
-    default:
-      return false;
-  }
+function buzRecipientIsSendable(record: SessionRecord): boolean {
+  // A live kill_failed runtime can still be working or idle: the failed stop
+  // is diagnostic, not proof of death. The liveness check happens below.
+  return record.status !== "done";
 }
 
 /**
- * Select the bees whose queue/ should be drained this tick: every record
- * whose CURRENT observed state is idle_with_output and whose queue/ mailbox
- * is non-empty.
+ * Select sendable bees with queued mail. Ready/idle runtimes drain directly;
+ * terminal-looking and kill_failed records get one explicit liveness check.
  *
  * The current state is taken from `currentStates` (this tick's derived
  * states) when supplied; otherwise the transition target when the bee
@@ -269,8 +255,14 @@ export async function selectBuzDispatchTriggers(
       : transition
         ? transition.to
         : record.lastObservedState;
-    if (current !== "idle_with_output") continue;
-    candidates.push({ record, ...(transition ? { transition } : {}) });
+    if (!buzRecipientIsSendable(record)) continue;
+    let action: BuzDispatchTrigger["action"] | undefined;
+    if (current === "idle_with_output" || current === "ready") action = "drain";
+    // A seal ends work but does not archive the Bee. Its process may be hot or
+    // cold, so the dispatcher probes before choosing drain/wake.
+    else if (current === "done" || current === "kill_failed") action = "ensure";
+    if (!action) continue;
+    candidates.push({ record, action, ...(transition ? { transition } : {}) });
   }
   const checked = await mapWithConcurrency(candidates, mailboxConcurrency, async (trigger) => (
     await hasQueuedMessages(trigger.record) ? trigger : null
@@ -290,8 +282,8 @@ async function defaultHasQueuedMessages(record: SessionRecord): Promise<boolean>
 }
 
 /**
- * Drain queue/ for every bee currently observed idle_with_output with
- * queued messages. Errors from a single drain do not abort the dispatcher —
+ * Drain every sendable live bee with actionable queued mail. Errors
+ * from a single recipient do not abort the dispatcher —
  * each bee's drain runs independently and any thrown error is captured into
  * the returned outcomes (via a synthetic empty DrainResult with errors[]).
  */
@@ -311,6 +303,12 @@ export async function dispatchBuzDrains(
     const { record } = trigger;
     try {
       const substrate = resolveSubstrate(record);
+      if (trigger.action === "ensure" && !(await substrate.hasSession(record.tmuxTarget))) {
+        return {
+          recipient: record.name,
+          result: { delivered: [], quarantined: [], errors: [] },
+        };
+      }
       const result = await drain(record, {
         transport: { substrate, tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId },
         stopOnFirstFailure: true,
@@ -320,12 +318,13 @@ export async function dispatchBuzDrains(
       });
       return { recipient: record.name, result };
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       return {
         recipient: record.name,
         result: {
           delivered: [],
           quarantined: [],
-          errors: [{ id: record.name, message: error instanceof Error ? error.message : String(error) }],
+          errors: [{ id: record.name, message }],
         },
       };
     }

@@ -7,6 +7,7 @@ import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AuthRecoveryOutcome } from "./authRecovery.js";
 import type { AutoswapOutcome } from "./autoswap.js";
 import type { BuzDispatchOutcome } from "./buzDispatcher.js";
+import type { BuzRecoveryDispatcher, BuzRecoveryOutcome } from "./buzRecovery.js";
 import type { NeedsInputOutcome } from "./needsInput.js";
 import type { RequestReconcileOutcome, RequestReconciler } from "./requestSweep.js";
 import type { TaskSupplyOutcome } from "./taskSupplyDispatcher.js";
@@ -85,6 +86,11 @@ export type TickDeps = {
    * tick and goes stale when its touchSession write failed).
    */
   dispatchBuzDrain?: (records: SessionRecord[], transitions: TickTransition[], currentStates: Map<string, BeeState>) => Promise<BuzDispatchOutcome[]>;
+  /**
+   * Tick-cheap launcher/collector for the detached message-recovery lane.
+   * The implementation owns its 1-2 wake slots; no revive is awaited here.
+   */
+  dispatchBuzRecovery?: BuzRecoveryDispatcher;
   /**
    * Optional task auto-supply dispatcher (agent task lists epic): on the same
    * idle_with_output observation that drains buz queues, feeds the top
@@ -221,6 +227,8 @@ export type DispatcherOutcomes = {
    * was not wired.
    */
   buzDrains: BuzDispatchOutcome[];
+  /** Settled outcomes collected from the detached message-recovery lane. */
+  buzRecoveries: BuzRecoveryOutcome[];
   /**
    * Task auto-supply outcomes: tasks fed to idle bees through the six-
    * condition gate, fed tasks flagged stalled, per-bee errors. Empty when no
@@ -387,8 +395,7 @@ export type TickOptions = {
  * own track in runDaemon, outside the tick path entirely.
  */
 export const tickDispatchers: readonly AnyTickDispatcher[] = [
-  // The buz queue dispatcher drains tier-B messages for any bee that
-  // transitioned into idle_with_output.
+  // The buz queue dispatcher only drains already-live ready runtimes.
   {
     key: "buzDrains",
     name: "dispatchBuzDrain",
@@ -420,6 +427,26 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
             errors: outcome.result.errors.length,
           }
         : null,
+  },
+  // Recovery is a separate detached lane. This stage only collects the prior
+  // settled batch and queues one background sweep (flightSweep pattern).
+  {
+    key: "buzRecoveries",
+    name: "dispatchBuzRecovery",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records }) => deps.dispatchBuzRecovery?.(records),
+    log: (outcome) => outcome.action === "deferred" || outcome.action === "live" || outcome.action === "skipped"
+      ? null
+      : {
+          level: outcome.action === "failed" || outcome.action === "undeliverable" ? "warn" : "info",
+          msg: `buz.recovery.${outcome.action}`,
+          recipient: outcome.recipient,
+          ...(outcome.messageId ? { messageId: outcome.messageId } : {}),
+          ...(outcome.attempt !== undefined ? { attempt: outcome.attempt } : {}),
+          ...(outcome.retryAt ? { retryAt: outcome.retryAt } : {}),
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+          ...(outcome.error ? { error: outcome.error } : {}),
+        },
   },
   // Task auto-supply: feed the top eligible task to each idle bee whose gate
   // opens. MUST follow the buz drain stage — it consumes its outcomes (a tick
@@ -653,6 +680,7 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
   return {
     buzDrains: [],
+    buzRecoveries: [],
     taskSupplies: [],
     requestReconciles: [],
     authRecoveries: [],

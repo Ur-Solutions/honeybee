@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
   BUZ_INJECTION_MARKER,
   BUZ_TIERS,
+  BuzDeliveryRejectedError,
   beeMailboxDir,
   buzRoot,
   consumeMessage,
@@ -284,6 +285,37 @@ test("sendBuzMessage tier=queue stores in queue/ and writes outbox/", async () =
     assert.equal(queue.length, 1);
     const inbox = await readdir(beeMailboxDir("CO.aaa", "inbox")).catch(() => []);
     assert.equal(inbox.length, 0, "queue tier must not write inbox/");
+  });
+});
+
+test("sendBuzMessage preserves a client-supplied UUIDv7 message id", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    const messageId = generateMessageId(1_700_000_000_000);
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "human", name: "apiary" },
+      tier: "queue",
+      body: "idempotent retry payload",
+      messageId,
+    });
+    assert.equal(result.message.id, messageId);
+    assert.equal((await readMessageById(recipient.name, messageId))?.message.id, messageId);
+  });
+});
+
+test("sendBuzMessage rejects a malformed client-supplied message id", async () => {
+  await withTempStore(async () => {
+    await assert.rejects(
+      sendBuzMessage({
+        recipient: makeRecord("CO.aaa"),
+        sender: { kind: "human", name: "apiary" },
+        tier: "queue",
+        body: "bad id",
+        messageId: "not-a-uuid",
+      }),
+      /RFC 9562 UUIDv7/,
+    );
   });
 });
 
@@ -585,13 +617,18 @@ test("processQueueForBee drains queue/ in mtime order and moves to inbox/", asyn
   });
 });
 
-test("processQueueForBee quarantines after 3 substrate failures and keeps draining", async () => {
+test("processQueueForBee quarantines a definite delivery rejection after 3 attempts", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa");
     await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.x" }, tier: "queue", body: "bad" });
 
     let attempts = 0;
-    const sub = fakeSubstrate({ sendText: async () => { attempts += 1; throw new Error("boom"); } });
+    const sub = fakeSubstrate({
+      sendText: async () => {
+        attempts += 1;
+        throw new BuzDeliveryRejectedError("recipient rejected payload");
+      },
+    });
 
     for (let i = 0; i < 3; i += 1) {
       await processQueueForBee(recipient, { transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget }, maxFailures: 3 });
@@ -599,6 +636,31 @@ test("processQueueForBee quarantines after 3 substrate failures and keeps draini
 
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 0);
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "quarantine"))).length, 1);
+    assert.equal(attempts, 3);
+  });
+});
+
+test("processQueueForBee retries transport failures forever without incrementing quarantine state", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.x" }, tier: "queue", body: "offline" });
+    const sub = fakeSubstrate({ sendText: async () => { throw new Error("socket unavailable"); } });
+
+    for (let i = 0; i < 5; i += 1) {
+      const result = await processQueueForBee(recipient, {
+        transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+        maxFailures: 3,
+      });
+      assert.equal(result.errors[0]?.message, "socket unavailable");
+    }
+
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "quarantine")).catch(() => [])).length, 0);
+    assert.equal(
+      (await readdir(beeMailboxDir("CO.aaa", "queue"))).some((file) => file.endsWith(".retries")),
+      false,
+      "transport failures never consume the delivery-rejected retry budget",
+    );
   });
 });
 
