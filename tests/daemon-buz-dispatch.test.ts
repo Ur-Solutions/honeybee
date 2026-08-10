@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
   beeMailboxDir,
   formatBuzInjection,
+  listMessages,
   parseBuzMessage,
   sendBuzMessage,
   type BuzSender,
@@ -16,9 +17,14 @@ import {
   findStaleBuzQueues,
   selectBuzDispatchTriggers,
 } from "../src/daemon/buzDispatcher.js";
+import {
+  createBuzRecoveryDispatcher,
+  runBuzRecoverySweep,
+} from "../src/daemon/buzRecovery.js";
 import { tick, type ProbeResult, type TickDeps, type TickTransition } from "../src/daemon/run.js";
+import { readBeeRequests } from "../src/requests/store.js";
 import type { BeeState } from "../src/state.js";
-import type { SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { Substrate } from "../src/substrates/index.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -148,6 +154,29 @@ test("selectBuzDispatchTriggers skips idle bees with an empty queue", async () =
   assert.equal(triggers.length, 0);
 });
 
+test("selectBuzDispatchTriggers drains ready bees, leaves cold recovery to its own lane, and probes kill_failed liveness", async () => {
+  const ready = makeRecord("ready");
+  const crashed = makeRecord("crashed");
+  const stopFailed = makeRecord("stop-failed", { status: "kill_failed" });
+  const archived = makeRecord("archived", { status: "done" });
+  const current = new Map<string, BeeState>([
+    [ready.name, "ready"],
+    [crashed.name, "crashed"],
+    [stopFailed.name, "kill_failed"],
+    [archived.name, "done"],
+  ]);
+  const triggers = await selectBuzDispatchTriggers(
+    [ready, crashed, stopFailed, archived],
+    [],
+    queueNonEmpty,
+    current,
+  );
+  assert.deepEqual(
+    triggers.map((trigger) => [trigger.record.name, trigger.action]),
+    [["ready", "drain"], ["stop-failed", "ensure"]],
+  );
+});
+
 test("selectBuzDispatchTriggers bounds concurrent mailbox probes", async () => {
   const records = ["alpha", "beta", "gamma", "delta"].map((name) => makeRecord(name, { lastObservedState: "idle_with_output" }));
   let active = 0;
@@ -178,7 +207,7 @@ test("selectBuzDispatchTriggers ignores transitions for unknown records", async 
   assert.equal(triggers.length, 0);
 });
 
-test("findStaleBuzQueues reports old mail only for currently live recipients", async () => {
+test("findStaleBuzQueues reports old mail for sendable hot or cold recipients, never archived ones", async () => {
   const now = Date.parse("2026-07-28T12:00:00.000Z");
   const oldMessage = {
     id: "old",
@@ -189,13 +218,8 @@ test("findStaleBuzQueues reports old mail only for currently live recipients", a
     sentAt: "2026-07-28T11:30:00.000Z",
     body: "stalled",
   };
-  const records = [makeRecord("alpha"), makeRecord("done"), makeRecord("fresh")];
-  const states = new Map<string, BeeState>([
-    ["alpha", "active"],
-    ["done", "done"],
-    ["fresh", "ready"],
-  ]);
-  const warnings = await findStaleBuzQueues(records, states, {
+  const records = [makeRecord("alpha"), makeRecord("cold"), makeRecord("done", { status: "done" }), makeRecord("fresh")];
+  const warnings = await findStaleBuzQueues(records, {
     now: () => now,
     staleAfterMs: 10 * 60_000,
     listQueue: async (record) => {
@@ -208,12 +232,12 @@ test("findStaleBuzQueues reports old mail only for currently live recipients", a
       return [{ message: { ...oldMessage, to: record.name }, path: `/tmp/${record.name}` }];
     },
   });
-  assert.deepEqual(warnings, [{
-    recipient: "alpha",
+  assert.deepEqual(warnings, ["alpha", "cold"].map((recipient) => ({
+    recipient,
     count: 1,
     oldestSentAt: oldMessage.sentAt,
     ageMs: 30 * 60_000,
-  }]);
+  })));
 });
 
 test("createBuzDrainDispatcher keeps stale diagnostics current but logs only their edge", async () => {
@@ -326,6 +350,217 @@ test("dispatchBuzDrains drains a bee that is ALREADY idle when a message lands i
     assert.deepEqual(calls, [formatBuzInjection(sent.message)]);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).filter((f) => f.endsWith(".md")).length, 0);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 1);
+  });
+});
+
+test("dispatchBuzDrains never wakes a cold bee inline", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.cold", {
+      lastObservedState: "crashed",
+      providerSessionId: "thread-1",
+      recoveryRequestedAt: "2026-08-10T00:00:00.000Z",
+    });
+    const sent = await sendBuzMessage({ recipient, sender, tier: "queue", body: "wake up" });
+    const outcomes = await dispatchBuzDrains([recipient], []);
+    assert.deepEqual(outcomes, []);
+    const queued = await listMessages(recipient.name, "queue");
+    assert.deepEqual(queued.map((entry) => entry.message.id), [sent.message.id]);
+  });
+});
+
+test("dispatchBuzDrains keeps draining a live kill_failed bee", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.stop-failed", { status: "kill_failed" });
+    const sent = await sendBuzMessage({ recipient, sender, tier: "queue", body: "still there?" });
+    const outcomes = await dispatchBuzDrains([recipient], [], {
+      currentStates: new Map([[recipient.name, "kill_failed"]]),
+      resolveSubstrate: () => fakeSubstrate({ hasSession: async () => true }),
+    });
+    assert.deepEqual(outcomes[0]?.result.delivered, [sent.message.id]);
+  });
+});
+
+// ─── detached recovery lane ──────────────────────────────────────────────
+
+async function seedRecoveryRecord(
+  name: string,
+  now: number,
+  overrides: Partial<SessionRecord> = {},
+): Promise<SessionRecord> {
+  const base = makeRecord(name, {
+    status: "dead",
+    lastObservedState: "crashed",
+    providerSessionId: `thread-${name}`,
+    ...overrides,
+  });
+  const sent = await sendBuzMessage({ recipient: base, sender, tier: "queue", body: `recover ${name}` });
+  const record = {
+    ...base,
+    recoveryRequestedAt: new Date(now).toISOString(),
+    recoveryMessageId: sent.message.id,
+    recoveryAttemptCount: 0,
+  };
+  await saveSession(record);
+  return record;
+}
+
+test("runBuzRecoverySweep persists backoff across sweeps and opens needs-action after the cap", async () => {
+  await withTempStore(async () => {
+    let now = Date.parse("2026-08-10T12:00:00.000Z");
+    const record = await seedRecoveryRecord("CO.retry-wake", now);
+    let wakes = 0;
+    const deps = {
+      now: () => now,
+      maxFailures: 3,
+      isLive: async () => false,
+      assertCwd: async () => undefined,
+      wakeRecipient: async () => {
+        wakes += 1;
+        throw new Error("credential service unavailable");
+      },
+    };
+
+    const first = await runBuzRecoverySweep([record], deps);
+    assert.equal(first[0]?.action, "failed");
+    assert.equal(first[0]?.attempt, 1);
+    assert.equal(wakes, 1);
+    const afterFirst = (await loadSession(record.name))!;
+    assert.equal(afterFirst.recoveryAttemptCount, 1);
+
+    const deferred = await runBuzRecoverySweep([afterFirst], deps);
+    assert.equal(deferred[0]?.action, "deferred");
+    assert.equal(wakes, 1);
+
+    now = Date.parse(afterFirst.recoveryNextAttemptAt!);
+    const second = await runBuzRecoverySweep([afterFirst], deps);
+    assert.equal(second[0]?.attempt, 2);
+    const afterSecond = (await loadSession(record.name))!;
+    now = Date.parse(afterSecond.recoveryNextAttemptAt!);
+    const exhausted = await runBuzRecoverySweep([afterSecond], deps);
+    assert.equal(exhausted[0]?.action, "undeliverable");
+    assert.equal(exhausted[0]?.reason, "wake-retry-exhausted");
+    assert.equal(wakes, 3);
+
+    const settled = (await loadSession(record.name))!;
+    assert.equal(settled.recoveryRequestedAt, undefined);
+    assert.equal(settled.recoveryMessageId, undefined);
+    const request = (await readBeeRequests(record.name)).find((candidate) => candidate.status === "open");
+    assert.equal(request?.kind, "manual-action");
+    assert.equal(request?.scope, "bee");
+    assert.equal(request?.evidence.detail, "wake-retry-exhausted");
+  });
+});
+
+test("runBuzRecoverySweep age-gates old cold mail instead of mass-reviving it", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-10T12:00:00.000Z");
+    const record = await seedRecoveryRecord("CO.old-mail", now - 60 * 60_000);
+    let wakes = 0;
+    const outcomes = await runBuzRecoverySweep([record], {
+      now: () => now,
+      maxRequestAgeMs: 10 * 60_000,
+      isLive: async () => false,
+      assertCwd: async () => undefined,
+      wakeRecipient: async (candidate) => {
+        wakes += 1;
+        return candidate;
+      },
+    });
+    assert.equal(wakes, 0);
+    assert.equal(outcomes[0]?.action, "undeliverable");
+    assert.equal(outcomes[0]?.reason, "recovery-request-expired");
+    assert.equal((await readBeeRequests(record.name))[0]?.evidence.detail, "recovery-request-expired");
+  });
+});
+
+test("runBuzRecoverySweep treats missing providerSessionId as a one-shot undeliverable skip", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-10T12:00:00.000Z");
+    const record = await seedRecoveryRecord("CO.no-provider", now, { providerSessionId: undefined });
+    let wakes = 0;
+    const outcomes = await runBuzRecoverySweep([record], {
+      now: () => now,
+      isLive: async () => false,
+      assertCwd: async () => undefined,
+      wakeRecipient: async (candidate) => {
+        wakes += 1;
+        return candidate;
+      },
+    });
+    assert.equal(wakes, 0);
+    assert.equal(outcomes[0]?.reason, "missing-provider-session");
+    assert.equal((await loadSession(record.name))?.recoveryRequestedAt, undefined);
+    assert.equal((await readBeeRequests(record.name)).length, 1);
+  });
+});
+
+test("runBuzRecoverySweep turns a now-dead kill_failed delivery into needs-action", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-10T12:00:00.000Z");
+    const record = await seedRecoveryRecord("CO.stopped-after-accept", now, { status: "kill_failed" });
+    const outcomes = await runBuzRecoverySweep([record], {
+      now: () => now,
+      isLive: async () => false,
+    });
+    assert.equal(outcomes[0]?.action, "undeliverable");
+    assert.equal(outcomes[0]?.reason, "archive-unresolved");
+    assert.equal((await readBeeRequests(record.name))[0]?.evidence.detail, "archive-unresolved");
+  });
+});
+
+test("runBuzRecoverySweep limits provider wakes to its own concurrency", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-10T12:00:00.000Z");
+    const records = await Promise.all([
+      seedRecoveryRecord("CO.wake-a", now),
+      seedRecoveryRecord("CO.wake-b", now),
+      seedRecoveryRecord("CO.wake-c", now),
+      seedRecoveryRecord("CO.wake-d", now),
+    ]);
+    let active = 0;
+    let maxActive = 0;
+    const outcomes = await runBuzRecoverySweep(records, {
+      now: () => now,
+      concurrency: 2,
+      isLive: async () => false,
+      assertCwd: async () => undefined,
+      wakeRecipient: async (candidate) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        active -= 1;
+        return candidate;
+      },
+    });
+    assert.equal(maxActive, 2);
+    assert.ok(outcomes.every((outcome) => outcome.action === "started"));
+  });
+});
+
+test("createBuzRecoveryDispatcher queues wake work off the tick-facing call", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-10T12:00:00.000Z");
+    const record = await seedRecoveryRecord("CO.detached", now);
+    const jobs: Array<() => Promise<void>> = [];
+    let wakes = 0;
+    const dispatcher = createBuzRecoveryDispatcher({
+      now: () => now,
+      isLive: async () => false,
+      assertCwd: async () => undefined,
+      wakeRecipient: async (candidate) => {
+        wakes += 1;
+        return candidate;
+      },
+      startBackground: (job) => jobs.push(job),
+    });
+
+    assert.deepEqual(await dispatcher([record]), []);
+    assert.equal(wakes, 0, "tick-facing call only schedules work");
+    assert.equal(jobs.length, 1);
+    await jobs[0]!();
+    const report = await dispatcher([]);
+    assert.equal(report[0]?.action, "started");
+    assert.equal(wakes, 1);
   });
 });
 
@@ -472,6 +707,21 @@ test("dispatchBuzDrains: next tick retries a previously failed message while the
     assert.equal(outcomes[0]!.result.delivered.length, 1);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).filter((f) => f.endsWith(".md")).length, 0);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 1);
+  });
+});
+
+test("daemon delivery never quarantines a valid message for transient runtime failures", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.retry", { lastObservedState: "idle_with_output" });
+    await sendBuzMessage({ recipient, sender, tier: "queue", body: "must survive recovery" });
+    const substrate = fakeSubstrate({ sendText: async () => { throw new Error("runner unavailable"); } });
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await dispatchBuzDrains([recipient], [], { resolveSubstrate: () => substrate });
+    }
+
+    assert.equal((await listMessages(recipient.name, "queue")).length, 1);
+    assert.equal((await listMessages(recipient.name, "quarantine")).length, 0);
   });
 });
 

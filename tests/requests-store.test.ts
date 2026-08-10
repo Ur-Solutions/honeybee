@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { pendingNeedsInputFromEvents, structuredStateFromEvents, type HsrEventSnapshot } from "../src/hsr/observe.js";
 import type { RunnerEvent } from "../src/hsr/types.js";
-import { authRequestId, needsInputRequestId, stopFailedRequestId } from "../src/requests/keys.js";
+import { authRequestId, messageDeliveryRequestId, needsInputRequestId, stopFailedRequestId } from "../src/requests/keys.js";
 import {
   cancelOpenRequests,
   cancelRequest,
@@ -273,11 +273,20 @@ test("cancelOpenRequests beforeGeneration cancels strictly-older generations onl
 test("closeRequestsForNewIncarnation cancels superseded with the generation-stamped detail", async () => {
   await withTempStore(async () => {
     await openRequest("bee1", input({ id: "old", generation: 1 }));
+    await openRequest("bee1", input({ id: "delivery", generation: 1, kind: "manual-action", scope: "bee" }));
     const cancelled = await closeRequestsForNewIncarnation("bee1", 2);
     assert.equal(cancelled.length, 1);
     assert.equal(cancelled[0]!.cancelReason, "superseded");
     assert.equal(cancelled[0]!.cancelDetail, "superseded by generation 2");
+    assert.equal((await readBeeRequests("bee1")).find((request) => request.id === "delivery")?.status, "open");
   });
+});
+
+test("messageDeliveryRequestId is stable and bee scoped", () => {
+  assert.equal(
+    messageDeliveryRequestId("CO.abc", "019c0000-0000-7000-8000-000000000001"),
+    "manual:CO.abc:message-delivery:019c0000-0000-7000-8000-000000000001",
+  );
 });
 
 // ---------------------------------------------------------------------------

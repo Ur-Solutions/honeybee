@@ -25,6 +25,15 @@ test("crashed: tmux target is not live and the record was never retired", () => 
   assert.equal(result.state, "crashed");
 });
 
+test("a durable recovery request projects queued instead of flashing crashed", () => {
+  const result = deriveState(bee({
+    recoveryRequestedAt: "2026-05-28T11:59:00.000Z",
+    recoveryMessageId: "019fe9d1-2dd4-76dc-ba45-a26b675617c9",
+  }), { liveTargets: new Set(), now: NOW });
+  assert.equal(result.state, "queued");
+  assert.match(result.detail, /recovery requested/);
+});
+
 test("dead: tmux target is not live and the record is explicitly marked dead", () => {
   const result = deriveState(bee({ status: "dead" }), { liveTargets: new Set(), now: NOW });
   assert.equal(result.state, "dead");

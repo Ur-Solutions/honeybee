@@ -112,7 +112,9 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
   //    trailing needs_input is resolved, hence NOT open.
   const stored = sources.storedRequests ?? [];
   const storedIds = new Set(stored.map((request) => request.id));
-  const openStored = stored.filter((request) => request.status === "open" && request.generation === generation);
+  const openStored = stored.filter((request) =>
+    request.status === "open" &&
+    (request.scope === "bee" || request.generation === generation));
   for (const request of openStored) requests.push(storedRequestView(request));
   const storedNeedsReplyOpen = openStored.some((request) => request.kind === "question" || request.kind === "permission");
   const storedAuthOpen = openStored.some((request) => request.kind === "auth");

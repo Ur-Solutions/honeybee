@@ -231,6 +231,44 @@ test("child birth capture failure rolls back the live ChildProcess and never pub
   });
 });
 
+test("adapter failure before spawn publishes a safe cause and completed no-child admission", async () => {
+  await withTempStore(async () => {
+    const bee = "adapter-start-failure";
+    await assert.rejects(
+      runHsrHost({
+        bee,
+        adapter: {
+          harness: "stub",
+          tier: () => "stream",
+          async start() {
+            throw Object.assign(new Error("spawn secret-command ENOENT"), { code: "ENOENT" });
+          },
+        },
+        opts: opts(bee),
+        processBirthCapture: {
+          timeoutMs: 0,
+          capture: async (pid) => ({ pgid: pid, startedAt: `test-birth:${pid}` }),
+        },
+        formatStartupFailure: () => ({
+          stage: "adapter-start",
+          code: "ENOENT",
+          message: "HSR harness executable could not be started",
+        }),
+      }),
+      /spawn secret-command ENOENT/,
+    );
+
+    const meta = await readHsrMetaStrict(bee);
+    assert.equal(meta?.status, "exited");
+    assert.equal(meta?.childAdmission, "none");
+    assert.deepEqual(meta?.startupFailure, {
+      stage: "adapter-start",
+      code: "ENOENT",
+      message: "HSR harness executable could not be started",
+    });
+  });
+});
+
 test("host birth capture failure starts no adapter and publishes no runtime metadata", async () => {
   await withTempStore(async () => {
     const bee = "host-capture-failure";

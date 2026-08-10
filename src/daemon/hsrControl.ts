@@ -68,6 +68,152 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Durable user-level message acceptance, independent of aggregate RPC I/O. */
+export async function acceptHsrMessage(params: {
+  bee: string;
+  text: string;
+  sender?: string;
+  subject?: string;
+  messageId?: string;
+}): Promise<Record<string, unknown>> {
+  if (!params.bee) return { ok: false, error: "bee required" };
+  if (!params.text.trim()) return { ok: false, error: "message text required" };
+  const { resolveSession } = await import("../cli/shared.js");
+  const record = await resolveSession(params.bee);
+  const [
+    {
+      isUuidV7,
+      openMessageDeliveryRequest,
+      readMessageById,
+      sanitizeHumanName,
+      sendBuzMessage,
+    },
+    { substrateFor },
+    { withSessionLifecycleTransaction },
+    { assertReviveWorkingDirectory },
+  ] = await Promise.all([
+    import("../buz.js"),
+    import("../substrates/index.js"),
+    import("../lifecycle.js"),
+    import("../commands/migrate.js"),
+  ]);
+  if (params.messageId !== undefined && !isUuidV7(params.messageId)) {
+    return { ok: false, error: "messageId must be an RFC 9562 UUIDv7" };
+  }
+  const senderName = sanitizeHumanName(params.sender ?? "apiary");
+  return withSessionLifecycleTransaction(record, async (lifecycle) => {
+    const current = await lifecycle.refresh();
+    if (current.status === "done") {
+      return { ok: false, error: `${current.name} is archived` };
+    }
+
+    const substrate = substrateFor(current);
+    const live = await substrate.hasSession(current.tmuxTarget).catch(() => false);
+    if (current.status === "kill_failed" && !live) {
+      return { ok: false, error: `${current.name} is archived (stop state unresolved)` };
+    }
+
+    let cwdUnavailable = false;
+    try {
+      await assertReviveWorkingDirectory(current);
+    } catch {
+      cwdUnavailable = true;
+    }
+    const missingProviderSession = !live && !current.providerSessionId;
+
+    let existing: Awaited<ReturnType<typeof readMessageById>> = null;
+    if (params.messageId) {
+      existing = await readMessageById(current.name, params.messageId);
+      if (existing) {
+        const samePayload = existing.message.to === current.name &&
+          existing.message.body === params.text &&
+          existing.message.subject === params.subject &&
+          existing.message.from.kind === "human" &&
+          existing.message.from.name === senderName;
+        if (!samePayload) {
+          return { ok: false, error: `messageId ${params.messageId} is already used with a different payload` };
+        }
+      }
+    }
+
+    const sent = existing
+      ? { message: existing.message }
+      : await sendBuzMessage({
+          recipient: current,
+          sender: { kind: "human", name: senderName },
+          // Known-undeliverable work is still persisted first, but must not
+          // make a doomed live transport attempt before needs-action is durable.
+          tier: cwdUnavailable || missingProviderSession ? "queue" : "next-tool",
+          body: params.text,
+          ...(params.messageId ? { messageId: params.messageId } : {}),
+          ...(params.subject ? { subject: params.subject } : {}),
+          ...(cwdUnavailable || missingProviderSession
+            ? {}
+            : {
+                transport: {
+                  substrate,
+                  tmuxTarget: current.tmuxTarget,
+                  agentPaneId: current.agentPaneId,
+                },
+              }),
+          ...(current.node ? { node: current.node } : {}),
+        });
+
+    const messageId = sent.message.id;
+    const existingDelivery = existing?.mailbox === "inbox" || existing?.mailbox === "read";
+    if (sent.message.deliveredAt || existingDelivery) {
+      return {
+        ok: true,
+        accepted: true,
+        messageId,
+        delivery: "delivered",
+        ...(existing ? { idempotent: true } : {}),
+      };
+    }
+
+    const undeliverableReason = cwdUnavailable
+      ? "missing-cwd" as const
+      : missingProviderSession
+        ? "missing-provider-session" as const
+        : existing?.mailbox === "quarantine"
+          ? "queued-message-missing" as const
+          : undefined;
+    if (undeliverableReason) {
+      const requestId = await openMessageDeliveryRequest(current, messageId, undeliverableReason);
+      return {
+        ok: true,
+        accepted: true,
+        messageId,
+        delivery: "undeliverable",
+        outcome: "UNDELIVERABLE",
+        requestId,
+        ...(existing ? { idempotent: true } : {}),
+      };
+    }
+
+    if (current.recoveryMessageId !== messageId) {
+      // The queue file is already durable. This separate first-class fact is
+      // the daemon work-set obligation; it changes neither lifecycle status
+      // nor the last state actually observed from the runtime.
+      await lifecycle.refresh();
+      await lifecycle.commit({
+        recoveryRequestedAt: new Date().toISOString(),
+        recoveryMessageId: messageId,
+        recoveryAttemptCount: 0,
+        recoveryNextAttemptAt: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    return {
+      ok: true,
+      accepted: true,
+      messageId,
+      delivery: "queued",
+      ...(existing ? { idempotent: true } : {}),
+    };
+  });
+}
+
 export async function startHsrControlServer(opts?: {
   socketPath?: string;
   /** Execution-protocol coordinator override (tests inject fakes). */
@@ -143,7 +289,8 @@ export async function startHsrControlServer(opts?: {
     // spawnEnv:1 = the optional env object accepted by spawn (validated, then
     // forwarded as repeated --env). spawnParent:1 = authenticated hosts may
     // pass top-level spawnedById; generic flags/env cannot set lineage.
-    // fork:1/handoff:1 = in-process
+    // message:1 = durable user-level send; accepts before runtime recovery and
+    // rejects only an archived/destroyed bee. fork:1/handoff:1 = in-process
     // cmdFork/cmdHandoff (session-fork-and-handoff epic). An older daemon
     // rejects unknown methods outright, which reads as "CLI fallback".
     // execution:1 = the contracts/execution/v1 protocol methods
@@ -158,6 +305,7 @@ export async function startHsrControlServer(opts?: {
       spawn: 2,
       spawnEnv: 1,
       spawnParent: 1,
+      message: 1,
       fork: 1,
       handoff: 1,
       execution: 1,
@@ -186,6 +334,22 @@ export async function startHsrControlServer(opts?: {
         });
       }
       return rows;
+    }),
+
+    // Product-level messaging boundary for Apiary. Unlike the raw `send`
+    // proxy below, this records the message durably before it depends on a
+    // runner. A cold active-lifecycle bee therefore returns acceptance and the
+    // daemon queue dispatcher revives it; harness/substrate states stay out of
+    // the client contract.
+    message: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; text?: unknown; sender?: unknown; subject?: unknown; messageId?: unknown };
+      return acceptHsrMessage({
+        bee: String(p.bee ?? ""),
+        text: String(p.text ?? ""),
+        ...(typeof p.sender === "string" ? { sender: p.sender } : {}),
+        ...(typeof p.subject === "string" ? { subject: p.subject } : {}),
+        ...(typeof p.messageId === "string" ? { messageId: p.messageId } : {}),
+      });
     }),
 
     send: guarded(async (params) => {

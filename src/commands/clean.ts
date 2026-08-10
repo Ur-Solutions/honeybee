@@ -130,7 +130,10 @@ export async function cmdCleanDead(parsed: Parsed) {
   }
 
   for (const record of dead) {
-    await purgeSessionData(record);
+    // Selection happened before the lifecycle lock. Re-check the authoritative
+    // record under that lock so an accept op that won the race cannot lose its
+    // queued message and session metadata to this stale dead snapshot.
+    if (!await purgeSessionData(record, { preserveRecoveryRequest: true })) continue;
     if (isPretty()) console.log(actionLine("ok", "clean", [bold(record.name), record.agent, dim(tildify(record.cwd))]));
     else console.log(`cleaned\t${record.name}`);
   }

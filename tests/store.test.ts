@@ -71,6 +71,7 @@ test("active-session policy keeps recoverable daemon work and excludes settled h
   assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "error" }), true, "provider errors can recover");
   assert.equal(isActiveSessionRecord({ ...record, status: "kill_failed", lastObservedState: "kill_failed" }), true, "unconfirmed teardown remains observable");
   assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "crashed" }), false);
+  assert.equal(isActiveSessionRecord({ ...record, status: "dead", lastObservedState: "crashed", recoveryRequestedAt: "2026-08-10T00:00:00.000Z" }), true, "durable recovery stays daemon-visible");
   assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "done" }), false, "completed current turn leaves the hot set");
   assert.equal(isActiveSessionRecord({ ...record, lastObservedState: "sealed" }), false);
   assert.equal(isActiveSessionRecord({ ...record, status: "dead" }), false);
@@ -157,6 +158,25 @@ test("active index follows crash, sealed-turn re-prompt, retire, and revive boun
     await touchSession(record.name, { lastObservedState: "crashed", lastObservedStateAt: "2026-05-28T00:01:00.000Z" });
     assert.deepEqual(await listActiveSessions(), [], "crash is retained but leaves daemon hot paths");
     assert.equal((await loadSession(record.name))?.lastObservedState, "crashed", "history remains explicitly readable");
+
+    await updateSession(record.name, {
+      recoveryRequestedAt: "2026-05-28T00:01:01.000Z",
+      recoveryMessageId: "019c0000-0000-7000-8000-000000000001",
+      recoveryAttemptCount: 1,
+      recoveryNextAttemptAt: "2026-05-28T00:01:06.000Z",
+    });
+    assert.deepEqual((await listActiveSessions()).map((item) => item.name), [record.name], "recovery request re-enters the hot index without changing observed state");
+    const recovering = await loadSession(record.name);
+    assert.equal(recovering?.status, "running");
+    assert.equal(recovering?.lastObservedState, "crashed");
+
+    await updateSession(record.name, {
+      recoveryRequestedAt: undefined,
+      recoveryMessageId: undefined,
+      recoveryAttemptCount: undefined,
+      recoveryNextAttemptAt: undefined,
+    });
+    assert.deepEqual(await listActiveSessions(), [], "explicitly resolved recovery leaves terminal history cold again");
 
     await updateSession(record.name, { status: "running", lastObservedState: undefined, lastObservedStateAt: undefined });
     assert.deepEqual((await listActiveSessions()).map((item) => item.name), [record.name], "revive re-enters the index");

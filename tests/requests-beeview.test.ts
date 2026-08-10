@@ -136,6 +136,22 @@ test("daemon-down fallback: with NO store record the live derivation still opens
   assert.equal(view.displayState, "needs-reply");
 });
 
+test("an exited runtime still projects a bee-scoped undeliverable-message request", () => {
+  const rec = record({ status: "dead", runtimeGeneration: 4 });
+  const request = storedRecord({
+    id: "manual:bee1:message-delivery:019fe9d1-2dd4-76dc-ba45-a26b675617c9",
+    kind: "manual-action",
+    scope: "bee",
+    generation: 3,
+    question: "Restore the working copy, then retry delivery.",
+    evidence: { grade: "structured", source: "buz-recovery", detail: "missing-cwd" },
+  });
+  const view = projectBeeView({ record: rec, context: { liveTargets: new Set(), now: NOW }, storedRequests: [request], now: NOW });
+  assert.equal(view.latestRuntime.state, "exited");
+  assert.equal(view.displayState, "needs-action");
+  assert.equal(view.openRequests[0]?.id, request.id);
+});
+
 const PERMISSION_PANE = [
   "tool output scrolls above",
   "Do you want to proceed?",

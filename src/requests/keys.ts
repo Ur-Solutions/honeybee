@@ -33,3 +33,8 @@ export function authPromptLossRequestId(bee: string, generation: number, eventTs
 export function stopFailedRequestId(bee: string, generation: number): string {
   return `manual:${bee}:${generation}:stop-failed`;
 }
+
+/** Bee-scoped manual action: one durably accepted buz message is undeliverable. */
+export function messageDeliveryRequestId(bee: string, messageId: string): string {
+  return `manual:${bee}:message-delivery:${messageId}`;
+}

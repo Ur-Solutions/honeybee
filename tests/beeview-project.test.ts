@@ -185,6 +185,14 @@ for (const row of rows) {
   test(`displayState precedence: ${row.label}`, () => {
     const view = project(row.sources());
     assert.equal(view.displayState, row.displayState);
+    assert.equal(
+      view.interactionState,
+      row.displayState === "retired"
+        ? "archived"
+        : row.displayState === "working"
+          ? "working"
+          : "idle",
+    );
     assert.equal(view.compatibilityFields.beeState, row.beeState);
     // The reason names the precedence rule that fired.
     assert.ok(view.displayStateReason.startsWith(row.displayState), `reason "${view.displayStateReason}" names ${row.displayState}`);
@@ -197,6 +205,32 @@ for (const row of rows) {
     if (view.latestContractResult) assert.ok(view.latestContractResult.evidence.grade);
   });
 }
+
+test("a live kill_failed bee stays idle when no turn is running", () => {
+  const rec = record({ status: "kill_failed", lastError: "tmux kill failed" });
+  const view = project({ record: rec, context: liveCtx(rec) });
+  assert.equal(view.displayState, "stop-failed");
+  assert.equal(view.interactionState, "idle");
+});
+
+test("a live kill_failed bee stays working while its turn is running", () => {
+  const rec = record({
+    status: "kill_failed",
+    lastError: "tmux kill failed",
+    lastPrompt: "keep going",
+    lastPromptAt: iso(NOW - 5_000),
+  });
+  const view = project({ record: rec, context: liveCtx(rec) });
+  assert.equal(view.displayState, "stop-failed");
+  assert.equal(view.interactionState, "working");
+});
+
+test("an exited kill_failed bee maps to archived by liveness", () => {
+  const rec = record({ status: "kill_failed", lastError: "tmux kill failed" });
+  const view = project({ record: rec, context: ctx() });
+  assert.equal(view.displayState, "stop-failed");
+  assert.equal(view.interactionState, "archived");
+});
 
 // ---------------------------------------------------------------------------
 // Deliberate divergences from deriveState.
@@ -328,6 +362,19 @@ test("crashed without mid-turn evidence has no fabricated turn result", () => {
   const view = project({ record: record({ lastObservedState: "idle_with_output" }), context: ctx() });
   assert.equal(view.displayState, "crashed");
   assert.equal(view.latestTurnResult, undefined);
+});
+
+test("accepted cold mail projects starting without fabricating a runtime observation", () => {
+  const rec = record({
+    recoveryRequestedAt: iso(NOW - 5_000),
+    recoveryMessageId: "019fe9d1-2dd4-76dc-ba45-a26b675617c9",
+  });
+  const view = project({ record: rec, context: ctx() });
+  assert.equal(view.displayState, "starting");
+  assert.equal(view.latestRuntime.state, "starting");
+  assert.equal(view.latestRuntime.evidence.source, "session-record");
+  assert.equal(view.interactionState, "idle");
+  assert.equal(rec.lastObservedState, undefined);
 });
 
 // ---------------------------------------------------------------------------

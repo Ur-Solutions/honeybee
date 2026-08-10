@@ -14,6 +14,7 @@ import { createAutoTitleDispatcher } from "./autoTitle.js";
 import { createAuthRecoveryDispatcher } from "./authRecovery.js";
 import { dispatchAutoswaps } from "./autoswap.js";
 import { createBuzDrainDispatcher } from "./buzDispatcher.js";
+import { createBuzRecoveryDispatcher } from "./buzRecovery.js";
 import { createNeedsInputDispatcher } from "./needsInput.js";
 import { createRequestReconciler } from "./requestSweep.js";
 import { createTaskSupplyDispatcher } from "./taskSupplyDispatcher.js";
@@ -131,6 +132,7 @@ export function buildDefaultDeps(): TickDeps {
     refreshTranscriptMetadata,
     appendLedger,
     dispatchBuzDrain,
+    dispatchBuzRecovery: createBuzRecoveryDispatcher(),
     dispatchTaskSupply: createTaskSupplyDispatcher(),
     reconcileRequests: createRequestReconciler(),
     recoverAuthNeeded: createAuthRecoveryDispatcher(),

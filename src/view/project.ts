@@ -81,9 +81,10 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
 
   const bee = projectBee(record, nodeName);
   const latestRuntime = projectRuntime(record, context, derived, { generation, unreachable, held });
-  // Scope closure is inherent: a retired bee or an exited runtime has no open
-  // requests — re-derivation from current evidence closes them naturally.
-  const openRequests = bee.lifecycle === "retired" || latestRuntime.state === "exited"
+  // Runtime-generation and turn requests close with an exited generation.
+  // Bee-scoped manual actions (for example an undeliverable accepted message)
+  // deliberately survive runtime exit and remain renderable until resolved.
+  const derivedRequests = bee.lifecycle === "retired"
     ? []
     : deriveOpenRequests({
         record,
@@ -94,6 +95,9 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
         ...(sources.storedRequests ? { storedRequests: sources.storedRequests } : {}),
         now: nowMs,
       });
+  const openRequests = latestRuntime.state === "exited"
+    ? derivedRequests.filter((request) => request.scope === "bee")
+    : derivedRequests;
   // Closed history (resolved/cancelled), newest first, capped at 5 — shown
   // for retired bees too (retire keeps the request file on purpose).
   const recentClosedRequests = (sources.storedRequests ?? [])
@@ -135,6 +139,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
     ...(latestTurnResult ? { latestTurnResult } : {}),
     ...(latestContractResult ? { latestContractResult } : {}),
     inboxSummary,
+    interactionState: interactionStateFor(record, context, derived, latestRuntime),
     displayState,
     displayStateReason,
     observationFreshness: projectFreshness(sources, derived, { unreachable, held, hiveStateOption, nowMs }),
@@ -251,6 +256,18 @@ function projectRuntime(
     // under the recorded stop intent.
     if (live) return { ...base, state: "online", stopFailed: true, evidence };
     return { ...base, state: "exited", exitClass: "stopped", stopFailed: true, evidence };
+  }
+  if (!live && record.recoveryRequestedAt) {
+    return {
+      ...base,
+      state: "starting",
+      evidence: {
+        grade: "structured",
+        source: "session-record",
+        observedAt: record.recoveryRequestedAt,
+        detail: "durable message recovery requested",
+      },
+    };
   }
   if (!live) {
     return {
@@ -482,6 +499,25 @@ function chooseDisplayState(facts: {
 
 function derivedMeansRunningTurn(state: BeeState): boolean {
   return state === "active";
+}
+
+function interactionStateFor(
+  record: SessionRecord,
+  context: StateContext,
+  derived: DerivedState,
+  runtime: BeeViewRuntime,
+): BeeViewV1["interactionState"] {
+  if (record.status === "done") return "archived";
+  if (record.status !== "kill_failed") {
+    return derivedMeansRunningTurn(derived.state) ? "working" : "idle";
+  }
+
+  // kill_failed records encode unresolved stop intent, not runtime death. A
+  // positive liveness probe keeps the bee interactive; re-derive without the
+  // diagnostic status override so a still-running turn remains `working`.
+  if (runtime.state === "exited") return "archived";
+  const liveState = deriveState({ ...record, status: "running" }, context);
+  return derivedMeansRunningTurn(liveState.state) ? "working" : "idle";
 }
 
 function projectFreshness(

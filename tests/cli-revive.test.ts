@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { assertReviveWorkingDirectory } from "../src/commands/migrate.js";
 import { ensureHsrRunDir, hsrControlSocketPath, readHsrMeta, writeHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
@@ -166,6 +167,14 @@ test("revive refuses ambiguous resume without a provider session id", { skip: !t
     );
     assert.equal(await hasSession("CO-no-session"), false, "revive must not launch an ambiguous latest-session resume");
   });
+});
+
+test("revive rejects a missing working directory before launching a runtime", async () => {
+  const missing = join(tmpdir(), "definitely-missing-hive-revive-cwd-71f23a");
+  await assert.rejects(
+    assertReviveWorkingDirectory({ name: "CO.missing-cwd", cwd: missing }),
+    /working directory for CO\.missing-cwd no longer exists.*restore or recreate the working copy/,
+  );
 });
 
 test("revive --session resumes and persists the exact provider session id", { skip: !tmuxAvailable() }, async () => {

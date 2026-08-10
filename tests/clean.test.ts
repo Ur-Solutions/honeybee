@@ -32,6 +32,12 @@ test("deadSessionRecords does not let a same-named session on another node prote
   assert.deepEqual(deadSessionRecords([localDead, remoteLive], live).map((record) => record.name), ["CO.aaa"]);
 });
 
+test("deadSessionRecords protects an accepted message until recovery resolves", () => {
+  const recovering = session("CO.recovering", "CO-recovering");
+  recovering.recoveryRequestedAt = "2026-08-10T00:00:00.000Z";
+  assert.deepEqual(deadSessionRecords([recovering], new Set()), []);
+});
+
 test("olderThanMillis filters by last update age", () => {
   const now = Date.parse("2026-05-28T12:00:00.000Z");
   const fresh = session("fresh", "fresh-target");

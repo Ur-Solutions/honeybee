@@ -103,6 +103,12 @@ export type HsrMeta = {
   childFingerprint?: ProcessBirthFingerprint;
   /** Durable outcome of the adapter's child-spawn admission. */
   childAdmission?: "pending" | "none" | "admitted";
+  /**
+   * Secret-scrubbed reason an adapter failed before reaching runnable state.
+   * The detached parent cannot safely recover this from host.log, whose raw
+   * provider diagnostics may contain credentials or payload-derived paths.
+   */
+  startupFailure?: HsrStartupFailure;
   startedAt: string; // ISO — detached host startup (includes any queued/starting wait)
   /** Set when this host entered the bounded Codex cold-start queue. */
   queuedAt?: string;
@@ -143,6 +149,20 @@ export type HsrMeta = {
    */
   mirrorOfNode?: string;
 };
+
+export type HsrStartupFailure = {
+  stage: "adapter-start";
+  message: string;
+  code?: string;
+};
+
+function validHsrStartupFailure(value: unknown): value is HsrStartupFailure {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const failure = value as Record<string, unknown>;
+  return failure.stage === "adapter-start" &&
+    typeof failure.message === "string" && failure.message.length > 0 &&
+    (failure.code === undefined || typeof failure.code === "string");
+}
 
 /** mkdir -p the run dir (owner-only). */
 export async function ensureHsrRunDir(bee: string): Promise<void> {
@@ -244,6 +264,7 @@ export async function readHsrMeta(bee: string): Promise<HsrMeta | null> {
       object.childAdmission !== "none" &&
       object.childAdmission !== "admitted"
     ) return null;
+    if (object.startupFailure !== undefined && !validHsrStartupFailure(object.startupFailure)) return null;
     const hasChildIdentity = hasChildPid || object.childFingerprint !== undefined;
     if (object.childAdmission === "admitted" && (!hasChildPid || !validFingerprint(object.childFingerprint))) return null;
     if ((object.childAdmission === "pending" || object.childAdmission === "none") && hasChildIdentity) return null;
@@ -332,6 +353,9 @@ export async function readHsrMetaStrict(bee: string): Promise<HsrMeta | null> {
   }
   if ((object.childAdmission === "pending" || object.childAdmission === "none") && hasChildIdentity) {
     throw new Error(`Invalid HSR metadata for ${bee}: ${object.childAdmission} admission cannot carry child identity`);
+  }
+  if (object.startupFailure !== undefined && !validHsrStartupFailure(object.startupFailure)) {
+    throw new Error(`Invalid HSR metadata for ${bee}: malformed startup failure`);
   }
   return object as unknown as HsrMeta;
 }

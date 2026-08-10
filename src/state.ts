@@ -345,6 +345,9 @@ function heldHsrStateForUnavailableObservation(record: SessionRecord, context: S
  * so it can never be confused with a crash.
  */
 function deadOrCrashed(record: SessionRecord, context: StateContext): DerivedState {
+  if (record.recoveryRequestedAt) {
+    return { state: "queued", detail: "message accepted — runtime recovery requested" };
+  }
   if (record.status === "running") {
     return { state: "crashed", detail: `exited without retire/kill — ${lastActivityHint(record, context)}` };
   }

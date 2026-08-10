@@ -29,6 +29,7 @@ import {
   readHsrMetaStrict,
   writeHsrMeta,
   type HsrMeta,
+  type HsrStartupFailure,
 } from "./runDir.js";
 import { codexStartupConcurrency, withCodexStartupSlot } from "./startupQueue.js";
 import { drainPendingHsrTurns, removePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
@@ -74,6 +75,8 @@ export async function runHsrHost(params: {
   processBirthCapture?: ProcessBirthCaptureOptions;
   /** Test barrier after exact child identity is durable, before readiness. */
   afterChildAdmission?: (identity: { pid: number; pgid: number }) => Promise<void>;
+  /** Scrub an adapter-start error before it is persisted for the parent. */
+  formatStartupFailure?: (error: unknown) => HsrStartupFailure;
 }): Promise<HsrHostHandle> {
   const { bee, adapter, opts } = params;
   const hostPid = params.hostPid ?? process.pid;
@@ -131,7 +134,14 @@ export async function runHsrHost(params: {
   await readHsrMetaStrict(bee);
   await writeHsrMeta(bee, meta);
 
+  let childAdmissionAttempted = false;
   const admitChild = async (identity: { pid: number; pgid: number }): Promise<void> => {
+    // Once this callback is entered, a child exists (or existed) and only its
+    // exact birth admission can prove cleanup. If adapter.start fails before
+    // entering it, the shared spawn helper never produced a child and the host
+    // may durably publish the completed no-child outcome instead of leaving a
+    // permanently unresolvable `pending` tombstone.
+    childAdmissionAttempted = true;
     const childFingerprint = await captureProcessBirthFingerprintWithRetry(identity.pid, params.processBirthCapture);
     if (!childFingerprint || childFingerprint.pgid !== identity.pgid) {
       throw new Error(`process ${identity.pid}/${identity.pgid} has no matching birth fingerprint`);
@@ -207,8 +217,22 @@ export async function runHsrHost(params: {
       current && current.hostPid === hostPid && current.startedAt === startedAt &&
       sameProcessBirthFingerprint(current.hostFingerprint, hostFingerprint)
     ) {
+      let startupFailure: HsrStartupFailure = {
+        stage: "adapter-start" as const,
+        message: "HSR harness failed during startup; inspect host.log for provider diagnostics",
+      };
+      try {
+        startupFailure = params.formatStartupFailure?.(error) ?? startupFailure;
+      } catch {
+        // A diagnostic formatter must never prevent durable exit/no-child
+        // publication or turn a provider failure into an unresolvable runtime.
+      }
       meta = {
         ...current,
+        ...(!childAdmissionAttempted && current.childAdmission === "pending"
+          ? { childAdmission: "none" as const }
+          : {}),
+        startupFailure,
         status: "exited",
         exitCode: null,
         endedAt: new Date().toISOString(),

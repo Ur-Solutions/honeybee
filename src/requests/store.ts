@@ -484,7 +484,7 @@ export async function closeRequestsForNewIncarnation(
 ): Promise<InterventionRequestRecord[]> {
   return cancelOpenRequests(
     bee,
-    { beforeGeneration: newGeneration },
+    { beforeGeneration: newGeneration, scopes: ["turn", "runtime-generation"] },
     "superseded",
     `superseded by generation ${newGeneration}`,
   );

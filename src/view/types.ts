@@ -191,6 +191,13 @@ export type BeeDisplayState =
   | "ready"
   | "offline";
 
+/**
+ * Product interaction contract. Consumers should use this three-state field
+ * for primary UX and keep displayState/runtime details for diagnostics only.
+ * Every non-archived bee accepts messages, including a cold idle runtime.
+ */
+export type BeeInteractionState = "working" | "idle" | "archived";
+
 export type ObservationSourceFreshness = {
   source: "hsr-events" | "pane-capture" | "hive-state-option"
     | "daemon-observation" | "node-probe";
@@ -236,6 +243,7 @@ export type BeeViewV1 = {
   latestTurnResult?: BeeViewTurnResult;
   latestContractResult?: BeeViewContractResult;
   inboxSummary: BeeViewInboxSummary;
+  interactionState: BeeInteractionState;
   displayState: BeeDisplayState;
   /** The precedence rule that produced displayState (for `state explain`). */
   displayStateReason: string;
