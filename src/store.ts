@@ -188,6 +188,18 @@ export type SessionRecord = {
   taskSupply?: TaskSupplyConfig;
   lastObservedState?: string;
   lastObservedStateAt?: string;
+  /**
+   * Durable delivery obligation created by the daemon `message:1` accept op.
+   * It keeps a cold/terminal observation in the daemon work set without
+   * fabricating lifecycle status or an observed runtime state.
+   */
+  recoveryRequestedAt?: string;
+  /** Exact queued buz message whose delivery owns the recovery obligation. */
+  recoveryMessageId?: string;
+  /** Persisted wake failures so daemon restarts cannot reset the retry cap. */
+  recoveryAttemptCount?: number;
+  /** ISO backoff boundary for the next detached wake attempt. */
+  recoveryNextAttemptAt?: string;
   runId?: string;
   /**
    * Execution-protocol Run identity (contracts/execution/v1) this bee is bound
@@ -275,12 +287,14 @@ const TERMINAL_OBSERVED_STATES = new Set([
  * must not bias automatic account selection.
  */
 export function isActiveSessionRecord(
-  record: Pick<SessionRecord, "status" | "lastObservedState">,
+  record: Pick<SessionRecord, "status" | "lastObservedState" | "recoveryRequestedAt">,
 ): boolean {
   // kill_failed means teardown could not prove the runtime stopped. Keep it in
   // the daemon work set until an operator retries/repairs it. Likewise a
   // provider/runtime `error` observation can recover on a later tick. Neither
   // contributes an account commitment (limits/commitments owns that policy).
+  if (record.status === "done") return false;
+  if (record.recoveryRequestedAt) return true;
   if (record.status !== "running" && record.status !== "kill_failed") return false;
   return !TERMINAL_OBSERVED_STATES.has(record.lastObservedState ?? "");
 }
@@ -1441,7 +1455,7 @@ function validateStrictSessionRecord(value: unknown, path: string): void {
   }
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "recoveryRequestedAt", "recoveryMessageId", "recoveryNextAttemptAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
@@ -1458,6 +1472,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "providerTitleKind",
   "autoTitleAttempts",
   "runtimeGeneration",
+  "recoveryAttemptCount",
   "buzAccept",
   "taskSupply",
   "tags",
@@ -1607,6 +1622,9 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
   if (typeof object.runtimeGeneration === "number" && Number.isSafeInteger(object.runtimeGeneration) && object.runtimeGeneration >= 0) {
     record.runtimeGeneration = object.runtimeGeneration;
+  }
+  if (typeof object.recoveryAttemptCount === "number" && Number.isSafeInteger(object.recoveryAttemptCount) && object.recoveryAttemptCount >= 0) {
+    record.recoveryAttemptCount = object.recoveryAttemptCount;
   }
   if (typeof object.launcherPgid === "number" && Number.isSafeInteger(object.launcherPgid) && object.launcherPgid > 0) {
     record.launcherPgid = object.launcherPgid;

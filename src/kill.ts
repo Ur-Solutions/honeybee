@@ -54,7 +54,10 @@ export type TransactionalKillOptions = {
 export type PurgeSessionDataOptions = Pick<
   TransactionalKillOptions,
   "emitLedger" | "finalCredentialSync" | "finalCredentialSyncBudgetMs" | "afterFinalCredentialQuarantine"
->;
+> & {
+  /** Clean-sweep CAS guard: accepted mail may make a previously dead snapshot active. */
+  preserveRecoveryRequest?: boolean;
+};
 
 export type KillOutcome =
   | { ok: true; alreadyGone: boolean; attempts: number }
@@ -94,14 +97,15 @@ type TeardownVerdict = {
 export async function purgeSessionData(
   record: SessionRecord,
   options: PurgeSessionDataOptions = {},
-): Promise<void> {
+): Promise<boolean> {
   // Hardened readers intentionally reject a malformed embedded name, but
   // clean/purge must still be able to contain and remove its sanitized file
   // and artifacts. Such a record cannot participate in generation CAS (it is
   // not authoritative readable input), so serialize on the sanitized
   // lifecycle + session locks and retain the record-last retry semantics.
   if (safeName(record.name) !== record.name) {
-    await withSessionLifecycleLock(record.name, async () => {
+    return withSessionLifecycleLock(record.name, async () => {
+      if (options.preserveRecoveryRequest && record.recoveryRequestedAt) return false;
       await runFinalCredentialSync(record, options, "purge");
       await withSessionLock(record.name, async () => {
         await rm(containedArtifactPath(sealsRoot(), record.name), { recursive: true, force: true });
@@ -110,19 +114,24 @@ export async function purgeSessionData(
         await deleteSessionLocked(record.name);
       });
       if (record.poolKey) await dropPoolClaimsForBee(record.poolKey, record.name).catch(() => undefined);
+      return true;
     });
-    return;
   }
-  await withSessionLifecycleTransactionIfPresent(record, async (lifecycle) => {
-    await purgeSessionDataInTransaction(lifecycle, options);
+  const purged = await withSessionLifecycleTransactionIfPresent(record, async (lifecycle) => {
+    const current = await lifecycle.refresh();
+    if (options.preserveRecoveryRequest && current.recoveryRequestedAt) return false;
+    await purgeSessionDataInTransaction(lifecycle, options, current);
+    return true;
   });
+  return purged ?? true;
 }
 
 async function purgeSessionDataInTransaction(
   lifecycle: SessionLifecycleTransaction,
   options: PurgeSessionDataOptions,
+  refreshedRecord?: SessionRecord,
 ): Promise<void> {
-  const record = await lifecycle.refresh();
+  const record = refreshedRecord ?? await lifecycle.refresh();
   // Credential harvest can touch the keychain, vault, and account locks. It is
   // deliberately bounded and completed before any artifact/session lock is
   // acquired or any retry handle is deleted.

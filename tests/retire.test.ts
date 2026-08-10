@@ -569,6 +569,25 @@ test("clean skips a filename-identity forgery without purging the real victim", 
   });
 });
 
+test("dead-sweep purge rechecks and preserves a recovery request that appeared after selection", async () => {
+  await withTempStore(async () => {
+    const selected = seed({ name: "CO.accept-race", tmuxTarget: "CO.accept-race", status: "dead" });
+    await saveSession(selected);
+    await saveSession({
+      ...selected,
+      recoveryRequestedAt: "2026-08-10T12:00:00.000Z",
+      recoveryMessageId: "019fe9d1-2dd4-76dc-ba45-a26b675617c9",
+    });
+
+    const purged = await purgeSessionData(selected, {
+      emitLedger: false,
+      preserveRecoveryRequest: true,
+    });
+    assert.equal(purged, false);
+    assert.equal((await loadSession(selected.name))?.recoveryMessageId, "019fe9d1-2dd4-76dc-ba45-a26b675617c9");
+  });
+});
+
 test("transactional kill revalidates shared-home ownership immediately after stop", async () => {
   await withTempStore(async (dir) => {
     const homePath = join(dir, "post-stop-shared-home");

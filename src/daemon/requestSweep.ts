@@ -150,7 +150,12 @@ export function createRequestReconciler(): RequestReconciler {
 
     // 2. Superseded backstop: an incarnation bump that happened while the
     //    daemon was down (record.runtimeGeneration moved past open records).
-    for (const cancelled of await cancelOpenRequests(bee, { beforeGeneration: generation }, "superseded", `superseded by generation ${generation}`)) {
+    for (const cancelled of await cancelOpenRequests(
+      bee,
+      { beforeGeneration: generation, scopes: ["turn", "runtime-generation"] },
+      "superseded",
+      `superseded by generation ${generation}`,
+    )) {
       emit(cancelled.id, "cancel", "superseded");
     }
 
@@ -235,7 +240,12 @@ export function createRequestReconciler(): RequestReconciler {
     //    the host pid is dead. Cancels everything up to and including the
     //    exited generation (stop-failed included — the stop took effect).
     if (obs !== undefined && !obs.live) {
-      for (const cancelled of await cancelOpenRequests(bee, { beforeGeneration: generation + 1 }, "scope-closed", "generation exited")) {
+      for (const cancelled of await cancelOpenRequests(
+        bee,
+        { beforeGeneration: generation + 1, scopes: ["turn", "runtime-generation"] },
+        "scope-closed",
+        "generation exited",
+      )) {
         emit(cancelled.id, "cancel", "generation exited");
       }
     }

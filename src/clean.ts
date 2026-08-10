@@ -5,7 +5,12 @@ import { liveTargetKey } from "./state.js";
 export function deadSessionRecords(records: SessionRecord[], liveTargets: Set<string>): SessionRecord[] {
   // liveTargets is keyed by liveTargetKey(node, target) so a session on one
   // node never protects a same-named record on another.
-  return records.filter((record) => !liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
+  // An accepted message is a durable delivery obligation. It protects the
+  // owning record until recovery succeeds or is explicitly failed into an
+  // InterventionRequest, closing the accept→wake clean --dead purge window.
+  return records.filter((record) =>
+    !record.recoveryRequestedAt &&
+    !liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)));
 }
 
 export function olderThanMillis(records: SessionRecord[], ageMs: number, now = Date.now()): SessionRecord[] {

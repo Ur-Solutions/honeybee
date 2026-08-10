@@ -364,6 +364,19 @@ test("crashed without mid-turn evidence has no fabricated turn result", () => {
   assert.equal(view.latestTurnResult, undefined);
 });
 
+test("accepted cold mail projects starting without fabricating a runtime observation", () => {
+  const rec = record({
+    recoveryRequestedAt: iso(NOW - 5_000),
+    recoveryMessageId: "019fe9d1-2dd4-76dc-ba45-a26b675617c9",
+  });
+  const view = project({ record: rec, context: ctx() });
+  assert.equal(view.displayState, "starting");
+  assert.equal(view.latestRuntime.state, "starting");
+  assert.equal(view.latestRuntime.evidence.source, "session-record");
+  assert.equal(view.interactionState, "idle");
+  assert.equal(rec.lastObservedState, undefined);
+});
+
 // ---------------------------------------------------------------------------
 // Requests: synthesized manual-action, structured needs_input, auth.
 // ---------------------------------------------------------------------------

@@ -92,6 +92,7 @@ export async function cmdCleanDead(parsed: Parsed) {
     const deadNames = new Set(dead.map((record) => record.name));
     for (const record of records) {
       if (deadNames.has(record.name)) continue;
+      if (record.recoveryRequestedAt) continue;
       const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
       // Only a bee whose comb is otherwise considered alive can be "pane-dead";
       // if its session is gone it is already in `dead`.
@@ -138,7 +139,10 @@ export async function cmdCleanDead(parsed: Parsed) {
   }
 
   for (const record of dead) {
-    await purgeSessionData(record);
+    // Selection happened before the lifecycle lock. Re-check the authoritative
+    // record under that lock so an accept op that won the race cannot lose its
+    // queued message and session metadata to this stale dead snapshot.
+    if (!await purgeSessionData(record, { preserveRecoveryRequest: true })) continue;
     if (isPretty()) console.log(actionLine("ok", "clean", [bold(record.name), record.agent, dim(tildify(record.cwd))]));
     else console.log(`cleaned\t${record.name}`);
   }
