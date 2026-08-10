@@ -134,6 +134,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
     ...(latestTurnResult ? { latestTurnResult } : {}),
     ...(latestContractResult ? { latestContractResult } : {}),
     inboxSummary,
+    interactionState: interactionStateFor(record, context, derived, latestRuntime),
     displayState,
     displayStateReason,
     observationFreshness: projectFreshness(sources, derived, { unreachable, held, hiveStateOption, nowMs }),
@@ -478,6 +479,25 @@ function chooseDisplayState(facts: {
 
 function derivedMeansRunningTurn(state: BeeState): boolean {
   return state === "active";
+}
+
+function interactionStateFor(
+  record: SessionRecord,
+  context: StateContext,
+  derived: DerivedState,
+  runtime: BeeViewRuntime,
+): BeeViewV1["interactionState"] {
+  if (record.status === "done") return "archived";
+  if (record.status !== "kill_failed") {
+    return derivedMeansRunningTurn(derived.state) ? "working" : "idle";
+  }
+
+  // kill_failed records encode unresolved stop intent, not runtime death. A
+  // positive liveness probe keeps the bee interactive; re-derive without the
+  // diagnostic status override so a still-running turn remains `working`.
+  if (runtime.state === "exited") return "archived";
+  const liveState = deriveState({ ...record, status: "running" }, context);
+  return derivedMeansRunningTurn(liveState.state) ? "working" : "idle";
 }
 
 function projectFreshness(

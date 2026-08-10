@@ -67,6 +67,27 @@ Observer freshness
 
 No record may duplicate another record's authoritative fact.
 
+### Product interaction projection
+
+Those domain facts do not become an equally large set of primary UX states.
+The human-facing interaction contract has exactly three states:
+
+```text
+working | idle | archived
+```
+
+- `working` means a Turn is running.
+- `idle` means no Turn is running and the Bee accepts a new message. The
+  runtime may be hot, booting, crashed, or absent; accepting the message is
+  durable and runtime recovery happens behind that boundary.
+- `archived` means retirement/destruction was explicitly requested. It is the
+  only state that rejects a new message (until an explicit restore).
+
+Authentication, provider startup, node reachability, process liveness, and
+observation confidence remain diagnostic/recovery facts. They may explain a
+delay, but consumers must not turn them into extra user-facing lifecycle
+states or require the user to run a separate revive operation before sending.
+
 ## Domain records
 
 ### Bee
