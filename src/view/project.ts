@@ -21,6 +21,7 @@ import { effectiveHiveState } from "../hiveState.js";
 import { structuredStateFromEvents, type HsrEventSnapshot } from "../hsr/observe.js";
 import type { RunnerEvent } from "../hsr/types.js";
 import { LOCAL_NODE_NAME } from "../node.js";
+import { isWellFormedPaneId } from "../paneId.js";
 import type { InterventionRequestRecord } from "../requests/store.js";
 import type { SealRecord } from "../seal.js";
 import { deriveState, liveTargetKey, parseBeeState, type BeeState, type DerivedState, type StateContext } from "../state.js";
@@ -185,18 +186,21 @@ function runtimeLiveness(record: SessionRecord, context: StateContext): { live: 
       evidence: { grade: "observer", source: "hsr-meta", detail: live ? "runner host pid alive" : "no live runner host" },
     };
   }
+  // Mirror deriveState: a live pane proves the bee live, but a pane id absent
+  // from livePanes is not proof of death (mis-stamped ids, partial listings) —
+  // tmux session liveness gets the final word before rendering crashed.
   const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
-  if (record.agentPaneId && context.livePanes && isLocal) {
-    const live = context.livePanes.has(record.agentPaneId);
+  const sessionLive = context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.liveTargets.has(record.tmuxTarget);
+  const pinnedPaneId = record.agentPaneId && isWellFormedPaneId(record.agentPaneId) ? record.agentPaneId : undefined;
+  if (pinnedPaneId && context.livePanes && isLocal && context.livePanes.has(pinnedPaneId)) {
     return {
-      live,
-      evidence: { grade: "observer", source: "node-probe", detail: `agent pane ${record.agentPaneId} ${live ? "present" : "gone"}` },
+      live: true,
+      evidence: { grade: "observer", source: "node-probe", detail: `agent pane ${pinnedPaneId} present` },
     };
   }
-  const live = context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.liveTargets.has(record.tmuxTarget);
   return {
-    live,
-    evidence: { grade: "observer", source: "node-probe", detail: `tmux session ${live ? "live" : "gone"}` },
+    live: sessionLive,
+    evidence: { grade: "observer", source: "node-probe", detail: `tmux session ${sessionLive ? "live" : "gone"}` },
   };
 }
 

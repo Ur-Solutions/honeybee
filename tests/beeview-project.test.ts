@@ -474,3 +474,26 @@ test("unreachable node marks the probe missing and observedLive false", () => {
   assert.equal(probe.status, "missing");
   assert.match(probe.caveat ?? "", /not a heartbeat contract/);
 });
+
+test("a mis-stamped pane id with a live session projects online, not crashed", () => {
+  // Fused "%id_pid" stamp (review §1.1): the pane set can never match it, but
+  // the tmux session is demonstrably alive — session liveness gets the final
+  // word in runtimeLiveness, mirroring deriveState.
+  const rec = record({ agentPaneId: "%110_18981" });
+  const view = project({
+    record: rec,
+    context: liveCtx(rec, { livePanes: new Set<string>(["%7"]) }),
+  });
+  assert.equal(view.latestRuntime.state, "online");
+  assert.notEqual(view.displayState, "crashed");
+});
+
+test("a valid pane id present in livePanes proves the bee live without session evidence", () => {
+  const rec = record({ agentPaneId: "%42" });
+  const view = project({
+    record: rec,
+    context: ctx({ livePanes: new Set<string>(["%42"]) }),
+  });
+  assert.equal(view.latestRuntime.state, "online");
+  assert.equal(view.latestRuntime.evidence.detail, "agent pane %42 present");
+});
