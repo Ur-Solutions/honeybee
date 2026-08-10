@@ -6,6 +6,7 @@ import { isBuzTier, type BuzTier } from "./buz_tiers.js";
 import { normalizeContract, type BeeContract } from "./contract.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
 import { withFileLock } from "./lock.js";
+import { isWellFormedPaneId, splitFusedPaneStamp } from "./paneId.js";
 import type { PreambleChannel } from "./preamble.js";
 import { dedupeTags, isValidSessionTag, MAX_TAGS_PER_BEE } from "./tags.js";
 import type { CombActivationBinding } from "./comb/types.js";
@@ -902,6 +903,99 @@ export async function loadSession(name: string): Promise<SessionRecord | null> {
   return loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir, paths.root);
 }
 
+/**
+ * One malformed agentPaneId observed on disk by normalizeSessionRecord. The
+ * raw value is kept so the repair sweep can tell a REPAIRABLE fused
+ * "%id_pid" stamp apart from unrecoverable garbage.
+ */
+export type PaneStampRepairNote = {
+  name: string;
+  raw: string;
+  tmuxTarget: string;
+  node?: string;
+};
+
+// Keyed by record name; re-reading the same poisoned record just refreshes
+// its note, so the registry is bounded by the store's record count.
+const pendingPaneStampRepairs = new Map<string, PaneStampRepairNote>();
+
+function notePaneStampRepair(note: PaneStampRepairNote): void {
+  pendingPaneStampRepairs.set(note.name, note);
+}
+
+/** TEST/introspection: names with a malformed on-disk pane stamp seen this process. */
+export function pendingPaneStampRepairNames(): string[] {
+  return [...pendingPaneStampRepairs.keys()];
+}
+
+export type PaneStampRepairResult = {
+  /** Fused stamps re-pinned to their verified pane id. */
+  repaired: Array<{ name: string; paneId: string }>;
+  /** Stamps dropped from the record — session liveness rules for these bees. */
+  dropped: string[];
+};
+
+/**
+ * One-shot store repair for malformed agentPaneId stamps (review §1.1): every
+ * record whose on-disk stamp failed shape validation during a load this
+ * process is rewritten. A fused "%id_pid" stamp on a LOCAL record is split
+ * back to its pane id, but re-pinned ONLY when that pane provably still
+ * belongs to the record's own tmux session (per the caller-supplied
+ * session→panes listing) — a bare pane-id match could adopt a foreign pane
+ * after a tmux server restart recycled pane ids. Everything else
+ * (unverifiable fused stamps, remote records, non-fused garbage) has the
+ * field dropped so session liveness rules instead of a stamp that can never
+ * match.
+ *
+ * Callers pass the pane lister (local-tmux's listPanesBySession) so the store
+ * stays free of a tmux dependency; tests inject a fake.
+ */
+export async function flushPaneStampRepairs(
+  listPanesBySession: () => Promise<Map<string, Set<string>>>,
+): Promise<PaneStampRepairResult> {
+  const result: PaneStampRepairResult = { repaired: [], dropped: [] };
+  if (pendingPaneStampRepairs.size === 0) return result;
+  const notes = [...pendingPaneStampRepairs.values()];
+  pendingPaneStampRepairs.clear();
+
+  // Records only carry `node` when remote (LOCAL_NODE_NAME is "local"; the
+  // constant lives in node.ts, which imports this module — matching deriveState
+  // literally here avoids the cycle).
+  const isLocalNote = (note: PaneStampRepairNote) => !note.node || note.node === "local";
+  const wantsPanes = notes.some((note) => isLocalNote(note) && splitFusedPaneStamp(note.raw));
+  const panesBySession = wantsPanes ? await listPanesBySession().catch(() => null) : null;
+
+  for (const note of notes) {
+    const fused = splitFusedPaneStamp(note.raw);
+    const verified = fused && isLocalNote(note) && panesBySession?.get(note.tmuxTarget)?.has(fused.paneId) === true;
+    const outcome = await repairPaneStampLocked(note, verified ? fused.paneId : undefined).catch(() => "failed" as const);
+    if (outcome === "repaired") result.repaired.push({ name: note.name, paneId: fused!.paneId });
+    else if (outcome === "dropped") result.dropped.push(note.name);
+  }
+  return result;
+}
+
+async function repairPaneStampLocked(
+  note: PaneStampRepairNote,
+  repairedPaneId: string | undefined,
+): Promise<"repaired" | "dropped" | "skipped"> {
+  return withSessionLock(note.name, async () => {
+    const paths = captureStorePaths();
+    const existing = await loadSessionFromDirectories(note.name, paths.currentDir, paths.legacyDir, paths.root);
+    if (!existing) return "skipped";
+    // normalize drops malformed stamps, so a present agentPaneId here means a
+    // concurrent writer (swap/revive) re-pinned a VALID pane meanwhile — the
+    // repair is superseded, never clobber it.
+    if (existing.agentPaneId !== undefined) return "skipped";
+    const merged: SessionRecord = repairedPaneId ? { ...existing, agentPaneId: repairedPaneId } : existing;
+    await saveSessionLocked(merged);
+    // Loading `existing` above re-noted the still-poisoned on-disk value; the
+    // write just cleaned it, so retire the note instead of re-flushing forever.
+    pendingPaneStampRepairs.delete(note.name);
+    return repairedPaneId ? "repaired" : "dropped";
+  });
+}
+
 async function loadCanonicalSessionFromDirectories(
   name: string,
   currentDir: string,
@@ -1436,6 +1530,11 @@ function validateStrictSessionRecord(value: unknown, path: string): void {
   if (object.substrate !== undefined && object.substrate !== "local-tmux" && object.substrate !== "hsr") {
     throw new Error(`Invalid session record ${path}: unknown substrate`);
   }
+  // agentPaneId shape (/^%\d+$/) is deliberately NOT enforced here: legacy
+  // records carry fused "%id_pid" mis-stamps, and rejecting them would brick
+  // strict consumers (transactionalKill, safety snapshots) for exactly the
+  // records that need repair. normalizeSessionRecord drops/queues malformed
+  // stamps instead, so no consumer ever trusts one.
   if (object.agentPaneId !== undefined && (typeof object.agentPaneId !== "string" || object.agentPaneId.length === 0)) {
     throw new Error(`Invalid session record ${path}: agentPaneId must be a non-empty string when present`);
   }
@@ -1510,6 +1609,21 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
 
   for (const key of OPTIONAL_STRING_SESSION_KEYS) {
     if (typeof object[key] === "string") record[key] = object[key];
+  }
+
+  // A mis-shaped agentPaneId (the fused "%110_18981" family, or any other
+  // non-#{pane_id} token) can never match a live pane, so trusting it marks a
+  // live bee permanently crashed (review §1.1). Drop it here — session
+  // liveness rules for the record — and queue the on-disk value for the
+  // one-shot repair sweep (flushPaneStampRepairs).
+  if (record.agentPaneId !== undefined && !isWellFormedPaneId(record.agentPaneId)) {
+    notePaneStampRepair({
+      name: record.name,
+      raw: record.agentPaneId,
+      tmuxTarget: record.tmuxTarget,
+      ...(record.node ? { node: record.node } : {}),
+    });
+    delete record.agentPaneId;
   }
 
   // Structured original launch. Invalid/empty arrays are ignored so a newer

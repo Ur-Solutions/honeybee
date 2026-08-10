@@ -7,6 +7,8 @@ import { test } from "node:test";
 import {
   activeSessionIndexPath,
   appendLedger,
+  flushPaneStampRepairs,
+  pendingPaneStampRepairNames,
   deleteSession,
   isActiveSessionRecord,
   ledgerPath,
@@ -813,5 +815,96 @@ test("an unknown status still downgrades to dead (regression guard)", async () =
     await writeFile(join(dir, "sessions", "CO.abc.json"), JSON.stringify({ ...raw, status: "frozen" }));
     const loaded = await loadSession("CO.abc");
     assert.equal(loaded?.status, "dead", "an unknown status is coerced to dead, not preserved");
+  });
+});
+
+test("normalize drops a malformed agentPaneId at load and queues it for repair (review §1.1)", async () => {
+  await withTempStore(async (dir) => {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    const fused = makeRecord(dir, { name: "CL.fused", tmuxTarget: "CL-fused", agentPaneId: "%110_18981" });
+    const garbage = makeRecord(dir, { name: "CL.noise", tmuxTarget: "CL-noise", agentPaneId: "Last login: %7" });
+    const good = makeRecord(dir, { name: "CL.good", tmuxTarget: "CL-good", agentPaneId: "%7" });
+    for (const record of [fused, garbage, good]) {
+      await writeFile(join(dir, "sessions", `${record.name}.json`), `${JSON.stringify(record)}\n`);
+    }
+
+    const records = await listSessions();
+    const byName = new Map(records.map((record) => [record.name, record]));
+    // Malformed stamps are never trusted in memory; a valid one passes through.
+    assert.equal(byName.get("CL.fused")?.agentPaneId, undefined);
+    assert.equal(byName.get("CL.noise")?.agentPaneId, undefined);
+    assert.equal(byName.get("CL.good")?.agentPaneId, "%7");
+    // Strict safety snapshots must still READ the poisoned records (repair,
+    // kill, and clean depend on it) — with the same sanitized view.
+    const strict = await listSessionsStrict();
+    assert.equal(strict.find((record) => record.name === "CL.fused")?.agentPaneId, undefined);
+
+    const pending = pendingPaneStampRepairNames();
+    assert.ok(pending.includes("CL.fused"));
+    assert.ok(pending.includes("CL.noise"));
+    assert.ok(!pending.includes("CL.good"));
+
+    // Repair sweep: the fused stamp re-pins ONLY when the pane still belongs
+    // to the record's own session; the garbage stamp is dropped outright.
+    const listerCalls: number[] = [];
+    const result = await flushPaneStampRepairs(async () => {
+      listerCalls.push(1);
+      return new Map([["CL-fused", new Set(["%110"])]]);
+    });
+    assert.deepEqual(result.repaired, [{ name: "CL.fused", paneId: "%110" }]);
+    assert.ok(result.dropped.includes("CL.noise"));
+    assert.equal(listerCalls.length, 1);
+
+    const repaired = JSON.parse(await readFile(join(dir, "sessions", "CL.fused.json"), "utf8"));
+    assert.equal(repaired.agentPaneId, "%110");
+    const dropped = JSON.parse(await readFile(join(dir, "sessions", "CL.noise.json"), "utf8"));
+    assert.equal("agentPaneId" in dropped, false);
+
+    // The sweep is one-shot: a second flush has nothing left to do.
+    const again = await flushPaneStampRepairs(async () => {
+      throw new Error("lister must not be called with no pending repairs");
+    });
+    assert.deepEqual(again, { repaired: [], dropped: [] });
+  });
+});
+
+test("pane-stamp repair drops unverifiable fused stamps and never probes tmux for remote records", async () => {
+  await withTempStore(async (dir) => {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    const gone = makeRecord(dir, { name: "CL.gone", tmuxTarget: "CL-gone", agentPaneId: "%9_777" });
+    const remote = makeRecord(dir, { name: "CL.far", tmuxTarget: "CL-far", node: "studio", agentPaneId: "%3_42" });
+    for (const record of [gone, remote]) {
+      await writeFile(join(dir, "sessions", `${record.name}.json`), `${JSON.stringify(record)}\n`);
+    }
+    await listSessions();
+
+    // The pane is not in the record's session (server restarted / pane died):
+    // the stamp must be DROPPED, never re-pinned to a foreign pane.
+    const result = await flushPaneStampRepairs(async () => new Map([["CL-other", new Set(["%9"])]]));
+    assert.ok(result.dropped.includes("CL.gone"));
+    assert.ok(result.dropped.includes("CL.far"));
+    assert.deepEqual(result.repaired, []);
+    const goneDisk = JSON.parse(await readFile(join(dir, "sessions", "CL.gone.json"), "utf8"));
+    assert.equal("agentPaneId" in goneDisk, false);
+    const farDisk = JSON.parse(await readFile(join(dir, "sessions", "CL.far.json"), "utf8"));
+    assert.equal("agentPaneId" in farDisk, false);
+  });
+});
+
+test("pane-stamp repair never clobbers a valid re-stamp that landed meanwhile", async () => {
+  await withTempStore(async (dir) => {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    const record = makeRecord(dir, { name: "CL.race", tmuxTarget: "CL-race", agentPaneId: "%5_99" });
+    await writeFile(join(dir, "sessions", "CL.race.json"), `${JSON.stringify(record)}\n`);
+    await listSessions();
+
+    // A swap/revive re-pins a fresh, valid pane before the sweep runs.
+    await updateSession("CL.race", { agentPaneId: "%8" });
+
+    const result = await flushPaneStampRepairs(async () => new Map([["CL-race", new Set(["%5"])]]));
+    assert.deepEqual(result.repaired, []);
+    assert.ok(!result.dropped.includes("CL.race"));
+    const disk = JSON.parse(await readFile(join(dir, "sessions", "CL.race.json"), "utf8"));
+    assert.equal(disk.agentPaneId, "%8");
   });
 });

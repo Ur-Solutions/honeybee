@@ -26,7 +26,8 @@ import { ensureSessionLive } from "../sessionLiveness.js";
 import { liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { assembleStateContext } from "../view/context.js";
 import { consumePreambleForDelivery } from "../spawnPreamble.js";
-import { appendLedger, listSessions, loadSession, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, flushPaneStampRepairs, listSessions, loadSession, updateSession, type SessionRecord } from "../store.js";
+import { listPanesBySession } from "../substrates/local-tmux.js";
 import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
 import { generateSwarmId, validSwarmId } from "../swarm.js";
 import { tmux } from "../tmux.js";
@@ -487,6 +488,11 @@ export async function buildStateContext(
   probe: MultiNodeLiveProbe,
   options: { unreachableNodes?: Set<string> } = {},
 ): Promise<StateContext & { hsrLive: Set<string>; now: number }> {
+  // Opportunistic one-shot repair: listing the records above queued any
+  // malformed on-disk agentPaneId stamps (the fused "%id_pid" family) for
+  // rewrite; persist the fix before deriving state so poisoned stamps stop
+  // resurfacing (review §1.1). Best-effort — display must not break on it.
+  await flushPaneStampRepairs(listPanesBySession).catch(() => undefined);
   return assembleStateContext(records, probe, {
     ...(options.unreachableNodes ? { unreachableNodes: options.unreachableNodes } : {}),
   });
