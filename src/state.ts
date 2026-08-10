@@ -1,6 +1,7 @@
 import { hasAgentDriver } from "./drivers.js";
 import { cyan, dim, gray, green, magenta, red, yellow } from "./format.js";
 import { LOCAL_NODE_NAME } from "./node.js";
+import { isWellFormedPaneId } from "./paneId.js";
 import { isAgentActivePane, isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "./readiness.js";
 import type { SessionRecord } from "./store.js";
 
@@ -31,9 +32,12 @@ export type StateContext = {
   liveTargets: Set<string>;
   /**
    * Server-wide live pane ids (e.g. "%7") on the LOCAL tmux server. When a bee
-   * is pane-pinned (agentPaneId) and local, liveness is the pane's presence
-   * here — so killing the agent pane reports the bee dead even while its
-   * session survives. Absent → fall back to session liveness for everyone.
+   * is pane-pinned (agentPaneId) and local, its pane's presence here proves it
+   * live. A pane id that is MISSING from the set is not proof of death on its
+   * own: mis-stamped ids (the fused "%110_18981" family) and partial listings
+   * from a busy server can never/transiently fail to match, so session
+   * liveness gets the final word before deriving dead/crashed (review §1.1,
+   * §1.5). Absent → session liveness for everyone.
    */
   livePanes?: Set<string>;
   panes?: PaneCaptureMap;
@@ -165,14 +169,20 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
     return deriveHsrState(record, context);
   }
 
-  // Pane-pinned local bees: liveness is the PANE, not the session. This is the
-  // fix for "agent pane killed but the session lives on" reporting false-alive.
-  // Only applied locally — livePanes is the local server's pane set; a remote
-  // bee's pane isn't in it, so remote bees keep session liveness.
+  // Pane-pinned local bees: a live pane proves the bee live even when session
+  // probing missed it. But a pane id ABSENT from livePanes is not proof of
+  // death: a mis-stamped id (fused "%110_18981", validated away here in case a
+  // test/legacy caller bypassed normalize) or a partial pane listing from a
+  // busy tmux server would otherwise mark a live bee permanently crashed
+  // (review §1.1/§1.5) — so tmux session liveness gets the final word before
+  // deadOrCrashed. Only applied locally — livePanes is the local server's pane
+  // set; a remote bee's pane isn't in it, so remote bees keep session liveness.
   const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
-  const live = record.agentPaneId && context.livePanes && isLocal
-    ? context.livePanes.has(record.agentPaneId)
-    : context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.liveTargets.has(record.tmuxTarget);
+  const sessionLive = context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) || context.liveTargets.has(record.tmuxTarget);
+  const pinnedPaneId = record.agentPaneId && isWellFormedPaneId(record.agentPaneId) ? record.agentPaneId : undefined;
+  const live = pinnedPaneId && context.livePanes && isLocal
+    ? context.livePanes.has(pinnedPaneId) || sessionLive
+    : sessionLive;
   if (!live) {
     if (context.seals?.has(record.name)) return { state: "done", detail: "sealed before exit" };
     return deadOrCrashed(record, context);

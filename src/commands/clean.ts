@@ -9,8 +9,9 @@ import { LOCAL_NODE_NAME, listNodes } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { resolveSessionTranscript } from "../sessionMetadata.js";
 import { cleanStatePriority, deriveState, isTerminalState, liveTargetKey, type BeeState, type DerivedState } from "../state.js";
-import { listSessions, safeName, type SessionRecord } from "../store.js";
+import { flushPaneStampRepairs, listSessions, safeName, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
+import { listPanesBySession } from "../substrates/local-tmux.js";
 import { tmux } from "../tmux.js";
 import { renderTranscript } from "../transcripts.js";
 import { rm, writeFile } from "node:fs/promises";
@@ -42,6 +43,10 @@ export async function cmdClean(parsed: Parsed) {
 
 export async function cmdCleanDead(parsed: Parsed) {
   const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
+  // The record scan above queued any malformed on-disk agentPaneId stamps
+  // (fused "%id_pid" mis-stamps, review §1.1) for repair; persist those fixes
+  // before making delete decisions. Best-effort — clean must not break on it.
+  await flushPaneStampRepairs(listPanesBySession).catch(() => undefined);
   // A filed (done) bee is filed, not dead — `clean` must never reap it (PRD
   // §13); only an explicit `hive kill` deletes a filed bee. Exclude it at the
   // source so neither the dead-sweep nor the pane-dead loop below can touch it.
@@ -81,27 +86,14 @@ export async function cmdCleanDead(parsed: Parsed) {
     if (hsrLive.has(record.name)) recordsConsideredAlive.add(liveTargetKey(record.node, record.tmuxTarget));
   }
   let dead = deadSessionRecords(records, recordsConsideredAlive);
-  // Phase B: a local sub-bee whose pane died (agentPaneId ∉ live panes) is dead
-  // even though its comb/session survives via a sibling pane. Mirror
-  // deriveState's pane-pinned liveness so `hive clean --dead` sweeps it too.
-  // Guard against a transient empty listPanes() (server hiccup): only sweep
-  // panes when at least one pane responded — an empty set can't be trusted to
-  // mean "all panes dead" while sessions are live.
-  const livePanes = await localSubstrate().listPanes().catch(() => new Set<string>());
-  if (livePanes.size > 0) {
-    const deadNames = new Set(dead.map((record) => record.name));
-    for (const record of records) {
-      if (deadNames.has(record.name)) continue;
-      const isLocal = !record.node || record.node === LOCAL_NODE_NAME;
-      // Only a bee whose comb is otherwise considered alive can be "pane-dead";
-      // if its session is gone it is already in `dead`.
-      const sessionLive = recordsConsideredAlive.has(liveTargetKey(record.node, record.tmuxTarget));
-      if (isLocal && sessionLive && record.agentPaneId && !livePanes.has(record.agentPaneId)) {
-        dead.push(record);
-        deadNames.add(record.name);
-      }
-    }
-  }
+  // No pane-level sweep here. An earlier phase B treated `agentPaneId ∉ live
+  // panes` as pane-dead and PURGED the record even while the bee's tmux
+  // session was demonstrably alive — but a mis-stamped pane id (the fused
+  // "%110_18981" family, review §1.1) or a partial pane listing from a busy
+  // server (review §1.5) fails that match for a live bee, so clean deleted
+  // records out from under running runtimes (data loss). Session liveness is
+  // authoritative for clean, mirroring deriveState's session fallback; the
+  // comb sub-bee case the sweep existed for is retired with combs (APIA-85).
   const olderThan = ageFlag(parsed, ["older-than", "older"]);
   if (olderThan !== undefined) dead = olderThanMillis(dead, olderThan);
   const dryRun = truthy(flag(parsed, "dry-run")) || truthy(flag(parsed, "n"));

@@ -24,16 +24,38 @@ test("paneArg targets the exact pane when pinned, else the session's active pane
   assert.equal(paneArg("CL-x", undefined), "=CL-x:");
 });
 
-test("deriveState: a pinned bee is dead when its pane is gone, even if the session lives", () => {
+test("deriveState: a live pane proves the bee live; a missing pane falls back to session liveness", () => {
   const rec = bee({ agentPaneId: "%7" });
   const sessionLive: Pick<StateContext, "liveTargets"> = { liveTargets: new Set(["CL-x"]) };
 
-  // Pane present → alive (some non-dead state).
+  // Pane present → alive (some non-dead state), even when the session probe missed it.
   assert.notEqual(deriveState(rec, { ...sessionLive, livePanes: new Set(["%7"]) }).state, "dead");
+  const paneOnly = deriveState(rec, { liveTargets: new Set(), livePanes: new Set(["%7"]) });
+  assert.notEqual(paneOnly.state, "dead");
+  assert.notEqual(paneOnly.state, "crashed");
 
-  // Pane gone but session still alive → DEAD. This is the problem (c) fix:
-  // killing the agent pane no longer reports the bee falsely alive.
-  assert.equal(deriveState(rec, { ...sessionLive, livePanes: new Set(["%9"]) }).state, "crashed");
+  // Pane gone but session still alive → NOT crashed. Pane absence alone is not
+  // proof of death: mis-stamped ids and partial pane listings from a busy
+  // server fail this match for demonstrably live bees (review §1.1/§1.5), so
+  // tmux session liveness gets the final word.
+  assert.notEqual(deriveState(rec, { ...sessionLive, livePanes: new Set(["%9"]) }).state, "crashed");
+
+  // Pane gone AND session gone → crashed (status "running" = un-commanded death).
+  assert.equal(deriveState(rec, { liveTargets: new Set(), livePanes: new Set(["%9"]) }).state, "crashed");
+});
+
+test("deriveState: a malformed pane stamp never decides liveness — session rules (review §1.1)", () => {
+  // The fused "%pane_pid" mis-stamp can never match a live pane id; before the
+  // shape guard it marked live bees permanently crashed.
+  const rec = bee({ agentPaneId: "%110_18981" });
+
+  // Session alive → live, regardless of the poisoned stamp.
+  const live = deriveState(rec, { liveTargets: new Set(["CL-x"]), livePanes: new Set(["%110"]) });
+  assert.notEqual(live.state, "crashed");
+  assert.notEqual(live.state, "dead");
+
+  // Session gone → crashed as usual; the stamp adds nothing.
+  assert.equal(deriveState(rec, { liveTargets: new Set(), livePanes: new Set(["%110"]) }).state, "crashed");
 });
 
 test("deriveState: legacy (unpinned) bees and missing livePanes fall back to session liveness", () => {

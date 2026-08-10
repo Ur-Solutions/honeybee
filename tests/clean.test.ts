@@ -228,6 +228,35 @@ test("hive clean --crashed removes only uncommanded dead running records", async
   }
 });
 
+test("hive clean --dead never purges a session-alive bee over a mis-stamped pane id (review §1.1)", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-panestamp-"));
+  const liveTarget = `hive-clean-panestamp-${process.pid}`;
+  try {
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    await tmuxNewSession(liveTarget, "/tmp", { command: "sleep", args: ["30"] });
+
+    // Fused "%pane_pid" mis-stamp that can never match a live pane. The old
+    // phase-B pane sweep purged this record while its session was alive.
+    const poisoned = session(liveTarget, liveTarget);
+    poisoned.agentPaneId = "%9999_54321";
+    await writeFile(join(dir, "sessions", `${poisoned.name}.json`), `${JSON.stringify(poisoned)}\n`);
+
+    const cleaned = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead"], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
+    });
+    assert.doesNotMatch(cleaned.stdout, new RegExp(liveTarget));
+
+    // The record survived, and the sweep repaired the poisoned stamp on disk
+    // (the pane does not exist, so the field is dropped — session liveness rules).
+    const reloaded = JSON.parse(await readFile(join(dir, "sessions", `${poisoned.name}.json`), "utf8"));
+    assert.equal("agentPaneId" in reloaded, false);
+  } finally {
+    await tmuxKill(liveTarget).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("hive clean --dead --older-than only removes stale dead sessions", async () => {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-"));
   try {
