@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -10,6 +10,7 @@ import {
   beeMailboxDir,
   buzRoot,
   consumeMessage,
+  countQuarantinedMessages,
   DEFAULT_BUZ_ACCEPT,
   DEFAULT_BUZ_TIER,
   downgradeTier,
@@ -23,6 +24,7 @@ import {
   processQueueForBee,
   purgeMailbox,
   readMessageById,
+  requeueQuarantinedMessages,
   resolveBuzAccept,
   sanitizeHumanName,
   sendBuzMessage,
@@ -661,6 +663,79 @@ test("processQueueForBee retries transport failures forever without incrementing
       false,
       "transport failures never consume the delivery-rejected retry budget",
     );
+  });
+});
+
+// ─── Quarantine re-drive (requeue) ─────────────────────────────────────────
+
+test("requeueQuarantinedMessages moves quarantined mail back to queue/ and it delivers on the next drain", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    const sent = await sendBuzMessage({ recipient, sender: { kind: "human", name: "apiary" }, tier: "queue", body: "steer" });
+
+    // Drive the message into quarantine via repeated definite rejections.
+    const rejecting = fakeSubstrate({ sendText: async () => { throw new BuzDeliveryRejectedError("rejected"); } });
+    for (let i = 0; i < 3; i += 1) {
+      await processQueueForBee(recipient, { transport: { substrate: rejecting, tmuxTarget: recipient.tmuxTarget }, maxFailures: 3 });
+    }
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "quarantine"))).length, 1);
+    assert.equal(await countQuarantinedMessages("CO.aaa"), 1);
+
+    const result = await requeueQuarantinedMessages("CO.aaa");
+    assert.deepEqual(result.requeued, [sent.message.id]);
+    assert.deepEqual(result.skipped, []);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "quarantine"))).length, 0);
+    assert.equal(await countQuarantinedMessages("CO.aaa"), 0);
+
+    // Recipient healthy again: the requeued message drains to inbox/.
+    const delivered: string[] = [];
+    const healthy = fakeSubstrate({ sendText: async (_t, text) => { delivered.push(text); } });
+    const drain = await processQueueForBee(recipient, { transport: { substrate: healthy, tmuxTarget: recipient.tmuxTarget } });
+    assert.deepEqual(drain.delivered, [sent.message.id]);
+    assert.deepEqual(delivered, [formatBuzInjection(sent.message)]);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "inbox"))).length, 1);
+  });
+});
+
+test("requeueQuarantinedMessages with an id moves only that message and resets its retry budget", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.aaa");
+    const first = await sendBuzMessage({ recipient, sender: { kind: "human", name: "apiary" }, tier: "queue", body: "one" });
+    const second = await sendBuzMessage({ recipient, sender: { kind: "human", name: "apiary" }, tier: "queue", body: "two" });
+
+    // Hand-stage both in quarantine the way the drain leaves them (rename
+    // preserves filenames), plus a stale retries sidecar for the target.
+    const queueDir = beeMailboxDir("CO.aaa", "queue");
+    const quarantineDir = beeMailboxDir("CO.aaa", "quarantine");
+    await mkdir(quarantineDir, { recursive: true });
+    for (const file of await readdir(queueDir)) {
+      await rename(join(queueDir, file), join(quarantineDir, file));
+    }
+    const firstFile = (await readdir(quarantineDir)).find((f) => f.includes(first.message.id))!;
+    await writeFile(join(queueDir, `${firstFile}.retries`), "2");
+
+    const result = await requeueQuarantinedMessages("CO.aaa", { id: first.message.id });
+    assert.deepEqual(result.requeued, [first.message.id]);
+    const queued = await readdir(queueDir);
+    assert.deepEqual(queued, [firstFile], "only the requested message returns to queue/, with no stale .retries sidecar");
+    const remaining = await readdir(quarantineDir);
+    assert.equal(remaining.length, 1);
+    assert.ok(remaining[0]!.includes(second.message.id));
+  });
+});
+
+test("requeueQuarantinedMessages leaves malformed quarantine files in place", async () => {
+  await withTempStore(async () => {
+    const quarantineDir = beeMailboxDir("CO.aaa", "quarantine");
+    await mkdir(quarantineDir, { recursive: true });
+    await writeFile(join(quarantineDir, "2026-01-01T00-00-00-000Z-from-x-bad.md"), "not a buz message");
+
+    const result = await requeueQuarantinedMessages("CO.aaa");
+    assert.deepEqual(result.requeued, []);
+    assert.equal(result.skipped.length, 1);
+    assert.match(result.skipped[0]!.reason, /malformed/);
+    assert.equal((await readdir(quarantineDir)).length, 1, "malformed file stays quarantined");
+    assert.equal(await countQuarantinedMessages("CO.aaa"), 1, "malformed files still count as dead letters");
   });
 });
 

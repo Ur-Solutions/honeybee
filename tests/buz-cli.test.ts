@@ -398,3 +398,62 @@ test("hive buz send --tier next-tool on a tmux bee downgrades to queue (substrat
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("hive buz inbox surfaces the quarantined count; quarantine lists and requeue re-drives", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    // A passive message lands in inbox/ so the listing is non-empty.
+    await hive(dir, "buz", "send", "CO.aaa", "--sender-human", "apiary", "--tier", "passive", "-p", "hello");
+    // A queued message, hand-quarantined the way the drain leaves it
+    // (rename preserving the filename).
+    await hive(dir, "buz", "send", "CO.aaa", "--sender-human", "apiary", "--tier", "queue", "-p", "steer");
+    const queueDir = join(dir, "buz", "CO.aaa", "queue");
+    const quarantineDir = join(dir, "buz", "CO.aaa", "quarantine");
+    await mkdir(quarantineDir, { recursive: true });
+    const [queued] = await readdir(queueDir);
+    const { rename } = await import("node:fs/promises");
+    await rename(join(queueDir, queued!), join(quarantineDir, queued!));
+
+    const inbox = await hive(dir, "buz", "inbox", "CO.aaa");
+    assert.match(inbox.stdout, /buz\.quarantine\.count\tCO\.aaa\t1/);
+
+    const listing = await hive(dir, "buz", "quarantine", "CO.aaa");
+    assert.match(listing.stdout, /buz\.quarantine\tCO\.aaa\t\S+\thuman:apiary\t/);
+
+    const requeue = await hive(dir, "buz", "requeue", "CO.aaa", "--all");
+    assert.match(requeue.stdout, /buz\.requeue\tCO\.aaa\t1\t\S+/);
+    assert.deepEqual(await readdir(quarantineDir), []);
+    assert.deepEqual(await readdir(queueDir), [queued]);
+
+    // Count note disappears once quarantine is empty.
+    const inboxAfter = await hive(dir, "buz", "inbox", "CO.aaa");
+    assert.doesNotMatch(inboxAfter.stdout, /buz\.quarantine\.count/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz requeue requires exactly one of <message-id> or --all", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    const stderr = await hiveExpectFail(dir, "buz", "requeue", "CO.aaa");
+    assert.match(stderr, /Usage: hive buz requeue/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz requeue <id> refuses messages that are not quarantined", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    const { stdout } = await hive(dir, "buz", "send", "CO.aaa", "--sender-human", "apiary", "--tier", "queue", "-p", "still queued");
+    const id = stdout.split("\t")[2]!;
+    const stderr = await hiveExpectFail(dir, "buz", "requeue", "CO.aaa", id);
+    assert.match(stderr, /is in queue\/; only quarantined messages can be requeued/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

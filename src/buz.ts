@@ -192,6 +192,12 @@ export { sendBuzMessage } from "./buz/send.js";
 
 export { cancelQueuedBuzMessage } from "./buz/cancel.js";
 
+export {
+  countQuarantinedMessages,
+  requeueQuarantinedMessages,
+  type RequeueResult,
+} from "./buz/requeue.js";
+
 export { processQueueForBee } from "./buz/drain.js";
 
 export {
