@@ -332,6 +332,30 @@ export async function buildResumeSpec(
   return stampIdentity(await assertReplayExecutable(replayRecordedLaunch(record, tool, resolved, extraArgs), resolved));
 }
 
+/** Fail before credential activation or process launch when a revive cwd is gone. */
+export async function assertReviveWorkingDirectory(
+  record: Pick<SessionRecord, "name" | "cwd">,
+  inspect: typeof stat = stat,
+): Promise<void> {
+  let cwdStat: Awaited<ReturnType<typeof stat>>;
+  try {
+    cwdStat = await inspect(record.cwd);
+  } catch (error) {
+    const detail = (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? "no longer exists"
+      : `is not accessible (${error instanceof Error ? error.message : String(error)})`;
+    throw new Error(
+      `hive revive: working directory for ${record.name} ${detail}: ${record.cwd}; ` +
+      "restore or recreate the working copy before reviving",
+    );
+  }
+  if (!cwdStat.isDirectory()) {
+    throw new Error(
+      `hive revive: working directory for ${record.name} is not a directory: ${record.cwd}; ` +
+      "restore or recreate the working copy before reviving",
+    );
+  }
+}
 
 /**
  * Re-fork the HSR runner host for a bee whose record still says substrate:"hsr",
@@ -377,6 +401,7 @@ async function reviveHsrRunnerInTransaction(
   const adapter = adapterFor(tool);
   const fresh = opts.fresh === true;
   const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
+  await assertReviveWorkingDirectory(record);
   const spec = await buildResumeSpec(record, tool, [], {
     replayLaunch: opts.replayLaunch,
     activateCredentials: opts.activateCredentials,

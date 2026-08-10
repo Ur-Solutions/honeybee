@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,10 +8,12 @@ import { test } from "node:test";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import {
   consumeHsrRunPayload,
+  hsrStartupFailureForPayload,
   startHsrHostFromPayload,
   type HsrRunPayload,
 } from "../src/hsr/runner-entry.js";
 import { spawnHsrHost } from "../src/hsr/runnerHost.js";
+import { hsrControlSocketPath, writeHsrMeta } from "../src/hsr/runDir.js";
 
 const SECRET = "hsr-payload-secret-sentinel-71f23a";
 
@@ -93,6 +96,89 @@ test("startup errors are redacted after the payload directory is removed", async
   assert.equal(existsSync(handoff.dir), false);
 });
 
+test("startup failure metadata distinguishes a vanished cwd from an unavailable harness", () => {
+  const missingCwd = join(tmpdir(), "definitely-missing-hsr-cwd-71f23a");
+  const spawnError = Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" });
+  assert.deepEqual(hsrStartupFailureForPayload(spawnError, { ...payload(), cwd: missingCwd }), {
+    stage: "adapter-start",
+    code: "ENOENT",
+    message: "HSR working directory disappeared during harness startup",
+  });
+  assert.deepEqual(hsrStartupFailureForPayload(spawnError, payload()), {
+    stage: "adapter-start",
+    code: "ENOENT",
+    message: "HSR harness executable could not be started",
+  });
+  const providerFailure = hsrStartupFailureForPayload(
+    new Error(`provider response leaked ${SECRET}`),
+    payload(),
+  );
+  assert.equal(providerFailure.message, "HSR harness failed during startup; inspect host.log for provider diagnostics");
+  assert.doesNotMatch(providerFailure.message, new RegExp(SECRET));
+});
+
+test("parent surfaces the detached startup cause without a false rollback warning", async () => {
+  const store = await mkdtemp(join(tmpdir(), "hive-hsr-startup-cause-store-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = store;
+  const bee = "parent-startup-cause";
+  const hostPid = 7654321;
+  try {
+    await assert.rejects(
+      spawnHsrHost(payload(bee), {
+        resolveEntry: async () => ({ path: "/unused/runner-entry.js", mode: "dedicated" }),
+        spawn: (() => {
+          const child = new EventEmitter() as EventEmitter & {
+            pid: number;
+            exitCode: number | null;
+            signalCode: NodeJS.Signals | null;
+            unref(): void;
+            kill(signal?: NodeJS.Signals | number): boolean;
+          };
+          child.pid = hostPid;
+          child.exitCode = null;
+          child.signalCode = null;
+          child.unref = () => undefined;
+          child.kill = (signal = "SIGTERM") => {
+            child.signalCode = typeof signal === "string" ? signal : "SIGTERM";
+            queueMicrotask(() => child.emit("exit", null, child.signalCode));
+            return true;
+          };
+          queueMicrotask(() => {
+            void writeHsrMeta(bee, {
+              bee,
+              harness: "stub",
+              tier: "stream",
+              hostPid,
+              hostFingerprint: { pgid: hostPid, startedAt: "test-parent-startup" },
+              childAdmission: "none",
+              startupFailure: {
+                stage: "adapter-start",
+                code: "ENOENT",
+                message: "HSR working directory disappeared during harness startup",
+              },
+              startedAt: "2026-08-09T08:14:03.958Z",
+              controlSocket: hsrControlSocketPath(bee),
+              status: "exited",
+              endedAt: "2026-08-09T08:14:03.969Z",
+            });
+          });
+          return child;
+        }) as unknown as typeof import("node:child_process").spawn,
+      }),
+      (error: Error) => {
+        assert.equal(error.message, "HSR working directory disappeared during harness startup");
+        assert.doesNotMatch(error.message, /rollback is unconfirmed/);
+        return true;
+      },
+    );
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(store, { recursive: true, force: true });
+  }
+});
+
 test("parent spawn failure removes an unconsumed payload and redacts its contents", async () => {
   const store = await mkdtemp(join(tmpdir(), "hive-hsr-payload-store-"));
   const previous = process.env.HIVE_STORE_ROOT;
@@ -121,6 +207,21 @@ test("parent spawn failure removes an unconsumed payload and redacts its content
     else process.env.HIVE_STORE_ROOT = previous;
     await rm(store, { recursive: true, force: true });
   }
+});
+
+test("parent rejects a missing working directory before spawning a detached host", async () => {
+  const missingCwd = join(tmpdir(), "definitely-missing-parent-hsr-cwd-71f23a");
+  let spawned = false;
+  await assert.rejects(
+    spawnHsrHost({ ...payload("missing-parent-cwd"), cwd: missingCwd }, {
+      spawn: (() => {
+        spawned = true;
+        throw new Error("must not spawn");
+      }) as typeof import("node:child_process").spawn,
+    }),
+    /HSR working directory is no longer available.*restore or recreate the working copy/,
+  );
+  assert.equal(spawned, false);
 });
 
 test("operator-supplied arbitrary payload paths are rejected without touching the file or directory", async () => {

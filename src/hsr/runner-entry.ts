@@ -4,7 +4,7 @@
  * the runner-host lifecycle; parent-side spawning stays in runnerHost.ts.
  */
 
-import { constants, realpathSync } from "node:fs";
+import { constants, existsSync, realpathSync } from "node:fs";
 import { lstat, open, realpath, rmdir, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -16,7 +16,7 @@ import {
   withoutAmbientProviderState,
 } from "./cellSandbox.js";
 import { runHsrHost } from "./host.js";
-import { hsrRunDir } from "./runDir.js";
+import { hsrRunDir, type HsrStartupFailure } from "./runDir.js";
 import type { RunnerOpts } from "./types.js";
 
 /** The JSON payload handed to a detached local HSR host. */
@@ -60,6 +60,30 @@ export function redactHsrPayloadError(error: unknown, payload: HsrRunPayload): E
     message = message.replaceAll(value, "[redacted]");
   }
   return new Error(message || "HSR runner startup failed");
+}
+
+/** Build the safe, actionable startup cause published to the spawning parent. */
+export function hsrStartupFailureForPayload(error: unknown, payload: HsrRunPayload): HsrStartupFailure {
+  const rawCode = error && typeof error === "object" ? (error as NodeJS.ErrnoException).code : undefined;
+  const code = typeof rawCode === "string" && /^[A-Z][A-Z0-9_]{0,31}$/.test(rawCode)
+    ? rawCode
+    : undefined;
+  if (code === "ENOENT") {
+    return {
+      stage: "adapter-start",
+      code,
+      message: existsSync(payload.cwd)
+        ? "HSR harness executable could not be started"
+        : "HSR working directory disappeared during harness startup",
+    };
+  }
+  return {
+    stage: "adapter-start",
+    ...(code ? { code } : {}),
+    message: code
+      ? `HSR harness failed during startup (${code}); inspect host.log for provider diagnostics`
+      : "HSR harness failed during startup; inspect host.log for provider diagnostics",
+  };
 }
 
 async function validatedHsrPayloadPath(payloadPath: string): Promise<{ payloadPath: string; dir: string }> {
@@ -230,7 +254,13 @@ async function hydrateAndStartConsumedPayload(
     args: payload.spec.args,
     runDir: hsrRunDir(payload.bee),
   };
-  const host = await runHost({ bee: payload.bee, adapter, opts, queueStartup: true });
+  const host = await runHost({
+    bee: payload.bee,
+    adapter,
+    opts,
+    queueStartup: true,
+    formatStartupFailure: (error) => hsrStartupFailureForPayload(error, payload),
+  });
   return { payload, host };
 }
 

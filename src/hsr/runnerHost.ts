@@ -117,6 +117,14 @@ export async function spawnHsrHost(
   payload: HsrRunPayload,
   dependencies: SpawnHsrHostDependencies = {},
 ): Promise<number> {
+  try {
+    await realpath(payload.cwd);
+  } catch (error) {
+    const reason = (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? "is no longer available"
+      : "could not be verified";
+    throw new Error(`HSR working directory ${reason}; restore or recreate the working copy before launch`);
+  }
   await ensureHsrRunDir(payload.bee);
   const dir = await (dependencies.makeTempDir ?? mkdtemp)(join(tmpdir(), "hive-hsr-payload-"));
   const payloadPath = join(dir, "payload.json");
@@ -183,7 +191,10 @@ async function waitForSpawnedHostChildAdmission(bee: string, hostPid: number, ti
       }
       if (meta.hostPid === hostPid) observedExpectedHost = true;
       if (meta.hostPid === hostPid && meta.status === "exited") {
-        throw new Error(`HSR birth admission for ${bee} exited before a runnable child was admitted`);
+        throw new Error(
+          meta.startupFailure?.message ??
+          `HSR birth admission for ${bee} exited before a runnable child was admitted`,
+        );
       }
       if (
         meta.hostPid === hostPid &&
