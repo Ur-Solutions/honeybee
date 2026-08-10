@@ -897,6 +897,13 @@ async function distributeClaudeChainLocked(
           home,
           reason: "non-raw-json-keychain",
         }).catch(() => undefined);
+        // Deliberately NO file repair here, unlike the stranded/unreadable
+        // branches above: those failed to READ the entry, while this one read
+        // bytes that decode to nothing — the home may hold an identity we
+        // cannot attribute, and stamping our chain into its file could cross
+        // accounts. The rotation-stranded marker still surfaces the home so
+        // the resume lane (which runs full activation, with its identity
+        // guards) handles any live bee on it.
         continue;
       }
       const repairingLegacyEntry = existingRaw !== null && !isRawClaudeCredentialPayload(existingRaw);

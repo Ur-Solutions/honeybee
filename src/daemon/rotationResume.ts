@@ -206,6 +206,11 @@ export function createRotationResumeDispatcher(deps: RotationResumeDeps = {}): (
             activateCredentials: true,
           });
           await writeState(record.name, { ...plan.state, status: "recovered" });
+          // Swallowed removal failure is safe but not free: the marker keeps
+          // the home, and once the resumed bee completes a turn the turn_end
+          // reset above re-arms its attempt budget, so it can be resumed
+          // again. Bounded by rotation cadence (the next full propagation
+          // clears the marker), so accepted over failing a successful resume.
           await removeMarkerHome(account, record.homePath).catch(() => undefined);
           await ledger({
             type: "bee.rotation_resume",
