@@ -225,14 +225,16 @@ test("hsrUnavailable: ZERO writes for the bee — nothing opens, nothing closes"
   });
 });
 
-test("registry: request reconciliation precedes auth recovery and needs-input, and skips an untrusted snapshot", async () => {
+test("registry: request reconciliation precedes automatic recovery and needs-input, and skips an untrusted snapshot", async () => {
   const names = tickDispatchers.map((dispatcher) => dispatcher.name);
   const reconcileIdx = names.indexOf("reconcileRequests");
   const authRecoveryIdx = names.indexOf("recoverAuthNeeded");
+  const rotationResumeIdx = names.indexOf("resumeRotationStranded");
   const needsInputIdx = names.indexOf("dispatchNeedsInput");
   assert.ok(reconcileIdx >= 0, "reconcileRequests is registered");
   assert.equal(reconcileIdx + 1, authRecoveryIdx, "auth recovery runs after its durable request is reconciled");
-  assert.equal(authRecoveryIdx + 1, needsInputIdx, "human routing follows automatic recovery");
+  assert.equal(authRecoveryIdx + 1, rotationResumeIdx, "rotation recovery follows explicit auth recovery");
+  assert.equal(rotationResumeIdx + 1, needsInputIdx, "human routing follows automatic recovery");
 
   const dispatcher = tickDispatchers[reconcileIdx]!;
   let called = 0;
