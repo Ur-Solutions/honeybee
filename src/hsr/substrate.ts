@@ -34,7 +34,7 @@ import {
   listHsrBees,
   type HsrProcessSignalDependencies,
 } from "./observe.js";
-import { readHsrMeta, readHsrMetaStrict, type HsrMeta } from "./runDir.js";
+import { readHsrMeta, readHsrMetaStrict, writeHsrMeta, type HsrMeta } from "./runDir.js";
 import { readProcessBirthFingerprint, sameProcessBirthFingerprint } from "./processIdentity.js";
 import { connectRpcClient } from "./rpc.js";
 import { clearPendingHsrTurns, enqueuePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
@@ -144,6 +144,48 @@ async function confirmChildGroupStopped(
 }
 
 /**
+ * Numeric-absence death proof for a host whose birth fingerprint is not
+ * comparable (legacy or hand-repaired metadata). Exact PID absence still
+ * proves the RECORDED host process no longer exists — the same carve-out
+ * waitUntilHostStopped grants exited pre-fingerprint metas, extended to
+ * stale `running` metas so a long-dead host cannot wedge kill/revive
+ * forever behind "HSR stop unconfirmed" (cell-smoothness Phase 2). A live,
+ * reused, or unreadable pid stays unconfirmed; mirrors and sentinel pids
+ * are never death-provable this way.
+ */
+async function recordedHostPidAbsent(meta: HsrMeta, deps: HsrProcessSignalDependencies): Promise<boolean> {
+  if (meta.mirrorOfNode || !Number.isSafeInteger(meta.hostPid) || meta.hostPid <= 0) return false;
+  if (meta.hostPid === process.pid) return false;
+  try {
+    return (await (deps.readProcessIdentity ?? readProcessBirthFingerprint)(meta.hostPid)) === null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Publish a proven stop outcome onto the exact incarnation's metadata. A
+ * confirmed-stopped host whose meta still says queued/running re-enters every
+ * observer and stop path looking alive (the revive wedge: each retry re-fails
+ * the same verification). Mirrors reapDeadHosts' flip; best-effort — the stop
+ * result stands even when the write fails, and a replacement incarnation's
+ * metadata is never touched.
+ */
+async function publishProvenStop(bee: string, initial: HsrMeta, current: HsrMeta | null): Promise<void> {
+  // Only the freshly-read on-disk meta authorizes the write: a replacement
+  // incarnation's metadata (or an already-final record) is never overwritten.
+  // Unlike the signalling paths, a pair of fingerprint-LESS metas with the
+  // same pid + startedAt is the same incarnation for this non-destructive
+  // publication — legacy metas must not be exempt from the flip.
+  if (!current || current.status === "exited") return;
+  const sameIncarnation = initial.hostPid === current.hostPid && initial.startedAt === current.startedAt &&
+    (sameProcessBirthFingerprint(initial.hostFingerprint, current.hostFingerprint) ||
+      (initial.hostFingerprint === undefined && current.hostFingerprint === undefined));
+  if (!sameIncarnation) return;
+  await writeHsrMeta(bee, { ...current, status: "exited", endedAt: new Date().toISOString() }).catch(() => undefined);
+}
+
+/**
  * Best-effort stop: ask the host to stop cleanly over the control socket and
  * give it a brief grace to finalize (the host's stop tears down the harness
  * child, then flips meta to "exited"). Only if that clean stop does not take —
@@ -210,19 +252,32 @@ export async function stopHsrIncarnation(
     } else {
       // Missing/replacement/exited meta never authorizes a signal. A gone or
       // different OS birth proves only that the INITIAL host is gone; a match
-      // behind replacement metadata stays unconfirmed, and unreadable legacy
-      // identity fails closed.
+      // behind replacement metadata stays unconfirmed. An unverifiable birth
+      // (legacy/hand-repaired meta without a comparable fingerprint) may still
+      // be death-proven by exact numeric PID absence; a live or unreadable
+      // pid keeps failing closed.
       stopped = hostIdentity === "gone" || hostIdentity === "mismatch" ||
+        (hostIdentity === "unverifiable" && await recordedHostPidAbsent(initial, deps)) ||
         (initial.hostPid === process.pid && sameHostIncarnation(initial, latest) && latest?.status === "exited");
     }
   }
 
   const finalMeta = await readHsrMetaStrict(bee);
   if (sameHostIncarnation(initial, finalMeta)) ownedMeta = finalMeta!;
-  const childStopped = stopped ? await confirmChildGroupStopped(ownedMeta, deps) : false;
+  let childStopped = stopped ? await confirmChildGroupStopped(ownedMeta, deps) : false;
+  // A host that died BEFORE child admission completed ("pending"/legacy, no
+  // child pid ever recorded) leaves nothing to verify — and, being dead, can
+  // never publish a locator either. With the host incarnation itself proven
+  // stopped above, refusing forever only wedges kill/revive on exactly the
+  // Cells that crashed during boot; treat the never-recorded child group as
+  // moot. A RECORDED child with unverifiable identity still fails closed.
+  if (stopped && !childStopped && ownedMeta.childPid === undefined && ownedMeta.childPgid === undefined) {
+    childStopped = true;
+  }
   const confirmed = stopped && childStopped;
   if (confirmed) {
     await clearPendingHsrTurns(bee).catch(() => undefined);
+    await publishProvenStop(bee, initial, finalMeta);
     return { ok: true, stdout: "", stderr: "", exitCode: 0 };
   }
   return {
