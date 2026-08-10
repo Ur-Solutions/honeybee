@@ -227,8 +227,12 @@ function providerWriteRoots(kind: string, env: Record<string, string>, cwd: stri
  * already send buz unconditionally, so allowing the mailbox subtree grants no
  * authority the Cell contract means to withhold — while leaving it under the
  * store-wide write deny strands a cell-bound bee's reports (observed live as
- * `EPERM: mkdir ~/.hive/buz/<bee>`). The rest of the hive store (sessions,
- * daemon state, machine identity) stays read-only.
+ * `EPERM: mkdir ~/.hive/buz/<bee>`). HSR next-tool delivery also serializes
+ * the sender against the recipient runner through
+ * `<store>/locks/hsr-turn-delivery/`; allow exactly that lock directory so a
+ * Cell can use the same non-interrupting delivery path as a host-side sender.
+ * The rest of the hive store (sessions, daemon state, machine identity) stays
+ * read-only.
  *
  * Every send also appends one audit line to `<store>/ledger.jsonl`, allowed as
  * a single file and pre-created because the Linux backend can only bind paths
@@ -245,11 +249,17 @@ function hiveBuzWritePaths(env: Record<string, string>, cwd: string): string[] {
   if (cwd === buzDir || cwd.startsWith(`${buzDir}${sep}`)) {
     throw new Error(`Cell sandbox refuses a buz root that contains the Cell: ${buzDir}`);
   }
-  const ledgerFile = join(realpathSync(configuredRoot), "ledger.jsonl");
+  const canonicalRoot = realpathSync(configuredRoot);
+  // withHsrTurnDeliveryLock creates transient `.lock.init-*` siblings, so the
+  // directory itself must exist and be writable on both Seatbelt and bwrap.
+  // Keep this narrower than `<store>/locks`: other control-plane locks remain
+  // host-only.
+  const hsrTurnDeliveryLocks = ensurePrivateDirectory(join(canonicalRoot, "locks", "hsr-turn-delivery"));
+  const ledgerFile = join(canonicalRoot, "ledger.jsonl");
   // Append-mode create: never truncates an existing ledger, and matches
   // appendLedger's own 0600 create mode.
   writeFileSync(ledgerFile, "", { flag: "a", mode: 0o600 });
-  return [buzDir, ledgerFile];
+  return [buzDir, hsrTurnDeliveryLocks, ledgerFile];
 }
 
 /**

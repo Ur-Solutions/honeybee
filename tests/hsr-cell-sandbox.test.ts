@@ -84,7 +84,7 @@ test("Cell policy permits only the Cell, provider state, and per-run scratch out
   }
 });
 
-test("Cell policy explicitly allows hive buz mailboxes and the ledger append, with rotation pinned off", async () => {
+test("Cell policy explicitly allows hive buz mailboxes, next-tool locks, and the ledger append", async () => {
   const root = await mkdtemp(join(tmpdir(), "hive-cell-buz-policy-"));
   const bin = join(root, "bin");
   const cell = join(root, "cell");
@@ -102,8 +102,12 @@ test("Cell policy explicitly allows hive buz mailboxes and the ledger append, wi
     });
     const canonicalStore = await realpath(store);
     assert.ok(built.state.allowWrite.includes(join(canonicalStore, "buz")), "buz mailbox subtree is writable");
+    const nextToolLocks = join(canonicalStore, "locks", "hsr-turn-delivery");
+    assert.ok(built.state.allowWrite.includes(nextToolLocks), "HSR next-tool delivery locks are writable");
+    assert.ok(!built.state.allowWrite.includes(join(canonicalStore, "locks")), "the broader lock tree stays host-only");
     assert.ok(built.state.allowWrite.includes(join(canonicalStore, "ledger.jsonl")), "ledger append target is writable");
     // The Linux backend can only bind paths that exist at wrap time.
+    assert.equal(await realpath(nextToolLocks), nextToolLocks);
     assert.equal(await readFile(join(store, "ledger.jsonl"), "utf8"), "");
     assert.equal(built.env.HIVE_LEDGER_MAX_BYTES, "0", "in-cell ledger rotation is pinned off");
     assert.ok(!built.state.allowWrite.includes(canonicalStore), "the store root itself stays read-only");
@@ -287,6 +291,7 @@ test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical
   const store = join(root, "store");
   await Promise.all([mkdir(cell), mkdir(canonical), mkdir(runDir), mkdir(provider), mkdir(store)]);
   await mkdir(join(store, "sessions"));
+  await mkdir(join(store, "locks", "host-only"), { recursive: true });
   const originalCwd = process.cwd();
   try {
     const baseEnv = {
@@ -310,10 +315,13 @@ test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical
       `printf escaped > ${JSON.stringify(join(canonical, "escaped.txt"))} 2>/dev/null || true`,
       "git add inside.txt",
       "git -c user.name=Cell -c user.email=cell@example.test commit -qm contained",
-      // Hive buz is explicitly available inside the Cell: mailbox writes and
-      // the ledger append succeed while the rest of the store stays read-only.
+      // Hive buz is explicitly available inside the Cell: mailbox writes,
+      // next-tool's HSR delivery lock, and the ledger append succeed while
+      // the rest of the store stays read-only.
       `mkdir -p ${JSON.stringify(join(store, "buz", "cl.test", "outbox"))}`,
       `printf msg > ${JSON.stringify(join(store, "buz", "cl.test", "outbox", "note.md"))}`,
+      `printf lock > ${JSON.stringify(join(store, "locks", "hsr-turn-delivery", "recipient.lock.init-cell-probe"))}`,
+      `printf blocked > ${JSON.stringify(join(store, "locks", "host-only", "escaped.lock"))} 2>/dev/null || true`,
       `printf '{"type":"buz.send"}\\n' >> ${JSON.stringify(join(store, "ledger.jsonl"))}`,
       `printf stray > ${JSON.stringify(join(store, "sessions", "escaped.json"))} 2>/dev/null || true`,
     ].join("; ");
@@ -323,6 +331,11 @@ test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical
     assert.equal(await readFile(join(cell, "inside.txt"), "utf8"), "inside");
     await assert.rejects(readFile(join(canonical, "escaped.txt"), "utf8"), /ENOENT/);
     assert.equal(await readFile(join(store, "buz", "cl.test", "outbox", "note.md"), "utf8"), "msg");
+    assert.equal(
+      await readFile(join(store, "locks", "hsr-turn-delivery", "recipient.lock.init-cell-probe"), "utf8"),
+      "lock",
+    );
+    await assert.rejects(readFile(join(store, "locks", "host-only", "escaped.lock"), "utf8"), /ENOENT/);
     assert.equal(await readFile(join(store, "ledger.jsonl"), "utf8"), '{"type":"buz.send"}\n');
     await assert.rejects(readFile(join(store, "sessions", "escaped.json"), "utf8"), /ENOENT/);
     assert.equal(initialized.env.HIVE_LEDGER_MAX_BYTES, "0");
