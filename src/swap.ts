@@ -11,7 +11,7 @@ import {
 import { isWellFormedPaneId } from "./paneId.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, splitShellWords } from "./agents.js";
 import { resumeArgsForAgent } from "./drivers.js";
-import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
+import { hsrCellPayloadFields, spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
 import { captureProcessBirthFingerprint, type ProcessBirthFingerprint } from "./hsr/processIdentity.js";
 import { stopHsrIncarnationByPid } from "./hsr/substrate.js";
 import { withSessionLifecycleTransaction } from "./lifecycle.js";
@@ -253,6 +253,8 @@ export async function swapAccount(
           authKind: "subscription",
           accountId: account.id,
           ...(model ? { model } : {}),
+          // A swapped execution Cell keeps its OS write boundary + grants.
+          ...hsrCellPayloadFields(current),
           spec: { command: spec.command, args: spec.args, env: spec.env },
         });
         runnerFingerprint = await captureProcessBirthFingerprint(runnerPid);

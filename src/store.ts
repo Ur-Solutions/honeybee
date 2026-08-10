@@ -210,6 +210,12 @@ export type SessionRecord = {
    * indeterminate) without ever counting processes.
    */
   executionRunId?: string;
+  /**
+   * Extra sandbox write roots granted at spawn (`hive spawn --sandbox-write`,
+   * Apiary Cell Layout v2 wrappers). Persisted so relaunches (revive/swap)
+   * replay the exact fs grants of the original Cell launch.
+   */
+  sandboxWriteRoots?: string[];
   flowName?: string;
   /** Vault account bound to this bee's home (Phase 3 identity layer). */
   accountId?: string;
@@ -1560,6 +1566,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
   ...OPTIONAL_STRING_SESSION_KEYS,
   "launchArgv",
+  "sandboxWriteRoots",
   "substrate",
   "runnerPid",
   "runnerFingerprint",
@@ -1648,6 +1655,16 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
 
   if (object.autoswap === true) record.autoswap = true;
+
+  // Extra sandbox write roots: only well-formed absolute paths survive the
+  // load; a malformed entry is dropped rather than thrown (forward-compatible
+  // like buzAccept), and an empty result omits the field entirely.
+  if (Array.isArray(object.sandboxWriteRoots)) {
+    const roots = object.sandboxWriteRoots.filter(
+      (value): value is string => typeof value === "string" && value.length > 0 && isAbsolute(value),
+    );
+    if (roots.length > 0) record.sandboxWriteRoots = [...roots];
+  }
 
   // Session preamble: forward-compatible like contract — a malformed block is
   // dropped on load rather than throwing. An unknown channel degrades to

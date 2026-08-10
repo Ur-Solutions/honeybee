@@ -30,6 +30,12 @@ export type HsrRunPayload = {
   model?: string;
   /** Trusted execution-protocol filesystem boundary. */
   filesystemWriteScope?: "cwd";
+  /**
+   * Extra allow-listed sandbox write roots (`hive spawn --sandbox-write`) —
+   * Apiary Cell Layout v2 wrapper dirs. Additive and only meaningful together
+   * with filesystemWriteScope: an unsandboxed runner ignores them.
+   */
+  extraWriteRoots?: string[];
   /** Resume an existing provider session instead of starting fresh. */
   resume?: boolean;
   /** Lineage for HIVE_COMB/HIVE_PARENT env stamping (APIA-82). */
@@ -235,6 +241,7 @@ async function hydrateAndStartConsumedPayload(
       cwd: payload.cwd,
       runDir: hsrRunDir(payload.bee),
       env: childEnv,
+      ...(payload.extraWriteRoots?.length ? { extraWriteRoots: payload.extraWriteRoots } : {}),
     });
     childEnv = initialized.env;
     cellSandbox = initialized.backend;

@@ -14,6 +14,7 @@
 // bee name (derived from runId) and stamped atomically at record creation via
 // executionRunId, so crash recovery can classify the outcome from durable
 // state alone.
+import { dirname } from "node:path";
 import type { JsonValue } from "../comb/types.js";
 import type { JsonObject } from "./contract.js";
 import { executionError, indeterminateExecutionError } from "./errors.js";
@@ -34,6 +35,13 @@ export type HsrHarnessLaunchConfig = {
   brief?: string;
   account?: string;
   preamble?: string;
+  /**
+   * Path-free Cell layout marker from the signed envelope (Apiary Cell Layout
+   * v2). The envelope never carries machine paths, so for "v2" the launcher
+   * itself derives the wrapper (the working copy's parent directory) and
+   * grants it as a Cell-sandbox write root so the harness can write `box/`.
+   */
+  cellLayout?: "v1" | "v2";
 };
 
 /**
@@ -55,19 +63,24 @@ export function resolveHsrHarnessLaunchConfig(intent: JsonObject): HsrHarnessLau
   if (preamble !== undefined && (typeof preamble !== "string" || preamble.trim().length === 0)) {
     throw executionError("HARNESS_UNAVAILABLE", "harness config.preamble must be a non-empty string");
   }
+  const cellLayout = config?.cellLayout;
+  if (cellLayout !== undefined && cellLayout !== "v1" && cellLayout !== "v2") {
+    throw executionError("HARNESS_UNAVAILABLE", "harness config.cellLayout must be \"v1\" or \"v2\" when present");
+  }
   return {
     driverId,
     ...(model !== undefined ? { model } : {}),
     ...(brief !== undefined ? { brief } : {}),
     ...(account !== undefined ? { account } : {}),
     ...(preamble !== undefined ? { preamble } : {}),
+    ...(cellLayout !== undefined ? { cellLayout } : {}),
   };
 }
 
 export function buildHsrSpawnFlags(
   beeName: string,
   cwd: string,
-  config: Pick<HsrHarnessLaunchConfig, "account" | "preamble">,
+  config: Pick<HsrHarnessLaunchConfig, "account" | "preamble" | "cellLayout">,
 ): Map<string, string | true | string[]> {
   const flags = new Map<string, string | true | string[]>([
     ["substrate", "hsr"],
@@ -76,6 +89,9 @@ export function buildHsrSpawnFlags(
   ]);
   if (config.account) flags.set("account", config.account);
   if (config.preamble) flags.set("preamble", config.preamble);
+  // Layout v2: the wrapper one level above the checkout owns `box/` — grant it
+  // as an extra Cell-sandbox write root (repeatable --sandbox-write shape).
+  if (config.cellLayout === "v2") flags.set("sandbox-write", [dirname(cwd)]);
   return flags;
 }
 
@@ -211,12 +227,12 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
     // harness config — never from daemon profiles or ambient configuration.
     // Keeping the preamble separate from brief lets spawn preserve host-owned
     // session envelopes beside Honeybee's identity before the operator prompt.
-    const { driverId, model, brief, account, preamble } = resolveHsrHarnessLaunchConfig(intent);
+    const { driverId, model, brief, account, preamble, cellLayout } = resolveHsrHarnessLaunchConfig(intent);
 
     let record: SpawnedExecutionBee;
     try {
       if (deps.spawn) {
-        record = await deps.spawn(request, { driverId, ...(model ? { model } : {}), ...(brief ? { brief } : {}), ...(account ? { account } : {}), ...(preamble ? { preamble } : {}) }, copy.path);
+        record = await deps.spawn(request, { driverId, ...(model ? { model } : {}), ...(brief ? { brief } : {}), ...(account ? { account } : {}), ...(preamble ? { preamble } : {}), ...(cellLayout ? { cellLayout } : {}) }, copy.path);
       } else {
         const { spawnSingleBee } = await import("../commands/spawn.js");
         // The registry locator is the node-private path; it is used here to run
@@ -224,6 +240,7 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
         const flags = buildHsrSpawnFlags(beeName, copy.path, {
           ...(account ? { account } : {}),
           ...(preamble ? { preamble } : {}),
+          ...(cellLayout ? { cellLayout } : {}),
         });
         let runtime: SpawnedRuntimeHandle | undefined;
         const spawned = await spawnSingleBee(

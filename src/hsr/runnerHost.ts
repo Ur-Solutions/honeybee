@@ -106,6 +106,21 @@ export type SpawnHsrHostDependencies = {
   spawn?: typeof spawnChild;
 };
 
+/**
+ * The Cell-sandbox payload fields every HSR RELAUNCH must replay from the
+ * session record: an execution Cell (executionRunId) keeps its OS write
+ * boundary across revive/swap, and the extra `--sandbox-write` grants ride
+ * along so a revived Layout-v2 Cell can still write its wrapper `box/`.
+ */
+export function hsrCellPayloadFields(
+  record: { executionRunId?: string; sandboxWriteRoots?: string[] },
+): Pick<HsrRunPayload, "filesystemWriteScope" | "extraWriteRoots"> {
+  return {
+    ...(record.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
+    ...(record.sandboxWriteRoots?.length ? { extraWriteRoots: [...record.sandboxWriteRoots] } : {}),
+  };
+}
+
 
 /**
  * Fork the detached `hive __hsr-run` host for a bee and return its pid. Mirrors

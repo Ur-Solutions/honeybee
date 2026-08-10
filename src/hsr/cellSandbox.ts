@@ -9,7 +9,7 @@
  * where Apiary and the operator can reach them.
  */
 
-import { accessSync, constants, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { accessSync, constants, lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
@@ -252,6 +252,54 @@ function hiveBuzWritePaths(env: Record<string, string>, cwd: string): string[] {
   return [buzDir, ledgerFile];
 }
 
+/**
+ * Operator/Apiary-granted extra write roots (`hive spawn --sandbox-write`) —
+ * the fs-grant seam Apiary's Cell Layout v2 rides: the harness cwd stays the
+ * checkout while the wrapper directory one level up (holding `box/`) becomes
+ * writable. Guards mirror assertNarrowProviderRoot: a grant must be a real,
+ * pre-existing, non-symlink directory and must never be broad enough to defeat
+ * containment — never the device root or $HOME, never a directory holding the
+ * hive store, and never an ancestor of the Cell other than its immediate
+ * parent (the one legitimate ancestor grant: the v2 wrapper; anything higher
+ * would fence in sibling Cells and the workspace itself).
+ */
+export function resolveCellSandboxExtraWriteRoots(
+  roots: readonly string[] | undefined,
+  cwd: string,
+  env: Record<string, string | undefined>,
+): string[] {
+  if (!roots || roots.length === 0) return [];
+  const canonicalCwd = realpathSync(cwd);
+  const homes = new Set([realpathSync(homedir())]);
+  if (env.HOME && isAbsolute(env.HOME)) homes.add(canonicalPotentialPath(env.HOME));
+  const storeRoot = canonicalPotentialPath(env.HIVE_STORE_ROOT ?? join(env.HOME ?? homedir(), ".hive"));
+  const resolved = new Set<string>();
+  for (const root of roots) {
+    if (!isAbsolute(root)) throw new Error(`Cell sandbox extra write root must be absolute: ${root}`);
+    let info: ReturnType<typeof lstatSync>;
+    try {
+      info = lstatSync(root);
+    } catch {
+      throw new Error(`Cell sandbox extra write root does not exist: ${root}`);
+    }
+    if (info.isSymbolicLink()) throw new Error(`Cell sandbox extra write root must not be a symlink: ${root}`);
+    if (!info.isDirectory()) throw new Error(`Cell sandbox extra write root must be a directory: ${root}`);
+    const normalized = realpathSync(root);
+    const deviceRoot = parse(normalized).root;
+    if (normalized === deviceRoot || homes.has(normalized)) {
+      throw new Error(`Cell sandbox refuses broad extra write root: ${root}`);
+    }
+    if (storeRoot === normalized || storeRoot.startsWith(`${normalized}${sep}`)) {
+      throw new Error(`Cell sandbox refuses an extra write root that contains the hive store: ${root}`);
+    }
+    if (canonicalCwd.startsWith(`${normalized}${sep}`) && normalized !== dirname(canonicalCwd)) {
+      throw new Error(`Cell sandbox refuses an extra write root above the Cell: ${root}`);
+    }
+    resolved.add(normalized);
+  }
+  return [...resolved];
+}
+
 function scratchEnvironment(scratchRoot: string): Record<string, string> {
   const temp = ensurePrivateDirectory(join(scratchRoot, "tmp"));
   const cache = ensurePrivateDirectory(join(scratchRoot, "cache"));
@@ -278,6 +326,8 @@ export function buildCellSandboxState(input: {
   cwd: string;
   runDir: string;
   env: Record<string, string>;
+  /** Extra allow-listed write roots (`--sandbox-write`), guarded above. */
+  extraWriteRoots?: readonly string[];
   platform?: Platform;
 }): { state: CellSandboxState; env: Record<string, string> } {
   const platform = input.platform ?? process.platform;
@@ -298,6 +348,7 @@ export function buildCellSandboxState(input: {
     scratchRoot,
     ...providerWriteRoots(input.kind, nextEnv, cwd),
     ...hiveBuzWritePaths(nextEnv, cwd),
+    ...resolveCellSandboxExtraWriteRoots(input.extraWriteRoots, cwd, nextEnv),
   ])];
   // Sandbox Runtime intentionally includes a few compatibility paths by
   // default. They are not part of Apiary's Cell contract, so carve them back
@@ -334,6 +385,7 @@ export function initializeCellSandbox(input: {
   cwd: string;
   runDir: string;
   env: Record<string, string>;
+  extraWriteRoots?: readonly string[];
 }): { backend: CellSandboxBackend; env: Record<string, string> } {
   if (activeState) throw new Error("Cell sandbox is already initialized in this runner process");
   const built = buildCellSandboxState(input);

@@ -29,7 +29,7 @@ import { formatShellCommand, hasSession } from "../tmux.js";
 import { identityRecipeForAgent, modelArgsForAgent } from "../drivers.js";
 import { deliverPromptText, resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
 import { loginSeatLiveDigest } from "./account.js";
-import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "../hsr/runnerHost.js";
+import { hsrCellPayloadFields, spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "../hsr/runnerHost.js";
 import { appendFile, readFile, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { RunnerEvent } from "../hsr/types.js";
@@ -419,6 +419,10 @@ async function reviveHsrRunnerInTransaction(
     authKind: "subscription",
     ...(record.accountId ? { accountId: record.accountId } : {}),
     ...(record.model ? { model: record.model } : {}),
+    // An execution Cell keeps its OS write boundary and --sandbox-write
+    // grants across revive; dropping them here would relaunch the same bee
+    // uncontained (or, for Layout v2, without its wrapper box/).
+    ...hsrCellPayloadFields(record),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
   const admittedMeta = await readHsrMetaStrict(record.name);
@@ -994,6 +998,7 @@ async function demoteInTransaction(lifecycle: SessionLifecycleTransaction, parse
     authKind: "subscription",
     ...(record.accountId ? { accountId: record.accountId } : {}),
     ...(record.model ? { model: record.model } : {}),
+    ...hsrCellPayloadFields(record),
     spec: { command: spec.command, args: spec.args, env: spec.env },
   });
   const admittedMeta = await readHsrMetaStrict(record.name);

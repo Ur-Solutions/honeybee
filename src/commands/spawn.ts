@@ -38,7 +38,7 @@ import { tmux } from "../tmux.js";
 import { linkHere } from "../spawnLink.js";
 import { randomUUID } from "node:crypto";
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { confirmPausedAccount, confirmSpawnReady, confirmSpawnReadyAll, dangerousMode, deliverHsrPrompt, deliverPromptText, deliverSpawnBrief, hasFlag, includePausedFlag, resolveBeeInCurrentPane, resolveSpawnColony, resolveSpawnCwd, resolveSpawnNode, resolveSpawnSubstrate, resolveSwarmIdHint, safeTmuxTarget, stringFlag, ttlFlagMs } from "../cli/shared.js";
 import { flowRun } from "../commands/flow.js";
@@ -48,6 +48,7 @@ import { instantiateRun } from "../comb/instantiate.js";
 import { loadCombVersion } from "../comb/registry.js";
 import { validateContract } from "../comb/schema.js";
 import type { JsonValue, StoredCombVersion } from "../comb/types.js";
+import { resolveCellSandboxExtraWriteRoots } from "../hsr/cellSandbox.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
 import { readHsrMetaStrict } from "../hsr/runDir.js";
 import { stopHsrIncarnationByPid } from "../hsr/substrate.js";
@@ -158,6 +159,26 @@ export function resolveSpawnEnvFlag(parsed: Parsed): Record<string, string> | un
   return parseEnvAssignments(assignments);
 }
 
+/**
+ * Repeatable `--sandbox-write <abs-dir>` — extra Cell-sandbox write roots
+ * (Apiary Cell Layout v2 wrapper dirs). Only the flag SHAPE is validated here;
+ * the narrow-root guards run in resolveCellSandboxExtraWriteRoots against the
+ * spawn cwd once it is known.
+ */
+export function resolveSandboxWriteFlag(parsed: Parsed): string[] | undefined {
+  const value = flag(parsed, "sandbox-write");
+  if (value === undefined) return undefined;
+  const entries = Array.isArray(value) ? value : [value];
+  const roots: string[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== "string" || entry.length === 0 || !isAbsolute(entry)) {
+      throw new Error("--sandbox-write requires an absolute directory (repeat the flag for multiple grants)");
+    }
+    roots.push(entry);
+  }
+  return roots.length > 0 ? roots : undefined;
+}
+
 export type SpawnOptions = {
   agent: string;
   extraArgs: string[];
@@ -191,6 +212,14 @@ export type SpawnOptions = {
    * run.start reservation. Only the in-process protocol launcher sets this.
    */
   executionRunId?: string;
+  /**
+   * Extra Cell-sandbox write roots (`--sandbox-write`, repeatable): absolute
+   * directories merged into the OS write allow-list when this spawn runs under
+   * the execution Cell sandbox (filesystemWriteScope "cwd"). Recorded on the
+   * SessionRecord either way so relaunches replay the same grants. This is the
+   * fs-grant seam Apiary's Cell Layout v2 wrapper (`box/`) rides.
+   */
+  sandboxWriteRoots?: string[];
   /** Receives the exact HSR incarnation immediately after the host fork. */
   onRuntimeLaunched?: (runtime: SpawnedRuntimeHandle) => void | Promise<void>;
   node?: NodeRecord;
@@ -381,6 +410,11 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
   if ((opts.repo || opts.checkout) && !isRemoteHsr) {
     throw new Error("--repo/--checkout provisioning requires a remote-hsr node (spawn with --node <remote-hsr>)");
   }
+  // --sandbox-write grants LOCAL directories; a remote bee's sandbox (if any)
+  // lives on the node where these paths do not exist.
+  if (opts.sandboxWriteRoots?.length && isRemote) {
+    throw new Error("--sandbox-write grants local directories; it cannot combine with a remote node spawn");
+  }
   // Executable validation only applies to local spawns; we cannot reach the remote
   // PATH cheaply and the remote runner host resolves the executable itself.
   if (!isRemote) {
@@ -552,6 +586,12 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     const hsrKitStamp = spec.homePath ? await readKitHomeStamp(spec.homePath) : kitStamp;
     const adapter = adapterFor(spec.kind);
     const runnerTier = adapter?.tier();
+    // Fail a bad --sandbox-write grant HERE, with the caller's error surface,
+    // instead of letting the detached runner die on the same guard behind a
+    // startup-failure meta. The runner re-validates authoritatively.
+    if (opts.sandboxWriteRoots?.length && opts.executionRunId) {
+      resolveCellSandboxExtraWriteRoots(opts.sandboxWriteRoots, opts.cwd, process.env as Record<string, string | undefined>);
+    }
     const hostPid = await (runtimeDeps.spawnHsrHost ?? spawnHsrHost)({
       bee: name,
       comb: name, // solo comb — a forked sub-bee will carry its parent's comb
@@ -562,6 +602,7 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
       ...(opts.account ? { accountId: opts.account.id } : {}),
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
+      ...(opts.sandboxWriteRoots?.length ? { extraWriteRoots: [...opts.sandboxWriteRoots] } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
     const admittedMeta = await (runtimeDeps.readHsrMetaStrict ?? readHsrMetaStrict)(name);
@@ -626,6 +667,7 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
         ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
         ...(spawnedById ? { spawnedById } : {}),
         ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
+        ...(opts.sandboxWriteRoots?.length ? { sandboxWriteRoots: [...opts.sandboxWriteRoots] } : {}),
         ...(opts.account ? { accountId: opts.account.id } : {}),
         ...(opts.autoswap ? { autoswap: true } : {}),
         ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
@@ -715,6 +757,9 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
     ...(spawnedById ? { spawnedById } : {}),
     ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
+    // A pane bee is not sandboxed, but the grants are still recorded so a
+    // later demote-to-HSR relaunch replays them.
+    ...(opts.sandboxWriteRoots?.length ? { sandboxWriteRoots: [...opts.sandboxWriteRoots] } : {}),
     ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
     ...(opts.account ? { accountId: opts.account.id } : {}),
     ...(opts.autoswap ? { autoswap: true } : {}),
@@ -1061,7 +1106,7 @@ export async function spawnSingleBee(
   } = {},
 ): Promise<SessionRecord> {
   const requested = parsed.args[0];
-  if (!requested) throw new Error("Usage: hive spawn <bee> [--template <name>] [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5)");
+  if (!requested) throw new Error("Usage: hive spawn <bee> [--template <name>] [--name name] [--cwd dir] [--account <name|auto>] [--env KEY=VALUE] [--kit-profile <p>] [--contract completion=seal[,sealType=<t>][,taskId=<id>][,attempt=<n>]] [--preamble <text>|--no-preamble] [--sandbox-write <abs-dir>]... [--yolo] [-- <bee-args...>]  (e.g. --account auto -- -m gpt-5.5; --sandbox-write adds Cell-sandbox write roots, repeatable)");
   const combAttachment = await prepareSpawnCombAttachment(parsed);
   const trackAttachment = await prepareSpawnTrackAttachment(parsed);
   // Opt-in spawn timing (HIVE_DEBUG_SPAWN). No-op object when disabled.
@@ -1097,6 +1142,7 @@ export async function spawnSingleBee(
   const contractRaw = stringFlag(parsed, ["contract"]);
   const contract = contractRaw !== undefined ? parseContractFlag(contractRaw) : undefined;
   const { preamble, noPreamble } = resolvePreambleFlags(parsed);
+  const sandboxWriteRoots = resolveSandboxWriteFlag(parsed);
   const accountQuery = typeof flag(parsed, "account") === "string" ? String(flag(parsed, "account")) : undefined;
   // Account binding precedence: explicit --account flag > profile account >
   // <tool>-<account> shorthand / account-id resolution.
@@ -1130,7 +1176,7 @@ export async function spawnSingleBee(
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(spawnedById ? { spawnedById } : {}), ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}), ...(trustedContext.onRuntimeLaunched ? { onRuntimeLaunched: trustedContext.onRuntimeLaunched } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) }, trustedContext.runtimeDependencies);
+    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(sandboxWriteRoots ? { sandboxWriteRoots } : {}), ...(spawnedById ? { spawnedById } : {}), ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}), ...(trustedContext.onRuntimeLaunched ? { onRuntimeLaunched: trustedContext.onRuntimeLaunched } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) }, trustedContext.runtimeDependencies);
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.

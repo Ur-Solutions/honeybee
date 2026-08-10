@@ -9,6 +9,7 @@ import {
   commandString,
   initializeCellSandbox,
   probeCellSandbox,
+  resolveCellSandboxExtraWriteRoots,
   shutdownCellSandbox,
   withoutAmbientProviderState,
   wrapCellSandboxCommand,
@@ -106,6 +107,78 @@ test("Cell policy explicitly allows hive buz mailboxes and the ledger append, wi
     assert.equal(await readFile(join(store, "ledger.jsonl"), "utf8"), "");
     assert.equal(built.env.HIVE_LEDGER_MAX_BYTES, "0", "in-cell ledger rotation is pinned off");
     assert.ok(!built.state.allowWrite.includes(canonicalStore), "the store root itself stays read-only");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Cell policy merges --sandbox-write grants; the Layout-v2 wrapper (the Cell's parent) is allowed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hive-cell-extra-roots-"));
+  const bin = join(root, "bin");
+  const wrapper = join(root, "cells", "wrapper");
+  const cell = join(wrapper, "checkout");
+  const box = join(wrapper, "box");
+  const sibling = join(root, "shared-scratch");
+  const runDir = join(root, "run");
+  await Promise.all([
+    mkdir(bin),
+    mkdir(cell, { recursive: true }),
+    mkdir(box, { recursive: true }),
+    mkdir(sibling),
+    mkdir(runDir),
+  ]);
+  try {
+    for (const name of ["bash", "bwrap", "rg"]) await executable(join(bin, name));
+    const built = buildCellSandboxState({
+      kind: "codex",
+      cwd: cell,
+      runDir,
+      platform: "linux",
+      env: { PATH: bin, HOME: join(root, "home"), HIVE_STORE_ROOT: join(root, "store") },
+      extraWriteRoots: [wrapper, sibling],
+    });
+    assert.ok(built.state.allowWrite.includes(await realpath(wrapper)), "the v2 wrapper (parent of the Cell) is writable");
+    assert.ok(built.state.allowWrite.includes(await realpath(sibling)), "an unrelated named grant is writable");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("extra write root guards refuse broad, unreal, or store-containing grants", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hive-cell-extra-guards-"));
+  const wrapper = join(root, "cells", "wrapper");
+  const cell = join(wrapper, "checkout");
+  const store = join(root, "home", ".hive");
+  const filePath = join(root, "a-file");
+  const linkPath = join(root, "a-link");
+  await mkdir(cell, { recursive: true });
+  await mkdir(store, { recursive: true });
+  await writeFile(filePath, "not a directory\n");
+  const { symlink } = await import("node:fs/promises");
+  await symlink(join(root, "cells"), linkPath);
+  const env = { HOME: join(root, "home") };
+  const refuse = (roots: string[], pattern: RegExp) =>
+    assert.throws(() => resolveCellSandboxExtraWriteRoots(roots, cell, env), pattern);
+  try {
+    // Happy paths: the immediate parent (v2 wrapper) and an unrelated dir.
+    assert.deepEqual(
+      resolveCellSandboxExtraWriteRoots([wrapper], cell, env),
+      [await realpath(wrapper)],
+    );
+    refuse(["relative/path"], /must be absolute/);
+    refuse([join(root, "missing")], /does not exist/);
+    refuse([filePath], /must be a directory/);
+    refuse([linkPath], /must not be a symlink/);
+    refuse(["/"], /refuses broad extra write root/);
+    refuse([join(root, "home")], /refuses broad extra write root|contains the hive store/);
+    // An ancestor of the hive store root (here: HOME's parent) is refused.
+    refuse([root], /contains the hive store|above the Cell/);
+    // The store root itself is refused.
+    refuse([store], /contains the hive store/);
+    // An ancestor of the Cell ABOVE the wrapper (would fence in sibling
+    // Cells / the whole cells root) is refused; only the immediate parent
+    // may be granted.
+    refuse([join(root, "cells")], /above the Cell/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
