@@ -5,6 +5,7 @@ import { deriveState, isTerminalState, liveTargetKey, type BeeState, type PaneCa
 import { shouldPersistObservationHeartbeat, type SessionRecord } from "../store.js";
 import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AuthRecoveryOutcome } from "./authRecovery.js";
+import type { RotationResumeOutcome } from "./rotationResume.js";
 import type { AutoswapOutcome } from "./autoswap.js";
 import type { BuzDispatchOutcome } from "./buzDispatcher.js";
 import type { BuzRecoveryDispatcher, BuzRecoveryOutcome } from "./buzRecovery.js";
@@ -127,6 +128,18 @@ export type TickDeps = {
     hsrObservations: ReadonlyMap<string, HsrObservation>,
     nowMs: number,
   ) => Promise<AuthRecoveryOutcome[]>;
+  /**
+   * Post-rotation stranded-home resume: auth-resumes idle live claude bees
+   * whose home's keychain copy a rotation could not advance (per-account
+   * rotation-stranded marker), before the stale chain ever fails a turn.
+   * Runs after recoverAuthNeeded so classifier-driven recovery wins ties.
+   */
+  resumeRotationStranded?: (
+    records: SessionRecord[],
+    currentStates: Map<string, BeeState>,
+    hsrObservations: ReadonlyMap<string, HsrObservation>,
+    nowMs: number,
+  ) => Promise<RotationResumeOutcome[]>;
   /**
    * Optional HSR needs-input router (APIA-79): for each blocked HSR bee with a
    * structured needs_input, routes the request as an interrupt-tier buz to the
@@ -252,6 +265,8 @@ export type DispatcherOutcomes = {
   requestReconciles: RequestReconcileOutcome[];
   /** Automatic auth recovery attempts/results (empty when no eligible bee). */
   authRecoveries: AuthRecoveryOutcome[];
+  /** Post-rotation stranded-home resumes (empty when no marker matches a live idle bee / not wired). */
+  rotationResumes: RotationResumeOutcome[];
   /**
    * HSR needs-input routing outcomes: each blocked HSR bee's request routed to
    * its parent (routedTo) or escalated to the user (escalated). Empty when no
@@ -520,6 +535,29 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
       ...(outcome.error ? { error: outcome.error } : {}),
     }),
   },
+  // Post-rotation stranded-home resume: restart idle claude bees still booted
+  // on a keychain copy the last rotation could not advance, before the stale
+  // refresh token fails a turn (or worse, trips provider reuse detection).
+  // AFTER recoverAuthNeeded: a bee that already surfaced an auth error is
+  // handled by the classifier lane; this lane only takes idle bees.
+  {
+    key: "rotationResumes",
+    name: "resumeRotationStranded",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed, hsrObs, nowMs, sessionsSnapshotTrusted }) =>
+      sessionsSnapshotTrusted ? deps.resumeRotationStranded?.(records, observed, hsrObs, nowMs) : undefined,
+    log: (outcome) => ({
+      level: outcome.action === "resumed" ? "info" : "warn",
+      msg: `rotation.resume.${outcome.action}`,
+      session: outcome.bee,
+      account: outcome.account,
+      generation: outcome.generation,
+      ...(outcome.attempt !== undefined ? { attempt: outcome.attempt } : {}),
+      ...(outcome.replayedPrompts !== undefined ? { replayedPrompts: outcome.replayedPrompts } : {}),
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
   // HSR needs-input router: route each blocked HSR bee's structured request to
   // its living parent (buz) or mark it escalated.
   {
@@ -714,6 +752,7 @@ export function emptyDispatcherOutcomes(): DispatcherOutcomes {
     taskSupplies: [],
     requestReconciles: [],
     authRecoveries: [],
+    rotationResumes: [],
     needsInput: [],
     nodeReachability: [],
     usage: [],

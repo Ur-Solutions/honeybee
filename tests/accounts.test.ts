@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 // Hermeticity: account activation now calls the external `kit` CLI. Force it
 // off so these unit tests never exec a real kit binary against temp homes
@@ -544,6 +544,91 @@ test("chain sync adopts a fresher legacy-hex keychain chain instead of quarantin
     assert.equal(vault.claudeAiOauth.accessToken, "tok-keychain-live", "the decoded legacy chain was adopted into the vault");
     const homeFile = JSON.parse(await readFile(filePath, "utf8"));
     assert.equal(homeFile.claudeAiOauth.accessToken, "tok-keychain-live", "distribution repaired the home instead of skipping it");
+    assert.equal(
+      await readFile(join(accountDir(account), "rotation-stranded.json"), "utf8").catch(() => null),
+      null,
+      "a fully-propagated distribution leaves no rotation-stranded marker",
+    );
+  });
+});
+
+test("chain sync repairs a stranded home's credentials file when its keychain read fails", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "keychain-stranded@a.b");
+    const now = Date.now();
+    const vaultRaw = chainJson("tok-vault", now + 1_000, "refresh-vault");
+    const strandedFileRaw = chainJson("tok-stranded-file-older", now + 2 * 3_600_000, "refresh-stranded-older");
+    const freshRaw = chainJson("tok-fresh", now + 8 * 3_600_000, "refresh-fresh");
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    const strandedHome = join(dir, "homes", account.id);
+    const strandedFilePath = join(strandedHome, ".credentials.json");
+    const extraHome = join(dir, "homes", "extra-fresh");
+    await mkdir(strandedHome, { recursive: true });
+    await mkdir(extraHome, { recursive: true });
+    await writeFile(vaultPath, vaultRaw);
+    await writeFile(strandedFilePath, strandedFileRaw);
+    await writeFile(join(extraHome, ".credentials.json"), freshRaw);
+
+    const result = await syncClaudeChainToVault(account, extraHome, {
+      // The stranded home's keychain READ fails (headless `security` session,
+      // the Aug 7–10 shape); the extra home's keychain is simply absent.
+      readKeychainRaw: async (candidate) => candidate === strandedHome
+        ? { status: "unreadable", reason: "security-error" }
+        : { status: "absent" },
+      fetchProfileEmail: async () => "keychain-stranded@a.b",
+    }, { trustExtraHome: true });
+
+    assert.equal(result.vaultUpdated, true);
+    assert.equal(result.chain?.oauth.accessToken, "tok-fresh");
+    const strandedFile = JSON.parse(await readFile(strandedFilePath, "utf8"));
+    assert.equal(
+      strandedFile.claudeAiOauth.accessToken,
+      "tok-fresh",
+      "the stranded home's credentials file was repaired even though its keychain was unreadable",
+    );
+    const marker = JSON.parse(await readFile(join(accountDir(account), "rotation-stranded.json"), "utf8"));
+    assert.deepEqual(
+      marker.strandedHomes,
+      [resolve(strandedHome)],
+      "distribution records the un-advanced keychain in the rotation-stranded marker",
+    );
+  });
+});
+
+test("chain sync never regresses a stranded home's fresher credentials file", async () => {
+  await withTempStore(async (dir) => {
+    const account = await addAccount("claude", "keychain-stranded-fresh@a.b");
+    const now = Date.now();
+    const vaultRaw = chainJson("tok-vault", now + 1_000, "refresh-vault");
+    // The stranded home holds the FRESHEST rotation — its keychain read failed,
+    // so the harvest never saw it; distribution must not stamp an older link
+    // over it (replaying a rotated-away refresh token revokes the chain).
+    const strandedFileRaw = chainJson("tok-stranded-freshest", now + 9 * 3_600_000, "refresh-stranded-freshest");
+    const freshRaw = chainJson("tok-adopted", now + 8 * 3_600_000, "refresh-adopted");
+    const vaultPath = join(accountDir(account), ".credentials.json");
+    const strandedHome = join(dir, "homes", account.id);
+    const strandedFilePath = join(strandedHome, ".credentials.json");
+    const extraHome = join(dir, "homes", "extra-adopted");
+    await mkdir(strandedHome, { recursive: true });
+    await mkdir(extraHome, { recursive: true });
+    await writeFile(vaultPath, vaultRaw);
+    await writeFile(strandedFilePath, strandedFileRaw);
+    await writeFile(join(extraHome, ".credentials.json"), freshRaw);
+
+    const result = await syncClaudeChainToVault(account, extraHome, {
+      readKeychainRaw: async (candidate) => candidate === strandedHome
+        ? { status: "unreadable", reason: "timeout" }
+        : { status: "absent" },
+      fetchProfileEmail: async () => "keychain-stranded-fresh@a.b",
+    }, { trustExtraHome: true });
+
+    assert.equal(result.vaultUpdated, true);
+    assert.equal(result.chain?.oauth.accessToken, "tok-adopted");
+    assert.equal(
+      await readFile(strandedFilePath, "utf8"),
+      strandedFileRaw,
+      "the stranded home's fresher file was left untouched",
+    );
   });
 });
 

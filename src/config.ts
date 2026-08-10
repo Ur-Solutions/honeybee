@@ -78,12 +78,23 @@ export type PreambleConfig = {
   maxChars?: number;
 };
 
+export type DaemonConfig = {
+  /**
+   * Post-rotation auto-resume: when a credential rotation could not advance a
+   * home's keychain copy (rotation-stranded marker), the daemon auth-resumes
+   * idle live claude bees on that home so they never replay the rotated-away
+   * refresh token. Default true; set false to disable the dispatcher.
+   */
+  rotationResume?: boolean;
+};
+
 export type HiveConfig = {
   bees?: Record<string, BeeConfig>;
   briefFooter?: string;
   naming?: NamingConfig;
   spawn?: SpawnConfig;
   preamble?: PreambleConfig;
+  daemon?: DaemonConfig;
 };
 
 /** Origin defaults when config is absent: agents run pane-less HSR, humans keep local tmux. */
@@ -111,7 +122,8 @@ export function briefFooter(): string {
 
 let cached: HiveConfig | undefined;
 
-const TOP_LEVEL_CONFIG_KEYS = new Set(["bees", "briefFooter", "naming", "spawn", "preamble"]);
+const TOP_LEVEL_CONFIG_KEYS = new Set(["bees", "briefFooter", "naming", "spawn", "preamble", "daemon"]);
+const DAEMON_CONFIG_KEYS = new Set(["rotationResume"]);
 const PREAMBLE_CONFIG_KEYS = new Set(["enabled", "identity", "text", "maxChars"]);
 const NAMING_CONFIG_KEYS = new Set(["auto", "tool", "model", "command", "effort"]);
 const SPAWN_CONFIG_KEYS = new Set(["defaultSubstrate"]);
@@ -147,6 +159,11 @@ export function loadConfig(): HiveConfig {
 
 export function resetConfigCache(): void {
   cached = undefined;
+}
+
+/** Post-rotation auto-resume of stranded-home claude bees. Default on. */
+export function rotationResumeEnabled(): boolean {
+  return loadConfig().daemon?.rotationResume !== false;
 }
 
 export function beeConfig(kind: string): BeeConfig {
@@ -238,6 +255,13 @@ function normalizeConfig(value: unknown): { config: HiveConfig; unknownKeys: str
     // spam the spawn path with warnings; drop it and keep the default.
     if (typeof r.maxChars === "number" && Number.isFinite(r.maxChars) && r.maxChars > 0) preamble.maxChars = r.maxChars;
     config.preamble = preamble;
+  }
+  if (object.daemon && typeof object.daemon === "object" && !Array.isArray(object.daemon)) {
+    const r = object.daemon as Record<string, unknown>;
+    collectUnknownKeys(r, DAEMON_CONFIG_KEYS, "daemon", unknownKeys);
+    const daemon: DaemonConfig = {};
+    if (typeof r.rotationResume === "boolean") daemon.rotationResume = r.rotationResume;
+    config.daemon = daemon;
   }
   if (object.bees && typeof object.bees === "object" && !Array.isArray(object.bees)) {
     const bees: Record<string, BeeConfig> = {};

@@ -494,6 +494,20 @@ export function isAuthNeededMessage(message: string): boolean {
   if ((m.includes("token") || m.includes("oauth")) && m.includes("revoked")) return true;
   if (m.includes("401") && (m.includes("oauth") || m.includes("unauthorized") || m.includes("authentication"))) return true;
   if ((m.includes("please log in") || m.includes("please login") || m.includes("sign in again")) && m.includes("auth")) return true;
+  // "Failed to authenticate: OAuth session expired and could not be refreshed"
+  // (2026-08-10 incident, CL.6139) has no "access token" wording, so it fell
+  // through every rule above — no auth_expired event, no needs-auth request,
+  // and daemon authRecovery never fired. The claude adapter prefixes its own
+  // auth failures with "Failed to authenticate", so match that prefix, plus
+  // the session-expired refresh-failure shape on its own.
+  if (m.startsWith("failed to authenticate")) return true;
+  if (
+    (m.includes("oauth") || m.includes("session")) &&
+    m.includes("expired") &&
+    (m.includes("could not be refreshed") || m.includes("couldn't be refreshed") || m.includes("cannot be refreshed"))
+  ) {
+    return true;
+  }
   return false;
 }
 

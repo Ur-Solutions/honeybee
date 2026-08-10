@@ -247,6 +247,28 @@ test("structuredStateFromEvents surfaces login-required auth failures as auth-ne
   );
 });
 
+test("structuredStateFromEvents recognizes OAuth session-expired refresh failures as auth-needed", () => {
+  // Exact string from the 2026-08-10 10:52 incident (CL.6139): the claude CLI's
+  // own error, with no "access token" wording — it must not fall through.
+  const message = "Failed to authenticate: OAuth session expired and could not be refreshed";
+  assert.equal(isAuthNeededMessage(message), true);
+  assert.equal(
+    structuredStateFromEvents([
+      { type: "turn_start", ts: 1 },
+      { type: "error", ts: 2, message },
+      { type: "turn_end", ts: 3 },
+    ]),
+    "auth-needed",
+  );
+  // Variants of the same failure shape.
+  assert.equal(isAuthNeededMessage("OAuth session expired and couldn't be refreshed"), true);
+  assert.equal(isAuthNeededMessage("session expired and cannot be refreshed"), true);
+  assert.equal(isAuthNeededMessage("Failed to authenticate: token exchange rejected"), true);
+  // Non-auth errors must not classify as auth-needed.
+  assert.equal(isAuthNeededMessage("session closed: pty exited"), false);
+  assert.equal(isAuthNeededMessage("request expired after 30s"), false);
+});
+
 test("structuredStateFromEvents recognizes Claude's /login error as auth-needed", () => {
   const message = "authentication_failed: Not logged in · Please run /login";
   assert.equal(isAuthNeededMessage(message), true);
