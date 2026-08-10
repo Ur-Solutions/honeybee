@@ -20,6 +20,7 @@ import { createRequestReconciler } from "./requestSweep.js";
 import { createTaskSupplyDispatcher } from "./taskSupplyDispatcher.js";
 import { createNodeReachabilityTracker } from "./nodeReachability.js";
 import { createPoolSweeper } from "./poolSweep.js";
+import { createTerminalReprobeSweeper } from "./terminalReprobe.js";
 import { createFlightSweeper } from "./flightSweep.js";
 import { createCombSweeper } from "./combSweep.js";
 import { createUsageSampler } from "./usageSampler.js";
@@ -143,6 +144,7 @@ export function buildDefaultDeps(): TickDeps {
     dispatchAutoTitle: createAutoTitleDispatcher(),
     refreshRemoteTokens: createTokenRefresher(),
     sweepPools: createPoolSweeper(),
+    reprobeTerminalCursors: createTerminalReprobeSweeper(),
     sweepCombs: createCombSweeper(),
     sweepFlights: createFlightSweeper(),
     // Pacing/single-flight lives in runDaemon. The sweep itself is isolated in

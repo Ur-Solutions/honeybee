@@ -14,6 +14,7 @@ import type { TaskSupplyOutcome } from "./taskSupplyDispatcher.js";
 import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./nodeReachability.js";
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
+import type { TerminalReprobeOutcome } from "./terminalReprobe.js";
 import type { FlightSweeper } from "./flightSweep.js";
 import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
 import type { CombSweeper } from "./combSweep.js";
@@ -184,6 +185,15 @@ export type TickDeps = {
    */
   sweepPools?: PoolSweeper;
   /**
+   * Optional terminal-cursor re-probe (cell-smoothness Phase 2): for records
+   * de-indexed by a stale terminal crashed/dead observation whose HSR meta
+   * still claims a running host, verifies the exact host incarnation by birth
+   * fingerprint and clears the stale cursor so the record re-enters the
+   * active index. Self-throttled — most ticks return []. Build once per
+   * daemon run (createTerminalReprobeSweeper).
+   */
+  reprobeTerminalCursors?: () => Promise<TerminalReprobeOutcome[]>;
+  /**
    * Optional flight reconciler (CL.701 §4.2): drives slot leases from this
    * tick's records + observed states — contract-matched seal completion,
    * readiness/first-evidence/stall deadlines, idempotent replacement under
@@ -263,6 +273,8 @@ export type DispatcherOutcomes = {
   tokenRefreshes: TokenRefreshOutcome[];
   /** Checkout-pool sweep outcomes (empty on throttled/no-op sweeps / not wired). */
   poolSweeps: PoolSweepOutcome[];
+  /** Terminal-cursor re-probe heals (empty on throttled/no-op sweeps / not wired). */
+  terminalReprobes: TerminalReprobeOutcome[];
   /** Flight reconciler outcomes (empty when no active flights / not wired). */
   flightSweeps: FlightSweepOutcome[];
   /** Combs engine outcomes (empty when no sweepable runs / not wired). */
@@ -675,6 +687,24 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
       ...(outcome.error ? { error: outcome.error } : {}),
     }),
   },
+  // Terminal-cursor re-probe: clear stale crashed/dead cursors off records
+  // whose exact HSR host incarnation verifiably lives, so they re-enter the
+  // active index. Self-throttled inside the sweeper — most ticks return [].
+  {
+    key: "terminalReprobes",
+    name: "reprobeTerminalCursors",
+    skipFirstTick: true,
+    capMs: 10_000,
+    timeoutKey: "dispatchMs",
+    run: ({ deps }) => deps.reprobeTerminalCursors?.(),
+    log: (outcome) => ({
+      level: outcome.action === "error" ? "warn" : "info",
+      msg: `hsr.reprobe.${outcome.action}`,
+      session: outcome.bee,
+      ...(outcome.clearedState ? { clearedState: outcome.clearedState } : {}),
+      ...(outcome.error ? { error: outcome.error } : {}),
+    }),
+  },
 ];
 
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
@@ -693,6 +723,7 @@ export function emptyDispatcherOutcomes(): DispatcherOutcomes {
     combSweeps: [],
     flightSweeps: [],
     poolSweeps: [],
+    terminalReprobes: [],
   };
 }
 

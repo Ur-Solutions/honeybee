@@ -33,6 +33,7 @@ function emptyTickResult(): TickResult {
     needsInput: [],
     nodeReachability: [],
     poolSweeps: [],
+    terminalReprobes: [],
     usage: [],
     autoswaps: [],
     autoTitles: [],
