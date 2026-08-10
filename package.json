@@ -28,6 +28,7 @@
     "build": "tsc -p tsconfig.json",
     "postbuild": "chmod +x dist/cli.js dist/cli-x.js",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "deploy": "node scripts/deploy-settle.mjs",
     "test": "node --import tsx --test tests/*.test.ts",
     "execution:digest": "tsx scripts/update-execution-digest.mjs",
     "dev": "tsx src/cli.ts",
