@@ -20,6 +20,7 @@ import { kitMaterializeHome, readKitHomeStamp } from "../kit.js";
 import { chooseLaunch, type LaunchTemplate } from "../launchTui.js";
 import { cachedAccountLimits, isFableModel, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
 import { LOCAL_NODE_NAME, authPolicyOf, type NodeRecord } from "../node.js";
+import { isWellFormedPaneId } from "../paneId.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { planSpawnPreamble } from "../spawnPreamble.js";
 import { parseEnvAssignments } from "../spawnEnv.js";
@@ -684,7 +685,10 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     launchArgv,
     command,
     tmuxTarget,
-    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+    // Stamp only an exact #{pane_id}: a mis-shaped token (fused "%id_pid",
+    // remote shell noise) can never match the pane-liveness probe and would
+    // mark this bee permanently crashed (review §1.1).
+    ...(launch.paneId && isWellFormedPaneId(launch.paneId) ? { agentPaneId: launch.paneId } : {}),
     ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
     // Solo combs: every bee gets combId == tmuxTarget at spawn (§12 Q3).

@@ -8,6 +8,7 @@ import {
   syncAccountCredentialsToVault,
   type AccountRecord,
 } from "./accounts.js";
+import { isWellFormedPaneId } from "./paneId.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, splitShellWords } from "./agents.js";
 import { resumeArgsForAgent } from "./drivers.js";
 import { spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
@@ -313,7 +314,10 @@ export async function swapAccount(
         providerSessionId: launchProviderSessionId,
         ...(relocatedTranscriptPath ? { transcriptPath: relocatedTranscriptPath } : {}),
         command: shellCommand(spec),
-        ...(paneId ? { agentPaneId: paneId } : {}),
+        // Re-pin only to an exact #{pane_id}; a mis-shaped launch token must
+        // not replace the binding (review §1.1). The stale pre-swap pane id is
+        // covered by deriveState's session-liveness fallback.
+        ...(paneId && isWellFormedPaneId(paneId) ? { agentPaneId: paneId } : {}),
         ...(launcherPgid ? { launcherPgid } : {}),
         ...(launcherFingerprint ? { launcherFingerprint } : {}),
         ...(runnerPid ? { runnerPid } : {}),

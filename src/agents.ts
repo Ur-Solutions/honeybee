@@ -9,6 +9,7 @@ import { assertExecutableAvailable } from "./execCheck.js";
 import { liveGatewayEnv } from "./gateways.js";
 import { writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity } from "./ids.js";
+import { isWellFormedPaneId } from "./paneId.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
 import { safeName, saveSession, type SessionRecord } from "./store.js";
 import { resolveSpawningBeeId } from "./spawnParent.js";
@@ -502,7 +503,9 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     launchArgv,
     command,
     tmuxTarget,
-    ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+    // Stamp only an exact #{pane_id} — a mis-shaped token would permanently
+    // fail the pane-liveness probe (review §1.1).
+    ...(launch.paneId && isWellFormedPaneId(launch.paneId) ? { agentPaneId: launch.paneId } : {}),
     ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
     ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
     // Solo combs: every bee gets combId == tmuxTarget at spawn (§12 Q3).
