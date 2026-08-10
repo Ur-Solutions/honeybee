@@ -1,6 +1,6 @@
 // `hive buz` — addressed bee-to-bee messaging (four-tier delivery + policy).
 // Extracted from cli.ts (HIVE-15).
-import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
+import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, countQuarantinedMessages, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, requeueQuarantinedMessages, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
 import { parseAge } from "../clean.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
@@ -20,6 +20,10 @@ export async function cmdBuz(parsed: Parsed) {
       return buzList(parsed, "outbox");
     case "queue":
       return buzList(parsed, "queue");
+    case "quarantine":
+      return buzList(parsed, "quarantine");
+    case "requeue":
+      return buzRequeue(parsed);
     case "read":
       return buzRead(parsed);
     case "cancel":
@@ -29,7 +33,7 @@ export async function cmdBuz(parsed: Parsed) {
     case "config":
       return buzConfig(parsed);
     default:
-      throw new Error(`Unknown buz subcommand: ${sub ?? ""}\nUsage: hive buz <send|inbox|outbox|queue|read|cancel|purge|config>`);
+      throw new Error(`Unknown buz subcommand: ${sub ?? ""}\nUsage: hive buz <send|inbox|outbox|queue|quarantine|requeue|read|cancel|purge|config>`);
   }
 }
 
@@ -106,7 +110,7 @@ export async function buzSend(parsed: Parsed) {
 }
 
 
-export async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "queue") {
+export async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "queue" | "quarantine") {
   const target = parsed.args[1];
   if (!target) throw new Error(`Usage: hive buz ${mailbox} <selector> [--limit N] [--from <ref>]`);
   const limit = numberFlag(parsed, ["limit"], 0) || undefined;
@@ -122,8 +126,21 @@ export async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "que
       ...(limit !== undefined ? { limit } : {}),
       ...(fromFilter ? { fromFilter } : {}),
     });
+    // Quarantine must be discoverable: mail dead-letters silently (the sender
+    // saw a successful enqueue), so the inbox view is where the operator
+    // learns re-drive is needed.
+    const quarantined = mailbox === "inbox" ? await countQuarantinedMessages(record.name) : 0;
+    const quarantineNote = () => {
+      if (quarantined === 0) return;
+      if (isPretty()) {
+        console.log(note(`${record.name}: ${quarantined} quarantined message(s) — inspect with \`hive buz quarantine ${record.name}\`, re-drive with \`hive buz requeue ${record.name} --all\``));
+      } else {
+        console.log(`buz.quarantine.count\t${record.name}\t${quarantined}`);
+      }
+    };
     if (listing.length === 0) {
       if (isPretty()) console.log(dim(`# ${record.name}: no ${mailbox} messages`));
+      quarantineNote();
       continue;
     }
     if (!isPretty()) {
@@ -140,6 +157,7 @@ export async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "que
           path,
         ].join("\t"));
       }
+      quarantineNote();
       continue;
     }
     if (records.length > 1) console.log(bold(record.name));
@@ -161,6 +179,41 @@ export async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "que
         dim(message.subject ?? ""),
       ]),
     ));
+    quarantineNote();
+  }
+}
+
+
+/**
+ * Re-drive quarantined messages: move them back to queue/ so the daemon drain
+ * retries delivery. Quarantine is reached via repeated definite delivery
+ * rejections (or malformed files, which stay put) — requeue is the operator's
+ * recovery path once the recipient is healthy again.
+ */
+export async function buzRequeue(parsed: Parsed) {
+  const target = parsed.args[1];
+  const id = parsed.args[2];
+  const all = truthy(flag(parsed, "all"));
+  if (!target || (!id && !all) || (id && all)) {
+    throw new Error("Usage: hive buz requeue <bee> <message-id> | hive buz requeue <bee> --all");
+  }
+
+  const record = await resolveSession(target);
+  const result = await requeueQuarantinedMessages(record.name, id ? { id } : {});
+
+  if (id && result.requeued.length === 0) {
+    const found = await readMessageById(record.name, id);
+    if (found) throw new Error(`message ${id} is in ${found.mailbox}/; only quarantined messages can be requeued`);
+    throw new Error(`No quarantined buz message with id ${id} for ${record.name}`);
+  }
+
+  for (const { file, reason } of result.skipped) {
+    console.error(note(`left in quarantine: ${file} (${reason})`));
+  }
+  if (isPretty()) {
+    console.log(actionLine("ok", "buz", [bold(record.name), `requeued:${result.requeued.length}`]));
+  } else {
+    console.log(`buz.requeue\t${record.name}\t${result.requeued.length}\t${result.requeued.join(",")}`);
   }
 }
 

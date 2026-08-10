@@ -71,7 +71,16 @@ function execPs(args: string[]): Promise<string> {
     execFile(
       "/bin/ps",
       args,
-      { maxBuffer: 16 * 1024 * 1024, timeout: PROCESS_CENSUS_TIMEOUT_MS, killSignal: "SIGKILL" },
+      {
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: PROCESS_CENSUS_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        // `lstart` is rendered via the locale's %c format, so the same birth
+        // instant prints differently across processes with different LANG/LC_*
+        // (launchd daemon vs desktop-spawned host). Fingerprints are compared
+        // as strings across processes; pin the locale so they are stable.
+        env: { ...process.env, LC_ALL: "C" },
+      },
       (error, stdout) => {
         if (error) reject(error);
         else resolve(stdout);
@@ -166,7 +175,21 @@ export function sameProcessBirthFingerprint(
   left: ProcessBirthFingerprint | undefined,
   right: ProcessBirthFingerprint | undefined,
 ): boolean {
-  return !!left && !!right && left.pgid === right.pgid && left.startedAt === right.startedAt;
+  return !!left && !!right && left.pgid === right.pgid &&
+    (left.startedAt === right.startedAt ||
+      normalizeStartedAt(left.startedAt) === normalizeStartedAt(right.startedAt));
+}
+
+/**
+ * Field-order-insensitive lstart comparison key. Fingerprints minted before
+ * execPs pinned LC_ALL=C may carry a locale-ordered date ("Mon 10 Aug ..."
+ * vs C's "Mon Aug 10 ..."): the fields are identical, only their order
+ * differs, so comparing the sorted token multiset recognizes the same birth
+ * instant without ever equating two different ones (a different second, day,
+ * month, or year always changes at least one token).
+ */
+function normalizeStartedAt(value: string): string {
+  return value.trim().split(/\s+/).sort().join(" ");
 }
 
 /**
