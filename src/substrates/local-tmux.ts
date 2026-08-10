@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
 import { realUserHome } from "../env.js";
+import { isWellFormedPaneId, splitFusedPaneStamp } from "../paneId.js";
 import {
   captureProcessBirthFingerprintWithRetry,
   inspectProcessBirth,
@@ -252,9 +253,14 @@ function parseLaunchResult(stdout: string): NewSessionResult {
   // single "%7_5908" token that could never match a live pane id. Also accept
   // the legacy "\t" and sanitized "_" joins so old output still parses.
   const raw = stdout.trim();
-  const legacy = raw.match(/^(%\d+)[\t_](\d+)$/);
-  const [paneId = "", pidRaw = ""] = legacy ? [legacy[1], legacy[2]] : raw.split(":");
+  const legacy = splitFusedPaneStamp(raw);
+  const [paneId = "", pidRaw = ""] = legacy ? [legacy.paneId, String(legacy.pid)] : raw.split(":");
   const launcherPgid = parsePositiveInt(pidRaw);
+  // Never publish a token that is not an exact #{pane_id}: a mis-shaped stamp
+  // would be pinned onto the SessionRecord and permanently fail the
+  // pane-liveness probe. An empty paneId makes admitTmuxLauncher fail the
+  // spawn loudly instead.
+  if (!isWellFormedPaneId(paneId)) return { paneId: "", ...(launcherPgid ? { launcherPgid } : {}) };
   return { paneId, ...(launcherPgid ? { launcherPgid } : {}) };
 }
 
@@ -567,6 +573,30 @@ export async function listPanes(): Promise<Set<string>> {
   const result = await tmux(["list-panes", "-a", "-F", "#{pane_id}"], { reject: false });
   if (!result.ok) return new Set();
   return new Set(result.stdout.split("\n").map((s) => s.trim()).filter(Boolean));
+}
+
+/**
+ * Live panes grouped by their owning session. Used by the pane-stamp repair
+ * sweep to re-pin a fused "%id_pid" stamp ONLY to a pane that provably belongs
+ * to the record's own session — a bare pane-id match could re-pin to a foreign
+ * pane after a server restart recycled the id. The ":" separator is
+ * locale-independent ASCII and cannot occur in a session name or pane id.
+ */
+export async function listPanesBySession(): Promise<Map<string, Set<string>>> {
+  const panes = new Map<string, Set<string>>();
+  const result = await tmux(["list-panes", "-a", "-F", "#{session_name}:#{pane_id}"], { reject: false });
+  if (!result.ok) return panes;
+  for (const line of result.stdout.split("\n")) {
+    const separator = line.lastIndexOf(":");
+    if (separator <= 0) continue;
+    const session = line.slice(0, separator);
+    const paneId = line.slice(separator + 1).trim();
+    if (!isWellFormedPaneId(paneId)) continue;
+    const existing = panes.get(session);
+    if (existing) existing.add(paneId);
+    else panes.set(session, new Set([paneId]));
+  }
+  return panes;
 }
 
 export async function listSessionStates(): Promise<Map<string, string>> {

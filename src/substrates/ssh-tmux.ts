@@ -2,6 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { buildAttachArgv } from "../attach.js";
 import type { NodeRecord } from "../node.js";
+import { isWellFormedPaneId, splitFusedPaneStamp } from "../paneId.js";
 import { parseProcessRows, type ProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import {
   formatShellCommand,
@@ -32,13 +33,29 @@ type ExactRemoteTargetAbsence =
   | { status: "indeterminate"; reason: string };
 
 function parseRemoteLaunchResult(stdout: string): { paneId: string; panePid?: number } {
-  const raw = stdout.trim();
-  const separator = raw.lastIndexOf(":");
-  if (separator < 0) return { paneId: raw };
-  const paneId = raw.slice(0, separator);
-  const parsed = Number(raw.slice(separator + 1));
-  const panePid = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
-  return { paneId, ...(panePid ? { panePid } : {}) };
+  // The remote login shell may prepend motd/profile noise to tmux's own
+  // "#{pane_id}:#{pane_pid}" line, and a remote tmux server without a UTF-8
+  // locale sanitizes the legacy "\t" join to "_" (the fused "%7_5908" family —
+  // same recovery as local-tmux's parseLaunchResult). Scan from the LAST line
+  // backwards for something that is exactly a pane-id line; never let shell
+  // noise become the paneId verbatim. An empty paneId is safe downstream:
+  // newSession falls back to "=target:" addressing and spawn skips the
+  // agentPaneId stamp, so session liveness rules.
+  const lines = stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!;
+    if (isWellFormedPaneId(line)) return { paneId: line };
+    const fused = splitFusedPaneStamp(line);
+    if (fused) return { paneId: fused.paneId, panePid: fused.pid };
+    const separator = line.lastIndexOf(":");
+    if (separator <= 0) continue;
+    const paneId = line.slice(0, separator);
+    if (!isWellFormedPaneId(paneId)) continue;
+    const parsed = Number(line.slice(separator + 1));
+    const panePid = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+    return { paneId, ...(panePid ? { panePid } : {}) };
+  }
+  return { paneId: "" };
 }
 
 function exactRemoteStopResult(

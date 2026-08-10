@@ -110,6 +110,58 @@ test("newSession captures the remote launcher process-group birth identity", asy
   ]);
 });
 
+test("newSession skips motd/profile noise and parses the last pane-id line (review §1.1)", async () => {
+  const cap = captureExec();
+  cap.respondWith((call) => {
+    if (call.argv.includes("new-session")) {
+      return { exitCode: 0, stdout: "Welcome to mini01!\nLast login: Sun Aug  9 10:00:00 2026\n%42:4242\n" };
+    }
+    if (call.argv.includes("/bin/ps")) {
+      return { exitCode: 0, stdout: "4242 1 4242 Fri Aug  7 10:00:00 2026\n" };
+    }
+    return { exitCode: 0 };
+  });
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  const launch = await s.newSession("alpha", "/remote/path", { command: "codex", args: [] });
+  assert.deepEqual(launch, {
+    paneId: "%42",
+    launcherPgid: 4242,
+    launcherFingerprint: { pgid: 4242, startedAt: "Fri Aug  7 10:00:00 2026" },
+  });
+});
+
+test("newSession recovers the fused '%id_pid' stamp a non-UTF-8 remote server produces", async () => {
+  const cap = captureExec();
+  cap.respondWith((call) => {
+    if (call.argv.includes("new-session")) return { exitCode: 0, stdout: "%42_4242\n" };
+    if (call.argv.includes("/bin/ps")) {
+      return { exitCode: 0, stdout: "4242 1 4242 Fri Aug  7 10:00:00 2026\n" };
+    }
+    return { exitCode: 0 };
+  });
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  const launch = await s.newSession("alpha", "/remote/path", { command: "codex", args: [] });
+  assert.equal(launch.paneId, "%42");
+  assert.equal(launch.launcherPgid, 4242);
+});
+
+test("newSession never publishes shell noise as a pane id — unparseable output yields no pane", async () => {
+  const cap = captureExec();
+  cap.respondWith((call) => {
+    if (call.argv.includes("new-session")) {
+      // No pane-id line at all: e.g. a profile that swallowed tmux's -P output.
+      return { exitCode: 0, stdout: "bash: warning: setlocale: LC_ALL: cannot change locale\n" };
+    }
+    return { exitCode: 0 };
+  });
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  const launch = await s.newSession("alpha", "/remote/path", { command: "codex", args: [] });
+  // Empty pane id → callers fall back to "=target:" addressing and spawn
+  // skips the agentPaneId stamp, so session liveness rules (review §1.1).
+  assert.deepEqual(launch, { paneId: "" });
+  assert.ok(!cap.calls.some((call) => call.argv.includes("/bin/ps")), "no birth capture without a pane pid");
+});
+
 test("newSession keeps token values out of the ssh command line while delivering them", async () => {
   const cap = captureExec();
   cap.respondWith(() => ({ exitCode: 0 }));
