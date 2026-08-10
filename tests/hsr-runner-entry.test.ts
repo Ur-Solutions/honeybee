@@ -10,8 +10,46 @@ import {
   resolveHsrEntry,
   waitForHsrHost,
 } from "../src/hsr/runnerHost.js";
+import { applyCellEnvironmentStamp, cellSpaceKeyForCwd } from "../src/hsr/runner-entry.js";
 
 const execFileAsync = promisify(execFile);
+
+test("cellSpaceKeyForCwd names the space from either Cell layout and stays silent otherwise", () => {
+  // Layout v1: the Cell cwd IS the kaia space directory.
+  assert.equal(cellSpaceKeyForCwd("/cells/honeybee-space-y2y8meccja7t"), "honeybee-space-y2y8meccja7t");
+  // Layout v2: `<wrapper>/<repo>-space-<id>` — the checkout is the space dir.
+  assert.equal(
+    cellSpaceKeyForCwd("/cells/honeybee-space-ab12cd34ef56/honeybee-space-y2y8meccja7t"),
+    "honeybee-space-y2y8meccja7t",
+  );
+  // A cwd one level inside a space dir still resolves via the parent.
+  assert.equal(cellSpaceKeyForCwd("/cells/apiary-space-77/checkout"), "apiary-space-77");
+  assert.equal(cellSpaceKeyForCwd("/home/user/ordinary-checkout"), undefined);
+  assert.equal(cellSpaceKeyForCwd("/tmp/space-station/repo"), undefined, "bare 'space-' prefix is not a Cell");
+});
+
+test("Cell spawns are stamped HIVE_CELL=1 + HIVE_CELL_SPACE; non-Cell spawns are scrubbed", () => {
+  const cellEnv: Record<string, string> = { PATH: "/usr/bin" };
+  applyCellEnvironmentStamp(cellEnv, {
+    filesystemWriteScope: "cwd",
+    cwd: "/cells/honeybee-space-y2y8meccja7t",
+  });
+  assert.equal(cellEnv.HIVE_CELL, "1");
+  assert.equal(cellEnv.HIVE_CELL_SPACE, "honeybee-space-y2y8meccja7t");
+
+  // Unknown space: the containment marker still lands, the space stamp does
+  // not — and a stale inherited value never leaks through.
+  const anonymous: Record<string, string> = { HIVE_CELL_SPACE: "stale-space-1" };
+  applyCellEnvironmentStamp(anonymous, { filesystemWriteScope: "cwd", cwd: "/somewhere/plain" });
+  assert.equal(anonymous.HIVE_CELL, "1");
+  assert.equal("HIVE_CELL_SPACE" in anonymous, false);
+
+  // Non-Cell spawn: ambient stamps from a Cell-hosted parent must be removed.
+  const plain: Record<string, string> = { HIVE_CELL: "1", HIVE_CELL_SPACE: "honeybee-space-y2y8meccja7t" };
+  applyCellEnvironmentStamp(plain, { cwd: "/home/user/repo" });
+  assert.equal("HIVE_CELL" in plain, false);
+  assert.equal("HIVE_CELL_SPACE" in plain, false);
+});
 
 test("resolveHsrEntry derives source and built entries from the runnerHost module", async () => {
   const sourcePaths = new Map([

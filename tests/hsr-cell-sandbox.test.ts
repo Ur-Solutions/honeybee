@@ -254,6 +254,28 @@ test("Linux wrapper keeps host networking, namespaces processes, and fences the 
   }
 });
 
+test("macOS wrapper allows pseudo-terminal allocation inside the Cell", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hive-cell-macos-pty-"));
+  const cell = join(root, "cell");
+  await mkdir(cell);
+  try {
+    const wrapper = await wrapCellSandboxCommandForState({
+      backend: "macos-seatbelt",
+      cwd: cell,
+      scratchRoot: join(root, "scratch"),
+      allowWrite: [cell],
+      denyWrite: [],
+      bashPath: "/bin/bash",
+    }, "/bin/echo", ["hello world"]);
+    assert.equal(wrapper.command, "/bin/bash");
+    const generated = wrapper.args[1]!;
+    assert.match(generated, /\(allow pseudo-tty\)/, "tmux and interactive tools can allocate ptys");
+    assert.match(generated, /\/dev\/ptmx/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("commandString preserves arbitrary argv as data", () => {
   assert.equal(commandString("/tmp/a b", ["", "a'b", "$(touch nope)"]),
     "'/tmp/a b' '' 'a'\\''b' '$(touch nope)'");

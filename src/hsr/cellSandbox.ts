@@ -443,8 +443,11 @@ export async function wrapCellSandboxCommandForState(
     gitSafeDirectories: [state.cwd],
     binShell: state.bashPath,
   };
+  // allowPty is Seatbelt-only: without it a tmux server (or anything calling
+  // openpty) cannot allocate pseudo-terminals inside the Cell. Linux needs no
+  // equivalent — bwrap's fresh /dev already mounts devpts.
   const wrapped = state.backend === "macos-seatbelt"
-    ? wrapCommandWithSandboxMacOS({ ...common, allowLocalBinding: true })
+    ? wrapCommandWithSandboxMacOS({ ...common, allowLocalBinding: true, allowPty: true })
     : await wrapCommandWithSandboxLinux({
         ...common,
         bwrapPath: state.bwrapPath,

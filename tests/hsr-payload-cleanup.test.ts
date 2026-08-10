@@ -56,6 +56,37 @@ test("successful child startup consumes the secret payload before adapter/provid
   assert.equal(started.host.bee, "payload-cleanup");
 });
 
+test("a non-Cell host scrubs ambient HIVE_CELL stamps before starting the harness child", async () => {
+  const handoff = await writePayload(`${JSON.stringify(payload())}\n`);
+  const previousCell = process.env.HIVE_CELL;
+  const previousSpace = process.env.HIVE_CELL_SPACE;
+  process.env.HIVE_CELL = "1";
+  process.env.HIVE_CELL_SPACE = "honeybee-space-ambient1";
+  let observedEnv: Record<string, string> | undefined;
+  try {
+    await startHsrHostFromPayload(handoff.path, {
+      loadAdapter: async () => stubAdapter,
+      runHost: async ({ bee, opts }) => {
+        observedEnv = opts.env;
+        return {
+          bee,
+          controlSocket: "/tmp/test.sock",
+          done: Promise.resolve(),
+          stop: async () => undefined,
+        };
+      },
+    });
+  } finally {
+    if (previousCell === undefined) delete process.env.HIVE_CELL;
+    else process.env.HIVE_CELL = previousCell;
+    if (previousSpace === undefined) delete process.env.HIVE_CELL_SPACE;
+    else process.env.HIVE_CELL_SPACE = previousSpace;
+  }
+  assert.ok(observedEnv, "runHost received the hydrated child env");
+  assert.equal("HIVE_CELL" in observedEnv!, false, "non-Cell child never inherits HIVE_CELL");
+  assert.equal("HIVE_CELL_SPACE" in observedEnv!, false, "non-Cell child never inherits HIVE_CELL_SPACE");
+});
+
 test("malformed and no-adapter payload failures remove secrets without echoing them", async () => {
   const malformed = await writePayload(`{"spec":{"env":{"TOKEN":"${SECRET}"}}`);
   await assert.rejects(
