@@ -35,6 +35,7 @@ import { resolveExplicitSpawningBeeId } from "../spawnParent.js";
 import { createExecutionAdminMethods } from "../execution/adminMethods.js";
 import { createExecutionRpcMethods } from "../execution/rpcMethods.js";
 import type { ExecutionService } from "../execution/service.js";
+import { createBrokerMethods } from "./broker.js";
 import { daemonRoot } from "./log.js";
 
 export type HsrControlServer = {
@@ -293,6 +294,8 @@ export async function startHsrControlServer(opts?: {
     // rejects only an archived/destroyed bee. fork:1/handoff:1 = in-process
     // cmdFork/cmdHandoff (session-fork-and-handoff epic). An older daemon
     // rejects unknown methods outright, which reads as "CLI fallback".
+    // broker:1 = Cell-confined CLI verbs routed through the daemon with a
+    // per-calling-bee ACL (broker:buz-send/inbox/state/seal).
     // execution:1 = the contracts/execution/v1 protocol methods
     // (protocol.hello, node.describe, run.start/get/events) are registered on
     // this socket; real capability negotiation is protocol.hello itself.
@@ -306,6 +309,7 @@ export async function startHsrControlServer(opts?: {
       spawnEnv: 1,
       spawnParent: 1,
       message: 1,
+      broker: 1,
       fork: 1,
       handoff: 1,
       execution: 1,
@@ -554,10 +558,11 @@ export async function startHsrControlServer(opts?: {
   // protocol.hello — a binding must be installable BEFORE any corpus method
   // can succeed (node.describe fails closed without one).
   const admin = createExecutionAdminMethods();
+  const broker = createBrokerMethods();
 
   server = await startRpcServer({
     socketPath,
-    methods: { ...execution.methods, ...admin, ...methods },
+    methods: { ...execution.methods, ...admin, ...broker, ...methods },
     onDisconnect: (ctx) => execution.onDisconnect(ctx),
   });
 

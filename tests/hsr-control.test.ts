@@ -66,6 +66,7 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
         spawnEnv: 1,
         spawnParent: 1,
         message: 1,
+        broker: 1,
         fork: 1,
         handoff: 1,
         execution: 1,
