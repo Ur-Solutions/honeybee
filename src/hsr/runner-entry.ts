@@ -92,6 +92,45 @@ export function hsrStartupFailureForPayload(error: unknown, payload: HsrRunPaylo
   };
 }
 
+/**
+ * Space-directory shape shared by both Apiary Cell layouts: kaia allocates
+ * `<repo>-space-<id>` (Layout v1 as the Cell cwd itself, Layout v2 as the
+ * checkout inside the wrapper). Mirrors Apiary's CELL_DIRECTORY_PATTERN.
+ */
+const CELL_SPACE_DIRECTORY = /^[a-z0-9][a-z0-9-]*-space-[a-z0-9]+$/;
+
+/** Best-effort space identity for a Cell cwd: the space directory's name. */
+export function cellSpaceKeyForCwd(cwd: string): string | undefined {
+  const resolved = resolve(cwd);
+  for (const candidate of [basename(resolved), basename(dirname(resolved))]) {
+    if (CELL_SPACE_DIRECTORY.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * Stamp (or scrub) the managed-Cell env markers on a child env, in place.
+ * HIVE_CELL=1 lets in-cell tools — the hive CLI first — detect containment
+ * and route store-mutating verbs over the daemon socket instead of hitting
+ * sandbox write denials; HIVE_CELL_SPACE names the space when the cwd reveals
+ * it. A non-Cell spawn must never inherit another Cell's stamps from the
+ * ambient host environment, so the else-branch deletes rather than ignores.
+ */
+export function applyCellEnvironmentStamp(
+  env: Record<string, string>,
+  payload: Pick<HsrRunPayload, "filesystemWriteScope" | "cwd">,
+): void {
+  if (payload.filesystemWriteScope === "cwd") {
+    env.HIVE_CELL = "1";
+    const spaceKey = cellSpaceKeyForCwd(payload.cwd);
+    if (spaceKey) env.HIVE_CELL_SPACE = spaceKey;
+    else delete env.HIVE_CELL_SPACE;
+  } else {
+    delete env.HIVE_CELL;
+    delete env.HIVE_CELL_SPACE;
+  }
+}
+
 async function validatedHsrPayloadPath(payloadPath: string): Promise<{ payloadPath: string; dir: string }> {
   if (basename(payloadPath) !== "payload.json") throw new Error("invalid HSR payload handoff path");
   const rawDir = dirname(resolve(payloadPath));
@@ -234,6 +273,7 @@ async function hydrateAndStartConsumedPayload(
   childEnv.HIVE_BEE = payload.bee;
   childEnv.HIVE_COMB = payload.comb ?? payload.bee;
   if (payload.parent) childEnv.HIVE_PARENT = payload.parent;
+  applyCellEnvironmentStamp(childEnv, payload);
   let cellSandbox: RunnerOpts["cellSandbox"];
   if (payload.filesystemWriteScope === "cwd") {
     const initialized = initializeCellSandbox({
