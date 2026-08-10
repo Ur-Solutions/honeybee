@@ -122,22 +122,29 @@ async function selectorNames(selector: string): Promise<Set<string>> {
 
 async function stateLs(parsed: Parsed): Promise<void> {
   const selector = parsed.args[1];
+  // Preserve the direct CLI's fail-fast validation order before its state
+  // observation pass; printStateList validates again for brokered payloads.
+  const stateFilterRaw = stringFlag(parsed, ["state"]);
+  if (stateFilterRaw !== undefined) parseDisplayStateFlag(stateFilterRaw);
+  const list = await listBeeViews();
+  const names = selector !== undefined ? await selectorNames(selector) : undefined;
+  printStateList(list, parsed, names);
+}
+
+/** Shared direct/brokered renderer for a BeeView list payload. */
+export function printStateList(list: BeeViewListV1, parsed: Parsed, selectorMatches?: Set<string>): void {
   const stateFilterRaw = stringFlag(parsed, ["state"]);
   const stateFilter = stateFilterRaw !== undefined ? parseDisplayStateFlag(stateFilterRaw) : undefined;
   const colonyFilter = stringFlag(parsed, ["colony"]);
   const nodeFilter = stringFlag(parsed, ["node"]);
   const showRetired = truthy(flag(parsed, "done")) || stateFilter === "retired";
 
-  const list = await listBeeViews();
   let bees = list.bees;
   if (!showRetired) bees = bees.filter((view) => view.displayState !== "retired");
   if (colonyFilter !== undefined) bees = bees.filter((view) => view.bee.colony === colonyFilter);
   if (nodeFilter !== undefined) bees = bees.filter((view) => view.bee.node === nodeFilter);
   if (stateFilter !== undefined) bees = bees.filter((view) => view.displayState === stateFilter);
-  if (selector !== undefined) {
-    const names = await selectorNames(selector);
-    bees = bees.filter((view) => names.has(view.bee.name));
-  }
+  if (selectorMatches !== undefined) bees = bees.filter((view) => selectorMatches.has(view.bee.name));
   bees = [...bees].sort((a, b) =>
     DISPLAY_STATE_ORDER.indexOf(a.displayState) - DISPLAY_STATE_ORDER.indexOf(b.displayState) ||
     a.bee.name.localeCompare(b.bee.name));
@@ -215,7 +222,11 @@ async function stateExplain(parsed: Parsed): Promise<void> {
   const target = parsed.args[1];
   if (!target) throw new Error(USAGE);
   const view = await getBeeView(target);
+  printStateExplanation(view, parsed);
+}
 
+/** Shared direct/brokered renderer for a single BeeView payload. */
+export function printStateExplanation(view: BeeViewV1, parsed: Parsed): void {
   if (truthy(flag(parsed, "json"))) {
     // The library shape, verbatim — CLI and library return byte-identical JSON.
     console.log(JSON.stringify(view, null, 2));

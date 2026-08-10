@@ -225,7 +225,7 @@ test("hsrUnavailable: ZERO writes for the bee — nothing opens, nothing closes"
   });
 });
 
-test("registry: request reconciliation precedes auth recovery and needs-input, and skips an untrusted snapshot", async () => {
+test("registry: request reconciliation precedes automatic recovery and needs-input, and skips an untrusted snapshot", async () => {
   const names = tickDispatchers.map((dispatcher) => dispatcher.name);
   const reconcileIdx = names.indexOf("reconcileRequests");
   const authRecoveryIdx = names.indexOf("recoverAuthNeeded");

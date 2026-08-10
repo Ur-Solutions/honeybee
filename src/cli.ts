@@ -3,6 +3,7 @@
 // handler lives in src/commands/*, shared helpers in src/cli/shared.ts, and the
 // HSR runner host in src/hsr/runnerHost.ts (HIVE-15 decomposition of cli.ts).
 import { getCompletions } from "./completion.js";
+import { dispatchCellBrokerVerb } from "./cellBroker.js";
 import { bold, cyan, dim, errorPrefix, gray, isPretty, yellow } from "./format.js";
 import { flag, parse, truthy } from "./parse.js";
 import { APP_NAME, VERSION } from "./cli/shared.js";
@@ -84,6 +85,7 @@ async function main(argv: string[]) {
 }
 
 async function dispatch(parsed: ReturnType<typeof parse>) {
+  if (await dispatchCellBrokerVerb(parsed)) return;
   switch (parsed.command) {
     case "spawn":
       await cmdSpawn(parsed);

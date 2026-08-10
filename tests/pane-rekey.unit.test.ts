@@ -46,7 +46,7 @@ test("two sub-bees in one comb derive state from their own pane, not colliding",
   assert.notEqual(deriveState(child, context).state, "blocked", "child reads %2, not the parent's pane");
 });
 
-test("sub-bee liveness is its own pane: a dead pane reports dead though the comb lives", () => {
+test("a missing pinned pane falls back to live session evidence when the pane listing may be partial", () => {
   const child = subbee({ name: "child", agentPaneId: "%2", combId: COMB, parentId: "parent" });
   const context: StateContext = {
     liveTargets: new Set([`local ${COMB}`]), // session still alive (sibling holds it)
@@ -54,7 +54,7 @@ test("sub-bee liveness is its own pane: a dead pane reports dead though the comb
     panes: new Map(),
     now: Date.parse("2026-06-15T11:00:00.000Z"),
   };
-  assert.equal(deriveState(child, context).state, "crashed");
+  assert.equal(deriveState(child, context).state, "ready");
 });
 
 test("legacy solo bee (no agentPaneId) still reads the tmuxTarget-keyed pane", () => {

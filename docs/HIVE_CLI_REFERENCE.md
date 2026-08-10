@@ -42,6 +42,47 @@ HIVE_STORE_ROOT=/path/to/store hive list
 
 Legacy `~/.agentpit` session records are still read for migration safety.
 
+## Cell-Confined Broker V1
+
+When `HIVE_CELL=1`, the CLI routes the following stateful verbs over the
+daemon's aggregate Unix socket instead of writing `~/.hive` or reaching tmux
+from inside the Cell:
+
+- `hive buz send` -> `broker:buz-send`
+- `hive buz inbox` -> `broker:buz-inbox`
+- `hive state ls|explain` -> `broker:state`
+- `hive seal` -> `broker:seal`
+
+The daemon advertises this surface as capability `broker: 1`. An older daemon,
+a missing socket, a missing identity, or an ACL refusal fails without attempting
+the direct filesystem path and starts its error with:
+
+```text
+this hive verb is brokered inside a Cell; denied: <reason>
+```
+
+Broker v1 requires the calling bee's canonical name in `HIVE_BEE_NAME`. This
+slice only consumes environment stamps; it does not add them to spawn. A
+sibling rollout supplies the spawn-side `HIVE_CELL`/`HIVE_CELL_SPACE` stamps,
+while v1 callers must also ensure `HIVE_BEE_NAME` is present.
+
+The default ACL lets a bee send buz as itself (including to another recipient),
+read its own inbox/state, and seal itself. Acting as another sender, inspecting
+another inbox/state, or sealing another bee is denied. Optional future/operated
+grants live at `~/.hive/broker-acl.json`, keyed by caller bee name:
+
+```json
+{
+  "CL.coordinator": {
+    "broker:state": ["CL.worker"],
+    "broker:seal": ["CL.worker"]
+  }
+}
+```
+
+`"*"` may be used as a subject grant. Outside a Cell (`HIVE_CELL` absent or not
+exactly `1`), every command keeps its pre-broker direct behavior.
+
 ## Parser Rules
 
 The argument parser is intentionally simple.

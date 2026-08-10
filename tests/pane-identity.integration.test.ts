@@ -1,6 +1,6 @@
-// Real-tmux proof of problem (c): pin a bee to its pane, add a second pane so
-// the session survives, kill the agent pane, and confirm deriveState now
-// reports the bee dead (the session is still alive). Private socket dir so the
+// Real-tmux proof of the partial-listing fallback: pin a bee to its pane, add a
+// second pane so the session survives, kill the agent pane, and confirm live
+// session evidence prevents a false crash. Private socket dir so the
 // developer's server is untouched.
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -39,7 +39,7 @@ function bee(paneId: string): SessionRecord {
   };
 }
 
-test("newSession returns the pane id; killing that pane reports the bee dead though the session lives", { timeout: 30_000 }, async () => {
+test("newSession returns the pane id; a live session prevents a false crash when that pane disappears", { timeout: 30_000 }, async () => {
   const cwd = process.env.TMUX_TMPDIR!;
   const { paneId } = await newSession("CL-pane", cwd, { command: "sleep", args: ["120"], env: {} });
   try {
@@ -57,8 +57,9 @@ test("newSession returns the pane id; killing that pane reports the bee dead tho
     const panesAfter = await listPanes();
     assert.ok(!panesAfter.has(paneId), "the agent pane is gone");
 
-    // The fix: pane-pinned liveness reports dead even though hasSession is true.
-    assert.equal(deriveState(rec, { liveTargets: new Set(["CL-pane"]), livePanes: panesAfter }).state, "crashed");
+    // A missing pane can be a partial listPanes result; session liveness gets
+    // the final word before deriveState can stamp a false crash.
+    assert.equal(deriveState(rec, { liveTargets: new Set(["CL-pane"]), livePanes: panesAfter }).state, "ready");
   } finally {
     await tmux(["kill-session", "-t", "=CL-pane"], { reject: false });
   }

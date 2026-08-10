@@ -11,7 +11,7 @@ import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { needsInputRequestId } from "../requests/keys.js";
 import { openAndResolveRequest } from "../requests/store.js";
-import { nextTurnPatch, recordSeal, sealArtifactExampleJson, sealHelpText, validateSealArtifact } from "../seal.js";
+import { nextTurnPatch, recordSeal, sealArtifactExampleJson, sealHelpText, validateSealArtifact, type SealRecord } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { appendLedger, updateSession, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
@@ -51,9 +51,15 @@ export async function cmdSeal(parsed: Parsed) {
   for (const record of records) {
     const stored = await recordSeal(record.name, artifact);
     await writeHiveState(record, "done");
-    if (isPretty()) console.log(actionLine("ok", "seal", [bold(record.name), dim(stored.status), dim(stored.type ?? "")]));
-    else console.log(`sealed\t${record.name}\t${stored.status}\t${stored.type ?? ""}\t${stored.sealedAt}`);
+    printSealResult(record.name, stored);
   }
+}
+
+
+/** Shared direct/brokered CLI rendering for one stored seal. */
+export function printSealResult(recordName: string, stored: SealRecord): void {
+  if (isPretty()) console.log(actionLine("ok", "seal", [bold(recordName), dim(stored.status), dim(stored.type ?? "")]));
+  else console.log(`sealed\t${recordName}\t${stored.status}\t${stored.type ?? ""}\t${stored.sealedAt}`);
 }
 
 
