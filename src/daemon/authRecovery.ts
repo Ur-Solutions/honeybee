@@ -46,13 +46,10 @@ export type AuthRecoveryOutcome = {
   error?: string;
 };
 
-function statePath(bee: string): string {
-  return join(hsrRunDir(bee), "auth-auto-recovery.json");
-}
-
-export async function readAuthRecoveryState(bee: string): Promise<AuthRecoveryAttemptState | null> {
+/** Shared attempt-state persistence — the rotation-resume lane keeps its own file with the same shape. */
+export async function readAttemptStateFile(bee: string, fileName: string): Promise<AuthRecoveryAttemptState | null> {
   try {
-    const parsed = JSON.parse(await readFile(statePath(bee), "utf8")) as Partial<AuthRecoveryAttemptState>;
+    const parsed = JSON.parse(await readFile(join(hsrRunDir(bee), fileName), "utf8")) as Partial<AuthRecoveryAttemptState>;
     if (
       parsed.version !== 1 ||
       typeof parsed.incidentAuthTs !== "number" ||
@@ -67,9 +64,17 @@ export async function readAuthRecoveryState(bee: string): Promise<AuthRecoveryAt
   }
 }
 
-export async function writeAuthRecoveryState(bee: string, state: AuthRecoveryAttemptState): Promise<void> {
+export async function writeAttemptStateFile(bee: string, fileName: string, state: AuthRecoveryAttemptState): Promise<void> {
   await ensureHsrRunDir(bee);
-  await atomicWriteFile(statePath(bee), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await atomicWriteFile(join(hsrRunDir(bee), fileName), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+}
+
+export async function readAuthRecoveryState(bee: string): Promise<AuthRecoveryAttemptState | null> {
+  return readAttemptStateFile(bee, "auth-auto-recovery.json");
+}
+
+export async function writeAuthRecoveryState(bee: string, state: AuthRecoveryAttemptState): Promise<void> {
+  await writeAttemptStateFile(bee, "auth-auto-recovery.json", state);
 }
 
 /** A completed turn strictly between the prior recovery and this auth turn resets the incident. */

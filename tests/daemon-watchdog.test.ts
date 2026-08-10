@@ -30,6 +30,7 @@ function emptyTickResult(): TickResult {
     taskSupplies: [],
     requestReconciles: [],
     authRecoveries: [],
+    rotationResumes: [],
     needsInput: [],
     nodeReachability: [],
     poolSweeps: [],

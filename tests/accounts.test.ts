@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 // Hermeticity: account activation now calls the external `kit` CLI. Force it
 // off so these unit tests never exec a real kit binary against temp homes
@@ -544,6 +544,11 @@ test("chain sync adopts a fresher legacy-hex keychain chain instead of quarantin
     assert.equal(vault.claudeAiOauth.accessToken, "tok-keychain-live", "the decoded legacy chain was adopted into the vault");
     const homeFile = JSON.parse(await readFile(filePath, "utf8"));
     assert.equal(homeFile.claudeAiOauth.accessToken, "tok-keychain-live", "distribution repaired the home instead of skipping it");
+    assert.equal(
+      await readFile(join(accountDir(account), "rotation-stranded.json"), "utf8").catch(() => null),
+      null,
+      "a fully-propagated distribution leaves no rotation-stranded marker",
+    );
   });
 });
 
@@ -580,6 +585,12 @@ test("chain sync repairs a stranded home's credentials file when its keychain re
       strandedFile.claudeAiOauth.accessToken,
       "tok-fresh",
       "the stranded home's credentials file was repaired even though its keychain was unreadable",
+    );
+    const marker = JSON.parse(await readFile(join(accountDir(account), "rotation-stranded.json"), "utf8"));
+    assert.deepEqual(
+      marker.strandedHomes,
+      [resolve(strandedHome)],
+      "distribution records the un-advanced keychain in the rotation-stranded marker",
     );
   });
 });

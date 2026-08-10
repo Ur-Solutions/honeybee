@@ -12,6 +12,7 @@ import { appendLedger, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
 import { createAutoTitleDispatcher } from "./autoTitle.js";
 import { createAuthRecoveryDispatcher } from "./authRecovery.js";
+import { createRotationResumeDispatcher } from "./rotationResume.js";
 import { dispatchAutoswaps } from "./autoswap.js";
 import { createBuzDrainDispatcher } from "./buzDispatcher.js";
 import { createBuzRecoveryDispatcher } from "./buzRecovery.js";
@@ -137,6 +138,7 @@ export function buildDefaultDeps(): TickDeps {
     dispatchTaskSupply: createTaskSupplyDispatcher(),
     reconcileRequests: createRequestReconciler(),
     recoverAuthNeeded: createAuthRecoveryDispatcher(),
+    resumeRotationStranded: createRotationResumeDispatcher(),
     dispatchNeedsInput: createNeedsInputDispatcher(),
     dispatchNodeReachability: createNodeReachabilityTracker(),
     sampleUsage: createUsageSampler(),
