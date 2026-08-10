@@ -1,6 +1,6 @@
 // `hive buz` — addressed bee-to-bee messaging (four-tier delivery + policy).
 // Extracted from cli.ts (HIVE-15).
-import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, countQuarantinedMessages, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, requeueQuarantinedMessages, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzTier } from "../buz.js";
+import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, countQuarantinedMessages, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, requeueQuarantinedMessages, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzSendResult, type BuzTier } from "../buz.js";
 import { parseAge } from "../clean.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
@@ -99,13 +99,21 @@ export async function buzSend(parsed: Parsed) {
       ...(transport ? { transport } : {}),
       ...(record.node ? { node: record.node } : {}),
     });
-    const m = result.message;
-    if (isPretty()) {
-      const downgradeNote = result.downgraded ? dim(`downgraded:${m.tier}->${m.deliveredAs}`) : dim(m.deliveredAs);
-      console.log(actionLine("ok", "buz", [bold(record.name), m.id, downgradeNote]));
-    } else {
-      console.log(`buz.send\t${record.name}\t${m.id}\t${m.tier}\t${m.deliveredAs}\t${result.downgraded ? "downgraded" : "ok"}`);
-    }
+    printBuzSendResult(record.name, result);
+  }
+}
+
+
+/** Shared direct/brokered CLI rendering for one buz-send result. */
+export function printBuzSendResult(recordName: string, result: BuzSendResult): void {
+  const message = result.message;
+  if (isPretty()) {
+    const downgradeNote = result.downgraded
+      ? dim(`downgraded:${message.tier}->${message.deliveredAs}`)
+      : dim(message.deliveredAs);
+    console.log(actionLine("ok", "buz", [bold(recordName), message.id, downgradeNote]));
+  } else {
+    console.log(`buz.send\t${recordName}\t${message.id}\t${message.tier}\t${message.deliveredAs}\t${result.downgraded ? "downgraded" : "ok"}`);
   }
 }
 
@@ -126,61 +134,82 @@ export async function buzList(parsed: Parsed, mailbox: "inbox" | "outbox" | "que
       ...(limit !== undefined ? { limit } : {}),
       ...(fromFilter ? { fromFilter } : {}),
     });
-    // Quarantine must be discoverable: mail dead-letters silently (the sender
-    // saw a successful enqueue), so the inbox view is where the operator
-    // learns re-drive is needed.
     const quarantined = mailbox === "inbox" ? await countQuarantinedMessages(record.name) : 0;
-    const quarantineNote = () => {
-      if (quarantined === 0) return;
-      if (isPretty()) {
-        console.log(note(`${record.name}: ${quarantined} quarantined message(s) — inspect with \`hive buz quarantine ${record.name}\`, re-drive with \`hive buz requeue ${record.name} --all\``));
-      } else {
-        console.log(`buz.quarantine.count\t${record.name}\t${quarantined}`);
-      }
-    };
-    if (listing.length === 0) {
-      if (isPretty()) console.log(dim(`# ${record.name}: no ${mailbox} messages`));
-      quarantineNote();
-      continue;
+    printBuzListing({
+      recordName: record.name,
+      mailbox,
+      listing,
+      quarantined,
+      showRecordHeader: records.length > 1,
+    });
+  }
+}
+
+
+export type BuzListEntry = { message: BuzMessage; path: string };
+
+/** Shared direct/brokered CLI rendering for one mailbox listing. */
+export function printBuzListing(params: {
+  recordName: string;
+  mailbox: "inbox" | "outbox" | "queue" | "quarantine";
+  listing: BuzListEntry[];
+  quarantined?: number;
+  showRecordHeader?: boolean;
+}): void {
+  const quarantined = params.quarantined ?? 0;
+  // Quarantine must be discoverable: mail dead-letters silently (the sender
+  // saw a successful enqueue), so the inbox view is where the operator learns
+  // re-drive is needed.
+  const quarantineNote = () => {
+    if (quarantined === 0) return;
+    if (isPretty()) {
+      console.log(note(`${params.recordName}: ${quarantined} quarantined message(s) — inspect with \`hive buz quarantine ${params.recordName}\`, re-drive with \`hive buz requeue ${params.recordName} --all\``));
+    } else {
+      console.log(`buz.quarantine.count\t${params.recordName}\t${quarantined}`);
     }
-    if (!isPretty()) {
-      for (const { message, path } of listing) {
-        console.log([
-          `buz.${mailbox}`,
-          record.name,
-          message.id,
-          senderDisplay(message.from),
-          message.to,
-          message.tier,
-          message.deliveredAs,
-          message.sentAt,
-          path,
-        ].join("\t"));
-      }
-      quarantineNote();
-      continue;
-    }
-    if (records.length > 1) console.log(bold(record.name));
-    console.log(formatTable(
-      [
-        { header: "ID" },
-        { header: "FROM" },
-        { header: "TIER" },
-        { header: "DELIVERED" },
-        { header: "AGE", align: "right" },
-        { header: "SUBJECT" },
-      ],
-      listing.map(({ message }) => [
+  };
+  if (params.listing.length === 0) {
+    if (isPretty()) console.log(dim(`# ${params.recordName}: no ${params.mailbox} messages`));
+    quarantineNote();
+    return;
+  }
+  if (!isPretty()) {
+    for (const { message, path } of params.listing) {
+      console.log([
+        `buz.${params.mailbox}`,
+        params.recordName,
         message.id,
         senderDisplay(message.from),
+        message.to,
         message.tier,
         message.deliveredAs,
-        dim(formatRelativeTime(message.sentAt)),
-        dim(message.subject ?? ""),
-      ]),
-    ));
+        message.sentAt,
+        path,
+      ].join("\t"));
+    }
     quarantineNote();
+    return;
   }
+  if (params.showRecordHeader) console.log(bold(params.recordName));
+  console.log(formatTable(
+    [
+      { header: "ID" },
+      { header: "FROM" },
+      { header: "TIER" },
+      { header: "DELIVERED" },
+      { header: "AGE", align: "right" },
+      { header: "SUBJECT" },
+    ],
+    params.listing.map(({ message }) => [
+      message.id,
+      senderDisplay(message.from),
+      message.tier,
+      message.deliveredAs,
+      dim(formatRelativeTime(message.sentAt)),
+      dim(message.subject ?? ""),
+    ]),
+  ));
+  quarantineNote();
 }
 
 
