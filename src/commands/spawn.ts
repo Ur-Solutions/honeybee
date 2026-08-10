@@ -651,11 +651,16 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     } catch (error) {
       const cleanup = await runtime.stop();
       if (cleanup.stopped && publishedRecord) {
-        // Do not leave a successfully-written SessionRecord claiming a stopped
-        // post-fork runtime is live. Lifecycle CAS prevents a same-name/new-
-        // generation replacement from being rewritten by this rollback.
+        // The runtime was stopped by INFRASTRUCTURE failure, not by a
+        // retire/kill — status stays "running" so the record derives `crashed`
+        // (status:"dead" here made rollbacks look like deliberate stops,
+        // hiding them from `hive revive --crashed` and operators — review
+        // §1.5). lastError records the rollback cause for `state explain`.
+        // Lifecycle CAS prevents a same-name/new-generation replacement from
+        // being rewritten by this rollback.
+        const cause = error instanceof Error ? error.message : String(error);
         await withSessionLifecycleTransaction(publishedRecord, (lifecycle) => lifecycle.commit({
-          status: "dead",
+          lastError: `spawn rolled back after post-fork ${postForkPhase} failure: ${cause}`,
           updatedAt: new Date().toISOString(),
         })).catch(() => undefined);
       }

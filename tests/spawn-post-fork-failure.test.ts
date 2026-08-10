@@ -5,7 +5,7 @@ import type { JsonObject } from "../src/execution/contract.js";
 import { createHsrRunLauncher } from "../src/execution/launcher.js";
 import { IndeterminateExecutionError } from "../src/execution/errors.js";
 import { registerWorkingCopy } from "../src/execution/workingCopies.js";
-import { saveSession } from "../src/store.js";
+import { loadSession, saveSession } from "../src/store.js";
 import { SpawnAfterForkError, type SpawnedRuntimeHandle } from "../src/spawnRuntime.js";
 import {
   buildRunStartEnvelope,
@@ -93,6 +93,30 @@ test("writeSpawnOptions failure after HSR fork reports unconfirmed exact teardow
         return true;
       },
     );
+  });
+});
+
+test("confirmed post-fork rollback keeps crashed semantics instead of committing status dead (review §1.5)", async () => {
+  await withTempStore(async () => {
+    await assert.rejects(
+      spawnBee(spawnOptions(), baseRuntimeDeps({
+        saveSession,
+        writeSpawnOptions: async () => { throw new Error("injected writeSpawnOptions failure"); },
+      })),
+      (error: unknown) => {
+        assert.ok(error instanceof SpawnAfterForkError);
+        assert.equal(error.phase, "spawn-options");
+        assert.equal(error.cleanup.stopped, true);
+        return true;
+      },
+    );
+    const record = await loadSession("protocol-post-fork-test");
+    assert.ok(record, "the published record survives the rollback");
+    // An infrastructure failure is NOT a deliberate stop: status stays
+    // "running" so the dead runtime derives `crashed` and stays visible to
+    // `hive revive --crashed`; the rollback cause lands in lastError.
+    assert.equal(record!.status, "running");
+    assert.match(record!.lastError ?? "", /spawn rolled back after post-fork spawn-options failure: injected writeSpawnOptions failure/);
   });
 });
 
