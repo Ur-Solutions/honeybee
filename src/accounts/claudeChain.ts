@@ -467,6 +467,7 @@ export async function syncClaudeChainToVaultLocked(
   const nowMs = (deps.now ?? Date.now)();
   let best = vault;
   const quarantinedHomes = new Set<string>();
+  const strandedHomes = new Set<string>();
   const parkingIntents = new Map<string, ClaudeChainParkingIntent>();
   const skipped: CredentialSyncSkip[] = [];
   let harvested = false;
@@ -488,8 +489,21 @@ export async function syncClaudeChainToVaultLocked(
       readFile(join(home, ".credentials.json"), "utf8").catch(() => null),
     ]);
     if (keychainRead.status === "unreadable") {
-      refusedNonRaw += 1;
-      quarantinedHomes.add(resolve(home));
+      // A read FAILURE (timeout, locked keychain, headless `security` session)
+      // is not a content refusal: the entry's bytes were never seen, so do not
+      // fold it into the non-raw-json refusal count — that mislabeling made
+      // the Aug 7–10 stranding look like corrupt credentials for three days.
+      // The home is stranded, not quarantined: distribution must still repair
+      // its readable .credentials.json copy (freshness-guarded), only the
+      // keychain entry itself stays untouched in this context.
+      strandedHomes.add(resolve(home));
+      await appendLedger({
+        type: "account.chain-sync-stranded",
+        account: account.id,
+        home,
+        reason: keychainRead.reason,
+        ...(keychainRead.detail ? { detail: keychainRead.detail } : {}),
+      }).catch(() => undefined);
       continue;
     }
     const keychainRaw = keychainRead.status === "present" ? keychainRead.raw : null;
@@ -575,7 +589,7 @@ export async function syncClaudeChainToVaultLocked(
   // the now-dead refresh token: their next turn fails even though the account
   // registry itself looks healthy. Distribute the adopted link just like a
   // Honeybee-owned refresh so all attributable homes advance atomically.
-  await distributeClaudeChainLocked(account, best.oauth, { quarantinedHomes, readKeychainRaw });
+  await distributeClaudeChainLocked(account, best.oauth, { quarantinedHomes, strandedHomes, readKeychainRaw });
   await appendLedger({
     type: "account.chain-sync",
     account: account.id,
@@ -698,8 +712,52 @@ export async function refreshClaudeOauthChain(refreshToken: string): Promise<Ref
  */
 type ClaudeDistributionOptions = {
   quarantinedHomes?: ReadonlySet<string>;
+  /**
+   * Homes whose keychain READ already failed in this context (timeout /
+   * headless `security` session). Their keychain entries must not be touched —
+   * the bytes were never seen — but their .credentials.json copies are still
+   * repaired, freshness-guarded. Skipping them entirely left every home on a
+   * dead link forever while headless reads kept failing (Aug 7–10 incident).
+   */
+  strandedHomes?: ReadonlySet<string>;
   readKeychainRaw?: RawClaudeKeychainReader;
 };
+
+/**
+ * Merge the fresh chain into a home's .credentials.json. Only updates files
+ * that already exist — refresh propagation must not seed credentials into
+ * homes that never held them.
+ */
+async function writeHomeCredentialsFile(home: string, sourceRaw: string): Promise<void> {
+  const filePath = join(home, ".credentials.json");
+  const existingFile = await readFile(filePath, "utf8").catch(() => null);
+  if (existingFile !== null) {
+    await atomicWriteFile(filePath, `${mergeCredentialsJson(existingFile, sourceRaw)}\n`, { mode: 0o600 });
+  }
+}
+
+/**
+ * File-only repair for a home whose keychain is unreadable in this context.
+ * Freshness-guarded: the harvest never saw this home (its keychain read
+ * failed, which also excluded its file), so the file may hold a fresher
+ * rotation than the chain being distributed — never regress it onto an older
+ * link, that replays a rotated-away refresh token and revokes the chain.
+ */
+async function repairStrandedHomeFile(account: AccountRecord, home: string, sourceRaw: string): Promise<void> {
+  const filePath = join(home, ".credentials.json");
+  const existingFile = await readFile(filePath, "utf8").catch(() => null);
+  if (existingFile === null) return;
+  const existingChain = parseClaudeChain(existingFile, `${home}:file`);
+  const sourceChain = parseClaudeChain(sourceRaw, "distribution");
+  if (existingChain && sourceChain && isBetterClaudeChain(existingChain, sourceChain)) return;
+  await atomicWriteFile(filePath, `${mergeCredentialsJson(existingFile, sourceRaw)}\n`, { mode: 0o600 });
+  await appendLedger({
+    type: "account.chain-file-repaired",
+    account: account.id,
+    home,
+    reason: "stranded-keychain",
+  }).catch(() => undefined);
+}
 
 async function distributeClaudeChainLocked(
   account: AccountRecord,
@@ -720,6 +778,13 @@ async function distributeClaudeChainLocked(
   for (const home of await claudeHomesForAccount(account)) {
     if (options.quarantinedHomes?.has(resolve(home))) continue;
     try {
+      if (options.strandedHomes?.has(resolve(home))) {
+        // The harvest already failed to read this home's keychain. Do NOT
+        // re-read it here: a flaky timeout that happens to succeed now would
+        // let this write clobber a keychain link the harvest never compared.
+        await repairStrandedHomeFile(account, home, sourceRaw);
+        continue;
+      }
       const existingEntry = await readKeychainRaw(home);
       if (existingEntry.status === "unreadable") {
         await appendLedger({
@@ -727,7 +792,16 @@ async function distributeClaudeChainLocked(
           account: account.id,
           home,
           reason: "unreadable-authoritative-keychain",
+          cause: existingEntry.reason,
+          ...(existingEntry.detail ? { detail: existingEntry.detail } : {}),
         }).catch(() => undefined);
+        // The keychain entry itself must not be written blind — its bytes are
+        // unknown and may hold another identity. But the home's
+        // .credentials.json is independently readable and mergeable; skipping
+        // it too stranded every home on a dead link on EVERY rotation while
+        // headless `security` reads kept failing (Aug 7–10 incident: six
+        // accounts refused continuously, homes never repaired).
+        await repairStrandedHomeFile(account, home, sourceRaw);
         continue;
       }
       const existingRaw = existingEntry.status === "present" ? existingEntry.raw : null;
@@ -768,13 +842,7 @@ async function distributeClaudeChainLocked(
       } else if (keychainWrite.ok && keychainWrite.mode === "identity-only") {
         await appendLedger({ type: "account.keychain-write-degraded", account: account.id, home, dropped: "sibling-keys" }).catch(() => {});
       }
-      // Only update home files that already exist — refresh propagation must
-      // not seed credentials into homes that never held them.
-      const filePath = join(home, ".credentials.json");
-      const existingFile = await readFile(filePath, "utf8").catch(() => null);
-      if (existingFile !== null) {
-        await atomicWriteFile(filePath, `${mergeCredentialsJson(existingFile, sourceRaw)}\n`, { mode: 0o600 });
-      }
+      await writeHomeCredentialsFile(home, sourceRaw);
     } catch (error) {
       // Best effort per home, but never silently: a swallowed propagation
       // failure leaves this home on a dead link with no trace to debug from.

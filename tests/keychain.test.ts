@@ -44,15 +44,17 @@ test("keychain reads distinguish explicit absence from unreadable and preserve p
       stderr: "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.",
     });
   }), { status: "absent" });
+  // Unreadable results carry the raw `security` diagnostic — "security-error"
+  // alone made the Aug 7–10 headless-read failures undiagnosable.
   assert.deepEqual(await read(async () => {
     throw Object.assign(new Error("ambiguous security failure"), { code: 44 });
-  }), { status: "unreadable", reason: "security-error" }, "exit-code truncation alone is not explicit absence");
+  }), { status: "unreadable", reason: "security-error", detail: "code=44" }, "exit-code truncation alone is not explicit absence");
   assert.deepEqual(await read(async () => {
-    throw Object.assign(new Error("User interaction is not allowed"), { code: 36 });
-  }), { status: "unreadable", reason: "security-error" });
+    throw Object.assign(new Error("User interaction is not allowed"), { code: 36, stderr: "security: SecKeychainItemCopyContent: User interaction is not allowed." });
+  }), { status: "unreadable", reason: "security-error", detail: "code=36 stderr=security: SecKeychainItemCopyContent: User interaction is not allowed." });
   assert.deepEqual(await read(async () => {
     throw Object.assign(new Error("timed out"), { code: "ETIMEDOUT", killed: true });
-  }), { status: "unreadable", reason: "timeout" });
+  }), { status: "unreadable", reason: "timeout", detail: "code=ETIMEDOUT" });
 
   // Exit zero means the item exists even when its payload is malformed/empty;
   // only the explicit item-not-found status above is absence.

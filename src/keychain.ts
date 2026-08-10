@@ -16,7 +16,7 @@ export type ClaudeKeychainReadResult =
   | { status: "present"; raw: string }
   | { status: "absent" }
   | { status: "unavailable" }
-  | { status: "unreadable"; reason: "timeout" | "security-error" };
+  | { status: "unreadable"; reason: "timeout" | "security-error"; detail?: string };
 
 type KeychainReadDeps = {
   available?: () => boolean;
@@ -75,6 +75,24 @@ function keychainReadFailureReason(error: unknown): "timeout" | "security-error"
 }
 
 /**
+ * The exact `security` exit code / stderr, for ledger events. "security-error"
+ * alone made the Aug 7–10 headless-read failures undiagnosable — the class
+ * (locked login keychain vs ACL vs missing session) only shows in the raw
+ * diagnostic.
+ */
+function keychainReadFailureDetail(error: unknown): string | undefined {
+  const failure = error as { code?: unknown; stderr?: unknown; message?: unknown };
+  const stderr = typeof failure.stderr === "string"
+    ? failure.stderr
+    : Buffer.isBuffer(failure.stderr) ? failure.stderr.toString("utf8") : "";
+  const parts: string[] = [];
+  if (failure.code !== undefined && failure.code !== null) parts.push(`code=${String(failure.code)}`);
+  if (stderr.trim()) parts.push(`stderr=${stderr.trim().slice(0, 200)}`);
+  if (parts.length === 0 && typeof failure.message === "string" && failure.message) return failure.message.slice(0, 200);
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+/**
  * Inspect the exact `security -w` rendering without erasing authority state.
  * Only an explicit errSecItemNotFound is absence. A successful empty password
  * is still a present (malformed) item, while locked/ACL/timeout failures are
@@ -95,7 +113,8 @@ export async function readClaudeKeychainState(homePath: string, deps: KeychainRe
     return { status: "present", raw: stdout.trim() };
   } catch (error) {
     if (explicitItemNotFound(error)) return { status: "absent" };
-    return { status: "unreadable", reason: keychainReadFailureReason(error) };
+    const detail = keychainReadFailureDetail(error);
+    return { status: "unreadable", reason: keychainReadFailureReason(error), ...(detail ? { detail } : {}) };
   }
 }
 
