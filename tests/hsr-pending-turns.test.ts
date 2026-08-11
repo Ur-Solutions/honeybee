@@ -9,7 +9,17 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { runHsrHost } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
-import { enqueueTurnForBootingHsrHost, readPendingHsrTurns } from "../src/hsr/pendingTurns.js";
+import {
+  enqueuePendingHsrTurn,
+  enqueueTurnForBootingHsrHost,
+  createPendingHsrDeliveryGate,
+  drainStagedPendingHsrTurns,
+  readPendingHsrTurns,
+  readStagedPendingHsrTurns,
+  restorePendingHsrTurnsAfterRecovery,
+  stagePendingHsrTurnsForRecovery,
+  withHsrTurnDeliveryLock,
+} from "../src/hsr/pendingTurns.js";
 import { hsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
@@ -134,7 +144,16 @@ test("a turn enqueued before host boot is drained into the harness at queued→r
     const identity = await captureProcessBirthFingerprint(process.pid);
     assert.ok(identity);
     assert.equal(await enqueueTurnForBootingHsrHost(bee, process.pid, "hello-from-before-boot", identity), true);
-    const handle = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee), queueStartup: true });
+    const handle = await runHsrHost({
+      bee,
+      adapter: stubAdapter,
+      opts: optsFor(bee),
+      queueStartup: true,
+      processBirthCapture: {
+        timeoutMs: 0,
+        capture: async (pid) => ({ pgid: pid, startedAt: `test-birth:${pid}` }),
+      },
+    });
     try {
       const sub = hsrSubstrate();
       await waitFor(
@@ -188,5 +207,56 @@ test("a live HSR send is removed only after a successful turn_end", async () => 
     } finally {
       await handle.stop();
     }
+  });
+});
+
+test("recovery staging preserves original pending turn identities and restores idempotently", async () => {
+  await withTempStore(async () => {
+    const bee = "recovery-stage";
+    const original = await withHsrTurnDeliveryLock(bee, () => enqueuePendingHsrTurn(bee, "resume this exact turn"));
+
+    const staged = await stagePendingHsrTurnsForRecovery(bee, "episode-1");
+    assert.deepEqual(staged.turns, [{ id: original.id, filename: original.filename, queuedAt: original.queuedAt }]);
+    assert.deepEqual(await readPendingHsrTurns(bee), []);
+
+    const restored = await restorePendingHsrTurnsAfterRecovery(bee);
+    assert.equal(restored?.episodeId, "episode-1");
+    assert.deepEqual(await readPendingHsrTurns(bee), [original]);
+
+    await restorePendingHsrTurnsAfterRecovery(bee);
+    assert.deepEqual(await readPendingHsrTurns(bee), [original], "a repeated restore never copies the turn");
+    assert.equal((await readStagedPendingHsrTurns(bee))?.turns.length, 1);
+  });
+});
+
+test("a live host accepts a recovered delivery id once until its journal acknowledgement", () => {
+  const gate = createPendingHsrDeliveryGate();
+  assert.equal(gate.claim("turn-file-1.json"), true);
+  assert.equal(gate.claim("turn-file-1.json"), false, "daemon retry on the same host is idempotent");
+  assert.equal(gate.claim("turn-file-2.json"), true, "distinct queued work is independent");
+  gate.release("turn-file-1.json");
+  assert.equal(gate.claim("turn-file-1.json"), true, "an acked id may be reclaimed only after release");
+});
+
+test("the replay marker clears only after replacement-host drain acceptance", async () => {
+  await withTempStore(async () => {
+    const bee = "recovery-drain-marker";
+    const original = await withHsrTurnDeliveryLock(bee, () => enqueuePendingHsrTurn(bee, "keep until accepted"));
+    await stagePendingHsrTurnsForRecovery(bee, "episode-marker");
+
+    await assert.rejects(
+      drainStagedPendingHsrTurns(bee, async () => { throw new Error("replacement socket not ready"); }),
+      /replacement socket not ready/,
+    );
+    assert.ok(await readStagedPendingHsrTurns(bee), "failed drain retains its replay marker");
+    assert.deepEqual(await readPendingHsrTurns(bee), [original], "restored journal remains durable");
+
+    let offered = 0;
+    assert.equal(await drainStagedPendingHsrTurns(bee, async () => {
+      offered = (await readPendingHsrTurns(bee)).length;
+      return offered;
+    }), 1);
+    assert.equal(offered, 1);
+    assert.equal(await readStagedPendingHsrTurns(bee), null);
   });
 });

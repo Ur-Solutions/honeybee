@@ -38,3 +38,8 @@ export function stopFailedRequestId(bee: string, generation: number): string {
 export function messageDeliveryRequestId(bee: string, messageId: string): string {
   return `manual:${bee}:message-delivery:${messageId}`;
 }
+
+/** Bee-scoped manual action: automatic runtime recovery exhausted its budget. */
+export function recoveryFailedRequestId(bee: string, episodeId: string): string {
+  return `manual:${bee}:recovery-failed:${episodeId}`;
+}

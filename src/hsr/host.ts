@@ -31,7 +31,12 @@ import {
   type HsrStartupFailure,
 } from "./runDir.js";
 import { codexStartupConcurrency, withCodexStartupSlot } from "./startupQueue.js";
-import { drainPendingHsrTurns, removePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
+import {
+  createPendingHsrDeliveryGate,
+  drainPendingHsrTurns,
+  removePendingHsrTurn,
+  withHsrTurnDeliveryLock,
+} from "./pendingTurns.js";
 import { isAuthNeededMessage, pendingNeedsInput } from "./observe.js";
 import {
   capturePersistableProcessBirthFingerprint,
@@ -284,11 +289,19 @@ export async function runHsrHost(params: {
   // it in place so auth recovery can replay the operator's exact text.
   const awaitingTurnStart: string[] = [];
   const openTurns: Array<{ deliveryId?: string; authFailed: boolean }> = [];
+  // One delivery id may be offered repeatedly when a daemon dies after the
+  // replacement host accepted its recovery drain but before clearing the
+  // replay manifest. De-dupe only within this live host incarnation: after a
+  // real host crash, a new host must replay the still-journaled turn.
+  const deliveryGate = createPendingHsrDeliveryGate();
   let lastAccountAuthFailureRecordedAt = 0;
 
   const sendTrackedTurn = async (text: string, mode: unknown, deliveryId: unknown): Promise<void> => {
     const trackedId = mode !== "next-tool" && typeof deliveryId === "string" ? deliveryId : undefined;
-    if (trackedId) awaitingTurnStart.push(trackedId);
+    if (trackedId) {
+      if (!deliveryGate.claim(trackedId)) return;
+      awaitingTurnStart.push(trackedId);
+    }
     try {
       await session.send(text, mode === "next-tool" ? { mode: "next-tool" } : undefined);
     } catch (error) {
@@ -297,6 +310,7 @@ export async function runHsrHost(params: {
       if (trackedId) {
         const pendingIndex = awaitingTurnStart.indexOf(trackedId);
         if (pendingIndex >= 0) awaitingTurnStart.splice(pendingIndex, 1);
+        deliveryGate.release(trackedId);
       }
       throw error;
     }
@@ -314,6 +328,11 @@ export async function runHsrHost(params: {
       return session.answer(String(p.requestId ?? ""), runnerInputAnswer(p.answer));
     },
     pendingInput: () => pendingNeedsInput(bee),
+    // Recovery restores the ORIGINAL pending files/ids, then invokes this RPC.
+    // sendTrackedTurn makes a repeated call on this same host idempotent.
+    drainPending: () => withHsrTurnDeliveryLock(bee, async () => ({
+      delivered: await drainPendingHsrTurns(bee, (turn) => sendTrackedTurn(turn.text, undefined, turn.filename)),
+    })),
     snapshot: (params) => {
       const lines = (params as { lines?: unknown })?.lines;
       return session.snapshot(typeof lines === "number" ? lines : undefined);
@@ -464,9 +483,15 @@ export async function runHsrHost(params: {
         } else if (event.type === "turn_end") {
           const completed = openTurns.shift();
           if (completed?.deliveryId && !completed.authFailed) {
-            await removePendingHsrTurn(bee, completed.deliveryId).catch((error) => {
+            let acknowledged = false;
+            await removePendingHsrTurn(bee, completed.deliveryId).then(() => {
+              acknowledged = true;
+            }).catch((error) => {
               process.stderr.write(`hsr host ${bee}: could not ack pending turn: ${String(error)}\n`);
             });
+            // A failed unlink leaves the journal authoritative; retain the
+            // in-host de-dupe until a later recovery instead of double-running.
+            if (acknowledged) deliveryGate.release(completed.deliveryId);
           }
         }
         try {
