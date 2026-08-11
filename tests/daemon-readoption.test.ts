@@ -245,6 +245,7 @@ test("shutdown stamps observer uncertainty without changing any bee cursor or pi
   const records = ["shutdown-a", "shutdown-b", "shutdown-c"].map((name, index) =>
     record(name, { runnerPid: 8000 + index }),
   );
+  records.push(record("shutdown-local", { substrate: "local-tmux", runnerPid: undefined }));
   const before = records.map(({ name, runnerPid, lastObservedState }) => ({ name, runnerPid, lastObservedState }));
   const markers = new Map<string, UnverifiedCursorMarker>();
   const outcomes = await markObserverOffline({
@@ -259,7 +260,7 @@ test("shutdown stamps observer uncertainty without changing any bee cursor or pi
     now: () => Date.parse(observedAt),
   });
 
-  assert.deepEqual(outcomes.map(({ status }) => status), ["marked", "marked", "marked"]);
+  assert.deepEqual(outcomes.map(({ status }) => status), ["marked", "marked", "marked", "marked"]);
   assert.deepEqual(records.map(({ name, runnerPid, lastObservedState }) => ({ name, runnerPid, lastObservedState })), before);
   for (const marker of markers.values()) {
     assert.deepEqual(marker, {

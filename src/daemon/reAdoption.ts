@@ -128,6 +128,11 @@ export function isHsrReAdoptionCandidate(record: SessionRecord): boolean {
   return record.substrate === "hsr" && record.status !== "done" && record.stateMachine?.lifecycle !== "archived";
 }
 
+/** Every active lifecycle cursor becomes uncertain when its observer exits. */
+export function isObserverCursorCandidate(record: SessionRecord): boolean {
+  return record.status !== "done" && record.stateMachine?.lifecycle !== "archived";
+}
+
 /**
  * Shutdown records observer uncertainty only. It never writes a bee runtime or
  * legacy observed state, and failures are reported without blocking teardown.
@@ -146,7 +151,7 @@ export async function markObserverOffline(options: ObserverOfflineOptions): Prom
     probeScheduledAt: offlineSince,
     observer,
   };
-  const records = (await (options.listRecords ?? listSessionsStrict)()).filter(isHsrReAdoptionCandidate);
+  const records = (await (options.listRecords ?? listSessionsStrict)()).filter(isObserverCursorCandidate);
   const markUnverified = options.markUnverified ?? markSessionUnverified;
   return mapWithConcurrency(records, Math.max(1, options.concurrency ?? 16), async (record) => {
     try {
