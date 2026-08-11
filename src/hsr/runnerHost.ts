@@ -4,7 +4,7 @@
 import { spawn as spawnChild } from "node:child_process";
 import { mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, extname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureOrphanedChildGroupStopped } from "./observe.js";
 import { ensureHsrRunDir, hsrRunDir, readHsrMeta, readHsrMetaStrict } from "./runDir.js";
@@ -66,6 +66,17 @@ export function dedicatedHsrEntryCandidate(runnerHostEntry: string): string | un
   return join(dirname(runnerHostEntry), `runner-entry${extension}`);
 }
 
+/**
+ * True when this module's own resolved entry IS the self-contained cloud
+ * runner-host bundle (`hive-runner-host-<version>.mjs`, emitted by
+ * buildRunnerHostBundle.ts). In a cloud Cell there is no dedicated runner-entry
+ * sibling on disk — the whole runner-host is this one file — so the bee host is
+ * spawned by re-execing the bundle itself with the `__hsr-run` marker.
+ */
+export function isRunnerHostBundleEntry(runnerHostEntry: string): boolean {
+  return extname(runnerHostEntry) === ".mjs" && basename(runnerHostEntry).startsWith("hive-runner-host-");
+}
+
 
 /**
  * Resolve the dedicated child from this module's own location. process.argv[1]
@@ -90,6 +101,14 @@ export async function resolveHsrEntry(
   try {
     return { path: await resolveRealpath(candidate), mode: "dedicated" };
   } catch {
+    // No dedicated sibling on disk. A self-contained runner-host bundle (cloud
+    // Cell) has none, so re-exec THIS bundle with the `__hsr-run` marker — the
+    // same command remoteHost.main() dispatches. This uses the module's OWN
+    // resolved entry (not process.argv[1]), preserving the safety that an
+    // ordinary imported runnerHost never re-execs an arbitrary embedding CLI.
+    if (isRunnerHostBundleEntry(runnerHostEntry)) {
+      return { path: runnerHostEntry, mode: "cli-fallback" };
+    }
     throw new Error(`hsr: dedicated runner entry unavailable (expected ${candidate})`);
   }
 }

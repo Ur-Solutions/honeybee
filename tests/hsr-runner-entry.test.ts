@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import {
@@ -7,9 +10,11 @@ import {
   dedicatedHsrEntryCandidate,
   hsrEntryArgv,
   inheritableExecArgvForHsr,
+  isRunnerHostBundleEntry,
   resolveHsrEntry,
   waitForHsrHost,
 } from "../src/hsr/runnerHost.js";
+import { ensureRunnerHostBundle } from "../src/hsr/buildRunnerHostBundle.js";
 import {
   applyCellEnvironmentStamp,
   applyCellGithubCredential,
@@ -126,6 +131,42 @@ test("resolveHsrEntry fails closed instead of relaunching an embedding test file
   await assert.rejects(() => resolveHsrEntry(""), /runnerHost module entry path/);
 });
 
+test("resolveHsrEntry re-execs a self-contained bundle when the dedicated sibling is absent", async () => {
+  const bundle = "/opt/hive/hive-runner-host-0.0.1+abc123def456.mjs";
+
+  // Cloud Cell: the bundle IS the whole runner-host; no runner-entry.mjs sibling
+  // exists on disk, so entry resolution falls back to re-execing the bundle
+  // itself with the `__hsr-run` marker (cli-fallback mode against the bundle).
+  const inCell = await resolveHsrEntry(bundle, async (path) => {
+    if (path === bundle) return bundle;
+    throw new Error("ENOENT");
+  });
+  assert.deepEqual(inCell, { path: bundle, mode: "cli-fallback" });
+  assert.deepEqual(hsrEntryArgv(inCell, "/tmp/hive-hsr-payload-x/payload.json"), [
+    bundle,
+    "__hsr-run",
+    "/tmp/hive-hsr-payload-x/payload.json",
+  ]);
+
+  // When the dedicated sibling IS present, it still wins over the self re-exec.
+  const withSibling = await resolveHsrEntry(bundle, async (path) => path);
+  assert.deepEqual(withSibling, { path: "/opt/hive/runner-entry.mjs", mode: "dedicated" });
+
+  // A non-bundle module with no sibling still fails closed — never self re-execs.
+  await assert.rejects(
+    () => resolveHsrEntry("/pkg/dist/hsr/runnerHost.js", async (path) => {
+      if (path.endsWith("runnerHost.js")) return path;
+      throw new Error("ENOENT");
+    }),
+    /dedicated runner entry unavailable.*runner-entry\.js/,
+  );
+
+  // The bundle-self predicate only matches the emitted `hive-runner-host-*.mjs`.
+  assert.equal(isRunnerHostBundleEntry("/opt/hive/hive-runner-host-0.0.1+abc.mjs"), true);
+  assert.equal(isRunnerHostBundleEntry("/opt/hive/runner-entry.mjs"), false);
+  assert.equal(isRunnerHostBundleEntry("/opt/hive/hive-runner-host-0.0.1+abc.js"), false);
+});
+
 test("hsrEntryArgv retains an explicit __hsr-run compatibility entry", () => {
   const fallback = { path: "/pkg/dist/cli.js", mode: "cli-fallback" } as const;
   assert.deepEqual(fallback, { path: "/pkg/dist/cli.js", mode: "cli-fallback" });
@@ -226,5 +267,43 @@ test("the dedicated source entry and __hsr-run fallback both remain executable u
         return true;
       },
     );
+  }
+});
+
+test("the built runner-host bundle prints only its version — no runner-entry guard collision", async () => {
+  // Regression for the two-entrypoint bundle: remoteHost.ts and runner-entry.ts
+  // share import.meta.url in the bundle, so both standalone guards used to fire.
+  // `--version` must now emit ONLY the version, never runner-entry's handoff
+  // error from a spuriously-fired second guard.
+  const { path: bundlePath, version } = await ensureRunnerHostBundle({ force: true });
+  const { stdout, stderr } = await execFileAsync(process.execPath, [bundlePath, "--version"]);
+  assert.equal(stdout.trim(), `runner-host ${version}`);
+  assert.equal(stderr, "");
+  assert.doesNotMatch(stdout + stderr, /invalid HSR payload handoff path/);
+});
+
+test("the built runner-host bundle routes __hsr-run into the bee host, not 'unknown command'", async () => {
+  // In-cell self-spawn: `node <bundle> __hsr-run <payload>` must reach
+  // runHsrHostFromPayload (remoteHost.main owns the marker). Proven by a payload
+  // CONTENT error — invalid JSON in an otherwise-valid handoff dir — rather than
+  // the "unknown command" dispatch miss or the handoff-path validation error.
+  const { path: bundlePath } = await ensureRunnerHostBundle({ force: true });
+  const dir = await mkdtemp(join(tmpdir(), "hive-hsr-payload-"));
+  const payloadPath = join(dir, "payload.json");
+  try {
+    await writeFile(payloadPath, "this is not valid json\n", { mode: 0o600 });
+    await assert.rejects(
+      execFileAsync(process.execPath, [bundlePath, "__hsr-run", payloadPath]),
+      (error: Error & { code?: number | string; stderr?: string }) => {
+        assert.equal(error.code, 1);
+        assert.match(error.stderr ?? "", /hive __hsr-run: invalid payload JSON/);
+        assert.doesNotMatch(error.stderr ?? "", /unknown command/);
+        assert.doesNotMatch(error.stderr ?? "", /invalid HSR payload handoff path/);
+        return true;
+      },
+    );
+  } finally {
+    // consumeHsrRunPayload removes the handoff on success; force covers that.
+    await rm(dir, { recursive: true, force: true });
   }
 });

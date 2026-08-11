@@ -361,11 +361,19 @@ async function hydrateAndStartConsumedPayload(
   return { payload, host };
 }
 
-// The CLI imports this module through runnerHost.ts for its fallback command,
-// so execute only when node/tsx invoked runner-entry itself.
-const invokedDirectly = (() => {
+// Standalone dedicated-sibling guard. Fires ONLY when node/tsx invoked the
+// dedicated `runner-entry` sibling directly (mode 'dedicated':
+// `node runner-entry.mjs <payloadPath>`). The CLI imports this module through
+// runnerHost.ts for its `__hsr-run` fallback, and the cloud runner-host bundle
+// bundles this module alongside remoteHost.ts under a SHARED import.meta.url — a
+// bare realpath self-check would then double-fire on every `connect`/`serve`/
+// `--version`. The bundle is named `hive-runner-host-*.mjs`, so gating on the
+// argv[1] basename stands this guard down inside the bundle; there remoteHost's
+// main() is the sole owner of the `__hsr-run` dispatch.
+const invokedAsDedicatedSibling = (() => {
   const entry = process.argv[1];
   if (!entry) return false;
+  if (!basename(entry).startsWith("runner-entry")) return false;
   try {
     return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
   } catch {
@@ -373,7 +381,7 @@ const invokedDirectly = (() => {
   }
 })();
 
-if (invokedDirectly) {
+if (invokedAsDedicatedSibling) {
   runHsrHostFromPayload(process.argv[2]).catch((error) => {
     process.stderr.write(`hive __hsr-run: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

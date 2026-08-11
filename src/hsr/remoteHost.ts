@@ -66,6 +66,14 @@ import {
   type DeliveredCredentialEraseResult,
 } from "./remoteCreds.js";
 import { runHsrHost, type HsrHostHandle } from "./host.js";
+// In-cell bee spawn: the cloud Cell is this single bundle (no dedicated
+// runner-entry sibling on disk), so runnerHost re-execs THIS bundle as
+// `node <bundle> __hsr-run <payloadPath>`. main() dispatches that here — and
+// runner-entry's own dedicated-sibling guard stands down inside the bundle — so
+// this is the sole entrypoint into the bee host. Imported straight from
+// runner-entry.js (already in the bundle closure) to avoid pulling the
+// substrate/observe graph that runnerHost.js would add.
+import { runHsrHostFromPayload } from "./runner-entry.js";
 import { adapterFor } from "./adapters/index.js";
 import { harnessSupportsRemoteHsr } from "./harness.js";
 import { normalizeCreds } from "./credsParams.js";
@@ -898,6 +906,16 @@ async function main(argv: string[]): Promise<number> {
     process.on("SIGTERM", shutdown);
     // Never resolves — the reconnect loop owns the event loop.
     return await new Promise<number>(() => {});
+  }
+
+  if (cmd === "__hsr-run") {
+    // Bundle-self bee spawn (in-cell): runnerHost re-execs this bundle with the
+    // `__hsr-run` marker when there is no dedicated runner-entry sibling. This
+    // owns the bundle's handoff into the bee host; runHsrHostFromPayload manages
+    // its own process lifetime (it calls process.exit on both success and
+    // startup failure), so control does not return here in practice.
+    await runHsrHostFromPayload(argv[1]);
+    return 0;
   }
 
   process.stderr.write(
