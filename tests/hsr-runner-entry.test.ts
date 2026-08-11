@@ -10,7 +10,11 @@ import {
   resolveHsrEntry,
   waitForHsrHost,
 } from "../src/hsr/runnerHost.js";
-import { applyCellEnvironmentStamp, cellSpaceKeyForCwd } from "../src/hsr/runner-entry.js";
+import {
+  applyCellEnvironmentStamp,
+  applyCellGithubCredential,
+  cellSpaceKeyForCwd,
+} from "../src/hsr/runner-entry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -49,6 +53,46 @@ test("Cell spawns are stamped HIVE_CELL=1 + HIVE_CELL_SPACE; non-Cell spawns are
   applyCellEnvironmentStamp(plain, { cwd: "/home/user/repo" });
   assert.equal("HIVE_CELL" in plain, false);
   assert.equal("HIVE_CELL_SPACE" in plain, false);
+});
+
+test("Cell spawns borrow the host gh session token; explicit tokens and opt-out win", async () => {
+  const cell = (): Parameters<typeof applyCellGithubCredential>[1] => ({ filesystemWriteScope: "cwd" });
+
+  const stamped: Record<string, string> = {};
+  await applyCellGithubCredential(stamped, cell(), async () => "gho_host_session_token\n");
+  assert.equal(stamped.GH_TOKEN, "gho_host_session_token");
+
+  // Non-Cell spawns are never stamped — the operator env already governs.
+  const plain: Record<string, string> = {};
+  await applyCellGithubCredential(plain, {}, async () => "gho_host_session_token");
+  assert.equal("GH_TOKEN" in plain, false);
+
+  // An explicit spawn-env credential always wins over the borrowed session.
+  const explicit: Record<string, string> = { GITHUB_TOKEN: "ghs_explicit" };
+  await applyCellGithubCredential(explicit, cell(), async () => "gho_host_session_token");
+  assert.equal("GH_TOKEN" in explicit, false);
+
+  // HIVE_CELL_GH=0 on the host opts the machine out entirely.
+  process.env.HIVE_CELL_GH = "0";
+  try {
+    const opted: Record<string, string> = {};
+    await applyCellGithubCredential(opted, cell(), async () => "gho_host_session_token");
+    assert.equal("GH_TOKEN" in opted, false);
+  } finally {
+    delete process.env.HIVE_CELL_GH;
+  }
+
+  // Not-a-token shapes (gh error prose, empties) and resolver failures are
+  // soft: the Cell simply stays unauthenticated.
+  const prose: Record<string, string> = {};
+  await applyCellGithubCredential(prose, cell(), async () => "no oauth token found\n");
+  assert.equal("GH_TOKEN" in prose, false);
+  const empty: Record<string, string> = {};
+  await applyCellGithubCredential(empty, cell(), async () => "  \n");
+  assert.equal("GH_TOKEN" in empty, false);
+  const failing: Record<string, string> = {};
+  await applyCellGithubCredential(failing, cell(), async () => { throw new Error("gh missing"); });
+  assert.equal("GH_TOKEN" in failing, false);
 });
 
 test("resolveHsrEntry derives source and built entries from the runnerHost module", async () => {

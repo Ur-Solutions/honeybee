@@ -4,6 +4,7 @@
  * the runner-host lifecycle; parent-side spawning stays in runnerHost.ts.
  */
 
+import { execFile } from "node:child_process";
 import { constants, existsSync, realpathSync } from "node:fs";
 import { lstat, open, realpath, rmdir, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -129,6 +130,54 @@ export function applyCellEnvironmentStamp(
     delete env.HIVE_CELL;
     delete env.HIVE_CELL_SPACE;
   }
+}
+
+/**
+ * Stamp the operator's GitHub credential into a managed Cell.
+ *
+ * gh inside a Cell resolves its config from the bee's HOME (the per-account
+ * hive home), which holds no gh session — bees were observed ssh-hopping to
+ * other machines just to reach an authenticated gh. gh accepts a token by
+ * env, so borrow the HOST session's token (`gh auth token` under the
+ * operator HOME) and stamp GH_TOKEN. This is the LOCAL trust model only
+ * (Cells are anti-footgun containment); cloud Cells mint short-lived
+ * repo-scoped GitHub App installation tokens instead. Fail-soft throughout:
+ * no gh on PATH, no session, or a slow probe leaves the env unstamped and gh
+ * degrades to its normal unauthenticated errors. HIVE_CELL_GH=0 in the host
+ * env opts out; an explicit GH_TOKEN/GITHUB_TOKEN in the spawn env wins.
+ */
+export async function applyCellGithubCredential(
+  env: Record<string, string>,
+  payload: Pick<HsrRunPayload, "filesystemWriteScope">,
+  resolveToken: () => Promise<string> = hostGithubSessionToken,
+): Promise<void> {
+  if (payload.filesystemWriteScope !== "cwd") return;
+  if (env.GH_TOKEN || env.GITHUB_TOKEN) return;
+  if (process.env.HIVE_CELL_GH === "0") return;
+  try {
+    const token = (await resolveToken()).trim();
+    // A credential is a single opaque line; anything else is not a token.
+    if (token.length === 0 || /[\s\u0000-\u001f\u007f]/.test(token)) return;
+    env.GH_TOKEN = token;
+  } catch {
+    // Fail-soft by design: an unauthenticated Cell is degraded, not broken.
+  }
+}
+
+function hostGithubSessionToken(): Promise<string> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(
+      "gh",
+      ["auth", "token"],
+      // The HOST environment on purpose: the operator HOME owns the gh
+      // session; the bee env points HOME at a hive home with no session.
+      { timeout: 3000, env: process.env, encoding: "utf8" },
+      (error, stdout) => {
+        if (error) rejectPromise(error);
+        else resolvePromise(stdout);
+      },
+    );
+  });
 }
 
 async function validatedHsrPayloadPath(payloadPath: string): Promise<{ payloadPath: string; dir: string }> {
@@ -274,6 +323,7 @@ async function hydrateAndStartConsumedPayload(
   childEnv.HIVE_COMB = payload.comb ?? payload.bee;
   if (payload.parent) childEnv.HIVE_PARENT = payload.parent;
   applyCellEnvironmentStamp(childEnv, payload);
+  await applyCellGithubCredential(childEnv, payload);
   let cellSandbox: RunnerOpts["cellSandbox"];
   if (payload.filesystemWriteScope === "cwd") {
     const initialized = initializeCellSandbox({
