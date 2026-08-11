@@ -44,7 +44,16 @@ import {
   reapDeadHosts,
   type HsrProcessSignalDependencies,
 } from "./observe.js";
-import { readHsrMeta, readHsrMetaStrict, hsrRunDir, readHsrRestart, writeHsrRestart, type HsrMeta } from "./runDir.js";
+import {
+  ackHsrEvents,
+  hsrRunDir,
+  readHsrEventsAfterSeq,
+  readHsrMeta,
+  readHsrMetaStrict,
+  readHsrRestart,
+  writeHsrRestart,
+  type HsrMeta,
+} from "./runDir.js";
 import { sameProcessBirthFingerprint } from "./processIdentity.js";
 import {
   deliverAndRecordCredentials,
@@ -599,16 +608,44 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
     // no live control socket needed, so it also serves exited bees. The local
     // event mirror (APIA-94) uses it to backfill events emitted before its
     // observe subscription attached.
+    //
+    // Cell-transport seq cursor: `afterSeq` (per-bee monotonic seq, wins over
+    // afterTs when both are sent) returns exactly the events with
+    // `seq > afterSeq` — the exact-resume path for consumers whose connection
+    // died. When the cursor points below the oldest retained seq (compaction
+    // folded it away), the result carries an explicit `gap: {fromSeq, toSeq}`
+    // so the consumer can resynchronize instead of silently diverging.
     events: guarded(async (params) => {
-      const p = (params ?? {}) as { bee?: unknown; afterTs?: unknown };
+      const p = (params ?? {}) as { bee?: unknown; afterTs?: unknown; afterSeq?: unknown };
       const bee = String(p.bee ?? "");
       if (!bee) return { ok: false, error: "bee required" };
+      const afterSeq = typeof p.afterSeq === "number" && Number.isFinite(p.afterSeq) ? p.afterSeq : undefined;
+      if (afterSeq !== undefined) {
+        const { events, gap } = await readHsrEventsAfterSeq(bee, afterSeq);
+        return { ok: true, events, ...(gap ? { gap } : {}) };
+      }
       const afterTs = typeof p.afterTs === "number" && Number.isFinite(p.afterTs) ? p.afterTs : undefined;
       const events = await readEventTail(bee);
       return {
         ok: true,
         events: afterTs === undefined ? events : events.filter((event) => typeof event.ts === "number" && event.ts > afterTs),
       };
+    }),
+
+    // Advance a bee's consumer ack watermark (cell transport). Events at or
+    // below the returned `ackedSeq` become foldable by compaction; everything
+    // above it is retained verbatim for exact seq-cursor resume, even past the
+    // size cap. The watermark is clamped to the issued high-water and never
+    // regresses, so a stale/duplicate ack is harmless.
+    ackEvents: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; upToSeq?: unknown };
+      const bee = String(p.bee ?? "");
+      if (!bee) return { ok: false, error: "bee required" };
+      if (typeof p.upToSeq !== "number" || !Number.isFinite(p.upToSeq) || p.upToSeq < 1) {
+        return { ok: false, error: "upToSeq must be a positive number" };
+      }
+      const ackedSeq = await ackHsrEvents(bee, p.upToSeq);
+      return { ok: true, ackedSeq };
     }),
 
     // Establish (or ref-count into) a relay of the bee's live event stream. Each

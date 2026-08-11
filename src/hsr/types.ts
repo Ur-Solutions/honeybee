@@ -49,8 +49,14 @@ export type RunnerInputAnswer = string | string[][];
  * A structured event emitted by a running harness. Replaces screen-scraping:
  * these feed `deriveState`, needs-input detection, the usage sampler, and the
  * ring buffer that backs `RunnerSession.snapshot()`.
+ *
+ * `seq` is the per-bee monotonic sequence cursor (cell transport): the run-dir
+ * writer stamps it on EVERY append (starting at 1), so a consumer that resumes
+ * after a dead connection can fetch exactly `seq > afterSeq` and ack a
+ * high-water mark. Optional on the wire for back-compat — legacy on-disk
+ * events and synthetic compaction checkpoints carry no seq.
  */
-export type RunnerEvent =
+export type RunnerEvent = (
   | { type: "turn_start"; ts: number; threadId?: string }
   | { type: "turn_end"; ts: number; threadId?: string }
   | { type: "text"; ts: number; text: string } // assistant output chunk (feeds ring buffer)
@@ -126,7 +132,8 @@ export type RunnerEvent =
       requestId?: string;
     }
   | { type: "error"; ts: number; message: string }
-  | { type: "exit"; ts: number; code: number | null; signal?: string };
+  | { type: "exit"; ts: number; code: number | null; signal?: string }
+) & { seq?: number };
 
 /**
  * Everything an adapter needs to start a session. The caller (SubstrateHsr) has
