@@ -31,8 +31,10 @@ function deny(reason: string): never {
 }
 
 function callingBee(): string {
-  const bee = process.env.HIVE_BEE_NAME?.trim();
-  if (!bee) deny("HIVE_BEE_NAME is required so the daemon can identify the calling bee");
+  // HSR runner-entry stamps the pane-less identity anchor as HIVE_BEE;
+  // HIVE_BEE_NAME remains the explicit override (and the pre-stamp contract).
+  const bee = (process.env.HIVE_BEE_NAME ?? process.env.HIVE_BEE)?.trim();
+  if (!bee) deny("HIVE_BEE_NAME (or the Cell-stamped HIVE_BEE) is required so the daemon can identify the calling bee");
   return bee;
 }
 

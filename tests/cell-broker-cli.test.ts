@@ -133,12 +133,36 @@ test("Cell CLI surfaces broker ACL denials with the Cell pointer", async () => {
   });
 });
 
-test("Cell CLI refuses politely when HIVE_BEE_NAME is missing", async () => {
+test("Cell CLI refuses politely when neither HIVE_BEE_NAME nor HIVE_BEE is present", async () => {
   await withStore(async (store) => {
-    const stderr = await hiveFailure(store, { HIVE_CELL: "1", HIVE_BEE_NAME: undefined }, "state", "ls", "--json");
+    const stderr = await hiveFailure(
+      store,
+      { HIVE_CELL: "1", HIVE_BEE_NAME: undefined, HIVE_BEE: undefined },
+      "state", "ls", "--json",
+    );
     assert.match(stderr, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.match(stderr, /HIVE_BEE_NAME is required/);
+    assert.match(stderr, /HIVE_BEE_NAME \(or the Cell-stamped HIVE_BEE\) is required/);
     assert.doesNotMatch(stderr, /EPERM|at .*\.ts:\d+/);
+  });
+});
+
+test("Cell CLI derives identity from the runner-stamped HIVE_BEE when HIVE_BEE_NAME is absent", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-caller");
+    await seedSession(store, "cell-other");
+    const server = await startHsrControlServer();
+    const env = { HIVE_CELL: "1", HIVE_BEE_NAME: undefined, HIVE_BEE: "cell-caller" };
+    try {
+      // A self-inbox read succeeding proves the daemon accepted HIVE_BEE as
+      // the caller identity; a cross-bee read is denied AS that identity.
+      await hive(store, env, "buz", "send", "cell-caller", "--tier", "passive", "-p", "self note");
+      const inbox = await hive(store, env, "buz", "inbox", "cell-caller", "--limit", "1");
+      assert.match(inbox.stdout, /^buz\.inbox\tcell-caller\t/m);
+      const stderr = await hiveFailure(store, env, "buz", "inbox", "cell-other");
+      assert.match(stderr, /cell-other is not granted/);
+    } finally {
+      await server.close();
+    }
   });
 });
 
