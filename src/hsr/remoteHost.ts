@@ -6,6 +6,10 @@
  *
  *   node hive-runner-host-<version>.mjs --version          (the handshake target)
  *   node hive-runner-host-<version>.mjs serve --socket <p> (the control plane)
+ *   node hive-runner-host-<version>.mjs connect --gateway <wss-url> \
+ *     --cell-id <id> --token-env CELL_TOKEN                (cell mode: dial OUT
+ *     to the Apiary Cloud gateway and serve the SAME controller over an
+ *     outbound WebSocket — see gatewayConnect.ts)
  *
  * APIA-90 scope is a DEPLOYABLE, HANDSHAKEABLE artifact plus a minimal serve
  * surface (`ping` + `liveness`). The full spawn/observe/steer surface that
@@ -35,6 +39,7 @@ import {
   type RpcMethodHandler,
   type RpcServer,
 } from "./rpc.js";
+import { connectToGateway } from "./gatewayConnect.js";
 import {
   ensureOrphanedChildGroupStopped,
   hsrObservations,
@@ -847,9 +852,57 @@ async function main(argv: string[]): Promise<number> {
     return await new Promise<number>(() => {});
   }
 
+  if (cmd === "connect") {
+    // Parse `--gateway <wss-url> --cell-id <id> [--token-env CELL_TOKEN]`
+    // (each flag also accepts the `--flag=value` form).
+    let gatewayUrl: string | undefined;
+    let cellId: string | undefined;
+    let tokenEnv = "CELL_TOKEN";
+    for (let i = 1; i < argv.length; i++) {
+      const arg = argv[i]!;
+      if (arg === "--gateway") gatewayUrl = argv[++i];
+      else if (arg.startsWith("--gateway=")) gatewayUrl = arg.slice("--gateway=".length);
+      else if (arg === "--cell-id") cellId = argv[++i];
+      else if (arg.startsWith("--cell-id=")) cellId = arg.slice("--cell-id=".length);
+      else if (arg === "--token-env") tokenEnv = argv[++i] ?? tokenEnv;
+      else if (arg.startsWith("--token-env=")) tokenEnv = arg.slice("--token-env=".length);
+    }
+    if (!gatewayUrl || !cellId) {
+      process.stderr.write("runner-host connect: --gateway <wss-url> and --cell-id <id> are required\n");
+      return 2;
+    }
+    const token = process.env[tokenEnv];
+    if (!token) {
+      process.stderr.write(`runner-host connect: env var ${tokenEnv} is empty (the gateway bearer token)\n`);
+      return 2;
+    }
+    // Same startup reaper as serve: adopt runners orphaned by a previous
+    // SIGKILLed/OOMed host before accepting control traffic.
+    await reapDeadHosts().catch(() => undefined);
+    const controller = buildController();
+    const connection = connectToGateway({
+      gatewayUrl,
+      cellId,
+      token,
+      methods: controller.methods,
+      runnerHostVersion: versionString(),
+    });
+    process.stdout.write(`runner-host connecting to ${gatewayUrl} as cell ${cellId} (${versionString()})\n`);
+    const shutdown = (): void => {
+      void connection
+        .close()
+        .then(() => controller.close())
+        .finally(() => process.exit(0));
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    // Never resolves — the reconnect loop owns the event loop.
+    return await new Promise<number>(() => {});
+  }
+
   process.stderr.write(
     `runner-host: unknown command ${cmd ?? "(none)"}\n` +
-      "usage: runner-host --version | serve --socket <path>\n",
+      "usage: runner-host --version | serve --socket <path> | connect --gateway <wss-url> --cell-id <id> [--token-env CELL_TOKEN]\n",
   );
   return 2;
 }

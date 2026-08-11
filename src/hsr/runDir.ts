@@ -20,6 +20,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -686,6 +687,33 @@ export async function compactHsrEvents(
   eventLogSizes.set(bee, Buffer.byteLength(content, "utf8"));
 }
 
+// Process-local tap over the append chain (cell transport). The per-bee
+// control-socket broadcast the serve mode relays carries the RAW runner event
+// — the seq is stamped by appendHsrEvent, on a copy, after the broadcast — so
+// a live-tail consumer that needs the stamped seq (the gateway `connect`
+// transport's subscribe stream) cannot use that relay. This tap fires INSIDE
+// the append chain, after the stamped line has landed on disk, with the exact
+// event object that was written (seq included): durable replay via
+// readHsrEventsAfterSeq and this live feed share one monotonic numbering, so a
+// replay→live handoff can merge on seq with no dupes and no holes. In-process
+// only by design: a cell's runners are hosted in-process by its controller,
+// so every event a cell produces flows through this process's append chain.
+const eventTap = new EventEmitter();
+eventTap.setMaxListeners(0);
+
+/**
+ * Subscribe to every stamped event append in THIS process. The listener runs
+ * synchronously on the append chain after the event is durable — keep it
+ * cheap and non-throwing (throws are swallowed, never fail the append).
+ * Returns an unsubscribe fn.
+ */
+export function onHsrEventAppended(listener: (bee: string, event: RunnerEvent) => void): () => void {
+  eventTap.on("append", listener);
+  return () => {
+    eventTap.removeListener("append", listener);
+  };
+}
+
 /**
  * Append one structured event to events.jsonl (owner-only, one JSON per line).
  * Every append is stamped with the bee's next monotonic `seq` (starting at 1;
@@ -703,11 +731,17 @@ export function appendHsrEvent(bee: string, event: RunnerEvent): Promise<void> {
     .then(async () => {
       const seqState = await loadSeqState(bee);
       seqState.lastSeq += 1;
-      const line = `${JSON.stringify({ ...event, seq: seqState.lastSeq })}\n`;
+      const stamped: RunnerEvent = { ...event, seq: seqState.lastSeq };
+      const line = `${JSON.stringify(stamped)}\n`;
       await appendFile(hsrEventsPath(bee), line, { mode: 0o600 });
       // Best-effort durability: the stamped event itself is the recovery
       // source of truth, so a failed sidecar write must not fail the append.
       await persistSeqState(bee, seqState).catch(() => undefined);
+      try {
+        eventTap.emit("append", bee, stamped);
+      } catch {
+        // A tap listener must never fail the append chain.
+      }
       let size = eventLogSizes.get(bee);
       if (size === undefined) {
         try {
