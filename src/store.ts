@@ -312,8 +312,13 @@ export const TERMINAL_OBSERVED_STATES = new Set([
  * self-sustain forever (2026-08-10 incident).
  */
 export function isActiveSessionRecord(
-  record: Pick<SessionRecord, "status" | "lastObservedState" | "recoveryRequestedAt">,
+  record: Pick<SessionRecord, "status" | "lastObservedState" | "recoveryRequestedAt" | "stateMachine">,
 ): boolean {
+  // Once the bounded cursor exists its lifecycle axis is authoritative. In
+  // particular, an archived cursor must never remain in the probe set merely
+  // because a mixed-version reader still sees the legacy status spelling.
+  if (record.stateMachine?.lifecycle === "archived") return false;
+  if (record.stateMachine?.lifecycle === "active") return true;
   // kill_failed means teardown could not prove the runtime stopped. Keep it in
   // the daemon work set until an operator retries/repairs it. Likewise a
   // provider/runtime `error` observation can recover on a later tick. Neither
@@ -895,8 +900,17 @@ export async function transitionSession(
 
     const stateMachine = makeStateMachineCursor(reduction, existing.stateMachine?.revision ?? 0);
     const resumesLiveWork = reduction.to.lifecycle === "active" && reduction.to.runtime === "live" && reduction.to.work === "working";
+    // Keep the legacy lifecycle spelling byte-compatible for existing readers
+    // while making the bounded cursor authoritative. This also makes active
+    // index membership flip atomically with explicit archive/revive events.
+    const legacyStatus = event.type === "bee.archived"
+      ? "done" as const
+      : event.type === "bee.revived"
+        ? "running" as const
+        : existing.status;
     const record: SessionRecord = {
       ...existing,
+      status: legacyStatus,
       stateMachine,
       stateUnverified: undefined,
       updatedAt: event.at,

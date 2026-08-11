@@ -172,6 +172,25 @@ test("transitionSession is idempotent for an exact lastEventId replay", async ()
   });
 });
 
+test("explicit archive and revive events atomically drive legacy status and probe membership", async () => {
+  await withTempStore(async () => {
+    await saveSession(record());
+    const archive = eventSet(1).find((event) => event.type === "bee.archived")!;
+    const archived = await transitionSession("CO.bounded", archive);
+    assert.equal(archived?.record.status, "done");
+    assert.equal(archived?.record.stateMachine?.lifecycle, "archived");
+    assert.equal(isActiveSessionRecord(archived!.record), false);
+    assert.deepEqual(await listActiveSessions(), []);
+
+    const revive = eventSet(2).find((event) => event.type === "bee.revived")!;
+    const revived = await transitionSession("CO.bounded", revive);
+    assert.equal(revived?.record.status, "running");
+    assert.equal(revived?.record.stateMachine?.lifecycle, "active");
+    assert.equal(isActiveSessionRecord(revived!.record), true);
+    assert.deepEqual((await listActiveSessions()).map((row) => row.name), ["CO.bounded"]);
+  });
+});
+
 test("terminal legacy cursor write without probe evidence is rejected at the store layer", async () => {
   await withTempStore(async (root) => {
     await saveSession(record());
