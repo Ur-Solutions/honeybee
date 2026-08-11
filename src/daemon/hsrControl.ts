@@ -35,7 +35,7 @@ import { resolveExplicitSpawningBeeId } from "../spawnParent.js";
 import { createExecutionAdminMethods } from "../execution/adminMethods.js";
 import { createExecutionRpcMethods } from "../execution/rpcMethods.js";
 import type { ExecutionService } from "../execution/service.js";
-import { createBrokerMethods } from "./broker.js";
+import { createBrokerMethods, type BrokerHandlerOptions } from "./broker.js";
 import { daemonRoot } from "./log.js";
 
 export type HsrControlServer = {
@@ -219,6 +219,8 @@ export async function startHsrControlServer(opts?: {
   socketPath?: string;
   /** Execution-protocol coordinator override (tests inject fakes). */
   executionService?: () => ExecutionService | Promise<ExecutionService>;
+  /** Cell broker dependency overrides (tests inject policy/spawn fakes). */
+  broker?: BrokerHandlerOptions;
 }): Promise<HsrControlServer> {
   const socketPath = opts?.socketPath ?? hsrControlSocketPath();
 
@@ -294,8 +296,8 @@ export async function startHsrControlServer(opts?: {
     // rejects only an archived/destroyed bee. fork:1/handoff:1 = in-process
     // cmdFork/cmdHandoff (session-fork-and-handoff epic). An older daemon
     // rejects unknown methods outright, which reads as "CLI fallback".
-    // broker:1 = Cell-confined CLI verbs routed through the daemon with a
-    // per-calling-bee ACL (broker:buz-send/inbox/state/seal).
+    // broker:2 = additive Cell broker: v1 buz/inbox/state/seal remain, while
+    // permission-gated host-side filesystem spawn adds broker:spawn.
     // execution:1 = the contracts/execution/v1 protocol methods
     // (protocol.hello, node.describe, run.start/get/events) are registered on
     // this socket; real capability negotiation is protocol.hello itself.
@@ -309,7 +311,7 @@ export async function startHsrControlServer(opts?: {
       spawnEnv: 1,
       spawnParent: 1,
       message: 1,
-      broker: 1,
+      broker: 2,
       fork: 1,
       handoff: 1,
       execution: 1,
@@ -558,7 +560,7 @@ export async function startHsrControlServer(opts?: {
   // protocol.hello — a binding must be installable BEFORE any corpus method
   // can succeed (node.describe fails closed without one).
   const admin = createExecutionAdminMethods();
-  const broker = createBrokerMethods();
+  const broker = createBrokerMethods(opts?.broker);
 
   server = await startRpcServer({
     socketPath,

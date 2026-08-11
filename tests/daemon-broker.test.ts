@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { listMessages } from "../src/buz.js";
-import { handleBrokerOperation, verifyBrokerCallerClaim } from "../src/daemon/broker.js";
+import {
+  brokerFilesystemSpawnParsed,
+  handleBrokerOperation,
+  verifyBrokerCallerClaim,
+  type BrokerSpawnArgs,
+} from "../src/daemon/broker.js";
 import type { BrokerAcl } from "../src/daemon/brokerPolicy.js";
 import { capturePersistableProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import { writeHsrMeta } from "../src/hsr/runDir.js";
@@ -44,6 +49,27 @@ async function withStore(fn: (store: string) => Promise<void>): Promise<void> {
 const loadDefaultAcl = async (): Promise<BrokerAcl> => ({});
 const verifiedTestCaller = async (): Promise<void> => undefined;
 const defaultOptions = { loadAcl: loadDefaultAcl, verifyCaller: verifiedTestCaller };
+
+test("broker:spawn maps normalized fields onto the internal yolo tmux spawn path", () => {
+  const parsed = brokerFilesystemSpawnParsed({
+    harness: "codex",
+    name: "child",
+    cwd: "/work/project",
+    model: "gpt-5.6-sol",
+    reasoning: "xhigh",
+    account: "auto",
+    prompt: "do the work",
+  });
+  assert.deepEqual(parsed.args, ["codex"]);
+  assert.equal(parsed.flags.get("cwd"), "/work/project");
+  assert.equal(parsed.flags.get("substrate"), "tmux");
+  assert.equal(parsed.flags.get("yolo"), true);
+  assert.equal(parsed.flags.get("name"), "child");
+  assert.equal(parsed.flags.get("account"), "auto");
+  assert.equal(parsed.flags.get("brief"), "do the work");
+  assert.equal(parsed.flags.get("briefed"), true);
+  assert.deepEqual(parsed.rest, ["-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="xhigh"']);
+});
 
 test("broker handlers perform buz send/inbox, self-scoped state, and self seal", async () => {
   await withStore(async (store) => {
@@ -211,5 +237,91 @@ test("HIVE_BROKER_VERIFY=0 restores v1 claimed-identity behavior", async () => {
       if (previous === undefined) delete process.env.HIVE_BROKER_VERIFY;
       else process.env.HIVE_BROKER_VERIFY = previous;
     }
+  });
+});
+
+test("broker:spawn denies by default with both pointers", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-caller", "CO.caller");
+    const cwd = join(store, "filesystem-child");
+    await mkdir(cwd);
+    let launches = 0;
+    const reply = await handleBrokerOperation("broker:spawn", {
+      callerBee: "cell-caller",
+      spawnArgs: { harness: "codex", cwd },
+    }, {
+      ...defaultOptions,
+      spawnFilesystem: async () => {
+        launches += 1;
+        return { name: "must-not-spawn" };
+      },
+    });
+    assert.equal(reply.ok, false);
+    assert.equal(launches, 0);
+    assert.match(reply.error ?? "", new RegExp(join(store, "broker-acl.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(reply.error ?? "", /child Cell agents can be spawned without a grant via the Apiary mcp agent_spawn tool/);
+  });
+});
+
+test("broker:spawn grants canonical cwd descendants, binds parentage, and refuses outside paths", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-caller", "CO.caller");
+    const allowed = join(store, "allowed");
+    const inside = join(allowed, "project");
+    const outside = join(store, "outside");
+    await Promise.all([mkdir(inside, { recursive: true }), mkdir(outside)]);
+    const canonicalInside = await realpath(inside);
+    const launches: Array<{ args: BrokerSpawnArgs; context: { spawnedById: string } }> = [];
+    const options = {
+      loadAcl: async (): Promise<BrokerAcl> => ({ "cell-caller": { "broker:spawn": [allowed] } }),
+      verifyCaller: verifiedTestCaller,
+      spawnFilesystem: async (args: BrokerSpawnArgs, context: { spawnedById: string }) => {
+        launches.push({ args, context });
+        return { name: args.name ?? "filesystem-child", id: "CO.child" };
+      },
+    };
+    const granted = await handleBrokerOperation("broker:spawn", {
+      callerBee: "cell-caller",
+      spawnArgs: {
+        harness: "codex",
+        name: "child-name",
+        cwd: inside,
+        model: "gpt-5.6-sol",
+        reasoning: "xhigh",
+        account: "auto",
+        prompt: "do the work",
+      },
+    }, options);
+    assert.deepEqual(granted, { ok: true, bee: "CO.child", name: "child-name" });
+    assert.equal(launches.length, 1);
+    assert.equal(launches[0]!.args.cwd, canonicalInside);
+    assert.deepEqual(launches[0]!.context, { spawnedById: "CO.caller" });
+
+    const refused = await handleBrokerOperation("broker:spawn", {
+      callerBee: "cell-caller",
+      spawnArgs: { harness: "codex", cwd: outside },
+    }, options);
+    assert.equal(refused.ok, false);
+    assert.equal(launches.length, 1);
+    assert.match(refused.error ?? "", /outside the allowed prefixes/);
+    assert.match(refused.error ?? "", /child Cell agents can be spawned without a grant via the Apiary mcp agent_spawn tool/);
+  });
+});
+
+test("broker:spawn fails closed on a malformed ACL", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-caller");
+    const cwd = join(store, "project");
+    await mkdir(cwd);
+    await writeFile(join(store, "broker-acl.json"), JSON.stringify({
+      "cell-caller": { "broker:spawn": ["relative/path"] },
+    }));
+    const reply = await handleBrokerOperation("broker:spawn", {
+      callerBee: "cell-caller",
+      spawnArgs: { harness: "codex", cwd },
+    }, { verifyCaller: verifiedTestCaller });
+    assert.equal(reply.ok, false);
+    assert.match(reply.error ?? "", /must contain absolute cwd prefixes/);
+    assert.match(reply.error ?? "", /child Cell agents can be spawned without a grant via the Apiary mcp agent_spawn tool/);
   });
 });

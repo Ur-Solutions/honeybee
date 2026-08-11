@@ -4,14 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-  BROKER_OPS,
+  BROKER_SELF_OPS,
   decideBrokerPolicy,
+  decideBrokerSpawnPolicy,
   loadBrokerAcl,
   type BrokerAcl,
 } from "../src/daemon/brokerPolicy.js";
 
 test("broker policy allows every v1 operation when caller acts as itself", () => {
-  for (const op of BROKER_OPS) {
+  for (const op of BROKER_SELF_OPS) {
     assert.deepEqual(decideBrokerPolicy({ op, callerBee: "CL.self", subjectBee: "CL.self" }), {
       allowed: true,
       reason: "self operation",
@@ -21,12 +22,23 @@ test("broker policy allows every v1 operation when caller acts as itself", () =>
 });
 
 test("broker policy denies cross-bee subjects by default", () => {
-  for (const op of BROKER_OPS) {
+  for (const op of BROKER_SELF_OPS) {
     const decision = decideBrokerPolicy({ op, callerBee: "CL.self", subjectBee: "CL.other" });
     assert.equal(decision.allowed, false, op);
     assert.equal(decision.source, "deny", op);
     assert.match(decision.reason, /CL\.other is not granted/, op);
   }
+});
+
+test("broker:spawn denies by default and grants only cwd-prefix descendants", () => {
+  const acl: BrokerAcl = {
+    "CL.builder": { "broker:spawn": ["/work/allowed"] },
+  };
+  assert.equal(decideBrokerSpawnPolicy({ callerBee: "CL.builder", cwd: "/work/allowed" }, acl).source, "acl");
+  assert.equal(decideBrokerSpawnPolicy({ callerBee: "CL.builder", cwd: "/work/allowed/child" }, acl).source, "acl");
+  assert.equal(decideBrokerSpawnPolicy({ callerBee: "CL.builder", cwd: "/work/allowed-other" }, acl).allowed, false);
+  assert.equal(decideBrokerSpawnPolicy({ callerBee: "CL.other", cwd: "/work/allowed" }, acl).allowed, false);
+  assert.match(decideBrokerSpawnPolicy({ callerBee: "CL.builder", cwd: "relative" }, acl).reason, /must be absolute/);
 });
 
 test("broker policy accepts exact and wildcard per-bee grants", () => {
@@ -82,16 +94,21 @@ test("broker ACL loader accepts the keyed file shape and fails closed on bad ent
     await writeFile(path, JSON.stringify({
       "CL.coordinator": {
         "broker:state": ["CL.worker"],
+        "broker:spawn": [dir],
       },
     }));
     assert.deepEqual(await loadBrokerAcl(path), {
       "CL.coordinator": {
         "broker:state": ["CL.worker"],
+        "broker:spawn": [dir],
       },
     });
 
     await writeFile(path, JSON.stringify({ "CL.coordinator": { "broker:nope": ["CL.worker"] } }));
     await assert.rejects(loadBrokerAcl(path), /unknown operation broker:nope/);
+
+    await writeFile(path, JSON.stringify({ "CL.coordinator": { "broker:spawn": ["relative/path"] } }));
+    await assert.rejects(loadBrokerAcl(path), /must contain absolute cwd prefixes/);
 
     await writeFile(path, "not json");
     await assert.rejects(loadBrokerAcl(path), /invalid broker ACL JSON/);

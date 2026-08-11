@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { CELL_BROKER_DENIAL_PREFIX } from "../src/cellBroker.js";
+import { CELL_BROKER_DENIAL_PREFIX, CELL_SPAWN_ALTERNATIVE } from "../src/cellBroker.js";
+import type { BrokerSpawnArgs } from "../src/daemon/broker.js";
 import { startHsrControlServer } from "../src/daemon/hsrControl.js";
 import { capturePersistableProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import { startRpcServer } from "../src/hsr/rpc.js";
@@ -229,5 +230,95 @@ test("outside Cells the existing direct CLI path is unchanged and needs no daemo
     const sent = await hive(store, { HIVE_CELL: undefined, HIVE_BEE_NAME: undefined }, "buz", "send", "direct-recipient", "--sender", "direct-caller", "--tier", "queue", "-p", "direct");
     assert.match(sent.stdout, /^buz\.send\tdirect-recipient\t/m);
     assert.equal((await readdir(join(store, "buz", "direct-recipient", "queue"))).length, 1);
+  });
+});
+
+test("Cell CLI broker:spawn denies by default, then routes a granted filesystem spawn", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-caller", "CO.caller");
+    const allowed = join(store, "allowed");
+    const cwd = join(allowed, "project");
+    await mkdir(cwd, { recursive: true });
+    const canonicalCwd = await realpath(cwd);
+    const launches: Array<{ args: BrokerSpawnArgs; context: { spawnedById: string } }> = [];
+    const server = await startHsrControlServer({
+      broker: {
+        spawnFilesystem: async (args, context) => {
+          launches.push({ args, context });
+          return { name: args.name ?? "child", id: "CO.child" };
+        },
+      },
+    });
+    const env = { HIVE_CELL: "1", HIVE_BEE_NAME: "cell-caller" };
+    try {
+      const denied = await hiveFailure(store, env,
+        "spawn", "codex", "do the work", "--cwd", cwd, "--name", "child-name");
+      assert.match(denied, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(denied, new RegExp(join(store, "broker-acl.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(denied, new RegExp(CELL_SPAWN_ALTERNATIVE));
+      assert.equal(launches.length, 0);
+
+      await writeFile(join(store, "broker-acl.json"), JSON.stringify({
+        "cell-caller": { "broker:spawn": [allowed] },
+      }));
+      const spawned = await hive(store, env,
+        "spawn", "codex", "do the work", "--cwd", cwd, "--name", "child-name",
+        "--account", "auto", "--model", "gpt-5.6-sol", "--reasoning", "xhigh");
+      assert.match(spawned.stdout, /^child-name\tcodex\t.*\tlocal$/m);
+      assert.equal(launches.length, 1);
+      assert.deepEqual(launches[0], {
+        args: {
+          harness: "codex",
+          name: "child-name",
+          cwd: canonicalCwd,
+          model: "gpt-5.6-sol",
+          reasoning: "xhigh",
+          account: "auto",
+          prompt: "do the work",
+        },
+        context: { spawnedById: "CO.caller" },
+      });
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+test("Cell CLI broker:spawn refuses politely when the daemon has only broker:1", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-caller");
+    const socketPath = join(store, "daemon", "hsr-control.sock");
+    const oldDaemon = await startRpcServer({
+      socketPath,
+      methods: {
+        capabilities: async () => ({ ok: true, broker: 1 }),
+      },
+    });
+    try {
+      const stderr = await hiveFailure(
+        store,
+        { HIVE_CELL: "1", HIVE_BEE_NAME: "cell-caller" },
+        "spawn", "codex", "--cwd", store,
+      );
+      assert.match(stderr, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(stderr, /does not advertise broker:2/);
+      assert.match(stderr, new RegExp(CELL_SPAWN_ALTERNATIVE));
+      assert.doesNotMatch(stderr, /EPERM|at .*\.ts:\d+/);
+    } finally {
+      await oldDaemon.close();
+    }
+  });
+});
+
+test("outside a Cell hive spawn stays on the direct command path", async () => {
+  await withStore(async (store) => {
+    const harness = "definitely-missing-direct-spawn-harness";
+    const stderr = await hiveFailure(
+      store,
+      { HIVE_CELL: undefined, HIVE_BEE_NAME: undefined },
+      "spawn", harness, "--cwd", store, "--no-wait",
+    );
+    assert.match(stderr, new RegExp(`Executable not found on PATH: ${harness}`));
+    assert.doesNotMatch(stderr, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 });

@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DEFAULT_BUZ_TIER, type BuzSendResult } from "./buz.js";
 import { stringFlag } from "./cli/shared.js";
 import { printBuzListing, printBuzSendResult, type BuzListEntry } from "./commands/buz.js";
@@ -12,6 +12,7 @@ import { validateSealArtifact, type SealRecord } from "./seal.js";
 import type { BeeViewListV1, BeeViewV1 } from "./view/types.js";
 
 export const CELL_BROKER_DENIAL_PREFIX = "this hive verb is brokered inside a Cell; denied:";
+export const CELL_SPAWN_ALTERNATIVE = "child Cell agents can be spawned without a grant via the Apiary mcp agent_spawn tool";
 
 type BrokerReply = { ok: boolean; error?: string } & Record<string, unknown>;
 
@@ -49,14 +50,22 @@ function asBrokerReply(value: unknown): BrokerReply {
   return value as BrokerReply;
 }
 
-async function callCellBroker(op: string, params: Record<string, unknown>): Promise<BrokerReply> {
+async function callCellBroker(
+  op: string,
+  params: Record<string, unknown>,
+  requiredBrokerVersion = 1,
+): Promise<BrokerReply> {
   const callerBee = callingBee();
   let client: RpcClient | undefined;
   try {
     client = await connectRpcClient(controlSocketPath());
     const capabilities = await client.call("capabilities");
-    if (!capabilities || typeof capabilities !== "object" || (capabilities as { broker?: unknown }).broker !== 1) {
-      deny("the running daemon does not advertise broker:1; deploy a broker-capable daemon");
+    const brokerVersion = capabilities && typeof capabilities === "object"
+      ? (capabilities as { broker?: unknown }).broker
+      : undefined;
+    if (typeof brokerVersion !== "number" || brokerVersion < requiredBrokerVersion) {
+      const alternative = requiredBrokerVersion >= 2 ? `; ${CELL_SPAWN_ALTERNATIVE}` : "";
+      deny(`the running daemon does not advertise broker:${requiredBrokerVersion}; deploy a broker-capable daemon${alternative}`);
     }
     const reply = asBrokerReply(await client.call(op, { ...params, callerBee }));
     if (!reply.ok) deny(reply.error || `${op} was refused without a reason`);
@@ -67,6 +76,80 @@ async function callCellBroker(op: string, params: Record<string, unknown>): Prom
   } finally {
     client?.close();
   }
+}
+
+function brokerSpawnRest(rest: string[]): { model?: string; reasoning?: string; prompt?: string } {
+  if (rest.length === 0) return {};
+  if (!rest[0]!.startsWith("-")) return { prompt: rest.join(" ").trim() };
+  let model: string | undefined;
+  let reasoning: string | undefined;
+  const nextValue = (index: number, option: string): string => {
+    const value = rest[index + 1];
+    if (!value) deny(`${option} requires a value in the brokered spawn harness arguments`);
+    return value;
+  };
+  for (let index = 0; index < rest.length; index += 1) {
+    const item = rest[index]!;
+    if (item === "-m" || item === "--model") {
+      model = nextValue(index, item);
+      index += 1;
+    } else if (item.startsWith("-m=") || item.startsWith("--model=")) {
+      model = item.slice(item.indexOf("=") + 1);
+    } else if (item === "--effort" || item === "--reasoning-effort" || item === "--variant") {
+      reasoning = nextValue(index, item);
+      index += 1;
+    } else if (item.startsWith("--effort=") || item.startsWith("--reasoning-effort=") || item.startsWith("--variant=")) {
+      reasoning = item.slice(item.indexOf("=") + 1);
+    } else if (item === "-c") {
+      const config = nextValue(index, item);
+      const prefix = "model_reasoning_effort=";
+      if (!config.startsWith(prefix)) deny(`brokered spawn does not support harness config ${config}`);
+      reasoning = config.slice(prefix.length).replace(/^["']|["']$/g, "");
+      index += 1;
+    } else {
+      deny(`brokered spawn does not support harness argument ${item}`);
+    }
+  }
+  return {
+    ...(model ? { model } : {}),
+    ...(reasoning ? { reasoning } : {}),
+  };
+}
+
+async function brokerSpawn(parsed: Parsed): Promise<void> {
+  const harness = parsed.args[0];
+  if (!harness) throw new Error("Usage: hive spawn <harness> [prompt] [--name name] [--cwd dir] [--account account] [--model model] [--reasoning effort]");
+  const allowedFlags = new Set(["name", "cwd", "account", "model", "reasoning", "effort", "prompt", "p", "yolo"]);
+  const unsupported = [...parsed.flags.keys()].find((key) => !allowedFlags.has(key));
+  if (unsupported) deny(`brokered spawn does not support --${unsupported}`);
+
+  const rest = brokerSpawnRest(parsed.rest);
+  const cwdFlag = stringFlag(parsed, ["cwd"]);
+  const cwd = resolve((cwdFlag ?? process.cwd()).replace(/^~(?=\/|$)/, process.env.HOME ?? "~"));
+  const name = stringFlag(parsed, ["name"]);
+  const account = stringFlag(parsed, ["account"]);
+  const model = stringFlag(parsed, ["model"]) ?? rest.model;
+  const reasoning = stringFlag(parsed, ["reasoning", "effort"]) ?? rest.reasoning;
+  const prompt = [
+    parsed.args.slice(1).join(" ").trim(),
+    stringFlag(parsed, ["prompt", "p"])?.trim() ?? "",
+    rest.prompt ?? "",
+  ].filter((value) => value.length > 0).join("\n\n");
+  const reply = await callCellBroker("broker:spawn", {
+    spawnArgs: {
+      harness,
+      cwd,
+      ...(name ? { name } : {}),
+      ...(model ? { model } : {}),
+      ...(reasoning ? { reasoning } : {}),
+      ...(account ? { account } : {}),
+      ...(prompt ? { prompt } : {}),
+    },
+  }, 2);
+  if (typeof reply.bee !== "string" || typeof reply.name !== "string") {
+    deny("daemon returned a malformed broker:spawn result");
+  }
+  process.stdout.write(`${reply.name}\t${harness}\t${cwd}\tlocal\n`);
 }
 
 function usageState(): never {
@@ -168,11 +251,15 @@ async function brokerSeal(parsed: Parsed): Promise<void> {
 }
 
 /**
- * Route the v1 brokered verb set before normal CLI dispatch. Outside a Cell
+ * Route the additive v2 brokered verb set before normal CLI dispatch. Outside a Cell
  * this is an immediate no-op, preserving the existing direct FS/tmux paths.
  */
 export async function dispatchCellBrokerVerb(parsed: Parsed): Promise<boolean> {
   if (process.env.HIVE_CELL !== "1") return false;
+  if (parsed.command === "spawn") {
+    await brokerSpawn(parsed);
+    return true;
+  }
   if (parsed.command === "buz" && parsed.args[0] === "send") {
     await brokerBuzSend(parsed);
     return true;

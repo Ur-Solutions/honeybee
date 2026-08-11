@@ -42,7 +42,7 @@ HIVE_STORE_ROOT=/path/to/store hive list
 
 Legacy `~/.agentpit` session records are still read for migration safety.
 
-## Cell-Confined Broker V1
+## Cell-Confined Broker V2
 
 When `HIVE_CELL=1`, the CLI routes the following stateful verbs over the
 daemon's aggregate Unix socket instead of writing `~/.hive` or reaching tmux
@@ -52,19 +52,24 @@ from inside the Cell:
 - `hive buz inbox` -> `broker:buz-inbox`
 - `hive state ls|explain` -> `broker:state`
 - `hive seal` -> `broker:seal`
+- `hive spawn` -> `broker:spawn` (host-side filesystem agent)
 
-The daemon advertises this surface as capability `broker: 1`. An older daemon,
-a missing socket, a missing identity, or an ACL refusal fails without attempting
-the direct filesystem path and starts its error with:
+The daemon advertises this additive surface as capability `broker: 2`; the v1
+verbs require only version 1, while filesystem spawn requires version 2. An
+older daemon, a missing socket, a missing identity, or an ACL refusal fails
+without attempting the direct filesystem path and starts its error with:
 
 ```text
 this hive verb is brokered inside a Cell; denied: <reason>
 ```
 
-Broker v1 requires the calling bee's canonical name in `HIVE_BEE_NAME`. This
-slice only consumes environment stamps; it does not add them to spawn. A
-sibling rollout supplies the spawn-side `HIVE_CELL`/`HIVE_CELL_SPACE` stamps,
-while v1 callers must also ensure `HIVE_BEE_NAME` is present.
+The caller name comes from `HIVE_BEE_NAME`, falling back to the HSR
+runner-stamped `HIVE_BEE`. Because Node does not expose macOS
+`LOCAL_PEERPID`/Unix peer credentials on `net.Socket`, the daemon currently
+canonicalizes that claim and requires the claimed bee to have a running,
+birth-verified local HSR host. This proves a live runner exists but does not yet
+attribute the accepted socket to that runner's exact child PID. Set
+`HIVE_BROKER_VERIFY=0` on the daemon only as an emergency compatibility opt-out.
 
 The default ACL lets a bee send buz as itself (including to another recipient),
 read its own inbox/state, and seal itself. Acting as another sender, inspecting
@@ -75,13 +80,21 @@ grants live at `~/.hive/broker-acl.json`, keyed by caller bee name:
 {
   "CL.coordinator": {
     "broker:state": ["CL.worker"],
-    "broker:seal": ["CL.worker"]
+    "broker:seal": ["CL.worker"],
+    "broker:spawn": ["/Users/me/Projects/allowed-root"]
   }
 }
 ```
 
-`"*"` may be used as a subject grant. Outside a Cell (`HIVE_CELL` absent or not
-exactly `1`), every command keeps its pre-broker direct behavior.
+`"*"` may be used as a bee-subject grant for the v1 operations. It is not valid
+for `broker:spawn`: those entries must be absolute cwd prefixes, and spawn is
+denied for every caller unless the requested canonical cwd is equal to or below
+one of its prefixes. The daemon invokes the internal spawn machinery with
+host-side tmux placement and yolo enabled; it does not shell out to `hive`.
+Every spawn denial points to `~/.hive/broker-acl.json` and reminds callers that
+child Cell agents can be spawned without a grant via the Apiary mcp
+`agent_spawn` tool. Outside a Cell (`HIVE_CELL` absent or not exactly `1`), every
+command keeps its pre-broker direct behavior.
 
 ## Parser Rules
 
