@@ -261,7 +261,7 @@ test("pre-v3 active index rebuilds immediately so terminal cursors become probea
     const indexed = makeRecord(dir, { name: "CO.v1-indexed", tmuxTarget: "CO.v1-indexed" });
     const omitted = makeRecord(dir, { name: "CO.v1-crashed", tmuxTarget: "CO.v1-crashed", lastObservedState: "crashed" });
     await saveSession(indexed);
-    await saveSession(omitted);
+    await saveSession(omitted, withProbe("dead"));
     const root = dir;
     const active = [indexed.name];
     const updatedAt = "2026-08-07T00:00:00.000Z";

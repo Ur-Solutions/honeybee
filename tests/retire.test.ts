@@ -78,6 +78,9 @@ test("transactionalRetire archives the record instead of deleting it", async () 
     const stored = await loadSession("retire-me");
     assert.ok(stored, "record must survive retire");
     assert.equal(stored!.status, "done");
+    assert.equal(stored!.stateMachine?.lifecycle, "archived");
+    assert.equal(stored!.stateMachine?.lastTransition.type, "bee.archived");
+    assert.equal(stored!.stateMachine?.lastTransition.evidence.some((item) => item.kind === "probe"), true);
     assert.equal(stored!.lastError, undefined, "stale lastError is cleared on retire");
     assert.match(await readFile(hsrEventsPath(record.name), "utf8"), /history/, "retire keeps HSR history");
     const [sealFile] = await readdir(join(sealsRoot(), record.name));

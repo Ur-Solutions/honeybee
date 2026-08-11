@@ -189,6 +189,9 @@ test("retire commits done before a queued revive launches a new generation", asy
     const revived = await reviving;
     assert.equal(statusAtLaunch, "done");
     assert.equal(revived.status, "running");
+    assert.equal(revived.stateMachine?.lifecycle, "active", "legacy records seed archived on retire and revive through the table");
+    assert.equal(revived.stateMachine?.lastTransition.type, "bee.revived");
+    assert.equal(revived.stateMachine?.revision, 2);
     assert.equal(revived.runtimeGeneration, 1);
     assert.equal(rig.runtime()?.live, true);
   });

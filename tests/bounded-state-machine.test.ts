@@ -193,6 +193,10 @@ test("explicit archive and revive events atomically drive legacy status and prob
 
 test("terminal legacy cursor write without probe evidence is rejected at the store layer", async () => {
   await withTempStore(async (root) => {
+    await assert.rejects(
+      saveSession(record({ lastObservedState: "crashed", lastObservedStateAt: at(1) })),
+      /requires probe evidence/,
+    );
     await saveSession(record());
     await assert.rejects(
       touchSession("CO.bounded", { lastObservedState: "crashed", lastObservedStateAt: at(1) }),
@@ -207,7 +211,9 @@ test("terminal legacy cursor write without probe evidence is rejected at the sto
 
 test("a crashed-marked active record stays probeable and heals on an alive probe", async () => {
   await withTempStore(async () => {
-    await saveSession(record({ lastObservedState: "crashed", lastObservedStateAt: at(1) }));
+    await saveSession(record({ lastObservedState: "crashed", lastObservedStateAt: at(1) }), {
+      probeEvidence: probe(1, "dead"),
+    });
     const crashed = (await loadSession("CO.bounded"))!;
     assert.equal(isActiveSessionRecord(crashed), true);
     assert.deepEqual((await listActiveSessions()).map((row) => row.name), ["CO.bounded"]);
