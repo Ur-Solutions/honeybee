@@ -8,7 +8,8 @@ import { addAccount, accountDir, clearAccountBootFailure, recordAccountBootFailu
 import { withCodexHomeBootLock } from "../src/codexBoot.js";
 import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 import { pickRoundRobinAccount } from "../src/limits/autoPick.js";
-import { activeSessionIndexPath, saveSession } from "../src/store.js";
+import type { ProbeEvidence } from "../src/stateMachine.js";
+import { activeSessionIndexPath, saveSession, TERMINAL_OBSERVED_STATES, type SessionRecord } from "../src/store.js";
 import { appendUsageEvent, isRecentlyAuthFailed, usageSummary } from "../src/usage.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -1411,6 +1412,18 @@ function liveSession(name: string, accountId: string, state: string, agent = "cl
   };
 }
 
+function terminalProbe(record: SessionRecord): ProbeEvidence {
+  return {
+    kind: "probe",
+    probeId: `limits-fixture:${record.name}`,
+    observerId: "limits-fixture",
+    observedAt: record.updatedAt,
+    outcome: record.lastObservedState === "done" || record.lastObservedState === "sealed" ? "alive" : "dead",
+    target: { substrate: "local-tmux", tmuxTarget: record.tmuxTarget },
+    detail: "test fixture terminal observation",
+  };
+}
+
 test("sessionCommitmentPercent weighs busy/parked work and explicitly zeros completed or failed turns", () => {
   assert.equal(sessionCommitmentPercent(liveSession("s1", "a", "active")), AUTO_COMMITMENT_BUSY_PERCENT);
   assert.equal(sessionCommitmentPercent(liveSession("s2", "a", "working")), AUTO_COMMITMENT_BUSY_PERCENT);
@@ -1445,7 +1458,7 @@ test("accountCommitments sums per account and filters by tool", async () => {
   assert.equal(codex.get("a"), undefined);
 });
 
-test("indexed account commitments match full-history parity while terminal rows stay cold", async () => {
+test("indexed account commitments match full-history parity while terminal rows remain probeable at zero commitment", async () => {
   await withTempStore(async () => {
     const sessions = [
       liveSession("busy", "a", "working"),
@@ -1455,7 +1468,11 @@ test("indexed account commitments match full-history parity while terminal rows 
       { ...liveSession("filed", "b", "active"), status: "done" as const },
       { ...liveSession("kill-failed", "b", "kill_failed"), status: "kill_failed" as const },
     ];
-    for (const session of sessions) await saveSession(session);
+    for (const session of sessions) {
+      await saveSession(session, TERMINAL_OBSERVED_STATES.has(session.lastObservedState ?? "")
+        ? { probeEvidence: terminalProbe(session) }
+        : undefined);
+    }
 
     const fromHistory = await accountCommitments("claude", sessions);
     const fromIndex = await accountCommitments("claude");

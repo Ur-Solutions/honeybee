@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import { deliverTrackFollowUp, renderTrackStatus } from "../src/commands/track.js";
 import { recordSeal, validateSealArtifact } from "../src/seal.js";
+import type { ProbeEvidence } from "../src/stateMachine.js";
 import { listActiveSessions, loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
 import {
   attachTrack,
@@ -36,6 +37,18 @@ const TRACK = {
     { id: "report", title: "Report the result" },
   ],
 };
+
+function terminalProbe(record: SessionRecord): ProbeEvidence {
+  return {
+    kind: "probe",
+    probeId: `track-fixture:${record.name}`,
+    observerId: "track-fixture",
+    observedAt: record.lastObservedStateAt ?? record.updatedAt,
+    outcome: "alive",
+    target: { substrate: "local-tmux", tmuxTarget: record.tmuxTarget },
+    detail: "test fixture completed-turn observation",
+  };
+}
 
 async function hive(store: string, args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ stdout: string; stderr: string }> {
   return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
@@ -187,15 +200,15 @@ test("track follow-up retires the completed-turn boundary and re-enters the acti
       lastObservedState: "done",
       lastObservedStateAt: "2026-08-07T08:01:00.000Z",
     };
-    await saveSession(record);
+    await saveSession(record, { probeEvidence: terminalProbe(record) });
     await recordSeal(record.name, validateSealArtifact({ status: "done", summary: "previous track turn" }));
-    assert.deepEqual(await listActiveSessions(), [], "completed warm turn starts outside the daemon hot set");
+    assert.deepEqual((await listActiveSessions()).map((candidate) => candidate.name), [record.name], "completed warm turn remains probeable");
 
     let delivered = false;
     await deliverTrackFollowUp(record, "next standing track instructions", {
       deliver: async () => {
         delivered = true;
-        assert.deepEqual(await listActiveSessions(), [], "turn boundary is persisted only after delivery succeeds");
+        assert.deepEqual((await listActiveSessions()).map((candidate) => candidate.name), [record.name], "terminal cursor remains probeable until delivery succeeds");
       },
       writeState: async () => undefined,
       now: () => new Date("2026-08-07T08:02:00.000Z"),
@@ -211,7 +224,7 @@ test("track follow-up retires the completed-turn boundary and re-enters the acti
     await updateSession(record.name, {
       lastObservedState: "done",
       lastObservedStateAt: "2026-08-07T08:03:00.000Z",
-    });
+    }, { probeEvidence: terminalProbe({ ...record, lastObservedStateAt: "2026-08-07T08:03:00.000Z" }) });
     const completedAgain = await loadSession(record.name);
     assert.ok(completedAgain);
     await assert.rejects(
@@ -222,7 +235,7 @@ test("track follow-up retires the completed-turn boundary and re-enters the acti
       /transport down/,
     );
     assert.equal((await loadSession(record.name))?.lastObservedState, "done", "failed delivery preserves the completed boundary");
-    assert.deepEqual(await listActiveSessions(), []);
+    assert.deepEqual((await listActiveSessions()).map((candidate) => candidate.name), [record.name]);
   });
 });
 
