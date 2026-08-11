@@ -76,6 +76,17 @@ test("detached runner publishes an OS-comparable host birth fingerprint", { skip
       const meta = await readHsrMetaStrict(bee);
       assert.equal(meta?.hostPid, hostPid);
       assert.ok(meta?.hostFingerprint);
+      assert.equal(
+        meta.hostFingerprint.pgid,
+        hostPid,
+        "the runner host is a setsid process-group leader, independent of its launcher",
+      );
+      const launcher = await captureProcessBirthFingerprint(process.pid);
+      assert.notEqual(
+        meta.hostFingerprint.pgid,
+        launcher?.pgid,
+        "daemon/CLI group signals cannot propagate into the detached runner host",
+      );
       assert.doesNotMatch(meta.hostFingerprint.startedAt, /^node-time-origin:/);
       assert.equal(await inspectProcessBirth(hostPid, meta.hostFingerprint), "match");
     } finally {

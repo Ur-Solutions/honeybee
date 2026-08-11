@@ -205,6 +205,9 @@ export async function renderCandidatePlist(options: InstallOptions = {}): Promis
     // launchd already defaults to 10s; use a more conservative explicit
     // interval so a persistent boot failure cannot become a hot crash loop.
     throttleInterval: DEFAULT_DAEMON_THROTTLE_SECONDS,
+    // launchctl bootout/reinstall is an observer lifecycle event. Detached
+    // HSR runner hosts are independent workloads and must outlive it.
+    abandonProcessGroup: true,
     runAtLoad: true,
     environmentVariables: env,
   });

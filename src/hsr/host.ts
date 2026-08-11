@@ -25,7 +25,6 @@ import { startRpcServer, type RpcMethodHandler } from "./rpc.js";
 import {
   ensureHsrRunDir,
   hsrControlSocketPath,
-  readHsrMeta,
   readHsrMetaStrict,
   writeHsrMeta,
   type HsrMeta,
@@ -315,7 +314,11 @@ export async function runHsrHost(params: {
       void session.stop();
       return { stopping: true };
     },
-    meta: () => readHsrMeta(bee),
+    // Return the host-owned in-memory incarnation, not a fresh disk read. A
+    // daemon/reaper can race and mis-stamp meta.json; the live control socket
+    // is the independent witness the restart re-adoption sweep uses to heal
+    // that stale cursor without confusing it for the runner's own testimony.
+    meta: () => meta,
   };
 
   let server: Awaited<ReturnType<typeof startRpcServer>>;

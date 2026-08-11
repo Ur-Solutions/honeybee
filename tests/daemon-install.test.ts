@@ -75,6 +75,9 @@ test("installAgent writes the plist to ~/Library/LaunchAgents/ and bootstraps vi
       assert.doesNotMatch(plistText, /<string>[^<]*daemon\/log\.txt<\/string>/);
       // Watchdog SIGKILL must always relaunch. Planned stops unload the job.
       assert.match(plistText, /<key>KeepAlive<\/key>\s+<true\/>/);
+      // A daemon reinstall owns only the observer. Detached HSR runners must
+      // not be swept up by launchd's process-group cleanup on bootout.
+      assert.match(plistText, /<key>AbandonProcessGroup<\/key>\s+<true\/>/);
       assert.match(plistText, /<key>ThrottleInterval<\/key>\s+<integer>30<\/integer>/);
       // We only need to assert that the bootstrap call shape is correct on macOS.
       if (process.platform === "darwin") {

@@ -28,6 +28,12 @@ export type RenderPlistOptions = {
   throttleInterval?: number;
   /** Optional EnvironmentVariables dictionary (e.g. HIVE_STORE_ROOT). */
   environmentVariables?: Record<string, string>;
+  /**
+   * Leave detached runner processes outside launchd's daemon teardown sweep.
+   * HSR hosts create their own process groups, but this is an additional
+   * launchd-side fence: bootout/reinstall owns the observer process only.
+   */
+  abandonProcessGroup?: boolean;
 };
 
 /**
@@ -105,6 +111,12 @@ export function renderPlist(options: RenderPlistOptions): string {
     lines.push(
       `  <key>ThrottleInterval</key>`,
       `  <integer>${options.throttleInterval}</integer>`,
+    );
+  }
+  if (options.abandonProcessGroup !== undefined) {
+    lines.push(
+      `  <key>AbandonProcessGroup</key>`,
+      `  <${options.abandonProcessGroup ? "true" : "false"}/>`,
     );
   }
   lines.push(

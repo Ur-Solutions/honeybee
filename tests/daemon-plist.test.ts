@@ -61,6 +61,17 @@ test("renderPlist renders KeepAlive SuccessfulExit dict", () => {
   assert.match(xml, /<key>KeepAlive<\/key>\s+<dict>\s+<key>SuccessfulExit<\/key>\s+<false\/>\s+<\/dict>/);
 });
 
+test("renderPlist can fence detached runner groups from launchd teardown", () => {
+  const xml = renderPlist({
+    label: "dev.honeybee.hive",
+    programArguments: ["/usr/bin/node", "/abs/cli.js", "daemon", "run"],
+    stdOutPath: "/tmp/out",
+    stdErrPath: "/tmp/err",
+    abandonProcessGroup: true,
+  });
+  assert.match(xml, /<key>AbandonProcessGroup<\/key>\s+<true\/>/);
+});
+
 test("renderPlist rejects an invalid throttle interval", () => {
   const base = {
     label: "dev.honeybee.hive",

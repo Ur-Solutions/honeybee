@@ -154,11 +154,13 @@ test("parent surfaces the detached startup cause without a false rollback warnin
   process.env.HIVE_STORE_ROOT = store;
   const bee = "parent-startup-cause";
   const hostPid = 7654321;
+  let spawnOptions: import("node:child_process").SpawnOptions | undefined;
   try {
     await assert.rejects(
       spawnHsrHost(payload(bee), {
         resolveEntry: async () => ({ path: "/unused/runner-entry.js", mode: "dedicated" }),
-        spawn: (() => {
+        spawn: ((_command: string, _args: readonly string[], options: import("node:child_process").SpawnOptions) => {
+          spawnOptions = options;
           const child = new EventEmitter() as EventEmitter & {
             pid: number;
             exitCode: number | null;
@@ -203,6 +205,8 @@ test("parent surfaces the detached startup cause without a false rollback warnin
         return true;
       },
     );
+    assert.equal(spawnOptions?.detached, true, "runner host owns a new session/process group");
+    assert.equal(spawnOptions?.stdio?.[0], "ignore", "runner host cannot retain daemon stdin");
   } finally {
     if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = previous;

@@ -157,6 +157,23 @@ test("runner-host: spawn+turn, sessionId, needs_input, snapshot, liveness, stop"
       const snap = (await client.call("snapshot", { lines: 5 })) as string;
       assert.match(snap, /echo:hello/);
 
+      // The socket reports the host-owned incarnation, independently of a
+      // stale external disk stamp. Boot re-adoption needs two witnesses to
+      // heal the 2026-08-10 false-exited incident safely.
+      const ownedMeta = (await client.call("meta")) as Awaited<ReturnType<typeof readHsrMeta>>;
+      assert.equal(ownedMeta?.status, "running");
+      await writeHsrMeta(bee, {
+        ...ownedMeta!,
+        status: "exited",
+        endedAt: new Date().toISOString(),
+      });
+      assert.equal(
+        ((await client.call("meta")) as Awaited<ReturnType<typeof readHsrMeta>>)?.status,
+        "running",
+        "a foreign disk cursor cannot rewrite the live host's testimony",
+      );
+      await writeHsrMeta(bee, ownedMeta!);
+
       // 5. liveness + stop.
       const liveBefore = await hsrLiveness();
       assert.equal(liveBefore.get(bee), true, "bee should be alive before stop");
