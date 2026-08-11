@@ -414,6 +414,31 @@ test("kill without remote process-group evidence stays unconfirmed", async () =>
   assert.equal(r2.exitCode, 1);
 });
 
+test("kill confirms an absent legacy remote process group and exact session", async () => {
+  const cap = captureExec();
+  cap.respondWith((call) => {
+    if (call.argv.includes("/bin/kill")) {
+      return { exitCode: 1, stderr: "kill: (-4242) - No such process" };
+    }
+    if (call.argv.includes("kill-session")) {
+      return { exitCode: 1, stderr: "can't find session: alpha" };
+    }
+    if (call.argv.includes("has-session")) {
+      return { exitCode: 1, stderr: "can't find session: alpha" };
+    }
+    return { exitCode: 0 };
+  });
+  const s = createSshTmuxSubstrate({ node: mini(), execHook: cap.hook });
+  const result = await s.kill("alpha", { launcherPgid: 4242 });
+
+  assert.equal(result.ok, true, result.stderr);
+  assert.deepEqual(
+    cap.calls.find((call) => call.argv.includes("/bin/kill"))?.argv,
+    ["ssh", ...MUX, "trmd@mini01", "/bin/kill", "-0", "--", "-4242"],
+  );
+  assert.ok(cap.calls.some((call) => call.argv.includes("has-session")), "session absence is positively probed");
+});
+
 test("kill confirms remote group and exact session absence after TERM", async () => {
   const cap = captureExec();
   let groupAlive = true;

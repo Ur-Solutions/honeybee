@@ -224,7 +224,7 @@ test("local kill terminates the supplied launcher process group", { timeout: 10_
   }
 });
 
-test("local fallback never signals a reused launcher PID or process group", async () => {
+test("local fallback never probes or signals a reused launcher process group", async () => {
   const recorded = { pgid: 7373, startedAt: "Mon Aug  7 09:00:00 2026" };
   const replacement = { pgid: 7373, startedAt: "Mon Aug  7 09:01:00 2026" };
   const signals: Array<[number, NodeJS.Signals | 0]> = [];
@@ -232,8 +232,34 @@ test("local fallback never signals a reused launcher PID or process group", asyn
     readProcessIdentity: async () => replacement,
     kill: (pid, signal) => { signals.push([pid, signal]); },
   });
-  assert.deepEqual(signals, [], "same numeric PID/PGID with a new birth receives no signal");
+  assert.deepEqual(signals, [], "same numeric PID/PGID with a new birth receives no signal or probe");
   assert.equal(result.status, "indeterminate", "a mismatched birth is not exact-group absence proof");
+});
+
+test("reused launcher birth remains indeterminate without adopting group absence", async () => {
+  const recorded = { pgid: 7374, startedAt: "Mon Aug  7 09:00:00 2026" };
+  const replacement = { pgid: 9000, startedAt: "Mon Aug  7 09:01:00 2026" };
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  const result = await terminateProcessGroup(7374, recorded, {
+    readProcessIdentity: async () => replacement,
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+    },
+  });
+  assert.deepEqual(signals, []);
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /birth identity is mismatch/);
+});
+
+test("a fingerprint naming another pgid remains indeterminate without probing either group", async () => {
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  const result = await terminateProcessGroup(7375, { pgid: 9999, startedAt: "Mon Aug  7 09:00:00 2026" }, {
+    kill: (pid, signal) => { signals.push([pid, signal]); },
+  });
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /mismatched birth fingerprint/);
+  assert.deepEqual(signals, []);
 });
 
 test("post-TERM gone leader plus present numeric group fails closed before SIGKILL", async () => {
@@ -277,14 +303,74 @@ test("replacement group appearing at the post-TERM presence barrier is never SIG
   assert.match(result.reason, /leader birth identity is mismatch immediately before SIGKILL/);
 });
 
-test("exact group stop is indeterminate without a matching birth fingerprint", async () => {
+test("exact group stop remains indeterminate without a fingerprint when the group is live", async () => {
   const signals: Array<[number, NodeJS.Signals | 0]> = [];
   const result = await terminateProcessGroup(7575, undefined, {
     kill: (pid, signal) => { signals.push([pid, signal]); },
   });
   assert.equal(result.status, "indeterminate");
-  assert.match(result.reason, /missing or mismatched birth fingerprint/);
+  assert.match(result.reason, /missing birth fingerprint for live process group/);
+  assert.deepEqual(signals, [[-7575, 0]]);
+});
+
+test("EPERM proves a legacy process group is present but never authorizes termination", async () => {
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  const result = await terminateProcessGroup(7578, undefined, {
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    },
+  });
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /missing birth fingerprint for live process group/);
+  assert.deepEqual(signals, [[-7578, 0]]);
+});
+
+test("unreadable birth identity cannot fall through to numeric group absence", async () => {
+  const recorded = { pgid: 7579, startedAt: "Mon Aug  7 09:00:00 2026" };
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  const result = await terminateProcessGroup(7579, recorded, {
+    readProcessIdentity: async () => { throw new Error("ps denied"); },
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+    },
+  });
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /birth identity is unverifiable/);
   assert.deepEqual(signals, []);
+});
+
+test("unsafe process-group ids are rejected without probing", async () => {
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  for (const pgid of [1, 0, -5, Number.NaN]) {
+    const result = await terminateProcessGroup(pgid, undefined, {
+      kill: (pid, signal) => { signals.push([pid, signal]); },
+    });
+    assert.equal(result.status, "indeterminate");
+    assert.match(result.reason, /invalid process-group id/);
+  }
+  assert.deepEqual(signals, []);
+});
+
+test("exact group stop confirms numeric absence without a birth fingerprint", async () => {
+  const signals: Array<[number, NodeJS.Signals | 0]> = [];
+  const result = await terminateProcessGroup(7576, undefined, {
+    kill: (pid, signal) => {
+      signals.push([pid, signal]);
+      throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+    },
+  });
+  assert.deepEqual(result, { status: "confirmed", reason: "absent" });
+  assert.deepEqual(signals, [[-7576, 0]]);
+});
+
+test("exact group stop remains indeterminate when legacy group presence is unreadable", async () => {
+  const result = await terminateProcessGroup(7577, undefined, {
+    kill: () => { throw Object.assign(new Error("operation not permitted"), { code: "EACCES" }); },
+  });
+  assert.equal(result.status, "indeterminate");
+  assert.match(result.reason, /could not verify process-group 7577 absence/);
 });
 
 test("exact group stop reports signal failure while the matching group remains live", async () => {

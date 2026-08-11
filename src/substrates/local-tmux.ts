@@ -319,14 +319,25 @@ export async function terminateProcessGroup(
   fingerprint: ProcessBirthFingerprint | undefined,
   deps: TmuxProcessSignalDependencies = {},
 ): Promise<ExactProcessGroupStopResult> {
-  if (!pgid) return { status: "confirmed", reason: "not-recorded" };
+  if (pgid === undefined) return { status: "confirmed", reason: "not-recorded" };
+  if (!Number.isSafeInteger(pgid) || pgid <= 1) {
+    return { status: "indeterminate", reason: `invalid process-group id ${pgid}` };
+  }
   if ((deps.platform ?? process.platform) === "win32") {
     return { status: "indeterminate", reason: `process-group verification is unavailable for ${pgid} on win32` };
   }
-  if (fingerprint?.pgid !== pgid) {
-    return { status: "indeterminate", reason: `missing or mismatched birth fingerprint for process group ${pgid}` };
-  }
   const kill = deps.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => { process.kill(pid, signal); });
+  if (!fingerprint) {
+    // Legacy records cannot authorize a terminating signal, but
+    // ESRCH from a signal-0 group probe is still exact absence proof.
+    const presence = await inspectProcessGroupPresence(pgid, kill);
+    if (presence.status === "absent") return { status: "confirmed", reason: "absent" };
+    if (presence.status === "indeterminate") return presence;
+    return { status: "indeterminate", reason: `missing birth fingerprint for live process group ${pgid}` };
+  }
+  if (fingerprint.pgid !== pgid) {
+    return { status: "indeterminate", reason: `mismatched birth fingerprint for process group ${pgid}` };
+  }
   const initialBirth = await inspectProcessBirth(pgid, fingerprint, deps.readProcessIdentity);
   if (initialBirth === "gone") return confirmProcessGroupAbsent(pgid, fingerprint, kill, deps.readProcessIdentity);
   if (initialBirth !== "match") {
@@ -403,6 +414,10 @@ async function inspectProcessGroupPresence(
     return { status: "present" };
   } catch (error) {
     if (isNoSuchProcessError(error)) return { status: "absent" };
+    // POSIX kill(2) reports EPERM when the target exists but the caller lacks
+    // permission to signal it. That proves presence even though ownership and
+    // teardown remain unconfirmed.
+    if ((error as { code?: unknown } | null)?.code === "EPERM") return { status: "present" };
     return { status: "indeterminate", reason: `could not verify process-group ${pgid} absence: ${errorMessage(error)}` };
   }
 }
