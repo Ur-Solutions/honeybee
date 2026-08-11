@@ -6,6 +6,10 @@
  *
  *   node hive-runner-host-<version>.mjs --version          (the handshake target)
  *   node hive-runner-host-<version>.mjs serve --socket <p> (the control plane)
+ *   node hive-runner-host-<version>.mjs connect --gateway <wss-url> \
+ *     --cell-id <id> --token-env CELL_TOKEN                (cell mode: dial OUT
+ *     to the Apiary Cloud gateway and serve the SAME controller over an
+ *     outbound WebSocket — see gatewayConnect.ts)
  *
  * APIA-90 scope is a DEPLOYABLE, HANDSHAKEABLE artifact plus a minimal serve
  * surface (`ping` + `liveness`). The full spawn/observe/steer surface that
@@ -35,6 +39,7 @@ import {
   type RpcMethodHandler,
   type RpcServer,
 } from "./rpc.js";
+import { connectToGateway } from "./gatewayConnect.js";
 import {
   ensureOrphanedChildGroupStopped,
   hsrObservations,
@@ -44,7 +49,17 @@ import {
   reapDeadHosts,
   type HsrProcessSignalDependencies,
 } from "./observe.js";
-import { readHsrMeta, readHsrMetaStrict, hsrRunDir, readHsrRestart, writeHsrRestart, type HsrMeta } from "./runDir.js";
+import {
+  ackHsrEvents,
+  forgetHsrRunState,
+  hsrRunDir,
+  readHsrEventsAfterSeq,
+  readHsrMeta,
+  readHsrMetaStrict,
+  readHsrRestart,
+  writeHsrRestart,
+  type HsrMeta,
+} from "./runDir.js";
 import { sameProcessBirthFingerprint } from "./processIdentity.js";
 import {
   deliverAndRecordCredentials,
@@ -52,6 +67,14 @@ import {
   type DeliveredCredentialEraseResult,
 } from "./remoteCreds.js";
 import { runHsrHost, type HsrHostHandle } from "./host.js";
+// In-cell bee spawn: the cloud Cell is this single bundle (no dedicated
+// runner-entry sibling on disk), so runnerHost re-execs THIS bundle as
+// `node <bundle> __hsr-run <payloadPath>`. main() dispatches that here — and
+// runner-entry's own dedicated-sibling guard stands down inside the bundle — so
+// this is the sole entrypoint into the bee host. Imported straight from
+// runner-entry.js (already in the bundle closure) to avoid pulling the
+// substrate/observe graph that runnerHost.js would add.
+import { runHsrHostFromPayload } from "./runner-entry.js";
 import { adapterFor } from "./adapters/index.js";
 import { harnessSupportsRemoteHsr } from "./harness.js";
 import { normalizeCreds } from "./credsParams.js";
@@ -599,16 +622,44 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
     // no live control socket needed, so it also serves exited bees. The local
     // event mirror (APIA-94) uses it to backfill events emitted before its
     // observe subscription attached.
+    //
+    // Cell-transport seq cursor: `afterSeq` (per-bee monotonic seq, wins over
+    // afterTs when both are sent) returns exactly the events with
+    // `seq > afterSeq` — the exact-resume path for consumers whose connection
+    // died. When the cursor points below the oldest retained seq (compaction
+    // folded it away), the result carries an explicit `gap: {fromSeq, toSeq}`
+    // so the consumer can resynchronize instead of silently diverging.
     events: guarded(async (params) => {
-      const p = (params ?? {}) as { bee?: unknown; afterTs?: unknown };
+      const p = (params ?? {}) as { bee?: unknown; afterTs?: unknown; afterSeq?: unknown };
       const bee = String(p.bee ?? "");
       if (!bee) return { ok: false, error: "bee required" };
+      const afterSeq = typeof p.afterSeq === "number" && Number.isFinite(p.afterSeq) ? p.afterSeq : undefined;
+      if (afterSeq !== undefined) {
+        const { events, gap } = await readHsrEventsAfterSeq(bee, afterSeq);
+        return { ok: true, events, ...(gap ? { gap } : {}) };
+      }
       const afterTs = typeof p.afterTs === "number" && Number.isFinite(p.afterTs) ? p.afterTs : undefined;
       const events = await readEventTail(bee);
       return {
         ok: true,
         events: afterTs === undefined ? events : events.filter((event) => typeof event.ts === "number" && event.ts > afterTs),
       };
+    }),
+
+    // Advance a bee's consumer ack watermark (cell transport). Events at or
+    // below the returned `ackedSeq` become foldable by compaction; everything
+    // above it is retained verbatim for exact seq-cursor resume, even past the
+    // size cap. The watermark is clamped to the issued high-water and never
+    // regresses, so a stale/duplicate ack is harmless.
+    ackEvents: guarded(async (params) => {
+      const p = (params ?? {}) as { bee?: unknown; upToSeq?: unknown };
+      const bee = String(p.bee ?? "");
+      if (!bee) return { ok: false, error: "bee required" };
+      if (typeof p.upToSeq !== "number" || !Number.isFinite(p.upToSeq) || p.upToSeq < 1) {
+        return { ok: false, error: "upToSeq must be a positive number" };
+      }
+      const ackedSeq = await ackHsrEvents(bee, p.upToSeq);
+      return { ok: true, ackedSeq };
     }),
 
     // Establish (or ref-count into) a relay of the bee's live event stream. Each
@@ -708,6 +759,10 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
       } catch {
         return { ok: false, error: `run state removal unconfirmed for ${bee}` };
       }
+      // The run dir is gone: drop this process's cached seq/size state for the
+      // bee so a later same-name spawn starts from on-disk truth, not a stale
+      // lastSeq/ackedSeq inherited from the deleted incarnation.
+      forgetHsrRunState(bee);
       return { ok: true, stdout: "", stderr: "", exitCode: 0 };
     }),
 
@@ -801,8 +856,20 @@ async function main(argv: string[]): Promise<number> {
     const server = await serve(socketPath);
     process.stdout.write(`runner-host serving on ${server.path} (${versionString()})\n`);
     // Keep the process alive until signalled; close the socket cleanly on exit.
+    // Guard against repeated/overlapping SIGINT/SIGTERM starting concurrent
+    // teardowns, and surface a non-zero exit when close REJECTS (an unconfirmed
+    // runner teardown must not be masked as a clean exit).
+    let shuttingDown = false;
     const shutdown = (): void => {
-      void server.close().finally(() => process.exit(0));
+      if (shuttingDown) return;
+      shuttingDown = true;
+      server.close().then(
+        () => process.exit(0),
+        (error) => {
+          process.stderr.write(`runner-host: shutdown close failed: ${messageOf(error)}\n`);
+          process.exit(1);
+        },
+      );
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
@@ -810,9 +877,79 @@ async function main(argv: string[]): Promise<number> {
     return await new Promise<number>(() => {});
   }
 
+  if (cmd === "connect") {
+    // Parse `--gateway <wss-url> --cell-id <id> [--token-env CELL_TOKEN]`
+    // (each flag also accepts the `--flag=value` form).
+    let gatewayUrl: string | undefined;
+    let cellId: string | undefined;
+    let tokenEnv = "CELL_TOKEN";
+    for (let i = 1; i < argv.length; i++) {
+      const arg = argv[i]!;
+      if (arg === "--gateway") gatewayUrl = argv[++i];
+      else if (arg.startsWith("--gateway=")) gatewayUrl = arg.slice("--gateway=".length);
+      else if (arg === "--cell-id") cellId = argv[++i];
+      else if (arg.startsWith("--cell-id=")) cellId = arg.slice("--cell-id=".length);
+      else if (arg === "--token-env") tokenEnv = argv[++i] ?? tokenEnv;
+      else if (arg.startsWith("--token-env=")) tokenEnv = arg.slice("--token-env=".length);
+    }
+    if (!gatewayUrl || !cellId) {
+      process.stderr.write("runner-host connect: --gateway <wss-url> and --cell-id <id> are required\n");
+      return 2;
+    }
+    const token = process.env[tokenEnv];
+    if (!token) {
+      process.stderr.write(`runner-host connect: env var ${tokenEnv} is empty (the gateway bearer token)\n`);
+      return 2;
+    }
+    // Same startup reaper as serve: adopt runners orphaned by a previous
+    // SIGKILLed/OOMed host before accepting control traffic.
+    await reapDeadHosts().catch(() => undefined);
+    const controller = buildController();
+    const connection = connectToGateway({
+      gatewayUrl,
+      cellId,
+      token,
+      methods: controller.methods,
+      runnerHostVersion: versionString(),
+    });
+    process.stdout.write(`runner-host connecting to ${gatewayUrl} as cell ${cellId} (${versionString()})\n`);
+    // Guard against repeated/overlapping signals, and exit non-zero if the
+    // controller teardown REJECTS rather than masking an unconfirmed runner
+    // teardown behind a clean exit.
+    let shuttingDown = false;
+    const shutdown = (): void => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      connection
+        .close()
+        .then(() => controller.close())
+        .then(
+          () => process.exit(0),
+          (error) => {
+            process.stderr.write(`runner-host: shutdown close failed: ${messageOf(error)}\n`);
+            process.exit(1);
+          },
+        );
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    // Never resolves — the reconnect loop owns the event loop.
+    return await new Promise<number>(() => {});
+  }
+
+  if (cmd === "__hsr-run") {
+    // Bundle-self bee spawn (in-cell): runnerHost re-execs this bundle with the
+    // `__hsr-run` marker when there is no dedicated runner-entry sibling. This
+    // owns the bundle's handoff into the bee host; runHsrHostFromPayload manages
+    // its own process lifetime (it calls process.exit on both success and
+    // startup failure), so control does not return here in practice.
+    await runHsrHostFromPayload(argv[1]);
+    return 0;
+  }
+
   process.stderr.write(
     `runner-host: unknown command ${cmd ?? "(none)"}\n` +
-      "usage: runner-host --version | serve --socket <path>\n",
+      "usage: runner-host --version | serve --socket <path> | connect --gateway <wss-url> --cell-id <id> [--token-env CELL_TOKEN]\n",
   );
   return 2;
 }
