@@ -25,7 +25,8 @@ import { isWellFormedPaneId } from "../paneId.js";
 import type { InterventionRequestRecord } from "../requests/store.js";
 import type { SealRecord } from "../seal.js";
 import { deriveState, liveTargetKey, parseBeeState, type BeeState, type DerivedState, type StateContext } from "../state.js";
-import type { SessionRecord } from "../store.js";
+import type { BeeWorkState } from "../stateMachine.js";
+import { legacyStateMachineSeed, type SessionRecord } from "../store.js";
 import { deriveOpenRequests, storedRequestView } from "./requests.js";
 import {
   BEE_VIEW_SCHEMA_VERSION,
@@ -78,13 +79,17 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
   const unreachable = context.unreachableNodes?.has(nodeName) === true;
   const held = context.hsrUnavailable?.has(record.name) === true;
   const hiveStateOption = sources.hiveStateOption && sources.hiveStateOption.length > 0 ? sources.hiveStateOption : undefined;
+  // Mixed-version writers still express explicit retirement as status:done.
+  // It remains authoritative during rollout even if an older stateMachine
+  // cursor is present; no observation or clock path can write this status.
+  const machine = record.status === "done" ? legacyStateMachineSeed(record) : record.stateMachine ?? legacyStateMachineSeed(record);
 
-  const bee = projectBee(record, nodeName);
-  const latestRuntime = projectRuntime(record, context, derived, { generation, unreachable, held });
+  const bee = projectBee(record, nodeName, machine.lifecycle);
+  const latestRuntime = projectRuntime(record, context, derived, machine.runtime, { generation, unreachable, held });
   // Runtime-generation and turn requests close with an exited generation.
   // Bee-scoped manual actions (for example an undeliverable accepted message)
   // deliberately survive runtime exit and remain renderable until resolved.
-  const derivedRequests = bee.lifecycle === "retired"
+  const derivedRequests = bee.lifecycleState === "archived"
     ? []
     : deriveOpenRequests({
         record,
@@ -95,9 +100,13 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
         ...(sources.storedRequests ? { storedRequests: sources.storedRequests } : {}),
         now: nowMs,
       });
-  const openRequests = latestRuntime.state === "exited"
-    ? derivedRequests.filter((request) => request.scope === "bee")
+  const transitionRequest = transitionRequestFallback(record);
+  const requestsWithRecovery = transitionRequest && !derivedRequests.some((request) => request.id === transitionRequest.id)
+    ? [...derivedRequests, transitionRequest]
     : derivedRequests;
+  const openRequests = latestRuntime.state === "exited"
+    ? requestsWithRecovery.filter((request) => request.scope === "bee")
+    : requestsWithRecovery;
   // Closed history (resolved/cancelled), newest first, capped at 5 — shown
   // for retired bees too (retire keeps the request file on purpose).
   const recentClosedRequests = (sources.storedRequests ?? [])
@@ -112,6 +121,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
     derived,
     latestRuntime,
     openRequests,
+    boundedWork: record.stateMachine?.work,
     nodeName,
     unreachable,
   });
@@ -125,7 +135,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
       needsAuth: openRequests.filter((request) => request.kind === "auth").length,
       needsAction: openRequests.filter((request) => request.kind === "manual-action").length,
     },
-    hasUnretiredResult: bee.lifecycle !== "retired" && (latestContractResult !== undefined || latestTurnResult !== undefined),
+    hasUnretiredResult: bee.lifecycleState !== "archived" && (latestContractResult !== undefined || latestTurnResult !== undefined),
     ...(resultTimes.length > 0 ? { latestResultAt: resultTimes[resultTimes.length - 1] } : {}),
   };
 
@@ -143,6 +153,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
     displayState,
     displayStateReason,
     observationFreshness: projectFreshness(sources, derived, { unreachable, held, hiveStateOption, nowMs }),
+    verification: projectVerification(record),
     lastProjectedAt: new Date(nowMs).toISOString(),
     compatibilityFields: {
       beeState: derived.state,
@@ -158,7 +169,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
   };
 }
 
-function projectBee(record: SessionRecord, nodeName: string): BeeViewBee {
+function projectBee(record: SessionRecord, nodeName: string, lifecycleState: BeeViewBee["lifecycleState"]): BeeViewBee {
   const taskAttribution = record.runId !== undefined || record.flowName !== undefined
     ? { ...(record.runId !== undefined ? { runId: record.runId } : {}), ...(record.flowName !== undefined ? { flowName: record.flowName } : {}) }
     : undefined;
@@ -173,7 +184,8 @@ function projectBee(record: SessionRecord, nodeName: string): BeeViewBee {
     ...(record.swarmId !== undefined ? { swarmId: record.swarmId } : {}),
     tags: record.tags ?? [],
     node: nodeName,
-    lifecycle: record.status === "done" ? "retired" : "active",
+    lifecycle: lifecycleState === "archived" ? "retired" : "active",
+    lifecycleState,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     ...(record.contract !== undefined ? { contract: record.contract } : {}),
@@ -213,10 +225,12 @@ function projectRuntime(
   record: SessionRecord,
   context: StateContext,
   derived: DerivedState,
+  runtimeState: BeeViewRuntime["runtimeState"],
   facts: { generation: number; unreachable: boolean; held: boolean },
 ): BeeViewRuntime {
   const base = {
     generation: facts.generation,
+    runtimeState,
     substrate: record.substrate === "hsr" ? ("hsr" as const) : ("local-tmux" as const),
     tmuxTarget: record.tmuxTarget,
     ...(record.agentPaneId !== undefined ? { agentPaneId: record.agentPaneId } : {}),
@@ -225,13 +239,51 @@ function projectRuntime(
     ...(record.providerSessionId !== undefined ? { providerSessionId: record.providerSessionId } : {}),
   };
 
-  if (record.status === "done") {
+  if (record.stateMachine?.lifecycle === "archived" || record.status === "done") {
     // A filed bee's runtime was torn down by retire/quest done: recorded intent.
     return {
       ...base,
       state: "exited",
       exitClass: "stopped",
       evidence: { grade: "legacy", source: "session-record", detail: 'record filed (status "done")' },
+    };
+  }
+  if (runtimeState === "recovering") {
+    return {
+      ...base,
+      state: "starting",
+      evidence: {
+        grade: "structured",
+        source: "state-transition",
+        observedAt: record.stateMachine?.transitionedAt,
+        detail: "probe-verified mid-turn death; recovery in progress",
+      },
+    };
+  }
+  if (runtimeState === "parked") {
+    return {
+      ...base,
+      state: "exited",
+      exitClass: "stopped",
+      evidence: {
+        grade: "structured",
+        source: "state-transition",
+        observedAt: record.stateMachine?.transitionedAt,
+        detail: "idle runtime parked after a negative liveness probe",
+      },
+    };
+  }
+  if (runtimeState === "lost") {
+    return {
+      ...base,
+      state: "exited",
+      exitClass: "crashed",
+      evidence: {
+        grade: "structured",
+        source: "state-transition",
+        observedAt: record.stateMachine?.transitionedAt,
+        detail: "runtime loss persisted with probe evidence",
+      },
     };
   }
   if (facts.unreachable) {
@@ -291,6 +343,62 @@ function isoFromEpochMs(ts: number): string | undefined {
 function closedRequestAt(record: InterventionRequestRecord): number {
   const parsed = Date.parse(record.resolvedAt ?? record.cancelledAt ?? record.updatedAt);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** Store-backed requests win; the proof-carrying transition is the daemon-down fallback. */
+function transitionRequestFallback(record: SessionRecord): BeeViewRequest | undefined {
+  const transition = record.stateMachine?.lastTransition;
+  if (record.stateMachine?.work !== "needs-you" || !transition?.requestId) {
+    return undefined;
+  }
+  if (transition.type === "request.opened") {
+    const kind = transition.cause === "auth" ? "auth" : transition.cause === "question" ? "question" : "permission";
+    return {
+      id: transition.requestId,
+      kind,
+      status: "open",
+      scope: "turn",
+      grade: "structured",
+      openedAt: transition.at,
+      question: transition.cause === "auth" ? "Authentication is required." : "The bee is waiting for your response.",
+      evidence: {
+        grade: "structured",
+        source: "state-transition",
+        observedAt: transition.at,
+        detail: `request.opened (${transition.cause})`,
+      },
+    };
+  }
+  if (transition.type !== "recovery.failed") return undefined;
+  return {
+    id: transition.requestId,
+    kind: "manual-action",
+    status: "open",
+    scope: "bee",
+    grade: "structured",
+    openedAt: transition.at,
+    question: "Automatic recovery failed after its retry budget was exhausted.",
+    input: { evidence: transition.evidence },
+    evidence: {
+      grade: "structured",
+      source: "state-transition",
+      observedAt: transition.at,
+      detail: `recovery.failed (${transition.cause})`,
+    },
+  };
+}
+
+function projectVerification(record: SessionRecord): BeeViewV1["verification"] {
+  const marker = record.stateUnverified;
+  if (!marker) return { unverified: false };
+  return {
+    unverified: true,
+    unverifiedSince: marker.since,
+    reason: marker.reason,
+    probeScheduledAt: marker.probeScheduledAt,
+    ...(marker.lastVerifiedAt ? { lastVerifiedAt: marker.lastVerifiedAt } : {}),
+    ...(marker.observer ? { observerOffline: marker.observer } : {}),
+  };
 }
 
 /** Last lifecycle event of `type`, honoring the root-thread scoping rule. */
@@ -444,13 +552,14 @@ function chooseDisplayState(facts: {
   derived: DerivedState;
   latestRuntime: BeeViewRuntime;
   openRequests: BeeViewRequest[];
+  boundedWork?: BeeWorkState;
   nodeName: string;
   unreachable: boolean;
 }): { displayState: BeeDisplayState; displayStateReason: string } {
   const { bee, derived, latestRuntime, openRequests } = facts;
 
   // ADR 001 precedence, top to bottom. Each rule names itself in the reason.
-  if (bee.lifecycle === "retired") {
+  if (bee.lifecycleState === "archived") {
     return { displayState: "retired", displayStateReason: 'retired — bee lifecycle is retired (record filed as "done")' };
   }
   const auth = openRequests.find((request) => request.kind === "auth");
@@ -468,6 +577,12 @@ function chooseDisplayState(facts: {
   if (latestRuntime.stopFailed) {
     return { displayState: "stop-failed", displayStateReason: "stop-failed — the latest stop request failed (status kill_failed); the runtime may still be alive" };
   }
+  if (latestRuntime.runtimeState === "recovering") {
+    return { displayState: "recovering", displayStateReason: "recovering — probe-verified mid-turn runtime loss is being revived" };
+  }
+  if (latestRuntime.runtimeState === "parked") {
+    return { displayState: "ready", displayStateReason: "ready — no running turn" };
+  }
   if (latestRuntime.state === "exited" && latestRuntime.exitClass === "crashed") {
     return { displayState: "crashed", displayStateReason: "crashed — the latest generation exited without stop intent" };
   }
@@ -479,6 +594,12 @@ function chooseDisplayState(facts: {
   }
   if (latestRuntime.state === "starting") {
     return { displayState: "starting", displayStateReason: `starting — the latest generation is ${derived.state}` };
+  }
+  if (facts.boundedWork === "working") {
+    return { displayState: "working", displayStateReason: "working — bounded state cursor has a running turn" };
+  }
+  if (facts.boundedWork === "done") {
+    return { displayState: "ready", displayStateReason: "ready — bounded state cursor has a settled turn" };
   }
   if (derivedMeansRunningTurn(derived.state)) {
     return { displayState: "working", displayStateReason: "working — the latest generation is online with a running turn" };
@@ -507,7 +628,8 @@ function interactionStateFor(
   derived: DerivedState,
   runtime: BeeViewRuntime,
 ): BeeViewV1["interactionState"] {
-  if (record.status === "done") return "archived";
+  if (record.stateMachine?.lifecycle === "archived" || record.status === "done") return "archived";
+  if (runtime.runtimeState === "recovering") return "working";
   if (record.status !== "kill_failed") {
     return derivedMeansRunningTurn(derived.state) ? "working" : "idle";
   }

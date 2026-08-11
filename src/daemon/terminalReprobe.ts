@@ -23,7 +23,7 @@ import { defaultIsPidAlive } from "../fsx.js";
 import { inspectHsrHostProcess, listHsrBees } from "../hsr/observe.js";
 import { readHsrMetaStrict, writeHsrMeta, type HsrMeta } from "../hsr/runDir.js";
 import type { ProcessIdentityVerdict } from "../hsr/processIdentity.js";
-import { isActiveSessionRecord, loadSession, updateSession, type SessionRecord } from "../store.js";
+import { isActiveSessionRecord, loadSession, updateSession, type SessionRecord, type UpdateSessionOptions } from "../store.js";
 import { envMs } from "./timeouts.js";
 
 export type TerminalReprobeOutcome = {
@@ -39,7 +39,7 @@ export type TerminalReprobeDependencies = {
   readMeta?: (bee: string) => Promise<HsrMeta | null>;
   writeMeta?: (bee: string, meta: HsrMeta) => Promise<void>;
   loadRecord?: (name: string) => Promise<SessionRecord | null>;
-  updateRecord?: (name: string, patch: Partial<SessionRecord>) => Promise<SessionRecord | null>;
+  updateRecord?: (name: string, patch: Partial<SessionRecord>, options?: UpdateSessionOptions) => Promise<SessionRecord | null>;
   isHostAlive?: (pid: number) => boolean;
   inspectHost?: (meta: HsrMeta) => Promise<ProcessIdentityVerdict>;
   intervalMs?: number;
@@ -107,9 +107,11 @@ export async function reprobeTerminalCursors(
       const record = await (deps.loadRecord ?? loadSession)(bee);
       if (!record || record.substrate !== "hsr" || record.status !== "running") continue;
       if (!REPROBE_TERMINAL_STATES.has(record.lastObservedState ?? "")) continue;
-      // Already in the work set (e.g. recoveryRequestedAt): the ordinary tick
-      // observation self-heals it; this sweep only serves de-indexed records.
-      if (isActiveSessionRecord(record)) continue;
+      if (record.recoveryRequestedAt) continue;
+      // Terminal-marked active records deliberately remain in the work set.
+      // This inverse sweep may still heal them immediately; the ordinary tick
+      // is the second path that will converge the same verified truth.
+      if (!isActiveSessionRecord(record)) continue;
       // Birth-fingerprint proof of life for the EXACT recorded incarnation.
       // gone/mismatch/unverifiable are not proof — leave the cursor alone.
       verdict ??= await (deps.inspectHost ? deps.inspectHost(meta) : inspectHsrHostProcess(meta));
@@ -117,6 +119,16 @@ export async function reprobeTerminalCursors(
       const healed = await (deps.updateRecord ?? updateSession)(bee, {
         lastObservedState: undefined,
         lastObservedStateAt: undefined,
+      }, {
+        probeEvidence: {
+          kind: "probe",
+          probeId: `terminal-reprobe:${bee}:${now()}`,
+          observerId: "terminal-reprobe",
+          observedAt: new Date(now()).toISOString(),
+          outcome: "alive",
+          target: { substrate: "hsr", ...(record.node ? { node: record.node } : {}), runnerPid: meta.hostPid },
+          detail: "host birth fingerprint matched the recorded runtime",
+        },
       });
       if (healed) {
         outcomes.push({ bee, action: "healed", clearedState: record.lastObservedState! });

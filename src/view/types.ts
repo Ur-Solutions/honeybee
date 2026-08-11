@@ -1,6 +1,7 @@
 import type { BeeState } from "../state.js";
 import type { SealStatus, SealType } from "../seal.js";
 import type { BeeContract } from "../contract.js";
+import type { BeeLifecycleState, BeeRuntimeState, ObserverOfflineMarker } from "../stateMachine.js";
 
 export const BEE_VIEW_SCHEMA_VERSION = 1 as const;
 
@@ -46,6 +47,8 @@ export type BeeViewBee = {
    * lifecycle (ADR invariant 10). Its seal appears in latestContractResult.
    */
   lifecycle: "active" | "retired";
+  /** Bounded lifecycle axis; lifecycle above remains byte-compatible. */
+  lifecycleState: BeeLifecycleState;
   createdAt: string;
   updatedAt: string;
   contract?: BeeContract;
@@ -64,6 +67,8 @@ export type BeeViewRuntime = {
    * unknown  — node unreachable or observation unavailable this pass
    */
   state: "starting" | "online" | "exited" | "unknown";
+  /** Bounded runtime axis; parked is diagnostic only and never a displayState. */
+  runtimeState: BeeRuntimeState;
   substrate: "local-tmux" | "hsr";
   tmuxTarget?: string;
   agentPaneId?: string;
@@ -187,6 +192,7 @@ export type BeeDisplayState =
   | "crashed"
   | "unreachable"
   | "starting"
+  | "recovering"
   | "working"
   | "ready"
   | "offline";
@@ -215,6 +221,16 @@ export type BeeViewObservationFreshness = {
   observedLive: boolean;
   /** The daemon is NOT required; this reports whether its cache was current. */
   sources: ObservationSourceFreshness[];
+};
+
+/** Explicit uncertainty attached to every projection; missing evidence never rewrites state. */
+export type BeeViewVerification = {
+  unverified: boolean;
+  unverifiedSince?: string;
+  reason?: "stale-cursor" | "observer-offline";
+  probeScheduledAt?: string;
+  lastVerifiedAt?: string;
+  observerOffline?: ObserverOfflineMarker;
 };
 
 /** Verbatim legacy fields so consumers migrate additively. */
@@ -248,6 +264,7 @@ export type BeeViewV1 = {
   /** The precedence rule that produced displayState (for `state explain`). */
   displayStateReason: string;
   observationFreshness: BeeViewObservationFreshness;
+  verification: BeeViewVerification;
   lastProjectedAt: string;
   compatibilityFields: BeeViewCompatibilityFields;
 };

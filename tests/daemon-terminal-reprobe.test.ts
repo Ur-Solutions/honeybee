@@ -70,7 +70,7 @@ test("a live runner behind a stale crashed cursor self-heals within one sweep", 
     const bee = "reprobe-heals";
     await saveSession(record(bee));
     await seedMeta(bee);
-    assert.equal(isActiveSessionRecord((await loadSession(bee))!), false, "the seeded record is de-indexed");
+    assert.equal(isActiveSessionRecord((await loadSession(bee))!), true, "the terminal cursor stays in the probe set");
 
     const outcomes = await reprobeTerminalCursors({
       isHostAlive: () => true,
@@ -99,7 +99,7 @@ test("a genuinely dead runner does not resurrect", async () => {
     assert.deepEqual(outcomes, []);
     const untouched = await loadSession(bee);
     assert.equal(untouched?.lastObservedState, "crashed", "the terminal cursor stands");
-    assert.equal(isActiveSessionRecord(untouched!), false);
+    assert.equal(isActiveSessionRecord(untouched!), true, "absence of a live probe does not de-index active lifecycle");
   });
 });
 

@@ -11,6 +11,20 @@ import type { PreambleChannel } from "./preamble.js";
 import { dedupeTags, isValidSessionTag, MAX_TAGS_PER_BEE } from "./tags.js";
 import type { CombActivationBinding } from "./comb/types.js";
 import type { ProcessBirthFingerprint } from "./hsr/processIdentity.js";
+import {
+  IllegalBeeTransitionError,
+  isBeeStateMachineCursor,
+  isProbeEvidence,
+  isUnverifiedCursorMarker,
+  makeStateMachineCursor,
+  reduceBeeTransition,
+  type BeeStateMachineCursor,
+  type BeeTransitionEvent,
+  type BeeTransitionReceipt,
+  type ProbeEvidence,
+  type StateMachineSeed,
+  type UnverifiedCursorMarker,
+} from "./stateMachine.js";
 
 /**
  * Per-bee task auto-supply config (see tasks/supplyConfig.ts for semantics
@@ -190,6 +204,14 @@ export type SessionRecord = {
   lastObservedState?: string;
   lastObservedStateAt?: string;
   /**
+   * Proof-carrying bounded state cursor. It may only be changed through
+   * transitionSession; raw save/update/touch attempts are rejected and
+   * durably audited.
+   */
+  stateMachine?: BeeStateMachineCursor;
+  /** Missing observation never changes the cursor; it marks it unverified. */
+  stateUnverified?: UnverifiedCursorMarker;
+  /**
    * Durable delivery obligation created by the daemon `message:1` accept op.
    * It keeps a cold/terminal observation in the daemon work set without
    * fabricating lifecycle status or an observed runtime state.
@@ -272,12 +294,8 @@ export async function ensureStore() {
   await mkdir(sessionsDir(), { recursive: true });
 }
 
-/**
- * Persisted observed states that have no daemon work left to do. A later send
- * or revive clears the turn/runtime boundary before setting status=running,
- * which transactionally puts the record back in the active index.
- */
-const TERMINAL_OBSERVED_STATES = new Set([
+/** Legacy terminal cursor spellings. They remain probeable while lifecycle is active. */
+export const TERMINAL_OBSERVED_STATES = new Set([
   "dead",
   "crashed",
   "done",
@@ -289,9 +307,9 @@ const TERMINAL_OBSERVED_STATES = new Set([
 
 /**
  * Whether a record belongs in operational hot paths. This is deliberately
- * narrower than status=running: a crashed bee or a warm runtime whose current
- * turn is sealed/done remains revivable history, but does not need probing and
- * must not bias automatic account selection.
+ * narrower than status=running for explicit lifecycle only. A terminal-marked
+ * active record stays probeable: de-indexing it makes one false crash cursor
+ * self-sustain forever (2026-08-10 incident).
  */
 export function isActiveSessionRecord(
   record: Pick<SessionRecord, "status" | "lastObservedState" | "recoveryRequestedAt">,
@@ -303,11 +321,11 @@ export function isActiveSessionRecord(
   if (record.status === "done") return false;
   if (record.recoveryRequestedAt) return true;
   if (record.status !== "running" && record.status !== "kill_failed") return false;
-  return !TERMINAL_OBSERVED_STATES.has(record.lastObservedState ?? "");
+  return true;
 }
 
-export const ACTIVE_SESSION_INDEX_VERSION = 2;
-const LEGACY_ACTIVE_SESSION_INDEX_VERSION = 1;
+/** v3 invalidates indexes that de-indexed terminal observation cursors. */
+export const ACTIVE_SESSION_INDEX_VERSION = 3;
 
 /**
  * A mixed-version writer does not know about the derived active index. Bound
@@ -483,12 +501,6 @@ function activeIndexChecksum(
     .digest("hex");
 }
 
-function legacyActiveIndexChecksum(root: string, active: readonly string[]): string {
-  return createHash("sha256")
-    .update(JSON.stringify({ version: LEGACY_ACTIVE_SESSION_INDEX_VERSION, root, active }))
-    .digest("hex");
-}
-
 function makeActiveSessionIndex(
   root: string,
   names: Iterable<string>,
@@ -545,21 +557,10 @@ async function readActiveSessionIndex(root: string): Promise<ActiveSessionIndex 
       )) return null;
       return candidate as ActiveSessionIndex;
     }
-    if (candidate.version !== LEGACY_ACTIVE_SESSION_INDEX_VERSION) return null;
-    if (candidate.checksum !== legacyActiveIndexChecksum(root, normalized)) return null;
-    // A checksum-valid v1 projection is safe to serve immediately. Normalize it
-    // only in memory; the paced canonical pass will publish v2 without making
-    // the first post-upgrade operational snapshot scan all historical rows.
-    const reconciledAt = candidate.updatedAt;
-    return {
-      version: ACTIVE_SESSION_INDEX_VERSION,
-      complete: true,
-      root,
-      active: normalized,
-      checksum: activeIndexChecksum(root, normalized, reconciledAt),
-      reconciledAt,
-      updatedAt: candidate.updatedAt,
-    };
+    // v1/v2 indexes encoded the old de-index-terminal policy. Serving one even
+    // briefly would preserve the absorbing false-crash bug, so upgrade is a
+    // mandatory canonical rebuild rather than a lazy in-memory normalization.
+    return null;
   } catch {
     return null;
   }
@@ -689,11 +690,16 @@ export async function withSessionLock<T>(name: string, fn: () => Promise<T>): Pr
  * auto-titler, touchSession heartbeats) persisted after the caller loaded its
  * snapshot (HIVE-49).
  */
-export async function saveSession(record: SessionRecord) {
+export type SaveSessionOptions = {
+  /** Required when overwriting an existing record with a new terminal cursor. */
+  probeEvidence?: ProbeEvidence;
+};
+
+export async function saveSession(record: SessionRecord, options: SaveSessionOptions = {}) {
   // Serialize against touchSession/updateSession so a concurrent merge can't
   // interleave with this full-record overwrite.
   await withSessionLock(record.name, async () => {
-    await saveSessionLocked(record);
+    await saveSessionLocked(record, options);
   });
 }
 
@@ -702,7 +708,30 @@ export async function saveSession(record: SessionRecord) {
  * already inside withSessionLock for the same record — the lock is not
  * reentrant, so calling saveSession there would deadlock.
  */
-export async function saveSessionLocked(record: SessionRecord) {
+export async function saveSessionLocked(record: SessionRecord, options: SaveSessionOptions = {}) {
+  const existing = await loadCanonicalSessionFromDirectories(record.name, sessionsDir(), legacySessionsDir());
+  const before = existing?.stateMachine;
+  const after = record.stateMachine;
+  if ((!before && after) || (before && JSON.stringify(before) !== JSON.stringify(after))) {
+    await rejectRawStateMutation(record.name, "saveSession", { stateMachine: after });
+  }
+  if (existing && legacyTerminalCursorClaimChanges(existing, record) && !isProbeEvidence(options.probeEvidence)) {
+    await appendLedger({
+      type: "state.transition.rejected",
+      session: record.name,
+      source: "legacy-cursor-write",
+      from: existing.lastObservedState ?? null,
+      to: record.lastObservedState ?? null,
+      evidence: options.probeEvidence ?? null,
+      reason: "terminal cursor write requires probe evidence",
+    });
+    throw new IllegalBeeTransitionError("terminal cursor write requires probe evidence");
+  }
+  await persistSessionRecord(record);
+}
+
+/** Internal full-record writer used after transitionSession has validated an event. */
+async function persistSessionRecord(record: SessionRecord) {
   const paths = captureStorePaths();
   await mkdir(paths.currentDir, { recursive: true });
   // Full saves are uncommon (spawn/fork/re-create), so always take the global
@@ -743,6 +772,203 @@ function compactSaveEvent(record: SessionRecord): Record<string, unknown> {
   };
 }
 
+function legacyTerminalCursorClaimChanges(
+  existing: Pick<SessionRecord, "lastObservedState">,
+  patch: Partial<SessionRecord>,
+): boolean {
+  if (!Object.prototype.hasOwnProperty.call(patch, "lastObservedState")) return false;
+  const next = patch.lastObservedState;
+  if (next === existing.lastObservedState) return false;
+  return TERMINAL_OBSERVED_STATES.has(next ?? "");
+}
+
+async function rejectRawStateMutation(
+  name: string,
+  source: "saveSession" | "updateSession" | "touchSession",
+  attempted: Record<string, unknown>,
+): Promise<never> {
+  await appendLedger({
+    type: "state.transition.rejected",
+    session: name,
+    source,
+    attempted,
+    evidence: null,
+    reason: "stateMachine may only be changed through transitionSession",
+  });
+  throw new IllegalBeeTransitionError("stateMachine may only be changed through transitionSession");
+}
+
+/** Derive a migration seed without rewriting legacy records merely by reading them. */
+export function legacyStateMachineSeed(
+  record: Pick<SessionRecord, "status" | "lastObservedState" | "lastPromptAt">,
+): StateMachineSeed {
+  if (record.status === "done") {
+    return { lifecycle: "archived", runtime: "parked", work: "done" };
+  }
+  const observed = record.lastObservedState;
+  if (observed === "blocked" || observed === "auth-needed") {
+    return { lifecycle: "active", runtime: "live", work: "needs-you" };
+  }
+  if (observed === "done" || observed === "sealed" || observed === "idle_with_output") {
+    return { lifecycle: "active", runtime: "live", work: "done" };
+  }
+  if (observed === "crashed" || observed === "dead" || observed === "killed" ||
+      observed === "error" || observed === "kill_failed") {
+    return { lifecycle: "active", runtime: "lost", work: "working" };
+  }
+  if (record.lastPromptAt || observed === "active" || observed === "working") {
+    return { lifecycle: "active", runtime: "live", work: "working" };
+  }
+  return { lifecycle: "active", runtime: "live", work: "spawning" };
+}
+
+export type SessionTransitionResult = {
+  record: SessionRecord;
+  from: StateMachineSeed;
+  to: StateMachineSeed;
+  /** False only for an exact replay of the cursor's last event id. */
+  changed: boolean;
+};
+
+function transitionEventMatchesReceipt(event: BeeTransitionEvent, receipt: BeeTransitionReceipt): boolean {
+  const evidence = [
+    ...("evidence" in event ? [event.evidence] : []),
+    ...("probe" in event ? [event.probe] : []),
+  ];
+  return receipt.eventId === event.eventId && receipt.type === event.type && receipt.cause === event.cause &&
+    receipt.at === event.at && JSON.stringify(receipt.evidence) === JSON.stringify(evidence) &&
+    receipt.requestId === ("requestId" in event ? event.requestId : undefined) &&
+    receipt.resume === (event.type === "bee.revived" ? event.resume : undefined);
+}
+
+/**
+ * The sole state-axis mutation API. Illegal attempts are appended to the
+ * durable ledger before rejection; exact last-event replays are idempotent.
+ */
+export async function transitionSession(
+  name: string,
+  event: BeeTransitionEvent,
+): Promise<SessionTransitionResult | null> {
+  return withSessionLock(name, async () => {
+    const paths = captureStorePaths();
+    const existing = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir, paths.root);
+    if (!existing) return null;
+    const current = existing.stateMachine ?? legacyStateMachineSeed(existing);
+    const from: StateMachineSeed = {
+      lifecycle: current.lifecycle,
+      runtime: current.runtime,
+      work: current.work,
+    };
+
+    if (existing.stateMachine?.lastEventId === event.eventId) {
+      const receipt = existing.stateMachine.lastTransition;
+      if (!transitionEventMatchesReceipt(event, receipt)) {
+        await appendLedger({
+          type: "state.transition.rejected",
+          session: name,
+          source: "transitionSession",
+          event,
+          from,
+          evidence: "probe" in event ? event.probe : "evidence" in event ? event.evidence : null,
+          reason: "lastEventId collision with a different transition",
+        });
+        throw new IllegalBeeTransitionError(`eventId ${event.eventId} was already used for ${receipt.type}`);
+      }
+      return { record: existing, from, to: from, changed: false };
+    }
+
+    let reduction;
+    try {
+      reduction = reduceBeeTransition(from, event);
+    } catch (error) {
+      await appendLedger({
+        type: "state.transition.rejected",
+        session: name,
+        source: "transitionSession",
+        event,
+        from,
+        evidence: "probe" in event ? event.probe : "evidence" in event ? event.evidence : null,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+
+    const stateMachine = makeStateMachineCursor(reduction, existing.stateMachine?.revision ?? 0);
+    const resumesLiveWork = reduction.to.lifecycle === "active" && reduction.to.runtime === "live" && reduction.to.work === "working";
+    const record: SessionRecord = {
+      ...existing,
+      stateMachine,
+      stateUnverified: undefined,
+      updatedAt: event.at,
+      ...(resumesLiveWork ? { lastObservedState: undefined, lastObservedStateAt: undefined } : {}),
+    };
+    delete (record as Record<string, unknown>).stateUnverified;
+    if (resumesLiveWork) {
+      delete (record as Record<string, unknown>).lastObservedState;
+      delete (record as Record<string, unknown>).lastObservedStateAt;
+    }
+    await persistSessionRecord(record);
+    await appendLedger({
+      type: "state.transition.accepted",
+      session: name,
+      event: reduction.receipt,
+      from: reduction.from,
+      to: reduction.to,
+      revision: stateMachine.revision,
+    });
+    return { record, from: reduction.from, to: reduction.to, changed: true };
+  });
+}
+
+/** Mark the last-known cursor uncertain without changing any state axis. */
+export async function markSessionUnverified(
+  name: string,
+  marker: UnverifiedCursorMarker,
+): Promise<SessionRecord | null> {
+  if (!isUnverifiedCursorMarker(marker)) {
+    await appendLedger({
+      type: "state.verification.rejected",
+      session: name,
+      marker,
+      reason: "invalid unverified cursor marker",
+    });
+    throw new Error("invalid unverified cursor marker");
+  }
+  const record = await mergeSessionFields(name, { stateUnverified: marker });
+  if (record) {
+    await appendLedger({ type: "state.unverified", session: name, marker });
+  }
+  return record;
+}
+
+/**
+ * A conclusive probe clears uncertainty. An alive probe also heals only the
+ * legacy false-crash cursor (crashed/dead); bounded axes still require an
+ * allowed transition event.
+ */
+export async function markSessionVerified(
+  name: string,
+  probe: ProbeEvidence,
+): Promise<SessionRecord | null> {
+  if (!isProbeEvidence(probe) || probe.outcome === "unreachable") {
+    await appendLedger({
+      type: "state.verification.rejected",
+      session: name,
+      evidence: probe,
+      reason: "verification requires a conclusive probe",
+    });
+    throw new Error("verification requires a conclusive probe");
+  }
+  const record = await mergeSessionFields(name, { stateUnverified: undefined }, {
+    probeEvidence: probe,
+    clearFalseCrashCursor: probe.outcome === "alive",
+  });
+  if (record) {
+    await appendLedger({ type: "state.verified", session: name, evidence: probe });
+  }
+  return record;
+}
+
 // How often a pure `lastObservedStateAt` heartbeat is allowed to hit disk for
 // live records. Terminal history never needs a freshness lease: its lifecycle
 // status is authoritative, and rewriting thousands of retired records turns a
@@ -774,6 +1000,8 @@ export function shouldPersistObservationHeartbeat(
 export type TouchSessionOptions = {
   /** Barrier used by deterministic mixed-writer regression tests/telemetry. */
   onBeforeObservationWrite?: () => Promise<void> | void;
+  /** Required when a legacy terminal cursor is changed. */
+  probeEvidence?: ProbeEvidence;
 };
 
 export async function touchSession(
@@ -781,9 +1009,12 @@ export async function touchSession(
   fields: Partial<SessionRecord>,
   options: TouchSessionOptions = {},
 ): Promise<SessionRecord | null> {
+  if (Object.prototype.hasOwnProperty.call(fields, "stateMachine")) {
+    await rejectRawStateMutation(name, "touchSession", { stateMachine: fields.stateMachine });
+  }
   const observation = await touchSessionObservation(name, fields, options);
   if (observation.handled) return observation.record;
-  return mergeSessionFields(name, fields, { skipNoopWrites: true });
+  return mergeSessionFields(name, fields, { skipNoopWrites: true, probeEvidence: options.probeEvidence });
 }
 
 type TouchSessionObservationResult =
@@ -852,8 +1083,20 @@ async function touchSessionObservation(
  *
  * Returns the merged record, or null when the record no longer exists on disk.
  */
-export async function updateSession(name: string, patch: Partial<SessionRecord>): Promise<SessionRecord | null> {
-  const merged = await mergeSessionFields(name, patch);
+export type UpdateSessionOptions = {
+  /** Required when a legacy terminal cursor is changed. */
+  probeEvidence?: ProbeEvidence;
+};
+
+export async function updateSession(
+  name: string,
+  patch: Partial<SessionRecord>,
+  options: UpdateSessionOptions = {},
+): Promise<SessionRecord | null> {
+  if (Object.prototype.hasOwnProperty.call(patch, "stateMachine")) {
+    await rejectRawStateMutation(name, "updateSession", { stateMachine: patch.stateMachine });
+  }
+  const merged = await mergeSessionFields(name, patch, { probeEvidence: options.probeEvidence });
   if (merged) await appendLedger(compactSaveEvent(merged));
   return merged;
 }
@@ -861,14 +1104,30 @@ export async function updateSession(name: string, patch: Partial<SessionRecord>)
 async function mergeSessionFields(
   name: string,
   fields: Partial<SessionRecord>,
-  options: { skipNoopWrites?: boolean } = {},
+  options: { skipNoopWrites?: boolean; probeEvidence?: ProbeEvidence; clearFalseCrashCursor?: boolean } = {},
 ): Promise<SessionRecord | null> {
   return withSessionLock(name, async () => {
     const paths = captureStorePaths();
     return withFileLock(sessionObservationLockPath(paths.root, name), async () => {
       const existing = await loadSessionFromDirectories(name, paths.currentDir, paths.legacyDir, paths.root);
       if (!existing) return null;
-      const merged: SessionRecord = { ...existing, ...fields, name: existing.name };
+      const appliedFields: Partial<SessionRecord> = options.clearFalseCrashCursor &&
+        (existing.lastObservedState === "crashed" || existing.lastObservedState === "dead")
+        ? { ...fields, lastObservedState: undefined, lastObservedStateAt: undefined }
+        : fields;
+      if (legacyTerminalCursorClaimChanges(existing, appliedFields) && !isProbeEvidence(options.probeEvidence)) {
+        await appendLedger({
+          type: "state.transition.rejected",
+          session: name,
+          source: "legacy-cursor-write",
+          from: existing.lastObservedState ?? null,
+          to: Object.prototype.hasOwnProperty.call(appliedFields, "lastObservedState") ? appliedFields.lastObservedState ?? null : existing.lastObservedState ?? null,
+          evidence: options.probeEvidence ?? null,
+          reason: "terminal cursor change requires probe evidence",
+        });
+        throw new IllegalBeeTransitionError("terminal cursor change requires probe evidence");
+      }
+      const merged: SessionRecord = { ...existing, ...appliedFields, name: existing.name };
       // An explicitly-undefined patch value means "delete this field". Strip the
       // keys so the returned record matches what JSON.stringify persists.
       const bag = merged as Record<string, unknown>;
@@ -1585,6 +1844,8 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "contract",
   "preamble",
   "combActivations",
+  "stateMachine",
+  "stateUnverified",
 ]);
 
 const DANGEROUS_SESSION_META_KEYS = new Set(["__proto__", "prototype", "constructor"]);
@@ -1687,6 +1948,15 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   if (object.contract !== undefined) {
     const contract = normalizeContract(object.contract);
     if (contract) record.contract = contract;
+  }
+
+  // Bounded state cursor + uncertainty marker. Malformed values are dropped
+  // fail-closed; no reader is allowed to infer a new state from bad metadata.
+  if (isBeeStateMachineCursor(object.stateMachine)) {
+    record.stateMachine = object.stateMachine;
+  }
+  if (isUnverifiedCursorMarker(object.stateUnverified)) {
+    record.stateUnverified = object.stateUnverified;
   }
 
   if (Array.isArray(object.combActivations)) {
