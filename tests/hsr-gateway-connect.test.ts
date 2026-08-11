@@ -567,3 +567,145 @@ test("presence edges are pushed best-effort when a bee's status flips", async ()
     },
   );
 });
+
+// --- connect-transport correctness blockers ----------------------------------
+
+test("the WebSocket global is resolved lazily: import + non-connect paths survive a missing global; connect() throws clearly", () => {
+  const saved = (globalThis as { WebSocket?: unknown }).WebSocket;
+  try {
+    // A missing global must not have broken this module's import (it loaded at
+    // the top of this file) nor a non-connect helper.
+    delete (globalThis as { WebSocket?: unknown }).WebSocket;
+    assert.equal(gatewayUrlWithCell("wss://gw.example/x", "c9"), "wss://gw.example/x?cell=c9");
+    // Dialing under a missing global throws a clear Node < 22 error rather than
+    // silently looping forever.
+    assert.throws(
+      () =>
+        connectToGateway({
+          gatewayUrl: "wss://gw.example/x",
+          cellId: "c9",
+          token: "t",
+          methods: {},
+          runnerHostVersion: "v",
+        }),
+      /Node 22/,
+      "connect() must throw a clear missing-global error",
+    );
+  } finally {
+    (globalThis as { WebSocket?: unknown }).WebSocket = saved;
+  }
+});
+
+test("a stale socket's late completion is dropped, never sent to the socket that replaced it (no id cross-talk)", async () => {
+  let sawStart!: () => void;
+  const started = new Promise<void>((resolve) => {
+    sawStart = resolve;
+  });
+  let release!: (value: unknown) => void;
+  const slow = new Promise<unknown>((resolve) => {
+    release = resolve;
+  });
+  const bee = "gw-scope";
+  await withConnectedCell(
+    async ({ controller }) => {
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, liveMeta(bee));
+      // A controller method that hangs until the test releases it — long enough
+      // to outlive its originating socket.
+      controller.methods.slow = async () => {
+        sawStart();
+        return slow;
+      };
+    },
+    async ({ gateway }) => {
+      const a = await gateway.nextConnection();
+      await a.take(isHello, "hello A");
+      a.send({ jsonrpc: "2.0", id: 1, method: "slow" }); // id 1 on socket A
+      await started; // the cell is now awaiting the slow handler
+      a.destroy(); // socket A dies mid-flight
+
+      const b = await gateway.nextConnection();
+      await b.take(isHello, "hello B");
+      release({ stale: true }); // A's completion resolves AFTER B replaced it
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.ok(
+        !b.received.some((frame) => (frame.result as { stale?: boolean } | undefined)?.stale),
+        "A's stale response must not land on B's socket",
+      );
+      // B's own id-1 request (ids restart per socket) is answered correctly.
+      const ping = await b.request("ping"); // id 1 on socket B
+      assert.deepEqual(ping.result, { ok: true, version: versionString() });
+    },
+  );
+});
+
+test("subscribe validates afterSeq as a cursor: string / negative / fractional / missing all get -32602", async () => {
+  const bee = "gw-cursor";
+  await withConnectedCell(
+    async () => {
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, liveMeta(bee));
+      await appendTexts(bee, 2);
+    },
+    async ({ gateway }) => {
+      const conn = await gateway.nextConnection();
+      await conn.take(isHello, "hello");
+      const bad: Array<Record<string, unknown>> = [
+        { bee, afterSeq: "3" },
+        { bee, afterSeq: -1 },
+        { bee, afterSeq: 1.5 },
+        { bee }, // missing
+      ];
+      for (const params of bad) {
+        const resp = await conn.request("subscribe", params);
+        assert.equal(resp.error?.code, -32602, `afterSeq ${JSON.stringify(params)} must be -32602`);
+      }
+      // A valid cursor still subscribes.
+      const ok = await conn.request("subscribe", { bee, afterSeq: 0 });
+      assert.deepEqual(ok.result, { ok: true });
+    },
+  );
+});
+
+test("a well-formed but invalid request (missing method / wrong jsonrpc) gets -32600", async () => {
+  const bee = "gw-invalid-req";
+  await withConnectedCell(
+    async () => {
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, liveMeta(bee));
+    },
+    async ({ gateway }) => {
+      const conn = await gateway.nextConnection();
+      await conn.take(isHello, "hello");
+      conn.send({ id: 501, method: "ping" }); // no jsonrpc field
+      const noVersion = await conn.take((frame) => frame.id === 501 && frame.error !== undefined, "no-jsonrpc error");
+      assert.equal(noVersion.error?.code, -32600);
+      conn.send({ jsonrpc: "1.0", id: 502, method: "ping" }); // wrong version
+      const wrong = await conn.take((frame) => frame.id === 502 && frame.error !== undefined, "wrong-version error");
+      assert.equal(wrong.error?.code, -32600);
+      conn.send({ jsonrpc: "2.0", id: 503 }); // numeric id but no method
+      const noMethod = await conn.take((frame) => frame.id === 503 && frame.error !== undefined, "no-method error");
+      assert.equal(noMethod.error?.code, -32600);
+    },
+  );
+});
+
+test("an oversize inbound frame drops the socket (mirrors rpc.ts 8 MiB cap) and the cell redials", async () => {
+  const bee = "gw-bigframe";
+  await withConnectedCell(
+    async () => {
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, liveMeta(bee));
+    },
+    async ({ gateway }) => {
+      const first = await gateway.nextConnection();
+      await first.take(isHello, "hello");
+      // A frame past the 8 MiB bound: the cell must close the socket rather than
+      // buffer it unboundedly.
+      first.send({ jsonrpc: "2.0", id: 1, method: "ping", params: "x".repeat(8 * 1024 * 1024 + 16) });
+      // The dropped socket triggers a redial: a fresh connection + hello.
+      const second = await gateway.nextConnection();
+      await second.take(isHello, "re-hello after oversize drop");
+    },
+  );
+});

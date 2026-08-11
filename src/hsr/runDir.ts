@@ -384,7 +384,13 @@ export function __testOnlyHasAppendChain(bee: string): boolean {
  * Durable per-bee event-sequence state (seq.json). `lastSeq` is the highest
  * seq ever issued (the high-water mark a restart resumes above); `ackedSeq` is
  * the consumer high-water mark advanced by ackHsrEvents — compaction may only
- * fold events at or below it (absent = no consumer, today's behavior).
+ * fold events at or below it. `subscribed` is an explicit consumer-active
+ * marker (set by markHsrConsumerSubscribed when the gateway connect transport
+ * engages a subscribe/ack path): while set but before any ack it protects
+ * EVERY stamped event from folding (an effective ack floor of 0), so a
+ * connected-but-un-acked consumer is no longer indistinguishable from true
+ * local-only serve mode. A bee with NEITHER field (no consumer ever) keeps
+ * today's byte-identical size-first fold.
  *
  * This lives in its OWN sidecar file (like restart.json), NOT in meta.json:
  * meta.json is owned by the host lifecycle, which rewrites its in-memory
@@ -393,7 +399,7 @@ export function __testOnlyHasAppendChain(bee: string): boolean {
  * (lost update), and liveness truth must never lose to a counter bump. The
  * sidecar has exactly one writer: the per-bee append chain below.
  */
-export type HsrSeqState = { lastSeq: number; ackedSeq?: number };
+export type HsrSeqState = { lastSeq: number; ackedSeq?: number; subscribed?: boolean };
 
 // In-memory seq state, one entry per bee, owned by the append chain. Seeded
 // once per process from max(seq.json lastSeq, highest stamped seq in
@@ -406,6 +412,18 @@ const seqStates = new Map<string, HsrSeqState>();
 export function __testOnlyResetSeqState(bee?: string): void {
   if (bee === undefined) seqStates.clear();
   else seqStates.delete(bee);
+}
+
+/**
+ * Drop this process's cached seq/size state for a bee. Called when a run dir is
+ * removed (kill) so a later spawn that RECREATES the same bee name in the same
+ * process starts from the on-disk truth instead of inheriting a stale
+ * lastSeq/ackedSeq/size from the deleted incarnation (the in-process cache is
+ * keyed by bee, so same-name reuse would otherwise resurrect a dead cursor).
+ */
+export function forgetHsrRunState(bee: string): void {
+  seqStates.delete(bee);
+  eventLogSizes.delete(bee);
 }
 
 /** Read seq.json back; null when missing/garbage (tolerant like readHsrMeta). */
@@ -422,9 +440,16 @@ export async function readHsrSeqState(bee: string): Promise<HsrSeqState | null> 
     const object = parsed as Record<string, unknown>;
     if (!Number.isSafeInteger(object.lastSeq) || Number(object.lastSeq) < 0) return null;
     if (object.ackedSeq !== undefined && (!Number.isSafeInteger(object.ackedSeq) || Number(object.ackedSeq) < 0)) return null;
+    const lastSeq = object.lastSeq as number;
+    // Clamp a corrupt/stale ackedSeq that somehow exceeds the issued high-water:
+    // an ack can never legitimately outrun lastSeq, and letting it through would
+    // let compaction fold events that were never issued/acked.
+    let ackedSeq = object.ackedSeq as number | undefined;
+    if (ackedSeq !== undefined && ackedSeq > lastSeq) ackedSeq = lastSeq;
     return {
-      lastSeq: object.lastSeq as number,
-      ...(object.ackedSeq !== undefined ? { ackedSeq: object.ackedSeq as number } : {}),
+      lastSeq,
+      ...(ackedSeq !== undefined ? { ackedSeq } : {}),
+      ...(object.subscribed === true ? { subscribed: true } : {}),
     };
   } catch {
     return null;
@@ -465,6 +490,41 @@ function stripSeqFromLine(line: string): string {
 }
 
 /**
+ * Make events.jsonl newline-safe before this process's first append. A crash
+ * mid-append can leave a torn final record (invalid JSON) OR a complete record
+ * that never got its trailing newline; a naive appendFile would then FUSE the
+ * next event's JSON onto that line and every reader would skip the whole fused
+ * line — a SILENT seq hole. Runs once per bee (from loadSeqState, on the
+ * single-writer append chain): a complete-but-unterminated final record is
+ * preserved by terminating its line; a torn partial is truncated away so its
+ * un-landed seq is reissued into a clean line instead of being swallowed.
+ * Returns the repaired content so the caller's max-seq scan sees the truth.
+ */
+async function repairTornEventLogTail(bee: string, raw: string): Promise<string> {
+  const lastNl = raw.lastIndexOf("\n");
+  const tail = raw.slice(lastNl + 1);
+  let complete = false;
+  try {
+    const parsed = JSON.parse(tail) as unknown;
+    complete = !!parsed && typeof parsed === "object";
+  } catch {
+    complete = false; // torn partial — unparseable
+  }
+  const repaired = complete
+    ? `${raw}\n` // whole record, just missing its newline: keep it, terminate the line
+    : lastNl >= 0
+      ? raw.slice(0, lastNl + 1) // drop the torn partial so the next append can't fuse onto it
+      : "";
+  try {
+    await atomicWriteFile(hsrEventsPath(bee), repaired, { mode: 0o600 });
+  } catch {
+    // Best-effort: if the repair write fails the append below still targets the
+    // same file; the scan already reflects `repaired`, so lastSeq is truthful.
+  }
+  return repaired;
+}
+
+/**
  * Load (and cache) a bee's seq state. Called only from the per-bee append
  * chain, so the seed read never races a stamped append. Legacy events.jsonl
  * files (pre-seq) scan to 0, so a fresh upgrade starts issuing at 1 with the
@@ -475,19 +535,27 @@ async function loadSeqState(bee: string): Promise<HsrSeqState> {
   if (cached) return cached;
   const persisted = await readHsrSeqState(bee);
   let maxInLog = 0;
+  let raw: string | undefined;
   try {
-    const raw = await readFile(hsrEventsPath(bee), "utf8");
+    raw = await readFile(hsrEventsPath(bee), "utf8");
+  } catch {
+    raw = undefined; // no events yet — fresh dir
+  }
+  // Newline-safe the tail exactly once per bee before any append lands on it.
+  if (raw !== undefined && raw.length > 0 && !raw.endsWith("\n")) {
+    raw = await repairTornEventLogTail(bee, raw);
+  }
+  if (raw !== undefined) {
     for (const line of raw.split("\n")) {
       if (line.trim().length === 0) continue;
       const seq = seqOfLine(line);
       if (seq !== undefined && seq > maxInLog) maxInLog = seq;
     }
-  } catch {
-    // no events yet — fresh dir
   }
   const state: HsrSeqState = {
     lastSeq: Math.max(persisted?.lastSeq ?? 0, maxInLog),
     ...(persisted?.ackedSeq !== undefined ? { ackedSeq: persisted.ackedSeq } : {}),
+    ...(persisted?.subscribed ? { subscribed: true } : {}),
   };
   seqStates.set(bee, state);
   return state;
@@ -570,15 +638,24 @@ export async function compactHsrEvents(
     keptBytes += lineBytes;
     keepStart -= 1;
   }
-  // Ack-aware floor: never fold an event above the consumer watermark. Only
-  // shrinks the dropped prefix (keeps more), so the byte/line bounds above
-  // remain the ceiling for what IS dropped.
-  const cachedSeqState = seqStates.get(bee);
-  const ackedSeq = cachedSeqState ? cachedSeqState.ackedSeq : (await readHsrSeqState(bee))?.ackedSeq;
-  if (ackedSeq !== undefined) {
+  // Ack-aware floor: never fold an event above the effective consumer
+  // watermark. Only shrinks the dropped prefix (keeps more), so the byte/line
+  // bounds above remain the ceiling for what IS dropped.
+  //   - an explicit ackedSeq → fold only events at or below it;
+  //   - a subscribed-but-un-acked consumer → floor of 0, so EVERY stamped
+  //     event survives (a connected/sleeping consumer that hasn't acked its
+  //     first event is protected, not folded like local-only serve mode);
+  //   - neither (no consumer ever) → undefined, today's byte-identical fold.
+  const seqState = seqStates.get(bee) ?? (await readHsrSeqState(bee)) ?? undefined;
+  let watermark: number | undefined;
+  if (seqState) {
+    if (seqState.ackedSeq !== undefined) watermark = seqState.ackedSeq;
+    else if (seqState.subscribed) watermark = 0;
+  }
+  if (watermark !== undefined) {
     for (let i = 0; i < keepStart; i++) {
       const seq = seqOfLine(lines[i]!);
-      if (seq !== undefined && seq > ackedSeq) {
+      if (seq !== undefined && seq > watermark) {
         keepStart = i;
         break;
       }
@@ -730,10 +807,16 @@ export function appendHsrEvent(bee: string, event: RunnerEvent): Promise<void> {
     .catch(() => undefined)
     .then(async () => {
       const seqState = await loadSeqState(bee);
-      seqState.lastSeq += 1;
-      const stamped: RunnerEvent = { ...event, seq: seqState.lastSeq };
+      // Allocate the next seq as a CANDIDATE, but do not advance the in-memory
+      // high-water until the event has durably landed. A rejected append thus
+      // leaves lastSeq untouched, so the next append REUSES this candidate (a
+      // clean reissue of the un-landed seq) instead of burning it into a silent
+      // cursor hole — never expose a seq as issued before its event is durable.
+      const candidate = seqState.lastSeq + 1;
+      const stamped: RunnerEvent = { ...event, seq: candidate };
       const line = `${JSON.stringify(stamped)}\n`;
       await appendFile(hsrEventsPath(bee), line, { mode: 0o600 });
+      seqState.lastSeq = candidate;
       // Best-effort durability: the stamped event itself is the recovery
       // source of truth, so a failed sidecar write must not fail the append.
       await persistSeqState(bee, seqState).catch(() => undefined);
@@ -786,8 +869,12 @@ export function ackHsrEvents(bee: string, upToSeq: number): Promise<number> {
       // An ack clamped to 0 (nothing issued yet) is a no-op — persisting a
       // 0 watermark would block compaction without protecting any event.
       if (target > (seqState.ackedSeq ?? 0)) {
+        // Persist BEFORE advancing the in-memory watermark: compaction reads the
+        // cached ackedSeq, so mutating it ahead of a rejected sidecar write would
+        // let a later fold drop never-acked events. A rejection here leaves the
+        // cache (and thus the compaction floor) untouched and fails the ack RPC.
+        await persistSeqState(bee, { ...seqState, ackedSeq: target });
         seqState.ackedSeq = target;
-        await persistSeqState(bee, seqState);
       }
       return seqState.ackedSeq ?? 0;
     });
@@ -803,15 +890,75 @@ export function ackHsrEvents(bee: string, upToSeq: number): Promise<number> {
 }
 
 /**
+ * Mark a bee as having an ACTIVE durable consumer (the gateway `connect`
+ * transport engaged a subscribe/ack path), persisted in seq.json. Until the
+ * consumer acks, this protects EVERY stamped event from compaction (an
+ * effective ack floor of 0, see compactHsrEvents) so a connected-but-sleeping
+ * consumer resumes exactly rather than degrading to a gap. Idempotent; runs on
+ * the per-bee append chain (the seq stamping / ack / compaction serialization
+ * domain).
+ *
+ * A genuinely local-only serve-mode bee never engages this path, so its
+ * seq.json carries NO watermark and compaction stays byte-identical to the
+ * pre-cell-transport size-first fold.
+ *
+ * UNBOUNDED-GROWTH NOTE: once subscribed, a consumer that connects but never
+ * acks holds the log above the size cap indefinitely (exact resume trades log
+ * bytes for durability). A consumer-expiry / quota policy is OUT OF SCOPE here;
+ * the operational contract is that a live consumer acks its high-water, and a
+ * gone consumer is reclaimed by killing the bee (which removes the run dir).
+ */
+export function markHsrConsumerSubscribed(bee: string): Promise<void> {
+  const prev = appendChains.get(bee) ?? Promise.resolve();
+  const result = prev
+    .catch(() => undefined)
+    .then(async () => {
+      const seqState = await loadSeqState(bee);
+      if (seqState.subscribed) return; // already active — idempotent
+      await persistSeqState(bee, { ...seqState, subscribed: true });
+      seqState.subscribed = true;
+    });
+  const next = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  appendChains.set(bee, next);
+  void next.then(() => {
+    if (appendChains.get(bee) === next) appendChains.delete(bee);
+  });
+  return result;
+}
+
+/**
  * The events strictly after a consumer's seq cursor, plus an EXPLICIT gap
- * marker when the cursor points below the oldest retained seq (its events were
- * compacted away, or the log itself was lost) — a resuming consumer must never
- * silently diverge. Legacy seq-less events and synthetic compaction
+ * marker when the retained stamped seqs are not the contiguous run the cursor
+ * expects — a compacted-away prefix, an INTERNAL hole (a torn/reissued line),
+ * or a tail lost below seq.json's issued high-water. A resuming consumer must
+ * never silently diverge. Legacy seq-less events and synthetic compaction
  * checkpoints have no cursor identity and are never returned here; they remain
  * reachable through the ts-based tail read (observe.ts readEventTail).
  */
 export type HsrSeqGap = { fromSeq: number; toSeq: number };
 export type HsrEventsAfterSeq = { events: RunnerEvent[]; gap?: HsrSeqGap };
+
+/**
+ * The first break in the contiguous seq run a consumer at `cursor` expects.
+ * Appends never skip a seq, so from cursor+1 the retained stamped seqs must be
+ * cursor+1, cursor+2, … up to the issued high-water; the FIRST missing seq (and
+ * the run of missing seqs before the next retained one, or up to issuedMax when
+ * nothing retained follows) is the gap. `retained` is in file (ascending)
+ * order. Undefined when the run is intact.
+ */
+function firstSeqGap(cursor: number, retained: number[], issuedMax: number): HsrSeqGap | undefined {
+  let expected = cursor + 1;
+  for (const seq of retained) {
+    if (seq < expected) continue; // at/below the cursor, or a duplicate already covered
+    if (seq > expected) return { fromSeq: expected, toSeq: seq - 1 };
+    expected = seq + 1; // seq === expected — the run continues
+  }
+  if (issuedMax >= expected) return { fromSeq: expected, toSeq: issuedMax };
+  return undefined;
+}
 
 /**
  * Read the events with `seq > afterSeq` off a bee's events.jsonl. Reads the
@@ -829,7 +976,7 @@ export async function readHsrEventsAfterSeq(bee: string, afterSeq: number): Prom
     raw = "";
   }
   const events: RunnerEvent[] = [];
-  let oldestRetained: number | undefined;
+  const retained: number[] = []; // stamped seqs in file (ascending) order
   for (const line of raw.split("\n")) {
     if (line.trim().length === 0) continue;
     let event: RunnerEvent;
@@ -842,24 +989,14 @@ export async function readHsrEventsAfterSeq(bee: string, afterSeq: number): Prom
     }
     const seq = event.seq;
     if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0) continue; // seq-less prefix
-    if (oldestRetained === undefined || seq < oldestRetained) oldestRetained = seq;
+    retained.push(seq);
     if (seq > cursor) events.push(event);
   }
-  // Appends never skip a seq (the event lands BEFORE the sidecar write), so a
-  // cursor below oldestRetained-1 means seqs [cursor+1, oldestRetained-1] were
-  // folded away — signal the gap instead of letting the consumer diverge.
-  if (oldestRetained !== undefined && cursor + 1 < oldestRetained) {
-    return { events, gap: { fromSeq: cursor + 1, toSeq: oldestRetained - 1 } };
-  }
-  if (oldestRetained === undefined) {
-    // No stamped events retained at all: if seqs were ever issued past the
-    // cursor, the whole span is gone (log removed / fully folded).
-    const persisted = await readHsrSeqState(bee);
-    if (persisted && persisted.lastSeq > cursor) {
-      return { events, gap: { fromSeq: cursor + 1, toSeq: persisted.lastSeq } };
-    }
-  }
-  return { events };
+  // The issued high-water (seq.json) bounds the trailing-gap check so a tail
+  // lost below lastSeq (retained prefix ends early) is reported too.
+  const persisted = await readHsrSeqState(bee);
+  const gap = firstSeqGap(cursor, retained, persisted?.lastSeq ?? 0);
+  return gap ? { events, gap } : { events };
 }
 
 /** Atomically replace the ring buffer text tail. */

@@ -51,6 +51,7 @@ import {
 } from "./observe.js";
 import {
   ackHsrEvents,
+  forgetHsrRunState,
   hsrRunDir,
   readHsrEventsAfterSeq,
   readHsrMeta,
@@ -758,6 +759,10 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
       } catch {
         return { ok: false, error: `run state removal unconfirmed for ${bee}` };
       }
+      // The run dir is gone: drop this process's cached seq/size state for the
+      // bee so a later same-name spawn starts from on-disk truth, not a stale
+      // lastSeq/ackedSeq inherited from the deleted incarnation.
+      forgetHsrRunState(bee);
       return { ok: true, stdout: "", stderr: "", exitCode: 0 };
     }),
 
@@ -851,8 +856,20 @@ async function main(argv: string[]): Promise<number> {
     const server = await serve(socketPath);
     process.stdout.write(`runner-host serving on ${server.path} (${versionString()})\n`);
     // Keep the process alive until signalled; close the socket cleanly on exit.
+    // Guard against repeated/overlapping SIGINT/SIGTERM starting concurrent
+    // teardowns, and surface a non-zero exit when close REJECTS (an unconfirmed
+    // runner teardown must not be masked as a clean exit).
+    let shuttingDown = false;
     const shutdown = (): void => {
-      void server.close().finally(() => process.exit(0));
+      if (shuttingDown) return;
+      shuttingDown = true;
+      server.close().then(
+        () => process.exit(0),
+        (error) => {
+          process.stderr.write(`runner-host: shutdown close failed: ${messageOf(error)}\n`);
+          process.exit(1);
+        },
+      );
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
@@ -896,11 +913,23 @@ async function main(argv: string[]): Promise<number> {
       runnerHostVersion: versionString(),
     });
     process.stdout.write(`runner-host connecting to ${gatewayUrl} as cell ${cellId} (${versionString()})\n`);
+    // Guard against repeated/overlapping signals, and exit non-zero if the
+    // controller teardown REJECTS rather than masking an unconfirmed runner
+    // teardown behind a clean exit.
+    let shuttingDown = false;
     const shutdown = (): void => {
-      void connection
+      if (shuttingDown) return;
+      shuttingDown = true;
+      connection
         .close()
         .then(() => controller.close())
-        .finally(() => process.exit(0));
+        .then(
+          () => process.exit(0),
+          (error) => {
+            process.stderr.write(`runner-host: shutdown close failed: ${messageOf(error)}\n`);
+            process.exit(1);
+          },
+        );
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
