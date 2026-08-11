@@ -73,6 +73,8 @@ export type TickDeps = {
     fields: Partial<SessionRecord>,
     options?: { probeEvidence?: ProbeEvidence },
   ) => Promise<SessionRecord | null>;
+  /** Clear observer-offline uncertainty after a conclusive local-tmux probe. */
+  markSessionVerified?: (name: string, probe: ProbeEvidence) => Promise<SessionRecord | null>;
   /**
    * Optional mirror of state transitions onto the bee's tmux session as the
    * @hive_state user option (status bars read it live). Best-effort: only
@@ -1077,6 +1079,28 @@ export async function tick(
             }, { probeEvidence: plan.probeEvidence }),
             timeouts.fsMs,
             `touchSession(${record.name})`,
+          );
+        } catch (error) {
+          errors.push(toError(error));
+        }
+      }
+
+      // HSR uncertainty is owned by the birth+meta+socket re-adoption path and
+      // H2 supervisor. A local tmux/pane probe is conclusive on its own; clear
+      // the daemon-offline marker on the first trusted observation so local
+      // bees do not remain unverified for the lifetime of the new daemon.
+      if (
+        record.substrate !== "hsr" &&
+        record.stateUnverified &&
+        plan.probeEvidence.outcome !== "unreachable" &&
+        plan.persistObservation &&
+        deps.markSessionVerified
+      ) {
+        try {
+          await withTimeout(
+            deps.markSessionVerified(record.name, plan.probeEvidence),
+            timeouts.fsMs,
+            `markSessionVerified(${record.name})`,
           );
         } catch (error) {
           errors.push(toError(error));

@@ -8,7 +8,7 @@ import { createIsolatedHsrObservations } from "./observerProcess.js";
 import { createIsolatedSessionLister } from "./sessionListProcess.js";
 import { createIsolatedCredentialSweeper } from "./credentialSweepProcess.js";
 import { createRemoteEventMirror } from "../hsr/remoteEventMirror.js";
-import { appendLedger, type SessionRecord, touchSession } from "../store.js";
+import { appendLedger, markSessionVerified, type SessionRecord, touchSession } from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
 import { createAutoTitleDispatcher } from "./autoTitle.js";
 import { createAuthRecoveryDispatcher } from "./authRecovery.js";
@@ -127,6 +127,7 @@ export function buildDefaultDeps(): TickDeps {
     mirrorRemoteEvents: createRemoteEventMirror(),
     sealedBeeNames,
     touchSession,
+    markSessionVerified,
     mirrorHiveState: async (record, state) => {
       const mapped = hiveStateFor(state);
       if (mapped) await writeHiveState(record, mapped);

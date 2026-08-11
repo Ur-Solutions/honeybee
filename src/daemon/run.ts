@@ -7,6 +7,7 @@ import { appendDaemonLog } from "./log.js";
 import { startHsrControlServer, type HsrControlServer } from "./hsrControl.js";
 import {
   markObserverOffline as markObserverOfflineCursors,
+  prepareBootCursors as prepareBootCursorMarkers,
   reconcileBootReAdoption,
   type AppliedReAdoptionOutcome,
   type CursorMarkerOutcome,
@@ -80,7 +81,9 @@ export type RunDaemonOptions = {
    * and embedders opt in; the `hive daemon run` CLI path enables it.
    */
   sentinel?: boolean;
-  /** Injectable proof-gated boot re-adoption (testing/H2 integration). */
+  /** Injectable cheap pre-tick uncertainty preparation (testing). */
+  prepareBootCursors?: (observerId: string) => Promise<CursorMarkerOutcome[]>;
+  /** Injectable proof-gated post-first-tick re-adoption (testing/H2 integration). */
   bootReAdoption?: (observerId: string) => Promise<AppliedReAdoptionOutcome[]>;
   /** Injectable shutdown uncertainty marker writer (testing). */
   observerOffline?: (info: {
@@ -327,27 +330,34 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   // The most recent budget-abandoned tick, until it settles. `result` carries
   // its late resolution so the next tick can adopt the observed map.
   let abandonedTick: { settled: boolean; result: TickResult | null } | null = null;
+  const prepareCursors = options.prepareBootCursors ?? ((id: string) => prepareBootCursorMarkers({
+    observerId: id,
+    listRecords: deps.listSessions,
+  }));
+  const reAdopt = options.bootReAdoption ?? ((id: string) => reconcileBootReAdoption({
+    observerId: id,
+    markBeforeProbe: false,
+  }));
+  let reAdoptionKicked = false;
   try {
-    // A cold daemon must prove every HSR cursor before the ordinary observation
-    // loop can treat it as current. The sweep first marks the complete set
-    // unverified, then re-adopts exact live host/socket incarnations. Proven
-    // deaths remain marked until H2 persists the required transition event.
+    // Cold boot does only the cheap, durable phase before the first tick. The
+    // expensive PID/socket sweep is deferred until that tick proves the loop
+    // healthy (2026-07-21 canary: a 1000-run-dir boot scan starved it past the
+    // watchdog budget). A kill anywhere after this await leaves idempotent
+    // markers that the next daemon schedules again.
     try {
-      const reAdoption = options.bootReAdoption ?? ((id: string) => reconcileBootReAdoption({ observerId: id }));
-      const outcomes = await reAdoption(observerId);
+      const outcomes = await prepareCursors(observerId);
       await safeLog({
         level: "info",
-        msg: "daemon.readoption.complete",
+        msg: "daemon.readoption.scheduled",
         observerId,
-        verifiedLive: outcomes.filter(({ action }) => action === "verified-live").length,
-        verifiedDead: outcomes.filter(({ action }) => action === "verified-dead").length,
-        deferred: outcomes.filter(({ action }) => action === "death-deferred").length,
-        unverified: outcomes.filter(({ action }) => action === "unverified" || action === "error").length,
+        marked: outcomes.filter(({ status }) => status === "marked").length,
+        errors: outcomes.filter(({ status }) => status === "error").length,
       });
     } catch (error) {
-      const reAdoptionError = toError(error);
-      pushRecentError(state, reAdoptionError);
-      await safeLog({ level: "warn", msg: "daemon.readoption.failed", observerId, error: reAdoptionError.message });
+      const preparationError = toError(error);
+      pushRecentError(state, preparationError);
+      await safeLog({ level: "warn", msg: "daemon.readoption.schedule.failed", observerId, error: preparationError.message });
     }
 
     while (!stopping) {
@@ -426,6 +436,30 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
         }
         for (const entry of logTickResult(result)) {
           await safeLog(entry);
+        }
+        // Kick once, only after a successful first tick, and never await the
+        // scan on the observation loop. Bounded probe concurrency lives in
+        // reconcileBootReAdoption; per-record markers make partial completion
+        // safe across SIGKILL/reinstall.
+        if (!reAdoptionKicked) {
+          reAdoptionKicked = true;
+          void reAdopt(observerId).then(
+            (outcomes) => appendDaemonLog({
+              level: "info",
+              msg: "daemon.readoption.complete",
+              observerId,
+              verifiedLive: outcomes.filter(({ action }) => action === "verified-live").length,
+              verifiedDead: outcomes.filter(({ action }) => action === "verified-dead").length,
+              deferred: outcomes.filter(({ action }) => action === "death-deferred").length,
+              unverified: outcomes.filter(({ action }) => action === "unverified" || action === "error").length,
+            }).catch(() => undefined),
+            (error) => appendDaemonLog({
+              level: "warn",
+              msg: "daemon.readoption.failed",
+              observerId,
+              error: toError(error).message,
+            }).catch(() => undefined),
+          );
         }
       } else if (tickError) {
         pushRecentError(state, tickError);

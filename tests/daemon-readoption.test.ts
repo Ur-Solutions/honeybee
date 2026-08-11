@@ -291,25 +291,36 @@ test("boot marks the complete set unverified before probing and preserves offlin
   const old = record("boot-old") as SessionRecord & { stateUnverified?: UnverifiedCursorMarker };
   old.stateUnverified = existing;
   const fresh = record("boot-fresh");
+  const partial = record("boot-partial") as SessionRecord & { stateUnverified?: UnverifiedCursorMarker };
+  partial.stateUnverified = {
+    since: "2026-08-11T18:59:45.000Z",
+    reason: "stale-cursor",
+    probeScheduledAt: "2026-08-11T18:59:45.000Z",
+  };
   const markers = new Map<string, UnverifiedCursorMarker>();
 
   const outcomes = await markBootCursorsUnverified({
     observerId: "daemon-new",
-    records: [old, fresh],
+    records: [old, fresh, partial],
     markUnverified: async (name, marker) => {
       markers.set(name, marker);
-      return name === old.name ? old : fresh;
+      return name === old.name ? old : name === fresh.name ? fresh : partial;
     },
     now: () => Date.parse(observedAt),
   });
 
-  assert.deepEqual(outcomes.map(({ status }) => status), ["marked", "marked"]);
+  assert.deepEqual(outcomes.map(({ status }) => status), ["marked", "marked", "marked"]);
   assert.deepEqual(markers.get(old.name), { ...existing, probeScheduledAt: observedAt });
   assert.deepEqual(markers.get(fresh.name), {
     since: observedAt,
     reason: "stale-cursor",
     probeScheduledAt: observedAt,
   });
+  assert.deepEqual(markers.get(partial.name), {
+    since: "2026-08-11T18:59:45.000Z",
+    reason: "stale-cursor",
+    probeScheduledAt: observedAt,
+  }, "a daemon killed mid-sweep leaves an idempotent marker whose original gap start survives reboot");
 });
 
 test("restart audit: three live cursors are unverified as one set, then verified with no pid/state transitions", async () => {

@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { readDaemonState } from "../src/daemon/index.js";
+import { prepareBootCursors } from "../src/daemon/reAdoption.js";
 import { runDaemon, type TickResult } from "../src/daemon/run.js";
+import type { SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-daemon-watchdog-"));
@@ -278,7 +280,7 @@ test("sentinel: stays quiet while the heartbeat keeps advancing", async () => {
   assert.deepEqual(killed, []);
 });
 
-test("proof-gated re-adoption runs before the first ordinary daemon tick", async () => {
+test("boot marks cursors first and defers proof-gated re-adoption until after the first healthy tick", async () => {
   await withTempStore(async () => {
     const order: string[] = [];
     await runDaemon({
@@ -287,12 +289,71 @@ test("proof-gated re-adoption runs before the first ordinary daemon tick", async
         order.push("tick");
         return emptyTickResult();
       },
+      prepareBootCursors: async () => {
+        order.push("mark");
+        return [];
+      },
       bootReAdoption: async () => {
         order.push("readopt");
         return [];
       },
       observerOffline: async () => [],
     });
-    assert.deepEqual(order, ["readopt", "tick", "tick"]);
+    assert.deepEqual(order, ["mark", "tick", "readopt", "tick"]);
+  });
+});
+
+test("a 1000-record boot population cannot make the deferred probe sweep block daemon ticks", async () => {
+  await withTempStore(async () => {
+    const records: SessionRecord[] = Array.from({ length: 1_000 }, (_, index) => ({
+      name: `large-${index}`,
+      agent: "stub",
+      cwd: "/tmp",
+      command: "stub",
+      tmuxTarget: `large-${index}`,
+      substrate: "hsr" as const,
+      runnerPid: 10_000 + index,
+      createdAt: "2026-08-11T19:00:00.000Z",
+      updatedAt: "2026-08-11T19:00:00.000Z",
+      status: "running" as const,
+    }));
+    const byName = new Map(records.map((record) => [record.name, record]));
+    let marked = 0;
+    let ticks = 0;
+    let sweepStarted = false;
+    let releaseSweep!: () => void;
+    const sweepGate = new Promise<void>((resolve) => {
+      releaseSweep = resolve;
+    });
+
+    await runDaemon({
+      config: { tickMs: 1, tickBudgetMs: 5_000, watchdogMs: 60_000, maxConsecutiveFailures: 1_000, maxTicks: 3 },
+      tickImpl: async () => {
+        ticks += 1;
+        return emptyTickResult();
+      },
+      prepareBootCursors: (observerId) => prepareBootCursors({
+        observerId,
+        listRecords: async () => records,
+        markUnverified: async (name) => {
+          marked += 1;
+          return byName.get(name) ?? null;
+        },
+        appendAudit: async () => undefined,
+        concurrency: 16,
+      }),
+      bootReAdoption: async () => {
+        sweepStarted = true;
+        await sweepGate;
+        return [];
+      },
+      observerOffline: async () => [],
+    });
+
+    assert.equal(marked, 1_000, "the cheap marker phase covers the complete population");
+    assert.equal(sweepStarted, true, "the proof sweep starts after tick one");
+    assert.equal(ticks, 3, "an arbitrarily slow sweep cannot block later daemon ticks");
+    releaseSweep();
+    await Promise.resolve();
   });
 });

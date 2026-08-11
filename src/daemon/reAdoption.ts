@@ -98,6 +98,12 @@ export type BootCursorMarkerOptions = {
   now?: () => number;
 };
 
+export type PrepareBootCursorsOptions = Omit<BootCursorMarkerOptions, "records" | "markUnverified"> & {
+  listRecords?: () => Promise<SessionRecord[]>;
+  markUnverified?: CursorMarkerWrite;
+  appendAudit?: (event: Record<string, unknown>) => Promise<void>;
+};
+
 export type LiveHsrReAdoptionProbe = Extract<HsrReAdoptionProbe, { classification: "live" }>;
 export type DeadHsrReAdoptionProbe = Extract<HsrReAdoptionProbe, { classification: "dead" }>;
 
@@ -121,6 +127,8 @@ export type BootReAdoptionLifecycleOptions = HsrReAdoptionDependencies & {
   onVerifiedDeath?: (probe: DeadHsrReAdoptionProbe) => Promise<"handled" | "deferred">;
   appendAudit?: (event: Record<string, unknown>) => Promise<void>;
   concurrency?: number;
+  /** Run's cold-boot path already prepared markers before the first tick. */
+  markBeforeProbe?: boolean;
 };
 
 /** Records whose runtime cursor still matters. Archived records never adopt. */
@@ -167,11 +175,11 @@ export async function markObserverOffline(options: ObserverOfflineOptions): Prom
 export async function markBootCursorsUnverified(options: BootCursorMarkerOptions): Promise<CursorMarkerOutcome[]> {
   const scheduledAt = new Date((options.now ?? Date.now)()).toISOString();
   return mapWithConcurrency(
-    options.records.filter(isHsrReAdoptionCandidate),
+    options.records.filter(isObserverCursorCandidate),
     Math.max(1, options.concurrency ?? 16),
     async (record) => {
       const existing = (record as SessionRecord & { stateUnverified?: UnverifiedCursorMarker }).stateUnverified;
-      const marker: UnverifiedCursorMarker = existing?.reason === "observer-offline"
+      const marker: UnverifiedCursorMarker = existing
         ? { ...existing, probeScheduledAt: scheduledAt }
         : {
             since: scheduledAt,
@@ -186,6 +194,32 @@ export async function markBootCursorsUnverified(options: BootCursorMarkerOptions
       }
     },
   );
+}
+
+/**
+ * Cold-boot phase: persist cheap, idempotent uncertainty for every active
+ * cursor. Expensive PID/socket probes deliberately do not run here.
+ */
+export async function prepareBootCursors(
+  options: PrepareBootCursorsOptions,
+): Promise<CursorMarkerOutcome[]> {
+  const records = await (options.listRecords ?? listSessionsStrict)();
+  const outcomes = await markBootCursorsUnverified({
+    observerId: options.observerId,
+    records,
+    markUnverified: options.markUnverified ?? markSessionUnverified,
+    concurrency: options.concurrency,
+    now: options.now,
+  });
+  const appendAudit = options.appendAudit ?? appendLedger;
+  await appendAudit({
+    type: "daemon.readoption.scheduled",
+    observerId: options.observerId,
+    beeCount: outcomes.filter(({ status }) => status === "marked").length,
+    errorCount: outcomes.filter(({ status }) => status === "error").length,
+    errors: outcomes.filter(({ status }) => status === "error").slice(0, 50).map(({ bee, error }) => ({ bee, error })),
+  }).catch(() => undefined);
+  return outcomes;
 }
 
 /**
@@ -204,13 +238,15 @@ export async function reconcileBootReAdoption(
   const concurrency = Math.max(1, options.concurrency ?? 16);
   const now = options.now ?? Date.now;
 
-  const markers = await markBootCursorsUnverified({
-    observerId: options.observerId,
-    records,
-    markUnverified,
-    concurrency,
-    now,
-  });
+  const markers = options.markBeforeProbe === false
+    ? []
+    : await markBootCursorsUnverified({
+        observerId: options.observerId,
+        records,
+        markUnverified,
+        concurrency,
+        now,
+      });
   await appendAudit({
     type: "daemon.readoption.start",
     observerId: options.observerId,

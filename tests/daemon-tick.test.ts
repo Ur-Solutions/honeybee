@@ -15,6 +15,7 @@ import {
 } from "../src/daemon/run.js";
 import type { BeeState, PaneCaptureMap } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
+import type { ProbeEvidence } from "../src/stateMachine.js";
 import type { NodeRecord } from "../src/node.js";
 import { nextRuntimeIncarnationPatch } from "../src/seal.js";
 
@@ -98,6 +99,37 @@ test("tick: no-op on empty sessions", async () => {
     assert.equal(result.observed.size, 0);
     assert.equal(capture.ledger.length, 0);
     assert.equal(capture.touches.length, 0);
+  });
+});
+
+test("the first conclusive local-tmux probe clears a daemon observer-offline marker", async () => {
+  await withTempStore(async () => {
+    const local = bee({
+      stateUnverified: {
+        since: "2026-08-11T19:00:00.000Z",
+        reason: "observer-offline",
+        probeScheduledAt: "2026-08-11T19:00:00.000Z",
+        observer: {
+          observerId: "daemon-old",
+          offlineSince: "2026-08-11T19:00:00.000Z",
+          reason: "upgrade",
+        },
+      },
+    });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records: [local], liveTargets: new Set([local.tmuxTarget]), capture });
+    const verified: Array<{ name: string; probe: ProbeEvidence }> = [];
+    deps.markSessionVerified = async (name, probe) => {
+      verified.push({ name, probe });
+      return local;
+    };
+
+    await tick(deps, new Map());
+
+    assert.equal(verified.length, 1);
+    assert.equal(verified[0]?.name, local.name);
+    assert.equal(verified[0]?.probe.outcome, "alive");
+    assert.equal(verified[0]?.probe.target.substrate, "local-tmux");
   });
 });
 
