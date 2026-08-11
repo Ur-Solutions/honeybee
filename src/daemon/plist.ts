@@ -186,6 +186,9 @@ export function renderSystemdUnit(options: RenderSystemdUnitOptions): string {
     `[Service]`,
     `Type=simple`,
     `ExecStart=${execStart}`,
+    // setsid creates a process group, not a new systemd cgroup. Fence service
+    // teardown to the observer so detached HSR hosts survive upgrades.
+    `KillMode=process`,
     wd.trimEnd(),
     envLines,
     `Restart=always`,

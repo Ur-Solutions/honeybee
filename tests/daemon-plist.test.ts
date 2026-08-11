@@ -185,6 +185,7 @@ test("renderSystemdUnit emits a minimal but complete unit", () => {
   assert.match(unit, /Description=Honeybee hive daemon/);
   assert.match(unit, /^\[Service\]/m);
   assert.match(unit, /ExecStart=\/usr\/bin\/node \/abs\/cli\.js daemon run/);
+  assert.match(unit, /KillMode=process/, "systemd teardown must not kill detached HSR hosts in the daemon cgroup");
   assert.match(unit, /WorkingDirectory=\/home\/test\/\.hive/);
   assert.match(unit, /Environment=HIVE_STORE_ROOT=/);
   assert.match(unit, /Restart=always/);
