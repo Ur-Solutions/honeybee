@@ -9,7 +9,7 @@
  * status stuck "running". Then asserts the recovery path actually stops the
  * child:
  *   - reapDeadHosts kills the orphan group and flips meta to "exited"
- *   - remoteHost.serve() runs that reaper at startup (serve-restart adoption)
+ *   - remoteHost.serve() never runs that destructive reaper at startup
  *   - the remote `kill` RPC signals the child group when the host is gone
  *     (previously it rm'd the run dir and leaked the still-running harness)
  *   - the local substrate kill does the same for a crashed local host
@@ -178,7 +178,7 @@ test("killOrphanedChildGroup is a no-op (false) for a dead group or a meta witho
   assert.equal(await killOrphanedChildGroup(null), false);
 });
 
-test("remoteHost.serve() reaps orphans at startup: a serve restart adopts and kills the leaked harness", async () => {
+test("remoteHost.serve() startup is a non-event for an existing runner cursor", async () => {
   await withTempStore(async (dir) => {
     const bee = "servereap";
     const orphan = spawnOrphan();
@@ -188,12 +188,12 @@ test("remoteHost.serve() reaps orphans at startup: a serve restart adopts and ki
       // runner's meta still says "running" with hostPid = the dead serve's pid.
       await writeOrphanedMeta(bee, orphan.pid as number, dir);
 
-      // A NEW serve starting on the same node must adopt the orphan.
+      // A NEW observer starting on the same node must not infer a bee event.
       server = await serve(join(dir, "control.sock"));
 
-      await waitFor(() => !isPidAlive(orphan.pid as number), "startup reaper killed the orphan");
+      assert.equal(isPidAlive(orphan.pid as number), true, "startup does not signal the runner group");
       const meta = await readHsrMeta(bee);
-      assert.equal(meta?.status, "exited");
+      assert.equal(meta?.status, "running", "startup does not stamp a terminal cursor");
     } finally {
       await server?.close();
       try {
@@ -211,8 +211,7 @@ test("remote kill RPC signals the orphaned child group when the host is gone (an
     let orphan: ChildProcess | undefined;
     const server = await serve(join(dir, "control.sock"));
     try {
-      // Orphan created AFTER serve start, so the startup reaper cannot have
-      // handled it — this exercises the kill path's own fallback.
+      // This exercises the explicit kill path's own proof-gated fallback.
       orphan = spawnOrphan();
       await writeOrphanedMeta(bee, orphan.pid as number, dir);
 
@@ -456,7 +455,7 @@ test("local HSR fallback treats a reused host PID as the old host gone without s
   });
 });
 
-test("remote kill and startup reaper never signal stale host/child numeric identities", async () => {
+test("remote kill and observer startup never signal stale host/child numeric identities", async () => {
   await withTempStore(async (dir) => {
     const bee = "remote-reuse";
     const oldHost = { pgid: 6161, startedAt: "Mon Aug  7 09:00:00 2026" };
@@ -491,8 +490,7 @@ test("remote kill and startup reaper never signal stale host/child numeric ident
     assert.deepEqual(signals, []);
     await controller.close();
 
-    // Recreate the same stale record: serve startup runs reapDeadHosts before
-    // accepting RPCs and must apply the identical fail-closed policy.
+    // Recreate the same stale record: serve startup is observation-only.
     await ensureHsrRunDir(bee);
     await writeHsrMeta(bee, {
       bee,
@@ -509,8 +507,8 @@ test("remote kill and startup reaper never signal stale host/child numeric ident
     });
     const server = await serve(join(dir, "reuse-control.sock"), { processSignals: deps });
     try {
-      assert.deepEqual(signals, [], "startup orphan handling never signals recycled identities");
-      assert.equal((await readHsrMeta(bee))?.status, "exited");
+      assert.deepEqual(signals, [], "observer startup never signals recycled identities");
+      assert.equal((await readHsrMeta(bee))?.status, "running");
     } finally {
       await server.close();
     }

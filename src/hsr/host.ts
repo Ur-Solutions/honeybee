@@ -127,11 +127,21 @@ export async function runHsrHost(params: {
     status: "queued",
     phaseTimingsMs: phaseTimings,
   };
+  // Every host-owned meta write is serialized. In particular, boot
+  // re-adoption may ask a live host to re-publish its in-memory cursor after a
+  // foreign observer falsely stamped disk `exited`. Serializing that repair
+  // with finalize guarantees a concurrently queued real exit always wins.
+  let metaWriteChain = Promise.resolve();
+  const persistMeta = (snapshot: HsrMeta = meta): Promise<void> => {
+    const write = metaWriteChain.then(() => writeHsrMeta(bee, snapshot));
+    metaWriteChain = write.catch(() => undefined);
+    return write;
+  };
   // Never replace an unreadable/corrupt locator with apparently healthy
   // startup state. A valid prior incarnation is expected on revive; lifecycle
   // ownership is responsible for stopping it before this launch.
   await readHsrMetaStrict(bee);
-  await writeHsrMeta(bee, meta);
+  await persistMeta();
 
   let childAdmissionAttempted = false;
   const admitChild = async (identity: { pid: number; pgid: number }): Promise<void> => {
@@ -159,7 +169,7 @@ export async function runHsrHost(params: {
       childFingerprint,
       childAdmission: "admitted",
     };
-    await writeHsrMeta(bee, meta);
+    await persistMeta();
     await params.afterChildAdmission?.(identity);
     await opts.onChildSpawn?.(identity);
   };
@@ -170,7 +180,7 @@ export async function runHsrHost(params: {
     const startAdapter = async (startOpts: RunnerOpts = admittedOpts) => {
       if (meta.startupPhase === "admission") {
         meta = { ...meta, startupPhase: "harness", phaseTimingsMs: phaseTimings };
-        await writeHsrMeta(bee, meta);
+        await persistMeta();
       }
       const adapterStarted = performance.now();
       try {
@@ -237,7 +247,7 @@ export async function runHsrHost(params: {
         endedAt: new Date().toISOString(),
         phaseTimingsMs: phaseTimings,
       };
-      await writeHsrMeta(bee, meta).catch(() => undefined);
+      await persistMeta().catch(() => undefined);
     }
     throw error;
   }
@@ -260,7 +270,7 @@ export async function runHsrHost(params: {
     ...(!publishStartup ? { runningAt: new Date().toISOString() } : {}),
     phaseTimingsMs: phaseTimings,
   };
-  await writeHsrMeta(bee, meta);
+  await persistMeta();
 
   let finalized = false;
   let resolveDone!: () => void;
@@ -319,6 +329,13 @@ export async function runHsrHost(params: {
     // is the independent witness the restart re-adoption sweep uses to heal
     // that stale cursor without confusing it for the runner's own testimony.
     meta: () => meta,
+    // Repair is performed by the process that owns the runtime testimony,
+    // never by the daemon. The serialized write uses the current in-memory
+    // value: if finalize raced, this re-publishes `exited`, not stale `running`.
+    reassertMeta: async () => {
+      await persistMeta();
+      return meta;
+    },
   };
 
   let server: Awaited<ReturnType<typeof startRpcServer>>;
@@ -328,7 +345,7 @@ export async function runHsrHost(params: {
     // Setup failed AFTER the harness child spawned (e.g. an AF_UNIX EINVAL on a
     // too-long socket path). Don't leak the runner: stop it and finalize meta.
     await session.stop().catch(() => undefined);
-    await writeHsrMeta(bee, { ...meta, status: "exited", exitCode: null, endedAt: new Date().toISOString() }).catch(() => undefined);
+    await persistMeta({ ...meta, status: "exited", exitCode: null, endedAt: new Date().toISOString() }).catch(() => undefined);
     throw error;
   }
 
@@ -340,13 +357,13 @@ export async function runHsrHost(params: {
       await withHsrTurnDeliveryLock(bee, async () => {
         phaseTimings.ready = elapsed();
         meta = { ...meta, status: "running", runningAt: new Date().toISOString(), phaseTimingsMs: phaseTimings };
-        await writeHsrMeta(bee, meta);
+        await persistMeta();
         await drainPendingHsrTurns(bee, (turn) => sendTrackedTurn(turn.text, undefined, turn.filename));
       });
     } catch (error) {
       await session.stop().catch(() => undefined);
       await server.close().catch(() => undefined);
-      await writeHsrMeta(bee, {
+      await persistMeta({
         ...meta,
         status: "exited",
         exitCode: null,
@@ -364,7 +381,7 @@ export async function runHsrHost(params: {
     if (finalized) return;
     if (session.sessionId && session.sessionId !== meta.sessionId) {
       meta = { ...meta, sessionId: session.sessionId };
-      await writeHsrMeta(bee, meta).catch(() => undefined);
+      await persistMeta().catch(() => undefined);
     }
   };
   let sessionIdReconcileTimer: NodeJS.Timeout | undefined;
@@ -391,7 +408,7 @@ export async function runHsrHost(params: {
       endedAt: new Date().toISOString(),
       phaseTimingsMs: phaseTimings,
     };
-    await writeHsrMeta(bee, meta).catch(() => undefined);
+    await persistMeta().catch(() => undefined);
     await server.close().catch(() => undefined);
     // Heavy SQLite maintenance is a shutdown concern. Acquire the same home
     // boot lock briefly; if another boot already owns it, skip rather than
@@ -422,7 +439,7 @@ export async function runHsrHost(params: {
         }
         if (timingChanged) {
           meta = { ...meta, phaseTimingsMs: phaseTimings };
-          await writeHsrMeta(bee, meta).catch(() => undefined);
+          await persistMeta().catch(() => undefined);
         }
         if (event.type === "turn_start") {
           openTurns.push({ deliveryId: awaitingTurnStart.shift(), authFailed: false });

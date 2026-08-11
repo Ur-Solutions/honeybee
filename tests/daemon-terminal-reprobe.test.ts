@@ -65,6 +65,11 @@ async function seedMeta(
   });
 }
 
+async function liveControl(disk: HsrMeta) {
+  const { endedAt: _endedAt, exitCode: _exitCode, ...rest } = disk;
+  return { status: "matched" as const, meta: { ...rest, status: "running" as const } };
+}
+
 test("a live runner behind a stale crashed cursor self-heals within one sweep", async () => {
   await withTempStore(async () => {
     const bee = "reprobe-heals";
@@ -75,6 +80,7 @@ test("a live runner behind a stale crashed cursor self-heals within one sweep", 
     const outcomes = await reprobeTerminalCursors({
       isHostAlive: () => true,
       inspectHost: async () => "match",
+      probeControl: liveControl,
     });
 
     assert.deepEqual(outcomes, [{ bee, action: "healed", clearedState: "crashed" }]);
@@ -137,6 +143,7 @@ test("only the false-crash class heals: deliberate terminal cursors and exited m
     const outcomes = await reprobeTerminalCursors({
       isHostAlive: () => true,
       inspectHost: async () => "match",
+      probeControl: liveControl,
     });
 
     assert.deepEqual(outcomes, []);
@@ -159,6 +166,8 @@ test("a mis-reaped exited meta with a verifiably live host restores to running, 
     const outcomes = await reprobeTerminalCursors({
       isHostAlive: () => true,
       inspectHost: async () => "match",
+      probeControl: liveControl,
+      writeMeta: async (name, repaired) => writeHsrMeta(name, repaired),
       now: () => nowMs,
     });
 
@@ -173,6 +182,23 @@ test("a mis-reaped exited meta with a verifiably live host restores to running, 
     const healed = await loadSession(bee);
     assert.equal(healed?.lastObservedState, undefined, "the record cursor heals in the same pass");
     assert.equal(isActiveSessionRecord(healed!), true);
+  });
+});
+
+test("birth match without the same live control socket cannot heal a false crash", async () => {
+  await withTempStore(async () => {
+    const bee = "reprobe-socket-absent";
+    await saveSession(record(bee));
+    await seedMeta(bee);
+
+    const outcomes = await reprobeTerminalCursors({
+      isHostAlive: () => true,
+      inspectHost: async () => "match",
+      probeControl: async () => ({ status: "absent", detail: "no socket at path" }),
+    });
+
+    assert.deepEqual(outcomes, []);
+    assert.equal((await loadSession(bee))?.lastObservedState, "crashed");
   });
 });
 

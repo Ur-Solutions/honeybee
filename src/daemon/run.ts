@@ -1,11 +1,16 @@
 import type { ChildProcess } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { acquireLongLivedLock, type LongLivedLock, LockBusyError } from "../fsx.js";
-import { reapDeadHosts } from "../hsr/observe.js";
 import type { BeeState } from "../state.js";
 import { appendLedger } from "../store.js";
 import { appendDaemonLog } from "./log.js";
 import { startHsrControlServer, type HsrControlServer } from "./hsrControl.js";
+import {
+  markObserverOffline as markObserverOfflineCursors,
+  reconcileBootReAdoption,
+  type AppliedReAdoptionOutcome,
+  type CursorMarkerOutcome,
+} from "./reAdoption.js";
 import {
   DAEMON_VERSION,
   daemonLockPath,
@@ -75,8 +80,14 @@ export type RunDaemonOptions = {
    * and embedders opt in; the `hive daemon run` CLI path enables it.
    */
   sentinel?: boolean;
-  /** Injectable crash-adoption reap (testing); defaults to reapDeadHosts. */
-  bootReap?: () => Promise<string[]>;
+  /** Injectable proof-gated boot re-adoption (testing/H2 integration). */
+  bootReAdoption?: (observerId: string) => Promise<AppliedReAdoptionOutcome[]>;
+  /** Injectable shutdown uncertainty marker writer (testing). */
+  observerOffline?: (info: {
+    observerId: string;
+    reason: string;
+    lastSeenAt: string;
+  }) => Promise<CursorMarkerOutcome[]>;
 };
 
 export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
@@ -99,6 +110,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   }
 
   const startedAt = new Date().toISOString();
+  const observerId = `daemon:${process.pid}:${startedAt}`;
   const state: DaemonState = {
     startedAt,
     lastTickAt: null,
@@ -181,20 +193,6 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   } catch (error) {
     await appendDaemonLog({ level: "warn", msg: "hsr.control.start.failed", error: error instanceof Error ? error.message : String(error) });
   }
-
-  // Crash adoption v1 (reapDeadHosts): reconcile HSR bees whose meta says
-  // "running" but whose host pid is dead. DEFERRED until after the FIRST
-  // SUCCESSFUL tick (2026-07-21 canary, round 2): merely detaching it was not
-  // enough — the scan is ~1000 run-dir reads plus main-thread JSON parsing in
-  // THIS process, and launched at boot it raced the cold first tick for the
-  // event loop and fs pool, starving it past the 120s budget into the breach
-  // cycle the detach was meant to fix (two post-patch pids breached exactly
-  // this way; verified via process sampling). Adoption is not urgent — the
-  // tick's per-bee observation reaches the same verdict — so it now waits for
-  // the loop to prove one healthy tick first. The kick lives in the loop body
-  // below; nothing runs here.
-  const bootReap = options.bootReap ?? reapDeadHosts;
-  let bootReapKicked = false;
 
   if (options.shutdownSignal) {
     if (options.shutdownSignal.aborted) {
@@ -330,6 +328,28 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   // its late resolution so the next tick can adopt the observed map.
   let abandonedTick: { settled: boolean; result: TickResult | null } | null = null;
   try {
+    // A cold daemon must prove every HSR cursor before the ordinary observation
+    // loop can treat it as current. The sweep first marks the complete set
+    // unverified, then re-adopts exact live host/socket incarnations. Proven
+    // deaths remain marked until H2 persists the required transition event.
+    try {
+      const reAdoption = options.bootReAdoption ?? ((id: string) => reconcileBootReAdoption({ observerId: id }));
+      const outcomes = await reAdoption(observerId);
+      await safeLog({
+        level: "info",
+        msg: "daemon.readoption.complete",
+        observerId,
+        verifiedLive: outcomes.filter(({ action }) => action === "verified-live").length,
+        verifiedDead: outcomes.filter(({ action }) => action === "verified-dead").length,
+        deferred: outcomes.filter(({ action }) => action === "death-deferred").length,
+        unverified: outcomes.filter(({ action }) => action === "unverified" || action === "error").length,
+      });
+    } catch (error) {
+      const reAdoptionError = toError(error);
+      pushRecentError(state, reAdoptionError);
+      await safeLog({ level: "warn", msg: "daemon.readoption.failed", observerId, error: reAdoptionError.message });
+    }
+
     while (!stopping) {
       if (config.maxTicks !== undefined && state.tickCount >= config.maxTicks) break;
       supervisor.beat();
@@ -398,17 +418,6 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
                 ageMs: outcome.staleQueue.ageMs,
               }]
             : []);
-        // Crash-adoption reap: kicked exactly once, only after the loop has
-        // PROVEN one healthy tick — never racing the cold boot tick for the
-        // event loop (2026-07-21 canary round 2).
-        if (!bootReapKicked) {
-          bootReapKicked = true;
-          void bootReap()
-            .then((reaped) =>
-              reaped.length > 0 ? appendDaemonLog({ level: "info", msg: "hsr.reaped", bees: reaped }).catch(() => undefined) : undefined,
-            )
-            .catch(() => undefined);
-        }
         // Record every partial-tick error into recentErrors, then flush the
         // tick's log fan-out (partials, transitions, dispatcher outcomes) in a
         // fixed order — see logTickResult().
@@ -469,6 +478,32 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     }
   } finally {
     supervisor.stop();
+    // Daemon shutdown is observer evidence only. Never infer or bulk-write a
+    // bee terminal state here; the next daemon will re-probe these markers.
+    try {
+      const writeOffline = options.observerOffline ?? ((info) => markObserverOfflineCursors(info));
+      const outcomes = await writeOffline({
+        observerId,
+        reason: stopReason,
+        lastSeenAt: state.lastSuccessfulTickAt ?? startedAt,
+      });
+      await appendLedger({
+        type: "daemon.observer-offline",
+        observerId,
+        offlineSince: new Date().toISOString(),
+        reason: stopReason,
+        beeCount: outcomes.filter(({ status }) => status === "marked").length,
+        errorCount: outcomes.filter(({ status }) => status === "error").length,
+        errors: outcomes.filter(({ status }) => status === "error").slice(0, 50).map(({ bee, error }) => ({ bee, error })),
+      }).catch(() => undefined);
+    } catch (error) {
+      await appendDaemonLog({
+        level: "warn",
+        msg: "daemon.observer-offline.failed",
+        observerId,
+        error: toError(error).message,
+      }).catch(() => undefined);
+    }
     // Closing the isolated worker cancels any active credential work. The
     // single-flight controller retains a non-isolated late promise until it
     // settles, but shutdown never waits indefinitely for it.

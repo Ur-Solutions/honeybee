@@ -46,7 +46,6 @@ import {
   inspectHsrHostProcess,
   pendingNeedsInput,
   readEventTail,
-  reapDeadHosts,
   type HsrProcessSignalDependencies,
 } from "./observe.js";
 import {
@@ -809,12 +808,10 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
 
 /** Start the runner-host control socket. Returns an RpcServer whose close also tears down the controller. */
 export async function serve(socketPath: string, options: RunnerHostControllerOptions = {}): Promise<RpcServer> {
-  // Startup reaper (HIVE-53): a previous serve that died without finalize
-  // (SIGKILL/OOM) left its in-process runners' meta "running" with hostPid =
-  // the dead serve's pid and their detached harness children orphaned. Adopt
-  // them before accepting control traffic: kill the orphaned child groups and
-  // flip their meta so the control plane restarts from a truthful view.
-  await reapDeadHosts(options.processSignals).catch(() => undefined);
+  // Starting an observer is not a bee event. In particular, never run the old
+  // bulk orphan reaper here: a locale-dependent birth mismatch during a
+  // reinstall killed live runners and stamped their metas exited. The daemon's
+  // proof-gated re-adoption/supervision path owns any later recovery action.
   const controller = buildController(options);
   const server = await startRpcServer({ socketPath, methods: controller.methods });
   controller.attachServer(server);
@@ -901,9 +898,8 @@ async function main(argv: string[]): Promise<number> {
       process.stderr.write(`runner-host connect: env var ${tokenEnv} is empty (the gateway bearer token)\n`);
       return 2;
     }
-    // Same startup reaper as serve: adopt runners orphaned by a previous
-    // SIGKILLed/OOMed host before accepting control traffic.
-    await reapDeadHosts().catch(() => undefined);
+    // Connecting a new observer must not signal runners or stamp their metas.
+    // Proof-gated re-adoption happens in the daemon/supervisor state machine.
     const controller = buildController();
     const connection = connectToGateway({
       gatewayUrl,

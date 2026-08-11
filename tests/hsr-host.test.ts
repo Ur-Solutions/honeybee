@@ -172,7 +172,12 @@ test("runner-host: spawn+turn, sessionId, needs_input, snapshot, liveness, stop"
         "running",
         "a foreign disk cursor cannot rewrite the live host's testimony",
       );
-      await writeHsrMeta(bee, ownedMeta!);
+      assert.equal(
+        ((await client.call("reassertMeta")) as Awaited<ReturnType<typeof readHsrMeta>>)?.status,
+        "running",
+        "the host re-publishes its own current testimony",
+      );
+      assert.equal((await readHsrMeta(bee))?.status, "running", "the false exit stamp is healed on disk");
 
       // 5. liveness + stop.
       const liveBefore = await hsrLiveness();

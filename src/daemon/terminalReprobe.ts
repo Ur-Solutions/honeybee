@@ -1,29 +1,28 @@
 /**
  * Terminal-cursor re-probe (cell-smoothness Phase 2).
  *
- * A record whose lastObservedState is terminal (crashed/dead) is de-indexed
- * from the daemon work set (store.ts isActiveSessionRecord) and therefore
- * never re-observed by the tick — one false crash observation is
- * self-sustaining forever, even while the bee's HSR host is demonstrably
- * alive (2026-08-10: six live bees hand-repaired out of exactly this state).
+ * Legacy false crash cursors remain probeable, but they still need a bounded
+ * periodic correction path for mixed-version writers.
  *
- * This sweep is reapDeadHosts' inverse, on both layers: reap flips
- * live-mismatch METAS to exited; this restores a mis-reaped exited META to
- * running and clears a stale terminal RECORD cursor when the meta's exact
- * host incarnation verifiably lives (birth-fingerprint probe, locale-
- * tolerant). Clearing the cursor puts the record back in the active index,
- * so the next tick re-observes it and truth re-propagates on its own.
+ * A repair requires both an exact host birth and the same incarnation's live
+ * control-socket testimony. False exited metadata is re-published by the host
+ * itself; the daemon never writes a cached running cursor.
  *
- * Cheap by construction: metas are read first (run-dir scan the boot reap
- * already pays), a dead host pid short-circuits before any record load, and
- * the whole sweep is throttled to one pass per interval.
+ * The whole sweep is throttled to one pass per interval.
  */
 
 import { defaultIsPidAlive } from "../fsx.js";
 import { inspectHsrHostProcess, listHsrBees } from "../hsr/observe.js";
-import { readHsrMetaStrict, writeHsrMeta, type HsrMeta } from "../hsr/runDir.js";
+import { readHsrMetaStrict, type HsrMeta } from "../hsr/runDir.js";
 import type { ProcessIdentityVerdict } from "../hsr/processIdentity.js";
-import { isActiveSessionRecord, loadSession, updateSession, type SessionRecord, type UpdateSessionOptions } from "../store.js";
+import type { ProbeEvidence } from "../stateMachine.js";
+import { isActiveSessionRecord, loadSession, markSessionVerified, type SessionRecord } from "../store.js";
+import {
+  probeHsrControl,
+  reassertHsrControlMeta,
+  sameHsrHostIncarnation,
+  type HsrControlProbe,
+} from "./reAdoption.js";
 import { envMs } from "./timeouts.js";
 
 export type TerminalReprobeOutcome = {
@@ -37,11 +36,14 @@ export type TerminalReprobeOutcome = {
 export type TerminalReprobeDependencies = {
   listBees?: () => Promise<string[]>;
   readMeta?: (bee: string) => Promise<HsrMeta | null>;
+  /** @deprecated test seam; production repairs through the host RPC. */
   writeMeta?: (bee: string, meta: HsrMeta) => Promise<void>;
   loadRecord?: (name: string) => Promise<SessionRecord | null>;
-  updateRecord?: (name: string, patch: Partial<SessionRecord>, options?: UpdateSessionOptions) => Promise<SessionRecord | null>;
+  markVerified?: (name: string, probe: ProbeEvidence) => Promise<SessionRecord | null>;
   isHostAlive?: (pid: number) => boolean;
   inspectHost?: (meta: HsrMeta) => Promise<ProcessIdentityVerdict>;
+  probeControl?: (meta: HsrMeta) => Promise<HsrControlProbe>;
+  repairMeta?: (expected: HsrMeta) => Promise<HsrMeta>;
   intervalMs?: number;
   /** Minimum age of an exited stamp before the inverse meta heal may act. */
   metaRestoreGraceMs?: number;
@@ -78,10 +80,20 @@ export async function reprobeTerminalCursors(
       // Mirrors have no local pid to fingerprint-verify; their status is the
       // remoteEventMirror's to own on both sides of this sweep.
       if (!meta || meta.mirrorOfNode) continue;
-      // Numeric-pid pre-filter: a dead host cannot heal anything (that is
-      // reapDeadHosts' territory) and must never resurrect a record or meta.
+      const record = await (deps.loadRecord ?? loadSession)(bee);
+      if (!record || record.substrate !== "hsr" || record.status !== "running") continue;
+      if (record.runnerPid !== undefined && record.runnerPid !== meta.hostPid) continue;
+      // Cheap numeric pre-filter only skips obvious dead hosts. It never proves
+      // life; birth identity plus the control socket below do that.
       if (!(deps.isHostAlive ?? defaultIsPidAlive)(meta.hostPid)) continue;
-      let verdict: ProcessIdentityVerdict | undefined;
+      const verdict = await (deps.inspectHost ? deps.inspectHost(meta) : inspectHsrHostProcess(meta));
+      if (verdict !== "match") continue;
+      const control = await (deps.probeControl ?? probeHsrControl)(meta);
+      if (
+        control.status !== "matched" ||
+        control.meta.status === "exited" ||
+        !sameHsrHostIncarnation(meta, control.meta)
+      ) continue;
       // Inverse meta heal — reapDeadHosts' converse: a meta stamped `exited`
       // while its exact recorded host incarnation verifiably lives is a
       // mis-reap (2026-08-10: a daemon-env locale flip made the boot reap
@@ -92,11 +104,13 @@ export async function reprobeTerminalCursors(
       if (meta.status === "exited" && !meta.startupFailure) {
         const endedAtMs = meta.endedAt ? Date.parse(meta.endedAt) : Number.NaN;
         if (!Number.isFinite(endedAtMs) || now() - endedAtMs < graceMs) continue;
-        verdict = await (deps.inspectHost ? deps.inspectHost(meta) : inspectHsrHostProcess(meta));
-        if (verdict !== "match") continue;
-        const { endedAt: _endedAt, exitCode: _exitCode, ...rest } = meta;
-        meta = { ...rest, status: "running" };
-        await (deps.writeMeta ?? writeHsrMeta)(bee, meta);
+        if (deps.writeMeta) {
+          await deps.writeMeta(bee, control.meta);
+          meta = control.meta;
+        } else {
+          meta = await (deps.repairMeta ?? reassertHsrControlMeta)(control.meta);
+        }
+        if (meta.status === "exited") continue;
         outcomes.push({ bee, action: "meta-restored" });
         // Fall through: the restored meta can now clear a stale record cursor
         // in this same pass instead of waiting a full sweep interval.
@@ -104,32 +118,22 @@ export async function reprobeTerminalCursors(
       // Only a local host claiming "running" can contradict a terminal record
       // cursor.
       if (meta.status !== "running") continue;
-      const record = await (deps.loadRecord ?? loadSession)(bee);
-      if (!record || record.substrate !== "hsr" || record.status !== "running") continue;
       if (!REPROBE_TERMINAL_STATES.has(record.lastObservedState ?? "")) continue;
       if (record.recoveryRequestedAt) continue;
       // Terminal-marked active records deliberately remain in the work set.
       // This inverse sweep may still heal them immediately; the ordinary tick
       // is the second path that will converge the same verified truth.
       if (!isActiveSessionRecord(record)) continue;
-      // Birth-fingerprint proof of life for the EXACT recorded incarnation.
-      // gone/mismatch/unverifiable are not proof — leave the cursor alone.
-      verdict ??= await (deps.inspectHost ? deps.inspectHost(meta) : inspectHsrHostProcess(meta));
-      if (verdict !== "match") continue;
-      const healed = await (deps.updateRecord ?? updateSession)(bee, {
-        lastObservedState: undefined,
-        lastObservedStateAt: undefined,
-      }, {
-        probeEvidence: {
-          kind: "probe",
-          probeId: `terminal-reprobe:${bee}:${now()}`,
-          observerId: "terminal-reprobe",
-          observedAt: new Date(now()).toISOString(),
-          outcome: "alive",
-          target: { substrate: "hsr", ...(record.node ? { node: record.node } : {}), runnerPid: meta.hostPid },
-          detail: "host birth fingerprint matched the recorded runtime",
-        },
-      });
+      const evidence: ProbeEvidence = {
+        kind: "probe",
+        probeId: `terminal-reprobe:${bee}:${now()}`,
+        observerId: "terminal-reprobe",
+        observedAt: new Date(now()).toISOString(),
+        outcome: "alive",
+        target: { substrate: "hsr", ...(record.node ? { node: record.node } : {}), runnerPid: meta.hostPid },
+        detail: "host birth matched; control socket owned the same live incarnation",
+      };
+      const healed = await (deps.markVerified ?? markSessionVerified)(bee, evidence);
       if (healed) {
         outcomes.push({ bee, action: "healed", clearedState: record.lastObservedState! });
       }

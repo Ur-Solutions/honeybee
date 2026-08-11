@@ -278,27 +278,21 @@ test("sentinel: stays quiet while the heartbeat keeps advancing", async () => {
   assert.deepEqual(killed, []);
 });
 
-test("canary round 2: crash-adoption reap runs only AFTER the first successful tick", async () => {
+test("proof-gated re-adoption runs before the first ordinary daemon tick", async () => {
   await withTempStore(async () => {
     const order: string[] = [];
-    let reapStarted: Promise<void> | null = null;
     await runDaemon({
       config: { tickMs: 5, tickBudgetMs: 5_000, watchdogMs: 60_000, maxConsecutiveFailures: 1_000, maxTicks: 2 },
       tickImpl: async () => {
         order.push("tick");
         return emptyTickResult();
       },
-      bootReap: async () => {
-        order.push("reap");
-        reapStarted = Promise.resolve();
+      bootReAdoption: async () => {
+        order.push("readopt");
         return [];
       },
+      observerOffline: async () => [],
     });
-    // Give the detached reap a beat to run if it was going to.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.ok(reapStarted !== null, "the reap did run");
-    const firstTick = order.indexOf("tick");
-    const firstReap = order.indexOf("reap");
-    assert.ok(firstTick >= 0 && firstReap > firstTick, `reap must follow the first successful tick (order: ${order.join(",")})`);
+    assert.deepEqual(order, ["readopt", "tick", "tick"]);
   });
 });
