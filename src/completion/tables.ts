@@ -45,7 +45,7 @@ export const HIVE_STATE_VALUES = ["waiting", "done", "failed", "working"];
 // BeeView display states (view/types.ts BeeDisplayState), for `hive state ls --state`.
 export const DISPLAY_STATE_VALUES = [
   "retired", "needs-auth", "needs-reply", "needs-action", "stop-failed",
-  "crashed", "unreachable", "starting", "working", "ready", "offline",
+  "crashed", "unreachable", "starting", "recovering", "working", "ready", "offline",
 ];
 export const BUZ_TIERS: readonly string[] = CANONICAL_BUZ_TIERS;
 export const TASK_STATUS_VALUES: readonly string[] = TASK_STATUSES;

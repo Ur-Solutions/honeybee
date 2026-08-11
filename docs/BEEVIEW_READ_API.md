@@ -6,10 +6,30 @@ Related: [ADR 001](./adr/001-bee-runtime-turn-state-model.md) (consumer
 contract), [Assessment](./STATE_MODEL_V2_ASSESSMENT.md) (§4 steps 3-6)
 
 BeeView is a versioned, Honeybee-owned read model: a pure projection of
-current stores (SessionRecord JSON, derived `BeeState`, tmux `@hive_state`,
+current stores (SessionRecord JSON, the bounded state cursor, derived `BeeState`, tmux `@hive_state`,
 HSR run dirs, seals) into structured facts. Library-first with a CLI mirror
 (`hive state explain` / `hive state ls`). No new persisted state, no writes,
-no daemon requirement; staleness is surfaced, never hidden.
+no daemon requirement; staleness is surfaced, never hidden. The 2026-08-11
+bounded-state extension is additive within schemaVersion 1: existing fields
+retain their spelling and meaning.
+
+### 2026-08-11 bounded-state extension
+
+- Internal lifecycle (`active | archived`) and runtime
+  (`live | parked | recovering | lost`) facts are exposed as
+  `bee.lifecycleState` and `latestRuntime.runtimeState`. They do not create a
+  second consumer vocabulary: attention remains `displayState` plus
+  `openRequests`.
+- `displayState` adds `recovering`, presented as working-flavoured. A parked
+  runtime projects as ordinary `ready`; parking is visible only in the runtime
+  diagnostic axis.
+- Recovery-budget exhaustion projects a `manual-action` request under the
+  transition's durable request id. A request-store row under that id remains
+  authoritative; the transition cursor is the daemon-down fallback.
+- Every projection carries `verification.unverified`. An observer-offline or
+  stale-cursor marker includes `unverifiedSince`, the scheduled probe time,
+  and optional observer details. It never changes lifecycle, runtime,
+  displayState, or requests.
 
 ## Decisions folded into this design (2026-07-28)
 
@@ -96,6 +116,8 @@ export type BeeViewBee = {
    * lifecycle (ADR invariant 10). Its seal appears in latestContractResult.
    */
   lifecycle: "active" | "retired";
+  /** Bounded axis. lifecycle above is retained for compatibility. */
+  lifecycleState: "active" | "archived";
   createdAt: string;
   updatedAt: string;
   contract?: BeeContract;
@@ -114,6 +136,8 @@ export type BeeViewRuntime = {
    * unknown  — node unreachable or observation unavailable this pass
    */
   state: "starting" | "online" | "exited" | "unknown";
+  /** Bounded runtime axis; parked never becomes a display state. */
+  runtimeState: "live" | "parked" | "recovering" | "lost";
   substrate: "local-tmux" | "hsr";
   tmuxTarget?: string;
   agentPaneId?: string;
@@ -238,6 +262,7 @@ export type BeeDisplayState =
   | "crashed"
   | "unreachable"
   | "starting"
+  | "recovering"
   | "working"
   | "ready"
   | "offline";
@@ -259,6 +284,20 @@ export type BeeViewObservationFreshness = {
   observedLive: boolean;
   /** The daemon is NOT required; this reports whether its cache was current. */
   sources: ObservationSourceFreshness[];
+};
+
+export type BeeViewVerification = {
+  unverified: boolean;
+  unverifiedSince?: string;
+  reason?: "stale-cursor" | "observer-offline";
+  probeScheduledAt?: string;
+  lastVerifiedAt?: string;
+  observerOffline?: {
+    observerId: string;
+    offlineSince: string;
+    lastSeenAt?: string;
+    reason: string;
+  };
 };
 
 /** Verbatim legacy fields so consumers migrate additively. */
@@ -287,6 +326,7 @@ export type BeeViewV1 = {
   /** The precedence rule that produced displayState (for `state explain`). */
   displayStateReason: string;
   observationFreshness: BeeViewObservationFreshness;
+  verification: BeeViewVerification;
   lastProjectedAt: string;
   compatibilityFields: BeeViewCompatibilityFields;
 };
@@ -313,7 +353,9 @@ export type BeeViewListV1 = {
   `wedged`/`error` → `needs-action` with a synthesized observer-grade
   manual-action request (id `manual:<bee>:<gen>:wedged`); `kill_failed` →
   `stop-failed`; `node_unreachable` → `unreachable` (with the caveat that
-  today's node probe is not a heartbeat contract — graded observer).
+   today's node probe is not a heartbeat contract — graded observer).
+  A bounded runtime in `recovering` projects as `recovering`; `parked`
+  projects as `ready` and is intentionally absent from displayState.
 - `openRequests` sources, STORE-FIRST (docs/INTERVENTION_REQUESTS.md):
   0. durable request-store records with status `open` and the CURRENT
      generation project verbatim (authoritative). An
@@ -338,6 +380,10 @@ export type BeeViewListV1 = {
   closed records, newest first.
 - Library calls never write: no `touchSession`, no `@hive_state` mirroring,
   no ledger appends. The daemon remains the only observer that persists.
+- Missing observation is not a state transition. `stateUnverified` is copied
+  into `verification` on every projection while the window remains open; the
+  last-known axes and display state are held until a conclusive probe clears
+  the marker.
 
 ## 2. Honeybee module layout
 
@@ -403,7 +449,8 @@ trigger; what changes is what a notification reads.
 hive state ls [selector] [--state <display>] [--colony c] [--node n] [--done] [--json]
     STATE(display, glyph-colored)  REF  NAME  REQS  RESULT  FRESH  DETAIL
     REQS = "1 reply" / "auth" / "-"; RESULT = "responded 3m" / "seal ok" / "-"
-    FRESH = worst source status ("live" / "stale 2d" / "held")
+    FRESH = worst source status ("live" / "stale 2d" / "held" /
+            "unverified 3m")
     --json = BeeViewListV1 verbatim.
 
 hive state explain <bee> [--json]

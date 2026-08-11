@@ -3,6 +3,7 @@ import type { NodeRecord } from "../node.js";
 import type { HsrObservation } from "../hsr/observe.js";
 import { deriveState, isTerminalState, liveTargetKey, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
 import { shouldPersistObservationHeartbeat, type SessionRecord } from "../store.js";
+import type { ProbeEvidence } from "../stateMachine.js";
 import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AuthRecoveryOutcome } from "./authRecovery.js";
 import type { RotationResumeOutcome } from "./rotationResume.js";
@@ -67,7 +68,11 @@ export type TickDeps = {
   mirrorRemoteEvents?: ((records: SessionRecord[]) => Promise<void>) & { close?: () => Promise<void> };
   sealedBeeNames: (records: readonly SessionRecord[]) => Promise<Set<string>>;
   /** Atomically persist observed state without ledger. */
-  touchSession: (name: string, fields: Partial<SessionRecord>) => Promise<SessionRecord | null>;
+  touchSession: (
+    name: string,
+    fields: Partial<SessionRecord>,
+    options?: { probeEvidence?: ProbeEvidence },
+  ) => Promise<SessionRecord | null>;
   /**
    * Optional mirror of state transitions onto the bee's tmux session as the
    * @hive_state user option (status bars read it live). Best-effort: only
@@ -1034,6 +1039,7 @@ export async function tick(
     return {
       record,
       state: derived.state,
+      probeEvidence: daemonProbeEvidence(record, derived.state, context, observedAtIso),
       // Terminal history is immutable. Its lifecycle status is authoritative,
       // so do not take a lock/read/write trip for a freshness timestamp that no
       // consumer should use. Meaningful lifecycle mutations revive the record
@@ -1068,7 +1074,7 @@ export async function tick(
             deps.touchSession(record.name, {
               lastObservedState: plan.state,
               lastObservedStateAt: observedAtIso,
-            }),
+            }, { probeEvidence: plan.probeEvidence }),
             timeouts.fsMs,
             `touchSession(${record.name})`,
           );
@@ -1192,6 +1198,36 @@ export async function tick(
     durationMs: Math.max(0, deps.now() - start),
     stageMs,
     truncated,
+  };
+}
+
+function daemonProbeEvidence(
+  record: SessionRecord,
+  state: BeeState,
+  context: StateContext,
+  observedAt: string,
+): ProbeEvidence {
+  const unreachable = record.node ? context.unreachableNodes?.has(record.node) === true : false;
+  const hsrObserved = record.substrate === "hsr" || context.hsrMirrors?.has(record.name);
+  const targetLive = context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) ||
+    context.liveTargets.has(record.tmuxTarget);
+  const paneLive = record.agentPaneId ? context.livePanes?.has(record.agentPaneId) === true : false;
+  const live = hsrObserved ? context.hsrLive?.has(record.name) === true : targetLive || paneLive;
+  const outcome = unreachable || state === "node_unreachable" ? "unreachable" : live ? "alive" : "dead";
+  return {
+    kind: "probe",
+    probeId: `daemon:${record.name}:${record.runtimeGeneration ?? 0}:${observedAt}`,
+    observerId: "hive-daemon",
+    observedAt,
+    outcome,
+    target: {
+      substrate: record.substrate ?? "local-tmux",
+      ...(record.node ? { node: record.node } : {}),
+      ...(record.substrate !== "hsr" ? { tmuxTarget: record.tmuxTarget } : {}),
+      ...(record.agentPaneId ? { agentPaneId: record.agentPaneId } : {}),
+      ...(record.runnerPid ? { runnerPid: record.runnerPid } : {}),
+    },
+    detail: `daemon derived ${state}`,
   };
 }
 

@@ -84,15 +84,18 @@ test("active index scales at 100/1k/3k/10k with 95% terminal history", { timeout
         const active = await listActiveSessionsHot();
         const hotMs = performance.now() - hotStarted;
 
-        const expectedActive = count / 20;
+        // All status:running records stay probeable, including the six slots
+        // carrying terminal observation cursors (7/20 total).
+        const expectedActive = count * 7 / 20;
         assert.equal(full.length, count);
         assert.equal(indexed, expectedActive);
         assert.equal(active.length, expectedActive);
-        assert.ok(active.every((candidate) => candidate.status === "running" && candidate.lastObservedState === undefined));
+        assert.ok(active.every((candidate) => candidate.status === "running"));
+        assert.ok(active.some((candidate) => candidate.lastObservedState === "crashed"));
 
         const manifestText = await readFile(activeSessionIndexPath(), "utf8");
         const manifest = JSON.parse(manifestText) as { active: string[]; reconciledAt: string };
-        assert.equal(manifest.active.length, expectedActive, "steady-state candidates equal 5% of history");
+        assert.equal(manifest.active.length, expectedActive, "every active lifecycle remains in the probe set");
 
         const repeatStarted = performance.now();
         for (let pass = 0; pass < 5; pass += 1) {
@@ -135,7 +138,7 @@ test("fresh direct-list process trusts an unchanged directory generation without
       "--eval",
       'import { listActiveSessions } from "./src/store.ts"; process.stdout.write(String((await listActiveSessions()).length));',
     ], { cwd: process.cwd(), env });
-    assert.equal(stdout, "5");
+    assert.equal(stdout, "35");
     assert.equal(
       await readFile(activeSessionIndexPath(), "utf8"),
       before,

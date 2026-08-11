@@ -40,6 +40,7 @@ const DISPLAY_STATE_ORDER: readonly BeeDisplayState[] = [
   "crashed",
   "unreachable",
   "starting",
+  "recovering",
   "working",
   "ready",
   "offline",
@@ -58,6 +59,7 @@ const DISPLAY_PRESENTATION: Record<BeeDisplayState, { glyph: string; color: Colo
   crashed: { glyph: "○", color: red, labelColor: red },
   unreachable: { glyph: "?", color: yellow, labelColor: yellow },
   starting: { glyph: "●", color: cyan, labelColor: cyan },
+  recovering: { glyph: "●", color: green, labelColor: green },
   working: { glyph: "●", color: green, labelColor: green },
   ready: { glyph: "●", color: green, labelColor: plain },
   offline: { glyph: "○", color: gray, labelColor: gray },
@@ -94,6 +96,9 @@ function formatResultCell(view: BeeViewV1, now: number): string {
 
 /** FRESH column: worst source status — "live" / "stale 2d" / "held" / "unreachable". */
 function formatFreshnessCell(view: BeeViewV1, now: number): string {
+  if (view.verification.unverified && view.verification.unverifiedSince) {
+    return `unverified ${formatRelativeTime(view.verification.unverifiedSince, now)}`;
+  }
   const sources = view.observationFreshness.sources;
   if (sources.some((s) => s.status === "missing" && (s.caveat ?? "").includes("state held"))) return "held";
   if (sources.some((s) => s.source === "node-probe" && s.status === "missing")) return "unreachable";
@@ -244,6 +249,7 @@ export function printStateExplanation(view: BeeViewV1, parsed: Parsed): void {
   identity.push(`node:${view.bee.node}`);
   lines.push(`${em(view.bee.id)}${view.bee.title ? ` ${view.bee.title}` : ""} ${soft(`(${view.bee.name})`)} — ${soft(identity.join(" · "))}`);
   lines.push(`lifecycle: ${view.bee.lifecycle}`);
+  lines.push(`axes: lifecycle=${view.bee.lifecycleState} runtime=${view.latestRuntime.runtimeState}`);
   lines.push(`display: ${view.displayStateReason}`);
   lines.push("");
 
@@ -306,6 +312,17 @@ export function printStateExplanation(view: BeeViewV1, parsed: Parsed): void {
   lines.push(`${em("Freshness")}   observed live: ${view.observationFreshness.observedLive ? "yes" : "no"}`);
   for (const source of view.observationFreshness.sources) {
     lines.push(`  ${formatFreshnessLine(source, now)}`);
+  }
+  if (view.verification.unverified) {
+    const since = view.verification.unverifiedSince
+      ? ` since ${view.verification.unverifiedSince}`
+      : "";
+    const observer = view.verification.observerOffline
+      ? ` observer=${view.verification.observerOffline.observerId}`
+      : "";
+    lines.push(`${em("Verification")} UNVERIFIED${since} reason=${view.verification.reason ?? "unknown"}${observer}`);
+  } else {
+    lines.push(`${em("Verification")} verified`);
   }
 
   const compat = view.compatibilityFields;

@@ -28,7 +28,7 @@ export const DEFAULT_ATTENTION_STATES: AttentionState[] = ["needs-auth", "needs-
 
 const VALID_STATES = new Set<string>([
   "retired", "needs-auth", "needs-reply", "needs-action", "stop-failed",
-  "crashed", "unreachable", "starting", "working", "ready", "offline",
+  "crashed", "unreachable", "starting", "recovering", "working", "ready", "offline",
 ]);
 
 export type BeeStateEntry = {
