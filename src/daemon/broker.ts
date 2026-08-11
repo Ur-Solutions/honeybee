@@ -9,7 +9,9 @@ import {
 } from "../buz.js";
 import { resolveSession } from "../cli/shared.js";
 import { writeHiveState } from "../hiveState.js";
+import { inspectHsrHostProcess } from "../hsr/observe.js";
 import type { RpcMethodHandler } from "../hsr/rpc.js";
+import { readHsrMeta } from "../hsr/runDir.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { recordSeal, validateSealArtifact } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
@@ -25,6 +27,7 @@ import {
 
 export type BrokerHandlerOptions = {
   loadAcl?: () => Promise<BrokerAcl>;
+  verifyCaller?: (callerBee: string) => Promise<void>;
 };
 
 type FlatBrokerReply = { ok: boolean; error?: string } & Record<string, unknown>;
@@ -43,6 +46,33 @@ function requiredString(params: Record<string, unknown>, key: string): string {
   const value = params[key];
   if (typeof value !== "string" || value.length === 0) throw new Error(`${key} required`);
   return value;
+}
+
+/**
+ * Verify the pragmatic v1 caller identity tier against the claimed bee's HSR
+ * runner. Node's net.Socket exposes no peer-credential API, and macOS
+ * LOCAL_PEERPID requires getsockopt on the accepted fd through native code.
+ * Until the RPC transport has that native seam, this proves that the claimed
+ * canonical bee has a currently running, birth-verified host. It does not yet
+ * attribute this exact socket connection to the host's child process; full
+ * socket-peer attribution is deliberately deferred.
+ *
+ * HIVE_BROKER_VERIFY=0 is a daemon-side emergency compatibility opt-out. Any
+ * other value (including malformed values) keeps verification enabled.
+ */
+export async function verifyBrokerCallerClaim(callerBee: string): Promise<void> {
+  if (process.env.HIVE_BROKER_VERIFY === "0") return;
+  const meta = await readHsrMeta(callerBee);
+  const live = !!meta &&
+    meta.bee === callerBee &&
+    meta.status === "running" &&
+    !meta.mirrorOfNode &&
+    await inspectHsrHostProcess(meta) === "match";
+  if (!live) {
+    throw new Error(
+      `claimed bee ${callerBee} has no live birth-verified HSR runner (daemon emergency opt-out: HIVE_BROKER_VERIFY=0)`,
+    );
+  }
 }
 
 async function authorizeSubject(
@@ -167,6 +197,10 @@ export async function handleBrokerOperation(
   }
   try {
     const value = paramsObject(params);
+    // Resolve first so an id/alias claim is verified against the canonical HSR
+    // run-dir name, and arbitrary caller text never becomes a filesystem path.
+    const caller = await resolveSession(requiredString(value, "callerBee"));
+    await (options.verifyCaller ?? verifyBrokerCallerClaim)(caller.name);
     switch (op as BrokerOp) {
       case "broker:buz-send":
         return await handleBuzSend(value, options);

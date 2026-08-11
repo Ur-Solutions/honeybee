@@ -7,13 +7,15 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import { CELL_BROKER_DENIAL_PREFIX } from "../src/cellBroker.js";
 import { startHsrControlServer } from "../src/daemon/hsrControl.js";
+import { capturePersistableProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import { startRpcServer } from "../src/hsr/rpc.js";
+import { writeHsrMeta } from "../src/hsr/runDir.js";
 import { listSeals } from "../src/seal.js";
 import type { BeeViewV1 } from "../src/view/types.js";
 
 const execFileAsync = promisify(execFile);
 
-async function seedSession(store: string, name: string, id = name): Promise<void> {
+async function seedSession(store: string, name: string, id = name, liveRunner = true): Promise<void> {
   const sessions = join(store, "sessions");
   await mkdir(sessions, { recursive: true });
   const now = "2026-08-10T12:00:00.000Z";
@@ -29,6 +31,20 @@ async function seedSession(store: string, name: string, id = name): Promise<void
     updatedAt: now,
     status: "dead",
   }, null, 2)}\n`, { mode: 0o600 });
+  if (liveRunner) {
+    const hostFingerprint = await capturePersistableProcessBirthFingerprint(process.pid);
+    assert.ok(hostFingerprint, "the test process must have a persistable birth fingerprint");
+    await writeHsrMeta(name, {
+      bee: name,
+      harness: "codex",
+      tier: "server",
+      hostPid: process.pid,
+      hostFingerprint,
+      startedAt: new Date().toISOString(),
+      controlSocket: join(store, `${name}.sock`),
+      status: "running",
+    });
+  }
 }
 
 function cliEnv(store: string, overrides: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
@@ -160,6 +176,25 @@ test("Cell CLI derives identity from the runner-stamped HIVE_BEE when HIVE_BEE_N
       assert.match(inbox.stdout, /^buz\.inbox\tcell-caller\t/m);
       const stderr = await hiveFailure(store, env, "buz", "inbox", "cell-other");
       assert.match(stderr, /cell-other is not granted/);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+test("Cell CLI denies a dead caller claim with the standard Cell pointer", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "dead-cell", "CO.dead", false);
+    const server = await startHsrControlServer();
+    try {
+      const stderr = await hiveFailure(
+        store,
+        { HIVE_CELL: "1", HIVE_BEE_NAME: "dead-cell" },
+        "state", "explain", "dead-cell", "--json",
+      );
+      assert.match(stderr, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(stderr, /no live birth-verified HSR runner/);
+      assert.doesNotMatch(stderr, /EPERM|at .*\.ts:\d+/);
     } finally {
       await server.close();
     }
