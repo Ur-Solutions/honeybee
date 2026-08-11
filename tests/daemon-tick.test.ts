@@ -14,8 +14,8 @@ import {
   type TickDispatcher,
 } from "../src/daemon/run.js";
 import type { BeeState, PaneCaptureMap } from "../src/state.js";
-import type { SessionRecord } from "../src/store.js";
 import type { ProbeEvidence } from "../src/stateMachine.js";
+import type { SessionRecord } from "../src/store.js";
 import type { NodeRecord } from "../src/node.js";
 import { nextRuntimeIncarnationPatch } from "../src/seal.js";
 
@@ -48,7 +48,7 @@ function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
 
 type Capture = {
   ledger: Record<string, unknown>[];
-  touches: Array<{ name: string; fields: Partial<SessionRecord> }>;
+  touches: Array<{ name: string; fields: Partial<SessionRecord>; probeEvidence?: ProbeEvidence }>;
 };
 
 function buildDeps(args: {
@@ -77,9 +77,9 @@ function buildDeps(args: {
     probeNodes: async () => probe,
     capturePanes: async () => panes,
     sealedBeeNames: async () => seals,
-    touchSession: async (name, fields) => {
+    touchSession: async (name, fields, options) => {
       if (args.failTouchFor?.has(name)) throw new Error(`touch failed for ${name}`);
-      args.capture.touches.push({ name, fields });
+      args.capture.touches.push({ name, fields, probeEvidence: options?.probeEvidence });
       const original = args.records.find((r) => r.name === name);
       return original ? { ...original, ...fields } : null;
     },
@@ -291,6 +291,9 @@ test("tick: a sealed HSR record without transcript metadata is neither observed 
 
     assert.deepEqual(observedBatches, []);
     assert.deepEqual(refreshed, []);
+    assert.equal(capture.touches[0]?.fields.lastObservedState, "done");
+    assert.equal(capture.touches[0]?.probeEvidence?.kind, "probe");
+    assert.equal(capture.touches[0]?.probeEvidence?.target.substrate, "hsr");
   });
 });
 
@@ -450,6 +453,45 @@ test("tick: passes HSR, remote-HSR, and tmux-pane activity signals to flight swe
     assert.equal(seenActivity?.get(tmuxBee.name)?.at, new Date(NOW).toISOString());
     assert.match(seenActivity?.get(tmuxBee.name)?.fingerprint ?? "", /^pane:tmux-bee:/);
     assert.equal(logTickResult(result).some((entry) => entry.msg === "flight.transition"), false);
+  });
+});
+
+test("tick: terminal remote-HSR mirror writes carry remote HSR probe provenance", async () => {
+  await withTempStore(async () => {
+    const NOW = Date.parse("2026-06-03T10:00:00.000Z");
+    const remote = bee({ name: "remote-dead", tmuxTarget: "remote-dead", node: "runner01" });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({
+      records: [remote],
+      nodes: [{
+        name: "runner01",
+        kind: "remote-hsr",
+        endpoint: "me@runner01",
+        capabilities: ["*"],
+        status: "unknown",
+        createdAt: "2026-06-03T09:00:00.000Z",
+        updatedAt: "2026-06-03T09:00:00.000Z",
+      }],
+      liveTargets: new Set(),
+      now: NOW,
+      capture,
+    });
+    deps.hsrObservations = async () => new Map([
+      [remote.name, { live: false, state: "dead" as BeeState, snapshot: "", mirrorOf: "runner01" }],
+    ]);
+    const touch = deps.touchSession;
+    let proof: ProbeEvidence | undefined;
+    deps.touchSession = async (name, fields, options) => {
+      proof = options?.probeEvidence;
+      return touch(name, fields, options);
+    };
+
+    await tick(deps, new Map());
+
+    assert.equal(capture.touches[0]?.fields.lastObservedState, "crashed");
+    assert.equal(proof?.outcome, "dead");
+    assert.equal(proof?.target.substrate, "hsr");
+    assert.equal(proof?.target.node, "runner01");
   });
 });
 

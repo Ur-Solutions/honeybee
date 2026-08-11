@@ -45,6 +45,20 @@ function record(name: string, overrides: Partial<SessionRecord> = {}): SessionRe
   };
 }
 
+async function saveTerminalRecord(value: SessionRecord): Promise<void> {
+  await saveSession(value, {
+    probeEvidence: {
+      kind: "probe",
+      probeId: `fixture:${value.name}`,
+      observerId: "terminal-reprobe-fixture",
+      observedAt: value.lastObservedStateAt ?? value.updatedAt,
+      outcome: value.lastObservedState === "done" ? "alive" : "dead",
+      target: { substrate: "hsr", runnerPid: value.runnerPid },
+      detail: "test fixture terminal observation",
+    },
+  });
+}
+
 async function seedMeta(
   bee: string,
   status: "running" | "exited" = "running",
@@ -73,7 +87,7 @@ async function liveControl(disk: HsrMeta) {
 test("a live runner behind a stale crashed cursor self-heals within one sweep", async () => {
   await withTempStore(async () => {
     const bee = "reprobe-heals";
-    await saveSession(record(bee));
+    await saveTerminalRecord(record(bee));
     await seedMeta(bee);
     assert.equal(isActiveSessionRecord((await loadSession(bee))!), true, "the terminal cursor stays in the probe set");
 
@@ -94,7 +108,7 @@ test("a live runner behind a stale crashed cursor self-heals within one sweep", 
 test("a genuinely dead runner does not resurrect", async () => {
   await withTempStore(async () => {
     const bee = "reprobe-dead-host";
-    await saveSession(record(bee));
+    await saveTerminalRecord(record(bee));
     await seedMeta(bee);
 
     const outcomes = await reprobeTerminalCursors({
@@ -115,7 +129,7 @@ test("a recycled pid (birth mismatch) or uncertain census is not proof of life",
       ["reprobe-mismatch", "mismatch"],
       ["reprobe-unverifiable", "unverifiable"],
     ] as const) {
-      await saveSession(record(bee));
+      await saveTerminalRecord(record(bee));
       await seedMeta(bee);
       const outcomes = await reprobeTerminalCursors({
         isHostAlive: () => true,
@@ -130,14 +144,14 @@ test("a recycled pid (birth mismatch) or uncertain census is not proof of life",
 test("only the false-crash class heals: deliberate terminal cursors and exited metas stand", async () => {
   await withTempStore(async () => {
     // A sealed/done cursor is a deliberate outcome, not a mislabel.
-    await saveSession(record("reprobe-done", { lastObservedState: "done" }));
+    await saveTerminalRecord(record("reprobe-done", { lastObservedState: "done" }));
     await seedMeta("reprobe-done");
     // An exited meta agrees with the crashed cursor — nothing to heal.
-    await saveSession(record("reprobe-exited-meta"));
+    await saveTerminalRecord(record("reprobe-exited-meta"));
     await seedMeta("reprobe-exited-meta", "exited");
     // A record already held in the work set (recovery obligation) is the
     // ordinary tick's to re-observe, not this sweep's.
-    await saveSession(record("reprobe-active", { recoveryRequestedAt: "2026-08-10T08:00:00.000Z" }));
+    await saveTerminalRecord(record("reprobe-active", { recoveryRequestedAt: "2026-08-10T08:00:00.000Z" }));
     await seedMeta("reprobe-active");
 
     const outcomes = await reprobeTerminalCursors({
@@ -156,7 +170,7 @@ test("only the false-crash class heals: deliberate terminal cursors and exited m
 test("a mis-reaped exited meta with a verifiably live host restores to running, cursor and all, in one sweep", async () => {
   await withTempStore(async () => {
     const bee = "reprobe-meta-restore";
-    await saveSession(record(bee));
+    await saveTerminalRecord(record(bee));
     const nowMs = Date.parse("2026-08-10T12:00:00.000Z");
     await seedMeta(bee, "exited", {
       endedAt: "2026-08-10T11:58:00.000Z", // two minutes ago — past the grace
@@ -188,7 +202,7 @@ test("a mis-reaped exited meta with a verifiably live host restores to running, 
 test("birth match without the same live control socket cannot heal a false crash", async () => {
   await withTempStore(async () => {
     const bee = "reprobe-socket-absent";
-    await saveSession(record(bee));
+    await saveTerminalRecord(record(bee));
     await seedMeta(bee);
 
     const outcomes = await reprobeTerminalCursors({
@@ -210,7 +224,7 @@ test("a recycled pid never restores an exited meta: birth mismatch is pid reuse"
       ["reprobe-meta-uncertain", "unverifiable"],
       ["reprobe-meta-gone", "gone"],
     ] as const) {
-      await saveSession(record(bee));
+      await saveTerminalRecord(record(bee));
       await seedMeta(bee, "exited", { endedAt: "2026-08-10T11:00:00.000Z", exitCode: null });
       const outcomes = await reprobeTerminalCursors({
         isHostAlive: () => true,
@@ -241,7 +255,7 @@ test("the inverse meta heal fails closed: dead pid, fresh exit, missing endedAt,
       startupFailure: { stage: "adapter-start", message: "harness failed during startup" },
     });
     for (const bee of ["meta-dead-pid", "meta-fresh-exit", "meta-no-endedat", "meta-startup-failure"]) {
-      await saveSession(record(bee));
+      await saveTerminalRecord(record(bee));
     }
 
     const outcomes = await reprobeTerminalCursors({
@@ -263,7 +277,7 @@ test("the inverse meta heal fails closed: dead pid, fresh exit, missing endedAt,
 test("the tick-wired sweeper throttles to one pass per interval", async () => {
   await withTempStore(async () => {
     const bee = "reprobe-throttle";
-    await saveSession(record(bee));
+    await saveTerminalRecord(record(bee));
     await seedMeta(bee);
     let sweeps = 0;
     let nowMs = 1_000_000;

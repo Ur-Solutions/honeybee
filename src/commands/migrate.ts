@@ -20,7 +20,8 @@ import { waitForAgentReady } from "../readiness.js";
 import { authPromptLossRequestId } from "../requests/keys.js";
 import { closeRequestsForNewIncarnation, openRequest, readBeeRequests, resolveRequest } from "../requests/store.js";
 import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
-import { appendLedger, listSessions, storeRoot, type SessionRecord } from "../store.js";
+import { appendLedger, listSessions, storeRoot, transitionSession, type SessionRecord } from "../store.js";
+import type { ProbeEvidence } from "../stateMachine.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { stopRuntimeStrict } from "../substrates/stop.js";
 import type { NewSessionResult, Substrate } from "../substrates/types.js";
@@ -55,6 +56,38 @@ type LaunchReplay = {
   spec: AgentSpec;
   source: LaunchReplaySource;
 };
+
+function hasArchivedLifecycle(record: SessionRecord): boolean {
+  return record.stateMachine?.lifecycle === "archived" || record.status === "done";
+}
+
+async function persistExplicitRevive(
+  record: SessionRecord,
+  at: string,
+  target: ProbeEvidence["target"],
+  detail: string,
+): Promise<SessionRecord> {
+  const transitionKey = `revive:${record.name}:${record.runtimeGeneration ?? 0}:${at}`;
+  const transitioned = await transitionSession(record.name, {
+    eventId: transitionKey,
+    at,
+    type: "bee.revived",
+    cause: "revive",
+    resume: "done",
+    evidence: { kind: "operator", actionId: transitionKey, observedAt: at, action: "revive" },
+    probe: {
+      kind: "probe",
+      probeId: `${transitionKey}:probe`,
+      observerId: "hive-revive",
+      observedAt: at,
+      outcome: "alive",
+      target,
+      detail,
+    },
+  });
+  if (!transitioned) throw new Error(`Session ${record.name} vanished before its revive transition`);
+  return transitioned.record;
+}
 
 /** True when `needle` occurs contiguously in `haystack`. */
 function containsArgv(haystack: readonly string[], needle: readonly string[]): boolean {
@@ -398,6 +431,7 @@ async function reviveHsrRunnerInTransaction(
   } = {},
 ): Promise<SessionRecord> {
   const record = await lifecycle.refresh();
+  const explicitArchivedRevive = hasArchivedLifecycle(record);
   const adapter = adapterFor(tool);
   const fresh = opts.fresh === true;
   const providerSessionId = fresh ? undefined : (opts.sessionOverride ?? record.providerSessionId);
@@ -432,7 +466,8 @@ async function reviveHsrRunnerInTransaction(
   }
   let restored: SessionRecord;
   try {
-    if (!(await (opts.waitForHsrHost ?? waitForHsrHost)(record.name, 5000))) {
+    const controlReady = await (opts.waitForHsrHost ?? waitForHsrHost)(record.name, 5000);
+    if (!controlReady) {
       console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
     }
     await opts.afterLaunch?.({ kind: "hsr", hostPid });
@@ -441,6 +476,7 @@ async function reviveHsrRunnerInTransaction(
     // writes survive, while deletion/replacement can never fabricate a
     // fallback row.
     const renderedCommand = shellCommand(spec);
+    const revivedAt = new Date().toISOString();
     restored = await lifecycle.commit({
       ...incarnation,
       ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
@@ -454,9 +490,21 @@ async function reviveHsrRunnerInTransaction(
       // after a successful --fresh launch.
       ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
       ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
-      updatedAt: new Date().toISOString(),
-      status: "running",
+      updatedAt: revivedAt,
+      // An explicit archived revive remains archived until the proof-carrying
+      // bee.revived event below atomically flips both lifecycle spellings.
+      ...(explicitArchivedRevive ? {} : { status: "running" as const }),
     });
+    if (explicitArchivedRevive) {
+      restored = await persistExplicitRevive(
+        restored,
+        revivedAt,
+        { substrate: "hsr", ...(record.node ? { node: record.node } : {}), runnerPid: hostPid },
+        controlReady
+          ? "HSR birth admission and control probe both verified the revived runtime"
+          : "HSR birth admission verified the revived host; control readiness will reconcile asynchronously",
+      );
+    }
   } catch (error) {
     await confirmLaunchedHsrStopped(record.name, hostPid, error, opts.stopHsrIncarnation);
     throw error;
@@ -788,6 +836,7 @@ async function reviveTmuxPaneInTransaction(
   } = {},
 ): Promise<SessionRecord> {
   const record = await lifecycle.refresh();
+  const explicitArchivedRevive = hasArchivedLifecycle(record);
   const spec = await buildResumeSpec(record, tool, opts.fresh ? [] : resumeArgs(tool, record.providerSessionId));
   const incarnation = await nextRuntimeIncarnationPatch(record);
   const tmuxTarget = safeTmuxTarget(record.name);
@@ -804,6 +853,7 @@ async function reviveTmuxPaneInTransaction(
   let restored: SessionRecord;
   try {
     await opts.afterLaunch?.({ kind: "tmux", result: launch });
+    const revivedAt = new Date().toISOString();
     restored = await lifecycle.commit({
       ...incarnation,
       command: shellCommand(spec),
@@ -812,8 +862,8 @@ async function reviveTmuxPaneInTransaction(
       ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
       ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
       combId: tmuxTarget,
-      updatedAt: new Date().toISOString(),
-      status: "running",
+      updatedAt: revivedAt,
+      ...(explicitArchivedRevive ? {} : { status: "running" as const }),
       substrate: undefined,
       runnerPid: undefined,
       runnerFingerprint: undefined,
@@ -822,6 +872,18 @@ async function reviveTmuxPaneInTransaction(
       // is an equally strong anchor, so retaining it would re-adopt the old id.
       ...(opts.fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
     });
+    if (explicitArchivedRevive) {
+      restored = await persistExplicitRevive(
+        restored,
+        revivedAt,
+        {
+          substrate: "local-tmux",
+          tmuxTarget,
+          ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+        },
+        "tmux new-session admission verified the revived runtime",
+      );
+    }
   } catch (error) {
     await confirmLaunchedTmuxStopped(substrate, tmuxTarget, launch, error);
     throw error;
@@ -1403,6 +1465,7 @@ async function reviveRecordInTransaction(
   },
 ): Promise<SessionRecord> {
   const record = await lifecycle.refresh();
+  const explicitArchivedRevive = hasArchivedLifecycle(record);
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   const fresh = opts.fresh;
   // sessionOverride resumes (and persists) a specific provider session — used to
@@ -1509,9 +1572,10 @@ async function reviveRecordInTransaction(
   let updated: SessionRecord;
   try {
     await opts.afterLaunch?.({ kind: "tmux", result: launch });
+    const revivedAt = new Date().toISOString();
     updated = await lifecycle.commit({
       ...incarnation,
-      status: "running",
+      ...(explicitArchivedRevive ? {} : { status: "running" as const }),
       lastReviveCommand: shellCommand(spec),
       combId: record.combId ?? record.tmuxTarget,
       ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
@@ -1527,8 +1591,20 @@ async function reviveRecordInTransaction(
       // undefined deletes the fields. The old transcript path must go too or
       // discovery will immediately restore the abandoned provider id.
       ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
-      updatedAt: new Date().toISOString(),
+      updatedAt: revivedAt,
     });
+    if (explicitArchivedRevive) {
+      updated = await persistExplicitRevive(
+        updated,
+        revivedAt,
+        {
+          substrate: "local-tmux",
+          tmuxTarget: record.tmuxTarget,
+          ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+        },
+        "tmux new-session admission verified the revived runtime",
+      );
+    }
   } catch (error) {
     await confirmLaunchedTmuxStopped(substrate, record.tmuxTarget, launch, error);
     throw error;

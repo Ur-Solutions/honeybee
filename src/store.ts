@@ -720,12 +720,14 @@ export async function saveSessionLocked(record: SessionRecord, options: SaveSess
   if ((!before && after) || (before && JSON.stringify(before) !== JSON.stringify(after))) {
     await rejectRawStateMutation(record.name, "saveSession", { stateMachine: after });
   }
-  if (existing && legacyTerminalCursorClaimChanges(existing, record) && !isProbeEvidence(options.probeEvidence)) {
+  const writesTerminalCursor = TERMINAL_OBSERVED_STATES.has(record.lastObservedState ?? "") &&
+    (!existing || existing.lastObservedState !== record.lastObservedState);
+  if (writesTerminalCursor && !isProbeEvidence(options.probeEvidence)) {
     await appendLedger({
       type: "state.transition.rejected",
       session: record.name,
       source: "legacy-cursor-write",
-      from: existing.lastObservedState ?? null,
+      from: existing?.lastObservedState ?? null,
       to: record.lastObservedState ?? null,
       evidence: options.probeEvidence ?? null,
       reason: "terminal cursor write requires probe evidence",

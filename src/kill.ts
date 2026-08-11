@@ -20,9 +20,12 @@ import {
   isActiveSessionRecord,
   listSessions,
   safeName,
+  transitionSession,
+  updateSession,
   withSessionLock,
   type SessionRecord,
 } from "./store.js";
+import type { ProbeEvidence } from "./stateMachine.js";
 import { syncCredentialPairIsolated } from "./daemon/credentialSweepProcess.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { dropPoolClaimsForBee } from "./pool.js";
@@ -85,6 +88,7 @@ type TeardownVerdict = {
   alreadyGone: boolean;
   killReturnedFailure: boolean;
   stillRunning: boolean;
+  substrateKind: Substrate["kind"];
   lastError?: string;
 };
 
@@ -243,6 +247,7 @@ async function teardownSession(
     alreadyGone,
     killReturnedFailure,
     stillRunning,
+    substrateKind: substrate.kind,
     ...(stillRunning || killReturnedFailure
       ? { lastError: lastProbeError ?? killStderr ?? "exact runtime cleanup is unconfirmed" }
       : {}),
@@ -566,6 +571,9 @@ export async function transactionalRetire(
 ): Promise<KillOutcome> {
   return withSessionLifecycleTransaction(record, async (lifecycle) => {
     const current = await lifecycle.refresh();
+    if (current.status === "done" || current.stateMachine?.lifecycle === "archived") {
+      return { ok: true, alreadyGone: true, attempts: 0 };
+    }
     const emitLedger = options.emitLedger !== false;
     const node = current.node ?? LOCAL_NODE_NAME;
     const verdict = await teardownSession(current, options);
@@ -594,13 +602,40 @@ export async function transactionalRetire(
 
     await lifecycle.refresh();
     await runFinalCredentialSync(current, options, "retire");
-    const retired = await lifecycle.commit({
-      status: "done",
-      updatedAt: new Date().toISOString(),
-      // A retired bee must not keep reporting a stale error from an earlier
-      // failed kill; explicit undefined deletes the field.
-      lastError: undefined,
+    const at = new Date().toISOString();
+    const transitionKey = `retire:${current.name}:${current.runtimeGeneration ?? 0}:${at}`;
+    const probe: ProbeEvidence = {
+      kind: "probe",
+      probeId: `${transitionKey}:probe`,
+      observerId: "hive-retire",
+      observedAt: at,
+      outcome: "dead",
+      target: {
+        substrate: verdict.substrateKind === "hsr" || verdict.substrateKind === "remote-hsr" ? "hsr" : "local-tmux",
+        ...(current.node ? { node: current.node } : {}),
+        ...(verdict.substrateKind === "hsr" || verdict.substrateKind === "remote-hsr"
+          ? { ...(current.runnerPid ? { runnerPid: current.runnerPid } : {}) }
+          : { tmuxTarget: current.tmuxTarget, ...(current.agentPaneId ? { agentPaneId: current.agentPaneId } : {}) }),
+      },
+      detail: verdict.alreadyGone
+        ? "explicit retire verified the runtime was already absent"
+        : `explicit retire verified runtime absence after ${verdict.attempts} teardown attempt(s)`,
+    };
+    const transitioned = await transitionSession(current.name, {
+      eventId: transitionKey,
+      at,
+      type: "bee.archived",
+      cause: "retire",
+      evidence: { kind: "operator", actionId: transitionKey, observedAt: at, action: "retire" },
+      probe,
     });
+    if (!transitioned) throw new Error(`Session ${current.name} vanished before its retire transition`);
+    // The explicit transition owns lifecycle/status. This metadata-only merge
+    // retires an earlier failed-stop message without bypassing the state table.
+    const retired = await updateSession(current.name, {
+      updatedAt: at,
+      lastError: undefined,
+    }) ?? transitioned.record;
     // Request closures happen only after the generation-checked terminal
     // commit. A stale retire can therefore never close a replacement's asks.
     await resolveRequest(retired.name, stopFailedRequestId(retired.name, retired.runtimeGeneration ?? 0), { by: "stop-succeeded" }).catch(() => undefined);

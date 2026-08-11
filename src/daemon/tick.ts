@@ -1041,7 +1041,7 @@ export async function tick(
     return {
       record,
       state: derived.state,
-      probeEvidence: daemonProbeEvidence(record, derived.state, context, observedAtIso),
+      probeEvidence: daemonProbeEvidence(record, derived.state, context, observedAtIso, remoteHsrNodes),
       // Terminal history is immutable. Its lifecycle status is authoritative,
       // so do not take a lock/read/write trip for a freshness timestamp that no
       // consumer should use. Meaningful lifecycle mutations revive the record
@@ -1230,9 +1230,11 @@ function daemonProbeEvidence(
   state: BeeState,
   context: StateContext,
   observedAt: string,
+  remoteHsrNodes: ReadonlySet<string>,
 ): ProbeEvidence {
   const unreachable = record.node ? context.unreachableNodes?.has(record.node) === true : false;
-  const hsrObserved = record.substrate === "hsr" || context.hsrMirrors?.has(record.name);
+  const hsrObserved = record.substrate === "hsr" || context.hsrMirrors?.has(record.name) ||
+    (record.node !== undefined && remoteHsrNodes.has(record.node));
   const targetLive = context.liveTargets.has(liveTargetKey(record.node, record.tmuxTarget)) ||
     context.liveTargets.has(record.tmuxTarget);
   const paneLive = record.agentPaneId ? context.livePanes?.has(record.agentPaneId) === true : false;
@@ -1245,7 +1247,10 @@ function daemonProbeEvidence(
     observedAt,
     outcome,
     target: {
-      substrate: record.substrate ?? "local-tmux",
+      // A remote-HSR mirror intentionally has no record.substrate; its
+      // mirrored run-dir observation is nevertheless HSR proof, not a tmux
+      // probe. Preserve that provenance for terminal audit/replay.
+      substrate: hsrObserved ? "hsr" : "local-tmux",
       ...(record.node ? { node: record.node } : {}),
       ...(record.substrate !== "hsr" ? { tmuxTarget: record.tmuxTarget } : {}),
       ...(record.agentPaneId ? { agentPaneId: record.agentPaneId } : {}),

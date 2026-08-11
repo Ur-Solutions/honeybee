@@ -331,7 +331,21 @@ test("restart audit: three live cursors are unverified as one set, then verified
         ...(index === 0 ? { lastObservedState: "crashed" } : {}),
       }),
     );
-    for (const candidate of records) await saveSession(candidate);
+    for (const candidate of records) {
+      await saveSession(candidate, candidate.lastObservedState === "crashed"
+        ? {
+            probeEvidence: {
+              kind: "probe",
+              probeId: `fixture:${candidate.name}`,
+              observerId: "restart-audit-fixture",
+              observedAt,
+              outcome: "dead",
+              target: { substrate: "hsr", runnerPid: candidate.runnerPid },
+              detail: "seed a proven terminal cursor for false-crash healing",
+            },
+          }
+        : undefined);
+    }
     const metas = new Map(records.map((candidate) => [
       candidate.name,
       meta(candidate.name, {
