@@ -406,6 +406,81 @@ test("tick: failed HSR observation holds trusted state and never persists a cras
   });
 });
 
+test("tick: probe-classified HSR deaths suppress legacy crash before mirror, ledger, and cursor writes", async () => {
+  await withTempStore(async () => {
+    const parked = bee({
+      name: "parked-hsr",
+      tmuxTarget: "parked-hsr",
+      substrate: "hsr",
+      lastObservedState: "idle_with_output",
+    });
+    const recovering = bee({
+      name: "recovering-hsr",
+      tmuxTarget: "recovering-hsr",
+      substrate: "hsr",
+      lastObservedState: "active",
+    });
+    const uncertain = bee({
+      name: "uncertain-hsr",
+      tmuxTarget: "uncertain-hsr",
+      substrate: "hsr",
+      lastObservedState: "active",
+    });
+    const records = [parked, recovering, uncertain];
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records, liveTargets: new Set(), capture });
+    deps.hsrObservations = async () => new Map(records.map((record) => [
+      record.name,
+      { live: false, snapshot: "" },
+    ]));
+    deps.reconcileRuntimeDeaths = async () => [
+      { bee: parked.name, action: "parked", suppressLegacyCrash: true },
+      { bee: recovering.name, action: "recovering", suppressLegacyCrash: true },
+      { bee: uncertain.name, action: "unverified", suppressLegacyCrash: true },
+    ];
+    const mirrored: Array<[string, BeeState]> = [];
+    deps.mirrorHiveState = async (record, state) => { mirrored.push([record.name, state]); };
+
+    const previous = new Map<string, BeeState>([
+      [parked.name, "idle_with_output"],
+      [recovering.name, "active"],
+      [uncertain.name, "active"],
+    ]);
+    const result = await tick(deps, previous);
+
+    assert.equal(result.observed.get(parked.name), "idle_with_output");
+    assert.equal(result.observed.get(recovering.name), "active");
+    assert.equal(result.observed.get(uncertain.name), "active");
+    assert.equal(result.transitions.length, 0);
+    assert.equal(mirrored.length, 0);
+    assert.equal(capture.ledger.some((event) => event.to === "crashed"), false);
+    assert.equal(capture.touches.some((touch) => touch.fields.lastObservedState === "crashed"), false);
+  });
+});
+
+test("tick: a timed-out exact death probe still cannot publish the coarse crash cursor", async () => {
+  await withTempStore(async () => {
+    const record = bee({
+      name: "slow-probe-hsr",
+      tmuxTarget: "slow-probe-hsr",
+      substrate: "hsr",
+      lastObservedState: "active",
+    });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records: [record], liveTargets: new Set(), capture });
+    deps.hsrObservations = async () => new Map([[record.name, { live: false, snapshot: "" }]]);
+    deps.reconcileRuntimeDeaths = async () => new Promise(() => undefined);
+    deps.timeouts = { substrateMs: 20 };
+
+    const result = await tick(deps, new Map([[record.name, "active"]]));
+
+    assert.equal(result.observed.get(record.name), "active");
+    assert.equal(result.runtimeDeaths[0]?.action, "unverified");
+    assert.equal(capture.touches.some((touch) => touch.fields.lastObservedState === "crashed"), false);
+    assert.match(result.errors.find((error) => /reconcileRuntimeDeaths/.test(error.message))?.message ?? "", /timed out/);
+  });
+});
+
 test("tick: passes HSR, remote-HSR, and tmux-pane activity signals to flight sweeps", async () => {
   await withTempStore(async () => {
     const NOW = Date.parse("2026-06-03T10:00:00.000Z");

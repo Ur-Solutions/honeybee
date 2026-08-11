@@ -4,7 +4,7 @@
 // validation, credential activation, and provider spawn run in a background
 // single-flight with their own concurrency, never inline with buz draining.
 
-import { assertReviveWorkingDirectory, reviveRecord } from "../commands/migrate.js";
+import { assertReviveWorkingDirectory } from "../commands/migrate.js";
 import {
   clearMessageRecovery,
   openMessageDeliveryRequest,
@@ -12,6 +12,7 @@ import {
   type MessageUndeliverableReason,
 } from "../buz.js";
 import { withSessionLifecycleTransaction } from "../lifecycle.js";
+import { wakeRuntimeForQueuedSend } from "../recovery/wake.js";
 import { loadSession, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
@@ -156,7 +157,9 @@ async function processRecoveryRecord(
   } catch (error) {
     return failAttempt(error);
   }
-  if (live) return { recipient: record.name, action: "live", messageId };
+  if (live && record.stateMachine?.runtime !== "parked") {
+    return { recipient: record.name, action: "live", messageId };
+  }
   if (record.status === "kill_failed") {
     return markUndeliverable(record, messageId, "archive-unresolved", deps, nowMs);
   }
@@ -180,7 +183,7 @@ async function processRecoveryRecord(
   }
 
   try {
-    await (deps.wakeRecipient ?? ((candidate) => reviveRecord(candidate, { fresh: false })))(record);
+    await (deps.wakeRecipient ?? wakeRuntimeForQueuedSend)(record);
     return {
       recipient: record.name,
       action: "started",

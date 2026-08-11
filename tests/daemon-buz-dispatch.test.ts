@@ -400,7 +400,17 @@ async function seedRecoveryRecord(
     recoveryMessageId: sent.message.id,
     recoveryAttemptCount: 0,
   };
-  await saveSession(record);
+  await saveSession(record, {
+    probeEvidence: {
+      kind: "probe",
+      probeId: `buz-recovery-fixture:${name}`,
+      observerId: "buz-recovery-test",
+      observedAt: new Date(now).toISOString(),
+      outcome: "dead",
+      target: { substrate: "hsr", tmuxTarget: record.tmuxTarget },
+      detail: "fixture proof for the cold recovery cursor",
+    },
+  });
   return record;
 }
 

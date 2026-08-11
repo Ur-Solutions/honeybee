@@ -4,14 +4,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  handleVerifiedBootRuntimeDeath,
+  handleVerifiedBootRuntimeLive,
   reconcileRuntimeDeaths,
   runRuntimeRecoverySweep,
   type RecoveryProbeEvidence,
   type RuntimeRecoveryTransitionEvent,
 } from "../src/daemon/runtimeRecovery.js";
-import { beginRuntimeRecovery, readRuntimeRecovery } from "../src/recovery/store.js";
+import {
+  beginRuntimeRecovery,
+  claimRuntimeRecoveryAttempt,
+  finishRuntimeRecoveryAttempt,
+  readRuntimeRecovery,
+} from "../src/recovery/store.js";
 import { readBeeRequests } from "../src/requests/store.js";
-import type { SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, transitionSession, type SessionRecord } from "../src/store.js";
+import type { DeadHsrReAdoptionProbe, LiveHsrReAdoptionProbe } from "../src/daemon/reAdoption.js";
 
 const START = Date.parse("2026-08-11T12:00:00.000Z");
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -69,9 +77,13 @@ test("verified idle death parks silently while mid-turn death recovers; uncertai
     const idle = record("idle");
     const working = record("working");
     const uncertain = record("uncertain");
+    const exactLive = record("exact-live");
     const transitions: Array<[string, RuntimeRecoveryTransitionEvent]> = [];
-    const decisions = await reconcileRuntimeDeaths([idle, working, uncertain], {
-      probe: async (candidate) => probe(candidate, candidate.name === "uncertain" ? "unreachable" : "dead"),
+    const decisions = await reconcileRuntimeDeaths([idle, working, uncertain, exactLive], {
+      probe: async (candidate) => probe(
+        candidate,
+        candidate.name === "uncertain" ? "unreachable" : candidate.name === "exact-live" ? "alive" : "dead",
+      ),
       hasPendingTurns: async (bee) => bee === "working",
       transition: async (bee, event) => { transitions.push([bee, event]); },
       now: () => START,
@@ -81,7 +93,12 @@ test("verified idle death parks silently while mid-turn death recovers; uncertai
     assert.deepEqual(decisions.map(({ bee, action, suppressLegacyCrash }) => ({ bee, action, suppressLegacyCrash })), [
       { bee: "idle", action: "parked", suppressLegacyCrash: true },
       { bee: "working", action: "recovering", suppressLegacyCrash: true },
-      { bee: "uncertain", action: "unverified", suppressLegacyCrash: false },
+      // Uncertainty changes no bounded axes, but it must also hold the legacy
+      // cursor: a coarse dead observation is not proof of a crash.
+      { bee: "uncertain", action: "unverified", suppressLegacyCrash: true },
+      // Exact live proof contradicts the coarse dead observation that admitted
+      // this candidate, so the legacy crash write is fenced too.
+      { bee: "exact-live", action: "live", suppressLegacyCrash: true },
     ]);
     assert.deepEqual(transitions.map(([bee, event]) => [bee, event.type]), [
       ["idle", "runtime.parked"],
@@ -89,6 +106,145 @@ test("verified idle death parks silently while mid-turn death recovers; uncertai
     ]);
     assert.equal((await readRuntimeRecovery("working"))?.nextAttemptAt, new Date(START + 15_000).toISOString());
     assert.equal(await readRuntimeRecovery("idle"), null);
+  });
+});
+
+test("a completed recovery budget does not turn a later idle death into mid-turn recovery", async () => {
+  await withTempStore(async () => {
+    const idle = record("idle-after-recovery");
+    await beginRuntimeRecovery({
+      bee: idle.name,
+      generation: 2,
+      probeId: "old-death",
+      episodeId: "completed-episode",
+      nowMs: START - 30_000,
+      random: () => 0.5,
+    });
+    const claim = await claimRuntimeRecoveryAttempt({
+      bee: idle.name,
+      nowMs: START - 15_000,
+      attemptId: "completed-attempt",
+      random: () => 0.5,
+    });
+    assert.ok(claim);
+    await finishRuntimeRecoveryAttempt({
+      bee: idle.name,
+      attemptId: "completed-attempt",
+      outcome: "succeeded",
+      nowMs: START - 14_000,
+      random: () => 0.5,
+    });
+
+    const transitions: RuntimeRecoveryTransitionEvent[] = [];
+    const [decision] = await reconcileRuntimeDeaths([idle], {
+      probe: async (candidate) => probe(candidate, "dead"),
+      hasPendingTurns: async () => false,
+      hasUnfinishedMarker: async () => false,
+      transition: async (_bee, event) => { transitions.push(event); },
+      now: () => START,
+    });
+
+    assert.equal(decision?.action, "parked");
+    assert.equal(transitions[0]?.type, "runtime.parked");
+    assert.equal((await readRuntimeRecovery(idle.name))?.status, "recovered");
+  });
+});
+
+test("a crash between budget creation and the bounded transition resumes the same recovery episode", async () => {
+  await withTempStore(async () => {
+    const torn = record("torn-transition");
+    torn.stateMachine!.work = "working";
+    const episode = await beginRuntimeRecovery({
+      bee: torn.name,
+      generation: 2,
+      probeId: "earlier-death-proof",
+      episodeId: "persisted-before-transition",
+      nowMs: START,
+      random: () => 0.5,
+    });
+    const transitions: RuntimeRecoveryTransitionEvent[] = [];
+    const [decision] = await reconcileRuntimeDeaths([torn], {
+      probe: async (candidate) => probe(candidate, "dead"),
+      hasPendingTurns: async () => false,
+      hasUnfinishedMarker: async () => false,
+      transition: async (_bee, event) => { transitions.push(event); },
+      now: () => START + 1_000,
+    });
+
+    assert.equal(decision?.action, "recovering");
+    assert.equal(decision?.episodeId, episode.episodeId);
+    assert.equal(transitions[0]?.type, "runtime.lost");
+    assert.equal((await readRuntimeRecovery(torn.name))?.episodeId, "persisted-before-transition");
+  });
+});
+
+test("boot re-adoption callbacks persist death and recovery-success before H1 clears uncertainty", async () => {
+  await withTempStore(async () => {
+    const idle = {
+      ...record("boot-idle"),
+      stateMachine: undefined,
+      lastObservedState: "idle_with_output",
+      lastObservedStateAt: new Date(START - 1_000).toISOString(),
+    };
+    await saveSession(idle);
+    const deadEvidence = probe(idle, "dead") as RecoveryProbeEvidence & { outcome: "dead" };
+    const deadProbe = {
+      classification: "dead",
+      record: idle,
+      evidence: deadEvidence,
+      diskMeta: {},
+      hostVerdict: "gone",
+    } as unknown as DeadHsrReAdoptionProbe;
+    assert.equal(await handleVerifiedBootRuntimeDeath(deadProbe, {
+      hasPendingTurns: async () => false,
+      hasUnfinishedMarker: async () => false,
+    }), "handled");
+    assert.equal((await loadSession(idle.name))?.stateMachine?.runtime, "parked");
+
+    const working = {
+      ...record("boot-working"),
+      stateMachine: undefined,
+      lastPrompt: "continue",
+      lastPromptAt: new Date(START - 5_000).toISOString(),
+    };
+    await saveSession(working);
+    await transitionSession(working.name, {
+      type: "runtime.lost",
+      eventId: "boot-working-lost",
+      at: new Date(START - 16_000).toISOString(),
+      cause: "mid-turn-death",
+      probe: probe(working, "dead"),
+    });
+    await beginRuntimeRecovery({
+      bee: working.name,
+      generation: 2,
+      probeId: "boot-working-death",
+      episodeId: "boot-working-episode",
+      nowMs: START - 15_000,
+      random: () => 0.5,
+    });
+    await claimRuntimeRecoveryAttempt({
+      bee: working.name,
+      nowMs: START,
+      attemptId: "boot-working-attempt",
+      random: () => 0.5,
+    });
+    const current = (await loadSession(working.name))!;
+    const liveEvidence = probe(current, "alive") as RecoveryProbeEvidence & { outcome: "alive" };
+    const liveProbe = {
+      classification: "live",
+      record: current,
+      evidence: liveEvidence,
+      diskMeta: {},
+      ownedMeta: {},
+      staleExitedMeta: false,
+    } as unknown as LiveHsrReAdoptionProbe;
+    await handleVerifiedBootRuntimeLive(liveProbe, {
+      now: () => START + 1_000,
+      drainStaged: async () => 0,
+    });
+    assert.equal((await loadSession(working.name))?.stateMachine?.runtime, "live");
+    assert.equal((await readRuntimeRecovery(working.name))?.status, "recovered");
   });
 });
 

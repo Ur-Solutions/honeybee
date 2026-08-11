@@ -3,12 +3,18 @@ import { hiveStateFor, writeHiveState } from "../hiveState.js";
 import { listNodes } from "../node.js";
 import { sealedBeeNames } from "../seal.js";
 import { refreshSessionTranscriptMetadata } from "../sessionMetadata.js";
-import { hsrObservations } from "../hsr/observe.js";
+import { hsrObservations, structuredStateFromEvents, type HsrObservation } from "../hsr/observe.js";
 import { createIsolatedHsrObservations } from "./observerProcess.js";
 import { createIsolatedSessionLister } from "./sessionListProcess.js";
 import { createIsolatedCredentialSweeper } from "./credentialSweepProcess.js";
 import { createRemoteEventMirror } from "../hsr/remoteEventMirror.js";
-import { appendLedger, markSessionVerified, type SessionRecord, touchSession } from "../store.js";
+import {
+  appendLedger,
+  markSessionVerified,
+  transitionSession,
+  type SessionRecord,
+  touchSession,
+} from "../store.js";
 import { localSubstrate } from "../substrates/index.js";
 import { createAutoTitleDispatcher } from "./autoTitle.js";
 import { createAuthRecoveryDispatcher } from "./authRecovery.js";
@@ -22,6 +28,8 @@ import { createTaskSupplyDispatcher } from "./taskSupplyDispatcher.js";
 import { createNodeReachabilityTracker } from "./nodeReachability.js";
 import { createPoolSweeper } from "./poolSweep.js";
 import { createTerminalReprobeSweeper } from "./terminalReprobe.js";
+import { probeHsrReAdoption } from "./reAdoption.js";
+import { createRuntimeRecoveryDispatcher, reconcileRuntimeDeaths } from "./runtimeRecovery.js";
 import { createFlightSweeper } from "./flightSweep.js";
 import { createCombSweeper } from "./combSweep.js";
 import { createUsageSampler } from "./usageSampler.js";
@@ -111,6 +119,9 @@ export function buildDefaultDeps(): TickDeps {
   const isolatedListSessions = createIsolatedSessionLister();
   const isolatedCredentialSweep = createIsolatedCredentialSweeper();
   const dispatchBuzDrain = createBuzDrainDispatcher();
+  const observerId = `hive-daemon:${process.pid}`;
+  const probeRuntime = async (record: SessionRecord) =>
+    (await probeHsrReAdoption(record, observerId)).evidence;
   return {
     listSessions: isolatedListSessions,
     listNodes,
@@ -136,6 +147,15 @@ export function buildDefaultDeps(): TickDeps {
     appendLedger,
     dispatchBuzDrain,
     dispatchBuzRecovery: createBuzRecoveryDispatcher(),
+    reconcileRuntimeDeaths: (records, observations) => reconcileRuntimeDeaths(records, {
+      probe: probeRuntime,
+      transition: transitionSession,
+      hasUnfinishedMarker: (bee) => Promise.resolve(hasUnfinishedHsrMarker(observations.get(bee))),
+    }),
+    dispatchRuntimeRecovery: createRuntimeRecoveryDispatcher({
+      probe: probeRuntime,
+      transition: transitionSession,
+    }),
     dispatchTaskSupply: createTaskSupplyDispatcher(),
     reconcileRequests: createRequestReconciler(),
     recoverAuthNeeded: createAuthRecoveryDispatcher(),
@@ -156,4 +176,11 @@ export function buildDefaultDeps(): TickDeps {
     syncChains: isolatedCredentialSweep,
     now: () => Date.now(),
   };
+}
+
+function hasUnfinishedHsrMarker(observation: HsrObservation | undefined): boolean {
+  const events = observation?.eventSnapshot?.events;
+  if (!events || events.length === 0) return false;
+  const state = structuredStateFromEvents(events);
+  return state === "active" || state === "blocked" || state === "auth-needed";
 }

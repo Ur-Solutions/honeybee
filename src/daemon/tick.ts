@@ -1,7 +1,7 @@
 import { hiveStateFor } from "../hiveState.js";
 import type { NodeRecord } from "../node.js";
 import type { HsrObservation } from "../hsr/observe.js";
-import { deriveState, isTerminalState, liveTargetKey, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
+import { deriveState, isTerminalState, liveTargetKey, parseBeeState, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
 import { shouldPersistObservationHeartbeat, type SessionRecord } from "../store.js";
 import type { ProbeEvidence } from "../stateMachine.js";
 import type { AutoTitleOutcome } from "./autoTitle.js";
@@ -17,6 +17,11 @@ import type { NodeReachabilityDispatcher, NodeReachabilityOutcome } from "./node
 import type { TokenRefreshOutcome } from "./tokenRefresh.js";
 import type { PoolSweeper, PoolSweepOutcome } from "./poolSweep.js";
 import type { TerminalReprobeOutcome } from "./terminalReprobe.js";
+import type {
+  RuntimeDeathDecision,
+  RuntimeRecoveryDispatcher,
+  RuntimeRecoveryOutcome,
+} from "./runtimeRecovery.js";
 import type { FlightSweeper } from "./flightSweep.js";
 import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
 import type { CombSweeper } from "./combSweep.js";
@@ -100,6 +105,16 @@ export type TickDeps = {
    * The implementation owns its 1-2 wake slots; no revive is awaited here.
    */
   dispatchBuzRecovery?: BuzRecoveryDispatcher;
+  /**
+   * Probe-verifies coarse local-HSR death observations before any legacy
+   * crashed cursor can be derived, mirrored, ledgered, or persisted.
+   */
+  reconcileRuntimeDeaths?: (
+    records: SessionRecord[],
+    observations: ReadonlyMap<string, HsrObservation>,
+  ) => Promise<RuntimeDeathDecision[]>;
+  /** Tick-cheap collector/launcher for bounded mid-turn recovery. */
+  dispatchRuntimeRecovery?: RuntimeRecoveryDispatcher;
   /**
    * Optional task auto-supply dispatcher (agent task lists epic): on the same
    * idle_with_output observation that drains buz queues, feeds the top
@@ -259,6 +274,8 @@ export type DispatcherOutcomes = {
   buzDrains: BuzDispatchOutcome[];
   /** Settled outcomes collected from the detached message-recovery lane. */
   buzRecoveries: BuzRecoveryOutcome[];
+  /** Settled outcomes collected from the detached runtime-recovery lane. */
+  runtimeRecoveries: RuntimeRecoveryOutcome[];
   /**
    * Task auto-supply outcomes: tasks fed to idle bees through the six-
    * condition gate, fed tasks flagged stalled, per-bee errors. Empty when no
@@ -304,6 +321,8 @@ export type DispatcherOutcomes = {
 };
 
 export type TickResult = DispatcherOutcomes & {
+  /** Exact-probe classifications made before legacy state derivation. */
+  runtimeDeaths: RuntimeDeathDecision[];
   transitions: TickTransition[];
   observed: Map<string, BeeState>;
   unreachableNodes: Set<string>;
@@ -479,6 +498,26 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
           ...(outcome.attempt !== undefined ? { attempt: outcome.attempt } : {}),
           ...(outcome.retryAt ? { retryAt: outcome.retryAt } : {}),
           ...(outcome.reason ? { reason: outcome.reason } : {}),
+          ...(outcome.error ? { error: outcome.error } : {}),
+        },
+  },
+  // Mid-turn recovery has its own durable budget and detached concurrency
+  // pool. Collection is cheap; launches never extend the observation tick.
+  {
+    key: "runtimeRecoveries",
+    name: "dispatchRuntimeRecovery",
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records }) => deps.dispatchRuntimeRecovery?.(records),
+    log: (outcome) => outcome.action === "deferred" || outcome.action === "unverified" || outcome.action === "skipped"
+      ? null
+      : {
+          level: outcome.action === "failed" || outcome.action === "exhausted" ? "warn" : "info",
+          msg: `runtime.recovery.${outcome.action}`,
+          session: outcome.bee,
+          ...(outcome.attempt !== undefined ? { attempt: outcome.attempt } : {}),
+          ...(outcome.retryAt ? { retryAt: outcome.retryAt } : {}),
+          ...(outcome.requestId ? { requestId: outcome.requestId } : {}),
+          ...(outcome.replayedTurns !== undefined ? { replayedTurns: outcome.replayedTurns } : {}),
           ...(outcome.error ? { error: outcome.error } : {}),
         },
   },
@@ -756,6 +795,7 @@ export function emptyDispatcherOutcomes(): DispatcherOutcomes {
   return {
     buzDrains: [],
     buzRecoveries: [],
+    runtimeRecoveries: [],
     taskSupplies: [],
     requestReconciles: [],
     authRecoveries: [],
@@ -1009,13 +1049,52 @@ export async function tick(
     now: nowMs,
   };
 
+  // A display-oriented HSR observation may suggest death, but only the exact
+  // pid + birth fingerprint + host-owned control-socket probe may authorize a
+  // runtime transition. Run that proof gate before deriving legacy state so a
+  // verified idle death becomes an invisible idle-shaped park and a verified
+  // mid-turn death becomes active-shaped recovery without ever writing crash.
+  let runtimeDeaths: RuntimeDeathDecision[] = [];
+  if (deps.reconcileRuntimeDeaths) {
+    const coarseDeaths = records.filter((record) =>
+      record.substrate === "hsr" && record.status === "running" &&
+      !hsrUnavailable.has(record.name) && hsrObs.get(record.name)?.live !== true);
+    if (coarseDeaths.length > 0) {
+      // Fail closed even if the exact-probe batch times out. Missing proof
+      // holds the prior cursor; it can never authorize a legacy crash write.
+      runtimeDeaths = coarseDeaths.map((record) => ({
+        bee: record.name,
+        action: "unverified" as const,
+        suppressLegacyCrash: true,
+      }));
+      try {
+        const reconciled = await timeStage("reconcileRuntimeDeaths", () =>
+          withTimeout(
+            deps.reconcileRuntimeDeaths!(coarseDeaths, hsrObs),
+            timeouts.substrateMs,
+            "reconcileRuntimeDeaths",
+          ));
+        const reconciledByBee = new Map(reconciled.map((decision) => [decision.bee, decision]));
+        runtimeDeaths = runtimeDeaths.map((fallback) => reconciledByBee.get(fallback.bee) ?? fallback);
+      } catch (error) {
+        errors.push(toError(error));
+      }
+    }
+  }
+  const runtimeDeathByBee = new Map(runtimeDeaths.map((decision) => [decision.bee, decision]));
+
   const observed = new Map<string, BeeState>();
   const transitions: TickTransition[] = [];
   const observedAtIso = new Date(nowMs).toISOString();
   const recordPlans = records.map((record) => {
-    const derived = deriveState(record, context);
-    observed.set(record.name, derived.state);
+    const rawDerived = deriveState(record, context);
     const prev = previousObserved.get(record.name);
+    const death = runtimeDeathByBee.get(record.name);
+    const state = death?.suppressLegacyCrash
+      ? heldRuntimeRecoveryState(death, prev, record.lastObservedState)
+      : rawDerived.state;
+    const derived = { ...rawDerived, state };
+    observed.set(record.name, derived.state);
     const mappedHiveState = hiveStateFor(derived.state);
     const liveHiveState = liveHiveStateFor(record, probe);
     const staleHiveState = mappedHiveState !== undefined && liveHiveState !== undefined && liveHiveState !== mappedHiveState;
@@ -1216,6 +1295,7 @@ export async function tick(
   return {
     transitions,
     observed,
+    runtimeDeaths,
     unreachableNodes: probe.unreachableNodes,
     errors,
     ...dispatchContext.outcomes,
@@ -1258,6 +1338,18 @@ function daemonProbeEvidence(
     },
     detail: `daemon derived ${state}`,
   };
+}
+
+function heldRuntimeRecoveryState(
+  decision: RuntimeDeathDecision,
+  previous: BeeState | undefined,
+  persisted: string | undefined,
+): BeeState {
+  if (decision.action === "parked") return "idle_with_output";
+  if (previous && !isTerminalState(previous)) return previous;
+  const parsed = parseBeeState(persisted);
+  if (parsed && !isTerminalState(parsed)) return parsed;
+  return "active";
 }
 
 function liveHiveStateFor(record: SessionRecord, probe: ProbeResult): string | undefined {

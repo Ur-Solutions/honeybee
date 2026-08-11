@@ -36,6 +36,7 @@ import { resolve } from "node:path";
 import type { RunnerEvent } from "../hsr/types.js";
 import { lastAuthNeededEvent } from "../view/requests.js";
 import { atomicWriteFile } from "../fsx.js";
+import { finalizeManualRuntimeRevive } from "../recovery/manual.js";
 
 // Harnesses whose interactive↔headless resume genuinely carries history — the
 // only ones promote/demote accept. claude is EXCLUDED: its interactive-TUI and
@@ -1446,7 +1447,7 @@ export async function reviveRecord(
   return withSessionLifecycleTransaction(record, (lifecycle) => reviveRecordInTransaction(lifecycle, opts));
 }
 
-async function reviveRecordInTransaction(
+export async function reviveRecordInTransaction(
   lifecycle: SessionLifecycleTransaction,
   opts: {
     fresh: boolean;
@@ -1639,7 +1640,14 @@ async function claudeAccountOwningHome(homePath: string): Promise<AccountRecord 
 /** Relaunch one dead bee and resume (or, with --fresh, start anew) its session. */
 export async function reviveOne(record: SessionRecord, parsed: Parsed, opts: { skipReadyWait?: boolean } = {}): Promise<SessionRecord> {
   const substrate = substrateFor(record);
-  if (await substrate.hasSession(record.tmuxTarget)) {
+  const alreadyLive = await substrate.hasSession(record.tmuxTarget);
+  // A prior manual revive may have launched and committed the replacement,
+  // then died before resolving the recovery request/resetting the budget.
+  // Treat that exact bounded state as a finalization retry, not "already
+  // running"; all ordinary live revives retain the existing rejection.
+  const finalizeExistingRecovery = alreadyLive && record.substrate === "hsr" &&
+    (record.stateMachine?.runtime === "lost" || record.stateMachine?.runtime === "recovering");
+  if (alreadyLive && !finalizeExistingRecovery) {
     throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
   }
   const tool = canonicalAgentKind(record.agent).toLowerCase();
@@ -1649,15 +1657,26 @@ export async function reviveOne(record: SessionRecord, parsed: Parsed, opts: { s
   // still exists on disk (claude/codex keep sessions keyed by project dir).
   const sessionOverride = stringFlag(parsed, ["session"]);
   const providerSessionId = fresh ? undefined : (sessionOverride ?? record.providerSessionId);
-  if (!fresh && !providerSessionId) {
+  if (!finalizeExistingRecovery && !fresh && !providerSessionId) {
     throw new Error(
       `hive revive: ${record.name} has no recorded provider session id; pass --session <id> to resume an exact ${tool} session, or --fresh to start anew`,
     );
   }
 
-  const updated = await reviveRecord(record, { fresh, sessionOverride });
+  const preserveRecoveryRequest = record.substrate === "hsr" &&
+    (record.stateMachine?.runtime === "lost" || record.stateMachine?.runtime === "recovering");
+  const launched = finalizeExistingRecovery
+    ? record
+    : await reviveRecord(record, {
+        fresh,
+        sessionOverride,
+        deferRequestClosure: preserveRecoveryRequest,
+      });
+  const updated = await finalizeManualRuntimeRevive(launched);
 
-  const how = providerSessionId ? `resumed ${providerSessionId}` : "fresh session";
+  const how = finalizeExistingRecovery
+    ? "verified existing replacement"
+    : providerSessionId ? `resumed ${providerSessionId}` : "fresh session";
   const relaunchedCommand = updated.lastReviveCommand ?? updated.command;
   if (isPretty()) {
     console.log(actionLine("ok", "revive", [bold(record.name), record.agent, dim(how)]));

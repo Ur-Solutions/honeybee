@@ -70,10 +70,24 @@ test("hive send starts a new turn above the previous seal", { skip: !tmuxAvailab
         lastObservedState: "done",
         lastObservedStateAt: "2026-08-04T00:01:00.000Z",
       };
-      await saveSession(record);
+      await saveSession(record, {
+        probeEvidence: {
+          kind: "probe",
+          probeId: "cli-send-sealed-fixture",
+          observerId: "cli-send-test",
+          observedAt: record.lastObservedStateAt!,
+          outcome: "dead",
+          target: { substrate: "local-tmux", tmuxTarget: target },
+          detail: "fixture proof for the prior turn's terminal cursor",
+        },
+      });
       await recordSeal(name, validateSealArtifact({ status: "done", summary: "first turn complete" }));
       assert.equal((await sealedBeeNames([record])).has(name), true);
-      assert.deepEqual(await listActiveSessions(), [], "completed turn starts outside daemon hot paths");
+      assert.deepEqual(
+        (await listActiveSessions()).map((candidate) => candidate.name),
+        [name],
+        "an active lifecycle stays probeable even when its legacy turn cursor says done",
+      );
     });
 
     await hive(store, socket, "send", name, "follow-up turn");

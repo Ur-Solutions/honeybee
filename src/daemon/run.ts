@@ -23,6 +23,10 @@ import {
 import { logTickResult, tick, type TickResult } from "./tick.js";
 import { defaultTickTimeouts, envMs, toError, withTimeout } from "./timeouts.js";
 import { buildDefaultDeps } from "./wiring.js";
+import {
+  handleVerifiedBootRuntimeDeath,
+  handleVerifiedBootRuntimeLive,
+} from "./runtimeRecovery.js";
 import { createCredentialSyncController, type CredentialSyncRunOutcome, type CredentialSyncSettlement } from "./credentialSyncController.js";
 import {
   createSupervisor,
@@ -337,6 +341,8 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   const reAdopt = options.bootReAdoption ?? ((id: string) => reconcileBootReAdoption({
     observerId: id,
     markBeforeProbe: false,
+    onVerifiedDeath: handleVerifiedBootRuntimeDeath,
+    onVerifiedLive: handleVerifiedBootRuntimeLive,
   }));
   let reAdoptionKicked = false;
   try {

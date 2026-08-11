@@ -226,10 +226,19 @@ export async function claimRuntimeRecoveryAttempt(input: {
     }
 
     const attemptNumber = attempts.length + 1;
+    const scheduledAtMs = Date.parse(record.nextAttemptAt ?? "");
+    const scheduledFromMs = Date.parse(attempts.at(-1)?.endedAt ?? record.detectedAt);
+    // Persist the delay that actually gated this attempt. Re-sampling jitter
+    // here would make the durable attempt history disagree with the schedule
+    // the daemon honored before (and across) a restart.
+    const persistedDelayMs = Number.isFinite(scheduledAtMs) && Number.isFinite(scheduledFromMs) &&
+      scheduledAtMs >= scheduledFromMs
+      ? scheduledAtMs - scheduledFromMs
+      : runtimeRecoveryBackoffMs(attemptNumber, input.random);
     const attempt: RuntimeRecoveryAttempt = {
       attemptId: input.attemptId ?? randomUUID(),
       attempt: attemptNumber,
-      scheduledDelayMs: runtimeRecoveryBackoffMs(attemptNumber, input.random),
+      scheduledDelayMs: persistedDelayMs,
       startedAt: iso(nowMs),
       leaseUntil: iso(nowMs + (input.leaseMs ?? RUNTIME_RECOVERY_ATTEMPT_LEASE_MS)),
       outcome: "started",

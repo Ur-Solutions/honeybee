@@ -59,6 +59,7 @@ test("recovery backoff and attempt budget survive a simulated daemon restart", a
     });
     assert.equal(first.action, "claimed");
     if (first.action !== "claimed") return;
+    assert.equal(first.attempt.scheduledDelayMs, 15_000);
     await finishRuntimeRecoveryAttempt({
       bee: "CO.recover",
       attemptId: first.attempt.attemptId,
@@ -74,12 +75,14 @@ test("recovery backoff and attempt budget survive a simulated daemon restart", a
     assert.equal(afterRestart?.attempts.length, 1);
     assert.equal(afterRestart?.nextAttemptAt, new Date(START + 76_000).toISOString());
     assert.equal((await claimRuntimeRecoveryAttempt({ bee: "CO.recover", nowMs: START + 75_999 })).action, "deferred");
-    assert.equal((await claimRuntimeRecoveryAttempt({
+    const second = await claimRuntimeRecoveryAttempt({
       bee: "CO.recover",
       nowMs: START + 76_000,
       random: noJitter,
       attemptId: "attempt-2",
-    })).action, "claimed");
+    });
+    assert.equal(second.action, "claimed");
+    if (second.action === "claimed") assert.equal(second.attempt.scheduledDelayMs, 60_000);
   });
 });
 

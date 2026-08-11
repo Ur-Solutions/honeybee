@@ -14,6 +14,7 @@ import { openAndResolveRequest } from "../requests/store.js";
 import { nextTurnPatch, recordSeal, sealArtifactExampleJson, sealHelpText, validateSealArtifact, type SealRecord } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { appendLedger, updateSession, type SessionRecord } from "../store.js";
+import { ensureLiveRuntimeForSend, markLiveRuntimeSteered } from "../recovery/wake.js";
 import { substrateFor } from "../substrates/index.js";
 import { dedupeTags, effectiveTags, isValidTagValue, rejectReservedNamespaceTag } from "../tags.js";
 import { tmux } from "../tmux.js";
@@ -388,29 +389,36 @@ export async function cmdSend(parsed: Parsed) {
 
   let sent = 0;
   for (const record of records) {
-    if (!(await substrateFor(record).hasSession(record.tmuxTarget))) {
-      if (!isMulti) throw new Error(`tmux session is not running: ${record.tmuxTarget}`);
-      if (isPretty()) console.error(note(`skip ${record.name} (dead)`));
+    let deliveryRecord: SessionRecord;
+    try {
+      deliveryRecord = (await ensureLiveRuntimeForSend(record)).record;
+    } catch (error) {
+      if (!isMulti) throw error;
+      if (isPretty()) console.error(note(`skip ${record.name} (${error instanceof Error ? error.message : String(error)})`));
       else console.error(`skip\t${record.name}\tdead`);
       continue;
     }
+    // Publish the steer while the runtime is probe/live. If the process dies
+    // after accepting the send, the supervisor sees durable working intent
+    // rather than a parked cursor with an orphaned pending turn.
+    const steeredRecord = await markLiveRuntimeSteered(deliveryRecord);
     // Snapshot before delivery so a very fast seal from the new turn remains
     // above the boundary. Persist only after sendText succeeds: a failed send
     // must leave the completed turn's seal authoritative.
-    const turn = await nextTurnPatch(record);
-    await substrateFor(record).sendText(record.tmuxTarget, prompt, record.agentPaneId);
+    const turn = await nextTurnPatch(steeredRecord);
+    await substrateFor(steeredRecord).sendText(steeredRecord.tmuxTarget, prompt, steeredRecord.agentPaneId);
     const now = new Date().toISOString();
-    await updateSession(record.name, {
+    await updateSession(deliveryRecord.name, {
       ...turn,
       updatedAt: now,
       status: "running",
       lastPrompt: prompt,
       lastPromptAt: now,
     });
-    await writeHiveState(record, "working");
-    await appendLedger({ type: "prompt.send", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
-    if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
-    else console.log(`sent\t${record.name}\t${prompt.length} chars`);
+    await writeHiveState(steeredRecord, "working");
+    await appendLedger({ type: "prompt.send", session: deliveryRecord.name, agent: deliveryRecord.agent, node: deliveryRecord.node ?? LOCAL_NODE_NAME, cwd: deliveryRecord.cwd, chars: prompt.length });
+    if (isPretty()) console.log(actionLine("ok", "send", [bold(deliveryRecord.name), `${prompt.length} chars`]));
+    else console.log(`sent\t${deliveryRecord.name}\t${prompt.length} chars`);
     sent += 1;
   }
 
