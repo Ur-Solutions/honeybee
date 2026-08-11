@@ -10,6 +10,7 @@ import {
   resolveSessionTranscript,
   syncHsrProviderSessionId,
 } from "../src/sessionMetadata.js";
+import type { ProbeEvidence } from "../src/stateMachine.js";
 import { loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { TranscriptFile } from "../src/transcripts.js";
 import { withFileLock } from "../src/lock.js";
@@ -39,6 +40,24 @@ function bee(name: string, overrides: Partial<SessionRecord> = {}): SessionRecor
     status: "running",
     ...overrides,
   };
+}
+
+function terminalProbe(record: SessionRecord): ProbeEvidence {
+  return {
+    kind: "probe",
+    probeId: `session-metadata-fixture:${record.name}`,
+    observerId: "session-metadata-fixture",
+    observedAt: record.lastObservedStateAt ?? record.updatedAt,
+    outcome: "dead",
+    target: record.substrate === "hsr"
+      ? { substrate: "hsr", runnerPid: record.runnerPid }
+      : { substrate: "local-tmux", tmuxTarget: record.tmuxTarget },
+    detail: "test fixture terminal observation",
+  };
+}
+
+async function saveTerminalSession(record: SessionRecord): Promise<void> {
+  await saveSession(record, { probeEvidence: terminalProbe(record) });
 }
 
 function claudeProjectKey(cwd: string): string {
@@ -163,7 +182,7 @@ test("crashed HSR bee never adopts a live sibling transcript from spawn proximit
       transcriptPath: siblingPath,
       lastObservedState: "working",
     });
-    await saveSession(crashed);
+    await saveTerminalSession(crashed);
     await saveSession(liveSibling);
 
     await refreshSessionTranscriptMetadata(crashed);
@@ -243,7 +262,7 @@ test("terminal sibling records retain transcript ownership against heuristic ado
       lastObservedState: "crashed",
     });
     await saveSession(target);
-    await saveSession(historical);
+    await saveTerminalSession(historical);
     const transcript: TranscriptFile = {
       provider: "claude",
       path: "/tmp/historical.jsonl",
@@ -359,7 +378,7 @@ test("an explicit stored session id still permits legitimate resume metadata", a
       lastObservedState: "crashed",
     });
     await saveSession(resumed);
-    await saveSession(historical);
+    await saveTerminalSession(historical);
     const transcript: TranscriptFile = {
       provider: "claude",
       path: "/tmp/resume.jsonl",

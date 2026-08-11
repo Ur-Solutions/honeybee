@@ -24,6 +24,7 @@ import {
 import { tick, type ProbeResult, type TickDeps, type TickTransition } from "../src/daemon/run.js";
 import { readBeeRequests } from "../src/requests/store.js";
 import type { BeeState } from "../src/state.js";
+import type { ProbeEvidence } from "../src/stateMachine.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { Substrate } from "../src/substrates/index.js";
 
@@ -52,6 +53,18 @@ function makeRecord(name: string, overrides: Partial<SessionRecord> = {}): Sessi
     status: "running",
     buzAccept: ["queue", "passive", "interrupt"],
     ...overrides,
+  };
+}
+
+function terminalProbe(record: SessionRecord): ProbeEvidence {
+  return {
+    kind: "probe",
+    probeId: `buz-recovery-fixture:${record.name}`,
+    observerId: "buz-recovery-fixture",
+    observedAt: record.lastObservedStateAt ?? record.updatedAt,
+    outcome: "dead",
+    target: { substrate: "local-tmux", tmuxTarget: record.tmuxTarget },
+    detail: "test fixture terminal observation",
   };
 }
 
@@ -400,7 +413,7 @@ async function seedRecoveryRecord(
     recoveryMessageId: sent.message.id,
     recoveryAttemptCount: 0,
   };
-  await saveSession(record);
+  await saveSession(record, { probeEvidence: terminalProbe(record) });
   return record;
 }
 
