@@ -92,6 +92,12 @@ export async function ensureRunnerHostBundle(opts?: { force?: boolean }): Promis
     bundle: true,
     platform: "node",
     format: "esm",
+    // CJS deps (e.g. node-forge via sandbox-runtime) use dynamic require;
+    // ESM output needs a require shim or the bundle fails at load with
+    // "Dynamic require of \"crypto\" is not supported".
+    banner: {
+      js: 'import { createRequire as __hsrCreateRequire } from "node:module"; const require = __hsrCreateRequire(import.meta.url);',
+    },
     // Minimum supported node on the remote (bootstrap precheck requires >=18).
     target: "node18",
     minify: false,
