@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { signalExitCode, terminateTestProcessTree } from "./test-process-control.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const manifestPath = resolve(root, ".test-dist", "test-files.json");
@@ -49,12 +50,21 @@ async function runGroup(files, execArgv = []) {
     {
       cwd: root,
       stdio: "inherit",
+      // `node --test` starts worker descendants. A dedicated process group lets
+      // Ctrl-C/termination reap the whole tree instead of orphaning workers.
+      detached: process.platform !== "win32",
       env: { ...process.env, HIVE_TEST_BUILT_CLI: "1" },
     },
   );
 
-  const forwardInterrupt = () => child.kill("SIGINT");
-  const forwardTermination = () => child.kill("SIGTERM");
+  let requestedSignal;
+  let termination;
+  const forwardSignal = (signal) => {
+    requestedSignal ??= signal;
+    termination ??= terminateTestProcessTree(child, signal);
+  };
+  const forwardInterrupt = () => forwardSignal("SIGINT");
+  const forwardTermination = () => forwardSignal("SIGTERM");
   process.once("SIGINT", forwardInterrupt);
   process.once("SIGTERM", forwardTermination);
   const result = await new Promise((resolveExit) => {
@@ -63,9 +73,14 @@ async function runGroup(files, execArgv = []) {
   });
   process.removeListener("SIGINT", forwardInterrupt);
   process.removeListener("SIGTERM", forwardTermination);
+  if (termination) await termination;
 
   if (result.error) throw result.error;
-  if (result.signal) process.kill(process.pid, result.signal);
+  if (requestedSignal) return signalExitCode(requestedSignal);
+  if (result.signal) {
+    await terminateTestProcessTree(child, result.signal);
+    return signalExitCode(result.signal);
+  }
   return result.code ?? 1;
 }
 
