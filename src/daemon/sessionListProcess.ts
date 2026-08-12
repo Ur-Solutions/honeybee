@@ -17,6 +17,7 @@ import {
   type SessionRecord,
 } from "../store.js";
 import { envMs } from "./timeouts.js";
+import { daemonWorkerArgv } from "./workerLaunch.js";
 
 type SessionListRequest = { id: number; root: string };
 type SessionListResponse = { id: number; ok: boolean; records?: SessionRecord[]; error?: string };
@@ -57,8 +58,6 @@ export async function runActiveIndexReconcileWorker(): Promise<void> {
  * a historical fs wedge cannot consume or kill the operational snapshot worker.
  */
 function reconcileActiveIndexIsolated(root: string, signal?: AbortSignal): Promise<number> {
-  const cliPath = process.argv[1];
-  if (!cliPath) return Promise.reject(new Error("cannot resolve CLI entrypoint for active-index reconciliation"));
   // Canonical history scans can legitimately exceed the 14s operational
   // snapshot deadline at 10k+ rows. This work is a separate disposable process,
   // so give it a larger bounded budget without delaying daemon observations.
@@ -66,7 +65,7 @@ function reconcileActiveIndexIsolated(root: string, signal?: AbortSignal): Promi
   return new Promise<number>((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      [...process.execArgv, cliPath, "daemon", "active-index-reconcile-worker"],
+      daemonWorkerArgv("active-index-reconcile-worker", import.meta.url),
       {
         env: { ...process.env, HIVE_STORE_ROOT: root },
         stdio: ["ignore", "ignore", "pipe"],
@@ -176,9 +175,7 @@ export type IsolatedSessionListerOptions = {
 export type IsolatedSessionLister = (() => Promise<SessionRecord[]>) & { close: () => Promise<void> };
 
 function defaultSpawnChild(): SessionListChild {
-  const cliPath = process.argv[1];
-  if (!cliPath) throw new Error("cannot resolve CLI entrypoint for the session-list child");
-  const child: ChildProcess = spawn(process.execPath, [...process.execArgv, cliPath, "daemon", "session-list-worker"], {
+  const child: ChildProcess = spawn(process.execPath, daemonWorkerArgv("session-list-worker", import.meta.url), {
     stdio: ["pipe", "pipe", "inherit"],
   });
   child.unref();

@@ -111,7 +111,7 @@ test("bees sidebar toggle is quiet for tmux hotkeys", { timeout: 30_000 }, async
   const session = "sidebar-quiet";
   await tmux(["new-session", "-d", "-s", session, "-x", "120", "-y", "40", "sleep 120"]);
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "bees", "--toggle-sidebar", "--width", "28"], {
+    const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "bees", "--toggle-sidebar", "--width", "28"], {
       cwd: process.cwd(),
       env: {
         ...process.env,

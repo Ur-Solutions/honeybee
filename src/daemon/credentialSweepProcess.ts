@@ -23,6 +23,7 @@ import {
 import { readFileLockIdentity, removeFileLockIfOwner, type FileLockOwnerIdentity } from "../lock.js";
 import { runCredentialPairSync, runCredentialSweep, type CredentialSweepProgress, type CredentialSweepTelemetry } from "./credentialSweep.js";
 import { envMs } from "./timeouts.js";
+import { daemonWorkerArgv } from "./workerLaunch.js";
 
 type CredentialSweepRequest =
   | { id: number; root: string; mode?: "sweep" }
@@ -125,9 +126,7 @@ export class CredentialSweepTimeoutError extends Error {
 }
 
 function defaultSpawnChild(): CredentialSweepChild {
-  const cliPath = process.argv[1];
-  if (!cliPath) throw new Error("cannot resolve CLI entrypoint for the credential-sweep child");
-  const child: ChildProcess = spawn(process.execPath, [...process.execArgv, cliPath, "daemon", "credential-sweep-worker"], {
+  const child: ChildProcess = spawn(process.execPath, daemonWorkerArgv("credential-sweep-worker", import.meta.url), {
     stdio: ["pipe", "pipe", "inherit"],
     // pgid === pid: timeout can terminate every inherited helper/descendant,
     // not merely the Node worker that launched `security`/Keychain work.

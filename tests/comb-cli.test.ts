@@ -373,7 +373,7 @@ async function invokeFullCli(
   try {
     const result = await execFileAsync(
       process.execPath,
-      ["--import", "tsx", "src/cli.ts", ...argv],
+      ["tests/cli-entry.mjs", ...argv],
       {
         cwd: process.cwd(),
         env: { ...process.env, HIVE_BEE: "", NO_COLOR: "1" },

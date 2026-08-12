@@ -12,7 +12,7 @@ const execFileAsync = promisify(execFile);
 const ENV = (dir: string) => ({ ...process.env, HIVE_STORE_ROOT: dir, HIVE_NO_KEYCHAIN: "1", NO_COLOR: "1", TERM: "dumb" });
 
 async function hive(dir: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], { cwd: process.cwd(), env: ENV(dir) });
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], { cwd: process.cwd(), env: ENV(dir) });
 }
 
 type SeedRecord = {

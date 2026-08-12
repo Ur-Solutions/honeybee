@@ -51,7 +51,7 @@ function terminalProbe(record: SessionRecord): ProbeEvidence {
 }
 
 async function hive(store: string, args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
     cwd: process.cwd(),
     env: { ...process.env, HIVE_STORE_ROOT: store, NO_COLOR: "1", TERM: "dumb", ...env },
   });
@@ -59,7 +59,7 @@ async function hive(store: string, args: string[], env: NodeJS.ProcessEnv = {}):
 
 async function hiveWithInput(store: string, args: string[], input: string): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+    const child = spawn(process.execPath, ["tests/cli-entry.mjs", ...args], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: store, NO_COLOR: "1", TERM: "dumb" },
       stdio: ["pipe", "pipe", "pipe"],

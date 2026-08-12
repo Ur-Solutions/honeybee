@@ -110,7 +110,7 @@ test("hive retire --compact compacts HSR events but preserves metadata, seals, m
     const events = Array.from({ length: 600 }, (_, index) => JSON.stringify({ type: "text", ts: index, text: `line ${index}` })).join("\n") + "\n";
     await writeFile(hsrEventsPath(record.name), events);
 
-    await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "retire", record.name, "--compact"], {
+    await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "retire", record.name, "--compact"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });

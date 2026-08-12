@@ -316,7 +316,7 @@ test("hive revive cancels open requests from the previous generation as supersed
     );
     await openRequest(bee, openInput({ id: "stale-question", kind: "question", generation: 1 }));
 
-    await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "revive", bee, "--fresh", "--no-wait"], {
+    await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "revive", bee, "--fresh", "--no-wait"], {
       cwd: process.cwd(),
       env: {
         ...process.env,

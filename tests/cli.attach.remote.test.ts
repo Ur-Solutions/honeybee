@@ -31,7 +31,7 @@ const ENV = (storeDir: string, stubDir: string) => ({
 });
 
 async function hive(storeDir: string, stubDir: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
     cwd: process.cwd(),
     env: ENV(storeDir, stubDir),
   });
@@ -88,7 +88,7 @@ test("hive attach --print emits a local tmux attach-session (no ssh) for a local
     const env = { ...ENV(storeDir, stubDir), TMUX: "" };
     const { stdout } = await execFileAsync(
       process.execPath,
-      ["--import", "tsx", "src/cli.ts", "attach", "--print", name],
+      ["tests/cli-entry.mjs", "attach", "--print", name],
       { cwd: process.cwd(), env },
     );
     assert.match(stdout, new RegExp(`\\btmux attach-session -t =${name}\\b`));

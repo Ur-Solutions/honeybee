@@ -12,7 +12,7 @@ const execFileAsync = promisify(execFile);
 const emptyCompletionState = { records: [], liveTargets: new Set<string>() };
 
 async function hive(store: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
     cwd: process.cwd(),
     env: { ...process.env, HIVE_STORE_ROOT: store, HIVE_NO_KEYCHAIN: "1", NO_COLOR: "1", TERM: "dumb" },
   });

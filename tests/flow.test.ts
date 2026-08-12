@@ -22,6 +22,11 @@ import {
 } from "../src/flow/index.js";
 import { parseJsonFlow, substituteString } from "../src/flow/json.js";
 
+const FLOW_SDK_PATH = join(
+  process.cwd(),
+  process.env.HIVE_TEST_BUILT_CLI === "1" ? ".test-dist/src/flow/index.js" : "src/flow/index.ts",
+);
+
 /* ------------------------------------------------------------------ */
 /*  Test harness — temp HIVE_STORE_ROOT and mock FlowContext.         */
 /* ------------------------------------------------------------------ */
@@ -549,7 +554,7 @@ test("listFlows mixes .ts and .json registry entries", async () => {
     const tsSource = join(dir, "ts-flow.ts");
     await writeFile(
       tsSource,
-      `import { defineFlow } from "${join(process.cwd(), "src/flow/index.ts")}";\n` +
+      `import { defineFlow } from "${FLOW_SDK_PATH}";\n` +
       `const flow = defineFlow({ name: "b-ts", run: async () => "ok" });\n` +
       `export default flow;\n`,
     );
@@ -575,7 +580,7 @@ test("loadFlow falls back to the recorded .source path when the registry TS copy
     const source = join(dir, "with-import.ts");
     await writeFile(
       source,
-      `import { defineFlow } from "${join(process.cwd(), "src/flow/index.ts")}";\n` +
+      `import { defineFlow } from "${FLOW_SDK_PATH}";\n` +
       `import { PAYLOAD } from "./helper.js";\n` +
       `export default defineFlow({ name: "with-import", run: async () => PAYLOAD });\n`,
     );
@@ -625,7 +630,7 @@ test("loadFlow loads a TS flow via tsLoader (dynamic import)", async () => {
     const source = join(dir, "ts-flow.ts");
     await writeFile(
       source,
-      `import { defineFlow } from "${join(process.cwd(), "src/flow/index.ts")}";\n` +
+      `import { defineFlow } from "${FLOW_SDK_PATH}";\n` +
       `export default defineFlow({\n` +
       `  name: "ts-flow",\n` +
       `  description: "TS authored",\n` +

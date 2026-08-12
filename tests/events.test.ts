@@ -97,29 +97,36 @@ test("ledgerFilesFor: since reaches into relevant rotations only", async () => {
 test("followLedgerEvents: streams appended lines and survives rotation", async () => {
   await withTempDir(async (dir) => {
     const path = join(dir, "ledger.jsonl");
-    await writeFile(path, line({ ts: "2026-07-20T10:00:00.000Z", type: "seal", session: "backlog" }));
+    const backlog = line({ ts: "2026-07-20T10:00:00.000Z", type: "seal", session: "backlog" });
+    await writeFile(path, backlog);
     const seen: LedgerEvent[] = [];
     const controller = new AbortController();
     const done = followLedgerEvents({
       path,
       pollMs: 5,
+      // Give the follower the exact call-site position. Without this handoff,
+      // its first async stat can race the append below and mistake that event
+      // for pre-existing backlog on a heavily loaded test runner.
+      fromPosition: Buffer.byteLength(backlog),
       signal: controller.signal,
       onEvent: (event) => seen.push(event),
     });
 
-    // Backlog before follow start is not replayed (position starts at EOF).
-    await appendFile(path, line({ ts: "2026-07-20T10:01:00.000Z", type: "state.transition", session: "a", to: "done" }));
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    assert.deepEqual(seen.map((e) => e.session), ["a"]);
+    try {
+      // Backlog before follow start is not replayed (position starts at EOF).
+      await appendFile(path, line({ ts: "2026-07-20T10:01:00.000Z", type: "state.transition", session: "a", to: "done" }));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.deepEqual(seen.map((e) => e.session), ["a"]);
 
-    // Rotate: move the file away, start a fresh one — follow resumes from 0.
-    await rename(path, `${path}.2026-07-20T10-02-00-000Z`);
-    await writeFile(path, line({ ts: "2026-07-20T10:03:00.000Z", type: "seal", session: "fresh" }));
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    assert.deepEqual(seen.map((e) => e.session), ["a", "fresh"]);
-
-    controller.abort();
-    await done;
+      // Rotate: move the file away, start a fresh one — follow resumes from 0.
+      await rename(path, `${path}.2026-07-20T10-02-00-000Z`);
+      await writeFile(path, line({ ts: "2026-07-20T10:03:00.000Z", type: "seal", session: "fresh" }));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.deepEqual(seen.map((e) => e.session), ["a", "fresh"]);
+    } finally {
+      controller.abort();
+      await done;
+    }
   });
 });
 

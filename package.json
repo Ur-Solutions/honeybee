@@ -26,10 +26,13 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:test": "node scripts/build-tests.mjs",
     "postbuild": "chmod +x dist/cli.js dist/cli-x.js",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "deploy": "node scripts/deploy-settle.mjs",
-    "test": "node --import tsx --test tests/*.test.ts",
+    "pretest": "npm run build:test",
+    "test": "node scripts/run-tests.mjs",
+    "test:source": "node --import tsx --test --test-concurrency=8 --test-reporter=dot tests/*.test.ts",
     "execution:digest": "tsx scripts/update-execution-digest.mjs",
     "dev": "tsx src/cli.ts",
     "hive": "node dist/cli.js"
@@ -39,6 +42,7 @@
   },
   "devDependencies": {
     "@types/node": "25.7.0",
+    "esbuild": "0.27.7",
     "tsx": "4.21.0",
     "typescript": "6.0.3"
   },

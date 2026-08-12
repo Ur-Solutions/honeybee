@@ -6,6 +6,7 @@
 import { rm } from "node:fs/promises";
 import { withFileLock } from "../lock.js";
 import { appendLedger } from "../store.js";
+import { clearMessageRecovery } from "./recovery.js";
 import { DELIVERY_LOCK_TIMEOUT_MS, deliveryLockPath, readMessageById, recipientWriteLockPath } from "./storage.js";
 
 /**
@@ -31,6 +32,17 @@ export async function cancelQueuedBuzMessage(beeName: string, id: string): Promi
       return true;
     }), { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS });
 
-  if (cancelled) await appendLedger({ type: "buz.cancel", bee: beeName, messageId: id });
+  if (cancelled) {
+    await appendLedger({ type: "buz.cancel", bee: beeName, messageId: id });
+    // An accepted message carries a durable delivery obligation. Cancelling
+    // the queued file without releasing that obligation leaves the daemon's
+    // recovery pass to find the file missing and cry "queued-message-missing"
+    // as a needs-action (observed live: CO.9be, 2026-08-12). The cancel IS
+    // the resolution.
+    await clearMessageRecovery(beeName, id, {
+      resolveRequestBy: "buz-cancel",
+      resolution: "message cancelled by sender",
+    }).catch(() => undefined);
+  }
   return cancelled;
 }

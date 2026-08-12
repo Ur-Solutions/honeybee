@@ -56,7 +56,7 @@ async function withIsolatedTmux<T>(fn: (socket: string) => Promise<T>): Promise<
 }
 
 async function hive(dir: string, socket: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
     cwd: process.cwd(),
     env: {
       ...process.env,

@@ -396,7 +396,7 @@ async function writeLiveHsr(root: string, bee: string, ring: string): Promise<vo
 
 async function runCli(root: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+    const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: root, HIVE_NO_KEYCHAIN: "1", NO_COLOR: "1", TERM: "dumb" },
       timeout: 10_000,

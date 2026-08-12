@@ -342,7 +342,7 @@ async function writeRecord(dir: string, record: SessionRecord): Promise<void> {
 
 async function hive(dir: string, ...args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+    const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
       timeout: 15_000,
@@ -397,14 +397,14 @@ test("hive kill on a real local-tmux session that resists kill: persists kill_fa
       TERM: "dumb",
       PATH: `${stubDir}:${process.env.PATH ?? ""}`,
     };
-    await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "node", "register", "stub-host", "--kind", "ssh-tmux", "--endpoint", "stub@localhost"], { cwd: process.cwd(), env });
+    await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "node", "register", "stub-host", "--kind", "ssh-tmux", "--endpoint", "stub@localhost"], { cwd: process.cwd(), env });
     await writeRecord(dir, seed({ name: "stub-bee", tmuxTarget: "stub-bee", node: "stub-host", id: "CO.stb" }));
 
     let stdout = "";
     let stderr = "";
     let code = 0;
     try {
-      const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "kill", "stub-bee", "--yes"], { cwd: process.cwd(), env, timeout: 15_000 });
+      const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "kill", "stub-bee", "--yes"], { cwd: process.cwd(), env, timeout: 15_000 });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (err) {

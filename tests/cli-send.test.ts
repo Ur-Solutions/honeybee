@@ -32,7 +32,7 @@ async function withStoreEnv<T>(store: string, fn: () => Promise<T>): Promise<T> 
 }
 
 async function hive(store: string, socket: string, ...args: string[]): Promise<void> {
-  await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+  await execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
     cwd: process.cwd(),
     env: {
       ...process.env,

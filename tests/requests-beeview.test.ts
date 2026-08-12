@@ -305,12 +305,12 @@ test("hive state explain shows the Recent history block and --json carries recen
     await cancelRequest(name, "req_hist_2", "scope-closed", "turn ended");
 
     const env = { ...process.env, HIVE_STORE_ROOT: store, HIVE_NO_KEYCHAIN: "1", NO_COLOR: "1", TERM: "dumb" };
-    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "state", "explain", name], { cwd: process.cwd(), env });
+    const { stdout } = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "state", "explain", name], { cwd: process.cwd(), env });
     assert.match(stdout, /Recent history/);
     assert.match(stdout, /req_hist_1 — resolved by hive-answer/);
     assert.match(stdout, /req_hist_2 — cancelled \(scope-closed\)/);
 
-    const json = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "state", "explain", name, "--json"], { cwd: process.cwd(), env });
+    const json = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "state", "explain", name, "--json"], { cwd: process.cwd(), env });
     const view = JSON.parse(json.stdout) as { recentClosedRequests?: Array<{ id: string; status: string }> };
     assert.ok(view.recentClosedRequests);
     assert.deepEqual(

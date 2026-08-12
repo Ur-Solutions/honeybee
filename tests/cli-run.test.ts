@@ -170,7 +170,7 @@ test("x rejects swarm flags with a helpful hint", async () => {
 
 async function runCli(args: string[], env: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+    const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
       cwd: process.cwd(),
       // These assert on the EXACT text a bee receives; the session preamble is
       // covered end-to-end in tests/preamble-cli.test.ts instead.

@@ -62,12 +62,12 @@ export async function openMessageDeliveryRequest(
 export async function clearMessageRecovery(
   bee: string,
   messageId: string,
-  options: { resolveRequestBy?: string } = {},
+  options: { resolveRequestBy?: string; resolution?: string } = {},
 ): Promise<boolean> {
   if (options.resolveRequestBy) {
     await resolveRequest(bee, messageDeliveryRequestId(bee, messageId), {
       by: options.resolveRequestBy,
-      resolution: "message delivered",
+      resolution: options.resolution ?? "message delivered",
     }).catch(() => undefined);
   }
   const record = await loadSession(bee);

@@ -96,7 +96,7 @@ test("hive clean --idle kills idle local tmux sessions and leaves active session
     await writeFile(join(dir, "sessions", `${newIdle.name}.json`), `${JSON.stringify(newIdle)}\n`);
     await writeFile(join(dir, "sessions", `${active.name}.json`), `${JSON.stringify(active)}\n`);
 
-    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--idle", "--dry-run"], {
+    const dryRun = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--idle", "--dry-run"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -105,7 +105,7 @@ test("hive clean --idle kills idle local tmux sessions and leaves active session
     assert.ok(dryRun.stdout.indexOf(oldIdleTarget) < dryRun.stdout.indexOf(newIdleTarget), "oldest idle session should be listed first");
     assert.doesNotMatch(dryRun.stdout, new RegExp(activeTarget));
 
-    const cleaned = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--idle"], {
+    const cleaned = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--idle"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -131,7 +131,7 @@ test("hive clean -i rejects --dry-run and --older-than", async () => {
   try {
     for (const extra of [["--dry-run"], ["--older-than", "1h"]]) {
       await assert.rejects(
-        execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "-i", ...extra], {
+        execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "-i", ...extra], {
           cwd: process.cwd(),
           env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
         }),
@@ -151,7 +151,7 @@ test("hive clean --interactive requires a TTY when there are targets", async () 
     await writeFile(join(dir, "sessions", "dead.json"), `${JSON.stringify(dead)}\n`);
 
     await assert.rejects(
-      execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--interactive"], {
+      execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--interactive"], {
         cwd: process.cwd(),
         env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
       }),
@@ -174,7 +174,7 @@ test("hive clean --dead removes dead session metadata", async () => {
     await writeFile(join(dir, "seals", "dead", "seal.json"), "seal");
     await writeFile(join(dir, "hsr", "dead", "events.jsonl"), "events");
 
-    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead", "--dry-run"], {
+    const dryRun = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--dead", "--dry-run"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -182,7 +182,7 @@ test("hive clean --dead removes dead session metadata", async () => {
     assert.match(dryRun.stdout, /dead\tdead\tdead\tcodex\t\d+[smhdwoy]\t\/tmp/);
     await readFile(join(dir, "sessions", "dead.json"), "utf8");
 
-    const cleaned = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead"], {
+    const cleaned = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--dead"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -210,7 +210,7 @@ test("hive clean --crashed removes only uncommanded dead running records", async
     await writeFile(join(dir, "sessions", "crashed.json"), `${JSON.stringify(crashed)}\n`);
     await writeFile(join(dir, "sessions", "dead.json"), `${JSON.stringify(dead)}\n`);
 
-    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--crashed", "--dry-run"], {
+    const dryRun = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--crashed", "--dry-run"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -220,7 +220,7 @@ test("hive clean --crashed removes only uncommanded dead running records", async
     await readFile(join(dir, "sessions", "crashed.json"), "utf8");
     await readFile(join(dir, "sessions", "dead.json"), "utf8");
 
-    const cleaned = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--crashed"], {
+    const cleaned = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--crashed"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -247,7 +247,7 @@ test("hive clean --dead never purges a session-alive bee over a mis-stamped pane
     poisoned.agentPaneId = "%9999_54321";
     await writeFile(join(dir, "sessions", `${poisoned.name}.json`), `${JSON.stringify(poisoned)}\n`);
 
-    const cleaned = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead"], {
+    const cleaned = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--dead"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -274,7 +274,7 @@ test("hive clean --dead --older-than only removes stale dead sessions", async ()
     await writeFile(join(dir, "sessions", "fresh.json"), `${JSON.stringify(fresh)}\n`);
     await writeFile(join(dir, "sessions", "stale.json"), `${JSON.stringify(stale)}\n`);
 
-    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead", "--older-than", "1h", "--dry-run"], {
+    const dryRun = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--dead", "--older-than", "1h", "--dry-run"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -282,7 +282,7 @@ test("hive clean --dead --older-than only removes stale dead sessions", async ()
     assert.doesNotMatch(dryRun.stdout, /fresh/);
     assert.match(dryRun.stdout, /stale/);
 
-    const cleaned = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead", "--older-than", "1h"], {
+    const cleaned = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--dead", "--older-than", "1h"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -325,7 +325,7 @@ test("hive clean --dead does not reap a live HSR bee (HIVE-1)", async () => {
     await writeFile(join(dir, "hsr", "hsr-live", "meta.json"), meta("hsr-live", process.pid));
     await writeFile(join(dir, "hsr", "hsr-dead", "meta.json"), meta("hsr-dead", 2 ** 22));
 
-    const dryRun = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "clean", "--dead", "--dry-run"], {
+    const dryRun = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "clean", "--dead", "--dry-run"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });
@@ -363,7 +363,7 @@ test("hive list derives HSR liveness through the shared state context (HIVE-16)"
     await writeFile(join(dir, "hsr", "hsr-live", "meta.json"), meta("hsr-live", process.pid));
     await writeFile(join(dir, "hsr", "hsr-dead", "meta.json"), meta("hsr-dead", 2 ** 22));
 
-    const listed = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "list", "--json"], {
+    const listed = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "list", "--json"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" },
     });

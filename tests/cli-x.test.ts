@@ -6,8 +6,8 @@ import { test } from "node:test";
 const execFileAsync = promisify(execFile);
 
 test("hive-x with no args reports the same usage as hive x", async () => {
-  const fast = await runCli("src/cli-x.ts", []);
-  const full = await runCli("src/cli.ts", ["x"]);
+  const fast = await runCli(process.env.HIVE_TEST_BUILT_CLI === "1" ? ".test-dist/src/cli-x.js" : "src/cli-x.ts", []);
+  const full = await runCli("tests/cli-entry.mjs", ["x"]);
 
   assert.equal(fast.code, 1);
   assert.equal(fast.stdout, full.stdout);
@@ -17,8 +17,8 @@ test("hive-x with no args reports the same usage as hive x", async () => {
 });
 
 test("hive-x preserves cmdX validation errors", async () => {
-  const fast = await runCli("src/cli-x.ts", ["sh", "do something", "--count", "3"]);
-  const full = await runCli("src/cli.ts", ["x", "sh", "do something", "--count", "3"]);
+  const fast = await runCli(process.env.HIVE_TEST_BUILT_CLI === "1" ? ".test-dist/src/cli-x.js" : "src/cli-x.ts", ["sh", "do something", "--count", "3"]);
+  const full = await runCli("tests/cli-entry.mjs", ["x", "sh", "do something", "--count", "3"]);
 
   assert.equal(fast.code, 1);
   assert.equal(fast.stdout, full.stdout);
@@ -28,7 +28,8 @@ test("hive-x preserves cmdX validation errors", async () => {
 
 async function runCli(entrypoint: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", entrypoint, ...args], {
+    const sourceLoader = entrypoint.endsWith(".ts") ? ["--import", "tsx"] : [];
+    const result = await execFileAsync(process.execPath, [...sourceLoader, entrypoint, ...args], {
       cwd: process.cwd(),
       env: { ...process.env, NO_COLOR: "1" },
       timeout: 10_000,

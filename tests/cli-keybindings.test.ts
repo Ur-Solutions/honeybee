@@ -32,7 +32,7 @@ type HiveResult = { stdout: string; stderr: string; code: number };
 // execFile rejects on non-zero exit; we want to assert on stdout/stderr/code
 // for the dim-stderr / exit-code contracts, so capture rather than throw.
 function hive(store: string, args: string[], extraEnv: Record<string, string> = {}, socket?: string): Promise<HiveResult> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
     cwd: process.cwd(),
     env: {
       ...process.env,

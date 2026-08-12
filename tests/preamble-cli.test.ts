@@ -27,7 +27,7 @@ function detachedRuntimeAvailable(): boolean {
  */
 async function runCli(args: string[], env: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+    const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
       cwd: process.cwd(),
       env: { ...process.env, ...env, NO_COLOR: "1" },
       timeout: 30_000,

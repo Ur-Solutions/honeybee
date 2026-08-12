@@ -12,6 +12,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
 import { daemonLogPath } from "./log.js";
+import { daemonWorkerArgv } from "./workerLaunch.js";
 import {
   daemonStatePath,
   maxRecentErrors,
@@ -191,14 +192,10 @@ export function recordFatalDiagnosticSync(
  * and continues — the sentinel is best-effort.
  */
 export function spawnSentinel(config: DaemonConfig): ChildProcess {
-  const cliPath = process.argv[1];
-  if (!cliPath) throw new Error("cannot resolve CLI entrypoint for sentinel");
   const sentinel = spawn(
     process.execPath,
     [
-      cliPath,
-      "daemon",
-      "sentinel",
+      ...daemonWorkerArgv("sentinel", import.meta.url),
       "--parent-pid",
       String(process.pid),
       "--state-path",

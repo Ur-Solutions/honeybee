@@ -49,7 +49,7 @@ async function runCli(
   env: Record<string, string>,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+    const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
       cwd: process.cwd(),
       // HIVE_BEE cleared: the suite may itself run inside a bee (agents test
       // hive with hive), and an inherited stamp would satisfy `hive here`'s

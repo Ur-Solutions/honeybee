@@ -47,7 +47,7 @@ async function readBee(root: string, name: string): Promise<Record<string, unkno
 
 async function runCli(args: string[], root: string, extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+    const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: root, NO_COLOR: "1", ...extraEnv },
       timeout: 15_000,

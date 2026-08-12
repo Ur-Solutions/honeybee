@@ -44,7 +44,7 @@ async function runCli(
   env: Record<string, string>,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    const result = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+    const result = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
       cwd: process.cwd(),
       // Fork seeding asserts on the exact brief a fork receives; the session
       // preamble is covered end-to-end in tests/preamble-cli.test.ts instead.

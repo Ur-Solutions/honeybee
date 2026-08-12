@@ -61,7 +61,7 @@ async function readBee(store: string, name: string): Promise<Record<string, unkn
 }
 
 function hive(store: string, socket: string, args: string[], envOverrides: Record<string, string | undefined> = {}): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
     cwd: process.cwd(),
     env: {
       ...process.env,

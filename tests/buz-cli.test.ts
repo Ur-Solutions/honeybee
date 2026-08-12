@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -11,7 +11,7 @@ const execFileAsync = promisify(execFile);
 const ENV = (dir: string) => ({ ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" });
 
 async function hive(dir: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], { cwd: process.cwd(), env: ENV(dir) });
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], { cwd: process.cwd(), env: ENV(dir) });
 }
 
 async function hiveExpectFail(dir: string, ...args: string[]): Promise<string> {
@@ -352,6 +352,62 @@ test("hive buz cancel removes a queued message before delivery", async () => {
     assert.match(stdout, new RegExp(`buz\\.cancel\\tCO\\.aaa\\t${id}`));
     const queue = await readdir(join(dir, "buz", "CO.aaa", "queue")).catch(() => []);
     assert.equal(queue.filter((f) => f.endsWith(".md")).length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("hive buz cancel releases the delivery obligation and resolves the recovery request", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
+  try {
+    await seedSession(dir, "CO.aaa");
+    await seedSession(dir, "CL.cc9");
+    await hive(dir, "buz", "send", "CO.aaa", "--sender", "CL.cc9", "--tier", "queue", "-p", "later");
+    const { stdout: listing } = await hive(dir, "buz", "queue", "CO.aaa");
+    const id = listing.split("\n")[0]!.split("\t")[2]!;
+
+    // Arm the durable delivery obligation exactly as message acceptance does,
+    // plus its open needs-action (the CO.9be 2026-08-12 shape).
+    const sessionPath = join(dir, "sessions", "CO.aaa.json");
+    const record = JSON.parse(await readFile(sessionPath, "utf8")) as Record<string, unknown>;
+    await writeFile(sessionPath, JSON.stringify({
+      ...record,
+      recoveryRequestedAt: "2026-08-12T11:48:02.279Z",
+      recoveryMessageId: id,
+      recoveryAttemptCount: 1,
+    }));
+    const requestId = `manual:CO.aaa:message-delivery:${id}`;
+    await mkdir(join(dir, "requests"), { recursive: true });
+    await writeFile(join(dir, "requests", "CO.aaa.json"), JSON.stringify({
+      version: 1,
+      bee: "CO.aaa",
+      requests: [{
+        id: requestId,
+        bee: "CO.aaa",
+        kind: "manual-action",
+        status: "open",
+        scope: "bee",
+        grade: "structured",
+        generation: 1,
+        openedAt: "2026-08-12T11:51:51.345Z",
+        updatedAt: "2026-08-12T11:51:51.431Z",
+        question: "The accepted message can no longer be found in the delivery queue.",
+        input: { messageId: id },
+        evidence: { grade: "structured", source: "buz-recovery", observedAt: "2026-08-12T11:51:51.345Z", detail: "queued-message-missing" },
+      }],
+    }));
+
+    await hive(dir, "buz", "cancel", "CO.aaa", id);
+    const after = JSON.parse(await readFile(sessionPath, "utf8")) as Record<string, unknown>;
+    assert.equal(after.recoveryMessageId, undefined, "cancel releases the delivery obligation");
+    assert.equal(after.recoveryRequestedAt, undefined);
+    const requests = JSON.parse(await readFile(join(dir, "requests", "CO.aaa.json"), "utf8")) as {
+      requests: { id: string; status: string; resolvedBy?: string; resolution?: string }[];
+    };
+    const request = requests.requests.find((entry) => entry.id === requestId);
+    assert.equal(request?.status, "resolved", "cancel resolves the recovery needs-action");
+    assert.equal(request?.resolvedBy, "buz-cancel");
+    assert.equal(request?.resolution, "message cancelled by sender");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

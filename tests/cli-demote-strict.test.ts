@@ -48,7 +48,7 @@ test("demote aborts before HSR spawn when pane kill cannot confirm the old proce
     }, null, 2)}\n`);
 
     await assert.rejects(
-      execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "demote", bee, "--now"], {
+      execFileAsync(process.execPath, ["tests/cli-entry.mjs", "demote", bee, "--now"], {
         cwd: process.cwd(),
         env: {
           ...process.env,

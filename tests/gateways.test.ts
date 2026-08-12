@@ -128,7 +128,7 @@ test("hive gateways lists valid live and stale advertisements", async () => {
   await withStore(async (root) => {
     await writeGateway(root, "live", gateway({ name: "live" }));
     await writeGateway(root, "dead", gateway({ name: "dead", pid: 2_147_483_647 }));
-    const { stdout } = await execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", "gateways"], {
+    const { stdout } = await execFileAsync(process.execPath, ["tests/cli-entry.mjs", "gateways"], {
       cwd: process.cwd(),
       env: { ...process.env, HIVE_STORE_ROOT: root, NO_COLOR: "1", TERM: "dumb" },
     });

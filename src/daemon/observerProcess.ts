@@ -15,6 +15,7 @@ import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { hsrObservations, type HsrEventSnapshot, type HsrObservation } from "../hsr/observe.js";
 import { envMs } from "./timeouts.js";
+import { daemonWorkerArgv } from "./workerLaunch.js";
 
 type ObserveRequest = { id: number; bees: readonly string[] };
 type WireEventSnapshot = Omit<HsrEventSnapshot, "tailEvents">;
@@ -85,11 +86,7 @@ export type IsolatedHsrObservations = ((beeNames: readonly string[]) => Promise<
 };
 
 function defaultSpawnChild(): ObserverChild {
-  const cliPath = process.argv[1];
-  if (!cliPath) throw new Error("cannot resolve CLI entrypoint for the hsr observer child");
-  // Preserve execArgv (e.g. `--import tsx` on source/dev daemons) or the
-  // child cannot load a .ts entrypoint (review CR-12).
-  const child: ChildProcess = spawn(process.execPath, [...process.execArgv, cliPath, "daemon", "hsr-observe-worker"], {
+  const child: ChildProcess = spawn(process.execPath, daemonWorkerArgv("hsr-observe-worker", import.meta.url), {
     // stderr inherits so a child crash is visible in the daemon's stream file.
     stdio: ["pipe", "pipe", "inherit"],
   });

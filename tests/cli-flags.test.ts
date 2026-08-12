@@ -11,7 +11,7 @@ const execFileAsync = promisify(execFile);
 const ENV = (dir: string) => ({ ...process.env, HIVE_STORE_ROOT: dir, NO_COLOR: "1", TERM: "dumb" });
 
 async function hive(dir: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], { cwd: process.cwd(), env: ENV(dir) });
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], { cwd: process.cwd(), env: ENV(dir) });
 }
 
 async function hiveExpectFail(dir: string, ...args: string[]): Promise<string> {
@@ -54,7 +54,10 @@ async function seedSession(dir: string, name: string, overrides: Record<string, 
 async function seedArgsFlow(dir: string): Promise<void> {
   const flowsDir = join(dir, "flows");
   await mkdir(flowsDir, { recursive: true });
-  const sdk = join(process.cwd(), "src/flow/index.ts");
+  const sdk = join(
+    process.cwd(),
+    process.env.HIVE_TEST_BUILT_CLI === "1" ? ".test-dist/src/flow/index.js" : "src/flow/index.ts",
+  );
   await writeFile(
     join(flowsDir, "arg-types.ts"),
     `import { defineFlow } from "${sdk}";\n` +

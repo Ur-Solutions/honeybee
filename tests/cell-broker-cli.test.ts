@@ -64,7 +64,7 @@ function cliEnv(store: string, overrides: Record<string, string | undefined> = {
 }
 
 async function hive(store: string, env: Record<string, string | undefined>, ...args: string[]) {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
     cwd: process.cwd(),
     env: cliEnv(store, env),
   });

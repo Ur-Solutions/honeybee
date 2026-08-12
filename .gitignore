@@ -1,7 +1,7 @@
 node_modules/
 dist/
+.test-dist/
 .DS_Store
 stress-reports/
 
 .claude/worktrees
-

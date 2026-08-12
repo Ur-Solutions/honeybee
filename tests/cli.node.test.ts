@@ -20,11 +20,11 @@ const PRETTY_ENV = (dir: string) => {
 };
 
 async function hive(dir: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], { cwd: process.cwd(), env: ENV(dir) });
+  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], { cwd: process.cwd(), env: ENV(dir) });
 }
 
 async function hivePretty(dir: string, ...args: string[]): Promise<{ stdout: string; stderr: string }> {
-  const result = await execFileAsync(process.execPath, ["--import", "tsx", "--import", FORCE_TTY_IMPORT, "src/cli.ts", ...args], { cwd: process.cwd(), env: PRETTY_ENV(dir) });
+  const result = await execFileAsync(process.execPath, ["--import", FORCE_TTY_IMPORT, "tests/cli-entry.mjs", ...args], { cwd: process.cwd(), env: PRETTY_ENV(dir) });
   return { stdout: stripAnsi(result.stdout), stderr: stripAnsi(result.stderr) };
 }
 
