@@ -63,8 +63,30 @@ export type EphemeralCredentialPolicy = {
    *                        holder of the real refresh token, so fleet-wide
    *                        refresh-reuse detection can never invalidate the
    *                        grant. Central refresh keeps the vault token fresh.
+   * "ship-refresh-blanked-file"
+   *                     — ship the account's primary credential file with EVERY
+   *                        OAuth refresh-token field blanked (`refresh_token`/
+   *                        `refresh` → "", field kept), preserving the access
+   *                        token / api key. Used by grok (auth.json, keyed by
+   *                        issuer::client) and kimi (credentials/kimi-code.json,
+   *                        flat). The vault stays the sole holder of every real
+   *                        refresh token, so no two fleet bees present the same
+   *                        one-time-use refresh token. An api-key-only file has
+   *                        no refresh field and ships its key verbatim.
+   * "ship-provider-file"
+   *                     — opencode's auth.json multiplexes EVERY provider login
+   *                        in one object keyed by providerID. Ship ONLY the
+   *                        account's single `provider` entry (codex-style
+   *                        single-provider), dropping every other provider's
+   *                        credential, with the kept entry's OAuth refresh field
+   *                        blanked. Never ships the whole multi-provider file.
    */
-  readonly strategy: "mint-token" | "ship-primary-file" | "ship-access-token";
+  readonly strategy:
+    | "mint-token"
+    | "ship-primary-file"
+    | "ship-access-token"
+    | "ship-refresh-blanked-file"
+    | "ship-provider-file";
   /** For "mint-token": the env var the token is delivered as. */
   readonly tokenEnv?: string;
   /** Secret-free human note. */
@@ -170,28 +192,41 @@ export const HARNESSES = {
   },
   opencode: {
     runner: true,
-    remoteHsr: "local-only",
     allowance: {
       subscription: {
         permittedTiers: ["server", "pty"],
         requiredFlags: OPENCODE_SERVER_FLAGS,
         scrubEnv: [],
         fingerprints: [],
-        note: "OpenCode 1.17.18 serve REST/SSE with per-bee Basic auth; full permission/question endpoints and native session resume verified. Local-only until provider-filtered auth.json delivery is safe.",
-        since: "2026-07-18",
+        note: "OpenCode 1.17.18 serve REST/SSE with per-bee Basic auth; full permission/question endpoints and native session resume verified. Remote HSR delivers a single-provider-filtered auth.json (other providers dropped, OAuth refresh blanked) into the isolated XDG_DATA_HOME.",
+        since: "2026-08-12",
       },
       "api-key": {
         permittedTiers: ["server", "pty"],
         requiredFlags: OPENCODE_SERVER_FLAGS,
         scrubEnv: [],
         fingerprints: [],
-        note: "OpenCode 1.17.18 serve REST/SSE with intentional provider API-key billing and per-bee Basic auth. Local-only until selected-provider credential filtering is implemented.",
-        since: "2026-07-18",
+        note: "OpenCode 1.17.18 serve REST/SSE with intentional provider API-key billing and per-bee Basic auth. Remote HSR delivers a single-provider-filtered auth.json (the account's provider key only; every other provider dropped).",
+        since: "2026-08-12",
       },
+    },
+    // opencode's auth.json is a multi-provider map (keyed by providerID). Ship
+    // ONLY the account's own provider entry into the remote isolated home's
+    // XDG_DATA_HOME (never the whole file), with any OAuth refresh token in that
+    // entry blanked. An api-key provider (e.g. the glm coding plan) ships its
+    // key verbatim — intentional provider billing, no rotating refresh to leak.
+    ephemeral: {
+      strategy: "ship-provider-file",
+      note: "ship single-provider-filtered auth.json (refresh blanked) into remote OPENCODE XDG_DATA_HOME",
     },
   },
   cursor: {
     runner: true,
+    // cursor's macOS credential store is a machine-global keychain slot that
+    // per-bee credential delivery cannot satisfy (no home-relative auth file to
+    // ship), so cursor stays local-only. Explicit here so a remote-hsr spawn is
+    // rejected at the policy gate with a clear message, not late at minting.
+    remoteHsr: "local-only",
     allowance: {
       subscription: {
         permittedTiers: ["turn", "pty"],
@@ -218,29 +253,35 @@ export const HARNESSES = {
   },
   kimi: {
     runner: true,
-    remoteHsr: "local-only",
     allowance: {
       subscription: {
         permittedTiers: ["stream", "pty"],
         requiredFlags: ["acp"],
         scrubEnv: [],
         fingerprints: [],
-        note: "Kimi Code 0.27 ACP JSON-RPC over stdio, with model/mode applied through session config; local HSR only until remote credentials have a tested delivery policy.",
-        since: "2026-07-17",
+        note: "Kimi Code 0.27 ACP JSON-RPC over stdio, with model/mode applied through session config. Remote HSR ships credentials/kimi-code.json with the rotating refresh_token blanked into the isolated KIMI_CODE_HOME. NOTE: kimi access tokens are short-lived (~15 min); with the refresh token blanked a remote bee cannot self-refresh, so long runs may need a re-login.",
+        since: "2026-08-12",
       },
       "api-key": {
         permittedTiers: ["stream", "pty"],
         requiredFlags: ["acp"],
         scrubEnv: [],
         fingerprints: [],
-        note: "Kimi Code 0.27 ACP JSON-RPC over stdio; local HSR only until remote API-key delivery is implemented and tested.",
-        since: "2026-07-17",
+        note: "Kimi Code 0.27 ACP JSON-RPC over stdio. Remote HSR ships credentials/kimi-code.json with any refresh_token blanked; an api-key-only credential ships verbatim.",
+        since: "2026-08-12",
       },
+    },
+    // kimi's credentials/kimi-code.json is a flat OAuth store whose refresh
+    // token ROTATES on every grant (single-use) — shipping it whole across a
+    // fleet trips reuse-detection. Blank the refresh token; the vault stays the
+    // sole holder of the real one, exactly like codex.
+    ephemeral: {
+      strategy: "ship-refresh-blanked-file",
+      note: "ship credentials/kimi-code.json (refresh_token blanked) into remote KIMI_CODE_HOME",
     },
   },
   grok: {
     runner: true,
-    remoteHsr: "local-only",
     allowance: {
       subscription: {
         permittedTiers: ["stream", "pty"],
@@ -249,17 +290,26 @@ export const HARNESSES = {
         // billing when its cached OAuth token is absent or expired.
         scrubEnv: ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"],
         fingerprints: [],
-        note: "Grok 0.2.102 native ACP stdio with cached-token authentication; local HSR only because OAuth refresh tokens are not safe to copy across nodes.",
-        since: "2026-07-18",
+        note: "Grok 0.2.102 native ACP stdio with cached-token authentication. Remote HSR ships auth.json with the OAuth refresh_token blanked into the isolated GROK_HOME; the adapter scrubs XAI_API_KEY so the delivered cached OAuth token (not API billing) is used.",
+        since: "2026-08-12",
       },
       "api-key": {
         permittedTiers: ["stream", "pty"],
         requiredFlags: ["--no-auto-update", "agent", "--no-leader", "stdio"],
         scrubEnv: [],
         fingerprints: [],
-        note: "Grok 0.2.102 ACP authenticates explicitly with xai.api_key and preserves XAI_API_KEY; still local-only until remote secret delivery/shredding is implemented.",
-        since: "2026-07-18",
+        note: "Grok 0.2.102 ACP authenticates explicitly with xai.api_key and preserves XAI_API_KEY. Remote HSR ships auth.json with any refresh_token blanked; an api-key-only credential ships its key verbatim.",
+        since: "2026-08-12",
       },
+    },
+    // grok's auth.json is keyed by issuer::client; each entry may carry an OAuth
+    // refresh_token that grok uses to self-refresh. Blank it (codex-style) so
+    // the vault stays the sole holder of the real refresh token; the delivered
+    // `key`/`expires_at` are preserved and the adapter's XAI_API_KEY scrub keeps
+    // a subscription bee on cached OAuth rather than developer API billing.
+    ephemeral: {
+      strategy: "ship-refresh-blanked-file",
+      note: "ship auth.json (refresh_token blanked) into remote GROK_HOME",
     },
   },
   pi: {

@@ -137,11 +137,107 @@ export async function mintEphemeralCredential(
     return mintCodexAccessTokenCredential(account, kind, deps);
   }
 
+  if (policy.strategy === "ship-refresh-blanked-file") {
+    return mintRefreshBlankedFileCredential(account, kind);
+  }
+
+  if (policy.strategy === "ship-provider-file") {
+    return mintOpenCodeProviderCredential(account, kind);
+  }
+
   // ship-primary-file
   const file = await requirePrimaryCredential(account, kind);
   return {
     files: [file],
     kindNote: `${kind}: shipped ${file.homeRelPath} into the remote isolated home (0600)`,
+  };
+}
+
+// OAuth refresh-token field names blanked before a credential file is shipped:
+// grok/codex/kimi use `refresh_token`, opencode's oauth entries use `refresh`.
+const REFRESH_TOKEN_KEYS = new Set(["refresh_token", "refresh"]);
+
+/**
+ * Deep-clone a parsed credential JSON with EVERY OAuth refresh-token field
+ * blanked to "" (field kept, so the harness's serde still parses the file).
+ * Blanks only string values under keys named exactly `refresh_token`/`refresh`;
+ * access tokens, api keys, and expiries are preserved untouched. The vault
+ * stays the sole holder of every real refresh token, so no two fleet bees ever
+ * present the same one-time-use refresh token (research §2). Opaque — the
+ * caller never logs the result.
+ */
+function blankRefreshTokens(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => blankRefreshTokens(item));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = REFRESH_TOKEN_KEYS.has(key) && typeof inner === "string" ? "" : blankRefreshTokens(inner);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * ship-refresh-blanked-file (grok, kimi): deliver the account's primary
+ * credential file with every OAuth refresh token blanked. Grok's auth.json is
+ * keyed by issuer::client (each entry may carry `refresh_token`); kimi's
+ * credentials/kimi-code.json is a flat OAuth store whose `refresh_token` ROTATES
+ * on every grant. Blanking keeps the vault the sole holder of the real refresh
+ * token — a delivered cached OAuth access token / api key is preserved, exactly
+ * like codex. An api-key-only file has no refresh field and ships verbatim.
+ */
+async function mintRefreshBlankedFileCredential(account: AccountRecord, kind: string): Promise<EphemeralCredential> {
+  const file = await requirePrimaryCredential(account, kind);
+  const raw = Buffer.from(file.contentB64, "base64").toString("utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${kind} credential file ${file.homeRelPath} for account ${account.id} is not valid JSON; re-login with: hive account login ${account.tool} ${account.label}`);
+  }
+  const body = `${JSON.stringify(blankRefreshTokens(parsed), null, 2)}\n`;
+  return {
+    files: [{ homeRelPath: file.homeRelPath, contentB64: Buffer.from(body, "utf8").toString("base64"), mode: 0o600 }],
+    kindNote: `${kind}: shipped ${file.homeRelPath} with OAuth refresh token(s) blanked into the remote isolated home (0600)`,
+  };
+}
+
+/**
+ * ship-provider-file (opencode): opencode's auth.json multiplexes EVERY
+ * provider login in one object keyed by providerID. Ship ONLY the account's
+ * single `provider` entry (codex-style single-provider) — every other
+ * provider's credential is dropped — with the kept entry's OAuth refresh token
+ * blanked. Never ships the whole multi-provider file. Fails closed when the
+ * account has no provider or the file has no entry for it.
+ */
+async function mintOpenCodeProviderCredential(account: AccountRecord, kind: string): Promise<EphemeralCredential> {
+  const provider = account.provider;
+  if (!provider) {
+    throw new Error(`opencode account ${account.id} has no provider; set one so a single-provider auth.json can be shipped (re-add with --provider <id>)`);
+  }
+  const file = await requirePrimaryCredential(account, kind); // xdg-data/opencode/auth.json
+  const raw = Buffer.from(file.contentB64, "base64").toString("utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`opencode auth.json for account ${account.id} is not valid JSON; re-login with: hive account login opencode ${account.label}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`opencode auth.json for account ${account.id} is not a provider map; re-login with: hive account login opencode ${account.label}`);
+  }
+  const providers = parsed as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(providers, provider)) {
+    throw new Error(`opencode auth.json for account ${account.id} has no entry for provider "${provider}"; re-login with: hive account login opencode ${account.label}`);
+  }
+  // Single-provider filter: a NEW object carrying ONLY this account's provider
+  // key, refresh blanked. Every other provider's credential is dropped.
+  const filtered = { [provider]: blankRefreshTokens(providers[provider]) };
+  const body = `${JSON.stringify(filtered, null, 2)}\n`;
+  return {
+    files: [{ homeRelPath: file.homeRelPath, contentB64: Buffer.from(body, "utf8").toString("base64"), mode: 0o600 }],
+    kindNote: `opencode: shipped a single-provider (${provider}) auth.json (refresh blanked, other providers dropped) into the remote isolated home (0600)`,
   };
 }
 

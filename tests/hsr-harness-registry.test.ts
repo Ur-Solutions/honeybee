@@ -89,19 +89,26 @@ test("legacy allowance behavior is preserved by the registry view", () => {
   assert.equal(allowanceFor("nope", "subscription"), undefined);
 });
 
-test("OpenCode, Kimi, and Grok HSR are explicitly local-only while filtered-credential runners remain allowed", () => {
-  assert.equal(harnessSupportsRemoteHsr("opencode"), false);
-  assert.equal(harnessSupportsRemoteHsr("kimi"), false);
-  assert.equal(harnessSupportsRemoteHsr("grok"), false);
+test("OpenCode, Kimi, and Grok HSR are now remote-capable; only cursor stays local-only", () => {
+  assert.equal(harnessSupportsRemoteHsr("opencode"), true);
+  assert.equal(harnessSupportsRemoteHsr("kimi"), true);
+  assert.equal(harnessSupportsRemoteHsr("grok"), true);
   assert.equal(harnessSupportsRemoteHsr("claude"), true);
   assert.equal(harnessSupportsRemoteHsr("codex"), true);
+  // cursor's macOS credential store is a machine-global keychain slot that
+  // credential delivery cannot satisfy, so it remains local-only.
+  assert.equal(harnessSupportsRemoteHsr("cursor"), false);
 });
 
-test("ephemeral policy: claude mints a token, codex ships an access-token-only auth.json", () => {
-  assert.deepEqual(ephemeralHarnesses(), ["claude", "codex"]);
+test("ephemeral policy: each remote-capable harness has the expected delivery strategy", () => {
+  assert.deepEqual(ephemeralHarnesses(), ["claude", "codex", "opencode", "kimi", "grok"]);
   assert.equal(ephemeralPolicyFor("claude")?.strategy, "mint-token");
   assert.equal(ephemeralPolicyFor("claude")?.tokenEnv, "CLAUDE_CODE_OAUTH_TOKEN");
   assert.equal(ephemeralPolicyFor("codex")?.strategy, "ship-access-token");
-  assert.equal(ephemeralPolicyFor("grok"), undefined, "grok has no ephemeral delivery wired");
+  assert.equal(ephemeralPolicyFor("grok")?.strategy, "ship-refresh-blanked-file");
+  assert.equal(ephemeralPolicyFor("kimi")?.strategy, "ship-refresh-blanked-file");
+  assert.equal(ephemeralPolicyFor("opencode")?.strategy, "ship-provider-file");
+  // cursor stays local-only: no ephemeral delivery policy.
+  assert.equal(ephemeralPolicyFor("cursor"), undefined, "cursor has no ephemeral delivery wired");
   assert.equal(ephemeralPolicyFor("stub"), undefined);
 });
