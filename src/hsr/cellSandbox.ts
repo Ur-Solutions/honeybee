@@ -57,6 +57,21 @@ const PROVIDER_HOME_ENV: Readonly<Record<string, string>> = {
 
 const ALL_PROVIDER_HOME_ENV = [...new Set(Object.values(PROVIDER_HOME_ENV))];
 
+// Darwin's Security.framework delegates certificate verification to trustd.
+// These exact services are the missing IPC seam for system-trust HTTPS; the
+// Sandbox Runtime baseline already allows com.apple.SecurityServer.
+const MACOS_SYSTEM_TRUST_MACH_SERVICES = [
+  "com.apple.trustd",
+  "com.apple.trustd.agent",
+];
+
+// Public, OS-managed trust anchors only. The user's login keychain is denied
+// separately below because it may contain private keys and credentials.
+const MACOS_SYSTEM_TRUST_READ_PATHS = [
+  "/System/Library/Keychains",
+  "/Library/Keychains/System.keychain",
+];
+
 let activeState: CellSandboxState | undefined;
 let previousClaudeCodeTmpdir: string | undefined;
 
@@ -431,10 +446,16 @@ export async function wrapCellSandboxCommandForState(
   args: string[],
 ): Promise<{ command: string; args: string[] }> {
   const raw = commandString(command, args);
+  const readConfig = state.backend === "macos-seatbelt"
+    ? {
+        denyOnly: [join(homedir(), "Library", "Keychains")],
+        allowWithinDeny: MACOS_SYSTEM_TRUST_READ_PATHS,
+      }
+    : { denyOnly: [], allowWithinDeny: [] };
   const common = {
     command: raw,
     needsNetworkRestriction: false,
-    readConfig: { denyOnly: [], allowWithinDeny: [] },
+    readConfig,
     writeConfig: { allowOnly: state.allowWrite, denyWithinAllow: state.denyWrite },
     unsetEnvVars: [],
     setEnvVars: {},
@@ -447,7 +468,12 @@ export async function wrapCellSandboxCommandForState(
   // openpty) cannot allocate pseudo-terminals inside the Cell. Linux needs no
   // equivalent — bwrap's fresh /dev already mounts devpts.
   const wrapped = state.backend === "macos-seatbelt"
-    ? wrapCommandWithSandboxMacOS({ ...common, allowLocalBinding: true, allowPty: true })
+    ? wrapCommandWithSandboxMacOS({
+        ...common,
+        allowLocalBinding: true,
+        allowMachLookup: MACOS_SYSTEM_TRUST_MACH_SERVICES,
+        allowPty: true,
+      })
     : await wrapCommandWithSandboxLinux({
         ...common,
         bwrapPath: state.bwrapPath,

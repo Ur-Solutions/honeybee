@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
@@ -254,7 +254,7 @@ test("Linux wrapper keeps host networking, namespaces processes, and fences the 
   }
 });
 
-test("macOS wrapper allows pseudo-terminal allocation inside the Cell", async () => {
+test("macOS wrapper allows system trust evaluation, denies the login keychain, and permits ptys", async () => {
   const root = await mkdtemp(join(tmpdir(), "hive-cell-macos-pty-"));
   const cell = join(root, "cell");
   await mkdir(cell);
@@ -269,6 +269,36 @@ test("macOS wrapper allows pseudo-terminal allocation inside the Cell", async ()
     }, "/bin/echo", ["hello world"]);
     assert.equal(wrapper.command, "/bin/bash");
     const generated = wrapper.args[1]!;
+    assert.ok(
+      generated.includes('(allow mach-lookup (global-name "com.apple.trustd"))'),
+      "system trustd is reachable by exact Mach service name",
+    );
+    assert.ok(
+      generated.includes('(allow mach-lookup (global-name "com.apple.trustd.agent"))'),
+      "per-user trustd is reachable by exact Mach service name",
+    );
+    assert.ok(
+      generated.includes('(allow mach-lookup (global-name "com.apple.SecurityServer"))'),
+      "the Sandbox Runtime baseline retains SecurityServer access",
+    );
+    for (const trustPath of [
+      "/System/Library/Keychains",
+      "/Library/Keychains/System.keychain",
+    ]) {
+      assert.ok(
+        generated.includes(`(allow file-read*\n  (subpath ${JSON.stringify(trustPath)})`),
+        `${trustPath} is explicitly read-only`,
+      );
+      assert.ok(
+        !generated.includes(`(allow file-write*\n  (subpath ${JSON.stringify(trustPath)})`),
+        `${trustPath} is not writable`,
+      );
+    }
+    const loginKeychains = join(homedir(), "Library", "Keychains");
+    assert.ok(
+      generated.includes(`(deny file-read*\n  (subpath ${JSON.stringify(loginKeychains)})`),
+      "the user login keychain remains unreadable",
+    );
     assert.match(generated, /\(allow pseudo-tty\)/, "tmux and interactive tools can allocate ptys");
     assert.match(generated, /\/dev\/ptmx/);
   } finally {
