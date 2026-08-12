@@ -10,6 +10,7 @@ import { APP_NAME, VERSION } from "./cli/shared.js";
 import { runHsrHostFromPayload } from "./hsr/runnerHost.js";
 import { cmdAccount, cmdActivate, cmdLimits, cmdLogin, cmdSwapAccount, cmdUsageSamples, wantsUsageLive } from "./commands/account.js";
 import { cmdBuz } from "./commands/buz.js";
+import { cmdCellCred } from "./commands/cellCred.js";
 import { cmdClean } from "./commands/clean.js";
 import { cmdColony } from "./commands/colony.js";
 import { cmdCompletion, cmdConfig } from "./commands/config.js";
@@ -273,6 +274,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "swap-account":
       await cmdSwapAccount(parsed);
       break;
+    case "cell-cred":
+      await cmdCellCred(parsed);
+      break;
     case "usage":
     case "limits":
       // One question, one command: where do my accounts stand against the
@@ -426,6 +430,7 @@ function printHelp() {
         ["activate", "<account>", "seed an account's credentials into a home slot (fast login)"],
         ["login", "<account>", "interactive (re)login seat in tmux; captures fresh credentials"],
         ["swap-account", "<bee> <account>", "re-credential a bee's home and resume on another account"],
+        ["cell-cred", "mint <account> --harness <k>", "mint a short-lived ephemeral credential and print it as JSON on stdout"],
       ],
     },
     {
