@@ -31,7 +31,7 @@ import { execFileSync } from "node:child_process";
 // CLAUDE_CONFIG_DIR / …). drivers.js is already in the runner-host bundle closure
 // (via remoteCreds' homeDirForSpec) and imports NO accounts/vault graph, so this
 // keeps the esbuild DCE lean.
-import { homeEnvForAgent } from "../drivers.js";
+import { homeEnvForAgent, identityEnvForAgent } from "../drivers.js";
 import {
   connectRpcClient,
   startRpcServer,
@@ -414,6 +414,16 @@ export function buildController(options: RunnerHostControllerOptions = {}): Runn
         return { ok: false, error: "failed to write delivered credentials into the remote home" };
       }
       if (homeEnv) childEnv[homeEnv] = homeDir;
+      // Home-RELATIVE identity env (e.g. opencode's XDG_DATA_HOME → <home>/xdg-data,
+      // where the delivered auth.json lives) must be re-derived against the REMOTE
+      // home: the value the local resolveAgent baked into spec.env points at a
+      // local path that does not exist on this node, so the child would look for
+      // the delivered credential in the wrong place. Re-template against homeDir
+      // and OVERRIDE the shipped value. No-op for harnesses without extraEnv
+      // (codex/claude/grok/kimi return {}). NOT a secret — these are paths.
+      for (const [key, value] of Object.entries(identityEnvForAgent(kind, homeDir))) {
+        childEnv[key] = value;
+      }
     }
 
     const resume = override.resume ?? p.resume === true;

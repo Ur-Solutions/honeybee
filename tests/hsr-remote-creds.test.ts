@@ -29,6 +29,7 @@ import { serve } from "../src/hsr/remoteHost.js";
 import { createRemoteHsrSubstrate } from "../src/substrates/remote-hsr.js";
 import { clearSubstrateCache } from "../src/substrates/index.js";
 import { mintEphemeralCredential } from "../src/hsr/remoteCreds.js";
+import { identityEnvForAgent } from "../src/drivers.js";
 import { accountDir, type AccountRecord } from "../src/accounts.js";
 import type { NodeRecord } from "../src/node.js";
 import type { TunnelChild, TunnelSpawnHook, SshExecHook } from "../src/hsr/remoteTransport.js";
@@ -204,10 +205,181 @@ test("mintEphemeralCredential: claude falls back to shipping .credentials.json w
   });
 });
 
-test("mintEphemeralCredential: unsupported harness is refused", async () => {
+test("mintEphemeralCredential: unsupported harness (cursor) is refused", async () => {
   await withTempStore(async () => {
-    const account = fakeAccount({ id: "grok-x", tool: "grok", label: "x", provider: "xai" });
-    await assert.rejects(() => mintEphemeralCredential(account, "grok"), /not wired for harness "grok"/);
+    // cursor stays local-only (machine-global keychain) — no ephemeral policy.
+    const account = fakeAccount({ id: "cursor-x", tool: "cursor", label: "x", provider: "cursor" });
+    await assert.rejects(() => mintEphemeralCredential(account, "cursor"), /not wired for harness "cursor"/);
+  });
+});
+
+// ── grok / kimi / opencode ephemeral delivery (APIA-93 flip) ─────────────────
+
+async function seedVaultFile(account: AccountRecord, relPath: string, contents: string): Promise<void> {
+  const abs = join(accountDir(account), relPath);
+  await mkdir(join(abs, ".."), { recursive: true, mode: 0o700 });
+  await writeFile(abs, contents, { mode: 0o600 });
+}
+
+function decodeShipped(cred: { files: { contentB64: string }[] }): string {
+  return Buffer.from(cred.files[0]!.contentB64, "base64").toString("utf8");
+}
+
+test("mintEphemeralCredential: grok ships auth.json with the OAuth refresh_token blanked, key/expiry preserved, no leak", async () => {
+  await withTempStore(async () => {
+    const account = fakeAccount({ id: "grok-sub", tool: "grok", label: "sub", provider: "xai" });
+    const REFRESH_SECRET = "SECRET-grok-refresh-DO-NOT-SHIP-77aa";
+    const KEY = "grok-access-key-KEEP-me";
+    // grok's real shape: keyed by "<issuer>::<client>", entry carries key + refresh_token.
+    const authJson = JSON.stringify({
+      "https://auth.x.ai::client-1": {
+        auth_mode: "oidc",
+        email: "grok@example.com",
+        key: KEY,
+        refresh_token: REFRESH_SECRET,
+        create_time: "2026-08-01T00:00:00.000Z",
+        expires_at: "2026-08-30T00:00:00.000Z",
+        principal_type: "User",
+      },
+    });
+    await seedVaultFile(account, "auth.json", authJson);
+
+    const cred = await mintEphemeralCredential(account, "grok");
+    assert.equal(cred.files.length, 1);
+    assert.equal(cred.files[0]!.homeRelPath, "auth.json");
+    assert.equal(cred.files[0]!.mode, 0o600);
+    assert.equal(cred.env, undefined, "grok delivers a file, not env (XAI_API_KEY scrub is the adapter's job)");
+
+    const shipped = JSON.parse(decodeShipped(cred)) as Record<string, { key: string; refresh_token: string; expires_at: string }>;
+    const entry = shipped["https://auth.x.ai::client-1"]!;
+    assert.equal(entry.refresh_token, "", "refresh_token blanked (field kept)");
+    assert.ok("refresh_token" in entry, "refresh_token field is preserved");
+    assert.equal(entry.key, KEY, "access key preserved");
+    assert.equal(entry.expires_at, "2026-08-30T00:00:00.000Z", "expiry preserved");
+    assert.ok(!decodeShipped(cred).includes(REFRESH_SECRET), "refresh token never shipped");
+    assert.ok(!cred.kindNote.includes(REFRESH_SECRET), "kindNote never leaks the refresh token");
+    assert.ok(!cred.kindNote.includes(KEY), "kindNote never leaks the access key");
+    assert.match(cred.kindNote, /refresh token\(s\) blanked/);
+  });
+});
+
+test("mintEphemeralCredential: kimi ships credentials/kimi-code.json with the rotating refresh_token blanked, access token preserved", async () => {
+  await withTempStore(async () => {
+    const account = fakeAccount({ id: "kimi-sub", tool: "kimi", label: "sub", provider: "moonshot" });
+    const REFRESH_SECRET = "SECRET-kimi-rotating-refresh-9911";
+    const ACCESS = "kimi-access-token-KEEP";
+    // kimi's real shape: FLAT object; refresh_token rotates on every grant.
+    const flat = JSON.stringify({
+      access_token: ACCESS,
+      refresh_token: REFRESH_SECRET,
+      expires_at: Math.floor(Date.now() / 1000) + 900,
+      scope: "read",
+      token_type: "Bearer",
+    });
+    await seedVaultFile(account, "credentials/kimi-code.json", flat);
+
+    const cred = await mintEphemeralCredential(account, "kimi");
+    assert.equal(cred.files.length, 1);
+    assert.equal(cred.files[0]!.homeRelPath, "credentials/kimi-code.json");
+    assert.equal(cred.files[0]!.mode, 0o600);
+
+    const shipped = JSON.parse(decodeShipped(cred)) as { access_token: string; refresh_token: string; token_type: string };
+    assert.equal(shipped.refresh_token, "", "rotating refresh_token blanked");
+    assert.equal(shipped.access_token, ACCESS, "access token preserved");
+    assert.equal(shipped.token_type, "Bearer", "other fields preserved");
+    assert.ok(!decodeShipped(cred).includes(REFRESH_SECRET), "refresh token never shipped");
+    assert.ok(!cred.kindNote.includes(REFRESH_SECRET));
+  });
+});
+
+test("mintEphemeralCredential: opencode ships ONLY the account's provider entry (others dropped), oauth refresh blanked", async () => {
+  await withTempStore(async () => {
+    const account = fakeAccount({ id: "oc-oauth", tool: "opencode", label: "oauth", provider: "anthropic" });
+    const KEPT_ACCESS = "anthropic-access-KEEP";
+    const KEPT_REFRESH = "SECRET-anthropic-refresh-DROP-me";
+    const FOREIGN_KEY = "SECRET-openai-key-of-another-provider-DROP";
+    // Multi-provider auth.json: the account owns "anthropic" only.
+    const authJson = JSON.stringify({
+      anthropic: { type: "oauth", access: KEPT_ACCESS, refresh: KEPT_REFRESH, expires: 1_900_000_000_000 },
+      openai: { type: "api", key: FOREIGN_KEY },
+      "zai-coding-plan": { type: "api", key: "SECRET-zai-key-DROP" },
+    });
+    await seedVaultFile(account, "xdg-data/opencode/auth.json", authJson);
+
+    const cred = await mintEphemeralCredential(account, "opencode");
+    assert.equal(cred.files.length, 1);
+    assert.equal(cred.files[0]!.homeRelPath, "xdg-data/opencode/auth.json");
+    assert.equal(cred.files[0]!.mode, 0o600);
+
+    const shipped = JSON.parse(decodeShipped(cred)) as Record<string, { type: string; access?: string; refresh?: string; key?: string }>;
+    assert.deepEqual(Object.keys(shipped), ["anthropic"], "only the account's provider entry is shipped");
+    assert.equal(shipped.anthropic!.access, KEPT_ACCESS, "kept provider access token preserved");
+    assert.equal(shipped.anthropic!.refresh, "", "kept provider OAuth refresh blanked");
+    const bytes = decodeShipped(cred);
+    assert.ok(!bytes.includes(FOREIGN_KEY), "a foreign provider's api key is NEVER shipped");
+    assert.ok(!bytes.includes("SECRET-zai-key-DROP"), "no other provider's credential is shipped");
+    assert.ok(!bytes.includes(KEPT_REFRESH), "the kept provider's refresh token is never shipped");
+    assert.ok(!cred.kindNote.includes(KEPT_REFRESH) && !cred.kindNote.includes(FOREIGN_KEY), "kindNote leaks no secrets");
+    assert.match(cred.kindNote, /single-provider \(anthropic\)/);
+  });
+});
+
+test("mintEphemeralCredential: opencode api-key provider ships its key verbatim (single provider), other providers dropped", async () => {
+  await withTempStore(async () => {
+    const account = fakeAccount({ id: "oc-glm", tool: "opencode", label: "glm", provider: "zai-coding-plan" });
+    const GLM_KEY = "zai-coding-plan-api-key-KEEP-billing";
+    const FOREIGN = "SECRET-anthropic-oauth-refresh-DROP";
+    const authJson = JSON.stringify({
+      "zai-coding-plan": { type: "api", key: GLM_KEY },
+      anthropic: { type: "oauth", access: "x", refresh: FOREIGN, expires: 1 },
+    });
+    await seedVaultFile(account, "xdg-data/opencode/auth.json", authJson);
+
+    const cred = await mintEphemeralCredential(account, "opencode");
+    const shipped = JSON.parse(decodeShipped(cred)) as Record<string, { type: string; key?: string }>;
+    assert.deepEqual(Object.keys(shipped), ["zai-coding-plan"]);
+    assert.equal(shipped["zai-coding-plan"]!.key, GLM_KEY, "the intended provider billing key ships verbatim");
+    assert.ok(!decodeShipped(cred).includes(FOREIGN), "the dropped provider's refresh token is never shipped");
+  });
+});
+
+test("mintEphemeralCredential: opencode fails closed when the account has no provider", async () => {
+  await withTempStore(async () => {
+    const account = fakeAccount({ id: "oc-noprov", tool: "opencode", label: "noprov", provider: undefined });
+    await seedVaultFile(account, "xdg-data/opencode/auth.json", JSON.stringify({ anthropic: { type: "api", key: "x" } }));
+    await assert.rejects(() => mintEphemeralCredential(account, "opencode"), /has no provider/);
+  });
+});
+
+test("mintEphemeralCredential: opencode fails closed when auth.json has no entry for the account's provider", async () => {
+  await withTempStore(async () => {
+    const account = fakeAccount({ id: "oc-missing", tool: "opencode", label: "missing", provider: "anthropic" });
+    await seedVaultFile(account, "xdg-data/opencode/auth.json", JSON.stringify({ openai: { type: "api", key: "x" } }));
+    await assert.rejects(() => mintEphemeralCredential(account, "opencode"), /no entry for provider "anthropic"/);
+  });
+});
+
+test("opencode delivery: the remote re-derives XDG_DATA_HOME against its OWN home so the delivered auth.json is found", () => {
+  // The delivered file lands at <remoteHome>/xdg-data/opencode/auth.json; the
+  // child discovers it via XDG_DATA_HOME. remoteHost re-templates this identity
+  // env against the REMOTE home (startRunner), overriding the local path baked
+  // into spec.env. grok/kimi/codex/claude have no home-relative extraEnv → {}.
+  assert.deepEqual(identityEnvForAgent("opencode", "/remote/store/hsr/bee/home"), {
+    XDG_DATA_HOME: "/remote/store/hsr/bee/home/xdg-data",
+  });
+  assert.deepEqual(identityEnvForAgent("grok", "/remote/store/hsr/bee/home"), {});
+  assert.deepEqual(identityEnvForAgent("kimi", "/remote/store/hsr/bee/home"), {});
+});
+
+test("mintEphemeralCredential: grok/opencode fail closed on a malformed credential file (no partial ship)", async () => {
+  await withTempStore(async () => {
+    const grok = fakeAccount({ id: "grok-bad", tool: "grok", label: "bad", provider: "xai" });
+    await seedVaultFile(grok, "auth.json", "{not json");
+    await assert.rejects(() => mintEphemeralCredential(grok, "grok"), /not valid JSON/);
+
+    const oc = fakeAccount({ id: "oc-bad", tool: "opencode", label: "bad", provider: "anthropic" });
+    await seedVaultFile(oc, "xdg-data/opencode/auth.json", "[\"array-not-map\"]");
+    await assert.rejects(() => mintEphemeralCredential(oc, "opencode"), /not a provider map/);
   });
 });
 
