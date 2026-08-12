@@ -153,7 +153,7 @@ export type DaemonDrainContext = {
 export type DrainResult = {
   delivered: string[];
   quarantined: string[];
-  errors: { id: string; message: string }[];
+  errors: { id: string; message: string; code?: string }[];
 };
 
 // ──────────────────────────────────────────────────────────────────────────

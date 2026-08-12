@@ -465,6 +465,44 @@ export async function markRequestRouted(
   });
 }
 
+/**
+ * Carry durable human intervention across a same-session lazy runner resume.
+ * Unlike an ordinary revive, a needs-you death did not end/supersede the turn:
+ * the runner process changed, but the provider's open question did not. Bee-
+ * scoped requests already survive every generation and are left untouched.
+ */
+export async function rebindOpenRequestsToGeneration(
+  bee: string,
+  generation: number,
+): Promise<InterventionRequestRecord[]> {
+  return mutateRequestFile<InterventionRequestRecord[]>(bee, (requests, nowIso) => {
+    const openRuntimeRequests = requests.filter((record) => record.status === "open" && record.scope !== "bee");
+    const sourceGeneration = openRuntimeRequests.reduce(
+      (latest, record) => Math.max(latest, record.generation),
+      Number.NEGATIVE_INFINITY,
+    );
+    const rebound: InterventionRequestRecord[] = [];
+    const next = requests.map((record) => {
+      if (record.status !== "open" || record.scope === "bee" ||
+          record.generation !== sourceGeneration || record.generation === generation) return record;
+      const copy = { ...record, generation, updatedAt: nowIso };
+      rebound.push(copy);
+      return copy;
+    });
+    if (rebound.length === 0) return { outcome: [], next: null, ledger: [] };
+    return {
+      outcome: rebound,
+      next,
+      ledger: [{
+        type: "request.rebind",
+        session: bee,
+        generation,
+        ids: rebound.map((record) => record.id),
+      }],
+    };
+  });
+}
+
 /** Delete the bee's whole request file (kill is PURGE; retire keeps it). */
 export async function removeBeeRequests(bee: string): Promise<void> {
   await withFileLock(requestLockPath(bee), async () => {

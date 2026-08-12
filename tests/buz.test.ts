@@ -36,7 +36,7 @@ import {
   type BuzTier,
 } from "../src/buz.js";
 import { parseBuzDocument } from "../src/buz_format.js";
-import type { SessionRecord } from "../src/store.js";
+import { saveSession, transitionSession, type SessionRecord } from "../src/store.js";
 import type { Substrate } from "../src/substrates/index.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -663,6 +663,59 @@ test("processQueueForBee retries transport failures forever without incrementing
       false,
       "transport failures never consume the delivery-rejected retry budget",
     );
+  });
+});
+
+test("processQueueForBee preserves the single transition audit for an illegal edge", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.illegal-drain", { substrate: "hsr" });
+    await saveSession(recipient);
+    const startedAt = "2026-08-12T07:00:00.000Z";
+    await transitionSession(recipient.name, {
+      type: "turn.started",
+      eventId: "illegal-drain-started",
+      at: startedAt,
+      cause: "first-turn",
+      evidence: { kind: "hook", hookId: "illegal-drain-started", observedAt: startedAt, hook: "turn-start" },
+    });
+    const requestedAt = "2026-08-12T07:00:01.000Z";
+    await transitionSession(recipient.name, {
+      type: "request.opened",
+      eventId: "illegal-drain-request",
+      at: requestedAt,
+      cause: "question",
+      requestId: "illegal-drain-request",
+      evidence: { kind: "request", requestId: "illegal-drain-request", observedAt: requestedAt, action: "opened" },
+    });
+    await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.x" }, tier: "queue", body: "retry me" });
+    const sub = fakeSubstrate({
+      sendText: async () => {
+        await transitionSession(recipient.name, {
+          type: "runtime.lost",
+          eventId: "illegal-drain-lost",
+          at: "2026-08-12T07:00:02.000Z",
+          cause: "mid-turn-death",
+          probe: {
+            kind: "probe",
+            probeId: "illegal-drain-dead",
+            observerId: "buz-test",
+            observedAt: "2026-08-12T07:00:02.000Z",
+            outcome: "dead",
+            target: { substrate: "hsr", runnerPid: 4242 },
+          },
+        });
+      },
+    });
+
+    const result = await processQueueForBee(recipient, {
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+      stopOnFirstFailure: true,
+    });
+    assert.equal(result.errors[0]?.code, "ILLEGAL_BEE_TRANSITION");
+    const ledger = (await readFile(join(buzRoot(), "..", "ledger.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(ledger.filter((row) => row.type === "state.transition.rejected").length, 1);
+    assert.equal(ledger.filter((row) => row.type === "buz.deliver" && row.ok === false).length, 0);
   });
 });
 

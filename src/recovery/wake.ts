@@ -10,6 +10,7 @@ import {
   withSessionLifecycleTransaction,
   type SessionLifecycleTransaction,
 } from "../lifecycle.js";
+import { rebindOpenRequestsToGeneration } from "../requests/store.js";
 import {
   legacyStateMachineSeed,
   loadSession,
@@ -34,6 +35,7 @@ export type EnsureLiveRuntimeDeps = {
   loadRecord?: typeof loadSession;
   now?: () => number;
   makeActionId?: () => string;
+  rebindRequests?: typeof rebindOpenRequestsToGeneration;
 };
 
 export type EnsureLiveRuntimeResult = {
@@ -44,6 +46,25 @@ export type EnsureLiveRuntimeResult = {
 
 function axes(record: SessionRecord) {
   return record.stateMachine ?? legacyStateMachineSeed(record);
+}
+
+async function markNeedsYouRuntimeResumed(
+  record: SessionRecord,
+  probe: ProbeEvidence,
+  deps: EnsureLiveRuntimeDeps,
+): Promise<SessionRecord> {
+  if (axes(record).work !== "needs-you") return record;
+  const actionId = `needs-you-runtime-revived:${probe.probeId}`;
+  const transitioned = await (deps.transition ?? transitionSession)(record.name, {
+    type: "bee.revived",
+    eventId: `needs-you-runtime-revived:${probe.probeId}`,
+    at: probe.observedAt,
+    cause: "revive",
+    resume: "needs-you",
+    evidence: { kind: "operator", actionId, observedAt: probe.observedAt, action: "revive" },
+    probe,
+  });
+  return transitioned?.record ?? record;
 }
 
 async function retryLifecycleConflict<T>(
@@ -99,6 +120,13 @@ export async function ensureLiveRuntimeForSend(
       }
       if (probe.outcome === "alive") {
         await (deps.markVerified ?? markSessionVerified)(record.name, probe);
+        if (state.work === "needs-you") {
+          await (deps.rebindRequests ?? rebindOpenRequestsToGeneration)(
+            record.name,
+            record.runtimeGeneration ?? 0,
+          );
+          record = await markNeedsYouRuntimeResumed(record, probe, deps);
+        }
         return { record, woke: false, probe };
       }
 
@@ -112,9 +140,12 @@ export async function ensureLiveRuntimeForSend(
         throw new Error(`hive send: ${record.name} is recovering; the accepted turn will resume automatically`);
       }
       if (currentAxes.runtime !== "parked") {
-        if (currentAxes.work !== "done") {
+        if (currentAxes.work === "working" || currentAxes.work === "spawning") {
           throw new Error(`hive send: ${record.name} died mid-turn and must be recovered by the supervisor`);
         }
+        // needs-you is idle-shaped for runtime death: the durable question is
+        // still open, but no turn is executing. Park it before lazy respawn,
+        // preserving the bounded work axis and request identity.
         const parked = await (deps.transition ?? transitionSession)(record.name, {
           type: "runtime.parked",
           eventId: `runtime-parked:${probe.probeId}`,
@@ -141,6 +172,17 @@ export async function ensureLiveRuntimeForSend(
         throw new Error(`hive send: replacement runtime probe returned ${after.outcome} for ${record.name}`);
       }
       await (deps.markVerified ?? markSessionVerified)(record.name, after);
+      if (currentAxes.work === "needs-you") {
+        await (deps.rebindRequests ?? rebindOpenRequestsToGeneration)(
+          record.name,
+          revived.runtimeGeneration ?? 0,
+        );
+        return {
+          record: await markNeedsYouRuntimeResumed(revived, after, deps),
+          woke: true,
+          probe: after,
+        };
+      }
       return { record: revived, woke: true, probe: after };
     }));
 }

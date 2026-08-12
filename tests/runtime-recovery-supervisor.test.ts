@@ -61,6 +61,12 @@ function record(name: string, runtime: "live" | "parked" | "recovering" | "lost"
   } as SessionRecord;
 }
 
+function needsYouRecord(name: string): SessionRecord {
+  const candidate = record(name);
+  candidate.stateMachine!.work = "needs-you";
+  return candidate;
+}
+
 function probe(record: SessionRecord, outcome: "alive" | "dead" | "unreachable"): RecoveryProbeEvidence {
   return {
     kind: "probe",
@@ -106,6 +112,25 @@ test("verified idle death parks silently while mid-turn death recovers; uncertai
     ]);
     assert.equal((await readRuntimeRecovery("working"))?.nextAttemptAt, new Date(START + 15_000).toISOString());
     assert.equal(await readRuntimeRecovery("idle"), null);
+  });
+});
+
+test("needs-you death parks even when HSR markers and staged work look unfinished", async () => {
+  await withTempStore(async () => {
+    const waiting = needsYouRecord("apiary-waggle-mso8zefe-1");
+    const transitions: RuntimeRecoveryTransitionEvent[] = [];
+    const [decision] = await reconcileRuntimeDeaths([waiting], {
+      probe: async (candidate) => probe(candidate, "dead"),
+      hasPendingTurns: async () => true,
+      hasUnfinishedMarker: async () => true,
+      transition: async (_bee, event) => { transitions.push(event); },
+      now: () => START,
+    });
+
+    assert.equal(decision?.action, "parked");
+    assert.equal(transitions.length, 1);
+    assert.equal(transitions[0]?.type, "runtime.parked");
+    assert.equal(await readRuntimeRecovery(waiting.name), null);
   });
 });
 
@@ -200,6 +225,36 @@ test("boot re-adoption callbacks persist death and recovery-success before H1 cl
       hasUnfinishedMarker: async () => false,
     }), "handled");
     assert.equal((await loadSession(idle.name))?.stateMachine?.runtime, "parked");
+
+    const waitingSeed = { ...record("boot-needs-you"), stateMachine: undefined };
+    await saveSession(waitingSeed);
+    await transitionSession(waitingSeed.name, {
+      type: "turn.started",
+      eventId: "boot-needs-you-started",
+      at: new Date(START - 2_000).toISOString(),
+      cause: "first-turn",
+      evidence: { kind: "hook", hookId: "boot-needs-you-started", observedAt: new Date(START - 2_000).toISOString(), hook: "turn-start" },
+    });
+    await transitionSession(waitingSeed.name, {
+      type: "request.opened",
+      eventId: "boot-needs-you-request",
+      at: new Date(START - 1_000).toISOString(),
+      cause: "question",
+      requestId: "boot-needs-you-request",
+      evidence: { kind: "request", requestId: "boot-needs-you-request", observedAt: new Date(START - 1_000).toISOString(), action: "opened" },
+    });
+    const waiting = (await loadSession(waitingSeed.name))!;
+    const waitingProbe = {
+      ...deadProbe,
+      record: waiting,
+      evidence: probe(waiting, "dead") as RecoveryProbeEvidence & { outcome: "dead" },
+    } as DeadHsrReAdoptionProbe;
+    assert.equal(await handleVerifiedBootRuntimeDeath(waitingProbe, {
+      hasPendingTurns: async () => true,
+      hasUnfinishedMarker: async () => true,
+    }), "handled");
+    assert.equal((await loadSession(waiting.name))?.stateMachine?.runtime, "parked");
+    assert.equal((await loadSession(waiting.name))?.stateMachine?.work, "needs-you");
 
     const working = {
       ...record("boot-working"),

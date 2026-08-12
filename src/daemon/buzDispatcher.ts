@@ -38,6 +38,7 @@ const DEFAULT_BUZ_MAILBOX_CONCURRENCY = 16;
 const DEFAULT_BUZ_DRAIN_CONCURRENCY = 8;
 const DEFAULT_BUZ_STALE_AFTER_MS = 10 * 60_000;
 const DEFAULT_BUZ_STALE_SCAN_INTERVAL_MS = 60_000;
+export const DEFAULT_BUZ_ILLEGAL_TRANSITION_BACKOFF_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
 
 export type BuzDispatchTrigger = {
   record: SessionRecord;
@@ -49,6 +50,8 @@ export type BuzDispatchTrigger = {
 export type BuzDispatchOutcome = {
   recipient: string;
   result: DrainResult;
+  /** Present only on the actual failed attempt; suppressed ticks emit nothing. */
+  illegalTransitionBackoff?: { attempt: number; retryAt: string };
   /** Operator diagnostic; deliberately separate from bee/task state. */
   staleQueue?: StaleBuzQueue & { newlyStale: boolean };
   /** A best-effort staleness scan failure must never fail normal delivery. */
@@ -99,7 +102,25 @@ export type BuzStalenessDeps = {
   scanIntervalMs?: number;
   mailboxConcurrency?: number;
   listQueue?: (record: SessionRecord) => ReturnType<typeof listMessages>;
+  /** @internal deterministic schedule override for tests. */
+  illegalTransitionBackoffMs?: readonly number[];
 };
+
+type IllegalTransitionBackoff = {
+  attempt: number;
+  retryAtMs: number;
+  signature: string;
+};
+
+function illegalTransitionError(result: DrainResult): DrainResult["errors"][number] | undefined {
+  return result.errors.find((error) => error.code === "ILLEGAL_BEE_TRANSITION");
+}
+
+function illegalTransitionDelayMs(attempt: number, schedule: readonly number[]): number {
+  const fallback = DEFAULT_BUZ_ILLEGAL_TRANSITION_BACKOFF_MS;
+  const bounded = schedule.length > 0 ? schedule : fallback;
+  return bounded[Math.min(Math.max(0, attempt - 1), bounded.length - 1)]!;
+}
 
 /**
  * Stateful daemon-facing dispatcher: normal queue draining plus a throttled
@@ -124,11 +145,43 @@ export function createBuzDrainDispatcher(
   let lastScanAt = Number.NEGATIVE_INFINITY;
   let warnings: StaleBuzQueue[] = [];
   let previousKeys = new Map<string, string>();
+  // Daemon-lifetime recipient circuit breaker. transitionSession already
+  // audits the rejected edge; suppressing identical drain attempts between
+  // these bounded retries keeps that ledger proof to one row per attempt,
+  // rather than one row per daemon tick.
+  const illegalBackoffs = new Map<string, IllegalTransitionBackoff>();
+  const illegalSchedule = deps.illegalTransitionBackoffMs ?? DEFAULT_BUZ_ILLEGAL_TRANSITION_BACKOFF_MS;
   return async (records, transitions, currentStates) => {
-    const drained = await dispatchBuzDrains(records, transitions, {
+    const present = new Set(records.map((record) => record.name));
+    for (const recipient of illegalBackoffs.keys()) {
+      if (!present.has(recipient)) illegalBackoffs.delete(recipient);
+    }
+    const drainNowMs = now();
+    const drainableRecords = records.filter((record) => {
+      const backoff = illegalBackoffs.get(record.name);
+      return !backoff || backoff.retryAtMs <= drainNowMs;
+    });
+    const drained = await dispatchBuzDrains(drainableRecords, transitions, {
       ...deps,
       currentStates,
     });
+    const attempted = new Set(drained.map((outcome) => outcome.recipient));
+    for (const outcome of drained) {
+      const illegal = illegalTransitionError(outcome.result);
+      if (!illegal) {
+        illegalBackoffs.delete(outcome.recipient);
+        continue;
+      }
+      const signature = `${illegal.code}:${illegal.message}`;
+      const previous = illegalBackoffs.get(outcome.recipient);
+      const attempt = previous?.signature === signature ? previous.attempt + 1 : 1;
+      const retryAtMs = drainNowMs + illegalTransitionDelayMs(attempt, illegalSchedule);
+      illegalBackoffs.set(outcome.recipient, { attempt, retryAtMs, signature });
+      outcome.illegalTransitionBackoff = { attempt, retryAt: new Date(retryAtMs).toISOString() };
+    }
+    for (const record of drainableRecords) {
+      if (!attempted.has(record.name)) illegalBackoffs.delete(record.name);
+    }
     const nowMs = now();
     let newlyStale = new Set<string>();
     if (nowMs - lastScanAt >= scanIntervalMs) {
@@ -319,12 +372,15 @@ export async function dispatchBuzDrains(
       return { recipient: record.name, result };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const code = typeof (error as { code?: unknown } | null)?.code === "string"
+        ? (error as { code: string }).code
+        : undefined;
       return {
         recipient: record.name,
         result: {
           delivered: [],
           quarantined: [],
-          errors: [{ id: record.name, message }],
+          errors: [{ id: record.name, message, ...(code ? { code } : {}) }],
         },
       };
     }

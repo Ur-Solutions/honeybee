@@ -21,12 +21,15 @@ import {
   createBuzRecoveryDispatcher,
   runBuzRecoverySweep,
 } from "../src/daemon/buzRecovery.js";
+import { reconcileRuntimeDeaths } from "../src/daemon/runtimeRecovery.js";
 import { tick, type ProbeResult, type TickDeps, type TickTransition } from "../src/daemon/run.js";
-import { readBeeRequests } from "../src/requests/store.js";
+import { wakeRuntimeForQueuedSend } from "../src/recovery/wake.js";
+import { openRequest, readBeeRequests } from "../src/requests/store.js";
 import type { BeeState } from "../src/state.js";
 import type { ProbeEvidence } from "../src/stateMachine.js";
-import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, transitionSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { Substrate } from "../src/substrates/index.js";
+import { projectBeeView } from "../src/view/project.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-buz-dispatch-"));
@@ -310,6 +313,77 @@ test("createBuzDrainDispatcher reports scan failures without rejecting delivery"
   assert.equal(outcomes[1]!.diagnosticError, "mailbox unavailable");
 });
 
+test("createBuzDrainDispatcher backs off identical illegal transitions per recipient", async () => {
+  await withTempStore(async () => {
+    let now = Date.parse("2026-08-12T07:00:00.000Z");
+    const recipient = makeRecord("CO.illegal");
+    await saveSession(recipient);
+    await transitionSession(recipient.name, {
+      type: "turn.started",
+      eventId: "illegal-fixture-start",
+      at: new Date(now - 2_000).toISOString(),
+      cause: "first-turn",
+      evidence: { kind: "hook", hookId: "illegal-fixture-start", observedAt: new Date(now - 2_000).toISOString(), hook: "turn-start" },
+    });
+    await transitionSession(recipient.name, {
+      type: "request.opened",
+      eventId: "illegal-fixture-request",
+      at: new Date(now - 1_000).toISOString(),
+      cause: "question",
+      requestId: "illegal-fixture-request",
+      evidence: { kind: "request", requestId: "illegal-fixture-request", observedAt: new Date(now - 1_000).toISOString(), action: "opened" },
+    });
+    const current = (await loadSession(recipient.name))!;
+    let attempts = 0;
+    const dispatcher = createBuzDrainDispatcher({
+      now: () => now,
+      scanIntervalMs: Number.MAX_SAFE_INTEGER,
+      illegalTransitionBackoffMs: [60_000, 5 * 60_000, 15 * 60_000],
+      hasQueuedMessages: async () => true,
+      drain: async (record) => {
+        attempts += 1;
+        await transitionSession(record.name, {
+          type: "runtime.lost",
+          eventId: `illegal-drain-${attempts}`,
+          at: new Date(now).toISOString(),
+          cause: "mid-turn-death",
+          probe: terminalProbe(record),
+        });
+        throw new Error("unreachable");
+      },
+      listQueue: async () => [],
+    });
+    const states = new Map<string, BeeState>([[recipient.name, "ready"]]);
+
+    const first = await dispatcher([current], [], states);
+    assert.equal(first[0]?.result.errors[0]?.code, "ILLEGAL_BEE_TRANSITION");
+    assert.deepEqual(first[0]?.illegalTransitionBackoff, {
+      attempt: 1,
+      retryAt: new Date(now + 60_000).toISOString(),
+    });
+
+    for (let tick = 1; tick < 20; tick += 1) {
+      now += 3_000;
+      assert.deepEqual(await dispatcher([current], [], states), []);
+    }
+    assert.equal(attempts, 1, "ordinary daemon ticks are suppressed during the recipient backoff");
+    const ledgerAfterHotTicks = (await readFile(join(process.env.HIVE_STORE_ROOT!, "ledger.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(ledgerAfterHotTicks.filter((row) => row.type === "state.transition.rejected").length, 1);
+
+    now = Date.parse(first[0]!.illegalTransitionBackoff!.retryAt);
+    const second = await dispatcher([current], [], states);
+    assert.equal(second[0]?.illegalTransitionBackoff?.attempt, 2);
+    assert.equal(Date.parse(second[0]!.illegalTransitionBackoff!.retryAt) - now, 5 * 60_000);
+    now = Date.parse(second[0]!.illegalTransitionBackoff!.retryAt);
+    const third = await dispatcher([current], [], states);
+    assert.equal(Date.parse(third[0]!.illegalTransitionBackoff!.retryAt) - now, 15 * 60_000);
+    now = Date.parse(third[0]!.illegalTransitionBackoff!.retryAt);
+    const capped = await dispatcher([current], [], states);
+    assert.equal(Date.parse(capped[0]!.illegalTransitionBackoff!.retryAt) - now, 15 * 60_000);
+  });
+});
+
 // ─── dispatchBuzDrains end-to-end ────────────────────────────────────────
 
 test("dispatchBuzDrains drains queue on active->idle_with_output and moves to inbox", async () => {
@@ -378,6 +452,139 @@ test("dispatchBuzDrains never wakes a cold bee inline", async () => {
     assert.deepEqual(outcomes, []);
     const queued = await listMessages(recipient.name, "queue");
     assert.deepEqual(queued.map((entry) => entry.message.id), [sent.message.id]);
+  });
+});
+
+test("live incident repro: needs-you dead runner parks, wakes lazily, and drains buz without closing its request", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-12T07:05:00.000Z");
+    const recipient = makeRecord("apiary-waggle-mso8zefe-1", {
+      substrate: "hsr",
+      providerSessionId: "thread-live-incident",
+      runtimeGeneration: 4,
+    });
+    await saveSession(recipient);
+    await transitionSession(recipient.name, {
+      type: "turn.started",
+      eventId: "incident-turn-started",
+      at: new Date(now - 3_000).toISOString(),
+      cause: "first-turn",
+      evidence: { kind: "hook", hookId: "incident-turn-started", observedAt: new Date(now - 3_000).toISOString(), hook: "turn-start" },
+    });
+    const requestId = "incident-open-question";
+    await openRequest(recipient.name, {
+      id: requestId,
+      kind: "question",
+      scope: "turn",
+      generation: 4,
+      openedAt: new Date(now - 2_000).toISOString(),
+      question: "Which Cloudflare account should I use?",
+      evidence: { grade: "structured", source: "hsr-events", observedAt: new Date(now - 2_000).toISOString() },
+    });
+    await transitionSession(recipient.name, {
+      type: "request.opened",
+      eventId: "incident-request-opened",
+      at: new Date(now - 2_000).toISOString(),
+      cause: "question",
+      requestId,
+      evidence: { kind: "request", requestId, observedAt: new Date(now - 2_000).toISOString(), action: "opened" },
+    });
+    await updateSession(recipient.name, {
+      lastObservedState: "blocked",
+      lastObservedStateAt: new Date(now - 1_000).toISOString(),
+    });
+    const queued = await sendBuzMessage({ recipient, sender, tier: "queue", body: "review-ready update" });
+    await updateSession(recipient.name, {
+      recoveryRequestedAt: new Date(now).toISOString(),
+      recoveryMessageId: queued.message.id,
+      recoveryAttemptCount: 0,
+    });
+
+    const deadProbe: ProbeEvidence = {
+      kind: "probe",
+      probeId: "incident-runner-dead",
+      observerId: "incident-repro",
+      observedAt: new Date(now).toISOString(),
+      outcome: "dead",
+      target: { substrate: "hsr", runnerPid: 4242 },
+    };
+    const beforeDeath = (await loadSession(recipient.name))!;
+    const [death] = await reconcileRuntimeDeaths([beforeDeath], {
+      probe: async () => deadProbe,
+      transition: transitionSession,
+      // This is the production incident shape: the structured needs_input tail
+      // looks unfinished even though bounded work has already suspended.
+      hasPendingTurns: async () => true,
+      hasUnfinishedMarker: async () => true,
+      now: () => now,
+    });
+    assert.equal(death?.action, "parked");
+    const parked = (await loadSession(recipient.name))!;
+    assert.equal(parked.stateMachine?.runtime, "parked");
+    assert.equal(parked.stateMachine?.work, "needs-you");
+
+    let live = false;
+    let launches = 0;
+    const recovery = await runBuzRecoverySweep([parked], {
+      now: () => now,
+      isLive: async () => live,
+      assertCwd: async () => undefined,
+      wakeRecipient: (snapshot) => wakeRuntimeForQueuedSend(snapshot, {
+        isLive: async () => live,
+        probe: async () => ({
+          ...deadProbe,
+          probeId: live ? "incident-replacement-live" : "incident-confirmed-dead",
+          outcome: live ? "alive" : "dead",
+        }),
+        assertCwd: async () => undefined,
+        reviveInTransaction: async (lifecycle) => {
+          launches += 1;
+          const current = await lifecycle.refresh();
+          const revived = await lifecycle.commit({
+            runtimeGeneration: (current.runtimeGeneration ?? 0) + 1,
+            status: "running",
+          });
+          live = true;
+          return revived;
+        },
+        now: () => now,
+      }),
+    });
+    assert.equal(recovery[0]?.action, "started");
+    assert.equal(launches, 1);
+    const awakened = (await loadSession(recipient.name))!;
+    assert.equal(awakened.stateMachine?.work, "needs-you");
+
+    const injected: string[] = [];
+    const drained = await dispatchBuzDrains([awakened], [], {
+      currentStates: new Map([[recipient.name, "ready"]]),
+      resolveSubstrate: () => fakeSubstrate({ sendText: async (_target, text) => { injected.push(text); } }),
+    });
+    assert.deepEqual(drained[0]?.result.delivered, [queued.message.id]);
+    assert.deepEqual(injected, [formatBuzInjection(queued.message)]);
+
+    const final = (await loadSession(recipient.name))!;
+    const storedRequests = await readBeeRequests(recipient.name);
+    assert.equal(final.runtimeGeneration, 5);
+    assert.equal(storedRequests.find((request) => request.id === requestId)?.generation, 5);
+    assert.equal(storedRequests.find((request) => request.id === requestId)?.status, "open");
+    const view = projectBeeView({
+      record: final,
+      context: {
+        liveTargets: new Set(),
+        hsrLive: new Set([recipient.name]),
+        hsrStates: new Map([[recipient.name, "blocked"]]),
+        now,
+      },
+      storedRequests,
+      now,
+    });
+    assert.equal(final.stateMachine?.work, "needs-you");
+    assert.equal(view.openRequests[0]?.id, requestId);
+    assert.equal(view.openRequests[0]?.status, "open");
+    const ledger = (await readFile(join(process.env.HIVE_STORE_ROOT!, "ledger.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(ledger.filter((row) => row.type === "state.transition.rejected").length, 0);
   });
 });
 

@@ -112,6 +112,7 @@ function eventSet(step: number): BeeTransitionEvent[] {
     { eventId: `park-${step}`, at: at(step), type: "runtime.parked", cause: "idle-death", probe: probe(step, "dead") },
     { eventId: `archive-${step}`, at: at(step), type: "bee.archived", cause: "retire", evidence: operator(step, "retire"), probe: probe(step) },
     { eventId: `revive-${step}`, at: at(step), type: "bee.revived", cause: "revive", resume: "working", evidence: operator(step, "revive"), probe: probe(step) },
+    { eventId: `revive-needs-you-${step}`, at: at(step), type: "bee.revived", cause: "revive", resume: "needs-you", evidence: operator(step, "revive"), probe: probe(step) },
   ];
 }
 
@@ -158,6 +159,49 @@ test("property-style: raw event sequences persist only table edges and audit eve
     await assert.rejects(updateSession(current.name, { stateMachine: current.stateMachine }), /only be changed through transitionSession/);
     assert.deepEqual((await loadSession(current.name))?.stateMachine, current.stateMachine);
   });
+});
+
+test("exhaustive table: needs-you runner death has a parked edge but no lost edge", () => {
+  const from: StateMachineSeed = { lifecycle: "active", runtime: "live", work: "needs-you" };
+  const accepted = eventSet(20).flatMap((event) => {
+    try {
+      return [[event.type, reduceBeeTransition(from, event).to] as const];
+    } catch {
+      return [];
+    }
+  });
+
+  assert.deepEqual(accepted, [
+    ["request.resolved", { lifecycle: "active", runtime: "live", work: "working" }],
+    ["runtime.parked", { lifecycle: "active", runtime: "parked", work: "needs-you" }],
+    ["bee.archived", { lifecycle: "archived", runtime: "parked", work: "done" }],
+  ]);
+  const lost = eventSet(21).find((event) => event.type === "runtime.lost")!;
+  assert.throws(() => reduceBeeTransition(from, lost), /illegal runtime\.lost transition/);
+
+  const parked = accepted.find(([type]) => type === "runtime.parked")![1];
+  const resumed = reduceBeeTransition(parked, {
+    eventId: "needs-you-resumed",
+    at: at(22),
+    type: "bee.revived",
+    cause: "revive",
+    resume: "needs-you",
+    evidence: operator(22, "revive"),
+    probe: probe(22, "alive"),
+  });
+  assert.deepEqual(resumed.to, from, "lazy respawn restores runtime without changing the open work axis");
+  assert.throws(
+    () => reduceBeeTransition({ lifecycle: "archived", runtime: "parked", work: "done" }, {
+      eventId: "archived-cannot-resume-needs-you",
+      at: at(23),
+      type: "bee.revived",
+      cause: "revive",
+      resume: "needs-you",
+      evidence: operator(23, "revive"),
+      probe: probe(23, "alive"),
+    }),
+    /illegal bee\.revived transition/,
+  );
 });
 
 test("transitionSession is idempotent for an exact lastEventId replay", async () => {

@@ -15,6 +15,7 @@ import {
   openAndResolveRequest,
   openRequest,
   readBeeRequests,
+  rebindOpenRequestsToGeneration,
   removeBeeRequests,
   requestsRoot,
   resolveRequest,
@@ -279,6 +280,25 @@ test("closeRequestsForNewIncarnation cancels superseded with the generation-stam
     assert.equal(cancelled[0]!.cancelReason, "superseded");
     assert.equal(cancelled[0]!.cancelDetail, "superseded by generation 2");
     assert.equal((await readBeeRequests("bee1")).find((request) => request.id === "delivery")?.status, "open");
+  });
+});
+
+test("needs-you lazy resume rebinds open runtime requests and leaves bee-scoped requests alone", async () => {
+  await withTempStore(async () => {
+    await openRequest("bee1", input({ id: "question", generation: 4, kind: "question", scope: "turn" }));
+    await openRequest("bee1", input({ id: "auth", generation: 4, kind: "auth", scope: "runtime-generation" }));
+    await openRequest("bee1", input({ id: "stale", generation: 2, kind: "question", scope: "turn" }));
+    await openRequest("bee1", input({ id: "delivery", generation: 4, kind: "manual-action", scope: "bee" }));
+
+    const rebound = await rebindOpenRequestsToGeneration("bee1", 5);
+    assert.deepEqual(rebound.map((request) => request.id).sort(), ["auth", "question"]);
+    const byId = new Map((await readBeeRequests("bee1")).map((request) => [request.id, request]));
+    assert.equal(byId.get("question")?.generation, 5);
+    assert.equal(byId.get("auth")?.generation, 5);
+    assert.equal(byId.get("stale")?.generation, 2, "an unrelated stale request is not resurrected");
+    assert.equal(byId.get("delivery")?.generation, 4);
+    assert.ok([...byId.values()].every((request) => request.status === "open"));
+    assert.deepEqual(await rebindOpenRequestsToGeneration("bee1", 5), [], "same-generation replay is idempotent");
   });
 });
 

@@ -88,6 +88,9 @@ export async function processQueueForBee(
         await context.transport.substrate.sendText(context.transport.tmuxTarget, formatBuzInjection(message), context.transport.agentPaneId);
       } catch (error) {
         const failureClass = (context.classifyFailure ?? classifyBuzDeliveryFailure)(error);
+        const errorCode = typeof (error as { code?: unknown } | null)?.code === "string"
+          ? (error as { code: string }).code
+          : undefined;
         if (failureClass === "delivery-rejected") {
           const retriesPath = `${entry.path}.retries`;
           const prev = Number((await readFile(retriesPath, "utf8").catch(() => "0")).trim()) || 0;
@@ -103,16 +106,26 @@ export async function processQueueForBee(
             }
           });
         }
-        result.errors.push({ id: message.id, message: error instanceof Error ? error.message : String(error) });
-        await appendLedger({
-          type: "buz.deliver",
-          messageId: message.id,
-          recipient: record.name,
-          tier: "queue",
-          ok: false,
-          failureClass,
-          error: error instanceof Error ? error.message : String(error),
+        result.errors.push({
+          id: message.id,
+          message: error instanceof Error ? error.message : String(error),
+          ...(errorCode ? { code: errorCode } : {}),
         });
+        // transitionSession already writes the authoritative rejected-edge
+        // audit before throwing. Do not duplicate that proof with a second
+        // buz.deliver failure row; the daemon recipient backoff controls its
+        // next bounded retry.
+        if (errorCode !== "ILLEGAL_BEE_TRANSITION") {
+          await appendLedger({
+            type: "buz.deliver",
+            messageId: message.id,
+            recipient: record.name,
+            tier: "queue",
+            ok: false,
+            failureClass,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         // Daemon dispatcher: stop after first failure so a broken substrate
         // doesn't burn through every queued message in a single tick.
         // Subsequent messages remain in queue/ and will be retried next tick.

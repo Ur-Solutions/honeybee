@@ -87,7 +87,7 @@ export type BeeTransitionReceipt = {
   at: string;
   evidence: TransitionEvidence[];
   requestId?: string;
-  resume?: "working" | "done";
+  resume?: "working" | "needs-you" | "done";
 };
 
 export type BeeStateMachineCursor = {
@@ -164,7 +164,7 @@ export type BeeTransitionEvent =
   | (EventBase & {
       type: "bee.revived";
       cause: "revive";
-      resume: "working" | "done";
+      resume: "working" | "needs-you" | "done";
       evidence: OperatorEvidence;
       probe: ProbeEvidence;
     });
@@ -318,7 +318,7 @@ export function reduceBeeTransition(current: StateMachineSeed, event: BeeTransit
   let to: StateMachineSeed | undefined;
 
   if (current.lifecycle === "archived") {
-    if (event.type === "bee.revived") {
+    if (event.type === "bee.revived" && event.resume !== "needs-you") {
       to = { lifecycle: "active", runtime: "live", work: event.resume };
     }
   } else if (event.type === "bee.archived") {
@@ -356,9 +356,21 @@ export function reduceBeeTransition(current: StateMachineSeed, event: BeeTransit
         if (current.work === "done") to = { ...current, runtime: "live", work: "working" };
         break;
       case "runtime.parked":
-        if (current.work === "done") to = { ...current, runtime: "parked", work: "done" };
+        // ADR: a needs-you turn has already stopped executing. Its open
+        // intervention is durable state, not runner-owned in-flight work, so
+        // verified runner death is idle-shaped: park without closing or
+        // recovering the question. runtime.lost intentionally remains legal
+        // only for working turns above.
+        if (current.work === "done" || current.work === "needs-you") {
+          to = { ...current, runtime: "parked", work: current.work };
+        }
         break;
       case "bee.revived":
+        // A lazy replacement for an idle-shaped needs-you death restores only
+        // runtime availability. The suspended work/request axis is unchanged.
+        if (current.runtime === "parked" && current.work === "needs-you" && event.resume === "needs-you") {
+          to = { ...current, runtime: "live", work: "needs-you" };
+        }
         break;
     }
   }

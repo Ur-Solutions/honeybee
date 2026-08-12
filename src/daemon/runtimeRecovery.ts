@@ -26,6 +26,7 @@ import type {
 } from "../stateMachine.js";
 import {
   appendLedger,
+  legacyStateMachineSeed,
   loadSession,
   markSessionVerified,
   transitionSession,
@@ -121,11 +122,17 @@ export async function reconcileRuntimeDeaths(
         (deps.hasPendingTurns ?? hasPendingHsrTurns)(record.name),
         deps.hasUnfinishedMarker?.(record.name) ?? Promise.resolve(false),
       ]);
-      const boundedWorkInFlight = record.stateMachine?.work === "working";
+      const boundedWork = record.stateMachine?.work ?? legacyStateMachineSeed(record).work;
       const reusableRecovery = existingRecovery?.status === "recovering" || existingRecovery?.status === "failed"
         ? existingRecovery
         : null;
-      const durableMidTurn = pending || unfinished || boundedWorkInFlight || staged !== null || reusableRecovery !== null;
+      // ADR: needs-you is an already-suspended turn. A structured blocked
+      // marker, staged input, or stale recovery episode cannot promote its
+      // runner death back into in-flight work; the open request outlives the
+      // runtime and the replacement is started lazily when delivery needs it.
+      const durableMidTurn = boundedWork !== "needs-you" && (
+        pending || unfinished || boundedWork === "working" || staged !== null || reusableRecovery !== null
+      );
       if (!durableMidTurn) {
         if (state !== "parked") {
           await deps.transition(record.name, {
