@@ -81,6 +81,31 @@ test("recycled pid with a different birth is a proven stop and never signals the
   });
 });
 
+test("an exited meta still stops its exact lingering host before replacement", async () => {
+  await withTempStore(async () => {
+    const bee = "stop-truth-exited-host-lingering";
+    const meta = await seedRunningMeta(bee, {
+      status: "exited",
+      endedAt: "2026-08-07T10:00:05.000Z",
+      childAdmission: "none",
+    });
+    let hostAlive = true;
+    const signals: Array<[number, NodeJS.Signals | 0]> = [];
+    const result = await stopHsrIncarnation(bee, meta, {
+      readProcessIdentity: async () => hostAlive ? hostBirth : null,
+      isProcessGroupAlive: () => false,
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (pid === hostBirth.pgid && signal === "SIGTERM") hostAlive = false;
+      },
+      sleep: async () => undefined,
+    });
+    assert.equal(result.ok, true, result.stderr);
+    assert.deepEqual(signals, [[hostBirth.pgid, "SIGTERM"]]);
+    assert.equal((await readHsrMetaStrict(bee))?.status, "exited");
+  });
+});
+
 test("a live matching host still refuses the blind provably-stopped shortcut", async () => {
   await withTempStore(async () => {
     const bee = "stop-truth-live-match";

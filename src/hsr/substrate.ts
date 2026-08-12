@@ -220,17 +220,20 @@ export async function stopHsrIncarnation(
       // Host unreachable / socket stale — fall through to the signal fallback.
     }
   }
-  // Fallback only when the host is still supposed to be running: an already
-  // "exited" meta means the bee stopped cleanly (its socket file is gone, so the
-  // stop attempt above throws) — signalling meta.hostPid then would target a
-  // recycled/unrelated pid.
+  // Fall back to an OS signal only after re-validating the exact host birth.
+  // An `exited` meta does not by itself prove the detached host process has
+  // returned: finalize publishes `exited` before runner-entry exits, and a slow
+  // or stuck finalizer can remain observable during an immediate account swap.
+  // The persisted birth fingerprint is the safety boundary here. A matching
+  // birth authorizes signalling that exact lingering host; a recycled,
+  // fingerprint-less, or otherwise unverifiable pid never does.
   if (!stopped) {
     const latest = await readHsrMetaStrict(bee);
     if (sameHostIncarnation(initial, latest)) ownedMeta = latest!;
     // Only signal the exact runtime incarnation read at entry. A replacement
     // host under the same bee name is not ours to shoot by a recycled pid.
     const hostIdentity = await inspectHsrHostProcess(initial, deps);
-    if (latest && latest.status !== "exited" && sameHostIncarnation(initial, latest) && hostIdentity === "match") {
+    if (latest && sameHostIncarnation(initial, latest) && hostIdentity === "match") {
       try {
         (deps.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => process.kill(pid, signal)))(initial.hostPid, "SIGTERM");
       } catch {
@@ -240,7 +243,7 @@ export async function stopHsrIncarnation(
       if (!stopped) {
         const current = await readHsrMetaStrict(bee);
         const currentIdentity = await inspectHsrHostProcess(initial, deps);
-        if (current && current.status !== "exited" && sameHostIncarnation(initial, current) && currentIdentity === "match") {
+        if (current && sameHostIncarnation(initial, current) && currentIdentity === "match") {
           try {
             (deps.kill ?? ((pid: number, signal: NodeJS.Signals | 0) => process.kill(pid, signal)))(initial.hostPid, "SIGKILL");
           } catch {
