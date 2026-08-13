@@ -29,6 +29,7 @@ import { deleteSession, saveSession } from "../src/store.js";
 import { claimWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
+import { createHsrRunLauncher } from "../src/execution/launcher.js";
 import {
   buildRunStartEnvelope,
   countingLauncher,
@@ -137,6 +138,75 @@ test("run.start golden path: request validates, launch binds, events are durable
     for (const event of events) {
       assert.deepEqual(validator.validate("run-event", event).errors, [], `event seq ${event.seq}`);
     }
+  });
+});
+
+test("run.start admits kit/profile only with a signed Kit profile and forwards it to launch", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const counting = countingLauncher();
+    let launchedHarness: JsonObject | undefined;
+    const service = makeService({
+      launcher: async (request) => {
+        launchedHarness = request.intent.harness as JsonObject;
+        return counting.launcher(request);
+      },
+    });
+    const response = (await service.runStart(buildRunStartEnvelope(ctx, {
+      mutateIntent: (intent) => {
+        const harness = intent.harness as JsonObject;
+        (harness.config as JsonObject).kitProfile = "web-qa";
+        (intent.requiredCapabilities as JsonObject[]).push({ capability: "kit/profile" });
+      },
+      mutateLease: (lease) => {
+        const harness = lease.allowedHarness as JsonObject;
+        (harness.config as JsonObject).kitProfile = "web-qa";
+        (lease.capabilities as JsonObject[]).push({ capability: "kit/profile" });
+      },
+    }))) as JsonObject;
+
+    assert.deepEqual(response.result, { runId: "run-0001", state: "running" });
+    assert.equal(counting.calls.length, 1);
+    assert.equal((launchedHarness!.config as JsonObject).kitProfile, "web-qa");
+  });
+});
+
+test("Kit profile convergence failure becomes a typed, cause-bearing run.failed event", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    await registerWorkingCopy({
+      workingCopyId: "wc-0001",
+      productId: "prod-honeycomb-app",
+      path: process.cwd(),
+      snapshotDigest: SNAPSHOT_DIGEST,
+      origin: "https://git.example.com/acme/honeycomb-app.git",
+      revision: "3f9c2b7d1a6e4f0c9b8a7d6e5f4c3b2a1d0e9f8c",
+    });
+    const launcher = createHsrRunLauncher({
+      nodeId: async () => ctx.nodeId,
+      spawn: async (_request, config) => {
+        assert.equal(config.kitProfile, "unknown-profile");
+        throw new Error("kit sync --profile unknown-profile failed: unknown profile");
+      },
+    });
+    const service = makeService({ launcher });
+    const response = (await service.runStart(buildRunStartEnvelope(ctx, {
+      mutateIntent: (intent) => {
+        const harness = intent.harness as JsonObject;
+        (harness.config as JsonObject).kitProfile = "unknown-profile";
+        (intent.requiredCapabilities as JsonObject[]).push({ capability: "kit/profile" });
+      },
+      mutateLease: (lease) => {
+        const harness = lease.allowedHarness as JsonObject;
+        (harness.config as JsonObject).kitProfile = "unknown-profile";
+        (lease.capabilities as JsonObject[]).push({ capability: "kit/profile" });
+      },
+    }))) as JsonObject;
+
+    assert.deepEqual(response.result, { runId: "run-0001", state: "failed" });
+    const failed = (await readRunEvents("run-0001")).find((event) => event.type === "run.failed");
+    assert.ok(failed, "terminal failure is durably visible to the run pane");
+    assert.match(String((failed.payload as JsonObject).cause), /^HARNESS_UNAVAILABLE: .*unknown-profile.*unknown profile/);
   });
 });
 
@@ -374,6 +444,32 @@ test("run.start validation matrix fails closed before any reservation", async ()
           },
         }),
         code: "LEASE_DENIED",
+      },
+      {
+        label: "Kit profile omitted from required capabilities",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-v17",
+          mutateIntent: (intent) => {
+            ((intent.harness as JsonObject).config as JsonObject).kitProfile = "web-qa";
+          },
+          mutateLease: (lease) => {
+            ((lease.allowedHarness as JsonObject).config as JsonObject).kitProfile = "web-qa";
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "kit/profile capability has no selected profile",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-v18",
+          mutateIntent: (intent) => {
+            (intent.requiredCapabilities as JsonObject[]).push({ capability: "kit/profile" });
+          },
+          mutateLease: (lease) => {
+            (lease.capabilities as JsonObject[]).push({ capability: "kit/profile" });
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
       },
     ];
     for (const testCase of cases) {

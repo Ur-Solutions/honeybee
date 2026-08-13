@@ -379,6 +379,11 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
   // Capability pin for the session record: what kit version/profile the home
   // actually carries after activation (empty when not kit-managed / remote).
   const kitStamp = !isRemoteSpawn && spec.homePath ? await readKitHomeStamp(spec.homePath) : {};
+  if (opts.kitProfile && (kitStamp.kitProfile !== opts.kitProfile || !kitStamp.kitVersion)) {
+    throw new Error(
+      `kit profile ${opts.kitProfile} did not converge for ${spec.homePath}: manifest reports profile ${kitStamp.kitProfile ?? "(missing)"}, version ${kitStamp.kitVersion ?? "(missing)"}`,
+    );
+  }
   // "activate" folds in resolveAgent + account activation (the OAuth-refresh
   // network call and accounts-lock wait live here); near-zero without --account.
   timer.mark("activate");

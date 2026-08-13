@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -9,8 +9,9 @@ import {
   readKitHomeStamp,
   resetKitProbeForTests,
 } from "../src/kit.js";
-import { resolveKitProfileFlag } from "../src/commands/spawn.js";
+import { resolveKitProfileFlag, spawnBee, type SpawnRuntimeDependencies } from "../src/commands/spawn.js";
 import { parse } from "../src/parse.js";
+import { loadSession } from "../src/store.js";
 
 async function makeStubKit(dir: string, body: string): Promise<string> {
   const bin = join(dir, "kit");
@@ -112,6 +113,125 @@ test("readKitHomeStamp reads the ownership manifest, {} otherwise", async () => 
     assert.deepEqual(await readKitHomeStamp(home), { kitVersion: "0.2.0", kitProfile: "web-qa" });
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("execution spawn converges Kit before HSR boot and stamps the exact profile/version", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-kit-execution-"));
+  const home = join(dir, "codex-home");
+  const previousStore = process.env.HIVE_STORE_ROOT;
+  const calls = join(dir, "calls.txt");
+  const hostPid = 58431;
+  try {
+    await mkdir(home, { recursive: true });
+    await makeStubKit(
+      dir,
+      `if [ "$1" = "version" ]; then echo '{"version":"9.9.9"}'; exit 0; fi
+echo "$@" > "${calls}"
+mkdir -p "${home}/.kit"
+echo '{"schema":1,"kitVersion":"9.9.9","profile":"web-qa","entries":[]}' > "${home}/.kit/manifest.json"
+echo '[]'`,
+    );
+    process.env.HIVE_KIT_BIN = join(dir, "kit");
+    process.env.HIVE_STORE_ROOT = join(dir, "store");
+    resetKitProbeForTests();
+    let forkObserved = false;
+    const runtimeDeps: SpawnRuntimeDependencies = {
+      spawnHsrHost: async () => {
+        forkObserved = true;
+        assert.deepEqual(
+          await readKitHomeStamp(home),
+          { kitVersion: "9.9.9", kitProfile: "web-qa" },
+          "strict convergence finishes before the harness host is forked",
+        );
+        return hostPid;
+      },
+      readHsrMetaStrict: async (bee) => ({
+        bee,
+        harness: "codex",
+        tier: "stream",
+        hostPid,
+        hostFingerprint: { pgid: hostPid, startedAt: "kit-profile-test-birth" },
+        childAdmission: "none",
+        startedAt: "2026-08-13T00:00:00.000Z",
+        controlSocket: join(dir, "control.sock"),
+        status: "queued",
+      }),
+      stopHsrIncarnationByPid: async () => ({ ok: true, stdout: "", stderr: "", exitCode: 0 }),
+    };
+
+    const record = await spawnBee({
+      agent: "codex",
+      extraArgs: [],
+      cwd: dir,
+      home,
+      yolo: false,
+      name: "execution-kit-profile",
+      substrate: "hsr",
+      executionRunId: "run-kit-profile",
+      kitProfile: "web-qa",
+    }, runtimeDeps);
+
+    assert.equal(forkObserved, true);
+    assert.equal(record.kitProfile, "web-qa");
+    assert.equal(record.kitVersion, "9.9.9");
+    const persisted = await loadSession(record.name);
+    assert.deepEqual(
+      { kitProfile: persisted?.kitProfile, kitVersion: persisted?.kitVersion },
+      { kitProfile: "web-qa", kitVersion: "9.9.9" },
+    );
+    assert.match((await readFile(calls, "utf8")).trim(), /--profile web-qa --json$/);
+  } finally {
+    delete process.env.HIVE_KIT_BIN;
+    if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousStore;
+    resetKitProbeForTests();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("execution spawn refuses to boot when Kit exits successfully without proving convergence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-kit-unproven-"));
+  const home = join(dir, "codex-home");
+  const previousStore = process.env.HIVE_STORE_ROOT;
+  try {
+    await mkdir(home, { recursive: true });
+    await makeStubKit(
+      dir,
+      `if [ "$1" = "version" ]; then echo '{"version":"9.9.9"}'; exit 0; fi
+echo '[]'`,
+    );
+    process.env.HIVE_KIT_BIN = join(dir, "kit");
+    process.env.HIVE_STORE_ROOT = join(dir, "store");
+    resetKitProbeForTests();
+    let forked = false;
+
+    await assert.rejects(
+      spawnBee({
+        agent: "codex",
+        extraArgs: [],
+        cwd: dir,
+        home,
+        yolo: false,
+        name: "execution-kit-unproven",
+        substrate: "hsr",
+        executionRunId: "run-kit-unproven",
+        kitProfile: "web-qa",
+      }, {
+        spawnHsrHost: async () => {
+          forked = true;
+          return 58432;
+        },
+      }),
+      /kit profile web-qa did not converge .*profile \(missing\), version \(missing\)/,
+    );
+    assert.equal(forked, false, "the harness host is never forked without a matching Kit manifest");
+  } finally {
+    delete process.env.HIVE_KIT_BIN;
+    if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousStore;
+    resetKitProbeForTests();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

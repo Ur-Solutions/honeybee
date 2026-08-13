@@ -13,6 +13,9 @@ import { bindingRefMatches } from "./nodeState.js";
 import { verifyCanonicalSignature, type SignatureVerifier } from "./signing.js";
 import { NATIVE_PROVIDER_ID, GIT_WORKTREE_MATERIALIZER_ID, ADVERTISED_HARNESSES } from "./describe.js";
 
+/** Capability leased by Apiary whenever signed harness config selects Kit. */
+export const KIT_PROFILE_CAPABILITY = "kit/profile";
+
 export type ValidatedRunStart = {
   envelope: JsonObject;
   body: JsonObject;
@@ -55,6 +58,7 @@ export function supportedCapabilities(): Set<string> {
   return new Set([
     ...ADVERTISED_HARNESSES.map((kind) => `harness/${kind}`),
     `materializer/${GIT_WORKTREE_MATERIALIZER_ID}`,
+    KIT_PROFILE_CAPABILITY,
   ]);
 }
 
@@ -162,6 +166,11 @@ export function validateRunStart(request: JsonValue, deps: RunStartValidationDep
   if (!(ADVERTISED_HARNESSES as readonly string[]).includes(driverId)) {
     throw executionError("HARNESS_UNAVAILABLE", `harness driver ${driverId} is not advertised by this node`);
   }
+  const harnessConfig = asObject(harness?.config);
+  const kitProfile = harnessConfig?.kitProfile;
+  if (kitProfile !== undefined && (typeof kitProfile !== "string" || kitProfile.trim().length === 0)) {
+    throw executionError("HARNESS_UNAVAILABLE", "harness config.kitProfile must be a non-empty string");
+  }
 
   // 7. The intent cannot widen the lease: every required capability must be
   //    authorized by an EXACT canonical leased entry (a differing minVersion
@@ -176,6 +185,7 @@ export function validateRunStart(request: JsonValue, deps: RunStartValidationDep
   );
   const requirements = Array.isArray(intent.requiredCapabilities) ? intent.requiredCapabilities : [];
   const supported = supportedCapabilities();
+  let requiresKitProfile = false;
   for (const entry of requirements) {
     const requirement = asObject(entry as JsonValue);
     const capability = requirement?.capability;
@@ -185,9 +195,16 @@ export function validateRunStart(request: JsonValue, deps: RunStartValidationDep
     if (typeof capability !== "string" || !supported.has(capability)) {
       throw executionError("CAPABILITY_MISMATCH", `required capability ${String(capability)} is not supported by this node`);
     }
+    if (capability === KIT_PROFILE_CAPABILITY) requiresKitProfile = true;
     if (requirement.minVersion !== undefined || requirement.params !== undefined) {
       throw executionError("CAPABILITY_MISMATCH", `capability constraints (minVersion/params) on ${capability} are not supported by this node`);
     }
+  }
+  if (kitProfile !== undefined && !requiresKitProfile) {
+    throw executionError("CAPABILITY_MISMATCH", `harness config.kitProfile requires ${KIT_PROFILE_CAPABILITY}`);
+  }
+  if (requiresKitProfile && kitProfile === undefined) {
+    throw executionError("CAPABILITY_MISMATCH", `${KIT_PROFILE_CAPABILITY} requires harness config.kitProfile`);
   }
   if (!canonicalEquals((intent.mutationAuthority ?? []) as JsonValue, (lease.mutationAuthority ?? []) as JsonValue)) {
     throw executionError("LEASE_DENIED", "intent mutation authority does not match the leased mutation authority");

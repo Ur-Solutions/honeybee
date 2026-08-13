@@ -36,6 +36,13 @@ export type HsrHarnessLaunchConfig = {
   account?: string;
   preamble?: string;
   /**
+   * Signed Kit capability profile. The production launcher translates this
+   * to spawn's strict --kit-profile path, which converges the dedicated home
+   * before the HSR host is forked and stamps the resulting manifest facts on
+   * the SessionRecord.
+   */
+  kitProfile?: string;
+  /**
    * Path-free Cell layout marker from the signed envelope (Apiary Cell Layout
    * v2). The envelope never carries machine paths, so for "v2" the launcher
    * itself derives the wrapper (the working copy's parent directory) and
@@ -63,6 +70,10 @@ export function resolveHsrHarnessLaunchConfig(intent: JsonObject): HsrHarnessLau
   if (preamble !== undefined && (typeof preamble !== "string" || preamble.trim().length === 0)) {
     throw executionError("HARNESS_UNAVAILABLE", "harness config.preamble must be a non-empty string");
   }
+  const kitProfile = config?.kitProfile;
+  if (kitProfile !== undefined && (typeof kitProfile !== "string" || kitProfile.trim().length === 0)) {
+    throw executionError("HARNESS_UNAVAILABLE", "harness config.kitProfile must be a non-empty string");
+  }
   const cellLayout = config?.cellLayout;
   if (cellLayout !== undefined && cellLayout !== "v1" && cellLayout !== "v2") {
     throw executionError("HARNESS_UNAVAILABLE", "harness config.cellLayout must be \"v1\" or \"v2\" when present");
@@ -73,6 +84,7 @@ export function resolveHsrHarnessLaunchConfig(intent: JsonObject): HsrHarnessLau
     ...(brief !== undefined ? { brief } : {}),
     ...(account !== undefined ? { account } : {}),
     ...(preamble !== undefined ? { preamble } : {}),
+    ...(kitProfile !== undefined ? { kitProfile } : {}),
     ...(cellLayout !== undefined ? { cellLayout } : {}),
   };
 }
@@ -80,7 +92,7 @@ export function resolveHsrHarnessLaunchConfig(intent: JsonObject): HsrHarnessLau
 export function buildHsrSpawnFlags(
   beeName: string,
   cwd: string,
-  config: Pick<HsrHarnessLaunchConfig, "account" | "preamble" | "cellLayout">,
+  config: Pick<HsrHarnessLaunchConfig, "account" | "preamble" | "kitProfile" | "cellLayout">,
 ): Map<string, string | true | string[]> {
   const flags = new Map<string, string | true | string[]>([
     ["substrate", "hsr"],
@@ -89,6 +101,7 @@ export function buildHsrSpawnFlags(
   ]);
   if (config.account) flags.set("account", config.account);
   if (config.preamble) flags.set("preamble", config.preamble);
+  if (config.kitProfile) flags.set("kit-profile", config.kitProfile);
   // Layout v2: the wrapper one level above the checkout owns `box/` — grant it
   // as an extra Cell-sandbox write root (repeatable --sandbox-write shape).
   if (config.cellLayout === "v2") flags.set("sandbox-write", [dirname(cwd)]);
@@ -227,12 +240,12 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
     // harness config — never from daemon profiles or ambient configuration.
     // Keeping the preamble separate from brief lets spawn preserve host-owned
     // session envelopes beside Honeybee's identity before the operator prompt.
-    const { driverId, model, brief, account, preamble, cellLayout } = resolveHsrHarnessLaunchConfig(intent);
+    const { driverId, model, brief, account, preamble, kitProfile, cellLayout } = resolveHsrHarnessLaunchConfig(intent);
 
     let record: SpawnedExecutionBee;
     try {
       if (deps.spawn) {
-        record = await deps.spawn(request, { driverId, ...(model ? { model } : {}), ...(brief ? { brief } : {}), ...(account ? { account } : {}), ...(preamble ? { preamble } : {}), ...(cellLayout ? { cellLayout } : {}) }, copy.path);
+        record = await deps.spawn(request, { driverId, ...(model ? { model } : {}), ...(brief ? { brief } : {}), ...(account ? { account } : {}), ...(preamble ? { preamble } : {}), ...(kitProfile ? { kitProfile } : {}), ...(cellLayout ? { cellLayout } : {}) }, copy.path);
       } else {
         const { spawnSingleBee } = await import("../commands/spawn.js");
         // The registry locator is the node-private path; it is used here to run
@@ -240,6 +253,7 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
         const flags = buildHsrSpawnFlags(beeName, copy.path, {
           ...(account ? { account } : {}),
           ...(preamble ? { preamble } : {}),
+          ...(kitProfile ? { kitProfile } : {}),
           ...(cellLayout ? { cellLayout } : {}),
         });
         let runtime: SpawnedRuntimeHandle | undefined;

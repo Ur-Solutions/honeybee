@@ -7,7 +7,7 @@
     "local-core-v1": {
       "activation": "baseline",
       "defaultEnabled": true,
-      "features": ["local-core-v1"],
+      "features": ["local-core-v1", "kit-profile-v1"],
       "methods": [
         {
           "method": "protocol.hello",

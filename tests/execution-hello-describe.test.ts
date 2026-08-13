@@ -37,6 +37,19 @@ test("protocol.hello: incompatible protocol range and malformed requests fail cl
   });
 });
 
+test("protocol.hello selects kit-profile-v1 when the client requests it", async () => {
+  await withTempStore(async () => {
+    const service = makeService();
+    const result = service.hello({
+      client: { product: "apiary", version: "0.4.0", protocolRange: "0.1" },
+      requiredFeatures: ["local-core-v1"],
+      optionalFeatures: ["kit-profile-v1"],
+    });
+    assert.equal(result.compatibility, "ready");
+    assert.deepEqual(result.selectedFeatures, ["local-core-v1", "kit-profile-v1"]);
+  });
+});
+
 test("node.describe: signed, owner-scoped, honest about absent harnesses and the delivered command set", async () => {
   await withTempStore(async () => {
     const { binding } = await installTestAuthority();
@@ -45,6 +58,7 @@ test("node.describe: signed, owner-scoped, honest about absent harnesses and the
     assert.ok("result" in outcome, JSON.stringify(outcome));
     const descriptor = outcome.result;
     assert.deepEqual(service.validator.validate("node-descriptor", descriptor).errors, []);
+    assert.deepEqual((descriptor.protocol as JsonObject).features, ["local-core-v1", "kit-profile-v1"]);
     const identity = await loadNodeIdentity();
     assert.ok(verifyCanonicalSignature(identity.publicKey, descriptor as Record<string, never>), "descriptor signature verifies");
     const harnesses = descriptor.harnesses as Array<Record<string, unknown>>;

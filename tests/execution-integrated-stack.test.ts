@@ -273,6 +273,7 @@ test("HSR launcher config keeps signed preamble separate from the operator brief
         brief: "Fix the transcript regression.",
         preamble: "You are inside Apiary.",
         account: "auto",
+        kitProfile: "web-qa",
       },
     },
   });
@@ -282,6 +283,7 @@ test("HSR launcher config keeps signed preamble separate from the operator brief
     brief: "Fix the transcript regression.",
     preamble: "You are inside Apiary.",
     account: "auto",
+    kitProfile: "web-qa",
   });
   assert.deepEqual([...buildHsrSpawnFlags("run-0001", "/tmp/cell", resolved)], [
     ["substrate", "hsr"],
@@ -289,6 +291,7 @@ test("HSR launcher config keeps signed preamble separate from the operator brief
     ["cwd", "/tmp/cell"],
     ["account", "auto"],
     ["preamble", "You are inside Apiary."],
+    ["kit-profile", "web-qa"],
   ]);
 });
 
@@ -298,6 +301,17 @@ test("HSR launcher config refuses a non-string signed preamble", async () => {
     () => resolveHsrHarnessLaunchConfig({ harness: { driverId: "codex", config: { brief: "hi", preamble: 123 } } }),
     (error: { code?: string }) => error.code === "HARNESS_UNAVAILABLE",
   );
+});
+
+test("HSR launcher config refuses an absent-value Kit profile instead of silently using the standing home", async () => {
+  const { resolveHsrHarnessLaunchConfig } = await import("../src/execution/launcher.js");
+  for (const kitProfile of [true, "", "   "]) {
+    assert.throws(
+      () => resolveHsrHarnessLaunchConfig({ harness: { driverId: "codex", config: { kitProfile } } }),
+      (error: { code?: string; message?: string }) =>
+        error.code === "HARNESS_UNAVAILABLE" && /kitProfile must be a non-empty string/.test(error.message ?? ""),
+    );
+  }
 });
 
 test("scope sanity: test-kit canonical nodeId differs from the minted identity", async () => {

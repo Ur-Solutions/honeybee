@@ -1,5 +1,5 @@
 {
-  "description": "Golden owner-scoped node.describe response: native provider, ready Claude driver, honestly absent Codex harness with an install hint, and an unactivated runtime-target feature set (absent from protocol.features).",
+  "description": "Golden owner-scoped node.describe response: native provider, ready Claude driver, honestly absent Codex harness with an install hint, Kit profile convergence, and an unactivated runtime-target feature set (absent from protocol.features).",
   "schema": "node-descriptor",
   "method": "node.describe",
   "valid": true,
@@ -15,7 +15,7 @@
     },
     "observedAt": "2026-08-05T09:59:30Z",
     "expiresAt": "2026-08-05T10:04:30Z",
-    "protocol": { "version": "0.1", "features": ["local-core-v1"] },
+    "protocol": { "version": "0.1", "features": ["local-core-v1", "kit-profile-v1"] },
     "platform": { "os": "darwin", "arch": "arm64", "version": "25.0" },
     "providers": [
       {

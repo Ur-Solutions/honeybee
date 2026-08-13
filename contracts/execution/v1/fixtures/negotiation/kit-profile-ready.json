@@ -1,5 +1,5 @@
 {
-  "description": "Optional-feature absence: credential-lease-v1 is not offered, the client stays ready and only the corresponding capability is unavailable.",
+  "description": "Compatible negotiation: Apiary requests optional Kit profile convergence and Honeybee selects kit-profile-v1 beside the required local core.",
   "request": {
     "client": {
       "product": "apiary",
@@ -10,7 +10,7 @@
       "local-core-v1"
     ],
     "optionalFeatures": [
-      "credential-lease-v1"
+      "kit-profile-v1"
     ]
   },
   "response": {
@@ -20,7 +20,8 @@
       "protocolVersion": "0.1"
     },
     "selectedFeatures": [
-      "local-core-v1"
+      "local-core-v1",
+      "kit-profile-v1"
     ],
     "missingRequiredFeatures": [],
     "compatibility": "ready",

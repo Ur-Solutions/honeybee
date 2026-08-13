@@ -14,8 +14,9 @@ pass Slice B fixtures; only then is it stamped `v1` (plan §5.1).
 ## Layout
 
 - `profile.json` — protocol/contract version, named feature profiles
-  (`local-core-v1` baseline; `runtime-target-v1` schema names only,
-  default-off), method-to-schema map, event-type registry, typed error codes.
+  (`local-core-v1` baseline with `kit-profile-v1`; `runtime-target-v1` schema
+  names only, default-off), method-to-schema map, event-type registry, typed
+  error codes.
 - `states.json` — Run / Lease / Command / Collection / Environment state
   machines (plus `runtime-target-v1` Target/Attachment, inactive).
 - `schemas/*.schema.json` — JSON Schema 2020-12 documents; `$ref` between files
