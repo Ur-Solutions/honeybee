@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
+import { setTimeout as sleep } from "node:timers/promises";
 import { isBuzTier, type BuzTier } from "./buz_tiers.js";
 import { normalizeContract, type BeeContract } from "./contract.js";
 import { atomicWriteFile, storeRoot } from "./fsx.js";
@@ -591,20 +593,73 @@ async function sessionDirectoryMtimes(paths: StorePaths): Promise<{ current: num
   return { current, legacy };
 }
 
-const ACTIVE_SESSION_RECONCILE_GENERATION_ATTEMPTS = 3;
+/**
+ * A canonical walk of several thousand records can overlap a short burst of
+ * same-membership metadata renames. Give that burst time to settle without
+ * turning account selection into an unbounded wait or weakening its freshness
+ * barrier. One final scan may finish just after the deadline; filesystem reads
+ * are not cancellable, but no further retry starts once the budget is spent.
+ */
+export const DEFAULT_ACTIVE_SESSION_RECONCILE_DEADLINE_MS = 5_000;
+const ACTIVE_SESSION_RECONCILE_INITIAL_BACKOFF_MS = 25;
+const ACTIVE_SESSION_RECONCILE_MAX_BACKOFF_MS = 250;
+const ACTIVE_SESSION_RECONCILE_JITTER = 0.2;
 
 export type ActiveSessionIndexRebuildOptions = {
   /** Attempt observation hook used by deterministic race tests/telemetry. */
   onAttempt?: (attempt: number) => Promise<void> | void;
+  /** Monotonic retry budget. Defaults to five seconds. */
+  deadlineMs?: number;
+  /** @internal Monotonic clock injection for deterministic retry tests. */
+  now?: () => number;
+  /** @internal Sleeper injection for deterministic retry tests. */
+  sleep?: (ms: number) => Promise<unknown>;
+  /** @internal Jitter source injection for deterministic retry tests. */
+  random?: () => number;
 };
+
+function boundedRandom(random: () => number): number {
+  const value = random();
+  if (!Number.isFinite(value)) return 0.5;
+  return Math.max(0, Math.min(1, value));
+}
+
+function activeSessionReconcileBackoffMs(attempt: number, random: () => number): number {
+  const exponent = Math.max(0, Math.min(30, Math.floor(attempt) - 1));
+  const base = Math.min(
+    ACTIVE_SESSION_RECONCILE_MAX_BACKOFF_MS,
+    ACTIVE_SESSION_RECONCILE_INITIAL_BACKOFF_MS * 2 ** exponent,
+  );
+  const jitter = 1 - ACTIVE_SESSION_RECONCILE_JITTER +
+    boundedRandom(random) * ACTIVE_SESSION_RECONCILE_JITTER * 2;
+  return Math.max(1, Math.round(base * jitter));
+}
 
 async function rebuildActiveSessionIndexLocked(
   paths: StorePaths,
   options: ActiveSessionIndexRebuildOptions = {},
 ): Promise<ActiveSessionIndex> {
   await mkdir(paths.currentDir, { recursive: true });
-  const previous = await readActiveSessionIndex(paths.root);
-  for (let attempt = 1; attempt <= ACTIVE_SESSION_RECONCILE_GENERATION_ATTEMPTS; attempt += 1) {
+  const requestedDeadlineMs = options.deadlineMs ?? DEFAULT_ACTIVE_SESSION_RECONCILE_DEADLINE_MS;
+  const deadlineMs = Number.isFinite(requestedDeadlineMs)
+    ? Math.max(0, requestedDeadlineMs)
+    : DEFAULT_ACTIVE_SESSION_RECONCILE_DEADLINE_MS;
+  const now = options.now ?? (() => performance.now());
+  const wait = options.sleep ?? sleep;
+  const random = options.random ?? Math.random;
+  const startedAt = now();
+  // Also count requested sleeps so a broken/fake sleeper cannot accidentally
+  // turn the injected policy into an infinite retry loop.
+  let scheduledWaitMs = 0;
+  let attempt = 0;
+  const elapsedMs = (): number => Math.max(0, now() - startedAt, scheduledWaitMs);
+  const generationFailure = (): Error => new Error(
+    `session directories changed during ${attempt} active-index reconciliation attempts ` +
+    `within the ${deadlineMs}ms deadline; prior projection preserved`,
+  );
+
+  for (;;) {
+    attempt += 1;
     const generationBefore = await sessionDirectoryMtimes(paths);
     await options.onAttempt?.(attempt);
     const snapshot = await scanSessionsSnapshot(paths.currentDir, paths.legacyDir);
@@ -613,11 +668,16 @@ async function rebuildActiveSessionIndexLocked(
       generationAfter.current !== generationBefore.current ||
       generationAfter.legacy !== generationBefore.legacy
     ) {
-      if (attempt < ACTIVE_SESSION_RECONCILE_GENERATION_ATTEMPTS) continue;
-      throw new Error(
-        `session directories changed during ${ACTIVE_SESSION_RECONCILE_GENERATION_ATTEMPTS} ` +
-        "active-index reconciliation attempts; prior projection preserved",
-      );
+      const remainingMs = deadlineMs - elapsedMs();
+      if (remainingMs <= 0) throw generationFailure();
+      // Keep the membership lock while waiting: modern membership-changing
+      // writers serialize behind this pass, while same-membership/legacy
+      // writers remain visible through the directory-generation barrier.
+      const delayMs = Math.min(activeSessionReconcileBackoffMs(attempt, random), remainingMs);
+      scheduledWaitMs += delayMs;
+      await wait(delayMs);
+      if (elapsedMs() >= deadlineMs) throw generationFailure();
+      continue;
     }
     if (snapshot.readFailures.length > 0) {
       throw new AggregateError(
@@ -630,7 +690,6 @@ async function rebuildActiveSessionIndexLocked(
     await writeActiveSessionIndex(index);
     return index;
   }
-  throw new Error("active-index reconciliation exhausted without an authoritative generation");
 }
 
 /**
@@ -1478,6 +1537,8 @@ export function listActiveSessionsHot(): Promise<SessionRecord[]> {
 export type ListActiveSessionsOptions = {
   /** Test/telemetry barrier after the shared record snapshot is materialized. */
   onSnapshotRead?: () => Promise<void> | void;
+  /** @internal Observation hook for root-scoped safety-flight tests/telemetry. */
+  onSafetyFlight?: (disposition: "started" | "joined") => void;
 };
 
 const ACTIVE_SESSION_CALLER_GENERATION_ATTEMPTS = 3;
@@ -1512,7 +1573,11 @@ function sharedActiveSessionsSafetySnapshot(
   options: ListActiveSessionsOptions,
 ): Promise<ActiveSessionsSafetySnapshot> {
   const current = listActiveSessionsSafetyInFlight.get(paths.root);
-  if (current) return current;
+  if (current) {
+    options.onSafetyFlight?.("joined");
+    return current;
+  }
+  options.onSafetyFlight?.("started");
 
   const pending = (async () => {
     const index = await currentActiveSessionIndex(paths);

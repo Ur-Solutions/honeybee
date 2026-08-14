@@ -9,7 +9,7 @@ import { withCodexHomeBootLock } from "../src/codexBoot.js";
 import { AUTO_COMMITMENT_BUSY_PERCENT, AUTO_COMMITMENT_PARKED_PERCENT, AUTO_PICK_DEBIT_PERCENT, AUTO_PICK_DEBIT_TTL_MS, CLAUDE_PROFILE_EMAIL_CACHE_MAX, accountCommitments, accountLimits, cachedAccountLimits, decayedPickDebit, effectiveWindowLoad, emailFromJwt, lastRateLimitsInFile, paceDelta, pendingPickDebits, pendingPicksPath, pickLeastLoadedAccount, recordAutoPick, selectLeastLoadedAccount, sessionCommitmentPercent, sortAccountsForLimitsDisplay, windowRolledOver } from "../src/limits.js";
 import { pickRoundRobinAccount } from "../src/limits/autoPick.js";
 import type { ProbeEvidence } from "../src/stateMachine.js";
-import { activeSessionIndexPath, saveSession, TERMINAL_OBSERVED_STATES, type SessionRecord } from "../src/store.js";
+import { activeSessionIndexPath, rebuildActiveSessionIndex, saveSession, TERMINAL_OBSERVED_STATES, type SessionRecord } from "../src/store.js";
 import { appendUsageEvent, isRecentlyAuthFailed, usageSummary } from "../src/usage.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
@@ -1503,6 +1503,31 @@ test("account commitments include an older-writer live record without daemon rec
       AUTO_COMMITMENT_BUSY_PERCENT,
       "auto-pick must not under-rank an account solely because the daemon is absent",
     );
+  });
+});
+
+test("automatic account selection rebuilds stale active membership before admitting a pick", async () => {
+  await withTempStore(async (dir) => {
+    const busy = await addAccount("claude", "busy-reconcile@a.b");
+    const quiet = await addAccount("claude", "quiet-reconcile@a.b");
+    await rebuildActiveSessionIndex();
+
+    // A mixed-version launch publishes a canonical live record but cannot
+    // update active-sessions.json. The next automatic pick must discover its
+    // commitment before it can admit more work to either account.
+    const oldWriter = liveSession("legacy-auto-commitment", busy.id, "working");
+    await writeFile(join(dir, "sessions", `${oldWriter.name}.json`), JSON.stringify(oldWriter));
+    const generation = new Date(Date.UTC(2040, 0, 4));
+    await utimes(join(dir, "sessions"), generation, generation);
+
+    const now = Date.parse("2026-06-10T12:00:00Z");
+    const choice = await pickLeastLoadedAccount("claude", {
+      hasCredentials: async () => true,
+      fetchLimits: async (accounts) => accounts.map((account) => okLimits(account.id, 10, 10)),
+      now: () => now,
+    });
+
+    assert.equal(choice.account.id, quiet.id);
   });
 });
 

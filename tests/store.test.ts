@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -226,7 +226,7 @@ test("active index rebuilds after missing/corrupt state and normalizes legacy ar
   });
 });
 
-test("canonical active-index reconciliation retries a directory generation race", async () => {
+test("canonical active-index reconciliation waits through a multi-scan churn burst and publishes only the stable generation", async () => {
   await withTempStore(async (dir) => {
     const sessions = join(dir, "sessions");
     await mkdir(sessions, { recursive: true });
@@ -235,24 +235,125 @@ test("canonical active-index reconciliation retries a directory generation race"
       tmuxTarget: "CO.before",
     })));
     const attempts: number[] = [];
+    const delays: number[] = [];
+    let now = 0;
 
     const active = await rebuildActiveSessionIndex({
+      deadlineMs: 1_000,
+      now: () => now,
+      random: () => 0.5,
+      sleep: async (ms) => {
+        delays.push(ms);
+        now += ms;
+      },
       onAttempt: async (attempt) => {
         attempts.push(attempt);
-        if (attempt !== 1) return;
-        await writeFile(join(sessions, "CO.raced.json"), JSON.stringify(makeRecord(dir, {
-          name: "CO.raced",
-          tmuxTarget: "CO.raced",
+        if (attempt > 4) return;
+        await writeFile(join(sessions, `CO.raced-${attempt}.json`), JSON.stringify(makeRecord(dir, {
+          name: `CO.raced-${attempt}`,
+          tmuxTarget: `CO.raced-${attempt}`,
         })));
+        const generation = new Date(Date.UTC(2040, 0, 1, 0, 0, attempt));
+        await utimes(sessions, generation, generation);
       },
     });
 
-    assert.equal(active, 2);
-    assert.deepEqual(attempts, [1, 2], "the first changed generation is discarded and rescanned once stable");
+    assert.equal(active, 5);
+    assert.deepEqual(attempts, [1, 2, 3, 4, 5], "churn beyond the old three-attempt cap recovers once stable");
+    assert.deepEqual(delays, [25, 50, 100, 200], "retry uses deterministic capped exponential backoff");
     assert.deepEqual(
       (await listActiveSessionsHot()).map((record) => record.name).sort(),
-      ["CO.before", "CO.raced"],
+      ["CO.before", "CO.raced-1", "CO.raced-2", "CO.raced-3", "CO.raced-4"],
     );
+  });
+});
+
+test("continuous active-index churn fails at the deadline and preserves the prior projection", async () => {
+  await withTempStore(async (dir) => {
+    const sessions = join(dir, "sessions");
+    await mkdir(sessions, { recursive: true });
+    const stable = makeRecord(dir, { name: "CO.stable", tmuxTarget: "CO.stable" });
+    await writeFile(join(sessions, `${stable.name}.json`), JSON.stringify(stable));
+    await rebuildActiveSessionIndex();
+    const projectionBefore = await readFile(activeSessionIndexPath(), "utf8");
+    const attempts: number[] = [];
+    const delays: number[] = [];
+    let now = 0;
+
+    await assert.rejects(
+      () => rebuildActiveSessionIndex({
+        deadlineMs: 100,
+        now: () => now,
+        random: () => 0.5,
+        sleep: async (ms) => {
+          delays.push(ms);
+          now += ms;
+        },
+        onAttempt: async (attempt) => {
+          attempts.push(attempt);
+          const name = `CO.continuous-${attempt}`;
+          await writeFile(join(sessions, `${name}.json`), JSON.stringify(makeRecord(dir, {
+            name,
+            tmuxTarget: name,
+          })));
+          const generation = new Date(Date.UTC(2040, 0, 2, 0, 0, attempt));
+          await utimes(sessions, generation, generation);
+        },
+      }),
+      /session directories changed during 3 active-index reconciliation attempts within the 100ms deadline; prior projection preserved/,
+    );
+
+    assert.deepEqual(attempts, [1, 2, 3]);
+    assert.deepEqual(delays, [25, 50, 25], "the last delay is clamped to the remaining deadline");
+    assert.equal(now, 100, "the injected clock proves retry exhaustion is bounded without real-time sleeps");
+    assert.equal(await readFile(activeSessionIndexPath(), "utf8"), projectionBefore);
+    assert.deepEqual(
+      (await listActiveSessionsHot()).map((record) => record.name),
+      [stable.name],
+      "an unsuccessful scan never exposes its partial/new membership",
+    );
+  });
+});
+
+test("concurrent safety callers share one reconciliation snapshot after a legacy generation advance", async () => {
+  await withTempStore(async (dir) => {
+    const indexed = makeRecord(dir, { name: "CO.shared-old", tmuxTarget: "CO.shared-old" });
+    await saveSession(indexed);
+    await listActiveSessions();
+
+    const added = makeRecord(dir, { name: "CO.shared-new", tmuxTarget: "CO.shared-new" });
+    await writeFile(join(dir, "sessions", `${added.name}.json`), JSON.stringify(added));
+    const generation = new Date(Date.UTC(2040, 0, 3));
+    await utimes(join(dir, "sessions"), generation, generation);
+
+    let snapshotReads = 0;
+    let snapshotReady!: () => void;
+    const entered = new Promise<void>((resolve) => { snapshotReady = resolve; });
+    let releaseSnapshot!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
+    const first = listActiveSessions({
+      onSnapshotRead: async () => {
+        snapshotReads += 1;
+        snapshotReady();
+        await gate;
+      },
+    });
+    await entered;
+    let joined!: () => void;
+    const secondJoined = new Promise<void>((resolve) => { joined = resolve; });
+    const second = listActiveSessions({
+      onSafetyFlight: (disposition) => {
+        if (disposition === "joined") joined();
+      },
+    });
+    await secondJoined;
+    releaseSnapshot();
+
+    const [firstRecords, secondRecords] = await Promise.all([first, second]);
+    const expected = [indexed.name, added.name].sort();
+    assert.deepEqual(firstRecords.map((record) => record.name).sort(), expected);
+    assert.deepEqual(secondRecords.map((record) => record.name).sort(), expected);
+    assert.equal(snapshotReads, 1, "the later caller joins the root-scoped safety flight");
   });
 });
 
