@@ -145,7 +145,12 @@ export type DaemonStatusReport = {
   plistPath: string | null;
 };
 
-const DEFAULT_TICK_MS = 2_000;
+// A full observation can consume most of a core on a large HSR fleet. Sleeping
+// five seconds between serialized sweeps keeps the daemon responsive on the
+// same cadence as Apiary's foreground status reconciliation without turning
+// observation into steady machine-wide contention. Operators that need a
+// tighter loop can still set HIVE_DAEMON_TICK_MS or pass --tick-ms.
+const DEFAULT_TICK_MS = 5_000;
 const DEFAULT_TICK_BUDGET_MS = 120_000;
 const MAX_RECENT_ERRORS = 10;
 /**

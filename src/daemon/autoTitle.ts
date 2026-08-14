@@ -48,6 +48,29 @@ export const AUTO_TITLE_RETRY_BACKOFF_MS = 10 * 60_000;
 // report it, and free the slot so titling recovers without a daemon restart.
 export const AUTO_TITLE_WATCHDOG_MS = 2 * 60_000;
 
+// A bee with no completed exchange used to be transcript-probed on every
+// daemon tick. A handful of waiting/untitled bees can make that a multi-second
+// provider-wide scan every few seconds. Remember negative probes briefly and
+// wake them immediately when the record's task/runtime signal changes.
+export const AUTO_TITLE_CONTEXT_RETRY_MS = 60_000;
+
+// Cold-starting a daemon may have many old untitled running records. Spread
+// their first negative probes across ticks so one reconciliation never blocks
+// on a whole fleet of transcript searches.
+export const AUTO_TITLE_CONTEXT_PROBES_PER_TICK = 1;
+
+function contextProbeSignature(record: SessionRecord): string {
+  return [
+    record.status,
+    record.lastObservedState ?? "",
+    record.lastPromptAt ?? "",
+    record.lastPrompt ?? "",
+    record.providerSessionId ?? "",
+    record.transcriptPath ?? "",
+    record.brief ?? "",
+  ].join("\0");
+}
+
 /**
  * Is this bee eligible for an auto-title attempt right now? Untitled bees and
  * bees carrying a provisional provider first-prompt fallback are eligible.
@@ -85,12 +108,18 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
   let inFlightToken = 0;
   let nextInFlightToken = 0;
   const finished: AutoTitleOutcome[] = [];
+  const contextMisses = new Map<string, { signature: string; retryAt: number }>();
 
   return async (records) => {
     const outcomes = finished.splice(0);
     if (!deps.enabled()) return outcomes;
 
     const now = deps.now();
+    const candidates = records.filter((record) => isAutoTitleCandidate(record, now));
+    const candidateNames = new Set(candidates.map((record) => record.name));
+    for (const bee of contextMisses.keys()) {
+      if (!candidateNames.has(bee)) contextMisses.delete(bee);
+    }
     if (inFlight) {
       // A generation that never settled (wedged subprocess) must not disable
       // titling forever — free the slot once it's clearly stale.
@@ -103,14 +132,38 @@ export function createAutoTitleDispatcher(overrides: Partial<AutoTitleDeps> = {}
       outcomes.push({ bee: staleBee, ok: false, error: `generation watchdog fired after ${AUTO_TITLE_WATCHDOG_MS}ms; freeing the slot` });
     }
 
-    for (const candidate of records) {
-      if (!isAutoTitleCandidate(candidate, now)) continue;
+    let contextProbes = 0;
+    for (const candidate of candidates) {
+      const candidateSignature = contextProbeSignature(candidate);
+      const candidateMiss = contextMisses.get(candidate.name);
+      if (
+        candidateMiss &&
+        candidateMiss.signature === candidateSignature &&
+        now < candidateMiss.retryAt
+      ) continue;
+      if (contextProbes >= AUTO_TITLE_CONTEXT_PROBES_PER_TICK) break;
+
       // Re-read before deciding: this tick's transcript refresh may have just
       // written a provider title that the in-memory record predates.
       const record = await deps.loadSession(candidate.name);
-      if (!record || !isAutoTitleCandidate(record, now)) continue;
+      if (!record || !isAutoTitleCandidate(record, now)) {
+        contextMisses.delete(candidate.name);
+        continue;
+      }
+      const signature = contextProbeSignature(record);
+      const miss = contextMisses.get(record.name);
+      if (miss && miss.signature === signature && now < miss.retryAt) continue;
+
+      contextProbes += 1;
       const context = await deps.contextFor(record);
-      if (!context) continue;
+      if (!context) {
+        contextMisses.set(record.name, {
+          signature,
+          retryAt: now + AUTO_TITLE_CONTEXT_RETRY_MS,
+        });
+        continue;
+      }
+      contextMisses.delete(record.name);
 
       // Claim before the slow call (bump the attempt counter and stamp the
       // attempt time) so a crash or wedged generator can't become one
