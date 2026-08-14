@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  AUTO_TITLE_CONTEXT_PROBES_PER_TICK,
+  AUTO_TITLE_CONTEXT_RETRY_MS,
   AUTO_TITLE_RETRY_BACKOFF_MS,
   AUTO_TITLE_WATCHDOG_MS,
   createAutoTitleDispatcher,
@@ -239,10 +241,75 @@ test("auto-title: defers while the initial exchange is missing; titles once it l
   assert.equal(capture.claims.length, 0);
 
   ready = true;
-  await dispatch([store.get(record.name)!]);
+  const landed = { ...store.get(record.name)!, lastObservedState: "idle_with_output" };
+  store.set(record.name, landed);
+  await dispatch([landed]);
   assert.equal(capture.claims.length, 1);
   await settle();
   assert.equal((await dispatch([store.get(record.name)!]))[0]?.ok, true);
+});
+
+test("auto-title: negative context probes back off until their retry window", async () => {
+  const record = bee();
+  const store = new Map([[record.name, record]]);
+  const capture: Capture = { claims: [], updates: [] };
+  let clock = NOW;
+  let probes = 0;
+  const dispatch = createAutoTitleDispatcher({
+    ...buildDeps({ store, capture, contextFor: async () => { probes += 1; return null; } }),
+    now: () => clock,
+  });
+
+  await dispatch([record]);
+  await dispatch([record]);
+  assert.equal(probes, 1, "an unchanged context miss is not re-probed every tick");
+
+  clock += AUTO_TITLE_CONTEXT_RETRY_MS;
+  await dispatch([record]);
+  assert.equal(probes, 2, "the safety retry eventually probes an unchanged record again");
+});
+
+test("auto-title: record activity bypasses a negative context backoff", async () => {
+  const record = bee();
+  const store = new Map([[record.name, record]]);
+  const capture: Capture = { claims: [], updates: [] };
+  let ready = false;
+  let probes = 0;
+  const dispatch = createAutoTitleDispatcher(buildDeps({
+    store,
+    capture,
+    contextFor: async () => {
+      probes += 1;
+      return ready ? { brief: "landed" } : null;
+    },
+  }));
+
+  await dispatch([record]);
+  ready = true;
+  const active = { ...record, lastObservedState: "active" };
+  store.set(record.name, active);
+  await dispatch([active]);
+
+  assert.equal(probes, 2);
+  assert.equal(capture.claims.length, 1, "a state edge wakes the candidate immediately");
+});
+
+test("auto-title: cold context misses are spread across ticks", async () => {
+  const records = ["a", "b", "c"].map((name) => bee({ name, tmuxTarget: `hive:${name}` }));
+  const store = new Map(records.map((record) => [record.name, record]));
+  const capture: Capture = { claims: [], updates: [] };
+  const probed: string[] = [];
+  const dispatch = createAutoTitleDispatcher(buildDeps({
+    store,
+    capture,
+    contextFor: async (record) => { probed.push(record.name); return null; },
+  }));
+
+  await dispatch(records);
+  assert.equal(probed.length, AUTO_TITLE_CONTEXT_PROBES_PER_TICK);
+  await dispatch(records);
+  assert.equal(probed.length, AUTO_TITLE_CONTEXT_PROBES_PER_TICK * 2);
+  assert.notEqual(probed[0], probed[1], "the cached miss lets the next candidate advance");
 });
 
 test("auto-title: disabled config does nothing", async () => {
