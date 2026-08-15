@@ -17,6 +17,7 @@ import { type LockOptions, type LockOwnerMetadata, withFileLock } from "../lock.
 import { appendLedger } from "../store.js";
 import { appendUsageEvent } from "../usage.js";
 import { accountDir, recipeFor, withAccountLock, type AccountRecord } from "./registry.js";
+import { clearAccountBootFailure } from "./bootHealth.js";
 import {
   claudeCredentialsEquivalent,
   claudeProfileEmailCached,
@@ -194,6 +195,7 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
     }
     return captured;
   });
+  const captureCompletedAt = Date.now();
   await appendLedger({
     type: "account.capture",
     account: account.id,
@@ -204,6 +206,10 @@ export async function captureAccountFromHome(account: AccountRecord, homePath: s
   // A fresh capture is positive auth evidence: it closes any standing
   // auth-failed health state so the account rejoins auto-selection.
   await appendUsageEvent({ ts: new Date().toISOString(), kind: "auth_ok", account: account.id, source: "capture" }).catch(() => undefined);
+  // The activation breaker is a separate selector input. Clear only an older
+  // activation failure; a failure recorded after this capture completed must
+  // remain quarantined.
+  await clearAccountBootFailure(account.id, "activation", captureCompletedAt).catch(() => undefined);
   return captured;
 }
 

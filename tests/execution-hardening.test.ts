@@ -130,6 +130,74 @@ test("event self-healing: state written without its lifecycle events re-derives 
   });
 });
 
+test("run.events polling is projection-only and never retries stop, retirement, or release", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    let clock = new Date("2026-08-05T10:30:00Z");
+    const expiresAt = "2026-08-05T11:00:00Z";
+    const control = fakeControl({ stopResult: { stopped: true, detail: "stop would mutate lifecycle" } });
+    let retirementCalls = 0;
+    const service = makeService({
+      launcher: countingLauncher().launcher,
+      control: control.control,
+      now: () => clock,
+      retireSession: async () => {
+        retirementCalls += 1;
+        return { retired: true, detail: "retirement would mutate lifecycle" };
+      },
+    });
+    await service.runStart(buildRunStartEnvelope(ctx, { expiresAt }));
+    await registerWorkingCopy({
+      workingCopyId: "wc-0001",
+      productId: "prod-honeycomb-app",
+      path: "/tmp/honeybee-event-observer",
+      snapshotDigest: SNAPSHOT_DIGEST,
+    });
+    await claimWorkingCopy("wc-0001", RUN_ID);
+
+    const effectKey = `${RUN_ID}/release-observer-regression`;
+    const releaseEnvelope = buildOperationEnvelope(ctx, effectKey, { runId: RUN_ID });
+    await admitOperation({
+      runId: RUN_ID,
+      method: "run.release",
+      effectKey,
+      requestDigest: String(releaseEnvelope.requestDigest),
+      protocolVersion: "0.1",
+      schemaDigest: service.schemaDigest,
+      init: {
+        releaseSteps: [
+          { step: "harness-stop", status: "pending" },
+          { step: "occupancy-release", status: "pending" },
+          { step: "environment-seal", status: "pending" },
+          { step: "environment-release", status: "pending" },
+        ],
+      },
+    });
+    const eventsBefore = await readRunEvents(RUN_ID);
+    const reservationBefore = (await readReservation(RUN_ID))!;
+
+    // Lease expiry is a lifecycle obligation, but event observation is not
+    // its retry clock. The daemon inventory/run.get will own that progression.
+    clock = new Date("2026-08-05T12:00:00Z");
+    let afterSeq = 0;
+    for (let index = 0; index < 12; index += 1) {
+      const page = await service.runEvents({ protocolVersion: "0.1", runId: RUN_ID, afterSeq });
+      assert.ok("result" in page);
+      afterSeq = Number(page.result.nextAfterSeq);
+    }
+
+    assert.equal(control.calls.filter((call) => call.method === "stop").length, 0);
+    assert.equal(retirementCalls, 0);
+    assert.deepEqual(await readRunEvents(RUN_ID), eventsBefore, "polling appends no repair/lifecycle events");
+    const reservationAfter = (await readReservation(RUN_ID))!;
+    assert.deepEqual(reservationAfter, reservationBefore, "polling mutates no reservation state");
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+    const release = (await readOperation(RUN_ID, effectKey))!;
+    assert.equal(release.result, undefined);
+    assert.ok(release.releaseSteps?.every((step) => step.status === "pending"));
+  });
+});
+
 test("terminal event repair is atomic and idempotent for every durable result", async () => {
   for (const outcome of ["completed", "failed", "cancelled"] as const) {
     await withTempStore(async () => {

@@ -251,21 +251,47 @@ function senderMatchesFilter(sender: BuzSender, rawFilter: string): boolean {
   }
 }
 
-export async function readMessageById(beeName: string, id: string): Promise<{ message: BuzMessage; path: string; mailbox: BuzMailbox } | null> {
+export async function readMessageById(
+  beeName: string,
+  id: string,
+  options: { strict?: boolean } = {},
+): Promise<{ message: BuzMessage; path: string; mailbox: BuzMailbox } | null> {
   for (const mailbox of BUZ_MAILBOXES) {
     const dir = beeMailboxDir(beeName, mailbox);
-    const entries = await readdir(dir).catch(() => [] as string[]);
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch (error) {
+      // Missing mailboxes are the normal empty-store shape. Any other I/O
+      // failure is not proof that an id is absent: callers use this read to
+      // decide whether replaying a durable effect is safe.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
     for (const file of entries) {
       if (!file.endsWith(`-${id}.md`)) continue;
       const path = join(dir, file);
-      // Like listMessages: a concurrent purge/drain may remove the file
-      // between readdir and readFile, and files may be malformed — treat
-      // both as "not found" rather than throwing.
-      const text = await readFile(path, "utf8").catch(() => null);
-      if (text === null) continue;
+      let text: string;
+      try {
+        text = await readFile(path, "utf8");
+      } catch (error) {
+        // A concurrent consume/purge may remove the file after readdir. Do not
+        // collapse permission/media faults into a false idempotency miss.
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
       try {
         return { message: parseBuzMessage(text), path, mailbox };
-      } catch {
+      } catch (error) {
+        // Display/cleanup callers historically tolerate malformed mail. A
+        // caller using this lookup as an idempotency authority cannot: a file
+        // naming the exact caller id but failing to parse is unknown durable
+        // state, not proof that the id is free to enqueue again.
+        if (options.strict) {
+          throw new Error(
+            `buz message ${id} in ${mailbox} is malformed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
         continue;
       }
     }

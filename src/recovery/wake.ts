@@ -20,7 +20,7 @@ import {
 } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
 import { probeHsrReAdoption } from "../daemon/reAdoption.js";
-import type { ProbeEvidence } from "../stateMachine.js";
+import { isArchivedSessionLifecycle, type ProbeEvidence } from "../stateMachine.js";
 
 export type EnsureLiveRuntimeDeps = {
   isLive?: (record: SessionRecord) => Promise<boolean>;
@@ -100,7 +100,7 @@ export async function ensureLiveRuntimeForSend(
     withSessionLifecycleTransaction(current, async (lifecycle) => {
       let record = await lifecycle.refresh();
       const state = axes(record);
-      if (state.lifecycle === "archived" || record.status === "done") {
+      if (isArchivedSessionLifecycle(record)) {
         throw new Error(`hive send: ${record.name} is archived`);
       }
 

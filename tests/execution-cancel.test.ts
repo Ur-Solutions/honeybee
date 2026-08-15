@@ -130,7 +130,7 @@ test("run.cancel of a terminal run records the terminal state and never revives 
   });
 });
 
-test("run.cancel never stops a session stamped with a different run, but still cancels durably", async () => {
+test("run.cancel never stops a session stamped with a different run or mistakes it for runtime-down proof", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
     const control = fakeControl();
@@ -140,9 +140,9 @@ test("run.cancel never stops a session stamped with a different run, but still c
     await saveSession({ ...(await loadSession(bee))!, executionRunId: "run-imposter" });
 
     const response = (await service.runCancel(cancelEnvelope(ctx))) as JsonObject;
-    assert.deepEqual(response.result, { runId: RUN_ID, state: "cancelled" });
+    assert.deepEqual(response.result, { runId: RUN_ID, state: "lost" });
     assert.equal(control.calls.filter((call) => call.method === "stop").length, 0, "imposter session must not be stopped");
-    assert.equal((await readReservation(RUN_ID))!.result?.outcome, "cancelled");
+    assert.equal((await readReservation(RUN_ID))!.result, undefined, "a foreign record does not prove this Run's host exited");
   });
 });
 

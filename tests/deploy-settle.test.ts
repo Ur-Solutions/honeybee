@@ -3,7 +3,7 @@
 // proves content equality between the local build and the installed tree —
 // stamp AND re-hash — with bounded retries.
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -135,4 +135,48 @@ test("settling without a local stamp is a caller error, not a wait", async () =>
       /no build stamp/,
     );
   });
+});
+
+test("deploy orchestrator rebinds launchd to the verified installed CLI before restart", async () => {
+  const source = await readFile(join(process.cwd(), "scripts", "deploy-settle.mjs"), "utf8");
+  assert.match(source, /const installedCli = join\(installedDist, "cli\.js"\)/);
+  assert.match(source, /\[installedCli, "daemon", "install", "--force"\]/);
+  assert.match(source, /\[installedCli, "daemon", "restart"\]/);
+  assert.doesNotMatch(source, /run\("hive", \["daemon", "restart"\]\)/);
+});
+
+test("deploy installs an immutable package archive, never a worktree symlink", async () => {
+  const source = await readFile(join(process.cwd(), "scripts", "deploy-settle.mjs"), "utf8");
+  assert.match(source, /\["pack", "--json", "--pack-destination", packRoot\]/);
+  assert.match(source, /run\("npm", \["i", "-g", join\(packRoot, filename\)\]\)/);
+  assert.doesNotMatch(source, /run\("npm", \["i", "-g", "\."\]\)/);
+  assert.match(source, /installedPackageRoot === realpathSync\(repoRoot\)/);
+  assert.ok(
+    source.indexOf("writeBuildStamp(localDist)") < source.indexOf('["pack", "--json"'),
+    "the packed archive must contain the certified build stamp",
+  );
+});
+
+test("deploy preflight certifies candidate corpus bytes before the global install mutates", async () => {
+  const source = await readFile(join(process.cwd(), "scripts", "deploy-settle.mjs"), "utf8");
+  assert.match(source, /computeExecutionValidationSurfaceDigest\(executionContract\)/);
+  assert.match(source, /executionBaselineFeatures\(executionContract\)/);
+  assert.match(source, /\["status", "--porcelain=v1", "--untracked-files=all", "--", contractCorpusPath\]/);
+  assert.match(source, /\["log", "-1", "--format=%H", "--", contractCorpusPath\]/);
+  assert.doesNotMatch(source, /APIARY_EXECUTION_CONTRACT_CONSUMER/);
+  assert.match(source, /process\.env\.APIARY_APP_BUNDLE !== undefined/);
+  assert.match(source, /loadExecutionContract\(\s*join\(installedPackageRoot, "contracts", "execution", "v1"\)/);
+  assert.match(source, /assertExecutionMaterializationMatches\(\s*executionCandidate/);
+  assert.match(source, /schemaDigest: installedExecutionDigest/);
+  assert.match(source, /validationSurfaceDigest: installedExecutionSurface/);
+  assert.ok(
+    source.indexOf("preflightInstalledExecutionConsumer(executionCandidate") <
+      source.indexOf('["pack", "--json", "--pack-destination", packRoot]'),
+    "consumer preflight must finish before npm mutates the installed Honeybee tree",
+  );
+  assert.ok(
+    source.indexOf("installed execution corpus verified") <
+      source.indexOf('[installedCli, "daemon", "restart"]'),
+    "installed contract bytes must be verified before daemon restart",
+  );
 });

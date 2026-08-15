@@ -101,6 +101,21 @@ export type BeeStateMachineCursor = {
   lastTransition: BeeTransitionReceipt;
 };
 
+/**
+ * One canonical retirement predicate for every Honeybee control/read path.
+ * Once a proof-carrying cursor exists its lifecycle axis outranks stale
+ * mixed-version scalars in both directions. Legacy `status:done` remains the
+ * archive spelling only when no canonical cursor exists.
+ */
+export function isArchivedSessionLifecycle(record: {
+  status: string;
+  stateMachine?: Pick<BeeStateMachineCursor, "lifecycle">;
+}): boolean {
+  return record.stateMachine !== undefined
+    ? record.stateMachine.lifecycle === "archived"
+    : record.status === "done";
+}
+
 type EventBase = { eventId: string; at: string };
 
 export type BeeTransitionEvent =

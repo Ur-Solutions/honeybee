@@ -658,6 +658,10 @@ test("late accepted at the legacy head or middle resets partial/full cursors and
       const oldHead = legacy.at(-1)!.seq;
       const counting = countingLauncher();
       const service = makeService({ launcher: counting.launcher });
+      // Lifecycle repair is owned by run.get/the daemon inventory. run.events
+      // is a pure projection read and only reports the resulting cursor reset.
+      const repairedProjection = await service.runGet({ protocolVersion: "0.1", runId: staged.runId });
+      assert.ok("result" in repairedProjection);
 
       for (const cursor of [2, oldHead]) {
         const stale = await service.runEvents({ protocolVersion: "0.1", runId: staged.runId, afterSeq: cursor, limit: 1 });
@@ -728,6 +732,8 @@ test("a restart self-heals the old equal-head reset generation once", async () =
     ]);
 
     const restarted = makeService();
+    const repairedProjection = await restarted.runGet({ protocolVersion: "0.1", runId: staged.runId });
+    assert.ok("result" in repairedProjection);
     const stale = await restarted.runEvents({ protocolVersion: "0.1", runId: staged.runId, afterSeq: oldHead });
     assert.ok("error" in stale);
     assert.equal(stale.error.code, "CURSOR_EXPIRED");
@@ -784,6 +790,8 @@ test("accepted-prefix migration explicitly resets a persisted pre-upgrade cursor
     ]);
 
     const upgraded = makeService();
+    const repairedProjection = await upgraded.runGet({ protocolVersion: "0.1", runId: staged.runId });
+    assert.ok("result" in repairedProjection);
     const stale = await upgraded.runEvents({
       protocolVersion: "0.1",
       runId: staged.runId,

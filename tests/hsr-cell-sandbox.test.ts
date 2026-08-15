@@ -4,6 +4,7 @@ import { chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:f
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { globToRegex } from "@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js";
 import {
   buildCellSandboxState,
   commandString,
@@ -79,6 +80,16 @@ test("Cell policy permits only the Cell, provider state, and per-run scratch out
     assert.ok(built.state.allowWrite.includes(await realpath(join(runDir, "cell-sandbox"))));
     assert.ok(!built.state.allowWrite.includes(join(root, "home")));
     assert.equal(built.env.TMPDIR, join(built.state.scratchRoot, "tmp"));
+    assert.equal(
+      built.env.npm_config_store_dir,
+      join(built.state.scratchRoot, "cache", "pnpm-store"),
+      "pnpm's effective store-dir key points at per-run scratch",
+    );
+    assert.equal(built.env.PNPM_STORE_DIR, built.env.npm_config_store_dir);
+    assert.ok(
+      built.state.packageManagerWriteTrees.includes(join(await realpath(cell), "**", "node_modules")),
+      "nested workspace dependency trees receive the narrow materialization carve-out",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -238,6 +249,7 @@ test("Linux wrapper keeps host networking, namespaces processes, and fences the 
     scratchRoot: join(root, "scratch"),
     allowWrite: [cell],
     denyWrite: [],
+    packageManagerWriteTrees: [],
     bashPath: "/bin/bash",
     bwrapPath: "/usr/bin/bwrap",
     rgPath: "/usr/bin/true",
@@ -265,6 +277,7 @@ test("macOS wrapper allows system trust evaluation, denies the login keychain, a
       scratchRoot: join(root, "scratch"),
       allowWrite: [cell],
       denyWrite: [],
+      packageManagerWriteTrees: [join(cell, "**", "node_modules")],
       bashPath: "/bin/bash",
     }, "/bin/echo", ["hello world"]);
     assert.equal(wrapper.command, "/bin/bash");
@@ -301,6 +314,23 @@ test("macOS wrapper allows system trust evaluation, denies the login keychain, a
     );
     assert.match(generated, /\(allow pseudo-tty\)/, "tmux and interactive tools can allocate ptys");
     assert.match(generated, /\/dev\/ptmx/);
+    assert.ok(
+      generated.includes("Honeybee Cell package-manager materialization carve-out"),
+      "the package-tree exception is appended to the Seatbelt profile",
+    );
+    for (const packagePattern of [
+      join(cell, "**", "node_modules", "**", ".gitmodules"),
+      join(cell, "**", "node_modules", "**", ".vscode", "**"),
+    ]) {
+      assert.ok(
+        generated.includes(`(regex ${JSON.stringify(globToRegex(packagePattern))})`),
+        `${packagePattern} is covered by an appended package-tree allow rule`,
+      );
+    }
+    assert.ok(
+      !generated.includes(`(allow file-write*\n  (subpath ${JSON.stringify(join(cell, ".vscode"))})`),
+      "the workspace's own editor configuration is not reopened",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -354,6 +384,9 @@ test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical
     } as Record<string, string>;
     assert.equal((await run("git", ["init", "-q"], { cwd: cell, env: baseEnv })).code, 0);
     await writeFile(join(cell, "base.txt"), "base\n");
+    await writeFile(join(cell, ".gitmodules"), "root-protected\n");
+    await mkdir(join(cell, ".vscode"));
+    await writeFile(join(cell, ".vscode", "root.json"), "root-protected\n");
     assert.equal((await run("git", ["add", "base.txt"], { cwd: cell, env: baseEnv })).code, 0);
     assert.equal((await run("git", ["-c", "user.name=Cell", "-c", "user.email=cell@example.test", "commit", "-qm", "base"], {
       cwd: cell,
@@ -376,6 +409,26 @@ test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical
       `printf blocked > ${JSON.stringify(join(store, "locks", "host-only", "escaped.lock"))} 2>/dev/null || true`,
       `printf '{"type":"buz.send"}\\n' >> ${JSON.stringify(join(store, "ledger.jsonl"))}`,
       `printf stray > ${JSON.stringify(join(store, "sessions", "escaped.json"))} 2>/dev/null || true`,
+      // Published packages may contain otherwise protected inert names. They
+      // must materialize without reopening the same paths in the project tree.
+      "mkdir -p node_modules/pkg/.vscode",
+      "printf package-editor > node_modules/pkg/.vscode/launch.json",
+      "printf package-submodules > node_modules/pkg/.gitmodules",
+      // The carve-out must remain path-safe under hardlink/symlink attacks:
+      // a protected project file cannot be aliased below node_modules and
+      // then mutated through the otherwise-safe package path.
+      "ln .gitmodules node_modules/evil-hardlink 2>/dev/null || true",
+      "printf bypass > node_modules/evil-hardlink 2>/dev/null || true",
+      "mkdir -p node_modules/evil",
+      "ln -s ../../.vscode node_modules/evil/.vscode 2>/dev/null || true",
+      "printf bypass > node_modules/evil/.vscode/root.json 2>/dev/null || true",
+      "mkdir -p .vscode 2>/dev/null || true",
+      "printf project-editor > .vscode/root.json 2>/dev/null || true",
+      "printf project-submodules > .gitmodules 2>/dev/null || true",
+      "mkdir -p node_modules/pkg/.git/hooks 2>/dev/null || true",
+      "printf package-hook > node_modules/pkg/.git/hooks/postinstall 2>/dev/null || true",
+      "mkdir -p node_modules/pkg/.git 2>/dev/null || true",
+      "printf package-config > node_modules/pkg/.git/config 2>/dev/null || true",
     ].join("; ");
     const wrapped = await wrapCellSandboxCommand("/bin/bash", ["-c", script]);
     const outcome = await run(wrapped.command, wrapped.args, { cwd: cell, env: initialized.env });
@@ -390,6 +443,12 @@ test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical
     await assert.rejects(readFile(join(store, "locks", "host-only", "escaped.lock"), "utf8"), /ENOENT/);
     assert.equal(await readFile(join(store, "ledger.jsonl"), "utf8"), '{"type":"buz.send"}\n');
     await assert.rejects(readFile(join(store, "sessions", "escaped.json"), "utf8"), /ENOENT/);
+    assert.equal(await readFile(join(cell, "node_modules", "pkg", ".vscode", "launch.json"), "utf8"), "package-editor");
+    assert.equal(await readFile(join(cell, "node_modules", "pkg", ".gitmodules"), "utf8"), "package-submodules");
+    assert.equal(await readFile(join(cell, ".vscode", "root.json"), "utf8"), "root-protected\n");
+    assert.equal(await readFile(join(cell, ".gitmodules"), "utf8"), "root-protected\n");
+    await assert.rejects(readFile(join(cell, "node_modules", "pkg", ".git", "hooks", "postinstall"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(cell, "node_modules", "pkg", ".git", "config"), "utf8"), /ENOENT/);
     assert.equal(initialized.env.HIVE_LEDGER_MAX_BYTES, "0");
     const count = await run("git", ["rev-list", "--count", "HEAD"], { cwd: cell, env: baseEnv });
     assert.equal(count.stdout.trim(), "2", count.stderr);

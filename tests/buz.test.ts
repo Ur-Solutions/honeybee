@@ -540,6 +540,19 @@ test("readMessageById returns null for a malformed message file", async () => {
   });
 });
 
+test("readMessageById strict mode fails closed for a malformed matching id", async () => {
+  await withTempStore(async () => {
+    const id = generateMessageId(Date.now());
+    const dir = beeMailboxDir("CO.aaa", "queue");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `20260101T000000-${id}.md`), "not a valid buz message", "utf8");
+    await assert.rejects(
+      () => readMessageById("CO.aaa", id, { strict: true }),
+      /is malformed/,
+    );
+  });
+});
+
 test("readMessageById returns null when the file vanishes between readdir and read", async () => {
   await withTempStore(async () => {
     const id = generateMessageId(Date.now());

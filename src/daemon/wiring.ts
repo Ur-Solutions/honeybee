@@ -22,6 +22,7 @@ import { createRotationResumeDispatcher } from "./rotationResume.js";
 import { dispatchAutoswaps } from "./autoswap.js";
 import { createBuzDrainDispatcher } from "./buzDispatcher.js";
 import { createBuzRecoveryDispatcher } from "./buzRecovery.js";
+import { createExecutionInventoryDispatcher } from "./executionReconcile.js";
 import { createNeedsInputDispatcher } from "./needsInput.js";
 import { createRequestReconciler } from "./requestSweep.js";
 import { createTaskSupplyDispatcher } from "./taskSupplyDispatcher.js";
@@ -37,6 +38,7 @@ import { createTokenRefresher } from "./tokenRefresh.js";
 import { defaultCapturePanes, defaultProbeNodes } from "./probe.js";
 import type { TickDeps } from "./tick.js";
 import { envMs } from "./timeouts.js";
+import { createProductionExecutionServiceProvider, type ExecutionServiceProvider } from "../execution/production.js";
 
 const DEFAULT_TRANSCRIPT_REFRESH_INTERVAL_MS = 15_000;
 
@@ -114,11 +116,17 @@ async function defaultTranscriptFileStat(path: string): Promise<TranscriptFileSt
   }
 }
 
-export function buildDefaultDeps(): TickDeps {
+export type BuildDefaultDepsOptions = {
+  /** Shared with the aggregate HSR RPC endpoint in runDaemon. */
+  executionService?: ExecutionServiceProvider;
+};
+
+export function buildDefaultDeps(options: BuildDefaultDepsOptions = {}): TickDeps {
   const refreshTranscriptMetadata = createThrottledTranscriptMetadataRefresh();
   const isolatedListSessions = createIsolatedSessionLister();
   const isolatedCredentialSweep = createIsolatedCredentialSweeper();
   const dispatchBuzDrain = createBuzDrainDispatcher();
+  const executionService = options.executionService ?? createProductionExecutionServiceProvider();
   const observerId = `hive-daemon:${process.pid}`;
   const probeRuntime = async (record: SessionRecord) =>
     (await probeHsrReAdoption(record, observerId)).evidence;
@@ -156,6 +164,7 @@ export function buildDefaultDeps(): TickDeps {
       probe: probeRuntime,
       transition: transitionSession,
     }),
+    reconcileExecutions: createExecutionInventoryDispatcher({ service: executionService }),
     dispatchTaskSupply: createTaskSupplyDispatcher(),
     reconcileRequests: createRequestReconciler(),
     recoverAuthNeeded: createAuthRecoveryDispatcher(),

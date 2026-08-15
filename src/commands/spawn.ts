@@ -1,7 +1,7 @@
 // `hive spawn`/new/launch — spawn orchestration: detached tmux + HSR bees,
 // account/profile resolution, homogeneous swarms, and frame-driven cohorts.
 // Extracted from cli.ts (HIVE-15).
-import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAccountIntoHome, autoAccountTool, defaultHomeForAccount, findAccount, listAccounts, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord, type SpawnAgentSpec } from "../accounts.js";
+import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAccountIntoHome, autoAccountTool, clearAccountBootFailure, defaultHomeForAccount, findAccount, listAccounts, recordAccountBootFailure, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord, type SpawnAgentSpec } from "../accounts.js";
 import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand, stampBeeIdentityEnv } from "../agents.js";
 import { syncBeesSidebarLayout } from "../beesSidebar.js";
 import { beeConfig } from "../config.js";
@@ -50,6 +50,7 @@ import { validateContract } from "../comb/schema.js";
 import type { JsonValue, StoredCombVersion } from "../comb/types.js";
 import { resolveCellSandboxExtraWriteRoots } from "../hsr/cellSandbox.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
+import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import { readHsrMetaStrict } from "../hsr/runDir.js";
 import { stopHsrIncarnationByPid } from "../hsr/substrate.js";
 import { transactionalRetire } from "../kill.js";
@@ -297,6 +298,63 @@ export type SpawnRuntimeDependencies = {
   stopHsrIncarnationByPid?: typeof stopHsrIncarnationByPid;
 };
 
+/** Account activation failed before any harness process was forked. */
+export class AccountActivationError extends Error {
+  readonly code = "HIVE_ACCOUNT_ACTIVATION_FAILED";
+
+  constructor(readonly accountId: string, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "AccountActivationError";
+  }
+}
+
+/**
+ * Retry only pre-fork account activation failures for an automatic selector.
+ * Explicit account requests never move, and the attempted-id fence guarantees
+ * a bounded refusal even if every account is unhealthy or the picker regresses.
+ */
+export async function withAutomaticAccountFallback<T>(input: {
+  initial: AccountRecord;
+  enabled: boolean;
+  launch(account: AccountRecord): Promise<T>;
+  pickReplacement(excluded: ReadonlySet<string>): Promise<AccountRecord>;
+}): Promise<{ account: AccountRecord; result: T }> {
+  const maxAttempts = 64;
+  let account = input.initial;
+  const attempted = new Set<string>();
+  while (true) {
+    attempted.add(account.id);
+    try {
+      return { account, result: await input.launch(account) };
+    } catch (error) {
+      if (!input.enabled || !(error instanceof AccountActivationError)) throw error;
+      if (attempted.size >= maxAttempts) {
+        throw new Error(
+          `Automatic ${account.tool} account fallback reached its ${maxAttempts}-account safety limit`,
+          { cause: error },
+        );
+      }
+      let replacement: AccountRecord;
+      try {
+        replacement = await input.pickReplacement(attempted);
+      } catch (selectionError) {
+        const detail = selectionError instanceof Error ? selectionError.message : String(selectionError);
+        throw new Error(
+          `Automatic ${account.tool} account fallback exhausted after ${[...attempted].join(", ")}: ${detail}`,
+          { cause: error },
+        );
+      }
+      if (attempted.has(replacement.id)) {
+        throw new Error(
+          `Automatic ${account.tool} account fallback repeated already-failed account ${replacement.id}`,
+          { cause: error },
+        );
+      }
+      account = replacement;
+    }
+  }
+}
+
 export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDependencies = {}): Promise<SessionRecord> {
   // When the caller threads a timer it also owns reporting (it has resolve/ready
   // phases to fold in); a bare spawnBee gets its own self-reporting timer so
@@ -359,7 +417,21 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
       }
     } else {
       if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${opts.account.id}`);
-      await activateAccountIntoHome(opts.account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+      const activationStartedAt = Date.now();
+      try {
+        await activateAccountIntoHome(opts.account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
+      } catch (error) {
+        // A credential file is not proof it can boot. Persist this pre-fork
+        // failure so future auto picks avoid the account even if this caller
+        // cannot fall back (explicit account, pool, legacy spawn).
+        await recordAccountBootFailure(opts.account.id, Date.now(), "activation").catch(() => undefined);
+        throw new AccountActivationError(opts.account.id, error);
+      }
+      // Clear only an earlier activation-stage breaker. Adapter boot failures
+      // remain open until actual harness readiness proves recovery. The
+      // timestamp fence prevents this success from erasing a newer concurrent
+      // activation failure after the per-account activation lock was released.
+      await clearAccountBootFailure(opts.account.id, "activation", activationStartedAt).catch(() => undefined);
       refreshIdentityEnv(spec, opts.env);
     }
   }
@@ -610,14 +682,16 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
       ...(opts.sandboxWriteRoots?.length ? { extraWriteRoots: [...opts.sandboxWriteRoots] } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
-    const admittedMeta = await (runtimeDeps.readHsrMetaStrict ?? readHsrMetaStrict)(name);
-    const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
-    const runtime: SpawnedRuntimeHandle = {
+    // The detached host exists before its metadata can be read. Construct the
+    // exact pid-scoped teardown handle immediately so a corrupt/unreadable
+    // admission record cannot escape the post-fork cleanup protocol and be
+    // flattened by execution into a comfortable no-runtime failure.
+    const runtimeForFingerprint = (hostFingerprint?: ProcessBirthFingerprint): SpawnedRuntimeHandle => ({
       identity: {
         kind: "hsr",
         beeName: name,
         hostPid,
-        ...(runnerFingerprint ? { hostFingerprint: runnerFingerprint } : {}),
+        ...(hostFingerprint ? { hostFingerprint } : {}),
       },
       async stop() {
         try {
@@ -630,11 +704,25 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
           return { stopped: false, detail: error instanceof Error ? error.message : String(error) };
         }
       },
-    };
+    });
+    const provisionalRuntime = runtimeForFingerprint();
+    let admittedMeta: Awaited<ReturnType<typeof readHsrMetaStrict>>;
+    try {
+      admittedMeta = await (runtimeDeps.readHsrMetaStrict ?? readHsrMetaStrict)(name);
+    } catch (error) {
+      const cleanup = await provisionalRuntime.stop();
+      throw new SpawnAfterForkError("runtime-admission", provisionalRuntime, cleanup, error);
+    }
+    const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
+    const runtime = runtimeForFingerprint(runnerFingerprint);
     if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
       const cleanup = await runtime.stop();
-      const detail = cleanup.stopped ? "exact host rollback confirmed" : `exact host rollback unconfirmed: ${cleanup.detail}`;
-      throw new Error(`HSR host ${hostPid} has no complete birth admission; ${detail}`);
+      throw new SpawnAfterForkError(
+        "runtime-admission",
+        runtime,
+        cleanup,
+        new Error(`HSR host ${hostPid} has no complete birth admission`),
+      );
     }
     let postForkPhase: SpawnAfterForkError["phase"] = "runtime-publish";
     let publishedRecord: SessionRecord | undefined;
@@ -871,7 +959,13 @@ export async function resolveAccountFlag(
 // hosts multiple providers (minimax + glm + kimi), an auto-pick for `opencode`
 // is provider-blind and may select a different provider than the user meant.
 // Account-first resolution (exact id) sidesteps this; left unchanged in S2.
-export async function pickAutoAccount(tool: string, ttlMs: number | undefined, includePaused = false, model?: string): Promise<AccountRecord> {
+export async function pickAutoAccount(
+  tool: string,
+  ttlMs: number | undefined,
+  includePaused = false,
+  model?: string,
+  excludeAccountIds?: ReadonlySet<string>,
+): Promise<AccountRecord> {
   const started = performance.now();
   let choice: Awaited<ReturnType<typeof pickLeastLoadedAccount>>;
   try {
@@ -879,6 +973,7 @@ export async function pickAutoAccount(tool: string, ttlMs: number | undefined, i
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(includePaused ? { includePaused } : {}),
       ...(model ? { model } : {}),
+      ...(excludeAccountIds ? { excludeAccountIds } : {}),
     });
   } catch (error) {
     await appendLedger({
@@ -1158,10 +1253,6 @@ export async function spawnSingleBee(
   // A paused account is only used deliberately: warn + confirm (or --yes),
   // before any home activation or session creation happens.
   await confirmPausedAccount(account, parsed);
-  // Model selector precedence: profile model override > the account's default
-  // model. Only meaningful when an account is bound.
-  const model = account ? (profile?.model ?? account.model) : undefined;
-  const provider = account?.provider;
   const autoswap = truthy(flag(parsed, "autoswap"));
   if (autoswap && !account) throw new Error("--autoswap requires an account (--account or a <tool>-<account> bee spec)");
   // APIA-95 working-copy provisioning (remote-hsr only): clone/reuse a checkout on
@@ -1181,7 +1272,74 @@ export async function spawnSingleBee(
   timer.mark("resolve");
   let record: SessionRecord;
   try {
-    record = await spawnBee({ agent, extraArgs, cwd, yolo, home, env, name, colony, brief: briefText, ...(contract ? { contract } : {}), ...(preamble ? { preamble } : {}), ...(noPreamble ? { noPreamble } : {}), ...(sandboxWriteRoots ? { sandboxWriteRoots } : {}), ...(spawnedById ? { spawnedById } : {}), ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}), ...(trustedContext.onRuntimeLaunched ? { onRuntimeLaunched: trustedContext.onRuntimeLaunched } : {}), node, account, model, provider, autoswap, timer, ...(repo ? { repo } : {}), ...(branch ? { branch } : {}), ...(ref ? { ref } : {}), ...(checkout ? { checkout } : {}), ...(kitProfile ? { kitProfile } : {}), ...(useHsr ? { substrate: "hsr" } : {}), ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}), ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}) }, trustedContext.runtimeDependencies);
+    const launch = (selectedAccount: AccountRecord | undefined) => spawnBee({
+      agent,
+      extraArgs,
+      cwd,
+      yolo,
+      home,
+      env,
+      name,
+      colony,
+      brief: briefText,
+      ...(contract ? { contract } : {}),
+      ...(preamble ? { preamble } : {}),
+      ...(noPreamble ? { noPreamble } : {}),
+      ...(sandboxWriteRoots ? { sandboxWriteRoots } : {}),
+      ...(spawnedById ? { spawnedById } : {}),
+      ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}),
+      ...(trustedContext.onRuntimeLaunched ? { onRuntimeLaunched: trustedContext.onRuntimeLaunched } : {}),
+      node,
+      account: selectedAccount,
+      // Model selector precedence: profile override > selected account default.
+      // The signed request's explicit argv selector remains in `extraArgs`.
+      model: selectedAccount ? (profile?.model ?? selectedAccount.model) : undefined,
+      provider: selectedAccount?.provider,
+      autoswap,
+      timer,
+      ...(repo ? { repo } : {}),
+      ...(branch ? { branch } : {}),
+      ...(ref ? { ref } : {}),
+      ...(checkout ? { checkout } : {}),
+      ...(kitProfile ? { kitProfile } : {}),
+      ...(useHsr ? { substrate: "hsr" } : {}),
+      ...(truthy(flag(parsed, "wait-host")) ? { waitForHost: true } : {}),
+      ...(poolPlan && poolAllocation ? { poolKey: poolPlan.pool.key, poolMember: poolAllocation.member } : {}),
+    }, trustedContext.runtimeDependencies);
+
+    const automaticProtocolFallback =
+      account !== undefined &&
+      accountQuery === AUTO_ACCOUNT_QUERY &&
+      trustedContext.protocolLaunch === true &&
+      poolPlan === undefined &&
+      home === undefined &&
+      (!node || node.kind === "local-tmux");
+    if (account && automaticProtocolFallback) {
+      const launched = await withAutomaticAccountFallback({
+        initial: account,
+        enabled: true,
+        launch,
+        pickReplacement: (excluded) => pickAutoAccount(
+          spec.kind,
+          ttlFlagMs(parsed),
+          includePausedFlag(parsed),
+          requestedModel,
+          excluded,
+        ),
+      });
+      record = launched.result;
+      if (launched.account.id !== account.id) {
+        await appendLedger({
+          type: "account.auto-fallback",
+          tool: spec.kind,
+          rejectedAccount: account.id,
+          selectedAccount: launched.account.id,
+          ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}),
+        }).catch(() => undefined);
+      }
+    } else {
+      record = await launch(account);
+    }
   } catch (error) {
     // Roll back à la fork-launch: drop the claim (and, with --no-keep, a member
     // this allocation created) when the spawn itself failed.

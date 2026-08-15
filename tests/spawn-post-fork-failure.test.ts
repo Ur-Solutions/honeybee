@@ -71,6 +71,30 @@ test("saveSession failure after HSR fork tears down the exact returned host inca
   });
 });
 
+test("unreadable HSR birth metadata after fork cannot leak the detached host", async () => {
+  await withTempStore(async () => {
+    const stops: Array<{ bee: string; pid: number }> = [];
+    await assert.rejects(
+      spawnBee(spawnOptions(), baseRuntimeDeps({
+        readHsrMetaStrict: async () => { throw new Error("injected corrupt admission metadata"); },
+        stopHsrIncarnationByPid: async (bee, pid) => {
+          stops.push({ bee, pid });
+          return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+        },
+      })),
+      (error: unknown) => {
+        assert.ok(error instanceof SpawnAfterForkError);
+        assert.equal(error.phase, "runtime-admission");
+        assert.equal(error.runtime.identity.hostPid, HOST_PID);
+        assert.equal(error.cleanup.stopped, true);
+        assert.match(error.message, /corrupt admission metadata/);
+        return true;
+      },
+    );
+    assert.deepEqual(stops, [{ bee: "protocol-post-fork-test", pid: HOST_PID }]);
+  });
+});
+
 test("writeSpawnOptions failure after HSR fork reports unconfirmed exact teardown phase", async () => {
   await withTempStore(async () => {
     await assert.rejects(

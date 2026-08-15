@@ -260,6 +260,7 @@ export type ServiceOptions = {
   afterAdmission?: (reservation: RunReservation) => void | Promise<void>;
   afterLaunchClaim?: (reservation: RunReservation, attemptId: string) => void | Promise<void>;
   appendLaunchEvents?: ExecutionServiceOptions["appendLaunchEvents"];
+  retireSession?: ExecutionServiceOptions["retireSession"];
   launchGraceMs?: number;
 };
 
@@ -285,6 +286,10 @@ export function makeService(opts: ServiceOptions = {}): ExecutionService {
     sessions: opts.sessions ?? storeSessionEvidenceSource(),
     control,
     stopKnownExecution: control.stop,
+    retireSession: opts.retireSession ?? (async () => ({
+      retired: true,
+      detail: "test SessionRecord archived after exact fake stop",
+    })),
     harnessProbe: async (kind) => (kind === "claude" ? { status: "ready" } : { status: "absent" }),
     ...(opts.now ? { now: opts.now } : {}),
     launchOwner: owner,

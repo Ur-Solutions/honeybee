@@ -25,7 +25,7 @@ import { isWellFormedPaneId } from "../paneId.js";
 import type { InterventionRequestRecord } from "../requests/store.js";
 import type { SealRecord } from "../seal.js";
 import { deriveState, liveTargetKey, parseBeeState, type BeeState, type DerivedState, type StateContext } from "../state.js";
-import type { BeeWorkState } from "../stateMachine.js";
+import { isArchivedSessionLifecycle, type BeeWorkState } from "../stateMachine.js";
 import { legacyStateMachineSeed, type SessionRecord } from "../store.js";
 import { deriveOpenRequests, storedRequestView } from "./requests.js";
 import {
@@ -79,10 +79,10 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
   const unreachable = context.unreachableNodes?.has(nodeName) === true;
   const held = context.hsrUnavailable?.has(record.name) === true;
   const hiveStateOption = sources.hiveStateOption && sources.hiveStateOption.length > 0 ? sources.hiveStateOption : undefined;
-  // Mixed-version writers still express explicit retirement as status:done.
-  // It remains authoritative during rollout even if an older stateMachine
-  // cursor is present; no observation or clock path can write this status.
-  const machine = record.status === "done" ? legacyStateMachineSeed(record) : record.stateMachine ?? legacyStateMachineSeed(record);
+  // Once present, the proof-carrying cursor is authoritative. Legacy
+  // status:done is retirement only for records with no canonical cursor; a
+  // stale mixed-version scalar must not archive an explicitly active bee.
+  const machine = record.stateMachine ?? legacyStateMachineSeed(record);
 
   const bee = projectBee(record, nodeName, machine.lifecycle);
   const latestRuntime = projectRuntime(record, context, derived, machine.runtime, { generation, unreachable, held });
@@ -239,7 +239,7 @@ function projectRuntime(
     ...(record.providerSessionId !== undefined ? { providerSessionId: record.providerSessionId } : {}),
   };
 
-  if (record.stateMachine?.lifecycle === "archived" || record.status === "done") {
+  if (isArchivedSessionLifecycle(record)) {
     // A filed bee's runtime was torn down by retire/quest done: recorded intent.
     return {
       ...base,
@@ -628,7 +628,7 @@ function interactionStateFor(
   derived: DerivedState,
   runtime: BeeViewRuntime,
 ): BeeViewV1["interactionState"] {
-  if (record.stateMachine?.lifecycle === "archived" || record.status === "done") return "archived";
+  if (isArchivedSessionLifecycle(record)) return "archived";
   if (runtime.runtimeState === "recovering") return "working";
   if (record.status !== "kill_failed") {
     return derivedMeansRunningTurn(derived.state) ? "working" : "idle";

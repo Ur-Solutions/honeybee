@@ -19,7 +19,7 @@
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { type AccountRecord, accountHasCredentials, listAccounts, recentAccountBootFailures } from "../accounts.js";
+import { type AccountRecord, accountCredentialUnavailableReason, accountHasCredentials, listAccounts, recentAccountBootFailures } from "../accounts.js";
 import { canonicalAgentKind } from "../agents.js";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
@@ -250,6 +250,13 @@ export const AUTO_STALE_LIMITS_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type PickAccountDeps = CachedLimitsOptions & {
   hasCredentials?: typeof accountHasCredentials;
+  /**
+   * Read-only proof that a credential cannot start. Tests that replace
+   * `hasCredentials` get a permissive default unless they supply this seam.
+   */
+  credentialUnavailableReason?: typeof accountCredentialUnavailableReason;
+  /** Accounts already tried by a bounded caller-side fallback. */
+  excludeAccountIds?: ReadonlySet<string>;
   /** Session records for the commitment penalty; defaults to the live store. */
   sessions?: SessionRecord[];
   /** Consider paused accounts too (they are excluded from the pool by default). */
@@ -305,35 +312,82 @@ export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps
   const registered = (await listAccounts()).filter((account) => account.tool === kind);
   const pool = pickableAccounts(kind, registered, deps.includePaused ?? false);
   const hasCredentials = deps.hasCredentials ?? accountHasCredentials;
+  const now = (deps.now ?? Date.now)();
+  const credentialHealth = deps.credentialUnavailableReason
+    ?? (deps.hasCredentials ? async () => null : accountCredentialUnavailableReason);
   const candidates: AccountRecord[] = [];
+  const unavailable = new Map<string, string>();
+  let credentialed = 0;
   for (const account of pool) {
-    if (await hasCredentials(account)) candidates.push(account);
+    if (!(await hasCredentials(account))) continue;
+    credentialed += 1;
+    if (deps.excludeAccountIds?.has(account.id)) continue;
+    const reason = await credentialHealth(account, now).catch(() => null);
+    if (reason) unavailable.set(account.id, reason);
+    else candidates.push(account);
   }
   if (candidates.length === 0) {
+    if (unavailable.size > 0) {
+      throw new Error(
+        `No ${kind} account has a usable vaulted credential: ${[...unavailable]
+          .map(([id, reason]) => `${id} (${reason})`)
+          .join(", ")}. Re-login with: hive login <${kind}-account>`,
+      );
+    }
+    if (credentialed > 0 && (deps.excludeAccountIds?.size ?? 0) > 0) {
+      throw new Error(`No untried ${kind} account remains after credential activation failures`);
+    }
     throw new Error(`No ${kind} account has vaulted credentials; capture some with: hive login <account>`);
   }
-  const now = (deps.now ?? Date.now)();
   const bootFailures = await recentAccountBootFailures(now);
+  // A provider-rejected activation is stronger evidence than an adapter boot
+  // wobble: selecting it again merely replays the same dead refresh chain.
+  // Keep boot/auth observations as the historical soft preference (including
+  // their single-account last resort), but quarantine activation failures
+  // until an explicit successful activation clears the breaker or it expires.
+  const activationFailed = candidates.filter(
+    (account) => bootFailures.get(account.id)?.stage === "activation",
+  );
+  const activationEligible = candidates.filter(
+    (account) => bootFailures.get(account.id)?.stage !== "activation",
+  );
+  if (activationEligible.length === 0 && activationFailed.length > 0) {
+    throw new Error(
+      `No ${kind} account is ready for automatic activation; recent credential activation failed for ${activationFailed
+        .map((account) => account.id)
+        .join(", ")}. Re-login with: hive login <${kind}-account>`,
+    );
+  }
   // A credential FILE existing is not health: an account whose last real
   // authentication attempt failed (revoked token, rejected refresh) must not
   // keep winning the pick — every bee placed on it strands at /login while
   // `account list` looks green (the 2026-08-08 incident shape).
-  const authFailures = await recentAuthFailures(candidates, now);
+  const authFailures = await recentAuthFailures(activationEligible, now);
   const unhealthy = (accountId: string): boolean => bootFailures.has(accountId) || authFailures.has(accountId);
-  const healthy = candidates.filter((account) => !unhealthy(account.id));
-  const skipped = healthy.length > 0 ? candidates.filter((account) => unhealthy(account.id)) : [];
-  const eligible = healthy.length > 0 ? healthy : candidates;
+  const healthy = activationEligible.filter((account) => !unhealthy(account.id));
+  const skipped = healthy.length > 0 ? activationEligible.filter((account) => unhealthy(account.id)) : [];
+  const eligible = healthy.length > 0 ? healthy : activationEligible;
+  const recentFailureStage = (accountId: string): "auth" | "boot" | "activation" => {
+    if (authFailures.has(accountId)) return "auth";
+    return bootFailures.get(accountId)?.stage === "activation" ? "activation" : "boot";
+  };
   const bootHealthReason = skipped.length > 0
-    ? `; skipped ${skipped.map((account) => `${account.id} for recent ${authFailures.has(account.id) ? "auth" : "boot"} failure`).join(", ")}`
+    ? `; skipped ${skipped.map((account) => `${account.id} for recent ${recentFailureStage(account.id)} failure`).join(", ")}`
     : healthy.length === 0 && (bootFailures.size > 0 || authFailures.size > 0)
       ? "; every credentialed account has a recent boot/auth failure; using last resort"
       : "";
+  const credentialHealthReason = unavailable.size > 0
+    ? `; skipped ${[...unavailable.keys()].join(", ")} for unusable credential preflight`
+    : "";
+  const activationHealthReason = activationFailed.length > 0
+    ? `; skipped ${activationFailed.map((account) => account.id).join(", ")} for recent credential activation failure`
+    : "";
   // A single candidate wins regardless of usage — skip the limits round-trips
   // and the pick bookkeeping (there is no herd to steer with one account).
   if (eligible.length === 1) {
     return {
       account: eligible[0]!,
-      reason: `only ${skipped.length > 0 ? "healthy " : ""}${kind} account with credentials${bootHealthReason}`,
+      reason: `only ${skipped.length > 0 ? "healthy " : ""}${kind} account with credentials${credentialHealthReason}${activationHealthReason}${bootHealthReason}`,
       nearTieIds: [eligible[0]!.id],
     };
   }
@@ -362,7 +416,8 @@ export async function pickLeastLoadedAccount(tool: string, deps: PickAccountDeps
     { ...(deps.model ? { model: deps.model } : {}) },
   )!;
   const rotated = choice.nearTieIds.length > 1 ? await rotateNearTie(kind, choice, eligible, byId) : choice;
-  const healthyChoice = bootHealthReason ? { ...rotated, reason: `${rotated.reason}${bootHealthReason}` } : rotated;
+  const healthReason = `${credentialHealthReason}${activationHealthReason}${bootHealthReason}`;
+  const healthyChoice = healthReason ? { ...rotated, reason: `${rotated.reason}${healthReason}` } : rotated;
   // Pick bookkeeping (HIVE-80): debit the winner so the next concurrent pick
   // sees this one, and age its cache entry so the picker re-reads live once
   // the provider's numbers can actually reflect the newly placed load.

@@ -31,6 +31,7 @@ function emptyTickResult(): TickResult {
     buzRecoveries: [],
     runtimeDeaths: [],
     runtimeRecoveries: [],
+    executionReconciles: [],
     taskSupplies: [],
     requestReconciles: [],
     authRecoveries: [],

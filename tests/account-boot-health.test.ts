@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   ACCOUNT_BOOT_FAILURE_COOLDOWN_MS,
+  clearAccountBootFailure,
   recentAccountBootFailures,
   recordAccountBootFailure,
 } from "../src/accounts.js";
@@ -92,5 +93,25 @@ test("account boot failures expire after the fixed cooldown", async () => {
     await recordAccountBootFailure("codex-expired", failedAt);
     const afterCooldown = failedAt + ACCOUNT_BOOT_FAILURE_COOLDOWN_MS + 1;
     assert.equal((await recentAccountBootFailures(afterCooldown)).has("codex-expired"), false);
+  });
+});
+
+test("stage-scoped clears never erase a different failure class", async () => {
+  await withTempStore(async () => {
+    const accountId = "claude-stage-health";
+    const failedAt = Date.parse("2026-08-15T06:00:00.000Z");
+    await recordAccountBootFailure(accountId, failedAt, "activation");
+    await clearAccountBootFailure(accountId, "boot");
+    assert.equal((await recentAccountBootFailures(failedAt + 1)).get(accountId)?.stage, "activation");
+
+    await clearAccountBootFailure(accountId, "activation", failedAt);
+    assert.equal(
+      (await recentAccountBootFailures(failedAt + 1)).get(accountId)?.stage,
+      "activation",
+      "a success observation cannot clear an equal/newer failure",
+    );
+
+    await clearAccountBootFailure(accountId, "activation", failedAt + 1);
+    assert.equal((await recentAccountBootFailures(failedAt + 1)).has(accountId), false);
   });
 });

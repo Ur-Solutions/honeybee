@@ -25,7 +25,7 @@ import {
   withSessionLock,
   type SessionRecord,
 } from "./store.js";
-import type { ProbeEvidence } from "./stateMachine.js";
+import { isArchivedSessionLifecycle, type ProbeEvidence } from "./stateMachine.js";
 import { syncCredentialPairIsolated } from "./daemon/credentialSweepProcess.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { dropPoolClaimsForBee } from "./pool.js";
@@ -571,7 +571,7 @@ export async function transactionalRetire(
 ): Promise<KillOutcome> {
   return withSessionLifecycleTransaction(record, async (lifecycle) => {
     const current = await lifecycle.refresh();
-    if (current.status === "done" || current.stateMachine?.lifecycle === "archived") {
+    if (isArchivedSessionLifecycle(current)) {
       return { ok: true, alreadyGone: true, attempts: 0 };
     }
     const emitLedger = options.emitLedger !== false;

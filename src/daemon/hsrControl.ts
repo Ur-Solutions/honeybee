@@ -32,8 +32,10 @@ import { hsrObservations, pendingNeedsInput } from "../hsr/observe.js";
 import { readHsrMeta } from "../hsr/runDir.js";
 import { assertCallerEnvAllowed } from "../spawnEnv.js";
 import { resolveExplicitSpawningBeeId } from "../spawnParent.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
 import { createExecutionAdminMethods } from "../execution/adminMethods.js";
 import { createExecutionRpcMethods } from "../execution/rpcMethods.js";
+import { createProductionExecutionServiceProvider } from "../execution/production.js";
 import type { ExecutionService } from "../execution/service.js";
 import { createBrokerMethods, type BrokerHandlerOptions } from "./broker.js";
 import { daemonRoot } from "./log.js";
@@ -69,16 +71,46 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Durable user-level message acceptance, independent of aggregate RPC I/O. */
-export async function acceptHsrMessage(params: {
+type HsrMessageParams = {
   bee: string;
   text: string;
   sender?: string;
   subject?: string;
   messageId?: string;
-}): Promise<Record<string, unknown>> {
-  if (!params.bee) return { ok: false, error: "bee required" };
-  if (!params.text.trim()) return { ok: false, error: "message text required" };
+};
+
+type HsrMessageAcceptanceHooks = {
+  /** Test-only fault boundary after queue persistence and before its recovery cursor. */
+  beforeRecoveryCommit?: (messageId: string) => void | Promise<void>;
+};
+
+function hsrMessageRefusal(
+  error: string,
+  refusal: "pre-admission" | "idempotency-conflict" = "pre-admission",
+): Record<string, unknown> {
+  return { ok: false, accepted: false, refusal, error };
+}
+
+function hsrMessageAmbiguity(
+  error: string,
+  messageId?: string,
+  accepted?: true,
+): Record<string, unknown> {
+  return {
+    ok: false,
+    ...(accepted ? { accepted: true } : {}),
+    acceptanceAmbiguous: true,
+    ...(messageId ? { messageId, retryWithSameMessageId: true } : {}),
+    error,
+  };
+}
+
+async function acceptHsrMessageOnce(
+  params: HsrMessageParams,
+  hooks?: HsrMessageAcceptanceHooks,
+): Promise<Record<string, unknown>> {
+  if (!params.bee) return hsrMessageRefusal("bee required");
+  if (!params.text.trim()) return hsrMessageRefusal("message text required");
   const { resolveSession } = await import("../cli/shared.js");
   const record = await resolveSession(params.bee);
   const [
@@ -99,20 +131,65 @@ export async function acceptHsrMessage(params: {
     import("../commands/migrate.js"),
   ]);
   if (params.messageId !== undefined && !isUuidV7(params.messageId)) {
-    return { ok: false, error: "messageId must be an RFC 9562 UUIDv7" };
+    return hsrMessageRefusal("messageId must be an RFC 9562 UUIDv7");
   }
   const senderName = sanitizeHumanName(params.sender ?? "apiary");
+  // sendBuzMessage omits an empty subject. Normalize the replay comparison to
+  // that wire shape so `subject: ""` cannot manufacture an id collision.
+  const subject = params.subject || undefined;
   return withSessionLifecycleTransaction(record, async (lifecycle) => {
     const current = await lifecycle.refresh();
-    if (current.status === "done") {
-      return { ok: false, error: `${current.name} is archived` };
+
+    let existing: Awaited<ReturnType<typeof readMessageById>> = null;
+    if (params.messageId) {
+      existing = await readMessageById(current.name, params.messageId, { strict: true });
+      if (existing) {
+        const samePayload = existing.message.to === current.name &&
+          existing.message.body === params.text &&
+          existing.message.subject === subject &&
+          existing.message.from.kind === "human" &&
+          existing.message.from.name === senderName;
+        if (!samePayload) {
+          return hsrMessageRefusal(
+            `messageId ${params.messageId} is already used with a different payload`,
+            "idempotency-conflict",
+          );
+        }
+      }
+    }
+
+    // A caller-owned id is the durable acceptance authority. Resolve it before
+    // new-admission lifecycle checks: a reply can be lost and the bee can be
+    // archived before the caller replays the exact accepted operation.
+    if (existing && (
+      existing.message.deliveredAt || existing.mailbox === "inbox" || existing.mailbox === "read"
+    )) {
+      return {
+        ok: true,
+        accepted: true,
+        messageId: existing.message.id,
+        delivery: "delivered",
+        idempotent: true,
+      };
+    }
+
+    // `outbox` is an audit copy, not proof that recipient admission committed.
+    // Never turn an outbox-only observation into a queued acceptance receipt.
+    if (existing?.mailbox === "outbox") {
+      return hsrMessageAmbiguity(
+        `messageId ${existing.message.id} has an outbox audit record but no recipient admission record`,
+        params.messageId,
+      );
     }
 
     const substrate = substrateFor(current);
     const live = await substrate.hasSession(current.tmuxTarget).catch(() => false);
-    if (current.status === "kill_failed" && !live) {
-      return { ok: false, error: `${current.name} is archived (stop state unresolved)` };
-    }
+    const terminalReason = isArchivedSessionLifecycle(current)
+      ? `${current.name} is archived`
+      : current.stateMachine === undefined && current.status === "kill_failed" && !live
+        ? `${current.name} is archived (stop state unresolved)`
+        : undefined;
+    if (terminalReason && !existing) return hsrMessageRefusal(terminalReason);
 
     let cwdUnavailable = false;
     try {
@@ -121,21 +198,6 @@ export async function acceptHsrMessage(params: {
       cwdUnavailable = true;
     }
     const missingProviderSession = !live && !current.providerSessionId;
-
-    let existing: Awaited<ReturnType<typeof readMessageById>> = null;
-    if (params.messageId) {
-      existing = await readMessageById(current.name, params.messageId);
-      if (existing) {
-        const samePayload = existing.message.to === current.name &&
-          existing.message.body === params.text &&
-          existing.message.subject === params.subject &&
-          existing.message.from.kind === "human" &&
-          existing.message.from.name === senderName;
-        if (!samePayload) {
-          return { ok: false, error: `messageId ${params.messageId} is already used with a different payload` };
-        }
-      }
-    }
 
     const sent = existing
       ? { message: existing.message }
@@ -147,7 +209,7 @@ export async function acceptHsrMessage(params: {
           tier: cwdUnavailable || missingProviderSession ? "queue" : "next-tool",
           body: params.text,
           ...(params.messageId ? { messageId: params.messageId } : {}),
-          ...(params.subject ? { subject: params.subject } : {}),
+          ...(subject ? { subject } : {}),
           ...(cwdUnavailable || missingProviderSession
             ? {}
             : {
@@ -161,8 +223,7 @@ export async function acceptHsrMessage(params: {
         });
 
     const messageId = sent.message.id;
-    const existingDelivery = existing?.mailbox === "inbox" || existing?.mailbox === "read";
-    if (sent.message.deliveredAt || existingDelivery) {
+    if (sent.message.deliveredAt) {
       return {
         ok: true,
         accepted: true,
@@ -172,13 +233,15 @@ export async function acceptHsrMessage(params: {
       };
     }
 
-    const undeliverableReason = cwdUnavailable
-      ? "missing-cwd" as const
-      : missingProviderSession
-        ? "missing-provider-session" as const
-        : existing?.mailbox === "quarantine"
-          ? "queued-message-missing" as const
-          : undefined;
+    const undeliverableReason = terminalReason && existing
+      ? "archive-unresolved" as const
+      : cwdUnavailable
+        ? "missing-cwd" as const
+        : missingProviderSession
+          ? "missing-provider-session" as const
+          : existing?.mailbox === "quarantine"
+            ? "queued-message-missing" as const
+            : undefined;
     if (undeliverableReason) {
       const requestId = await openMessageDeliveryRequest(current, messageId, undeliverableReason);
       return {
@@ -192,11 +255,14 @@ export async function acceptHsrMessage(params: {
       };
     }
 
-    if (current.recoveryMessageId !== messageId) {
+    if (!current.recoveryRequestedAt || !current.recoveryMessageId) {
       // The queue file is already durable. This separate first-class fact is
       // the daemon work-set obligation; it changes neither lifecycle status
-      // nor the last state actually observed from the runtime.
+      // nor the last state actually observed from the runtime. One record is
+      // a cursor over the durable queue, so a later accepted message must not
+      // replace an older unresolved owner.
       await lifecycle.refresh();
+      await hooks?.beforeRecoveryCommit?.(messageId);
       await lifecycle.commit({
         recoveryRequestedAt: new Date().toISOString(),
         recoveryMessageId: messageId,
@@ -213,6 +279,65 @@ export async function acceptHsrMessage(params: {
       ...(existing ? { idempotent: true } : {}),
     };
   });
+}
+
+async function hsrMessageWasDurablyAccepted(params: HsrMessageParams): Promise<boolean> {
+  if (!params.messageId) return false;
+  const [{ resolveSession }, { readMessageById, sanitizeHumanName }] = await Promise.all([
+    import("../cli/shared.js"),
+    import("../buz.js"),
+  ]);
+  const record = await resolveSession(params.bee);
+  const existing = await readMessageById(record.name, params.messageId, { strict: true });
+  if (!existing || existing.mailbox === "outbox") return false;
+  const senderName = sanitizeHumanName(params.sender ?? "apiary");
+  return existing.message.to === record.name
+    && existing.message.body === params.text
+    && existing.message.subject === (params.subject || undefined)
+    && existing.message.from.kind === "human"
+    && existing.message.from.name === senderName;
+}
+
+/** Durable user-level message acceptance, independent of aggregate RPC I/O. */
+export async function acceptHsrMessage(
+  params: HsrMessageParams,
+  hooks?: HsrMessageAcceptanceHooks,
+): Promise<Record<string, unknown>> {
+  try {
+    return await acceptHsrMessageOnce(params, hooks);
+  } catch (firstError) {
+    // A caller key lets the daemon safely retry its own persist/finalize
+    // operation. The retry re-reads the recipient mailbox before doing work,
+    // so a throw after sendBuzMessage cannot become a false refusal or a
+    // duplicate message. One-shot store faults therefore heal within the same
+    // RPC and return an idempotent receipt.
+    if (params.messageId) {
+      try {
+        const repaired = await acceptHsrMessageOnce(params, hooks);
+        if (repaired.ok === true) return repaired;
+      } catch (repairError) {
+        const accepted = await hsrMessageWasDurablyAccepted(params).catch(() => false);
+        return hsrMessageAmbiguity(
+          `${messageOf(firstError)}; idempotent receipt recovery failed: ${messageOf(repairError)}`,
+          params.messageId,
+          accepted ? true : undefined,
+        );
+      }
+
+      // The first attempt threw, so even a later refusal cannot prove that no
+      // recipient write happened in the crash window. Keep the exact key alive.
+      const accepted = await hsrMessageWasDurablyAccepted(params).catch(() => false);
+      return hsrMessageAmbiguity(
+        `${messageOf(firstError)}; durable acceptance could not be reconciled`,
+        params.messageId,
+        accepted ? true : undefined,
+      );
+    }
+
+    // Without a caller key there is no replay-safe identity. Preserve the
+    // distinction from a positive refusal, but do not advertise safe retry.
+    return hsrMessageAmbiguity(messageOf(firstError));
+  }
 }
 
 export async function startHsrControlServer(opts?: {
@@ -539,21 +664,7 @@ export async function startHsrControlServer(opts?: {
   // coordinator is built lazily on first protocol call so daemon boot does not
   // pay the contract/ajv load, and legacy methods are untouched.
   const execution = createExecutionRpcMethods(
-    opts?.executionService ??
-      (async () => {
-        const [{ createExecutionService, storeSessionEvidenceSource }, { createHsrRunLauncher }, { requireExecutionBinding }] =
-          await Promise.all([
-            import("../execution/service.js"),
-            import("../execution/launcher.js"),
-            import("../execution/nodeState.js"),
-          ]);
-        return createExecutionService({
-          // Runs execute as the CANONICAL bound Apiary nodeId; resolved lazily
-          // because runs cannot exist before a binding does.
-          launcher: createHsrRunLauncher({ nodeId: async () => (await requireExecutionBinding()).nodeId }),
-          sessions: storeSessionEvidenceSource(),
-        });
-      }),
+    opts?.executionService ?? createProductionExecutionServiceProvider(),
   );
 
   // Node-local admin bootstrap methods (executionAdmin:1). Available without

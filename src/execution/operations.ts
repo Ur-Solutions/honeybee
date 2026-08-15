@@ -41,6 +41,7 @@ import {
   type ReleaseStepId,
 } from "./opsStore.js";
 import {
+  appendRunLossEpisodeEvents,
   appendRunEvents,
   appendRunTerminalEvents,
   commitRunTerminalResult,
@@ -50,6 +51,7 @@ import {
   lossEpisodePayload,
   mutateReservation,
   readReservation,
+  type RunEventInput,
   type RunReservation,
 } from "./runStore.js";
 import type { SignatureVerifier } from "./signing.js";
@@ -69,6 +71,11 @@ export type SessionEvidenceReader = {
   evidence(beeName: string): Promise<{ sessionExists: boolean; stampedRunId?: string }>;
 };
 
+export type ExecutionSessionRetirementResult = {
+  retired: boolean;
+  detail: string;
+};
+
 export type RunOperationsDeps = {
   contract: ExecutionContract;
   validator: ExecutionValidator;
@@ -79,6 +86,8 @@ export type RunOperationsDeps = {
   verifySignature?: SignatureVerifier;
   control: HarnessControl;
   sessions: SessionEvidenceReader;
+  /** Archive only the exact SessionRecord owned by this Run after stop proof. */
+  retireSession: (reservation: RunReservation) => Promise<ExecutionSessionRetirementResult>;
   /** Injectable only to place deterministic tests at the post-ownership read barrier. */
   collectGitDiffMetadata?: typeof collectGitDiffMetadata;
   /** Bounded durable continuation lease; production defaults to 15 seconds. */
@@ -817,12 +826,20 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           } else if (!reservation.result) {
             // running (or lost): stop only the session provably bound to THIS
             // run, only over its control socket — never a kill -9.
-            let stopConfirmed = true;
-            let stopDetail: string | undefined;
+            // Absence of a SessionRecord is deliberately NOT exit proof. A
+            // coordinator can die after the non-deduplicating launcher side
+            // effect but before publishing that record; treating absence as
+            // down would free occupancy under a hidden live harness.
+            let stopConfirmed = false;
+            let stopDetail = "no durable session evidence proves the activated runtime is down";
             if (await sessionIsOurs(reservation)) {
-              const stop = await deps.control.stop(reservation.beeName);
-              stopDetail = stop.detail;
-              stopConfirmed = stop.stopped;
+              try {
+                const stop = await deps.control.stop(reservation.beeName);
+                stopDetail = stop.detail;
+                stopConfirmed = stop.stopped;
+              } catch (error) {
+                stopDetail = error instanceof Error ? error.message : String(error);
+              }
             }
             if (!stopConfirmed) {
               // The owned harness may still be alive: never project terminal
@@ -834,8 +851,8 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               if (reservation.result) {
                 state = reservation.result.outcome;
               } else {
-                await appendEvents(
-                  validated.runId,
+                await appendRunLossEpisodeEvents(
+                  reservation,
                   protocolVersion,
                   [
                     {
@@ -864,7 +881,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               reservation = await commitRunTerminalResult(
                 validated.runId,
                 { outcome: "cancelled", cause: reason ?? "cancel_requested" },
-                { now, clearIndeterminate: true },
+                { now, clearIndeterminate: true, launchOccupancyCleanupProof: "runtime-down" },
               );
               await appendRunTerminalEvents(reservation, protocolVersion, await deps.origin());
               state = reservation.result?.outcome ?? "cancelled";
@@ -1338,11 +1355,12 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             // not deliver a duplicate stop. completed/failed results do not
             // carry this liveness guarantee and must still probe an owned host.
             const stopAlreadyProven = terminal && reservation.result?.outcome === "cancelled";
-            if (!terminal && (settled.state === "accepted" || settled.state === "starting") && !ours) {
-              // A launch may still be CREATING the process: "no live harness"
-              // would be a guess, and releasing occupancy under a nascent
-              // harness could free a tree it is about to mutate.
-              await annotatePending("launch unresolved and no provable session yet");
+            if (!terminal && !ours) {
+              // Any nonterminal Run may still own an unpublished runtime. In
+              // particular, `lost` after launch activation means the
+              // coordinator died in the fork -> SessionRecord crash window.
+              // Absence is never a process-exit proof for destructive cleanup.
+              await annotatePending("run is nonterminal and no durable session evidence proves its runtime is down");
               break;
             }
             let detail = stopAlreadyProven
@@ -1364,8 +1382,8 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               reservation = await mutateReservation(runId, (record) =>
                 enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
               );
-              await appendEvents(
-                runId,
+              await appendRunLossEpisodeEvents(
+                reservation,
                 protocolVersion,
                 [{
                   type: "run.lost",
@@ -1377,10 +1395,49 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               await annotatePending(detail);
               break;
             }
+            // Apiary's physical Cell fence reads the durable SessionRecord
+            // lifecycle; Honeybee's private stop verdict is not visible
+            // there. Archive this exact execution generation before the
+            // harness-stop step can settle, otherwise a clean release remains
+            // indistinguishable from deleting beneath a live agent.
+            let retirement: ExecutionSessionRetirementResult;
+            try {
+              retirement = await deps.retireSession(reservation);
+            } catch (error) {
+              retirement = {
+                retired: false,
+                detail: error instanceof Error ? error.message : String(error),
+              };
+            }
+            if (!retirement.retired) {
+              reservation = await mutateReservation(runId, (record) =>
+                enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
+              );
+              await appendRunLossEpisodeEvents(
+                reservation,
+                protocolVersion,
+                [{
+                  type: "run.lost",
+                  payload: lossEpisodePayload(reservation, {
+                    cause: "release_stop_unconfirmed",
+                    detail: `runtime stopped but SessionRecord retirement is unconfirmed: ${retirement.detail}`,
+                  }),
+                  origin: await deps.origin(),
+                }],
+                { onlyIfAbsentKeys: true },
+              );
+              await annotatePending(`SessionRecord retirement unconfirmed: ${retirement.detail}`);
+              break;
+            }
+            detail = `${detail}; ${retirement.detail}`;
             // Stop confirmed (or no session belonging to this Run remains):
             // resolve any earlier liveness doubt. The terminal helper preserves
             // an already-committed result while clearing only the loss episode.
             if (reservation.indeterminateCause === "release_stop_unconfirmed") {
+              const lossEpisodeId = reservation.lossEpisodeId;
+              if (!lossEpisodeId) {
+                throw executionError("AUTHORITY_UNAVAILABLE", `run ${runId} release loss has no durable episode identity`);
+              }
               await appendEvents(
                 runId,
                 protocolVersion,
@@ -1391,6 +1448,37 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                 }],
                 { onlyIfAbsentKeys: true },
               );
+              // completed is not a legal direct successor of recovering. A
+              // completion that won before stop doubt is a delayed receipt for
+              // a runtime that did run and has now exited, so publish the
+              // episode-keyed recovered-running bridge before restoring its
+              // immutable terminal winner. Failed/cancelled may terminate
+              // directly from recovering, but still publish the exit proof.
+              const recoveryReceipts: RunEventInput[] = [];
+              if (reservation.result?.outcome === "completed") {
+                if (!reservation.sessionRef) {
+                  throw executionError(
+                    "AUTHORITY_UNAVAILABLE",
+                    `run ${runId} completed release recovery has no canonical session reference`,
+                  );
+                }
+                recoveryReceipts.push({
+                  type: "harness.running",
+                  payload: { sessionRef: reservation.sessionRef, recovered: true, lossEpisodeId },
+                  origin: await deps.origin({ driverId: driverIdOf(reservation) }),
+                });
+              }
+              recoveryReceipts.push({
+                type: "harness.exited",
+                payload: {
+                  lossEpisodeId,
+                  ...(reservation.result?.harnessExitCode !== undefined
+                    ? { exitCode: reservation.result.harnessExitCode }
+                    : {}),
+                },
+                origin: await deps.origin({ driverId: driverIdOf(reservation) }),
+              });
+              await appendEvents(runId, protocolVersion, recoveryReceipts, { onlyIfAbsentKeys: true });
             }
             reservation = await commitRunTerminalResult(
               runId,

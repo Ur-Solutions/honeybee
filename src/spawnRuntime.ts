@@ -28,7 +28,7 @@ export class SpawnAfterForkError extends Error {
   readonly code = "HIVE_SPAWN_AFTER_FORK";
 
   constructor(
-    readonly phase: "runtime-publish" | "session-save" | "spawn-options",
+    readonly phase: "runtime-admission" | "runtime-publish" | "session-save" | "spawn-options",
     readonly runtime: SpawnedRuntimeHandle,
     readonly cleanup: SpawnRuntimeCleanup,
     readonly original: unknown,

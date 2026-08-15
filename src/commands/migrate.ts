@@ -21,7 +21,7 @@ import { authPromptLossRequestId } from "../requests/keys.js";
 import { closeRequestsForNewIncarnation, openRequest, readBeeRequests, resolveRequest } from "../requests/store.js";
 import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
 import { appendLedger, listSessions, storeRoot, transitionSession, type SessionRecord } from "../store.js";
-import type { ProbeEvidence } from "../stateMachine.js";
+import { isArchivedSessionLifecycle, type ProbeEvidence } from "../stateMachine.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { stopRuntimeStrict } from "../substrates/stop.js";
 import type { NewSessionResult, Substrate } from "../substrates/types.js";
@@ -59,7 +59,7 @@ type LaunchReplay = {
 };
 
 function hasArchivedLifecycle(record: SessionRecord): boolean {
-  return record.stateMachine?.lifecycle === "archived" || record.status === "done";
+  return isArchivedSessionLifecycle(record);
 }
 
 async function persistExplicitRevive(

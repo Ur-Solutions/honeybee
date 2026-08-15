@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -421,6 +421,37 @@ test("dispatchBuzDrains drains queue on active->idle_with_output and moves to in
   });
 });
 
+test("dispatchBuzDrains promotes queued A when the current recovery owner B is delivered", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.promote-after-delivery", { lastObservedState: "idle_with_output" });
+    await saveSession(recipient);
+    const a = await sendBuzMessage({ recipient, sender, tier: "queue", body: "A" });
+    const b = await sendBuzMessage({ recipient, sender, tier: "queue", body: "B" });
+    assert.ok(a.queuePath && b.queuePath);
+
+    // Force B to be the next FIFO delivery while A remains queued, recreating
+    // a current-owner settlement with an older obligation still on disk.
+    const stamp = Date.parse("2026-08-12T10:00:00.000Z");
+    await utimes(b.queuePath, new Date(stamp), new Date(stamp));
+    await utimes(a.queuePath, new Date(stamp + 1_000), new Date(stamp + 1_000));
+    await updateSession(recipient.name, {
+      recoveryRequestedAt: new Date(stamp).toISOString(),
+      recoveryMessageId: b.message.id,
+      recoveryAttemptCount: 2,
+    });
+
+    const outcomes = await dispatchBuzDrains([recipient], [], {
+      currentStates: new Map([[recipient.name, "idle_with_output"]]),
+      resolveSubstrate: () => fakeSubstrate(),
+    });
+    assert.deepEqual(outcomes[0]?.result.delivered, [b.message.id]);
+    const after = (await loadSession(recipient.name))!;
+    assert.equal(after.recoveryMessageId, a.message.id);
+    assert.equal(after.recoveryAttemptCount, 0);
+    assert.equal(after.recoveryNextAttemptAt, undefined);
+  });
+});
+
 test("dispatchBuzDrains drains a bee that is ALREADY idle when a message lands in queue/ (no transition)", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa", { lastObservedState: "idle_with_output" });
@@ -671,14 +702,13 @@ test("runBuzRecoverySweep persists backoff across sweeps and opens needs-action 
   });
 });
 
-test("runBuzRecoverySweep age-gates old cold mail instead of mass-reviving it", async () => {
+test("runBuzRecoverySweep resumes accepted cold mail after a sleep longer than 15 minutes", async () => {
   await withTempStore(async () => {
     const now = Date.parse("2026-08-10T12:00:00.000Z");
-    const record = await seedRecoveryRecord("CO.old-mail", now - 60 * 60_000);
+    const record = await seedRecoveryRecord("CO.slept-mail", now - 24 * 60 * 60_000);
     let wakes = 0;
     const outcomes = await runBuzRecoverySweep([record], {
       now: () => now,
-      maxRequestAgeMs: 10 * 60_000,
       isLive: async () => false,
       assertCwd: async () => undefined,
       wakeRecipient: async (candidate) => {
@@ -686,10 +716,10 @@ test("runBuzRecoverySweep age-gates old cold mail instead of mass-reviving it", 
         return candidate;
       },
     });
-    assert.equal(wakes, 0);
-    assert.equal(outcomes[0]?.action, "undeliverable");
-    assert.equal(outcomes[0]?.reason, "recovery-request-expired");
-    assert.equal((await readBeeRequests(record.name))[0]?.evidence.detail, "recovery-request-expired");
+    assert.equal(wakes, 1, "daemon downtime does not spend or expire the bounded wake budget");
+    assert.equal(outcomes[0]?.action, "started");
+    assert.equal((await loadSession(record.name))?.recoveryMessageId, record.recoveryMessageId);
+    assert.equal((await readBeeRequests(record.name)).length, 0);
   });
 });
 

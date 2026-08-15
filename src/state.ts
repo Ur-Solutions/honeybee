@@ -3,6 +3,7 @@ import { cyan, dim, gray, green, magenta, red, yellow } from "./format.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { isWellFormedPaneId } from "./paneId.js";
 import { isAgentActivePane, isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "./readiness.js";
+import { isArchivedSessionLifecycle } from "./stateMachine.js";
 import type { SessionRecord } from "./store.js";
 
 export type BeeState =
@@ -135,7 +136,7 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   // "offline" on an unreachable node. Short-circuit BEFORE the liveness/node
   // probe so the filed status always wins — even over a stray live target of
   // the same name.
-  if (record.status === "done") {
+  if (isArchivedSessionLifecycle(record)) {
     return { state: "done", detail: "filed" };
   }
 

@@ -9,7 +9,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { addAccount } from "../src/accounts.js";
 import { agentDefaultsToYolo } from "../src/agents.js";
-import { resolveSpawnOverlays } from "../src/commands/spawn.js";
+import {
+  AccountActivationError,
+  resolveSpawnOverlays,
+  withAutomaticAccountFallback,
+} from "../src/commands/spawn.js";
 import { resetConfigCache } from "../src/config.js";
 import type { Parsed } from "../src/parse.js";
 
@@ -77,5 +81,55 @@ test("the same hostile overlay DOES rewrite an untrusted spawn (the bypass is wh
     assert.equal(legacy.profile?.account.id, "codex-evil");
     assert.ok(legacy.extraArgs.includes("--injected-arg"), "legacy thin profile appends its args");
     assert.equal(legacy.yolo, !defaultYolo, "legacy thin profile flips yolo");
+  });
+});
+
+test("protocol auto fallback retries a different account only for pre-fork activation failure", async () => {
+  await withHostileOverlay(async () => {
+    const first = await addAccount("claude", "expired@example.com");
+    const second = await addAccount("claude", "healthy@example.com");
+    const launched: string[] = [];
+    const exclusions: string[][] = [];
+
+    const result = await withAutomaticAccountFallback({
+      initial: first,
+      enabled: true,
+      launch: async (account) => {
+        launched.push(account.id);
+        if (account.id === first.id) throw new AccountActivationError(account.id, new Error("refresh rejected"));
+        return "running";
+      },
+      pickReplacement: async (excluded) => {
+        exclusions.push([...excluded]);
+        return second;
+      },
+    });
+
+    assert.deepEqual(launched, [first.id, second.id]);
+    assert.deepEqual(exclusions, [[first.id]]);
+    assert.equal(result.account.id, second.id);
+    assert.equal(result.result, "running");
+  });
+});
+
+test("explicit account activation failure never changes identity", async () => {
+  await withHostileOverlay(async () => {
+    const explicit = await addAccount("claude", "explicit@example.com");
+    let pickerCalled = false;
+    await assert.rejects(
+      withAutomaticAccountFallback({
+        initial: explicit,
+        enabled: false,
+        launch: async () => {
+          throw new AccountActivationError(explicit.id, new Error("refresh rejected"));
+        },
+        pickReplacement: async () => {
+          pickerCalled = true;
+          return explicit;
+        },
+      }),
+      /refresh rejected/,
+    );
+    assert.equal(pickerCalled, false);
   });
 });

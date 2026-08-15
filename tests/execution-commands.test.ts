@@ -418,6 +418,7 @@ test("run.command vs concurrent cancel: a cancel landing after the pre-lock sett
       binding: async () => ctx.binding,
       control: control.control,
       sessions: storeSessionEvidenceSource(),
+      retireSession: async () => ({ retired: true, detail: "test SessionRecord archived" }),
       settle: async (reservation) => ({ reservation, state: "running" }),
       origin: async () => ({ nodeId: ctx.nodeId }),
     });
@@ -458,6 +459,7 @@ test("run.command admitted before cancel rechecks the reservation at the dispatc
       binding: async () => ctx.binding,
       control: control.control,
       sessions: storeSessionEvidenceSource(),
+      retireSession: async () => ({ retired: true, detail: "test SessionRecord archived" }),
       // Preserve the running snapshot captured before the concurrent cancel;
       // the dispatch claim itself must close the remaining race.
       settle: async (reservation) => ({ reservation, state: "running" }),

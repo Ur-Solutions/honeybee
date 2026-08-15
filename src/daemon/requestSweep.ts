@@ -36,6 +36,7 @@
 // same evidence cannot re-open anything a human or a scope change closed.
 
 import type { HsrObservation } from "../hsr/observe.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
 import { authRequestId, needsInputRequestId, stopFailedRequestId } from "../requests/keys.js";
 import {
   cancelOpenRequests,
@@ -140,7 +141,7 @@ export function createRequestReconciler(): RequestReconciler {
     };
 
     // 1. Retired backstop: a filed record closes everything; nothing re-opens.
-    if (record.status === "done") {
+    if (isArchivedSessionLifecycle(record)) {
       for (const cancelled of await cancelOpenRequests(bee, {}, "scope-closed", "retired")) {
         emit(cancelled.id, "cancel", "retired");
       }

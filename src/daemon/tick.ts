@@ -3,13 +3,15 @@ import type { NodeRecord } from "../node.js";
 import type { HsrObservation } from "../hsr/observe.js";
 import { deriveState, isTerminalState, liveTargetKey, parseBeeState, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
 import { shouldPersistObservationHeartbeat, type SessionRecord } from "../store.js";
-import type { ProbeEvidence } from "../stateMachine.js";
+import { isArchivedSessionLifecycle, type ProbeEvidence } from "../stateMachine.js";
 import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AuthRecoveryOutcome } from "./authRecovery.js";
 import type { RotationResumeOutcome } from "./rotationResume.js";
 import type { AutoswapOutcome } from "./autoswap.js";
 import type { BuzDispatchOutcome } from "./buzDispatcher.js";
 import type { BuzRecoveryDispatcher, BuzRecoveryOutcome } from "./buzRecovery.js";
+import type { ExecutionInventoryDispatcher } from "./executionReconcile.js";
+import type { ExecutionInventoryOutcome } from "../execution/service.js";
 import type { NeedsInputOutcome } from "./needsInput.js";
 import type { RequestReconcileOutcome, RequestReconciler } from "./requestSweep.js";
 import type { TaskSupplyOutcome } from "./taskSupplyDispatcher.js";
@@ -115,6 +117,12 @@ export type TickDeps = {
   ) => Promise<RuntimeDeathDecision[]>;
   /** Tick-cheap collector/launcher for bounded mid-turn recovery. */
   dispatchRuntimeRecovery?: RuntimeRecoveryDispatcher;
+  /**
+   * Tick-cheap collector/launcher for node-owned durable execution recovery.
+   * The detached lane enumerates bounded reservation pages and shares the RPC
+   * coordinator's durable ownership/lock contracts.
+   */
+  reconcileExecutions?: ExecutionInventoryDispatcher;
   /**
    * Optional task auto-supply dispatcher (agent task lists epic): on the same
    * idle_with_output observation that drains buz queues, feeds the top
@@ -276,6 +284,8 @@ export type DispatcherOutcomes = {
   buzRecoveries: BuzRecoveryOutcome[];
   /** Settled outcomes collected from the detached runtime-recovery lane. */
   runtimeRecoveries: RuntimeRecoveryOutcome[];
+  /** Settled outcomes from the detached durable execution inventory lane. */
+  executionReconciles: ExecutionInventoryOutcome[];
   /**
    * Task auto-supply outcomes: tasks fed to idle bees through the six-
    * condition gate, fed tasks flagged stalled, per-bee errors. Empty when no
@@ -518,6 +528,27 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
           ...(outcome.retryAt ? { retryAt: outcome.retryAt } : {}),
           ...(outcome.requestId ? { requestId: outcome.requestId } : {}),
           ...(outcome.replayedTurns !== undefined ? { replayedTurns: outcome.replayedTurns } : {}),
+          ...(outcome.error ? { error: outcome.error } : {}),
+        },
+  },
+  // Durable execution reconciliation is node-owned, not client-owned. The
+  // dispatcher merely collects/starts a bounded background page; launch
+  // readiness and cleanup locks never extend the observation tick.
+  {
+    key: "executionReconciles",
+    name: "reconcileExecutions",
+    skipFirstTick: true,
+    timeoutKey: "dispatchMs",
+    run: ({ deps }) => deps.reconcileExecutions?.(),
+    log: (outcome) => outcome.action === "stable"
+      ? null
+      : {
+          level: outcome.action === "error" || outcome.action === "deferred" ? "warn" : "info",
+          msg: `execution.reconcile.${outcome.action}`,
+          ...(outcome.runId ? { run: outcome.runId } : {}),
+          directory: outcome.directory,
+          ...(outcome.phase ? { phase: outcome.phase } : {}),
+          ...(outcome.detail ? { detail: outcome.detail } : {}),
           ...(outcome.error ? { error: outcome.error } : {}),
         },
   },
@@ -796,6 +827,7 @@ export function emptyDispatcherOutcomes(): DispatcherOutcomes {
     buzDrains: [],
     buzRecoveries: [],
     runtimeRecoveries: [],
+    executionReconciles: [],
     taskSupplies: [],
     requestReconciles: [],
     authRecoveries: [],
@@ -1110,7 +1142,7 @@ export async function tick(
     const terminal = isTerminalState(derived.state);
     // "done" covers both filed and sealed bees; the persisted status tells
     // them apart (a filed record carries status "done", a sealed one doesn't).
-    const filed = record.status === "done";
+    const filed = isArchivedSessionLifecycle(record);
     const sealedNow = derived.state === "done" && !filed;
     // A seal is already a durable task artifact: it does not justify one last
     // provider-wide transcript scan. Other fast terminal exits get one claimed

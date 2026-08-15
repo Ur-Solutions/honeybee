@@ -57,6 +57,7 @@ function operations(
     binding: async () => ctx.binding,
     control,
     sessions: storeSessionEvidenceSource(),
+    retireSession: async () => ({ retired: true, detail: "test SessionRecord archived" }),
     settle: async (reservation) => ({ reservation, state: "running" }),
     origin: async () => ({ nodeId: ctx.nodeId }),
     operationAttemptLeaseMs: options.operationAttemptLeaseMs ?? LEASE_MS,

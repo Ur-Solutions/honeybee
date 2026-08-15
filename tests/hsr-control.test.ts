@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,20 +8,20 @@ import { runHsrHost } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { hsrRunDir } from "../src/hsr/runDir.js";
 import { acceptHsrMessage, startHsrControlServer } from "../src/daemon/hsrControl.js";
-import { generateMessageId, listMessages } from "../src/buz.js";
+import { cancelQueuedBuzMessage, generateMessageId, listMessages } from "../src/buz.js";
 import { readBeeRequests } from "../src/requests/store.js";
-import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Set HIVE_STORE_ROOT to a fresh mkdtemp dir for the duration of `fn`. */
-async function withTempStore(fn: () => Promise<void>): Promise<void> {
+async function withTempStore(fn: (root: string) => Promise<void>): Promise<void> {
   const prev = process.env.HIVE_STORE_ROOT;
   const dir = await mkdtemp(join(tmpdir(), "honeybee-hsr-control-"));
   process.env.HIVE_STORE_ROOT = dir;
   try {
-    await fn();
+    await fn(dir);
   } finally {
     if (prev === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = prev;
@@ -246,8 +246,210 @@ test("hsr-control message durably accepts a cold idle bee and rejects an archive
       text: "do not revive archived work",
     });
     assert.equal(refused.ok, false);
+    assert.equal(refused.accepted, false, "archived is a positive pre-admission refusal");
     assert.match(String(refused.error), /archived/);
     assert.equal((await listMessages(archived.name, "queue")).length, 0);
+  });
+});
+
+test("hsr-control message accepts canonical active lifecycle despite a stale done scalar", async () => {
+  await withTempStore(async (root) => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "message-canonical-active",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "message-canonical-active",
+      substrate: "hsr",
+      providerSessionId: "thread-canonical-active",
+      createdAt: now,
+      updatedAt: now,
+      status: "done",
+      stateMachine: {
+        lifecycle: "active",
+        runtime: "parked",
+        work: "done",
+        revision: 1,
+        transitionedAt: now,
+        lastEventId: "event-message-canonical-active",
+        lastTransition: {
+          eventId: "event-message-canonical-active",
+          type: "runtime.parked",
+          cause: "idle-death",
+          at: now,
+          evidence: [{
+            kind: "probe",
+            probeId: "probe-message-canonical-active",
+            observerId: "hsr-control-test",
+            observedAt: now,
+            outcome: "dead",
+            target: { substrate: "hsr", tmuxTarget: "message-canonical-active" },
+          }],
+        },
+      },
+    };
+    // Seed the mixed-version record exactly as an older writer could have
+    // left it. Public writers correctly reject direct stateMachine mutation;
+    // this regression exercises tolerant loading of already-durable bytes.
+    const legacy = { ...record };
+    delete legacy.stateMachine;
+    await saveSession(legacy);
+    await writeFile(
+      join(root, "sessions", `${record.name}.json`),
+      `${JSON.stringify(record, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const messageId = generateMessageId();
+
+    const accepted = await acceptHsrMessage({
+      bee: record.name,
+      text: "canonical state remains live",
+      messageId,
+    });
+
+    assert.equal(accepted.ok, true);
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.messageId, messageId);
+    assert.equal(accepted.delivery, "queued");
+    assert.equal((await listMessages(record.name, "queue")).length, 1);
+  });
+});
+
+test("hsr-control repairs a fault after queue persistence into an idempotent receipt", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "message-post-persist-repair",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "message-post-persist-repair",
+      substrate: "hsr",
+      providerSessionId: "thread-post-persist-repair",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+    };
+    await saveSession(record);
+    const messageId = generateMessageId();
+    let failOnce = true;
+
+    const accepted = await acceptHsrMessage(
+      { bee: record.name, text: "persist exactly once", messageId },
+      {
+        beforeRecoveryCommit: () => {
+          if (!failOnce) return;
+          failOnce = false;
+          throw new Error("injected cursor commit failure after queue persistence");
+        },
+      },
+    );
+
+    assert.deepEqual(
+      {
+        ok: accepted.ok,
+        accepted: accepted.accepted,
+        messageId: accepted.messageId,
+        delivery: accepted.delivery,
+        idempotent: accepted.idempotent,
+      },
+      { ok: true, accepted: true, messageId, delivery: "queued", idempotent: true },
+    );
+    assert.deepEqual(
+      (await listMessages(record.name, "queue")).map((entry) => entry.message.id),
+      [messageId],
+      "the internal receipt repair must re-read, not enqueue a duplicate",
+    );
+    assert.equal((await loadSession(record.name))?.recoveryMessageId, messageId);
+  });
+});
+
+test("hsr-control types persistent post-persist failure as keyed ambiguity until replay repairs it", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "message-post-persist-ambiguous",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "message-post-persist-ambiguous",
+      substrate: "hsr",
+      providerSessionId: "thread-post-persist-ambiguous",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+    };
+    await saveSession(record);
+    const messageId = generateMessageId();
+
+    const ambiguous = await acceptHsrMessage(
+      { bee: record.name, text: "retain my durable identity", messageId },
+      {
+        beforeRecoveryCommit: () => {
+          throw new Error("injected persistent cursor store failure");
+        },
+      },
+    );
+
+    assert.equal(ambiguous.ok, false);
+    assert.equal(ambiguous.accepted, true, "recipient queue re-read proves durable admission");
+    assert.equal(ambiguous.acceptanceAmbiguous, true);
+    assert.equal(ambiguous.retryWithSameMessageId, true);
+    assert.equal(ambiguous.messageId, messageId);
+    assert.deepEqual((await listMessages(record.name, "queue")).map((entry) => entry.message.id), [messageId]);
+    assert.equal((await loadSession(record.name))?.recoveryMessageId, undefined);
+
+    const replay = await acceptHsrMessage({
+      bee: record.name,
+      text: "retain my durable identity",
+      messageId,
+    });
+    assert.equal(replay.ok, true);
+    assert.equal(replay.idempotent, true);
+    assert.equal(replay.messageId, messageId);
+    assert.equal((await loadSession(record.name))?.recoveryMessageId, messageId);
+    assert.equal((await listMessages(record.name, "queue")).length, 1);
+  });
+});
+
+test("hsr-control recovery keeps A authoritative and promotes A if legacy B is cancelled", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "queued-a-b-cancel-b",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "queued-a-b-cancel-b",
+      substrate: "hsr",
+      providerSessionId: "thread-a-b",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+    };
+    await saveSession(record);
+
+    const a = await acceptHsrMessage({ bee: record.name, text: "A" });
+    const b = await acceptHsrMessage({ bee: record.name, text: "B" });
+    assert.equal((await loadSession(record.name))?.recoveryMessageId, a.messageId, "B cannot overwrite A's recovery cursor");
+
+    // Recreate the legacy overwrite shape found in production. Cancelling B
+    // must consult queue/ and promote A instead of clearing the only cursor.
+    await updateSession(record.name, {
+      recoveryRequestedAt: new Date().toISOString(),
+      recoveryMessageId: String(b.messageId),
+      recoveryAttemptCount: 3,
+      recoveryNextAttemptAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    assert.equal(await cancelQueuedBuzMessage(record.name, String(b.messageId)), true);
+
+    const after = (await loadSession(record.name))!;
+    assert.equal(after.recoveryMessageId, a.messageId, "settling B promotes the still-durable A");
+    assert.equal(typeof after.recoveryRequestedAt, "string");
+    assert.equal(after.recoveryAttemptCount, 0, "the promoted message gets its own retry budget");
+    assert.equal(after.recoveryNextAttemptAt, undefined);
+    assert.deepEqual((await listMessages(record.name, "queue")).map((entry) => entry.message.id), [a.messageId]);
   });
 });
 
@@ -332,6 +534,38 @@ test("hsr-control messageId makes client retries idempotent", async () => {
     const collision = await acceptHsrMessage({ bee: record.name, text: "different operation", messageId });
     assert.equal(collision.ok, false);
     assert.match(String(collision.error), /different payload/);
+    assert.equal((await listMessages(record.name, "queue")).length, 1);
+  });
+});
+
+test("hsr-control receipts an exact accepted id even if the bee archives before replay", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "accepted-then-archived",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "accepted-then-archived",
+      substrate: "hsr",
+      providerSessionId: "thread-accepted-then-archived",
+      createdAt: now,
+      updatedAt: now,
+      status: "dead",
+    };
+    await saveSession(record);
+    const messageId = generateMessageId();
+    const first = await acceptHsrMessage({ bee: record.name, text: "accepted before archive", messageId });
+    assert.equal(first.ok, true);
+    await updateSession(record.name, { status: "done", updatedAt: new Date().toISOString() });
+
+    const replay = await acceptHsrMessage({ bee: record.name, text: "accepted before archive", messageId });
+    assert.equal(replay.ok, true, "terminal lifecycle drift cannot rewrite durable acceptance as refusal");
+    assert.equal(replay.accepted, true);
+    assert.equal(replay.idempotent, true);
+    assert.equal(replay.messageId, messageId);
+    assert.equal(replay.delivery, "undeliverable");
+    assert.equal((await readBeeRequests(record.name))[0]?.evidence.detail, "archive-unresolved");
     assert.equal((await listMessages(record.name, "queue")).length, 1);
   });
 });

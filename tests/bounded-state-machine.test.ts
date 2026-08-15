@@ -302,6 +302,18 @@ test("BeeView projects recovering, invisible parked, recovery failure, and obser
   assert.equal(parkedView.displayState, "ready");
   assert.equal(parkedView.latestRuntime.runtimeState, "parked");
 
+  const mixedVersionView = viewFor(record({
+    status: "done",
+    lastPromptAt: at(1),
+    stateMachine: parked,
+  }));
+  assert.equal(mixedVersionView.bee.lifecycleState, "active", "canonical active outranks a stale done scalar");
+  assert.equal(mixedVersionView.displayState, "ready");
+  assert.equal(mixedVersionView.interactionState, "idle");
+  assert.equal(mixedVersionView.latestRuntime.runtimeState, "parked");
+  assert.equal(mixedVersionView.latestRuntime.evidence.grade, "structured");
+  assert.match(mixedVersionView.latestRuntime.evidence.detail ?? "", /idle runtime parked/);
+
   const failedEvent = eventSet(12).find((event) => event.type === "recovery.failed")!;
   const failed = cursor(axes(recovering), failedEvent, recovering.revision);
   const failedView = viewFor(record({ lastPromptAt: at(1), stateMachine: failed }));

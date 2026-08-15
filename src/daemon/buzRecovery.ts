@@ -16,10 +16,8 @@ import { wakeRuntimeForQueuedSend } from "../recovery/wake.js";
 import { loadSession, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
-import { envMs } from "./timeouts.js";
 
 export const DEFAULT_BUZ_RECOVERY_CONCURRENCY = 2;
-export const DEFAULT_BUZ_RECOVERY_MAX_AGE_MS = 15 * 60_000;
 export const DEFAULT_BUZ_WAKE_RETRY_MS = 5_000;
 export const MAX_BUZ_WAKE_RETRY_MS = 5 * 60_000;
 export const DEFAULT_BUZ_WAKE_MAX_FAILURES = 8;
@@ -37,7 +35,6 @@ export type BuzRecoveryOutcome = {
 export type BuzRecoveryDeps = {
   now?: () => number;
   concurrency?: number;
-  maxRequestAgeMs?: number;
   maxFailures?: number;
   loadRecord?: typeof loadSession;
   readMessage?: typeof readMessageById;
@@ -162,15 +159,6 @@ async function processRecoveryRecord(
   }
   if (record.status === "kill_failed") {
     return markUndeliverable(record, messageId, "archive-unresolved", deps, nowMs);
-  }
-
-  const requestedAtMs = Date.parse(record.recoveryRequestedAt);
-  const maxRequestAgeMs = deps.maxRequestAgeMs ?? envMs(
-    "HIVE_BUZ_RECOVERY_MAX_AGE_MS",
-    DEFAULT_BUZ_RECOVERY_MAX_AGE_MS,
-  );
-  if (!Number.isFinite(requestedAtMs) || nowMs - requestedAtMs > maxRequestAgeMs) {
-    return markUndeliverable(record, messageId, "recovery-request-expired", deps, nowMs);
   }
 
   try {

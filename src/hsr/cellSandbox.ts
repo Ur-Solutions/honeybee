@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { getDefaultWritePaths } from "@anthropic-ai/sandbox-runtime";
+import { globToRegex } from "@anthropic-ai/sandbox-runtime/dist/sandbox/sandbox-utils.js";
 import { wrapCommandWithSandboxMacOS } from "@anthropic-ai/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js";
 import {
   cleanupBwrapMountPoints,
@@ -32,6 +33,8 @@ export type CellSandboxState = {
   scratchRoot: string;
   allowWrite: string[];
   denyWrite: string[];
+  /** Package-manager materialization trees exempted from config-name denies. */
+  packageManagerWriteTrees: string[];
   bashPath: string;
   bwrapPath?: string;
   rgPath?: string;
@@ -328,6 +331,7 @@ export function resolveCellSandboxExtraWriteRoots(
 function scratchEnvironment(scratchRoot: string): Record<string, string> {
   const temp = ensurePrivateDirectory(join(scratchRoot, "tmp"));
   const cache = ensurePrivateDirectory(join(scratchRoot, "cache"));
+  const pnpmStore = ensurePrivateDirectory(join(cache, "pnpm-store"));
   return {
     TMPDIR: temp,
     TMP: temp,
@@ -335,7 +339,12 @@ function scratchEnvironment(scratchRoot: string): Record<string, string> {
     CLAUDE_CODE_TMPDIR: temp,
     XDG_CACHE_HOME: cache,
     npm_config_cache: ensurePrivateDirectory(join(cache, "npm")),
-    PNPM_STORE_DIR: ensurePrivateDirectory(join(cache, "pnpm-store")),
+    // pnpm reads npm_config_store_dir. PNPM_STORE_DIR looks plausible but is
+    // not a pnpm configuration key; keep it as a compatibility receipt while
+    // setting the effective key so installs cannot fall back to a host/global
+    // or workspace-local store by accident.
+    npm_config_store_dir: pnpmStore,
+    PNPM_STORE_DIR: pnpmStore,
     YARN_CACHE_FOLDER: ensurePrivateDirectory(join(cache, "yarn")),
     PIP_CACHE_DIR: ensurePrivateDirectory(join(cache, "pip")),
     UV_CACHE_DIR: ensurePrivateDirectory(join(cache, "uv")),
@@ -343,6 +352,117 @@ function scratchEnvironment(scratchRoot: string): Record<string, string> {
     GOMODCACHE: ensurePrivateDirectory(join(cache, "go-mod")),
     GRADLE_USER_HOME: ensurePrivateDirectory(join(cache, "gradle")),
   };
+}
+
+const PACKAGE_MANAGER_SAFE_DANGEROUS_FILES = [
+  ".gitconfig",
+  ".gitmodules",
+  ".bashrc",
+  ".bash_profile",
+  ".zshrc",
+  ".zprofile",
+  ".profile",
+  ".ripgreprc",
+  ".mcp.json",
+] as const;
+
+const PACKAGE_MANAGER_SAFE_DANGEROUS_DIRECTORIES = [
+  ".vscode",
+  ".idea",
+  ".claude/commands",
+  ".claude/agents",
+] as const;
+
+/**
+ * Published package contents are inert below package-manager trees. Editors
+ * do not load node_modules/.vscode and Git does not consult a nested package's
+ * .gitmodules from the workspace root. Git hooks and .git/config are
+ * intentionally absent: those remain denied at every depth.
+ */
+function packageManagerWriteTrees(cwd: string, env: Record<string, string>): string[] {
+  return [...new Set([
+    // Covers root and monorepo-package dependency trees, including pnpm's
+    // node_modules/.pnpm staging directories.
+    join(cwd, "**", "node_modules"),
+    join(cwd, ".pnpm-store"),
+    env.npm_config_store_dir,
+    env.npm_config_cache,
+    env.YARN_CACHE_FOLDER,
+  ].filter((path): path is string => typeof path === "string" && path.length > 0))];
+}
+
+function macPackageManagerWriteRules(trees: readonly string[]): string {
+  const patterns: string[] = [];
+  for (const tree of trees) {
+    for (const file of PACKAGE_MANAGER_SAFE_DANGEROUS_FILES) {
+      patterns.push(join(tree, "**", file));
+    }
+    for (const directory of PACKAGE_MANAGER_SAFE_DANGEROUS_DIRECTORIES) {
+      // The directory path itself must be creatable before writes below it
+      // can match the recursive rule.
+      patterns.push(join(tree, "**", directory));
+      patterns.push(join(tree, "**", directory, "**"));
+    }
+  }
+  if (patterns.length === 0) return "";
+  return [
+    "",
+    "; Honeybee Cell package-manager materialization carve-out",
+    ...patterns.flatMap((pattern) => [
+      "(allow file-write*",
+      `  (regex ${JSON.stringify(globToRegex(pattern))})`,
+      ")",
+      // Sandbox Runtime adds operation-specific move/create denies for every
+      // mandatory path. A later generic file-write* allow does not override
+      // a more specific Seatbelt operation, so reopen those two operations
+      // over the exact same inert package paths as well.
+      "(allow file-write-create file-write-unlink",
+      `  (regex ${JSON.stringify(globToRegex(pattern))})`,
+      ")",
+    ]),
+  ].join("\n");
+}
+
+/**
+ * Sandbox Runtime 0.0.67 emits its SBPL profile as one shell-quoted `-p`
+ * argument and offers no supported mandatory-deny exclusion API. Decode that
+ * exact token, append the narrow last-match-wins rules above, and quote it
+ * again. Any upstream command-shape drift fails closed instead of silently
+ * dropping containment.
+ */
+export function appendMacPackageManagerWriteRules(
+  wrappedCommand: string,
+  trees: readonly string[],
+): string {
+  const marker = "/usr/bin/sandbox-exec -p ";
+  const markerIndex = wrappedCommand.indexOf(marker);
+  if (markerIndex < 0) throw new Error("Cell sandbox could not locate the macOS Seatbelt profile");
+  const tokenStart = markerIndex + marker.length;
+  if (wrappedCommand[tokenStart] !== "'") {
+    throw new Error("Cell sandbox found an unsupported macOS Seatbelt profile encoding");
+  }
+  let cursor = tokenStart + 1;
+  let profile = "";
+  let tokenEnd = -1;
+  for (;;) {
+    const quoteIndex = wrappedCommand.indexOf("'", cursor);
+    if (quoteIndex < 0) break;
+    profile += wrappedCommand.slice(cursor, quoteIndex);
+    if (wrappedCommand.startsWith(`'"'"'`, quoteIndex)) {
+      profile += "'";
+      cursor = quoteIndex + 5;
+      continue;
+    }
+    tokenEnd = quoteIndex + 1;
+    break;
+  }
+  if (tokenEnd < 0 || wrappedCommand[tokenEnd] !== " ") {
+    throw new Error("Cell sandbox found a truncated macOS Seatbelt profile");
+  }
+  const rules = macPackageManagerWriteRules(trees);
+  if (rules.length === 0) return wrappedCommand;
+  const quotedProfile = shellQuote(`${profile}${rules}`);
+  return `${wrappedCommand.slice(0, tokenStart)}${quotedProfile}${wrappedCommand.slice(tokenEnd)}`;
 }
 
 /** Pure enough for policy tests; filesystem roots must already exist. */
@@ -393,6 +513,7 @@ export function buildCellSandboxState(input: {
     scratchRoot,
     allowWrite,
     denyWrite,
+    packageManagerWriteTrees: packageManagerWriteTrees(cwd, nextEnv),
     bashPath,
     ...(support.backend === "linux-bubblewrap"
       ? {
@@ -468,12 +589,12 @@ export async function wrapCellSandboxCommandForState(
   // openpty) cannot allocate pseudo-terminals inside the Cell. Linux needs no
   // equivalent — bwrap's fresh /dev already mounts devpts.
   const wrapped = state.backend === "macos-seatbelt"
-    ? wrapCommandWithSandboxMacOS({
+    ? appendMacPackageManagerWriteRules(wrapCommandWithSandboxMacOS({
         ...common,
         allowLocalBinding: true,
         allowMachLookup: MACOS_SYSTEM_TRUST_MACH_SERVICES,
         allowPty: true,
-      })
+      }), state.packageManagerWriteTrees)
     : await wrapCommandWithSandboxLinux({
         ...common,
         bwrapPath: state.bwrapPath,

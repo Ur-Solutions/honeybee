@@ -16,6 +16,7 @@ import type { ProcessBirthFingerprint } from "./hsr/processIdentity.js";
 import {
   IllegalBeeTransitionError,
   isBeeStateMachineCursor,
+  isArchivedSessionLifecycle,
   isProbeEvidence,
   isUnverifiedCursorMarker,
   makeStateMachineCursor,
@@ -219,7 +220,7 @@ export type SessionRecord = {
    * fabricating lifecycle status or an observed runtime state.
    */
   recoveryRequestedAt?: string;
-  /** Exact queued buz message whose delivery owns the recovery obligation. */
+  /** Exact queued buz message currently at the head of the recovery obligation. */
   recoveryMessageId?: string;
   /** Persisted wake failures so daemon restarts cannot reset the retry cap. */
   recoveryAttemptCount?: number;
@@ -319,13 +320,12 @@ export function isActiveSessionRecord(
   // Once the bounded cursor exists its lifecycle axis is authoritative. In
   // particular, an archived cursor must never remain in the probe set merely
   // because a mixed-version reader still sees the legacy status spelling.
-  if (record.stateMachine?.lifecycle === "archived") return false;
+  if (isArchivedSessionLifecycle(record)) return false;
   if (record.stateMachine?.lifecycle === "active") return true;
   // kill_failed means teardown could not prove the runtime stopped. Keep it in
   // the daemon work set until an operator retries/repairs it. Likewise a
   // provider/runtime `error` observation can recover on a later tick. Neither
   // contributes an account commitment (limits/commitments owns that policy).
-  if (record.status === "done") return false;
   if (record.recoveryRequestedAt) return true;
   if (record.status !== "running" && record.status !== "kill_failed") return false;
   return true;
