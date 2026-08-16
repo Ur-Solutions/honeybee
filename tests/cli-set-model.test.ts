@@ -5,8 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
+import { reviveRecord } from "../src/commands/migrate.js";
+import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
+import { hasSession, setTmuxSocket, terminateProcessGroup, tmux } from "../src/substrates/local-tmux.js";
 import { ensureHsrRunDir, hsrControlSocketPath, writeHsrMeta } from "../src/hsr/runDir.js";
+import type { ProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
+import type { SessionRecord } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -83,10 +87,41 @@ async function killHsrBee(store: string, bee: string): Promise<void> {
   process.env.HIVE_STORE_ROOT = store;
   try {
     const { hsrSubstrate } = await import("../src/hsr/substrate.js");
-    await hsrSubstrate().kill(bee).catch(() => undefined);
+    const stopped = await hsrSubstrate().kill(bee);
+    assert.equal(stopped.ok, true, stopped.stderr);
   } finally {
     if (prev === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = prev;
+  }
+}
+
+async function reviveHsrBee(store: string, bee: string): Promise<SessionRecord> {
+  const prev = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = store;
+  try {
+    const record = await readBee(store, bee) as unknown as SessionRecord;
+    return await reviveRecord(record, {
+      fresh: false,
+      skipCredentialActivation: true,
+    });
+  } finally {
+    if (prev === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = prev;
+  }
+}
+
+async function cleanupExactTmuxRuntime(
+  target: string,
+  launcherPgid: number,
+  launcherFingerprint: ProcessBirthFingerprint,
+): Promise<void> {
+  const cleanup = await Promise.allSettled([
+    terminateProcessGroup(launcherPgid, launcherFingerprint),
+    tmux(["kill-session", "-t", `=${target}`], { reject: false }),
+  ]);
+  assert.equal(cleanup[0].status, "fulfilled", "exact fixture process-group cleanup completes");
+  if (cleanup[0].status === "fulfilled") {
+    assert.equal(cleanup[0].value.status, "confirmed", cleanup[0].value.reason);
   }
 }
 
@@ -226,24 +261,35 @@ test("set-model refuses relaunch when pane teardown cannot prove the old process
   await withRig(async ({ store, socket }) => {
     const bee = "CO.unconfirmed-group";
     const target = "CO-unconfirmed-group";
-    await tmux(["new-session", "-d", "-s", target, "sleep 120"]);
-    const pane = await tmux(["display-message", "-p", "-t", `=${target}:`, "#{pane_pid}"]);
-    const launcherPgid = Number(pane.stdout.trim());
-    assert.ok(Number.isSafeInteger(launcherPgid) && launcherPgid > 0);
-    await seedBee(store, bee, {
-      status: "running",
-      providerSessionId: "sess-group",
-      launcherPgid,
-      // Deliberately missing launcherFingerprint: signalling must fail closed.
-    });
+    let launcherPgid = 0;
+    let cleanupFingerprint: ProcessBirthFingerprint | undefined;
+    try {
+      await tmux(["new-session", "-d", "-s", target, "sleep 120"]);
+      const pane = await tmux(["display-message", "-p", "-t", `=${target}:`, "#{pane_pid}"]);
+      launcherPgid = Number(pane.stdout.trim());
+      assert.ok(Number.isSafeInteger(launcherPgid) && launcherPgid > 0);
+      cleanupFingerprint = await captureProcessBirthFingerprint(launcherPgid);
+      assert.ok(cleanupFingerprint);
+      assert.equal(cleanupFingerprint.pgid, launcherPgid);
+      await seedBee(store, bee, {
+        status: "running",
+        providerSessionId: "sess-group",
+        launcherPgid,
+        // Deliberately missing launcherFingerprint: signalling must fail closed.
+      });
 
-    await assert.rejects(
-      hive(store, socket, ["set-model", bee, "gpt-5.5"]),
-      /exact cleanup unconfirmed.*missing or mismatched birth fingerprint/,
-    );
+      await assert.rejects(
+        hive(store, socket, ["set-model", bee, "gpt-5.5"]),
+        /exact cleanup unconfirmed.*(?:missing|mismatched) birth fingerprint/,
+      );
 
-    assert.equal((await readBee(store, bee)).model, undefined, "selection stays aligned with the old runtime");
-    assert.equal(await hasSession(target), false, "tmux removed the pane, but that alone did not authorize relaunch");
+      assert.equal((await readBee(store, bee)).model, undefined, "selection stays aligned with the old runtime");
+      assert.equal(await hasSession(target), false, "tmux removed the pane, but that alone did not authorize relaunch");
+    } finally {
+      if (launcherPgid > 0 && cleanupFingerprint) {
+        await cleanupExactTmuxRuntime(target, launcherPgid, cleanupFingerprint);
+      }
+    }
   });
 });
 
@@ -325,7 +371,7 @@ test("set-model on a downed HSR bee records the selection and revive applies it"
       ])
       assert.match(result.stdout, /set-model\tHSR\.switch\tgpt-5\.5\trecorded/)
 
-      await hive(store, socket, ["revive", bee, "--no-wait"], { HIVE_CODEX_CMD: fakeCodex })
+      await reviveHsrBee(store, bee)
       const record = await readBee(store, bee)
       assert.equal(record.model, "gpt-5.5")
       assert.equal(record.modelExtraArgs, "-c model_reasoning_effort=high")
@@ -338,7 +384,8 @@ test("set-model on a downed HSR bee records the selection and revive applies it"
       )
       assert.equal(typeof record.runnerPid, "number")
     } finally {
-      await killHsrBee(store, bee)
+      const cleanup = await Promise.allSettled([killHsrBee(store, bee)])
+      assert.equal(cleanup[0].status, "fulfilled", "exact HSR fixture cleanup completes")
     }
   })
 })

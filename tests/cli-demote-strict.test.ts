@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
+import { terminateProcessGroup } from "../src/substrates/local-tmux.js";
+import type { ProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,12 +27,20 @@ test("demote aborts before HSR spawn when pane kill cannot confirm the old proce
   const store = await mkdtemp(join(tmpdir(), "hive-demote-strict-store-"));
   const bee = "CO.demote-unconfirmed";
   const target = "CO-demote-unconfirmed";
+  let launcherPgid: number | undefined;
+  let cleanupFingerprint: ProcessBirthFingerprint | undefined;
   setTmuxSocket(socket);
   try {
-    await tmux(["new-session", "-d", "-s", target, "sleep 120"]);
+    // --now sends C-c before strict teardown. Keep this exact fixture group
+    // alive through that interrupt so the missing record fingerprint (not a
+    // scheduling race with sleep exiting) deterministically fails closed.
+    await tmux(["new-session", "-d", "-s", target, "trap '' INT HUP TERM; while :; do sleep 1; done"]);
     const pane = await tmux(["display-message", "-p", "-t", `=${target}:`, "#{pane_pid}"]);
-    const launcherPgid = Number(pane.stdout.trim());
+    launcherPgid = Number(pane.stdout.trim());
     assert.ok(Number.isSafeInteger(launcherPgid) && launcherPgid > 0);
+    cleanupFingerprint = await captureProcessBirthFingerprint(launcherPgid);
+    assert.ok(cleanupFingerprint);
+    assert.equal(cleanupFingerprint.pgid, launcherPgid);
     await mkdir(join(store, "sessions"), { recursive: true });
     await writeFile(join(store, "sessions", `${bee}.json`), `${JSON.stringify({
       name: bee,
@@ -59,7 +70,7 @@ test("demote aborts before HSR spawn when pane kill cannot confirm the old proce
           TERM: "dumb",
         },
       }),
-      /exact cleanup unconfirmed.*missing or mismatched birth fingerprint/,
+      /exact cleanup unconfirmed.*(?:missing|mismatched) birth fingerprint/,
     );
 
     const persisted = JSON.parse(await readFile(join(store, "sessions", `${bee}.json`), "utf8")) as Record<string, unknown>;
@@ -67,9 +78,20 @@ test("demote aborts before HSR spawn when pane kill cannot confirm the old proce
     assert.equal(persisted.runtimeGeneration, undefined, "no replacement generation is committed");
     assert.equal(await hasSession(target), false, "pane absence alone did not authorize HSR spawn");
   } finally {
-    await tmux(["kill-server"], { reject: false }).catch(() => undefined);
+    const cleanup = await Promise.allSettled([
+      launcherPgid && cleanupFingerprint
+        ? terminateProcessGroup(launcherPgid, cleanupFingerprint)
+        : Promise.resolve(undefined),
+      tmux(["kill-session", "-t", `=${target}`], { reject: false }),
+    ]);
+    assert.equal(cleanup[0].status, "fulfilled", "exact fixture process-group cleanup completes");
+    if (cleanup[0].status === "fulfilled" && cleanup[0].value) {
+      assert.equal(cleanup[0].value.status, "confirmed", cleanup[0].value.reason);
+    }
     setTmuxSocket(undefined);
-    await rm(socketDir, { recursive: true, force: true });
-    await rm(store, { recursive: true, force: true });
+    await Promise.allSettled([
+      rm(socketDir, { recursive: true, force: true }),
+      rm(store, { recursive: true, force: true }),
+    ]);
   }
 });

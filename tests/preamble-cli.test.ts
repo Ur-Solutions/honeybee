@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import {
+  inspectProcessBirth,
+  listProcessRows,
+  readProcessGroupPresence,
+  sameProcessBirthFingerprint,
+  type ProcessBirthFingerprint,
+} from "../src/hsr/processIdentity.js";
+import type { HsrMeta } from "../src/hsr/runDir.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -55,6 +63,177 @@ async function readRecord(storeRoot: string, name: string): Promise<Record<strin
   return JSON.parse(await readFile(join(storeRoot, "sessions", `${name}.json`), "utf8")) as Record<string, unknown>;
 }
 
+async function readCleanupMeta(storeRoot: string, name: string): Promise<HsrMeta | null> {
+  try {
+    return JSON.parse(await readFile(join(storeRoot, "hsr", name, "meta.json"), "utf8")) as HsrMeta;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+type ExactGroupLocator = {
+  label: string;
+  pid: number;
+  pgid: number;
+  fingerprint: ProcessBirthFingerprint;
+};
+
+const EXACT_GROUP_STOP_GRACE_MS = 2_000;
+
+async function waitForExactGroupExit(locator: ExactGroupLocator, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const verdict = await inspectProcessBirth(locator.pid, locator.fingerprint);
+    if (verdict === "gone" || verdict === "mismatch") {
+      // A mismatch is a replacement incarnation and is deliberately never
+      // signalled. The exact group this test launched is no longer live.
+      if (verdict === "mismatch" || await readProcessGroupPresence(locator.pgid) === "absent") return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
+  return false;
+}
+
+/**
+ * Last-resort test-only cleanup, fenced to process groups captured from this
+ * test's own HSR meta. This never searches names or uses broad pkill: every
+ * signal is preceded by a pid/pgid/birth match, so recycled identities fail
+ * closed. It runs even when the CLI cleanup assertion fails.
+ */
+async function finalizeExactProcessGroup(locator: ExactGroupLocator): Promise<void> {
+  let verdict = await inspectProcessBirth(locator.pid, locator.fingerprint);
+  if (verdict === "match") {
+    try {
+      process.kill(-locator.pgid, "SIGTERM");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+  if (!(await waitForExactGroupExit(locator, EXACT_GROUP_STOP_GRACE_MS))) {
+    // Revalidate immediately before escalation. A vanished/recycled leader can
+    // never authorize a signal to the numeric group it used to own.
+    verdict = await inspectProcessBirth(locator.pid, locator.fingerprint);
+    if (verdict === "match") {
+      try {
+        process.kill(-locator.pgid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+  }
+  assert.equal(
+    await waitForExactGroupExit(locator, EXACT_GROUP_STOP_GRACE_MS),
+    true,
+    `${locator.label} exact process group ${locator.pgid} survived test cleanup`,
+  );
+}
+
+async function captureExactHsrProcessGroups(
+  meta: HsrMeta | null,
+  groups: ExactGroupLocator[],
+): Promise<void> {
+  if (!meta) return;
+  const add = (group: ExactGroupLocator): void => {
+    if (!groups.some((candidate) => candidate.pgid === group.pgid)) groups.push(group);
+  };
+  if (meta.childPid && meta.childPgid && meta.childFingerprint) {
+    add({
+      label: `${meta.bee} child`,
+      pid: meta.childPid,
+      pgid: meta.childPgid,
+      fingerprint: meta.childFingerprint,
+    });
+  }
+  if (meta.hostFingerprint) {
+    add({
+      label: `${meta.bee} host`,
+      pid: meta.hostPid,
+      pgid: meta.hostFingerprint.pgid,
+      fingerprint: meta.hostFingerprint,
+    });
+
+    // The child group may be runnable before its locator reaches meta.json.
+    // Take one coherent descendant census while the exact host birth still
+    // anchors ownership, then retain every detached group leader from that
+    // tree. This closes the publication race without matching process names.
+    const rows = await listProcessRows();
+    const host = rows.find((row) => row.pid === meta.hostPid);
+    if (host && sameProcessBirthFingerprint(
+      { pgid: host.pgid, startedAt: host.startedAt },
+      meta.hostFingerprint,
+    )) {
+      const owned = new Set([meta.hostPid]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const row of rows) {
+          if (owned.has(row.pid) || !owned.has(row.ppid)) continue;
+          owned.add(row.pid);
+          changed = true;
+        }
+      }
+      for (const row of rows) {
+        if (!owned.has(row.pid) || row.pid !== row.pgid) continue;
+        add({
+          label: `${meta.bee} descendant`,
+          pid: row.pid,
+          pgid: row.pgid,
+          fingerprint: { pgid: row.pgid, startedAt: row.startedAt },
+        });
+      }
+    }
+  }
+}
+
+async function finalizeHsrProcesses(groups: ExactGroupLocator[]): Promise<void> {
+  const results = await Promise.allSettled(groups.map((group) => finalizeExactProcessGroup(group)));
+  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `failed to finalize ${failures.length}/${groups.length} exact HSR process groups`);
+  }
+}
+
+async function cleanupBee(
+  storeRoot: string,
+  name: string,
+  env: Record<string, string>,
+): Promise<void> {
+  const recordPath = join(storeRoot, "sessions", `${name}.json`);
+  const processGroups: ExactGroupLocator[] = [];
+  let operationError: unknown;
+  try {
+    // All capture/read work belongs inside the protected region. The capture
+    // function appends exact locators as it learns them, so even a later
+    // census/read failure cannot discard an already-owned process group.
+    const meta = await readCleanupMeta(storeRoot, name);
+    await captureExactHsrProcessGroups(meta, processGroups);
+    const recordExists = await stat(recordPath).then(() => true, (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    });
+    if (!recordExists) return;
+    const killed = await runCli(["kill", name, "--yes"], env);
+    assert.equal(killed.code, 0, `non-interactive cleanup failed for ${name}: ${killed.stderr || killed.stdout}`);
+    await assert.rejects(() => stat(recordPath), { code: "ENOENT" });
+    await assert.rejects(() => stat(join(storeRoot, "hsr", name)), { code: "ENOENT" });
+  } catch (error) {
+    operationError = error;
+  } finally {
+    // Independent of the CLI result and before withStore removes the only temp
+    // state that could otherwise hide a leaked detached host/child locator.
+    try {
+      await finalizeHsrProcesses(processGroups);
+    } catch (cleanupError) {
+      if (operationError !== undefined) {
+        throw new AggregateError([operationError, cleanupError], `cleanup and exact process finalization failed for ${name}`);
+      }
+      throw cleanupError;
+    }
+    if (operationError !== undefined) throw operationError;
+  }
+}
+
 async function writeDurableFakeClaude(storeRoot: string): Promise<string> {
   const path = join(storeRoot, "fake-claude");
   await writeFile(path, `#!${process.execPath}\nsetInterval(() => {}, 1_000);\n`, { mode: 0o700 });
@@ -98,7 +277,7 @@ test("the message channel prepends the preamble to a stub bee's first prompt, on
       const after = await runCli(["tail", name, "-n", "80"], env);
       assert.equal(after.stdout.match(/<hive-session>/g)?.length, 1);
     } finally {
-      await runCli(["kill", name], env);
+      await cleanupBee(storeRoot, name, env);
     }
   });
 });
@@ -123,8 +302,8 @@ test("--no-preamble and HIVE_PREAMBLE_DISABLE both inject nothing", { skip: !det
       assert.equal(viaEnv.code, 0, viaEnv.stderr);
       assert.equal((await readRecord(storeRoot, envName)).preamble, undefined);
     } finally {
-      await runCli(["kill", flagName], base);
-      await runCli(["kill", envName], base);
+      await cleanupBee(storeRoot, flagName, base);
+      await cleanupBee(storeRoot, envName, base);
     }
   });
 });
@@ -156,7 +335,7 @@ test("a claude spawn carries the preamble in argv, so revive re-applies it", { s
       assert.equal(launchArgv[flagAt + 1], preamble.text);
       assert.match(launchArgv[flagAt + 1]!, /HOST_LAYER_MARKER/);
     } finally {
-      await runCli(["kill", name], env);
+      await cleanupBee(storeRoot, name, env);
     }
   });
 });
@@ -175,7 +354,7 @@ test("config preamble.text layers after the host layer for every spawn", { skip:
       const { text } = (await readRecord(storeRoot, name)).preamble as { text: string };
       assert.ok(text.indexOf("HOST_LAYER_MARKER") < text.indexOf("CONFIG_LAYER_MARKER"), text);
     } finally {
-      await runCli(["kill", name], env);
+      await cleanupBee(storeRoot, name, env);
     }
   });
 });
