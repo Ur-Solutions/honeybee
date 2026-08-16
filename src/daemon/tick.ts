@@ -22,6 +22,7 @@ import type {
   RuntimeRecoveryDispatcher,
   RuntimeRecoveryOutcome,
 } from "./runtimeRecovery.js";
+import type { RuntimeParkingDispatcher, RuntimeParkingOutcome } from "./runtimeParking.js";
 import type { FlightSweeper } from "./flightSweep.js";
 import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
 import type { CombSweeper } from "./combSweep.js";
@@ -115,6 +116,8 @@ export type TickDeps = {
   ) => Promise<RuntimeDeathDecision[]>;
   /** Tick-cheap collector/launcher for bounded mid-turn recovery. */
   dispatchRuntimeRecovery?: RuntimeRecoveryDispatcher;
+  /** Tick-cheap collector/launcher for intentional idle HSR offload. */
+  dispatchRuntimeParking?: RuntimeParkingDispatcher;
   /**
    * Optional task auto-supply dispatcher (agent task lists epic): on the same
    * idle_with_output observation that drains buz queues, feeds the top
@@ -276,6 +279,8 @@ export type DispatcherOutcomes = {
   buzRecoveries: BuzRecoveryOutcome[];
   /** Settled outcomes collected from the detached runtime-recovery lane. */
   runtimeRecoveries: RuntimeRecoveryOutcome[];
+  /** Settled outcomes collected from the detached idle-runtime parking lane. */
+  runtimeParkings: RuntimeParkingOutcome[];
   /**
    * Task auto-supply outcomes: tasks fed to idle bees through the six-
    * condition gate, fed tasks flagged stalled, per-bee errors. Empty when no
@@ -789,6 +794,27 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
       ...(outcome.error ? { error: outcome.error } : {}),
     }),
   },
+  // Idle HSR parking is last and detached. Every work-producing/recovery stage
+  // gets first refusal; this stage only derives candidates and launches the
+  // strict stop/probe transaction off-tick.
+  {
+    key: "runtimeParkings",
+    name: "dispatchRuntimeParking",
+    skipFirstTick: true,
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, observed, hsrObs, nowMs, sessionsSnapshotTrusted }) =>
+      sessionsSnapshotTrusted ? deps.dispatchRuntimeParking?.(records, observed, hsrObs, nowMs) : undefined,
+    log: (outcome) => outcome.action === "skipped"
+      ? null
+      : {
+          level: outcome.action === "failed" ? "warn" : "info",
+          msg: `runtime.parking.${outcome.action}`,
+          session: outcome.bee,
+          generation: outcome.generation,
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+          ...(outcome.error ? { error: outcome.error } : {}),
+        },
+  },
 ];
 
 export function emptyDispatcherOutcomes(): DispatcherOutcomes {
@@ -796,6 +822,7 @@ export function emptyDispatcherOutcomes(): DispatcherOutcomes {
     buzDrains: [],
     buzRecoveries: [],
     runtimeRecoveries: [],
+    runtimeParkings: [],
     taskSupplies: [],
     requestReconciles: [],
     authRecoveries: [],

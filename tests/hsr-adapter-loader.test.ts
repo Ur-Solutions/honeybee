@@ -16,6 +16,13 @@ test("loadAdapterFor matches the complete synchronous registry", async () => {
   }
 });
 
+test("only adapters that reconstruct provider pending-input handles advertise recovery", async () => {
+  for (const harness of ["stub", "claude", "codex", "cursor", "grok", "kimi"] as const) {
+    assert.equal((await loadAdapterFor(harness))?.pendingInputRecovery, undefined, harness);
+  }
+  assert.equal((await loadAdapterFor("opencode"))?.pendingInputRecovery, "resume-reconcile");
+});
+
 test("loadAdapterFor invokes only the requested own-key loader", async () => {
   const adapter = adapterFor("stub");
   assert.ok(adapter);

@@ -1,4 +1,4 @@
-import { withSessionLifecycleTransaction } from "../lifecycle.js";
+import { LifecycleConflictError, withSessionLifecycleTransaction } from "../lifecycle.js";
 import { messageDeliveryRequestId } from "../requests/keys.js";
 import { openRequest, resolveRequest } from "../requests/store.js";
 import { loadSession, type SessionRecord } from "../store.js";
@@ -52,6 +52,45 @@ export async function openMessageDeliveryRequest(
     },
   });
   return id;
+}
+
+/**
+ * Turn a queue-tier send that raced intentional parking into one durable wake
+ * obligation. If the queue write wins first, the parking primitive sees the
+ * mailbox and cancels; if parking wins first, this waits for its lifecycle
+ * lock and requests one lazy replacement.
+ */
+export async function requestMessageRecoveryIfParked(
+  snapshot: SessionRecord,
+  messageId: string,
+  now: () => number = Date.now,
+): Promise<boolean> {
+  let current = snapshot;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await withSessionLifecycleTransaction(current, async (lifecycle) => {
+        const record = await lifecycle.refresh();
+        if (record.status === "done" || record.stateMachine?.lifecycle === "archived") return false;
+        if (record.stateMachine?.runtime !== "parked") return false;
+        if (record.recoveryRequestedAt && record.recoveryMessageId) return true;
+        const at = new Date(now()).toISOString();
+        await lifecycle.commit({
+          recoveryRequestedAt: at,
+          recoveryMessageId: messageId,
+          recoveryAttemptCount: 0,
+          recoveryNextAttemptAt: undefined,
+          updatedAt: at,
+        });
+        return true;
+      });
+    } catch (error) {
+      if (!(error instanceof LifecycleConflictError)) throw error;
+      const latest = await loadSession(snapshot.name);
+      if (!latest) return false;
+      current = latest;
+    }
+  }
+  return false;
 }
 
 /**

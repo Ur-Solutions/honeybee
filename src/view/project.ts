@@ -261,6 +261,7 @@ function projectRuntime(
     };
   }
   if (runtimeState === "parked") {
+    const intentional = record.stateMachine?.lastTransition.cause === "intentional-idle-offload";
     return {
       ...base,
       state: "exited",
@@ -269,7 +270,9 @@ function projectRuntime(
         grade: "structured",
         source: "state-transition",
         observedAt: record.stateMachine?.transitionedAt,
-        detail: "idle runtime parked after a negative liveness probe",
+        detail: intentional
+          ? "idle HSR runtime intentionally offloaded after its configured grace"
+          : "idle runtime parked after a negative liveness probe",
       },
     };
   }

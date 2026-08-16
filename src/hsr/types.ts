@@ -225,6 +225,12 @@ export type RunnerSession = {
 export type RunnerAdapter = {
   harness: string; // "claude" | "codex" | ...
   tier(): RunnerTier; // from allowance registry + probing
+  /**
+   * The adapter can reconstruct provider-native pending input handles before a
+   * resumed session is exposed as ready. Omission is deliberately fail-closed:
+   * most stream/ACP handles exist only in the dead adapter process.
+   */
+  pendingInputRecovery?: "resume-reconcile";
   start(opts: RunnerOpts): Promise<RunnerSession>;
 };
 

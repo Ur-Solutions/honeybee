@@ -389,26 +389,24 @@ export async function cmdSend(parsed: Parsed) {
 
   let sent = 0;
   for (const record of records) {
-    let deliveryRecord: SessionRecord;
+    let steeredRecord: SessionRecord;
     try {
-      deliveryRecord = (await ensureLiveRuntimeForSend(record)).record;
+      // Wake and publish working intent in one lifecycle transaction. This is
+      // the cancellation fence against an idle-parking sweep.
+      steeredRecord = await markLiveRuntimeSteered(record);
     } catch (error) {
       if (!isMulti) throw error;
       if (isPretty()) console.error(note(`skip ${record.name} (${error instanceof Error ? error.message : String(error)})`));
       else console.error(`skip\t${record.name}\tdead`);
       continue;
     }
-    // Publish the steer while the runtime is probe/live. If the process dies
-    // after accepting the send, the supervisor sees durable working intent
-    // rather than a parked cursor with an orphaned pending turn.
-    const steeredRecord = await markLiveRuntimeSteered(deliveryRecord);
     // Snapshot before delivery so a very fast seal from the new turn remains
     // above the boundary. Persist only after sendText succeeds: a failed send
     // must leave the completed turn's seal authoritative.
     const turn = await nextTurnPatch(steeredRecord);
     await substrateFor(steeredRecord).sendText(steeredRecord.tmuxTarget, prompt, steeredRecord.agentPaneId);
     const now = new Date().toISOString();
-    await updateSession(deliveryRecord.name, {
+    await updateSession(steeredRecord.name, {
       ...turn,
       updatedAt: now,
       status: "running",
@@ -416,9 +414,9 @@ export async function cmdSend(parsed: Parsed) {
       lastPromptAt: now,
     });
     await writeHiveState(steeredRecord, "working");
-    await appendLedger({ type: "prompt.send", session: deliveryRecord.name, agent: deliveryRecord.agent, node: deliveryRecord.node ?? LOCAL_NODE_NAME, cwd: deliveryRecord.cwd, chars: prompt.length });
-    if (isPretty()) console.log(actionLine("ok", "send", [bold(deliveryRecord.name), `${prompt.length} chars`]));
-    else console.log(`sent\t${deliveryRecord.name}\t${prompt.length} chars`);
+    await appendLedger({ type: "prompt.send", session: steeredRecord.name, agent: steeredRecord.agent, node: steeredRecord.node ?? LOCAL_NODE_NAME, cwd: steeredRecord.cwd, chars: prompt.length });
+    if (isPretty()) console.log(actionLine("ok", "send", [bold(steeredRecord.name), `${prompt.length} chars`]));
+    else console.log(`sent\t${steeredRecord.name}\t${prompt.length} chars`);
     sent += 1;
   }
 
@@ -441,12 +439,16 @@ export async function cmdAnswer(parsed: Parsed) {
   const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ");
   const answer = text.length > 0 ? text : "yes";
 
-  const record = await resolveSession(target);
+  let record = await resolveSession(target);
   if (record.substrate !== "hsr") {
     throw new Error(`hive answer applies to HSR bees only; ${record.name} is ${record.substrate ?? "local-tmux"}`);
   }
   const pending = await pendingNeedsInput(record.name);
   if (!pending) throw new Error(`No pending needs-input for ${record.name}`);
+  // Intentional parking preserves the durable needs-you request. Lazily wake
+  // that same provider session and rebind its request generation before the
+  // answer RPC so a parked question remains answerable.
+  record = (await ensureLiveRuntimeForSend(record)).record;
   const meta = await readHsrMeta(record.name);
   if (!meta?.controlSocket) throw new Error(`No control socket for ${record.name}`);
 

@@ -888,6 +888,20 @@ export async function startOpenCodeRunner(
         }
       }
     }
+    const statusMap = asObject(statusValue);
+    const status = statusMap ? asObject(statusMap[sessionId]) : undefined;
+    if (status && status.type !== "idle") {
+      await handleProviderEvent({ type: "session.status", properties: { sessionID: sessionId, status } });
+    } else {
+      // OpenCode's live transition publishes session.status(idle) immediately
+      // followed by session.idle. Only session.idle closes a live turn, or the
+      // queued prompt it releases could be mistaken for the old turn by that
+      // second event. A reconnect has no replayed idle event, so close it here.
+      finishTurn();
+    }
+    // Rebuild pending handles after status reconciliation: finishTurn clears
+    // stale in-memory handles, while these provider lists are authoritative.
+    // OpenCode can report an idle session that is still awaiting a question.
     for (const item of Array.isArray(permissionsValue) ? permissionsValue : []) {
       const properties = asObject(item);
       if (properties && stringField(properties, "sessionID") === sessionId) {
@@ -899,17 +913,6 @@ export async function startOpenCodeRunner(
       if (properties && stringField(properties, "sessionID") === sessionId) {
         await handleProviderEvent({ type: "question.asked", properties });
       }
-    }
-    const statusMap = asObject(statusValue);
-    const status = statusMap ? asObject(statusMap[sessionId]) : undefined;
-    if (status && status.type !== "idle") {
-      await handleProviderEvent({ type: "session.status", properties: { sessionID: sessionId, status } });
-    } else {
-      // OpenCode's live transition publishes session.status(idle) immediately
-      // followed by session.idle. Only session.idle closes a live turn, or the
-      // queued prompt it releases could be mistaken for the old turn by that
-      // second event. A reconnect has no replayed idle event, so close it here.
-      finishTurn();
     }
   }
 
@@ -945,7 +948,10 @@ export async function startOpenCodeRunner(
           const eventObject = asObject(event);
           if (eventObject?.type === "server.connected") {
             connected = true;
-            if (reconnect) await reconcileAfterReconnect();
+            // A resumed server starts with an empty in-memory pendingInputs
+            // map. Reconcile provider-owned questions/permissions before the
+            // session becomes ready, exactly as we do after an SSE reconnect.
+            if (reconnect || (opts.resume && reconnects === 0)) await reconcileAfterReconnect();
             resolveSseReady();
             continue;
           }
@@ -1064,6 +1070,7 @@ export async function startOpenCodeRunner(
 
 export const openCodeAdapter: RunnerAdapter = {
   harness: "opencode",
+  pendingInputRecovery: "resume-reconcile",
   tier(): RunnerTier {
     return "server";
   },

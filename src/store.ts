@@ -899,6 +899,7 @@ export type SessionTransitionResult = {
 function transitionEventMatchesReceipt(event: BeeTransitionEvent, receipt: BeeTransitionReceipt): boolean {
   const evidence = [
     ...("evidence" in event ? [event.evidence] : []),
+    ...("liveProbe" in event ? [event.liveProbe] : []),
     ...("probe" in event ? [event.probe] : []),
   ];
   return receipt.eventId === event.eventId && receipt.type === event.type && receipt.cause === event.cause &&

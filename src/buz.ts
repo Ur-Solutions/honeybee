@@ -203,6 +203,7 @@ export { processQueueForBee } from "./buz/drain.js";
 export {
   clearMessageRecovery,
   openMessageDeliveryRequest,
+  requestMessageRecoveryIfParked,
   type MessageUndeliverableReason,
 } from "./buz/recovery.js";
 

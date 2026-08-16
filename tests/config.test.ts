@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { resolveAgent } from "../src/agents.js";
-import { beeConfig, briefFooter, DEFAULT_BRIEF_FOOTER, loadConfig, namingConfig, resetConfigCache } from "../src/config.js";
+import { beeConfig, briefFooter, DEFAULT_BRIEF_FOOTER, DEFAULT_IDLE_HSR_PARK_AFTER_MS, idleHsrParkAfterMs, loadConfig, namingConfig, resetConfigCache } from "../src/config.js";
 
 async function withTempConfig(contents: object | null, fn: () => Promise<void> | void): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-config-"));
@@ -166,6 +166,33 @@ test("briefFooter honors config override (including empty string for disable)", 
   await withTempConfig({ briefFooter: "" }, () => {
     assert.equal(briefFooter(), "");
   });
+});
+
+test("idle HSR parking grace defaults on, is configurable, and can be disabled", async () => {
+  const previous = process.env.HIVE_DAEMON_HSR_IDLE_PARK_AFTER_MS;
+  delete process.env.HIVE_DAEMON_HSR_IDLE_PARK_AFTER_MS;
+  try {
+    await withTempConfig(null, () => {
+      assert.equal(idleHsrParkAfterMs(), DEFAULT_IDLE_HSR_PARK_AFTER_MS);
+    });
+    await withTempConfig({ daemon: { idleHsrParkAfterMs: 42_000 } }, () => {
+      assert.equal(idleHsrParkAfterMs(), 42_000);
+    });
+    await withTempConfig({ daemon: { idleHsrParkAfterMs: false } }, () => {
+      assert.equal(idleHsrParkAfterMs(), null);
+    });
+    process.env.HIVE_DAEMON_HSR_IDLE_PARK_AFTER_MS = "1234";
+    await withTempConfig({ daemon: { idleHsrParkAfterMs: false } }, () => {
+      assert.equal(idleHsrParkAfterMs(), 1234, "environment override wins");
+    });
+    process.env.HIVE_DAEMON_HSR_IDLE_PARK_AFTER_MS = "0";
+    await withTempConfig(null, () => {
+      assert.equal(idleHsrParkAfterMs(), null);
+    });
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_DAEMON_HSR_IDLE_PARK_AFTER_MS;
+    else process.env.HIVE_DAEMON_HSR_IDLE_PARK_AFTER_MS = previous;
+  }
 });
 
 test("namingConfig defaults: auto-titling on, claude with haiku, low effort", async () => {

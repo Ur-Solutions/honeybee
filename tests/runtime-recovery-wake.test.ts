@@ -7,6 +7,7 @@ import { finalizeManualRuntimeRevive } from "../src/recovery/manual.js";
 import {
   ensureLiveRuntimeForSend,
   markLiveRuntimeSteered,
+  PendingInputRecoveryError,
 } from "../src/recovery/wake.js";
 import { openRequest, readBeeRequests } from "../src/requests/store.js";
 import {
@@ -106,11 +107,77 @@ test("concurrent direct sends lazily respawn one parked runner and serialize the
     assert.equal(wakes.filter((wake) => wake.woke).length, 1);
     assert.deepEqual(new Set(wakes.map((wake) => wake.record.runtimeGeneration)), new Set([2]));
 
-    await Promise.all(wakes.map((wake) => markLiveRuntimeSteered(wake.record)));
+    await Promise.all(wakes.map((wake) => markLiveRuntimeSteered(wake.record, deps)));
     const steered = (await loadSession(initial.name))!;
     assert.equal(steered.stateMachine?.runtime, "live");
     assert.equal(steered.stateMachine?.work, "working");
     assert.equal(steered.stateMachine?.revision, 2);
+  });
+});
+
+test("a dead needs-you runtime fails closed when its adapter cannot reconstruct pending input", async () => {
+  await withTempStore(async () => {
+    const initial = record("CO.pending-lost", { agent: "stub" });
+    await saveSession(initial);
+    await transitionSession(initial.name, {
+      type: "request.opened",
+      eventId: "pending-opened",
+      at: new Date(T0 - 1_000).toISOString(),
+      cause: "question",
+      requestId: "request-1",
+      evidence: { kind: "request", requestId: "request-1", observedAt: new Date(T0 - 1_000).toISOString(), action: "opened" },
+    });
+    const pending = (await loadSession(initial.name))!;
+    let launches = 0;
+    let rebinds = 0;
+    await assert.rejects(
+      () => ensureLiveRuntimeForSend(pending, {
+        isLive: async () => false,
+        probe: async () => probe("pending-dead", "dead"),
+        markVerified: async () => pending,
+        assertCwd: async () => undefined,
+        reviveInTransaction: async () => { launches += 1; return pending; },
+        rebindRequests: async () => { rebinds += 1; return []; },
+      }),
+      (error: unknown) => error instanceof PendingInputRecoveryError &&
+        error.code === "PENDING_INPUT_LOST_REISSUE_REQUIRED" && /must be reissued/.test(error.message),
+    );
+    assert.equal(launches, 0);
+    assert.equal(rebinds, 0, "an old provider-local request is never rebound speculatively");
+  });
+});
+
+test("a pending-input reconciliation capability permits resume before request rebinding", async () => {
+  await withTempStore(async () => {
+    const initial = record("OP.pending-resume", { agent: "opencode" });
+    await saveSession(initial);
+    await transitionSession(initial.name, {
+      type: "request.opened",
+      eventId: "pending-opened",
+      at: new Date(T0 - 1_000).toISOString(),
+      cause: "question",
+      requestId: "request-1",
+      evidence: { kind: "request", requestId: "request-1", observedAt: new Date(T0 - 1_000).toISOString(), action: "opened" },
+    });
+    const pending = (await loadSession(initial.name))!;
+    let live = false;
+    const order: string[] = [];
+    const resumed = await ensureLiveRuntimeForSend(pending, {
+      isLive: async () => live,
+      probe: async () => probe(live ? "pending-alive" : "pending-dead", live ? "alive" : "dead"),
+      markVerified: async () => pending,
+      assertCwd: async () => undefined,
+      canReconcilePendingInput: () => true,
+      reviveInTransaction: async (lifecycle) => {
+        order.push("resume");
+        live = true;
+        return lifecycle.commit({ runtimeGeneration: 2, status: "running" });
+      },
+      rebindRequests: async () => { order.push("rebind"); return []; },
+    });
+    assert.equal(resumed.woke, true);
+    assert.equal(resumed.record.stateMachine?.work, "needs-you");
+    assert.deepEqual(order, ["resume", "rebind"]);
   });
 });
 

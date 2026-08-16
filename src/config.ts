@@ -86,6 +86,11 @@ export type DaemonConfig = {
    * refresh token. Default true; set false to disable the dispatcher.
    */
   rotationResume?: boolean;
+  /**
+   * Grace before a live, settled local HSR runtime is intentionally stopped
+   * and left lazily wakeable. `false` disables automatic parking.
+   */
+  idleHsrParkAfterMs?: number | false;
 };
 
 export type HiveConfig = {
@@ -123,7 +128,7 @@ export function briefFooter(): string {
 let cached: HiveConfig | undefined;
 
 const TOP_LEVEL_CONFIG_KEYS = new Set(["bees", "briefFooter", "naming", "spawn", "preamble", "daemon"]);
-const DAEMON_CONFIG_KEYS = new Set(["rotationResume"]);
+const DAEMON_CONFIG_KEYS = new Set(["rotationResume", "idleHsrParkAfterMs"]);
 const PREAMBLE_CONFIG_KEYS = new Set(["enabled", "identity", "text", "maxChars"]);
 const NAMING_CONFIG_KEYS = new Set(["auto", "tool", "model", "command", "effort"]);
 const SPAWN_CONFIG_KEYS = new Set(["defaultSubstrate"]);
@@ -164,6 +169,22 @@ export function resetConfigCache(): void {
 /** Post-rotation auto-resume of stranded-home claude bees. Default on. */
 export function rotationResumeEnabled(): boolean {
   return loadConfig().daemon?.rotationResume !== false;
+}
+
+export const DEFAULT_IDLE_HSR_PARK_AFTER_MS = 15 * 60_000;
+
+/** Config/env-resolved HSR idle parking grace; null disables the policy. */
+export function idleHsrParkAfterMs(): number | null {
+  const rawEnv = process.env.HIVE_DAEMON_HSR_IDLE_PARK_AFTER_MS;
+  if (rawEnv !== undefined) {
+    const parsed = Number(rawEnv);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    if (parsed === 0) return null;
+  }
+  const configured = loadConfig().daemon?.idleHsrParkAfterMs;
+  if (configured === false) return null;
+  if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) return configured;
+  return DEFAULT_IDLE_HSR_PARK_AFTER_MS;
 }
 
 export function beeConfig(kind: string): BeeConfig {
@@ -261,6 +282,10 @@ function normalizeConfig(value: unknown): { config: HiveConfig; unknownKeys: str
     collectUnknownKeys(r, DAEMON_CONFIG_KEYS, "daemon", unknownKeys);
     const daemon: DaemonConfig = {};
     if (typeof r.rotationResume === "boolean") daemon.rotationResume = r.rotationResume;
+    if (r.idleHsrParkAfterMs === false) daemon.idleHsrParkAfterMs = false;
+    else if (typeof r.idleHsrParkAfterMs === "number" && Number.isFinite(r.idleHsrParkAfterMs) && r.idleHsrParkAfterMs > 0) {
+      daemon.idleHsrParkAfterMs = r.idleHsrParkAfterMs;
+    }
     config.daemon = daemon;
   }
   if (object.bees && typeof object.bees === "object" && !Array.isArray(object.bees)) {

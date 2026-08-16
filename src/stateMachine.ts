@@ -58,12 +58,25 @@ export type RecoveryEvidence = {
   detail?: string;
 };
 
+/** Durable policy proof for an intentional idle runtime offload. */
+export type ParkingEvidence = {
+  kind: "parking";
+  parkingId: string;
+  observedAt: string;
+  policy: "idle-grace";
+  idleSince: string;
+  graceMs: number;
+  runtimeGeneration: number;
+  work: "done" | "needs-you";
+};
+
 export type TransitionEvidence =
   | ProbeEvidence
   | HookEvidence
   | RequestEvidence
   | OperatorEvidence
-  | RecoveryEvidence;
+  | RecoveryEvidence
+  | ParkingEvidence;
 
 export type ObserverOfflineMarker = {
   observerId: string;
@@ -153,6 +166,15 @@ export type BeeTransitionEvent =
   | (EventBase & {
       type: "runtime.parked";
       cause: "idle-death";
+      probe: ProbeEvidence;
+    })
+  | (EventBase & {
+      type: "runtime.parked";
+      cause: "intentional-idle-offload";
+      evidence: ParkingEvidence;
+      /** Exact generation was alive immediately before the intentional stop. */
+      liveProbe: ProbeEvidence;
+      /** Exact generation was dead after the stop completed. */
       probe: ProbeEvidence;
     })
   | (EventBase & {
@@ -246,6 +268,12 @@ function isTransitionEvidence(value: unknown): value is TransitionEvidence {
       return isNonEmptyString(value.attemptId) && Number.isSafeInteger(value.attempt) && Number(value.attempt) > 0 &&
         Number.isSafeInteger(value.budget) && Number(value.budget) > 0 &&
         (value.outcome === "started" || value.outcome === "succeeded" || value.outcome === "failed");
+    case "parking":
+      return isNonEmptyString(value.parkingId) && value.policy === "idle-grace" &&
+        isIsoTimestamp(value.observedAt) && isIsoTimestamp(value.idleSince) &&
+        Number.isFinite(value.graceMs) && Number(value.graceMs) >= 0 &&
+        Number.isSafeInteger(value.runtimeGeneration) && Number(value.runtimeGeneration) >= 0 &&
+        (value.work === "done" || value.work === "needs-you");
     default:
       return false;
   }
@@ -254,6 +282,7 @@ function isTransitionEvidence(value: unknown): value is TransitionEvidence {
 function evidenceFor(event: BeeTransitionEvent): TransitionEvidence[] {
   const evidence: TransitionEvidence[] = [];
   if ("evidence" in event) evidence.push(event.evidence);
+  if ("liveProbe" in event) evidence.push(event.liveProbe);
   if ("probe" in event) evidence.push(event.probe);
   return evidence;
 }
@@ -263,6 +292,9 @@ function assertEventShape(event: BeeTransitionEvent): void {
   if (!isIsoTimestamp(event.at)) throw new IllegalBeeTransitionError("transition at must be an ISO timestamp");
   if ("probe" in event && !isProbeEvidence(event.probe)) {
     throw new IllegalBeeTransitionError(`${event.type} requires well-formed probe evidence`);
+  }
+  if ("liveProbe" in event && !isProbeEvidence(event.liveProbe)) {
+    throw new IllegalBeeTransitionError(`${event.type} requires well-formed pre-stop probe evidence`);
   }
   if ("requestId" in event && !isNonEmptyString(event.requestId)) {
     throw new IllegalBeeTransitionError(`${event.type} requires a requestId`);
@@ -292,6 +324,19 @@ function assertEventShape(event: BeeTransitionEvent): void {
     if (!isRecord(event.evidence) || event.evidence.kind !== "operator" || !isNonEmptyString(event.evidence.actionId) ||
         !isIsoTimestamp(event.evidence.observedAt)) {
       throw new IllegalBeeTransitionError(`${event.type} requires operator evidence`);
+    }
+  }
+  if (event.type === "runtime.parked" && event.cause === "intentional-idle-offload") {
+    if (!isRecord(event.evidence) || event.evidence.kind !== "parking" ||
+        !isNonEmptyString(event.evidence.parkingId) || event.evidence.policy !== "idle-grace" ||
+        !isIsoTimestamp(event.evidence.observedAt) || !isIsoTimestamp(event.evidence.idleSince) ||
+        !Number.isFinite(event.evidence.graceMs) || Number(event.evidence.graceMs) < 0 ||
+        !Number.isSafeInteger(event.evidence.runtimeGeneration) || Number(event.evidence.runtimeGeneration) < 0 ||
+        (event.evidence.work !== "done" && event.evidence.work !== "needs-you")) {
+      throw new IllegalBeeTransitionError("intentional runtime.parked requires idle-grace parking evidence");
+    }
+    if (event.liveProbe.outcome !== "alive") {
+      throw new IllegalBeeTransitionError("intentional runtime.parked requires an alive pre-stop probe");
     }
   }
   if (event.type === "runtime.lost" || event.type === "runtime.parked" ||
@@ -361,7 +406,8 @@ export function reduceBeeTransition(current: StateMachineSeed, event: BeeTransit
         // verified runner death is idle-shaped: park without closing or
         // recovering the question. runtime.lost intentionally remains legal
         // only for working turns above.
-        if (current.work === "done" || current.work === "needs-you") {
+        if ((current.work === "done" || current.work === "needs-you") &&
+            (event.cause !== "intentional-idle-offload" || event.evidence.work === current.work)) {
           to = { ...current, runtime: "parked", work: current.work };
         }
         break;

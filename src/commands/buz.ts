@@ -1,6 +1,6 @@
 // `hive buz` — addressed bee-to-bee messaging (four-tier delivery + policy).
 // Extracted from cli.ts (HIVE-15).
-import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, countQuarantinedMessages, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, requeueQuarantinedMessages, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzSendResult, type BuzTier } from "../buz.js";
+import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, countQuarantinedMessages, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, requeueQuarantinedMessages, requestMessageRecoveryIfParked, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzSendResult, type BuzTier } from "../buz.js";
 import { parseAge } from "../clean.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
@@ -99,6 +99,9 @@ export async function buzSend(parsed: Parsed) {
       ...(transport ? { transport } : {}),
       ...(record.node ? { node: record.node } : {}),
     });
+    if (result.message.deliveredAs === "queue" && !result.message.deliveredAt) {
+      await requestMessageRecoveryIfParked(record, result.message.id);
+    }
     printBuzSendResult(record.name, result);
   }
 }

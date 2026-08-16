@@ -19,6 +19,10 @@ let promptBeforeSubscription = false;
 let healthUnauthorizedAttempts = 0;
 let descendant;
 
+if (process.env.FAKE_OPENCODE_INITIAL_QUESTIONS) {
+  questions = JSON.parse(process.env.FAKE_OPENCODE_INITIAL_QUESTIONS);
+}
+
 if (process.env.FAKE_OPENCODE_RESUME_ID) {
   const id = process.env.FAKE_OPENCODE_RESUME_ID;
   const directory = process.env.FAKE_OPENCODE_RESUME_DIR ?? process.cwd();

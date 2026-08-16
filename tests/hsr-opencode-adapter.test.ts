@@ -26,6 +26,7 @@ type FixtureState = {
   sseClients: number;
   descendantPid?: number;
   sessions: Array<Record<string, unknown>>;
+  questions: Array<Record<string, unknown>>;
   requests: Array<{
     method: string;
     path: string;
@@ -549,6 +550,35 @@ test("resume validates cwd/ownership, claims an unowned session, and aborts thro
     await rig.session.interrupt();
     await waitFor(async () => (await rig.state()).requests.some((request) => request.path === `/session/${sessionId}/abort`), "abort endpoint");
     await waitFor(() => rig.events.some((event) => event.type === "turn_end"), "abort idle event");
+  } finally {
+    await rig.cleanup();
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  }
+});
+
+test("resume reconciles provider-pending input before exposing the session as ready", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hive-opencode-resume-pending-"));
+  const sessionId = "ses_resume_pending";
+  const rig = await startRig({
+    cwd: root,
+    resume: true,
+    sessionId,
+    env: {
+      FAKE_OPENCODE_RESUME_ID: sessionId,
+      FAKE_OPENCODE_RESUME_DIR: root,
+      FAKE_OPENCODE_INITIAL_QUESTIONS: JSON.stringify([{
+        id: "que_initial", sessionID: sessionId,
+        questions: [{ header: "Resume", question: "Continue?", options: [{ label: "yes", description: "Continue" }] }],
+      }]),
+    },
+  });
+  try {
+    const initialState = await rig.state();
+    assert.equal(initialState.questions.some((item) => item.id === "que_initial"), true, JSON.stringify(initialState.questions));
+    await rig.session.answer("que_initial", "yes");
+    const state = await rig.state();
+    assert.ok(state.requests.some((request) => request.path === "/question"));
+    assert.ok(state.requests.some((request) => request.path === "/question/que_initial/reply"));
   } finally {
     await rig.cleanup();
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });

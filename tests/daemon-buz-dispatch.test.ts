@@ -29,7 +29,6 @@ import type { BeeState } from "../src/state.js";
 import type { ProbeEvidence } from "../src/stateMachine.js";
 import { loadSession, saveSession, transitionSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { Substrate } from "../src/substrates/index.js";
-import { projectBeeView } from "../src/view/project.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-buz-dispatch-"));
@@ -313,7 +312,7 @@ test("createBuzDrainDispatcher reports scan failures without rejecting delivery"
   assert.equal(outcomes[1]!.diagnosticError, "mailbox unavailable");
 });
 
-test("createBuzDrainDispatcher backs off identical illegal transitions per recipient", async () => {
+test("createBuzDrainDispatcher backs off then opens the circuit on identical illegal transitions", async () => {
   await withTempStore(async () => {
     let now = Date.parse("2026-08-12T07:00:00.000Z");
     const recipient = makeRecord("CO.illegal");
@@ -339,6 +338,7 @@ test("createBuzDrainDispatcher backs off identical illegal transitions per recip
       now: () => now,
       scanIntervalMs: Number.MAX_SAFE_INTEGER,
       illegalTransitionBackoffMs: [60_000, 5 * 60_000, 15 * 60_000],
+      retryOpenCooldownMs: 15 * 60_000,
       hasQueuedMessages: async () => true,
       drain: async (record) => {
         attempts += 1;
@@ -357,6 +357,11 @@ test("createBuzDrainDispatcher backs off identical illegal transitions per recip
 
     const first = await dispatcher([current], [], states);
     assert.equal(first[0]?.result.errors[0]?.code, "ILLEGAL_BEE_TRANSITION");
+    assert.deepEqual(first[0]?.retryQuarantine, {
+      attempt: 1,
+      retryAt: new Date(now + 60_000).toISOString(),
+      circuitOpen: false,
+    });
     assert.deepEqual(first[0]?.illegalTransitionBackoff, {
       attempt: 1,
       retryAt: new Date(now + 60_000).toISOString(),
@@ -380,8 +385,104 @@ test("createBuzDrainDispatcher backs off identical illegal transitions per recip
     assert.equal(Date.parse(third[0]!.illegalTransitionBackoff!.retryAt) - now, 15 * 60_000);
     now = Date.parse(third[0]!.illegalTransitionBackoff!.retryAt);
     const capped = await dispatcher([current], [], states);
-    assert.equal(Date.parse(capped[0]!.illegalTransitionBackoff!.retryAt) - now, 15 * 60_000);
+    assert.deepEqual(capped[0]?.retryQuarantine, {
+      attempt: 4,
+      retryAt: new Date(now + 15 * 60_000).toISOString(),
+      circuitOpen: true,
+    });
+    assert.equal(capped[0]?.illegalTransitionBackoff, undefined);
+    now += 15 * 60_000 - 1;
+    assert.deepEqual(await dispatcher([current], [], states), []);
+    assert.equal(attempts, 4, "the open recipient circuit stops unbounded rejected-edge retries");
+    now += 1;
+    const halfOpen = await dispatcher([current], [], states);
+    assert.equal(halfOpen[0]?.retryQuarantine?.attempt, 4, "half-open failures keep the capped counter");
+    assert.equal(attempts, 5, "one probe is admitted after the bounded open cooldown");
   });
+});
+
+test("persistent transport errors are quarantined per recipient without quarantining valid mail", async () => {
+  let now = Date.parse("2026-08-12T08:00:00.000Z");
+  const recipient = makeRecord("CO.transport-stuck");
+  const states = new Map<string, BeeState>([[recipient.name, "ready"]]);
+  let attempts = 0;
+  const dispatcher = createBuzDrainDispatcher({
+    now: () => now,
+    scanIntervalMs: Number.MAX_SAFE_INTEGER,
+    retryBackoffMs: [10, 20],
+    retryMaxAttempts: 3,
+    retryOpenCooldownMs: 10 * 60_000,
+    hasQueuedMessages: async () => true,
+    drain: async () => {
+      attempts += 1;
+      return {
+        delivered: [],
+        quarantined: [],
+        // Dynamic diagnostic text must not evade the recipient-level cap.
+        errors: [{ id: "message-1", code: "ECONNREFUSED", message: `runner unavailable (attempt ${attempts})` }],
+      };
+    },
+    listQueue: async () => [],
+  });
+
+  const first = await dispatcher([recipient], [], states);
+  assert.equal(first[0]?.retryQuarantine?.attempt, 1);
+  now += 9;
+  assert.deepEqual(await dispatcher([recipient], [], states), []);
+  now += 1;
+  const second = await dispatcher([recipient], [], states);
+  assert.equal(second[0]?.retryQuarantine?.attempt, 2);
+  now += 20;
+  const opened = await dispatcher([recipient], [], states);
+  assert.deepEqual(opened[0]?.retryQuarantine, {
+    attempt: 3,
+    retryAt: new Date(now + 10 * 60_000).toISOString(),
+    circuitOpen: true,
+  });
+
+  for (let tick = 0; tick < 100; tick += 1) {
+    now += 1_000;
+    assert.deepEqual(await dispatcher([recipient], [], states), []);
+  }
+  assert.equal(attempts, 3, "one broken recipient cannot emit failures forever");
+  assert.deepEqual(opened[0]?.result.quarantined, [], "the valid message remains recoverable");
+});
+
+test("an open circuit half-open probe delivers after transport recovery without a state transition", async () => {
+  let now = Date.parse("2026-08-12T09:00:00.000Z");
+  const recipient = makeRecord("CO.transport-recovers", { lastObservedState: "crashed" });
+  const states = new Map<string, BeeState>([[recipient.name, "ready"]]);
+  let attempts = 0;
+  let healthy = false;
+  const dispatcher = createBuzDrainDispatcher({
+    now: () => now,
+    scanIntervalMs: Number.MAX_SAFE_INTEGER,
+    retryBackoffMs: [10],
+    retryMaxAttempts: 2,
+    retryOpenCooldownMs: 100,
+    hasQueuedMessages: async () => true,
+    drain: async () => {
+      attempts += 1;
+      return healthy
+        ? { delivered: ["message-1"], quarantined: [], errors: [] }
+        : { delivered: [], quarantined: [], errors: [{ id: "message-1", message: "parked runtime" }] };
+    },
+    listQueue: async () => [],
+  });
+
+  await dispatcher([recipient], [], states);
+  now += 10;
+  const opened = await dispatcher([recipient], [], states);
+  assert.equal(opened[0]?.retryQuarantine?.circuitOpen, true);
+  now += 99;
+  assert.deepEqual(await dispatcher([recipient], [], states), []);
+
+  healthy = true;
+  now += 1;
+  const recovered = await dispatcher([recipient], [], states);
+  assert.deepEqual(recovered[0]?.result.delivered, ["message-1"]);
+  assert.equal(recovered[0]?.retryQuarantine, undefined);
+  assert.equal(attempts, 3, "the bounded half-open probe observes transport recovery");
 });
 
 // ─── dispatchBuzDrains end-to-end ────────────────────────────────────────
@@ -455,7 +556,7 @@ test("dispatchBuzDrains never wakes a cold bee inline", async () => {
   });
 });
 
-test("live incident repro: needs-you dead runner parks, wakes lazily, and drains buz without closing its request", async () => {
+test("needs-you death fails closed when the adapter cannot reconcile its provider-local answer handle", async () => {
   await withTempStore(async () => {
     const now = Date.parse("2026-08-12T07:05:00.000Z");
     const recipient = makeRecord("apiary-waggle-mso8zefe-1", {
@@ -550,38 +651,22 @@ test("live incident repro: needs-you dead runner parks, wakes lazily, and drains
         now: () => now,
       }),
     });
-    assert.equal(recovery[0]?.action, "started");
-    assert.equal(launches, 1);
-    const awakened = (await loadSession(recipient.name))!;
-    assert.equal(awakened.stateMachine?.work, "needs-you");
-
-    const injected: string[] = [];
-    const drained = await dispatchBuzDrains([awakened], [], {
-      currentStates: new Map([[recipient.name, "ready"]]),
-      resolveSubstrate: () => fakeSubstrate({ sendText: async (_target, text) => { injected.push(text); } }),
-    });
-    assert.deepEqual(drained[0]?.result.delivered, [queued.message.id]);
-    assert.deepEqual(injected, [formatBuzInjection(queued.message)]);
+    assert.equal(recovery[0]?.action, "failed");
+    assert.match(recovery[0]?.error ?? "", /pending-input handle.*must be reissued/);
+    assert.equal(launches, 0);
+    assert.deepEqual(
+      (await listMessages(recipient.name, "queue")).map((entry) => entry.message.id),
+      [queued.message.id],
+      "mail remains durable while the unrecoverable question is reissued",
+    );
 
     const final = (await loadSession(recipient.name))!;
     const storedRequests = await readBeeRequests(recipient.name);
-    assert.equal(final.runtimeGeneration, 5);
-    assert.equal(storedRequests.find((request) => request.id === requestId)?.generation, 5);
+    assert.equal(final.runtimeGeneration, 4);
+    assert.equal(storedRequests.find((request) => request.id === requestId)?.generation, 4);
     assert.equal(storedRequests.find((request) => request.id === requestId)?.status, "open");
-    const view = projectBeeView({
-      record: final,
-      context: {
-        liveTargets: new Set(),
-        hsrLive: new Set([recipient.name]),
-        hsrStates: new Map([[recipient.name, "blocked"]]),
-        now,
-      },
-      storedRequests,
-      now,
-    });
     assert.equal(final.stateMachine?.work, "needs-you");
-    assert.equal(view.openRequests[0]?.id, requestId);
-    assert.equal(view.openRequests[0]?.status, "open");
+    assert.equal(final.stateMachine?.runtime, "parked");
     const ledger = (await readFile(join(process.env.HIVE_STORE_ROOT!, "ledger.jsonl"), "utf8"))
       .trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(ledger.filter((row) => row.type === "state.transition.rejected").length, 0);

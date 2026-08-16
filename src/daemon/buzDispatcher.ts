@@ -39,6 +39,8 @@ const DEFAULT_BUZ_DRAIN_CONCURRENCY = 8;
 const DEFAULT_BUZ_STALE_AFTER_MS = 10 * 60_000;
 const DEFAULT_BUZ_STALE_SCAN_INTERVAL_MS = 60_000;
 export const DEFAULT_BUZ_ILLEGAL_TRANSITION_BACKOFF_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
+export const DEFAULT_BUZ_RETRY_MAX_ATTEMPTS = 4;
+export const DEFAULT_BUZ_RETRY_OPEN_COOLDOWN_MS = 15 * 60_000;
 
 export type BuzDispatchTrigger = {
   record: SessionRecord;
@@ -50,6 +52,8 @@ export type BuzDispatchTrigger = {
 export type BuzDispatchOutcome = {
   recipient: string;
   result: DrainResult;
+  /** Bounded retry state for any repeated recipient delivery failure. */
+  retryQuarantine?: { attempt: number; retryAt?: string; circuitOpen: boolean };
   /** Present only on the actual failed attempt; suppressed ticks emit nothing. */
   illegalTransitionBackoff?: { attempt: number; retryAt: string };
   /** Operator diagnostic; deliberately separate from bee/task state. */
@@ -104,22 +108,46 @@ export type BuzStalenessDeps = {
   listQueue?: (record: SessionRecord) => ReturnType<typeof listMessages>;
   /** @internal deterministic schedule override for tests. */
   illegalTransitionBackoffMs?: readonly number[];
+  /** @internal deterministic general retry schedule override for tests. */
+  retryBackoffMs?: readonly number[];
+  /** Number of identical failures before the recipient circuit stays open. */
+  retryMaxAttempts?: number;
+  /** Cooldown between half-open transport probes after the retry cap. */
+  retryOpenCooldownMs?: number;
 };
 
-type IllegalTransitionBackoff = {
+type RecipientRetryCircuit = {
   attempt: number;
   retryAtMs: number;
   signature: string;
+  incarnation: string;
+  open: boolean;
 };
 
-function illegalTransitionError(result: DrainResult): DrainResult["errors"][number] | undefined {
-  return result.errors.find((error) => error.code === "ILLEGAL_BEE_TRANSITION");
+function deliveryFailureSignature(result: DrainResult): string | undefined {
+  if (result.errors.length === 0) return undefined;
+  return result.errors
+    .map((error) => `${error.id}:${error.code ?? "ERROR"}:${error.message}`)
+    .join("\n");
 }
 
-function illegalTransitionDelayMs(attempt: number, schedule: readonly number[]): number {
+function retryDelayMs(attempt: number, schedule: readonly number[]): number {
   const fallback = DEFAULT_BUZ_ILLEGAL_TRANSITION_BACKOFF_MS;
   const bounded = schedule.length > 0 ? schedule : fallback;
   return bounded[Math.min(Math.max(0, attempt - 1), bounded.length - 1)]!;
+}
+
+function recipientIncarnation(record: SessionRecord, currentState: string | undefined): string {
+  return JSON.stringify([
+    record.runtimeGeneration ?? 0,
+    record.runnerPid ?? null,
+    record.launcherPgid ?? null,
+    record.status,
+    currentState ?? record.lastObservedState ?? null,
+    record.stateMachine?.lifecycle ?? null,
+    record.stateMachine?.runtime ?? null,
+    record.recoveryRequestedAt ?? null,
+  ]);
 }
 
 /**
@@ -145,21 +173,41 @@ export function createBuzDrainDispatcher(
   let lastScanAt = Number.NEGATIVE_INFINITY;
   let warnings: StaleBuzQueue[] = [];
   let previousKeys = new Map<string, string>();
-  // Daemon-lifetime recipient circuit breaker. transitionSession already
-  // audits the rejected edge; suppressing identical drain attempts between
-  // these bounded retries keeps that ledger proof to one row per attempt,
-  // rather than one row per daemon tick.
-  const illegalBackoffs = new Map<string, IllegalTransitionBackoff>();
-  const illegalSchedule = deps.illegalTransitionBackoffMs ?? DEFAULT_BUZ_ILLEGAL_TRANSITION_BACKOFF_MS;
+  // Daemon-lifetime recipient circuit breaker. Any consecutive persistent
+  // transport/substrate/state error is retried only a bounded number of times;
+  // after that the queued message remains durable and the recipient gets one
+  // half-open probe per bounded cooldown. A transition/incarnation change
+  // grants an immediate probe. This caps load without requiring BeeState to
+  // change before a repaired transport can deliver again.
+  const retryCircuits = new Map<string, RecipientRetryCircuit>();
+  const retrySchedule = deps.retryBackoffMs ?? deps.illegalTransitionBackoffMs ?? DEFAULT_BUZ_ILLEGAL_TRANSITION_BACKOFF_MS;
+  const retryMaxAttempts = Math.max(
+    1,
+    deps.retryMaxAttempts ?? envConcurrency("HIVE_BUZ_RETRY_MAX_ATTEMPTS", DEFAULT_BUZ_RETRY_MAX_ATTEMPTS),
+  );
+  const retryOpenCooldownMs = Math.max(
+    1,
+    deps.retryOpenCooldownMs ?? envMs("HIVE_BUZ_RETRY_OPEN_COOLDOWN_MS", DEFAULT_BUZ_RETRY_OPEN_COOLDOWN_MS),
+  );
   return async (records, transitions, currentStates) => {
     const present = new Set(records.map((record) => record.name));
-    for (const recipient of illegalBackoffs.keys()) {
-      if (!present.has(recipient)) illegalBackoffs.delete(recipient);
+    for (const recipient of retryCircuits.keys()) {
+      if (!present.has(recipient)) retryCircuits.delete(recipient);
     }
+    const transitioned = new Set(transitions.map((transition) => transition.name));
     const drainNowMs = now();
     const drainableRecords = records.filter((record) => {
-      const backoff = illegalBackoffs.get(record.name);
-      return !backoff || backoff.retryAtMs <= drainNowMs;
+      const circuit = retryCircuits.get(record.name);
+      if (!circuit) return true;
+      const incarnation = recipientIncarnation(record, currentStates.get(record.name));
+      if (transitioned.has(record.name) || circuit.incarnation !== incarnation) {
+        retryCircuits.delete(record.name);
+        return true;
+      }
+      // Open circuits admit exactly one half-open probe per cooldown. The
+      // dispatcher is tick-serialized; the result below immediately schedules
+      // the next cooldown before a subsequent daemon tick can retry.
+      return circuit.retryAtMs <= drainNowMs;
     });
     const drained = await dispatchBuzDrains(drainableRecords, transitions, {
       ...deps,
@@ -167,20 +215,38 @@ export function createBuzDrainDispatcher(
     });
     const attempted = new Set(drained.map((outcome) => outcome.recipient));
     for (const outcome of drained) {
-      const illegal = illegalTransitionError(outcome.result);
-      if (!illegal) {
-        illegalBackoffs.delete(outcome.recipient);
+      const signature = deliveryFailureSignature(outcome.result);
+      if (!signature) {
+        retryCircuits.delete(outcome.recipient);
         continue;
       }
-      const signature = `${illegal.code}:${illegal.message}`;
-      const previous = illegalBackoffs.get(outcome.recipient);
-      const attempt = previous?.signature === signature ? previous.attempt + 1 : 1;
-      const retryAtMs = drainNowMs + illegalTransitionDelayMs(attempt, illegalSchedule);
-      illegalBackoffs.set(outcome.recipient, { attempt, retryAtMs, signature });
-      outcome.illegalTransitionBackoff = { attempt, retryAt: new Date(retryAtMs).toISOString() };
+      const record = records.find((candidate) => candidate.name === outcome.recipient)!;
+      const incarnation = recipientIncarnation(record, currentStates.get(record.name));
+      const previous = retryCircuits.get(outcome.recipient);
+      // Error wording is not a recovery signal: RPC wrappers commonly include
+      // changing timestamps/attempt ids. Only a successful drain or recipient
+      // lifecycle/incarnation edge resets the bounded failure count.
+      const attempt = previous?.incarnation === incarnation
+        ? Math.min(retryMaxAttempts, previous.attempt + 1)
+        : 1;
+      const open = attempt >= retryMaxAttempts;
+      const retryAtMs = drainNowMs + (open
+        ? retryOpenCooldownMs
+        : retryDelayMs(attempt, retrySchedule));
+      retryCircuits.set(outcome.recipient, { attempt, retryAtMs, signature, incarnation, open });
+      outcome.retryQuarantine = {
+        attempt,
+        circuitOpen: open,
+        retryAt: new Date(retryAtMs).toISOString(),
+      };
+      // Retain the old diagnostic during its migration; the generalized
+      // quarantine above is authoritative for all failure classes.
+      if (!open && outcome.result.errors.some((error) => error.code === "ILLEGAL_BEE_TRANSITION")) {
+        outcome.illegalTransitionBackoff = { attempt, retryAt: new Date(retryAtMs).toISOString() };
+      }
     }
     for (const record of drainableRecords) {
-      if (!attempted.has(record.name)) illegalBackoffs.delete(record.name);
+      if (!attempted.has(record.name)) retryCircuits.delete(record.name);
     }
     const nowMs = now();
     let newlyStale = new Set<string>();
