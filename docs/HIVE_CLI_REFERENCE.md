@@ -776,7 +776,7 @@ Show known sessions with derived state.
 ```sh
 hive list [selector] [--colony <name>] [--swarm <id>] [--node <name>]
           [--state <s>] [--agent <a>] [--repo <name>] [--tag <ns:val>]...
-          [--done] [--json] [--wide]
+          [--done|--history] [--json] [--wide]
 hive ps --wide
 ```
 
@@ -800,15 +800,21 @@ three. The facets:
 - positional `[selector]`: a bee / `@swarm` / `colony:<name>` / `#tag` /
   `tag:<...>` selector applied as a filter alongside the flags (an unknown
   colony/swarm errors, consistent with other commands).
-- `--done`: include the done visibility class: **sealed** bees and **filed**
-  (`status:"done"`) bees. Both derive to the `done` state and are **hidden by
-  default**; `--done` re-includes them. An explicit `--state done` also
-  reveals and filters to that state. Legacy spellings are still accepted:
-  `--archived` as a flag alias, and `--state sealed` / `--state archived` as
-  state aliases for `done`.
+- default visibility: reads the active-session projection, not the full
+  historical record catalog. Retired/filed and dead records are hidden unless
+  history is requested.
+- `--done` / `--history`: include the historical catalog, including the done
+  visibility class: **sealed** bees and **filed** (`status:"done"`) bees.
+  Both derive to the `done` state and are **hidden by default**; these flags
+  re-include them. An explicit `--state done` or `--state dead` also switches
+  to the historical catalog and filters to that state. Legacy spellings are
+  still accepted: `--archived` as a flag alias, and `--state sealed` /
+  `--state archived` as state aliases for `done`.
 
 **`--json`** emits a machine array regardless of TTY, after all filters are
-applied. Each element has the shape:
+applied. It is noninteractive, performs one load, never enters raw-mode/TUI,
+and then exits. `hive bees --json` emits the same row shape. Each element has
+the shape:
 
 ```json
 {
