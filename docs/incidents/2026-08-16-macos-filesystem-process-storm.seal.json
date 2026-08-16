@@ -1,0 +1,62 @@
+{
+  "status": "done",
+  "type": "implementation",
+  "summary": "Deployed Honeybee storm prevention at 09c10e8e: idempotent integrity fencing, bounded detached daemon maintenance, exact versioned stop recovery, and authoritative one-shot bees JSON. Final daemon PID 73606 is sub-second steady-state with zero repeated fenced-row writes; account:auto smoke passed and was exactly retired. Unsafe cached display semantics were fully reverted before the final install.",
+  "output": {
+    "commit": "09c10e8ee0a9ed598d5c601e1eb3eef62b2a898c",
+    "runnerArtifactSha256": "f33e5a6916387d3a3f23066d103e37a203c76b8fef13b3ba187068d3af70752f",
+    "daemonPid": 73606,
+    "latestTickMs": 847,
+    "fencedSessionSavesAfterRestart": 0,
+    "beesJsonSeconds": 1.34,
+    "smokeRunId": "run-0e72732117f8e44e7a79238d36bc1c15",
+    "smokeSessionId": "xr-fef39ebe1e33",
+    "remainingAdoptedHsrRoots": 225,
+    "report": "docs/incidents/2026-08-16-macos-filesystem-process-storm.md"
+  },
+  "filesChanged": [
+    "src/hsr/eventIntegrity.ts",
+    "src/daemon/hsrStopRecovery.ts",
+    "src/daemon/poolSweep.ts",
+    "src/daemon/terminalReprobe.ts",
+    "src/daemon/usageSampler.ts",
+    "src/commands/observe.ts",
+    "docs/incidents/2026-08-16-macos-filesystem-process-storm.md"
+  ],
+  "testsRun": [
+    {
+      "command": "npm run check",
+      "result": "passed"
+    },
+    {
+      "command": "node --import tsx --test --test-concurrency=1 <185 focused daemon/HSR/list tests>",
+      "result": "passed"
+    },
+    {
+      "command": "node --import tsx --test --test-concurrency=1 tests/cli-list-facets.test.ts tests/beesTui.test.ts",
+      "result": "passed",
+      "notes": "32/32 after reverting the unsafe cached display projection"
+    },
+    {
+      "command": "npm run build",
+      "result": "passed"
+    },
+    {
+      "command": "Apiary account:auto smoke run-0e72732117f8e44e7a79238d36bc1c15",
+      "result": "passed",
+      "notes": "Exact HIVE_FINAL_SMOKE_OK response; exact retirement; no surviving host PID"
+    }
+  ],
+  "risks": [
+    "225 launchd-adopted HSR roots remain and require exact, birth-validated one-time cleanup.",
+    "fseventsd remains near one CPU core while historical backlog drains.",
+    "Legacy kill_failed rows without stopIntent remain manual-only by design.",
+    "The interactive bees TUI retains its authoritative full refresh until a correctness-preserving snapshot protocol is designed."
+  ],
+  "nextActions": [
+    "Perform the documented exact dry-run cleanup while preserving all live and ready sessions.",
+    "Reboot orderly after cleanup, then remeasure fseventsd, swap, process roots, and daemon ticks.",
+    "Design a truth-preserving event-driven TUI snapshot with freshness and complete substrate/Pro/seal metadata."
+  ],
+  "confidence": 0.98
+}
