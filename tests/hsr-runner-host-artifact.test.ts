@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn as spawnChild, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -134,6 +134,49 @@ test("rebuilding changed source at the same package version changes the staged d
     assert.match(second, /^0\.0\.1\+sha256\.[a-f0-9]{64}$/);
     assert.notEqual(first, second);
     assert.notEqual(runnerHostBundlePath(first), runnerHostBundlePath(second));
+  });
+});
+
+test("runner-host artifact bytes do not depend on a symlinked node_modules target", async () => {
+  await withTempStore(async (root) => {
+    const physical = join(root, "physical-dependencies");
+    const project = join(root, "project");
+    const dependency = join(physical, "node_modules", "fixture-dependency");
+    await mkdir(dependency, { recursive: true });
+    await writeFile(join(dependency, "package.json"), JSON.stringify({
+      name: "fixture-dependency",
+      type: "module",
+      exports: "./index.js",
+    }));
+    await writeFile(join(dependency, "index.js"), 'export const value = "stable dependency";\n');
+    await mkdir(project, { recursive: true });
+    const entry = 'import { value } from "fixture-dependency"; process.stdout.write(value);\n';
+    await writeFile(join(project, "entry.mjs"), entry);
+    await cp(join(physical, "node_modules"), join(project, "node_modules"), { recursive: true });
+
+    const helperUrl = pathToFileURL(join(process.cwd(), "scripts", "runner-host-artifact.mjs")).href;
+    const stageScript = [
+      `import { stageRunnerHostArtifact } from ${JSON.stringify(helperUrl)};`,
+      "await stageRunnerHostArtifact(JSON.parse(process.argv[1]));",
+    ].join("\n");
+    const build = () => execFileAsync(process.execPath, ["--input-type=module", "--eval", stageScript, JSON.stringify({
+      root: project,
+      outDir: join(project, "dist"),
+      entryPoint: join(project, "entry.mjs"),
+      packageVersion: "0.0.1",
+    })]);
+    await build();
+    const copiedArtifact = await readFile(join(project, "dist", RUNNER_HOST_ARTIFACT_FILENAME));
+    const copiedManifest = await readFile(join(project, "dist", RUNNER_HOST_ARTIFACT_MANIFEST_FILENAME));
+    await rm(join(project, "node_modules"), { recursive: true, force: true });
+    await symlink(join(physical, "node_modules"), join(project, "node_modules"), "dir");
+    await build();
+    const linkedArtifact = await readFile(join(project, "dist", RUNNER_HOST_ARTIFACT_FILENAME));
+    assert.deepEqual(linkedArtifact, copiedArtifact);
+    assert.deepEqual(
+      await readFile(join(project, "dist", RUNNER_HOST_ARTIFACT_MANIFEST_FILENAME)),
+      copiedManifest,
+    );
   });
 });
 

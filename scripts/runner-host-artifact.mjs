@@ -35,6 +35,11 @@ export async function stageRunnerHostArtifact({ root, outDir, entryPoint, packag
       },
       target: "node18",
       minify: false,
+      // Worktrees commonly symlink node_modules to the primary checkout. Keep
+      // dependency paths rooted at this build tree so esbuild's module labels
+      // (and therefore the content-addressed artifact) do not encode the
+      // symlink target's machine-specific relative path.
+      preserveSymlinks: true,
       define: {
         __HIVE_RUNNER_HOST_CONTENT_ADDRESSABLE__: "true",
         __HIVE_RUNNER_HOST_PACKAGE_VERSION__: JSON.stringify(packageVersion),
