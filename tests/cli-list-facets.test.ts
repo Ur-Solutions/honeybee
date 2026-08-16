@@ -86,6 +86,33 @@ test("hive list --json emits all records with the documented fields", async () =
   });
 });
 
+test("hive bees --json is a one-shot alias of the authoritative list projection", async () => {
+  await withFixture(async ({ store, repoA, repoB }) => {
+    await seed(store, { name: "alpha", agent: "claude", cwd: repoA, colony: "frontend" });
+    await seed(store, { name: "beta", agent: "codex", cwd: repoB, colony: "backend" });
+    await seed(store, { name: "filed", agent: "codex", cwd: repoB, status: "done" });
+
+    const [listed, bees] = await Promise.all([
+      hive(store, "list", "--json"),
+      hive(store, "bees", "--json"),
+    ]);
+    const byName = (raw: string) => (JSON.parse(raw) as Array<{ name: string }>).sort((a, b) => a.name.localeCompare(b.name));
+    assert.deepEqual(byName(bees.stdout), byName(listed.stdout));
+    assert.deepEqual(
+      (JSON.parse(bees.stdout) as Array<{ name: string }>).map(({ name }) => name).sort(),
+      ["alpha", "beta"],
+      "default done visibility stays identical to the authoritative list",
+    );
+
+    const [listedDone, beesDone] = await Promise.all([
+      hive(store, "list", "--done", "--json"),
+      hive(store, "bees", "--done", "--json"),
+    ]);
+    assert.deepEqual(byName(beesDone.stdout), byName(listedDone.stdout));
+    assert.equal((JSON.parse(beesDone.stdout) as Array<{ name: string }>).some(({ name }) => name === "filed"), true);
+  });
+});
+
 test("hive list --agent filters by agent", async () => {
   await withFixture(async ({ store, repoA, repoB }) => {
     await seed(store, { name: "alpha", agent: "claude", cwd: repoA });

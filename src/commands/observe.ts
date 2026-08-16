@@ -250,6 +250,13 @@ export async function cmdList(parsed: Parsed) {
 
 
 export async function cmdBees(parsed: Parsed): Promise<void> {
+  // Machine output is the authoritative list projection, not a TUI snapshot.
+  // Exit before sidebar/raw-mode setup even when stdin/stdout are TTY.
+  if (truthy(flag(parsed, "json"))) {
+    await cmdList(parsed);
+    return;
+  }
+
   if (truthy(flag(parsed, "toggle-sidebar"))) {
     const widthRaw = stringFlag(parsed, ["width", "w"]);
     const width = widthRaw !== undefined ? Number(widthRaw) : undefined;

@@ -378,7 +378,7 @@ function printHelp() {
       rows: [
         ["list", "", "show all known sessions with state (alias: ps)"],
         ["state", "<ls|explain>", "BeeView read model: display state, requests, results, freshness (--json)"],
-        ["bees", "", "grouped fuzzy fleet TUI (^g cycles colony/pro/folder/type grouping, tab previews; --sidebar)"],
+        ["bees", "", "grouped fuzzy fleet TUI; --json emits one authoritative snapshot and exits"],
         ["fleet", "[<bee>|--all]", "orchestrator fleet trees with live state + seals (no arg: self inside a bee, else all fleets; --all forces all; --json)"],
         ["gateways", "", "list operator gateway advertisements and liveness"],
         ["tail", "<session>", "capture or follow pane content"],

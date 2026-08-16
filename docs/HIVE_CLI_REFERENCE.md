@@ -820,6 +820,11 @@ applied. Each element has the shape:
 }
 ```
 
+`hive bees --json` uses this same authoritative projection, including the
+same filters, done visibility, node/substrate labels, and repository metadata.
+It emits one snapshot and exits before any TUI, raw-mode, sidebar, or refresh
+timer is initialized.
+
 `state` is the live `@hive_state` when the bee is live, else the derived
 `BeeState`; `beeState` is always the derived `BeeState`.
 
