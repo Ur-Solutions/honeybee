@@ -6,12 +6,19 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { cmdAnswer } from "../src/commands/messaging.js";
+import {
+  HsrAnswerAmbiguousError,
+  createHsrAnswerOperation,
+  markHsrAnswerOperationAmbiguous,
+  offerHsrAnswerOperation,
+} from "../src/answerReceipt.js";
 import { createRequestReconciler } from "../src/daemon/requestSweep.js";
 import { resolveAuthRequestsAfterResume } from "../src/commands/migrate.js";
 import { runHsrHost, type HsrHostHandle } from "../src/hsr/host.js";
+import { hsrAnswerHostFromMeta } from "../src/hsr/answer.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { hsrObservations, pendingNeedsInput } from "../src/hsr/observe.js";
-import { hsrEventsPath, hsrRunDir } from "../src/hsr/runDir.js";
+import { hsrEventsPath, hsrRunDir, readHsrMetaStrict } from "../src/hsr/runDir.js";
 import { readHsrEventIntegrityReceipt } from "../src/hsr/eventIntegrity.js";
 import { transactionalKill, transactionalRetire } from "../src/kill.js";
 import type { Parsed } from "../src/parse.js";
@@ -171,6 +178,42 @@ test("cmdAnswer attributes the resolution to the calling bee via HIVE_BEE", asyn
       if (previousHiveBee === undefined) delete process.env.HIVE_BEE;
       else process.env.HIVE_BEE = previousHiveBee;
       await handle?.stop().catch(() => undefined);
+    }
+  });
+});
+
+test("cmdAnswer admits an exact ambiguous retry on a live host without a generic wake fence", async () => {
+  await withTempStore(async () => {
+    const bee = "answer-exact-ambiguous-retry";
+    const opts: RunnerOpts = {
+      bee,
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+      runDir: hsrRunDir(bee),
+    };
+    const handle = await runHsrHost({ bee, adapter: stubAdapter, opts });
+    const client = await (await import("../src/hsr/rpc.js")).connectRpcClient(handle.controlSocket);
+    try {
+      await client.call("send", { text: "ask me" });
+      await waitFor(async () => (await pendingNeedsInput(bee)) !== null, "pending exact answer retry");
+      const current = record(bee, { substrate: "hsr", runtimeGeneration: 3 });
+      await saveSession(current);
+      const pending = (await pendingNeedsInput(bee))!;
+      const meta = await readHsrMetaStrict(bee);
+      assert.ok(meta);
+      const operation = createHsrAnswerOperation(current, pending.requestId, "yes", hsrAnswerHostFromMeta(meta!));
+      await offerHsrAnswerOperation(bee, operation);
+      await markHsrAnswerOperationAmbiguous(bee, operation, "injected lost answer outcome");
+
+      await assert.rejects(
+        cmdAnswer(parsed(["answer", bee, "yes"])),
+        (error: unknown) => error instanceof HsrAnswerAmbiguousError &&
+          error.operation.answerDigest === operation.answerDigest,
+      );
+      assert.equal((await pendingNeedsInput(bee))?.requestId, pending.requestId, "retry emits no second provider answer");
+    } finally {
+      client.close();
+      await handle.stop().catch(() => undefined);
     }
   });
 });

@@ -606,7 +606,7 @@ export async function cmdAnswer(parsed: Parsed) {
   // that same local provider session and rebind its request generation before
   // the exact lifecycle/host-qualified answer admission below. Remote HSRs are
   // already governed by their node authority and are never locally parked.
-  if (record.substrate === "hsr") {
+  if (record.substrate === "hsr" && !(await initialSubstrate.hasSession(record.tmuxTarget))) {
     if (record.stateMachine?.runtime === "parked") {
       const pendingBeforeWake = await pendingNeedsInput(record.name);
       if (!pendingBeforeWake) throw new Error(`No pending needs-input for ${record.name}`);
