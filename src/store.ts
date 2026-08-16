@@ -78,6 +78,17 @@ export type HsrEventIntegrityDoubt = {
   fenceError: string;
 };
 
+export type SessionStopIntent = {
+  version: 1;
+  action: "kill" | "retire";
+  generation: number;
+  requestedAt: string;
+  attempts: number;
+  lastAttemptAt?: string;
+  nextAttemptAt?: string;
+  blockedReason?: "event-integrity" | "exhausted";
+};
+
 export type SessionRecord = {
   name: string;
   agent: string;
@@ -185,6 +196,12 @@ export type SessionRecord = {
   deliveryStopDoubt?: DeliveryStopDoubt;
   /** Independent event-history loss fence; cleared only by exact HSR reconcile. */
   eventIntegrityDoubt?: HsrEventIntegrityDoubt;
+  /**
+   * Explicit lifecycle intent behind status=kill_failed. Older records lack
+   * this and must remain manual-only: status alone does not say whether a
+   * proven stop should purge (`kill`) or archive (`retire`).
+   */
+  stopIntent?: SessionStopIntent;
   notes?: string;
   id?: string;
   prefix?: string;
@@ -1960,6 +1977,9 @@ function validateStrictSessionRecord(value: unknown, path: string): void {
   if (object.eventIntegrityDoubt !== undefined && !normalizeHsrEventIntegrityDoubt(object.eventIntegrityDoubt)) {
     throw new Error(`Invalid session record ${path}: malformed eventIntegrityDoubt`);
   }
+  if (object.stopIntent !== undefined && !normalizeSessionStopIntent(object.stopIntent)) {
+    throw new Error(`Invalid session record ${path}: malformed stopIntent`);
+  }
 }
 
 function normalizeDeliveryStopDoubt(value: unknown): DeliveryStopDoubt | null {
@@ -2043,6 +2063,37 @@ function normalizeHsrEventIntegrityDoubt(value: unknown): HsrEventIntegrityDoubt
   };
 }
 
+function normalizeSessionStopIntent(value: unknown): SessionStopIntent | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const intent = value as Record<string, unknown>;
+  if (
+    intent.version !== 1 ||
+    (intent.action !== "kill" && intent.action !== "retire") ||
+    !Number.isSafeInteger(intent.generation) || (intent.generation as number) < 0 ||
+    typeof intent.requestedAt !== "string" || !Number.isFinite(Date.parse(intent.requestedAt)) ||
+    !Number.isSafeInteger(intent.attempts) || (intent.attempts as number) < 0 ||
+    (intent.lastAttemptAt !== undefined && (typeof intent.lastAttemptAt !== "string" || !Number.isFinite(Date.parse(intent.lastAttemptAt)))) ||
+    (intent.nextAttemptAt !== undefined && (typeof intent.nextAttemptAt !== "string" || !Number.isFinite(Date.parse(intent.nextAttemptAt)))) ||
+    (
+      intent.blockedReason !== undefined &&
+      intent.blockedReason !== "event-integrity" &&
+      intent.blockedReason !== "exhausted"
+    )
+  ) return null;
+  return {
+    version: 1,
+    action: intent.action,
+    generation: intent.generation as number,
+    requestedAt: intent.requestedAt,
+    attempts: intent.attempts as number,
+    ...(typeof intent.lastAttemptAt === "string" ? { lastAttemptAt: intent.lastAttemptAt } : {}),
+    ...(typeof intent.nextAttemptAt === "string" ? { nextAttemptAt: intent.nextAttemptAt } : {}),
+    ...(intent.blockedReason === "event-integrity" || intent.blockedReason === "exhausted"
+      ? { blockedReason: intent.blockedReason }
+      : {}),
+  };
+}
+
 const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "remoteLaunchId", "remoteIncarnation", "lastObservedState", "lastObservedStateAt", "recoveryRequestedAt", "recoveryMessageId", "recoveryNextAttemptAt", "runId", "executionRunId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
@@ -2072,6 +2123,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "combActivations",
   "deliveryStopDoubt",
   "eventIntegrityDoubt",
+  "stopIntent",
   "stateMachine",
   "stateUnverified",
 ]);
@@ -2156,6 +2208,12 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
     const marker = normalizeHsrEventIntegrityDoubt(object.eventIntegrityDoubt);
     if (!marker) throw new Error(`Invalid session record ${path}: malformed eventIntegrityDoubt`);
     record.eventIntegrityDoubt = marker;
+  }
+
+  if (object.stopIntent !== undefined) {
+    const intent = normalizeSessionStopIntent(object.stopIntent);
+    if (!intent) throw new Error(`Invalid session record ${path}: malformed stopIntent`);
+    record.stopIntent = intent;
   }
 
   // Extra sandbox write roots: only well-formed absolute paths survive the

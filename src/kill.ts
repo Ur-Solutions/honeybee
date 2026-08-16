@@ -31,6 +31,7 @@ import {
   transitionSession,
   updateSession,
   withSessionLock,
+  type SessionStopIntent,
   type SessionRecord,
 } from "./store.js";
 import { isArchivedSessionLifecycle, type ProbeEvidence } from "./stateMachine.js";
@@ -106,6 +107,28 @@ function errorMessage(error: unknown): string {
   } catch {
     return String(error);
   }
+}
+
+function explicitStopIntent(
+  record: SessionRecord,
+  action: SessionStopIntent["action"],
+  now = new Date().toISOString(),
+): SessionStopIntent {
+  const generation = record.runtimeGeneration ?? 0;
+  const existing = record.stopIntent?.version === 1 &&
+    record.stopIntent.action === action &&
+    record.stopIntent.generation === generation
+    ? record.stopIntent
+    : undefined;
+  return {
+    version: 1,
+    action,
+    generation,
+    requestedAt: existing?.requestedAt ?? now,
+    attempts: existing?.attempts ?? 0,
+    ...(existing?.lastAttemptAt ? { lastAttemptAt: existing.lastAttemptAt } : {}),
+    ...(existing?.nextAttemptAt ? { nextAttemptAt: existing.nextAttemptAt } : {}),
+  };
 }
 
 async function eventIntegrityStopBlock(
@@ -271,6 +294,7 @@ export async function retireSessionAfterConfirmedRuntimeStopInTransaction(
   const retired = await updateSession(current.name, {
     updatedAt: at,
     lastError: undefined,
+    stopIntent: undefined,
   }) ?? transitioned.record;
   await resolveRequest(retired.name, stopFailedRequestId(retired.name, retired.runtimeGeneration ?? 0), { by: "stop-succeeded" }).catch(() => undefined);
   await cancelOpenRequests(retired.name, {}, "scope-closed", "retired").catch(() => undefined);
@@ -712,6 +736,7 @@ async function transactionalKillInTransaction(
   const stopping = await lifecycle.commit({
     status: "kill_failed",
     lastError: STOP_INTENT_PENDING_ERROR,
+    stopIntent: explicitStopIntent(current, "kill"),
     updatedAt: new Date().toISOString(),
   });
   const verdict = await teardownSession(stopping, options);
@@ -724,6 +749,7 @@ async function transactionalKillInTransaction(
     const failed = await lifecycle.commit({
       status: "kill_failed",
       lastError,
+      stopIntent: explicitStopIntent(stopping, "kill"),
       updatedAt: new Date().toISOString(),
     });
     await openStopFailedRequest(failed, lastError);
@@ -751,6 +777,10 @@ async function transactionalKillInTransaction(
     await lifecycle.commit({
       status: "kill_failed",
       lastError,
+      stopIntent: {
+        ...explicitStopIntent(stopped, "kill"),
+        blockedReason: "event-integrity",
+      },
       updatedAt: new Date().toISOString(),
     });
     if (emitLedger) {
@@ -832,6 +862,9 @@ export async function transactionalRetire(
           runtimeStopConfirmed: true,
         });
       }
+      if (current.stopIntent) {
+        await updateSession(current.name, { stopIntent: undefined, updatedAt: new Date().toISOString() });
+      }
       return { ok: true, alreadyGone: true, attempts: 0 };
     }
     const emitLedger = options.emitLedger !== false;
@@ -841,6 +874,7 @@ export async function transactionalRetire(
     const stopping = await lifecycle.commit({
       status: "kill_failed",
       lastError: STOP_INTENT_PENDING_ERROR,
+      stopIntent: explicitStopIntent(current, "retire"),
       updatedAt: new Date().toISOString(),
     });
     const verdict = await teardownSession(stopping, options);
@@ -851,6 +885,7 @@ export async function transactionalRetire(
       const failed = await lifecycle.commit({
         status: "kill_failed",
         lastError,
+        stopIntent: explicitStopIntent(stopping, "retire"),
         updatedAt: new Date().toISOString(),
       });
       await openStopFailedRequest(failed, lastError);
@@ -881,6 +916,10 @@ export async function transactionalRetire(
       await lifecycle.commit({
         status: "kill_failed",
         lastError,
+        stopIntent: {
+          ...explicitStopIntent(stopped, "retire"),
+          blockedReason: "event-integrity",
+        },
         updatedAt: new Date().toISOString(),
       });
       if (emitLedger) {

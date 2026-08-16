@@ -31,6 +31,7 @@ import { createPoolSweeper } from "./poolSweep.js";
 import { createTerminalReprobeSweeper } from "./terminalReprobe.js";
 import { probeHsrReAdoption } from "./reAdoption.js";
 import { createRuntimeRecoveryDispatcher, reconcileRuntimeDeaths } from "./runtimeRecovery.js";
+import { createHsrStopRecoveryDispatcher } from "./hsrStopRecovery.js";
 import { createRuntimeParkingDispatcher } from "./runtimeParking.js";
 import { createFlightSweeper } from "./flightSweep.js";
 import { createCombSweeper } from "./combSweep.js";
@@ -172,6 +173,7 @@ export function buildDefaultDeps(options: BuildDefaultDepsOptions = {}): TickDep
       probe: probeRuntime,
       transition: transitionSession,
     }),
+    dispatchHsrStopRecovery: createHsrStopRecoveryDispatcher(),
     dispatchRuntimeParking: createRuntimeParkingDispatcher(),
     reconcileExecutions: createExecutionInventoryDispatcher({ service: executionService }),
     dispatchTaskSupply: createTaskSupplyDispatcher(),

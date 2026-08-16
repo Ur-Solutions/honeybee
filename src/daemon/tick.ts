@@ -24,6 +24,7 @@ import type {
   RuntimeRecoveryDispatcher,
   RuntimeRecoveryOutcome,
 } from "./runtimeRecovery.js";
+import type { HsrStopRecoveryDispatcher, HsrStopRecoveryOutcome } from "./hsrStopRecovery.js";
 import type { RuntimeParkingDispatcher, RuntimeParkingOutcome } from "./runtimeParking.js";
 import type { FlightSweeper } from "./flightSweep.js";
 import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal, type FlightSweepOutcome } from "../flight/controller.js";
@@ -118,6 +119,8 @@ export type TickDeps = {
   ) => Promise<RuntimeDeathDecision[]>;
   /** Tick-cheap collector/launcher for bounded mid-turn recovery. */
   dispatchRuntimeRecovery?: RuntimeRecoveryDispatcher;
+  /** Tick-cheap collector/launcher for explicit HSR kill_failed teardown retry. */
+  dispatchHsrStopRecovery?: HsrStopRecoveryDispatcher;
   /** Tick-cheap collector/launcher for intentional idle HSR offload. */
   dispatchRuntimeParking?: RuntimeParkingDispatcher;
   /**
@@ -287,6 +290,8 @@ export type DispatcherOutcomes = {
   buzRecoveries: BuzRecoveryOutcome[];
   /** Settled outcomes collected from the detached runtime-recovery lane. */
   runtimeRecoveries: RuntimeRecoveryOutcome[];
+  /** Settled outcomes collected from the explicit stop-doubt retry lane. */
+  hsrStopRecoveries: HsrStopRecoveryOutcome[];
   /** Settled outcomes collected from the detached idle-runtime parking lane. */
   runtimeParkings: RuntimeParkingOutcome[];
   /** Settled outcomes from the detached durable execution inventory lane. */
@@ -533,6 +538,29 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
           ...(outcome.retryAt ? { retryAt: outcome.retryAt } : {}),
           ...(outcome.requestId ? { requestId: outcome.requestId } : {}),
           ...(outcome.replayedTurns !== undefined ? { replayedTurns: outcome.replayedTurns } : {}),
+          ...(outcome.error ? { error: outcome.error } : {}),
+        },
+  },
+  // Explicit HSR stop retry is separate from runtime recovery: kill_failed
+  // bees are never revived or admitted to work, only exact-stopped again
+  // according to their durable kill/retire intent.
+  {
+    key: "hsrStopRecoveries",
+    name: "dispatchHsrStopRecovery",
+    skipFirstTick: true,
+    timeoutKey: "dispatchMs",
+    run: ({ deps, records, sessionsSnapshotTrusted }) =>
+      sessionsSnapshotTrusted ? deps.dispatchHsrStopRecovery?.(records) : undefined,
+    log: (outcome) => outcome.action === "deferred" || outcome.action === "skipped"
+      ? null
+      : {
+          level: outcome.action === "failed" || outcome.action === "exhausted" || outcome.action === "integrity" ? "warn" : "info",
+          msg: `hsr.stop_recovery.${outcome.action}`,
+          session: outcome.bee,
+          ...(outcome.intent ? { intent: outcome.intent } : {}),
+          ...(outcome.generation !== undefined ? { generation: outcome.generation } : {}),
+          ...(outcome.attempt !== undefined ? { attempt: outcome.attempt } : {}),
+          ...(outcome.retryAt ? { retryAt: outcome.retryAt } : {}),
           ...(outcome.error ? { error: outcome.error } : {}),
         },
   },
@@ -872,6 +900,7 @@ export function emptyDispatcherOutcomes(): DispatcherOutcomes {
     buzDrains: [],
     buzRecoveries: [],
     runtimeRecoveries: [],
+    hsrStopRecoveries: [],
     runtimeParkings: [],
     executionReconciles: [],
     taskSupplies: [],
