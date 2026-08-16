@@ -5,9 +5,17 @@ import {
   purgeSessionAfterConfirmedRuntimeStopInTransaction,
   transactionalRetire,
 } from "../kill.js";
-import { withSessionLifecycleTransaction } from "../lifecycle.js";
+import { LifecycleConflictError, withSessionLifecycleTransaction } from "../lifecycle.js";
+import {
+  parkIdleHsrRuntime,
+  type ParkIdleHsrRuntimeDeps,
+} from "../recovery/park.js";
 import type { SpawnRuntimeCleanup, SpawnedRuntimeHandle } from "../spawnRuntime.js";
-import { loadSession, type SessionRecord } from "../store.js";
+import {
+  legacyStateMachineSeed,
+  loadSession,
+  type SessionRecord,
+} from "../store.js";
 
 export type ExecutionRuntimeOwner = {
   runId: string;
@@ -36,6 +44,18 @@ export type ExecutionRuntimeSettlementOptions = {
 };
 
 export type ExecutionSessionOwner = ExecutionRuntimeOwner & { sessionRef?: string };
+
+export type ExecutionRuntimeParkingResult =
+  | { status: "parked"; detail: string }
+  | { status: "deferred"; detail: string }
+  | { status: "unconfirmed"; detail: string };
+
+export type ExecutionRuntimeParkingOptions = {
+  load?: typeof loadSession;
+  park?: typeof parkIdleHsrRuntime;
+  parkDeps?: ParkIdleHsrRuntimeDeps;
+  now?: () => number;
+};
 
 const STOP_INTENT = "execution runtime stop is in progress; exact cleanup is not yet confirmed";
 
@@ -233,6 +253,134 @@ function exactExecutionSession(owner: ExecutionSessionOwner, record: SessionReco
   return record.name === owner.beeName
     && record.executionRunId === owner.runId
     && (owner.sessionRef === undefined || record.id === owner.sessionRef);
+}
+
+function isExactParkedExecutionSession(owner: ExecutionSessionOwner, record: SessionRecord): boolean {
+  const state = record.stateMachine ?? legacyStateMachineSeed(record);
+  return exactExecutionSession(owner, record)
+    && record.status === "running"
+    && record.stateUnverified === undefined
+    && record.substrate === "hsr"
+    && Boolean(record.providerSessionId)
+    && state.lifecycle === "active"
+    && state.runtime === "parked"
+    && state.work === "done";
+}
+
+/**
+ * Scale an expired execution runtime to zero without filing its logical Bee.
+ *
+ * Lease expiry is resource policy, not an operator lifecycle decision. Only a
+ * settled, exact, active HSR generation is stopped here. A real in-flight turn
+ * is deferred until the daemon's structured turn_end reconciliation changes
+ * the bounded work axis to done; an explicit run.cancel/run.release continues
+ * to use stopAndRetireExecutionSession instead.
+ */
+export async function parkExpiredExecutionSession(
+  owner: ExecutionSessionOwner,
+  leaseExpiresAt: string,
+  context: string,
+  options: ExecutionRuntimeParkingOptions = {},
+): Promise<ExecutionRuntimeParkingResult> {
+  const load = options.load ?? loadSession;
+  let snapshot: SessionRecord | null;
+  try {
+    snapshot = await load(owner.beeName);
+  } catch (error) {
+    return {
+      status: "unconfirmed",
+      detail: `${context}; canonical SessionRecord could not be read before parking: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (!snapshot || !exactExecutionSession(owner, snapshot)) {
+    return {
+      status: "unconfirmed",
+      detail: `${context}; no exact canonical execution generation authorizes runtime parking`,
+    };
+  }
+  const state = snapshot.stateMachine ?? legacyStateMachineSeed(snapshot);
+  if (state.lifecycle !== "active") {
+    return {
+      status: "unconfirmed",
+      detail: `${context}; exact execution SessionRecord is archived rather than actively parked`,
+    };
+  }
+  if (snapshot.status !== "running" || snapshot.stateUnverified) {
+    return {
+      status: "unconfirmed",
+      detail: `${context}; exact execution SessionRecord has unresolved runtime state`,
+    };
+  }
+  if (state.work !== "done") {
+    return {
+      status: "deferred",
+      detail: `${context}; bounded work is ${state.work}, so expiry will not interrupt an in-flight turn`,
+    };
+  }
+  if (snapshot.substrate !== "hsr" || !snapshot.providerSessionId) {
+    return {
+      status: "unconfirmed",
+      detail: `${context}; exact execution runtime is not a resumable local HSR`,
+    };
+  }
+  // Idempotent success is still proof-bound: a parked needs-you row, an
+  // unverified cursor, or a non-resumable substrate must never terminalize a
+  // Run merely because one axis happens to say parked.
+  if (isExactParkedExecutionSession(owner, snapshot)) {
+    return { status: "parked", detail: "exact execution runtime was already parked; logical Bee remains active" };
+  }
+  if (state.runtime !== "live") {
+    return {
+      status: "deferred",
+      detail: `${context}; runtime is ${state.runtime}, so expiry waits for runtime reconciliation`,
+    };
+  }
+
+  try {
+    const parked = await (options.park ?? parkIdleHsrRuntime)(snapshot, {
+      idleSince: leaseExpiresAt,
+      graceMs: 0,
+      work: "done",
+    }, {
+      ...options.parkDeps,
+      now: options.now ?? options.parkDeps?.now,
+    });
+    // Re-read after every parking attempt, including an apparent winner. A
+    // concurrent uncertainty/fence write is independent of the lifecycle lock
+    // and must win over the in-memory parking result.
+    const latest = await load(owner.beeName);
+    if (latest && isExactParkedExecutionSession(owner, latest)) {
+      return {
+        status: "parked",
+        detail: parked.action === "parked"
+          ? "exact execution runtime parked; logical Bee remains active"
+          : "a concurrent parking winner left the logical Bee active",
+      };
+    }
+    if (parked.action === "parked") {
+      return {
+        status: "unconfirmed",
+        detail: `${context}; post-stop canonical parked proof was invalidated by a concurrent state/fence write`,
+      };
+    }
+    const deferredReasons = new Set([
+      "work-changed",
+      "queued-send",
+      "runtime-not-live",
+      "runtime-died-before-offload",
+    ]);
+    return deferredReasons.has(parked.reason ?? "")
+      ? { status: "deferred", detail: `${context}; parking deferred (${parked.reason})` }
+      : { status: "unconfirmed", detail: `${context}; parking was not authorized (${parked.reason ?? "unknown reason"})` };
+  } catch (error) {
+    if (error instanceof LifecycleConflictError) {
+      return { status: "deferred", detail: `${context}; a concurrent lifecycle mutation won before parking` };
+    }
+    return {
+      status: "unconfirmed",
+      detail: `${context}; runtime parking could not be confirmed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 /**

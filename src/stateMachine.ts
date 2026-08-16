@@ -60,6 +60,57 @@ export type RecoveryEvidence = {
   detail?: string;
 };
 
+/** Exact audit proof for correcting the historical lease-expiry archive bug. */
+export type ArchiveCorrectionEvidence = {
+  kind: "repair";
+  repairId: string;
+  observedAt: string;
+  action: "lease-expiry-archive-correction";
+  runId: string;
+  sessionRef: string;
+  providerSessionId: string;
+  leaseExpiresAt: string;
+  archivedEventId: string;
+  runtimeGeneration: number;
+  runnerPid: number;
+  runnerFingerprint: { pgid: number; startedAt: string };
+  closureLastSeq: number;
+  closureClosedAt: string;
+};
+
+/**
+ * Exact audit proof for undoing the one mixed-version daemon overwrite that
+ * could follow a historical lease-archive correction before the fixed daemon
+ * was deployed. This is not a second general unarchive/revive primitive: it
+ * binds both the accepted correction and the compatibility writer's exact
+ * runtime.lost edge, plus an optional zero-replay successor that was strictly
+ * stopped before the cursor was restored.
+ */
+export type ArchiveCorrectionRestoreEvidence = {
+  kind: "repair";
+  repairId: string;
+  observedAt: string;
+  action: "lease-expiry-archive-correction-restore";
+  runId: string;
+  sessionRef: string;
+  providerSessionId: string;
+  leaseExpiresAt: string;
+  archivedEventId: string;
+  correctionEventId: string;
+  overwrittenEventId: string;
+  originalRuntimeGeneration: number;
+  originalRunnerPid: number;
+  originalRunnerFingerprint: { pgid: number; startedAt: string };
+  closureLastSeq: number;
+  closureClosedAt: string;
+  currentRuntimeGeneration: number;
+  currentRunnerPid: number;
+  currentRunnerFingerprint: { pgid: number; startedAt: string };
+  recoveryEpisodeId?: string;
+  recoveryAttemptId?: string;
+  recoveryEventId?: string;
+};
+
 /** Durable policy proof for an intentional idle runtime offload. */
 export type ParkingEvidence = {
   kind: "parking";
@@ -78,6 +129,8 @@ export type TransitionEvidence =
   | RequestEvidence
   | OperatorEvidence
   | RecoveryEvidence
+  | ArchiveCorrectionEvidence
+  | ArchiveCorrectionRestoreEvidence
   | ParkingEvidence;
 
 export type ObserverOfflineMarker = {
@@ -233,6 +286,18 @@ export type BeeTransitionEvent =
       probe: ProbeEvidence;
     })
   | (EventBase & {
+      type: "bee.archive-corrected";
+      cause: "lease-expiry-offload-repair";
+      evidence: ArchiveCorrectionEvidence;
+      probe: ProbeEvidence;
+    })
+  | (EventBase & {
+      type: "bee.archive-correction-restored";
+      cause: "legacy-daemon-overwrite-repair";
+      evidence: ArchiveCorrectionRestoreEvidence;
+      probe: ProbeEvidence;
+    })
+  | (EventBase & {
       type: "bee.revived";
       cause: "revive";
       resume: "working" | "needs-you" | "done";
@@ -324,6 +389,38 @@ function isTransitionEvidence(value: unknown): value is TransitionEvidence {
       return isNonEmptyString(value.attemptId) && Number.isSafeInteger(value.attempt) && Number(value.attempt) > 0 &&
         Number.isSafeInteger(value.budget) && Number(value.budget) > 0 &&
         (value.outcome === "started" || value.outcome === "succeeded" || value.outcome === "failed");
+    case "repair":
+      if (value.action === "lease-expiry-archive-correction-restore") {
+        const recoveryFields = [value.recoveryEpisodeId, value.recoveryAttemptId, value.recoveryEventId];
+        const hasRecovery = recoveryFields.every(isNonEmptyString);
+        const hasNoRecovery = recoveryFields.every((field) => field === undefined);
+        return isNonEmptyString(value.repairId) && isNonEmptyString(value.runId) &&
+          isNonEmptyString(value.sessionRef) && isNonEmptyString(value.providerSessionId) &&
+          isIsoTimestamp(value.leaseExpiresAt) && isNonEmptyString(value.archivedEventId) &&
+          isNonEmptyString(value.correctionEventId) && isNonEmptyString(value.overwrittenEventId) &&
+          Number.isSafeInteger(value.originalRuntimeGeneration) && Number(value.originalRuntimeGeneration) >= 0 &&
+          Number.isSafeInteger(value.originalRunnerPid) && Number(value.originalRunnerPid) > 0 &&
+          isRecord(value.originalRunnerFingerprint) &&
+          Number.isSafeInteger(value.originalRunnerFingerprint.pgid) && Number(value.originalRunnerFingerprint.pgid) > 0 &&
+          isNonEmptyString(value.originalRunnerFingerprint.startedAt) &&
+          Number.isSafeInteger(value.closureLastSeq) && Number(value.closureLastSeq) > 0 &&
+          isIsoTimestamp(value.closureClosedAt) &&
+          Number.isSafeInteger(value.currentRuntimeGeneration) && Number(value.currentRuntimeGeneration) >= 0 &&
+          Number.isSafeInteger(value.currentRunnerPid) && Number(value.currentRunnerPid) > 0 &&
+          isRecord(value.currentRunnerFingerprint) &&
+          Number.isSafeInteger(value.currentRunnerFingerprint.pgid) && Number(value.currentRunnerFingerprint.pgid) > 0 &&
+          isNonEmptyString(value.currentRunnerFingerprint.startedAt) &&
+          (hasRecovery || hasNoRecovery);
+      }
+      return isNonEmptyString(value.repairId) && value.action === "lease-expiry-archive-correction" &&
+        isNonEmptyString(value.runId) && isNonEmptyString(value.sessionRef) &&
+        isNonEmptyString(value.providerSessionId) && isIsoTimestamp(value.leaseExpiresAt) &&
+        isNonEmptyString(value.archivedEventId) && Number.isSafeInteger(value.runtimeGeneration) &&
+        Number(value.runtimeGeneration) >= 0 && Number.isSafeInteger(value.runnerPid) && Number(value.runnerPid) > 0 &&
+        isRecord(value.runnerFingerprint) && Number.isSafeInteger(value.runnerFingerprint.pgid) &&
+        Number(value.runnerFingerprint.pgid) > 0 && isNonEmptyString(value.runnerFingerprint.startedAt) &&
+        Number.isSafeInteger(value.closureLastSeq) &&
+        Number(value.closureLastSeq) > 0 && isIsoTimestamp(value.closureClosedAt);
     case "parking":
       return isNonEmptyString(value.parkingId) && value.policy === "idle-grace" &&
         isIsoTimestamp(value.observedAt) && isIsoTimestamp(value.idleSince) &&
@@ -382,6 +479,30 @@ function assertEventShape(event: BeeTransitionEvent): void {
       throw new IllegalBeeTransitionError(`${event.type} requires operator evidence`);
     }
   }
+  if (event.type === "bee.archive-corrected") {
+    if (!isRecord(event.evidence) || event.evidence.kind !== "repair" ||
+        event.evidence.action !== "lease-expiry-archive-correction" ||
+        !isNonEmptyString(event.evidence.repairId) || !isNonEmptyString(event.evidence.runId) ||
+        !isNonEmptyString(event.evidence.sessionRef) || !isNonEmptyString(event.evidence.providerSessionId) ||
+        !isIsoTimestamp(event.evidence.observedAt) || !isIsoTimestamp(event.evidence.leaseExpiresAt) ||
+        !isNonEmptyString(event.evidence.archivedEventId) ||
+        !Number.isSafeInteger(event.evidence.runtimeGeneration) || event.evidence.runtimeGeneration < 0 ||
+        !Number.isSafeInteger(event.evidence.runnerPid) || event.evidence.runnerPid <= 0 ||
+        !isRecord(event.evidence.runnerFingerprint) ||
+        !Number.isSafeInteger(event.evidence.runnerFingerprint.pgid) || event.evidence.runnerFingerprint.pgid <= 0 ||
+        !isNonEmptyString(event.evidence.runnerFingerprint.startedAt) ||
+        !Number.isSafeInteger(event.evidence.closureLastSeq) || Number(event.evidence.closureLastSeq) <= 0 ||
+        !isIsoTimestamp(event.evidence.closureClosedAt)) {
+      throw new IllegalBeeTransitionError("bee.archive-corrected requires exact lease-expiry repair evidence");
+    }
+  }
+  if (event.type === "bee.archive-correction-restored") {
+    if (!isRecord(event.evidence) || event.evidence.kind !== "repair" ||
+        event.evidence.action !== "lease-expiry-archive-correction-restore" ||
+        !isTransitionEvidence(event.evidence)) {
+      throw new IllegalBeeTransitionError("bee.archive-correction-restored requires exact overwrite-repair evidence");
+    }
+  }
   if (event.type === "runtime.parked" && event.cause === "intentional-idle-offload") {
     if (!isRecord(event.evidence) || event.evidence.kind !== "parking" ||
         !isNonEmptyString(event.evidence.parkingId) || event.evidence.policy !== "idle-grace" ||
@@ -396,6 +517,8 @@ function assertEventShape(event: BeeTransitionEvent): void {
     }
   }
   if (event.type === "runtime.lost" || event.type === "runtime.parked" ||
+      event.type === "bee.archive-corrected" ||
+      event.type === "bee.archive-correction-restored" ||
       event.type === "recovery.failed") {
     if (event.probe.outcome !== "dead") {
       throw new IllegalBeeTransitionError(`${event.type} requires a probe whose outcome is dead`);
@@ -419,11 +542,19 @@ export function reduceBeeTransition(current: StateMachineSeed, event: BeeTransit
   let to: StateMachineSeed | undefined;
 
   if (current.lifecycle === "archived") {
-    if (event.type === "bee.revived" && event.resume !== "needs-you") {
+    if (event.type === "bee.archive-corrected") {
+      to = { lifecycle: "active", runtime: "parked", work: "done" };
+    } else if (event.type === "bee.revived" && event.resume !== "needs-you") {
       to = { lifecycle: "active", runtime: "live", work: event.resume };
     }
   } else if (event.type === "bee.archived") {
     to = { lifecycle: "archived", runtime: "parked", work: "done" };
+  } else if (
+    event.type === "bee.archive-correction-restored" &&
+    current.lifecycle === "active" && current.work === "working" &&
+    (current.runtime === "recovering" || current.runtime === "live")
+  ) {
+    to = { lifecycle: "active", runtime: "parked", work: "done" };
   } else {
     switch (event.type) {
       case "turn.started":

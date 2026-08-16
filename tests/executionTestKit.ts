@@ -274,6 +274,8 @@ export type ServiceOptions = {
   appendLaunchEvents?: ExecutionServiceOptions["appendLaunchEvents"];
   retireSession?: ExecutionServiceOptions["retireSession"];
   stopAndRetireSession?: ExecutionServiceOptions["stopAndRetireSession"];
+  parkSessionRuntime?: ExecutionServiceOptions["parkSessionRuntime"];
+  operationPersistence?: ExecutionServiceOptions["operationPersistence"];
   /** Exercise the production lifecycle-fenced strict substrate protocol. */
   useProductionStopProtocol?: boolean;
   launchGraceMs?: number;
@@ -320,7 +322,15 @@ export function makeService(opts: ServiceOptions = {}): ExecutionService {
           detail: retirement.detail,
           cleanup,
           stopDoubtPersisted: true,
-        };
+      };
+  };
+  const testParkSessionRuntime: NonNullable<ExecutionServiceOptions["parkSessionRuntime"]> = async (
+    reservation,
+  ) => {
+    const cleanup = await control.stop(reservation.beeName);
+    return cleanup.stopped
+      ? { status: "parked", detail: "test runtime parked without archiving its SessionRecord" }
+      : { status: "unconfirmed", detail: cleanup.detail };
   };
   return createExecutionService({
     launcher: opts.launcher ?? countingLauncher().launcher,
@@ -331,6 +341,7 @@ export function makeService(opts: ServiceOptions = {}): ExecutionService {
     ...(!opts.useProductionStopProtocol
       ? { stopAndRetireSession: opts.stopAndRetireSession ?? testStopAndRetireSession }
       : {}),
+    parkSessionRuntime: opts.parkSessionRuntime ?? testParkSessionRuntime,
     harnessProbe: async (kind) => (kind === "claude" ? { status: "ready" } : { status: "absent" }),
     ...(opts.now ? { now: opts.now } : {}),
     launchOwner: owner,
@@ -338,6 +349,7 @@ export function makeService(opts: ServiceOptions = {}): ExecutionService {
     ...(opts.afterAdmission ? { afterAdmission: opts.afterAdmission } : {}),
     ...(opts.afterLaunchClaim ? { afterLaunchClaim: opts.afterLaunchClaim } : {}),
     ...(opts.appendLaunchEvents ? { appendLaunchEvents: opts.appendLaunchEvents } : {}),
+    ...(opts.operationPersistence ? { operationPersistence: opts.operationPersistence } : {}),
     ...(opts.launchGraceMs !== undefined ? { launchGraceMs: opts.launchGraceMs } : {}),
   });
 }

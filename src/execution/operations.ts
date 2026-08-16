@@ -33,6 +33,7 @@ import {
   mutateOperation,
   readOperation,
   setOperationResult,
+  type CancelLifecycleSettlement,
   type OperationMethod,
   type OperationAttempt,
   type OperationAttemptKind,
@@ -129,6 +130,10 @@ const MAX_OPERATION_ATTEMPT_LEASE_MS = 60_000;
 function asObject(value: JsonValue | undefined): JsonObject | undefined {
   if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as JsonObject;
+}
+
+function isLeaseParkedTerminal(reservation: RunReservation): boolean {
+  return reservation.result?.outcome === "cancelled" && reservation.result.cause === "lease_expired";
 }
 
 export function createRunOperations(deps: RunOperationsDeps): RunOperations {
@@ -477,6 +482,232 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
     }
   }
 
+  /**
+   * Publish the operator cancel member only from durable proof that the
+   * lease-terminal Bee cleanup settled. The new-writer-only cancelLifecycle
+   * receipt is that proof: admission and a legacy terminal operation result
+   * are intentionally insufficient because older coordinators wrote those
+   * bytes without attempting to archive an already-terminal Run's Bee.
+   */
+  async function appendSettledExplicitCancel(record: OperationRecord): Promise<void> {
+    const proof = record.cancelLifecycle;
+    if (!proof) {
+      throw executionError(
+        "AUTHORITY_UNAVAILABLE",
+        `run.cancel operation ${record.effectKey} has no archive-settlement proof`,
+      );
+    }
+    await appendEvents(
+      record.runId,
+      protocolVersion,
+      [{
+        type: "cancel.requested",
+        payload: {
+          effectKey: record.effectKey,
+          ...(record.cause ? { reason: record.cause } : {}),
+          lifecycleProofId: `${record.effectKey}/archive-settled/v1`,
+          lifecycleProof: proof,
+        },
+        origin: await deps.origin(),
+      }],
+      { onlyIfAbsentKeys: true },
+    );
+  }
+
+  function exactCancelLifecycleSettlement(
+    operation: OperationRecord,
+    reservation: RunReservation,
+  ): CancelLifecycleSettlement | undefined {
+    const proof = operation.cancelLifecycle;
+    if (
+      proof?.version !== 1 ||
+      proof.state !== "archive-settled" ||
+      proof.runId !== operation.runId ||
+      proof.effectKey !== operation.effectKey ||
+      proof.beeName !== reservation.beeName ||
+      proof.leaseId !== reservation.leaseId ||
+      proof.resultCause !== "lease_expired" ||
+      proof.sessionRef !== reservation.sessionRef
+    ) return undefined;
+    return proof;
+  }
+
+  /**
+   * Continue one explicit cancel that arrived after immutable lease expiry.
+   * Ordering is exact and crash-safe:
+   *
+   *   stop/archive -> durable cancelLifecycle archive proof -> cancel.requested
+   *
+   * A crash before the proof simply retries the idempotent exact cleanup. A
+   * crash after it self-heals only the missing event and never stops twice.
+   * The Run's own immutable `{ outcome: cancelled, cause: lease_expired }` is
+   * untouched.
+   */
+  async function progressLeaseExpiredCancel(
+    runId: string,
+    effectKey: string,
+    observedReservation?: RunReservation,
+  ): Promise<OperationRecord> {
+    let operation = await readOperation(runId, effectKey);
+    if (!operation || operation.method !== "run.cancel") {
+      throw executionError("AUTHORITY_UNAVAILABLE", `run.cancel operation ${effectKey} has no durable record`);
+    }
+    let reservation = (await readReservation(runId)) ?? observedReservation;
+    if (!reservation || !isLeaseParkedTerminal(reservation)) return operation;
+    if (operation.cancelLifecycle && !exactCancelLifecycleSettlement(operation, reservation)) {
+      // A structurally valid receipt bound to different lifecycle facts is
+      // conflicting authority, not permission to retry a destructive stop.
+      throw executionError(
+        "AUTHORITY_UNAVAILABLE",
+        `run.cancel operation ${effectKey} archive-settlement proof does not bind the current lease-terminal Run`,
+      );
+    }
+    if (
+      reservation.indeterminateAt === undefined &&
+      exactCancelLifecycleSettlement(operation, reservation)
+    ) {
+      await appendSettledExplicitCancel(operation);
+      return operation;
+    }
+    if (
+      reservation.indeterminateAt !== undefined &&
+      reservation.indeterminateCause !== "cancel_stop_unconfirmed"
+    ) {
+      // An unrelated uncertainty episode owns the Run. It must reconcile
+      // before this operation may claim lifecycle settlement.
+      return operation;
+    }
+
+    let stopConfirmed = false;
+    let stopDetail = "no exact SessionRecord remains to archive";
+    const ours = await sessionIsOurs(reservation);
+    if (ours) {
+      try {
+        const stop = await stopAndRetireSession(
+          reservation,
+          "run.cancel is explicitly retiring a lease-parked execution session",
+        );
+        stopConfirmed = stop.settled;
+        stopDetail = stop.detail;
+      } catch (error) {
+        stopDetail = error instanceof Error ? error.message : String(error);
+      }
+    } else {
+      // Absence or a foreign run stamp is not archive proof. Lease parking
+      // proved the old runtime down, but explicit cancel additionally owns a
+      // logical Bee lifecycle transition; without its exact SessionRecord we
+      // cannot honestly claim that transition settled.
+      stopDetail = "no exact Run-bound SessionRecord proves Bee archival";
+    }
+
+    if (!stopConfirmed) {
+      let lossEntered = false;
+      reservation = await mutateReservation(runId, async (record) => {
+        const currentOperation = await readOperation(runId, effectKey);
+        if (currentOperation && exactCancelLifecycleSettlement(currentOperation, record)) return record;
+        lossEntered = true;
+        return enterLossEpisode(record, "cancel_stop_unconfirmed", now().toISOString());
+      });
+      if (!lossEntered) {
+        operation = (await readOperation(runId, effectKey)) ?? operation;
+        if (reservation.indeterminateAt === undefined && exactCancelLifecycleSettlement(operation, reservation)) {
+          await appendSettledExplicitCancel(operation);
+        }
+        return operation;
+      }
+      await appendRunLossEpisodeEvents(
+        reservation,
+        protocolVersion,
+        [{
+          type: "run.lost",
+          payload: lossEpisodePayload(reservation, { cause: "cancel_stop_unconfirmed", detail: stopDetail }),
+          origin: await deps.origin(),
+        }],
+        { onlyIfAbsentKeys: true },
+      );
+      return persistOperationResult(
+        runId,
+        effectKey,
+        { runId, state: "lost" },
+        undefined,
+        async (currentOperation) => {
+          const currentReservation = await readReservation(runId);
+          return Boolean(
+            currentReservation &&
+            currentReservation.indeterminateCause === "cancel_stop_unconfirmed" &&
+            !exactCancelLifecycleSettlement(currentOperation, currentReservation),
+          );
+        },
+      );
+    }
+
+    if (reservation.indeterminateCause === "cancel_stop_unconfirmed") {
+      await appendEvents(
+        runId,
+        protocolVersion,
+        [{
+          type: "run.recovering",
+          payload: lossEpisodePayload(reservation, {
+            cause: "cancel_stop_unconfirmed",
+            verified: ["run-identity", "process-stop"],
+          }),
+          origin: await deps.origin(),
+        }],
+        { onlyIfAbsentKeys: true },
+      );
+      reservation = await commitRunTerminalResult(
+        runId,
+        reservation.result!,
+        { now, clearIndeterminate: true, launchOccupancyCleanupProof: "runtime-down" },
+      );
+      await appendRunTerminalEvents(reservation, protocolVersion, await deps.origin());
+    }
+
+    // Re-read after the external lifecycle effect. A concurrent uncertainty
+    // writer must win before the operation is allowed to become publication
+    // proof, even though the exact stop itself already completed.
+    reservation = (await readReservation(runId)) ?? reservation;
+    if (!isLeaseParkedTerminal(reservation) || reservation.indeterminateAt !== undefined) return operation;
+
+    const settledAt = now().toISOString();
+    operation = await persistOperationResult(
+      runId,
+      effectKey,
+      { runId, state: "cancelled" },
+      {
+        cancelLifecycle: {
+          version: 1,
+          state: "archive-settled",
+          runId,
+          effectKey,
+          beeName: reservation.beeName,
+          leaseId: reservation.leaseId,
+          resultCause: "lease_expired",
+          settledAt,
+          ...(reservation.sessionRef ? { sessionRef: reservation.sessionRef } : {}),
+        },
+      },
+      async (currentOperation) => {
+        const currentReservation = await readReservation(runId);
+        return Boolean(
+          currentReservation &&
+          isLeaseParkedTerminal(currentReservation) &&
+          currentReservation.indeterminateAt === undefined &&
+          currentReservation.beeName === reservation.beeName &&
+          currentReservation.leaseId === reservation.leaseId &&
+          currentReservation.sessionRef === reservation.sessionRef &&
+          (
+            exactCancelLifecycleSettlement(currentOperation, currentReservation) !== undefined ||
+            currentOperation.cancelLifecycle === undefined
+          ),
+        );
+      },
+    );
+    if (!exactCancelLifecycleSettlement(operation, reservation)) return operation;
+    await appendSettledExplicitCancel(operation);
+    return operation;
+  }
+
   async function reconcileOperations(runId: string): Promise<void> {
     const records = await listOperations(runId);
     if (records.length === 0) return;
@@ -530,11 +761,22 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         // continues it once the blocking condition (e.g. an in-flight launch)
         // resolves — best-effort here; the RPC retry surfaces errors.
         await progressRelease(runId, record.effectKey).catch(() => undefined);
+      } else if (record.method === "run.cancel" && reservation && isLeaseParkedTerminal(reservation)) {
+        if (!inFlight.has(flightKey(runId, record.effectKey))) {
+          await singleFlight(
+            flightKey(runId, record.effectKey),
+            () => progressLeaseExpiredCancel(runId, record.effectKey, reservation),
+          ).catch(() => undefined);
+        }
       } else if (record.method === "run.cancel" && reservation?.cancel) {
         await appendEvents(
           runId,
           protocolVersion,
-          [{ type: "cancel.requested", payload: { effectKey: record.effectKey }, origin: await deps.origin() }],
+          [{
+            type: "cancel.requested",
+            payload: { effectKey: record.effectKey, ...(record.cause ? { reason: record.cause } : {}) },
+            origin: await deps.origin(),
+          }],
           { onlyIfAbsentKeys: true },
         );
       }
@@ -815,6 +1057,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         requestDigest: validated.requestDigest,
         protocolVersion,
         schemaDigest,
+        ...(reason ? { init: { cause: reason } } : {}),
       });
       // Desired-state progression runs on create AND on replay (retries
       // continue an unfinished cancellation instead of assuming it happened);
@@ -827,6 +1070,9 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         const settled = fresh ? await deps.settle(fresh) : { reservation: prepared.reservation, state: prepared.state };
         let reservation = settled.reservation;
         let state = settled.state;
+        if (isLeaseParkedTerminal(reservation)) {
+          return progressLeaseExpiredCancel(validated.runId, validated.effectKey, reservation);
+        }
         if (!TERMINAL_RUN_STATES.has(state)) {
           if (!isTransitionAllowed(deps.contract, "run", state, "cancelled")) {
             throw executionError("RUN_VERSION_CONFLICT", `run ${validated.runId} cannot be cancelled from state ${state}`);

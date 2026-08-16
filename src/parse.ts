@@ -15,6 +15,7 @@ export const BOOLEAN_FLAGS = new Set([
   "accept-trust",
   "against-recommended",
   "all",
+  "apply",
   // Legacy alias for --done (archived → done rename).
   "archived",
   "attach",

@@ -61,6 +61,54 @@ test("kill_failed: record explicitly marked", () => {
   assert.match(result.detail, /tmux refused/);
 });
 
+test("pending lazy-wake fence is list-visible as booting, while true stop failure stays kill_failed", () => {
+  const pending = bee({
+    status: "kill_failed",
+    runtimeGeneration: 2,
+    runtimeReplacement: {
+      version: 1,
+      reservationId: "wake-reservation",
+      operation: "lazy-wake",
+      sourceGeneration: 2,
+      state: "pending",
+      startedAt: "2026-05-28T11:59:00.000Z",
+      updatedAt: "2026-05-28T11:59:00.000Z",
+    },
+  });
+  const waking = deriveState(pending, { liveTargets: new Set(), now: NOW });
+  assert.equal(waking.state, "booting");
+  assert.match(waking.detail, /lazy-wake.*waking/);
+
+  const failed = bee({
+    ...pending,
+    runtimeReplacement: { ...pending.runtimeReplacement!, state: "stop-failed" },
+    lastError: "exact stop unconfirmed",
+  });
+  assert.equal(deriveState(failed, { liveTargets: new Set(), now: NOW }).state, "kill_failed");
+
+  const stale = bee({
+    ...pending,
+    runtimeGeneration: 3,
+    lastError: "later generation stop unconfirmed",
+  });
+  assert.equal(deriveState(stale, { liveTargets: new Set(), now: NOW }).state, "kill_failed");
+
+  const explicitStopWon = bee({
+    ...pending,
+    stopIntent: {
+      version: 1,
+      action: "retire",
+      generation: 2,
+      requestedAt: "2026-05-28T11:59:01.000Z",
+      attempts: 1,
+    },
+    lastError: "explicit retire won while replacement was pending",
+  });
+  const stopped = deriveState(explicitStopWon, { liveTargets: new Set(), now: NOW });
+  assert.equal(stopped.state, "kill_failed", "a stronger stop fence outranks stale pending provenance");
+  assert.match(stopped.detail, /explicit retire won/);
+});
+
 test("deriveState preserves stop doubt while canonical archive still wins", () => {
   const at = "2026-05-28T11:30:00.000Z";
   const active = bee({

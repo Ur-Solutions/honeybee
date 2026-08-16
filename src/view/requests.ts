@@ -28,12 +28,12 @@
 
 import { createHash } from "node:crypto";
 import { isAuthNeededMessage, type HsrEventSnapshot } from "../hsr/observe.js";
-import { authRequestId, needsInputRequestId } from "../requests/keys.js";
+import { authRequestId, needsInputRequestId, stopFailedRequestId } from "../requests/keys.js";
 import type { InterventionRequestRecord } from "../requests/store.js";
 import type { RunnerEvent } from "../hsr/types.js";
 import { isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "../readiness.js";
 import type { DerivedState, StateContext } from "../state.js";
-import type { SessionRecord } from "../store.js";
+import { isPendingSessionRuntimeReplacement, type SessionRecord } from "../store.js";
 import type { BeeViewRequest } from "./types.js";
 
 export type OpenRequestSources = {
@@ -112,9 +112,11 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
   //    trailing needs_input is resolved, hence NOT open.
   const stored = sources.storedRequests ?? [];
   const storedIds = new Set(stored.map((request) => request.id));
+  const pendingReplacement = isPendingSessionRuntimeReplacement(record);
   const openStored = stored.filter((request) =>
     request.status === "open" &&
-    (request.scope === "bee" || request.generation === generation));
+    (request.scope === "bee" || request.generation === generation) &&
+    !(pendingReplacement && request.id === stopFailedRequestId(record.name, generation)));
   for (const request of openStored) requests.push(storedRequestView(request));
   const storedNeedsReplyOpen = openStored.some((request) => request.kind === "question" || request.kind === "permission");
   const storedAuthOpen = openStored.some((request) => request.kind === "auth");

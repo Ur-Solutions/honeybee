@@ -1050,8 +1050,23 @@ export type RunEventInput = {
  */
 export function eventFamilyKey(type: string, payload: JsonValue): string {
   const doc = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? (payload as JsonObject) : {};
-  const member = doc.effectKey ?? doc.collectionId ?? doc.inputRequestId ?? doc.lossEpisodeId ?? "";
-  return `${type}#${typeof member === "string" ? member : JSON.stringify(member)}`;
+  // A proof-bearing post-lease cancel must coexist with a legacy bare
+  // cancel.requested for the same effect key: old daemons could emit the bare
+  // member without archiving the Bee. The proof id therefore owns a distinct
+  // idempotency member and can durably supersede that unsafe compatibility
+  // row while remaining once-only itself.
+  const member = type === "cancel.requested" && doc.lifecycleProofId !== undefined
+    ? ["proof", doc.lifecycleProofId]
+    : doc.effectKey !== undefined
+      ? ["effect", doc.effectKey]
+      : doc.collectionId !== undefined
+        ? ["collection", doc.collectionId]
+        : doc.inputRequestId !== undefined
+          ? ["input", doc.inputRequestId]
+          : doc.lossEpisodeId !== undefined
+            ? ["loss", doc.lossEpisodeId]
+            : ["singleton", ""];
+  return `${type}#${JSON.stringify(member)}`;
 }
 
 export type StoredRunEvent = {

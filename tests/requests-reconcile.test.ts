@@ -314,6 +314,75 @@ test("a kill_failed record without a stop-failed request gets one opened by the 
   });
 });
 
+test("a pending lazy-wake replacement fence never opens a stop-failed request", async () => {
+  await withTempStore(async () => {
+    const reconcile = createRequestReconciler();
+    const record = bee("alpha", {
+      status: "kill_failed",
+      runtimeGeneration: 2,
+      lastError: "replacement operation lazy-wake is stopping generation 2",
+      runtimeReplacement: {
+        version: 1,
+        reservationId: "lazy-wake-reservation",
+        operation: "lazy-wake",
+        sourceGeneration: 2,
+        state: "pending",
+        startedAt: iso(NOW - 5_000),
+        updatedAt: iso(NOW - 5_000),
+      },
+    });
+    assert.deepEqual(await reconcile(input({ records: [record] })), []);
+    assert.deepEqual(await readBeeRequests(record.name), []);
+
+    const failed = {
+      ...record,
+      runtimeReplacement: {
+        ...record.runtimeReplacement!,
+        state: "stop-failed" as const,
+        detail: "exact stop unconfirmed",
+      },
+      lastError: "exact stop unconfirmed",
+    };
+    const outcomes = await reconcile(input({ records: [failed] }));
+    assert.deepEqual(outcomes.map((outcome) => `${outcome.action}:${outcome.id}`), [
+      `open:${stopFailedRequestId("alpha", 2)}`,
+    ]);
+  });
+});
+
+test("a stronger stop fence opens manual action even when stale replacement provenance remains pending", async () => {
+  await withTempStore(async () => {
+    const reconcile = createRequestReconciler();
+    const record = bee("alpha", {
+      status: "kill_failed",
+      runtimeGeneration: 2,
+      lastError: "explicit retire won while replacement was pending",
+      stopIntent: {
+        version: 1,
+        action: "retire",
+        generation: 2,
+        requestedAt: iso(NOW - 4_000),
+        attempts: 1,
+      },
+      runtimeReplacement: {
+        version: 1,
+        reservationId: "compatibility-repair",
+        operation: "archive-correction-restore",
+        sourceGeneration: 2,
+        state: "pending",
+        startedAt: iso(NOW - 5_000),
+        updatedAt: iso(NOW - 5_000),
+      },
+    });
+
+    const outcomes = await reconcile(input({ records: [record] }));
+    assert.deepEqual(outcomes.map((outcome) => `${outcome.action}:${outcome.id}`), [
+      `open:${stopFailedRequestId("alpha", 2)}`,
+    ]);
+    assert.match((await readBeeRequests("alpha"))[0]!.question!, /explicit retire won/);
+  });
+});
+
 test("a retired record's opens cancel scope-closed \"retired\" and nothing re-opens", async () => {
   await withTempStore(async () => {
     const reconcile = createRequestReconciler();

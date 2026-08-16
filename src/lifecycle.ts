@@ -119,6 +119,17 @@ class LockedSessionLifecycleTransaction implements SessionLifecycleTransaction {
       for (const key of Object.keys(bag)) {
         if (bag[key] === undefined) delete bag[key];
       }
+      // Runtime replacement provenance belongs only to the fail-closed source
+      // generation. Publishing a live successor is the exact success boundary:
+      // clear the marker in the same canonical write so neither callers nor
+      // readers can observe stale "waking" provenance on the new generation.
+      if (
+        current.runtimeReplacement
+        && patch.status === "running"
+        && (merged.runtimeGeneration ?? 0) > (current.runtimeGeneration ?? 0)
+      ) {
+        delete bag.runtimeReplacement;
+      }
       await saveSessionLocked(merged);
       this.#record = merged;
       this.#identity = lifecycleIdentity(merged);

@@ -5,10 +5,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { requestMessageRecoveryIfParked } from "../src/buz/recovery.js";
 import {
+  reconcileObservedHsrWork,
   runRuntimeParkingSweep,
   selectRuntimeParkingCandidates,
 } from "../src/daemon/runtimeParking.js";
+import { parkExpiredExecutionSession } from "../src/execution/runtimeSettlement.js";
 import type { HsrObservation } from "../src/hsr/observe.js";
+import type { RunnerEvent } from "../src/hsr/types.js";
 import type { SessionLifecycleTransaction } from "../src/lifecycle.js";
 import { parkIdleHsrRuntime } from "../src/recovery/park.js";
 import {
@@ -18,6 +21,7 @@ import {
 import type { BeeState } from "../src/state.js";
 import {
   loadSession,
+  markSessionUnverified,
   saveSession,
   transitionSession,
   updateSession,
@@ -85,6 +89,36 @@ function oldIdleObservation(state: BeeState = "idle_with_output"): HsrObservatio
   };
 }
 
+function structuredIdleObservation(record: SessionRecord, turnEndAt: number): HsrObservation {
+  const turnEnd: RunnerEvent = {
+    type: "turn_end",
+    ts: turnEndAt,
+    seq: 17,
+    threadId: record.providerSessionId,
+  };
+  return {
+    live: true,
+    state: "idle_with_output",
+    snapshot: "idle",
+    activity: {
+      at: turnEndAt,
+      fingerprint: `turn_end:${turnEndAt}:fixture`,
+      eventType: "turn_end",
+    },
+    eventSnapshot: {
+      events: [turnEnd],
+      tailEvents: [turnEnd],
+      activity: {
+        at: turnEndAt,
+        fingerprint: `turn_end:${turnEndAt}:fixture`,
+        eventType: "turn_end",
+      },
+      usage: { totals: null },
+      pendingNeedsInput: null,
+    },
+  };
+}
+
 function successfulParkingDeps(live: { value: boolean }) {
   return {
     now: () => T0,
@@ -144,6 +178,233 @@ test("intentional parking evidence is fenced to the current work axis", () => {
       probe: probe("dead-after", "dead"),
     },
   ), /illegal runtime\.parked transition/);
+});
+
+test("trusted HSR turn_end settles a stale working cursor before idle parking", async () => {
+  await withTempStore(async () => {
+    const initial = record("CO.observed-settle", {
+      lastObservedState: "active",
+      lastPromptAt: new Date(T0 - 4 * GRACE_MS).toISOString(),
+    });
+    await saveSession(initial);
+    const observation = structuredIdleObservation(initial, T0 - 2 * GRACE_MS);
+    const live = { value: true };
+
+    const result = await runRuntimeParkingSweep(
+      [initial],
+      new Map([[initial.name, "idle_with_output"]]),
+      new Map([[initial.name, observation]]),
+      T0,
+      { graceMs: GRACE_MS, ...successfulParkingDeps(live) },
+    );
+
+    assert.equal(result[0]?.action, "parked");
+    const parked = (await loadSession(initial.name))!;
+    assert.equal(parked.status, "running");
+    assert.equal(parked.stateMachine?.lifecycle, "active");
+    assert.equal(parked.stateMachine?.runtime, "parked");
+    assert.equal(parked.stateMachine?.work, "done");
+    assert.equal(parked.stateMachine?.revision, 2, "turn_end settle and parking are separate audited edges");
+  });
+});
+
+test("an old turn_end cannot settle or park a newer accepted prompt", async () => {
+  await withTempStore(async () => {
+    const initial = record("CO.observed-stale", {
+      lastObservedState: "active",
+      lastPromptAt: new Date(T0 - GRACE_MS).toISOString(),
+    });
+    await saveSession(initial);
+    const observation = structuredIdleObservation(initial, T0 - 2 * GRACE_MS);
+    const reconciled = await reconcileObservedHsrWork(
+      initial,
+      "idle_with_output",
+      observation,
+      T0,
+    );
+    assert.equal(reconciled.changed, false);
+    assert.equal(reconciled.reason, "turn-end-predates-current-work");
+    assert.equal((await loadSession(initial.name))!.stateMachine, undefined);
+  });
+});
+
+test("a same-millisecond turn_end cannot prove it followed the current prompt", async () => {
+  await withTempStore(async () => {
+    const boundary = T0 - GRACE_MS;
+    const initial = record("CO.observed-same-ms", {
+      lastObservedState: "active",
+      lastPromptAt: new Date(boundary).toISOString(),
+    });
+    await saveSession(initial);
+    const reconciled = await reconcileObservedHsrWork(
+      initial,
+      "idle_with_output",
+      structuredIdleObservation(initial, boundary),
+      T0,
+    );
+    assert.equal(reconciled.changed, false);
+    assert.equal(reconciled.reason, "turn-end-predates-current-work");
+    assert.equal((await loadSession(initial.name))!.stateMachine, undefined);
+  });
+});
+
+test("execution lease expiry parks an exact settled runtime but leaves the Bee active", async () => {
+  await withTempStore(async () => {
+    const initial = record("CO.execution-lease", {
+      id: "BEE.execution-lease",
+      executionRunId: "run-execution-lease",
+      lastObservedState: "idle_with_output",
+      lastPromptAt: new Date(T0 - 4 * GRACE_MS).toISOString(),
+    });
+    await saveSession(initial);
+    const live = { value: true };
+    const parked = await parkExpiredExecutionSession(
+      {
+        runId: "run-execution-lease",
+        beeName: initial.name,
+        sessionRef: initial.id,
+      },
+      new Date(T0 - 3 * GRACE_MS).toISOString(),
+      "test lease expiry",
+      {
+        now: () => T0,
+        parkDeps: successfulParkingDeps(live),
+      },
+    );
+    assert.equal(parked.status, "parked");
+    const recordAfter = (await loadSession(initial.name))!;
+    assert.equal(recordAfter.status, "running");
+    assert.equal(recordAfter.stateMachine?.lifecycle, "active");
+    assert.equal(recordAfter.stateMachine?.runtime, "parked");
+    assert.equal(recordAfter.stateMachine?.work, "done");
+  });
+});
+
+test("an already-parked execution is terminal proof only when every resumability fence still matches", async () => {
+  await withTempStore(async () => {
+    const owner = (name: string) => ({ runId: `run-${name}`, beeName: name, sessionRef: `BEE.${name}` });
+    const parkDone = async (name: string, overrides: Partial<SessionRecord> = {}) => {
+      const initial = record(name, {
+        id: `BEE.${name}`,
+        executionRunId: `run-${name}`,
+        lastObservedState: "idle_with_output",
+        ...overrides,
+      });
+      await saveSession(initial);
+      await transitionSession(name, {
+        type: "runtime.parked",
+        eventId: `park-${name}`,
+        at: new Date(T0 - GRACE_MS).toISOString(),
+        cause: "idle-death",
+        probe: probe(`park-${name}`, "dead", T0 - GRACE_MS),
+      });
+      return (await loadSession(name))!;
+    };
+
+    const uncertain = await parkDone("CO.parked-unverified");
+    await markSessionUnverified(uncertain.name, {
+      since: new Date(T0).toISOString(),
+      reason: "stale-cursor",
+      probeScheduledAt: new Date(T0).toISOString(),
+    });
+    assert.equal((await parkExpiredExecutionSession(
+      owner(uncertain.name),
+      new Date(T0 - 2 * GRACE_MS).toISOString(),
+      "unverified parked control",
+      { now: () => T0 },
+    )).status, "unconfirmed");
+
+    const nonHsr = await parkDone("CO.parked-non-hsr");
+    await updateSession(nonHsr.name, { substrate: undefined });
+    assert.equal((await parkExpiredExecutionSession(
+      owner(nonHsr.name),
+      new Date(T0 - 2 * GRACE_MS).toISOString(),
+      "non-HSR parked control",
+      { now: () => T0 },
+    )).status, "unconfirmed");
+
+    const noProvider = await parkDone("CO.parked-no-provider");
+    await updateSession(noProvider.name, { providerSessionId: undefined });
+    assert.equal((await parkExpiredExecutionSession(
+      owner(noProvider.name),
+      new Date(T0 - 2 * GRACE_MS).toISOString(),
+      "missing provider parked control",
+      { now: () => T0 },
+    )).status, "unconfirmed");
+
+    const needsYou = record("CO.parked-needs-you", {
+      id: "BEE.CO.parked-needs-you",
+      executionRunId: "run-CO.parked-needs-you",
+      lastObservedState: undefined,
+      lastObservedStateAt: undefined,
+    });
+    await saveSession(needsYou);
+    await transitionSession(needsYou.name, {
+      type: "turn.started",
+      eventId: "parked-needs-you-start",
+      at: new Date(T0 - 3 * GRACE_MS).toISOString(),
+      cause: "first-turn",
+      evidence: { kind: "hook", hookId: "parked-needs-you-start", observedAt: new Date(T0 - 3 * GRACE_MS).toISOString(), hook: "turn-start" },
+    });
+    await transitionSession(needsYou.name, {
+      type: "request.opened",
+      eventId: "parked-needs-you-request",
+      at: new Date(T0 - 2 * GRACE_MS).toISOString(),
+      cause: "question",
+      requestId: "parked-needs-you-request",
+      evidence: { kind: "request", requestId: "parked-needs-you-request", observedAt: new Date(T0 - 2 * GRACE_MS).toISOString(), action: "opened" },
+    });
+    await transitionSession(needsYou.name, {
+      type: "runtime.parked",
+      eventId: "parked-needs-you-dead",
+      at: new Date(T0 - GRACE_MS).toISOString(),
+      cause: "idle-death",
+      probe: probe("parked-needs-you-dead", "dead", T0 - GRACE_MS),
+    });
+    assert.equal((await parkExpiredExecutionSession(
+      owner(needsYou.name),
+      new Date(T0 - 4 * GRACE_MS).toISOString(),
+      "needs-you parked control",
+      { now: () => T0 },
+    )).status, "deferred");
+  });
+});
+
+test("a concurrent uncertainty write after physical parking invalidates lease terminal proof", async () => {
+  await withTempStore(async () => {
+    const initial = record("CO.execution-park-race", {
+      id: "BEE.execution-park-race",
+      executionRunId: "run-execution-park-race",
+      lastObservedState: "idle_with_output",
+    });
+    await saveSession(initial);
+    const live = { value: true };
+    const result = await parkExpiredExecutionSession(
+      {
+        runId: "run-execution-park-race",
+        beeName: initial.name,
+        sessionRef: initial.id,
+      },
+      new Date(T0 - 2 * GRACE_MS).toISOString(),
+      "post-park uncertainty race",
+      {
+        now: () => T0,
+        parkDeps: successfulParkingDeps(live),
+        park: async (record, intent, deps) => {
+          const parked = await parkIdleHsrRuntime(record, intent, deps);
+          await markSessionUnverified(record.name, {
+            since: new Date(T0).toISOString(),
+            reason: "stale-cursor",
+            probeScheduledAt: new Date(T0).toISOString(),
+          });
+          return parked;
+        },
+      },
+    );
+    assert.equal(result.status, "unconfirmed");
+    assert.equal((await loadSession(initial.name))!.stateMachine?.runtime, "parked");
+    assert.ok((await loadSession(initial.name))!.stateUnverified);
+  });
 });
 
 test("needs-you runtimes stay live because interactive answer handles are process-local", async () => {

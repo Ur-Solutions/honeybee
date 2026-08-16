@@ -76,12 +76,15 @@ import {
   createRunOperations,
   type ExecutionSessionRetirementResult,
   type RunOperations,
+  type RunOperationsDeps,
 } from "./operations.js";
 import type { SignatureVerifier } from "./signing.js";
 import {
+  parkExpiredExecutionSession,
   stopAndRetireExecutionSession,
   stopAndSettleExecutionRuntime,
   type ExecutionRuntimeOwner,
+  type ExecutionRuntimeParkingResult,
   type ExecutionRuntimeSettlement,
 } from "./runtimeSettlement.js";
 
@@ -144,6 +147,11 @@ export type ExecutionServiceOptions = {
     reservation: RunReservation,
     context: string,
   ) => Promise<ExecutionRuntimeSettlement>;
+  /** @internal runtime-only lease offload; must never archive the Bee. */
+  parkSessionRuntime?: (
+    reservation: RunReservation,
+    context: string,
+  ) => Promise<ExecutionRuntimeParkingResult>;
   harnessProbe?: HarnessProbe;
   verifySignature?: SignatureVerifier;
   now?: () => Date;
@@ -158,6 +166,8 @@ export type ExecutionServiceOptions = {
   appendLaunchEvents?: typeof appendRunEvents;
   /** Deterministic crash seam after exact runtime stop dispatch, before purge. */
   afterRuntimeStopDispatch?: () => void | Promise<void>;
+  /** @internal deterministic operation-store crash/race seams. */
+  operationPersistence?: RunOperationsDeps["operationPersistence"];
   /** @deprecated Elapsed time no longer grants launch authority. */
   launchGraceMs?: number;
 };
@@ -293,6 +303,19 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       ? [{ afterStopDispatch: options.afterRuntimeStopDispatch }]
       : []),
   ));
+  const parkSessionRuntime = options.parkSessionRuntime ?? (async (
+    reservation: RunReservation,
+    context: string,
+  ) => parkExpiredExecutionSession(
+    {
+      runId: reservation.runId,
+      beeName: reservation.beeName,
+      ...(reservation.sessionRef ? { sessionRef: reservation.sessionRef } : {}),
+    },
+    reservation.leaseExpiresAt,
+    context,
+    { now: () => now().getTime() },
+  ));
   const inFlight = new Map<string, Promise<void>>();
   let launchOwnerPromise: Promise<RunLaunchOwner> | undefined;
   const launchOwner = (): Promise<RunLaunchOwner> => (launchOwnerPromise ??= (async () => {
@@ -344,6 +367,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     "launch_commit_cleanup_unconfirmed",
     "start_outcome_indeterminate",
     "readiness_stop_unconfirmed",
+    "lease_parking_unconfirmed",
     "cancel_stop_unconfirmed",
     "release_stop_unconfirmed",
   ]);
@@ -1062,7 +1086,9 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     // crash cannot strand Apiary at recovering with no way to replay it.
     if (
       current.phase === "started" &&
+      !current.result &&
       current.indeterminateAt &&
+      current.indeterminateCause !== "lease_parking_unconfirmed" &&
       recoverableLostCauses.has(current.indeterminateCause ?? "") &&
       launchEvidence.ready === true &&
       launchEvidence.sessionRef === current.sessionRef &&
@@ -1114,33 +1140,67 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       }
     }
     const leaseExpired = Date.parse(current.leaseExpiresAt) < now().getTime();
-    const terminalCancelStopDoubt =
-      current.result?.outcome === "cancelled" && current.indeterminateCause === "cancel_stop_unconfirmed";
-    if (
-      current.phase === "started" &&
-      ((!current.result && (current.cancel !== undefined || leaseExpired)) || terminalCancelStopDoubt)
-    ) {
-      // Durable desired-state stop reconciler. Two ways in: execution
-      // authority died with the lease (a still-running harness must not
-      // continue unbounded), or a cancellation intent exists whose stop was
-      // never confirmed. EVERY reconcile pass retries the clean stop until it
-      // is confirmed or the session outcome proves exit — a transient stop
-      // failure never strands a live harness behind a lost marker.
-      if (!current.result && !current.cancel) {
+    if (current.phase === "started" && !current.result && !current.cancel && leaseExpired) {
+      // A capability lease ending is a hidden resource boundary, not a user
+      // decision to file the conversation. Park only the exact settled HSR
+      // generation; leave its SessionRecord active so an ordinary send can
+      // lazily wake the same provider context. A real in-flight turn defers
+      // the offload until structured turn_end evidence settles the work axis.
+      let parking: ExecutionRuntimeParkingResult;
+      try {
+        parking = await parkSessionRuntime(current, "reconcile expired execution lease");
+      } catch (error) {
+        parking = {
+          status: "unconfirmed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+      if (parking.status === "parked") {
+        const recovering = current.indeterminateCause === "lease_parking_unconfirmed"
+          ? await publishLossRecoveryExit(current, ["run-identity", "runtime-parked"])
+          : null;
+        if (recovering) current = recovering;
+        current = await commitRunTerminalResult(
+          current.runId,
+          { outcome: "cancelled", cause: "lease_expired" },
+          {
+            now,
+            clearIndeterminate: true,
+            canCommit: (record) => record.phase === "started" && !record.result && !record.cancel &&
+              Date.parse(record.leaseExpiresAt) < now().getTime(),
+          },
+        );
+        await appendRunTerminalEvents(current, protocolVersion, await origin());
+      } else if (parking.status === "unconfirmed") {
         current = await mutateReservation(current.runId, (record) =>
           record.result || record.cancel
             ? record
-            : { ...record, cancel: { requestedAt: now().toISOString(), reason: "lease_expired" } },
+            : enterLossEpisode(record, "lease_parking_unconfirmed", now().toISOString()),
         );
-        if (!current.result && current.cancel?.reason === "lease_expired") {
-          await appendRunEvents(
-            current.runId,
+        if (!current.result && !current.cancel && current.indeterminateCause === "lease_parking_unconfirmed") {
+          await appendRunLossEpisodeEvents(
+            current,
             protocolVersion,
-            [{ type: "cancel.requested", payload: { reason: "lease_expired" }, origin: await origin() }],
+            [{
+              type: "run.lost",
+              payload: lossEpisodePayload(current, { cause: "lease_parking_unconfirmed", detail: parking.detail }),
+              origin: await origin(),
+            }],
             { onlyIfAbsentKeys: true },
           );
         }
       }
+    }
+    const terminalCancelStopDoubt =
+      current.result?.outcome === "cancelled" && current.indeterminateCause === "cancel_stop_unconfirmed";
+    if (
+      current.phase === "started" &&
+      ((!current.result && current.cancel !== undefined) || terminalCancelStopDoubt)
+    ) {
+      // Explicit cancellation is a lifecycle decision and retains the strict
+      // stop+archive protocol. EVERY reconcile pass retries until teardown is
+      // confirmed or exit is proven; this path is intentionally separate from
+      // lease parking above.
       if (!current.result || terminalCancelStopDoubt) {
         const evidence = await options.sessions.evidence(current.beeName);
         const ours = evidence.sessionExists && (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
@@ -1150,9 +1210,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           try {
             const stop = await stopAndRetireSession(
               current,
-              current.cancel?.reason === "lease_expired"
-                ? "reconcile expired execution lease"
-                : "reconcile cancelled execution runtime",
+              "reconcile cancelled execution runtime",
             );
             stopConfirmed = stop.settled;
             detail = stop.detail;
@@ -1224,7 +1282,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         await appendRunTerminalEvents(current, protocolVersion, await origin());
       }
     }
-    if (current.phase === "started" && !current.result) {
+    if (
+      current.phase === "started" &&
+      !current.result &&
+      current.indeterminateCause !== "lease_parking_unconfirmed"
+    ) {
       const outcome = await options.sessions.outcome(current.beeName);
       if (outcome && !outcome.live) {
         const exitCode = outcome.exitCode ?? undefined;
@@ -1360,6 +1422,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     sessions: options.sessions,
     retireSession,
     stopAndRetireSession,
+    ...(options.operationPersistence ? { operationPersistence: options.operationPersistence } : {}),
     settle: async (reservation) => {
       const settled = await reconcile(reservation);
       return { reservation: settled, state: deriveState(settled, inFlight.has(settled.runId)).state };

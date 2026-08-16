@@ -4,7 +4,7 @@ import { LOCAL_NODE_NAME } from "./node.js";
 import { isWellFormedPaneId } from "./paneId.js";
 import { isAgentActivePane, isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "./readiness.js";
 import { isActiveSessionLifecycle, isArchivedSessionLifecycle } from "./stateMachine.js";
-import type { SessionRecord } from "./store.js";
+import { isPendingSessionRuntimeReplacement, type SessionRecord } from "./store.js";
 
 export type BeeState =
   | "dead"
@@ -137,6 +137,12 @@ export function deriveState(record: SessionRecord, context: StateContext): Deriv
   }
 
   if (record.status === "kill_failed") {
+    if (isPendingSessionRuntimeReplacement(record)) {
+      return {
+        state: "booting",
+        detail: `${record.runtimeReplacement!.operation} — waking runtime generation ${record.runtimeGeneration ?? 0}`,
+      };
+    }
     return { state: "kill_failed", detail: record.lastError ?? "previous kill failed" };
   }
 

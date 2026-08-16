@@ -50,7 +50,7 @@ import {
 } from "../requests/store.js";
 import { lastAuthNeededEvent } from "../view/requests.js";
 import type { BeeState } from "../state.js";
-import type { SessionRecord } from "../store.js";
+import { isPendingSessionRuntimeReplacement, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
 import type { RemoteHsrSubstrate } from "../substrates/remote-hsr.js";
 
@@ -143,7 +143,7 @@ export function createRequestReconciler(): RequestReconciler {
       pending !== null ||
       authEvent !== undefined ||
       (cached !== undefined && cached.openIds.size > 0) ||
-      record.status === "kill_failed";
+      (record.status === "kill_failed" && !isPendingSessionRuntimeReplacement(record));
     if (!shouldTouch) return;
 
     let requests = await readBeeRequests(bee);
@@ -212,7 +212,7 @@ export function createRequestReconciler(): RequestReconciler {
       };
       if ((await openRequest(bee, input)).created) emit(input.id, "open", "auth");
     }
-    if (record.status === "kill_failed") {
+    if (record.status === "kill_failed" && !isPendingSessionRuntimeReplacement(record)) {
       const input: OpenRequestInput = {
         id: stopFailedRequestId(bee, generation),
         kind: "manual-action",

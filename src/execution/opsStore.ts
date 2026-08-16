@@ -49,6 +49,24 @@ export type ReleaseStep = {
   completedAt?: string;
 };
 
+/**
+ * New-writer-only proof that an explicit cancel arriving after lease expiry
+ * completed the Bee lifecycle cleanup. A bare terminal operation result is
+ * deliberately insufficient: older Honeybee versions wrote that result for
+ * an already-terminal Run without archiving its still-active parked Bee.
+ */
+export type CancelLifecycleSettlement = {
+  version: 1;
+  state: "archive-settled";
+  runId: string;
+  effectKey: string;
+  beeName: string;
+  leaseId: string;
+  resultCause: "lease_expired";
+  settledAt: string;
+  sessionRef?: string;
+};
+
 export type OperationAttemptKind = "command-dispatch" | "collection";
 
 /**
@@ -106,6 +124,8 @@ export type OperationRecord = {
   retainUntil?: string;
   /** run.release only: the durable cleanup step ledger. */
   releaseSteps?: ReleaseStep[];
+  /** run.cancel after lease expiry only: exact archive-settlement proof. */
+  cancelLifecycle?: CancelLifecycleSettlement;
   /** Replay-stable method result (the response envelope's `result`). */
   result?: JsonObject;
   createdAt: string;
@@ -135,6 +155,26 @@ function parseOperation(raw: string, subject: string): OperationRecord {
     typeof parsed.runId !== "string"
   ) {
     throw executionError("AUTHORITY_UNAVAILABLE", `${subject} has an unknown version or missing fields`);
+  }
+  if (parsed.cancelLifecycle !== undefined) {
+    const proof = parsed.cancelLifecycle as Record<string, unknown> | null;
+    if (
+      !proof || Array.isArray(proof) ||
+      proof.version !== 1 ||
+      proof.state !== "archive-settled" ||
+      typeof proof.runId !== "string" || proof.runId.length === 0 ||
+      typeof proof.effectKey !== "string" || proof.effectKey.length === 0 ||
+      typeof proof.beeName !== "string" || proof.beeName.length === 0 ||
+      typeof proof.leaseId !== "string" || proof.leaseId.length === 0 ||
+      proof.resultCause !== "lease_expired" ||
+      typeof proof.settledAt !== "string" || !Number.isFinite(Date.parse(proof.settledAt)) ||
+      (proof.sessionRef !== undefined && (typeof proof.sessionRef !== "string" || proof.sessionRef.length === 0)) ||
+      parsed.method !== "run.cancel" ||
+      proof.runId !== parsed.runId ||
+      proof.effectKey !== parsed.effectKey
+    ) {
+      throw executionError("AUTHORITY_UNAVAILABLE", `${subject} has malformed cancelLifecycle proof`);
+    }
   }
   return parsed as unknown as OperationRecord;
 }
@@ -336,10 +376,10 @@ export async function setOperationResult(
   effectKey: string,
   result: JsonObject,
   extra?: Partial<OperationRecord>,
-  guard?: (record: OperationRecord) => boolean,
+  guard?: (record: OperationRecord) => boolean | Promise<boolean>,
 ): Promise<OperationRecord> {
-  return mutateOperation(runId, effectKey, (record) => {
-    if (guard && !guard(record)) return record;
+  return mutateOperation(runId, effectKey, async (record) => {
+    if (guard && !(await guard(record))) return record;
     const changed = record.result === undefined || canonicalDigest(record.result as JsonValue) !== canonicalDigest(result as JsonValue);
     return {
       ...record,

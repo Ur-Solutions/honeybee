@@ -29,7 +29,7 @@ import {
   type SessionRecord,
 } from "../src/store.js";
 import type { Substrate } from "../src/substrates/types.js";
-import { withSessionLifecycleTransaction } from "../src/lifecycle.js";
+import { withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "../src/lifecycle.js";
 
 const LAUNCH_BIRTH: ProcessBirthFingerprint = {
   pgid: 48_321,
@@ -233,7 +233,47 @@ test("replacement publication is bound to the exact predecessor and next runtime
         return published;
       }));
     assert.equal(updated.runtimeGeneration, 8);
+    assert.equal(updated.runtimeReplacement, undefined, "successor publication clears replacement provenance atomically");
+    assert.equal((await loadSession(old.name))?.runtimeReplacement, undefined);
     assert.equal(await readBeeNameLaunchReservation(old.name), null);
+  });
+});
+
+test("predecessor-stop journal failure becomes true stop-failed provenance without weakening admission", async () => {
+  await withTempStore(async () => {
+    const old = { ...publishedTmuxRecord("replacement-stopping-write-failure"), runtimeGeneration: 5 };
+    await saveSession(old);
+    const reservationDir = dirname(beeNameLaunchReservationPath(old.name));
+    let madeReadOnly = false;
+    try {
+      await assert.rejects(withSessionLifecycleTransaction(old, (lifecycle) => {
+        const injected: SessionLifecycleTransaction = {
+          refresh: () => lifecycle.refresh(),
+          destructiveCommit: (fn) => lifecycle.destructiveCommit(fn),
+          commit: async (patch) => {
+            const committed = await lifecycle.commit(patch);
+            if (patch.runtimeReplacement?.state === "pending" && !madeReadOnly) {
+              madeReadOnly = true;
+              await chmod(reservationDir, 0o500);
+            }
+            return committed;
+          },
+        };
+        return beginBeeReplacementOperation(injected, "lazy-wake");
+      }));
+    } finally {
+      if (madeReadOnly) await chmod(reservationDir, 0o700);
+    }
+
+    const fenced = (await loadSession(old.name))!;
+    assert.equal(fenced.status, "kill_failed");
+    assert.equal(fenced.runtimeGeneration, 5);
+    assert.equal(fenced.runtimeReplacement?.operation, "lazy-wake");
+    assert.equal(fenced.runtimeReplacement?.state, "stop-failed");
+    assert.match(fenced.runtimeReplacement?.detail ?? "", /predecessor-stop admission persistence failed/);
+    assert.match(fenced.lastError ?? "", /could not persist predecessor-stop admission/);
+    assert.equal(fenced.runtimeReplacement?.updatedAt, fenced.updatedAt);
+    assert.equal((await readBeeNameLaunchReservation(old.name))?.phase, "reserved");
   });
 });
 
@@ -263,6 +303,13 @@ test("every replacement operation leaves a generation-bound fence after a post-d
       assert.equal(journal?.phase, "launched", operation);
       assert.equal(journal?.operation, operation);
       assert.equal(journal?.replacementOf?.runtimeGeneration, 3);
+      const fenced = await loadSession(old.name);
+      assert.equal(fenced?.status, "kill_failed");
+      assert.deepEqual(fenced?.runtimeReplacement && {
+        operation: fenced.runtimeReplacement.operation,
+        sourceGeneration: fenced.runtimeReplacement.sourceGeneration,
+        state: fenced.runtimeReplacement.state,
+      }, { operation, sourceGeneration: 3, state: "pending" });
       let called = false;
       await assert.rejects(
         withSessionLifecycleTransaction(old, (lifecycle) =>

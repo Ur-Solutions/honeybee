@@ -26,7 +26,12 @@ import type { InterventionRequestRecord } from "../requests/store.js";
 import type { SealRecord } from "../seal.js";
 import { deriveState, liveTargetKey, parseBeeState, type BeeState, type DerivedState, type StateContext } from "../state.js";
 import { isActiveSessionLifecycle, isArchivedSessionLifecycle, type BeeWorkState } from "../stateMachine.js";
-import { legacyStateMachineSeed, type SessionRecord } from "../store.js";
+import {
+  currentSessionRuntimeReplacement,
+  isPendingSessionRuntimeReplacement,
+  legacyStateMachineSeed,
+  type SessionRecord,
+} from "../store.js";
 import { deriveOpenRequests, storedRequestView } from "./requests.js";
 import {
   BEE_VIEW_SCHEMA_VERSION,
@@ -37,6 +42,7 @@ import {
   type BeeViewObservationFreshness,
   type BeeViewRequest,
   type BeeViewRuntime,
+  type BeeViewRuntimeReplacement,
   type BeeViewTurnResult,
   type BeeViewV1,
   type ObservationSourceFreshness,
@@ -228,6 +234,19 @@ function projectRuntime(
   runtimeState: BeeViewRuntime["runtimeState"],
   facts: { generation: number; unreachable: boolean; held: boolean },
 ): BeeViewRuntime {
+  const currentReplacement = isArchivedSessionLifecycle(record)
+    ? undefined
+    : currentSessionRuntimeReplacement(record);
+  const replacement: BeeViewRuntimeReplacement | undefined = currentReplacement
+    ? {
+        operation: currentReplacement.operation,
+        sourceGeneration: currentReplacement.sourceGeneration,
+        state: currentReplacement.state,
+        startedAt: currentReplacement.startedAt,
+        updatedAt: currentReplacement.updatedAt,
+        ...(currentReplacement.detail !== undefined ? { detail: currentReplacement.detail } : {}),
+      }
+    : undefined;
   const base = {
     generation: facts.generation,
     runtimeState,
@@ -237,6 +256,7 @@ function projectRuntime(
     ...(record.runnerPid !== undefined ? { runnerPid: record.runnerPid } : {}),
     ...(record.runnerTier !== undefined ? { runnerTier: record.runnerTier } : {}),
     ...(record.providerSessionId !== undefined ? { providerSessionId: record.providerSessionId } : {}),
+    ...(replacement ? { replacement } : {}),
   };
 
   if (isArchivedSessionLifecycle(record)) {
@@ -248,11 +268,26 @@ function projectRuntime(
       evidence: { grade: "legacy", source: "session-record", detail: 'record filed (status "done")' },
     };
   }
-  // `kill_failed` is orthogonal stop-doubt evidence, not a legacy lifecycle
-  // scalar. Keep it visible through every active-runtime projection (including
-  // recovering/parked/lost/unreachable/held) so the view cannot accidentally
-  // present an ownership-held Bee as ready or merely crashed.
-  const activeBase = record.status === "kill_failed" ? { ...base, stopFailed: true as const } : base;
+  // The crash-safe replacement fence deliberately reuses status=kill_failed
+  // so mixed-version writers stay non-runnable. Structured pending provenance
+  // distinguishes that internal fence from a stop Honeybee actually failed to
+  // prove. Both remain mutation-closed; only the latter projects stopFailed.
+  const replacementPending = isPendingSessionRuntimeReplacement(record);
+  const activeBase = record.status === "kill_failed" && !replacementPending
+    ? { ...base, stopFailed: true as const }
+    : base;
+  if (replacementPending && replacement) {
+    return {
+      ...activeBase,
+      state: "starting",
+      evidence: {
+        grade: "structured",
+        source: "session-record",
+        observedAt: replacement.updatedAt,
+        detail: `${replacement.operation} replacement pending for generation ${replacement.sourceGeneration}`,
+      },
+    };
+  }
   if (runtimeState === "recovering") {
     return {
       ...activeBase,
@@ -585,6 +620,12 @@ function chooseDisplayState(facts: {
   if (latestRuntime.stopFailed) {
     return { displayState: "stop-failed", displayStateReason: "stop-failed — the latest stop request failed (status kill_failed); the runtime may still be alive" };
   }
+  if (latestRuntime.replacement?.state === "pending") {
+    return {
+      displayState: "recovering",
+      displayStateReason: `recovering — ${latestRuntime.replacement.operation} is waking a replacement runtime`,
+    };
+  }
   if (latestRuntime.runtimeState === "recovering") {
     return { displayState: "recovering", displayStateReason: "recovering — probe-verified mid-turn runtime loss is being revived" };
   }
@@ -639,6 +680,8 @@ function interactionStateFor(
   // Stop doubt is orthogonal to runtime liveness. A positive probe proves
   // identity/existence, not permission to resume work after an explicit stop;
   // expose a distinct active-but-non-interactive state on every runtime axis.
+  if (runtime.stopFailed) return "blocked";
+  if (runtime.replacement?.state === "pending") return "working";
   if (record.status === "kill_failed") return "blocked";
   if (runtime.runtimeState === "recovering") return "working";
   return derivedMeansRunningTurn(derived.state) ? "working" : "idle";

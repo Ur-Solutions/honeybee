@@ -19,7 +19,7 @@ import { mintEphemeralCredential } from "./hsr/remoteCreds.js";
 import { stopHsrIncarnationByPid } from "./hsr/substrate.js";
 import { withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "./lifecycle.js";
 import { closeRequestsForNewIncarnation } from "./requests/store.js";
-import { appendLedger, type SessionRecord } from "./store.js";
+import { appendLedger, currentSessionRuntimeReplacement, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 import { stopRuntimeForReplacement } from "./substrates/stop.js";
 import type { NewSessionResult } from "./substrates/types.js";
@@ -230,11 +230,22 @@ async function withSwapLaunchReservation(input: {
     } else {
       await reservation.retainStopDoubt(detail).catch(() => undefined);
     }
+    const canonical = await lifecycle.refresh();
+    const replacement = currentSessionRuntimeReplacement(canonical);
+    const updatedAt = new Date().toISOString();
     await lifecycle.commit({
       ...runtimePatch(remoteLocator),
       status: "kill_failed",
       lastError: `account swap launch cleanup unconfirmed: ${detail}`,
-      updatedAt: new Date().toISOString(),
+      ...(replacement ? {
+        runtimeReplacement: {
+          ...replacement,
+          state: "stop-failed" as const,
+          updatedAt,
+          detail: `account swap launch cleanup unconfirmed: ${detail}`,
+        },
+      } : {}),
+      updatedAt,
     }).catch(() => undefined);
   };
 
@@ -502,10 +513,21 @@ export async function swapAccount(
       context: `Could not stop ${record.name} before swap`,
       onStopUnconfirmed: async (message) => {
         await replacement.noteFailure(`account swap stop unconfirmed: ${message}`).catch(() => undefined);
+        const canonical = await lifecycle.refresh();
+        const provenance = currentSessionRuntimeReplacement(canonical);
+        const updatedAt = new Date().toISOString();
         await lifecycle.commit({
           status: "kill_failed",
           lastError: `account swap stop unconfirmed: ${message}`,
-          updatedAt: new Date().toISOString(),
+          ...(provenance ? {
+            runtimeReplacement: {
+              ...provenance,
+              state: "stop-failed" as const,
+              updatedAt,
+              detail: `account swap stop unconfirmed: ${message}`,
+            },
+          } : {}),
+          updatedAt,
         });
       },
     });

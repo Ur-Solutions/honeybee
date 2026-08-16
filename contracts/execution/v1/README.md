@@ -35,6 +35,45 @@ runner-host epoch; `checkpoint` has no runtime implementation. An older/direct
 client that still sends either receives `CAPABILITY_MISMATCH` before a durable
 operation or provider effect.
 
+## Lease expiry and Bee lifecycle
+
+An execution lease bounds Run authority and resource occupancy; it does not
+file the user's logical conversation. When a started Run reaches lease expiry,
+Honeybee waits for any real in-flight turn to settle, parks the exact HSR
+runtime, and may terminalize the internal Run as `cancelled` with cause
+`lease_expired`. The SessionRecord remains active, messageable, and bound to
+the same provider session so an ordinary send can lazily replace its runtime.
+
+Explicit `run.cancel` and `run.release` are different: they remain lifecycle
+terminal actions and stop/archive the exact Bee generation. Older Honeybee
+versions incorrectly routed lease expiry through that explicit archive path.
+When an explicit cancel arrives after the Run already settled with
+`lease_expired`, Honeybee first proves the exact Bee archive, then persists a
+versioned `cancelLifecycle.state=archive-settled` operation receipt, and only
+then appends a proof-bearing `cancel.requested`. That event carries a distinct
+`lifecycleProofId` plus the exact v1 receipt; a bare legacy
+`cancel.requested` is not archive proof and must not override lease-offload
+semantics in a consumer. Proof-bearing members use a separate idempotency key
+so a fixed daemon can supersede an unsafe bare row from an older daemon.
+
+`hive execution repair-lease-archive <bee> --run <exact-run-id>` is a
+bounded legacy migration for one operator-authorized case. It defaults to
+proof-only inspection and requires `--apply` to write the audited correction;
+it is not a general unarchive/revive primitive. Historical storage used the
+same generic retire evidence for automatic and human retirement, so this
+repair is deliberately never run automatically.
+
+During a mixed-version deployment, a daemon that had already classified the
+pre-correction runtime could overwrite the accepted correction and launch one
+replacement before the fixed binary took over. An explicit retry recognizes
+only the durable correction → same-generation `runtime.lost` → one succeeded,
+zero-replay recovery chain. With the old daemon quiesced, it fences delivery,
+strictly stops that exact no-work successor (host and child group), revalidates
+its clean event closure, and records a dedicated correction-restore edge back
+to active/parked/done. Any prompt, pending delivery, extra recovery attempt,
+changed process birth, explicit lifecycle action, or stop/closure doubt makes
+the retry fail closed.
+
 ## Schema digest
 
 `schemaDigest` is `sha256:` over the canonical JSON (sorted keys) of

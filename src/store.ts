@@ -89,6 +89,28 @@ export type SessionStopIntent = {
   blockedReason?: "event-integrity" | "exhausted";
 };
 
+/**
+ * Crash-safe provenance for the temporary non-runnable fence used while one
+ * runtime generation is being replaced. `status: "kill_failed"` remains the
+ * durable admission fence for mixed-version readers, but this structured
+ * marker distinguishes an operation that is still in progress from a stop
+ * Honeybee actually failed to prove.
+ *
+ * The marker is generation-bound. A successor publication increments
+ * runtimeGeneration, so a stale marker can never disguise stop doubt for a
+ * later incarnation even if an older writer failed to remove it.
+ */
+export type SessionRuntimeReplacement = {
+  version: 1;
+  reservationId: string;
+  operation: string;
+  sourceGeneration: number;
+  state: "pending" | "stop-failed";
+  startedAt: string;
+  updatedAt: string;
+  detail?: string;
+};
+
 export type SessionRecord = {
   name: string;
   agent: string;
@@ -202,6 +224,8 @@ export type SessionRecord = {
    * proven stop should purge (`kill`) or archive (`retire`).
    */
   stopIntent?: SessionStopIntent;
+  /** Structured provenance for an in-flight or failed runtime replacement. */
+  runtimeReplacement?: SessionRuntimeReplacement;
   notes?: string;
   id?: string;
   prefix?: string;
@@ -361,6 +385,45 @@ export type SessionPreamble = {
    */
   delivered?: boolean;
 };
+
+/** Return only replacement provenance that still binds the fenced generation. */
+export function currentSessionRuntimeReplacement(
+  record: Pick<SessionRecord, "status" | "runtimeGeneration" | "runtimeReplacement">,
+): SessionRuntimeReplacement | undefined {
+  const replacement = record.runtimeReplacement;
+  if (
+    record.status !== "kill_failed"
+    || !replacement
+    || replacement.sourceGeneration !== (record.runtimeGeneration ?? 0)
+  ) return undefined;
+  return replacement;
+}
+
+/** A pending replacement is fail-closed internally, but is not a failed stop. */
+export function isPendingSessionRuntimeReplacement(
+  record: Pick<
+    SessionRecord,
+    | "status"
+    | "runtimeGeneration"
+    | "runtimeReplacement"
+    | "stopIntent"
+    | "deliveryStopDoubt"
+    | "eventIntegrityDoubt"
+    | "stateUnverified"
+  >,
+): boolean {
+  // A replacement marker is subordinate to every durable stop/observation
+  // fence. Those fields can win a race after the marker is published; treating
+  // the stale marker as authoritative would hide a real failed stop as
+  // "booting" and suppress its manual-action request. `lastError` is not a
+  // fence here: an ordinary pending replacement deliberately records a
+  // human-readable replacement detail there for mixed-version readers.
+  return currentSessionRuntimeReplacement(record)?.state === "pending"
+    && record.stopIntent === undefined
+    && record.deliveryStopDoubt === undefined
+    && record.eventIntegrityDoubt === undefined
+    && record.stateUnverified === undefined;
+}
 
 export { storeRoot } from "./fsx.js";
 
@@ -1015,6 +1078,109 @@ export async function transitionSession(
       return { record: existing, from, to: from, changed: false };
     }
 
+    // This event is deliberately not a general-purpose unarchive primitive.
+    // Its evidence names the exact historical archive receipt that was proven
+    // to be the old lease-expiry bug. Bind that receipt under the same session
+    // lock as the transition so a concurrent revive/re-retire (or any later
+    // operator decision) wins and can never be silently corrected away.
+    if (
+      event.type === "bee.archive-corrected" &&
+      (
+        existing.stateMachine?.lastEventId !== event.evidence.archivedEventId ||
+        existing.stateMachine.lastTransition.type !== "bee.archived" ||
+        existing.stateMachine.lastTransition.cause !== "retire" ||
+        existing.status !== "done" ||
+        existing.stateMachine.lifecycle !== "archived" ||
+        existing.stateMachine.runtime !== "parked" ||
+        existing.stateMachine.work !== "done" ||
+        existing.executionRunId !== event.evidence.runId ||
+        existing.id !== event.evidence.sessionRef ||
+        existing.providerSessionId !== event.evidence.providerSessionId ||
+        existing.substrate !== "hsr" ||
+        existing.runnerPid !== event.evidence.runnerPid ||
+        (existing.runtimeGeneration ?? 0) !== event.evidence.runtimeGeneration ||
+        existing.runnerFingerprint?.pgid !== event.evidence.runnerFingerprint.pgid ||
+        existing.runnerFingerprint.startedAt !== event.evidence.runnerFingerprint.startedAt ||
+        existing.lastError !== undefined ||
+        existing.stopIntent !== undefined ||
+        existing.deliveryStopDoubt !== undefined ||
+        existing.eventIntegrityDoubt !== undefined ||
+        existing.runtimeReplacement !== undefined ||
+        existing.stateUnverified !== undefined
+      )
+    ) {
+      await appendLedger({
+        type: "state.transition.rejected",
+        session: name,
+        source: "transitionSession",
+        event,
+        from,
+        evidence: event.evidence,
+        reason: "lease-expiry archive correction no longer names the current retire transition",
+      });
+      throw new IllegalBeeTransitionError(
+        "lease-expiry archive correction no longer names the current retire transition",
+      );
+    }
+
+    // A pre-fix daemon could have loaded the old live/working cursor before
+    // the archive correction committed, then overwrite that correction with
+    // its runtime.lost (+ optional zero-replay recovery.succeeded) cursor. The
+    // dedicated restore edge is admitted only while the repair owns an exact
+    // generation-bound stop fence and every current identity still matches
+    // the durable correction provenance. It cannot demote ordinary live work.
+    if (event.type === "bee.archive-correction-restored") {
+      const recoveredSuccessor = event.evidence.recoveryEventId !== undefined;
+      const expectedCurrentEventId = recoveredSuccessor
+        ? event.evidence.recoveryEventId
+        : event.evidence.overwrittenEventId;
+      const expectedCurrentType = recoveredSuccessor ? "recovery.succeeded" : "runtime.lost";
+      const expectedCurrentCause = recoveredSuccessor ? "revive-ok" : "mid-turn-death";
+      const expectedCurrentRuntime = recoveredSuccessor ? "live" : "recovering";
+      const replacement = existing.runtimeReplacement;
+      const state = existing.stateMachine;
+      if (
+        !state || state.lastEventId !== expectedCurrentEventId ||
+        state.lastTransition.type !== expectedCurrentType ||
+        state.lastTransition.cause !== expectedCurrentCause ||
+        existing.status !== "kill_failed" ||
+        state.lifecycle !== "active" ||
+        state.runtime !== expectedCurrentRuntime ||
+        state.work !== "working" ||
+        existing.executionRunId !== event.evidence.runId ||
+        existing.id !== event.evidence.sessionRef ||
+        existing.providerSessionId !== event.evidence.providerSessionId ||
+        existing.substrate !== "hsr" ||
+        existing.runnerPid !== event.evidence.currentRunnerPid ||
+        (existing.runtimeGeneration ?? 0) !== event.evidence.currentRuntimeGeneration ||
+        existing.runnerFingerprint?.pgid !== event.evidence.currentRunnerFingerprint.pgid ||
+        existing.runnerFingerprint.startedAt !== event.evidence.currentRunnerFingerprint.startedAt ||
+        existing.lastError !== undefined ||
+        existing.stopIntent !== undefined ||
+        existing.deliveryStopDoubt !== undefined ||
+        existing.eventIntegrityDoubt !== undefined ||
+        existing.stateUnverified !== undefined ||
+        !replacement || replacement.version !== 1 ||
+        replacement.reservationId !== event.evidence.repairId ||
+        replacement.operation !== "lease-expiry-archive-correction-restore" ||
+        replacement.sourceGeneration !== event.evidence.currentRuntimeGeneration ||
+        replacement.state !== "pending"
+      ) {
+        await appendLedger({
+          type: "state.transition.rejected",
+          session: name,
+          source: "transitionSession",
+          event,
+          from,
+          evidence: event.evidence,
+          reason: "lease-expiry archive correction restore no longer names the fenced compatibility overwrite",
+        });
+        throw new IllegalBeeTransitionError(
+          "lease-expiry archive correction restore no longer names the fenced compatibility overwrite",
+        );
+      }
+    }
+
     let reduction;
     try {
       reduction = reduceBeeTransition(from, event);
@@ -1033,12 +1199,15 @@ export async function transitionSession(
 
     const stateMachine = makeStateMachineCursor(reduction, existing.stateMachine?.revision ?? 0);
     const resumesLiveWork = reduction.to.lifecycle === "active" && reduction.to.runtime === "live" && reduction.to.work === "working";
+    const correctsHistoricalArchive = event.type === "bee.archive-corrected" ||
+      event.type === "bee.archive-correction-restored";
     // Keep the legacy lifecycle spelling byte-compatible for existing readers
     // while making the bounded cursor authoritative. This also makes active
     // index membership flip atomically with explicit archive/revive events.
     const legacyStatus = event.type === "bee.archived"
       ? "done" as const
-      : event.type === "bee.revived"
+      : event.type === "bee.revived" || event.type === "bee.archive-corrected" ||
+          event.type === "bee.archive-correction-restored"
         ? "running" as const
         : existing.status;
     const record: SessionRecord = {
@@ -1047,10 +1216,15 @@ export async function transitionSession(
       stateMachine,
       stateUnverified: undefined,
       updatedAt: event.at,
-      ...(resumesLiveWork ? { lastObservedState: undefined, lastObservedStateAt: undefined } : {}),
+      ...(resumesLiveWork || correctsHistoricalArchive
+        ? { lastObservedState: undefined, lastObservedStateAt: undefined }
+        : {}),
     };
     delete (record as Record<string, unknown>).stateUnverified;
-    if (resumesLiveWork) {
+    if (event.type === "bee.revived" || event.type === "bee.archive-correction-restored") {
+      delete (record as Record<string, unknown>).runtimeReplacement;
+    }
+    if (resumesLiveWork || correctsHistoricalArchive) {
       delete (record as Record<string, unknown>).lastObservedState;
       delete (record as Record<string, unknown>).lastObservedStateAt;
     }
@@ -1980,6 +2154,9 @@ function validateStrictSessionRecord(value: unknown, path: string): void {
   if (object.stopIntent !== undefined && !normalizeSessionStopIntent(object.stopIntent)) {
     throw new Error(`Invalid session record ${path}: malformed stopIntent`);
   }
+  if (object.runtimeReplacement !== undefined && !normalizeSessionRuntimeReplacement(object.runtimeReplacement)) {
+    throw new Error(`Invalid session record ${path}: malformed runtimeReplacement`);
+  }
 }
 
 function normalizeDeliveryStopDoubt(value: unknown): DeliveryStopDoubt | null {
@@ -2094,6 +2271,31 @@ function normalizeSessionStopIntent(value: unknown): SessionStopIntent | null {
   };
 }
 
+function normalizeSessionRuntimeReplacement(value: unknown): SessionRuntimeReplacement | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const replacement = value as Record<string, unknown>;
+  if (
+    replacement.version !== 1
+    || typeof replacement.reservationId !== "string" || replacement.reservationId.length === 0
+    || typeof replacement.operation !== "string" || replacement.operation.length === 0
+    || !Number.isSafeInteger(replacement.sourceGeneration) || (replacement.sourceGeneration as number) < 0
+    || (replacement.state !== "pending" && replacement.state !== "stop-failed")
+    || typeof replacement.startedAt !== "string" || !Number.isFinite(Date.parse(replacement.startedAt))
+    || typeof replacement.updatedAt !== "string" || !Number.isFinite(Date.parse(replacement.updatedAt))
+    || (replacement.detail !== undefined && typeof replacement.detail !== "string")
+  ) return null;
+  return {
+    version: 1,
+    reservationId: replacement.reservationId,
+    operation: replacement.operation,
+    sourceGeneration: replacement.sourceGeneration as number,
+    state: replacement.state,
+    startedAt: replacement.startedAt,
+    updatedAt: replacement.updatedAt,
+    ...(typeof replacement.detail === "string" ? { detail: replacement.detail } : {}),
+  };
+}
+
 const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "remoteLaunchId", "remoteIncarnation", "lastObservedState", "lastObservedStateAt", "recoveryRequestedAt", "recoveryMessageId", "recoveryNextAttemptAt", "runId", "executionRunId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
@@ -2124,6 +2326,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "deliveryStopDoubt",
   "eventIntegrityDoubt",
   "stopIntent",
+  "runtimeReplacement",
   "stateMachine",
   "stateUnverified",
 ]);
@@ -2214,6 +2417,12 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
     const intent = normalizeSessionStopIntent(object.stopIntent);
     if (!intent) throw new Error(`Invalid session record ${path}: malformed stopIntent`);
     record.stopIntent = intent;
+  }
+
+  if (object.runtimeReplacement !== undefined) {
+    const replacement = normalizeSessionRuntimeReplacement(object.runtimeReplacement);
+    if (!replacement) throw new Error(`Invalid session record ${path}: malformed runtimeReplacement`);
+    record.runtimeReplacement = replacement;
   }
 
   // Extra sandbox write roots: only well-formed absolute paths survive the

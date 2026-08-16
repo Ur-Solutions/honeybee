@@ -21,7 +21,7 @@ import { waitForAgentReady } from "../readiness.js";
 import { authPromptLossRequestId } from "../requests/keys.js";
 import { closeRequestsForNewIncarnation, openRequest, readBeeRequests, resolveRequest } from "../requests/store.js";
 import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
-import { appendLedger, listSessions, storeRoot, transitionSession, type SessionRecord } from "../store.js";
+import { appendLedger, currentSessionRuntimeReplacement, listSessions, storeRoot, transitionSession, type SessionRecord } from "../store.js";
 import { isArchivedSessionLifecycle, isRunnableSessionRecord, type ProbeEvidence } from "../stateMachine.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { stopRuntimeForReplacement } from "../substrates/stop.js";
@@ -316,10 +316,21 @@ async function persistReplacementStopDoubt(
   cause: unknown,
 ): Promise<void> {
   const message = cause instanceof Error ? cause.message : String(cause);
+  const current = await lifecycle.refresh();
+  const replacement = currentSessionRuntimeReplacement(current);
+  const updatedAt = new Date().toISOString();
   await lifecycle.commit({
     status: "kill_failed",
     lastError: `${operation}: ${message}`,
-    updatedAt: new Date().toISOString(),
+    ...(replacement ? {
+      runtimeReplacement: {
+        ...replacement,
+        state: "stop-failed" as const,
+        updatedAt,
+        detail: `${operation}: ${message}`,
+      },
+    } : {}),
+    updatedAt,
   });
 }
 
@@ -663,11 +674,22 @@ async function persistLaunchedReplacementStopDoubt(
   operation: string,
   detail: string,
 ): Promise<void> {
+  const current = await lifecycle.refresh();
+  const replacement = currentSessionRuntimeReplacement(current);
+  const updatedAt = new Date().toISOString();
   await lifecycle.commit({
     ...ownership,
     status: "kill_failed",
     lastError: `${operation}: ${detail}`,
-    updatedAt: new Date().toISOString(),
+    ...(replacement ? {
+      runtimeReplacement: {
+        ...replacement,
+        state: "stop-failed" as const,
+        updatedAt,
+        detail: `${operation}: ${detail}`,
+      },
+    } : {}),
+    updatedAt,
   });
 }
 
@@ -1922,6 +1944,9 @@ export async function reviveRecordInTransaction(
             remoteLaunchId: locator.launchId,
             ...(locator.incarnation ? { remoteIncarnation: locator.incarnation } : {}),
           }, detail).catch(() => undefined);
+          const current = await lifecycle.refresh();
+          const replacement = currentSessionRuntimeReplacement(current);
+          const updatedAt = new Date().toISOString();
           await lifecycle.commit({
             ...incarnation,
             node: record.node,
@@ -1930,7 +1955,15 @@ export async function reviveRecordInTransaction(
             cwd: spawnResult?.cwd ?? record.cwd,
             status: "kill_failed",
             lastError: `remote HSR revive launch cleanup unconfirmed: ${detail}`,
-            updatedAt: new Date().toISOString(),
+            ...(replacement ? {
+              runtimeReplacement: {
+                ...replacement,
+                state: "stop-failed" as const,
+                updatedAt,
+                detail: `remote HSR revive launch cleanup unconfirmed: ${detail}`,
+              },
+            } : {}),
+            updatedAt,
           }).catch(() => undefined);
         };
         const cleanup = async (cause: unknown, locator: { launchId: string; incarnation?: string }): Promise<never> => {

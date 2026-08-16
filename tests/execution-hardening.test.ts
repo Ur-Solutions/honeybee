@@ -298,7 +298,7 @@ test("stale exit folds cannot escape a concurrently committed cancellation", asy
   }
 });
 
-test("lease expiry stops ongoing execution: confirmed stop -> cancelled(lease_expired); unconfirmed -> lost", async () => {
+test("lease expiry parks the runtime without explicit-cancel semantics: parked -> cancelled(lease_expired); unconfirmed -> lost", async () => {
   await withTempStore(async () => {
     const expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
     const { control } = await startRunning({ expiresAt });
@@ -309,7 +309,7 @@ test("lease expiry stops ongoing execution: confirmed stop -> cancelled(lease_ex
     const reservation = (await readReservation(RUN_ID))!;
     assert.equal(reservation.result?.cause, "lease_expired");
     const types = (await readRunEvents(RUN_ID)).map((event) => event.type);
-    assert.ok(types.includes("cancel.requested"));
+    assert.ok(!types.includes("cancel.requested"), "resource offload is not an operator cancellation request");
     assert.ok(types.includes("run.cancelled"));
   });
 
@@ -322,7 +322,59 @@ test("lease expiry stops ongoing execution: confirmed stop -> cancelled(lease_ex
     assert.equal(projection.state, "lost");
     const reservation = (await readReservation(RUN_ID))!;
     assert.equal(reservation.result, undefined, "no false terminal over a possibly-live harness");
-    assert.ok((await readRunEvents(RUN_ID)).some((event) => event.type === "run.lost"));
+    const events = await readRunEvents(RUN_ID);
+    assert.ok(events.some((event) => event.type === "run.lost"));
+    assert.equal((events.find((event) => event.type === "run.lost")!.payload as JsonObject).cause, "lease_parking_unconfirmed");
+  });
+});
+
+test("lease parking deferral still folds a proven harness exit, while unconfirmed parking doubt stays nonterminal", async () => {
+  await withTempStore(async () => {
+    const expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    await startRunning({ expiresAt });
+    const record = (await loadSession(beeNameForRun(RUN_ID)))!;
+    const sessions: SessionEvidenceSource = {
+      evidence: async () => ({
+        sessionExists: true,
+        stampedRunId: RUN_ID,
+        sessionRef: record.id,
+        ready: false,
+      }),
+      outcome: async () => ({ live: false, exitCode: 17 }),
+    };
+    const later = makeService({
+      sessions,
+      now: () => new Date(Date.now() + 2 * 60 * 60_000),
+      parkSessionRuntime: async () => ({ status: "deferred", detail: "bounded work is still in flight" }),
+    });
+    const projection = ((await later.runGet({ protocolVersion: "0.1", runId: RUN_ID })) as { result: JsonObject }).result;
+    assert.equal(projection.state, "failed");
+    assert.equal((await readReservation(RUN_ID))!.result?.harnessExitCode, 17);
+  });
+
+  await withTempStore(async () => {
+    const expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    await startRunning({ expiresAt });
+    const record = (await loadSession(beeNameForRun(RUN_ID)))!;
+    const sessions: SessionEvidenceSource = {
+      evidence: async () => ({
+        sessionExists: true,
+        stampedRunId: RUN_ID,
+        sessionRef: record.id,
+        ready: false,
+      }),
+      outcome: async () => ({ live: false, exitCode: 0 }),
+    };
+    const later = makeService({
+      sessions,
+      now: () => new Date(Date.now() + 2 * 60 * 60_000),
+      parkSessionRuntime: async () => ({ status: "unconfirmed", detail: "runtime stopped but canonical park receipt failed" }),
+    });
+    const projection = ((await later.runGet({ protocolVersion: "0.1", runId: RUN_ID })) as { result: JsonObject }).result;
+    assert.equal(projection.state, "lost");
+    const reservation = (await readReservation(RUN_ID))!;
+    assert.equal(reservation.result, undefined, "dead outcome cannot bypass the missing logical parked proof");
+    assert.equal(reservation.indeterminateCause, "lease_parking_unconfirmed");
   });
 });
 
@@ -351,7 +403,8 @@ test("stop retries on every reconcile pass: a transient first failure never stra
     await startRunning({ control, expiresAt });
     const later = makeService({ control: control.control, now: () => new Date(Date.now() + 2 * 60 * 60_000) });
 
-    // First pass: stop unconfirmed -> lost, cancel(lease_expired) persisted.
+    // First pass: runtime-only parking is unconfirmed -> lost. No explicit
+    // cancellation intent is manufactured from the resource lease.
     let projection = ((await later.runGet({ protocolVersion: "0.1", runId: RUN_ID })) as { result: JsonObject }).result;
     assert.equal(projection.state, "lost");
     const stopsAfterFirst = control.calls.filter((call) => call.method === "stop").length;
@@ -360,6 +413,13 @@ test("stop retries on every reconcile pass: a transient first failure never stra
     // Second pass with the failure persisting: the reconciler RETRIES.
     await later.runGet({ protocolVersion: "0.1", runId: RUN_ID });
     assert.ok(control.calls.filter((call) => call.method === "stop").length > stopsAfterFirst, "stop retried on later reconcile");
+    const unresolvedEvents = await readRunEvents(RUN_ID);
+    assert.equal(unresolvedEvents.filter((event) => event.type === "run.lost").length, 1, "one durable loss episode is reused");
+    assert.equal(
+      unresolvedEvents.filter((event) => event.type === "run.recovering").length,
+      0,
+      "ordinary ready evidence cannot clear a runtime-parking doubt",
+    );
 
     // Failure clears: a later reconcile confirms the stop and terminalizes.
     control.behavior.stopResult = { stopped: true, detail: "clean stop confirmed" };
@@ -369,8 +429,7 @@ test("stop retries on every reconcile pass: a transient first failure never stra
     assert.equal(reservation.result?.cause, "lease_expired");
     assert.equal(reservation.indeterminateAt, undefined);
     const events = await readRunEvents(RUN_ID);
-    assert.deepEqual(events.slice(-5).map((event) => event.type), [
-      "cancel.requested",
+    assert.deepEqual(events.slice(-4).map((event) => event.type), [
       "run.lost",
       "run.recovering",
       "harness.exited",

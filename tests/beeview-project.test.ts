@@ -5,6 +5,7 @@ import type { RunnerEvent } from "../src/hsr/types.js";
 import type { SealRecord } from "../src/seal.js";
 import { liveTargetKey, type BeeState, type StateContext } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
+import { isRunnableSessionRecord } from "../src/stateMachine.js";
 import { projectBeeView, type BeeViewProjectionSources } from "../src/view/project.js";
 import type { BeeDisplayState } from "../src/view/types.js";
 import { lifecycleCursor } from "./lifecycle-fixtures.js";
@@ -384,6 +385,80 @@ test("BeeView preserves stop doubt while canonical archive still wins", () => {
   const archivedView = project({ record: archived, context: liveCtx(archived) });
   assert.equal(archivedView.displayState, "retired");
   assert.equal(archivedView.interactionState, "archived");
+});
+
+test("parked lazy wake projects recovering while its crash-safe replacement fence stays non-runnable", () => {
+  const at = iso(NOW - 5_000);
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const pending = record({
+    status: "kill_failed",
+    runtimeGeneration: 4,
+    lastError: "replacement operation lazy-wake is stopping generation 4",
+    runtimeReplacement: {
+      version: 1,
+      reservationId: "reservation-lazy-wake",
+      operation: "lazy-wake",
+      sourceGeneration: 4,
+      state: "pending",
+      startedAt: at,
+      updatedAt: at,
+    },
+    stateMachine: { ...cursor, runtime: "parked", work: "done" },
+  });
+
+  const waking = project({ record: pending, context: ctx() });
+  assert.equal(isRunnableSessionRecord(pending), false, "the durable replacement fence still closes mutation admission");
+  assert.equal(waking.bee.lifecycleState, "active");
+  assert.equal(waking.latestRuntime.runtimeState, "parked");
+  assert.equal(waking.latestRuntime.state, "starting");
+  assert.equal(waking.latestRuntime.stopFailed, undefined);
+  assert.deepEqual(waking.latestRuntime.replacement, {
+    operation: "lazy-wake",
+    sourceGeneration: 4,
+    state: "pending",
+    startedAt: at,
+    updatedAt: at,
+  });
+  assert.equal(waking.displayState, "recovering");
+  assert.equal(waking.interactionState, "working");
+  assert.equal(waking.compatibilityFields.beeState, "booting");
+  assert.equal(waking.compatibilityFields.sessionStatus, "kill_failed", "raw compatibility retains the internal fence only");
+
+  const failed: SessionRecord = {
+    ...pending,
+    lastError: "hive revive stop unconfirmed: host survived",
+    runtimeReplacement: {
+      ...pending.runtimeReplacement!,
+      state: "stop-failed",
+      detail: "hive revive stop unconfirmed: host survived",
+    },
+  };
+  const failedView = project({ record: failed, context: ctx() });
+  assert.equal(isRunnableSessionRecord(failed), false);
+  assert.equal(failedView.latestRuntime.stopFailed, true);
+  assert.equal(failedView.latestRuntime.replacement?.state, "stop-failed");
+  assert.equal(failedView.displayState, "stop-failed");
+  assert.equal(failedView.interactionState, "blocked");
+  assert.equal(failedView.compatibilityFields.beeState, "kill_failed");
+
+  const explicitStopWon: SessionRecord = {
+    ...pending,
+    stopIntent: {
+      version: 1,
+      action: "retire",
+      generation: 4,
+      requestedAt: iso(NOW - 4_000),
+      attempts: 1,
+    },
+    lastError: "explicit retire won while replacement was pending",
+  };
+  const fencedView = project({ record: explicitStopWon, context: ctx() });
+  assert.equal(fencedView.latestRuntime.replacement?.state, "pending", "provenance remains visible for audit");
+  assert.equal(fencedView.latestRuntime.state, "exited");
+  assert.equal(fencedView.latestRuntime.stopFailed, true);
+  assert.equal(fencedView.displayState, "stop-failed");
+  assert.equal(fencedView.interactionState, "blocked");
+  assert.equal(fencedView.compatibilityFields.beeState, "kill_failed");
 });
 
 test("stop doubt outranks every active runtime and observer projection", () => {

@@ -56,6 +56,20 @@ export type BeeViewBee = {
   taskAttribution?: { runId?: string; flowName?: string };
 };
 
+/**
+ * Structured provenance for a fail-closed runtime replacement. `pending`
+ * means Honeybee is waking/replacing the generation, not that a stop failed;
+ * `stop-failed` is the operator-actionable control case.
+ */
+export type BeeViewRuntimeReplacement = {
+  operation: string;
+  sourceGeneration: number;
+  state: "pending" | "stop-failed";
+  startedAt: string;
+  updatedAt: string;
+  detail?: string;
+};
+
 /** Latest runtime incarnation (ADR "RuntimeGeneration", projected). */
 export type BeeViewRuntime = {
   /** record.runtimeGeneration ?? 0 — monotonic across revive/promote/demote. */
@@ -75,6 +89,8 @@ export type BeeViewRuntime = {
   runnerPid?: number;
   runnerTier?: string;
   providerSessionId?: string;
+  /** Present while a generation-bound replacement fence is current. */
+  replacement?: BeeViewRuntimeReplacement;
   /**
    * Only derivable for exited runtimes, from recorded intent:
    *   stopped — record.status "dead"/"done" (a retire/kill was recorded)

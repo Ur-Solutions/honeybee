@@ -27,7 +27,7 @@ import {
 } from "./hsr/eventIntegrity.js";
 import { withSessionLifecycleLock, type SessionLifecycleTransaction } from "./lifecycle.js";
 import { isActiveSessionLifecycle } from "./stateMachine.js";
-import { loadSession, safeName, type SessionRecord } from "./store.js";
+import { currentSessionRuntimeReplacement, loadSession, safeName, type SessionRecord } from "./store.js";
 import type { NewSessionResult, SubstrateKind } from "./substrates/types.js";
 
 export type TmuxLaunchReservationRuntime = {
@@ -437,6 +437,21 @@ export async function beginBeeReplacementOperation(
         updatedAt: new Date().toISOString(),
       };
       await writeReservation(adopted);
+      const adoptedAt = new Date().toISOString();
+      await lifecycle.commit({
+        runtimeReplacement: {
+          version: 1,
+          reservationId: adopted.reservationId,
+          operation,
+          sourceGeneration: current.runtimeGeneration ?? 0,
+          state: "pending",
+          startedAt: current.runtimeReplacement?.reservationId === adopted.reservationId
+            ? current.runtimeReplacement.startedAt
+            : adopted.createdAt,
+          updatedAt: adoptedAt,
+        },
+        updatedAt: adoptedAt,
+      });
       return new DurableBeeNameLaunchReservation(adopted);
     }
   }
@@ -448,11 +463,21 @@ export async function beginBeeReplacementOperation(
   }
 
   const handle = await createBeeReplacementLaunchAdmission(lifecycle, operation);
+  const startedAt = new Date().toISOString();
   try {
     await lifecycle.commit({
       status: "kill_failed",
       lastError: `replacement operation ${operation} is stopping generation ${current.runtimeGeneration ?? 0}`,
-      updatedAt: new Date().toISOString(),
+      runtimeReplacement: {
+        version: 1,
+        reservationId: handle.id,
+        operation,
+        sourceGeneration: current.runtimeGeneration ?? 0,
+        state: "pending",
+        startedAt,
+        updatedAt: startedAt,
+      },
+      updatedAt: startedAt,
     });
   } catch (error) {
     // No stop signal has been sent yet. Remove our journal before surfacing the
@@ -464,7 +489,34 @@ export async function beginBeeReplacementOperation(
   // every subsequent coordinator crash replayable only by exact-generation
   // adoption; a crash while the journal is still `reserved` proves no stop was
   // dispatched and is safely reclaimable.
-  await handle.markPredecessorStopping();
+  try {
+    await handle.markPredecessorStopping();
+  } catch (error) {
+    // The reservation write is an ambiguous durability boundary: a failed
+    // atomic write may have left either `reserved` or `stopping` on disk. Never
+    // roll the canonical work fence back or ask the in-memory handle to rewrite
+    // the journal from its stale phase. Instead expose a genuine, mutation-
+    // closed admission failure until exact reservation reconciliation repairs
+    // it; this must not masquerade forever as a normal lazy wake.
+    const message = messageOf(error);
+    const currentFenced = await lifecycle.refresh();
+    const replacement = currentSessionRuntimeReplacement(currentFenced);
+    const failedAt = new Date().toISOString();
+    await lifecycle.commit({
+      status: "kill_failed",
+      lastError: `replacement operation ${operation} could not persist predecessor-stop admission: ${message}`,
+      ...(replacement ? {
+        runtimeReplacement: {
+          ...replacement,
+          state: "stop-failed" as const,
+          updatedAt: failedAt,
+          detail: `predecessor-stop admission persistence failed: ${message}`,
+        },
+      } : {}),
+      updatedAt: failedAt,
+    });
+    throw error;
+  }
   return handle;
 }
 

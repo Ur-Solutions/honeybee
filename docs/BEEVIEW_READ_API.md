@@ -8,10 +8,27 @@ contract), [Assessment](./STATE_MODEL_V2_ASSESSMENT.md) (§4 steps 3-6)
 BeeView is a versioned, Honeybee-owned read model: a pure projection of
 current stores (SessionRecord JSON, the bounded state cursor, derived `BeeState`, tmux `@hive_state`,
 HSR run dirs, seals) into structured facts. Library-first with a CLI mirror
-(`hive state explain` / `hive state ls`). No new persisted state, no writes,
-no daemon requirement; staleness is surfaced, never hidden. The 2026-08-11
+(`hive state explain` / `hive state ls`). The read path performs no writes and
+has no daemon requirement; staleness is surfaced, never hidden. Runtime replacement
+provenance is a persisted safety fact owned by lifecycle admission, not a
+BeeView write. The 2026-08-11
 bounded-state extension is additive within schemaVersion 1: existing fields
 retain their spelling and meaning.
+
+### 2026-08-16 runtime-replacement provenance
+
+- The crash-safe replacement path keeps its durable, non-runnable internal
+  fence, but `latestRuntime.replacement` now distinguishes a replacement that
+  is still `pending` from a genuine `stop-failed` result. The internal launch
+  reservation id is deliberately not part of BeeView.
+- A pending `lazy-wake` projects as `latestRuntime.state: "starting"`,
+  `displayState: "recovering"`, and `interactionState: "working"`; it never
+  sets `latestRuntime.stopFailed` or creates a stop-failed request. The bounded
+  runtime axis may remain `parked` until successor publication.
+- Both pending and failed replacement fences remain mutation-closed. A true
+  teardown failure projects `stopFailed: true`, `displayState: "stop-failed"`,
+  and `interactionState: "blocked"`. Successful successor publication clears
+  replacement provenance in the same generation commit.
 
 ### 2026-08-11 bounded-state extension
 
@@ -125,6 +142,15 @@ export type BeeViewBee = {
   taskAttribution?: { runId?: string; flowName?: string };
 };
 
+export type BeeViewRuntimeReplacement = {
+  operation: string;
+  sourceGeneration: number;
+  state: "pending" | "stop-failed";
+  startedAt: string;
+  updatedAt: string;
+  detail?: string;
+};
+
 /** Latest runtime incarnation (ADR "RuntimeGeneration", projected). */
 export type BeeViewRuntime = {
   /** record.runtimeGeneration ?? 0 — monotonic across revive/promote/demote. */
@@ -144,6 +170,8 @@ export type BeeViewRuntime = {
   runnerPid?: number;
   runnerTier?: string;
   providerSessionId?: string;
+  /** Current generation-bound replacement provenance; no internal reservation id. */
+  replacement?: BeeViewRuntimeReplacement;
   /**
    * Only derivable for exited runtimes, from recorded intent:
    *   stopped — record.status "dead"/"done" (a retire/kill was recorded)
@@ -351,8 +379,9 @@ export type BeeViewListV1 = {
     (`settled-unverified` observer-grade, or `responded` when structured/hook
     evidence exists).
   `wedged`/`error` → `needs-action` with a synthesized observer-grade
-  manual-action request (id `manual:<bee>:<gen>:wedged`); `kill_failed` →
-  `stop-failed`; `node_unreachable` → `unreachable` (with the caveat that
+  manual-action request (id `manual:<bee>:<gen>:wedged`); a genuine
+  `kill_failed` stop result → `stop-failed`, while a generation-bound pending
+  replacement fence → `recovering`; `node_unreachable` → `unreachable` (with the caveat that
    today's node probe is not a heartbeat contract — graded observer).
   A bounded runtime in `recovering` projects as `recovering`; `parked`
   projects as `ready` and is intentionally absent from displayState.

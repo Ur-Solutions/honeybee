@@ -16,6 +16,7 @@ import { cmdColony } from "./commands/colony.js";
 import { cmdCompletion, cmdConfig } from "./commands/config.js";
 import { cmdDaemon, cmdSessions, cmdSync } from "./commands/daemon.js";
 import { cmdEvents } from "./commands/events.js";
+import { cmdExecution } from "./commands/execution.js";
 import { cmdFlight } from "./commands/flight.js";
 import { cmdFlow, runFlowExec } from "./commands/flow.js";
 import { cmdComb, COMB_HELP, runCombSweepExec } from "./commands/comb.js";
@@ -306,6 +307,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "events":
       await cmdEvents(parsed);
       break;
+    case "execution":
+      await cmdExecution(parsed);
+      break;
     case "flight":
       await cmdFlight(parsed);
       break;
@@ -440,6 +444,7 @@ function printHelp() {
     {
       title: "Substrate & daemon",
       rows: [
+        ["execution", "repair-lease-archive <bee>", "inspect/apply one proof-bound historical execution lease archive correction"],
         ["node", "<list|register|…>", "manage substrate endpoints (local + ssh-tmux)"],
         ["substrate", "list", "show available substrate kinds"],
         ["daemon", "<status|logs|…>", "manage the hive daemon LaunchAgent + inspect state/logs"],
