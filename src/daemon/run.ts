@@ -553,6 +553,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     // single-flight controller retains a non-isolated late promise until it
     // settles, but shutdown never waits indefinitely for it.
     await deps.syncChains?.close?.().catch(() => undefined);
+    await deps.dispatchHsrStopRecovery?.close?.().catch(() => undefined);
     await deps.sampleUsage?.close?.().catch(() => undefined);
     await deps.sweepPools?.close?.().catch(() => undefined);
     await deps.reprobeTerminalCursors?.close?.().catch(() => undefined);

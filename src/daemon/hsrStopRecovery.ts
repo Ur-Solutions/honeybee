@@ -32,7 +32,9 @@ export type HsrStopRecoveryDeps = {
   appendEvent?: typeof appendLedger;
 };
 
-export type HsrStopRecoveryDispatcher = (records: SessionRecord[]) => Promise<HsrStopRecoveryOutcome[]>;
+export type HsrStopRecoveryDispatcher = (
+  (records: SessionRecord[]) => Promise<HsrStopRecoveryOutcome[]>
+) & { close?: () => Promise<void> };
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -239,25 +241,37 @@ export function createHsrStopRecoveryDispatcher(
   deps: HsrStopRecoveryDeps & { startBackground?: (job: () => Promise<void>) => void } = {},
 ): HsrStopRecoveryDispatcher {
   const startBackground = deps.startBackground ?? ((job: () => Promise<void>) => queueMicrotask(() => void job()));
-  let inFlight = false;
+  let inFlight: Promise<void> | undefined;
   let pending: HsrStopRecoveryOutcome[] = [];
-  return async (records) => {
+  const dispatcher = (async (records) => {
     const report = pending;
     pending = [];
     const now = deps.now ?? Date.now;
     if (inFlight || !records.some((record) => hasRetryableHsrStopIntent(record, now()))) {
       return report;
     }
-    inFlight = true;
-    startBackground(async () => {
+    inFlight = new Promise<void>((resolve, reject) => {
       try {
-        pending = await runHsrStopRecoverySweep(records, deps);
+        startBackground(async () => {
+          try {
+            pending = await runHsrStopRecoverySweep(records, deps);
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
       } catch (error) {
-        pending = [{ bee: "<hsr-stop-recovery-sweep>", action: "failed", error: errorMessage(error) }];
-      } finally {
-        inFlight = false;
+        reject(error);
       }
+    }).catch((error) => {
+      pending = [{ bee: "<hsr-stop-recovery-sweep>", action: "failed", error: errorMessage(error) }];
+    }).finally(() => {
+      inFlight = undefined;
     });
     return report;
+  }) as HsrStopRecoveryDispatcher;
+  dispatcher.close = async () => {
+    await inFlight;
   };
+  return dispatcher;
 }

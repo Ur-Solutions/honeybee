@@ -240,6 +240,38 @@ test("HSR stop recovery dispatcher does not overlap background sweeps", async ()
   assert.equal(starts, 1);
 });
 
+test("HSR stop recovery dispatcher joins its tracked sweep during shutdown", async () => {
+  await withTempStore(async () => {
+    const session = record("shutdown-join", "kill");
+    await saveSession(session);
+    let run: (() => Promise<void>) | undefined;
+    let finished = false;
+    const dispatcher = createHsrStopRecoveryDispatcher({
+      startBackground: (job) => {
+        run = job;
+      },
+      now: () => NOW,
+      killRecord: async () => {
+        finished = true;
+        return { ok: false, lastError: "still live", stillRunning: true, attempts: 1 };
+      },
+      appendEvent: async () => undefined,
+    });
+
+    await dispatcher([session]);
+    let closed = false;
+    const closing = dispatcher.close?.().then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    assert.equal(closed, false, "shutdown remains fenced while the retry is pending");
+    await run?.();
+    await closing;
+    assert.equal(finished, true);
+    assert.equal(closed, true);
+  });
+});
+
 test("HSR stop recovery never signals a replaced host or child process group", async () => {
   await withTempStore(async () => {
     const session = record("replacement-refusal", "retire");
