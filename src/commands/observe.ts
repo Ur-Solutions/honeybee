@@ -25,7 +25,7 @@ import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, resolveSessionTranscript } from "../sessionMetadata.js";
 import { deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, parseBeeState, stateLabel, type BeeState, type DerivedState, type StateContext } from "../state.js";
 import { isArchivedSessionLifecycle } from "../stateMachine.js";
-import { listActiveSessionsHot, listSessions, loadSession, type SessionRecord } from "../store.js";
+import { listActiveSessions, listActiveSessionsHot, listSessions, loadSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { effectiveTags, normalizeTagArg } from "../tags.js";
 import { appendedPaneText, parseTailOptions } from "../tail.js";
@@ -129,10 +129,7 @@ function wantsHistoryRecords(parsed: Parsed, stateFilter = normalizedStateFilter
 async function sessionRecordsForListing(parsed: Parsed, deps: ObserveDeps = {}): Promise<SessionRecord[]> {
   return wantsHistoryRecords(parsed)
     ? (deps.listSessions ?? listSessions)()
-    // These are display commands, not account-admission decisions. Trust the
-    // daemon-maintained projection so a busy sessions directory cannot force
-    // every `list`/TUI refresh through the safety API's full-history rebuild.
-    : (deps.listActiveSessions ?? deps.listActiveSessionsHot ?? listActiveSessionsHot)();
+    : (deps.listActiveSessions ?? listActiveSessions)();
 }
 
 async function loadBeeListSnapshot(parsed: Parsed, deps: ObserveDeps = {}): Promise<BeeListSnapshot> {
