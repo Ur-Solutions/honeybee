@@ -45,7 +45,7 @@ import { isTerminalState, type BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
 import { envMs } from "./timeouts.js";
 
-const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
+const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60_000;
 
 export type PoolFlagReason = "dirty" | "parked-branch";
 
@@ -64,6 +64,12 @@ export type PoolSweepOutcome = {
   extended?: number;
   /** Loud soft-cap warning text (pre-extend pushing past maxSize). */
   warned?: string;
+  /** Detached scheduler diagnostic; `pool: "*"` means lane-wide. */
+  action?: "started" | "completed";
+  durationMs?: number;
+  poolsDiscovered?: number;
+  skippedWhileInFlight?: number;
+  throttledTicks?: number;
   error?: string;
 };
 
@@ -152,6 +158,12 @@ export type PoolSweeperDeps = {
   refreshPool?: (pool: ResolvedPool) => Promise<ResolvedPool>;
   /** @internal deterministic background-job scheduler for concurrency tests. */
   startBackground?: (job: () => Promise<void>) => void;
+  /**
+   * Production daemon mode: the tick only starts/collects one shared sweep lane.
+   * The full project/pool discovery and checkout work never runs inline with
+   * the 5s observation loop.
+   */
+  detached?: boolean;
 };
 
 /**
@@ -236,10 +248,8 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
     return { created: created.length, ...(warned ? { warned } : {}) };
   });
 
-  return async (records, currentStates) => {
+  const runSweepPass = async (records: SessionRecord[], currentStates: Map<string, BeeState>) => {
     const nowMs = now();
-    if (nowMs - lastSweepAt < intervalMs) return [];
-    lastSweepAt = nowMs;
 
     const recordByName = new Map(records.map((record) => [record.name, record]));
 
@@ -258,7 +268,7 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
     } catch {
       pools = [];
     }
-    if (pools.length === 0) return [];
+    if (pools.length === 0) return { outcomes, poolsDiscovered: 0 };
 
     // This barrier is deliberately after discovery but before any per-pool
     // mutation. A display-terminal state does not release capacity: only the
@@ -268,7 +278,10 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
       liveBees = await observeLiveBees(records, currentStates);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      return pools.map((pool) => ({ pool: pool.key, error: `occupancy observation failed closed: ${detail}` }));
+      return {
+        outcomes: pools.map((pool) => ({ pool: pool.key, error: `occupancy observation failed closed: ${detail}` })),
+        poolsDiscovered: pools.length,
+      };
     }
 
     for (const pool of pools) {
@@ -417,8 +430,108 @@ export function createPoolSweeper(deps: PoolSweeperDeps = {}): PoolSweeper {
         outcomes.push(outcome);
       }
     }
-    return outcomes;
+    return { outcomes, poolsDiscovered: pools.length };
   };
+
+  const runThrottled = async (records: SessionRecord[], currentStates: Map<string, BeeState>) => {
+    const nowMs = now();
+    if (nowMs - lastSweepAt < intervalMs) return [];
+    lastSweepAt = nowMs;
+    return (await runSweepPass(records, currentStates)).outcomes;
+  };
+
+  if (!deps.detached) return runThrottled;
+
+  let inFlight: Promise<void> | undefined;
+  let startedAtMs = 0;
+  let pending: PoolSweepOutcome[] = [];
+  let skippedWhileInFlight = 0;
+  let throttledTicks = 0;
+
+  const detached = (async (records: SessionRecord[], currentStates: Map<string, BeeState>) => {
+    const report = pending;
+    pending = [];
+    const nowMs = now();
+    if (inFlight) {
+      skippedWhileInFlight += 1;
+      return report;
+    }
+    if (nowMs - lastSweepAt < intervalMs) {
+      throttledTicks += 1;
+      return report;
+    }
+
+    lastSweepAt = nowMs;
+    startedAtMs = nowMs;
+    const startSkipped = skippedWhileInFlight;
+    const startThrottled = throttledTicks;
+    skippedWhileInFlight = 0;
+    throttledTicks = 0;
+    report.push({
+      pool: "*",
+      action: "started",
+      ...(startSkipped > 0 ? { skippedWhileInFlight: startSkipped } : {}),
+      ...(startThrottled > 0 ? { throttledTicks: startThrottled } : {}),
+    });
+
+    const job = async () => {
+      try {
+        const result = await runSweepPass(records, currentStates);
+        pending = [
+          {
+            pool: "*",
+            action: "completed",
+            durationMs: Math.max(0, now() - startedAtMs),
+            poolsDiscovered: result.poolsDiscovered,
+            ...(skippedWhileInFlight > 0 ? { skippedWhileInFlight } : {}),
+            ...(throttledTicks > 0 ? { throttledTicks } : {}),
+          },
+          ...result.outcomes,
+        ];
+      } catch (error) {
+        pending = [{
+          pool: "*",
+          action: "completed",
+          durationMs: Math.max(0, now() - startedAtMs),
+          ...(skippedWhileInFlight > 0 ? { skippedWhileInFlight } : {}),
+          ...(throttledTicks > 0 ? { throttledTicks } : {}),
+          error: error instanceof Error ? error.message : String(error),
+        }];
+      } finally {
+        skippedWhileInFlight = 0;
+        throttledTicks = 0;
+        inFlight = undefined;
+      }
+    };
+    inFlight = new Promise<void>((resolve, reject) => {
+      try {
+        startBackground(async () => {
+          try {
+            await job();
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+      } catch (error) {
+        reject(error);
+      }
+    }).catch((error) => {
+      pending = [{
+        pool: "*",
+        action: "completed",
+        durationMs: Math.max(0, now() - startedAtMs),
+        error: error instanceof Error ? error.message : String(error),
+      }];
+    }).finally(() => {
+      inFlight = undefined;
+    });
+    return report;
+  }) as PoolSweeper & { close: () => Promise<void> };
+  detached.close = async () => {
+    await inFlight;
+  };
+  return detached;
 }
 
 /** Back out the member number from a sync row's path (`…/<pool>-<n>`), -1 when unparseable. */

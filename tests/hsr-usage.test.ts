@@ -218,13 +218,16 @@ test("HSR sampler trusts absence from a supplied observation batch instead of re
   assert.equal(reads, 0);
 });
 
-test("HSR sampler coalesces a later tick while an abandoned sample is still running", async () => {
+test("detached HSR sampler coalesces later ticks while a sample is still running", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
+  const jobs: Array<() => Promise<void>> = [];
   let reads = 0;
   const sampler = createUsageSampler({
+    detached: true,
+    startBackground: (job) => jobs.push(job),
     readHsrUsage: async () => {
       reads += 1;
       await gate;
@@ -235,10 +238,45 @@ test("HSR sampler coalesces a later tick while an abandoned sample is still runn
 
   const first = sampler([record()], new Map(), 1_000);
   const second = sampler([record()], new Map(), 2_000);
-  assert.equal(second, first);
+  assert.deepEqual(await first, [{ bee: "*", account: "*", sampled: false, exhausted: false, diagnostic: "started", considered: 1, processed: 1 }]);
+  assert.deepEqual(await second, []);
+  const running = jobs.shift()!();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(reads, 1);
   release();
-  await first;
+  await running;
+  const reported = await sampler([record()], new Map(), 3_000);
+  assert.equal(reported[0]!.diagnostic, "completed");
+  assert.equal(reported[0]!.skippedWhileInFlight, 1);
+});
+
+test("HSR sampler budget rotates candidates for eventual coverage", async () => {
+  const readOrder: string[] = [];
+  const sampler = createUsageSampler({
+    sampleBudget: 2,
+    readHsrUsage: async (bee) => {
+      readOrder.push(bee);
+      return { totals: { inputTokens: 1, outputTokens: 1 } };
+    },
+    appendUsageEvent: async () => undefined,
+    sampleIntervalMs: 0,
+  });
+  const records = [
+    record({ name: "CL.1" }),
+    record({ name: "CL.2" }),
+    record({ name: "CL.3" }),
+  ];
+
+  const first = await sampler(records, new Map(), 1_000);
+  const second = await sampler(records, new Map(), 2_000);
+
+  assert.deepEqual(readOrder, ["CL.1", "CL.2", "CL.3", "CL.1"]);
+  assert.equal(first[0]!.diagnostic, "completed");
+  assert.equal(first[0]!.considered, 3);
+  assert.equal(first[0]!.processed, 2);
+  assert.equal(second[0]!.diagnostic, "completed");
+  assert.equal(second[0]!.considered, 3);
+  assert.equal(second[0]!.processed, 2);
 });
 
 test("claude parseLine maps rate_limit_event: [] when allowed, exhausted when rejected", () => {

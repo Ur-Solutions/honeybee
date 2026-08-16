@@ -30,7 +30,13 @@ export type UsageTickOutcome = {
   sampled: boolean;
   /** True on the rising edge of an exhaustion message (event emitted this tick). */
   exhausted: boolean;
+  diagnostic?: "started" | "completed";
+  considered?: number;
+  processed?: number;
+  durationMs?: number;
+  skippedWhileInFlight?: number;
   resetHint?: string;
+  error?: string;
 };
 
 export type UsageSamplerDeps = {
@@ -51,6 +57,12 @@ export type UsageSamplerDeps = {
   isMirroredRemoteBee?: (record: SessionRecord) => Promise<boolean>;
   /** Minimum interval between transcript reads per bee (default 60s). */
   sampleIntervalMs?: number;
+  /** Maximum active account-bound records sampled in one pass; undefined = all. */
+  sampleBudget?: number;
+  /** Production daemon mode: start/collect one tracked background pass. */
+  detached?: boolean;
+  /** @internal deterministic background-job scheduler for concurrency tests. */
+  startBackground?: (job: () => Promise<void>) => void;
 };
 
 export type UsageSampler = (
@@ -71,6 +83,7 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
   const readHsrRuntimeStartedAt = deps.readHsrRuntimeStartedAt ?? defaultHsrRuntimeStartedAt;
   const isMirroredRemoteBee = deps.isMirroredRemoteBee ?? defaultIsMirroredRemoteBee;
   const sampleIntervalMs = deps.sampleIntervalMs ?? DEFAULT_SAMPLE_INTERVAL_MS;
+  const sampleBudget = deps.sampleBudget;
 
   // Sampler state survives across ticks: rising-edge debounce for exhaustion
   // and per-bee sampling throttle/dedupe.
@@ -81,7 +94,7 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
   const lastHsrExhaustedTs = new Map<string, number>();
   const lastSampleAt = new Map<string, number>();
   const lastTotals = new Map<string, TokenTotals>();
-  let inFlight: Promise<UsageTickOutcome[]> | undefined;
+  let cursor = 0;
 
   // Append a fresh token sample for `record` if `totals` moved since the last
   // one (shared by the tmux + HSR paths). Mutates outcome.sampled.
@@ -172,12 +185,18 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
     hsrObservations?: ReadonlyMap<string, HsrObservation>,
   ): Promise<UsageTickOutcome[]> => {
     const outcomes: UsageTickOutcome[] = [];
+    const eligible = records.filter((record) => record.accountId && isActiveSessionLifecycle(record));
+    const ordered = sampleBudget === undefined
+      ? eligible
+      : rotateAndLimit(eligible, cursor, sampleBudget);
+    if (sampleBudget !== undefined && eligible.length > 0) {
+      cursor = (cursor + ordered.length) % eligible.length;
+    }
 
-    for (const record of records) {
+    for (const record of ordered) {
       // Historical records cannot produce new usage or exhaustion edges. A
       // cold daemon previously re-read hundreds of archived HSR logs (and, on
       // a cache miss, their full transcripts) before its first useful sample.
-      if (!record.accountId || !isActiveSessionLifecycle(record)) continue;
       const hsrObservation = hsrObservations?.get(record.name);
 
       // When the tick supplied its coherent HSR observation batch, absence is
@@ -204,7 +223,7 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
       }
       if (pane === undefined) continue;
 
-      const outcome: UsageTickOutcome = { bee: record.name, account: record.accountId, sampled: false, exhausted: false };
+      const outcome: UsageTickOutcome = { bee: record.name, account: record.accountId!, sampled: false, exhausted: false };
 
       const hit = exhaustionForAgent(record.agent, recentPane(pane));
       if (hit) {
@@ -227,20 +246,129 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
       outcomes.push(outcome);
     }
 
+    if (sampleBudget !== undefined && eligible.length > ordered.length) {
+      outcomes.unshift({
+        bee: "*",
+        account: "*",
+        sampled: false,
+        exhausted: false,
+        diagnostic: "completed",
+        considered: eligible.length,
+        processed: ordered.length,
+      });
+    }
     return outcomes;
   };
 
-  return (records, panes, nowMs, hsrObservations) => {
-    // withTimeout cannot cancel work it abandons. Share the still-running
-    // sample with later ticks so a slow registry never accumulates overlapping
-    // transcript scans in the same daemon process.
-    if (inFlight) return inFlight;
-    const current = sample(records, panes, nowMs, hsrObservations).finally(() => {
-      if (inFlight === current) inFlight = undefined;
+  if (!deps.detached) return sample;
+  const startBackground = deps.startBackground ?? ((job: () => Promise<void>) => {
+    queueMicrotask(() => void job());
+  });
+
+  let inFlight: Promise<void> | undefined;
+  let pending: UsageTickOutcome[] = [];
+  let startedAtMs = 0;
+  let skippedWhileInFlight = 0;
+  const detached = (async (records, panes, nowMs, hsrObservations) => {
+    const report = pending;
+    pending = [];
+    if (inFlight) {
+      skippedWhileInFlight += 1;
+      return report;
+    }
+    const eligibleCount = records.filter((record) => record.accountId && isActiveSessionLifecycle(record)).length;
+    const processed = sampleBudget === undefined ? eligibleCount : Math.min(eligibleCount, sampleBudget);
+    startedAtMs = nowMs;
+    report.push({
+      bee: "*",
+      account: "*",
+      sampled: false,
+      exhausted: false,
+      diagnostic: "started",
+      considered: eligibleCount,
+      processed,
+      ...(skippedWhileInFlight > 0 ? { skippedWhileInFlight } : {}),
     });
-    inFlight = current;
-    return current;
+    skippedWhileInFlight = 0;
+    const job = async () => {
+      try {
+        const outcomes = await sample(records, panes, nowMs, hsrObservations);
+        pending = [
+          {
+            bee: "*",
+            account: "*",
+            sampled: false,
+            exhausted: false,
+            diagnostic: "completed",
+            considered: eligibleCount,
+            processed,
+            durationMs: Math.max(0, Date.now() - startedAtMs),
+            ...(skippedWhileInFlight > 0 ? { skippedWhileInFlight } : {}),
+          },
+          ...outcomes.filter((outcome) => outcome.diagnostic !== "completed"),
+        ];
+      } catch (error) {
+        pending = [{
+          bee: "*",
+          account: "*",
+          sampled: false,
+          exhausted: false,
+          diagnostic: "completed",
+          considered: eligibleCount,
+          processed,
+          durationMs: Math.max(0, Date.now() - startedAtMs),
+          ...(skippedWhileInFlight > 0 ? { skippedWhileInFlight } : {}),
+          error: error instanceof Error ? error.message : String(error),
+        }];
+      } finally {
+        skippedWhileInFlight = 0;
+        inFlight = undefined;
+      }
+    };
+    inFlight = new Promise<void>((resolve, reject) => {
+      try {
+        startBackground(async () => {
+          try {
+            await job();
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+      } catch (error) {
+        reject(error);
+      }
+    }).catch((error) => {
+      pending = [{
+        bee: "*",
+        account: "*",
+        sampled: false,
+        exhausted: false,
+        diagnostic: "completed",
+        considered: eligibleCount,
+        processed,
+        durationMs: Math.max(0, Date.now() - startedAtMs),
+        error: error instanceof Error ? error.message : String(error),
+      }];
+    }).finally(() => {
+      inFlight = undefined;
+    });
+    return report;
+  }) as UsageSampler & { close: () => Promise<void> };
+  detached.close = async () => {
+    await inFlight;
   };
+  return detached;
+}
+
+function rotateAndLimit<T>(items: readonly T[], cursor: number, limit: number): T[] {
+  if (items.length === 0 || limit <= 0) return [];
+  const count = Math.min(items.length, Math.max(0, Math.floor(limit)));
+  const selected: T[] = [];
+  for (let index = 0; index < count; index += 1) {
+    selected.push(items[(cursor + index) % items.length]!);
+  }
+  return selected;
 }
 
 // A remote bee is fed from the HSR path iff it carries a non-local node, is not

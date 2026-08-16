@@ -210,6 +210,58 @@ test("sweeper: throttles to its interval (second call within it returns [])", as
   });
 });
 
+test("detached sweeper starts one discovery lane and reports skipped repeated ticks on completion", async () => {
+  await withTempStore(async () => {
+    const jobs: Array<() => Promise<void>> = [];
+    const h = buildSweeper(() => resolvedPool(), {
+      detached: true,
+      startBackground: (job) => jobs.push(job),
+    });
+
+    const first = await h.sweep([], new Map());
+    assert.deepEqual(first, [{ pool: "*", action: "started" }]);
+    assert.equal(jobs.length, 1);
+    assert.deepEqual(await h.sweep([], new Map()), [], "an in-flight pass does not start another discovery");
+
+    await jobs.shift()!();
+    const reported = await h.sweep([], new Map());
+    assert.equal(reported[0]!.action, "completed");
+    assert.equal(reported[0]!.poolsDiscovered, 1);
+    assert.equal(reported[0]!.skippedWhileInFlight, 1);
+  });
+});
+
+test("detached sweeper close waits for the tracked lane instead of abandoning it", async () => {
+  await withTempStore(async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const jobs: Array<() => Promise<void>> = [];
+    const h = buildSweeper(() => resolvedPool(), {
+      detached: true,
+      startBackground: (job) => jobs.push(job),
+      listRepoEntries: async () => {
+        await gate;
+        return [ENTRY];
+      },
+    });
+
+    await h.sweep([], new Map());
+    const running = jobs.shift()!();
+    const close = (h.sweep as ReturnType<typeof createPoolSweeper> & { close: () => Promise<void> }).close();
+    let closed = false;
+    close.then(() => {
+      closed = true;
+    }).catch(() => undefined);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closed, false, "close is still waiting on the blocked sweep");
+    release();
+    await running;
+    await close;
+  });
+});
+
 test("sweeper: GCs expired claims under the lock", async () => {
   await withTempStore(async () => {
     const record = emptyPoolRecord(FACETS);

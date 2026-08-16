@@ -31,9 +31,14 @@ import { envMs } from "./timeouts.js";
 
 export type TerminalReprobeOutcome = {
   bee: string;
-  action: "healed" | "meta-restored" | "error";
+  action: "healed" | "meta-restored" | "error" | "started" | "completed";
   /** The stale cursor value that was cleared (healed only). */
   clearedState?: string;
+  candidates?: number;
+  processed?: number;
+  durationMs?: number;
+  skippedWhileInFlight?: number;
+  throttledTicks?: number;
   error?: string;
 };
 
@@ -51,6 +56,10 @@ export type TerminalReprobeDependencies = {
   probeControl?: (meta: HsrMeta) => Promise<HsrControlProbe>;
   repairMeta?: (expected: HsrMeta) => Promise<HsrMeta>;
   intervalMs?: number;
+  maxCandidates?: number;
+  detached?: boolean;
+  /** @internal deterministic background-job scheduler for concurrency tests. */
+  startBackground?: (job: () => Promise<void>) => void;
   /** Minimum age of an exited stamp before the inverse meta heal may act. */
   metaRestoreGraceMs?: number;
   now?: () => number;
@@ -59,7 +68,8 @@ export type TerminalReprobeDependencies = {
 /** Only the FALSE-crash class is healable; done/sealed/retired/killed are deliberate. */
 const REPROBE_TERMINAL_STATES = new Set(["crashed", "dead"]);
 
-const DEFAULT_TERMINAL_REPROBE_INTERVAL_MS = 60_000;
+const DEFAULT_TERMINAL_REPROBE_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_MAX_TERMINAL_REPROBE_CANDIDATES = 25;
 
 /**
  * A clean shutdown writes `exited` moments before the host process actually
@@ -75,9 +85,12 @@ const DEFAULT_META_RESTORE_GRACE_MS = 30_000;
  */
 export async function reprobeTerminalCursors(
   deps: TerminalReprobeDependencies = {},
+  candidateRecords?: readonly SessionRecord[],
 ): Promise<TerminalReprobeOutcome[]> {
   const outcomes: TerminalReprobeOutcome[] = [];
-  const bees = await (deps.listBees ?? listHsrBees)();
+  const bees = candidateRecords
+    ? selectTerminalReprobeCandidates(candidateRecords).map((record) => record.name)
+    : await (deps.listBees ?? listHsrBees)();
   const now = deps.now ?? (() => Date.now());
   const graceMs = deps.metaRestoreGraceMs ?? DEFAULT_META_RESTORE_GRACE_MS;
   // Lazily take one coherent process snapshot only when a plausible local HSR
@@ -167,6 +180,25 @@ export async function reprobeTerminalCursors(
   return outcomes;
 }
 
+export function selectTerminalReprobeCandidates(records: readonly SessionRecord[]): SessionRecord[] {
+  return records.filter((record) =>
+    record.substrate === "hsr" &&
+    isActiveSessionLifecycle(record) &&
+    record.runnerPid !== undefined &&
+    REPROBE_TERMINAL_STATES.has(record.lastObservedState ?? "") &&
+    !record.recoveryRequestedAt);
+}
+
+function takeRoundRobin<T>(items: readonly T[], cursor: number, limit: number): { selected: T[]; nextCursor: number } {
+  if (items.length === 0 || limit <= 0) return { selected: [], nextCursor: cursor };
+  const count = Math.min(items.length, limit);
+  const selected: T[] = [];
+  for (let index = 0; index < count; index += 1) {
+    selected.push(items[(cursor + index) % items.length]!);
+  }
+  return { selected, nextCursor: (cursor + count) % items.length };
+}
+
 /**
  * The tick-wired sweeper: self-throttled to one pass per interval
  * (HIVE_DAEMON_TERMINAL_REPROBE_INTERVAL_MS, default 60s), like the pool
@@ -174,15 +206,125 @@ export async function reprobeTerminalCursors(
  */
 export function createTerminalReprobeSweeper(
   deps: TerminalReprobeDependencies = {},
-): () => Promise<TerminalReprobeOutcome[]> {
+): ((records?: readonly SessionRecord[]) => Promise<TerminalReprobeOutcome[]>) & { close?: () => Promise<void> } {
   const intervalMs = deps.intervalMs ??
     envMs("HIVE_DAEMON_TERMINAL_REPROBE_INTERVAL_MS", DEFAULT_TERMINAL_REPROBE_INTERVAL_MS);
+  const maxCandidates = deps.maxCandidates ?? DEFAULT_MAX_TERMINAL_REPROBE_CANDIDATES;
+  const startBackground = deps.startBackground ?? ((job: () => Promise<void>) => {
+    queueMicrotask(() => void job());
+  });
   const now = deps.now ?? (() => Date.now());
   let lastSweepAt = Number.NEGATIVE_INFINITY;
-  return async () => {
+  let cursor = 0;
+
+  const runThrottled = async (records?: readonly SessionRecord[]) => {
     const at = now();
     if (at - lastSweepAt < intervalMs) return [];
     lastSweepAt = at;
-    return reprobeTerminalCursors(deps);
+    if (!records) return reprobeTerminalCursors(deps);
+    const candidates = selectTerminalReprobeCandidates(records).sort((a, b) => a.name.localeCompare(b.name));
+    const picked = takeRoundRobin(candidates, cursor, maxCandidates);
+    cursor = picked.nextCursor;
+    return reprobeTerminalCursors(deps, picked.selected);
   };
+
+  if (!deps.detached) return runThrottled;
+
+  let inFlight: Promise<void> | undefined;
+  let pending: TerminalReprobeOutcome[] = [];
+  let startedAtMs = 0;
+  let skippedWhileInFlight = 0;
+  let throttledTicks = 0;
+
+  const detached = (async (records?: readonly SessionRecord[]) => {
+    const report = pending;
+    pending = [];
+    const at = now();
+    if (inFlight) {
+      skippedWhileInFlight += 1;
+      return report;
+    }
+    if (at - lastSweepAt < intervalMs) {
+      throttledTicks += 1;
+      return report;
+    }
+
+    const candidates = records
+      ? selectTerminalReprobeCandidates(records).sort((a, b) => a.name.localeCompare(b.name))
+      : undefined;
+    const picked = candidates ? takeRoundRobin(candidates, cursor, maxCandidates) : undefined;
+    if (picked) cursor = picked.nextCursor;
+    const selectedRecords = picked?.selected;
+    lastSweepAt = at;
+    startedAtMs = at;
+    report.push({
+      bee: "*",
+      action: "started",
+      ...(candidates ? { candidates: candidates.length, processed: selectedRecords?.length ?? 0 } : {}),
+      ...(skippedWhileInFlight > 0 ? { skippedWhileInFlight } : {}),
+      ...(throttledTicks > 0 ? { throttledTicks } : {}),
+    });
+    skippedWhileInFlight = 0;
+    throttledTicks = 0;
+
+    const job = async () => {
+      try {
+        const outcomes = await reprobeTerminalCursors(deps, selectedRecords);
+        pending = [
+          {
+            bee: "*",
+            action: "completed",
+            durationMs: Math.max(0, now() - startedAtMs),
+            ...(candidates ? { candidates: candidates.length, processed: selectedRecords?.length ?? 0 } : {}),
+            ...(skippedWhileInFlight > 0 ? { skippedWhileInFlight } : {}),
+            ...(throttledTicks > 0 ? { throttledTicks } : {}),
+          },
+          ...outcomes,
+        ];
+      } catch (error) {
+        pending = [{
+          bee: "*",
+          action: "completed",
+          durationMs: Math.max(0, now() - startedAtMs),
+          ...(candidates ? { candidates: candidates.length, processed: selectedRecords?.length ?? 0 } : {}),
+          ...(skippedWhileInFlight > 0 ? { skippedWhileInFlight } : {}),
+          ...(throttledTicks > 0 ? { throttledTicks } : {}),
+          error: error instanceof Error ? error.message : String(error),
+        }];
+      } finally {
+        skippedWhileInFlight = 0;
+        throttledTicks = 0;
+        inFlight = undefined;
+      }
+    };
+    inFlight = new Promise<void>((resolve, reject) => {
+      try {
+        startBackground(async () => {
+          try {
+            await job();
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+      } catch (error) {
+        reject(error);
+      }
+    }).catch((error) => {
+      pending = [{
+        bee: "*",
+        action: "completed",
+        durationMs: Math.max(0, now() - startedAtMs),
+        ...(candidates ? { candidates: candidates.length, processed: selectedRecords?.length ?? 0 } : {}),
+        error: error instanceof Error ? error.message : String(error),
+      }];
+    }).finally(() => {
+      inFlight = undefined;
+    });
+    return report;
+  }) as ((records?: readonly SessionRecord[]) => Promise<TerminalReprobeOutcome[]>) & { close: () => Promise<void> };
+  detached.close = async () => {
+    await inFlight;
+  };
+  return detached;
 }

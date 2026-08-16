@@ -7,7 +7,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createTerminalReprobeSweeper, reprobeTerminalCursors } from "../src/daemon/terminalReprobe.js";
+import { createTerminalReprobeSweeper, reprobeTerminalCursors, selectTerminalReprobeCandidates } from "../src/daemon/terminalReprobe.js";
 import { ensureHsrRunDir, readHsrMetaStrict, writeHsrMeta, type HsrMeta } from "../src/hsr/runDir.js";
 import { isActiveSessionRecord, loadSession, saveSession, type SessionRecord } from "../src/store.js";
 
@@ -364,4 +364,85 @@ test("the tick-wired sweeper throttles to one pass per interval", async () => {
     await sweeper();
     assert.equal(sweeps, 2, "the next interval sweeps again");
   });
+});
+
+test("record-derived candidates avoid run-dir enumeration and advance fairly", async () => {
+  const records = ["reprobe-1", "reprobe-2", "reprobe-3"].map((name) => record(name));
+  const seen: string[] = [];
+  let nowMs = 1_000_000;
+  const sweeper = createTerminalReprobeSweeper({
+    intervalMs: 1000,
+    maxCandidates: 2,
+    now: () => nowMs,
+    listBees: async () => {
+      throw new Error("production candidate path must not enumerate run dirs");
+    },
+    readMeta: async (bee) => {
+      seen.push(bee);
+      return {
+        bee,
+        harness: "stub",
+        tier: "stream",
+        hostPid: hostBirth.pgid,
+        hostFingerprint: hostBirth,
+        childAdmission: "none",
+        startedAt: "2026-08-07T10:00:00.000Z",
+        controlSocket: join("/tmp", `${bee}.sock`),
+        status: "running",
+      };
+    },
+    loadRecord: async (name) => records.find((candidate) => candidate.name === name) ?? null,
+    isHostAlive: () => false,
+  });
+
+  assert.deepEqual(selectTerminalReprobeCandidates(records).map((candidate) => candidate.name), [
+    "reprobe-1",
+    "reprobe-2",
+    "reprobe-3",
+  ]);
+  await sweeper(records);
+  nowMs += 1000;
+  await sweeper(records);
+  assert.deepEqual(seen, ["reprobe-1", "reprobe-2", "reprobe-3", "reprobe-1"]);
+});
+
+test("detached terminal reprobe coalesces repeated ticks and reports completion diagnostics", async () => {
+  const records = [record("reprobe-detached")];
+  const jobs: Array<() => Promise<void>> = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const sweeper = createTerminalReprobeSweeper({
+    detached: true,
+    intervalMs: 1000,
+    startBackground: (job) => jobs.push(job),
+    readMeta: async (bee) => {
+      await gate;
+      return {
+        bee,
+        harness: "stub",
+        tier: "stream",
+        hostPid: hostBirth.pgid,
+        hostFingerprint: hostBirth,
+        childAdmission: "none",
+        startedAt: "2026-08-07T10:00:00.000Z",
+        controlSocket: join("/tmp", `${bee}.sock`),
+        status: "running",
+      };
+    },
+    loadRecord: async (name) => records.find((candidate) => candidate.name === name) ?? null,
+    isHostAlive: () => false,
+  });
+
+  assert.deepEqual(await sweeper(records), [{ bee: "*", action: "started", candidates: 1, processed: 1 }]);
+  const running = jobs.shift()!();
+  assert.deepEqual(await sweeper(records), []);
+  release();
+  await running;
+  const reported = await sweeper(records);
+  assert.equal(reported[0]!.action, "completed");
+  assert.equal(reported[0]!.candidates, 1);
+  assert.equal(reported[0]!.processed, 1);
+  assert.equal(reported[0]!.skippedWhileInFlight, 1);
 });

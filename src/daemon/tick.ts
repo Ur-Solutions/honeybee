@@ -196,7 +196,7 @@ export type TickDeps = {
    * account-bound bees, appends usage samples and emits account.exhausted
    * events. Stateful across ticks — build once per daemon run.
    */
-  sampleUsage?: UsageSampler;
+  sampleUsage?: UsageSampler & { close?: () => Promise<void> };
   /**
    * Optional autoswap dispatcher (Phase 3): consumes the sampler's
    * rising-edge exhaustion outcomes for autoswap-enabled bees and calls the
@@ -229,7 +229,7 @@ export type TickDeps = {
    * ticks (vacate-edge detection, flag de-dupe, background extends) and
    * self-throttled — build once per daemon run.
    */
-  sweepPools?: PoolSweeper;
+  sweepPools?: PoolSweeper & { close?: () => Promise<void> };
   /**
    * Optional terminal-cursor re-probe (cell-smoothness Phase 2): for records
    * de-indexed by a stale terminal crashed/dead observation whose HSR meta
@@ -238,7 +238,7 @@ export type TickDeps = {
    * active index. Self-throttled — most ticks return []. Build once per
    * daemon run (createTerminalReprobeSweeper).
    */
-  reprobeTerminalCursors?: () => Promise<TerminalReprobeOutcome[]>;
+  reprobeTerminalCursors?: ((records: readonly SessionRecord[]) => Promise<TerminalReprobeOutcome[]>) & { close?: () => Promise<void> };
   /**
    * Optional flight reconciler (CL.701 §4.2): drives slot leases from this
    * tick's records + observed states — contract-matched seal completion,
@@ -737,7 +737,17 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
     timeoutKey: "dispatchMs",
     run: ({ deps, records, panes, nowMs, hsrObs }) => deps.sampleUsage?.(records, panes, nowMs, hsrObs),
     log: (outcome) =>
-      outcome.exhausted
+      outcome.diagnostic
+        ? {
+            level: "info",
+            msg: `usage.sample.${outcome.diagnostic}`,
+            considered: outcome.considered ?? 0,
+            processed: outcome.processed ?? 0,
+            ...(outcome.durationMs !== undefined ? { durationMs: outcome.durationMs } : {}),
+            ...(outcome.skippedWhileInFlight !== undefined ? { skippedWhileInFlight: outcome.skippedWhileInFlight } : {}),
+            ...(outcome.error ? { error: outcome.error } : {}),
+          }
+        : outcome.exhausted
         ? {
             level: "warn",
             msg: "account.exhausted",
@@ -796,8 +806,12 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
     run: ({ deps, records, observed }) => deps.sweepPools?.(records, observed),
     log: (outcome) => ({
       level: outcome.error || outcome.flagged || outcome.warned ? "warn" : "info",
-      msg: "pool.sweep",
+      msg: outcome.action ? `pool.sweep.${outcome.action}` : "pool.sweep",
       pool: outcome.pool,
+      ...(outcome.durationMs !== undefined ? { durationMs: outcome.durationMs } : {}),
+      ...(outcome.poolsDiscovered !== undefined ? { poolsDiscovered: outcome.poolsDiscovered } : {}),
+      ...(outcome.skippedWhileInFlight !== undefined ? { skippedWhileInFlight: outcome.skippedWhileInFlight } : {}),
+      ...(outcome.throttledTicks !== undefined ? { throttledTicks: outcome.throttledTicks } : {}),
       ...(outcome.gcExpired !== undefined ? { gcExpired: outcome.gcExpired } : {}),
       ...(outcome.synced ? { synced: outcome.synced.map((row) => `${row.member}:${row.status}`).join(",") } : {}),
       ...(outcome.flagged ? { flagged: outcome.flagged.map((f) => `${f.member}:${f.reason}${f.nudged ? `→${f.nudged}` : ""}`).join(",") } : {}),
@@ -816,11 +830,16 @@ export const tickDispatchers: readonly AnyTickDispatcher[] = [
     skipFirstTick: true,
     capMs: 10_000,
     timeoutKey: "dispatchMs",
-    run: ({ deps }) => deps.reprobeTerminalCursors?.(),
+    run: ({ deps, records }) => deps.reprobeTerminalCursors?.(records),
     log: (outcome) => ({
       level: outcome.action === "error" ? "warn" : "info",
       msg: `hsr.reprobe.${outcome.action}`,
       session: outcome.bee,
+      ...(outcome.candidates !== undefined ? { candidates: outcome.candidates } : {}),
+      ...(outcome.processed !== undefined ? { processed: outcome.processed } : {}),
+      ...(outcome.durationMs !== undefined ? { durationMs: outcome.durationMs } : {}),
+      ...(outcome.skippedWhileInFlight !== undefined ? { skippedWhileInFlight: outcome.skippedWhileInFlight } : {}),
+      ...(outcome.throttledTicks !== undefined ? { throttledTicks: outcome.throttledTicks } : {}),
       ...(outcome.clearedState ? { clearedState: outcome.clearedState } : {}),
       ...(outcome.error ? { error: outcome.error } : {}),
     }),
