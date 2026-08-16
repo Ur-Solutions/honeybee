@@ -20,6 +20,7 @@ import {
 } from "../src/accounts.js";
 import { fileLockMutationGuardPath, readFileLockIdentity } from "../src/lock.js";
 import {
+  createDefaultAccountHomes,
   planCredentialSweep,
   runCredentialSweep,
   type CredentialSweepTelemetry,
@@ -136,6 +137,25 @@ test("credential sweep plan collapses 3k records to 19 canonical pairs and curre
   assert.equal(plan.skippedPairs, 2_982);
   assert.equal(plan.pairs.find((pair) => pair.account.id === "codex-0")?.evidence.name, "CO.current");
   assert.equal(plan.pairs.find((pair) => pair.account.id === "codex-0")?.homePath, await canonicalActivationHomePath("/tmp/sweep-home-0"));
+});
+
+test("default chain-sync home discovery scans shared slots once per tool", async () => {
+  const scans: string[] = [];
+  const shared = ["/tmp/shared-codex", "/tmp/shared-codex/../shared-codex"];
+  const homesFor = createDefaultAccountHomes(async (tool) => {
+    scans.push(tool);
+    return shared;
+  });
+
+  const [first, second] = await Promise.all([
+    homesFor(account("codex-first")),
+    homesFor(account("codex-second")),
+  ]);
+
+  assert.deepEqual(scans, ["codex"], "same-tool accounts share the expensive candidate scan");
+  assert.equal(first.filter((home) => resolve(home) === "/tmp/shared-codex").length, 1);
+  assert.equal(second.filter((home) => resolve(home) === "/tmp/shared-codex").length, 1);
+  assert.notEqual(first[0], second[0], "account-specific dedicated homes stay distinct");
 });
 
 test("credential sweep runs canonical accounts once and skips their dedicated session pairs", async () => {

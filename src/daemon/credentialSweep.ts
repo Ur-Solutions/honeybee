@@ -213,12 +213,29 @@ export async function planCredentialSweep(
   };
 }
 
-async function defaultAccountHomes(account: AccountRecord): Promise<string[]> {
-  const homes = [...dedicatedHomesFor(account)];
-  if (account.tool === "claude" || account.tool === "codex" || account.tool === "grok") {
-    homes.push(...await candidateHomes(account.tool));
-  }
-  return homes;
+/**
+ * Build one sweep-scoped home enumerator. Shared ~/.tool slot discovery is a
+ * filesystem scan, but its result depends only on the tool, not the account;
+ * cache the in-flight scan so N accounts of one provider do it once.
+ */
+export function createDefaultAccountHomes(
+  scanCandidates: (tool: string) => Promise<string[]> = candidateHomes,
+): (account: AccountRecord) => Promise<string[]> {
+  const candidatesByTool = new Map<string, Promise<string[]>>();
+  return async (account) => {
+    const homes = [...dedicatedHomesFor(account)];
+    if (account.tool === "claude" || account.tool === "codex" || account.tool === "grok") {
+      let candidates = candidatesByTool.get(account.tool);
+      if (!candidates) {
+        candidates = scanCandidates(account.tool);
+        candidatesByTool.set(account.tool, candidates);
+      }
+      homes.push(...await candidates);
+    }
+    // Remove lexical duplicates before the later realpath/canonical ownership
+    // scan. Physical aliases are still collapsed by that safety-critical pass.
+    return [...new Map(homes.map((home) => [resolve(home), home])).values()];
+  };
 }
 
 function legacyOwnBinding(
@@ -411,15 +428,16 @@ function initialTelemetry(plan: CredentialSweepPlan): CredentialSweepTelemetry {
 export async function runCredentialSweep(
   overrides: Partial<CredentialSweepDeps> = {},
 ): Promise<CredentialSweepTelemetry> {
+  const accountHomes = overrides.accountHomes ?? createDefaultAccountHomes();
   const deps: CredentialSweepDeps = {
     listAccounts,
     listSessions,
     syncAccount: syncAccountCredentialsToVault,
-    accountHomes: defaultAccountHomes,
     listQuarantined: listCredentialHarvestWorkItems,
     now: Date.now,
     concurrency: envConcurrency("HIVE_DAEMON_CHAIN_SYNC_CONCURRENCY", DEFAULT_ACCOUNT_CONCURRENCY),
     ...overrides,
+    accountHomes,
   };
   const startedAt = deps.now();
   const [accounts, records, quarantined] = await Promise.all([

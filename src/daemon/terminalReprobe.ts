@@ -14,7 +14,11 @@
 import { defaultIsPidAlive } from "../fsx.js";
 import { inspectHsrHostProcess, listHsrBees } from "../hsr/observe.js";
 import { readHsrMetaStrict, type HsrMeta } from "../hsr/runDir.js";
-import type { ProcessIdentityVerdict } from "../hsr/processIdentity.js";
+import {
+  listProcessRows,
+  type ProcessIdentityVerdict,
+  type ProcessRow,
+} from "../hsr/processIdentity.js";
 import type { ProbeEvidence } from "../stateMachine.js";
 import { isActiveSessionRecord, loadSession, markSessionVerified, type SessionRecord } from "../store.js";
 import {
@@ -41,6 +45,8 @@ export type TerminalReprobeDependencies = {
   loadRecord?: (name: string) => Promise<SessionRecord | null>;
   markVerified?: (name: string, probe: ProbeEvidence) => Promise<SessionRecord | null>;
   isHostAlive?: (pid: number) => boolean;
+  /** One bounded topology/birth census shared by every host in this sweep. */
+  listProcesses?: () => Promise<ProcessRow[]>;
   inspectHost?: (meta: HsrMeta) => Promise<ProcessIdentityVerdict>;
   probeControl?: (meta: HsrMeta) => Promise<HsrControlProbe>;
   repairMeta?: (expected: HsrMeta) => Promise<HsrMeta>;
@@ -74,6 +80,23 @@ export async function reprobeTerminalCursors(
   const bees = await (deps.listBees ?? listHsrBees)();
   const now = deps.now ?? (() => Date.now());
   const graceMs = deps.metaRestoreGraceMs ?? DEFAULT_META_RESTORE_GRACE_MS;
+  // Lazily take one coherent process snapshot only when a plausible local HSR
+  // host reaches the birth check. The previous default called `/bin/ps -p`
+  // once per bee; a large stale-terminal fleet could therefore fork hundreds
+  // of helpers every minute. A single `ps -A` keeps the sweep bounded while
+  // retaining the exact pid + pgid + birth fingerprint comparison.
+  let processRows: Promise<Map<number, ProcessRow>> | undefined;
+  const inspectHost = deps.inspectHost ?? (async (meta: HsrMeta) => {
+    processRows ??= (deps.listProcesses ?? listProcessRows)().then(
+      (rows) => new Map(rows.map((row) => [row.pid, row])),
+    );
+    return inspectHsrHostProcess(meta, {
+      readProcessIdentity: async (pid) => {
+        const row = (await processRows!).get(pid);
+        return row ? { pgid: row.pgid, startedAt: row.startedAt } : null;
+      },
+    });
+  });
   for (const bee of bees) {
     try {
       let meta = await (deps.readMeta ?? readHsrMetaStrict)(bee).catch(() => null);
@@ -86,7 +109,7 @@ export async function reprobeTerminalCursors(
       // Cheap numeric pre-filter only skips obvious dead hosts. It never proves
       // life; birth identity plus the control socket below do that.
       if (!(deps.isHostAlive ?? defaultIsPidAlive)(meta.hostPid)) continue;
-      const verdict = await (deps.inspectHost ? deps.inspectHost(meta) : inspectHsrHostProcess(meta));
+      const verdict = await inspectHost(meta);
       if (verdict !== "match") continue;
       const control = await (deps.probeControl ?? probeHsrControl)(meta);
       if (

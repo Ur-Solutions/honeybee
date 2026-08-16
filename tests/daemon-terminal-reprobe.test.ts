@@ -141,6 +141,75 @@ test("a recycled pid (birth mismatch) or uncertain census is not proof of life",
   });
 });
 
+test("one process census birth-checks every candidate in a sweep", async () => {
+  await withTempStore(async () => {
+    const secondBirth = { pgid: 5858, startedAt: "Fri Aug  7 10:01:00 2026" };
+    await saveTerminalRecord(record("reprobe-batch-a"));
+    await saveTerminalRecord(record("reprobe-batch-b", { runnerPid: secondBirth.pgid }));
+    await seedMeta("reprobe-batch-a");
+    await seedMeta("reprobe-batch-b", "running", {
+      hostPid: secondBirth.pgid,
+      hostFingerprint: secondBirth,
+    });
+    let censuses = 0;
+
+    const outcomes = await reprobeTerminalCursors({
+      isHostAlive: () => true,
+      listProcesses: async () => {
+        censuses += 1;
+        return [
+          { pid: hostBirth.pgid, ppid: 1, pgid: hostBirth.pgid, startedAt: hostBirth.startedAt },
+          { pid: secondBirth.pgid, ppid: 1, pgid: secondBirth.pgid, startedAt: secondBirth.startedAt },
+        ];
+      },
+      probeControl: liveControl,
+    });
+
+    assert.equal(censuses, 1, "the sweep executes one process census, not one ps per bee");
+    assert.deepEqual(outcomes, [
+      { bee: "reprobe-batch-a", action: "healed", clearedState: "crashed" },
+      { bee: "reprobe-batch-b", action: "healed", clearedState: "crashed" },
+    ]);
+  });
+});
+
+test("the shared census still rejects pid reuse and fails closed once on census error", async () => {
+  await withTempStore(async () => {
+    for (const bee of ["reprobe-batch-reused", "reprobe-batch-unreadable"]) {
+      await saveTerminalRecord(record(bee));
+      await seedMeta(bee);
+    }
+    let censuses = 0;
+    const reused = await reprobeTerminalCursors({
+      listBees: async () => ["reprobe-batch-reused"],
+      isHostAlive: () => true,
+      listProcesses: async () => {
+        censuses += 1;
+        return [{
+          pid: hostBirth.pgid,
+          ppid: 1,
+          pgid: hostBirth.pgid,
+          startedAt: "Fri Aug  7 11:00:00 2026",
+        }];
+      },
+      probeControl: liveControl,
+    });
+    assert.deepEqual(reused, [], "a recycled pid from the batch is not the recorded incarnation");
+
+    const unreadable = await reprobeTerminalCursors({
+      listBees: async () => ["reprobe-batch-reused", "reprobe-batch-unreadable"],
+      isHostAlive: () => true,
+      listProcesses: async () => {
+        censuses += 1;
+        throw new Error("ps unavailable");
+      },
+      probeControl: async () => { throw new Error("unverifiable births must not reach the socket"); },
+    });
+    assert.deepEqual(unreadable, []);
+    assert.equal(censuses, 2, "each sweep makes at most one census attempt even when it fails");
+  });
+});
+
 test("only the false-crash class heals: deliberate terminal cursors and exited metas stand", async () => {
   await withTempStore(async () => {
     // A sealed/done cursor is a deliberate outcome, not a mislabel.
