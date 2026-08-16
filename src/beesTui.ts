@@ -581,14 +581,12 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
 
     const start = () => {
       if (!options.syncGroupMode && !options.refreshItems) return;
-      let syncingGroup = false;
       let refreshing = false;
       let tick = 0;
       let lastSignature = beesCatalogSignature(catalog);
       pollTimer = setInterval(() => {
         tick += 1;
-        if (options.syncGroupMode && !syncingGroup) {
-          syncingGroup = true;
+        if (options.syncGroupMode) {
           void options.syncGroupMode().then((mode) => {
             // Same guard as the catalog refresh below: a confirm modal or an
             // in-flight kill owns the screen, so don't re-group/repaint under
@@ -597,7 +595,7 @@ export async function runBeesTui(options: RunBeesTuiOptions): Promise<void> {
             groupMode = mode;
             regroup();
             render();
-          }).catch(() => undefined).finally(() => { syncingGroup = false; });
+          });
         }
         // Catalog refresh runs every other tick (~3s) and never overlaps
         // itself, so a slow store/probe read can't pile up. A confirm modal or

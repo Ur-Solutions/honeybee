@@ -12,7 +12,7 @@ import { transactionalKill, transactionalRetire } from "../kill.js";
 import { withSessionLifecycleTransaction } from "../lifecycle.js";
 import { sessionDisplayName, shouldShowNodeColumn, substrateLabelFor } from "../listView.js";
 import { DEFAULT_ATTENTION_STATES, attentionCount, parseStateList, pickNextBee, type BeeStateEntry } from "../next.js";
-import { LOCAL_NODE_NAME, listNodes, loadNode, type NodeRecord } from "../node.js";
+import { LOCAL_NODE_NAME, listNodes, loadNode } from "../node.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { liveBeesFromSessions, poolsForProject, poolStatus, projectRepresentatives, type PoolStatus } from "../pool.js";
 import { listProRepoEntries, resolveProSlotForCwd, type ProRepoEntry, type ProSlotKind } from "../proProjects.js";
@@ -23,9 +23,9 @@ import { compactHsrEvents, hsrEventsPath, type HsrEventsCompactLimits } from "..
 import { loadLatestSeal } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, resolveSessionTranscript } from "../sessionMetadata.js";
-import { deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, parseBeeState, stateLabel, type BeeState, type DerivedState, type StateContext } from "../state.js";
+import { deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
 import { isArchivedSessionLifecycle } from "../stateMachine.js";
-import { listActiveSessions, listActiveSessionsHot, listSessions, loadSession, type SessionRecord } from "../store.js";
+import { listSessions, loadSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { effectiveTags, normalizeTagArg } from "../tags.js";
 import { appendedPaneText, parseTailOptions } from "../tail.js";
@@ -67,90 +67,33 @@ export async function followTail(record: SessionRecord, lines: number, pollMs: n
 }
 
 
-type ObserveDeps = {
-  listSessions?: () => Promise<SessionRecord[]>;
-  listActiveSessions?: () => Promise<SessionRecord[]>;
-  listActiveSessionsHot?: () => Promise<SessionRecord[]>;
-  listNodes?: () => Promise<NodeRecord[]>;
-  loadNode?: (name: string) => Promise<NodeRecord | null>;
-  liveTargetsAcrossNodes?: typeof liveTargetsAcrossNodes;
-  buildStateContext?: typeof buildStateContext;
-  listProRepoEntries?: () => Promise<ProRepoEntry[]>;
-  poolsForProject?: typeof poolsForProject;
-  poolStatus?: typeof poolStatus;
-  projectRepresentatives?: typeof projectRepresentatives;
-  runBeesTui?: typeof runBeesTui;
-  now?: () => number;
-};
+export async function cmdList(parsed: Parsed) {
+  const [allRecords, nodes] = await Promise.all([listSessions(), listNodes()]);
+  const nodeKindByName = new Map(nodes.map((n) => [n.name, n.kind]));
+  const substrateOf = (r: SessionRecord) => substrateLabelFor(r, (name) => nodeKindByName.get(name));
 
-type BeeListSnapshot = {
-  records: SessionRecord[];
-  nodes: NodeRecord[];
-  probe: Awaited<ReturnType<typeof liveTargetsAcrossNodes>>;
-  states: Map<string, DerivedState>;
-};
-
-type BeeJsonRow = {
-  ref: string;
-  name: string;
-  id: string | undefined;
-  title: string | undefined;
-  agent: string;
-  state: string;
-  beeState: BeeState;
-  detail: string;
-  colony: string | undefined;
-  swarm: string | undefined;
-  comb: string | undefined;
-  node: string;
-  substrate: string;
-  repo: string;
-  cwd: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
-const BEES_TUI_FULL_REFRESH_MS = 60_000;
-
-function normalizedStateFilter(parsed: Parsed): string | undefined {
-  const rawStateFilter = stringFlag(parsed, ["state"]);
-  return rawStateFilter === "archived" || rawStateFilter === "sealed" ? "done" : rawStateFilter;
-}
-
-function wantsHistoryRecords(parsed: Parsed, stateFilter = normalizedStateFilter(parsed)): boolean {
-  return truthy(flag(parsed, "history")) ||
-    truthy(flag(parsed, "all")) ||
-    truthy(flag(parsed, "done")) ||
-    truthy(flag(parsed, "archived")) ||
-    stateFilter === "done" ||
-    stateFilter === "dead";
-}
-
-async function sessionRecordsForListing(parsed: Parsed, deps: ObserveDeps = {}): Promise<SessionRecord[]> {
-  return wantsHistoryRecords(parsed)
-    ? (deps.listSessions ?? listSessions)()
-    : (deps.listActiveSessions ?? listActiveSessions)();
-}
-
-async function loadBeeListSnapshot(parsed: Parsed, deps: ObserveDeps = {}): Promise<BeeListSnapshot> {
-  const [allRecords, nodes] = await Promise.all([sessionRecordsForListing(parsed, deps), (deps.listNodes ?? listNodes)()]);
   const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
   const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")).replace(/^@/, "") : undefined;
   const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
-  const stateFilter = normalizedStateFilter(parsed);
+  const rawStateFilter = stringFlag(parsed, ["state"]);
+  // Legacy state names from before the archived/sealed → done rename.
+  const stateFilter = rawStateFilter === "archived" || rawStateFilter === "sealed" ? "done" : rawStateFilter;
   const agentFilter = stringFlag(parsed, ["agent"]);
   const repoFilter = stringFlag(parsed, ["repo"]);
   const tagFilters = arrayFlag(parsed, "tag");
+  const jsonOut = truthy(flag(parsed, "json"));
   const positionalSel = parsed.args[0];
   if (nodeFilter) {
-    const node = await (deps.loadNode ?? loadNode)(nodeFilter);
+    const node = await loadNode(nodeFilter);
     if (!node) throw new Error(`Unknown node: ${nodeFilter}. Register it with: hive node register ${nodeFilter} --kind ssh-tmux --endpoint user@host`);
   }
-  const probe = await (deps.liveTargetsAcrossNodes ?? liveTargetsAcrossNodes)(nodes, nodeFilter);
+  const probe = await liveTargetsAcrossNodes(nodes, nodeFilter);
   let records = allRecords;
-  // Default list/bees reads the active-session projection. Explicit history
-  // flags fall back to the canonical record catalog, including dead/done rows.
-  const showDone = wantsHistoryRecords(parsed, stateFilter);
+  // Done bees (filed or sealed) stay out of the everyday list; --done (legacy
+  // alias --archived) or an explicit done-state query restores them. Persisted
+  // filed records can be removed before the state pass; a sealed bee's done
+  // state is derived from seal evidence and is removed below.
+  const showDone = truthy(flag(parsed, "done")) || truthy(flag(parsed, "archived")) || stateFilter === "done";
   if (!showDone) records = records.filter((record) => !isArchivedSessionLifecycle(record));
   if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
   if (swarmFilter) records = records.filter((r) => r.swarmId === swarmFilter);
@@ -173,7 +116,7 @@ async function loadBeeListSnapshot(parsed: Parsed, deps: ObserveDeps = {}): Prom
     records = records.filter((r) => names.has(r.name));
   }
 
-  const context = await (deps.buildStateContext ?? buildStateContext)(records, probe);
+  const context = await buildStateContext(records, probe);
   const states = new Map(records.map((record) => [record.name, deriveState(record, context)] as const));
 
   if (!showDone) records = records.filter((record) => !isDoneState(states.get(record.name)!.state));
@@ -199,117 +142,32 @@ async function loadBeeListSnapshot(parsed: Parsed, deps: ObserveDeps = {}): Prom
     });
   }
 
-  return { records, nodes, probe, states };
-}
-
-async function loadCheapBeeListSnapshot(parsed: Parsed, deps: ObserveDeps = {}): Promise<BeeListSnapshot> {
-  // History and positional selectors preserve the full resolver semantics.
-  if (wantsHistoryRecords(parsed) || parsed.args[0]) return loadBeeListSnapshot(parsed, deps);
-
-  const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
-  const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")).replace(/^@/, "") : undefined;
-  const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
-  const stateFilter = normalizedStateFilter(parsed);
-  const agentFilter = stringFlag(parsed, ["agent"]);
-  const repoFilter = stringFlag(parsed, ["repo"]);
-  const tagFilters = arrayFlag(parsed, "tag");
-  if (nodeFilter) {
-    const node = await (deps.loadNode ?? loadNode)(nodeFilter);
-    if (!node) throw new Error(`Unknown node: ${nodeFilter}. Register it with: hive node register ${nodeFilter} --kind ssh-tmux --endpoint user@host`);
-  }
-
-  let records = await (deps.listActiveSessionsHot ?? listActiveSessionsHot)();
-  if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
-  if (swarmFilter) records = records.filter((r) => r.swarmId === swarmFilter);
-  if (nodeFilter) records = records.filter((r) => (r.node ?? LOCAL_NODE_NAME) === nodeFilter);
-  if (agentFilter) records = records.filter((r) => r.agent === agentFilter);
-  if (repoFilter) records = records.filter((r) => repoTagFor(r.cwd) === repoFilter);
-  if (tagFilters.length > 0) {
-    records = records.filter((r) => {
-      const tags = effectiveTags(r);
-      return tagFilters.every((arg) => tags.has(normalizeTagArg(arg)));
-    });
-  }
-
-  const context = cheapActiveStateContext(records, deps.now?.() ?? Date.now());
-  const probe = {
-    liveTargets: context.liveTargets,
-    unreachableNodes: new Set<string>(),
-    perNode: new Map<string, string[]>(),
-    states: cheapProbeForRecords(records).states,
-  };
-  const states = new Map(records.map((record) => [record.name, deriveState(record, context)] as const));
-  if (stateFilter) {
-    records = records.filter((r) => {
-      const beeState = states.get(r.name)!.state;
-      return (
-        (liveHiveStateFor(r, states, probe) ?? hiveStateFor(beeState)) === stateFilter ||
-        beeState === stateFilter ||
-        stateLabel(beeState) === stateFilter
-      );
-    });
-  }
-  return { records, nodes: [], probe, states };
-}
-
-function liveHiveStateFor(
-  record: SessionRecord,
-  states: Map<string, DerivedState>,
-  probe: Awaited<ReturnType<typeof liveTargetsAcrossNodes>>,
-): string | undefined {
-  const state = probe.states.get(liveTargetKey(record.node, record.tmuxTarget));
-  return effectiveHiveState(state, states.get(record.name)?.state);
-}
-
-function beeJsonRows(snapshot: BeeListSnapshot): BeeJsonRow[] {
-  const nodeKindByName = new Map(snapshot.nodes.map((n) => [n.name, n.kind]));
-  const substrateOf = (r: SessionRecord) => substrateLabelFor(r, (name) => nodeKindByName.get(name));
-  return snapshot.records.map((r) => ({
-    ref: highlightUniqueSessionReference(snapshot.records, r, { start: "", end: "" }),
-    name: r.name,
-    id: r.id,
-    title: r.title,
-    agent: r.agent,
-    state: liveHiveStateFor(r, snapshot.states, snapshot.probe) ?? snapshot.states.get(r.name)!.state,
-    beeState: snapshot.states.get(r.name)!.state,
-    detail: snapshot.states.get(r.name)!.detail,
-    colony: r.colony,
-    swarm: r.swarmId,
-    comb: r.combId,
-    node: r.node ?? LOCAL_NODE_NAME,
-    substrate: substrateOf(r),
-    repo: repoTagFor(r.cwd),
-    cwd: r.cwd,
-    createdAt: r.createdAt,
-    updatedAt: r.updatedAt,
-  }));
-}
-
-export async function loadBeesJsonRows(
-  parsed: Parsed,
-  deps: ObserveDeps = {},
-  options: { mode?: "full" | "cheap" } = {},
-): Promise<BeeJsonRow[]> {
-  return beeJsonRows(await (options.mode === "cheap" ? loadCheapBeeListSnapshot(parsed, deps) : loadBeeListSnapshot(parsed, deps)));
-}
-
-export async function cmdList(parsed: Parsed) {
-  const snapshot = await loadBeeListSnapshot(parsed);
-  const { records, nodes, probe, states } = snapshot;
-  const nodeKindByName = new Map(nodes.map((n) => [n.name, n.kind]));
-  const substrateOf = (r: SessionRecord) => substrateLabelFor(r, (name) => nodeKindByName.get(name));
-  const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
-  const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")).replace(/^@/, "") : undefined;
-  const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
-  const stateFilter = normalizedStateFilter(parsed);
-  const agentFilter = stringFlag(parsed, ["agent"]);
-  const repoFilter = stringFlag(parsed, ["repo"]);
-  const tagFilters = arrayFlag(parsed, "tag");
-  const jsonOut = truthy(flag(parsed, "json"));
-  const positionalSel = parsed.args[0];
-
   if (jsonOut) {
-    console.log(JSON.stringify(beeJsonRows(snapshot), null, 2));
+    console.log(
+      JSON.stringify(
+        records.map((r) => ({
+          ref: highlightUniqueSessionReference(records, r, { start: "", end: "" }),
+          name: r.name,
+          id: r.id,
+          title: r.title,
+          agent: r.agent,
+          state: liveHiveState(r) ?? states.get(r.name)!.state,
+          beeState: states.get(r.name)!.state,
+          detail: states.get(r.name)!.detail,
+          colony: r.colony,
+          swarm: r.swarmId,
+          comb: r.combId,
+          node: r.node ?? LOCAL_NODE_NAME,
+          substrate: substrateOf(r),
+          repo: repoTagFor(r.cwd),
+          cwd: r.cwd,
+          createdAt: r.createdAt,
+          updatedAt: r.updatedAt,
+        })),
+        null,
+        2,
+      ),
+    );
     return;
   }
 
@@ -318,7 +176,7 @@ export async function cmdList(parsed: Parsed) {
     for (const record of records) {
       const derived = states.get(record.name)!;
       const ref = highlightUniqueSessionReference(records, record, marker);
-      console.log(`${liveHiveStateFor(record, states, probe) ?? derived.state}\t${ref}\t${sessionDisplayName(record, { collapseDefaultId: false })}\t${record.agent}\t${record.cwd}\t${record.command}`);
+      console.log(`${liveHiveState(record) ?? derived.state}\t${ref}\t${sessionDisplayName(record, { collapseDefaultId: false })}\t${record.agent}\t${record.cwd}\t${record.command}`);
     }
     if (probe.unreachableNodes.size > 0) {
       console.error(`# ${probe.unreachableNodes.size} node(s) unreachable: ${[...probe.unreachableNodes].join(", ")}`);
@@ -356,7 +214,7 @@ export async function cmdList(parsed: Parsed) {
     const ageText = formatRelativeTime(ageSource, now);
     const age = isTerminalState(derived.state) ? dim(ageText) : ageText;
     const nodeName = record.node ?? LOCAL_NODE_NAME;
-    const live = liveHiveStateFor(record, states, probe);
+    const live = liveHiveState(record);
     const row = [
       live ? formatHiveStateCell(live) : formatStateCell(derived.state),
       ref,
@@ -391,12 +249,7 @@ export async function cmdList(parsed: Parsed) {
 }
 
 
-export async function cmdBees(parsed: Parsed, deps: ObserveDeps = {}): Promise<void> {
-  if (truthy(flag(parsed, "json"))) {
-    console.log(JSON.stringify(await loadBeesJsonRows(parsed, deps, { mode: "cheap" }), null, 2));
-    return;
-  }
-
+export async function cmdBees(parsed: Parsed): Promise<void> {
   if (truthy(flag(parsed, "toggle-sidebar"))) {
     const widthRaw = stringFlag(parsed, ["width", "w"]);
     const width = widthRaw !== undefined ? Number(widthRaw) : undefined;
@@ -404,14 +257,14 @@ export async function cmdBees(parsed: Parsed, deps: ObserveDeps = {}): Promise<v
     return;
   }
 
-  const { items, records, poolsLine } = await loadBeesTuiItems(parsed, { deps, mode: "full" });
+  const { items, records, poolsLine } = await loadBeesTuiItems(parsed);
   const sidebar = truthy(flag(parsed, "sidebar"));
   const groupMode = (await readBeesGroupMode()) ?? undefined;
   // The sidebar lives beside one bee's window: start on that bee and mark it, so
   // each window's fresh strip lands on its bee instead of resetting to the top.
   const currentName = sidebar ? await resolveCurrentSidebarBeeName(records) : undefined;
 
-  await (deps.runBeesTui ?? runBeesTui)({
+  await runBeesTui({
     items,
     sidebar,
     groupMode,
@@ -427,7 +280,7 @@ export async function cmdBees(parsed: Parsed, deps: ObserveDeps = {}): Promise<v
     // Live-refresh the catalog so renames/spawns/kills/state changes appear
     // without reopening. Reuses the same filters this invocation was launched
     // with; the TUI diffs and only redraws on real change.
-    refreshItems: createBeesTuiRefreshItems(parsed, { deps, initialItems: items }),
+    refreshItems: async () => (await loadBeesTuiItems(parsed)).items,
     onPreview: async (item) => {
       const record = await resolveSession(item.name).catch(() => undefined);
       if (!record) return;
@@ -479,18 +332,17 @@ async function beesPoolsLine(
   records: SessionRecord[],
   context: Parameters<typeof liveBeesFromSessions>[1],
   entries: ProRepoEntry[],
-  deps: ObserveDeps = {},
 ): Promise<string | undefined> {
   try {
     const projects = new Set(items.filter((item) => item.proArea).map((item) => `${item.proArea}/${item.proProject}`));
     if (projects.size === 0) return undefined;
     const liveBees = liveBeesFromSessions(records, context);
     const chips: string[] = [];
-    for (const scope of (deps.projectRepresentatives ?? projectRepresentatives)(entries)) {
+    for (const scope of projectRepresentatives(entries)) {
       if (!projects.has(`${scope.area}/${scope.project}`)) continue;
-      const pools = await (deps.poolsForProject ?? poolsForProject)(scope, entries).catch(() => []);
+      const pools = await poolsForProject(scope, entries).catch(() => []);
       for (const pool of pools) {
-        chips.push(poolCapacityChip(await (deps.poolStatus ?? poolStatus)(pool, { liveBees })));
+        chips.push(poolCapacityChip(await poolStatus(pool, { liveBees })));
       }
     }
     return chips.length > 0 ? `pools: ${chips.join(" | ")}` : undefined;
@@ -499,52 +351,31 @@ async function beesPoolsLine(
   }
 }
 
-type BeesTuiLoadOptions = {
-  deps?: ObserveDeps;
-  mode?: "full" | "cheap";
-};
-
-export async function loadBeesTuiItems(parsed: Parsed, options: BeesTuiLoadOptions = {}): Promise<{ items: BeesTuiItem[]; records: SessionRecord[]; poolsLine?: string }> {
-  const deps = options.deps ?? {};
-  if (options.mode === "cheap") return loadCheapBeesTuiItems(parsed, deps);
-
+export async function loadBeesTuiItems(parsed: Parsed): Promise<{ items: BeesTuiItem[]; records: SessionRecord[]; poolsLine?: string }> {
   const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
   const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")) : undefined;
   const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
 
-  const allRecords = await sessionRecordsForListing(parsed, deps);
-  const nodes = await (deps.listNodes ?? listNodes)();
+  const allRecords = await listSessions();
+  const nodes = await listNodes();
   if (nodeFilter && !nodes.some((node) => node.name === nodeFilter)) {
     throw new Error(`Unknown node: ${nodeFilter}. Register it with: hive node register ${nodeFilter} --kind ssh-tmux --endpoint user@host`);
   }
-  const probe = await (deps.liveTargetsAcrossNodes ?? liveTargetsAcrossNodes)(nodes, nodeFilter);
+  const probe = await liveTargetsAcrossNodes(nodes, nodeFilter);
   let records = allRecords;
   if (colonyFilter) records = records.filter((record) => record.colony === colonyFilter);
   if (swarmFilter) records = records.filter((record) => record.swarmId === swarmFilter);
   if (nodeFilter) records = records.filter((record) => (record.node ?? LOCAL_NODE_NAME) === nodeFilter);
 
-  const context = await (deps.buildStateContext ?? buildStateContext)(records, probe);
-  if (!wantsHistoryRecords(parsed)) {
-    records = records.filter((record) => !isDoneState(deriveState(record, context).state));
-  }
+  const context = await buildStateContext(records, probe);
 
   // Resolve each bee's cwd to its pro area/project/repo once, so the TUI can
   // group by pro facets without shelling out. Best-effort: no pro CLI → no
   // facets (those grouping modes just bucket everything under "no pro …").
-  const proEntries = await (deps.listProRepoEntries ?? listProRepoEntries)().catch(() => [] as ProRepoEntry[]);
-  const items = beesTuiItemsFromRecords(records, context, probe, proEntries);
-  const poolsLine = await beesPoolsLine(items, records, context, proEntries, deps);
-  return { items, records, ...(poolsLine ? { poolsLine } : {}) };
-}
+  const proEntries = await listProRepoEntries().catch(() => [] as ProRepoEntry[]);
 
-function beesTuiItemsFromRecords(
-  records: SessionRecord[],
-  context: StateContext,
-  probe: Pick<Awaited<ReturnType<typeof liveTargetsAcrossNodes>>, "states">,
-  proEntries: ProRepoEntry[],
-): BeesTuiItem[] {
   const now = Date.now();
-  return records.map((record) => {
+  const items = records.map((record) => {
     const derived = deriveState(record, context);
     const live = derived.state !== "dead" && derived.state !== "done" && derived.state !== "node_unreachable";
     const liveHive = effectiveHiveState(probe.states.get(liveTargetKey(record.node, record.tmuxTarget)), derived.state);
@@ -595,88 +426,8 @@ function beesTuiItemsFromRecords(
       }),
     };
   });
-}
-
-async function loadCheapBeesTuiItems(parsed: Parsed, deps: ObserveDeps = {}): Promise<{ items: BeesTuiItem[]; records: SessionRecord[] }> {
-  if (wantsHistoryRecords(parsed)) {
-    return { items: [], records: [] };
-  }
-  const colonyFilter = typeof flag(parsed, "colony") === "string" ? String(flag(parsed, "colony")) : undefined;
-  const swarmFilter = typeof flag(parsed, "swarm") === "string" ? String(flag(parsed, "swarm")) : undefined;
-  const nodeFilter = typeof flag(parsed, "node") === "string" ? String(flag(parsed, "node")) : undefined;
-  let records = await (deps.listActiveSessionsHot ?? listActiveSessionsHot)();
-  if (colonyFilter) records = records.filter((record) => record.colony === colonyFilter);
-  if (swarmFilter) records = records.filter((record) => record.swarmId === swarmFilter);
-  if (nodeFilter) records = records.filter((record) => (record.node ?? LOCAL_NODE_NAME) === nodeFilter);
-  const context = cheapActiveStateContext(records, deps.now?.() ?? Date.now());
-  const probe = cheapProbeForRecords(records);
-  return { items: beesTuiItemsFromRecords(records, context, probe, []), records };
-}
-
-function cheapProbeForRecords(records: readonly SessionRecord[]): Pick<Awaited<ReturnType<typeof liveTargetsAcrossNodes>>, "states"> {
-  const states = new Map<string, string>();
-  for (const record of records) {
-    const parsed = parseBeeState(record.lastObservedState);
-    if (!parsed) continue;
-    const hiveState = hiveStateFor(parsed);
-    if (hiveState) states.set(liveTargetKey(record.node, record.tmuxTarget), hiveState);
-  }
-  return { states };
-}
-
-function cheapActiveStateContext(records: readonly SessionRecord[], now: number): StateContext {
-  const liveTargets = new Set<string>();
-  const hsrLive = new Set<string>();
-  const hsrStates = new Map<string, BeeState>();
-  const previousStates = new Map<string, BeeState>();
-  for (const record of records) {
-    const previous = parseBeeState(record.lastObservedState);
-    if (previous) previousStates.set(record.name, previous);
-    if (record.substrate === "hsr") {
-      hsrLive.add(record.name);
-      if (previous) hsrStates.set(record.name, previous);
-    } else {
-      liveTargets.add(liveTargetKey(record.node, record.tmuxTarget));
-    }
-  }
-  return {
-    liveTargets,
-    livePanes: new Set(),
-    panes: new Map(),
-    previousStates,
-    seals: new Set(),
-    unreachableNodes: new Set(),
-    hsrLive,
-    hsrStates,
-    hsrSnapshots: new Map(),
-    hsrMirrors: new Set(),
-    hsrUnavailable: new Set(),
-    now,
-  };
-}
-
-export function createBeesTuiRefreshItems(
-  parsed: Parsed,
-  options: { deps?: ObserveDeps; initialItems?: BeesTuiItem[]; fullRefreshMs?: number; now?: () => number } = {},
-): () => Promise<BeesTuiItem[]> {
-  const deps = options.deps ?? {};
-  const fullRefreshMs = options.fullRefreshMs ?? BEES_TUI_FULL_REFRESH_MS;
-  const clock = options.now ?? (() => Date.now());
-  let lastFullRefreshAt = clock();
-  let lastItems = [...(options.initialItems ?? [])];
-  return async () => {
-    const fullDue = clock() - lastFullRefreshAt >= fullRefreshMs;
-    if (fullDue) {
-      const full = await loadBeesTuiItems(parsed, { deps, mode: "full" });
-      lastFullRefreshAt = clock();
-      lastItems = full.items;
-      return full.items;
-    }
-    if (wantsHistoryRecords(parsed)) return lastItems;
-    const cheap = await loadBeesTuiItems(parsed, { deps, mode: "cheap" });
-    lastItems = cheap.items;
-    return cheap.items;
-  };
+  const poolsLine = await beesPoolsLine(items, records, context, proEntries);
+  return { items, records, ...(poolsLine ? { poolsLine } : {}) };
 }
 
 

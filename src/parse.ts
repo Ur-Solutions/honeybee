@@ -41,7 +41,6 @@ export const BOOLEAN_FLAGS = new Set([
   "foreground",
   "fresh",
   "here",
-  "history",
   "window",
   "forever",
   "help",

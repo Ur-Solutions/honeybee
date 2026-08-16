@@ -37,7 +37,7 @@ async function seed(dir: string, record: SeedRecord): Promise<void> {
     id: record.name,
     createdAt: now,
     updatedAt: now,
-    status: record.status ?? "running",
+    status: record.status ?? "dead",
     ...(record.colony ? { colony: record.colony } : {}),
     ...(record.swarmId ? { swarmId: record.swarmId } : {}),
   };
@@ -62,7 +62,7 @@ async function withFixture(fn: (ctx: { store: string; repoA: string; repoB: stri
   }
 }
 
-test("hive list --json emits active records with the documented fields", async () => {
+test("hive list --json emits all records with the documented fields", async () => {
   await withFixture(async ({ store, repoA, repoB }) => {
     await seed(store, { name: "alpha", agent: "claude", cwd: repoA, colony: "frontend" });
     await seed(store, { name: "beta", agent: "codex", cwd: repoB, colony: "backend" });
@@ -80,9 +80,9 @@ test("hive list --json emits active records with the documented fields", async (
     assert.equal(a.colony, "frontend");
     assert.equal(a.cwd, repoA);
     assert.equal(a.repo, basename(repoA));
-    // No live tmux for an active record → crashed.
-    assert.equal(a.beeState, "crashed");
-    assert.equal(a.state, "crashed");
+    // No live tmux → dead.
+    assert.equal(a.beeState, "dead");
+    assert.equal(a.state, "dead");
   });
 });
 
@@ -161,10 +161,10 @@ test("hive list rejects a genuinely unknown colony selector", async () => {
   });
 });
 
-test("hive list --state dead opts into history and matches dead bees", async () => {
+test("hive list --state dead matches dead bees with no live tmux", async () => {
   await withFixture(async ({ store, repoA, repoB }) => {
-    await seed(store, { name: "alpha", agent: "claude", cwd: repoA, status: "dead" });
-    await seed(store, { name: "beta", agent: "codex", cwd: repoB, status: "dead" });
+    await seed(store, { name: "alpha", agent: "claude", cwd: repoA });
+    await seed(store, { name: "beta", agent: "codex", cwd: repoB });
 
     const { stdout } = await hive(store, "list", "--state", "dead", "--json");
     const rows = JSON.parse(stdout) as Array<{ name: string; beeState: string }>;
