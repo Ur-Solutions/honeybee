@@ -3,6 +3,7 @@
 import { transactionalKill, transactionalRetire, type KillOutcome } from "../kill.js";
 import { LifecycleConflictError, withSessionLifecycleTransaction } from "../lifecycle.js";
 import { appendLedger, loadSession, type SessionRecord, type SessionStopIntent } from "../store.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 
 const DEFAULT_HSR_STOP_RECOVERY_CONCURRENCY = 1;
@@ -27,8 +28,8 @@ export type HsrStopRecoveryDeps = {
   baseDelayMs?: number;
   maxDelayMs?: number;
   loadRecord?: typeof loadSession;
-  killRecord?: (record: SessionRecord) => Promise<KillOutcome>;
-  retireRecord?: (record: SessionRecord) => Promise<KillOutcome>;
+  killRecord?: (record: SessionRecord, expectedIntent: SessionStopIntent) => Promise<KillOutcome>;
+  retireRecord?: (record: SessionRecord, expectedIntent: SessionStopIntent) => Promise<KillOutcome>;
   appendEvent?: typeof appendLedger;
 };
 
@@ -53,6 +54,7 @@ function intentMatchesRecord(record: SessionRecord): boolean {
     intent.version === 1 &&
     record.status === "kill_failed" &&
     record.substrate === "hsr" &&
+    !isArchivedSessionLifecycle(record) &&
     intent.generation === (record.runtimeGeneration ?? 0) &&
     !intent.blockedReason;
 }
@@ -186,8 +188,8 @@ async function recoverOne(snapshot: SessionRecord, deps: HsrStopRecoveryDeps): P
   }).catch(() => undefined);
 
   const outcome = intent.action === "kill"
-    ? await (deps.killRecord ?? ((record) => transactionalKill(record)))(claimed.record)
-    : await (deps.retireRecord ?? ((record) => transactionalRetire(record)))(claimed.record);
+    ? await (deps.killRecord ?? ((record, expectedIntent) => transactionalKill(record, { expectedStopIntent: expectedIntent })))(claimed.record, intent)
+    : await (deps.retireRecord ?? ((record, expectedIntent) => transactionalRetire(record, { expectedStopIntent: expectedIntent })))(claimed.record, intent);
 
   if (outcome.ok) {
     return {
@@ -199,7 +201,7 @@ async function recoverOne(snapshot: SessionRecord, deps: HsrStopRecoveryDeps): P
     };
   }
 
-  if (!outcome.stillRunning) {
+  if (outcome.failureKind === "event-integrity") {
     return markStopIntentBlocked(claimed.record, "event-integrity", outcome.lastError);
   }
 

@@ -15,6 +15,7 @@ import {
 import { removeHsrRunDirUnderEventAuthority } from "./hsr/runDir.js";
 import { preservePendingHsrTurnReceiptsForPurge } from "./hsr/pendingTurns.js";
 import {
+  LifecycleConflictError,
   withSessionLifecycleLock,
   withSessionLifecycleTransaction,
   withSessionLifecycleTransactionIfPresent,
@@ -64,6 +65,12 @@ export type TransactionalKillOptions = {
   afterTeardown?: (record: SessionRecord) => Promise<void>;
   /** Deterministic crash-window hook after the irreversible stop dispatch. */
   afterStopDispatch?: (record: SessionRecord) => Promise<void>;
+  /**
+   * Daemon stop-recovery CAS token. When present, the exact durable intent
+   * claimed by the dispatcher must still be current immediately before any
+   * stop-side effect. User-initiated kill/retire calls omit this.
+   */
+  expectedStopIntent?: SessionStopIntent;
 };
 
 export type PurgeSessionDataOptions = Pick<
@@ -89,7 +96,13 @@ export type TransactionalCleanOptions = TransactionalKillOptions & {
 
 export type KillOutcome =
   | { ok: true; alreadyGone: boolean; attempts: number }
-  | { ok: false; lastError: string; stillRunning: boolean; attempts: number };
+  | {
+      ok: false;
+      lastError: string;
+      stillRunning: boolean;
+      attempts: number;
+      failureKind: "runtime-unconfirmed" | "settlement" | "event-integrity";
+    };
 
 const DEFAULT_POLL_ATTEMPTS = 4;
 const DEFAULT_POLL_INTERVAL_MS = 750;
@@ -131,6 +144,27 @@ function explicitStopIntent(
   };
 }
 
+function sameStopIntent(left: SessionStopIntent | undefined, right: SessionStopIntent): boolean {
+  return !!left &&
+    left.version === right.version &&
+    left.action === right.action &&
+    left.generation === right.generation &&
+    left.requestedAt === right.requestedAt &&
+    left.attempts === right.attempts &&
+    left.lastAttemptAt === right.lastAttemptAt &&
+    left.nextAttemptAt === right.nextAttemptAt &&
+    left.blockedReason === right.blockedReason;
+}
+
+function assertExpectedStopIntent(record: SessionRecord, expected: SessionStopIntent | undefined): void {
+  if (!expected) return;
+  if (record.status !== "kill_failed" || !sameStopIntent(record.stopIntent, expected)) {
+    throw new LifecycleConflictError(
+      `Session ${record.name} stop intent changed before the claimed recovery attempt could dispatch`,
+    );
+  }
+}
+
 async function eventIntegrityStopBlock(
   record: SessionRecord,
   operation: "session kill" | "session retire",
@@ -149,6 +183,7 @@ type TeardownVerdict = {
   attempts: number;
   alreadyGone: boolean;
   killReturnedFailure: boolean;
+  exactIncarnationStopped: boolean;
   stillRunning: boolean;
   substrateKind: Substrate["kind"];
   lastError?: string;
@@ -451,6 +486,7 @@ async function teardownSession(
     attempts,
     alreadyGone,
     killReturnedFailure,
+    exactIncarnationStopped,
     stillRunning,
     substrateKind: substrate.kind,
     ...(stillRunning || killReturnedFailure
@@ -726,6 +762,7 @@ async function transactionalKillInTransaction(
   current: SessionRecord,
   options: TransactionalKillOptions,
 ): Promise<KillOutcome> {
+  assertExpectedStopIntent(current, options.expectedStopIntent);
   const emitLedger = options.emitLedger !== false;
   const node = current.node ?? LOCAL_NODE_NAME;
   // Persist explicit stop intent before the first signal/RPC. The lifecycle
@@ -744,7 +781,7 @@ async function transactionalKillInTransaction(
 
   // Pane/session absence cannot override an indeterminate exact process-group
   // stop: an escaped child may have survived after tmux removed the target.
-  if (verdict.stillRunning || verdict.killReturnedFailure) {
+  if (verdict.stillRunning || (verdict.killReturnedFailure && !verdict.exactIncarnationStopped)) {
     const lastError = verdict.lastError ?? "exact runtime cleanup is unconfirmed";
     const failed = await lifecycle.commit({
       status: "kill_failed",
@@ -763,7 +800,45 @@ async function transactionalKillInTransaction(
         lastError,
       });
     }
-    return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
+    return {
+      ok: false,
+      lastError,
+      stillRunning: true,
+      attempts: verdict.attempts,
+      failureKind: "runtime-unconfirmed",
+    };
+  }
+
+  // Local/remote HSR teardown may prove the exact process generation stopped
+  // before its durable provider-event or delivery settlement finishes. Do not
+  // signal again in this attempt and do not mislabel it as a live runtime;
+  // retain the intent so the bounded recovery lane can retry settlement.
+  if (verdict.killReturnedFailure) {
+    const lastError = verdict.lastError ?? "stopped runtime settlement is unconfirmed";
+    const failed = await lifecycle.commit({
+      status: "kill_failed",
+      lastError,
+      stopIntent: explicitStopIntent(stopping, "kill"),
+      updatedAt: new Date().toISOString(),
+    });
+    await openStopFailedRequest(failed, lastError);
+    if (emitLedger) {
+      await appendLedger({
+        type: "session.kill",
+        session: current.name,
+        node,
+        ok: false,
+        attempts: verdict.attempts,
+        lastError,
+      });
+    }
+    return {
+      ok: false,
+      lastError,
+      stillRunning: false,
+      attempts: verdict.attempts,
+      failureKind: "settlement",
+    };
   }
 
   // Process absence is not permission to erase unresolved provider-event
@@ -793,7 +868,13 @@ async function transactionalKillInTransaction(
         lastError,
       });
     }
-    return { ok: false, lastError, stillRunning: false, attempts: verdict.attempts };
+    return {
+      ok: false,
+      lastError,
+      stillRunning: false,
+      attempts: verdict.attempts,
+      failureKind: "event-integrity",
+    };
   }
 
   await purgeSessionDataInTransaction(lifecycle, options, undefined, { runtimeStopConfirmed: true });
@@ -847,10 +928,17 @@ export async function transactionalRetire(
 ): Promise<KillOutcome> {
   return withSessionLifecycleTransaction(record, async (lifecycle) => {
     const current = await lifecycle.refresh();
+    assertExpectedStopIntent(current, options.expectedStopIntent);
     if (isArchivedSessionLifecycle(current)) {
       const existingIntegrityBlock = await eventIntegrityStopBlock(current, "session retire");
       if (existingIntegrityBlock) {
-        return { ok: false, lastError: existingIntegrityBlock, stillRunning: false, attempts: 0 };
+        return {
+          ok: false,
+          lastError: existingIntegrityBlock,
+          stillRunning: false,
+          attempts: 0,
+          failureKind: "event-integrity",
+        };
       }
       // A coordinator may have completed the proof-carrying archive transition
       // and died before removing a predecessor-only replacement journal. The
@@ -880,7 +968,7 @@ export async function transactionalRetire(
     const verdict = await teardownSession(stopping, options);
     await options.afterTeardown?.(stopping);
 
-    if (verdict.stillRunning || verdict.killReturnedFailure) {
+    if (verdict.stillRunning || (verdict.killReturnedFailure && !verdict.exactIncarnationStopped)) {
       const lastError = verdict.lastError ?? "exact runtime cleanup is unconfirmed";
       const failed = await lifecycle.commit({
         status: "kill_failed",
@@ -899,7 +987,41 @@ export async function transactionalRetire(
           lastError,
         });
       }
-      return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
+      return {
+        ok: false,
+        lastError,
+        stillRunning: true,
+        attempts: verdict.attempts,
+        failureKind: "runtime-unconfirmed",
+      };
+    }
+
+    if (verdict.killReturnedFailure) {
+      const lastError = verdict.lastError ?? "stopped runtime settlement is unconfirmed";
+      const failed = await lifecycle.commit({
+        status: "kill_failed",
+        lastError,
+        stopIntent: explicitStopIntent(stopping, "retire"),
+        updatedAt: new Date().toISOString(),
+      });
+      await openStopFailedRequest(failed, lastError);
+      if (emitLedger) {
+        await appendLedger({
+          type: "session.retire",
+          session: current.name,
+          node,
+          ok: false,
+          attempts: verdict.attempts,
+          lastError,
+        });
+      }
+      return {
+        ok: false,
+        lastError,
+        stillRunning: false,
+        attempts: verdict.attempts,
+        failureKind: "settlement",
+      };
     }
 
     // Exact process absence does not prove that every provider event made it
@@ -932,7 +1054,13 @@ export async function transactionalRetire(
           lastError,
         });
       }
-      return { ok: false, lastError, stillRunning: false, attempts: verdict.attempts };
+      return {
+        ok: false,
+        lastError,
+        stillRunning: false,
+        attempts: verdict.attempts,
+        failureKind: "event-integrity",
+      };
     }
 
     await retireSessionAfterConfirmedRuntimeStopInTransaction(

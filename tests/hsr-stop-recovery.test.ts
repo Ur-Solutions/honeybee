@@ -10,7 +10,7 @@ import {
   runHsrStopRecoverySweep,
 } from "../src/daemon/hsrStopRecovery.js";
 import { transactionalKill, transactionalRetire } from "../src/kill.js";
-import { loadSession, saveSession, type HsrEventIntegrityDoubt, type SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, transitionSession, updateSession, type HsrEventIntegrityDoubt, type SessionRecord } from "../src/store.js";
 import type { KillResult, Substrate } from "../src/substrates/types.js";
 
 const NOW = Date.parse("2026-08-16T10:00:00.000Z");
@@ -251,9 +251,15 @@ test("HSR stop recovery dispatcher joins its tracked sweep during shutdown", asy
         run = job;
       },
       now: () => NOW,
-      killRecord: async () => {
-        finished = true;
-        return { ok: false, lastError: "still live", stillRunning: true, attempts: 1 };
+    killRecord: async () => {
+      finished = true;
+      return {
+        ok: false,
+        lastError: "still live",
+        stillRunning: true,
+        attempts: 1,
+        failureKind: "runtime-unconfirmed",
+      };
       },
       appendEvent: async () => undefined,
     });
@@ -269,6 +275,141 @@ test("HSR stop recovery dispatcher joins its tracked sweep during shutdown", asy
     await closing;
     assert.equal(finished, true);
     assert.equal(closed, true);
+  });
+});
+
+test("HSR stop recovery cannot dispatch a stale kill claim after a retire intent wins", async () => {
+  await withTempStore(async () => {
+    const session = record("intent-race", "kill");
+    await saveSession(session);
+    let signals = 0;
+    const substrate = fakeSubstrate({
+      hasSession: async () => true,
+      kill: async () => {
+        signals += 1;
+        return killResult(true);
+      },
+    });
+
+    const outcomes = await runHsrStopRecoverySweep([session], {
+      now: () => NOW,
+      killRecord: async (candidate, expectedIntent) => {
+        await updateSession(candidate.name, {
+          stopIntent: {
+            version: 1,
+            action: "retire",
+            generation: expectedIntent.generation,
+            requestedAt: new Date(NOW + 1).toISOString(),
+            attempts: 0,
+          },
+        });
+        return transactionalKill(candidate, {
+          substrate,
+          pollIntervalMs: 0,
+          emitLedger: false,
+          expectedStopIntent: expectedIntent,
+        });
+      },
+    });
+
+    assert.equal(outcomes[0]?.action, "skipped");
+    assert.equal(signals, 0, "a superseded claim performs no process-group signal");
+    assert.equal((await loadSession(session.name))?.stopIntent?.action, "retire");
+  });
+});
+
+test("HSR stop recovery retries stopped-runtime settlement without calling it event-integrity", async () => {
+  await withTempStore(async () => {
+    const session = record("settlement-retry", "kill");
+    await saveSession(session);
+
+    const outcomes = await runHsrStopRecoverySweep([session], {
+      now: () => NOW,
+      killRecord: async () => ({
+        ok: false,
+        lastError: "runtime stopped; delivery settlement unavailable",
+        stillRunning: false,
+        attempts: 1,
+        failureKind: "settlement",
+      }),
+    });
+
+    assert.equal(outcomes[0]?.action, "failed");
+    const persisted = await loadSession(session.name);
+    assert.equal(persisted?.stopIntent?.attempts, 1);
+    assert.equal(persisted?.stopIntent?.blockedReason, undefined);
+  });
+});
+
+test("transactional kill classifies an exact-stopped HSR settlement failure without re-probing it live", async () => {
+  await withTempStore(async () => {
+    const session = record("stopped-settlement", "kill");
+    await saveSession(session);
+    let probes = 0;
+    const substrate = fakeSubstrate({
+      hasSession: async () => {
+        probes += 1;
+        return true;
+      },
+      kill: async () => ({
+        ok: false,
+        stdout: "",
+        stderr: "runtime stopped but settlement is pending",
+        exitCode: 1,
+        incarnationStopped: true,
+      }),
+    });
+
+    const outcome = await transactionalKill(session, {
+      substrate,
+      emitLedger: false,
+      expectedStopIntent: session.stopIntent,
+    });
+
+    assert.equal(outcome.ok, false);
+    if (outcome.ok) return;
+    assert.equal(outcome.stillRunning, false);
+    assert.equal(outcome.failureKind, "settlement");
+    assert.equal(probes, 1, "only the pre-dispatch presence probe runs after exact stop proof");
+    assert.equal((await loadSession(session.name))?.stopIntent?.blockedReason, undefined);
+  });
+});
+
+test("HSR stop recovery ignores archived lifecycle rows with stale stop intents", async () => {
+  await withTempStore(async () => {
+    const session = record("archived-intent", "kill");
+    await saveSession(session);
+    const at = "2026-08-16T09:30:00.000Z";
+    await transitionSession(session.name, {
+      type: "bee.archived",
+      eventId: "archived-intent-event",
+      at,
+      cause: "retire",
+      evidence: { kind: "operator", actionId: "archived-intent-event", observedAt: at, action: "retire" },
+      probe: {
+        kind: "probe",
+        probeId: "archived-intent-probe",
+        observerId: "hsr-stop-recovery-test",
+        observedAt: at,
+        outcome: "dead",
+        target: { substrate: "hsr", tmuxTarget: session.tmuxTarget },
+      },
+    });
+    const archived = (await loadSession(session.name))!;
+    assert.equal(archived.stopIntent?.action, "kill", "fixture retains the stale intent for the guard");
+    let stops = 0;
+
+    const outcomes = await runHsrStopRecoverySweep([archived], {
+      now: () => NOW,
+      killRecord: async () => {
+        stops += 1;
+        return { ok: true, alreadyGone: true, attempts: 0 };
+      },
+    });
+
+    assert.deepEqual(outcomes, []);
+    assert.equal(stops, 0);
+    assert.equal((await loadSession(session.name))?.stateMachine?.lifecycle, "archived");
   });
 });
 

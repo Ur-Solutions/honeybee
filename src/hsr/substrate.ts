@@ -562,6 +562,7 @@ export async function stopHsrIncarnation(
         stdout: "",
         stderr: `HSR runtime stopped but source-history settlement is unconfirmed for ${bee}: ${error instanceof Error ? error.message : String(error)}`,
         exitCode: 1,
+        incarnationStopped: true,
       };
     }
     if (sourceHistory.kind === "integrity") {
@@ -581,12 +582,13 @@ export async function stopHsrIncarnation(
         stdout: "",
         stderr: `HSR runtime stopped but durable delivery ownership could not be settled for ${bee}: ${error instanceof Error ? error.message : String(error)}`,
         exitCode: 1,
+        incarnationStopped: true,
       };
     }
     if (sourceHistory.kind === "clean" || sourceHistory.kind === "acknowledged") {
       await publishProvenStop(bee, initial, await readHsrMetaStrict(bee));
     }
-    return { ok: true, stdout: "", stderr: "", exitCode: 0 };
+    return { ok: true, stdout: "", stderr: "", exitCode: 0, incarnationStopped: true };
   }
   return {
     ok: false,
