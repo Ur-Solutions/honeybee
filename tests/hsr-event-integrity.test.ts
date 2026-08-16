@@ -149,6 +149,57 @@ test("rediscovering the same event-integrity fence preserves receipt and session
   });
 });
 
+test("reconfirming an unchanged event-integrity stop is a semantic no-op", async () => {
+  await withTempStore(async () => {
+    const bee = "event-integrity-idempotent-stop-confirmation";
+    const current = record(bee, {
+      substrate: "hsr",
+      runnerPid: host.hostPid,
+      runnerFingerprint: host.hostFingerprint,
+    });
+    await saveSession(current);
+    await ensureHsrRunDir(bee);
+    await writeHsrMeta(bee, {
+      bee,
+      harness: "stub",
+      tier: "stream",
+      ...host,
+      childAdmission: "none",
+      controlSocket: "",
+      status: "running",
+    });
+
+    const receipt = await persistHsrEventIntegrityFailure({
+      bee,
+      host,
+      deliveryIds: [],
+      reason: "fixture source history is incomplete",
+    });
+    const firstConfirmation = await recordHsrEventIntegrityStop(
+      bee,
+      receipt.integrityId,
+      host,
+      "confirmed",
+      "exact host and child-group stop proof",
+    );
+    const canonicalTimestamp = "2026-08-15T19:31:00.000Z";
+    const fenced = (await loadSession(bee))!;
+    await saveSession({ ...fenced, updatedAt: canonicalTimestamp });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const replay = await recordHsrEventIntegrityStop(
+      bee,
+      receipt.integrityId,
+      host,
+      "confirmed",
+      "exact host and child-group stop proof",
+    );
+
+    assert.equal(replay.updatedAt, firstConfirmation.updatedAt, "receipt confirmation timestamp is preserved");
+    assert.equal((await loadSession(bee))?.updatedAt, canonicalTimestamp, "canonical activity time is preserved");
+  });
+});
+
 test("acknowledging a stopped corrupt source quarantines evidence and unblocks one exact replacement", async () => {
   await withTempStore(async () => {
     const bee = "event-integrity-ack-quarantine";

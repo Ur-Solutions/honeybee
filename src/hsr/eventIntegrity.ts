@@ -724,6 +724,8 @@ export async function recordHsrEventIntegrityStop(
     }
     if (current.phase !== "unresolved") return current;
     if (current.stopState === "confirmed" && stopState === "doubt") return current;
+    const stopDetailChanged = stopDetail !== undefined && stopDetail !== current.stopDetail;
+    if (current.stopState === stopState && !stopDetailChanged) return current;
     const updated: HsrEventIntegrityReceipt = {
       ...current,
       stopState,
